@@ -1,0 +1,14 @@
+# Spike S10 egress proxy: CONNECT to port 443 on github.com and api.github.com
+# only, sources restricted to the internal network's subnet (rendered in).
+acl workers src @SUBNET@
+acl SSL_ports port 443
+acl CONNECT method CONNECT
+acl allowed dstdomain github.com api.github.com
+http_access deny CONNECT !SSL_ports
+http_access deny !CONNECT
+http_access allow workers allowed
+http_access deny all
+http_port 3128
+cache deny all
+access_log /var/log/squid/access.log
+pid_filename none
