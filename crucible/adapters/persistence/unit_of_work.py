@@ -19,12 +19,25 @@ from crucible.adapters.persistence.models import (
     ExecutionRow,
     IdempotencyKeyRow,
     LeaseRow,
-    PolicyRow,
     PrincipalRow,
     RepositoryRow,
     SupervisorStatusRow,
     TaskContractRow,
     TaskRow,
+)
+from crucible.adapters.persistence.records import (
+    Acceptances,
+    Artifacts,
+    AttemptMetricsRepo,
+    Decisions,
+    Dispositions,
+    Escalations,
+    Evidences,
+    GateResults,
+    Policies,
+    ReviewReports,
+    RoutingPolicies,
+    Wakes,
 )
 from crucible.domain.entities import (
     Attempt,
@@ -33,7 +46,6 @@ from crucible.domain.entities import (
     Execution,
     ExecutionRole,
     Lease,
-    Policy,
     Principal,
     Repository,
     Role,
@@ -46,22 +58,33 @@ from crucible.domain.ids import new_id
 from crucible.domain.lifecycle import AttemptState, ExecutionState, TaskState
 from crucible.domain.time import ensure_utc
 from crucible.ports.repository import (
+    AcceptanceRepository,
     AppendOnlyViolationError,
+    ArtifactRepository,
+    AttemptMetricsRepository,
     AttemptRepository,
     ClaimRepository,
     ContractRepository,
+    DecisionRepository,
+    DispositionRepository,
+    EscalationRepository,
     EventRepository,
+    EvidenceRepository,
     ExecutionRepository,
     FencedTokenRejectedError,
+    GateResultRepository,
     IdempotencyKeyTakenError,
     IdempotencyRepository,
     LeaseRepository,
     PolicyRepository,
     PrincipalRepository,
     RepositoryRegistry,
+    ReviewReportRepository,
+    RoutingPolicyRepository,
     SupervisorStatusRepository,
     TaskRepository,
     UnitOfWork,
+    WakeRepository,
 )
 
 SUPERVISOR_LEASE_KIND = "supervisor"
@@ -190,23 +213,6 @@ class Repositories:
         return self._to_entity(row)
 
 
-class Policies:
-    def __init__(self, session: Session) -> None:
-        self._s = session
-
-    def get(self, name: str, version: int) -> Policy | None:
-        row = self._s.get(PolicyRow, (name, version))
-        if row is None:
-            return None
-        return Policy(
-            name=row.name,
-            version=row.version,
-            document=row.document,
-            created_at=ensure_utc(row.created_at),
-            retired_at=_dt(row.retired_at),
-        )
-
-
 class Tasks:
     def __init__(self, session: Session) -> None:
         self._s = session
@@ -227,6 +233,8 @@ class Tasks:
             created_at=ensure_utc(row.created_at),
             updated_at=ensure_utc(row.updated_at),
             closed_at=_dt(row.closed_at),
+            head_sha=row.head_sha,
+            publish_pending=row.publish_pending,
         )
 
     def add(self, task: Task) -> None:
@@ -245,6 +253,8 @@ class Tasks:
                 created_at=task.created_at,
                 updated_at=task.updated_at,
                 closed_at=task.closed_at,
+                head_sha=task.head_sha,
+                publish_pending=task.publish_pending,
             )
         )
         self._s.flush()
@@ -273,6 +283,8 @@ class Tasks:
                 contract_version=task.contract_version,
                 updated_at=task.updated_at,
                 closed_at=task.closed_at,
+                head_sha=task.head_sha,
+                publish_pending=task.publish_pending,
             )
         )
 
@@ -419,6 +431,14 @@ class Executions:
     def list_for_task(self, task_id: str) -> Sequence[Execution]:
         rows = self._s.scalars(
             select(ExecutionRow).where(ExecutionRow.task_id == task_id).order_by(ExecutionRow.id)
+        ).all()
+        return [self._to_entity(r) for r in rows]
+
+    def list_for_task_by_role(self, task_id: str, role: ExecutionRole) -> Sequence[Execution]:
+        rows = self._s.scalars(
+            select(ExecutionRow)
+            .where(ExecutionRow.task_id == task_id, ExecutionRow.role == role.value)
+            .order_by(ExecutionRow.id)
         ).all()
         return [self._to_entity(r) for r in rows]
 
@@ -828,6 +848,17 @@ class SqlUnitOfWork:
     claims: ClaimRepository
     supervisor_status: SupervisorStatusRepository
     idempotency: IdempotencyRepository
+    routing_policies: RoutingPolicyRepository
+    artifacts: ArtifactRepository
+    evidence: EvidenceRepository
+    review_reports: ReviewReportRepository
+    gate_results: GateResultRepository
+    acceptance: AcceptanceRepository
+    decisions: DecisionRepository
+    escalations: EscalationRepository
+    dispositions: DispositionRepository
+    wakes: WakeRepository
+    attempt_metrics: AttemptMetricsRepository
 
     def __init__(self, session_factory: sessionmaker[Session]) -> None:
         self._factory = session_factory
@@ -854,6 +885,17 @@ class SqlUnitOfWork:
         self.claims = Claims(s)
         self.supervisor_status = SupervisorStatuses(s)
         self.idempotency = IdempotencyKeys(s)
+        self.routing_policies = RoutingPolicies(s)
+        self.artifacts = Artifacts(s)
+        self.evidence = Evidences(s)
+        self.review_reports = ReviewReports(s)
+        self.gate_results = GateResults(s)
+        self.acceptance = Acceptances(s)
+        self.decisions = Decisions(s)
+        self.escalations = Escalations(s)
+        self.dispositions = Dispositions(s)
+        self.wakes = Wakes(s)
+        self.attempt_metrics = AttemptMetricsRepo(s)
         return self
 
     def __exit__(

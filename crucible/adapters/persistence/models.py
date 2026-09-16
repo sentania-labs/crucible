@@ -9,6 +9,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -16,8 +17,9 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 ID = String(26)
@@ -80,6 +82,8 @@ class TaskRow(Base):
     created_at: Mapped[datetime] = mapped_column(TZ)
     updated_at: Mapped[datetime] = mapped_column(TZ)
     closed_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
+    head_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    publish_pending: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 class TaskContractRow(Base):
@@ -198,4 +202,185 @@ class IdempotencyKeyRow(Base):
     request_sha256: Mapped[str] = mapped_column(String(64))
     response_status: Mapped[int | None] = mapped_column(Integer, nullable=True)
     response_body: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(TZ)
+
+
+class RoutingPolicyRow(Base):
+    __tablename__ = "routing_policies"
+    name: Mapped[str] = mapped_column(String(128), primary_key=True)
+    version: Mapped[int] = mapped_column(Integer, primary_key=True)
+    document: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(TZ)
+    retired_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
+
+
+class ArtifactRow(Base):
+    __tablename__ = "artifacts"
+    __table_args__ = (
+        Index("ix_artifacts_attempt", "attempt_id"),
+        Index("ix_artifacts_task", "task_id"),
+    )
+    id: Mapped[str] = mapped_column(ID, primary_key=True)
+    attempt_id: Mapped[str | None] = mapped_column(ID, ForeignKey("attempts.id"), nullable=True)
+    task_id: Mapped[str | None] = mapped_column(ID, ForeignKey("tasks.id"), nullable=True)
+    type: Mapped[str] = mapped_column(String(64))
+    path: Mapped[str] = mapped_column(Text)
+    size: Mapped[int] = mapped_column(BigInteger)
+    sha256: Mapped[str] = mapped_column(String(64))
+    content_type: Mapped[str] = mapped_column(String(128))
+    created_by: Mapped[str] = mapped_column(String(160))
+    created_at: Mapped[datetime] = mapped_column(TZ)
+
+
+class EvidenceRow(Base):
+    __tablename__ = "evidence"
+    __table_args__ = (
+        Index("ix_evidence_attempt_kind", "attempt_id", "kind"),
+        Index("ix_evidence_task", "task_id"),
+    )
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    attempt_id: Mapped[str | None] = mapped_column(ID, ForeignKey("attempts.id"), nullable=True)
+    task_id: Mapped[str | None] = mapped_column(ID, ForeignKey("tasks.id"), nullable=True)
+    pull_request_id: Mapped[str | None] = mapped_column(ID, nullable=True)
+    kind: Mapped[str] = mapped_column(String(32))
+    observed_at: Mapped[datetime] = mapped_column(TZ)
+    source: Mapped[str] = mapped_column(String(16))
+    verified: Mapped[bool] = mapped_column(Boolean)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    artifact_id: Mapped[str | None] = mapped_column(ID, ForeignKey("artifacts.id"), nullable=True)
+
+
+class ReviewReportRow(Base):
+    __tablename__ = "review_reports"
+    __table_args__ = (Index("ix_review_reports_task_head", "task_id", "head_sha"),)
+    id: Mapped[str] = mapped_column(ID, primary_key=True)
+    task_id: Mapped[str] = mapped_column(ID, ForeignKey("tasks.id"))
+    head_sha: Mapped[str] = mapped_column(String(64))
+    reviewer_kind: Mapped[str] = mapped_column(String(32))
+    reviewer_attempt_id: Mapped[str | None] = mapped_column(
+        ID, ForeignKey("attempts.id"), nullable=True
+    )
+    reviewer_principal_id: Mapped[str | None] = mapped_column(
+        ID, ForeignKey("principals.id"), nullable=True
+    )
+    document: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    artifact_id: Mapped[str | None] = mapped_column(ID, ForeignKey("artifacts.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(TZ)
+    superseded_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
+
+
+class GateResultRow(Base):
+    __tablename__ = "gate_results"
+    __table_args__ = (
+        UniqueConstraint("attempt_id", "gate", "head_sha", name="uq_gate_results_attempt_gate"),
+        Index("ix_gate_results_task", "task_id"),
+    )
+    id: Mapped[str] = mapped_column(ID, primary_key=True)
+    task_id: Mapped[str] = mapped_column(ID, ForeignKey("tasks.id"))
+    attempt_id: Mapped[str] = mapped_column(ID, ForeignKey("attempts.id"))
+    head_sha: Mapped[str] = mapped_column(String(64))
+    gate: Mapped[str] = mapped_column(String(48))
+    phase: Mapped[str] = mapped_column(String(16))
+    result: Mapped[str] = mapped_column(String(16))
+    detail: Mapped[str] = mapped_column(Text)
+    evidence_ids: Mapped[list[Any]] = mapped_column(ARRAY(BigInteger))
+    evaluated_at: Mapped[datetime] = mapped_column(TZ)
+
+
+class AcceptanceResultRow(Base):
+    __tablename__ = "acceptance_results"
+    __table_args__ = (Index("ix_acceptance_task", "task_id"),)
+    id: Mapped[str] = mapped_column(ID, primary_key=True)
+    task_id: Mapped[str] = mapped_column(ID, ForeignKey("tasks.id"))
+    head_sha: Mapped[str] = mapped_column(String(64))
+    principal_id: Mapped[str] = mapped_column(ID, ForeignKey("principals.id"))
+    verdict: Mapped[str] = mapped_column(String(24))
+    reasoning: Mapped[str] = mapped_column(Text)
+    superseded_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(TZ)
+
+
+class EscalationRow(Base):
+    __tablename__ = "escalations"
+    __table_args__ = (Index("ix_escalations_task_state", "task_id", "state"),)
+    id: Mapped[str] = mapped_column(ID, primary_key=True)
+    task_id: Mapped[str] = mapped_column(ID, ForeignKey("tasks.id"))
+    attempt_id: Mapped[str | None] = mapped_column(ID, ForeignKey("attempts.id"), nullable=True)
+    state: Mapped[str] = mapped_column(String(16))
+    question: Mapped[str] = mapped_column(Text)
+    opened_at: Mapped[datetime] = mapped_column(TZ)
+    closed_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
+    decision_id: Mapped[str | None] = mapped_column(ID, nullable=True)
+    last_wake_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
+
+
+class DecisionRow(Base):
+    __tablename__ = "decisions"
+    __table_args__ = (Index("ix_decisions_task", "task_id"),)
+    id: Mapped[str] = mapped_column(ID, primary_key=True)
+    task_id: Mapped[str | None] = mapped_column(ID, ForeignKey("tasks.id"), nullable=True)
+    escalation_id: Mapped[str | None] = mapped_column(
+        ID, ForeignKey("escalations.id"), nullable=True
+    )
+    principal_id: Mapped[str] = mapped_column(ID, ForeignKey("principals.id"))
+    kind: Mapped[str] = mapped_column(String(48))
+    verbatim: Mapped[str] = mapped_column(Text)
+    resolves: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(TZ)
+
+
+class ReviewDispositionRow(Base):
+    __tablename__ = "review_dispositions"
+    id: Mapped[str] = mapped_column(ID, primary_key=True)
+    review_comment_id: Mapped[str] = mapped_column(String(64), unique=True)
+    principal_id: Mapped[str] = mapped_column(ID, ForeignKey("principals.id"))
+    disposition: Mapped[str] = mapped_column(String(24))
+    reasoning: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(TZ)
+
+
+class WakeRow(Base):
+    __tablename__ = "wakes"
+    __table_args__ = (
+        Index(
+            "ix_wakes_principal_unacked",
+            "principal_id",
+            "acked_at",
+            postgresql_where=text("acked_at IS NULL"),
+        ),
+    )
+    id: Mapped[str] = mapped_column(ID, primary_key=True)
+    principal_id: Mapped[str] = mapped_column(ID, ForeignKey("principals.id"))
+    task_id: Mapped[str | None] = mapped_column(ID, ForeignKey("tasks.id"), nullable=True)
+    reason: Mapped[str] = mapped_column(String(48))
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(TZ)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    delivered_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
+    acked_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
+    ack_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    gave_up_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
+
+
+class AttemptMetricsRow(Base):
+    __tablename__ = "attempt_metrics"
+    __table_args__ = (Index("ix_attempt_metrics_model", "model", "created_at"),)
+    attempt_id: Mapped[str] = mapped_column(ID, ForeignKey("attempts.id"), primary_key=True)
+    task_id: Mapped[str] = mapped_column(ID, ForeignKey("tasks.id"))
+    model: Mapped[str] = mapped_column(String(128))
+    harness: Mapped[str] = mapped_column(String(32))
+    endpoint_kind: Mapped[str] = mapped_column(String(16))
+    pool: Mapped[str] = mapped_column(String(64))
+    wall_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    tokens_in: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    tokens_out: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    cost_units: Mapped[float | None] = mapped_column(Float, nullable=True)
+    cost_source: Mapped[str] = mapped_column(String(24))
+    exit_class: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    gates_passed: Mapped[int] = mapped_column(Integer, default=0)
+    gates_failed: Mapped[int] = mapped_column(Integer, default=0)
+    corrections_after: Mapped[int] = mapped_column(Integer, default=0)
+    acceptance_verdict: Mapped[str | None] = mapped_column(String(24), nullable=True)
     created_at: Mapped[datetime] = mapped_column(TZ)
