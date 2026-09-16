@@ -39,6 +39,12 @@ class TaskState(StrEnum):
     CLOSED = "closed"
 
 
+class EscalationState(StrEnum):
+    OPEN = "open"
+    ANSWERED = "answered"
+    CLOSED = "closed"
+
+
 class ExecutionState(StrEnum):
     CREATED = "created"
     ACTIVE = "active"
@@ -176,6 +182,16 @@ ATTEMPT_TRANSITIONS: frozenset[tuple[AttemptState, AttemptState]] = frozenset(
 )
 
 
+_X = EscalationState
+ESCALATION_TRANSITIONS: frozenset[tuple[EscalationState, EscalationState]] = frozenset(
+    {
+        (_X.OPEN, _X.ANSWERED),
+        (_X.ANSWERED, _X.CLOSED),
+        (_X.OPEN, _X.CLOSED),
+    }
+)
+
+
 class IllegalTransitionError(Exception):
     """Raised when the transition table does not permit current -> target."""
 
@@ -191,6 +207,7 @@ _TABLES: Mapping[str, frozenset[tuple[StrEnum, StrEnum]]] = {
     "task": TASK_TRANSITIONS,
     "execution": EXECUTION_TRANSITIONS,
     "attempt": ATTEMPT_TRANSITIONS,
+    "escalation": ESCALATION_TRANSITIONS,
 }
 
 
