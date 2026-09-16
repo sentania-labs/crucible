@@ -33,6 +33,7 @@ class EventKind(StrEnum):
     ATTEMPT_RUNNING = "attempt_running"
     ATTEMPT_TIMEOUT_DRAIN = "attempt_timeout_drain"
     ATTEMPT_TIMEOUT_KILL = "attempt_timeout_kill"
+    ATTEMPT_CANCEL_KILL = "attempt_cancel_kill"
     ATTEMPT_TERMINATING = "attempt_terminating"
     ATTEMPT_EXITED = "attempt_exited"
     ATTEMPT_LOST = "attempt_lost"

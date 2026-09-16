@@ -149,3 +149,78 @@ async def test_worker_removed_out_of_band_is_lost(
     provider.remove_out_of_band(str(attempt["id"]))
     assert await run_until(supervisor, client, task_id, {"reported"}) == "reported"
     assert "attempt_lost" in event_kinds(client, task_id)
+
+
+async def test_stranded_launch_without_handle_is_environment_failure(
+    ctx: AppContext, provider: FakeProvider, client: TestClient, clock: FakeClock
+) -> None:
+    """Crucible died after `preparing` was recorded and before any worker existed."""
+    a = make_supervisor(ctx, provider, holder="sup-a")
+    task_id = submit_and_start(
+        client,
+        "crucible-worker:fake-succeed-5",
+        lifecycle={"max_attempts": 2, "retry_on": ["environment"], "cleanup": "policy"},
+    )
+    await a.tick()
+    (attempt,) = client.get(f"/v1/tasks/{task_id}").json()["executions"][0]["attempts"]
+    from crucible.domain.lifecycle import AttemptState  # noqa: PLC0415
+
+    provider.remove_out_of_band(str(attempt["id"]))
+    with ctx.uow_factory() as uow:
+        uow.set_fenced_token(a.fenced_token or 0)
+        row = uow.attempts.get(attempt["id"], for_update=True)
+        assert row is not None
+        row.state = AttemptState.PREPARING
+        row.handle = None
+        uow.attempts.save(row)
+        uow.commit()
+    clock.advance(31)
+    b = make_supervisor(ctx, provider, holder="sup-b")
+    await b.tick()
+    kinds = event_kinds(client, task_id)
+    assert "task_retry_scheduled" in kinds
+    attempts = [
+        x for e in client.get(f"/v1/tasks/{task_id}").json()["executions"] for x in e["attempts"]
+    ]
+    assert attempts[0]["exit_class"] == "environment" and len(attempts) == 2
+    assert await run_until(b, client, task_id, {"reported"}) == "reported"
+
+
+async def test_worker_surviving_kill_is_killed_again(
+    client: TestClient, supervisor: Supervisor, provider: FakeProvider, clock: FakeClock
+) -> None:
+    task_id = submit_and_start(client, "crucible-worker:fake-immortal")
+    await supervisor.tick()
+    (attempt,) = client.get(f"/v1/tasks/{task_id}").json()["executions"][0]["attempts"]
+    worker = provider.worker(str(attempt["id"]))
+    assert worker is not None
+    clock.advance(3600)
+    await supervisor.tick()
+    assert worker.drains == 1
+    clock.advance(60)
+    await supervisor.tick()
+    assert worker.kills == 1, "first kill issued at the grace deadline"
+    await supervisor.tick()
+    assert worker.kills == 2 and worker.drains == 1, "re-killed, never re-drained"
+    assert await run_until(supervisor, client, task_id, {"reported"}) == "reported"
+    kinds = event_kinds(client, task_id)
+    assert kinds.count("attempt_timeout_drain") == 1 and kinds.count("attempt_timeout_kill") == 1
+
+
+async def test_illegal_supervisor_transition_is_recorded(
+    ctx: AppContext, provider: FakeProvider, client: TestClient
+) -> None:
+    from crucible.application.transitions import move_task  # noqa: PLC0415
+    from crucible.domain.events import EventKind  # noqa: PLC0415
+    from crucible.domain.lifecycle import IllegalTransitionError, TaskState  # noqa: PLC0415
+
+    sup: Supervisor = make_supervisor(ctx, provider)
+    await sup.tick()
+    task_id = client.post("/v1/tasks", json=contract_document()).json()["id"]
+    with pytest.raises(IllegalTransitionError), sup._fenced() as uow:
+        task = uow.tasks.get(task_id, for_update=True)
+        assert task is not None
+        move_task(uow, ctx.clock, task, TaskState.REPORTED, EventKind.TASK_REPORTED)
+    kinds = event_kinds(client, task_id)
+    assert kinds == ["task_submitted", "transition_rejected"]
+    assert client.get(f"/v1/tasks/{task_id}").json()["state"] == "submitted"

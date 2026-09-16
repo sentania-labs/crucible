@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import socket
 from dataclasses import dataclass
 
@@ -13,6 +14,7 @@ from crucible.adapters.clock import SystemClock
 from crucible.adapters.execution.fake import FakeProvider
 from crucible.adapters.persistence.unit_of_work import SqlUnitOfWorkFactory, make_engine
 from crucible.application.supervisor import Supervisor
+from crucible.domain.ids import new_id
 from crucible.ports.execution import ExecutionProvider
 from crucible.settings import Settings
 
@@ -29,7 +31,7 @@ class Wiring:
             self.ctx.uow_factory,
             self.providers,
             self.ctx.clock,
-            holder=s.holder or f"{socket.gethostname()}:{id(self) & 0xFFFF:04x}",
+            holder=f"{s.holder or socket.gethostname()}:{os.getpid()}:{new_id()[-6:]}",
             lease_ttl_seconds=s.lease_ttl_seconds,
             attempt_lease_ttl_seconds=s.attempt_lease_ttl_seconds,
             grace_seconds=s.grace_seconds,

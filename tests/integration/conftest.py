@@ -25,6 +25,11 @@ from tests.fixtures import REPOSITORY_URL, FakeClock, contract_document
 
 pytestmark = pytest.mark.integration
 
+# The same digest compose.yaml pins, so the tier and the stack run one Postgres build.
+POSTGRES_IMAGE = (
+    "postgres:16@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94"
+)
+
 TRUNCATE = (
     "TRUNCATE idempotency_keys, supervisor_status, completion_claims, leases, events, "
     "attempts, executions, task_contracts, tasks, repositories, principals RESTART IDENTITY CASCADE"
@@ -39,7 +44,7 @@ def database_url() -> Iterator[str]:
         return
     from testcontainers.postgres import PostgresContainer  # noqa: PLC0415
 
-    with PostgresContainer("postgres:16", driver="psycopg") as pg:
+    with PostgresContainer(POSTGRES_IMAGE, driver="psycopg") as pg:
         yield pg.get_connection_url()
 
 

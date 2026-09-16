@@ -235,3 +235,18 @@ def test_openapi_published(client: TestClient) -> None:
     spec = client.get("/v1/openapi.json").json()
     assert "/v1/tasks/{task_id}/start" in spec["paths"]
     assert "TaskView" in spec["components"]["schemas"]
+
+
+def test_idempotency_key_is_scoped_by_route(client: TestClient) -> None:
+    a = contract_document(external_id="EX-A")
+    a["repository"]["work_branch"] = "crucible/EX-A"
+    b = contract_document(external_id="EX-B")
+    b["repository"]["work_branch"] = "crucible/EX-B"
+    ida = client.post("/v1/tasks", json=a).json()["id"]
+    idb = client.post("/v1/tasks", json=b).json()["id"]
+    body = {"reason": "r", "verbatim": "stop", "decided_by": "scott"}
+    r1 = client.post(f"/v1/tasks/{ida}/cancel", json=body, headers={"Idempotency-Key": "same"})
+    assert r1.status_code == 200 and r1.json()["id"] == ida
+    r2 = client.post(f"/v1/tasks/{idb}/cancel", json=body, headers={"Idempotency-Key": "same"})
+    assert r2.status_code == 422, "the same key on another route must not replay task A"
+    assert client.get(f"/v1/tasks/{idb}").json()["state"] == "submitted"

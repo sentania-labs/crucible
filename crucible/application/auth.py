@@ -35,6 +35,8 @@ def mint_token(
     uow: UnitOfWork, clock: Clock, *, name: str, role: Role, rotate: bool = False
 ) -> MintedToken:
     """Create a principal with a fresh token, or rotate an existing principal's token."""
+    if name == "crucible" or name.startswith("worker:") or not name.strip():
+        raise ValueError(f"principal name {name!r} is reserved")
     existing = uow.principals.get_by_name(name)
     secret = secrets.token_urlsafe(SECRET_BYTES)
     salt = secrets.token_bytes(SALT_BYTES)

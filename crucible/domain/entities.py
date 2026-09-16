@@ -123,6 +123,7 @@ class Attempt:
     exit_class: ExitClass | None = None
     timeout_at: datetime | None = None
     drain_deadline: datetime | None = None
+    killed_at: datetime | None = None
     termination_reason: str | None = None
 
 

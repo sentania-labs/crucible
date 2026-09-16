@@ -46,6 +46,7 @@ EVENT_KINDS = (
     "attempt_running",
     "attempt_timeout_drain",
     "attempt_timeout_kill",
+    "attempt_cancel_kill",
     "attempt_terminating",
     "attempt_exited",
     "attempt_lost",
@@ -228,8 +229,9 @@ BEGIN
             TG_TABLE_NAME USING ERRCODE = 'CRU01';
     END IF;
     presented := setting::bigint;
+    -- FOR SHARE waits for an in-flight takeover to commit, then sees its token.
     SELECT fenced_token INTO current_token FROM leases
-        WHERE kind = 'supervisor' AND key = 'supervisor';
+        WHERE kind = 'supervisor' AND key = 'supervisor' FOR SHARE;
     IF current_token IS NULL OR current_token <> presented THEN
         RAISE EXCEPTION 'stale fenced token % for % (current %)',
             presented, TG_TABLE_NAME, current_token USING ERRCODE = 'CRU01';
@@ -240,7 +242,7 @@ $$ LANGUAGE plpgsql;
 """
 
 APPEND_ONLY_TABLES = ("events", "task_contracts")
-FENCED_TABLES = ("executions", "attempts", "completion_claims", "events")
+FENCED_TABLES = ("executions", "attempts", "completion_claims", "supervisor_status", "events")
 
 
 def upgrade() -> None:
@@ -344,6 +346,7 @@ def upgrade() -> None:
         sa.Column("exit_class", sa.String(32), nullable=True),
         sa.Column("timeout_at", TZ, nullable=True),
         sa.Column("drain_deadline", TZ, nullable=True),
+        sa.Column("killed_at", TZ, nullable=True),
         sa.Column("termination_reason", sa.String(32), nullable=True),
         sa.UniqueConstraint("execution_id", "number", name="uq_attempts_execution_number"),
     )

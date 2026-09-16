@@ -9,6 +9,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from fastapi.responses import JSONResponse
+from sqlalchemy.exc import IntegrityError
 
 from crucible.application.errors import IdempotencyKeyReuseError
 from crucible.domain.entities import Principal
@@ -18,12 +19,13 @@ from crucible.ports.repository import UnitOfWorkFactory
 Producer = Callable[[], Awaitable[tuple[int, dict[str, Any]]]]
 
 
-def body_sha256(body: bytes) -> str:
+def body_sha256(body: bytes, scope: str = "") -> str:
+    """Hash of the canonical body, scoped by route so one key cannot straddle two endpoints."""
     try:
         canonical = json.dumps(json.loads(body or b"{}"), sort_keys=True, separators=(",", ":"))
     except ValueError:
         canonical = body.decode("utf-8", "replace")
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return hashlib.sha256(f"{scope}\n{canonical}".encode()).hexdigest()
 
 
 async def with_idempotency(
@@ -33,12 +35,13 @@ async def with_idempotency(
     principal: Principal,
     key: str | None,
     body: bytes,
+    scope: str,
     produce: Producer,
 ) -> JSONResponse:
     if key is None:
         status, payload = await produce()
         return JSONResponse(status_code=status, content=payload)
-    digest = body_sha256(body)
+    digest = body_sha256(body, scope)
     with uow_factory() as uow:
         stored = uow.idempotency.get(principal.id, key)
     if stored is not None:
@@ -51,9 +54,19 @@ async def with_idempotency(
             status_code=status, content=payload, headers={"Idempotent-Replayed": "true"}
         )
     status, payload = await produce()
-    with uow_factory() as uow:
-        uow.idempotency.put(
-            principal.id, key, request_sha256=digest, status=status, body=payload, now=clock.now()
-        )
-        uow.commit()
+    try:
+        with uow_factory() as uow:
+            uow.idempotency.put(
+                principal.id,
+                key,
+                request_sha256=digest,
+                status=status,
+                body=payload,
+                now=clock.now(),
+            )
+            uow.commit()
+    except IntegrityError:
+        # A concurrent first request stored the key; the mutation above still succeeded,
+        # so the caller gets its own result rather than a 500.
+        pass
     return JSONResponse(status_code=status, content=payload)

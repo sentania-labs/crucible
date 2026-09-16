@@ -10,6 +10,7 @@ optionally followed by `-<n>` observations before the scripted exit. Behaviors:
 - crash              exit 1, no report
 - environment        exit 70
 - hang               never exits; ignores drain, dies on kill
+- immortal           ignores drain and the first kill, dies on the second kill
 - vanish             disappears after launch (loss)
 
 A test may also script a behavior per external_id with `script()`, which wins over
@@ -48,6 +49,7 @@ Behavior = Literal[
     "crash",
     "environment",
     "hang",
+    "immortal",
     "vanish",
     "prepare-fails",
 ]
@@ -60,6 +62,7 @@ BEHAVIORS: frozenset[str] = frozenset(
         "crash",
         "environment",
         "hang",
+        "immortal",
         "vanish",
         "prepare-fails",
     }
@@ -194,7 +197,7 @@ class FakeProvider:
         if worker.state is not ObservationState.RUNNING:
             return Observation(worker.state, exit_code=worker.exit_code)
         worker.observations += 1
-        if worker.behavior == "hang":
+        if worker.behavior in ("hang", "immortal"):
             return Observation(ObservationState.RUNNING)
         if worker.observations < worker.remaining:
             return Observation(ObservationState.RUNNING)
@@ -239,12 +242,14 @@ class FakeProvider:
             return
         if mode == "drain":
             worker.drains += 1
-            if worker.behavior != "hang":
+            if worker.behavior not in ("hang", "immortal"):
                 worker.state = ObservationState.EXITED
                 worker.exit_code = 143
                 worker.killed = True
             return
         worker.kills += 1
+        if worker.behavior == "immortal" and worker.kills < 2:
+            return
         worker.state = ObservationState.EXITED
         worker.exit_code = 137
         worker.killed = True

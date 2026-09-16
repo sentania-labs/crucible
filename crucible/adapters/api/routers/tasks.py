@@ -39,6 +39,7 @@ async def submit(
         principal=principal,
         key=idempotency_key,
         body=body,
+        scope=str(request.url.path),
         produce=produce,
     )
 
@@ -94,6 +95,7 @@ async def start(
         principal=principal,
         key=idempotency_key,
         body=raw,
+        scope=str(request.url.path),
         produce=produce,
     )
 
@@ -120,6 +122,7 @@ async def cancel(
         principal=principal,
         key=idempotency_key,
         body=raw,
+        scope=str(request.url.path),
         produce=produce,
     )
 

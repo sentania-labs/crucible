@@ -451,6 +451,7 @@ class Attempts:
             exit_class=ExitClass(row.exit_class) if row.exit_class else None,
             timeout_at=_dt(row.timeout_at),
             drain_deadline=_dt(row.drain_deadline),
+            killed_at=_dt(row.killed_at),
             termination_reason=row.termination_reason,
         )
 
@@ -473,6 +474,7 @@ class Attempts:
                 exit_class=attempt.exit_class.value if attempt.exit_class else None,
                 timeout_at=attempt.timeout_at,
                 drain_deadline=attempt.drain_deadline,
+                killed_at=attempt.killed_at,
                 termination_reason=attempt.termination_reason,
             )
         )
@@ -501,6 +503,7 @@ class Attempts:
                 exit_class=attempt.exit_class.value if attempt.exit_class else None,
                 timeout_at=attempt.timeout_at,
                 drain_deadline=attempt.drain_deadline,
+                killed_at=attempt.killed_at,
                 termination_reason=attempt.termination_reason,
             )
         )
@@ -630,11 +633,10 @@ class Leases:
             self._s.add(row)
             self._s.flush()
             return self._to_entity(row)
-        if row.holder == holder:
-            row.expires_at = expires
-            self._s.flush()
-            return self._to_entity(row)
         if ensure_utc(row.expires_at) <= now:
+            # Only an expired lease can be taken, whatever the holder name says: a process
+            # that lost its token waits like any other standby. Every acquisition bumps the
+            # token, so a replacement never shares one with its predecessor.
             row.holder = holder
             row.fenced_token = row.fenced_token + 1
             row.expires_at = expires
@@ -651,6 +653,10 @@ class Leases:
         row.expires_at = now + timedelta(seconds=ttl_seconds)
         self._s.flush()
         return self._to_entity(row)
+
+    def verify_supervisor(self, holder: str, fenced_token: int) -> bool:
+        row = self._supervisor_row(for_update=False)
+        return row is not None and row.holder == holder and row.fenced_token == fenced_token
 
     def release_supervisor(self, holder: str, fenced_token: int) -> bool:
         row = self._supervisor_row(for_update=True)

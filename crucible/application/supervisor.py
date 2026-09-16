@@ -83,6 +83,12 @@ class TickResult:
 
 
 @dataclass(slots=True)
+class _CancelWork:
+    task_id: str
+    attempt: Attempt | None
+
+
+@dataclass(slots=True)
 class _Pending:
     attempt: Attempt
     execution: Execution
@@ -128,10 +134,26 @@ class Supervisor:
             with self._uow_factory() as uow:
                 uow.set_fenced_token(self.fenced_token)
                 yield uow
+        except IllegalTransitionError as exc:
+            # The attempting transaction rolled back; the rejection is recorded on its own (09).
+            self._record_rejection(exc)
+            raise
         except FencedTokenRejectedError as exc:
             log.warning("fenced write rejected; standing down", extra={"holder": self.holder})
             self.fenced_token = None
             raise LeaseLostError(str(exc)) from exc
+
+    def _record_rejection(self, exc: IllegalTransitionError) -> None:
+        if self.fenced_token is None:
+            log.error("illegal transition with no lease; not recorded", extra={"error": str(exc)})
+            return
+        try:
+            with self._uow_factory() as fresh:
+                fresh.set_fenced_token(self.fenced_token)
+                record_rejected_transition(fresh, self._clock, exc, principal=PRINCIPAL_CRUCIBLE)
+                fresh.commit()
+        except FencedTokenRejectedError:
+            log.error("illegal transition; lease lost before it could be recorded")
 
     async def _db(self, fn: Callable[[], T]) -> T:
         return await asyncio.to_thread(fn)
@@ -426,8 +448,13 @@ class Supervisor:
             with log_context(
                 task_id=item.task.id, execution_id=item.execution.id, attempt_id=item.attempt.id
             ):
-                if await self._launch_one(item):
-                    launched += 1
+                try:
+                    if await self._launch_one(item):
+                        launched += 1
+                except LeaseLostError:
+                    raise
+                except Exception:
+                    log.exception("launch step failed; continuing with the next attempt")
         return launched
 
     async def _launch_one(self, item: _Pending) -> bool:
@@ -444,7 +471,8 @@ class Supervisor:
             network=item.contract.get("constraints", {}).get("network", "policy"),
         )
         provider = self._provider(execution.provider)
-        await self._db(partial(self._mark_preparing, attempt.id))
+        if not await self._db(partial(self._mark_preparing, attempt.id)):
+            return False
         try:
             ws = await provider.prepare(spec)
         except ProviderError as exc:
@@ -464,13 +492,19 @@ class Supervisor:
         log.info("attempt launched", extra={"handle": handle.ref, "provider": provider.name})
         return True
 
-    def _mark_preparing(self, attempt_id: str) -> None:
+    def _mark_preparing(self, attempt_id: str) -> bool:
+        """Begin the launch, unless the task was cancelled after the attempt was listed."""
         with self._fenced() as uow:
             attempt = uow.attempts.get(attempt_id, for_update=True)
             assert attempt is not None
             task = uow.tasks.get(attempt.task_id, for_update=True)
             execution = uow.executions.get(attempt.execution_id, for_update=True)
             assert task is not None and execution is not None
+            if attempt.state is not AttemptState.PENDING or task.state not in (
+                TaskState.SCHEDULED,
+                TaskState.RUNNING,
+            ):
+                return False
             move_attempt(
                 uow, self._clock, attempt, AttemptState.PREPARING, EventKind.ATTEMPT_PREPARING
             )
@@ -490,6 +524,7 @@ class Supervisor:
                     payload={"attempt_number": attempt.number},
                 )
             uow.commit()
+            return True
 
     def _mark_launching(self, attempt_id: str, ws: Workspace) -> None:
         with self._fenced() as uow:
@@ -552,7 +587,14 @@ class Supervisor:
     def _list_live(self) -> list[Attempt]:
         with self._uow_factory() as uow:
             return list(
-                uow.attempts.list_in_states([AttemptState.RUNNING, AttemptState.TERMINATING])
+                uow.attempts.list_in_states(
+                    [
+                        AttemptState.PREPARING,
+                        AttemptState.LAUNCHING,
+                        AttemptState.RUNNING,
+                        AttemptState.TERMINATING,
+                    ]
+                )
             )
 
     async def _observe_attempts(self) -> tuple[int, int]:
@@ -562,11 +604,30 @@ class Supervisor:
                 task_id=attempt.task_id, execution_id=attempt.execution_id, attempt_id=attempt.id
             ):
                 observed += 1
-                if await self._observe_one(attempt):
-                    finished += 1
+                try:
+                    if await self._observe_one(attempt):
+                        finished += 1
+                except LeaseLostError:
+                    raise
+                except Exception:
+                    log.exception("observe step failed; continuing with the next attempt")
         return observed, finished
 
     async def _observe_one(self, attempt: Attempt) -> bool:
+        if attempt.state in (AttemptState.PREPARING, AttemptState.LAUNCHING):
+            # Launching finished before this step ran, so an attempt still here has no
+            # worker behind it: Crucible died mid-launch. Classify as environment (10, 16).
+            if attempt.handle is None:
+                await self._db(
+                    partial(
+                        self._environment_failure,
+                        attempt.id,
+                        "reconcile",
+                        "attempt stranded in launch with no provider handle",
+                    )
+                )
+                return True
+            return False
         provider_name = await self._db(partial(self._execution_provider_name, attempt))
         provider = self._provider(provider_name)
         handle = self._handles.get(attempt.id) or Handle(
@@ -576,20 +637,23 @@ class Supervisor:
         observation = await provider.observe(handle)
         now = self._clock.now()
         if observation.state is ObservationState.RUNNING:
-            if attempt.state is AttemptState.RUNNING and attempt.timeout_at is not None:
-                if attempt.drain_deadline is None and now >= attempt.timeout_at:
-                    await provider.terminate(handle, "drain")
-                    await self._db(partial(self._record_drain, attempt.id, TERMINATION_TIMEOUT))
-                    return False
-                if attempt.drain_deadline is not None and now >= attempt.drain_deadline:
-                    await provider.terminate(handle, "kill")
-                    await self._db(partial(self._record_kill, attempt.id))
-                    return False
-            if attempt.state is AttemptState.TERMINATING and (
-                attempt.drain_deadline is not None and now >= attempt.drain_deadline
-            ):
+            if attempt.drain_deadline is not None and now >= attempt.drain_deadline:
+                # Past the grace window (timeout or cancel): kill, and keep killing every
+                # tick until the provider stops seeing it. The event is written once.
                 await provider.terminate(handle, "kill")
-                await self._db(partial(self._record_kill, attempt.id))
+                if attempt.killed_at is None:
+                    await self._db(partial(self._record_kill, attempt.id))
+                else:
+                    log.warning("worker survived kill; retrying", extra={"handle": handle.ref})
+                return False
+            if (
+                attempt.state is AttemptState.RUNNING
+                and attempt.timeout_at is not None
+                and attempt.drain_deadline is None
+                and now >= attempt.timeout_at
+            ):
+                await provider.terminate(handle, "drain")
+                await self._db(partial(self._record_drain, attempt.id, TERMINATION_TIMEOUT))
                 return False
             await self._db(partial(self._renew_attempt_lease, attempt.id))
             return False
@@ -605,6 +669,10 @@ class Supervisor:
     def _renew_attempt_lease(self, attempt_id: str) -> None:
         with self._fenced() as uow:
             assert self.fenced_token is not None
+            # Attempt leases are not a fenced table; check the supervisor lease explicitly.
+            if not uow.leases.verify_supervisor(self.holder, self.fenced_token):
+                self.fenced_token = None
+                raise LeaseLostError("supervisor lease changed hands")
             uow.leases.upsert_attempt_lease(
                 attempt_id,
                 self.holder,
@@ -642,12 +710,17 @@ class Supervisor:
         with self._fenced() as uow:
             attempt = uow.attempts.get(attempt_id, for_update=True)
             assert attempt is not None
-            attempt.drain_deadline = None
+            attempt.killed_at = self._clock.now()
             uow.attempts.save(attempt)
+            kind = (
+                EventKind.ATTEMPT_CANCEL_KILL
+                if attempt.termination_reason == TERMINATION_CANCEL
+                else EventKind.ATTEMPT_TIMEOUT_KILL
+            )
             record_event(
                 uow,
                 self._clock,
-                EventKind.ATTEMPT_TIMEOUT_KILL,
+                kind,
                 principal=PRINCIPAL_CRUCIBLE,
                 task_id=attempt.task_id,
                 execution_id=attempt.execution_id,
@@ -713,7 +786,8 @@ class Supervisor:
                 },
             )
             claim_ok = False
-            if outputs.report is not None:
+            cancelled = attempt.termination_reason == TERMINATION_CANCEL
+            if outputs.report is not None and not cancelled:
                 claim, errors = parse_claim(outputs.report)
                 claim_ok = claim is not None
                 secret_hits = find_secrets(outputs.report)
@@ -760,6 +834,7 @@ class Supervisor:
                 payload={
                     "report_present": outputs.report is not None,
                     "report_parsed": claim_ok,
+                    "partial_report_kept_unparsed": cancelled and outputs.report is not None,
                     "blocked_present": outputs.blocked_md is not None,
                 },
             )
@@ -800,8 +875,8 @@ class Supervisor:
                 payload={"exit_class": exit_class.value},
             )
         common = {"execution_id": execution.id, "attempt_id": attempt.id}
-        if task.state is TaskState.CANCELLING:
-            self._finish_cancelling(uow, task, execution)
+        if task.state in (TaskState.CANCELLING, TaskState.CANCELLED):
+            self._finish_cancelling(uow, task)
             return
         if attempt.state is AttemptState.SUCCEEDED:
             move_execution(
@@ -871,29 +946,23 @@ class Supervisor:
         exit_class: ExitClass,
         common: dict[str, str],
     ) -> None:
-        try:
-            move_task(
-                uow,
-                self._clock,
-                task,
-                TaskState.REPORTED,
-                EventKind.TASK_REPORTED,
-                payload={
-                    **common,
-                    "exit_class": exit_class.value,
-                    "attempt_state": attempt.state.value,
-                    "note": "pre-PR gate evaluation is C2",
-                },
+        move_task(
+            uow,
+            self._clock,
+            task,
+            TaskState.REPORTED,
+            EventKind.TASK_REPORTED,
+            payload={
                 **common,
-            )
-        except IllegalTransitionError as exc:
-            uow.rollback()
-            with self._uow_factory() as fresh:
-                record_rejected_transition(fresh, self._clock, exc, principal=PRINCIPAL_CRUCIBLE)
-                fresh.commit()
-            raise
+                "exit_class": exit_class.value,
+                "attempt_state": attempt.state.value,
+                "note": "pre-PR gate evaluation is C2",
+            },
+            **common,
+        )
 
-    def _finish_cancelling(self, uow: UnitOfWork, task: Task, execution: Execution) -> None:
+    def _finish_cancelling(self, uow: UnitOfWork, task: Task) -> None:
+        """Once no attempt is live, close open executions; a cancelling task becomes cancelled."""
         attempts = uow.attempts.list_for_task(task.id)
         if any(a.state not in ATTEMPT_TERMINAL for a in attempts):
             return
@@ -902,38 +971,33 @@ class Supervisor:
                 move_execution(
                     uow, self._clock, e, ExecutionState.CANCELLED, EventKind.EXECUTION_CANCELLED
                 )
-        move_task(uow, self._clock, task, TaskState.CANCELLED, EventKind.TASK_CANCELLED)
+        if task.state is TaskState.CANCELLING:
+            move_task(uow, self._clock, task, TaskState.CANCELLED, EventKind.TASK_CANCELLED)
 
     # ----- step: cancellations -----------------------------------------
 
-    def _list_cancel_work(self) -> list[Attempt]:
-        out: list[Attempt] = []
+    def _list_cancel_work(self) -> list[_CancelWork]:
+        """Live attempts of cancelling or cancelled tasks, plus tasks whose executions can close."""
+        out: list[_CancelWork] = []
         with self._uow_factory() as uow:
             for state in (TaskState.CANCELLING, TaskState.CANCELLED):
                 for task in uow.tasks.list_by_state(state):
-                    out.extend(
-                        a
-                        for a in uow.attempts.list_for_task(task.id)
-                        if a.state not in ATTEMPT_TERMINAL
+                    attempts = uow.attempts.list_for_task(task.id)
+                    live = [a for a in attempts if a.state not in ATTEMPT_TERMINAL]
+                    out.extend(_CancelWork(task_id=task.id, attempt=a) for a in live)
+                    open_exec = any(
+                        e.state in (ExecutionState.CREATED, ExecutionState.ACTIVE)
+                        for e in uow.executions.list_for_task(task.id)
                     )
-            for task in uow.tasks.list_by_state(TaskState.CANCELLING):
-                if all(a.state in ATTEMPT_TERMINAL for a in uow.attempts.list_for_task(task.id)):
-                    out.append(
-                        Attempt(
-                            id="",
-                            execution_id="",
-                            task_id=task.id,
-                            number=0,
-                            state=AttemptState.FAILED,
-                            created_at=self._clock.now(),
-                        )
-                    )
+                    if not live and (open_exec or state is TaskState.CANCELLING):
+                        out.append(_CancelWork(task_id=task.id, attempt=None))
         return out
 
     async def _sweep_cancellations(self) -> None:
-        for attempt in await self._db(self._list_cancel_work):
-            if attempt.id == "":
-                await self._db(partial(self._settle_cancelled_task, attempt.task_id))
+        for work in await self._db(self._list_cancel_work):
+            attempt = work.attempt
+            if attempt is None:
+                await self._db(partial(self._settle_cancelled_task, work.task_id))
                 continue
             with log_context(
                 task_id=attempt.task_id, execution_id=attempt.execution_id, attempt_id=attempt.id
@@ -991,36 +1055,22 @@ class Supervisor:
                 payload={"exit_class": ExitClass.KILLED.value},
             )
             task = uow.tasks.get(attempt.task_id, for_update=True)
-            execution = uow.executions.get(attempt.execution_id, for_update=True)
-            assert task is not None and execution is not None
-            if task.state is TaskState.CANCELLING:
-                self._finish_cancelling(uow, task, execution)
-            elif execution.state in (ExecutionState.CREATED, ExecutionState.ACTIVE):
-                move_execution(
-                    uow,
-                    self._clock,
-                    execution,
-                    ExecutionState.CANCELLED,
-                    EventKind.EXECUTION_CANCELLED,
-                )
+            assert task is not None
+            self._finish_cancelling(uow, task)
             uow.commit()
 
     def _settle_cancelled_task(self, task_id: str) -> None:
         with self._fenced() as uow:
             task = uow.tasks.get(task_id, for_update=True)
-            if task is None or task.state is not TaskState.CANCELLING:
+            if task is None or task.state not in (TaskState.CANCELLING, TaskState.CANCELLED):
                 return
-            execution = next(iter(uow.executions.list_for_task(task.id)), None)
-            if execution is None:
-                move_task(uow, self._clock, task, TaskState.CANCELLED, EventKind.TASK_CANCELLED)
-            else:
-                self._finish_cancelling(uow, task, execution)
+            self._finish_cancelling(uow, task)
             uow.commit()
 
     # ----- step: status -------------------------------------------------
 
     def _status_step(self, started: float) -> dict[str, int]:
-        with self._uow_factory() as uow:
+        with self._fenced() as uow:
             counts = {
                 "tasks_scheduled": len(uow.tasks.list_by_state(TaskState.SCHEDULED)),
                 "tasks_running": len(uow.tasks.list_by_state(TaskState.RUNNING)),

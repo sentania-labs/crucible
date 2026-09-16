@@ -137,6 +137,7 @@ class AttemptRow(Base):
     exit_class: Mapped[str | None] = mapped_column(String(32), nullable=True)
     timeout_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
     drain_deadline: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
+    killed_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
     termination_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
 

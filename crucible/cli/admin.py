@@ -50,7 +50,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     settings = load_settings(args.config)
-    configure_logging(settings.service.log_level)
+    # Results go to stdout as JSON; logs go to stderr so callers can parse stdout.
+    configure_logging(settings.service.log_level, stream=sys.stderr)
     if args.command == "migrate":
         upgrade(settings.database.url)
         print(json.dumps({"migrated_to": head_revision(settings.database.url)}))
