@@ -12,7 +12,9 @@ delivery half of the task lifecycle (09).
   one publisher job at a time. Tokens live in memory and in the tmpfs of
   the publisher container, never elsewhere.
 - App permissions: Metadata read, Contents read/write, Pull requests
-  read/write, Checks read, Actions read. Nothing else. Repository
+  read/write, Checks read, Actions read, Issues read (for
+  `GET /issues/{n}/reactions` only, S12 rerun). Nothing else, and no
+  Issues write. Repository
   registration (`PUT /repositories/{name}`) records the installation ID
   the App has for that repository; the key never appears in the record.
 - Workers receive no GitHub credential. The worker's checkout has its
@@ -118,9 +120,16 @@ App-authored PR is reviewed automatically (pickup 11 s after open,
 completion 101 s) with no human comment. **Repository onboarding
 prerequisite**: the Codex GitHub App must be installed on the repository
 with review of all pull requests enabled (code and security review as the
-operator chooses); Crucible's registration check records whether the
-first App-authored PR received a reviewer signal and reports a
-repository whose PRs get none. The orchestrator-posted `@codex review`
+operator chooses). GitHub exposes neither setting, so registration
+(`PUT /repositories/{name}`) requires an operator **attestation**
+(`external_review.attested_all_prs: true`, with the attesting principal
+and time recorded as an event) whenever the repository's policy requires
+external review; a registration without it is accepted only with
+`external_review.required_rounds: 0`. Optionally `POST
+/admin/repositories/{name}/probe-review` opens a throwaway App-authored
+PR, waits for a reviewer signal, closes it, and records the observed
+result; the first real task's reviewer signal also updates the record,
+and a repository whose PRs get none is reported by the admin status. The orchestrator-posted `@codex review`
 comment under the operator's account remains the fallback for a
 repository where automatic review is not enabled and for an explicit
 re-review after a correction, both recorded as events.
@@ -158,10 +167,15 @@ result. Crucible persists a review cycle row per PR head it published
 (or per trigger it recorded) with the components the policy expects
 (`external_review.components`, default `["code"]`; `["code",
 "security"]` where the repository runs both), and attaches each received
-signal to the open cycle by head SHA and component; the
+signal to the open cycle by head SHA and, where the signal names one,
+component. GitHub does not label the reviewer's signals by component, so
+the rule is: a review object or review comment attaches to the component
+its body names if any, else to `code`; a reaction-only clean result
+(`+1` with no review object) completes **every** configured component of
+the cycle at once, because the provider emits one combined verdict. The
 `external_review_rounds` gate counts completed cycles, never individual
-signals, so one component can satisfy neither a one-round nor a two-round
-policy by itself. When `retrigger_after_correction` is true the same
+signals; a cycle with two components and one review object with findings
+stays open until the second component's result or the cycle timeout. When `retrigger_after_correction` is true the same
 trigger path applies to every corrected head: Crucible wakes the
 orchestrator with reason `external_review_trigger_needed`, the
 orchestrator posts the trigger under the operator's account, and a new
