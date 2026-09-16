@@ -12,6 +12,12 @@ optionally followed by `-<n>` observations before the scripted exit. Behaviors:
 - hang               never exits; ignores drain, dies on kill
 - immortal           ignores drain and the first kill, dies on the second kill
 - vanish             disappears after launch (loss)
+- review             exit 0 with a valid ReviewReportV1 (used by a `review` execution)
+- review-disapprove  exit 0 with a ReviewReportV1 whose verdict is request_changes
+- out-of-scope       exit 0 with a report, but the diff touches a path outside allowed_paths
+- injected           exit 0 with a report, but the branch carries a `.crucible/` path
+- secret-leak        exit 0 with a report, but the scanner matches a credential shape
+- no-commits         exit 0 with a report, but the collected branch has no commit
 
 A test may also script a behavior per external_id with `script()`, which wins over
 the image tag. Handles survive as long as the provider instance does, which is how the
@@ -20,12 +26,16 @@ the image tag. Handles survive as long as the provider instance does, which is h
 
 from __future__ import annotations
 
+import hashlib
+import posixpath
 import re
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from crucible.ports.execution import (
+    BranchBundle,
     CleanupPolicy,
+    CollectedArtifact,
     CollectedOutputs,
     Handle,
     IsolationLevel,
@@ -39,7 +49,7 @@ from crucible.ports.execution import (
 )
 
 PROVIDER_NAME = "fake"
-_TAG = re.compile(r"^.*:fake-(?P<behavior>[a-z]+(?:-[a-z]+)?)(?:-(?P<n>\d+))?$")
+_TAG = re.compile(r"^.*:fake-(?P<behavior>[a-z]+(?:-[a-z]+)*)(?:-(?P<n>\d+))?$")
 
 Behavior = Literal[
     "succeed",
@@ -52,6 +62,12 @@ Behavior = Literal[
     "immortal",
     "vanish",
     "prepare-fails",
+    "review",
+    "review-disapprove",
+    "out-of-scope",
+    "injected",
+    "secret-leak",
+    "no-commits",
 ]
 BEHAVIORS: frozenset[str] = frozenset(
     {
@@ -65,8 +81,70 @@ BEHAVIORS: frozenset[str] = frozenset(
         "immortal",
         "vanish",
         "prepare-fails",
+        "review",
+        "review-disapprove",
+        "out-of-scope",
+        "injected",
+        "secret-leak",
+        "no-commits",
     }
 )
+
+# Behaviors that exit 0 with a CompletionClaimV1; the gates then tell them apart.
+REPORTING_BEHAVIORS: frozenset[str] = frozenset(
+    {"succeed", "out-of-scope", "injected", "secret-leak", "no-commits"}
+)
+REVIEW_BEHAVIORS: frozenset[str] = frozenset({"review", "review-disapprove"})
+
+OUT_OF_SCOPE_PATH = "infrastructure/outside-the-contract.txt"
+INJECTED_PATH = ".crucible/identity.md"
+
+
+def synthetic_head_sha(attempt_id: str) -> str:
+    """A deterministic 40-hex stand-in for the head the collector would read (08)."""
+    return hashlib.sha256(f"crucible-fake-head:{attempt_id}".encode()).hexdigest()[:40]
+
+
+def _concrete(pattern: str) -> str:
+    """Turn an allowed_paths glob into one concrete path under it."""
+    path = pattern.replace("/**", "/fake_change.py").replace("**", "fake_change.py")
+    path = path.replace("*", "fake")
+    return posixpath.normpath(path)
+
+
+def changed_paths(contract: dict[str, Any], behavior: str) -> tuple[str, ...]:
+    allowed = [str(p) for p in contract.get("scope", {}).get("allowed_paths", [])]
+    paths = [_concrete(p) for p in allowed[:2]] or ["src/fake_change.py"]
+    if behavior == "out-of-scope":
+        paths.append(OUT_OF_SCOPE_PATH)
+    if behavior == "injected":
+        paths.append(INJECTED_PATH)
+    return tuple(dict.fromkeys(paths))
+
+
+def default_review_report(spec: LaunchSpec, head_sha: str, verdict: str) -> dict[str, Any]:
+    """A valid ReviewReportV1 from a `review` execution's attempt."""
+    findings = (
+        []
+        if verdict == "approve"
+        else [
+            {
+                "severity": "major",
+                "path": "src/fake_change.py",
+                "line": 1,
+                "text": "The fake reviewer wants a narrower change.",
+            }
+        ]
+    )
+    return {
+        "schema_version": "1.0",
+        "task_external_id": spec.external_id,
+        "reviewed_head_sha": head_sha,
+        "reviewer": {"kind": "crucible_review_execution", "attempt_id": spec.attempt_id},
+        "verdict": verdict,
+        "findings": findings,
+        "summary": f"Fake non-author review of {head_sha} for {spec.external_id}.",
+    }
 
 
 @dataclass(slots=True)
@@ -83,9 +161,17 @@ class _Worker:
     logs: list[LogChunk] = field(default_factory=list)
 
 
-def default_report(spec: LaunchSpec) -> dict[str, Any]:
+def default_report(
+    spec: LaunchSpec, head_sha: str | None = None, behavior: str = "succeed"
+) -> dict[str, Any]:
     """A valid CompletionClaimV1 for the contract the worker was given."""
     contract = spec.contract
+    head = head_sha or synthetic_head_sha(spec.attempt_id)
+    evidence_paths = [
+        str(v["path"])
+        for v in contract.get("required_verification", [])
+        if v.get("kind") == "artifact"
+    ]
     checks = [
         {
             "id": v["id"],
@@ -100,18 +186,18 @@ def default_report(spec: LaunchSpec) -> dict[str, Any]:
         "schema_version": "1.0",
         "task_external_id": spec.external_id,
         "summary": f"Fake worker completed {spec.external_id}.",
-        "changed_files": ["src/example.py"],
+        "changed_files": list(changed_paths(contract, behavior)),
         "refs": {
             "branch": contract.get("repository", {}).get("work_branch", "crucible/unknown"),
-            "head_sha": "0" * 40,
-            "commits": 1,
+            "head_sha": head,
+            "commits": 0 if behavior == "no-commits" else 1,
         },
         "checks": checks,
         "acceptance_mapping": [
             {"id": c["id"], "status": "met", "evidence": "report/evidence.md"}
             for c in contract.get("acceptance_criteria", [])
         ],
-        "run_evidence": ["run-evidence.md"],
+        "run_evidence": evidence_paths,
         "proposed_pull_request": {
             "title": contract.get("title", "Fake change"),
             "body": "Fake worker output.",
@@ -132,6 +218,7 @@ class FakeProvider:
         self._scripts: dict[str, tuple[str, int]] = {}
         self._reports: dict[str, dict[str, Any]] = {}
         self._workspaces: dict[str, Workspace] = {}
+        self._review_heads: dict[str, str] = {}
         self.cleaned: list[str] = []
 
     # test controls
@@ -183,8 +270,17 @@ class FakeProvider:
         self._workspaces[spec.attempt_id] = ws
         return ws
 
+    def review_head(self, attempt_id: str, head_sha: str) -> None:
+        """Tell a review worker which head it is reviewing (the supervisor passes it)."""
+        self._review_heads[attempt_id] = head_sha
+
     async def launch(self, ws: Workspace, spec: LaunchSpec) -> Handle:
         behavior, after = self._behavior_for(spec)
+        if spec.role == "review" and behavior not in REVIEW_BEHAVIORS:
+            behavior = "review"
+        review_head = spec.env.get("CRUCIBLE_REVIEW_HEAD_SHA")
+        if review_head:
+            self._review_heads[spec.attempt_id] = review_head
         worker = _Worker(spec=spec, behavior=behavior, remaining=after)
         worker.logs.append(LogChunk("stdout", f"fake worker {behavior} start\n".encode()))
         self._workers[spec.attempt_id] = worker
@@ -206,13 +302,11 @@ class FakeProvider:
             return Observation(ObservationState.LOST, detail="worker vanished")
         worker.state = ObservationState.EXITED
         worker.exit_code = {
-            "succeed": 0,
-            "succeed-noreport": 0,
             "blocked": 75,
             "blocked-nofile": 75,
             "crash": 1,
             "environment": 70,
-        }[worker.behavior]
+        }.get(worker.behavior, 0)
         worker.logs.append(LogChunk("stdout", f"fake worker exit {worker.exit_code}\n".encode()))
         return Observation(ObservationState.EXITED, exit_code=worker.exit_code)
 
@@ -225,10 +319,68 @@ class FakeProvider:
         if worker is None:
             return CollectedOutputs(report=None, report_raw=None, blocked_md=None)
         spec = worker.spec
-        if worker.behavior == "succeed" and worker.exit_code == 0:
-            report = self._reports.get(spec.external_id) or default_report(spec)
+        behavior = worker.behavior
+        head = synthetic_head_sha(spec.attempt_id)
+        if behavior in REVIEW_BEHAVIORS and worker.exit_code == 0:
+            verdict = "approve" if behavior == "review" else "request_changes"
+            head = self._review_heads.get(spec.attempt_id, head)
+            report = self._reports.get(spec.external_id) or default_review_report(
+                spec, head, verdict
+            )
             return CollectedOutputs(report=report, report_raw=None, blocked_md=None)
-        if worker.behavior == "blocked" and worker.exit_code == 75:
+        if behavior in REPORTING_BEHAVIORS and worker.exit_code == 0:
+            report = self._reports.get(spec.external_id) or default_report(spec, head, behavior)
+            paths = changed_paths(spec.contract, behavior)
+            commits = 0 if behavior == "no-commits" else 1
+            bundle = BranchBundle(
+                head_sha=head,
+                base_ref=str(spec.contract.get("repository", {}).get("base_ref", "main")),
+                work_branch=str(spec.contract.get("repository", {}).get("work_branch", "")),
+                commits=commits,
+                verified=True,
+                commit_paths=paths,
+                commit_messages=(f"Fake commit for {spec.external_id}",) if commits else (),
+            )
+            artifacts = [
+                CollectedArtifact(
+                    name="report/completion-claim.json",
+                    type="completion_claim",
+                    content=b"",
+                    content_type="application/json",
+                )
+            ]
+            for verification in spec.contract.get("required_verification", []):
+                if verification.get("kind") == "artifact":
+                    artifacts.append(
+                        CollectedArtifact(
+                            name=str(verification["path"]),
+                            type="run_evidence",
+                            content=(
+                                f"# Run evidence for {spec.external_id}\n\n"
+                                f"Produced by the fake provider at head {head}.\n"
+                            ).encode(),
+                            content_type="text/markdown",
+                        )
+                    )
+            if behavior == "secret-leak":
+                # Built at runtime so no secret-shaped literal is ever committed (12).
+                artifacts.append(
+                    CollectedArtifact(
+                        name="report/leak.txt",
+                        type="scanner_input",
+                        content=("gh" + "p_" + "A" * 36).encode(),
+                        content_type="text/plain",
+                    )
+                )
+            return CollectedOutputs(
+                report=report,
+                report_raw=None,
+                blocked_md=None,
+                diff_paths=paths,
+                bundle=bundle,
+                artifacts=tuple(artifacts),
+            )
+        if behavior == "blocked" and worker.exit_code == 75:
             return CollectedOutputs(
                 report=None,
                 report_raw=None,

@@ -41,6 +41,7 @@ class LaunchSpec:
     attempt_id: str
     task_id: str
     external_id: str
+    role: str
     harness: str
     model: str
     image: str
@@ -87,14 +88,44 @@ class LogChunk:
 
 
 @dataclass(frozen=True, slots=True)
+class CollectedArtifact:
+    """One file the collector copied out of the workspace. Bytes are data, never code."""
+
+    name: str
+    type: str
+    content: bytes
+    content_type: str = "application/octet-stream"
+
+
+@dataclass(frozen=True, slots=True)
+class BranchBundle:
+    """What `git bundle create base_ref..work_branch` plus `git bundle verify` produced.
+
+    The Docker collector builds this in C3; the fake provider synthesizes it so the
+    gate path is exercised end to end (08)."""
+
+    head_sha: str
+    base_ref: str
+    work_branch: str
+    commits: int
+    verified: bool
+    commit_paths: tuple[str, ...] = ()
+    commit_messages: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class CollectedOutputs:
-    """What the collector produced (08). C1 carries the report directory only."""
+    """What the collector produced (08): the report directory, the diff path list, the
+    branch bundle summary, and the artifacts copied out of the workspace."""
 
     report: dict[str, Any] | None
     report_raw: str | None
     blocked_md: str | None
     stdout_tail: str = ""
     stderr_tail: str = ""
+    diff_paths: tuple[str, ...] = ()
+    bundle: BranchBundle | None = None
+    artifacts: tuple[CollectedArtifact, ...] = ()
 
 
 class CleanupPolicy(StrEnum):
