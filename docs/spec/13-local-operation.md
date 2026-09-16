@@ -138,12 +138,11 @@ firewall rules.
 
 ## GitHub webhook ingress
 
-`POST /v1/github/webhook` must be reachable by GitHub to deliver events.
-On a workstation behind a private network that requires a public route,
-which is the operator's decision alone (22, Q13). Until one exists,
-Crucible runs on polling only, which is complete but slower (default 120
-seconds). In Kubernetes the endpoint sits behind the cluster's ingress
-with the webhook secret validating every delivery.
+Polling is the complete observation path and the local default; no
+public route to the workstation is required or created (22, Q13).
+`github.webhook_enabled` stays false locally. In Kubernetes the endpoint
+sits behind the cluster's ingress with the webhook secret validating every
+delivery in memory before anything is stored (23).
 
 ## Filesystem
 

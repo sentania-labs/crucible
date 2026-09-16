@@ -87,6 +87,10 @@ gates:
     - ci_green_for_head
   skipped: []                          # release gates live on the release contract (24)
 
+deliverables:
+  allow_branch_only: false             # `branch` deliverables refused unless true
+  on_out_of_band_head: "block"         # block: task to head_diverged and wake (09); the only option in v0.x
+
 pull_request:
   require_pre_pr_verification: true
   open_only_after_pre_pr_gates_pass: true
@@ -97,22 +101,25 @@ pull_request:
 
 internal_review:
   required: true
+  required_for_corrections: false      # a correction contract may still request one
   reviewer_must_not_be_author: true
   executor: "orchestrator_or_crucible" # orchestrator uploads a ReviewReportV1, or requests a Crucible review execution
 
 external_review:
   provider: "codex"
-  reviewer_logins: ["chatgpt-codex-connector[bot]"]   # allowlisted identities; verify in S12
+  reviewer_logins: ["chatgpt-codex-connector[bot]"]   # allowlisted identities (confirmed on sentania-labs/crucible#1)
   required_rounds: 1
   retrigger_after_correction: false
   require_review_on_final_sha: false
   require_feedback_disposition: true
-  accepted_signals: ["review", "comment", "reaction"]  # from an allowlisted login only
+  accepted_signals: ["review", "comment", "reaction:+1"]  # from an allowlisted login only; +1 is the reviewer's "no findings" signal
+  round_counting: "per_pull_request"   # a round is one accepted signal on any head; final-SHA rule below
   wait_timeout_hours: 24               # then wake Foundry with reason external_review_overdue
 
 ci_certification:
   require_green_on_final_sha: true
-  required_checks: []                  # empty means every non-skipped required check on the SHA
+  required_checks: []                  # empty: use branch protection or ruleset required checks; if that is empty too, every observed run on the SHA
+  allow_no_ci: false                   # false: zero observed runs is pending forever (wake on timeout); true only for a repository that intentionally has no CI
   on_failure: "escalate"
   automatic_retry: false
   automatic_worker_correction: false
@@ -120,6 +127,7 @@ ci_certification:
 
 release:
   require_operator_approval: true
+  authorization_recorder: "orchestrator_relay"   # orchestrator_relay: Foundry records the operator's verbatim approval and identity; operator_token: the operator's own principal must record it
   trigger: "tag"
   tag_pattern: "v{major}.{minor}.{patch}"
   version_files: []                    # paths whose version string must agree with the tag
@@ -152,6 +160,9 @@ retention:
 - `network.egress_allowlist` entries are hostnames, no wildcards in v0.x.
 - `external_review.required_rounds: 0` makes the external review gates
   `skipped`; `reviewer_logins` must be non-empty when rounds are above 0.
+- `ci_certification.allow_no_ci: true` and `deliverables.allow_branch_only:
+  true` may only be set by an `operator` or `admin` principal and are
+  recorded as decisions.
 - `release.require_operator_approval` may only be `false` under a policy
   the operator uploaded (principal role `operator` or `admin`), which is
   recorded as a decision.

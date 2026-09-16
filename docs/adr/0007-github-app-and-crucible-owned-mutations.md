@@ -24,6 +24,10 @@ the worker's. Personal access tokens are long-lived and user-scoped.
   body from contract and verified evidence, adding only authorized closing
   references, observing review and CI, tagging releases. Every such action
   is a durable event.
+- Observation of the PR is by polling, complete on its own (reviews,
+  comments, reactions, PR state, checks, workflows, head changes);
+  webhooks are an optional accelerator whose payloads are verified in
+  memory and normalized and scanned before anything is stored.
 - Workers edit, run checks, commit locally, and produce claims. Their
   checkout has no push credential. Any mode granting a worker GitHub access
   is an explicit policy exception with its own ADR.

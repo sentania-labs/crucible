@@ -69,29 +69,58 @@ review is recorded, and Foundry's `AcceptanceResult` for that head is
 
 ## Observation
 
-After publication Crucible watches the PR until the task is terminal:
+After publication Crucible watches the PR until the task is terminal.
+Polling is the complete observation path; webhooks only shorten latency.
 
-- **Webhooks**: `POST /v1/github/webhook` accepts `pull_request`,
+- **Polling** (always on): every `github.poll_interval_seconds` (default
+  120) the supervisor fetches, for every PR in an observed state: the PR
+  (state, head SHA, mergeability, merged flag and merger), its reviews,
+  its review comments, its issue comments, the reactions on the PR
+  itself, on each review, and on each comment, the check runs and check
+  suites for the current head, the workflow runs for the current head,
+  and the base branch's required checks. Reactions are polled because
+  GitHub delivers no webhook event for them; the configured reviewer
+  signals "reviewed, no findings" with a thumbs-up, so the reaction poll
+  is part of every cycle, not an extra.
+- **Webhooks** (optional accelerator, off by default on a workstation;
+  Q13): `POST /v1/github/webhook` accepts `pull_request`,
   `pull_request_review`, `pull_request_review_comment`, `issue_comment`,
-  `check_run`, `check_suite`, `workflow_run`, and `push` events. Each
-  delivery is HMAC-verified, deduplicated by delivery ID, stored raw in
-  `github_deliveries`, and processed by the supervisor on its next tick.
-  Webhooks are an accelerator, never the only source.
-- **Polling**: every `github.poll_interval_seconds` (default 120) the
-  supervisor fetches, for every PR in an observed state, the PR itself,
-  its reviews and comments, and the check runs and workflow runs for the
-  current head. Polling is the reconciliation path and is sufficient on its
-  own when no webhook route exists (13, Q13).
+  `check_run`, `check_suite`, `workflow_run`, and `push`. A review or
+  comment delivery triggers an immediate reaction poll for its subject.
+  Handling of each delivery: verify the HMAC against the raw body in
+  memory; reject and count on mismatch, storing nothing; parse; extract
+  only the fields Crucible uses; run every user-controlled text field
+  (review bodies, comment bodies, titles) through the secret scanner and
+  redaction; store the delivery ID, event and action, normalized fields,
+  and a SHA-256 of the original body; discard the raw body. The same
+  normalization and scanning applies to text fetched by polling before it
+  is written to `review_comments` or `external_reviews`.
 - Every observed change is an event: head changed (and by whom), review
-  received, comment received, check concluded, PR closed or merged.
+  received, comment received, reaction received, check concluded, PR
+  closed or merged.
+- **Head changed out of band**: a head Crucible did not push moves the task
+  to `head_diverged` (09). The previous head's acceptance, review report,
+  and gate results are marked superseded and kept as history. Nothing
+  about the new SHA is trusted: CI on it is observed and recorded but
+  cannot move the task. Foundry decides `recollect` (Crucible fetches the
+  new head into a fresh collector, produces a bundle, and the task
+  re-enters `reported` for the full pre-PR path, internal review as the
+  policy and Foundry decide, acceptance, and `publishing`, which verifies
+  the remote already matches) or `reject`.
 
 Foundry is not required to remain connected for any of this.
 
 ## External review (bounded input, not a loop)
 
-- A round is one review, comment, or reaction on the PR from a login in
-  `external_review.reviewer_logins`. Any other user's activity is recorded
-  but satisfies nothing.
+- A round is one accepted signal from a login in
+  `external_review.reviewer_logins`: a submitted review, a comment, or a
+  `+1` reaction on the PR (the configured reviewer's "no findings"
+  signal). Any other user's activity, including reactions, is recorded but
+  satisfies nothing. Rounds are counted per PR across heads.
+- A round with no findings (a `+1` reaction, or a review with no comments)
+  moves the task through `external_feedback_received` with nothing to
+  disposition; Crucible records it and, when `required_rounds` is
+  satisfied, advances to CI certification without a wake for judgment.
 - Received: Crucible stores the review, its comments (each with ID, path,
   line, body, reviewed SHA), and reactions, then moves the task to
   `external_feedback_received` and wakes Foundry.
@@ -102,22 +131,34 @@ Foundry is not required to remain connected for any of this.
   and the task re-enters supervision against the existing branch. The
   correcting worker reruns every required check; Crucible re-verifies,
   Foundry accepts, Crucible pushes the corrected head.
-- With the default policy no further external review is requested after a
-  correction and none is required on the final SHA. The round count is
-  per PR, not per head. Other repositories may set `required_rounds`,
+- Advancement out of `external_feedback_received` requires the
+  `external_review_rounds` gate: every received comment dispositioned and
+  the accepted-signal count at or above `required_rounds`. With rounds
+  outstanding the task returns to `awaiting_external_review`. With the
+  default policy (one round, no retrigger after correction, no
+  requirement on the final SHA) a correction never causes a second round.
+  Other repositories may set `required_rounds`,
   `retrigger_after_correction` (Crucible posts the provider's trigger
-  comment), and `require_review_on_final_sha` differently.
+  comment after each corrected head), and `require_review_on_final_sha`
+  (the last accepted signal must name the accepted head) differently.
 - Nothing received is overdue silently: `wait_timeout_hours` produces a
   repeat wake.
 
 ## CI certification
 
-- Required checks: the policy's `ci_certification.required_checks`, or,
-  when empty, every check the repository's branch protection or ruleset
-  marks required for the base branch, or, when that is empty too, every
-  non-skipped check run and workflow run on the head SHA.
-- Green: every required check concluded `success` on the current head.
-  Pending otherwise. The task moves to `ready_for_merge` and wakes Foundry.
+- Required-check set: the policy's `ci_certification.required_checks`,
+  or, when empty, every check the repository's branch protection or
+  ruleset marks required for the base branch, or, when that is empty too,
+  every non-skipped check run and workflow run observed on the accepted
+  head SHA.
+- Green: the set is non-empty and every member concluded `success` on the
+  accepted head. **An empty set is `pending`, never green**: before GitHub
+  has created any run, or on a repository with no CI, the task waits and
+  `wait_timeout_hours` wakes Foundry with `ci_certification_overdue`. A
+  repository that intentionally has no CI needs
+  `ci_certification.allow_no_ci: true`, an operator-recorded policy
+  decision, which makes the gate `skipped` rather than passed. On green
+  the task moves to `ready_for_merge` and wakes Foundry.
 - Failed: any required check concluded `failure`, `cancelled`,
   `timed_out`, or `action_required`. Crucible captures the check name,
   workflow, job, head SHA, and the available log excerpt (through the
@@ -131,8 +172,9 @@ Foundry is not required to remain connected for any of this.
   intent and wakes the operator to re-run it on GitHub, because re-running
   needs Actions write, which the App does not hold; 22), `correct` (a
   correction follows), `reject`, `cancel`.
-- A head that changes while awaiting certification starts a new
-  certification row for the new head; the old one stays as history.
+- A head that changes while awaiting certification is a divergence
+  (above), not a new certification: the task leaves the certification
+  path until Foundry decides.
 - `wait_timeout_hours` without a conclusion produces a wake with reason
   `ci_certification_overdue`.
 

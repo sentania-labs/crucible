@@ -15,7 +15,12 @@ behind "try again".
   re-runs each required command in a verifier container and the gate uses
   only that evidence. The contract must include every check the repository
   policy requires.
-- Required PR CI must be green on the final head SHA.
+- Required PR CI must be green on the final head SHA. Green means a
+  non-empty required-check set with every member successful; an empty
+  set is pending, never a pass, unless a repository is explicitly
+  policy-marked as having no CI.
+- A PR head Crucible did not push supersedes the previous head's
+  acceptance and gates; the task blocks until Foundry decides.
 - A required failure moves the task to `ci_certification_failed` with the
   check, workflow, job, log excerpt, and head SHA captured, wakes Foundry,
   and performs no retry and no worker correction.

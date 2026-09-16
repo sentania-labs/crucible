@@ -20,38 +20,44 @@ running --attempt retry--> scheduled              (policy permitted a new attemp
 blocked --decision--> scheduled
 
 reported --mechanical pre-PR gates fail--> pre_pr_gates_failed --wake-->
-reported --mechanical gates pass, review required--> awaiting_internal_review --wake-->
-reported --mechanical gates pass, review not required--> gates_passed
+reported --mechanical gates pass, internal review required for this head--> awaiting_internal_review --wake-->
+reported --mechanical gates pass, internal review not required for this head--> gates_passed
 awaiting_internal_review --ReviewReport recorded for this head--> gates_passed
 gates_passed --wake--> awaiting_acceptance
 
-awaiting_acceptance --accept, deliverable is not pull_request--> accepted
-awaiting_acceptance --accept, deliverable is pull_request--> publishing
+awaiting_acceptance --accept, deliverable is artifacts--> accepted
+awaiting_acceptance --accept, deliverable is branch or pull_request--> publishing
 awaiting_acceptance --reject--> rejected
 awaiting_acceptance --needs_more_work (correction attached)--> scheduled
 pre_pr_gates_failed --correction attached--> scheduled
 pre_pr_gates_failed --reject--> rejected
 
-publishing --branch pushed, PR opened or head updated--> awaiting_external_review   (rounds outstanding)
-publishing --branch pushed, PR opened or head updated--> awaiting_ci_certification  (rounds satisfied or 0)
-publishing --push or PR call failed--> publish_failed --wake-->
+publishing --branch pushed and verified, deliverable is branch--> accepted
+publishing --branch pushed and verified, PR opened or head updated, rounds outstanding--> awaiting_external_review
+publishing --branch pushed and verified, PR opened or head updated, rounds satisfied--> awaiting_ci_certification
+publishing --push, verification, or PR call failed--> publish_failed --wake-->
 publish_failed --retry publish (decision)--> publishing
 publish_failed --cancel--> cancelled
 
-awaiting_external_review --review received from allowlisted login--> external_feedback_received --wake-->
+awaiting_external_review --review signal from allowlisted login--> external_feedback_received --wake-->
 awaiting_external_review --wait_timeout_hours elapsed--> (repeat wake, reason external_review_overdue; no state change)
-external_feedback_received --every comment has a disposition, none is fix--> awaiting_ci_certification
+external_feedback_received --every comment dispositioned, none is fix, rounds satisfied--> awaiting_ci_certification
+external_feedback_received --every comment dispositioned, none is fix, rounds outstanding--> awaiting_external_review
 external_feedback_received --correction attached--> scheduled
 
-awaiting_ci_certification --required checks green on current head--> ready_for_merge --wake-->
-awaiting_ci_certification --a required check failed on current head--> ci_certification_failed --wake-->
-awaiting_ci_certification --head changed out of band--> awaiting_ci_certification (new certification row; informational wake)
+awaiting_ci_certification --required checks green on the accepted head--> ready_for_merge --wake-->
+awaiting_ci_certification --a required check failed on the accepted head--> ci_certification_failed --wake-->
 ci_certification_failed --ci-decision rerun--> awaiting_ci_certification
 ci_certification_failed --ci-decision correct, correction attached--> scheduled
 ci_certification_failed --ci-decision reject--> rejected
 
+{awaiting_external_review, external_feedback_received, awaiting_ci_certification, ready_for_merge}
+    --PR head changed out of band--> head_diverged --wake-->
+head_diverged --head-decision recollect--> reported     (new collected head from the remote; all gates, review, acceptance start over)
+head_diverged --head-decision reject--> rejected
+head_diverged --cancel--> cancelled
+
 ready_for_merge --PR merged (observed)--> merged --wake-->
-ready_for_merge --head changed--> awaiting_ci_certification
 ready_for_merge --PR closed unmerged--> rejected
 merged --included in a release contract--> release_candidate
 release_candidate --release succeeded--> released
@@ -61,7 +67,7 @@ release_candidate --release failed or cancelled--> merged
 {submitted, scheduled, blocked, awaiting_internal_review, awaiting_acceptance,
  pre_pr_gates_failed, publish_failed, awaiting_external_review,
  external_feedback_received, awaiting_ci_certification, ci_certification_failed,
- ready_for_merge} --cancel--> cancelled
+ head_diverged, ready_for_merge} --cancel--> cancelled
 running --cancel--> cancelling --all attempts terminal--> cancelled
 ```
 
@@ -70,17 +76,38 @@ Terminal: `cancelled`, `rejected`, `closed`. There is no task-level
 `reported` task whose gates then fail (`exit_clean`, `report_present`), so
 Foundry always sees the outcome through the same path. Foundry alone moves
 `awaiting_acceptance`, `pre_pr_gates_failed`, `external_feedback_received`,
-`ci_certification_failed`, and `publish_failed` forward and issues `close`.
+`ci_certification_failed`, `head_diverged`, and `publish_failed` forward
+and issues `close`.
 Crucible alone moves everything else, and only Crucible touches GitHub.
 
 A correction re-enters at `scheduled` with a `correct` execution whose
 workspace starts from the remote `work_branch` head (08). It then passes
-through `reported`, the pre-PR gates, internal review if the policy
-requires it for corrections, acceptance, and `publishing` again; the push
-updates the PR head. Because the default policy has
-`retrigger_after_correction: false` and `required_rounds: 1`, the second
-pass through `publishing` lands in `awaiting_ci_certification`, never back
-in `awaiting_external_review`.
+through `reported`, every mechanical pre-PR gate including the full
+verification re-run, acceptance, and `publishing` again; the push updates
+the PR head. A correction does not automatically require another internal
+review: `awaiting_internal_review` is entered for a corrected head only
+when the correction contract sets `request_internal_review: true` (Foundry
+asks for one when the correction is substantial, expands scope, or creates
+architectural risk) or the policy sets
+`internal_review.required_for_corrections: true`. Because the default
+policy has `retrigger_after_correction: false` and `required_rounds: 1`,
+the second pass through `publishing` lands in `awaiting_ci_certification`,
+never back in `awaiting_external_review`.
+
+**Every state after `publishing` is bound to the accepted head.** Gate
+results, the review report, and the AcceptanceResult all name the SHA
+they were made for. A PR head that Crucible did not push invalidates all
+of them: the task moves to `head_diverged` and nothing about the new SHA
+is trusted, however green its CI. Foundry decides whether to `recollect`
+(Crucible fetches the new head into a fresh collector, and the task
+re-runs pre-PR gates, internal review when applicable, and acceptance
+before `publishing` re-verifies it) or to reject.
+
+**Branch-only deliverables** (`branch`, allowed only under a policy with
+`deliverables.allow_branch_only: true`) pass through `publishing` like a
+PR deliverable: the bundle head is pushed and `branch_pushed_at_head`
+verified, then the task moves to `accepted`. Nothing is accepted
+unpublished.
 
 Cancelling a task after `publishing` never closes the PR; Crucible records
 the cancellation on the PR record and leaves the PR to the operator.
@@ -134,8 +161,8 @@ terminated with exit_class `timeout`, reason `stall`) | `exited`.
 
 `opening` -> `open` -> `merged` | `closed`. Head history is a list of
 (SHA, pushed_by: crucible | other, observed_at). A head Crucible did not
-push is recorded with `pushed_by: other` and wakes Foundry; Crucible never
-force-pushes over it.
+push is recorded with `pushed_by: other`, moves the task to
+`head_diverged`, and wakes Foundry; Crucible never force-pushes over it.
 
 ## Release (24)
 
@@ -174,6 +201,7 @@ change.
 | task `awaiting_external_review` | PR observation registered (polling and webhook routing) |
 | task `external_feedback_received` | ExternalReview and comment rows written; wake |
 | task `ci_certification_failed` | CICertification row with captured check, workflow, job, log pointers, head SHA; wake; no retry, no correction |
+| task `head_diverged` | previous head's acceptance, review, and gate results marked `superseded` (rows kept); PR observation continues; wake |
 | task `ready_for_merge` | wake (reason `ready_for_merge`) |
 | task `merged` | merge SHA and merger recorded; wake (informational) |
 | task `blocked` | escalation opened; wake created |

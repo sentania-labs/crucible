@@ -19,8 +19,17 @@ judgment to a party outside the boundary.
 - A round counts only from an allowlisted reviewer login. Any other
   activity is recorded and satisfies nothing.
 - Crucible records feedback and wakes Foundry. Foundry interprets and
-  records dispositions. A correction is a new contract version Foundry
-  authors; Crucible never forwards feedback to a worker.
+  records dispositions. Accepted feedback may create one correction
+  execution as a new contract version Foundry authors; Crucible never
+  forwards feedback to a worker.
+- The corrected head reruns every required test, scan, verification
+  command, and mechanical pre-PR gate. It does not automatically get a
+  second internal review (Foundry may request one) and never a second
+  external review under the default policy. Final CI must be green; a CI
+  failure escalates.
+- A round is counted only from an allowlisted login, including its
+  thumbs-up reaction meaning "no findings". Advancement waits for the
+  configured number of rounds.
 - Crucible watches the PR by webhook plus polling; Foundry keeps no loop.
 
 ## Consequences

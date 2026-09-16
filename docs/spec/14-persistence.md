@@ -19,7 +19,7 @@
 | `evidence` | id, attempt_id, kind, observed_at, source, verified, payload JSONB, artifact_id |
 | `completion_claims` | attempt_id PK, document JSONB, parsed_ok, parse_errors JSONB |
 | `gate_results` | id, attempt_id, gate, result, evaluated_at, evidence_ids BIGINT[], detail |
-| `acceptance_results` | id, task_id, principal_id, verdict, reasoning, created_at |
+| `acceptance_results` | id, task_id, head_sha, principal_id, verdict, reasoning, superseded_at, created_at |
 | `decisions` | id, task_id, escalation_id, principal_id, verbatim TEXT, resolves, created_at |
 | `escalations` | id, task_id, attempt_id, state, question, opened_at, closed_at |
 | `wakes` | id, principal_id, task_id, reason, payload JSONB, created_at, delivered_at, acked_at, attempts |
@@ -31,11 +31,12 @@
 | `pull_requests` | id, task_id UNIQUE, repository_id, number, url, base_ref, state, opened_at, merged_at, merge_sha, merged_by, closed_by, body_sha256 |
 | `pull_request_heads` | id, pull_request_id, sha, pushed_by (crucible, other), observed_at |
 | `external_reviews` | id, pull_request_id, reviewer_login, signal, github_id, reviewed_sha, body, received_at |
-| `review_comments` | id, external_review_id, github_id, path, line, body, created_at |
+| `review_comments` | id, external_review_id, github_id, path, line, body (stored only after secret scanning and redaction), body_sha256, created_at |
 | `review_dispositions` | id, review_comment_id UNIQUE, principal_id, disposition, reasoning, created_at |
 | `ci_certifications` | id, pull_request_id, head_sha, state, required_checks JSONB, check_runs JSONB, failure JSONB (check, workflow, job, log artifact), evaluated_at |
 | `ci_decisions` | id, task_id, ci_certification_id, principal_id, cause, action, reasoning, created_at |
-| `github_deliveries` | delivery_id PK, event, received_at, signature_ok, payload JSONB, processed_at |
+| `github_deliveries` | delivery_id PK, event, action, received_at, body_sha256, normalized JSONB (scanned and redacted fields only; never the raw body), processed_at |
+| `reactions` | id, subject_kind (pull_request, review, comment), subject_github_id, github_id, login, content, observed_at |
 | `release_contracts` | id, external_id, repository_id, target_branch, target_sha, version, tag, document JSONB, sha256, authorization_decision_id, submitted_at |
 | `releases` | id, release_contract_id UNIQUE, state, tag_sha, tagged_at, workflow_run_url, conclusion, ended_at |
 | `retention_actions` | id, policy_name, policy_version, kind, target, performed_at, event_seq |

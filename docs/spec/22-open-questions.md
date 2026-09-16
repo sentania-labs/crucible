@@ -30,38 +30,58 @@
   outward-facing push under the App identity always follows a recorded
   judgment. It costs one API call per head. Set the flag false to push on
   gates alone.
-- **I2. Corrections pass through the full pre-PR path again**, including
-  the internal review gate. The policy could exempt corrections from a
-  second internal review; the default here does not, because a correction
-  is new code under the same author.
+- **I2 (revised by the operator).** A correction reruns every required
+  test, scan, verification command, and mechanical pre-PR gate. It does
+  not automatically require another internal review; Foundry requests one
+  through the correction contract when the correction is substantial,
+  expands scope, or creates architectural risk.
 - **I3. A PR closed without merge rejects the task**; cancelling a task
   never closes its PR. Both are recorded, neither is reversible by Crucible.
 - **I4. Merge is observed, never performed.** Crucible has no merge
   endpoint, matching "I review and merge".
 - **I5. `required_checks` resolution order**: policy list, then the base
-  branch's protection or ruleset, then every non-skipped check on the SHA.
+  branch's protection or ruleset, then every observed check on the SHA;
+  an empty result is `pending`, never a pass, unless the policy explicitly
+  allows a repository without CI.
+- **I6. Branch-only deliverables publish before acceptance.** `branch`
+  deliverables pass through `publishing` and `branch_pushed_at_head` and
+  only then become `accepted`; the kind itself needs a policy allowance.
+- **I7. An out-of-band PR head blocks.** The task moves to
+  `head_diverged`, the previous head's acceptance and gates are
+  superseded, and Foundry chooses recollect or reject. Green CI on the new
+  SHA is never sufficient.
+
+## Resolved after the external review of PR #1 (operator, 2026-09-16)
+
+- **Q13 Webhook route.** Polling is the complete initial observation path
+  and covers reviews, review comments, issue comments, reactions, PR state,
+  checks, workflows, and head changes. No public route on the workstation.
+  Webhooks are added when Crucible sits behind Kubernetes ingress.
+- **Q14 Release authorization.** Foundry records the operator's verbatim
+  approval and identity as the durable authorization the release contract
+  references (`authorization_recorder: orchestrator_relay`). Direct
+  operator-token authorization stays available as a stricter policy.
+- **Q15 Reviewer login.** Confirmed from PR #1: `chatgpt-codex-connector[bot]`
+  submits the review; the summary comment posts as `chatgpt-codex-connector`.
+  The reviewer reacts with a thumbs-up when a review finishes with no
+  findings, so `reaction:+1` is an accepted signal.
+- **Q16 `source.migrated`.** Included in the bootstrap export as
+  informational metadata; verified and recorded, never used to decide
+  authority.
+
+## External review of PR #1: findings and dispositions
+
+One Codex round on commit `5f3e516`, seven inline findings, all
+dispositioned `fix` by the operator's direction and corrected in this
+revision: branch-only publication (09), out-of-band head invalidation (09,
+23), no vacuous CI pass (11, 23), configured round counts (09, 11),
+reaction observation (23), tag bound to the authorized version (24),
+webhook payloads normalized and scanned before storage (04, 14, 23). No
+second review round requested.
 
 ## Still open (operator judgment required)
 
-- **Q13. Webhook route to the workstation.** GitHub must reach
-  `/v1/github/webhook` for webhooks to work locally. That needs a public
-  route, which is the operator's decision alone (a public DNS record, a
-  tunnel, or nothing). Polling alone is complete and is the default until
-  told otherwise. Recommendation: polling only until Crucible runs in
-  Kubernetes behind existing ingress.
-- **Q14. Who records release authorization.** Option A: the operator holds
-  an `operator` role token and records the decision directly. Option B:
-  Foundry records it with the operator's verbatim words. Default in this
-  specification: A required; B allowed only if the policy says so.
-  Recommendation: A, because it keeps the one consequential act on a
-  credential only the operator holds.
-- **Q15. External reviewer login.** The default `reviewer_logins` value is
-  the Codex connector's expected bot login; S12 confirms it. No action
-  needed unless the operator uses a different reviewer App.
-- **Q16. `source.migrated` in the bootstrap export bundle.** The ledger
-  tool's worker asked whether the export should carry the migrated flag.
-  Recommendation: yes, as informational metadata the import verifies but
-  does not act on.
+None at this revision.
 
 ## New conflicts introduced by the decisions
 

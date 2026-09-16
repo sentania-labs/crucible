@@ -10,8 +10,12 @@ the operator's words.
 
 ## Decision
 
-- Foundry proposes; the operator authorizes as a recorded Decision with
-  verbatim words; Foundry submits a `ReleaseContractV1` referencing it.
+- Foundry proposes; the operator authorizes in their own words; Foundry
+  records that as a durable Decision with the verbatim text and the
+  operator's identity (a stricter policy can require the operator's own
+  token); Foundry submits a `ReleaseContractV1` referencing it.
+- The tag is bound to the authorized version: it must be the exact
+  rendering of the contract's version through the policy's tag pattern.
 - Crucible verifies fixed gates (authorization, included PRs merged,
   target SHA current, CI green, version increases, version files agree,
   changelog, tag absent, evidence present), then creates and pushes an

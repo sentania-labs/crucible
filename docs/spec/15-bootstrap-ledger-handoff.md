@@ -32,7 +32,7 @@ Produced by `foundry-ledger export --format crucible`:
 ```json
 {
   "schema_version": "1.0",
-  "source": { "tool": "foundry-ledger", "db_sha256": "...", "exported_at": "..." },
+  "source": { "tool": "foundry-ledger", "db_sha256": "...", "exported_at": "...", "migrated": false },
   "tasks": [ { "external_id": "FDY-0001", "title": "...", "state": "done",
                "created": "...", "updated": "...", "contract": {...},
                "refs": {...}, "evidence": [...], "last_report": "...",
@@ -78,3 +78,12 @@ Produced by `foundry-ledger export --format crucible`:
 
 After step 6, Foundry is a client. Any harness, or a person with the token,
 can carry on from Crucible's state alone.
+
+## `source.migrated`
+
+The export carries `source.migrated` as informational metadata: whether
+the SQLite ledger had already been marked migrated when the bundle was
+produced. Crucible verifies the field is present and records its value on
+the import row and in the verification report. It never uses the value to
+decide whether the import becomes authoritative; only the verification
+result and the explicit commit call do that.

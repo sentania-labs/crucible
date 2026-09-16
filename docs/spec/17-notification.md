@@ -15,7 +15,7 @@ Only when judgment is required or work has stopped needing it:
 | `external_review_overdue` | repeat, no state change |
 | `ci_certification_failed` | `ci_certification_failed` |
 | `ci_certification_overdue` | repeat, no state change |
-| `head_changed_out_of_band` | informational |
+| `head_diverged` | `head_diverged` (decision required) |
 | `ready_for_merge` | `ready_for_merge` |
 | `merged` | `merged` (informational) |
 | `release_gates_failed`, `release_succeeded`, `release_workflow_failed` | release lifecycle (24) |

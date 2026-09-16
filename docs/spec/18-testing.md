@@ -44,7 +44,18 @@ Docker daemon.
   close-without-merge, head changed by other, webhook signature valid and
   invalid, delivery dedupe, poll-only mode equivalence.
 - Correction loop: external feedback to correction to re-publish to CI
-  certification without a second external review round.
+  certification without a second external review round or a second
+  internal review unless requested.
+- Round counting: a two-round policy waits for the second allowlisted
+  signal; a `+1` reaction from the allowlisted login counts, from another
+  login does not.
+- Branch-only deliverable: published and verified before `accepted`.
+- Out-of-band head: task blocks in `head_diverged`; green CI on the new
+  SHA does not advance it; recollect re-runs the pre-PR path.
+- Empty required-check set stays pending; `allow_no_ci` makes it skipped.
+- Release tag not matching the rendered version is refused.
+- Webhook: raw body never reaches storage; a comment containing a
+  credential-shaped string is stored redacted with the body hash.
 - Retention: deterministic and idempotent; every deletion an event.
 
 ## End-to-end (Docker provider, real containers, no model)

@@ -1,6 +1,6 @@
 # 00. Overview, scope, and non-goals
 
-Status: draft for review. Version 0.3, 2026-09-16, incorporating the operator's decisions on the sixteen open questions (22). Version 0.2 followed one non-author adversarial review round.
+Status: draft for review. Version 0.3, 2026-09-16, incorporating the operator's decisions on the sixteen open questions and the corrections from one external review round on PR #1 (22). Version 0.2 followed one non-author adversarial review round.
 
 ## Purpose
 

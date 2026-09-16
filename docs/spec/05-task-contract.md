@@ -96,9 +96,10 @@ records them on the task row and the `task_submitted` event from the
 authenticated token, so a client cannot claim another principal.
 
 Deliverable kinds: `pull_request` (the normal case), `branch` (push only,
-no PR; requires an explicit policy allowance), `artifacts` (no repository
-output; used for spikes and reports). Only `pull_request` enters the PR
-pipeline (23).
+no PR; requires `deliverables.allow_branch_only: true` in policy), and
+`artifacts` (no repository output; used for spikes and reports). `branch`
+and `pull_request` both pass through `publishing` (09); only
+`pull_request` continues into review and CI certification (23).
 
 ## Correction versions
 
@@ -115,6 +116,7 @@ correction:
   instructions: >
     Concrete, bounded instructions for the correcting worker.
   resume_from: "remote_branch"     # the worker starts from the current remote work_branch head
+  request_internal_review: false   # true when Foundry judges the correction substantial (09)
 ```
 
 A correction version may narrow `scope` and `objective` and may not widen

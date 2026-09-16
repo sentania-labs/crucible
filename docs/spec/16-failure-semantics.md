@@ -32,7 +32,7 @@ pushed.
 | PR API error | `publish_failed` with response class; wake; Foundry may retry publish |
 | required CI check failed | `ci_certification_failed`; evidence captured; wake; no retry, no correction until Foundry decides |
 | external review not received in `wait_timeout_hours` | repeat wake; state unchanged |
-| head changed by someone else | new certification row; informational wake; Crucible never overwrites |
+| head changed by someone else | task `head_diverged`; previous head's acceptance, review, and gates superseded; wake; Foundry chooses recollect or reject; Crucible never overwrites |
 | PR closed without merge | task `rejected`, closer recorded |
 | release gate failed or tag push rejected | release `gates_failed`; wake; nothing pushed or re-pushed |
 | release workflow failed | release `workflow_failed`; wake; no re-tag |

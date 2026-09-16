@@ -47,6 +47,7 @@ instead of a bearer token (below).
 | POST | `/tasks/{id}/accept` | Record an `AcceptanceResult` (accepted, rejected, needs_more_work) with reasoning for the current collected head. Orchestrator role only. |
 | POST | `/tasks/{id}/corrections` | Attach a correction: a new contract version whose `correction` section names the review comments or CI findings it addresses, plus an execution request. Creates a `correct` execution against the existing remote branch. Allowed in `pre_pr_gates_failed`, `external_feedback_received`, `ci_certification_failed`, and after `needs_more_work`. |
 | POST | `/tasks/{id}/dispositions` | Record `ReviewDisposition` rows for received external review comments. Orchestrator role. |
+| POST | `/tasks/{id}/head-decision` | In `head_diverged`: `recollect` (Crucible collects the new remote head and the task re-enters `reported`), `reject`, or `cancel`, with reasoning. |
 | POST | `/tasks/{id}/ci-decision` | In `ci_certification_failed`: record the cause Foundry determined (enum in 23) and the action: `rerun` (recorded; the operator re-runs on GitHub, 23), `correct` (followed by a correction), `reject`, or `cancel`. |
 | POST | `/tasks/{id}/decisions` | Record a `Decision` (verbatim text, who, what it resolves). |
 | POST | `/tasks/{id}/close` | Orchestrator closes an `accepted`, `merged`, or `released` task. |
@@ -103,7 +104,7 @@ instead of a bearer token (below).
 
 | Method | Path | Purpose |
 |---|---|---|
-| POST | `/github/webhook` | Receives GitHub webhook deliveries. Authenticated by the `X-Hub-Signature-256` HMAC over the raw body using the webhook secret mounted from the credential source; unsigned or mismatched deliveries are rejected and counted. Deduplicated by `X-GitHub-Delivery`. Stored raw and processed by the supervisor, never inline. Detail in 23. |
+| POST | `/github/webhook` | Optional accelerator, off by default locally (23). Verifies the `X-Hub-Signature-256` HMAC against the raw request body in memory; unsigned or mismatched deliveries are rejected and counted, and nothing of them is stored. An accepted delivery is parsed and normalized in memory to the fields Crucible uses (delivery ID, event and action, repository, PR number, head SHA, review or comment IDs, login, reviewed SHA, check conclusion), user-controlled text is passed through the secret scanner and redaction before it is kept, and only that normalized record plus a SHA-256 of the original body is stored. The raw body is never persisted. Deduplicated by delivery ID. Processed by the supervisor tick. |
 
 ### Bootstrap import
 

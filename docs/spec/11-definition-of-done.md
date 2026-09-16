@@ -107,11 +107,11 @@ it cannot check stays with Foundry or the user.
 
 | Gate | Passes when | Evidence consumed |
 |---|---|---|
-| `branch_pushed_at_head` | remote `work_branch` head equals the collected head Crucible pushed | ls-remote after push |
+| `branch_pushed_at_head` | remote `work_branch` head equals the collected head Crucible pushed, which equals the head the AcceptanceResult names | ls-remote after push |
 | `pr_exists_head_matches` | PR exists, targets `deliverables.target`, head equals the pushed head, draft flag as the contract says, body is the one Crucible rendered | GitHub API |
-| `external_review_rounds` | at least `required_rounds` reviews received from allowlisted logins; `pending` until then; `skipped` at 0 rounds | ExternalReview rows |
+| `external_review_rounds` | the count of accepted signals (review, comment, or `+1` reaction) from allowlisted logins on this PR is at least `required_rounds`; `pending` until then; `skipped` at 0 rounds. Advancement out of `external_feedback_received` requires this gate to pass, so a policy with more than one round waits for each | ExternalReview rows |
 | `feedback_dispositions_complete` | every received review comment has a ReviewDisposition; `skipped` when `require_feedback_disposition` is false | dispositions |
-| `ci_green_for_head` | every required check concluded success on the current PR head; `pending` while any is queued or running; `fail` on any failure | CICertification |
+| `ci_green_for_head` | the required-check set (23) is non-empty and every member concluded success on the accepted head; `pending` while any is queued or running **or while the set is empty**, so a head with no observed runs never passes; `fail` on any failure. Only `allow_no_ci: true` turns the empty set into `skipped` | CICertification |
 
 ## Judgment (never a gate)
 

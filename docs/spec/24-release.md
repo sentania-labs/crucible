@@ -15,11 +15,12 @@ worker-supervision readiness gate.
 2. Crucible observes and records those merges (23).
 3. Foundry determines whether the merged changes form a releasable batch.
 4. Foundry proposes version, included changes, and summary to the operator.
-5. The operator approves in their own words; Foundry records that as a
-   `Decision` of kind `release_authorization` with the verbatim text
-   (operator role principal, or orchestrator role relaying with the
-   operator's words and identity recorded; policy chooses which is
-   acceptable, default operator role).
+5. The operator approves in their own words. Foundry records that as a
+   `Decision` of kind `release_authorization` carrying the verbatim text,
+   the operator's identity, the repository, the version, and the target
+   SHA (`authorization_recorder: orchestrator_relay`, the default). A
+   stricter policy (`operator_token`) requires the operator's own
+   principal to record it.
 6. Foundry submits a `ReleaseContractV1` referencing that decision.
 7. Crucible verifies the release gates.
 8. Crucible creates and pushes the annotated tag through a publisher
@@ -54,10 +55,11 @@ Immutable once submitted. A change is a new contract.
 
 | Gate | Passes when |
 |---|---|
-| `authorization_present` | the referenced decision exists, is kind `release_authorization`, names this repository and version, and was recorded by a principal the policy accepts |
+| `authorization_present` | the referenced decision exists, is kind `release_authorization`, names this repository, this version, and this target SHA, carries the operator's verbatim words and identity, and was recorded by a principal the policy's `authorization_recorder` accepts |
 | `included_prs_merged` | every included PR is `merged` in Crucible's record and on GitHub, with merge SHA reachable from `target_sha` |
 | `target_sha_current` | the remote `target_branch` head equals `target_sha` at verification time and again immediately before the push |
 | `ci_green_for_target` | required checks are green for `target_sha` |
+| `tag_matches_version` | `tag` equals `tag_pattern` rendered with exactly the contract's `version` components (for `v{major}.{minor}.{patch}` and version `1.4.0`, only `v1.4.0`); any other tag name fails, whatever else is true |
 | `version_increases` | `version` parses as semver and is greater than the highest existing tag matching `tag_pattern` |
 | `version_files_agree` | every path in the policy's `version_files` contains `version` at `target_sha` |
 | `changelog_satisfied` | when `changelog_required`: the changelog at `target_sha` has an entry for `version` |
