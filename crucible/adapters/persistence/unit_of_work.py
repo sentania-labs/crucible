@@ -1,0 +1,876 @@
+"""SQLAlchemy unit of work. One transaction per unit; the supervisor sets its fenced
+token with SET LOCAL at the start of every transaction, never per connection (14)."""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+from datetime import UTC, datetime, timedelta
+from types import TracebackType
+from typing import Any
+
+from sqlalchemy import Engine, create_engine, select, text, update
+from sqlalchemy.exc import DBAPIError
+from sqlalchemy.orm import Session, sessionmaker
+
+from crucible.adapters.persistence.models import (
+    AttemptRow,
+    CompletionClaimRow,
+    EventRow,
+    ExecutionRow,
+    IdempotencyKeyRow,
+    LeaseRow,
+    PolicyRow,
+    PrincipalRow,
+    RepositoryRow,
+    SupervisorStatusRow,
+    TaskContractRow,
+    TaskRow,
+)
+from crucible.domain.entities import (
+    Attempt,
+    CompletionClaimRecord,
+    Event,
+    Execution,
+    ExecutionRole,
+    Lease,
+    Policy,
+    Principal,
+    Repository,
+    Role,
+    SupervisorStatus,
+    Task,
+    TaskContract,
+)
+from crucible.domain.exit_class import ExitClass
+from crucible.domain.ids import new_id
+from crucible.domain.lifecycle import AttemptState, ExecutionState, TaskState
+from crucible.domain.time import ensure_utc
+from crucible.ports.repository import (
+    AppendOnlyViolationError,
+    AttemptRepository,
+    ClaimRepository,
+    ContractRepository,
+    EventRepository,
+    ExecutionRepository,
+    FencedTokenRejectedError,
+    IdempotencyRepository,
+    LeaseRepository,
+    PolicyRepository,
+    PrincipalRepository,
+    RepositoryRegistry,
+    SupervisorStatusRepository,
+    TaskRepository,
+    UnitOfWork,
+)
+
+SUPERVISOR_LEASE_KIND = "supervisor"
+SUPERVISOR_LEASE_KEY = "supervisor"
+ATTEMPT_LEASE_KIND = "attempt"
+FENCED_TOKEN_SETTING = "crucible.fenced_token"
+FENCED_TOKEN_SQLSTATE = "CRU01"
+APPEND_ONLY_SQLSTATE = "CRU02"
+
+
+def translate_error(exc: BaseException) -> Exception | None:
+    """Map the database's trigger errors onto port-level exceptions."""
+    if not isinstance(exc, DBAPIError):
+        return None
+    sqlstate = getattr(exc.orig, "sqlstate", None)
+    if sqlstate == FENCED_TOKEN_SQLSTATE:
+        return FencedTokenRejectedError(str(exc.orig).splitlines()[0])
+    if sqlstate == APPEND_ONLY_SQLSTATE:
+        return AppendOnlyViolationError(str(exc.orig).splitlines()[0])
+    return None
+
+
+def make_engine(url: str) -> Engine:
+    return create_engine(url, pool_pre_ping=True, future=True)
+
+
+def _dt(value: datetime | None) -> datetime | None:
+    return ensure_utc(value) if value is not None else None
+
+
+class Principals:
+    def __init__(self, session: Session) -> None:
+        self._s = session
+
+    @staticmethod
+    def _to_entity(row: PrincipalRow) -> Principal:
+        return Principal(
+            id=row.id,
+            name=row.name,
+            role=Role(row.role),
+            created_at=ensure_utc(row.created_at),
+            disabled_at=_dt(row.disabled_at),
+        )
+
+    def get(self, principal_id: str) -> Principal | None:
+        row = self._s.get(PrincipalRow, principal_id)
+        return self._to_entity(row) if row else None
+
+    def get_by_name(self, name: str) -> Principal | None:
+        row = self._s.scalar(select(PrincipalRow).where(PrincipalRow.name == name))
+        return self._to_entity(row) if row else None
+
+    def add(self, principal: Principal, token_salt: bytes, token_hash: bytes) -> None:
+        self._s.add(
+            PrincipalRow(
+                id=principal.id,
+                name=principal.name,
+                role=principal.role.value,
+                token_salt=token_salt,
+                token_hash=token_hash,
+                created_at=principal.created_at,
+                disabled_at=principal.disabled_at,
+            )
+        )
+        self._s.flush()
+
+    def credentials(self, principal_id: str) -> tuple[bytes, bytes] | None:
+        row = self._s.get(PrincipalRow, principal_id)
+        if row is None or row.disabled_at is not None:
+            return None
+        return row.token_salt, row.token_hash
+
+    def rotate(self, principal_id: str, token_salt: bytes, token_hash: bytes) -> None:
+        self._s.execute(
+            update(PrincipalRow)
+            .where(PrincipalRow.id == principal_id)
+            .values(token_salt=token_salt, token_hash=token_hash)
+        )
+
+    def list_all(self) -> Sequence[Principal]:
+        rows = self._s.scalars(select(PrincipalRow).order_by(PrincipalRow.name)).all()
+        return [self._to_entity(r) for r in rows]
+
+
+class Repositories:
+    def __init__(self, session: Session) -> None:
+        self._s = session
+
+    @staticmethod
+    def _to_entity(row: RepositoryRow) -> Repository:
+        return Repository(
+            id=row.id,
+            name=row.name,
+            url=row.url,
+            default_branch=row.default_branch,
+            policy_name=row.policy_name,
+            installation_id=row.installation_id,
+            registered_by=row.registered_by,
+            created_at=ensure_utc(row.created_at),
+        )
+
+    def get_by_name(self, name: str) -> Repository | None:
+        row = self._s.scalar(select(RepositoryRow).where(RepositoryRow.name == name))
+        return self._to_entity(row) if row else None
+
+    def get(self, repository_id: str) -> Repository | None:
+        row = self._s.get(RepositoryRow, repository_id)
+        return self._to_entity(row) if row else None
+
+    def upsert(self, repository: Repository) -> Repository:
+        row = self._s.scalar(select(RepositoryRow).where(RepositoryRow.name == repository.name))
+        if row is None:
+            row = RepositoryRow(
+                id=repository.id,
+                name=repository.name,
+                created_at=repository.created_at,
+                registered_by=repository.registered_by,
+            )
+            self._s.add(row)
+        row.url = repository.url
+        row.default_branch = repository.default_branch
+        row.installation_id = repository.installation_id
+        row.policy_name = repository.policy_name
+        row.registered_by = repository.registered_by
+        self._s.flush()
+        return self._to_entity(row)
+
+
+class Policies:
+    def __init__(self, session: Session) -> None:
+        self._s = session
+
+    def get(self, name: str, version: int) -> Policy | None:
+        row = self._s.get(PolicyRow, (name, version))
+        if row is None:
+            return None
+        return Policy(
+            name=row.name,
+            version=row.version,
+            document=row.document,
+            created_at=ensure_utc(row.created_at),
+            retired_at=_dt(row.retired_at),
+        )
+
+
+class Tasks:
+    def __init__(self, session: Session) -> None:
+        self._s = session
+
+    @staticmethod
+    def _to_entity(row: TaskRow) -> Task:
+        return Task(
+            id=row.id,
+            external_id=row.external_id,
+            principal_id=row.principal_id,
+            project=row.project,
+            title=row.title,
+            state=TaskState(row.state),
+            contract_version=row.contract_version,
+            policy_name=row.policy_name,
+            policy_version=row.policy_version,
+            repository_id=row.repository_id,
+            created_at=ensure_utc(row.created_at),
+            updated_at=ensure_utc(row.updated_at),
+            closed_at=_dt(row.closed_at),
+        )
+
+    def add(self, task: Task) -> None:
+        self._s.add(
+            TaskRow(
+                id=task.id,
+                external_id=task.external_id,
+                principal_id=task.principal_id,
+                repository_id=task.repository_id,
+                project=task.project,
+                title=task.title,
+                state=task.state.value,
+                contract_version=task.contract_version,
+                policy_name=task.policy_name,
+                policy_version=task.policy_version,
+                created_at=task.created_at,
+                updated_at=task.updated_at,
+                closed_at=task.closed_at,
+            )
+        )
+        self._s.flush()
+
+    def get(self, task_id: str, *, for_update: bool = False) -> Task | None:
+        stmt = select(TaskRow).where(TaskRow.id == task_id)
+        if for_update:
+            stmt = stmt.with_for_update()
+        row = self._s.scalar(stmt)
+        return self._to_entity(row) if row else None
+
+    def get_by_external_id(self, principal_id: str, external_id: str) -> Task | None:
+        row = self._s.scalar(
+            select(TaskRow).where(
+                TaskRow.principal_id == principal_id, TaskRow.external_id == external_id
+            )
+        )
+        return self._to_entity(row) if row else None
+
+    def save(self, task: Task) -> None:
+        self._s.execute(
+            update(TaskRow)
+            .where(TaskRow.id == task.id)
+            .values(
+                state=task.state.value,
+                contract_version=task.contract_version,
+                updated_at=task.updated_at,
+                closed_at=task.closed_at,
+            )
+        )
+
+    def list_by_state(self, state: TaskState, *, for_update: bool = False) -> Sequence[Task]:
+        stmt = select(TaskRow).where(TaskRow.state == state.value).order_by(TaskRow.id)
+        if for_update:
+            stmt = stmt.with_for_update()
+        return [self._to_entity(r) for r in self._s.scalars(stmt).all()]
+
+    def search(
+        self,
+        *,
+        state: TaskState | None,
+        project: str | None,
+        repository_id: str | None,
+        external_id: str | None,
+        updated_since: datetime | None,
+        after_id: str | None,
+        limit: int,
+    ) -> Sequence[Task]:
+        stmt = select(TaskRow).order_by(TaskRow.id).limit(limit)
+        if state is not None:
+            stmt = stmt.where(TaskRow.state == state.value)
+        if project is not None:
+            stmt = stmt.where(TaskRow.project == project)
+        if repository_id is not None:
+            stmt = stmt.where(TaskRow.repository_id == repository_id)
+        if external_id is not None:
+            stmt = stmt.where(TaskRow.external_id == external_id)
+        if updated_since is not None:
+            stmt = stmt.where(TaskRow.updated_at >= updated_since)
+        if after_id is not None:
+            stmt = stmt.where(TaskRow.id > after_id)
+        return [self._to_entity(r) for r in self._s.scalars(stmt).all()]
+
+
+class Contracts:
+    def __init__(self, session: Session) -> None:
+        self._s = session
+
+    @staticmethod
+    def _to_entity(row: TaskContractRow) -> TaskContract:
+        return TaskContract(
+            id=row.id,
+            task_id=row.task_id,
+            version=row.version,
+            document=row.document,
+            sha256=row.sha256,
+            submitted_at=ensure_utc(row.submitted_at),
+        )
+
+    def add(self, contract: TaskContract) -> None:
+        self._s.add(
+            TaskContractRow(
+                id=contract.id,
+                task_id=contract.task_id,
+                version=contract.version,
+                document=contract.document,
+                sha256=contract.sha256,
+                submitted_at=contract.submitted_at,
+            )
+        )
+        self._s.flush()
+
+    def get(self, task_id: str, version: int) -> TaskContract | None:
+        row = self._s.scalar(
+            select(TaskContractRow).where(
+                TaskContractRow.task_id == task_id, TaskContractRow.version == version
+            )
+        )
+        return self._to_entity(row) if row else None
+
+    def list_for_task(self, task_id: str) -> Sequence[TaskContract]:
+        rows = self._s.scalars(
+            select(TaskContractRow)
+            .where(TaskContractRow.task_id == task_id)
+            .order_by(TaskContractRow.version)
+        ).all()
+        return [self._to_entity(r) for r in rows]
+
+
+class Executions:
+    def __init__(self, session: Session) -> None:
+        self._s = session
+
+    @staticmethod
+    def _to_entity(row: ExecutionRow) -> Execution:
+        return Execution(
+            id=row.id,
+            task_id=row.task_id,
+            role=ExecutionRole(row.role),
+            contract_version=row.contract_version,
+            harness=row.harness,
+            model=row.model,
+            effort=row.effort,
+            provider=row.provider,
+            image=row.image,
+            policy_snapshot=row.policy_snapshot,
+            state=ExecutionState(row.state),
+            max_attempts=row.max_attempts,
+            retry_on=[str(x) for x in row.retry_on],
+            timeout_seconds=row.timeout_seconds,
+            created_at=ensure_utc(row.created_at),
+            ended_at=_dt(row.ended_at),
+        )
+
+    def add(self, execution: Execution) -> None:
+        self._s.add(
+            ExecutionRow(
+                id=execution.id,
+                task_id=execution.task_id,
+                role=execution.role.value,
+                contract_version=execution.contract_version,
+                harness=execution.harness,
+                model=execution.model,
+                effort=execution.effort,
+                provider=execution.provider,
+                image=execution.image,
+                policy_snapshot=execution.policy_snapshot,
+                state=execution.state.value,
+                max_attempts=execution.max_attempts,
+                retry_on=list(execution.retry_on),
+                timeout_seconds=execution.timeout_seconds,
+                created_at=execution.created_at,
+                ended_at=execution.ended_at,
+            )
+        )
+        self._s.flush()
+
+    def get(self, execution_id: str, *, for_update: bool = False) -> Execution | None:
+        stmt = select(ExecutionRow).where(ExecutionRow.id == execution_id)
+        if for_update:
+            stmt = stmt.with_for_update()
+        row = self._s.scalar(stmt)
+        return self._to_entity(row) if row else None
+
+    def save(self, execution: Execution) -> None:
+        self._s.execute(
+            update(ExecutionRow)
+            .where(ExecutionRow.id == execution.id)
+            .values(state=execution.state.value, ended_at=execution.ended_at)
+        )
+
+    def list_for_task(self, task_id: str) -> Sequence[Execution]:
+        rows = self._s.scalars(
+            select(ExecutionRow).where(ExecutionRow.task_id == task_id).order_by(ExecutionRow.id)
+        ).all()
+        return [self._to_entity(r) for r in rows]
+
+    def list_by_state(self, state: ExecutionState) -> Sequence[Execution]:
+        rows = self._s.scalars(
+            select(ExecutionRow).where(ExecutionRow.state == state.value).order_by(ExecutionRow.id)
+        ).all()
+        return [self._to_entity(r) for r in rows]
+
+
+class Attempts:
+    def __init__(self, session: Session) -> None:
+        self._s = session
+
+    @staticmethod
+    def _to_entity(row: AttemptRow) -> Attempt:
+        return Attempt(
+            id=row.id,
+            execution_id=row.execution_id,
+            task_id=row.task_id,
+            number=row.number,
+            state=AttemptState(row.state),
+            created_at=ensure_utc(row.created_at),
+            workspace_path=row.workspace_path,
+            handle=row.handle,
+            identity_sha256=row.identity_sha256,
+            image_digest=row.image_digest,
+            started_at=_dt(row.started_at),
+            ended_at=_dt(row.ended_at),
+            exit_code=row.exit_code,
+            exit_class=ExitClass(row.exit_class) if row.exit_class else None,
+            timeout_at=_dt(row.timeout_at),
+            drain_deadline=_dt(row.drain_deadline),
+            termination_reason=row.termination_reason,
+        )
+
+    def add(self, attempt: Attempt) -> None:
+        self._s.add(
+            AttemptRow(
+                id=attempt.id,
+                execution_id=attempt.execution_id,
+                task_id=attempt.task_id,
+                number=attempt.number,
+                state=attempt.state.value,
+                created_at=attempt.created_at,
+                workspace_path=attempt.workspace_path,
+                handle=attempt.handle,
+                identity_sha256=attempt.identity_sha256,
+                image_digest=attempt.image_digest,
+                started_at=attempt.started_at,
+                ended_at=attempt.ended_at,
+                exit_code=attempt.exit_code,
+                exit_class=attempt.exit_class.value if attempt.exit_class else None,
+                timeout_at=attempt.timeout_at,
+                drain_deadline=attempt.drain_deadline,
+                termination_reason=attempt.termination_reason,
+            )
+        )
+        self._s.flush()
+
+    def get(self, attempt_id: str, *, for_update: bool = False) -> Attempt | None:
+        stmt = select(AttemptRow).where(AttemptRow.id == attempt_id)
+        if for_update:
+            stmt = stmt.with_for_update()
+        row = self._s.scalar(stmt)
+        return self._to_entity(row) if row else None
+
+    def save(self, attempt: Attempt) -> None:
+        self._s.execute(
+            update(AttemptRow)
+            .where(AttemptRow.id == attempt.id)
+            .values(
+                state=attempt.state.value,
+                workspace_path=attempt.workspace_path,
+                handle=attempt.handle,
+                identity_sha256=attempt.identity_sha256,
+                image_digest=attempt.image_digest,
+                started_at=attempt.started_at,
+                ended_at=attempt.ended_at,
+                exit_code=attempt.exit_code,
+                exit_class=attempt.exit_class.value if attempt.exit_class else None,
+                timeout_at=attempt.timeout_at,
+                drain_deadline=attempt.drain_deadline,
+                termination_reason=attempt.termination_reason,
+            )
+        )
+
+    def list_for_execution(self, execution_id: str) -> Sequence[Attempt]:
+        rows = self._s.scalars(
+            select(AttemptRow)
+            .where(AttemptRow.execution_id == execution_id)
+            .order_by(AttemptRow.number)
+        ).all()
+        return [self._to_entity(r) for r in rows]
+
+    def list_for_task(self, task_id: str) -> Sequence[Attempt]:
+        rows = self._s.scalars(
+            select(AttemptRow).where(AttemptRow.task_id == task_id).order_by(AttemptRow.id)
+        ).all()
+        return [self._to_entity(r) for r in rows]
+
+    def list_in_states(
+        self, states: Sequence[AttemptState], *, for_update: bool = False
+    ) -> Sequence[Attempt]:
+        stmt = (
+            select(AttemptRow)
+            .where(AttemptRow.state.in_([s.value for s in states]))
+            .order_by(AttemptRow.id)
+        )
+        if for_update:
+            stmt = stmt.with_for_update()
+        return [self._to_entity(r) for r in self._s.scalars(stmt).all()]
+
+
+class Events:
+    def __init__(self, session: Session) -> None:
+        self._s = session
+
+    @staticmethod
+    def _to_entity(row: EventRow) -> Event:
+        return Event(
+            seq=row.seq,
+            ts=ensure_utc(row.ts),
+            kind=row.kind,
+            principal=row.principal,
+            verified=row.verified,
+            payload=row.payload,
+            task_id=row.task_id,
+            execution_id=row.execution_id,
+            attempt_id=row.attempt_id,
+        )
+
+    def append(self, event: Event) -> Event:
+        row = EventRow(
+            ts=event.ts,
+            kind=event.kind,
+            task_id=event.task_id,
+            execution_id=event.execution_id,
+            attempt_id=event.attempt_id,
+            principal=event.principal,
+            verified=event.verified,
+            payload=event.payload,
+        )
+        self._s.add(row)
+        self._s.flush()
+        event.seq = row.seq
+        return event
+
+    def list_for_task(self, task_id: str, *, after_seq: int, limit: int) -> Sequence[Event]:
+        rows = self._s.scalars(
+            select(EventRow)
+            .where(EventRow.task_id == task_id, EventRow.seq > after_seq)
+            .order_by(EventRow.seq)
+            .limit(limit)
+        ).all()
+        return [self._to_entity(r) for r in rows]
+
+    def list_global(
+        self, *, after_seq: int, kind: str | None, since: datetime | None, limit: int
+    ) -> Sequence[Event]:
+        stmt = select(EventRow).where(EventRow.seq > after_seq).order_by(EventRow.seq).limit(limit)
+        if kind is not None:
+            stmt = stmt.where(EventRow.kind == kind)
+        if since is not None:
+            stmt = stmt.where(EventRow.ts >= since)
+        return [self._to_entity(r) for r in self._s.scalars(stmt).all()]
+
+
+class Leases:
+    def __init__(self, session: Session) -> None:
+        self._s = session
+
+    @staticmethod
+    def _to_entity(row: LeaseRow) -> Lease:
+        return Lease(
+            id=row.id,
+            kind=row.kind,
+            key=row.key,
+            holder=row.holder,
+            fenced_token=row.fenced_token,
+            expires_at=ensure_utc(row.expires_at),
+        )
+
+    def _supervisor_row(self, *, for_update: bool) -> LeaseRow | None:
+        stmt = select(LeaseRow).where(
+            LeaseRow.kind == SUPERVISOR_LEASE_KIND, LeaseRow.key == SUPERVISOR_LEASE_KEY
+        )
+        if for_update:
+            stmt = stmt.with_for_update()
+        return self._s.scalar(stmt)
+
+    def get_supervisor(self) -> Lease | None:
+        row = self._supervisor_row(for_update=False)
+        return self._to_entity(row) if row else None
+
+    def acquire_supervisor(self, holder: str, now: datetime, ttl_seconds: int) -> Lease | None:
+        """Take the lease if free or expired, or renew it if already ours. The fenced
+        token increases on every change of holder, so a stale holder's token is dead."""
+        row = self._supervisor_row(for_update=True)
+        expires = now + timedelta(seconds=ttl_seconds)
+        if row is None:
+            row = LeaseRow(
+                id=new_id(),
+                kind=SUPERVISOR_LEASE_KIND,
+                key=SUPERVISOR_LEASE_KEY,
+                holder=holder,
+                fenced_token=1,
+                expires_at=expires,
+            )
+            self._s.add(row)
+            self._s.flush()
+            return self._to_entity(row)
+        if row.holder == holder:
+            row.expires_at = expires
+            self._s.flush()
+            return self._to_entity(row)
+        if ensure_utc(row.expires_at) <= now:
+            row.holder = holder
+            row.fenced_token = row.fenced_token + 1
+            row.expires_at = expires
+            self._s.flush()
+            return self._to_entity(row)
+        return None
+
+    def renew_supervisor(
+        self, holder: str, fenced_token: int, now: datetime, ttl_seconds: int
+    ) -> Lease | None:
+        row = self._supervisor_row(for_update=True)
+        if row is None or row.holder != holder or row.fenced_token != fenced_token:
+            return None
+        row.expires_at = now + timedelta(seconds=ttl_seconds)
+        self._s.flush()
+        return self._to_entity(row)
+
+    def release_supervisor(self, holder: str, fenced_token: int) -> bool:
+        row = self._supervisor_row(for_update=True)
+        if row is None or row.holder != holder or row.fenced_token != fenced_token:
+            return False
+        row.expires_at = datetime(1970, 1, 1, tzinfo=UTC)
+        self._s.flush()
+        return True
+
+    def upsert_attempt_lease(
+        self, attempt_id: str, holder: str, fenced_token: int, now: datetime, ttl_seconds: int
+    ) -> Lease:
+        row = self._s.scalar(
+            select(LeaseRow)
+            .where(LeaseRow.kind == ATTEMPT_LEASE_KIND, LeaseRow.key == attempt_id)
+            .with_for_update()
+        )
+        expires = now + timedelta(seconds=ttl_seconds)
+        if row is None:
+            row = LeaseRow(
+                id=new_id(),
+                kind=ATTEMPT_LEASE_KIND,
+                key=attempt_id,
+                holder=holder,
+                fenced_token=fenced_token,
+                expires_at=expires,
+            )
+            self._s.add(row)
+        else:
+            row.holder = holder
+            row.fenced_token = fenced_token
+            row.expires_at = expires
+        self._s.flush()
+        return self._to_entity(row)
+
+    def get_attempt_lease(self, attempt_id: str) -> Lease | None:
+        row = self._s.scalar(
+            select(LeaseRow).where(LeaseRow.kind == ATTEMPT_LEASE_KIND, LeaseRow.key == attempt_id)
+        )
+        return self._to_entity(row) if row else None
+
+    def release_attempt_lease(self, attempt_id: str) -> None:
+        row = self._s.scalar(
+            select(LeaseRow).where(LeaseRow.kind == ATTEMPT_LEASE_KIND, LeaseRow.key == attempt_id)
+        )
+        if row is not None:
+            self._s.delete(row)
+            self._s.flush()
+
+
+class Claims:
+    def __init__(self, session: Session) -> None:
+        self._s = session
+
+    def put(self, record: CompletionClaimRecord) -> None:
+        row = self._s.get(CompletionClaimRow, record.attempt_id)
+        if row is None:
+            row = CompletionClaimRow(attempt_id=record.attempt_id)
+            self._s.add(row)
+        row.document = record.document
+        row.parsed_ok = record.parsed_ok
+        row.parse_errors = list(record.parse_errors)
+        self._s.flush()
+
+    def get(self, attempt_id: str) -> CompletionClaimRecord | None:
+        row = self._s.get(CompletionClaimRow, attempt_id)
+        if row is None:
+            return None
+        return CompletionClaimRecord(
+            attempt_id=row.attempt_id,
+            document=row.document,
+            parsed_ok=row.parsed_ok,
+            parse_errors=[dict(e) for e in row.parse_errors],
+        )
+
+
+class SupervisorStatuses:
+    def __init__(self, session: Session) -> None:
+        self._s = session
+
+    def get(self) -> SupervisorStatus:
+        row = self._s.get(SupervisorStatusRow, True)
+        if row is None:
+            return SupervisorStatus(holder=None, last_tick_at=None, tick_ms=None, counts={})
+        return SupervisorStatus(
+            holder=row.holder,
+            last_tick_at=_dt(row.last_tick_at),
+            tick_ms=row.tick_ms,
+            counts={str(k): int(v) for k, v in row.counts.items()},
+        )
+
+    def write(self, status: SupervisorStatus) -> None:
+        row = self._s.get(SupervisorStatusRow, True)
+        if row is None:
+            row = SupervisorStatusRow(singleton=True, counts={})
+            self._s.add(row)
+        row.holder = status.holder
+        row.last_tick_at = status.last_tick_at
+        row.tick_ms = status.tick_ms
+        row.counts = dict(status.counts)
+        self._s.flush()
+
+
+class IdempotencyKeys:
+    def __init__(self, session: Session) -> None:
+        self._s = session
+
+    def get(self, principal_id: str, key: str) -> tuple[str, int, dict[str, Any]] | None:
+        row = self._s.scalar(
+            select(IdempotencyKeyRow).where(
+                IdempotencyKeyRow.principal_id == principal_id, IdempotencyKeyRow.key == key
+            )
+        )
+        if row is None:
+            return None
+        return row.request_sha256, row.response_status, row.response_body
+
+    def put(
+        self,
+        principal_id: str,
+        key: str,
+        *,
+        request_sha256: str,
+        status: int,
+        body: dict[str, Any],
+        now: datetime,
+    ) -> None:
+        self._s.add(
+            IdempotencyKeyRow(
+                id=new_id(),
+                principal_id=principal_id,
+                key=key,
+                request_sha256=request_sha256,
+                response_status=status,
+                response_body=body,
+                created_at=now,
+            )
+        )
+        self._s.flush()
+
+
+class SqlUnitOfWork:
+    """One database transaction. Use as a context manager; commit explicitly."""
+
+    principals: PrincipalRepository
+    repositories: RepositoryRegistry
+    policies: PolicyRepository
+    tasks: TaskRepository
+    contracts: ContractRepository
+    executions: ExecutionRepository
+    attempts: AttemptRepository
+    events: EventRepository
+    leases: LeaseRepository
+    claims: ClaimRepository
+    supervisor_status: SupervisorStatusRepository
+    idempotency: IdempotencyRepository
+
+    def __init__(self, session_factory: sessionmaker[Session]) -> None:
+        self._factory = session_factory
+        self._session: Session | None = None
+
+    @property
+    def session(self) -> Session:
+        assert self._session is not None, "unit of work not entered"
+        return self._session
+
+    def __enter__(self) -> UnitOfWork:
+        self._session = self._factory()
+        self._session.begin()
+        s = self._session
+        self.principals = Principals(s)
+        self.repositories = Repositories(s)
+        self.policies = Policies(s)
+        self.tasks = Tasks(s)
+        self.contracts = Contracts(s)
+        self.executions = Executions(s)
+        self.attempts = Attempts(s)
+        self.events = Events(s)
+        self.leases = Leases(s)
+        self.claims = Claims(s)
+        self.supervisor_status = SupervisorStatuses(s)
+        self.idempotency = IdempotencyKeys(s)
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        assert self._session is not None
+        try:
+            if self._session.in_transaction():
+                self._session.rollback()
+        finally:
+            self._session.close()
+            self._session = None
+        if exc is not None:
+            translated = translate_error(exc)
+            if translated is not None:
+                raise translated from exc
+
+    def commit(self) -> None:
+        self.session.commit()
+
+    def rollback(self) -> None:
+        self.session.rollback()
+
+    def set_fenced_token(self, fenced_token: int) -> None:
+        """Transaction-local: SET LOCAL semantics via set_config(..., is_local=true)."""
+        self.session.execute(
+            text("SELECT set_config(:name, :value, true)"),
+            {"name": FENCED_TOKEN_SETTING, "value": str(fenced_token)},
+        )
+
+
+class SqlUnitOfWorkFactory:
+    def __init__(self, engine: Engine) -> None:
+        self.engine = engine
+        self._sessions = sessionmaker(bind=engine, expire_on_commit=False)
+
+    def __call__(self) -> UnitOfWork:
+        return SqlUnitOfWork(self._sessions)
