@@ -37,15 +37,21 @@ real Docker daemon. Each step gates the next:
 2. **Build** `ghcr.io/sentania-labs/crucible:<version>` with `VERSION` passed in.
 3. **Check the version reached the artifact**: the package version inside the
    image and the OCI version label must both equal the tag.
-4. **Smoke the exact image**, not a rebuild: `docker compose up --wait` with no
-   `--build`, so compose resolves the locally tagged `latest`. It checks
-   `/v1/ready`, asserts `/v1/health` reports the tagged version, then drives one
-   task through the fake provider to `reported`.
-5. **Publish.** Push `:<version>` only if that tag does not already exist in
-   GHCR, so a re-run after a transient failure is idempotent and a published
-   version is never overwritten. Push `:latest` only when this version is the
-   highest already published, so re-tagging an old fix does not move `latest`
-   backwards.
+4. **Smoke the exact image**, not a rebuild and not the published one.
+   `CRUCIBLE_IMAGE` pins compose to this run's versioned local tag and
+   `--pull never` forbids the registry, so a v0.2.0 run cannot boot the
+   published v0.1.0. Compose will still build when an image is absent, because
+   the services carry a `build:` section, so the step compares the running
+   containers' image IDs against the freshly built one rather than trusting the
+   pull policy. It then checks `/v1/ready`, asserts `/v1/health` reports the
+   tagged version, and drives one task through the fake provider to `reported`.
+5. **Publish.** Whether the version already exists is decided by the registry
+   API, where only an explicit HTTP 404 means absent: a blip, a rate limit or an
+   auth failure stops the job rather than being read as "not published". An
+   existing version from this same commit is a re-run and the push is skipped;
+   an existing version from a different commit means the tag was moved, which
+   fails the job. Push `:latest` only when this version is the highest already
+   published, so re-tagging an old fix does not move `latest` backwards.
 6. **Create the GitHub release** with generated notes, last, so a release never
    points at a version that is not consumable from the registry.
 
@@ -57,6 +63,9 @@ The workflow uses the job's `GITHUB_TOKEN` with `packages: write` and
 `compose.yaml` names `ghcr.io/sentania-labs/crucible:latest`. Deployments pin an
 exact tag and that pin lives in the deployment repository, which is what keeps
 this repository free of version-bump commits.
+
+`CRUCIBLE_IMAGE` overrides that reference and exists for the release workflow,
+which uses it to boot one exact locally built candidate.
 
 Use `make up` for local work. It passes `--build`, so the working tree is what
 runs. A bare `docker compose up` pulls the published `latest` when one exists

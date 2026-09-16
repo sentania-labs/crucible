@@ -70,14 +70,39 @@ jobs:
       # from this same commit, the run is a re-run of a transient failure and
       # the push is skipped. If it is there from a DIFFERENT commit, the tag was
       # moved: that is an escalation, never a quiet re-publish (ADR 0010).
+      #
+      # The registry API, not `docker manifest inspect`: only an explicit 404
+      # means absent. A network blip, a rate limit or an auth problem must stop
+      # the job, because treating those as "absent" would republish over a
+      # version that already exists.
       - name: refuse to republish a moved tag
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          if ! docker manifest inspect "${IMAGE}:${VERSION}" >/dev/null 2>&1; then
-            echo "ALREADY_PUBLISHED=false" >> "$GITHUB_ENV"
-            echo "${VERSION} is not published yet"
-            exit 0
-          fi
+          REG_TOKEN=$(curl -fsS -u "$GHCR_USER:$GHCR_TOKEN" \
+            "https://ghcr.io/token?scope=repository:sentania-labs/crucible:pull" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
+          CODE=$(curl -sS -o /dev/null -w '%{http_code}' -X GET \
+            -H "Authorization: Bearer $REG_TOKEN" \
+            -H 'Accept: application/vnd.oci.image.index.v1+json' \
+            -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+            -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
+            -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+            "https://ghcr.io/v2/sentania-labs/crucible/manifests/${VERSION}")
+          case "$CODE" in
+            404)
+              echo "ALREADY_PUBLISHED=false" >> "$GITHUB_ENV"
+              echo "${VERSION} is not published yet"
+              exit 0
+              ;;
+            200) ;;
+            *)
+              echo "::error::GHCR returned HTTP $CODE for manifest ${VERSION}; cannot tell whether this version is already published, so refusing to continue"
+              exit 1
+              ;;
+          esac
           docker pull -q "${IMAGE}:${VERSION}"
           REV=$(docker image inspect "${IMAGE}:${VERSION}" \
             --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')
@@ -110,10 +135,29 @@ jobs:
       # operator boots it, and drive one task end to end. This is the last gate
       # before the artifact leaves the repository.
       - name: compose smoke against the built image
+        env:
+          CRUCIBLE_IMAGE: ghcr.io/sentania-labs/crucible:${{ env.VERSION }}
         run: |
           set -euo pipefail
           cp .env.example .env
-          docker compose up -d --wait
+          # CRUCIBLE_IMAGE pins compose to this run's versioned local tag and
+          # --pull never forbids reaching the registry, so a v0.2.0 run can
+          # never end up smoking the published v0.1.0. --pull never does not
+          # stop compose building when the image is absent, because the service
+          # has a build section, so the image ID is checked below rather than
+          # trusted.
+          docker compose up -d --wait --pull never
+          # Prove it: the running container must be the image just built, by ID.
+          BUILT=$(docker image inspect "${IMAGE}:${VERSION}" --format '{{.Id}}')
+          for SVC in crucible migrate; do
+            CID=$(docker compose ps -aq "$SVC")
+            RUNNING=$(docker inspect "$CID" --format '{{.Image}}')
+            echo "$SVC image: $RUNNING"
+            if [ "$RUNNING" != "$BUILT" ]; then
+              echo "::error::$SVC is running image $RUNNING, not the freshly built $BUILT"
+              exit 1
+            fi
+          done
           curl -fsS http://127.0.0.1:8080/v1/ready
           HEALTH=$(curl -fsS http://127.0.0.1:8080/v1/health)
           echo "health: $HEALTH"
@@ -153,10 +197,14 @@ jobs:
 
       - name: logs on failure
         if: failure()
+        env:
+          CRUCIBLE_IMAGE: ghcr.io/sentania-labs/crucible:${{ env.VERSION }}
         run: docker compose logs
 
       - name: down
         if: always()
+        env:
+          CRUCIBLE_IMAGE: ghcr.io/sentania-labs/crucible:${{ env.VERSION }}
         run: make down
 
       # Gate 4. Publish. An existing version tag is never overwritten: a re-run

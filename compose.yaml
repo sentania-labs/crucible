@@ -27,7 +27,9 @@ services:
     # Use `make up`: it passes --build, so your working tree is what runs. A bare
     # `docker compose up` pulls the published `latest` when one exists and only
     # builds if the pull fails, which is not what you want while developing.
-    image: ghcr.io/sentania-labs/crucible:latest
+    # CRUCIBLE_IMAGE lets the release workflow boot one exact, locally built
+    # candidate instead of whatever `latest` currently resolves to.
+    image: ${CRUCIBLE_IMAGE:-ghcr.io/sentania-labs/crucible:latest}
     build: .
     profiles: ["full"]
     command: ["crucible-admin", "migrate"]
@@ -39,7 +41,7 @@ services:
 
   crucible:
     # Tracks `latest`; deployments pin an exact tag (see migrate above).
-    image: ghcr.io/sentania-labs/crucible:latest
+    image: ${CRUCIBLE_IMAGE:-ghcr.io/sentania-labs/crucible:latest}
     build: .
     profiles: ["full"]
     restart: unless-stopped
