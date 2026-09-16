@@ -40,7 +40,7 @@ instead of a bearer token (below).
 | POST | `/tasks` | Submit a task contract (body: `TaskContractV1`). Validates, persists, returns the task in `submitted`. Does not launch. |
 | GET | `/tasks` | List with filters: `state`, `project`, `repository`, `external_id`, `updated_since`. |
 | GET | `/tasks/{id}` | Full task view: contract versions, executions, latest attempt summary, gate summary, PR summary, open escalations. |
-| POST | `/tasks/{id}/start` | Move to `scheduled`; body names harness, model, image, provider, policy version, and optional overrides. This is Foundry's dispatch decision. |
+| POST | `/tasks/{id}/start` | Move to `scheduled`; body names harness, model, image, provider, policy version, and optional overrides. This is Foundry's dispatch decision. Overrides create an amendment (05); until the amendment path exists (C2) the body must agree with the contract. |
 | POST | `/tasks/{id}/cancel` | Request cancellation; body carries reason and the deciding principal's verbatim words. The API writes the task state and enqueues termination for the supervisor. |
 | POST | `/tasks/{id}/amend` | Attach a new contract version; allowed only in `submitted`, `blocked`, or `awaiting_acceptance`. |
 | POST | `/tasks/{id}/review` | Request the internal non-author review of the current collected head. Body either names an execution request for a Crucible `review` execution, or carries an uploaded `ReviewReportV1` produced by the orchestrator through its own harness. Allowed in `awaiting_internal_review`. |
@@ -83,7 +83,7 @@ instead of a bearer token (below).
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/health` | Liveness (process up). No auth. |
-| GET | `/ready` | Readiness: database reachable, migrations current, supervisor lease held within the window. |
+| GET | `/ready` | Readiness, no auth (compose healthchecks and Foundry's probe need it). True only when all hold: database reachable; migrations at head **and** the live schema matches the ORM metadata (schema drift is not-ready, naming the first difference); the supervisor lease is held and the holder's last tick within the lease window succeeded. A supervisor whose ticks are failing makes the service not-ready with the last error summary, even though the lease is renewed. |
 | GET | `/supervisor` | Lease holder, last tick, tick duration, queue depths, provider status, GitHub observation status (last poll, webhook deliveries pending). |
 | POST | `/supervisor/reconcile` | Force a reconciliation pass now. Admin. |
 | GET | `/wakes` | Pending wakes for the caller's principal; `?since=`. |

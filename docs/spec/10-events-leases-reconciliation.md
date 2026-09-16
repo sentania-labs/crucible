@@ -86,7 +86,9 @@ Runs at supervisor start and every `reconcile_interval` (default 60 s):
 10. Write the supervisor liveness row (`last_tick`, duration, counts).
 
 Reconciliation is idempotent; running it twice changes nothing the second
-time. That property is tested.
+time except lease expiry times and the liveness row. That property is
+tested. The liveness row records the last successful tick, the last tick
+error, and consecutive failures; readiness (04) reads it.
 
 ## Foundry disconnect
 

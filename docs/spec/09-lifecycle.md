@@ -132,7 +132,7 @@ by itself (Foundry's acceptance does).
 ```
 pending --prepare--> preparing --ready--> launching --started--> running
 running --provider reports exit--> exited
-running --timeout--> exited            (after drain then kill; exit_class timeout)
+running --timeout--> exited            (after drain then kill; exit_class timeout; the attempt row holds drain_deadline, killed_at, termination_reason)
 running --terminate--> terminating --provider reports exit--> exited   (exit_class killed)
 running --provider cannot see it--> exited   (exit_class lost)
 exited --collect done, logs drained--> collected
@@ -188,7 +188,7 @@ change.
 
 | Transition | Side effects |
 |---|---|
-| task `start` | execution created; first attempt `pending`; enqueued |
+| task `start` | the API records the start request and moves the task to `scheduled`; the supervisor materializes the execution and first attempt (`pending`) on its next tick, because those tables are fenced to the supervisor (14) |
 | attempt `launching` | checkout lease taken; identity bundle hash recorded; image digest resolved and recorded; container name `crucible-<attempt_id>` reserved |
 | attempt `running` | attempt lease created; worker `injected` |
 | attempt `exited` | final log drain scheduled; provider handle retained until `collected` |
