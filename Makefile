@@ -13,7 +13,7 @@ dev: ## developer mode: postgres only; run `uv run crucible serve --all` on the 
 	$(COMPOSE) --profile dev up -d --wait
 
 down:
-	$(COMPOSE) --profile dev down
+	$(COMPOSE) --profile "*" down
 
 lint:
 	$(UV) sync --frozen --quiet
