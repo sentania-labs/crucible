@@ -1,6 +1,6 @@
 [project]
 name = "crucible"
-version = "0.1.0"
+dynamic = ["version"]
 description = "A deterministic supervisor for AI coding workers."
 readme = "README.md"
 license = "MIT"
@@ -34,8 +34,16 @@ dev = [
 ]
 
 [build-system]
-requires = ["hatchling>=1.27"]
+requires = ["hatchling>=1.27", "hatch-vcs>=0.4"]
 build-backend = "hatchling.build"
+
+# The version comes from the git tag, never from a checked-in constant, so a
+# release needs a tag and not a version-bump commit (sdlc skill). A build with
+# no tag in reach reports a dev version; a build with no git at all (the
+# Docker image) gets the version from the VERSION build arg the Dockerfile takes.
+[tool.hatch.version]
+source = "vcs"
+fallback-version = "0.0.0.dev0"
 
 [tool.hatch.build.targets.wheel]
 packages = ["crucible"]

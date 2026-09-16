@@ -78,6 +78,16 @@ is `fake` and whose image is `crucible-worker:fake-succeed`, `POST
 /v1/tasks/{id}/start`, and watch `GET /v1/tasks/{id}/events`. OpenAPI is at
 `/v1/openapi.json`.
 
+## Releases
+
+A release is a tag push, not a merge: `git tag -a vX.Y.Z -m vX.Y.Z && git push
+origin vX.Y.Z` on `main`. The version is derived from that tag (`hatch-vcs`), so
+nothing in the tree pins it and `/v1/health` reports what was tagged. The
+release workflow refuses a tag that is not `vMAJOR.MINOR.PATCH` or whose commit
+is not reachable from `main`, builds and smokes the image, publishes
+`ghcr.io/sentania-labs/crucible:<version>` to GHCR, and then cuts the GitHub
+release. Details: [docs/implementation-notes/release.md](docs/implementation-notes/release.md).
+
 ## Layout
 
 ```

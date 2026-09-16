@@ -22,7 +22,12 @@ services:
       retries: 20
 
   migrate:
-    image: crucible:dev
+    # Checked-in defaults track `latest`; a deployment pins an exact tag and that
+    # pin lives in the deployment repo, not here (sdlc skill).
+    # Use `make up`: it passes --build, so your working tree is what runs. A bare
+    # `docker compose up` pulls the published `latest` when one exists and only
+    # builds if the pull fails, which is not what you want while developing.
+    image: ghcr.io/sentania-labs/crucible:latest
     build: .
     profiles: ["full"]
     command: ["crucible-admin", "migrate"]
@@ -33,7 +38,8 @@ services:
         condition: service_healthy
 
   crucible:
-    image: crucible:dev
+    # Tracks `latest`; deployments pin an exact tag (see migrate above).
+    image: ghcr.io/sentania-labs/crucible:latest
     build: .
     profiles: ["full"]
     restart: unless-stopped
