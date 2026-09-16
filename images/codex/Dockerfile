@@ -42,14 +42,16 @@ RUN set -eu; \
         'Suites: bookworm bookworm-updates' \
         'Components: main' \
         'Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg' \
+        'Check-Valid-Until: no' \
         '' \
         'Types: deb' \
         "URIs: http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}" \
         'Suites: bookworm-security' \
         'Components: main' \
         'Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg' \
+        'Check-Valid-Until: no' \
         > /etc/apt/sources.list.d/debian.sources; \
-    apt-get -o Acquire::Check-Valid-Until=false update; \
+    apt-get update; \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         "git=${GIT_VERSION}" \
         "curl=${CURL_VERSION}" \
@@ -61,8 +63,10 @@ RUN set -eu; \
     useradd --uid 1000 --gid 1000 --create-home --home-dir /home/worker --shell /bin/bash worker; \
     find / -xdev -type f -perm /6000 -exec chmod a-s {} +
 # The snapshot sources stay in place on purpose: a per-project image built
-# FROM this one that runs apt-get gets the same frozen package set. Note
-# that snapshot.debian.org is rate limited.
+# FROM this one that runs a plain apt-get update gets the same frozen
+# package set. Check-Valid-Until: no lives in the stanzas, not on the
+# command line, so that keeps working after the snapshot's Release
+# metadata expires. Note that snapshot.debian.org is rate limited.
 # Setuid and setgid bits are stripped from every binary (su, mount, passwd,
 # ...) so a per-project image inherits none; the launch flags
 # (--cap-drop ALL, no-new-privileges) are then belt and braces, not the
