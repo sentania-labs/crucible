@@ -112,3 +112,13 @@ the collector's copy (08). Missing file with exit 0 is
 success. `blocked.md` with exit 75 produces an escalation and moves the task
 to `blocked`; exit 75 without it is `failed`. Progress lines are ingested as events with the
 worker as source and marked `unverified`.
+
+## Local model endpoints
+
+Codex and AGY can be pointed at an OpenAI-compatible endpoint by
+configuration, which is how local models on the operator's DGX Spark and
+RTX 9060 enter the routing policy with cost class none. The adapter gains
+an `endpoint` in its launch context (`subscription` or a local URL on the
+egress allowlist); the identity, report, and gate contracts do not change.
+Which harness fronts each local server, what the model ids are, and how
+quality compares are answered by spike S13 before the entries are enabled.

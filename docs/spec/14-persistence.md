@@ -40,6 +40,8 @@
 | `reactions` | id, subject_kind (pull_request, review, comment), subject_github_id, github_id, login, content, observed_at |
 | `release_contracts` | id, external_id, repository_id, target_branch, target_sha, version, tag, document JSONB, sha256, authorization_decision_id, submitted_at |
 | `releases` | id, release_contract_id UNIQUE, state, tag_sha, tagged_at, workflow_run_url, conclusion, ended_at |
+| `routing_policies` | (name, version) PK, document JSONB, created_at, retired_at |
+| `attempt_metrics` | attempt_id PK, model, harness, endpoint_kind, pool, wall_ms, tokens_in, tokens_out, cost_units, cost_source (harness_reported, none), exit_class, gates_passed, gates_failed, corrections_after, acceptance_verdict |
 | `retention_actions` | id, policy_name, policy_version, kind, target, performed_at, event_seq |
 
 Indexes: tasks (state), (principal_id, updated_at); events (task_id, seq);
