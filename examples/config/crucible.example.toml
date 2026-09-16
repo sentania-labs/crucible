@@ -1,0 +1,44 @@
+# Example Crucible configuration. All paths are illustrative.
+[service]
+bind = "0.0.0.0:8080"
+render_timezone = "UTC"
+artifact_root = "/var/lib/crucible/artifacts"
+
+[database]
+url = "postgresql+psycopg://crucible:CHANGE_ME@postgres:5432/crucible"
+
+[docker]
+endpoint = "tcp://docker-socket-proxy:2375"
+worker_network = "crucible-workers"
+image_allowlist = ["crucible-worker:*", "ghcr.io/example-org/crucible-worker:*"]
+
+[supervisor]
+tick_seconds = 5
+lease_ttl_seconds = 30
+reconcile_interval_seconds = 60
+max_concurrency = 3
+
+[credentials.claude_code]
+source = "directory"
+path = "/var/lib/crucible/credentials/claude_code"
+mount_mode = "rw-narrow"
+
+[credentials.codex]
+source = "directory"
+path = "/var/lib/crucible/credentials/codex"
+mount_mode = "ro"
+
+[credentials.agy]
+source = "directory"
+path = "/var/lib/crucible/credentials/agy"
+mount_mode = "ro"
+
+[credentials.github-app]
+source = "file"
+path = "/var/lib/crucible/credentials/github/token"
+mount_mode = "ro"
+inject_as = "GH_TOKEN"
+
+[wake.foundry]
+mode = "poll"          # or "webhook"
+webhook_url = ""

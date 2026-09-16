@@ -1,0 +1,59 @@
+# Example TaskContractV1. Fictional repository and names.
+schema_version: "1.0"
+external_id: "EX-0001"
+title: "Return 409 on duplicate import ID"
+project: "example-service"
+parent_external_id: null
+repository:
+  url: "https://github.com/example-org/example-service.git"
+  default_branch: "main"
+  base_ref: "main"
+  work_branch: "crucible/EX-0001"
+  auth: { source: "credential:github-app" }
+scope:
+  allowed_paths: ["src/ledger/**", "tests/ledger/**", "docs/ledger.md"]
+  prohibited_paths: [".github/**"]
+  may_add_dependencies: false
+  may_modify_ci: false
+objective: >
+  Importing a bundle containing an ID that already exists must fail with HTTP
+  409 and leave the database unchanged.
+context:
+  - { kind: "issue", ref: "https://github.com/example-org/example-service/issues/17" }
+project_instructions:
+  - { kind: "file", ref: "CONTRIBUTING.md" }
+acceptance_criteria:
+  - { id: "AC1", text: "Duplicate ID import returns 409 with no partial write." }
+  - { id: "AC2", text: "Existing import tests pass." }
+required_verification:
+  - { id: "V1", command: "make lint", expect_exit: 0 }
+  - { id: "V2", command: "make test", expect_exit: 0 }
+  - { id: "V3", kind: "artifact", path: "report/run-evidence.md" }
+constraints:
+  prohibited_actions: ["git push --force", "modify files outside allowed_paths", "delegate to other agents"]
+  network: "policy"
+deliverables:
+  - { kind: "branch", ref: "crucible/EX-0001" }
+  - { kind: "pull_request", target: "main", draft: false }
+reporting:
+  report_schema: "CompletionClaimV1"
+  report_dir: ".crucible/report"
+  progress_events: true
+escalation:
+  conditions: ["a required verification command does not exist in the repository"]
+  action: "write report/blocked.md with the question and exit 75"
+policy: { name: "default-software", version: 1 }
+execution_request:
+  harness: "codex"
+  model: "example-model"
+  effort: "high"
+  provider: "docker"
+  image: "crucible-worker:codex-example"
+  timeout_seconds: 3600
+  rationale: "Mechanical change with clear tests."
+lifecycle:
+  max_attempts: 2
+  retry_on: ["environment", "lost"]
+  cleanup: "policy"
+submitted_by: "example-orchestrator"
+submitted_at: "2026-09-16T06:00:00-05:00"
