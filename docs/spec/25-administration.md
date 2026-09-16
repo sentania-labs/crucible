@@ -15,8 +15,14 @@ without Foundry.
 - **`crucible-admin` CLI** calls the same application services as the API
   (`crucible/application/admin/*`), not a private path; the CLI is a
   client of the service layer running in-process (local mode) or against
-  the API (remote mode). Anything the CLI can do, the API can do, and the
-  audit event is identical.
+  the API (remote mode). Every operation in the table below exists on
+  both, with the same audit event, and parity tests drive both entry
+  points. Four operations are CLI-only by design because they need the
+  database or filesystem directly and run before or beside the service:
+  `migrate`, `import` (bootstrap, which also has its verify and commit API
+  in 15), `export`, and `token create`; they are audited the same way and
+  the API exposes their status (migration head, import state, token list
+  without secrets) but not their execution.
 - **Sanitized status** only. No response, log line, event payload, table
   row, or artifact ever carries a credential value, a token, a key, or a
   file's contents. Validation results are booleans, enumerations,
@@ -88,11 +94,15 @@ stale instance cannot administer).
    harness version, image digest, timestamp, and whether the auth files
    changed during the probe (which sets `refresh_requires_rw`).
 7. Report whether the credential requires writable refresh state and set
-   `mount_mode` accordingly (`rw-narrow` when the probe changed files).
+   `mount_mode` to the stricter of the adapter's declared minimum (07;
+   Codex is `rw-narrow` from the start because a read-only config
+   directory fails before auth) and what the probe observed (`rw-narrow`
+   when the probe changed files). A probe that changes nothing never
+   lowers the adapter's minimum.
 8. Remove all probe resources.
 9. Mark `session_compatibility: unverified` until the daily-session
-   compatibility test (21, S1b) passes; a harness is not enabled for
-   normal workers before that.
+   compatibility test (21, S1b) passes for that harness, Claude Code
+   included; a harness is not enabled for normal workers before that.
 
 "Dedicated Crucible credential" means dedicated authentication state for
 Crucible, not necessarily a separate subscription or account. Whether a
