@@ -23,6 +23,8 @@
 
 | 17 | Harness and model rotation | Selection by capability, cost, and speed with rotation across providers and local models; frontier models never spent on simple work; quality feedback informs selection; routing policy as data, metrics per attempt, selection stays Foundry's | 00, 03, 04, 05, 05b, 07, 14, 21 |
 
+| 18 | External reviewer on App-authored PRs | Repository setting "review all pull requests" makes the reviewer handle App-authored PRs automatically; that setting is a repository-onboarding prerequisite; Issues read added to the App for reaction observation; reaction-only clean results bound to a head by time; no automatic re-review on a new head | 23, 05b, ADR 0007 |
+
 ## Interpretations made while incorporating (confirm or correct)
 
 - **I1. Foundry's acceptance sits between pre-PR gates and the push.** The

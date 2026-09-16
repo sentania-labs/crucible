@@ -94,7 +94,7 @@ instead of a bearer token (below).
 | Method | Path | Purpose |
 |---|---|---|
 | GET/PUT | `/policies/{name}/{version}` | Read or upload a policy document. Versions are immutable once referenced. |
-| GET/PUT | `/repositories/{name}` | Register a target repository: URL, installation reference, default branch, policy. Admin. Never carries a credential. |
+| GET/PUT | `/repositories/{name}` | Register a target repository: URL, installation reference, default branch, policy, and the operator's attestation that the external reviewer reviews all pull requests there (23). Admin. Never carries a credential. |
 | GET | `/harnesses` | Supported harnesses: adapter supported version range, installed versions per image, credential requirements, capability flags. |
 | GET | `/images` | Worker images known to Crucible: harness, version, digest, promotion state. |
 | POST | `/images/{digest}/promote` | Set promotion state (`default`, `retained`, `retired`). Admin; records the decision. |

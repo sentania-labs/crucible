@@ -12,7 +12,10 @@ the worker's. Personal access tokens are long-lived and user-scoped.
 ## Decision
 
 - A GitHub App with Metadata read, Contents read/write, Pull requests
-  read/write, Checks read, Actions read. Crucible mints short-lived,
+  read/write, Checks read, Actions read, and Issues read. Issues read was
+  added after S12's rerun showed a clean external review is signaled only
+  by reactions on the PR, readable through `GET /issues/{n}/reactions`;
+  no Issues write is requested. Crucible mints short-lived,
   repository-scoped installation tokens on demand. The private key is a
   mounted file locally and a projected or external Secret in Kubernetes,
   on Crucible's pods only.
@@ -40,8 +43,8 @@ the worker's. Personal access tokens are long-lived and user-scoped.
 ## Consequences
 
 Publication needs a bundle-based publisher container so Crucible never
-runs git over a worker's `.git` directory with a credential present. The
-App must be installed on every target repository, and the external
-reviewer and CI must be configured to run on `crucible/*` PRs. Re-running
+runs git over a worker's `.git` directory with a credential present. The App must be installed on every target repository, the external
+reviewer must be set to review all pull requests there (so App-authored
+PRs are reviewed, S12 rerun), and CI must run on `crucible/*` PRs. Re-running
 a failed workflow needs Actions write, which is not granted; the operator
 re-runs by hand until they choose to widen the permission.
