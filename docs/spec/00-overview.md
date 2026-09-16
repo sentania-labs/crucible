@@ -1,6 +1,6 @@
 # 00. Overview, scope, and non-goals
 
-Status: draft for review. Version 0.1, 2026-09-16.
+Status: draft for review. Version 0.2, 2026-09-16, after one non-author adversarial review round.
 
 ## Purpose
 
