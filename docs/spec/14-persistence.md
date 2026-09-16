@@ -61,7 +61,7 @@ for every attached table).
 The API role writes only `tasks` (submit, start, cancel, amend, close),
 `task_contracts`, `idempotency_keys` (in the same transaction as the
 mutation they record), `acceptance_results`, `decisions`, `artifacts`,
-`wakes` (ack), and `policies`; it enqueues everything that touches an attempt for the
+`wakes` (ack), `policies`, and `routing_policies`; it enqueues everything that touches an attempt for the
 supervisor.
 
 ## Strategy
