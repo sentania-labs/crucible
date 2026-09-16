@@ -56,7 +56,9 @@ mount_mode = "rw-narrow"       # the CLI writes session and log state beside its
 [credentials.agy]
 source = "directory"
 path = "/var/lib/crucible/credentials/agy"
-mount_mode = "ro"
+mount_mode = "ro"      # S1: AGY refreshes in memory per run from the mounted refresh token and
+                               # wrote nothing back; ro holds until an authenticated C3 re-run shows
+                               # a rotated refresh token, which would make it rw-narrow like Codex
 
 [github.app]
 app_id = 0                     # public identifier, not a secret
