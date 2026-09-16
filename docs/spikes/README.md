@@ -7,7 +7,7 @@ before C1 starts.
 
 | ID | Question | Result |
 |---|---|---|
-| S1b | Do dedicated Crucible credential sessions leave the operator's daily sessions valid? | pass; Codex refresh re-check pending ([S1b.md](S1b.md)) |
+| S1b | Do dedicated Crucible credential sessions leave the operator's daily sessions valid? | pass on exercised steps; Claude Code verified; Codex and AGY pending their Crucible-side refresh ([S1b.md](S1b.md)) |
 | S1 | Does each harness's subscription auth work from a mounted config directory inside a non-root container? | adjust design: all three complete a prompt as uid 1000 from a mounted copy; Claude Code `rw-narrow` shape confirmed; Codex and AGY refreshed their own tokens on the first run, which stopped their authenticated spikes and is escalated ([S1.md](S1.md)) |
 | S2 | Can Codex's own sandbox run inside the container? | proceed, not enabled: no bubblewrap in the image or binary, and user namespaces are unavailable under the hardened shape on this host ([S2.md](S2.md)) |
 | S3 | Does AGY operate headless with `--add-dir`, and what is its argv ceiling? | proceed, partial: headless flags and stream-json confirmed; the ceiling is the Linux 128 KiB per-argument limit; the 100 KB bundle run is blocked on the S1 finding ([S3.md](S3.md)) |

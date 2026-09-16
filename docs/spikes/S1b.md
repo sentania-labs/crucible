@@ -6,8 +6,8 @@ directories, no token value was recorded or compared, and every scratch
 copy used for a container run was removed. Hashes below are SHA-256
 prefixes of whole files, used only to show change or no change.
 
-Result: **pass for all three harnesses on the steps that could be
-exercised.** The dedicated sessions did not invalidate the operator's
+Result: **pass on the steps that could be exercised; Claude Code verified,
+Codex and AGY pending their Crucible-side refresh.** The dedicated sessions did not invalidate the operator's
 sessions, including across a host-side AGY refresh and a host-side Codex
 refresh observed earlier the same day. The Crucible-side refresh of a
 dedicated Codex session (steps 5 and 6) has not yet occurred naturally and
@@ -54,7 +54,7 @@ minutes, which the onboarding command must state up front.
 | 2 dedicated login | 17:19:15 to 17:19:44 | `HOME=<dedicated> agy -p ...` prints a Google OAuth URL and waits **60 seconds** for a pasted code; the first two attempts timed out on the round trip; the third succeeded with the operator ready; token written under `.gemini/antigravity-cli/` |
 | 3 worker prompt | 17:20:39 | exit 0, `OK`; per-attempt copy of the token file only; token unchanged |
 | 4 operator session | 17:20:43 | `agy -p` OK; the host token file **changed** (the host session refreshed itself) |
-| 5 and 6 refresh | covered from the host side | the host refresh after the dedicated login succeeded, so the dedicated session did not invalidate it; a Crucible-side refresh is expected on the dedicated session's first run after its one-hour expiry and is re-checked then |
+| 5 and 6 refresh | pending | the host refresh after the dedicated login succeeded, which is the opposite direction; a Crucible-side refresh is expected on the dedicated session's first run after its one-hour expiry, and steps 3 and 4 are re-run then |
 
 The 60-second window is the onboarding constraint for AGY: the admin
 command must tell the operator to have the browser signed in first.
@@ -84,8 +84,11 @@ oldest is not established by this test.
 
 ## Decision
 
-Proceed. `session_compatibility` may be set to `verified` for AGY and
-Claude Code now, and for Codex once its dedicated session has refreshed
-and the operator's session is confirmed after it. Onboarding must state
+Proceed. `session_compatibility` may be set to `verified` for Claude Code
+now (no refresh exists). AGY and Codex stay `unverified` until their
+dedicated sessions have refreshed on the Crucible side and the operator's
+session is confirmed after that refresh; the host-side refreshes observed
+today show only that the operator's session can refresh after the
+dedicated login, not that a Crucible-side refresh leaves it valid. Onboarding must state
 the device-code expiry (Codex), the 60-second window (AGY), and the
 one-time display of the long-lived token (Claude Code).
