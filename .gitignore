@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+
+# Local environment and secrets: never committed
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+credentials/
+state/
+var/
+
+# Harness auth material that a worker container may write back
+.claude/
+.codex/
+.gemini/
+.config/
+
+# Editor and OS
+.idea/
+.vscode/
+.DS_Store
+
+# Generated review surfaces and scratch
+.lavish/
+*.html
+tmp/
