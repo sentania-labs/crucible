@@ -99,6 +99,9 @@ instead of a bearer token (below).
 | GET | `/images` | Worker images known to Crucible: harness, version, digest, promotion state. |
 | POST | `/images/{digest}/promote` | Set promotion state (`default`, `retained`, `retired`). Admin; records the decision. |
 | GET | `/providers` | Registered execution providers and their capabilities. |
+| GET/PUT | `/routing/{name}/{version}` | Read or upload a routing policy (05b). Admin. |
+| GET | `/routing/usage` | Per-pool usage in the current window, from AttemptMetrics. |
+| GET | `/routing/history` | Per-model outcomes: `?model=&project=&since=`; wall time, cost where reported, exit class, gates passed, corrections, acceptance. Foundry reads this before selecting. |
 
 ### GitHub ingress
 

@@ -18,7 +18,7 @@ whether or not the orchestrator is connected.
 |---|---|
 | What outcome is required | Validates the task contract against its schema |
 | How work is decomposed | Persists tasks and every state transition |
-| Which model, harness, and execution environment | Provisions the environment named in the contract |
+| Which model, harness, and execution environment, chosen by task tier from the routing policy and the recorded history | Provisions the environment named in the contract; refuses models outside the routing policy or with an exhausted quota pool; records cost, duration, and outcome per attempt |
 | Constraints and acceptance criteria | Launches and monitors the worker |
 | Whether output semantically satisfies the outcome | Delivers injected identity and instructions |
 | What external review feedback means and whether to amend | Pushes branches, opens PRs, pushes tags, and watches them |

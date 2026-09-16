@@ -46,6 +46,9 @@ network:
     - "registry.npmjs.org"
   harness_endpoints: "from-harness"    # each adapter contributes its model endpoints (S6)
 
+routing:                               # see RoutingPolicyV1 below; this names which one applies
+  policy: { name: "default-routing", version: 1 }
+
 images:
   allowlist: ["crucible-worker:*", "ghcr.io/sentania-labs/crucible-worker:*"]
   require_default_or_retained: true    # candidates only with an explicit per-task override
@@ -176,3 +179,68 @@ policy but not the reverse, `required_verification` a superset of
 `repository.required_checks`, `deliverables[].closes` the only closing
 references. Review round counts and CI rules come from policy only; a
 contract cannot change them.
+
+## Routing policy (RoutingPolicyV1)
+
+Uploaded and versioned like a policy. Foundry selects from it; Crucible
+never selects, but refuses a contract whose model is absent or disabled,
+whose harness does not match the entry, or whose quota pool is exhausted,
+and reports per-pool usage on `GET /routing/usage`. The operator's
+direction (2026-09-16): rotate work across providers by capability, cost,
+and speed; never spend frontier models on simple work; local models carry
+routine work once they exist.
+
+```yaml
+schema_version: "1.0"
+name: "default-routing"
+version: 1
+tiers:                                 # task tiers Foundry assigns in the contract's execution_request.tier
+  trivial:   { allowed_capability: ["small", "mid"],  prefer: ["small"] }     # frontier is refused, not merely dispreferred
+  standard:  { allowed_capability: ["mid", "small"],  prefer: ["mid"] }       # a task that truly needs frontier is marked complex
+  complex:   { allowed_capability: ["frontier", "mid"], prefer: ["frontier"] }
+models:
+  - { id: "claude-fable-5-1",      harness: claude_code, endpoint: subscription, capability: frontier, cost: high,  speed: medium, pool: anthropic-sub, weight: 1, enabled: true }
+  - { id: "claude-sonnet-5",       harness: claude_code, endpoint: subscription, capability: mid,      cost: medium, speed: fast,  pool: anthropic-sub, weight: 2, enabled: true }
+  - { id: "gpt-5-codex",           harness: codex,       endpoint: subscription, capability: frontier, cost: high,  speed: medium, pool: openai-sub,    weight: 1, enabled: true }
+  - { id: "gpt-5-codex-mini",      harness: codex,       endpoint: subscription, capability: mid,      cost: medium, speed: fast,  pool: openai-sub,    weight: 2, enabled: true }
+  - { id: "gemini-3-pro",          harness: agy,         endpoint: subscription, capability: mid,      cost: medium, speed: fast,  pool: google-sub,    weight: 2, enabled: true }
+  - { id: "local-spark-large",     harness: codex,       endpoint: local, endpoint_url: "http://spark.example.internal:8000/v1", capability: mid,   cost: none, speed: medium, pool: local-spark, weight: 3, enabled: false }   # DGX Spark, when present
+  - { id: "local-rtx-small",       harness: codex,       endpoint: local, endpoint_url: "http://rtx.example.internal:8000/v1",   capability: small, cost: none, speed: fast,   pool: local-rtx,   weight: 3, enabled: false }   # RTX 9060 16 GB
+pools:                                 # budget_units is one of attempts | tokens_out | cost_units, all recorded in AttemptMetrics
+  anthropic-sub: { window: "5h", budget_units: "tokens_out", soft_limit: 0 }   # 0 means observe only until measured
+  openai-sub:    { window: "5h", budget_units: "tokens_out", soft_limit: 0 }
+  google-sub:    { window: "24h", budget_units: "tokens_out", soft_limit: 0 }
+  local-spark:   { window: "1h", budget_units: "attempts", soft_limit: 0 }
+  local-rtx:     { window: "1h", budget_units: "attempts", soft_limit: 0 }
+rotation:
+  strategy: "weighted-least-recent"    # among models allowed for the tier, prefer the preferred capability, then the least recently used, weighted
+  quality_feedback: true               # a model whose last N attempts on this project ended in gate failures or corrections drops one preference step
+  quality_window: 10
+```
+
+Model ids are what the harness accepts; they are illustrative here and
+the operator's private routing policy holds the real ones. A `local`
+entry must carry `endpoint_url`; Crucible passes it to the adapter's
+launch context and adds its hostname to that attempt's egress allowlist.
+A pool's `budget_units` must be a unit AttemptMetrics records; when a
+harness reports no token counts, `tokens_out` is recorded as null and the
+pool falls back to counting attempts, which `GET /routing/usage` states.
+The quota check runs twice: advisory at submit (422 so Foundry can pick
+again) and authoritative at attempt launch, where the supervisor reserves
+the pool capacity in the same fenced transaction that moves the attempt
+to `launching`; if the pool crossed its soft limit since submit, the
+attempt is refused with class `quota_exhausted` and Foundry is woken. A `local`
+entry must carry `endpoint_url`; Crucible passes it to the adapter's
+launch context and adds its hostname to that attempt's egress allowlist.
+A pool's `budget_units` must be a unit AttemptMetrics records; when a
+harness reports no token counts, `tokens_out` is recorded as null and the
+pool falls back to counting attempts, which `GET /routing/usage` states.
+The quota check runs twice: advisory at submit (422 so Foundry can pick
+again) and authoritative at attempt launch, where the supervisor reserves
+the pool capacity in the same fenced transaction that moves the attempt
+to `launching`; if the pool crossed its soft limit since submit, the
+attempt is refused with class `quota_exhausted` and Foundry is woken. Foundry
+records the tier and the chosen model with its rationale in the contract
+(05); Crucible records the outcome in AttemptMetrics (03, 14) and exposes
+`GET /routing/history?model=&project=` so the next selection is informed.
+Selection itself stays a Foundry judgment; the policy bounds it.

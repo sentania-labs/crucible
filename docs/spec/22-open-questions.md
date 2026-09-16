@@ -21,6 +21,8 @@
 | 15 | Harness credentials | Per-harness mounts, narrow disposable copies, allowlisted sync-back, concurrency 1; a worker may misuse its own credential, mitigations listed, broker later | 12, ADR 0007 |
 | 16 | Harness versions | No self-update; version pinned per image; digest recorded per attempt; adapter version ranges with refusal; Renovate weekly PRs, canary, explicit promotion, one retained prior version | 07, 13, ADR 0011 |
 
+| 17 | Harness and model rotation | Selection by capability, cost, and speed with rotation across providers and local models; frontier models never spent on simple work; quality feedback informs selection; routing policy as data, metrics per attempt, selection stays Foundry's | 00, 03, 04, 05, 05b, 07, 14, 21 |
+
 ## Interpretations made while incorporating (confirm or correct)
 
 - **I1. Foundry's acceptance sits between pre-PR gates and the push.** The
