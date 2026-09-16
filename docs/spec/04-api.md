@@ -103,6 +103,10 @@ instead of a bearer token (below).
 | GET | `/routing/usage` | Per-pool usage in the current window, from AttemptMetrics. |
 | GET | `/routing/history` | Per-model outcomes: `?model=&project=&since=`; wall time, cost where reported, exit class, gates passed, corrections, acceptance. Foundry reads this before selecting. |
 
+### Administration
+
+`/v1/admin/*`, admin role, versioned with the rest: status, harnesses, credentials (validate, probe, login, rotate, remove), images, providers, github, repositories, audit. Detail in 25. `GET /v1/capabilities` gives orchestrator principals the sanitized read-only subset Foundry needs to report an unavailable capability.
+
 ### GitHub ingress
 
 | Method | Path | Purpose |

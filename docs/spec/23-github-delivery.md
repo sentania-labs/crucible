@@ -110,6 +110,36 @@ Polling is the complete observation path; webhooks only shorten latency.
 
 Foundry is not required to remain connected for any of this.
 
+## Triggering the external reviewer
+
+S12 (docs/spikes/S12.md) showed the reviewer's automatic trigger is tied
+to the PR author's connected account, so a PR authored by the App may not
+be reviewed automatically. Until the rerun under the repository's
+"all PRs" setting settles it, the trigger comment is posted by the
+orchestrator under the operator's connected account when Crucible reports
+the PR open, recorded as an event on the task. The bot's summary comment
+is edited in place and never counts as a round; the review object, its
+comments, or the bot's no-findings comment do. Installation tokens are
+about 390 characters with dots, not the short `ghs_` form, and the
+redaction patterns cover both.
+
+A round means one configured review cycle after publication. When the
+repository's Codex configuration runs code review and security review in
+that cycle, both are components of the same round; the round completes
+only when every configured component has completed or reached a terminal
+result. Crucible persists a review cycle row per PR head it published
+(or per trigger it recorded) with the components the policy expects
+(`external_review.components`, default `["code"]`; `["code",
+"security"]` where the repository runs both), and attaches each received
+signal to the open cycle by head SHA and component; the
+`external_review_rounds` gate counts completed cycles, never individual
+signals, so one component can satisfy neither a one-round nor a two-round
+policy by itself. When `retrigger_after_correction` is true the same
+trigger path applies to every corrected head: Crucible wakes the
+orchestrator with reason `external_review_trigger_needed`, the
+orchestrator posts the trigger under the operator's account, and a new
+cycle opens on that head.
+
 ## External review (bounded input, not a loop)
 
 - A round is one accepted signal from a login in
@@ -133,7 +163,7 @@ Foundry is not required to remain connected for any of this.
   Foundry accepts, Crucible pushes the corrected head.
 - Advancement out of `external_feedback_received` requires the
   `external_review_rounds` gate: every received comment dispositioned and
-  the accepted-signal count at or above `required_rounds`. With rounds
+  the completed-cycle count at or above `required_rounds`. With rounds
   outstanding the task returns to `awaiting_external_review`. With the
   default policy (one round, no retrigger after correction, no
   requirement on the final SHA) a correction never causes a second round.

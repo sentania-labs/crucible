@@ -53,6 +53,8 @@ Crucible only records.
   certification, merge observation (23).
 - Release contract and lifecycle designed; implemented after readiness (24).
 - Worker image version pinning, digest recording, and promotion (13).
+- Administration: versioned admin API, `crucible-admin` CLI on the same
+  services, credential onboarding and validation, sanitized status (25).
 - Foundry wake channel (webhook and poll).
 - Bootstrap-ledger import API and authority handoff.
 - Docker Compose for normal and developer modes.
@@ -77,7 +79,7 @@ Crucible only records.
 
 Architecture (01) and the domain model (03) first. The contracts (04 to 08)
 define what crosses the API. Lifecycle, events, and gates (09 to 11) define
-behavior. Operations (12 to 17) define how it runs. Testing, readiness,
+behavior. Operations (12 to 17) and administration (25) define how it runs. Testing, readiness,
 phases, spikes, and decisions (18 to 22) define how it gets built and
 accepted. GitHub delivery (23) and release (24) define what happens after
 a worker is done.

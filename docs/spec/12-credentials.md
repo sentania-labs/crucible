@@ -42,6 +42,14 @@ A credential broker or authentication proxy that keeps the token outside
 the container is a possible later hardening (ADR 0007), not an initial
 requirement.
 
+## Onboarding
+
+Credentials enter Crucible only through the administrative onboarding
+workflow (25): a dedicated directory, the harness's own interactive login
+pointed at it, validation, a bounded probe in the hardened image, and the
+daily-session compatibility test (21, S1b) before the harness is enabled.
+The operator's daily-use directories are never copied.
+
 ## Credential sources (config, sanitized example in `examples/config/`)
 
 ```toml
