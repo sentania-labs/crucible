@@ -50,5 +50,6 @@ def wire(settings: Settings) -> Wiring:
         providers=list(providers.values()),
         database_url=settings.database.url,
         engine=engine,
+        lease_ttl_seconds=settings.supervisor.lease_ttl_seconds,
     )
     return Wiring(settings=settings, ctx=ctx, providers=providers)

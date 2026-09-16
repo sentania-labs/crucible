@@ -74,7 +74,8 @@ async def test_submit_start_run_to_reported(client: TestClient, supervisor: Supe
     ready = client.get("/v1/ready")
     assert ready.status_code == 200, ready.text
     sup = client.get("/v1/supervisor").json()
-    assert sup["lease"]["holder"] == "sup-a"
+    assert sup["lease"]["holder"] == "sup-a" and sup["healthy"] is True
+    assert sup["last_success_at"] is not None and sup["last_error"] is None
     assert sup["counts"]["tasks_running"] == 0
     assert sup["tick_ms"] is not None
     assert sup["providers"][0]["name"] == "fake"

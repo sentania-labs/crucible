@@ -8,7 +8,7 @@ from sqlalchemy import text
 from crucible import __version__
 from crucible.adapters.api.deps import Ctx, Reader, UoW
 from crucible.adapters.persistence.migrate import is_current
-from crucible.application.queries import supervisor_view
+from crucible.application.queries import supervisor_health, supervisor_view
 from crucible.contracts.api import HealthView, ReadyCheck, ReadyView, SupervisorView
 
 router = APIRouter()
@@ -31,17 +31,8 @@ def ready(ctx: Ctx, response: Response) -> ReadyView:
         ok, detail = is_current(ctx.engine, ctx.database_url)
         migrations = ReadyCheck(ok=ok, detail=detail)
         with ctx.uow_factory() as uow:
-            lease = uow.leases.get_supervisor()
-        now = ctx.clock.now()
-        if lease is None:
-            supervisor = ReadyCheck(ok=False, detail="no supervisor lease")
-        elif lease.expires_at <= now:
-            supervisor = ReadyCheck(
-                ok=False,
-                detail=f"lease held by {lease.holder} expired {lease.expires_at.isoformat()}",
-            )
-        else:
-            supervisor = ReadyCheck(ok=True, detail=f"held by {lease.holder}")
+            sup_ok, sup_detail = supervisor_health(uow, ctx.clock.now(), ctx.lease_ttl_seconds)
+        supervisor = ReadyCheck(ok=sup_ok, detail=sup_detail)
     except Exception as exc:  # the readiness probe must never raise
         database = ReadyCheck(ok=False, detail=type(exc).__name__)
     view = ReadyView(
@@ -57,4 +48,4 @@ def ready(ctx: Ctx, response: Response) -> ReadyView:
 
 @router.get("/supervisor", response_model=SupervisorView)
 def supervisor_status(ctx: Ctx, uow: UoW, _principal: Reader) -> SupervisorView:
-    return supervisor_view(uow, ctx.providers)
+    return supervisor_view(uow, ctx.providers, ctx.clock.now(), ctx.lease_ttl_seconds)

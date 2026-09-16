@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import base64
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from crucible.application.errors import NotFoundError
@@ -300,9 +300,33 @@ def attempt_view(uow: UnitOfWork, attempt_id: str) -> AttemptView:
     )
 
 
-def supervisor_view(uow: UnitOfWork, providers: list[ExecutionProvider]) -> SupervisorView:
+def supervisor_health(uow: UnitOfWork, now: datetime, lease_ttl_seconds: int) -> tuple[bool, str]:
+    """Supervisor is healthy only when the lease is held and the last tick inside the lease
+    window succeeded. A held lease next to failing ticks is not healthy (10, 19)."""
     lease = uow.leases.get_supervisor()
     status = uow.supervisor_status.get()
+    if lease is None:
+        return False, "no supervisor lease"
+    if lease.expires_at <= now:
+        return False, f"lease held by {lease.holder} expired {lease.expires_at.isoformat()}"
+    window_start = now - timedelta(seconds=lease_ttl_seconds)
+    last_ok = status.last_success_at
+    if last_ok is None or last_ok < window_start:
+        detail = "no successful tick within the lease window"
+        if status.last_error is not None:
+            detail += f"; last error: {status.last_error}"
+        return False, detail
+    if status.last_error_at is not None and status.last_error_at > last_ok:
+        return False, f"last tick failed: {status.last_error}"
+    return True, f"held by {lease.holder}, last successful tick {last_ok.isoformat()}"
+
+
+def supervisor_view(
+    uow: UnitOfWork, providers: list[ExecutionProvider], now: datetime, lease_ttl_seconds: int
+) -> SupervisorView:
+    lease = uow.leases.get_supervisor()
+    status = uow.supervisor_status.get()
+    healthy, _ = supervisor_health(uow, now, lease_ttl_seconds)
     return SupervisorView(
         lease=(
             {
@@ -314,6 +338,10 @@ def supervisor_view(uow: UnitOfWork, providers: list[ExecutionProvider]) -> Supe
             else None
         ),
         last_tick_at=status.last_tick_at,
+        last_success_at=status.last_success_at,
+        last_error_at=status.last_error_at,
+        last_error=status.last_error,
+        healthy=healthy,
         tick_ms=status.tick_ms,
         counts=status.counts,
         providers=[{"name": p.name, **p.capabilities().as_dict()} for p in providers],

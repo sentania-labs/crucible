@@ -276,8 +276,27 @@ class Supervisor:
             result.counts = await self._db(partial(self._status_step, started))
         except LeaseLostError:
             result.held = False
+        except Exception as exc:
+            # The liveness row must say the tick failed, or readiness lies (19).
+            summary = f"{type(exc).__name__}: {str(exc).splitlines()[0] if str(exc) else ''}"
+            await self._db(partial(self._record_failure, summary))
+            raise
         result.duration_ms = int((time.monotonic() - started) * 1000)
         return result
+
+    def _record_failure(self, summary: str) -> None:
+        try:
+            with self._fenced() as uow:
+                status = uow.supervisor_status.get()
+                status.holder = self.holder
+                status.last_tick_at = self._clock.now()
+                status.last_error_at = status.last_tick_at
+                status.last_error = summary[:1000]
+                uow.supervisor_status.write(status)
+                uow.commit()
+        except Exception:
+            # Nothing more to do here: a stale last_success_at already fails readiness.
+            log.exception("could not record the tick failure on the liveness row")
 
     async def reconcile(self) -> TickResult:
         """Reconciliation is the tick; running it twice changes nothing the second time."""
@@ -1083,6 +1102,7 @@ class Supervisor:
             status = uow.supervisor_status.get()
             status.holder = self.holder
             status.last_tick_at = self._clock.now()
+            status.last_success_at = status.last_tick_at
             status.tick_ms = int((time.monotonic() - started) * 1000)
             status.counts = counts
             uow.supervisor_status.write(status)

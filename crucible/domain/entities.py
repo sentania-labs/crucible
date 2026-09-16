@@ -164,3 +164,6 @@ class SupervisorStatus:
     last_tick_at: datetime | None
     tick_ms: int | None
     counts: dict[str, int]
+    last_success_at: datetime | None = None
+    last_error_at: datetime | None = None
+    last_error: str | None = None

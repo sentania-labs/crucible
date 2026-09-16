@@ -18,3 +18,11 @@ release; the merge is not.
 
 Style: typed Python 3.12, `ruff` formatting, `mypy --strict`. No em-dashes in
 prose, comments, or commit messages.
+
+Migrations: a migration that has been applied to any database, including a
+developer's, is never edited. Schema changes are a new revision. Before the
+first tagged release the initial revision may be squashed, only together with a
+`make reset` (compose down with volumes) called out in the PR, because every
+existing database is wrong after a squash. Readiness compares the live schema to
+the ORM and reports "schema drift" when they differ; that check exists because
+revision 0001 was once rewritten in place after it had been applied.

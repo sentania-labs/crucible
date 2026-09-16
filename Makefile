@@ -2,7 +2,7 @@
 COMPOSE ?= docker compose
 UV ?= uv
 
-.PHONY: up dev down lint test test-unit test-integration e2e build
+.PHONY: up dev down reset lint test test-unit test-integration e2e build
 
 up: ## normal mode: postgres, migrate, crucible
 	@test -f .env || cp .env.example .env
@@ -14,6 +14,9 @@ dev: ## developer mode: postgres only; run `uv run crucible serve --all` on the 
 
 down:
 	$(COMPOSE) --profile "*" down
+
+reset: ## DESTRUCTIVE: down plus the postgres and artifact volumes; the only cure for schema drift
+	$(COMPOSE) --profile "*" down --volumes
 
 lint:
 	$(UV) sync --frozen --quiet

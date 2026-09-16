@@ -193,6 +193,10 @@ class ReadyView(Response):
 class SupervisorView(Response):
     lease: dict[str, Any] | None
     last_tick_at: Rfc3339 | None
+    last_success_at: Rfc3339 | None
+    last_error_at: Rfc3339 | None
+    last_error: str | None
+    healthy: bool
     tick_ms: int | None
     counts: dict[str, int]
     providers: list[dict[str, Any]]

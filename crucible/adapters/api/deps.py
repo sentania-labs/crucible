@@ -24,6 +24,7 @@ class AppContext:
     providers: list[ExecutionProvider]
     database_url: str
     engine: Engine
+    lease_ttl_seconds: int = 30
 
 
 def app_context(request: Request) -> AppContext:

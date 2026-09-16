@@ -55,7 +55,13 @@ make dev         # postgres only; then: uv run crucible serve --all
 make lint        # ruff, mypy --strict, import-linter
 make test        # unit tier, then the integration tier against postgres:16 in a container
 make down
+make reset       # DESTRUCTIVE: down and delete the postgres and artifact volumes
 ```
+
+`/v1/ready` reports not ready with "schema drift" when the live schema does not
+match what the code expects (for example a database created by an earlier
+build of this branch). Before the first tagged release the answer is
+`make reset`, which deletes the database; after it, a migration.
 
 `make up` copies `.env.example` to `.env` if none exists; change
 `POSTGRES_PASSWORD` there. First use after `make up`:

@@ -69,3 +69,22 @@ def test_unknown_event_kind_is_rejected(migrated: str) -> None:
             )
         )
     engine.dispose()
+
+
+def test_fresh_schema_has_no_drift(migrated: str) -> None:
+    engine = make_engine(migrated)
+    assert migrate.schema_drift(engine) is None
+    ok, detail = migrate.is_current(engine, migrated)
+    assert ok and "schema matches" in detail
+    engine.dispose()
+
+
+def test_0002_down_and_up(database_url: str) -> None:
+    engine = make_engine(database_url)
+    migrate.downgrade(database_url, "0001_walking_skeleton")
+    cols = {c["name"] for c in inspect(engine).get_columns("supervisor_status")}
+    assert "last_success_at" not in cols
+    migrate.upgrade(database_url)
+    cols = {c["name"] for c in inspect(engine).get_columns("supervisor_status")}
+    assert {"last_success_at", "last_error_at", "last_error"} <= cols
+    engine.dispose()

@@ -746,6 +746,9 @@ class SupervisorStatuses:
             last_tick_at=_dt(row.last_tick_at),
             tick_ms=row.tick_ms,
             counts={str(k): int(v) for k, v in row.counts.items()},
+            last_success_at=_dt(row.last_success_at),
+            last_error_at=_dt(row.last_error_at),
+            last_error=row.last_error,
         )
 
     def write(self, status: SupervisorStatus) -> None:
@@ -757,6 +760,9 @@ class SupervisorStatuses:
         row.last_tick_at = status.last_tick_at
         row.tick_ms = status.tick_ms
         row.counts = dict(status.counts)
+        row.last_success_at = status.last_success_at
+        row.last_error_at = status.last_error_at
+        row.last_error = status.last_error
         self._s.flush()
 
 
