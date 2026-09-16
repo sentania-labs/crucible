@@ -37,6 +37,15 @@ Dependency direction is inward only: adapters import application and
 domain; domain imports nothing above it. Enforced by an import-linter rule
 in CI.
 
+## Transport
+
+PostgreSQL carries authoritative state, durable events, wakes, leases, and
+queued work: polling, transactional claiming (`SELECT ... FOR UPDATE SKIP
+LOCKED`), and database-backed leases. No Redis, NATS, or message broker
+(ADR 0013). If measurement later shows PostgreSQL cannot meet
+event-delivery or queue-throughput needs, a transport is evaluated by ADR;
+infrastructure is not added on hypothetical scale.
+
 ## Processes
 
 Two long-running roles, one image:
