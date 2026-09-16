@@ -141,8 +141,9 @@ of the previous version's. `required_verification` may not shrink.
 - `policy` exists and is not retired; `lifecycle.max_attempts` within it.
 - `execution_request.model` is an enabled entry of the routing policy
   whose `harness` matches, whose capability is allowed for `tier`, and
-  whose quota pool is not over its soft limit; otherwise 422 naming the
-  rule, so Foundry picks again.
+  whose quota pool is not over its soft limit at submit (advisory; the
+  authoritative reservation happens at attempt launch, 05b); otherwise 422
+  naming the rule, so Foundry picks again.
 - `execution_request.harness` is registered; `provider` is registered
   (only `fake` until C3) and supports the harness; `image` matches the provider's allowlist pattern,
   resolves to a known `WorkerImage` whose harness version is inside the
