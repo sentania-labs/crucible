@@ -229,6 +229,16 @@ The quota check runs twice: advisory at submit (422 so Foundry can pick
 again) and authoritative at attempt launch, where the supervisor reserves
 the pool capacity in the same fenced transaction that moves the attempt
 to `launching`; if the pool crossed its soft limit since submit, the
+attempt is refused with class `quota_exhausted` and Foundry is woken. A `local`
+entry must carry `endpoint_url`; Crucible passes it to the adapter's
+launch context and adds its hostname to that attempt's egress allowlist.
+A pool's `budget_units` must be a unit AttemptMetrics records; when a
+harness reports no token counts, `tokens_out` is recorded as null and the
+pool falls back to counting attempts, which `GET /routing/usage` states.
+The quota check runs twice: advisory at submit (422 so Foundry can pick
+again) and authoritative at attempt launch, where the supervisor reserves
+the pool capacity in the same fenced transaction that moves the attempt
+to `launching`; if the pool crossed its soft limit since submit, the
 attempt is refused with class `quota_exhausted` and Foundry is woken. Foundry
 records the tier and the chosen model with its rationale in the contract
 (05); Crucible records the outcome in AttemptMetrics (03, 14) and exposes

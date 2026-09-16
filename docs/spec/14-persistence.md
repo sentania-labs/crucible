@@ -50,7 +50,7 @@ where acked_at is null.
 
 Triggers: `events`, `task_contracts`, `release_contracts`, `review_dispositions`, and `ci_decisions` reject UPDATE and DELETE. No table ever holds a token, key, or secret; a CI check asserts no column name matches the secret-name pattern. Writes to
 `executions`, `attempts`, `workers`, `heartbeats`, `gate_results`,
-`completion_claims`, `supervisor_status`, and `events` rows whose
+`completion_claims`, `attempt_metrics`, `supervisor_status`, and `events` rows whose
 `principal` is `crucible` require a transaction-local `crucible.fenced_token` (set with `SET LOCAL`
 at the start of every supervisor transaction, never per connection, because
 pooled connections would carry a stale value) exactly equal to the token on
