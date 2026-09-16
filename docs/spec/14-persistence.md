@@ -9,7 +9,7 @@
 | `tasks` | id ULID PK, external_id, principal_id, project, title, state, contract_version, policy_name, policy_version, created_at, updated_at, closed_at; UNIQUE (principal_id, external_id) |
 | `task_contracts` | id, task_id, version, document JSONB, sha256, submitted_at; UNIQUE (task_id, version) |
 | `executions` | id, task_id, role (implement, correct, review), contract_version, harness, model, effort, provider, image, policy snapshot JSONB, state, created_at, ended_at |
-| `attempts` | id, execution_id, number, state, workspace_path, handle (provider ref), identity_sha256, image_digest, started_at, ended_at, exit_code, exit_class, timeout_at |
+| `attempts` | id, execution_id, number, state, workspace_path, handle (provider ref), identity_sha256, image_digest, started_at, ended_at, exit_code, exit_class, timeout_at, drain_deadline, killed_at, termination_reason |
 | `workers` | attempt_id PK, state, last_signal_at, last_signal |
 | `leases` | id, kind, key, holder, fenced_token BIGINT, expires_at; UNIQUE (kind, key) |
 | `heartbeats` | id BIGSERIAL, attempt_id, ts, signal, detail |
@@ -57,8 +57,9 @@ interleave; a BEFORE trigger rejects anything else (the principal check is
 nested inside the trigger body because PL/pgSQL compiles `NEW.principal`
 for every attached table).
 The API role writes only `tasks` (submit, start, cancel, amend, close),
-`acceptance_results`, `decisions`, `artifacts`, `wakes` (ack), and
-`policies`; it enqueues everything that touches an attempt for the
+`task_contracts`, `idempotency_keys` (in the same transaction as the
+mutation they record), `acceptance_results`, `decisions`, `artifacts`,
+`wakes` (ack), and `policies`; it enqueues everything that touches an attempt for the
 supervisor.
 
 ## Strategy
