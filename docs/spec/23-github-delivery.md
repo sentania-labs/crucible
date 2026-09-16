@@ -110,6 +110,25 @@ Polling is the complete observation path; webhooks only shorten latency.
 
 Foundry is not required to remain connected for any of this.
 
+## Triggering the external reviewer
+
+S12 (docs/spikes/S12.md) showed the reviewer's automatic trigger is tied
+to the PR author's connected account, so a PR authored by the App may not
+be reviewed automatically. Until the rerun under the repository's
+"all PRs" setting settles it, the trigger comment is posted by the
+orchestrator under the operator's connected account when Crucible reports
+the PR open, recorded as an event on the task. The bot's summary comment
+is edited in place and never counts as a round; the review object, its
+comments, or the bot's no-findings comment do. Installation tokens are
+about 390 characters with dots, not the short `ghs_` form, and the
+redaction patterns cover both.
+
+A round means one configured review cycle after publication. When the
+repository's Codex configuration runs code review and security review in
+that cycle, both are components of the same round; the round completes
+only when every configured component has completed or reached a terminal
+result.
+
 ## External review (bounded input, not a loop)
 
 - A round is one accepted signal from a login in
