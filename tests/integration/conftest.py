@@ -113,6 +113,7 @@ def tokens(ctx: AppContext) -> dict[str, str]:
                 url=REPOSITORY_URL, default_branch="main", policy_name="default-software"
             ),
         )
+        uow.commit()
     return out
 
 

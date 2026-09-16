@@ -73,4 +73,5 @@ def put_repository(
     repo = register_repository(
         uow, ctx.clock, principal_name=principal.name, name=name, registration=body
     )
+    uow.commit()
     return _repo_view(repo)

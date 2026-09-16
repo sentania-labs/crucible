@@ -52,5 +52,4 @@ def cancel_task(
             principal=principal.name,
             payload=payload,
         )
-    uow.commit()
     return task

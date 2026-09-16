@@ -1,5 +1,11 @@
-"""Idempotency-Key on creating POSTs (04): same key and body replays the stored
-response; same key with a different body is 422 idempotency-key-reuse."""
+"""Idempotency-Key on creating POSTs (04).
+
+The key row is reserved inside the mutation's transaction and completed with the
+response in that same transaction, so either both the mutation and the record commit
+or neither does. A repeat with the same key and body replays the stored response; the
+same key with a different body is 422 idempotency-key-reuse. Two concurrent first
+requests serialize on the unique index: the second waits for the first to commit, then
+replays it. The mutation never runs twice."""
 
 from __future__ import annotations
 
@@ -9,14 +15,14 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from fastapi.responses import JSONResponse
-from sqlalchemy.exc import IntegrityError
 
-from crucible.application.errors import IdempotencyKeyReuseError
+from crucible.application.errors import IdempotencyInProgressError, IdempotencyKeyReuseError
 from crucible.domain.entities import Principal
 from crucible.ports.clock import Clock
-from crucible.ports.repository import UnitOfWorkFactory
+from crucible.ports.repository import IdempotencyKeyTakenError, UnitOfWork, UnitOfWorkFactory
 
-Producer = Callable[[], Awaitable[tuple[int, dict[str, Any]]]]
+Producer = Callable[[UnitOfWork], Awaitable[tuple[int, dict[str, Any]]]]
+REPLAYED_HEADER = "Idempotent-Replayed"
 
 
 def body_sha256(body: bytes, scope: str = "") -> str:
@@ -26,6 +32,23 @@ def body_sha256(body: bytes, scope: str = "") -> str:
     except ValueError:
         canonical = body.decode("utf-8", "replace")
     return hashlib.sha256(f"{scope}\n{canonical}".encode()).hexdigest()
+
+
+def _replay(
+    uow_factory: UnitOfWorkFactory, principal: Principal, key: str, digest: str
+) -> JSONResponse:
+    with uow_factory() as uow:
+        stored = uow.idempotency.get(principal.id, key)
+    if stored is None:
+        raise IdempotencyInProgressError(f"Idempotency-Key {key!r} is being processed")
+    stored_digest, status, payload = stored
+    if stored_digest != digest:
+        raise IdempotencyKeyReuseError(
+            f"Idempotency-Key {key!r} was used with a different request body"
+        )
+    if status is None or payload is None:
+        raise IdempotencyInProgressError(f"Idempotency-Key {key!r} is being processed")
+    return JSONResponse(status_code=status, content=payload, headers={REPLAYED_HEADER: "true"})
 
 
 async def with_idempotency(
@@ -38,35 +61,19 @@ async def with_idempotency(
     scope: str,
     produce: Producer,
 ) -> JSONResponse:
+    """Run the mutation in one transaction, with the key reserved and completed inside it."""
     if key is None:
-        status, payload = await produce()
+        with uow_factory() as uow:
+            status, payload = await produce(uow)
+            uow.commit()
         return JSONResponse(status_code=status, content=payload)
     digest = body_sha256(body, scope)
-    with uow_factory() as uow:
-        stored = uow.idempotency.get(principal.id, key)
-    if stored is not None:
-        stored_digest, status, payload = stored
-        if stored_digest != digest:
-            raise IdempotencyKeyReuseError(
-                f"Idempotency-Key {key!r} was used with a different request body"
-            )
-        return JSONResponse(
-            status_code=status, content=payload, headers={"Idempotent-Replayed": "true"}
-        )
-    status, payload = await produce()
     try:
         with uow_factory() as uow:
-            uow.idempotency.put(
-                principal.id,
-                key,
-                request_sha256=digest,
-                status=status,
-                body=payload,
-                now=clock.now(),
-            )
+            uow.idempotency.reserve(principal.id, key, request_sha256=digest, now=clock.now())
+            status, payload = await produce(uow)
+            uow.idempotency.complete(principal.id, key, status=status, body=payload)
             uow.commit()
-    except IntegrityError:
-        # A concurrent first request stored the key; the mutation above still succeeded,
-        # so the caller gets its own result rather than a 500.
-        pass
+    except IdempotencyKeyTakenError:
+        return _replay(uow_factory, principal, key, digest)
     return JSONResponse(status_code=status, content=payload)

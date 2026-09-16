@@ -71,5 +71,4 @@ def start_task(
             "contract_version": task.contract_version,
         },
     )
-    uow.commit()
     return task

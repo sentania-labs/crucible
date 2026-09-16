@@ -16,6 +16,7 @@ from crucible.application.start_task import start_task
 from crucible.application.submit_task import submit_task
 from crucible.contracts.api import CancelRequest, EventList, StartRequest, TaskList, TaskView
 from crucible.domain.lifecycle import TaskState
+from crucible.ports.repository import UnitOfWork
 
 router = APIRouter(prefix="/tasks")
 IdemKey = Annotated[str | None, Header(alias="Idempotency-Key")]
@@ -28,10 +29,9 @@ async def submit(
     body = await request.body()
     document: Any = await request.json() if body else {}
 
-    async def produce() -> tuple[int, dict[str, Any]]:
-        with ctx.uow_factory() as uow:
-            task, _ = submit_task(uow, ctx.clock, principal=principal, body=document)
-            return 201, task_view(uow, task.id).model_dump(mode="json")
+    async def produce(uow: UnitOfWork) -> tuple[int, dict[str, Any]]:
+        task, _ = submit_task(uow, ctx.clock, principal=principal, body=document)
+        return 201, task_view(uow, task.id).model_dump(mode="json")
 
     return await with_idempotency(
         uow_factory=ctx.uow_factory,
@@ -84,10 +84,9 @@ async def start(
 ) -> JSONResponse:
     raw = await request.body()
 
-    async def produce() -> tuple[int, dict[str, Any]]:
-        with ctx.uow_factory() as uow:
-            task = start_task(uow, ctx.clock, principal=principal, task_id=task_id, request=body)
-            return 200, task_view(uow, task.id).model_dump(mode="json")
+    async def produce(uow: UnitOfWork) -> tuple[int, dict[str, Any]]:
+        task = start_task(uow, ctx.clock, principal=principal, task_id=task_id, request=body)
+        return 200, task_view(uow, task.id).model_dump(mode="json")
 
     return await with_idempotency(
         uow_factory=ctx.uow_factory,
@@ -111,10 +110,9 @@ async def cancel(
 ) -> JSONResponse:
     raw = await request.body()
 
-    async def produce() -> tuple[int, dict[str, Any]]:
-        with ctx.uow_factory() as uow:
-            task = cancel_task(uow, ctx.clock, principal=principal, task_id=task_id, request=body)
-            return 200, task_view(uow, task.id).model_dump(mode="json")
+    async def produce(uow: UnitOfWork) -> tuple[int, dict[str, Any]]:
+        task = cancel_task(uow, ctx.clock, principal=principal, task_id=task_id, request=body)
+        return 200, task_view(uow, task.id).model_dump(mode="json")
 
     return await with_idempotency(
         uow_factory=ctx.uow_factory,

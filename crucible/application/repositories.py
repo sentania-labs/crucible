@@ -46,5 +46,4 @@ def register_repository(
             "policy_name": repository.policy_name,
         },
     )
-    uow.commit()
     return repository

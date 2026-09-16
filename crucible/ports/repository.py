@@ -154,18 +154,24 @@ class SupervisorStatusRepository(Protocol):
     def write(self, status: SupervisorStatus) -> None: ...
 
 
-class IdempotencyRepository(Protocol):
-    def get(self, principal_id: str, key: str) -> tuple[str, int, dict[str, Any]] | None: ...
+class IdempotencyKeyTakenError(Exception):
+    """The (principal, key) row already exists; read it back in a fresh transaction."""
 
-    def put(
-        self,
-        principal_id: str,
-        key: str,
-        *,
-        request_sha256: str,
-        status: int,
-        body: dict[str, Any],
-        now: datetime,
+
+class IdempotencyRepository(Protocol):
+    def get(
+        self, principal_id: str, key: str
+    ) -> tuple[str, int | None, dict[str, Any] | None] | None:
+        """(request_sha256, response_status, response_body); status is None while reserved."""
+        ...
+
+    def reserve(self, principal_id: str, key: str, *, request_sha256: str, now: datetime) -> None:
+        """Insert the key row inside the current transaction; raises IdempotencyKeyTakenError
+        once the conflicting row's transaction has committed."""
+        ...
+
+    def complete(
+        self, principal_id: str, key: str, *, status: int, body: dict[str, Any]
     ) -> None: ...
 
 

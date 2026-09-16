@@ -13,7 +13,7 @@ from crucible.application.registry import REGISTERED_HARNESSES, REGISTERED_PROVI
 from crucible.application.transitions import record_event
 from crucible.contracts.common import to_document
 from crucible.contracts.task_contract import TaskContractV1, contract_sha256
-from crucible.domain.entities import Policy, Principal, Repository, Task, TaskContract
+from crucible.domain.entities import Event, Policy, Principal, Repository, Task, TaskContract
 from crucible.domain.events import EventKind
 from crucible.domain.exit_class import ExitClass
 from crucible.domain.ids import new_id
@@ -147,15 +147,18 @@ def submit_task(
     policy = uow.policies.get(contract.policy.name, contract.policy.version)
     problems, _ = _check_against_registry(contract, repository, policy)
     if problems:
-        record_event(
-            uow,
-            clock,
-            EventKind.CONTRACT_REJECTED,
+        # The request transaction rolls back; the API records this event on its own.
+        rejection = Event(
+            seq=None,
+            ts=clock.now(),
+            kind=EventKind.CONTRACT_REJECTED.value,
             principal=principal.name,
+            verified=True,
             payload={"external_id": contract.external_id, "problems": problems},
         )
-        uow.commit()
-        raise ContractValidationError("task contract failed validation", errors=problems)
+        raise ContractValidationError(
+            "task contract failed validation", errors=problems, event=rejection
+        )
     assert repository is not None
     if uow.tasks.get_by_external_id(principal.id, contract.external_id) is not None:
         raise DuplicateExternalIdError(
@@ -201,5 +204,4 @@ def submit_task(
             "policy": {"name": contract.policy.name, "version": contract.policy.version},
         },
     )
-    uow.commit()
     return task, stored

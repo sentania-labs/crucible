@@ -224,3 +224,112 @@ async def test_illegal_supervisor_transition_is_recorded(
     kinds = event_kinds(client, task_id)
     assert kinds == ["task_submitted", "transition_rejected"]
     assert client.get(f"/v1/tasks/{task_id}").json()["state"] == "submitted"
+
+
+class _SupervisorDied(BaseException):
+    """A process death: not an Exception, so nothing in the tick can catch it."""
+
+
+async def _crash_launch_at(
+    ctx: AppContext, provider: FakeProvider, client: TestClient, where: str, image: str
+) -> tuple[str, str]:
+    """Run supervisor A until it dies at `where`; return (task_id, attempt_id)."""
+    from unittest.mock import patch  # noqa: PLC0415
+
+    a = make_supervisor(ctx, provider, holder="sup-a")
+    task_id = submit_and_start(
+        client,
+        image,
+        lifecycle={"max_attempts": 2, "retry_on": ["environment"], "cleanup": "policy"},
+    )
+
+    def die(*_args: object, **_kw: object) -> None:
+        raise _SupervisorDied("supervisor process died here")
+
+    target = {"before_prepare": (provider, "prepare"), "before_launch": (provider, "launch")}.get(
+        where, (a, "_mark_running")
+    )
+    with patch.object(*target, side_effect=die), pytest.raises(_SupervisorDied):
+        await a.tick()
+    (attempt,) = client.get(f"/v1/tasks/{task_id}").json()["executions"][0]["attempts"]
+    return task_id, str(attempt["id"])
+
+
+def _attempts(client: TestClient, task_id: str) -> list[dict[str, Any]]:
+    return [
+        x for e in client.get(f"/v1/tasks/{task_id}").json()["executions"] for x in e["attempts"]
+    ]
+
+
+async def test_crash_before_prepare_is_environment_on_reconcile(
+    ctx: AppContext, provider: FakeProvider, client: TestClient, clock: FakeClock
+) -> None:
+    task_id, attempt_id = await _crash_launch_at(
+        ctx, provider, client, "before_prepare", "crucible-worker:fake-succeed"
+    )
+    assert client.get(f"/v1/attempts/{attempt_id}").json()["state"] == "preparing"
+    clock.advance(31)
+    b = make_supervisor(ctx, provider, holder="sup-b")
+    await b.tick()
+    first = client.get(f"/v1/attempts/{attempt_id}").json()
+    assert first["state"] == "failed" and first["exit_class"] == "environment"
+    assert "task_retry_scheduled" in event_kinds(client, task_id)
+    assert await run_until(b, client, task_id, {"reported"}) == "reported"
+    attempts = _attempts(client, task_id)
+    assert [a["number"] for a in attempts] == [1, 2] and attempts[1]["state"] == "succeeded"
+
+
+async def test_crash_before_launch_is_environment_on_reconcile(
+    ctx: AppContext, provider: FakeProvider, client: TestClient, clock: FakeClock
+) -> None:
+    task_id, attempt_id = await _crash_launch_at(
+        ctx, provider, client, "before_launch", "crucible-worker:fake-succeed"
+    )
+    assert client.get(f"/v1/attempts/{attempt_id}").json()["state"] == "launching"
+    assert provider.worker(attempt_id) is None
+    clock.advance(31)
+    b = make_supervisor(ctx, provider, holder="sup-b")
+    await b.tick()
+    first = client.get(f"/v1/attempts/{attempt_id}").json()
+    assert first["state"] == "failed" and first["exit_class"] == "environment"
+    events = client.get(f"/v1/tasks/{task_id}/events").json()["items"]
+    collected = next(e for e in events if e["kind"] == "attempt_collected")
+    assert collected["payload"]["stage"] == "reconcile"
+    assert await run_until(b, client, task_id, {"reported"}) == "reported"
+    assert len(_attempts(client, task_id)) == 2
+
+
+async def test_crash_after_launch_adopts_the_worker_on_reconcile(
+    ctx: AppContext, provider: FakeProvider, client: TestClient, clock: FakeClock
+) -> None:
+    task_id, attempt_id = await _crash_launch_at(
+        ctx, provider, client, "after_launch", "crucible-worker:fake-succeed-3"
+    )
+    assert client.get(f"/v1/attempts/{attempt_id}").json()["state"] == "launching"
+    assert provider.worker(attempt_id) is not None, "the worker outlived the supervisor"
+    clock.advance(31)
+    b = make_supervisor(ctx, provider, holder="sup-b")
+    await b.tick()
+    adopted = client.get(f"/v1/attempts/{attempt_id}").json()
+    assert adopted["state"] == "running" and adopted["handle"] == f"fake-{attempt_id}"
+    assert adopted["lease"]["holder"] == "sup-b"
+    assert "attempt_adopted" in event_kinds(client, task_id)
+    assert await run_until(b, client, task_id, {"reported"}) == "reported"
+    attempts = _attempts(client, task_id)
+    assert len(attempts) == 1 and attempts[0]["state"] == "succeeded"
+
+
+async def test_crash_after_launch_with_a_vanished_worker_is_environment(
+    ctx: AppContext, provider: FakeProvider, client: TestClient, clock: FakeClock
+) -> None:
+    task_id, attempt_id = await _crash_launch_at(
+        ctx, provider, client, "after_launch", "crucible-worker:fake-succeed-3"
+    )
+    provider.remove_out_of_band(attempt_id)
+    clock.advance(31)
+    b = make_supervisor(ctx, provider, holder="sup-b")
+    await b.tick()
+    first = client.get(f"/v1/attempts/{attempt_id}").json()
+    assert first["state"] == "failed" and first["exit_class"] == "environment"
+    assert await run_until(b, client, task_id, {"reported"}) == "reported"
+    assert len(_attempts(client, task_id)) == 2

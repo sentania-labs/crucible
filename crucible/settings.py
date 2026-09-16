@@ -1,15 +1,18 @@
-"""Configuration: environment (CRUCIBLE_ prefix, `__` nesting) plus an optional TOML file
-named by CRUCIBLE_CONFIG. Sanitized example in examples/config/."""
+"""Configuration: environment (CRUCIBLE_ prefix, `__` nesting) over an optional TOML file
+named by CRUCIBLE_CONFIG. Precedence: constructor, environment, TOML, defaults. Sanitized
+example in examples/config/."""
 
 from __future__ import annotations
 
 import os
-import tomllib
-from pathlib import Path
-from typing import Any
 
 from pydantic import BaseModel, Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import (
+    BaseSettings,
+    PydanticBaseSettingsSource,
+    SettingsConfigDict,
+    TomlConfigSettingsSource,
+)
 
 
 class ServiceSettings(BaseModel):
@@ -42,24 +45,31 @@ class SupervisorSettings(BaseModel):
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_prefix="CRUCIBLE_", env_nested_delimiter="__", extra="ignore"
+        env_prefix="CRUCIBLE_", env_nested_delimiter="__", extra="ignore", toml_file=None
     )
 
     service: ServiceSettings = Field(default_factory=ServiceSettings)
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)
     supervisor: SupervisorSettings = Field(default_factory=SupervisorSettings)
 
-
-def _load_toml(path: Path) -> dict[str, Any]:
-    with path.open("rb") as handle:
-        return tomllib.load(handle)
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        # Earlier sources win: the environment overrides the TOML file.
+        return (init_settings, env_settings, TomlConfigSettingsSource(settings_cls))
 
 
 def load_settings(config_path: str | None = None) -> Settings:
-    """TOML values are the base; environment variables override them."""
+    """Settings with the TOML file (argument, else CRUCIBLE_CONFIG) as the lowest source."""
     path = config_path or os.environ.get("CRUCIBLE_CONFIG")
-    base: dict[str, Any] = {}
-    if path:
-        base = _load_toml(Path(path))
-    known = {"service", "database", "supervisor"}
-    return Settings(**{k: v for k, v in base.items() if k in known})
+
+    class ConfiguredSettings(Settings):
+        model_config = SettingsConfigDict(**{**Settings.model_config, "toml_file": path})
+
+    return ConfiguredSettings()

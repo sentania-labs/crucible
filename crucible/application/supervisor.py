@@ -314,13 +314,12 @@ class Supervisor:
                     await provider.terminate(handle, "kill")
                     await self._db(partial(self._record_orphan, handle, name))
                     orphans += 1
-                elif action == "adopt":
-                    self._handles[handle.attempt_id] = handle
         return orphans
 
     def _classify_handle(self, handle: Handle) -> str:
-        with self._fenced() as uow:
-            attempt = uow.attempts.get(handle.attempt_id, for_update=True)
+        """A provider handle with no live attempt behind it is an orphan (10 step 3)."""
+        with self._uow_factory() as uow:
+            attempt = uow.attempts.get(handle.attempt_id)
             if (
                 attempt is None
                 or attempt.state in ATTEMPT_TERMINAL
@@ -330,26 +329,6 @@ class Supervisor:
                     AttemptState.COLLECTED,
                 )
             ):
-                return "orphan"
-            if attempt.state is AttemptState.LAUNCHING:
-                attempt.handle = handle.ref
-                attempt.started_at = attempt.started_at or self._clock.now()
-                execution = uow.executions.get(attempt.execution_id)
-                assert execution is not None
-                attempt.timeout_at = attempt.started_at + timedelta(
-                    seconds=execution.timeout_seconds
-                )
-                move_attempt(
-                    uow,
-                    self._clock,
-                    attempt,
-                    AttemptState.RUNNING,
-                    EventKind.ATTEMPT_ADOPTED,
-                    payload={"handle": handle.ref},
-                )
-                uow.commit()
-                return "adopt"
-            if attempt.handle is None:
                 return "orphan"
             self._handles.setdefault(handle.attempt_id, handle)
             return "keep"
@@ -634,19 +613,7 @@ class Supervisor:
 
     async def _observe_one(self, attempt: Attempt) -> bool:
         if attempt.state in (AttemptState.PREPARING, AttemptState.LAUNCHING):
-            # Launching finished before this step ran, so an attempt still here has no
-            # worker behind it: Crucible died mid-launch. Classify as environment (10, 16).
-            if attempt.handle is None:
-                await self._db(
-                    partial(
-                        self._environment_failure,
-                        attempt.id,
-                        "reconcile",
-                        "attempt stranded in launch with no provider handle",
-                    )
-                )
-                return True
-            return False
+            return await self._reconcile_stranded(attempt)
         provider_name = await self._db(partial(self._execution_provider_name, attempt))
         provider = self._provider(provider_name)
         handle = self._handles.get(attempt.id) or Handle(
@@ -684,6 +651,65 @@ class Supervisor:
         self._handles.pop(attempt.id, None)
         self._workspaces.pop(attempt.id, None)
         return True
+
+    async def _reconcile_stranded(self, attempt: Attempt) -> bool:
+        """An attempt still in preparing or launching after the launch step ran was left
+        there by a supervisor that died mid-launch. If the provider can see a worker for
+        it, adopt it as running; otherwise collect it as environment so the retry rule
+        applies (10, 16)."""
+        provider_name = await self._db(partial(self._execution_provider_name, attempt))
+        provider = self._provider(provider_name)
+        handle = self._handles.get(attempt.id)
+        if handle is None:
+            discovered = {h.attempt_id: h for h in await provider.reconcile()}
+            handle = discovered.get(attempt.id)
+        if handle is None and attempt.handle is not None:
+            handle = Handle(provider=provider_name, ref=attempt.handle, attempt_id=attempt.id)
+        if handle is not None:
+            observation = await provider.observe(handle)
+            if observation.state is not ObservationState.LOST:
+                self._handles[attempt.id] = handle
+                await self._db(partial(self._adopt, attempt.id, handle))
+                return False
+        await self._db(
+            partial(
+                self._environment_failure,
+                attempt.id,
+                "reconcile",
+                "attempt stranded in launch with no worker the provider can see",
+            )
+        )
+        return True
+
+    def _adopt(self, attempt_id: str, handle: Handle) -> None:
+        with self._fenced() as uow:
+            attempt = uow.attempts.get(attempt_id, for_update=True)
+            assert attempt is not None
+            if attempt.state not in (AttemptState.PREPARING, AttemptState.LAUNCHING):
+                return
+            execution = uow.executions.get(attempt.execution_id)
+            assert execution is not None
+            now = self._clock.now()
+            if attempt.state is AttemptState.PREPARING:
+                move_attempt(
+                    uow, self._clock, attempt, AttemptState.LAUNCHING, EventKind.ATTEMPT_LAUNCHING
+                )
+            attempt.handle = handle.ref
+            attempt.started_at = attempt.started_at or now
+            attempt.timeout_at = attempt.started_at + timedelta(seconds=execution.timeout_seconds)
+            move_attempt(
+                uow,
+                self._clock,
+                attempt,
+                AttemptState.RUNNING,
+                EventKind.ATTEMPT_ADOPTED,
+                payload={"handle": handle.ref},
+            )
+            assert self.fenced_token is not None
+            uow.leases.upsert_attempt_lease(
+                attempt.id, self.holder, self.fenced_token, now, self.attempt_lease_ttl_seconds
+            )
+            uow.commit()
 
     def _renew_attempt_lease(self, attempt_id: str) -> None:
         with self._fenced() as uow:

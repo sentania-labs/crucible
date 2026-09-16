@@ -107,6 +107,7 @@ def main(argv: list[str] | None = None) -> None:
                     installation_id=args.installation_id,
                 ),
             )
+            uow.commit()
         print(json.dumps({"repository": repo.name, "id": repo.id, "url": repo.url}))
         return
 

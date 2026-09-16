@@ -83,7 +83,7 @@ def test_ready_reports_schema_drift(client: TestClient, engine: Engine, migrated
         assert ready.status_code == 503
         detail = ready.json()["migrations"]["detail"]
         assert detail.startswith(
-            "schema drift at head 0002_supervisor_liveness: add_column attempts.killed_at"
+            "schema drift at head 0003_idempotency_reservation: add_column attempts.killed_at"
         )
         ok, serve_detail = migrate.is_current(engine, migrated)
         assert not ok and "schema drift" in serve_detail, "serve refuses on the same check"

@@ -46,6 +46,11 @@ def problem_response(
 def install_problem_handlers(app: FastAPI) -> None:
     @app.exception_handler(ApplicationError)
     async def _application_error(request: Request, exc: ApplicationError) -> JSONResponse:
+        if exc.event is not None:
+            ctx: AppContext = request.app.state.ctx
+            with ctx.uow_factory() as uow:
+                uow.events.append(exc.event)
+                uow.commit()
         return problem_response(
             slug=exc.slug,
             title=exc.title,

@@ -196,6 +196,6 @@ class IdempotencyKeyRow(Base):
     principal_id: Mapped[str] = mapped_column(ID, ForeignKey("principals.id"))
     key: Mapped[str] = mapped_column(String(255))
     request_sha256: Mapped[str] = mapped_column(String(64))
-    response_status: Mapped[int] = mapped_column(Integer)
-    response_body: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    response_status: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    response_body: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(TZ)

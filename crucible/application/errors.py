@@ -4,16 +4,26 @@ from __future__ import annotations
 
 from typing import Any
 
+from crucible.domain.entities import Event
+
 
 class ApplicationError(Exception):
     slug = "application-error"
     status = 500
     title = "Application error"
 
-    def __init__(self, detail: str, *, errors: list[dict[str, Any]] | None = None) -> None:
+    def __init__(
+        self,
+        detail: str,
+        *,
+        errors: list[dict[str, Any]] | None = None,
+        event: Event | None = None,
+    ) -> None:
         super().__init__(detail)
         self.detail = detail
         self.errors = errors or []
+        # An event to record on its own after the request transaction has rolled back.
+        self.event = event
 
 
 class NotFoundError(ApplicationError):
@@ -60,3 +70,9 @@ class IdempotencyKeyReuseError(ApplicationError):
     slug = "idempotency-key-reuse"
     status = 422
     title = "Idempotency-Key reused with a different body"
+
+
+class IdempotencyInProgressError(ApplicationError):
+    slug = "idempotency-in-progress"
+    status = 409
+    title = "A request with this Idempotency-Key is still in progress"

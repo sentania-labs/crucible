@@ -9,7 +9,7 @@ from types import TracebackType
 from typing import Any
 
 from sqlalchemy import Engine, create_engine, select, text, update
-from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from crucible.adapters.persistence.models import (
@@ -53,6 +53,7 @@ from crucible.ports.repository import (
     EventRepository,
     ExecutionRepository,
     FencedTokenRejectedError,
+    IdempotencyKeyTakenError,
     IdempotencyRepository,
     LeaseRepository,
     PolicyRepository,
@@ -770,37 +771,45 @@ class IdempotencyKeys:
     def __init__(self, session: Session) -> None:
         self._s = session
 
-    def get(self, principal_id: str, key: str) -> tuple[str, int, dict[str, Any]] | None:
-        row = self._s.scalar(
+    def _row(self, principal_id: str, key: str) -> IdempotencyKeyRow | None:
+        return self._s.scalar(
             select(IdempotencyKeyRow).where(
                 IdempotencyKeyRow.principal_id == principal_id, IdempotencyKeyRow.key == key
             )
         )
+
+    def get(
+        self, principal_id: str, key: str
+    ) -> tuple[str, int | None, dict[str, Any] | None] | None:
+        row = self._row(principal_id, key)
         if row is None:
             return None
         return row.request_sha256, row.response_status, row.response_body
 
-    def put(
-        self,
-        principal_id: str,
-        key: str,
-        *,
-        request_sha256: str,
-        status: int,
-        body: dict[str, Any],
-        now: datetime,
-    ) -> None:
+    def reserve(self, principal_id: str, key: str, *, request_sha256: str, now: datetime) -> None:
         self._s.add(
             IdempotencyKeyRow(
                 id=new_id(),
                 principal_id=principal_id,
                 key=key,
                 request_sha256=request_sha256,
-                response_status=status,
-                response_body=body,
+                response_status=None,
+                response_body=None,
                 created_at=now,
             )
         )
+        try:
+            # On a concurrent first request PostgreSQL blocks here until the other
+            # transaction commits, then raises on the unique index.
+            self._s.flush()
+        except IntegrityError as exc:
+            raise IdempotencyKeyTakenError(key) from exc
+
+    def complete(self, principal_id: str, key: str, *, status: int, body: dict[str, Any]) -> None:
+        row = self._row(principal_id, key)
+        assert row is not None, "complete without reserve"
+        row.response_status = status
+        row.response_body = body
         self._s.flush()
 
 
