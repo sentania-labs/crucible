@@ -5,11 +5,9 @@ title: "Return 409 on duplicate import ID"
 project: "example-service"
 parent_external_id: null
 repository:
-  url: "https://github.com/example-org/example-service.git"
-  default_branch: "main"
+  name: "example-service"          # registered with Crucible; carries URL and App installation
   base_ref: "main"
   work_branch: "crucible/EX-0001"
-  auth: { source: "credential:github-app" }
 scope:
   allowed_paths: ["src/ledger/**", "tests/ledger/**", "docs/ledger.md"]
   prohibited_paths: [".github/**"]
@@ -28,16 +26,19 @@ acceptance_criteria:
 required_verification:
   - { id: "V1", command: "make lint", expect_exit: 0 }
   - { id: "V2", command: "make test", expect_exit: 0 }
-  - { id: "V3", kind: "artifact", path: "report/run-evidence.md" }
+  - { id: "V3", command: "make scan", expect_exit: 0 }
+  - { id: "V4", kind: "artifact", path: "report/run-evidence.md" }
 constraints:
-  prohibited_actions: ["git push --force", "modify files outside allowed_paths", "delegate to other agents"]
+  prohibited_actions: ["modify files outside allowed_paths", "delegate to other agents"]
   network: "policy"
 deliverables:
-  - { kind: "branch", ref: "crucible/EX-0001" }
-  - { kind: "pull_request", target: "main", draft: false }
+  - kind: "pull_request"
+    target: "main"
+    draft: false
+    closes: ["https://github.com/example-org/example-service/issues/17"]
 reporting:
   report_schema: "CompletionClaimV1"
-  report_dir: ".crucible/report"
+  report_dir: "/crucible/report"
   progress_events: true
 escalation:
   conditions: ["a required verification command does not exist in the repository"]
@@ -55,5 +56,4 @@ lifecycle:
   max_attempts: 2
   retry_on: ["environment", "lost"]
   cleanup: "policy"
-submitted_by: "example-orchestrator"
-submitted_at: "2026-09-16T06:00:00-05:00"
+correction: null

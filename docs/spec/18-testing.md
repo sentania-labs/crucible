@@ -14,7 +14,11 @@ Docker daemon.
 - Harness adapters: launch spec construction, exit classification, report
   parsing with malformed inputs.
 - Docker create-request policy: every forbidden option is refused.
-- Secret scanner patterns.
+- Secret scanner patterns, including GitHub installation token shapes.
+- PR body rendering: worker-asserted text never labeled verified; only
+  contract closing references survive; secret patterns rejected.
+- Release gates against synthetic tag lists and version files.
+- Harness version range refusal.
 
 ## Integration (PostgreSQL in a container, fake provider)
 
@@ -33,6 +37,26 @@ Docker daemon.
 - Bootstrap import: verify, reject on tamper, commit, state mapping.
 - Wake creation and poll; webhook retry schedule with a failing receiver.
 - API auth: roles, idempotency keys, problem details.
+- GitHub delivery against a recorded fake GitHub API: publish, PR open,
+  head update, external review from an allowlisted login and from a
+  non-allowlisted one (must not satisfy), dispositions, CI green, CI
+  failure with evidence capture and no automatic retry, merge observed,
+  close-without-merge, head changed by other, webhook signature valid and
+  invalid, delivery dedupe, poll-only mode equivalence.
+- Correction loop: external feedback to correction to re-publish to CI
+  certification without a second external review round or a second
+  internal review unless requested.
+- Round counting: a two-round policy waits for the second allowlisted
+  signal; a `+1` reaction from the allowlisted login counts, from another
+  login does not.
+- Branch-only deliverable: published and verified before `accepted`.
+- Out-of-band head: task blocks in `head_diverged`; green CI on the new
+  SHA does not advance it; recollect re-runs the pre-PR path.
+- Empty required-check set stays pending; `allow_no_ci` makes it skipped.
+- Release tag not matching the rendered version is refused.
+- Webhook: raw body never reaches storage; a comment containing a
+  credential-shaped string is stored redacted with the body hash.
+- Retention: deterministic and idempotent; every deletion an event.
 
 ## End-to-end (Docker provider, real containers, no model)
 
@@ -42,8 +66,10 @@ requested code). Proves the real provider path without a subscription:
 
 - Prepare, launch, observe, logs, collect, cleanup on a real container.
 - Isolation: the script attempts to reach the Docker socket, the proxy, the
-  database, and another credential mount; each attempt must fail and be
-  recorded as a test assertion.
+  database, another credential mount, and to `git push`; each attempt must
+  fail and be recorded as a test assertion.
+- Publisher: push from a bundle to a throwaway repository with a token on
+  tmpfs; the token is absent from env, logs, events, and the host after.
 - Timeout drain then kill.
 - Loss: the container is removed out of band; reconcile marks `lost`.
 - Orphan: a labeled container with no attempt row is removed.

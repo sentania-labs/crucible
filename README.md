@@ -10,7 +10,7 @@ It does not decide what to build. An orchestrator (Foundry, or a person)
 decides outcomes, scope, model, and acceptance. Crucible executes, persists,
 observes, and enforces.
 
-**Status: specification.** No implementation exists yet. The specification is
+**Status: specification, version 0.3.** No implementation exists yet. The specification is
 under [`docs/spec/`](docs/spec/00-overview.md) and the decisions behind it
 under [`docs/adr/`](docs/adr/). Implementation starts only after the
 specification is approved.
@@ -28,19 +28,27 @@ specification is approved.
 - Evaluate deterministic definition-of-done gates and record the evidence.
 - Keep authorized work running while the orchestrator is disconnected, and
   wake it when judgment is required.
+- Own the routine GitHub mutations through a narrowly scoped GitHub App:
+  push the verified branch, open the PR with a body built from verified
+  evidence, watch external review and CI, observe the merge, and tag a
+  release only from an explicit, operator-authorized release contract.
+- Never give a worker a GitHub credential, the Docker socket, or another
+  harness's credentials.
 
 ## What it will not do
 
 Interpret ambiguous requirements, choose architecture, invent acceptance
 criteria, broaden scope, pick a model by judgment, create follow-up work on
-its own, approve semantic correctness, accept a risk, or declare success.
+its own, approve semantic correctness, accept a risk, declare success,
+interpret review feedback, merge a PR, or decide that a release should
+happen.
 
 ## Layout
 
 ```
 docs/spec/      the specification, one concern per file
 docs/adr/       architectural decision records
-examples/       sanitized example task contracts and configuration
+examples/       sanitized example task and release contracts and configuration
 ```
 
 ## License

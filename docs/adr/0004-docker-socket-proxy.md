@@ -1,30 +1,35 @@
-# ADR 0004: Restricted Docker socket proxy for the local provider
+# ADR 0004: Rootless Docker daemon preferred; restricted socket proxy in front of whichever daemon is used
 
-Status: proposed, 2026-09-16.
+Status: accepted with the operator's decision 13, 2026-09-16 (supersedes the 0.2 proposal).
 
 ## Context
 
-Crucible must create sibling containers locally. Mounting the host Docker
-socket into Crucible makes it root-equivalent on the host; mounting it
-into workers is unacceptable.
+Crucible must create sibling containers locally. Anything that can talk to
+a Docker socket is root-equivalent on that daemon's host user. A proxy can
+narrow the API surface but cannot validate request bodies, so a proxy alone
+leaves a compromised Crucible root-equivalent when the daemon is the host's
+rootful one.
 
 ## Decision
 
-Only a socket-proxy container mounts the socket. Crucible talks HTTP to the
-proxy with an endpoint allowlist limited to what the provider uses.
-Crucible also refuses to emit dangerous create requests. Workers receive
-neither the socket nor the proxy address and are on a network that cannot
-reach them. The pattern is Docker-only; Kubernetes uses the API server with
-a namespaced ServiceAccount.
+1. Run the rootless-Docker spike (S9) first in C0. If a dedicated rootless
+   daemon for a Crucible service user works reliably on the development
+   workstation, it is the default local arrangement from C3: a full escape
+   yields an unprivileged user.
+2. If S9 fails, the host socket is used temporarily through the proxy,
+   with the root-equivalent trust risk recorded in the readiness report
+   and revisited before any multi-user deployment.
+3. In both cases only the socket-proxy container mounts the socket;
+   Crucible talks HTTP to the proxy with an endpoint allowlist, refuses to
+   emit dangerous create requests, and no worker, collector, verifier, or
+   publisher container ever receives the socket or the proxy endpoint.
+4. The pattern is Docker-only; Kubernetes uses the API server with a
+   namespaced ServiceAccount and admission policy.
 
 ## Consequences
 
-The proxy reduces the API surface but does not validate request bodies, so
-a compromised Crucible remains root-equivalent on the host through it. The
-proxy plus Crucible's own create-request policy protect against Crucible
-bugs and accidents, not against Crucible being hostile. Bounding the blast
-radius further needs a rootless Docker daemon dedicated to Crucible or a
-body-validating authorization layer; that choice is the operator's (spec 22,
-Q11). The proxy is one more container to maintain. `exec` into workers is
-not available to Crucible, which is intentional: observation is by logs and
-collected files.
+One extra daemon to install and keep patched in the preferred arrangement,
+and some Docker features unavailable in rootless mode (privileged ports,
+some storage drivers, cgroup limits contingent on host delegation). The
+proxy remains a tripwire, not a boundary. `exec` into workers is not
+available to Crucible, which is intentional.

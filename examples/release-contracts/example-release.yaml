@@ -1,0 +1,15 @@
+# Example ReleaseContractV1. Fictional repository and names.
+schema_version: "1.0"
+external_id: "EX-0009"
+repository: { name: "example-service" }
+target_branch: "main"
+target_sha: "0123456789abcdef0123456789abcdef01234567"
+version: "1.4.0"
+tag: "v1.4.0"
+included:
+  pull_requests: [18, 19]
+  issues: ["https://github.com/example-org/example-service/issues/17"]
+notes: |
+  Duplicate import IDs now return 409. Import verification tightened.
+required_gates: ["all"]
+authorization: { decision_id: "01J0000000000000000000EXMPL" }

@@ -73,3 +73,12 @@ idea, redesign), **Reject** (exclude, with reason), **Defer** (later).
   cap is 3 per provider and is a policy value.
 - Everything prior kept state under one user's home directory with absolute
   paths. Crucible's state is a database and a configurable artifact root.
+
+## Reuse rule (operator decision 14, 2026-09-16)
+
+No code from Sandcastle, the earlier Foundry, Stewart, or Vault is reused
+by default. Reuse of any specific helper requires an ADR recording the
+exact code or concept, its source and license, why reuse beats writing it,
+the attribution required, and how it fits Crucible's architecture. Concepts
+may be adopted or adapted without copying implementations, as the table
+above does.
