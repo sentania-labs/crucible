@@ -18,6 +18,7 @@ from crucible.domain.entities import (
     AttemptMetrics,
     DispositionKind,
     Event,
+    EvidenceRecord,
     GateResultRecord,
     ReviewDisposition,
     Role,
@@ -278,12 +279,31 @@ def test_review_dispositions_are_append_only(ctx: AppContext) -> None:
         )
 
 
-def test_evidence_cannot_claim_a_worker_assertion_is_verified(ctx: AppContext) -> None:
-    """A CHECK keeps the 11 rule in the schema, not only in the evaluator."""
-    with pytest.raises(IntegrityError), ctx.engine.begin() as conn:
-        conn.execute(
-            text(
-                "INSERT INTO evidence (kind, observed_at, source, verified, payload) "
-                "VALUES ('exit_info', now(), 'worker', true, '{}'::jsonb)"
-            )
-        )
+async def test_evidence_is_fenced_and_a_worker_row_can_never_be_verified(
+    ctx: AppContext, provider: FakeProvider
+) -> None:
+    """Two protections: `evidence` is the supervisor's to write (14), and a CHECK keeps
+    the 11 rule in the schema, not only in the evaluator."""
+    worker_row = EvidenceRecord(
+        id=None,
+        attempt_id=None,
+        task_id=None,
+        kind="exit_info",
+        observed_at=ctx.clock.now(),
+        source="worker",
+        verified=True,
+        payload={},
+    )
+    with (
+        pytest.raises(FencedTokenRejectedError, match="requires a transaction-local"),
+        ctx.uow_factory() as uow,
+    ):
+        uow.evidence.add(worker_row)
+        uow.commit()
+
+    supervisor = make_supervisor(ctx, provider)
+    assert (await supervisor.tick()).held
+    with pytest.raises(IntegrityError), ctx.uow_factory() as uow:
+        uow.set_fenced_token(supervisor.fenced_token or 0)
+        uow.evidence.add(worker_row)
+        uow.commit()

@@ -122,6 +122,21 @@ def changed_paths(contract: dict[str, Any], behavior: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(paths))
 
 
+def synthetic_diff(paths: tuple[str, ...], behavior: str) -> str:
+    """A unified diff over the changed paths, so the scanner has content to read (11)."""
+    chunks = []
+    for path in paths:
+        body = f"+# fake change for {path}\n"
+        if behavior == "secret-leak" and path == paths[0]:
+            # Built here at runtime; no secret-shaped literal is ever committed (12).
+            body += '+TOKEN = "' + "gh" + "p_" + "A" * 36 + '"\n'
+        chunks.append(
+            f"diff --git a/{path} b/{path}\n"
+            f"--- a/{path}\n+++ b/{path}\n@@ -0,0 +1,{body.count(chr(10))} @@\n{body}"
+        )
+    return "".join(chunks)
+
+
 def default_review_report(spec: LaunchSpec, head_sha: str, verdict: str) -> dict[str, Any]:
     """A valid ReviewReportV1 from a `review` execution's attempt."""
     findings = (
@@ -362,21 +377,12 @@ class FakeProvider:
                             content_type="text/markdown",
                         )
                     )
-            if behavior == "secret-leak":
-                # Built at runtime so no secret-shaped literal is ever committed (12).
-                artifacts.append(
-                    CollectedArtifact(
-                        name="report/leak.txt",
-                        type="scanner_input",
-                        content=("gh" + "p_" + "A" * 36).encode(),
-                        content_type="text/plain",
-                    )
-                )
             return CollectedOutputs(
                 report=report,
                 report_raw=None,
                 blocked_md=None,
                 diff_paths=paths,
+                diff_text=synthetic_diff(paths, behavior),
                 bundle=bundle,
                 artifacts=tuple(artifacts),
             )

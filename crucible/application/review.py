@@ -18,12 +18,10 @@ from crucible.application.errors import (
 )
 from crucible.application.transitions import record_event
 from crucible.contracts.api import ReviewRequest
-from crucible.contracts.evidence import EvidenceKind, EvidenceSource
 from crucible.contracts.review_report import parse_review_report
 from crucible.domain.entities import (
     Attempt,
     Event,
-    EvidenceRecord,
     Execution,
     ExecutionRole,
     Principal,
@@ -96,11 +94,14 @@ def record_review_report(
             errors=errors,
             event=_rejection(clock, task, principal_name, errors),
         )
-    if task.head_sha and report.reviewed_head_sha != task.head_sha:
+    if report.reviewed_head_sha != (task.head_sha or ""):
         problems = [
             {
                 "path": "reviewed_head_sha",
-                "message": f"the collected head is {task.head_sha}; a review is bound to its head",
+                "message": (
+                    f"the collected head is {task.head_sha or 'not collected yet'}; "
+                    "a review is bound to the head it reviewed"
+                ),
             }
         ]
         raise ContractValidationError(
@@ -108,11 +109,41 @@ def record_review_report(
             errors=problems,
             event=_rejection(clock, task, principal_name, problems),
         )
-    # The reviewer the document names wins: an uploaded report may not claim an attempt
-    # of this task, and a review execution names its own attempt.
-    reviewer_kind = report.reviewer.kind
-    if report.reviewer.attempt_id:
-        reviewer_attempt_id = report.reviewer.attempt_id
+    # The caller says who ran the review; the document may only agree with it. A worker
+    # that names someone else's attempt is asserting its own non-authorship, which is the
+    # one thing `reviewer_must_not_be_author` may not take on trust (11).
+    problems = []
+    if reviewer_kind == REVIEWER_EXECUTION:
+        if report.reviewer.kind != REVIEWER_EXECUTION:
+            problems.append(
+                {
+                    "path": "reviewer.kind",
+                    "message": f"a review execution's report must say {REVIEWER_EXECUTION!r}",
+                }
+            )
+        elif report.reviewer.attempt_id != reviewer_attempt_id:
+            problems.append(
+                {
+                    "path": "reviewer.attempt_id",
+                    "message": "the report names an attempt other than the one that ran it",
+                }
+            )
+    elif report.reviewer.kind != REVIEWER_ORCHESTRATOR:
+        problems.append(
+            {
+                "path": "reviewer.kind",
+                "message": (
+                    "an uploaded report is the orchestrator's; a "
+                    f"{REVIEWER_EXECUTION!r} reviewer is Crucible's to record"
+                ),
+            }
+        )
+    if problems:
+        raise ForbiddenError(
+            "the report disagrees with the reviewer that produced it",
+            errors=problems,
+            event=_rejection(clock, task, principal_name, problems),
+        )
     authors = _author_attempt_ids(uow, task)
     if reviewer_attempt_id is not None and reviewer_attempt_id in authors:
         problems = [
@@ -138,27 +169,6 @@ def record_review_report(
         artifact_id=artifact_id,
     )
     uow.review_reports.add(record)
-    uow.evidence.add(
-        EvidenceRecord(
-            id=None,
-            attempt_id=reviewer_attempt_id,
-            task_id=task.id,
-            kind=EvidenceKind.REVIEW_RECEIVED.value,
-            observed_at=record.created_at,
-            source=EvidenceSource.CRUCIBLE.value,
-            verified=True,
-            payload={
-                "review_report_id": record.id,
-                "reviewed_head_sha": record.head_sha,
-                "reviewer_kind": reviewer_kind,
-                "reviewer_attempt_id": reviewer_attempt_id,
-                "reviewer_principal_id": reviewer_principal_id,
-                "reviewer_is_author": False,
-                "verdict": report.verdict,
-                "findings": len(report.findings),
-            },
-        )
-    )
     record_event(
         uow,
         clock,
@@ -176,6 +186,28 @@ def record_review_report(
         },
     )
     return record
+
+
+def review_evidence_payload(
+    record: ReviewReportRecord, *, reviewer_is_author: bool
+) -> dict[str, Any]:
+    """What the internal_review_recorded gate reads. Written by the supervisor, because
+    `evidence` is fenced (14) and a gate never consumes a row a request wrote."""
+    document = record.document
+    return {
+        "review_report_id": record.id,
+        "reviewed_head_sha": record.head_sha,
+        "reviewer_kind": record.reviewer_kind,
+        "reviewer_attempt_id": record.reviewer_attempt_id,
+        "reviewer_principal_id": record.reviewer_principal_id,
+        "reviewer_is_author": reviewer_is_author,
+        "verdict": document.get("verdict"),
+        "findings": len(document.get("findings", [])),
+    }
+
+
+def author_attempt_ids(uow: UnitOfWork, task: Task) -> set[str]:
+    return _author_attempt_ids(uow, task)
 
 
 def request_review(

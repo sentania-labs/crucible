@@ -94,9 +94,11 @@ def gate_input(uow: UnitOfWork, *, task: Task, attempt: Attempt, execution: Exec
 
 
 def configured_pre_pr_gates(policy: dict[str, Any]) -> list[str]:
-    """The policy names the required set; with no policy document, every pre-PR gate."""
+    """The policy names the required set (05b); with no policy document, every pre-PR gate.
+
+    An explicit empty list is an empty set, which is not the same as no policy at all."""
     gates = policy.get("gates", {}).get("pre_pr")
-    if not gates:
+    if gates is None:
         return sorted(PRE_PR_GATES)
     return [str(g) for g in gates]
 
@@ -275,6 +277,16 @@ def evaluate_and_advance(
         extra_links={"accept": f"/v1/tasks/{task.id}/accept"},
     )
     return outcomes
+
+
+def _review_note(uow: UnitOfWork, task: Task) -> str:
+    """A reviewer that asked for changes does not stop the gate, so the wake says so (11)."""
+    reports = [
+        r for r in uow.review_reports.list_for_task(task.id) if r.head_sha == (task.head_sha or "")
+    ]
+    if any(r.document.get("verdict") == "request_changes" for r in reports):
+        return "the internal review recorded request_changes, which no gate acts on; "
+    return ""
 
 
 def counts_for_metrics(outcomes: dict[str, GateOutcome]) -> tuple[int, int]:

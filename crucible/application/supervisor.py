@@ -29,7 +29,12 @@ from crucible.application.decisions import (
 from crucible.application.errors import ApplicationError
 from crucible.application.evidence import record_collection_evidence
 from crucible.application.gates import evaluate_and_advance
-from crucible.application.review import latest_work_attempt, record_review_report
+from crucible.application.review import (
+    author_attempt_ids,
+    latest_work_attempt,
+    record_review_report,
+    review_evidence_payload,
+)
 from crucible.application.routing import reserve
 from crucible.application.transitions import (
     move_attempt,
@@ -45,11 +50,13 @@ from crucible.application.wakes import (
     wake_body,
 )
 from crucible.contracts.completion_claim import parse_claim
+from crucible.contracts.evidence import ROLE_RUN_EVIDENCE, EvidenceKind, EvidenceSource
 from crucible.contracts.wake import WakeReason
 from crucible.domain.entities import (
     Attempt,
     AttemptMetrics,
     CompletionClaimRecord,
+    EvidenceRecord,
     Execution,
     ExecutionRole,
     Task,
@@ -298,6 +305,7 @@ class Supervisor:
             observed, finished = await self._observe_attempts()
             result.observed, result.finished = observed, finished
             await self._sweep_cancellations()
+            await self._db(self._materialize_evidence)
             await self._db(self._evaluate_pending_gates)
             await self._db(self._refresh_attempt_metrics)
             await self._db(self._repeat_stale_escalations)
@@ -469,17 +477,27 @@ class Supervisor:
         """A `review` execution the API asked for (04). Execution rows are fenced to the
         supervisor, so the request is an event and this materializes it."""
         for task in uow.tasks.list_by_state(TaskState.AWAITING_INTERNAL_REVIEW, for_update=True):
-            requests = [
-                e
-                for e in uow.events.list_for_task(task.id, after_seq=0, limit=500)
-                if e.kind == EventKind.REVIEW_EXECUTION_REQUESTED.value
-            ]
-            if not requests:
+            requested = uow.events.latest_for_task_kind(
+                task.id, EventKind.REVIEW_EXECUTION_REQUESTED.value
+            )
+            if requested is None:
                 continue
-            request = requests[-1].payload
+            request = requested.payload
             contract_version = int(request.get("contract_version", task.contract_version))
             existing = uow.executions.list_for_task_by_role(task.id, ExecutionRole.REVIEW)
-            if any(e.contract_version == contract_version for e in existing):
+            # A failed review execution may be asked for again; a live or successful one
+            # is the answer to this request.
+            if any(
+                e.contract_version == contract_version and e.state is not ExecutionState.FAILED
+                for e in existing
+            ):
+                continue
+            if any(
+                e.contract_version == contract_version
+                and e.state is ExecutionState.FAILED
+                and e.created_at > requested.ts
+                for e in existing
+            ):
                 continue
             policy = uow.policies.get(task.policy_name, task.policy_version)
             assert policy is not None
@@ -523,6 +541,76 @@ class Supervisor:
 
     # ----- step: gates, metrics, escalations, wakes -------------------------
 
+    def _materialize_evidence(self) -> None:
+        """`evidence` is fenced to the supervisor (14), so the rows a gate consumes are
+        derived here from what the API recorded: uploaded artifacts and review reports.
+
+        Idempotent: a row is written only when no evidence already points at the source."""
+        with self._fenced() as uow:
+            for state in (
+                TaskState.REPORTED,
+                TaskState.AWAITING_INTERNAL_REVIEW,
+                TaskState.PRE_PR_GATES_FAILED,
+                TaskState.AWAITING_ACCEPTANCE,
+            ):
+                for task in uow.tasks.list_by_state(state):
+                    self._evidence_for_task(uow, task)
+            uow.commit()
+
+    def _evidence_for_task(self, uow: UnitOfWork, task: Task) -> None:
+        existing = list(uow.evidence.list_for_task(task.id))
+        seen_artifacts = {e.artifact_id for e in existing if e.artifact_id is not None}
+        seen_reports = {
+            str(e.payload.get("review_report_id"))
+            for e in existing
+            if e.kind == EvidenceKind.REVIEW_RECEIVED.value
+        }
+        work = latest_work_attempt(uow, task)
+        if work is not None:
+            attempt = work[0]
+            for artifact in uow.artifacts.list_for_attempt(attempt.id):
+                if artifact.type != "run_evidence" or artifact.id in seen_artifacts:
+                    continue
+                uow.evidence.add(
+                    EvidenceRecord(
+                        id=None,
+                        attempt_id=attempt.id,
+                        task_id=task.id,
+                        kind=EvidenceKind.ARTIFACT_PRESENT.value,
+                        observed_at=self._clock.now(),
+                        source=EvidenceSource.CRUCIBLE.value,
+                        verified=True,
+                        payload={
+                            "role": ROLE_RUN_EVIDENCE,
+                            "path": artifact.path,
+                            "name": artifact.type,
+                            "size": artifact.size,
+                            "uploaded_by": artifact.created_by,
+                        },
+                        artifact_id=artifact.id,
+                    )
+                )
+        authors = author_attempt_ids(uow, task)
+        for report in uow.review_reports.list_for_task(task.id):
+            if report.id in seen_reports:
+                continue
+            uow.evidence.add(
+                EvidenceRecord(
+                    id=None,
+                    attempt_id=report.reviewer_attempt_id,
+                    task_id=task.id,
+                    kind=EvidenceKind.REVIEW_RECEIVED.value,
+                    observed_at=self._clock.now(),
+                    source=EvidenceSource.CRUCIBLE.value,
+                    verified=True,
+                    payload=review_evidence_payload(
+                        report,
+                        reviewer_is_author=report.reviewer_attempt_id in authors,
+                    ),
+                    artifact_id=report.artifact_id,
+                )
+            )
+
     def _evaluate_pending_gates(self) -> None:
         """10 step 5: every task in `reported` with pending gates is evaluated.
 
@@ -550,6 +638,8 @@ class Supervisor:
         (14), so the supervisor backfills it. Writing the same values twice changes
         nothing, which keeps reconciliation idempotent."""
         with self._fenced() as uow:
+            # States whose metrics can still change. A closed or cancelled task is done
+            # with, and rescanning it every tick would grow the tick without end.
             settled = (
                 TaskState.AWAITING_ACCEPTANCE,
                 TaskState.ACCEPTED,
@@ -1311,6 +1401,10 @@ class Supervisor:
                 detail = "ReviewReportV1 recorded"
             except ApplicationError as exc:
                 detail = exc.detail
+                if exc.event is not None:
+                    # The supervisor's transaction does not roll back here, so the
+                    # rejection is recorded in place rather than by the API handler.
+                    uow.events.append(exc.event)
         move_attempt(
             uow,
             self._clock,

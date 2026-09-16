@@ -6,6 +6,7 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
+from crucible.adapters.execution.fake import FakeProvider
 from crucible.application.supervisor import Supervisor
 from crucible.domain.gates import GateName
 from tests.integration.conftest import (
@@ -90,10 +91,11 @@ async def test_a_review_for_another_head_is_refused(
     assert "review_report_rejected" in event_kinds(client, task_id)
 
 
-async def test_a_review_naming_the_author_attempt_is_refused(
+async def test_an_uploaded_report_may_not_claim_a_review_execution(
     client: TestClient, supervisor: Supervisor
 ) -> None:
-    """reviewer_must_not_be_author is mechanical (11)."""
+    """reviewer_must_not_be_author is mechanical (11): an upload is the orchestrator's,
+    and only Crucible may record a report as a review execution's."""
     task_id = submit_and_start(client, "crucible-worker:fake-succeed")
     await run_to_settled(supervisor, client, task_id)
     view = client.get(f"/v1/tasks/{task_id}").json()
@@ -109,8 +111,44 @@ async def test_a_review_naming_the_author_attempt_is_refused(
     }
     r = client.post(f"/v1/tasks/{task_id}/review", json={"report": report})
     assert r.status_code == 403
-    assert "reviewer_must_not_be_author" in r.json()["errors"][0]["message"]
+    assert r.json()["errors"][0]["path"] == "reviewer.kind"
     assert client.get(f"/v1/tasks/{task_id}").json()["state"] == "awaiting_internal_review"
+    assert "review_report_rejected" in event_kinds(client, task_id)
+
+
+async def test_a_review_worker_may_not_name_another_attempt_as_the_reviewer(
+    client: TestClient, supervisor: Supervisor, provider: FakeProvider
+) -> None:
+    """The supervisor knows which attempt ran the review; the document may only agree.
+
+    A worker that names the implementing attempt would be asserting its own
+    non-authorship, which is the one thing this constraint may not take on trust."""
+    task_id = submit_and_start(client, "crucible-worker:fake-succeed", external_id="EX-FORGE")
+    await run_to_settled(supervisor, client, task_id)
+    view = client.get(f"/v1/tasks/{task_id}").json()
+    author = view["latest_attempt"]["id"]
+    provider.set_report(
+        "EX-FORGE",
+        {
+            "schema_version": "1.0",
+            "task_external_id": "EX-FORGE",
+            "reviewed_head_sha": view["head_sha"],
+            "reviewer": {"kind": "crucible_review_execution", "attempt_id": author},
+            "verdict": "approve",
+            "findings": [],
+            "summary": "The author signing off on itself.",
+        },
+    )
+    client.post(f"/v1/tasks/{task_id}/review", json={"execution": REVIEW_EXECUTION})
+    for _ in range(4):
+        await supervisor.tick()
+    after = client.get(f"/v1/tasks/{task_id}").json()
+    assert after["state"] == "awaiting_internal_review"
+    assert after["review_reports"] == []
+    review = next(e for e in after["executions"] if e["role"] == "review")
+    assert review["state"] == "failed"
+    assert "review_report_rejected" in event_kinds(client, task_id)
+    assert gates(client, author)[GateName.INTERNAL_REVIEW_RECORDED] == "pending"
 
 
 async def test_an_unparsable_review_is_refused_with_paths(

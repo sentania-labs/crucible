@@ -146,3 +146,70 @@ def test_a_correction_keeps_the_task_identity() -> None:
     moved = _correction(**{"external_id": "EX-9999"})
     problems = correction_narrows(_contract(), moved)
     assert any(p["path"] == "external_id" for p in problems)
+
+
+def test_webhook_deliverer_is_unconfigured_without_a_url() -> None:
+    from crucible.adapters.notification.webhook import WebhookWakeDeliverer  # noqa: PLC0415
+
+    assert WebhookWakeDeliverer(None, "s").configured is False
+    assert WebhookWakeDeliverer("https://foundry.invalid/wake", None).configured is True
+
+
+async def test_an_unconfigured_deliverer_reports_poll_only() -> None:
+    from crucible.adapters.notification.webhook import WebhookWakeDeliverer  # noqa: PLC0415
+
+    result = await WebhookWakeDeliverer(None, None).deliver(b"{}")
+    assert result.ok is False and "poll only" in result.detail
+
+
+async def test_delivery_signs_the_body_and_reports_the_status() -> None:
+    """The signature covers the raw body, and the secret never appears in the request."""
+    import http.server  # noqa: PLC0415
+    import threading  # noqa: PLC0415
+
+    from crucible.adapters.notification.webhook import (  # noqa: PLC0415
+        SIGNATURE_HEADER,
+        WebhookWakeDeliverer,
+    )
+
+    seen: dict[str, Any] = {}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            length = int(self.headers.get("Content-Length", "0"))
+            seen["body"] = self.rfile.read(length)
+            seen["headers"] = dict(self.headers)
+            self.send_response(503 if seen.get("fail") else 204)
+            self.end_headers()
+
+        def log_message(self, *_args: Any) -> None:
+            return
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        url = f"http://127.0.0.1:{server.server_address[1]}/wake"
+        secret = "wake-secret-for-this-test-only"
+        body = json.dumps({"id": "01ARZ3NDEKTSV4RRFFQ69G5FAV"}).encode()
+        result = await WebhookWakeDeliverer(url, secret).deliver(body)
+        assert result.ok is True and result.detail == "HTTP 204"
+        assert seen["body"] == body
+        expected = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+        assert seen["headers"][SIGNATURE_HEADER] == f"sha256={expected}"
+        assert secret not in str(seen["headers"])
+
+        seen["fail"] = True
+        failed = await WebhookWakeDeliverer(url, secret).deliver(body)
+        assert failed.ok is False and failed.detail == "HTTP 503"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+async def test_delivery_to_a_dead_receiver_is_a_failure_not_an_exception() -> None:
+    from crucible.adapters.notification.webhook import WebhookWakeDeliverer  # noqa: PLC0415
+
+    # Port 1 on loopback refuses immediately.
+    result = await WebhookWakeDeliverer("http://127.0.0.1:1/wake", None).deliver(b"{}")
+    assert result.ok is False and result.detail

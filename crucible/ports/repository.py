@@ -143,6 +143,10 @@ class AttemptRepository(Protocol):
 class EventRepository(Protocol):
     def append(self, event: Event) -> Event: ...
 
+    def latest_for_task_kind(self, task_id: str, kind: str) -> Event | None:
+        """The most recent event of one kind, so a busy task's request is still found."""
+        ...
+
     def list_for_task(self, task_id: str, *, after_seq: int, limit: int) -> Sequence[Event]: ...
 
     def list_global(

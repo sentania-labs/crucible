@@ -120,10 +120,16 @@ def _scanner_findings(
         hit = scan_text(outputs.blocked_md)
         if hit:
             findings.append({"where": "report/blocked.md", "pattern": hit})
+    if outputs.diff_text is not None:
+        # The content, not the path list: a credential committed into a file is what
+        # this gate exists to catch (11).
+        hit = scan_text(outputs.diff_text)
+        if hit:
+            findings.append({"where": "diff", "pattern": hit})
     for path in outputs.diff_paths:
         hit = scan_text(path)
         if hit:
-            findings.append({"where": f"diff:{path}", "pattern": hit})
+            findings.append({"where": f"diff-path:{path}", "pattern": hit})
     if outputs.bundle is not None:
         for index, message in enumerate(outputs.bundle.commit_messages):
             hit = scan_text(message)
@@ -138,7 +144,9 @@ def _scanner_findings(
 
 def _scanned_inputs(outputs: CollectedOutputs, claim: dict[str, Any] | None) -> list[str]:
     scanned = ["report" if claim is not None else "report:absent"]
-    scanned.extend(f"diff:{p}" for p in outputs.diff_paths)
+    if outputs.diff_text is not None:
+        scanned.append("diff")
+    scanned.extend(f"diff-path:{p}" for p in outputs.diff_paths)
     if outputs.bundle is not None:
         scanned.extend(f"commit[{i}].message" for i in range(len(outputs.bundle.commit_messages)))
     scanned.extend(f"artifact:{a.name}" for a in outputs.artifacts)
@@ -189,26 +197,36 @@ def record_collection_evidence(
             findings.append({"where": "report/completion-claim.json", "pattern": exc.pattern})
     if claim is not None:
         refs = claim.get("refs", {}) if isinstance(claim.get("refs"), dict) else {}
+        # A report the scanner matched is never copied into a row: 14 says no table ever
+        # holds a secret, and the gate that reads this one has already failed.
+        redacted = bool(findings)
+        payload: dict[str, Any] = {
+            "role": ROLE_COMPLETION_CLAIM,
+            "parsed_ok": claim_parsed_ok,
+            "parse_errors": parse_errors,
+            "redacted": redacted,
+        }
+        if not redacted:
+            payload.update(
+                {
+                    "claimed_head_sha": refs.get("head_sha"),
+                    "claimed_commits": refs.get("commits"),
+                    "mapped_criteria": [
+                        {"id": m.get("id"), "status": m.get("status")}
+                        for m in claim.get("acceptance_mapping", [])
+                        if isinstance(m, dict)
+                    ],
+                    "run_evidence": claim.get("run_evidence", []),
+                    "changed_files": claim.get("changed_files", []),
+                }
+            )
         _add(
             uow,
             clock,
             attempt=attempt,
             kind=EvidenceKind.ARTIFACT_PRESENT,
             source=EvidenceSource.CRUCIBLE,
-            payload={
-                "role": ROLE_COMPLETION_CLAIM,
-                "parsed_ok": claim_parsed_ok,
-                "parse_errors": parse_errors,
-                "claimed_head_sha": refs.get("head_sha"),
-                "claimed_commits": refs.get("commits"),
-                "mapped_criteria": [
-                    {"id": m.get("id"), "status": m.get("status")}
-                    for m in claim.get("acceptance_mapping", [])
-                    if isinstance(m, dict)
-                ],
-                "run_evidence": claim.get("run_evidence", []),
-                "changed_files": claim.get("changed_files", []),
-            },
+            payload=payload,
             artifact_id=claim_artifact_id,
         )
         # The worker's own claim, recorded unverified. A gate never reads this row (11).
@@ -288,7 +306,13 @@ def record_collection_evidence(
         attempt=attempt,
         kind=EvidenceKind.SCANNER_RESULT,
         source=EvidenceSource.CRUCIBLE,
-        payload={"findings": findings, "scanned": _scanned_inputs(outputs, claim)},
+        payload={
+            "findings": findings,
+            "scanned": _scanned_inputs(outputs, claim),
+            # The gate reports `pass` only when the diff itself was read (11). A
+            # collector that produced no diff leaves this false and the gate waits.
+            "diff_scanned": outputs.diff_text is not None,
+        },
     )
     record_event(
         uow,

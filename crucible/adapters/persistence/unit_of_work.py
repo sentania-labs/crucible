@@ -590,6 +590,15 @@ class Events:
         event.seq = row.seq
         return event
 
+    def latest_for_task_kind(self, task_id: str, kind: str) -> Event | None:
+        row = self._s.scalars(
+            select(EventRow)
+            .where(EventRow.task_id == task_id, EventRow.kind == kind)
+            .order_by(EventRow.seq.desc())
+            .limit(1)
+        ).first()
+        return self._to_entity(row) if row else None
+
     def list_for_task(self, task_id: str, *, after_seq: int, limit: int) -> Sequence[Event]:
         rows = self._s.scalars(
             select(EventRow)

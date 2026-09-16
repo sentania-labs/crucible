@@ -7,7 +7,11 @@ import copy
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import text
 
+from crucible.adapters.api.deps import AppContext
+from crucible.application.errors import ForbiddenError
+from crucible.application.policies import put_policy
 from crucible.application.supervisor import Supervisor
 from tests.fixtures import contract_document
 from tests.integration.conftest import run_to_settled, submit_and_start
@@ -85,22 +89,87 @@ def test_rw_narrow_harnesses_must_have_concurrency_one(
         ("release", "require_operator_approval", False),
     ],
 )
-def test_operator_only_settings_need_an_operator_principal(
-    client: TestClient, tokens: dict[str, str], section: str, field: str, value: bool
+def test_an_operator_principal_may_set_an_operator_only_field(
+    ctx: AppContext, tokens: dict[str, str], section: str, field: str, value: bool
 ) -> None:
+    """05b: these three may only be uploaded by an operator or admin, and each is
+    recorded as a decision. The use case is called directly, because the route's own
+    admin check would refuse an operator principal before this rule is reached."""
     document = seeded_policy()
     document["version"] = 7
     document[section][field] = value
-    r = client.put(
-        "/v1/policies/default-software/7",
-        json=document,
-        headers={"Authorization": f"Bearer {tokens['orchestrator']}"},
+    with ctx.uow_factory() as uow:
+        operator = uow.principals.get_by_name("operator-principal")
+        assert operator is not None
+        put_policy(
+            uow,
+            ctx.clock,
+            principal=operator,
+            name="default-software",
+            version=7,
+            document=document,
+        )
+        uow.commit()
+    with ctx.uow_factory() as uow:
+        stored = uow.policies.get("default-software", 7)
+        assert stored is not None and stored.document[section][field] is value
+    with ctx.engine.connect() as conn:
+        recorded = conn.execute(
+            text("SELECT kind, resolves, verbatim FROM decisions ORDER BY id")
+        ).all()
+    kinds = {row[0] for row in recorded}
+    assert kinds == {"policy_operator_setting"}
+    assert {row[1] for row in recorded} == {f"{section}.{field}"}
+    assert all("operator-principal" in row[2] for row in recorded)
+
+
+@pytest.mark.parametrize(
+    ("section", "field", "value"),
+    [
+        ("ci_certification", "allow_no_ci", True),
+        ("deliverables", "allow_branch_only", True),
+        ("release", "require_operator_approval", False),
+    ],
+)
+def test_an_orchestrator_principal_may_not_set_an_operator_only_field(
+    ctx: AppContext, tokens: dict[str, str], section: str, field: str, value: bool
+) -> None:
+    document = seeded_policy()
+    document["version"] = 8
+    document[section][field] = value
+    with ctx.uow_factory() as uow:
+        orchestrator = uow.principals.get_by_name("orchestrator-principal")
+        assert orchestrator is not None
+        with pytest.raises(ForbiddenError) as exc:
+            put_policy(
+                uow,
+                ctx.clock,
+                principal=orchestrator,
+                name="default-software",
+                version=8,
+                document=document,
+            )
+    assert [e["path"] for e in exc.value.errors] == [f"{section}.{field}"]
+    with ctx.uow_factory() as uow:
+        assert uow.policies.get("default-software", 8) is None
+
+
+def test_the_upload_route_is_admin_only(client: TestClient, tokens: dict[str, str]) -> None:
+    document = seeded_policy()
+    document["version"] = 9
+    for role in ("orchestrator", "operator", "observer"):
+        r = client.put(
+            "/v1/policies/default-software/9",
+            json=document,
+            headers={"Authorization": f"Bearer {tokens[role]}"},
+        )
+        assert r.status_code == 403, role
+    assert (
+        client.put(
+            "/v1/policies/default-software/9", json=document, headers=admin(tokens)
+        ).status_code
+        == 200
     )
-    # An orchestrator cannot upload a policy at all, and an admin can: the rule is about
-    # which principals may set these fields, so the admin path must succeed.
-    assert r.status_code == 403
-    ok = client.put("/v1/policies/default-software/7", json=document, headers=admin(tokens))
-    assert ok.status_code == 200, ok.text
 
 
 def test_a_referenced_policy_version_is_immutable(

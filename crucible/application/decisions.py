@@ -114,6 +114,13 @@ def record_decision(
         escalation = uow.escalations.get(request.escalation_id, for_update=True)
         if escalation is None or escalation.task_id != task.id:
             raise NotFoundError(f"escalation {request.escalation_id} not found on this task")
+        # Validated before anything is written: 11 level 4 says the verbatim words are the
+        # record, and a refusal after the insert would roll them back with the rest.
+        check_transition("escalation", escalation.id, escalation.state, EscalationState.ANSWERED)
+    if request.reschedule and task.state is not TaskState.BLOCKED:
+        raise TransitionNotAllowedError(
+            f"reschedule applies to a blocked task; task is {task.state.value}"
+        )
     decision = Decision(
         id=new_id(),
         task_id=task.id,
@@ -144,7 +151,6 @@ def record_decision(
             (EscalationState.ANSWERED, EventKind.ESCALATION_ANSWERED),
             (EscalationState.CLOSED, EventKind.ESCALATION_CLOSED),
         ):
-            check_transition("escalation", escalation.id, escalation.state, target)
             escalation.state = target
             if target is EscalationState.CLOSED:
                 escalation.closed_at = clock.now()
@@ -159,10 +165,6 @@ def record_decision(
                 payload={"escalation_id": escalation.id, "decision_id": decision.id},
             )
     if request.reschedule:
-        if task.state is not TaskState.BLOCKED:
-            raise TransitionNotAllowedError(
-                f"reschedule applies to a blocked task; task is {task.state.value}"
-            )
         stored = uow.contracts.get(task.id, task.contract_version)
         assert stored is not None
         request_body = stored.document["execution_request"]

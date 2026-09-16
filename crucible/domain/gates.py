@@ -8,11 +8,12 @@ and never satisfy a gate (11).
 
 from __future__ import annotations
 
-import fnmatch
 import posixpath
+import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
+from functools import lru_cache
 from typing import Any
 
 
@@ -81,6 +82,10 @@ ALL_GATES: frozenset[str] = PRE_PR_GATES | PUBLICATION_GATES | POST_PR_GATES
 # here so the row exists and carries a clear marker, and they never report `pass`.
 DEFERRED_TO_C3: frozenset[str] = frozenset({GateName.VERIFICATION_RAN, GateName.WORKSPACE_CLEAN})
 DEFERRED_MARKER = "deferred:c3-verifier"
+# A gate whose evidence the C2 collector cannot produce says so rather than claiming
+# coverage it does not have. The fake provider does produce a diff, so this marker is
+# what a future collector that cannot would trip.
+COLLECTOR_MARKER = "incomplete:collector"
 
 WORKER_SOURCE = "worker"
 
@@ -162,15 +167,51 @@ def _missing(kind: str, *, role: str | None = None) -> GateOutcome:
     return GateOutcome(GateResult.FAIL, f"no verified {what} evidence was collected")
 
 
+@lru_cache(maxsize=1024)
+def _glob_re(pattern: str) -> re.Pattern[str]:
+    """A path glob where `*` stops at a separator and `**` crosses one.
+
+    `fnmatch` alone lets `src/*` match `src/a/b/c.py`, which would widen every
+    allowed_paths entry silently."""
+    out: list[str] = []
+    index = 0
+    while index < len(pattern):
+        char = pattern[index]
+        if char == "*":
+            if pattern.startswith("**/", index):
+                out.append("(?:.*/)?")
+                index += 3
+                continue
+            if pattern.startswith("**", index):
+                out.append(".*")
+                index += 2
+                continue
+            out.append("[^/]*")
+            index += 1
+            continue
+        if char == "?":
+            out.append("[^/]")
+            index += 1
+            continue
+        if char == "[":
+            close = pattern.find("]", index + 1)
+            if close != -1:
+                out.append(pattern[index : close + 1])
+                index = close + 1
+                continue
+        out.append(re.escape(char))
+        index += 1
+    return re.compile("".join(out) + r"\Z")
+
+
 def _matches_any(path: str, patterns: Sequence[str]) -> bool:
     normalized = posixpath.normpath(path)
     for pattern in patterns:
-        if fnmatch.fnmatchcase(normalized, pattern):
+        normalized_pattern = pattern.rstrip("/")
+        if _glob_re(normalized_pattern).match(normalized):
             return True
-        # `src/**` must also match `src/a/b.py`, which fnmatch alone does not do.
-        if pattern.endswith("/**") and normalized.startswith(pattern[:-2]):
-            return True
-        if pattern.endswith("**") and normalized.startswith(pattern[:-2]):
+        # `src/**` names the directory's contents, so `src/a/b.py` is inside it.
+        if normalized_pattern.endswith("/**") and normalized.startswith(normalized_pattern[:-2]):
             return True
     return False
 
@@ -220,7 +261,11 @@ def commits_present(gi: GateInput) -> GateOutcome:
         return GateOutcome(GateResult.FAIL, "git bundle verify failed on the collected branch", ids)
     collected = str(bundle.payload.get("head_sha") or "")
     claimed = str(bundle.payload.get("claimed_head_sha") or "")
-    if claimed and collected != claimed:
+    if not claimed:
+        return GateOutcome(
+            GateResult.FAIL, "the report claims no head_sha to compare the bundle head to", ids
+        )
+    if collected != claimed:
         return GateOutcome(
             GateResult.FAIL,
             "the bundle head does not equal the head_sha the report claims",
@@ -263,6 +308,10 @@ def no_injected_files(gi: GateInput) -> GateOutcome:
     bundle = gi.one("bundle_head")
     if diff is None:
         return _missing("diff_paths")
+    if bundle is None:
+        # 11 wants the diff and every commit on work_branch. Without the commit list the
+        # gate has only half its evidence.
+        return _missing("bundle_head")
     ids = tuple(e.id for e in (diff, bundle) if e is not None)
     paths = [str(p) for p in diff.payload.get("paths", [])]
     if bundle is not None:
@@ -284,6 +333,20 @@ def no_secrets(gi: GateInput) -> GateOutcome:
         where = [f"{f.get('where')}:{f.get('pattern')}" for f in findings][:10]
         return GateOutcome(GateResult.FAIL, f"secret pattern matched at {where}", (item.id,))
     scanned = item.payload.get("scanned") or []
+    if not item.payload.get("diff_scanned"):
+        # 11 wants the scanner over the diff itself. A collector that produced no diff
+        # content leaves this gate waiting rather than claiming coverage it lacks.
+        return GateOutcome(
+            GateResult.PENDING,
+            f"{COLLECTOR_MARKER}: the collector produced no diff content to scan",
+            (item.id,),
+        )
+    if not scanned:
+        return GateOutcome(
+            GateResult.PENDING,
+            f"{COLLECTOR_MARKER}: the scanner reported no inputs",
+            (item.id,),
+        )
     return GateOutcome(
         GateResult.PASS, f"scanner found nothing across {len(scanned)} input(s)", (item.id,)
     )
@@ -298,13 +361,14 @@ def run_evidence_present(gi: GateInput) -> GateOutcome:
     if not required:
         return GateOutcome(GateResult.SKIPPED, "the contract requires no artifact verification")
     items = gi.of_kind("artifact_present", role="run_evidence")
-    by_path = {str(i.payload.get("path")): i for i in items}
+    by_path = {posixpath.normpath(str(i.payload.get("path"))): i for i in items}
     ids: list[int] = []
     missing: list[str] = []
     empty: list[str] = []
     for verification in required:
         path = str(verification.get("path"))
-        item = by_path.get(path) or by_path.get(posixpath.basename(path))
+        # The contract names a path; a file of the same name elsewhere is a different file.
+        item = by_path.get(posixpath.normpath(path))
         if item is None:
             missing.append(path)
             continue

@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from crucible.domain.gates import (
+    COLLECTOR_MARKER,
     DEFERRED_MARKER,
     DEFERRED_TO_C3,
     PRE_PR_EVALUATORS,
@@ -74,7 +75,7 @@ def _passing_evidence() -> list[EvidenceItem]:
         ),
         _ev(
             "scanner_result",
-            {"findings": [], "scanned": ["report", "diff:src/ledger/a.py"]},
+            {"findings": [], "scanned": ["report", "diff"], "diff_scanned": True},
             ident=5,
         ),
         _ev(
@@ -225,12 +226,89 @@ def test_no_secrets_reports_the_pattern_not_the_value() -> None:
     evidence = _passing_evidence()
     evidence[4] = _ev(
         "scanner_result",
-        {"findings": [{"where": "report.summary", "pattern": "github_token"}], "scanned": []},
+        {
+            "findings": [{"where": "diff", "pattern": "github_token"}],
+            "scanned": ["diff"],
+            "diff_scanned": True,
+        },
         ident=5,
     )
     outcome = evaluate_gate(GateName.NO_SECRETS, _gi(evidence))
     assert outcome.result is GateResult.FAIL
     assert "github_token" in outcome.detail and "ghp_" not in outcome.detail
+
+
+def test_no_secrets_will_not_pass_without_the_diff_content() -> None:
+    """11 wants the scanner over the diff; an empty finding list is not coverage."""
+    evidence = _passing_evidence()
+    evidence[4] = _ev(
+        "scanner_result", {"findings": [], "scanned": ["report"], "diff_scanned": False}, ident=5
+    )
+    outcome = evaluate_gate(GateName.NO_SECRETS, _gi(evidence))
+    assert outcome.result is GateResult.PENDING
+    assert COLLECTOR_MARKER in outcome.detail
+
+
+def test_no_secrets_will_not_pass_on_an_empty_scanned_list() -> None:
+    evidence = _passing_evidence()
+    evidence[4] = _ev(
+        "scanner_result", {"findings": [], "scanned": [], "diff_scanned": True}, ident=5
+    )
+    assert evaluate_gate(GateName.NO_SECRETS, _gi(evidence)).result is GateResult.PENDING
+
+
+def test_no_injected_files_needs_the_commit_list() -> None:
+    """11 wants the diff and every commit on work_branch, not the diff alone."""
+    evidence = [e for e in _passing_evidence() if e.kind != "bundle_head"]
+    assert evaluate_gate(GateName.NO_INJECTED_FILES, _gi(evidence)).result is GateResult.FAIL
+
+
+def test_commits_present_fails_when_the_report_claims_no_head() -> None:
+    evidence = _passing_evidence()
+    payload = dict(evidence[2].payload)
+    payload["claimed_head_sha"] = None
+    evidence[2] = _ev("bundle_head", payload, ident=3)
+    outcome = evaluate_gate(GateName.COMMITS_PRESENT, _gi(evidence))
+    assert outcome.result is GateResult.FAIL and "claims no head_sha" in outcome.detail
+
+
+@pytest.mark.parametrize(
+    ("pattern", "path", "matches"),
+    [
+        ("src/*", "src/a.py", True),
+        ("src/*", "src/a/b.py", False),
+        ("src/**", "src/a/b/c.py", True),
+        ("src/**/*.py", "src/a/b.py", True),
+        ("src/ledger/**", "src/ledger/import.py", True),
+        ("src/ledger/**", "src/other/import.py", False),
+        ("docs/ledger.md", "docs/ledger.md", True),
+        ("docs/ledger.md", "docs/ledger.md.bak", False),
+    ],
+)
+def test_a_single_star_does_not_cross_a_separator(pattern: str, path: str, matches: bool) -> None:
+    """`src/*` naming everything under src would widen every contract silently."""
+    contract = contract_document()
+    contract["scope"] = {
+        "allowed_paths": [pattern],
+        "prohibited_paths": [],
+        "may_add_dependencies": False,
+        "may_modify_ci": False,
+    }
+    evidence = _passing_evidence()
+    evidence[3] = _ev("diff_paths", {"paths": [path]}, ident=4)
+    outcome = evaluate_gate(GateName.SCOPE_CONTAINED, _gi(evidence, contract=contract))
+    assert (outcome.result is GateResult.PASS) is matches
+
+
+def test_run_evidence_matches_the_path_not_the_basename() -> None:
+    evidence = _passing_evidence()
+    evidence[5] = _ev(
+        "artifact_present",
+        {"role": "run_evidence", "path": "somewhere/else/run-evidence.md", "size": 42},
+        ident=6,
+    )
+    outcome = evaluate_gate(GateName.RUN_EVIDENCE_PRESENT, _gi(evidence))
+    assert outcome.result is GateResult.FAIL and "report/run-evidence.md" in outcome.detail
 
 
 def test_run_evidence_present_fails_when_missing_or_empty() -> None:
@@ -336,3 +414,20 @@ def test_an_evaluator_that_raises_is_error_not_an_exception() -> None:
 
 def test_unknown_gate_is_error() -> None:
     assert evaluate_gate("no_such_gate", _gi([])).result is GateResult.ERROR
+
+
+def test_configured_pre_pr_gates_reads_the_policy() -> None:
+    """05b: the policy names the required set. An explicit empty list is an empty set."""
+    from crucible.application.gates import configured_pre_pr_gates  # noqa: PLC0415
+
+    assert configured_pre_pr_gates({}) == sorted(PRE_PR_GATES)
+    assert configured_pre_pr_gates({"gates": {}}) == sorted(PRE_PR_GATES)
+    assert configured_pre_pr_gates({"gates": {"pre_pr": []}}) == []
+    narrowed = {"gates": {"pre_pr": ["exit_clean", "no_secrets"]}}
+    assert configured_pre_pr_gates(narrowed) == ["exit_clean", "no_secrets"]
+
+
+def test_a_narrowed_gate_set_only_runs_what_the_policy_asked_for() -> None:
+    """A gate a policy moved out of pre_pr is not silently evaluated anyway."""
+    outcomes = evaluate_pre_pr(["exit_clean"], _gi(_passing_evidence()))
+    assert set(outcomes) == {"exit_clean"}

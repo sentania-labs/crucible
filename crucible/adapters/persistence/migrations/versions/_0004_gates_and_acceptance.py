@@ -206,7 +206,7 @@ DEFAULT_ROUTING = {
     },
 }
 
-NEW_FENCED_TABLES = ("gate_results", "attempt_metrics")
+NEW_FENCED_TABLES = ("gate_results", "attempt_metrics", "evidence")
 NEW_APPEND_ONLY_TABLES = ("review_dispositions",)
 C2_TABLES = (
     "attempt_metrics",
@@ -232,9 +232,14 @@ def upgrade() -> None:
     op.alter_column("tasks", "publish_pending", server_default=None)
 
     op.drop_constraint("ck_events_kind", "events", type_="check")
-    op.create_check_constraint(
-        "ck_events_kind", "events", "kind IN (" + ", ".join(f"'{k}'" for k in EVENT_KINDS) + ")"
+    # The new list is a strict superset of the old one, so every existing row already
+    # satisfies it. NOT VALID skips the full scan and the ACCESS EXCLUSIVE lock it would
+    # take on the append-only audit log; VALIDATE then confirms it without blocking reads.
+    allowed = ", ".join(f"'{k}'" for k in EVENT_KINDS)
+    op.execute(
+        f"ALTER TABLE events ADD CONSTRAINT ck_events_kind CHECK (kind IN ({allowed})) NOT VALID"
     )
+    op.execute("ALTER TABLE events VALIDATE CONSTRAINT ck_events_kind")
 
     op.create_table(
         "routing_policies",
@@ -432,30 +437,54 @@ def upgrade() -> None:
     )
     # The C1 seed predates PolicyV1: it carries no `routing` section, and its
     # `round_counting` says `per_pull_request` where 05b says `completed_cycles`. 0001 is
-    # applied and is never edited, so the correction is data here.
-    op.execute(
-        sa.text(
-            "UPDATE policies SET document = jsonb_set("
-            "  jsonb_set(document, '{routing}', CAST(:routing AS jsonb), true),"
-            "  '{external_review,round_counting}', '\"completed_cycles\"', true)"
-            " WHERE name = :name AND version = :version"
-        ).bindparams(
-            routing=json.dumps({"policy": {"name": "default-routing", "version": 1}}),
-            name="default-software",
-            version=1,
+    # applied and is never edited, so the correction is data here. Read, modify, write
+    # back, so a missing row or a missing subsection is an error rather than a silent
+    # half-application, and an operator's own edit to `routing` is left alone.
+    connection = op.get_bind()
+    row = connection.execute(
+        sa.text("SELECT document FROM policies WHERE name = :name AND version = :version"),
+        {"name": "default-software", "version": 1},
+    ).scalar_one_or_none()
+    if row is None:
+        raise RuntimeError(
+            "policy default-software/1 is missing; revision 0001 seeds it and 0004 corrects it"
         )
+    document = dict(row)
+    if "routing" not in document:
+        document["routing"] = {"policy": {"name": "default-routing", "version": 1}}
+    external_review = document.get("external_review")
+    if not isinstance(external_review, dict):
+        raise RuntimeError("policy default-software/1 has no external_review section to correct")
+    if external_review.get("round_counting") == "per_pull_request":
+        external_review["round_counting"] = "completed_cycles"
+    connection.execute(
+        sa.text(
+            "UPDATE policies SET document = CAST(:document AS jsonb) "
+            "WHERE name = :name AND version = :version"
+        ),
+        {"document": json.dumps(document), "name": "default-software", "version": 1},
     )
 
 
 def downgrade() -> None:
-    op.execute(
-        sa.text(
-            "UPDATE policies SET document = jsonb_set("
-            "  document - 'routing',"
-            "  '{external_review,round_counting}', '\"per_pull_request\"', true)"
-            " WHERE name = :name AND version = :version"
-        ).bindparams(name="default-software", version=1)
-    )
+    connection = op.get_bind()
+    row = connection.execute(
+        sa.text("SELECT document FROM policies WHERE name = :name AND version = :version"),
+        {"name": "default-software", "version": 1},
+    ).scalar_one_or_none()
+    if row is not None:
+        document = dict(row)
+        document.pop("routing", None)
+        external_review = document.get("external_review")
+        if isinstance(external_review, dict):
+            external_review["round_counting"] = "per_pull_request"
+        connection.execute(
+            sa.text(
+                "UPDATE policies SET document = CAST(:document AS jsonb) "
+                "WHERE name = :name AND version = :version"
+            ),
+            {"document": json.dumps(document), "name": "default-software", "version": 1},
+        )
     for table in NEW_FENCED_TABLES:
         op.execute(f"DROP TRIGGER IF EXISTS trg_{table}_fenced ON {table};")
     for table in NEW_APPEND_ONLY_TABLES:

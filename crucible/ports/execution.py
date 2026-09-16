@@ -124,6 +124,10 @@ class CollectedOutputs:
     stdout_tail: str = ""
     stderr_tail: str = ""
     diff_paths: tuple[str, ...] = ()
+    # The full diff against base_ref. The secret scanner needs the content, not only the
+    # path list (11), so a collector that cannot produce it leaves this None and the
+    # no_secrets gate refuses to report `pass`.
+    diff_text: str | None = None
     bundle: BranchBundle | None = None
     artifacts: tuple[CollectedArtifact, ...] = ()
 

@@ -9,8 +9,7 @@ from crucible.application.errors import (
     NotFoundError,
 )
 from crucible.application.evidence import store_artifact
-from crucible.contracts.evidence import ROLE_RUN_EVIDENCE, EvidenceKind, EvidenceSource
-from crucible.domain.entities import Artifact, Event, EvidenceRecord, Principal, Role
+from crucible.domain.entities import Artifact, Event, Principal, Role
 from crucible.domain.events import EventKind
 from crucible.ports.artifacts import ArtifactStore, SecretInArtifactError
 from crucible.ports.clock import Clock
@@ -78,25 +77,8 @@ def upload_artifact(
             errors=[{"path": "file", "message": f"secret pattern {exc.pattern} at {exc.where}"}],
             event=rejection,
         ) from None
-    if artifact_type == "run_evidence":
-        uow.evidence.add(
-            EvidenceRecord(
-                id=None,
-                attempt_id=attempt.id,
-                task_id=attempt.task_id,
-                kind=EvidenceKind.ARTIFACT_PRESENT.value,
-                observed_at=clock.now(),
-                source=EvidenceSource.CRUCIBLE.value,
-                verified=True,
-                payload={
-                    "role": ROLE_RUN_EVIDENCE,
-                    "path": filename,
-                    "size": artifact.size,
-                    "uploaded_by": principal.name,
-                },
-                artifact_id=artifact.id,
-            )
-        )
+    # `evidence` is fenced to the supervisor (14): an uploaded artifact becomes evidence
+    # on the next tick, so a request can never manufacture a row a gate will consume.
     return artifact
 
 

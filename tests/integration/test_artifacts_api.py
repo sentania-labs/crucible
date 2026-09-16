@@ -74,9 +74,21 @@ async def test_upload_run_evidence_becomes_evidence(
     assert r.status_code == 201, r.text
     artifact = r.json()
     assert artifact["created_by"] == "orchestrator-principal"
+
+    # `evidence` is fenced to the supervisor (14), so the request cannot write the row a
+    # gate would read. The next tick derives it from the artifact.
+    before = client.get(f"/v1/attempts/{attempt_id}/evidence").json()["items"]
+    assert not any(e["artifact_id"] == artifact["id"] for e in before)
+    await supervisor.tick()
     evidence = client.get(f"/v1/attempts/{attempt_id}/evidence").json()["items"]
-    uploaded = [e for e in evidence if e["payload"].get("path") == "report/extra-evidence.md"]
-    assert len(uploaded) == 1 and uploaded[0]["artifact_id"] == artifact["id"]
+    uploaded = [e for e in evidence if e["artifact_id"] == artifact["id"]]
+    assert len(uploaded) == 1
+    assert uploaded[0]["source"] == "crucible" and uploaded[0]["verified"] is True
+    assert uploaded[0]["payload"]["uploaded_by"] == "orchestrator-principal"
+    # Running the tick again does not duplicate it.
+    await supervisor.tick()
+    again = client.get(f"/v1/attempts/{attempt_id}/evidence").json()["items"]
+    assert len([e for e in again if e["artifact_id"] == artifact["id"]]) == 1
 
 
 async def test_an_upload_carrying_a_secret_is_refused(

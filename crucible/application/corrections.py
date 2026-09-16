@@ -22,7 +22,7 @@ from crucible.contracts.task_contract import (
     contract_sha256,
     correction_narrows,
 )
-from crucible.domain.entities import Principal, Task, TaskContract
+from crucible.domain.entities import AcceptanceVerdict, Principal, Task, TaskContract
 from crucible.domain.events import EventKind
 from crucible.domain.ids import new_id
 from crucible.domain.lifecycle import TaskState
@@ -92,15 +92,28 @@ def attach_correction(
     previous = _previous(uow, task, contract.correction.of_version)
     problems: list[dict[str, Any]] = correction_narrows(previous, contract)
     if task.state is TaskState.AWAITING_ACCEPTANCE:
-        latest = uow.acceptance.list_for_task(task.id)
-        verdicts = [a.verdict.value for a in latest]
-        if "needs_more_work" not in verdicts:
+        # The current verdict only. A needs_more_work that a later accept superseded is
+        # not a standing request for more work.
+        current = [a for a in uow.acceptance.list_for_task(task.id) if a.superseded_at is None]
+        verdict = current[-1].verdict if current else None
+        if verdict is not AcceptanceVerdict.NEEDS_MORE_WORK:
             problems.append(
                 {
                     "path": "$",
                     "message": (
                         "a correction from awaiting_acceptance follows a needs_more_work "
-                        "AcceptanceResult"
+                        f"AcceptanceResult; the current verdict is "
+                        f"{verdict.value if verdict else 'none'}"
+                    ),
+                }
+            )
+        if task.publish_pending:
+            problems.append(
+                {
+                    "path": "$",
+                    "message": (
+                        "this head was accepted and is waiting for the publisher; "
+                        "correcting it would abandon an accepted head"
                     ),
                 }
             )
@@ -170,16 +183,39 @@ def amend_task(
             errors=[{"path": "correction", "message": "must be null on an amendment"}],
         )
     previous = _previous(uow, task, task.contract_version)
+    problems: list[dict[str, Any]] = []
     if contract.external_identity_fields() != previous.external_identity_fields():
-        raise ContractValidationError(
-            "an amendment keeps the task's identity",
-            errors=[
-                {
-                    "path": "external_id",
-                    "message": "external_id, repository, and policy are not amendable",
-                }
-            ],
+        problems.append(
+            {
+                "path": "external_id",
+                "message": "external_id, repository, and policy are not amendable",
+            }
         )
+    if task.state is TaskState.AWAITING_ACCEPTANCE:
+        # The gate results and the AcceptanceResult name a head that ran under the
+        # previous version. An amendment here may narrow, never widen, and may not change
+        # what the deliverable is, or a `pull_request` task could be walked to `accepted`
+        # as an `artifacts` one without ever being published (09).
+        problems.extend(correction_narrows(previous, contract))
+        if [d.kind for d in contract.deliverables] != [d.kind for d in previous.deliverables]:
+            problems.append(
+                {
+                    "path": "deliverables",
+                    "message": (
+                        "the deliverable kind is not amendable once the gates have passed "
+                        "on a collected head"
+                    ),
+                }
+            )
+        if task.publish_pending:
+            problems.append(
+                {
+                    "path": "$",
+                    "message": "this head was accepted and is waiting for the publisher",
+                }
+            )
+    if problems:
+        raise ContractValidationError("amendment failed validation", errors=problems)
     stored = _store_version(uow, clock, task, contract)
     task.contract_version = stored.version
     task.updated_at = clock.now()

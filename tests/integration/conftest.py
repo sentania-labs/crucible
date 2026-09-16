@@ -179,7 +179,12 @@ def supervisor(ctx: AppContext, provider: FakeProvider) -> Supervisor:
 
 
 def submit_and_start(
-    client: TestClient, image: str, external_id: str = "EX-0001", **overrides: Any
+    client: TestClient,
+    image: str,
+    external_id: str = "EX-0001",
+    *,
+    start: bool = True,
+    **overrides: Any,
 ) -> str:
     doc = contract_document(external_id=external_id, **overrides)
     doc["repository"]["work_branch"] = f"crucible/{external_id}"
@@ -187,6 +192,8 @@ def submit_and_start(
     r = client.post("/v1/tasks", json=doc)
     assert r.status_code == 201, r.text
     task_id: str = r.json()["id"]
+    if not start:
+        return task_id
     req = doc["execution_request"]
     r = client.post(
         f"/v1/tasks/{task_id}/start",
