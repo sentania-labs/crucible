@@ -1,0 +1,278 @@
+# The tag push is the release (sdlc skill). This workflow owns every step after
+# it: refuse a bad tag, build, smoke the image an operator would run, publish to
+# GHCR, and only then cut the GitHub release.
+#
+# GitHub-hosted runners: the smoke test is `docker compose`, which needs a real
+# Docker daemon, and the repository is public so hosted minutes are free
+# (github-ci skill). Nothing here touches the lab.
+name: release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+# Repo-wide, not per-ref, and never cancelled: two tags pushed close together
+# would otherwise both read the published tag list before either pushed, both
+# conclude they are the highest version, and race `latest` onto the lower one.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/sentania-labs/crucible
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # create the GitHub release
+      packages: write # push to GHCR
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          fetch-depth: 0
+
+      # Gate 1. A tag on a stray branch, or a tag that is not vMAJOR.MINOR.PATCH,
+      # must not publish anything.
+      - name: refuse a bad tag
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          # Leading zeros are rejected: v1.02.3 would install as 1.2.3 and the
+          # version check below would fail confusingly after a full build.
+          if ! printf '%s' "$TAG" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then
+            echo "tag $TAG is not vMAJOR.MINOR.PATCH" >&2
+            exit 1
+          fi
+          # FETCH_HEAD, not origin/main: on a tag ref the remote-tracking branch
+          # may not exist, and merge-base would then error with a message that
+          # reads like an unreachable commit.
+          git fetch --no-tags origin main
+          MAIN=$(git rev-parse FETCH_HEAD)
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" "$MAIN"; then
+            echo "commit $GITHUB_SHA is not reachable from main ($MAIN); refusing to publish" >&2
+            exit 1
+          fi
+          echo "VERSION=${TAG#v}" >> "$GITHUB_ENV"
+
+      # Gate 2. The version reaches the image through the build arg, because
+      # .git is not in the build context.
+      - name: log in to GHCR
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+
+      # A published version is immutable. If this version is already in GHCR
+      # from this same commit, the run is a re-run of a transient failure and
+      # the push is skipped. If it is there from a DIFFERENT commit, the tag was
+      # moved: that is an escalation, never a quiet re-publish (ADR 0010).
+      #
+      # The registry API, not `docker manifest inspect`: only an explicit 404
+      # means absent. A network blip, a rate limit or an auth problem must stop
+      # the job, because treating those as "absent" would republish over a
+      # version that already exists.
+      - name: refuse to republish a moved tag
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          REG_TOKEN=$(curl -fsS -u "$GHCR_USER:$GHCR_TOKEN" \
+            "https://ghcr.io/token?scope=repository:sentania-labs/crucible:pull" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
+          CODE=$(curl -sS -o /dev/null -w '%{http_code}' -X GET \
+            -H "Authorization: Bearer $REG_TOKEN" \
+            -H 'Accept: application/vnd.oci.image.index.v1+json' \
+            -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+            -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
+            -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+            "https://ghcr.io/v2/sentania-labs/crucible/manifests/${VERSION}")
+          case "$CODE" in
+            404)
+              echo "ALREADY_PUBLISHED=false" >> "$GITHUB_ENV"
+              echo "${VERSION} is not published yet"
+              exit 0
+              ;;
+            200) ;;
+            *)
+              echo "::error::GHCR returned HTTP $CODE for manifest ${VERSION}; cannot tell whether this version is already published, so refusing to continue"
+              exit 1
+              ;;
+          esac
+          docker pull -q "${IMAGE}:${VERSION}"
+          REV=$(docker image inspect "${IMAGE}:${VERSION}" \
+            --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')
+          if [ "$REV" != "$GITHUB_SHA" ]; then
+            echo "::error::${IMAGE}:${VERSION} is already published from commit ${REV:-unknown}, but the tag now points at ${GITHUB_SHA}. A published version is never overwritten. Cut a new version instead."
+            exit 1
+          fi
+          echo "ALREADY_PUBLISHED=true" >> "$GITHUB_ENV"
+          echo "${VERSION} is already published from this commit; this run will re-verify but not re-push"
+
+      - name: build the image
+        run: |
+          set -euo pipefail
+          docker build --build-arg "VERSION=${VERSION}" --build-arg "REVISION=${GITHUB_SHA}" \
+            -t "${IMAGE}:${VERSION}" -t "${IMAGE}:latest" .
+
+      - name: the image reports the tagged version
+        run: |
+          set -euo pipefail
+          GOT=$(docker run --rm --entrypoint python "${IMAGE}:${VERSION}" \
+            -c 'import crucible; print(crucible.__version__)')
+          echo "package version: $GOT"
+          [ "$GOT" = "${VERSION}" ]
+          LABEL=$(docker image inspect "${IMAGE}:${VERSION}" \
+            --format '{{index .Config.Labels "org.opencontainers.image.version"}}')
+          echo "image label: $LABEL"
+          [ "$LABEL" = "${VERSION}" ]
+
+      # Gate 3. Boot the exact image that is about to be published, the way an
+      # operator boots it, and drive one task end to end. This is the last gate
+      # before the artifact leaves the repository.
+      - name: compose smoke against the built image
+        env:
+          CRUCIBLE_IMAGE: ghcr.io/sentania-labs/crucible:${{ env.VERSION }}
+        run: |
+          set -euo pipefail
+          cp .env.example .env
+          # CRUCIBLE_IMAGE pins compose to this run's versioned local tag and
+          # --pull never forbids reaching the registry, so a v0.2.0 run can
+          # never end up smoking the published v0.1.0. --pull never does not
+          # stop compose building when the image is absent, because the service
+          # has a build section, so the image ID is checked below rather than
+          # trusted.
+          docker compose up -d --wait --pull never
+          # Prove it: the running container must be the image just built, by ID.
+          BUILT=$(docker image inspect "${IMAGE}:${VERSION}" --format '{{.Id}}')
+          for SVC in crucible migrate; do
+            CID=$(docker compose ps -aq "$SVC")
+            RUNNING=$(docker inspect "$CID" --format '{{.Image}}')
+            echo "$SVC image: $RUNNING"
+            if [ "$RUNNING" != "$BUILT" ]; then
+              echo "::error::$SVC is running image $RUNNING, not the freshly built $BUILT"
+              exit 1
+            fi
+          done
+          curl -fsS http://127.0.0.1:8080/v1/ready
+          HEALTH=$(curl -fsS http://127.0.0.1:8080/v1/health)
+          echo "health: $HEALTH"
+          printf '%s' "$HEALTH" | python3 -c 'import json,os,sys; v=json.load(sys.stdin)["version"]; print("reported version:", v); sys.exit(0 if v == os.environ["VERSION"] else 1)'
+          TOKEN=$(docker compose exec -T crucible crucible-admin token create --principal release --role orchestrator | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
+          docker compose exec -T crucible crucible-admin repository register --name example-service --url https://github.com/example-org/example-service >/dev/null
+          BODY=$(python3 - <<'PY'
+          import json
+          print(json.dumps({
+            "schema_version": "1.0", "external_id": "REL-1", "title": "Release smoke", "project": "example-service",
+            "parent_external_id": None,
+            "repository": {"name": "example-service", "base_ref": "main", "work_branch": "crucible/REL-1"},
+            "scope": {"allowed_paths": ["src/**"], "prohibited_paths": [".github/**"], "may_add_dependencies": False, "may_modify_ci": False},
+            "objective": "Prove the published image.", "context": [], "project_instructions": [],
+            "acceptance_criteria": [{"id": "AC1", "text": "The task reaches reported."}],
+            "required_verification": [{"id": "V1", "command": "make lint", "expect_exit": 0}, {"id": "V2", "command": "make test", "expect_exit": 0}, {"id": "V3", "command": "make scan", "expect_exit": 0}],
+            "constraints": {"prohibited_actions": [], "network": "policy"},
+            "deliverables": [{"kind": "pull_request", "target": "main", "draft": False, "closes": []}],
+            "reporting": {"report_schema": "CompletionClaimV1", "report_dir": "/crucible/report", "progress_events": True},
+            "escalation": {"conditions": [], "action": "write report/blocked.md with the question and exit 75"},
+            "policy": {"name": "default-software", "version": 1},
+            "execution_request": {"harness": "codex", "model": "fake-model", "effort": "high", "provider": "fake", "image": "crucible-worker:fake-succeed", "timeout_seconds": 600, "rationale": "release smoke"},
+            "lifecycle": {"max_attempts": 2, "retry_on": ["environment", "lost"], "cleanup": "policy"},
+            "correction": None}))
+          PY
+          )
+          TASK=$(curl -fsS -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d "$BODY" http://127.0.0.1:8080/v1/tasks | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+          curl -fsS -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"harness":"codex","model":"fake-model","provider":"fake","image":"crucible-worker:fake-succeed","policy_version":1}' "http://127.0.0.1:8080/v1/tasks/$TASK/start" >/dev/null
+          STATE=unknown
+          for _ in $(seq 1 30); do
+            STATE=$(curl -fsS -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:8080/v1/tasks/$TASK" | python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])')
+            [ "$STATE" = reported ] && break
+            sleep 2
+          done
+          echo "task state: $STATE"
+          [ "$STATE" = reported ]
+
+      - name: logs on failure
+        if: failure()
+        env:
+          CRUCIBLE_IMAGE: ghcr.io/sentania-labs/crucible:${{ env.VERSION }}
+        run: docker compose logs
+
+      - name: down
+        if: always()
+        env:
+          CRUCIBLE_IMAGE: ghcr.io/sentania-labs/crucible:${{ env.VERSION }}
+        run: make down
+
+      # Gate 4. Publish. An existing version tag is never overwritten: a re-run
+      # after a transient failure skips the push instead of failing on it.
+      - name: push the version tag, never over an existing one
+        run: |
+          set -euo pipefail
+          if [ "$ALREADY_PUBLISHED" = true ]; then
+            echo "${IMAGE}:${VERSION} already published from this commit; leaving it alone"
+          else
+            docker push "${IMAGE}:${VERSION}"
+          fi
+
+      # `latest` follows the highest published version, not the most recent
+      # push, so re-tagging an old fix does not move it backwards. A tag list
+      # that cannot be read is fatal: treating a failed lookup as "no versions
+      # published" would move `latest` in exactly the direction this prevents.
+      - name: move latest only if this is the highest published version
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          REG_TOKEN=$(curl -fsS -u "$GHCR_USER:$GHCR_TOKEN" \
+            "https://ghcr.io/token?scope=repository:sentania-labs/crucible:pull" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
+          URL="https://ghcr.io/v2/sentania-labs/crucible/tags/list?n=100"
+          TAGS=""
+          BODY=$(mktemp)
+          HEAD=$(mktemp)
+          for _ in $(seq 1 20); do
+            CODE=$(curl -sS -o "$BODY" -D "$HEAD" -w '%{http_code}' \
+              -H "Authorization: Bearer $REG_TOKEN" "$URL")
+            if [ "$CODE" = 404 ]; then
+              echo "no package published yet; this is the first version"
+              break
+            fi
+            if [ "$CODE" != 200 ]; then
+              echo "::error::GHCR tag list returned HTTP $CODE; refusing to guess whether ${VERSION} is the highest version"
+              exit 1
+            fi
+            TAGS="$TAGS
+          $(python3 -c 'import json,sys; print("\n".join(json.load(open(sys.argv[1])).get("tags") or []))' "$BODY")"
+            NEXT=$(sed -n 's/.*<\([^>]*\)>.*rel="next".*/\1/Ip' "$HEAD" | head -n 1)
+            [ -n "$NEXT" ] || break
+            case "$NEXT" in
+              /*) URL="https://ghcr.io$NEXT" ;;
+              *) URL="$NEXT" ;;
+            esac
+          done
+          HIGHEST=$(printf '%s\n%s\n' "$TAGS" "${VERSION}" \
+            | tr -d '[:blank:]' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)
+          echo "highest published version: $HIGHEST"
+          if [ "$HIGHEST" = "${VERSION}" ]; then
+            docker push "${IMAGE}:latest"
+          else
+            echo "${VERSION} is not the highest; leaving latest where it is"
+          fi
+
+      # Gate 5. The release is created last, so a GitHub release never points at
+      # a version that is not consumable from the registry.
+      - name: create the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            echo "release ${GITHUB_REF_NAME} already exists"
+          else
+            gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" --generate-notes
+          fi
