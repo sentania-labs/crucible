@@ -1,0 +1,84 @@
+# Lint, unit, integration, and a compose smoke on GitHub-hosted runners: the
+# integration tier needs a Docker daemon and the repository is public (github-ci skill).
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: astral-sh/setup-uv@eb1897b8dc4b5d5bfe39a428a8f2304605e0983c # v7.0.0
+        with:
+          enable-cache: true
+      - run: make lint
+
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: astral-sh/setup-uv@eb1897b8dc4b5d5bfe39a428a8f2304605e0983c # v7.0.0
+        with:
+          enable-cache: true
+      - run: make test
+
+  compose-smoke:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: make up from a clean clone
+        run: make up
+      - name: readiness and a task through the fake provider
+        run: |
+          set -euo pipefail
+          curl -fsS http://127.0.0.1:8080/v1/health
+          curl -fsS http://127.0.0.1:8080/v1/ready
+          TOKEN=$(docker compose exec -T crucible crucible-admin token create --principal ci --role orchestrator | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
+          docker compose exec -T crucible crucible-admin repository register --name example-service --url https://github.com/example-org/example-service >/dev/null
+          BODY=$(python3 - <<'PY'
+          import json
+          print(json.dumps({
+            "schema_version": "1.0", "external_id": "CI-1", "title": "CI smoke", "project": "example-service",
+            "parent_external_id": None,
+            "repository": {"name": "example-service", "base_ref": "main", "work_branch": "crucible/CI-1"},
+            "scope": {"allowed_paths": ["src/**"], "prohibited_paths": [".github/**"], "may_add_dependencies": False, "may_modify_ci": False},
+            "objective": "Prove the compose stack.", "context": [], "project_instructions": [],
+            "acceptance_criteria": [{"id": "AC1", "text": "The task reaches reported."}],
+            "required_verification": [{"id": "V1", "command": "make lint", "expect_exit": 0}, {"id": "V2", "command": "make test", "expect_exit": 0}, {"id": "V3", "command": "make scan", "expect_exit": 0}],
+            "constraints": {"prohibited_actions": [], "network": "policy"},
+            "deliverables": [{"kind": "pull_request", "target": "main", "draft": False, "closes": []}],
+            "reporting": {"report_schema": "CompletionClaimV1", "report_dir": "/crucible/report", "progress_events": True},
+            "escalation": {"conditions": [], "action": "write report/blocked.md with the question and exit 75"},
+            "policy": {"name": "default-software", "version": 1},
+            "execution_request": {"harness": "codex", "model": "fake-model", "effort": "high", "provider": "fake", "image": "crucible-worker:fake-succeed", "timeout_seconds": 600, "rationale": "ci"},
+            "lifecycle": {"max_attempts": 2, "retry_on": ["environment", "lost"], "cleanup": "policy"},
+            "correction": None}))
+          PY
+          )
+          TASK=$(curl -fsS -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d "$BODY" http://127.0.0.1:8080/v1/tasks | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+          curl -fsS -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"harness":"codex","model":"fake-model","provider":"fake","image":"crucible-worker:fake-succeed","policy_version":1}' "http://127.0.0.1:8080/v1/tasks/$TASK/start" >/dev/null
+          for i in $(seq 1 30); do
+            STATE=$(curl -fsS -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:8080/v1/tasks/$TASK" | python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])')
+            [ "$STATE" = reported ] && break
+            sleep 2
+          done
+          echo "task state: $STATE"
+          [ "$STATE" = reported ]
+          curl -fsS -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:8080/v1/tasks/$TASK/events" | python3 -c 'import json,sys; [print(e["seq"], e["kind"]) for e in json.load(sys.stdin)["items"]]'
+      - name: logs on failure
+        if: failure()
+        run: docker compose logs
+      - name: down
+        if: always()
+        run: make down
