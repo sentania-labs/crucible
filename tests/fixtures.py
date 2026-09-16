@@ -63,8 +63,9 @@ def contract_document(**overrides: Any) -> dict[str, Any]:
         },
         "policy": {"name": "default-software", "version": 1},
         "execution_request": {
+            "tier": "standard",
             "harness": "codex",
-            "model": "fake-model",
+            "model": "gpt-5-codex-mini",
             "effort": "high",
             "provider": "fake",
             "image": "crucible-worker:fake-succeed",

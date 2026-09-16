@@ -135,7 +135,7 @@ def test_start_disagreeing_with_contract_is_422(client: TestClient) -> None:
         f"/v1/tasks/{task_id}/start",
         json={
             "harness": "claude_code",
-            "model": "fake-model",
+            "model": "gpt-5-codex-mini",
             "provider": "fake",
             "image": "crucible-worker:fake-succeed",
             "policy_version": 1,
@@ -146,7 +146,7 @@ def test_start_disagreeing_with_contract_is_422(client: TestClient) -> None:
         f"/v1/tasks/{task_id}/start",
         json={
             "harness": "codex",
-            "model": "fake-model",
+            "model": "gpt-5-codex-mini",
             "provider": "fake",
             "image": "crucible-worker:fake-succeed",
             "policy_version": 1,
@@ -161,7 +161,7 @@ def test_start_twice_is_409(client: TestClient) -> None:
     task_id = client.post("/v1/tasks", json=contract_document()).json()["id"]
     body = {
         "harness": "codex",
-        "model": "fake-model",
+        "model": "gpt-5-codex-mini",
         "provider": "fake",
         "image": "crucible-worker:fake-succeed",
         "policy_version": 1,

@@ -9,7 +9,7 @@ from sqlalchemy import Engine, text
 from crucible.adapters.persistence import migrate
 from crucible.application.supervisor import Supervisor
 from tests.fixtures import FakeClock
-from tests.integration.conftest import run_until, submit_and_start
+from tests.integration.conftest import run_to_settled, submit_and_start
 
 pytestmark = pytest.mark.integration
 
@@ -71,7 +71,7 @@ async def test_ready_turns_not_ready_when_a_task_cannot_progress(
     assert client.get(f"/v1/tasks/{task_id}").json()["state"] == "scheduled"
     assert client.get("/v1/ready").status_code == 503
     monkeypatch.undo()
-    assert await run_until(supervisor, client, task_id, {"reported"}) == "reported"
+    assert await run_to_settled(supervisor, client, task_id) == "awaiting_internal_review"
 
 
 def test_ready_reports_schema_drift(client: TestClient, engine: Engine, migrated: str) -> None:
@@ -82,9 +82,8 @@ def test_ready_reports_schema_drift(client: TestClient, engine: Engine, migrated
         ready = client.get("/v1/ready")
         assert ready.status_code == 503
         detail = ready.json()["migrations"]["detail"]
-        assert detail.startswith(
-            "schema drift at head 0003_idempotency_reservation: add_column attempts.killed_at"
-        )
+        head = migrate.head_revision(migrated)
+        assert detail.startswith(f"schema drift at head {head}: add_column attempts.killed_at")
         ok, serve_detail = migrate.is_current(engine, migrated)
         assert not ok and "schema drift" in serve_detail, "serve refuses on the same check"
     finally:

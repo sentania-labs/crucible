@@ -7,11 +7,12 @@ from crucible.ports.execution import LaunchSpec, ObservationState, ProviderError
 from tests.fixtures import contract_document
 
 
-def _spec(image: str, external_id: str = "EX-0001") -> LaunchSpec:
+def _spec(image: str, external_id: str = "EX-0001", role: str = "implement") -> LaunchSpec:
     return LaunchSpec(
         attempt_id=f"attempt-{external_id}",
         task_id="t",
         external_id=external_id,
+        role=role,
         harness="codex",
         model="m",
         image=image,

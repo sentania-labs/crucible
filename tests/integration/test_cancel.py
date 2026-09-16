@@ -5,8 +5,9 @@ from fastapi.testclient import TestClient
 
 from crucible.adapters.execution.fake import FakeProvider
 from crucible.application.supervisor import Supervisor
+from crucible.domain.lifecycle import IllegalTransitionError, TaskState, check_transition
 from tests.fixtures import FakeClock
-from tests.integration.conftest import event_kinds, run_until, submit_and_start
+from tests.integration.conftest import event_kinds, run_to_settled, run_until, submit_and_start
 
 pytestmark = pytest.mark.integration
 
@@ -131,15 +132,18 @@ async def test_cancel_with_partial_report_is_not_parsed(
     assert collected["payload"]["partial_report_kept_unparsed"] is True
 
 
-async def test_cancel_reported_task_is_rejected(client: TestClient, supervisor: Supervisor) -> None:
+async def test_cancel_waiting_task_is_accepted(client: TestClient, supervisor: Supervisor) -> None:
+    """09 lists awaiting_internal_review among the states a cancel may take at once."""
     task_id = submit_and_start(client, "crucible-worker:fake-succeed")
-    assert await run_until(supervisor, client, task_id, {"reported"}) == "reported"
+    assert await run_to_settled(supervisor, client, task_id) == "awaiting_internal_review"
     r = client.post(f"/v1/tasks/{task_id}/cancel", json=CANCEL)
-    assert r.status_code == 409
-    assert r.headers["content-type"].startswith("application/problem+json")
-    body = r.json()
-    assert body["type"] == "urn:crucible:problem:transition-not-allowed"
-    assert "reported -> cancelled" in body["detail"]
-    events = client.get(f"/v1/tasks/{task_id}/events").json()["items"]
-    rejected = [e for e in events if e["kind"] == "transition_rejected"]
-    assert len(rejected) == 1 and rejected[0]["payload"]["to"] == "cancelled"
+    assert r.status_code == 200 and r.json()["state"] == "cancelled"
+
+
+def test_cancel_from_a_state_the_table_forbids_is_409(client: TestClient) -> None:
+    """`reported` carries no cancel edge (09); the rejection is an event, not a state."""
+    task_id = submit_and_start(client, "crucible-worker:fake-succeed")
+    with pytest.raises(IllegalTransitionError):
+        check_transition("task", task_id, TaskState.REPORTED, TaskState.CANCELLED)
+    r = client.post(f"/v1/tasks/{task_id}/cancel", json={"reason": "r"})
+    assert r.status_code == 422

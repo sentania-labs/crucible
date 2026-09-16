@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -16,11 +17,13 @@ from crucible.adapters.api.deps import AppContext
 from crucible.adapters.execution.fake import FakeProvider
 from crucible.adapters.persistence import migrate
 from crucible.adapters.persistence.unit_of_work import SqlUnitOfWorkFactory, make_engine
+from crucible.adapters.storage.disk import DiskArtifactStore
 from crucible.application.auth import mint_token
 from crucible.application.repositories import register_repository
 from crucible.application.supervisor import Supervisor
 from crucible.contracts.api import RepositoryRegistration
 from crucible.domain.entities import Role
+from crucible.ports.notification import DeliveryResult
 from tests.fixtures import REPOSITORY_URL, FakeClock, contract_document
 
 pytestmark = pytest.mark.integration
@@ -31,7 +34,9 @@ POSTGRES_IMAGE = (
 )
 
 TRUNCATE = (
-    "TRUNCATE idempotency_keys, supervisor_status, completion_claims, leases, events, "
+    "TRUNCATE attempt_metrics, wakes, review_dispositions, decisions, escalations, "
+    "acceptance_results, gate_results, review_reports, evidence, artifacts, "
+    "idempotency_keys, supervisor_status, completion_claims, leases, events, "
     "attempts, executions, task_contracts, tasks, repositories, principals RESTART IDENTITY CASCADE"
 )
 
@@ -80,11 +85,38 @@ def provider() -> FakeProvider:
 
 
 @pytest.fixture
+def artifact_store(tmp_path: Path) -> DiskArtifactStore:
+    return DiskArtifactStore(tmp_path / "artifacts")
+
+
+class RecordingDeliverer:
+    """A wake receiver a test can make fail. Delivery is best effort; poll is durable."""
+
+    def __init__(
+        self, *, ok: bool = True, url: str | None = "https://foundry.invalid/wake"
+    ) -> None:
+        self.ok = ok
+        self.url = url
+        self.bodies: list[bytes] = []
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.url)
+
+    async def deliver(self, body: bytes) -> DeliveryResult:
+        self.bodies.append(body)
+        if self.ok:
+            return DeliveryResult(True, "HTTP 200")
+        return DeliveryResult(False, "HTTP 503")
+
+
+@pytest.fixture
 def ctx(
     engine: Engine,
     uow_factory: SqlUnitOfWorkFactory,
     clock: FakeClock,
     provider: FakeProvider,
+    artifact_store: DiskArtifactStore,
     migrated: str,
 ) -> AppContext:
     return AppContext(
@@ -93,6 +125,7 @@ def ctx(
         providers=[provider],
         database_url=migrated,
         engine=engine,
+        artifact_store=artifact_store,
     )
 
 
@@ -132,6 +165,8 @@ def make_supervisor(
         {"fake": provider},
         ctx.clock,
         holder=holder,
+        artifact_store=kw.pop("artifact_store", ctx.artifact_store),
+        wake_deliverer=kw.pop("wake_deliverer", None),
         lease_ttl_seconds=kw.pop("lease_ttl_seconds", 30),
         grace_seconds=kw.pop("grace_seconds", 60),
         **kw,
@@ -180,7 +215,85 @@ async def run_until(
     raise AssertionError(f"task never reached {states}; last state {state}")
 
 
+# In C2 the same tick that reports a task also evaluates its pre-PR gates (09, 11), so a
+# run settles past `reported` rather than in it.
+POST_REPORT_STATES = {
+    "reported",
+    "pre_pr_gates_failed",
+    "awaiting_internal_review",
+    "gates_passed",
+    "awaiting_acceptance",
+}
+
+
+async def run_to_settled(
+    supervisor: Supervisor, client: TestClient, task_id: str, max_ticks: int = 12
+) -> str:
+    return await run_until(supervisor, client, task_id, POST_REPORT_STATES, max_ticks)
+
+
 def event_kinds(client: TestClient, task_id: str) -> list[str]:
     r = client.get(f"/v1/tasks/{task_id}/events", params={"limit": 200})
     assert r.status_code == 200
     return [e["kind"] for e in r.json()["items"]]
+
+
+ARTIFACTS_DELIVERABLE: list[dict[str, Any]] = [
+    {"kind": "artifacts", "target": None, "draft": False, "closes": []}
+]
+
+
+def upload_review(
+    client: TestClient, task_id: str, *, verdict: str = "approve", head_sha: str | None = None
+) -> Any:
+    """Upload a ReviewReportV1 as the orchestrator's own non-author review (04, 11)."""
+    view = client.get(f"/v1/tasks/{task_id}").json()
+    head = head_sha or view["head_sha"]
+    report = {
+        "schema_version": "1.0",
+        "task_external_id": view["external_id"],
+        "reviewed_head_sha": head,
+        "reviewer": {"kind": "orchestrator", "principal": "orchestrator-principal"},
+        "verdict": verdict,
+        "findings": (
+            []
+            if verdict == "approve"
+            else [{"severity": "major", "path": "src/a.py", "line": 1, "text": "narrow it"}]
+        ),
+        "summary": f"Reviewed {head}.",
+    }
+    return client.post(f"/v1/tasks/{task_id}/review", json={"report": report})
+
+
+async def review_and_settle(
+    supervisor: Supervisor,
+    client: TestClient,
+    task_id: str,
+    *,
+    verdict: str = "approve",
+) -> str:
+    """Upload a review, then tick: gate_results is fenced to the supervisor (14), so the
+    next tick is what resolves internal_review_recorded."""
+    response = upload_review(client, task_id, verdict=verdict)
+    assert response.status_code == 200, response.text
+    await supervisor.tick()
+    return str(client.get(f"/v1/tasks/{task_id}").json()["state"])
+
+
+def correction_document(
+    client: TestClient, task_id: str, *, image: str, reason: str = "pre_pr_gates", **overrides: Any
+) -> dict[str, Any]:
+    """A correction version of the task's current contract (05)."""
+    view = client.get(f"/v1/tasks/{task_id}").json()
+    document = dict(view["contract"])
+    document["execution_request"] = {**document["execution_request"], "image": image}
+    document["correction"] = {
+        "of_version": view["contract_version"],
+        "reason": reason,
+        "addresses": [{"kind": "acceptance", "id": "1", "disposition_id": None}],
+        "instructions": "Keep every change inside the contract's allowed paths.",
+        "resume_from": "remote_branch",
+        "request_internal_review": False,
+    }
+    document.update(overrides)
+    return document
