@@ -1,0 +1,2 @@
+# build.sh writes OCI and docker tarballs here; they are never committed.
+out/
