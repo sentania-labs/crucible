@@ -48,6 +48,11 @@ HERE = Path(__file__).resolve().parent
 # and underscores, so the shape check must pin neither length nor alphabet.
 # The positive control below is what proves this regex matches a real token.
 TOKEN_RE = re.compile(rb"ghs_[A-Za-z0-9_.-]{20,2000}")
+# Longest byte run TOKEN_RE can match, derived from the pattern rather than
+# restated, so the two cannot drift apart. Streaming scans keep at least this
+# much overlap between reads, or a candidate that straddles a read boundary is
+# split and neither buffer contains the whole of it.
+MAX_CANDIDATE_BYTES = len(b"ghs_") + int(re.search(rb",(\d+)\}$", TOKEN_RE.pattern).group(1))
 
 
 def local(ts=None):
@@ -175,7 +180,9 @@ class Scanner:
         return hits + hash_hits
 
     def positive_control(self):
-        """A scan that must find the token, so a silently empty scan cannot pass."""
+        """Two scans that must find the token, so a silently empty scan cannot
+        pass. The second one runs the streaming path with the token straddling a
+        read boundary, which is the case a short overlap used to miss."""
         probe = b"prefix " + self.value + b" suffix"
         row = {"location": "POSITIVE CONTROL (synthetic buffer containing the token)",
                "bytes": len(probe), "samples": 1,
@@ -186,25 +193,73 @@ class Scanner:
                "note": "must be non-zero; proves the scanner detects this token's value and shape"}
         with self.lock:
             self.rows.append(row)
-        return row["substring_hits"] > 0 and row["hash_matches"] > 0
+        buffer_ok = row["substring_hits"] > 0 and row["hash_matches"] > 0
+        # Straddle the first read boundary by all but one byte of the token, the
+        # worst case: read 1 ends one byte into the value. A control that
+        # straddles by less passes with any overlap at least that wide, so it
+        # would not notice the overlap shrinking back toward the old 64 bytes.
+        pad = b"x" * (self.READ_BYTES - (len(self.value) - 1))
+        stream_row = self.check_stream(
+            "POSITIVE CONTROL (streaming scan, token straddling an 8 MiB read boundary)",
+            io.BytesIO(pad + self.value + b" suffix" + b"y" * 4096),
+            note="must be exactly 1/1/1; proves check_stream's overlap recovers a split "
+                 "token and does not count it twice")
+        # Exactly one, not at least one: a double count in the overlap is as much
+        # a defect as a miss, and only the equality catches it.
+        stream_ok = (stream_row["substring_hits"] == 1 and stream_row["pattern_candidates"] == 1
+                     and stream_row["hash_matches"] == 1)
+        return {"buffer": buffer_ok, "stream": stream_ok}
+
+    READ_BYTES = 8 << 20
+
+    def _count_window(self, buf, base, lo, hi):
+        """Count value and shape matches whose start offset, absolute in the
+        stream, falls in [lo, hi). The window keeps the overlap from being
+        counted twice."""
+        hits = cands = hh = 0
+        i = buf.find(self.value, max(0, lo - base))
+        while i >= 0 and base + i < hi:
+            hits += 1
+            i = buf.find(self.value, i + 1)
+        for m in TOKEN_RE.finditer(buf):
+            if lo <= base + m.start() < hi:
+                cands += 1
+                if hashlib.sha256(m.group()).hexdigest() == self.digest:
+                    hh += 1
+        return hits, cands, hh
 
     def check_stream(self, location, stream, note=""):
+        """Scan a stream in reads of READ_BYTES, keeping MAX_CANDIDATE_BYTES of
+        overlap between them so no candidate is split across a boundary. A match
+        is attributed to the first read whose counted window contains its start,
+        so the overlap never double-counts."""
+        overlap = max(MAX_CANDIDATE_BYTES, len(self.value))
         total, hits, cands, hh = 0, 0, 0, 0
-        tail = b""
+        tail, base, counted_from = b"", 0, 0
         while True:
-            chunk = stream.read(8 << 20)
-            if not chunk:
-                break
+            chunk = stream.read(self.READ_BYTES)
+            last = not chunk
             buf = tail + chunk
-            hits += buf.count(self.value)
-            found = TOKEN_RE.findall(buf)
-            cands += len(found)
-            hh += sum(1 for c in found if hashlib.sha256(c).hexdigest() == self.digest)
             total += len(chunk)
-            tail = buf[-64:]
+            end = base + len(buf)
+            # Anything starting in the final `overlap` bytes may run past this
+            # read, so it waits for the next buffer; the last read counts to end.
+            limit = end if last else max(counted_from, end - overlap)
+            h, c, m = self._count_window(buf, base, counted_from, limit)
+            hits += h
+            cands += c
+            hh += m
+            counted_from = limit
+            if last:
+                break
+            keep = end - counted_from
+            tail = buf[len(buf) - keep:] if keep else b""
+            base = end - len(tail)
+        row = {"location": location, "bytes": total, "samples": 1, "substring_hits": hits,
+               "pattern_candidates": cands, "hash_matches": hh, "note": note}
         with self.lock:
-            self.rows.append({"location": location, "bytes": total, "samples": 1, "substring_hits": hits,
-                              "pattern_candidates": cands, "hash_matches": hh, "note": note})
+            self.rows.append(row)
+        return row
 
     def check_tree(self, location, root: Path, max_file=64 << 20, note=""):
         total, files, hits, cands, hh, skipped = 0, 0, 0, 0, 0, 0
@@ -293,7 +348,7 @@ def cmd_run(args):
     result["network"] = {"name": NETWORK, "subnet": subnet, "egress": EGRESS, "squid_image": SQUID_IMAGE}
     time.sleep(2)
 
-    branch = f"crucible/S10-{stamp}"
+    branch = args.branch or f"crucible/S10-{stamp}"
     tag = f"s10-{stamp}"
     publisher = f"{PUBLISHER}-{stamp}"
     argv = ["docker", "run", "-i", "--name", publisher,
@@ -341,7 +396,7 @@ def cmd_run(args):
             result["pr"]["created_at_local"] = local(pr["created_at"])
     if (out / "api-calls.tsv").exists():
         result["api_calls_in_container"] = [l.split("\t") for l in (out / "api-calls.tsv").read_text().splitlines()]
-    for f in ("push-branch.err", "push-tag.err"):
+    for f in ("push-branch.err", "tag-create.err", "push-tag.err"):
         if (out / f).exists():
             result[f] = (out / f).read_text()[-2000:]
 
@@ -371,8 +426,7 @@ def cmd_run(args):
     for label, root in (("worktree " + args.worktree, Path(args.worktree)),
                         ("publisher output dir " + str(out), out),
                         ("scratch root " + str(scratch) + " (run records, rendered squid.conf)", scratch),
-                        ("/tmp (whole tree)" if not args.light else "/tmp: NOT SCANNED (--light)",
-                         Path("/tmp") if not args.light else out),
+                        ("/tmp (whole tree)", Path("/tmp") if not args.light else None),
                         ("/dev/shm", Path("/dev/shm")),
                         ("~/.config/gh", Path.home() / ".config/gh"),
                         ("~/.gitconfig and ~/.git-credentials", Path.home())):
@@ -383,16 +437,23 @@ def cmd_run(args):
                 if fp.exists():
                     data += fp.read_bytes()
             scanner.check(label, data, note="present: " + ",".join(fn for fn in (".gitconfig", ".git-credentials", ".netrc") if (root / fn).exists()))
+        elif root is None:
+            # --light: the location is omitted from the proof entirely rather than
+            # substituted, so no row claims coverage it does not have and the
+            # empty-scan guard is not satisfied by a decoy.
+            result.setdefault("locations_not_scanned", []).append(label + " (--light)")
         elif root.exists():
             scanner.check_tree(label, root)
     scanner.check("this process argv (sys.argv)", " ".join(sys.argv).encode())
     scanner.check("this process environ", "\n".join(f"{k}={v}" for k, v in os.environ.items()).encode())
 
-    control_ok = scanner.positive_control()
+    control = scanner.positive_control()
+    control_ok = all(control.values())
     negative = [r for r in scanner.rows if not r["location"].startswith("POSITIVE CONTROL")]
     empty = [r["location"] for r in negative if r["bytes"] == 0]
     result["absence_proof"] = scanner.rows
     result["positive_control_detects"] = control_ok
+    result["positive_control_detail"] = control
     result["empty_scans"] = empty
     result["absence_clean"] = (control_ok and not empty
                                and all(r["substring_hits"] == 0 and r["hash_matches"] == 0 for r in negative))
@@ -411,8 +472,8 @@ def cmd_observe(args):
     pr_number = args.pr
     scratch = Path(args.scratch)
     events = []
-    seen = set()
-    accepted_headers = {}
+    seen = {}
+    calls = {}
     pr0 = api("GET", f"/repos/{REPO}/pulls/{pr_number}", token=token)
     pr_created = pr0["body"]["created_at"]
     head = pr0["body"]["head"]["sha"]
@@ -422,19 +483,49 @@ def cmd_observe(args):
     def delta(ts):
         return int((datetime.fromisoformat(ts.replace("Z", "+00:00")) - t_open).total_seconds())
 
-    def note(kind, obj_id, login, user_type, ts, extra):
-        key = (kind, obj_id)
-        if key in seen:
-            return
-        seen.add(key)
-        ev = {"kind": kind, "id": obj_id, "login": login, "user_type": user_type, "at_utc": ts,
-              "at_local": local(ts), "seconds_after_pr_open": delta(ts), "observed_local": local(), **extra}
+    def emit(kind, obj_id, login, user_type, ts, extra, event):
+        ev = {"kind": kind, "id": obj_id, "login": login, "user_type": user_type, "event": event,
+              "at_utc": ts, "at_local": local(ts), "seconds_after_pr_open": delta(ts),
+              "observed_local": local(), **extra}
         events.append(ev)
-        log(f"SIGNAL {kind} id={obj_id} login={login} type={user_type} at={ev['at_local']} (+{ev['seconds_after_pr_open']}s) {json.dumps(extra)[:300]}")
+        log(f"SIGNAL {kind} {event} id={obj_id} login={login} type={user_type} at={ev['at_local']} "
+            f"(+{ev['seconds_after_pr_open']}s) {json.dumps(extra)[:300]}")
+
+    def note(kind, obj_id, login, user_type, ts, extra, updated_at=None):
+        """Record an object the first time it is seen, and again whenever its body
+        or `updated_at` changes, so a summary comment edited in place is visible
+        rather than swallowed by the first-sighting dedupe."""
+        key = (kind, obj_id)
+        body = extra.get("body")
+        body_hash = hashlib.sha256(body.encode()).hexdigest()[:16] if isinstance(body, str) else None
+        state = seen.get(key)
+        stamped = dict(extra, body_sha256_16=body_hash, updated_at_utc=updated_at,
+                       updated_at_local=local(updated_at) if updated_at else None)
+        if state is None:
+            seen[key] = {"body_hash": body_hash, "updated_at": updated_at, "revisions": 0}
+            emit(kind, obj_id, login, user_type, ts, stamped, "created")
+            return
+        changed = (body_hash is not None and body_hash != state["body_hash"]) or \
+                  (updated_at is not None and updated_at != state["updated_at"])
+        if not changed:
+            return
+        state["revisions"] += 1
+        previous = state["body_hash"]
+        state["body_hash"], state["updated_at"] = body_hash, updated_at
+        emit(kind, obj_id, login, user_type, updated_at or ts,
+             dict(stamped, previous_body_sha256_16=previous, created_at_utc=ts),
+             f"edited_in_place_{state['revisions']}")
 
     def get(path, label):
         r = api("GET", path, token=token)
-        accepted_headers.setdefault(label, r["accepted"])
+        e = calls.setdefault(label, {"statuses": {}, "accepted": r["accepted"], "example_path": path})
+        e["statuses"][str(r["status"])] = e["statuses"].get(str(r["status"]), 0) + 1
+        e["last_status"] = r["status"]
+        if r["accepted"]:
+            e["accepted"] = r["accepted"]
+        if r["status"] != 200 and "error_message" not in e:
+            b = r["body"]
+            e["error_message"] = b.get("message") if isinstance(b, dict) else str(b)[:200]
         return r["body"] if r["status"] == 200 else []
 
     started = time.monotonic()
@@ -445,6 +536,9 @@ def cmd_observe(args):
         cycle += 1
         pr = get(f"/repos/{REPO}/pulls/{pr_number}", "GET pulls/{n}")
         head = pr["head"]["sha"] if pr else head
+        if pr:
+            note("pr_head", head, pr["user"]["login"], pr["user"]["type"], pr["updated_at"],
+                 {"state": pr["state"], "head_sha": head, "title": pr["title"]})
         for rv in get(f"/repos/{REPO}/pulls/{pr_number}/reviews", "GET pulls/{n}/reviews"):
             note("review", rv["id"], rv["user"]["login"], rv["user"]["type"], rv["submitted_at"],
                  {"state": rv["state"], "commit_id": rv["commit_id"], "body": rv["body"], "html_url": rv["html_url"]})
@@ -452,13 +546,13 @@ def cmd_observe(args):
             note("review_comment", c["id"], c["user"]["login"], c["user"]["type"], c["created_at"],
                  {"path": c.get("path"), "line": c.get("line"), "commit_id": c["commit_id"],
                   "original_commit_id": c.get("original_commit_id"), "review_id": c.get("pull_request_review_id"),
-                  "body": c["body"], "html_url": c["html_url"]})
+                  "body": c["body"], "html_url": c["html_url"]}, updated_at=c.get("updated_at"))
             for rx in get(f"/repos/{REPO}/pulls/comments/{c['id']}/reactions", "GET pulls/comments/{id}/reactions"):
                 note("reaction_on_review_comment", rx["id"], rx["user"]["login"], rx["user"]["type"], rx["created_at"],
                      {"content": rx["content"], "comment_id": c["id"]})
         for c in get(f"/repos/{REPO}/issues/{pr_number}/comments", "GET issues/{n}/comments"):
             note("issue_comment", c["id"], c["user"]["login"], c["user"]["type"], c["created_at"],
-                 {"body": c["body"], "html_url": c["html_url"]})
+                 {"body": c["body"], "html_url": c["html_url"]}, updated_at=c.get("updated_at"))
             for rx in get(f"/repos/{REPO}/issues/comments/{c['id']}/reactions", "GET issues/comments/{id}/reactions"):
                 note("reaction_on_issue_comment", rx["id"], rx["user"]["login"], rx["user"]["type"], rx["created_at"],
                      {"content": rx["content"], "comment_id": c["id"]})
@@ -472,7 +566,7 @@ def cmd_observe(args):
         for suite in (cs.get("check_suites", []) if isinstance(cs, dict) else []):
             note("check_suite", suite["id"], suite["app"]["slug"] if suite.get("app") else "?", "App", suite["created_at"],
                  {"status": suite["status"], "conclusion": suite["conclusion"], "head_sha": suite["head_sha"]})
-        actor_events = [e for e in events if e["kind"] not in ("check_run", "check_suite")]
+        actor_events = [e for e in events if e["kind"] not in ("check_run", "check_suite", "pr_head")]
         n_now = len(actor_events)
         if n_now and n_now != last_signal:
             last_signal = n_now
@@ -494,14 +588,14 @@ def cmd_observe(args):
             log("max wait reached")
             break
         time.sleep(args.interval)
-    outp = scratch / f"s12-pr{pr_number}.json"
+    outp = scratch / f"s12-pr{pr_number}-{datetime.now(TZ).strftime('%Y%m%d-%H%M%S')}.json"
     outp.write_text(json.dumps({"pr": pr_number, "pr_created_at_utc": pr_created, "pr_created_at_local": local(pr_created),
                                 "pr_author": pr0["body"]["user"]["login"], "head": head, "events": events,
                                 "flags": {"interval": args.interval, "max_minutes": args.max_minutes,
                                           "settle_minutes": args.settle_minutes,
                                           "fallback_trigger": args.fallback_trigger,
                                           "post_trigger_minutes": args.post_trigger_minutes},
-                                "trigger_posted": trigger_posted, "accepted_permissions_headers": accepted_headers,
+                                "trigger_posted": trigger_posted, "calls_with_app_token": calls,
                                 "mint": evidence, "finished_local": local()}, indent=2))
     del token
     log(f"observe finished; {len(events)} signals; written {outp}")
@@ -537,16 +631,18 @@ def main():
     r = sub.add_parser("run")
     r.add_argument("--scratch", required=True)
     r.add_argument("--worktree", required=True)
-    r.add_argument("--mode", default="full", choices=["full", "push-only", "pr-expect-403"])
+    r.add_argument("--mode", default="full", choices=["full", "push-only", "pr-expect-403", "followup"])
+    r.add_argument("--branch", default=None, help="push onto an existing branch (followup mode)")
     r.add_argument("--permissions", default=None, help="downscope the token, e.g. contents=write")
     r.add_argument("--light", action="store_true", help="skip the /tmp walk (repeat runs)")
     r.set_defaults(fn=cmd_run)
     o = sub.add_parser("observe")
     o.add_argument("--pr", type=int, required=True)
     o.add_argument("--scratch", required=True)
-    o.add_argument("--interval", type=int, default=60)
-    o.add_argument("--max-minutes", type=float, default=20)
-    o.add_argument("--settle-minutes", type=float, default=6)
+    o.add_argument("--interval", type=int, default=30)
+    o.add_argument("--max-minutes", type=float, default=30)
+    o.add_argument("--settle-minutes", type=float, default=1e9,
+                   help="stop early once no new actor signal for this long; the default never settles")
     o.add_argument("--fallback-trigger", action="store_true")
     o.add_argument("--post-trigger-minutes", type=float, default=15)
     o.set_defaults(fn=cmd_observe)
@@ -556,6 +652,8 @@ def main():
     c.add_argument("--keep-squid", action="store_true")
     c.set_defaults(fn=cmd_cleanup)
     args = ap.parse_args()
+    if getattr(args, "mode", None) == "followup" and not args.branch:
+        ap.error("--mode followup needs --branch: the branch must already exist")
     args.fn(args)
 
 
