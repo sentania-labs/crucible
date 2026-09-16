@@ -115,7 +115,7 @@ external_review:
   retrigger_after_correction: false
   require_review_on_final_sha: false
   require_feedback_disposition: true
-  accepted_signals: ["review", "comment", "reaction:+1"]  # from an allowlisted login only; +1 is the reviewer's "no findings" signal
+  accepted_signals: ["reaction:+1", "review", "comment"]  # from an allowlisted login only; +1 is the durable "no findings" signal (S12 rerun)
   components: ["code"]                 # review components in one cycle; ["code", "security"] where the repo runs both
   round_counting: "completed_cycles"   # a round is one completed cycle (all components terminal) on a published head
   wait_timeout_hours: 24               # then wake Foundry with reason external_review_overdue

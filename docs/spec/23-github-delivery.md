@@ -112,12 +112,39 @@ Foundry is not required to remain connected for any of this.
 
 ## Triggering the external reviewer
 
-S12 (docs/spikes/S12.md) showed the reviewer's automatic trigger is tied
-to the PR author's connected account, so a PR authored by the App may not
-be reviewed automatically. Until the rerun under the repository's
-"all PRs" setting settles it, the trigger comment is posted by the
-orchestrator under the operator's connected account when Crucible reports
-the PR open, recorded as an event on the task. The bot's summary comment
+S12's rerun (docs/spikes/S12.md, 2026-09-16) settled it: with the
+repository's Codex setting "review all pull requests" enabled, an
+App-authored PR is reviewed automatically (pickup 11 s after open,
+completion 101 s) with no human comment. **Repository onboarding
+prerequisite**: the Codex GitHub App must be installed on the repository
+with review of all pull requests enabled (code and security review as the
+operator chooses); Crucible's registration check records whether the
+first App-authored PR received a reviewer signal and reports a
+repository whose PRs get none. The orchestrator-posted `@codex review`
+comment under the operator's account remains the fallback for a
+repository where automatic review is not enabled and for an explicit
+re-review after a correction, both recorded as events.
+
+What the reviewer emits, as observed: a clean result is **reactions on
+the PR only**: `eyes` on pickup (deleted on completion, so it lives about
+90 to 150 seconds) and a durable `+1`; no comment, no review object, no
+check run. A result with findings is a review object with inline
+comments plus the summary comment. Reactions carry no commit id, so a
+reaction's head binding is inferred from the PR head at its `created_at`
+against the head history, and `require_review_on_final_sha` cannot be
+satisfied by a reaction-only result; a policy that needs a per-head
+result must use the trigger comment after each head. Code review and
+security review are not separable in the GitHub record and are treated as
+one round. A new head does not re-trigger the reviewer by itself.
+
+Reading reactions needs the App permission **Issues: read** (the
+endpoint is `GET /issues/{n}/reactions`; comments are readable with Pull
+requests read alone). It is added to the App's permission set for that
+one call (ADR 0007). Because the pickup reaction is transient, the
+supervisor polls reactions every `github.reactions_poll_interval_seconds`
+(default 60) while a PR is `awaiting_external_review`, and treats the
+durable `+1` as the completion signal; a missed `eyes` is informational
+only. The bot's summary comment
 is edited in place and never counts as a round; the review object, its
 comments, or the bot's no-findings comment do. Installation tokens are
 about 390 characters with dots, not the short `ghs_` form, and the

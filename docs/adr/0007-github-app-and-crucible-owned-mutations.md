@@ -12,7 +12,10 @@ the worker's. Personal access tokens are long-lived and user-scoped.
 ## Decision
 
 - A GitHub App with Metadata read, Contents read/write, Pull requests
-  read/write, Checks read, Actions read. Crucible mints short-lived,
+  read/write, Checks read, Actions read, and Issues read. Issues read was
+  added after S12's rerun showed a clean external review is signaled only
+  by reactions on the PR, readable through `GET /issues/{n}/reactions`;
+  no Issues write is requested. Crucible mints short-lived,
   repository-scoped installation tokens on demand. The private key is a
   mounted file locally and a projected or external Secret in Kubernetes,
   on Crucible's pods only.
