@@ -140,12 +140,26 @@ jobs:
         run: |
           set -euo pipefail
           cp .env.example .env
+          # --pull never applies to EVERY service, not just the candidate, and a
+          # fresh runner has nothing cached, so the pinned supporting images have
+          # to be fetched explicitly first. The first live run of this workflow
+          # (tag v0.1.0, run 35158679884) died here on
+          # "No such image: postgres:16@sha256:f1c3...". Every service except the
+          # candidate is pulled, by name, so a service added later is covered
+          # without anyone remembering to update this list.
+          for SVC in $(docker compose config --services); do
+            case "$SVC" in
+              crucible|migrate) continue ;;
+            esac
+            echo "pulling supporting image for $SVC"
+            docker compose pull --quiet "$SVC"
+          done
           # CRUCIBLE_IMAGE pins compose to this run's versioned local tag and
-          # --pull never forbids reaching the registry, so a v0.2.0 run can
-          # never end up smoking the published v0.1.0. --pull never does not
-          # stop compose building when the image is absent, because the service
-          # has a build section, so the image ID is checked below rather than
-          # trusted.
+          # --pull never forbids reaching the registry for the candidate, so a
+          # v0.2.0 run can never end up smoking the published v0.1.0. --pull
+          # never does not stop compose building when an image is absent,
+          # because the service has a build section, so the image ID is checked
+          # below rather than trusted.
           docker compose up -d --wait --pull never
           # Prove it: the running container must be the image just built, by ID.
           BUILT=$(docker image inspect "${IMAGE}:${VERSION}" --format '{{.Id}}')
