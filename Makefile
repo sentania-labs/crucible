@@ -2,7 +2,7 @@
 COMPOSE ?= docker compose
 UV ?= uv
 
-.PHONY: up dev down reset lint test test-unit test-integration e2e build
+.PHONY: up dev down reset lint scan scan-tree scan-history test test-unit test-integration e2e build
 
 up: ## normal mode: postgres, migrate, crucible
 	@test -f .env || cp .env.example .env
@@ -24,6 +24,15 @@ lint:
 	$(UV) run ruff check crucible tests
 	$(UV) run mypy crucible tests
 	$(UV) run lint-imports
+
+scan: scan-tree scan-history ## secret scan; needs gitleaks on PATH
+
+scan-tree: ## every tracked file as it is in the working tree (caches and .venv excluded)
+	@T=$$(mktemp -d) && git ls-files -z | tar --null -T - -cf - | tar -xf - -C "$$T" \
+	  && gitleaks detect --no-git --redact --no-banner --source "$$T"; S=$$?; rm -rf "$$T"; exit $$S
+
+scan-history: ## commits in SCAN_RANGE (default origin/main..HEAD)
+	gitleaks detect --redact --no-banner --source . --log-opts="$${SCAN_RANGE:-origin/main..HEAD}"
 
 test: test-unit test-integration
 
