@@ -10,10 +10,11 @@ It does not decide what to build. An orchestrator (Foundry, or a person)
 decides outcomes, scope, model, and acceptance. Crucible executes, persists,
 observes, and enforces.
 
-**Status: specification, version 0.3.** No implementation exists yet. The specification is
-under [`docs/spec/`](docs/spec/00-overview.md) and the decisions behind it
-under [`docs/adr/`](docs/adr/). Implementation starts only after the
-specification is approved.
+**Status: specification version 0.3; implementation phase C1 (walking
+skeleton).** The specification is under
+[`docs/spec/`](docs/spec/00-overview.md) and the decisions behind it under
+[`docs/adr/`](docs/adr/). Phase notes are under
+[`docs/implementation-notes/`](docs/implementation-notes/c1.md).
 
 ## What it will do
 
@@ -43,11 +44,42 @@ its own, approve semantic correctness, accept a risk, declare success,
 interpret review feedback, merge a PR, or decide that a release should
 happen.
 
+## Running locally
+
+Needs Docker with Compose, and [uv](https://docs.astral.sh/uv/) for the
+developer mode and the test suites.
+
+```sh
+make up          # postgres, migrations, crucible (api + supervisor) on 127.0.0.1:8080
+make dev         # postgres only; then: uv run crucible serve --all
+make lint        # ruff, mypy --strict, import-linter
+make test        # unit tier, then the integration tier against postgres:16 in a container
+make down
+```
+
+`make up` copies `.env.example` to `.env` if none exists; change
+`POSTGRES_PASSWORD` there. First use after `make up`:
+
+```sh
+docker compose exec crucible crucible-admin token create --principal foundry --role orchestrator
+docker compose exec crucible crucible-admin repository register --name example-service \
+  --url https://github.com/example-org/example-service
+curl -s http://127.0.0.1:8080/v1/ready
+```
+
+Then `POST /v1/tasks` with a `TaskContractV1` whose `execution_request.provider`
+is `fake` and whose image is `crucible-worker:fake-succeed`, `POST
+/v1/tasks/{id}/start`, and watch `GET /v1/tasks/{id}/events`. OpenAPI is at
+`/v1/openapi.json`.
+
 ## Layout
 
 ```
+crucible/       the service: domain, contracts, application, ports, adapters, scheduler, cli
+tests/          unit (no I/O) and integration (PostgreSQL in a container, fake provider)
 docs/spec/      the specification, one concern per file
 docs/adr/       architectural decision records
+docs/implementation-notes/  what each phase decided where the spec was open
 examples/       sanitized example task and release contracts and configuration
 ```
 
