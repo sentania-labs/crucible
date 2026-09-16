@@ -63,7 +63,9 @@ paths, emit N log lines. Every lifecycle and gate test runs against it.
   repo (rw), identity (ro), one credential dir (ro or narrow rw), report dir
   (rw). Labels: `crucible.attempt`, `crucible.task`, `crucible.owner`.
 - `observe`: container inspect; `lost` if the container ID no longer exists.
-- `logs`: docker logs with timestamps, since offset.
+- `logs`: docker logs with timestamps, since offset. `--since` is
+  inclusive (S8), so resume is strict-after by the stored
+  (timestamp, line hash) pair from 10, never by timestamp alone.
 - `collect`: never runs git or reads worker-written files as the Crucible
   process. It launches a throwaway collector container (the same hardened
   shape as a worker, `--network none`, uid 1000, the repo mounted ro, the

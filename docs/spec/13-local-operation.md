@@ -34,8 +34,15 @@ socket proxy, and the egress proxy only; `uv run crucible serve --all
 proxy published on loopback only. Same API, same providers, same worker
 containers. The artifact root is a host directory in this mode.
 
-A `Makefile` wraps both: `make up`, `make dev`, `make down`, `make lint`,
-`make test`, `make e2e`. CI calls the same targets.
+A `Makefile` wraps both: `make up`, `make dev`, `make down`, `make reset`
+(down with volumes; the only sanctioned way to discard a development
+database), `make lint`, `make test`, `make e2e`. CI calls the same
+targets. `COMPOSE_PROFILES=full` in `.env` is what lets one compose file
+serve both modes; `--profile dev` overrides it.
+
+The egress proxy image must be able to log to the container's stdout;
+`ubuntu/squid` cannot (S9), so the pinned choice is made in C3 with that
+requirement.
 
 ## Worker images and harness version management
 
@@ -52,9 +59,12 @@ provider's image allowlist controls what may run.
 Rules:
 
 - Harness CLIs never update themselves inside a running worker. The image
-  sets each CLI's documented auto-update opt-out and the root filesystem is
-  read-only, so an update cannot land even if attempted. S11 confirms per
-  harness.
+  sets each CLI's auto-update opt-out and the root filesystem is
+  read-only, so an update cannot land even if attempted. Found in S7:
+  Claude Code honors `DISABLE_AUTOUPDATER=1` and `DISABLE_UPDATES=1`; AGY
+  honors `AGY_CLI_DISABLE_AUTO_UPDATE=1`; Codex has no environment
+  variable, only the config key `check_for_update_on_startup=false`, which
+  the Codex adapter passes at launch. S11 re-confirms on each promotion.
 - Every attempt records the image digest it ran, resolved at launch.
   Retries and corrections of a task keep that digest unless Foundry
   explicitly authorizes a different image in the correction contract.
@@ -93,8 +103,11 @@ that authority. The model, in order of preference:
    socket is proxied to Crucible. A full escape yields that unprivileged
    user, not root. Costs: one daemon to install, some feature loss (no
    privileged ports, slower overlay, cgroup limits depend on the host's
-   cgroup v2 delegation). Spike S9 runs early in C0; if it passes on the
-   development workstation this is the default local arrangement from C3.
+   cgroup v2 delegation). Spike S9 passed on the development workstation
+   on 2026-09-16 (`docs/spikes/S9.md`): limits enforced, internal network
+   egress only through the proxy, performance on par with rootful. This is
+   the default local arrangement from C3; socket `/run/user/<uid>/docker.sock`
+   of the `crucible` service user, proxied.
 2. **Default socket through the proxy (temporary fallback).** If S9 fails,
    the host daemon's socket is proxied. A compromise of Crucible is then a
    compromise of the host. That risk is recorded in the readiness report
@@ -108,8 +121,12 @@ In both arrangements:
   `containers` (create, start, inspect, logs, stop, kill, remove, list),
   `images` (inspect, list), `networks` (inspect, connect), `volumes`
   (create, remove, inspect), and disables `exec`, `build`, `swarm`,
-  `system`, `plugins`, `secrets`, `configs`. It cannot reject a create
-  request that asks for `Privileged`, a host namespace, or a bind of `/`.
+  `system`, `plugins`, `secrets`, `configs`. Note from S9: with the
+  reference proxy image, `EXEC=0` refuses `exec` start and inspect but
+  still lets `POST /containers/{id}/exec` create an exec instance; no
+  command runs, but Crucible's client must not rely on the create call
+  failing. It cannot reject a create request that asks for `Privileged`,
+  a host namespace, or a bind of `/`.
   It is a tripwire against accidents and a reduction of surface, not a
   boundary against a compromised Crucible.
 - **Create-request policy in Crucible** refuses to emit `Privileged`, host

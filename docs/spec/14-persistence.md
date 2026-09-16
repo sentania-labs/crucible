@@ -23,7 +23,8 @@
 | `decisions` | id, task_id, escalation_id, principal_id, verbatim TEXT, resolves, created_at |
 | `escalations` | id, task_id, attempt_id, state, question, opened_at, closed_at |
 | `wakes` | id, principal_id, task_id, reason, payload JSONB, created_at, delivered_at, acked_at, attempts |
-| `supervisor_status` | singleton: holder, last_tick_at, tick_ms, counts JSONB |
+| `supervisor_status` | singleton: holder, last_tick_at, last_success_at, last_error, consecutive_failures, tick_ms, counts JSONB |
+| `idempotency_keys` | (principal_id, key) PK, request_sha256, response JSONB, created_at |
 | `bootstrap_imports` | id, source_sha256, manifest JSONB, verified_at, committed_at, state |
 | `repositories` | id, name UNIQUE, url, default_branch, installation_id, policy_name, registered_by, created_at |
 | `worker_images` | digest PK, reference, harness, harness_version, build_inputs_sha256, promotion_state, promoted_at, promoted_by |
@@ -46,11 +47,15 @@ attempts (state); leases (expires_at); wakes (principal_id, acked_at) partial
 where acked_at is null.
 
 Triggers: `events`, `task_contracts`, `release_contracts`, `review_dispositions`, and `ci_decisions` reject UPDATE and DELETE. No table ever holds a token, key, or secret; a CI check asserts no column name matches the secret-name pattern. Writes to
-`executions`, `attempts`, `workers`, `heartbeats`, and `gate_results`
-require a transaction-local `crucible.fenced_token` (set with `SET LOCAL`
+`executions`, `attempts`, `workers`, `heartbeats`, `gate_results`,
+`completion_claims`, `supervisor_status`, and `events` rows whose
+`principal` is `crucible` require a transaction-local `crucible.fenced_token` (set with `SET LOCAL`
 at the start of every supervisor transaction, never per connection, because
 pooled connections would carry a stale value) exactly equal to the token on
-the current `supervisor` lease row; a BEFORE trigger rejects anything else.
+the current `supervisor` lease row, read `FOR SHARE` so a takeover cannot
+interleave; a BEFORE trigger rejects anything else (the principal check is
+nested inside the trigger body because PL/pgSQL compiles `NEW.principal`
+for every attached table).
 The API role writes only `tasks` (submit, start, cancel, amend, close),
 `acceptance_results`, `decisions`, `artifacts`, `wakes` (ack), and
 `policies`; it enqueues everything that touches an attempt for the
@@ -66,6 +71,12 @@ supervisor.
   refuses to serve if the head revision is not applied, and `/ready` reports
   it.
 - Down migrations required for every revision in v0.x.
+- An applied migration is never edited. Before the first tagged release
+  the initial revision may be squashed only together with a documented
+  `make reset`; after it, every change is a new revision. Readiness
+  compares the live schema to the ORM metadata so a rewritten or
+  half-applied migration is reported, not masked by the revision id (found
+  in C1 verification, 2026-09-16).
 - Migrations tested in CI against a fresh database and against a database
   seeded at the previous release's head.
 - JSONB documents validated by Pydantic on the way in and out; schema

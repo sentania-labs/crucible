@@ -138,8 +138,8 @@ of the previous version's. `required_verification` may not shrink.
   `repository.required_checks` lists (05b); missing ones are a 422 naming
   the check.
 - `policy` exists and is not retired; `lifecycle.max_attempts` within it.
-- `execution_request.harness` is registered; `provider` is registered and
-  supports the harness; `image` matches the provider's allowlist pattern,
+- `execution_request.harness` is registered; `provider` is registered
+  (only `fake` until C3) and supports the harness; `image` matches the provider's allowlist pattern,
   resolves to a known `WorkerImage` whose harness version is inside the
   adapter's supported range, and is not `retired`.
 - `deliverables[].closes` entries are issues in the same repository.
