@@ -16,7 +16,12 @@ image_allowlist = ["crucible-worker:*", "ghcr.io/example-org/crucible-worker:*"]
 tick_seconds = 5
 lease_ttl_seconds = 30
 reconcile_interval_seconds = 60
-max_concurrency = 3
+
+[skills]
+root = "/var/lib/crucible/skills"     # only skills a contract names are copied into a bundle
+
+[egress]
+proxy = "http://egress-proxy:3128"
 
 [credentials.claude_code]
 source = "directory"
@@ -26,7 +31,7 @@ mount_mode = "rw-narrow"
 [credentials.codex]
 source = "directory"
 path = "/var/lib/crucible/credentials/codex"
-mount_mode = "ro"
+mount_mode = "rw-narrow"
 
 [credentials.agy]
 source = "directory"
@@ -37,7 +42,7 @@ mount_mode = "ro"
 source = "file"
 path = "/var/lib/crucible/credentials/github/token"
 mount_mode = "ro"
-inject_as = "GH_TOKEN"
+mount_path = "/crucible/credentials/github/token"
 
 [wake.foundry]
 mode = "poll"          # or "webhook"

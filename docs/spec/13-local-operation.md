@@ -5,7 +5,8 @@
 | Service | Image | Role | Persistent |
 |---|---|---|---|
 | `postgres` | `postgres:16` pinned by digest | authoritative state | volume `crucible-pg` |
-| `docker-socket-proxy` | `tecnativa/docker-socket-proxy` pinned by digest, or an equivalent | restricted Docker API | no |
+| `docker-socket-proxy` | `tecnativa/docker-socket-proxy` pinned by digest, or an equivalent | reduced Docker API surface | no |
+| `egress-proxy` | a small CONNECT proxy image pinned by digest | worker egress allowlist | no |
 | `crucible` | `ghcr.io/sentania-labs/crucible:<tag>` | api + supervisor (`serve --all`) | volume `crucible-artifacts` |
 
 Workers are not Compose services. They are containers Crucible creates
@@ -43,48 +44,64 @@ toolchains (Python, Node, Go) come from a per-project image the task
 contract names, built `FROM` the harness base; the provider's image
 allowlist pattern controls what may run.
 
-## Docker socket: the authority Crucible holds, and how it is restricted
+## Docker socket: the authority Crucible holds, stated honestly
 
 Anything that can talk to the Docker socket is root-equivalent on the host.
 Crucible must create containers, so it needs some of that authority. The
-model:
+model, and its limits:
 
 1. **Crucible never sees the raw socket.** Only `docker-socket-proxy` mounts
    `/var/run/docker.sock`. Crucible talks HTTP to the proxy.
-2. **The proxy allows only what the provider uses**: `containers` (create,
-   start, inspect, logs, stop, kill, remove, list by label), `images`
-   (inspect, list), `networks` (inspect, connect), `volumes` (create,
-   remove, inspect), `exec` disabled, `build` disabled, `swarm`, `system`,
-   `plugins`, `secrets`, `configs` disabled. `POST` is allowed only for the
-   listed endpoints.
-3. **Create-request policy in Crucible itself**: the provider refuses to
-   emit a create request with `Privileged`, host PID or network namespace,
-   any bind mount outside the artifact root and credential root, any
-   capability add, or an image outside the allowlist. Unit-tested.
-4. **Effective host authority Crucible retains**: it can run any allowlisted
-   image with bind mounts under two configured roots, as uid 1000, with
-   dropped capabilities, on a private network. It cannot escalate to root
-   on the host through the proxy's allowed surface. A compromise of Crucible
-   is a compromise of every worker workspace and every mounted credential
-   directory, which is the accepted blast radius for trusted control-plane
-   software on a single-operator workstation.
+2. **The proxy narrows the API surface, not the request bodies.** It allows
+   `containers` (create, start, inspect, logs, stop, kill, remove, list),
+   `images` (inspect, list), `networks` (inspect, connect), `volumes`
+   (create, remove, inspect), and disables `exec`, `build`, `swarm`,
+   `system`, `plugins`, `secrets`, `configs`. It cannot reject a create
+   request that asks for `Privileged`, a host namespace, or a bind of `/`,
+   and it exposes every container on the host to inspect, kill, and
+   archive. So the proxy is a tripwire against accidents and a reduction of
+   surface, not a security boundary against a compromised Crucible.
+3. **Create-request policy in Crucible** refuses to emit `Privileged`, host
+   PID or network namespaces, any bind mount outside the artifact root and
+   credential root, any capability add, or an image outside the allowlist.
+   Unit-tested. This protects against Crucible bugs, not against Crucible
+   being compromised, because compromised code does not run its own checks.
+4. **Effective host authority Crucible retains: root-equivalent.** A
+   compromise of Crucible in the default local mode is a compromise of the
+   host. This is the same authority any developer tool with socket access
+   holds, and it is acceptable only because Crucible is trusted control-plane
+   software on a single-operator workstation that already runs Docker.
+   The operator decides whether that is acceptable (22, Q11). Two ways to
+   bound it, in order of preference:
+   - **Rootless Docker daemon dedicated to Crucible.** The socket belongs to
+     an unprivileged user; a full escape yields that user, not root. Costs
+     one daemon to install and some feature loss (no privileged ports,
+     slower overlay).
+   - **A body-validating authorization layer** in front of the socket (a
+     Docker authz plugin or a small purpose-built proxy that parses create
+     bodies) so the rejections in item 3 happen server-side. More code to
+     own; recommended only if rootless is not possible.
 5. **Workers never receive the socket or the proxy endpoint.** Verified by
    the isolation integration test (18) that runs a worker whose only job is
    to try.
 6. **Not carried to Kubernetes.** The Kubernetes provider uses the API
    server with a namespaced ServiceAccount. Nothing in the Docker model
    survives that move except the create-request policy, which becomes a Pod
-   spec policy.
+   spec policy enforced by admission on the cluster, not by Crucible.
 
 ## Networking
 
-`crucible-workers` is a bridge network with no access to the Compose
-internal network (so a worker cannot reach `postgres` or `crucible`).
-Egress: policy `network: none` gives `--network none`; `network: policy`
-attaches to the bridge where an egress allowlist (package registries,
-GitHub, the model provider endpoints each harness needs) is enforced by an
-iptables rule set on the bridge in v0.x. Spike S6 confirms each harness's
-required endpoints. Kubernetes uses NetworkPolicy for the same.
+Workers attach only to `crucible-workers`, a Docker network created with
+`internal: true`: no default route, no reach to the Compose internal
+network, `postgres`, `crucible`, or the socket proxy. Egress is provided by
+an `egress-proxy` service (an HTTP CONNECT proxy with a hostname allowlist,
+plus a resolver) that sits on both `crucible-workers` and the outside; the
+provider sets `HTTPS_PROXY`, `HTTP_PROXY`, and `NO_PROXY` in the worker
+environment, and git and each harness honor them. The allowlist is the
+union of the policy's `egress_allowlist` and the adapter's declared model
+endpoints (S6). `network: none` gives `--network none` and no proxy. No
+host firewall rules are touched by Crucible; it cannot and must not program
+host iptables.
 
 ## Filesystem
 
@@ -93,5 +110,5 @@ rw, identity ro, one credential mount, report dir rw. Nothing else.
 
 ## Resource limits
 
-Defaults from policy: 2 CPU, 4 GiB, 512 pids, 20 GiB tmpfs total. Concurrency
-cap default 3 workers per provider, 1 per harness while spike S1 is open.
+From the policy (05b): CPU, memory, pids, tmpfs total, concurrency per
+provider and per harness.

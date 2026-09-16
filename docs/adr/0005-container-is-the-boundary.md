@@ -4,8 +4,8 @@ Status: proposed, 2026-09-16.
 
 ## Context
 
-Codex's built-in sandbox (bubblewrap) does not work on the reference
-workstation because user namespaces are denied. Claude Code and AGY run
+Codex's built-in sandbox (bubblewrap) needs user namespaces, which some
+hosts deny, so it cannot be assumed available. Claude Code and AGY run
 with permission prompts bypassed in non-interactive mode. Relying on any
 harness's internal sandbox would make Crucible's safety depend on three
 vendors' implementations and on host kernel settings.

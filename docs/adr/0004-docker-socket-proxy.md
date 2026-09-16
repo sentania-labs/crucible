@@ -19,7 +19,12 @@ a namespaced ServiceAccount.
 
 ## Consequences
 
-A Crucible compromise is bounded to allowlisted images, two mount roots,
-uid 1000, and dropped capabilities. The proxy is one more container and one
-more pinned image to maintain. `exec` into workers is not available to
-Crucible, which is intentional: observation is by logs and collected files.
+The proxy reduces the API surface but does not validate request bodies, so
+a compromised Crucible remains root-equivalent on the host through it. The
+proxy plus Crucible's own create-request policy protect against Crucible
+bugs and accidents, not against Crucible being hostile. Bounding the blast
+radius further needs a rootless Docker daemon dedicated to Crucible or a
+body-validating authorization layer; that choice is the operator's (spec 22,
+Q11). The proxy is one more container to maintain. `exec` into workers is
+not available to Crucible, which is intentional: observation is by logs and
+collected files.

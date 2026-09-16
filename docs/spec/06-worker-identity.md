@@ -14,7 +14,13 @@ identity/
   skills/<name>/       only the skills the contract names
   policy.md            the deterministic policy in words: timeouts, paths, gates
   report-schema.json   CompletionClaimV1 JSON schema
+  history/             prior attempts' reports, open and answered escalations with
+                       verbatim decisions, and the latest AcceptanceResult reasoning
+                       (present on retries, after a decision, and on needs_more_work)
 ```
+
+Skills named in `project_instructions` are copied from the configured
+`skills_root`; only the named ones, nothing else in that root.
 
 The bundle's content hash is recorded on the attempt. The rendered
 `IDENTITY.md` is stored as an artifact so the exact instructions a worker saw
@@ -35,15 +41,18 @@ are reproducible.
 5. **Procedure pointers.** Which project files and skills to read first.
 6. **Verification.** The `required_verification` list, verbatim, and the
    instruction to capture each command's output to `report/`.
-7. **Reporting protocol.** Write `report/report.yaml` matching
-   `CompletionClaimV1`; write `report/progress.jsonl` lines as milestones
-   pass; write `report/blocked.md` and exit 75 to escalate; exit 0 only after
-   `report.yaml` exists.
+7. **Reporting protocol.** The report directory is `/crucible/report`,
+   mounted writable and outside the checkout. Write `report.yaml` there
+   matching `CompletionClaimV1`; write `progress.jsonl` lines as milestones
+   pass; capture each verification command's output to a log file there;
+   write `blocked.md` and exit 75 to escalate; exit 0 only after
+   `report.yaml` exists. Every path inside the report resolves against this
+   directory.
 8. **Exit codes.** 0 done with report, 75 blocked, 70 cannot proceed (bad
    environment), anything else is failure.
 9. **Prohibitions.** No pushing to any branch other than `work_branch`, no
-   force, no delegating, no editing `.crucible/`, no reading other users'
-   home directories, no claiming completion without evidence.
+   force, no delegating, no writing anywhere but the checkout and
+   `/crucible/report`, no claiming completion without evidence.
 
 ## Harness-specific delivery
 

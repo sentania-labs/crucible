@@ -24,10 +24,12 @@ clean clone.
 
 ## Phase C2: gates, claims, evidence, wakes
 
-CompletionClaimV1 parsing; evidence model; all diff-based gates
-(`report_present`, `exit_clean`, `scope_contained`, `no_injected_files`,
-`no_secrets`, `verification_ran`, `run_evidence_present`,
-`criteria_mapped`, `dependencies_unchanged`, `ci_unchanged`); policies;
+CompletionClaimV1 parsing; evidence model; PolicyV1 (05b) and the policy
+API; every gate in 11 that needs only the collected tree, the report, or
+the artifact store (`report_present`, `exit_clean`, `scope_contained`,
+`no_injected_files`, `no_secrets`, `run_evidence_present`,
+`criteria_mapped`, `review_round_recorded` via artifact upload,
+`dependencies_unchanged`, `ci_unchanged`); the artifact upload endpoint;
 acceptance and decision endpoints; wakes with poll and webhook.
 Acceptance: fake-provider runs reach `awaiting_acceptance` with correct
 gate results for pass and fail fixtures; a scripted client reconstructs
@@ -35,9 +37,12 @@ state from the API.
 
 ## Phase C3: Docker provider and worker images
 
-Socket proxy, provider implementation, create-request policy, workspace
-prepare with worktrees and checkout leases, log capture, collect, cleanup,
-reconcile by label, harness base images, the script-harness e2e image.
+Socket proxy, egress proxy, provider implementation, create-request policy,
+workspace prepare with dissociated clones and checkout leases, the
+collector and verifier containers (`verification_ran` and
+`workspace_clean` land here), log capture with timestamp-and-hash resume,
+cleanup after `logs_drained`, reconcile by label, harness base images, the
+script-harness e2e image.
 Acceptance: full e2e tier green including isolation, loss, orphan, restart,
 and disconnect tests.
 

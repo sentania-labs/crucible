@@ -26,7 +26,7 @@ mount_mode = "rw-narrow"       # the CLI refreshes tokens in place
 [credentials.codex]
 source = "directory"
 path = "/var/lib/crucible/credentials/codex"
-mount_mode = "ro"              # promoted to rw-narrow if spike S1 shows refresh writes
+mount_mode = "rw-narrow"       # the CLI writes session and log state beside its auth file
 [credentials.agy]
 source = "directory"
 path = "/var/lib/crucible/credentials/agy"
@@ -35,7 +35,7 @@ mount_mode = "ro"
 source = "file"
 path = "/var/lib/crucible/credentials/github/token"
 mount_mode = "ro"
-inject_as = "GH_TOKEN"         # env var name only; the provider reads the file at launch
+mount_path = "/crucible/credentials/github/token"   # read by the git credential helper, never exported to env
 ```
 
 Subscription authentication is the requirement: each harness is logged in
@@ -44,23 +44,35 @@ state directory is what gets mounted. No commercial API keys. Where a
 harness offers a long-lived subscription token command (Claude Code's
 `setup-token` flow, for example) that token file is the credential.
 
-`rw-narrow` means: a per-harness Docker volume seeded from the source
-directory, mounted writable at the harness's config path only, synced back
-to the source on clean exit if the harness rewrote it, never shared between
-two concurrent workers of the same harness (each gets its own copy; the last
-successful refresh wins on sync, with a recorded event). Spike S1 (21)
-determines whether concurrent refresh breaks any harness, and if so,
-per-harness concurrency drops to 1 until solved.
+`rw-narrow` means: a per-attempt Docker volume seeded with **only the named
+auth files** of that harness (the adapter's `credential_spec` lists them,
+for example an OAuth credentials file and, for Claude Code, the top-level
+state file it keeps beside its config directory), mounted writable at the
+paths the harness expects. Everything else the harness reads from its config
+directory (settings, hooks, MCP definitions, instruction files) is mounted
+read-only from a Crucible-owned template, so a worker cannot plant a hook or
+a server definition that a later worker inherits. On clean exit, Crucible
+validates each named auth file's JSON shape and syncs back only those files,
+choosing by the newest issued-at timestamp inside the token, never by exit
+order. Per-harness concurrency is 1 whenever `rw-narrow` is in effect (05b
+enforces this), because refresh tokens rotate and two concurrent refreshes
+leave one worker with a revoked token and every later worker locked out.
+Spike S1 records what each harness actually writes and where.
 
 ## Repository credentials
 
-A GitHub token or App installation token, scoped to the target repository,
-read-only mounted, injected as an environment variable by the provider from
-the mounted file at container start. Workers push to `work_branch` only; the
-token's permissions cannot enforce a branch, so `branch_pushed_at_head` and
-branch protection on the repository are the guard. Force-push is prohibited
-by identity and detectable by the gate (remote head must equal collected
-HEAD).
+A GitHub App installation token (or a fine-grained token, operator's
+choice, 22 Q2) scoped to the target repository, mounted read-only as a file.
+It is never placed in the environment. The provider installs a git
+credential helper in the worker image that reads the mounted file, and a
+`gh` configuration that does the same, so `git push` and `gh pr create`
+work without the token ever appearing in `env`, `ps`, or logs. Commit
+author identity comes from policy (`git.author_name`, `git.author_email`),
+set through the worker's read-only git config template, with the attempt ID
+as a commit trailer. Workers push to `work_branch` only; a token cannot
+enforce a branch, so `branch_pushed_at_head` and repository branch
+protection are the guard. Force-push is prohibited by identity and detected
+by the gate.
 
 ## Logs and artifacts
 

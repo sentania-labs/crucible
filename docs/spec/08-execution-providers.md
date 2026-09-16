@@ -41,11 +41,16 @@ paths, emit N log lines. Every lifecycle and gate test runs against it.
 
 - Talks to Docker through the socket proxy endpoint, never the raw socket
   (13). API version pinned.
-- `prepare`: clone or fetch the repository into
-  `<artifact_root>/workspaces/<attempt>/repo` on the host (bare-cache plus
-  worktree for speed), check out `base_ref`, create `work_branch`, write
-  shims, write `.git/info/exclude`, take the checkout lease, render the
-  identity bundle to `<artifact_root>/workspaces/<attempt>/identity`.
+- `prepare`: take the checkout lease first; then `git clone --reference
+  <cache> --dissociate` into `<artifact_root>/workspaces/<attempt>/repo`
+  (the cache is a bare repository only Crucible reads; nothing shared is
+  mounted into a worker); if remote `work_branch` already exists (a retry or
+  `needs_more_work`), fetch and check it out, else create it from
+  `base_ref`; record which happened as an event; write shims and
+  `.git/info/exclude`; install the git credential helper and author
+  identity from policy; render the identity bundle to
+  `<artifact_root>/workspaces/<attempt>/identity`; create the empty report
+  directory at `<artifact_root>/workspaces/<attempt>/report`.
 - `launch`: create a container from the allowlisted image with: `--user
   1000:1000`, `--cap-drop ALL`, `--security-opt no-new-privileges`,
   `--read-only` root with tmpfs for `/tmp` and `/home/worker`, memory and
@@ -55,13 +60,25 @@ paths, emit N log lines. Every lifecycle and gate test runs against it.
   (rw). Labels: `crucible.attempt`, `crucible.task`, `crucible.owner`.
 - `observe`: container inspect; `lost` if the container ID no longer exists.
 - `logs`: docker logs with timestamps, since offset.
-- `collect`: read report dir, `git diff --stat` and full diff against
-  `base_ref`, changed-path list, HEAD SHA, whether `work_branch` was pushed
-  (ls-remote), transcript.
+- `collect`: never runs git or reads worker-written files as the Crucible
+  process. It launches a throwaway collector container (the same hardened
+  shape as a worker, `--network none`, uid 1000, the repo mounted ro, the
+  report dir mounted ro, an output dir mounted rw) that produces: `git diff
+  --stat` and the full diff against `base_ref`, the changed-path list, HEAD
+  SHA, `git log --format` of `work_branch`, and a copy of the report
+  directory. Git in the collector runs with `GIT_CONFIG_GLOBAL=/dev/null`,
+  `GIT_CONFIG_NOSYSTEM=1`, `-c core.fsmonitor= -c diff.external= -c
+  core.pager=cat -c core.hooksPath=/dev/null`. The copy step opens every
+  file with `O_NOFOLLOW`, rejects symlinks, hard links, devices, and files
+  above the policy size cap, and records each rejection as an event.
+  Whether `work_branch` was pushed is checked by `ls-remote` from Crucible
+  against the remote, not from the worker's tree. Everything read from the
+  tree is data.
 - `terminate`: `drain` sends SIGTERM and waits the policy grace; `kill`
   sends SIGKILL.
-- `cleanup`: remove container; keep or delete the workspace per policy;
-  release the lease.
+- `cleanup`: only for attempts whose exit path recorded `logs_drained`;
+  remove container; keep or delete the workspace per policy; release the
+  lease; remove the per-attempt credential volume.
 - `reconcile`: list containers by label; anything with a label but no live
   attempt row is orphaned and removed; any live attempt with no container is
   marked `lost`.

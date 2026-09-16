@@ -17,15 +17,20 @@ are not events; they are a separate stream (below).
 
 `log_chunks`: `attempt_id`, `stream`, `offset_start`, `offset_end`, `ts`,
 `content` (bytea, gzip above a threshold). The supervisor pulls provider
-logs each tick and appends. Live tail streams chunks as they land. Log
-bytes advancing is one heartbeat signal.
+logs each tick and appends. Resume position is the last stored
+`(timestamp, sha256(line))`: the pull asks the provider for lines since
+that timestamp and skips until the hash matches, which avoids both
+duplicates and drops among lines sharing a timestamp (Docker has no byte
+offsets). Live tail streams chunks as they land. Log bytes advancing is one
+heartbeat signal. An attempt records `logs_drained` after the final pull
+following exit; cleanup never runs before it.
 
 ## Leases
 
 | Lease | Held by | Renewed | Expiry meaning |
 |---|---|---|---|
 | supervisor | one Crucible instance | every tick (default 5 s), TTL 30 s | another instance may take over; the old one must stop acting on expiry |
-| attempt | the supervisor on behalf of a running attempt | every observation tick | worker considered `lost` if provider also cannot see it; `stalled` if provider sees it but nothing advances |
+| attempt | the supervisor on behalf of a running attempt | every observation tick | informational: an expired attempt lease means observation stopped (Crucible was down); loss is decided only when the provider cannot see the worker |
 | checkout | an attempt, for `repository.url` + `work_branch` | for the life of the attempt | released on terminal attempt state or by reconcile after loss |
 
 Leases are rows with `holder`, `expires_at`, `fenced_token` (monotonic).

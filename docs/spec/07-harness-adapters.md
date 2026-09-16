@@ -20,11 +20,13 @@ class HarnessAdapter(Protocol):
 values, only names that the provider resolves from mounts), mounts, working
 dir, user, resource limits, network mode, expected exit semantics.
 
-`ExitClass`: `completed`, `blocked` (75), `environment` (70),
-`auth_failure`, `quota_exhausted`, `timeout`, `killed`, `crashed`,
-`unknown`. Only `environment`, `auth_failure`, and `quota_exhausted` are
-retry-eligible under the default policy, because those are not the worker's
-fault and a retry is not a second guess at the work.
+`ExitClass` is the one enum used by contracts, policies, and 16:
+`completed`, `completed_without_report`, `blocked`, `environment`,
+`auth_failure`, `quota_exhausted`, `timeout`, `killed`, `crashed`, `lost`,
+`unknown`. Which classes may retry is a policy decision (05b
+`retry.eligible_classes`), narrowed by the contract's `retry_on`; a retry
+happens only when the class is in both. Gate failures are never a class and
+never retry.
 
 ## Common rules
 
@@ -45,12 +47,19 @@ fault and a retry is not a second guess at the work.
 
 - Launch: `claude -p --permission-mode bypassPermissions
   --append-system-prompt-file /crucible/identity/IDENTITY.md
-  --output-format stream-json --model <model>` with the prompt on stdin:
-  "Read /crucible/identity/IDENTITY.md and execute the task."
-- Credentials: subscription OAuth state under the harness config dir. Mounted
-  from `credential:claude_code` to `/home/worker/.claude` as a narrow
-  writable volume, because the CLI refreshes tokens in place. Spike S1 (21)
-  must confirm refresh behavior and whether read-only suffices.
+  --output-format stream-json --verbose --model <model>` with the prompt on
+  stdin: "Read /crucible/identity/IDENTITY.md and execute the task."
+  (`stream-json` requires `--verbose` in print mode.)
+- Credentials: subscription OAuth state. Two files are the credential: the
+  credentials file inside the CLI's config directory and the top-level
+  state file the CLI keeps beside it in the home directory. Both are
+  `rw-narrow` (12) because the CLI refreshes tokens in place; the rest of
+  the config directory (settings, hooks, MCP definitions) is mounted
+  read-only from a Crucible-owned template. If the operator uses the CLI's
+  long-lived token command instead, that token is delivered through the
+  CLI's documented environment variable from the mounted file at container
+  start, as the one exception to file-only delivery, and S1 records which
+  path is in use.
 - Shim: none if the checkout has a `CLAUDE.md`; otherwise a one-line
   untracked `CLAUDE.md` pointing at the identity file.
 - Stream-json lines are parsed into progress events (tool use, text) at low
@@ -67,17 +76,21 @@ fault and a retry is not a second guess at the work.
   the container is the boundary regardless. Where user namespaces are
   available in the container, spike S2 tests enabling Codex's sandbox as
   defense in depth.
-- Credentials: `credential:codex` mounted to `/home/worker/.codex` (auth
-  file). Narrow writable if refresh writes; spike S1 decides.
+- Credentials: `credential:codex` is `rw-narrow` from the start: the CLI
+  writes session and log state beside its auth file, so a read-only mount
+  fails before auth is tested. Only the auth file syncs back (12).
 - Shim: untracked `AGENTS.md` if absent.
-- Output: plain text stream; the last message is stored as the summary
-  artifact; the report file is the fact.
+- Output: run with `--json` and `-o /crucible/report/codex-last-message.md`;
+  the JSON event stream is stored as the transcript artifact, the last
+  message as a summary artifact; the report file is the fact.
 
 ## AGY
 
 - Launch: `agy -p "<pointer>" --model <model> --effort <effort>
   --dangerously-skip-permissions --add-dir /crucible/identity
-  --output-format stream-json`. Prompt is under 1 KB by construction.
+  --output-format stream-json`, as observed in the CLI's own `--help` on the
+  reference install. Spike S3 produces the final argv and confirms every
+  flag before this section is frozen. Prompt is under 1 KB by construction.
 - Credentials: `credential:agy` mounted to the Gemini config dir.
 - Shim: untracked `AGENTS.md` if absent (AGY reads `AGENTS.md`; it does not
   read `GEMINI.md` reliably in headless mode per the operator's setup notes).
@@ -85,8 +98,9 @@ fault and a retry is not a second guess at the work.
 
 ## Report parsing (all harnesses)
 
-`report/report.yaml` is parsed against `CompletionClaimV1`. Missing file with
-exit 0 is `completed_without_report`, a hard failure of the report gate, never
-a success. `report/blocked.md` with exit 75 produces an escalation and moves
-the task to `blocked`. Progress lines are ingested as events with the
+`/crucible/report/report.yaml` is parsed against `CompletionClaimV1` from
+the collector's copy (08). Missing file with exit 0 is
+`completed_without_report`, a hard failure of the report gate, never a
+success. `blocked.md` with exit 75 produces an escalation and moves the task
+to `blocked`; exit 75 without it is `failed`. Progress lines are ingested as events with the
 worker as source and marked `unverified`.

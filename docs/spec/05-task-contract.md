@@ -62,7 +62,7 @@ deliverables:
 
 reporting:
   report_schema: "CompletionClaimV1"
-  report_dir: ".crucible/report"   # inside the checkout, gitignored by Crucible
+  report_dir: "/crucible/report"   # a separate rw mount, never inside the checkout
   progress_events: true
 
 escalation:
@@ -85,12 +85,13 @@ execution_request:                 # Foundry's selection; Crucible does not choo
 
 lifecycle:
   max_attempts: 2                  # must not exceed the policy's cap
-  retry_on: ["infrastructure_failure"]   # never on gate failure
+  retry_on: ["environment", "lost"]      # subset of the ExitClass enum (07); never on gate failure
   cleanup: "policy"
-
-submitted_by: "foundry"
-submitted_at: "2026-09-16T05:40:00-05:00"
 ```
+
+The submitting principal and receipt time are not contract fields: Crucible
+records them on the task row and the `task_submitted` event from the
+authenticated token, so a client cannot claim another principal.
 
 ## Validation rules (deterministic, on submit)
 
@@ -105,7 +106,12 @@ submitted_at: "2026-09-16T05:40:00-05:00"
   supports the harness; `image` matches the provider's allowlist pattern.
 - `repository.auth.source` and every `credential:` reference name a
   configured mount, and none contains a value.
-- `timeout_seconds` within policy bounds.
+- `timeout_seconds` within policy bounds; `retry_on` a subset of both the
+  `ExitClass` enum and the policy's `retry.eligible_classes`.
+- The contract is authoritative for harness, model, provider, image, and
+  policy. `POST /tasks/{id}/start` may carry an `overrides` object; applying
+  it creates a new contract version through the amendment path and records
+  an `amend` event, so the stored contract always says what actually ran.
 - No string field contains something that matches the secret-pattern
   scanner (bearer-like tokens, private key headers). Rejected with 422 and
   the offending path, not the value.

@@ -38,6 +38,13 @@ proceeds on the recommendation unless told otherwise.
 9. **Crucible's own delivery.** Crucible is consumed by Foundry, so it is a
    branch-and-PR repository with tagged releases per the delivery pipeline.
    Its CI needs a Docker daemon, so it runs GitHub-hosted. Confirm.
-10. **Sandcastle code reuse.** None proposed. If a specific helper (the
+11. **Docker socket blast radius.** In the default local mode a Crucible
+    compromise is root-equivalent on the host (13, ADR 0004); the proxy
+    reduces surface but cannot validate request bodies. Accept that for a
+    single-operator workstation, or run a rootless Docker daemon dedicated
+    to Crucible so an escape yields an unprivileged user? Recommendation:
+    accept for C1 to C3 with the risk recorded, and make rootless Docker a
+    C3 acceptance item if the workstation supports it (S9, added to 21).
+12. **Sandcastle code reuse.** None proposed. If a specific helper (the
     Docker volume label formatting, the idle-timeout state machine) proves
     worth porting, it gets an ADR with attribution. Confirm no default reuse.

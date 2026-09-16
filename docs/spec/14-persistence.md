@@ -31,10 +31,15 @@ attempts (state); leases (expires_at); wakes (principal_id, acked_at) partial
 where acked_at is null.
 
 Triggers: `events` and `task_contracts` reject UPDATE and DELETE. Writes to
-`tasks`, `executions`, `attempts` require a `fenced_token` session variable
-equal to or newer than the current supervisor lease token, enforced by a
-BEFORE trigger, for the supervisor role; the API role is exempt for the
-operations it owns (submit, start, cancel, accept, decisions).
+`executions`, `attempts`, `workers`, `heartbeats`, and `gate_results`
+require a transaction-local `crucible.fenced_token` (set with `SET LOCAL`
+at the start of every supervisor transaction, never per connection, because
+pooled connections would carry a stale value) exactly equal to the token on
+the current `supervisor` lease row; a BEFORE trigger rejects anything else.
+The API role writes only `tasks` (submit, start, cancel, amend, close),
+`acceptance_results`, `decisions`, `artifacts`, `wakes` (ack), and
+`policies`; it enqueues everything that touches an attempt for the
+supervisor.
 
 ## Strategy
 

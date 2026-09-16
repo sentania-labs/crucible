@@ -15,6 +15,8 @@ C1 starts.
 | S7 | Can harness versions be pinned and updated predictably in images? | Build images at two versions; verify version reporting; rebuild reproducibly | Same inputs produce the same image digest, or the reason is recorded |
 | S8 | Does a running worker survive a Crucible container restart and a Compose restart? | Start a long fake task; restart `crucible`; then `docker compose restart` | Worker unaffected; re-attach succeeds; logs resume |
 
+| S9 | Does a rootless Docker daemon dedicated to Crucible run the worker images and the socket proxy with acceptable performance? | Install rootless dockerd for a service user; run the C3 e2e tier against it | Documented pass or the specific blocker |
+
 Spike results go in `docs/spikes/S<n>.md` with commands, output excerpts,
 and the decision. Credentials used during spikes are the operator's own
 host directories, copied to a scratch location and deleted after; nothing

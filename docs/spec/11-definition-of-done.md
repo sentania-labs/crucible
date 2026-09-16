@@ -41,8 +41,8 @@ blockers: []
 follow_ups: ["..."]
 ```
 
-Every field required; empty lists are explicit. Missing or unparsable
-report is a report-gate failure.
+Every field required; empty lists are explicit. All paths are relative to
+`/crucible/report`. Missing or unparsable report is a report-gate failure.
 
 ## Derivation from the delivery pipeline
 
@@ -65,14 +65,14 @@ it cannot check stays with Foundry or the user.
 | `scope_contained` | every changed path matches `allowed_paths` and none matches `prohibited_paths` | diff path list from `collect` |
 | `no_injected_files` | shims, `.crucible/`, identity paths absent from diff and from any commit on `work_branch` | diff, `git log --stat` |
 | `no_secrets` | secret scanner over the diff and the report finds nothing | scanner output artifact |
-| `verification_ran` | for each `required_verification` command: a log artifact exists, its recorded exit matches `expect_exit`, and the command string appears in the captured worker transcript | check logs, transcript |
+| `verification_ran` | for each `required_verification` command: Crucible itself re-ran the command after exit, in a fresh verifier container from the collected tree (same image, `network` per policy), and its exit matches `expect_exit`; the verifier's log is the evidence. The worker's own check logs are stored as a claim and shown to Foundry, never consumed by the gate | verifier exit and log (verified) |
 | `run_evidence_present` | each `kind: artifact` verification path exists and is non-empty | artifacts |
 | `criteria_mapped` | every `acceptance_criteria.id` appears in `acceptance_mapping` with a status | report |
 | `branch_pushed_at_head` | remote `work_branch` head equals reported `head_sha` equals collected HEAD | ls-remote, collect |
-| `review_round_recorded` | a review artifact for `head_sha` by a principal other than the worker exists (Foundry attaches it via the artifacts API after running the reviewer) | artifact of type `review` |
+| `review_round_recorded` | an artifact of type `review` for `head_sha` exists, uploaded through `POST /attempts/{id}/artifacts` by a principal other than the worker, or produced by a Crucible `reviewer` role attempt (22 Q3) | artifact of type `review` with principal |
 | `pr_exists_head_matches` | PR exists, targets `deliverables.target`, head equals `head_sha`, not draft when contract says not draft | provider query via repository auth |
-| `ci_green_for_head` | the workflow run for `head_sha` concluded success (the run, not the merge) | CI API query |
-| `external_review_round` | configured reviewer bot has left a review or reaction on the PR (absence means not yet, so `pending`) | PR reactions and reviews |
+| `ci_green_for_head` | every check named in the policy's `gates.ci.required_checks` concluded success for `head_sha`; with an empty list, every non-skipped run for that SHA (the run, not the merge). No runs yet is `pending` | CI API query |
+| `external_review_round` | the policy's `bot_login` has left one of the `accepted_signals` on the PR; absence is `pending`; an empty `bot_login` makes the gate `skipped` | PR reactions and reviews |
 | `release_shape` | when the contract deliverable is a tag: annotated, `vMAJOR.MINOR.PATCH`, reachable from default branch | git query |
 | `dependencies_unchanged` | when `may_add_dependencies` is false: lockfiles and manifests unchanged | diff |
 | `ci_unchanged` | when `may_modify_ci` is false: no change under workflow paths | diff |

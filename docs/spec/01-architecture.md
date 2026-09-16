@@ -26,7 +26,7 @@ crucible/
     notify/       webhook, poll queue
   scheduler/      the supervision loop: leases, heartbeats, timeouts,
                   reconciliation ticks
-  cli/            crucible-admin: migrate, import, reconcile, tokens
+  cli/            crucible-admin: migrate, import, reconcile, tokens, drain, export
 ```
 
 Dependency direction is inward only: adapters import application and

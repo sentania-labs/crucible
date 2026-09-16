@@ -38,7 +38,7 @@ Produced by `foundry-ledger export --format crucible`:
                "refs": {...}, "evidence": [...], "last_report": "...",
                "blockers": [...], "decisions_pending": [...] } ],
   "events": [ { "seq": 1, "ts": "...", "task": "FDY-0001", "event": "...",
-                "who": "scott", "detail": "..." } ],
+                "who": "operator", "detail": "..." } ],
   "counts": { "tasks": 8, "events": 25 },
   "content_sha256": "sha256 over canonical JSON of tasks and events"
 }
@@ -60,7 +60,7 @@ Produced by `foundry-ledger export --format crucible`:
 3. Records are written in one transaction under a `bootstrap_imports` row in
    state `verified`. `external_id` is preserved on every task; events get
    new global `seq` values but keep their original `seq` in the payload.
-   Timestamps are stored as given, with the source zone recorded.
+   Timestamps are normalized to UTC on import; the original string is kept in the event payload.
 4. The response is a verification report: counts written, per-state map,
    content hash, and a diff of any field that could not be carried.
 5. Foundry (or the operator) POSTs `/commit`. The import row becomes
