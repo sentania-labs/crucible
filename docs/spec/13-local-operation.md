@@ -148,7 +148,15 @@ network, `postgres`, `crucible`, or the socket proxy. Egress is provided by
 resolver) that sits on both `crucible-workers` and the outside; the
 provider sets `HTTPS_PROXY`, `HTTP_PROXY`, and `NO_PROXY` in the container
 environment. The worker allowlist is the union of the policy's
-`egress_allowlist` and the adapter's declared model endpoints (S6). The
+`egress_allowlist` and the adapter's declared model endpoints. From S6
+(Claude Code and the others provisional until an authenticated run
+completes through the filter in C3): Claude Code `api.anthropic.com`
+(plus `mcp-proxy.anthropic.com` only if account MCP connectors are
+wanted; telemetry to Datadog denied); Codex `api.openai.com`,
+`auth.openai.com`, possibly `chatgpt.com`; AGY
+`daily-cloudcode-pa.googleapis.com`, `oauth2.googleapis.com`. Everything
+else each CLI tried (experiment flags, update checks, browser downloads)
+is denied. The
 publisher's allowlist is `github.com` and `api.github.com` only. `network:
 none` gives `--network none` and no proxy. Crucible never programs host
 firewall rules.

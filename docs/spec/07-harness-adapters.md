@@ -14,7 +14,8 @@ class HarnessAdapter(Protocol):
     def credential_spec(self) -> CredentialSpec: ...
     def build_launch(self, ctx: LaunchContext) -> LaunchSpec: ...
     def parse_report(self, report_dir: Path, exit: ExitInfo) -> ParsedReport: ...
-    def classify_exit(self, exit: ExitInfo, stderr_tail: str) -> ExitClass: ...
+    def classify_exit(self, exit: ExitInfo, stdout_tail: str, stderr_tail: str) -> ExitClass: ...
+    # both tails: Claude Code and AGY report a missing or expired login on stdout (S5)
 ```
 
 `LaunchSpec`: image, command and args, stdin bytes or file, env (no secret
@@ -33,6 +34,9 @@ never retry.
 
 - Non-interactive only. No TTY. Permission prompts disabled by the harness's
   own flag; the container is the boundary (12).
+- Auth failures are classified from both stdout and stderr tails (S5).
+- Codex is launched with `--disable plugins` so it does not contact
+  github.com or chatgpt.com for plugin sync (S6).
 - The task contract and identity are delivered as files. Argv carries only
   a short pointer. This is forced by AGY's 128 KB argv ceiling and applied
   uniformly.
@@ -81,9 +85,10 @@ never retry.
   --model <model> -C <checkout>` with `IDENTITY.md` followed by the prompt on
   stdin. `--sandbox read-only` and friends are not used: Codex's bubblewrap
   sandbox needs user namespaces, which the reference workstation denies, and
-  the container is the boundary regardless. Where user namespaces are
-  available in the container, spike S2 tests enabling Codex's sandbox as
-  defense in depth.
+  the container is the boundary regardless. S2 showed Codex's sandbox
+  cannot run inside the worker container at all (no bubblewrap in the
+  image, and user namespaces are blocked under every seccomp profile
+  tried), so it is never enabled; the container is the only boundary.
 - Credentials: `credential:codex` is `rw-narrow` from the start: the CLI
   writes session and log state beside its auth file, so a read-only mount
   fails before auth is tested. Only the auth file syncs back (12).
@@ -97,8 +102,9 @@ never retry.
 - Launch: `agy -p "<pointer>" --model <model> --effort <effort>
   --dangerously-skip-permissions --add-dir /crucible/identity
   --output-format stream-json`, as observed in the CLI's own `--help` on the
-  reference install. Spike S3 produces the final argv and confirms every
-  flag before this section is frozen. Prompt is under 1 KB by construction.
+  reference install; S3 confirmed the flags and stream-json output. The
+  argv ceiling is the kernel's 128 KiB per argument (S3), so the prompt
+  is under 1 KB by construction and the bundle travels by `--add-dir`.
 - Credentials: `credential:agy` mounted to the Gemini config dir.
 - Shim: untracked `AGENTS.md` if absent (AGY reads `AGENTS.md`; it does not
   read `GEMINI.md` reliably in headless mode per the operator's setup notes).

@@ -65,8 +65,13 @@ webhook_secret_path = "/var/lib/crucible/credentials/github/webhook.secret"
 ```
 
 Subscription authentication is the requirement for harnesses: each harness
-is logged in once on the host by the operator (interactive login), and the
-resulting state directory is what gets mounted. No commercial API keys.
+is logged in once by the operator (interactive login) **into Crucible's
+own credential directory** (for example with `CLAUDE_CONFIG_DIR`,
+`CODEX_HOME`, or the equivalent pointed at that directory), and that
+directory is what gets mounted. It is never a copy of the operator's
+daily-use directory: S1 showed Codex and AGY refresh their tokens on
+their own during a run, and a refresh from a copy races the operator's
+own session. No commercial API keys.
 
 `rw-narrow` means: a per-attempt Docker volume seeded with **only the named
 auth files** of that harness (the adapter's `credential_spec` lists them),
@@ -86,8 +91,14 @@ locked out. Spike S1 records what each harness actually writes and where.
 
 Locally the App private key and webhook secret are files under a private
 credential directory mounted read-only into the `crucible` container only.
-In Kubernetes they are a projected Secret or an external-secrets mount on
-the `crucible` pods only. Crucible signs a JWT with the key in memory,
+In Kubernetes they are a Secret mounted on the `crucible` pods only,
+delivered through the GitOps repository as a SealedSecret (encrypted to
+the cluster's key, so only the ciphertext is committed) or as an
+ExternalSecret pointing at a secret store; Crucible reads a file path and
+does not care which. Rotation is a new App key (GitHub allows several per
+App), a new sealed manifest, and a revoke of the old key. Rebuilding a
+cluster re-seals and is a natural rotation point. Workers, collectors,
+verifiers, and publishers never mount that Secret. Crucible signs a JWT with the key in memory,
 exchanges it for an installation token scoped to the one repository the
 job needs, and hands that token to the publisher container as a file on
 tmpfs read by a git credential helper. The token is never in `env`, `ps`,
