@@ -120,10 +120,14 @@ BRANCH_PUSH_MS=$((t1 - t0))
 TAG_PUSH=skipped
 TAG_PUSH_MS=0
 if [ "$S10_MODE" != followup ]; then
-    "${GIT[@]}" tag -a "$S10_TAG" -m "S10 annotated tag $S10_STAMP (throwaway)"
     log "push tag start"
     t0=$(now_ms)
-    if "${GIT[@]}" push --quiet origin "refs/tags/$S10_TAG" 2>"$OUT/push-tag.err"; then
+    # Creating the tag is part of the step: if it fails (a leftover tag of the
+    # same name, say) that must land in TAG_PUSH and reach the accounting at the
+    # end, not abort the script through set -e with nothing written.
+    if "${GIT[@]}" tag -a "$S10_TAG" -m "S10 annotated tag $S10_STAMP (throwaway)" \
+           2>"$OUT/tag-create.err" \
+       && "${GIT[@]}" push --quiet origin "refs/tags/$S10_TAG" 2>"$OUT/push-tag.err"; then
         TAG_PUSH=ok
     else
         TAG_PUSH=failed

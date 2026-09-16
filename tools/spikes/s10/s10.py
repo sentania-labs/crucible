@@ -48,10 +48,11 @@ HERE = Path(__file__).resolve().parent
 # and underscores, so the shape check must pin neither length nor alphabet.
 # The positive control below is what proves this regex matches a real token.
 TOKEN_RE = re.compile(rb"ghs_[A-Za-z0-9_.-]{20,2000}")
-# Longest byte run TOKEN_RE can match: the four-byte prefix plus its upper bound.
-# Streaming scans must keep at least this much overlap between reads, or a token
-# that straddles a read boundary is split and neither buffer contains the value.
-MAX_CANDIDATE_BYTES = 4 + 2000
+# Longest byte run TOKEN_RE can match, derived from the pattern rather than
+# restated, so the two cannot drift apart. Streaming scans keep at least this
+# much overlap between reads, or a candidate that straddles a read boundary is
+# split and neither buffer contains the whole of it.
+MAX_CANDIDATE_BYTES = len(b"ghs_") + int(re.search(rb",(\d+)\}$", TOKEN_RE.pattern).group(1))
 
 
 def local(ts=None):
@@ -193,14 +194,20 @@ class Scanner:
         with self.lock:
             self.rows.append(row)
         buffer_ok = row["substring_hits"] > 0 and row["hash_matches"] > 0
-        # Straddle the first read boundary by 100 bytes: the token starts inside
-        # read 1 and ends inside read 2, so only the overlap can recover it.
-        pad = b"x" * (self.READ_BYTES - 100)
+        # Straddle the first read boundary by all but one byte of the token, the
+        # worst case: read 1 ends one byte into the value. A control that
+        # straddles by less passes with any overlap at least that wide, so it
+        # would not notice the overlap shrinking back toward the old 64 bytes.
+        pad = b"x" * (self.READ_BYTES - (len(self.value) - 1))
         stream_row = self.check_stream(
             "POSITIVE CONTROL (streaming scan, token straddling an 8 MiB read boundary)",
             io.BytesIO(pad + self.value + b" suffix" + b"y" * 4096),
-            note="must be non-zero; proves check_stream's overlap recovers a split token")
-        stream_ok = stream_row["substring_hits"] > 0 and stream_row["hash_matches"] > 0
+            note="must be exactly 1/1/1; proves check_stream's overlap recovers a split "
+                 "token and does not count it twice")
+        # Exactly one, not at least one: a double count in the overlap is as much
+        # a defect as a miss, and only the equality catches it.
+        stream_ok = (stream_row["substring_hits"] == 1 and stream_row["pattern_candidates"] == 1
+                     and stream_row["hash_matches"] == 1)
         return {"buffer": buffer_ok, "stream": stream_ok}
 
     READ_BYTES = 8 << 20
@@ -389,7 +396,7 @@ def cmd_run(args):
             result["pr"]["created_at_local"] = local(pr["created_at"])
     if (out / "api-calls.tsv").exists():
         result["api_calls_in_container"] = [l.split("\t") for l in (out / "api-calls.tsv").read_text().splitlines()]
-    for f in ("push-branch.err", "push-tag.err"):
+    for f in ("push-branch.err", "tag-create.err", "push-tag.err"):
         if (out / f).exists():
             result[f] = (out / f).read_text()[-2000:]
 
@@ -419,8 +426,7 @@ def cmd_run(args):
     for label, root in (("worktree " + args.worktree, Path(args.worktree)),
                         ("publisher output dir " + str(out), out),
                         ("scratch root " + str(scratch) + " (run records, rendered squid.conf)", scratch),
-                        ("/tmp (whole tree)" if not args.light else "/tmp: NOT SCANNED (--light)",
-                         Path("/tmp") if not args.light else out),
+                        ("/tmp (whole tree)", Path("/tmp") if not args.light else None),
                         ("/dev/shm", Path("/dev/shm")),
                         ("~/.config/gh", Path.home() / ".config/gh"),
                         ("~/.gitconfig and ~/.git-credentials", Path.home())):
@@ -431,6 +437,11 @@ def cmd_run(args):
                 if fp.exists():
                     data += fp.read_bytes()
             scanner.check(label, data, note="present: " + ",".join(fn for fn in (".gitconfig", ".git-credentials", ".netrc") if (root / fn).exists()))
+        elif root is None:
+            # --light: the location is omitted from the proof entirely rather than
+            # substituted, so no row claims coverage it does not have and the
+            # empty-scan guard is not satisfied by a decoy.
+            result.setdefault("locations_not_scanned", []).append(label + " (--light)")
         elif root.exists():
             scanner.check_tree(label, root)
     scanner.check("this process argv (sys.argv)", " ".join(sys.argv).encode())
@@ -641,6 +652,8 @@ def main():
     c.add_argument("--keep-squid", action="store_true")
     c.set_defaults(fn=cmd_cleanup)
     args = ap.parse_args()
+    if getattr(args, "mode", None) == "followup" and not args.branch:
+        ap.error("--mode followup needs --branch: the branch must already exist")
     args.fn(args)
 
 
