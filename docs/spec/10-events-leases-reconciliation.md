@@ -4,8 +4,12 @@
 
 Append-only table `events` with a global monotonic `seq` (BIGSERIAL), `ts`,
 `kind`, `task_id`, `execution_id`, `attempt_id`, `principal` (who caused it:
-`crucible`, an API principal, or `worker:<attempt>`), `payload` (JSONB,
-schema per kind), and `verified` (false for anything a worker asserted).
+`crucible`, an API principal, `github` for verified deliveries and polls,
+or `worker:<attempt>`), `payload` (JSONB, schema per kind), and `verified`
+(false for anything a worker asserted). Every outward-facing GitHub action
+is two events: `github_call_started` and `github_call_completed` or
+`github_call_failed`, with the endpoint, repository, and response class,
+never a token.
 Kinds are an enum; adding one is a migration. Events are never updated or
 deleted. Retention: forever in v0.x (volume is small); archival to object
 storage is a later policy.
@@ -70,8 +74,16 @@ Runs at supervisor start and every `reconcile_interval` (default 60 s):
    orphan; terminate and clean up; event recorded.
 4. For every checkout lease past expiry with no live attempt: release.
 5. For every task in `reported` with pending gates: evaluate.
-6. For every wake undelivered past its retry schedule: redeliver.
-7. Write the supervisor liveness row (`last_tick`, duration, counts).
+6. Process stored GitHub webhook deliveries not yet processed; for every
+   PR or release in an observed state whose last poll is older than
+   `github.poll_interval_seconds`: poll, record changes, re-evaluate
+   post-PR gates (23).
+7. For every task in `publishing` whose publisher job has no live
+   container: re-verify remote head and PR existence, then resume or
+   mark `publish_failed`.
+8. For every wake undelivered past its retry schedule: redeliver.
+9. Apply retention: each deletion an event and a `RetentionAction`.
+10. Write the supervisor liveness row (`last_tick`, duration, counts).
 
 Reconciliation is idempotent; running it twice changes nothing the second
 time. That property is tested.

@@ -1,6 +1,6 @@
 # 00. Overview, scope, and non-goals
 
-Status: draft for review. Version 0.2, 2026-09-16, after one non-author adversarial review round.
+Status: draft for review. Version 0.3, 2026-09-16, incorporating the operator's decisions on the sixteen open questions (22). Version 0.2 followed one non-author adversarial review round.
 
 ## Purpose
 
@@ -21,6 +21,8 @@ whether or not the orchestrator is connected.
 | Which model, harness, and execution environment | Provisions the environment named in the contract |
 | Constraints and acceptance criteria | Launches and monitors the worker |
 | Whether output semantically satisfies the outcome | Delivers injected identity and instructions |
+| What external review feedback means and whether to amend | Pushes branches, opens PRs, pushes tags, and watches them |
+| Whether merged changes form a release | Verifies release gates and performs the tag |
 | Whether a risk is acceptable | Captures events, logs, evidence, artifacts |
 | Whether more work is needed | Enforces deterministic policies and gates |
 | What escalates to the user | Detects completion, failure, timeout, loss, stall |
@@ -46,6 +48,11 @@ Crucible only records.
 - Lease and heartbeat based liveness; restart reconciliation.
 - Deterministic definition-of-done gates with evidence records.
 - Structured logging, durable events, artifact and log storage on disk.
+- GitHub delivery: App-authenticated push, PR open with a rendered body,
+  webhook and polling observation, external review recording, CI
+  certification, merge observation (23).
+- Release contract and lifecycle designed; implemented after readiness (24).
+- Worker image version pinning, digest recording, and promotion (13).
 - Foundry wake channel (webhook and poll).
 - Bootstrap-ledger import API and authority handoff.
 - Docker Compose for normal and developer modes.
@@ -59,8 +66,10 @@ Crucible only records.
 - Kubernetes execution provider (designed for, not built, in v0.x).
 - Multi-tenant authorization. One trust domain, one operator.
 - Secret storage. Credentials are mounted from outside; never persisted.
-- Deployment of the products workers build. Publish is a one-way handoff
-  owned by the target repository's own CI.
+- Deployment of the products workers build. The tag is a one-way handoff
+  to the target repository's own release workflow.
+- Merging PRs. The operator merges; Crucible observes.
+- Moving Foundry into a persistent service. Nothing here depends on it.
 - Cross-workspace request routing between agents.
 - Compatibility with any earlier system's state formats or files.
 
@@ -69,4 +78,6 @@ Crucible only records.
 Architecture (01) and the domain model (03) first. The contracts (04 to 08)
 define what crosses the API. Lifecycle, events, and gates (09 to 11) define
 behavior. Operations (12 to 17) define how it runs. Testing, readiness,
-phases, and open questions (18 to 22) define how it gets built and accepted.
+phases, spikes, and decisions (18 to 22) define how it gets built and
+accepted. GitHub delivery (23) and release (24) define what happens after
+a worker is done.

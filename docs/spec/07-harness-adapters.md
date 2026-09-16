@@ -9,6 +9,7 @@ run back into a parsed report. Adapters contain no lifecycle logic.
 ```python
 class HarnessAdapter(Protocol):
     name: HarnessName                     # "claude_code" | "codex" | "agy"
+    supported_versions: VersionRange      # tested range; launch refused outside it
     def capabilities(self) -> HarnessCapabilities: ...
     def credential_spec(self) -> CredentialSpec: ...
     def build_launch(self, ctx: LaunchContext) -> LaunchSpec: ...
@@ -39,9 +40,16 @@ never retry.
   (`/home/worker`), not a host home.
 - stdout and stderr are captured by the provider, chunked, and stored (10).
 - Version pinning: each adapter declares the harness version range it was
-  tested with; the worker image tag encodes the installed version;
-  `GET /harnesses` reports both. Mismatch is a launch-time failure, not a
-  warning.
+  tested with; the worker image carries the installed version in a label;
+  the attempt records the image digest it ran; `GET /harnesses` reports
+  installed and supported versions. A combination outside the range is a
+  launch-time refusal with a wake, not a warning. Harness CLIs never
+  self-update inside a worker: each image sets the CLI's auto-update
+  opt-out and the root filesystem is read-only (13, S11).
+- Retries and corrections keep the image digest of the task's first
+  attempt unless the correction contract names a different image.
+- No `gh` in worker images and no GitHub credential: adapters never
+  instruct a worker to push or open a PR.
 
 ## Claude Code
 

@@ -50,9 +50,15 @@ are reproducible.
    directory.
 8. **Exit codes.** 0 done with report, 75 blocked, 70 cannot proceed (bad
    environment), anything else is failure.
-9. **Prohibitions.** No pushing to any branch other than `work_branch`, no
-   force, no delegating, no writing anywhere but the checkout and
-   `/crucible/report`, no claiming completion without evidence.
+9. **Prohibitions.** No pushing at all (the checkout has no remote
+   credential; Crucible pushes after verification), no force, no branch
+   other than `work_branch`, no delegating, no writing anywhere but the
+   checkout and `/crucible/report`, no claiming completion without
+   evidence, no closing references to issues the contract did not name.
+10. **Commits.** Commit locally on `work_branch` with the policy's author
+    identity and the attempt trailer; Crucible collects, verifies, and
+    publishes the commits. The claim's `proposed_pull_request` is a draft
+    Crucible may rewrite.
 
 ## Harness-specific delivery
 
@@ -68,5 +74,7 @@ Shims are written by Crucible after checkout, listed in
 
 ## What is never in the bundle
 
-Credentials, the Crucible API token, other tasks' contracts, the
-orchestrator's own identity, or any file the contract did not name.
+Credentials, the Crucible API token, GitHub tokens, other tasks'
+contracts, external review feedback that Foundry has not turned into a
+correction contract, the orchestrator's own identity, or any file the
+contract did not name.

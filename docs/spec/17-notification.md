@@ -4,15 +4,31 @@
 
 Only when judgment is required or work has stopped needing it:
 
-- task `gates_passed` or `gates_failed` (awaiting acceptance)
-- task `blocked` (escalation opened)
-- attempt `failed`, `timed_out`, `lost` with no retry remaining
-- `quota_exhausted` or `auth_failure` on any harness
-- an escalation older than `escalation_stale_hours` (repeat)
-- supervisor takeover by a new instance (informational, once)
-- bootstrap import verified (awaiting commit)
+| Reason | State |
+|---|---|
+| `internal_review_needed` | `awaiting_internal_review` |
+| `gates_passed` | `awaiting_acceptance` |
+| `pre_pr_gates_failed` | `pre_pr_gates_failed` |
+| `blocked` | `blocked` (escalation opened) |
+| `publish_failed` | `publish_failed` |
+| `external_feedback_received` | `external_feedback_received` |
+| `external_review_overdue` | repeat, no state change |
+| `ci_certification_failed` | `ci_certification_failed` |
+| `ci_certification_overdue` | repeat, no state change |
+| `head_changed_out_of_band` | informational |
+| `ready_for_merge` | `ready_for_merge` |
+| `merged` | `merged` (informational) |
+| `release_gates_failed`, `release_succeeded`, `release_workflow_failed` | release lifecycle (24) |
+| `attempt_failed`, `timed_out`, `lost` with no retry remaining | `reported` |
+| `quota_exhausted`, `auth_failure` | any |
+| `harness_version_unsupported` | launch refused |
+| `escalation_stale` | repeat |
+| `supervisor_takeover` | informational, once |
+| `bootstrap_import_verified` | awaiting commit |
 
 Progress is not a wake. Foundry polls or tails logs when it wants progress.
+Review feedback is never sent to a worker; it is only ever carried to
+Foundry.
 
 ## WakeV1
 
@@ -20,11 +36,12 @@ Progress is not a wake. Foundry polls or tails logs when it wants progress.
 {
   "id": "01J...", "schema_version": "1.0",
   "principal": "foundry",
-  "reason": "gates_failed",
-  "task": { "id": "01J...", "external_id": "FDY-0042", "state": "awaiting_acceptance" },
+  "reason": "external_feedback_received",
+  "task": { "id": "01J...", "external_id": "FDY-0042", "state": "external_feedback_received" },
   "attempt_id": "01J...",
-  "summary": "2 of 9 required gates failed: scope_contained, verification_ran",
-  "links": { "task": "/v1/tasks/01J...", "gates": "/v1/attempts/01J.../gates" },
+  "pull_request": { "number": 18, "url": "...", "head_sha": "abc123..." },
+  "summary": "1 review from chatgpt-codex-connector[bot] on abc123: 3 comments, 0 dispositions recorded",
+  "links": { "task": "/v1/tasks/01J...", "pull_request": "/v1/tasks/01J.../pull-request" },
   "created_at": "2026-09-16T06:10:00-05:00"
 }
 ```
@@ -41,7 +58,6 @@ Progress is not a wake. Foundry polls or tails logs when it wants progress.
 4. Ack: `POST /v1/wakes/{id}/ack` with what Foundry did. Unacked wakes are
    listed on `GET /supervisor` as a count.
 
-For a Foundry running inside an interactive harness on a workstation, the
-webhook target is a small local receiver (part of Foundry's tooling, not
-Crucible) that writes to Foundry's inbox file, or nothing at all: poll is
-sufficient and is the default configuration.
+For a Foundry running inside an interactive harness on a workstation, poll
+is sufficient and is the default. Moving Foundry into a persistent service
+later changes only the delivery target, not the wake contract.

@@ -14,7 +14,7 @@ passing evidence, presented by Foundry and approved by the operator.
 | Detect completion, failure, timeout, cancellation, stall, and loss | integration: one test per class with the fake provider; e2e: timeout, loss, cancel on Docker |
 | Preserve worker reports and verification evidence | integration: claim parsed and stored; evidence rows verified-only for gates |
 | Restart and reconcile active or interrupted executions | e2e: Crucible restart with running worker; integration: reconcile idempotence |
-| Enforce the required deterministic gates | unit: each gate; integration: a run that fails `scope_contained` reaches `gates_failed` |
+| Enforce the required deterministic gates | unit: each gate; integration: a run that fails `scope_contained` reaches `pre_pr_gates_failed` |
 | Stop or terminate a worker safely | e2e: drain then kill; partial report captured |
 | Prevent concurrent workers from corrupting the same working tree | integration: checkout lease refusal; e2e: two attempts, one repo |
 | Expose sufficient API state for Foundry to inspect and reconcile | integration: a scripted Foundry start-of-session (list tasks, wakes, events) reconstructs state from the API alone |
@@ -28,6 +28,11 @@ Additional, from the operator's direction:
 | Workers cannot access the Docker socket, proxy, database, or other credentials | e2e isolation test |
 | Codex's disabled sandbox cannot escape the container | spike S4: container hardening verified with the sandbox disabled |
 | Bootstrap ledger imported and authority handed off | integration: import tests; live: the real Foundry ledger imported, verified, committed |
+| Workers hold no GitHub credential; Crucible pushes and opens the PR only after pre-PR gates and acceptance | e2e: `git push` from a worker fails; a script-harness task reaches `ready_for_merge` on the throwaway repository |
+| External review recorded only from allowlisted logins; feedback reaches Foundry, never a worker | integration: non-allowlisted activity satisfies nothing; disposition required before ready |
+| A required CI failure escalates with evidence and triggers no retry or correction | integration and e2e: forced failure lands in `ci_certification_failed` |
+| Docker authority arrangement recorded | S9 result and the arrangement in use named in the report |
+| Harness versions pinned, digests recorded, unsupported combinations refused | unit: refusal; live: `GET /harnesses` matches image labels |
 
 The readiness report is a document in Crucible's repo listing each row, the
 test names, the CI run URL, and the live-run artifact IDs.

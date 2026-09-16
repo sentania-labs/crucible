@@ -13,17 +13,21 @@ crucible/
   contracts/      versioned Pydantic models: task contract, API schemas,
                   worker identity, worker report, events
   application/    use cases: submit task, schedule, launch, ingest report,
-                  evaluate gates, reconcile, cancel, import bootstrap ledger
+                  evaluate gates, publish, observe PR, certify CI, release,
+                  reconcile, cancel, retain, import bootstrap ledger
   ports/          abstract interfaces the application depends on:
                   Repository, ExecutionProvider, HarnessAdapter,
-                  ArtifactStore, Notifier, Clock
+                  ArtifactStore, Notifier, Clock, GitHost (push, PR,
+                  reviews, checks, tags), TokenMinter
   adapters/
-    api/          FastAPI routers for /v1, auth, OpenAPI
+    api/          FastAPI routers for /v1, auth, OpenAPI, GitHub webhook receiver
     persistence/  SQLAlchemy models, repositories, Alembic migrations
     execution/    fake, docker, (kubernetes later), hostprocess
     harness/      claude_code, codex, agy launch specs and report parsers
     artifacts/    filesystem store (object store later)
     notify/       webhook, poll queue
+    github/       GitHub App JWT and installation tokens, REST client,
+                  delivery parsing, publisher job
   scheduler/      the supervision loop: leases, heartbeats, timeouts,
                   reconciliation ticks
   cli/            crucible-admin: migrate, import, reconcile, tokens, drain, export
@@ -57,14 +61,19 @@ They split when deployed to Kubernetes.
 |     v                                                      |
 |  +---------------------- Docker Compose ----------------+  |
 |  |  crucible (api + supervisor)      postgres           |  |
-|  |     | docker socket proxy (restricted)               |  |
+|  |     | docker socket proxy (restricted; rootless      |
+  |     |   daemon preferred, 13)                        |  |
 |  |     v                                                |  |
 |  |  worker container (per attempt)                      |  |
 |  |    - repo checkout volume (rw, per attempt)          |  |
 |  |    - identity + contract mount (ro)                  |  |
 |  |    - one harness credential mount (ro or narrow rw)  |  |
-|  |    - NO docker socket, NO crucible token, NO db      |  |
+|  |    - NO docker socket, NO crucible token, NO db,     |  |
+|  |      NO GitHub credential                            |  |
+|  |  publisher container (per push or tag job)           |  |
+|  |    - bundle (ro), tmpfs token file, github.com only  |  |
 |  +------------------------------------------------------+  |
+|          ^ GitHub webhooks (HMAC) and polling                |
 +-----------------------------------------------------------+
 ```
 
@@ -72,14 +81,17 @@ Three trust levels:
 
 1. **Operator and Foundry**: fully trusted. Hold the API token.
 2. **Crucible**: trusted control plane. Holds the database credential, the
-   docker socket proxy endpoint, and read access to the credential
-   directories it mounts into workers. It is the primary security boundary
-   around workers.
+   docker socket proxy endpoint, the GitHub App private key, and read
+   access to the credential directories it mounts into workers. It is the
+   primary security boundary around workers and the only party that
+   writes to GitHub.
 3. **Workers**: untrusted. They run model-driven code with whatever the
    harness permits (usually everything, since harness sandboxes are bypassed
    or unavailable). Containment is the container: no socket, no Crucible
-   credentials, no other harness's credentials, network as policy allows,
-   filesystem limited to the checkout and mounts, resource limits applied.
+   credentials, no other harness's credentials, no GitHub credential,
+   network as policy allows, filesystem limited to the checkout and mounts,
+   resource limits applied. A worker can misuse its own harness credential
+   within the egress allowlist; 12 states the mitigations.
 
 The worker reports back by writing files into a designated report directory
 inside the checkout mount (which Crucible reads after exit), never by calling
@@ -107,8 +119,10 @@ socket anywhere. Detail in 08-execution-providers.md.
 
 ## Cross-cutting
 
-- **Time**: all timestamps stored as UTC with timezone; rendered for people
-  in the operator's configured zone. Never epoch in any API or log.
+- **Time**: all timestamps stored as UTC with offset; rendered for people
+  in the operator's configured zone (`service.render_timezone`, default
+  UTC in the repository, `America/Chicago` in the operator's private
+  configuration). Never epoch in any API or log.
 - **IDs**: ULIDs for every entity; stable task IDs from an orchestrator may be
   supplied as `external_id` and are unique per orchestrator namespace.
 - **Logging**: structured JSON to stdout, one event per line, with

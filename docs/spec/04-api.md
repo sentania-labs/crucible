@@ -12,11 +12,13 @@ Bearer tokens, created by `crucible-admin token create --principal <name>
 | Role | May |
 |---|---|
 | `orchestrator` | everything below except admin |
+| `operator` | everything an orchestrator may, plus record decisions of kind `release_authorization` and other operator-only decision kinds |
 | `observer` | GET only |
-| `admin` | token management, bootstrap import, policy upload, forced reconcile |
+| `admin` | token management, repository registration, bootstrap import, policy upload, forced reconcile, image promotion |
 
 Every mutating request records `principal` on the resulting event. Workers
-never hold a token.
+never hold a token. The GitHub webhook endpoint uses HMAC verification
+instead of a bearer token (below).
 
 ## Conventions
 
@@ -36,15 +38,20 @@ never hold a token.
 | Method | Path | Purpose |
 |---|---|---|
 | POST | `/tasks` | Submit a task contract (body: `TaskContractV1`). Validates, persists, returns the task in `submitted`. Does not launch. |
-| GET | `/tasks` | List with filters: `state`, `project`, `external_id`, `updated_since`. |
-| GET | `/tasks/{id}` | Full task view: contract, executions, latest attempt summary, gate summary, open escalations. |
-| POST | `/tasks/{id}/start` | Move to `scheduled`; body names harness, model, provider, policy version, and optional overrides. This is Foundry's dispatch decision. |
-| POST | `/tasks/{id}/cancel` | Request cancellation; body carries reason and the deciding principal's verbatim words. The API writes the task state and enqueues termination for the supervisor; it never writes attempt rows itself. |
+| GET | `/tasks` | List with filters: `state`, `project`, `repository`, `external_id`, `updated_since`. |
+| GET | `/tasks/{id}` | Full task view: contract versions, executions, latest attempt summary, gate summary, PR summary, open escalations. |
+| POST | `/tasks/{id}/start` | Move to `scheduled`; body names harness, model, image, provider, policy version, and optional overrides. This is Foundry's dispatch decision. |
+| POST | `/tasks/{id}/cancel` | Request cancellation; body carries reason and the deciding principal's verbatim words. The API writes the task state and enqueues termination for the supervisor. |
 | POST | `/tasks/{id}/amend` | Attach a new contract version; allowed only in `submitted`, `blocked`, or `awaiting_acceptance`. |
-| POST | `/tasks/{id}/accept` | Record an `AcceptanceResult` (accepted, rejected, needs_more_work) with reasoning. Orchestrator role only. |
+| POST | `/tasks/{id}/review` | Request the internal non-author review of the current collected head. Body either names an execution request for a Crucible `review` execution, or carries an uploaded `ReviewReportV1` produced by the orchestrator through its own harness. Allowed in `awaiting_internal_review`. |
+| POST | `/tasks/{id}/accept` | Record an `AcceptanceResult` (accepted, rejected, needs_more_work) with reasoning for the current collected head. Orchestrator role only. |
+| POST | `/tasks/{id}/corrections` | Attach a correction: a new contract version whose `correction` section names the review comments or CI findings it addresses, plus an execution request. Creates a `correct` execution against the existing remote branch. Allowed in `pre_pr_gates_failed`, `external_feedback_received`, `ci_certification_failed`, and after `needs_more_work`. |
+| POST | `/tasks/{id}/dispositions` | Record `ReviewDisposition` rows for received external review comments. Orchestrator role. |
+| POST | `/tasks/{id}/ci-decision` | In `ci_certification_failed`: record the cause Foundry determined (enum in 23) and the action: `rerun` (recorded; the operator re-runs on GitHub, 23), `correct` (followed by a correction), `reject`, or `cancel`. |
 | POST | `/tasks/{id}/decisions` | Record a `Decision` (verbatim text, who, what it resolves). |
-| POST | `/tasks/{id}/close` | Orchestrator closes an accepted task. |
+| POST | `/tasks/{id}/close` | Orchestrator closes an `accepted`, `merged`, or `released` task. |
 | GET | `/tasks/{id}/events` | Ordered events for the task and its children. |
+| GET | `/tasks/{id}/pull-request` | The PR record with head history, external reviews, dispositions, and CI certifications. |
 | GET | `/events` | Global feed, `?cursor=&kind=&since=`. |
 
 ### Executions and attempts
@@ -53,33 +60,50 @@ never hold a token.
 |---|---|---|
 | GET | `/executions/{id}` | Execution with its attempts. |
 | POST | `/executions/{id}/retry` | Create a new attempt now, if policy permits; body carries reason. |
-| GET | `/attempts/{id}` | Attempt with worker, lease, heartbeat summary, exit info. |
+| GET | `/attempts/{id}` | Attempt with worker, lease, heartbeat summary, image digest, exit info. |
 | GET | `/attempts/{id}/logs` | Log chunks; `?stream=stdout|stderr&offset=`; `Accept: text/event-stream` for live tail. |
 | GET | `/attempts/{id}/artifacts` | List artifacts with type, size, sha256. |
-| POST | `/attempts/{id}/artifacts` | Upload an artifact (multipart: type, file). Principal recorded; used for review artifacts and operator evidence. Orchestrator role. |
+| POST | `/attempts/{id}/artifacts` | Upload an artifact (multipart: type, file). Principal recorded. Orchestrator role. |
 | GET | `/artifacts/{id}` | Metadata; `/artifacts/{id}/content` streams bytes. |
 | GET | `/attempts/{id}/report` | Parsed `CompletionClaimV1` or 404 if none. |
 | GET | `/attempts/{id}/gates` | Gate results with evidence links. |
 | POST | `/attempts/{id}/terminate` | Stop the worker: `mode=drain|kill`, reason, verbatim words. |
+
+### Releases
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/releases` | Submit a `ReleaseContractV1` (24). Validates, verifies the referenced authorization decision exists, returns the release in `submitted`. Orchestrator role. |
+| GET | `/releases/{id}` | Release with gate results, tag, observed workflow run, outcome. |
+| POST | `/releases/{id}/cancel` | Withdraw before tagging. |
 
 ### Supervision and health
 
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/health` | Liveness (process up). No auth. |
-| GET | `/ready` | Readiness: database reachable, migrations current, supervisor lease held by some instance within the window. |
-| GET | `/supervisor` | Lease holder, last tick, tick duration, queue depths, provider status. |
+| GET | `/ready` | Readiness: database reachable, migrations current, supervisor lease held within the window. |
+| GET | `/supervisor` | Lease holder, last tick, tick duration, queue depths, provider status, GitHub observation status (last poll, webhook deliveries pending). |
 | POST | `/supervisor/reconcile` | Force a reconciliation pass now. Admin. |
 | GET | `/wakes` | Pending wakes for the caller's principal; `?since=`. |
 | POST | `/wakes/{id}/ack` | Mark handled, with what was done. |
 
-### Policies, harnesses, providers
+### Policies, repositories, harnesses, images, providers
 
 | Method | Path | Purpose |
 |---|---|---|
 | GET/PUT | `/policies/{name}/{version}` | Read or upload a policy document. Versions are immutable once referenced. |
-| GET | `/harnesses` | Supported harnesses, pinned versions, credential requirements, capability flags. |
+| GET/PUT | `/repositories/{name}` | Register a target repository: URL, installation reference, default branch, policy. Admin. Never carries a credential. |
+| GET | `/harnesses` | Supported harnesses: adapter supported version range, installed versions per image, credential requirements, capability flags. |
+| GET | `/images` | Worker images known to Crucible: harness, version, digest, promotion state. |
+| POST | `/images/{digest}/promote` | Set promotion state (`default`, `retained`, `retired`). Admin; records the decision. |
 | GET | `/providers` | Registered execution providers and their capabilities. |
+
+### GitHub ingress
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/github/webhook` | Receives GitHub webhook deliveries. Authenticated by the `X-Hub-Signature-256` HMAC over the raw body using the webhook secret mounted from the credential source; unsigned or mismatched deliveries are rejected and counted. Deduplicated by `X-GitHub-Delivery`. Stored raw and processed by the supervisor, never inline. Detail in 23. |
 
 ### Bootstrap import
 
@@ -96,7 +120,7 @@ every start-of-session. Detail in 17.
 
 ## Versioning of contracts inside the API
 
-`TaskContractV1`, `CompletionClaimV1`, `WorkerIdentityV1`, `PolicyV1`,
-`EventV1`, `BootstrapExportV1`. Each carries `schema_version`. The API
-rejects unknown major versions and records the rejection as an event on the
-principal.
+`TaskContractV1`, `CompletionClaimV1`, `ReviewReportV1`, `WorkerIdentityV1`,
+`PolicyV1`, `ReleaseContractV1`, `EventV1`, `WakeV1`, `BootstrapExportV1`.
+Each carries `schema_version`. The API rejects unknown major versions and
+records the rejection as an event on the principal.
