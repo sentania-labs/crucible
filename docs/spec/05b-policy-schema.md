@@ -116,7 +116,8 @@ external_review:
   require_review_on_final_sha: false
   require_feedback_disposition: true
   accepted_signals: ["review", "comment", "reaction:+1"]  # from an allowlisted login only; +1 is the reviewer's "no findings" signal
-  round_counting: "per_pull_request"   # a round is one accepted signal on any head; final-SHA rule below
+  components: ["code"]                 # review components in one cycle; ["code", "security"] where the repo runs both
+  round_counting: "completed_cycles"   # a round is one completed cycle (all components terminal) on a published head
   wait_timeout_hours: 24               # then wake Foundry with reason external_review_overdue
 
 ci_certification:
