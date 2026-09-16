@@ -40,6 +40,8 @@
 | `reactions` | id, subject_kind (pull_request, review, comment), subject_github_id, github_id, login, content, observed_at |
 | `release_contracts` | id, external_id, repository_id, target_branch, target_sha, version, tag, document JSONB, sha256, authorization_decision_id, submitted_at |
 | `releases` | id, release_contract_id UNIQUE, state, tag_sha, tagged_at, workflow_run_url, conclusion, ended_at |
+| `routing_policies` | (name, version) PK, document JSONB, created_at, retired_at |
+| `attempt_metrics` | attempt_id PK, model, harness, endpoint_kind, pool, wall_ms, tokens_in, tokens_out, cost_units, cost_source (harness_reported, none), exit_class, gates_passed, gates_failed, corrections_after, acceptance_verdict |
 | `retention_actions` | id, policy_name, policy_version, kind, target, performed_at, event_seq |
 
 Indexes: tasks (state), (principal_id, updated_at); events (task_id, seq);
@@ -48,7 +50,7 @@ where acked_at is null.
 
 Triggers: `events`, `task_contracts`, `release_contracts`, `review_dispositions`, and `ci_decisions` reject UPDATE and DELETE. No table ever holds a token, key, or secret; a CI check asserts no column name matches the secret-name pattern. Writes to
 `executions`, `attempts`, `workers`, `heartbeats`, `gate_results`,
-`completion_claims`, `supervisor_status`, and `events` rows whose
+`completion_claims`, `attempt_metrics`, `supervisor_status`, and `events` rows whose
 `principal` is `crucible` require a transaction-local `crucible.fenced_token` (set with `SET LOCAL`
 at the start of every supervisor transaction, never per connection, because
 pooled connections would carry a stale value) exactly equal to the token on
@@ -59,7 +61,7 @@ for every attached table).
 The API role writes only `tasks` (submit, start, cancel, amend, close),
 `task_contracts`, `idempotency_keys` (in the same transaction as the
 mutation they record), `acceptance_results`, `decisions`, `artifacts`,
-`wakes` (ack), and `policies`; it enqueues everything that touches an attempt for the
+`wakes` (ack), `policies`, and `routing_policies`; it enqueues everything that touches an attempt for the
 supervisor.
 
 ## Strategy

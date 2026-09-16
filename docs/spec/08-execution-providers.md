@@ -55,7 +55,9 @@ paths, emit N log lines. Every lifecycle and gate test runs against it.
   directory at `<artifact_root>/workspaces/<attempt>/report`.
 - `launch`: resolve the image tag to a digest and record it on the
   attempt; refuse if the image's harness version is outside the adapter's
-  supported range; then create a container from the allowlisted image with: `--user
+  supported range; then create a container from the allowlisted image with: `--init`
+  (S5: a harness as PID 1 ignores SIGTERM, so drain would always end in
+  SIGKILL after the grace period), `--user
   1000:1000`, `--cap-drop ALL`, `--security-opt no-new-privileges`,
   `--read-only` root with tmpfs for `/tmp` and `/home/worker`, memory and
   CPU limits from policy, `--pids-limit`, network per policy (dedicated
