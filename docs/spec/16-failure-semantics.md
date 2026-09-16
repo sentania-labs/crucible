@@ -47,7 +47,7 @@ the container is alive; a worker is never marked lost merely because
 Crucible was down, only because the provider cannot see it. A publisher job
 interrupted mid-way is re-verified on restart: if the remote head already
 equals the bundle head the push step is complete; if a PR for the task
-exists the open step is complete; otherwise the job re-runs. Stored raw
+exists the open step is complete; otherwise the job re-runs. Stored normalized
 webhook deliveries are processed after restart; polling covers anything
 delivered while down.
 
