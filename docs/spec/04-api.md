@@ -43,7 +43,7 @@ instead of a bearer token (below).
 | POST | `/tasks/{id}/start` | Move to `scheduled`; body names harness, model, image, provider, policy version, and optional overrides. This is Foundry's dispatch decision. Overrides create an amendment (05); until the amendment path exists (C2) the body must agree with the contract. |
 | POST | `/tasks/{id}/cancel` | Request cancellation; body carries reason and the deciding principal's verbatim words. The API writes the task state and enqueues termination for the supervisor. |
 | POST | `/tasks/{id}/amend` | Attach a new contract version; allowed only in `submitted`, `blocked`, or `awaiting_acceptance`. |
-| POST | `/tasks/{id}/review` | Request the internal non-author review of the current collected head. Body either names an execution request for a Crucible `review` execution, or carries an uploaded `ReviewReportV1` produced by the orchestrator through its own harness. Allowed in `awaiting_internal_review`. |
+| POST | `/tasks/{id}/review` | Request the internal non-author review of the current collected head. Body either names an execution request for a Crucible `review` execution, or carries an uploaded `ReviewReportV1` produced by the orchestrator through its own harness. Allowed in `awaiting_internal_review`. The API records the request; the supervisor creates the review execution, or turns the uploaded report into evidence and resolves the gate, on its next tick, so clients poll the task rather than read the outcome from the response. The reviewer identity recorded is the authenticated caller's (or the review attempt's), never the one the document names. |
 | POST | `/tasks/{id}/accept` | Record an `AcceptanceResult` (accepted, rejected, needs_more_work) with reasoning for the current collected head. Orchestrator role only. |
 | POST | `/tasks/{id}/corrections` | Attach a correction: a new contract version whose `correction` section names the review comments or CI findings it addresses, plus an execution request. Creates a `correct` execution against the existing remote branch. Allowed in `pre_pr_gates_failed`, `external_feedback_received`, `ci_certification_failed`, and after `needs_more_work`. |
 | POST | `/tasks/{id}/dispositions` | Record `ReviewDisposition` rows for received external review comments. Orchestrator role. |
@@ -64,7 +64,7 @@ instead of a bearer token (below).
 | GET | `/attempts/{id}` | Attempt with worker, lease, heartbeat summary, image digest, exit info. |
 | GET | `/attempts/{id}/logs` | Log chunks; `?stream=stdout|stderr&offset=`; `Accept: text/event-stream` for live tail. |
 | GET | `/attempts/{id}/artifacts` | List artifacts with type, size, sha256. |
-| POST | `/attempts/{id}/artifacts` | Upload an artifact (multipart: type, file). Principal recorded. Orchestrator role. |
+| POST | `/attempts/{id}/artifacts` | Upload an artifact: raw request body with `type` and `filename` as query parameters (no multipart dependency). The logical filename is kept apart from the content-addressed storage path. Principal recorded. Becomes evidence on the next supervisor tick. Orchestrator role. |
 | GET | `/artifacts/{id}` | Metadata; `/artifacts/{id}/content` streams bytes. |
 | GET | `/attempts/{id}/report` | Parsed `CompletionClaimV1` or 404 if none. |
 | GET | `/attempts/{id}/gates` | Gate results with evidence links. |

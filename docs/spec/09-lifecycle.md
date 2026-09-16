@@ -103,6 +103,11 @@ is trusted, however green its CI. Foundry decides whether to `recollect`
 re-runs pre-PR gates, internal review when applicable, and acceptance
 before `publishing` re-verifies it) or to reject.
 
+**Until the publisher exists (C2, C3)**, an accepted `branch` or
+`pull_request` deliverable stays in `awaiting_acceptance` with a
+`publish_pending` flag and a wake of that reason; C4 replaces the flag with
+the `publishing` edge.
+
 **Branch-only deliverables** (`branch`, allowed only under a policy with
 `deliverables.allow_branch_only: true`) pass through `publishing` like a
 PR deliverable: the bundle head is pushed and `branch_pushed_at_head`
