@@ -1,0 +1,64 @@
+# Crucible local operation (13). Normal mode: `make up`. Developer mode: `make dev`
+# (postgres only) and `uv run crucible serve --all` on the host.
+# The socket proxy and egress proxy services arrive with the Docker provider in C3.
+name: crucible
+
+services:
+  postgres:
+    image: postgres:16@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: crucible
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: crucible
+    volumes:
+      - crucible-pg:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U crucible -d crucible"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  migrate:
+    image: crucible:dev
+    build: .
+    profiles: ["full"]
+    command: ["crucible-admin", "migrate"]
+    environment:
+      CRUCIBLE_DATABASE__URL: postgresql+psycopg://crucible:${POSTGRES_PASSWORD}@postgres:5432/crucible
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  crucible:
+    image: crucible:dev
+    build: .
+    profiles: ["full"]
+    restart: unless-stopped
+    command: ["crucible", "serve", "--all"]
+    environment:
+      CRUCIBLE_DATABASE__URL: postgresql+psycopg://crucible:${POSTGRES_PASSWORD}@postgres:5432/crucible
+      CRUCIBLE_SERVICE__BIND: 0.0.0.0:8080
+      CRUCIBLE_SERVICE__RENDER_TIMEZONE: UTC
+      CRUCIBLE_SUPERVISOR__HOLDER: crucible-compose
+    volumes:
+      - crucible-artifacts:/var/lib/crucible/artifacts
+    ports:
+      - "127.0.0.1:${CRUCIBLE_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/v1/ready', timeout=3).status == 200 else 1)"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  crucible-pg:
+  crucible-artifacts:

@@ -35,3 +35,7 @@ var/
 .lavish/
 *.html
 tmp/
+
+# Crucible local state
+.env
+report/

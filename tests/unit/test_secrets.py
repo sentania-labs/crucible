@@ -1,0 +1,66 @@
+from __future__ import annotations
+
+import pytest
+
+from crucible.domain.secrets import find_secrets, scan_text
+
+
+# Every fixture is assembled at runtime from fragments so no committed line is itself
+# secret-shaped: the repository must scan clean, and Crucible's own no_secrets gate
+# runs the same kind of scanner over its PRs.
+def _repeat(char: str, count: int) -> str:
+    return char * count
+
+
+def _join(*parts: str) -> str:
+    return "".join(parts)
+
+
+SECRET_FIXTURES: list[tuple[str, str]] = [
+    (_join("token ghp_", _repeat("a", 36), " here"), "github_token"),
+    (_join("ghs_", _repeat("B", 36)), "github_token"),
+    (_join("github_pat_", _repeat("x", 30)), "github_fine_grained_token"),
+    (_join("-----BEGIN ", "RSA PRIVATE KEY", "-----"), "private_key_header"),
+    (_join("-----BEGIN ", "PRIVATE KEY", "-----"), "private_key_header"),
+    (_join("Authorization: ", "Bearer ", "abcdefghijklmnopqrstuvwxyz0123"), "bearer_token"),
+    (_join("AK", "IA", "ABCDEFGH", "IJKLMNOP"), "aws_access_key"),
+    (_join("sk-", _repeat("q", 24)), "openai_style_key"),
+    (_join("xox", "b-", "1234567890", "-abcdef"), "slack_token"),
+    (
+        ".".join(
+            [_join("eyJ", "hbGciOiJIUzI1NiJ9"), _join("eyJ", "zdWIiOiIxMjM0In0"), "abcdefghijkl"]
+        ),
+        "jwt",
+    ),
+    (_join("cru_", "01ARZ3NDEKTSV4RRFFQ69G5FAV", ".", _repeat("s", 40)), "crucible_token"),
+]
+
+
+@pytest.mark.parametrize(
+    ("text", "pattern"),
+    SECRET_FIXTURES,
+    ids=[f"{p}-{i}" for i, (_, p) in enumerate(SECRET_FIXTURES)],
+)
+def test_patterns_match(text: str, pattern: str) -> None:
+    assert scan_text(text) == pattern
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "make lint && make test",
+        "the bearer of bad news",
+        "https://github.com/example-org/example-service/issues/17",
+        "sk-short",
+        "ghp_tooshort",
+    ],
+)
+def test_ordinary_text_is_clean(text: str) -> None:
+    assert scan_text(text) is None
+
+
+def test_find_secrets_reports_path_not_value() -> None:
+    doc = {"a": {"b": ["fine", _join("ghp_", _repeat("c", 36))]}, "c": "ok"}
+    matches = find_secrets(doc)
+    assert [(m.path, m.pattern) for m in matches] == [("a.b[1]", "github_token")]
+    assert "ccc" not in repr(matches)
