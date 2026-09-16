@@ -10,11 +10,11 @@ It does not decide what to build. An orchestrator (Foundry, or a person)
 decides outcomes, scope, model, and acceptance. Crucible executes, persists,
 observes, and enforces.
 
-**Status: specification version 0.3; implementation phase C1 (walking
-skeleton).** The specification is under
+**Status: specification version 0.3; implementation phase C2 (gates, claims,
+review, acceptance, wakes).** The specification is under
 [`docs/spec/`](docs/spec/00-overview.md) and the decisions behind it under
 [`docs/adr/`](docs/adr/). Phase notes are under
-[`docs/implementation-notes/`](docs/implementation-notes/c1.md).
+[`docs/implementation-notes/`](docs/implementation-notes/c2.md).
 
 ## What it will do
 
@@ -78,6 +78,41 @@ is `fake` and whose image is `crucible-worker:fake-succeed`, `POST
 /v1/tasks/{id}/start`, and watch `GET /v1/tasks/{id}/events`. OpenAPI is at
 `/v1/openapi.json`.
 
+## The supervision half, end to end
+
+A run on the fake provider goes contract, attempt, collected head, gates,
+internal review, acceptance:
+
+```sh
+GET  /v1/tasks/{id}                     # state, head_sha, gate_summary, review, acceptance
+GET  /v1/attempts/{id}/gates            # one row per pre-PR gate, with its evidence ids
+GET  /v1/attempts/{id}/evidence         # what the gates read; a worker row is never verified
+GET  /v1/attempts/{id}/report           # the parsed CompletionClaimV1
+POST /v1/tasks/{id}/review              # upload a ReviewReportV1, or ask for a review execution
+POST /v1/tasks/{id}/accept              # Foundry's AcceptanceResult; Crucible never infers one
+POST /v1/tasks/{id}/corrections         # a narrowed contract version and a `correct` execution
+GET  /v1/wakes                          # what needs judgment; poll is the durable path
+POST /v1/wakes/{id}/ack                 # what you did about it
+```
+
+The gate rows say `pending` for `verification_ran` and `workspace_clean`, whose
+verifier container arrives in C3, and for `internal_review_recorded` until a
+non-author review of that exact head exists. An `artifacts` deliverable reaches
+`accepted`; a `branch` or `pull_request` one records the acceptance and waits for
+the publisher, which arrives in C4.
+
+Policies and the routing policy they name are documents, not defaults in code:
+
+```sh
+GET  /v1/policies/default-software/1    # every tunable the specification mentions
+PUT  /v1/policies/{name}/{version}      # admin; a version a task references is immutable
+GET  /v1/routing/default-routing/1      # the models Foundry may name, per tier
+GET  /v1/routing/usage                  # per-pool usage in the current window
+GET  /v1/routing/history?model=&project=  # what each model actually did
+```
+
+`examples/policies/default-software.yaml` is the seeded default, verbatim.
+
 ## Releases
 
 A release is a tag push, not a merge: `git tag -a vX.Y.Z -m vX.Y.Z && git push
@@ -96,7 +131,7 @@ tests/          unit (no I/O) and integration (PostgreSQL in a container, fake p
 docs/spec/      the specification, one concern per file
 docs/adr/       architectural decision records
 docs/implementation-notes/  what each phase decided where the spec was open
-examples/       sanitized example task and release contracts and configuration
+examples/       sanitized example task and release contracts, policies, and configuration
 ```
 
 ## License
