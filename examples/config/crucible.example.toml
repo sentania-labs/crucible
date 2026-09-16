@@ -25,6 +25,7 @@ proxy = "http://egress-proxy:3128"
 
 [github]
 poll_interval_seconds = 120           # polling is complete on its own; webhooks accelerate it
+reactions_poll_interval_seconds = 60  # reviewer pickup reaction is transient; completion +1 is durable
 webhook_enabled = false               # true only when GitHub can reach /v1/github/webhook
 
 [github.app]

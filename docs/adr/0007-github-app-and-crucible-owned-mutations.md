@@ -43,8 +43,8 @@ the worker's. Personal access tokens are long-lived and user-scoped.
 ## Consequences
 
 Publication needs a bundle-based publisher container so Crucible never
-runs git over a worker's `.git` directory with a credential present. The
-App must be installed on every target repository, and the external
-reviewer and CI must be configured to run on `crucible/*` PRs. Re-running
+runs git over a worker's `.git` directory with a credential present. The App must be installed on every target repository, the external
+reviewer must be set to review all pull requests there (so App-authored
+PRs are reviewed, S12 rerun), and CI must run on `crucible/*` PRs. Re-running
 a failed workflow needs Actions write, which is not granted; the operator
 re-runs by hand until they choose to widen the permission.
