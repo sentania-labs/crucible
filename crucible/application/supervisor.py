@@ -19,8 +19,18 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import timedelta
 from functools import partial
-from typing import Any, TypeVar
+from typing import Any, ClassVar, TypeVar
 
+from crucible.application.decisions import (
+    DEFAULT_ESCALATION_STALE_HOURS,
+    open_escalation,
+    repeat_stale_escalation_wakes,
+)
+from crucible.application.errors import ApplicationError
+from crucible.application.evidence import record_collection_evidence
+from crucible.application.gates import evaluate_and_advance
+from crucible.application.review import latest_work_attempt, record_review_report
+from crucible.application.routing import reserve
 from crucible.application.transitions import (
     move_attempt,
     move_execution,
@@ -28,9 +38,17 @@ from crucible.application.transitions import (
     record_event,
     record_rejected_transition,
 )
+from crucible.application.wakes import (
+    create_wake,
+    record_delivery,
+    retry_hours_from_policy,
+    wake_body,
+)
 from crucible.contracts.completion_claim import parse_claim
+from crucible.contracts.wake import WakeReason
 from crucible.domain.entities import (
     Attempt,
+    AttemptMetrics,
     CompletionClaimRecord,
     Execution,
     ExecutionRole,
@@ -48,6 +66,7 @@ from crucible.domain.lifecycle import (
 )
 from crucible.domain.secrets import find_secrets
 from crucible.logs import log_context
+from crucible.ports.artifacts import ArtifactStore
 from crucible.ports.clock import Clock
 from crucible.ports.execution import (
     CollectedOutputs,
@@ -58,6 +77,7 @@ from crucible.ports.execution import (
     ProviderError,
     Workspace,
 )
+from crucible.ports.notification import WakeDeliverer
 from crucible.ports.repository import FencedTokenRejectedError, UnitOfWork, UnitOfWorkFactory
 
 log = logging.getLogger("crucible.supervisor")
@@ -78,6 +98,7 @@ class TickResult:
     observed: int = 0
     finished: int = 0
     orphans: int = 0
+    wakes_delivered: int = 0
     duration_ms: int = 0
     counts: dict[str, int] = field(default_factory=dict)
 
@@ -104,6 +125,8 @@ class Supervisor:
         clock: Clock,
         *,
         holder: str,
+        artifact_store: ArtifactStore,
+        wake_deliverer: WakeDeliverer | None = None,
         lease_ttl_seconds: int = 30,
         attempt_lease_ttl_seconds: int = 60,
         grace_seconds: int = 60,
@@ -111,6 +134,8 @@ class Supervisor:
         self._uow_factory = uow_factory
         self._providers = providers
         self._clock = clock
+        self._artifacts = artifact_store
+        self._wakes = wake_deliverer
         self.holder = holder
         self.lease_ttl_seconds = lease_ttl_seconds
         self.attempt_lease_ttl_seconds = attempt_lease_ttl_seconds
@@ -273,6 +298,10 @@ class Supervisor:
             observed, finished = await self._observe_attempts()
             result.observed, result.finished = observed, finished
             await self._sweep_cancellations()
+            await self._db(self._evaluate_pending_gates)
+            await self._db(self._refresh_attempt_metrics)
+            await self._db(self._repeat_stale_escalations)
+            result.wakes_delivered = await self._deliver_wakes()
             result.counts = await self._db(partial(self._status_step, started))
         except LeaseLostError:
             result.held = False
@@ -358,6 +387,18 @@ class Supervisor:
                     continue
                 stored = uow.contracts.get(task.id, task.contract_version)
                 assert stored is not None
+                # A contract version carrying a correction section runs as a `correct`
+                # execution against the existing branch (09). One execution per version.
+                role = (
+                    ExecutionRole.CORRECT
+                    if stored.document.get("correction")
+                    else ExecutionRole.IMPLEMENT
+                )
+                if any(
+                    e.contract_version == task.contract_version and e.role is role
+                    for e in uow.executions.list_for_task(task.id)
+                ):
+                    continue
                 policy = uow.policies.get(task.policy_name, task.policy_version)
                 assert policy is not None
                 req = stored.document["execution_request"]
@@ -366,7 +407,7 @@ class Supervisor:
                 execution = Execution(
                     id=new_id(),
                     task_id=task.id,
-                    role=ExecutionRole.IMPLEMENT,
+                    role=role,
                     contract_version=task.contract_version,
                     harness=str(req["harness"]),
                     model=str(req["model"]),
@@ -399,6 +440,7 @@ class Supervisor:
                     },
                 )
                 self._create_attempt(uow, execution, number=1)
+            self._materialize_review_executions(uow)
             uow.commit()
 
     def _create_attempt(self, uow: UnitOfWork, execution: Execution, *, number: int) -> Attempt:
@@ -423,6 +465,211 @@ class Supervisor:
         )
         return attempt
 
+    def _materialize_review_executions(self, uow: UnitOfWork) -> None:
+        """A `review` execution the API asked for (04). Execution rows are fenced to the
+        supervisor, so the request is an event and this materializes it."""
+        for task in uow.tasks.list_by_state(TaskState.AWAITING_INTERNAL_REVIEW, for_update=True):
+            requests = [
+                e
+                for e in uow.events.list_for_task(task.id, after_seq=0, limit=500)
+                if e.kind == EventKind.REVIEW_EXECUTION_REQUESTED.value
+            ]
+            if not requests:
+                continue
+            request = requests[-1].payload
+            contract_version = int(request.get("contract_version", task.contract_version))
+            existing = uow.executions.list_for_task_by_role(task.id, ExecutionRole.REVIEW)
+            if any(e.contract_version == contract_version for e in existing):
+                continue
+            policy = uow.policies.get(task.policy_name, task.policy_version)
+            assert policy is not None
+            now = self._clock.now()
+            execution = Execution(
+                id=new_id(),
+                task_id=task.id,
+                role=ExecutionRole.REVIEW,
+                contract_version=contract_version,
+                harness=str(request["harness"]),
+                model=str(request["model"]),
+                effort=request.get("effort"),
+                provider=str(request["provider"]),
+                image=str(request["image"]),
+                policy_snapshot=policy.document,
+                state=ExecutionState.CREATED,
+                max_attempts=1,
+                retry_on=[],
+                timeout_seconds=int(request["timeout_seconds"]),
+                created_at=now,
+            )
+            uow.executions.add(execution)
+            record_event(
+                uow,
+                self._clock,
+                EventKind.EXECUTION_CREATED,
+                principal=PRINCIPAL_CRUCIBLE,
+                task_id=task.id,
+                execution_id=execution.id,
+                payload={
+                    "role": execution.role.value,
+                    "harness": execution.harness,
+                    "model": execution.model,
+                    "provider": execution.provider,
+                    "image": execution.image,
+                    "head_sha": task.head_sha,
+                    "note": "reviewer_must_not_be_author: a review never shares an attempt",
+                },
+            )
+            self._create_attempt(uow, execution, number=1)
+
+    # ----- step: gates, metrics, escalations, wakes -------------------------
+
+    def _evaluate_pending_gates(self) -> None:
+        """10 step 5: every task in `reported` with pending gates is evaluated.
+
+        A task waiting in `awaiting_internal_review` is re-evaluated too: gate_results is
+        fenced to the supervisor (14), so the API records the review report and the next
+        tick is what resolves the gate."""
+        for state in (TaskState.REPORTED, TaskState.AWAITING_INTERNAL_REVIEW):
+            with self._fenced() as uow:
+                for task in uow.tasks.list_by_state(state, for_update=True):
+                    work = latest_work_attempt(uow, task)
+                    if work is None:
+                        continue
+                    attempt, execution = work
+                    if attempt.state not in ATTEMPT_TERMINAL:
+                        continue
+                    evaluate_and_advance(
+                        uow, self._clock, task=task, attempt=attempt, execution=execution
+                    )
+                uow.commit()
+
+    def _refresh_attempt_metrics(self) -> None:
+        """Fold gate counts, corrections, and the acceptance verdict into AttemptMetrics.
+
+        The API writes acceptance and contract versions but cannot write this fenced table
+        (14), so the supervisor backfills it. Writing the same values twice changes
+        nothing, which keeps reconciliation idempotent."""
+        with self._fenced() as uow:
+            settled = (
+                TaskState.AWAITING_ACCEPTANCE,
+                TaskState.ACCEPTED,
+                TaskState.PRE_PR_GATES_FAILED,
+                TaskState.REJECTED,
+            )
+            for state in settled:
+                for task in uow.tasks.list_by_state(state):
+                    self._metrics_for_task(uow, task)
+            uow.commit()
+
+    def _metrics_for_task(self, uow: UnitOfWork, task: Task) -> None:
+        acceptances = [a for a in uow.acceptance.list_for_task(task.id) if a.superseded_at is None]
+        verdict = acceptances[-1].verdict.value if acceptances else None
+        corrections = sum(
+            1 for c in uow.contracts.list_for_task(task.id) if (c.document or {}).get("correction")
+        )
+        for execution in uow.executions.list_for_task(task.id):
+            if execution.role is ExecutionRole.REVIEW:
+                continue
+            for attempt in uow.attempts.list_for_execution(execution.id):
+                metrics = uow.attempt_metrics.get(attempt.id)
+                if metrics is None:
+                    continue
+                gates = uow.gate_results.list_for_attempt(attempt.id)
+                passed = sum(1 for g in gates if g.result == "pass")
+                failed = sum(1 for g in gates if g.result in ("fail", "error"))
+                after = sum(
+                    1
+                    for c in uow.contracts.list_for_task(task.id)
+                    if (c.document or {}).get("correction")
+                    and c.version > execution.contract_version
+                )
+                unchanged = (
+                    metrics.gates_passed == passed
+                    and metrics.gates_failed == failed
+                    and metrics.corrections_after == after
+                    and metrics.acceptance_verdict == verdict
+                )
+                if unchanged:
+                    continue
+                metrics.gates_passed = passed
+                metrics.gates_failed = failed
+                metrics.corrections_after = after
+                metrics.acceptance_verdict = verdict
+                uow.attempt_metrics.put(metrics)
+                record_event(
+                    uow,
+                    self._clock,
+                    EventKind.ATTEMPT_METRICS_RECORDED,
+                    principal=PRINCIPAL_CRUCIBLE,
+                    task_id=task.id,
+                    execution_id=execution.id,
+                    attempt_id=attempt.id,
+                    payload={
+                        "gates_passed": passed,
+                        "gates_failed": failed,
+                        "corrections_after": after,
+                        "acceptance_verdict": verdict,
+                        "corrections_total": corrections,
+                    },
+                )
+
+    def _repeat_stale_escalations(self) -> None:
+        with self._fenced() as uow:
+            repeat_stale_escalation_wakes(
+                uow, self._clock, stale_hours=self._escalation_stale_hours(uow)
+            )
+            uow.commit()
+
+    def _escalation_stale_hours(self, uow: UnitOfWork) -> int:
+        for escalation in uow.escalations.list_open():
+            task = uow.tasks.get(escalation.task_id)
+            if task is None:
+                continue
+            policy = uow.policies.get(task.policy_name, task.policy_version)
+            if policy is not None:
+                return int(
+                    policy.document.get("limits", {}).get(
+                        "escalation_stale_hours", DEFAULT_ESCALATION_STALE_HOURS
+                    )
+                )
+        return DEFAULT_ESCALATION_STALE_HOURS
+
+    async def _deliver_wakes(self) -> int:
+        """10 step 8: redeliver every wake past its retry schedule. Poll is the fallback,
+        so a missing or failing webhook only delays (17)."""
+        if self._wakes is None or not self._wakes.configured:
+            return 0
+        delivered = 0
+        for wake_id, body, retry_hours in await self._db(self._list_due_wakes):
+            result = await self._wakes.deliver(body)
+            await self._db(
+                partial(self._record_wake_delivery, wake_id, result.ok, result.detail, retry_hours)
+            )
+            delivered += int(result.ok)
+        return delivered
+
+    def _list_due_wakes(self) -> list[tuple[str, bytes, int]]:
+        out: list[tuple[str, bytes, int]] = []
+        with self._uow_factory() as uow:
+            for wake in uow.wakes.list_undelivered(self._clock.now()):
+                policy_document = None
+                if wake.task_id is not None:
+                    task = uow.tasks.get(wake.task_id)
+                    if task is not None:
+                        policy = uow.policies.get(task.policy_name, task.policy_version)
+                        policy_document = policy.document if policy else None
+                out.append(
+                    (wake.id, wake_body(uow, wake), retry_hours_from_policy(policy_document))
+                )
+        return out
+
+    def _record_wake_delivery(self, wake_id: str, ok: bool, detail: str, retry_hours: int) -> None:
+        with self._fenced() as uow:
+            record_delivery(
+                uow, self._clock, wake_id, ok=ok, detail=detail, retry_hours=retry_hours
+            )
+            uow.commit()
+
     # ----- step: launch pending attempts -------------------------------
 
     def _list_pending(self) -> list[_Pending]:
@@ -433,7 +680,10 @@ class Supervisor:
                 task = uow.tasks.get(attempt.task_id)
                 if execution is None or task is None:
                     continue
-                if task.state not in (TaskState.SCHEDULED, TaskState.RUNNING):
+                if execution.role is ExecutionRole.REVIEW:
+                    if task.state is not TaskState.AWAITING_INTERNAL_REVIEW:
+                        continue
+                elif task.state not in (TaskState.SCHEDULED, TaskState.RUNNING):
                     continue
                 stored = uow.contracts.get(task.id, execution.contract_version)
                 assert stored is not None
@@ -457,15 +707,20 @@ class Supervisor:
 
     async def _launch_one(self, item: _Pending) -> bool:
         attempt, execution, task = item.attempt, item.execution, item.task
+        env: dict[str, str] = {}
+        if execution.role is ExecutionRole.REVIEW and task.head_sha:
+            env["CRUCIBLE_REVIEW_HEAD_SHA"] = task.head_sha
         spec = LaunchSpec(
             attempt_id=attempt.id,
             task_id=task.id,
             external_id=task.external_id,
+            role=execution.role.value,
             harness=execution.harness,
             model=execution.model,
             image=execution.image,
             timeout_seconds=execution.timeout_seconds,
             contract=item.contract,
+            env=env,
             network=item.contract.get("constraints", {}).get("network", "policy"),
         )
         provider = self._provider(execution.provider)
@@ -478,7 +733,8 @@ class Supervisor:
             await self._db(partial(self._environment_failure, attempt.id, "prepare", detail))
             return False
         self._workspaces[attempt.id] = ws
-        await self._db(partial(self._mark_launching, attempt.id, ws))
+        if not await self._db(partial(self._mark_launching, attempt.id, ws)):
+            return False
         try:
             handle = await provider.launch(ws, spec)
         except ProviderError as exc:
@@ -498,10 +754,13 @@ class Supervisor:
             task = uow.tasks.get(attempt.task_id, for_update=True)
             execution = uow.executions.get(attempt.execution_id, for_update=True)
             assert task is not None and execution is not None
-            if attempt.state is not AttemptState.PENDING or task.state not in (
-                TaskState.SCHEDULED,
-                TaskState.RUNNING,
-            ):
+            review = execution.role is ExecutionRole.REVIEW
+            allowed = (
+                (TaskState.AWAITING_INTERNAL_REVIEW,)
+                if review
+                else (TaskState.SCHEDULED, TaskState.RUNNING)
+            )
+            if attempt.state is not AttemptState.PENDING or task.state not in allowed:
                 return False
             move_attempt(
                 uow, self._clock, attempt, AttemptState.PREPARING, EventKind.ATTEMPT_PREPARING
@@ -510,7 +769,7 @@ class Supervisor:
                 move_execution(
                     uow, self._clock, execution, ExecutionState.ACTIVE, EventKind.EXECUTION_ACTIVE
                 )
-            if task.state is TaskState.SCHEDULED:
+            if not review and task.state is TaskState.SCHEDULED:
                 move_task(
                     uow,
                     self._clock,
@@ -524,10 +783,69 @@ class Supervisor:
             uow.commit()
             return True
 
-    def _mark_launching(self, attempt_id: str, ws: Workspace) -> None:
+    def _mark_launching(self, attempt_id: str, ws: Workspace) -> bool:
+        """Reserve the quota pool and move to launching in one fenced transaction (05b).
+
+        A pool that crossed its soft limit since submit refuses the attempt with class
+        quota_exhausted and wakes Foundry."""
         with self._fenced() as uow:
             attempt = uow.attempts.get(attempt_id, for_update=True)
             assert attempt is not None
+            execution = uow.executions.get(attempt.execution_id)
+            assert execution is not None
+            reservation = reserve(
+                uow,
+                execution.policy_snapshot or {},
+                harness=execution.harness,
+                model_id=execution.model,
+                now=self._clock.now(),
+            )
+            if not reservation.ok:
+                task = uow.tasks.get(attempt.task_id, for_update=True)
+                assert task is not None
+                attempt.exit_class = ExitClass.QUOTA_EXHAUSTED
+                attempt.ended_at = self._clock.now()
+                record_event(
+                    uow,
+                    self._clock,
+                    EventKind.QUOTA_EXHAUSTED,
+                    principal=PRINCIPAL_CRUCIBLE,
+                    task_id=attempt.task_id,
+                    execution_id=execution.id,
+                    attempt_id=attempt.id,
+                    payload={"pool": reservation.pool, "detail": reservation.detail},
+                )
+                create_wake(
+                    uow,
+                    self._clock,
+                    principal_id=task.principal_id,
+                    reason=WakeReason.QUOTA_EXHAUSTED,
+                    summary=reservation.detail,
+                    task=task,
+                    attempt_id=attempt.id,
+                )
+                move_attempt(
+                    uow,
+                    self._clock,
+                    attempt,
+                    AttemptState.COLLECTED,
+                    EventKind.ATTEMPT_COLLECTED,
+                    payload={"exit_class": ExitClass.QUOTA_EXHAUSTED.value},
+                )
+                self._classify_and_finish(uow, attempt, None)
+                uow.commit()
+                return False
+            self._ensure_metrics(uow, attempt, execution, reservation)
+            record_event(
+                uow,
+                self._clock,
+                EventKind.QUOTA_RESERVED,
+                principal=PRINCIPAL_CRUCIBLE,
+                task_id=attempt.task_id,
+                execution_id=execution.id,
+                attempt_id=attempt.id,
+                payload={"pool": reservation.pool, "detail": reservation.detail},
+            )
             attempt.workspace_path = ws.checkout_path.removesuffix("/repo")
             move_attempt(
                 uow,
@@ -538,6 +856,25 @@ class Supervisor:
                 payload={"workspace": attempt.workspace_path},
             )
             uow.commit()
+            return True
+
+    def _ensure_metrics(
+        self, uow: UnitOfWork, attempt: Attempt, execution: Execution, reservation: Any
+    ) -> None:
+        if uow.attempt_metrics.get(attempt.id) is not None:
+            return
+        uow.attempt_metrics.put(
+            AttemptMetrics(
+                attempt_id=attempt.id,
+                task_id=attempt.task_id,
+                model=execution.model,
+                harness=execution.harness,
+                endpoint_kind=reservation.endpoint_kind,
+                pool=reservation.pool,
+                cost_source="none",
+                created_at=self._clock.now(),
+            )
+        )
 
     def _mark_running(self, attempt_id: str, handle: Handle) -> None:
         with self._fenced() as uow:
@@ -577,8 +914,31 @@ class Supervisor:
                 EventKind.ATTEMPT_COLLECTED,
                 payload={"stage": stage, "detail": detail, "exit_class": ExitClass.ENVIRONMENT},
             )
+            self._record_bare_evidence(uow, attempt)
             self._classify_and_finish(uow, attempt, None)
             uow.commit()
+
+    def _record_bare_evidence(self, uow: UnitOfWork, attempt: Attempt) -> None:
+        """An attempt that produced nothing still records its exit, so the gates that
+        read it fail rather than wait (09, 11)."""
+        task = uow.tasks.get(attempt.task_id)
+        if task is None:
+            return
+        execution = uow.executions.get(attempt.execution_id)
+        if execution is not None and execution.role is ExecutionRole.REVIEW:
+            return
+        record_collection_evidence(
+            uow,
+            self._clock,
+            self._artifacts,
+            attempt=attempt,
+            task=task,
+            outputs=CollectedOutputs(report=None, report_raw=None, blocked_md=None),
+            claim=None,
+            claim_parsed_ok=False,
+            parse_errors=[],
+        )
+        self._record_wall_time(uow, attempt)
 
     # ----- step: observe ---------------------------------------------------
 
@@ -798,6 +1158,7 @@ class Supervisor:
                 payload={"report_present": False, "blocked_present": False},
             )
             uow.leases.release_attempt_lease(attempt.id)
+            self._record_bare_evidence(uow, attempt)
             self._classify_and_finish(uow, attempt, None)
             uow.commit()
 
@@ -807,6 +1168,8 @@ class Supervisor:
         with self._fenced() as uow:
             attempt = uow.attempts.get(attempt_id, for_update=True)
             assert attempt is not None
+            task = uow.tasks.get(attempt.task_id, for_update=True)
+            assert task is not None
             attempt.exit_code = exit_code
             attempt.ended_at = self._clock.now()
             timed_out = attempt.termination_reason == TERMINATION_TIMEOUT
@@ -830,6 +1193,13 @@ class Supervisor:
                     "termination_reason": attempt.termination_reason,
                 },
             )
+            execution = uow.executions.get(attempt.execution_id)
+            assert execution is not None
+            if execution.role is ExecutionRole.REVIEW:
+                self._finish_review_attempt(uow, attempt, outputs)
+                uow.leases.release_attempt_lease(attempt.id)
+                uow.commit()
+                return
             claim_ok = False
             cancelled = attempt.termination_reason == TERMINATION_CANCEL
             if outputs.report is not None and not cancelled:
@@ -884,8 +1254,102 @@ class Supervisor:
                 },
             )
             uow.leases.release_attempt_lease(attempt.id)
+            claim_document = outputs.report if (outputs.report and not cancelled) else None
+            stored_claim = uow.claims.get(attempt.id) if claim_document else None
+            errors = list(stored_claim.parse_errors) if stored_claim else []
+            head = record_collection_evidence(
+                uow,
+                self._clock,
+                self._artifacts,
+                attempt=attempt,
+                task=task,
+                outputs=outputs,
+                claim=claim_document,
+                claim_parsed_ok=claim_ok,
+                parse_errors=errors,
+            )
+            if head:
+                task.head_sha = head
+                task.updated_at = self._clock.now()
+                uow.tasks.save(task)
+            self._record_wall_time(uow, attempt)
             self._classify_and_finish(uow, attempt, blocked_text, claim_ok=claim_ok)
             uow.commit()
+
+    def _record_wall_time(self, uow: UnitOfWork, attempt: Attempt) -> None:
+        metrics = uow.attempt_metrics.get(attempt.id)
+        if metrics is None:
+            return
+        if attempt.started_at is not None and attempt.ended_at is not None:
+            metrics.wall_ms = int((attempt.ended_at - attempt.started_at).total_seconds() * 1000)
+        metrics.exit_class = attempt.exit_class.value if attempt.exit_class else None
+        uow.attempt_metrics.put(metrics)
+
+    def _finish_review_attempt(
+        self, uow: UnitOfWork, attempt: Attempt, outputs: CollectedOutputs
+    ) -> None:
+        """A `review` execution succeeds when a ReviewReportV1 parses (09). Its verdict
+        does not move the task by itself; Foundry's acceptance does (11)."""
+        task = uow.tasks.get(attempt.task_id, for_update=True)
+        execution = uow.executions.get(attempt.execution_id, for_update=True)
+        assert task is not None and execution is not None
+        recorded = False
+        detail = "no review report was produced"
+        if outputs.report is not None:
+            try:
+                record_review_report(
+                    uow,
+                    self._clock,
+                    task=task,
+                    document=outputs.report,
+                    reviewer_kind="crucible_review_execution",
+                    reviewer_attempt_id=attempt.id,
+                    reviewer_principal_id=None,
+                    principal_name=PRINCIPAL_CRUCIBLE,
+                )
+                recorded = True
+                detail = "ReviewReportV1 recorded"
+            except ApplicationError as exc:
+                detail = exc.detail
+        move_attempt(
+            uow,
+            self._clock,
+            attempt,
+            AttemptState.COLLECTED,
+            EventKind.ATTEMPT_COLLECTED,
+            payload={"role": "review", "review_recorded": recorded, "detail": detail},
+        )
+        self._record_wall_time(uow, attempt)
+        if recorded and attempt.exit_code == 0:
+            move_attempt(
+                uow, self._clock, attempt, AttemptState.SUCCEEDED, EventKind.ATTEMPT_SUCCEEDED
+            )
+            move_execution(
+                uow, self._clock, execution, ExecutionState.SUCCEEDED, EventKind.EXECUTION_SUCCEEDED
+            )
+        else:
+            move_attempt(
+                uow,
+                self._clock,
+                attempt,
+                AttemptState.FAILED,
+                EventKind.ATTEMPT_FAILED,
+                payload={"role": "review", "detail": detail},
+            )
+            move_execution(
+                uow,
+                self._clock,
+                execution,
+                ExecutionState.FAILED,
+                EventKind.EXECUTION_FAILED,
+                payload={"role": "review", "detail": detail},
+            )
+        work = latest_work_attempt(uow, task)
+        if work is not None:
+            work_attempt, work_execution = work
+            evaluate_and_advance(
+                uow, self._clock, task=task, attempt=work_attempt, execution=work_execution
+            )
 
     # ----- classification, retry, task transition --------------------------
 
@@ -936,13 +1400,16 @@ class Supervisor:
                 task,
                 TaskState.BLOCKED,
                 EventKind.TASK_BLOCKED,
-                payload={
-                    **common,
-                    "exit_class": exit_class.value,
-                    "blocked_md": blocked_text,
-                    "note": "escalation and wake rows are C2",
-                },
+                payload={**common, "exit_class": exit_class.value, "blocked_md": blocked_text},
                 **common,
+            )
+            # 09: entering `blocked` opens an escalation and creates a wake.
+            open_escalation(
+                uow,
+                self._clock,
+                task=task,
+                attempt_id=attempt.id,
+                question=blocked_text or "the worker exited 75 without a question",
             )
             return
         retryable = exit_class.value in execution.retry_on and exit_class in (
@@ -983,6 +1450,14 @@ class Supervisor:
         )
         self._task_reported(uow, task, attempt, exit_class, common)
 
+    # Exit classes that wake Foundry once no retry remains (17).
+    _FAILURE_WAKE_REASONS: ClassVar[dict[ExitClass, WakeReason]] = {
+        ExitClass.TIMEOUT: WakeReason.TIMED_OUT,
+        ExitClass.LOST: WakeReason.LOST,
+        ExitClass.AUTH_FAILURE: WakeReason.AUTH_FAILURE,
+        ExitClass.QUOTA_EXHAUSTED: WakeReason.QUOTA_EXHAUSTED,
+    }
+
     def _task_reported(
         self,
         uow: UnitOfWork,
@@ -1001,10 +1476,24 @@ class Supervisor:
                 **common,
                 "exit_class": exit_class.value,
                 "attempt_state": attempt.state.value,
-                "note": "pre-PR gate evaluation is C2",
+                "head_sha": task.head_sha,
             },
             **common,
         )
+        if attempt.state is AttemptState.FAILED:
+            reason = self._FAILURE_WAKE_REASONS.get(exit_class, WakeReason.ATTEMPT_FAILED)
+            create_wake(
+                uow,
+                self._clock,
+                principal_id=task.principal_id,
+                reason=reason,
+                summary=(
+                    f"attempt {attempt.number} ended {exit_class.value} with no retry remaining; "
+                    "the pre-PR gates will say so"
+                ),
+                task=task,
+                attempt_id=attempt.id,
+            )
 
     def _finish_cancelling(self, uow: UnitOfWork, task: Task) -> None:
         """Once no attempt is live, close open executions; a cancelling task becomes cancelled."""

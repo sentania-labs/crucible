@@ -8,19 +8,45 @@ from typing import Any
 
 from crucible.application.errors import NotFoundError
 from crucible.contracts.api import (
+    AcceptanceView,
+    ArtifactList,
+    ArtifactView,
     AttemptSummary,
     AttemptView,
+    CompletionClaimView,
     ContractVersionView,
+    DecisionView,
+    EscalationView,
     EventList,
     EventView,
+    EvidenceList,
+    EvidenceView,
     ExecutionSummary,
     ExecutionView,
+    GateList,
+    GateResultView,
+    ReviewReportView,
     SupervisorView,
     TaskList,
     TaskListItem,
     TaskView,
+    WakeList,
+    WakeView,
 )
-from crucible.domain.entities import Attempt, Event, Execution
+from crucible.domain.entities import (
+    AcceptanceResult,
+    Artifact,
+    Attempt,
+    Decision,
+    Escalation,
+    EscalationState,
+    Event,
+    EvidenceRecord,
+    Execution,
+    GateResultRecord,
+    ReviewReportRecord,
+    Wake,
+)
 from crucible.domain.lifecycle import TaskState
 from crucible.ports.execution import ExecutionProvider
 from crucible.ports.repository import UnitOfWork
@@ -114,9 +140,32 @@ def task_view(uow: UnitOfWork, task_id: str) -> TaskView:
         contract=current.document if current else {},
         executions=summaries,
         latest_attempt=latest,
-        gate_summary={},
+        head_sha=task.head_sha,
+        publish_pending=task.publish_pending,
+        gate_summary=gate_summary(uow, task.id),
         pull_request=None,
-        open_escalations=[],
+        open_escalations=[
+            _escalation_view(e).model_dump(mode="json")
+            for e in uow.escalations.list_for_task(task.id)
+            if e.state is not EscalationState.CLOSED
+        ],
+        review_reports=[
+            _review_view(uow, r).model_dump(mode="json")
+            for r in uow.review_reports.list_for_task(task.id)
+        ],
+        acceptance_results=[
+            _acceptance_view(uow, a).model_dump(mode="json")
+            for a in uow.acceptance.list_for_task(task.id)
+        ],
+        decisions=[
+            _decision_view(uow, d).model_dump(mode="json")
+            for d in uow.decisions.list_for_task(task.id)
+        ],
+        unacked_wakes=len(
+            uow.wakes.list_for_principal(
+                task.principal_id, since=None, include_acked=False, limit=MAX_LIMIT
+            )
+        ),
     )
 
 
@@ -343,7 +392,218 @@ def supervisor_view(
         last_error=status.last_error,
         healthy=healthy,
         tick_ms=status.tick_ms,
-        counts=status.counts,
+        counts={**status.counts, "wakes_unacked": uow.wakes.count_unacked()},
         providers=[{"name": p.name, **p.capabilities().as_dict()} for p in providers],
         github=None,
     )
+
+
+# ----- C2 views ----------------------------------------------------------------
+
+
+def _escalation_view(e: Escalation) -> EscalationView:
+    return EscalationView(
+        id=e.id,
+        state=e.state.value,
+        question=e.question,
+        attempt_id=e.attempt_id,
+        opened_at=e.opened_at,
+        closed_at=e.closed_at,
+        decision_id=e.decision_id,
+    )
+
+
+def _principal_name(uow: UnitOfWork, principal_id: str | None) -> str | None:
+    if principal_id is None:
+        return None
+    principal = uow.principals.get(principal_id)
+    return principal.name if principal else principal_id
+
+
+def _review_view(uow: UnitOfWork, r: ReviewReportRecord) -> ReviewReportView:
+    return ReviewReportView(
+        id=r.id,
+        task_id=r.task_id,
+        head_sha=r.head_sha,
+        reviewer_kind=r.reviewer_kind,
+        reviewer_attempt_id=r.reviewer_attempt_id,
+        reviewer_principal=_principal_name(uow, r.reviewer_principal_id),
+        verdict=str(r.document.get("verdict", "")),
+        findings=len(r.document.get("findings", [])),
+        document=r.document,
+        created_at=r.created_at,
+    )
+
+
+def _acceptance_view(uow: UnitOfWork, a: AcceptanceResult) -> AcceptanceView:
+    return AcceptanceView(
+        id=a.id,
+        head_sha=a.head_sha,
+        principal=_principal_name(uow, a.principal_id) or a.principal_id,
+        verdict=a.verdict.value,
+        reasoning=a.reasoning,
+        superseded_at=a.superseded_at,
+        created_at=a.created_at,
+    )
+
+
+def _decision_view(uow: UnitOfWork, d: Decision) -> DecisionView:
+    return DecisionView(
+        id=d.id,
+        kind=d.kind,
+        principal=_principal_name(uow, d.principal_id) or d.principal_id,
+        verbatim=d.verbatim,
+        resolves=d.resolves,
+        escalation_id=d.escalation_id,
+        created_at=d.created_at,
+    )
+
+
+def _gate_view(g: GateResultRecord) -> GateResultView:
+    return GateResultView(
+        gate=g.gate,
+        phase=g.phase,
+        result=g.result,
+        detail=g.detail,
+        head_sha=g.head_sha,
+        evidence_ids=list(g.evidence_ids),
+        evaluated_at=g.evaluated_at,
+    )
+
+
+def gate_summary(uow: UnitOfWork, task_id: str) -> dict[str, Any]:
+    """What the gates say for the head the task is currently bound to."""
+    task = uow.tasks.get(task_id)
+    rows = [
+        g
+        for g in uow.gate_results.list_for_task(task_id)
+        if task is None or not task.head_sha or g.head_sha == task.head_sha
+    ]
+    counts: dict[str, int] = {}
+    for row in rows:
+        counts[row.result] = counts.get(row.result, 0) + 1
+    return {
+        "head_sha": task.head_sha if task else None,
+        "counts": counts,
+        "results": {row.gate: row.result for row in rows},
+        "failing": sorted(row.gate for row in rows if row.result in ("fail", "error")),
+    }
+
+
+def attempt_gates(uow: UnitOfWork, attempt_id: str) -> GateList:
+    attempt = uow.attempts.get(attempt_id)
+    if attempt is None:
+        raise NotFoundError(f"attempt {attempt_id} not found")
+    rows = list(uow.gate_results.list_for_attempt(attempt_id))
+    counts: dict[str, int] = {}
+    for row in rows:
+        counts[row.result] = counts.get(row.result, 0) + 1
+    task = uow.tasks.get(attempt.task_id)
+    return GateList(
+        attempt_id=attempt_id,
+        head_sha=task.head_sha if task else None,
+        items=[_gate_view(r) for r in rows],
+        counts=counts,
+    )
+
+
+def _evidence_view(e: EvidenceRecord) -> EvidenceView:
+    return EvidenceView(
+        id=int(e.id or 0),
+        attempt_id=e.attempt_id,
+        kind=e.kind,
+        source=e.source,
+        verified=e.verified,
+        observed_at=e.observed_at,
+        payload=e.payload,
+        artifact_id=e.artifact_id,
+    )
+
+
+def attempt_evidence(uow: UnitOfWork, attempt_id: str) -> EvidenceList:
+    if uow.attempts.get(attempt_id) is None:
+        raise NotFoundError(f"attempt {attempt_id} not found")
+    return EvidenceList(
+        items=[_evidence_view(e) for e in uow.evidence.list_for_attempt(attempt_id)]
+    )
+
+
+def _artifact_view(a: Artifact) -> ArtifactView:
+    return ArtifactView(
+        id=a.id,
+        attempt_id=a.attempt_id,
+        task_id=a.task_id,
+        type=a.type,
+        size=a.size,
+        sha256=a.sha256,
+        content_type=a.content_type,
+        created_by=a.created_by,
+        created_at=a.created_at,
+    )
+
+
+def attempt_artifacts(uow: UnitOfWork, attempt_id: str) -> ArtifactList:
+    if uow.attempts.get(attempt_id) is None:
+        raise NotFoundError(f"attempt {attempt_id} not found")
+    return ArtifactList(
+        items=[_artifact_view(a) for a in uow.artifacts.list_for_attempt(attempt_id)]
+    )
+
+
+def artifact_view(uow: UnitOfWork, artifact_id: str) -> ArtifactView:
+    artifact = uow.artifacts.get(artifact_id)
+    if artifact is None:
+        raise NotFoundError(f"artifact {artifact_id} not found")
+    return _artifact_view(artifact)
+
+
+def attempt_report(uow: UnitOfWork, attempt_id: str) -> CompletionClaimView:
+    if uow.attempts.get(attempt_id) is None:
+        raise NotFoundError(f"attempt {attempt_id} not found")
+    claim = uow.claims.get(attempt_id)
+    if claim is None:
+        raise NotFoundError(f"attempt {attempt_id} has no parsed report")
+    return CompletionClaimView(
+        attempt_id=attempt_id,
+        parsed_ok=claim.parsed_ok,
+        parse_errors=claim.parse_errors,
+        document=claim.document,
+    )
+
+
+def wake_view(uow: UnitOfWork, w: Wake) -> WakeView:
+    return WakeView(
+        id=w.id,
+        principal=_principal_name(uow, w.principal_id) or w.principal_id,
+        reason=w.reason,
+        task_id=w.task_id,
+        summary=str(w.payload.get("summary", "")),
+        payload=w.payload,
+        created_at=w.created_at,
+        attempts=w.attempts,
+        delivered_at=w.delivered_at,
+        acked_at=w.acked_at,
+        ack_note=w.ack_note,
+        next_attempt_at=w.next_attempt_at,
+        last_error=w.last_error,
+        gave_up_at=w.gave_up_at,
+    )
+
+
+def wake_list(
+    uow: UnitOfWork,
+    *,
+    principal_id: str,
+    since: datetime | None,
+    include_acked: bool,
+    limit: int | None,
+) -> WakeList:
+    size = clamp_limit(limit)
+    rows = list(
+        uow.wakes.list_for_principal(
+            principal_id, since=since, include_acked=include_acked, limit=size + 1
+        )
+    )
+    page = rows[:size]
+    next_cursor = encode_cursor(page[-1].id) if len(rows) > size and page else None
+    return WakeList(items=[wake_view(uow, w) for w in page], next_cursor=next_cursor)
