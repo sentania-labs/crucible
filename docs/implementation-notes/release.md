@@ -37,7 +37,8 @@ real Docker daemon. Each step gates the next:
 2. **Build** `ghcr.io/sentania-labs/crucible:<version>` with `VERSION` passed in.
 3. **Check the version reached the artifact**: the package version inside the
    image and the OCI version label must both equal the tag.
-4. **Smoke the exact image**, not a rebuild and not the published one.
+4. **Pull the supporting images, then smoke the exact image**, not a rebuild and
+   not the published one.
    `CRUCIBLE_IMAGE` pins compose to this run's versioned local tag and
    `--pull never` forbids the registry, so a v0.2.0 run cannot boot the
    published v0.1.0. Compose will still build when an image is absent, because
@@ -71,6 +72,43 @@ Use `make up` for local work. It passes `--build`, so the working tree is what
 runs. A bare `docker compose up` pulls the published `latest` when one exists
 and only builds if that pull fails, so once v0.1.0 is out it would silently
 exercise the release instead of your change.
+
+## First live run: the fresh-runner pull trap
+
+The first live run of this workflow, on tag `v0.1.0` (run `35158679884`), failed
+at the smoke step with:
+
+```
+Container crucible-postgres-1  Error response from daemon: No such image:
+postgres:16@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94
+```
+
+`docker compose up --pull never` applies the pull policy to **every** service,
+not just the release candidate. A GitHub-hosted runner is a clean machine with
+no image cache, so the digest-pinned `postgres:16` was never fetched and compose
+refused to create the container. It passed in local testing only because
+postgres was already on the workstation, which is exactly the class of
+assumption a fresh runner exists to catch.
+
+The gates behaved correctly: the smoke failed, the publish and release steps
+were skipped, nothing reached GHCR and no GitHub release was created. The cost
+was a burnt tag, not a bad artifact.
+
+The fix pulls every service except the candidate by name before the smoke, so a
+service added later is covered without anyone remembering to update a list, and
+leaves `--pull never` in place so the candidate itself can still never be
+fetched from the registry.
+
+Reproduced locally before fixing. The workstation's copy of the pinned postgres
+image could not be removed, because containers belonging to other projects were
+using it, so the reproduction pinned a different postgres 16 digest that was
+genuinely absent from the local daemon, which is the same condition:
+
+- Before the fix: `up -d --wait --pull never` failed with the identical
+  `No such image: postgres:16@sha256:...` error.
+- After the fix: the supporting image is pulled, the stack comes up healthy, the
+  running containers' image IDs still match the freshly built candidate, and
+  `/v1/health` reports the derived version.
 
 ## Who pushes the tag
 
