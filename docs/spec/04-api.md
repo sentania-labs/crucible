@@ -52,7 +52,7 @@ instead of a bearer token (below).
 | POST | `/tasks/{id}/decisions` | Record a `Decision` (verbatim text, who, what it resolves). |
 | POST | `/tasks/{id}/close` | Orchestrator closes an `accepted`, `merged`, or `released` task. |
 | GET | `/tasks/{id}/events` | Ordered events for the task and its children. |
-| GET | `/tasks/{id}/pull-request` | The PR record with head history, external reviews, dispositions, and CI certifications. |
+| GET | `/tasks/{id}/pull-request` | The PR record with head history, the external review cycles and their completed components, external reviews, comments, dispositions, the observed reactions, whether reactions are observable at all, and CI certifications. |
 | GET | `/events` | Global feed, `?cursor=&kind=&since=`. |
 
 ### Executions and attempts
