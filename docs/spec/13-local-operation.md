@@ -188,8 +188,9 @@ declared endpoints, the hostnames of every enabled local model
 to launch an attempt whose effective allowlist exceeds what the proxy
 was configured with, and a per-attempt proxy is a later hardening. Worker
 `/tmp` is mounted without `noexec` in v0.x because no evidence exists yet
-that the real harnesses never execute from it; C5 tests each harness with
-`noexec` and 13 is updated with the result. From S6, as each list stood after an authenticated task completed through
+that the real harnesses never execute from it. C5a did not test it; the
+test against each real harness is carried forward and this section is
+updated with the result. From S6, as each list stood after an authenticated task completed through
 the filter (so none of them is provisional any more): Claude Code
 `api.anthropic.com` (plus `mcp-proxy.anthropic.com` only if account MCP
 connectors are wanted; telemetry to Datadog denied); Codex

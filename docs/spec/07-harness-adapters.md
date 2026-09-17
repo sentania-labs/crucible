@@ -146,6 +146,9 @@ never retry.
   CLI needs. The list is no longer provisional.
 - Shim: untracked `AGENTS.md` if absent (AGY reads `AGENTS.md`; it does not
   read `GEMINI.md` reliably in headless mode per the operator's setup notes).
+- Templates: none. AGY's config directory carries no settings file the
+  adapter needs to pin, so nothing is mounted read-only on top of the copy
+  and `config/` is not seeded.
 - Output: stream-json parsed like Claude Code's, keyed by `event` rather
   than `type` (`{"event": "result", "result": {...}}`); the adapter reads
   both keys.
