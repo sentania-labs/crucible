@@ -147,8 +147,16 @@ network, `postgres`, `crucible`, or the socket proxy. Egress is provided by
 `egress-proxy` (an HTTP CONNECT proxy with a hostname allowlist plus a
 resolver) that sits on both `crucible-workers` and the outside; the
 provider sets `HTTPS_PROXY`, `HTTP_PROXY`, and `NO_PROXY` in the container
-environment. The worker allowlist is the union of the policy's
-`egress_allowlist` and the adapter's declared model endpoints. From S6
+environment. One egress proxy serves the deployment, so its allowlist is
+deployment-wide: the union over every enabled harness of the adapter's
+declared endpoints, the hostnames of every enabled local model
+`endpoint_url` in the routing policy (05b), and the policy
+`egress_allowlist`; Crucible refuses
+to launch an attempt whose effective allowlist exceeds what the proxy
+was configured with, and a per-attempt proxy is a later hardening. Worker
+`/tmp` is mounted without `noexec` in v0.x because no evidence exists yet
+that the real harnesses never execute from it; C5 tests each harness with
+`noexec` and 13 is updated with the result. From S6
 (Claude Code and the others provisional until an authenticated run
 completes through the filter in C3): Claude Code `api.anthropic.com`
 (plus `mcp-proxy.anthropic.com` only if account MCP connectors are

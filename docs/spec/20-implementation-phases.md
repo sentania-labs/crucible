@@ -1,7 +1,11 @@
 # 20. Proposed implementation phases
 
-Each phase ends with a tagged release, a demo the operator can run with one
-command, and a Foundry review. Nothing broad before something works end to
+Each phase ends with a merged, verified PR, a demo the operator can run
+with one command, and a Foundry review. Releases are cut only when the
+operator judges a milestone functional (operator decision, 2026-09-16:
+"I'm not sure we need to keep tagging non-functional things"); the
+worker-supervision readiness milestone (C6) is the next planned release
+after v0.2.1. Nothing broad before something works end to
 end. Phase sizes are bounded so a worker can deliver each as a reviewed PR
 series; Foundry decomposes further at dispatch.
 
