@@ -293,6 +293,8 @@ def test_credentials_validate_and_probe_through_api_and_cli(
         "duration_seconds",
         "files",
         "detail",
+        "conclusive",
+        "cause",
     }
     kinds = audit_kinds(admin_client)
     assert ("credential_validated", "admin-principal") in kinds
@@ -769,24 +771,85 @@ def test_a_failed_swap_leaves_the_configured_directory_exactly_as_it_was(
     assert (incoming / "auth.json").is_file(), "the caller's directory is never touched"
 
 
-def test_a_probe_that_times_out_makes_a_validated_credential_invalid(
+def test_an_inconclusive_probe_leaves_the_credential_state_alone(
     admin_client: TestClient,
     live_supervisor: Supervisor,
     provider: FakeProvider,
 ) -> None:
-    """S4: when the shape check passed and the probe did not, nothing recorded the
-    failure, so a previously validated credential still read as validated."""
+    """A probe that timed out is evidence about the run, not about the credential. The
+    first version of this fix marked the credential invalid on any unsuccessful probe,
+    which would take a working harness out of service on latency alone."""
     asyncio.run(live_supervisor.tick())
     first = admin_client.post(
         "/v1/admin/credentials/codex/validate", json={"reason": "first pass"}
     ).json()
-    assert first["validated"] is True
+    assert first["validated"] is True and first["conclusive"] is True
     assert first["credential"]["state"] == "validated"
+
     provider.probe_outcome = "timeout"
-    second = admin_client.post(
-        "/v1/admin/credentials/codex/validate", json={"reason": "after the timeout"}
+    slow = admin_client.post(
+        "/v1/admin/credentials/codex/validate", json={"reason": "a slow daemon"}
     ).json()
-    assert second["validated"] is False
-    assert second["probe"]["exit_class"] == "timeout"
-    assert second["credential"]["state"] == "invalid", second["credential"]
+    assert slow["validated"] is False
+    assert slow["conclusive"] is False and slow["cause"] == "timeout"
+    assert slow["probe"]["conclusive"] is False
+    assert slow["credential"]["state"] == "validated", slow["credential"]
+    status = admin_client.get("/v1/admin/status").json()
+    assert status["credentials"]["codex"]["last_launch_outcome"] == "probe:inconclusive:timeout"
+
+    provider.probe_outcome = "auth_failure"
+    refused = admin_client.post(
+        "/v1/admin/credentials/codex/validate", json={"reason": "after a revoked token"}
+    ).json()
+    assert refused["validated"] is False
+    assert refused["conclusive"] is True and refused["cause"] == ""
+    assert refused["probe"]["exit_class"] == "auth_failure"
+    assert refused["credential"]["state"] == "invalid", refused["credential"]
     assert admin_client.get("/v1/admin/credentials/codex").json()["state"] == "invalid"
+
+
+def test_a_probe_the_provider_never_answered_is_inconclusive(
+    admin_ctx: AdminContext,
+    live_supervisor: Supervisor,
+    provider: FakeProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A daemon that will not answer says nothing about the credential either, and the
+    operator gets a record with the cause rather than a 500."""
+    from crucible.ports.execution import ProviderError  # noqa: PLC0415
+
+    asyncio.run(live_supervisor.tick())
+
+    async def refuse(_request: object) -> None:
+        raise ProviderError("the daemon socket is not there")
+
+    monkeypatch.setattr(provider, "probe_credential", refuse)
+    with admin_ctx.uow_factory() as uow:
+        before = credentials_state(admin_ctx, uow, "codex")
+    with admin_ctx.uow_factory() as uow:
+        report = asyncio.run(
+            credentials_module_probe(admin_ctx, uow, harness="codex", reason="daemon down")
+        )
+        uow.commit()
+    assert report.probe is not None
+    assert report.probe.conclusive is False
+    assert report.probe.cause == "provider_unavailable"
+    assert report.probe.detail.startswith("ProviderError")
+    # Whatever the state was, it is what it still is: nothing was observed.
+    assert report.state["state"] == before["state"]
+    assert report.state["last_auth_failure_at"] == before["last_auth_failure_at"]
+    assert report.state["last_launch_outcome"] == "probe:inconclusive:provider_unavailable"
+
+
+def credentials_state(ctx: AdminContext, uow: Any, harness: str) -> Any:
+    from crucible.application.admin import credentials as credentials_module  # noqa: PLC0415
+
+    return credentials_module.state_view(ctx, uow, harness)
+
+
+def credentials_module_probe(ctx: AdminContext, uow: Any, *, harness: str, reason: str) -> Any:
+    from crucible.application.admin import credentials as credentials_module  # noqa: PLC0415
+
+    return credentials_module.probe(
+        ctx, uow, principal="admin-principal", harness=harness, reason=reason
+    )

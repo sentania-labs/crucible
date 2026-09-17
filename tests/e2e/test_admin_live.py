@@ -55,6 +55,12 @@ from tests.e2e.test_live_harness import (
 
 LOCAL_TZ = ZoneInfo("America/Chicago")
 
+# 25 bounds the probe at 120 s and this tier holds it there. Every probe recorded on this
+# branch finished in 3.0 to 9.9 s against warm images on the rootless daemon, so the bound
+# is two orders of magnitude clear of the observed cost; raising it would need evidence
+# that a probe legitimately needs longer, and there is none.
+PROBE_TIMEOUT_SECONDS = 120
+
 
 def _why_not() -> str:
     root = os.environ.get(CREDENTIAL_ROOT_ENV, "")
@@ -165,7 +171,7 @@ def _context(
         artifact_root=str(artifact_root),
         lease_ttl_seconds=600,
         credential_retention_hours=0,
-        probe_timeout_seconds=120,
+        probe_timeout_seconds=PROBE_TIMEOUT_SECONDS,
     )
     return AppContext(
         uow_factory=SqlUnitOfWorkFactory(engine),
@@ -244,7 +250,7 @@ def _config_file(
         f'artifact_root = "{artifact_root}"',
         "[admin]",
         "credential_retention_hours = 0",
-        "probe_timeout_seconds = 120",
+        f"probe_timeout_seconds = {PROBE_TIMEOUT_SECONDS}",
     ]
     for harness, source in sources.items():
         lines += [f"[credentials.{harness}]", f'path = "{source.path}"']
@@ -368,11 +374,23 @@ def test_the_probe_runs_live_for_each_harness_through_api_and_cli(
                 "duration_seconds": probe["duration_seconds"],
                 "mount_mode": probe["mount_mode"],
                 "auth_files_changed": probe["auth_files_changed"],
+                "conclusive": probe["conclusive"],
+                "cause": probe["cause"],
+                "detail": probe["detail"],
                 "files": probe["files"],
             }
             entries.append(entry)
             _record(entry)
-            assert probe["exit_class"] == "completed", entry
+            # An inconclusive probe is never a pass here: the tier's job is to see the
+            # dedicated credential work live. The message names what came back, because
+            # a bare assertion on an intermittent failure tells the next reader nothing.
+            assert probe["conclusive"] is True and probe["exit_class"] == "completed", (
+                f"the {harness} probe through the {entry_point} did not complete: "
+                f"exit_class={probe['exit_class']} conclusive={probe['conclusive']} "
+                f"cause={probe['cause']!r} exit_code={probe['exit_code']} "
+                f"duration={probe['duration_seconds']}s (bound {PROBE_TIMEOUT_SECONDS}s) "
+                f"image={probe['image']} detail={probe['detail']!r}"
+            )
             assert set(probe) == {
                 "harness",
                 "exit_class",
@@ -385,6 +403,8 @@ def test_the_probe_runs_live_for_each_harness_through_api_and_cli(
                 "duration_seconds",
                 "files",
                 "detail",
+                "conclusive",
+                "cause",
             }, "the probe records what 25 allows and nothing else"
             blob = json.dumps(report)
             for value in secrets:

@@ -287,7 +287,7 @@ class FakeProvider:
         self.discarded: list[str] = []
         # Harnesses the administrative probe was run for (25).
         self.probes: list[str] = []
-        # "completed" or "timeout": what the next administrative probe reports.
+        # "completed", "timeout" or "auth_failure": what the next probe reports.
         self.probe_outcome = "completed"
         # What `list_images` answers: whatever a test hands it (08, 25).
         self.images: list[ImageInfo] = []
@@ -501,9 +501,19 @@ class FakeProvider:
     async def probe_credential(self, request: ProbeRequest) -> ProbeResult:
         """No image and no credential to run (08): the probe records a synthetic
         success so the administrative services can be exercised without a daemon.
-        `probe_outcome` makes it report a timeout instead, which is how a test sees what
-        an unsuccessful validation does to the credential's state."""
+        `probe_outcome` makes it report a timeout or an observed authentication failure
+        instead, which is how a test sees the difference between a probe that decided
+        nothing and one that decided the credential is bad."""
         self.probes.append(request.harness)
+        if self.probe_outcome == "auth_failure":
+            return ProbeResult(
+                exit_code=1,
+                image_digest="sha256:" + "f" * 64,
+                harness_version="fake",
+                duration_seconds=0.4,
+                # A phrase all three adapters' auth patterns carry (S5).
+                stdout_tail="Not logged in\n",
+            )
         if self.probe_outcome == "timeout":
             return ProbeResult(
                 exit_code=None,

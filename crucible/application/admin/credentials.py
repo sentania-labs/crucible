@@ -13,6 +13,7 @@ import contextlib
 import json
 import os
 import shutil
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -41,6 +42,7 @@ from crucible.ports.execution import (
     ExecutionProvider,
     ProbeRequest,
     ProbeResult,
+    ProviderError,
 )
 from crucible.ports.harness import (
     CredentialSource,
@@ -93,6 +95,13 @@ class ProbeRecord:
     duration_seconds: float
     files: tuple[dict[str, Any], ...] = ()
     detail: str = ""
+    # Whether the run says anything about the credential at all. A probe that completed
+    # and a probe that saw the provider reject the credential are both conclusive; a
+    # probe that timed out, crashed, was blocked, lost, or never reached the provider
+    # says nothing about the credential, only about the run.
+    conclusive: bool = True
+    # Empty when conclusive; otherwise why the run decided nothing.
+    cause: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -107,6 +116,8 @@ class ProbeRecord:
             "duration_seconds": self.duration_seconds,
             "files": [dict(f) for f in self.files],
             "detail": self.detail,
+            "conclusive": self.conclusive,
+            "cause": self.cause,
         }
 
 
@@ -243,21 +254,28 @@ async def validate(
     validated = (
         shape.ok
         and probe is not None
+        and probe.conclusive
         and probe.exit_class
         in (
             ExitClass.COMPLETED.value,
             ExitClass.COMPLETED_WITHOUT_REPORT.value,
         )
     )
+    observed_auth_failure = probe is not None and probe.exit_class == ExitClass.AUTH_FAILURE.value
+    inconclusive = probe is not None and not probe.conclusive
+    cause = probe.cause if probe is not None else ""
     if state is not None:
         if validated:
             state.last_validated_at = now
-        else:
-            # 25: an unsuccessful validation yields `invalid`, whether the shape check or
-            # the probe is what failed. Without this a probe that timed out or crashed
-            # left a previously validated credential reading `validated`, which is the
-            # one thing the operator would act on.
+        elif not shape.ok or observed_auth_failure:
+            # 25: `invalid` means the shape check failed or the probe saw the provider
+            # refuse the credential. Those are the two pieces of evidence there are.
             state.last_auth_failure_at = now
+        # An inconclusive probe (a timeout, a daemon that would not answer, a crash) says
+        # nothing about the credential, only about the run, so the previous state stands
+        # exactly as it was. Marking it invalid would take a working harness out of
+        # service on latency, which is not a credential problem and is not what an
+        # operator reading `invalid` would go and fix.
         state.updated_at = now
         uow.harnesses.put(state)
     after = state_view(ctx, uow, harness)
@@ -272,9 +290,15 @@ async def validate(
         harness=harness,
         shape=shape.as_dict(),
         validated=validated,
+        conclusive=not inconclusive,
+        cause=cause,
     )
     return CredentialReport(
-        harness, after, shape=shape, probe=probe, extra={"validated": validated}
+        harness,
+        after,
+        shape=shape,
+        probe=probe,
+        extra={"validated": validated, "conclusive": not inconclusive, "cause": cause},
     )
 
 
@@ -315,6 +339,48 @@ async def probe_image(
     )
 
 
+def _record_inconclusive(
+    ctx: AdminContext,
+    uow: UnitOfWork,
+    *,
+    harness: str,
+    principal: str,
+    reason: str,
+    image: str,
+    mode: MountMode,
+    cause: str,
+    detail: str,
+    duration: float,
+) -> ProbeRecord:
+    """A probe that decided nothing. It is recorded like any other, with its cause, and
+    it moves no credential state: `last_launch_outcome` says `probe:inconclusive:<cause>`
+    so the status shows what happened without claiming the credential is bad."""
+    record = ProbeRecord(
+        harness=harness,
+        exit_class=ExitClass.ENVIRONMENT.value,
+        exit_code=None,
+        harness_version=None,
+        image=image,
+        image_digest="",
+        auth_files_changed=False,
+        mount_mode=mode.value,
+        duration_seconds=round(duration, 1),
+        detail=detail,
+        conclusive=False,
+        cause=cause,
+    )
+    record_launch_outcome(
+        uow,
+        ctx.clock,
+        name=harness,
+        outcome=f"probe:inconclusive:{cause}",
+        at=ctx.clock.now(),
+        auth_failure=False,
+    )
+    record_event_probe(uow, ctx, principal, record, reason)
+    return record
+
+
 async def _probe_async(
     ctx: AdminContext, uow: UnitOfWork, *, harness: str, principal: str, reason: str
 ) -> ProbeRecord:
@@ -336,24 +402,40 @@ async def _probe_async(
             credential_mounted=True,
         )
     )
-    result: ProbeResult = await provider.probe_credential(
-        ProbeRequest(
-            harness=harness,
-            image=image,
-            argv=tuple(launch.argv),
-            env=dict(launch.env),
-            env_from_files=dict(launch.env_from_files),
-            stdin_files=tuple(launch.stdin_files),
-            stdin_text=PROBE_PROMPT if launch.stdin_text else "",
-            identity_text=f"# Probe\n\n{PROBE_PROMPT}\n",
-            timeout_seconds=ctx.probe_timeout_seconds,
-            policy={
-                "resources": {"cpus": 2, "memory": "3GiB", "pids": 1024, "tmpfs_total": "1GiB"},
-                "network": {"mode": "egress-proxy", "egress_allowlist": []},
-                "images": {"allowlist": [image]},
-            },
-        )
+    request = ProbeRequest(
+        harness=harness,
+        image=image,
+        argv=tuple(launch.argv),
+        env=dict(launch.env),
+        env_from_files=dict(launch.env_from_files),
+        stdin_files=tuple(launch.stdin_files),
+        stdin_text=PROBE_PROMPT if launch.stdin_text else "",
+        identity_text=f"# Probe\n\n{PROBE_PROMPT}\n",
+        timeout_seconds=ctx.probe_timeout_seconds,
+        policy={
+            "resources": {"cpus": 2, "memory": "3GiB", "pids": 1024, "tmpfs_total": "1GiB"},
+            "network": {"mode": "egress-proxy", "egress_allowlist": []},
+            "images": {"allowlist": [image]},
+        },
     )
+    started = time.monotonic()
+    try:
+        result: ProbeResult = await provider.probe_credential(request)
+    except ProviderError as exc:
+        # The run never reached the provider, so it observed nothing about the
+        # credential. That is an inconclusive probe with a cause, not a failed one.
+        return _record_inconclusive(
+            ctx,
+            uow,
+            harness=harness,
+            principal=principal,
+            reason=reason,
+            image=image,
+            mode=mode,
+            cause="provider_unavailable",
+            detail=f"{type(exc).__name__}: {exc}",
+            duration=time.monotonic() - started,
+        )
     exit_class = adapter.classify_exit(
         ExitInfo(
             exit_code=result.exit_code,
@@ -369,6 +451,9 @@ async def _probe_async(
         exit_class = ExitClass.COMPLETED
     sync = result.credential_sync
     changed = bool(sync and sync.changed)
+    # Only two outcomes say anything about the credential itself: it worked, or the
+    # provider refused it. Everything else is about the run.
+    conclusive = exit_class in (ExitClass.COMPLETED, ExitClass.AUTH_FAILURE)
     record = ProbeRecord(
         harness=harness,
         exit_class=exit_class.value,
@@ -381,13 +466,17 @@ async def _probe_async(
         duration_seconds=round(result.duration_seconds, 1),
         files=tuple(f.as_dict() for f in sync.files) if sync else (),
         detail=result.detail,
+        conclusive=conclusive,
+        cause="" if conclusive else exit_class.value,
     )
     now = ctx.clock.now()
     record_launch_outcome(
         uow,
         ctx.clock,
         name=harness,
-        outcome=f"probe:{exit_class.value}",
+        outcome=(
+            f"probe:{exit_class.value}" if conclusive else f"probe:inconclusive:{record.cause}"
+        ),
         at=now,
         auth_failure=exit_class is ExitClass.AUTH_FAILURE,
     )
