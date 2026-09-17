@@ -72,7 +72,9 @@ paths, emit N log lines. Every lifecycle and gate test runs against it.
   process. It launches a throwaway collector container (the same hardened
   shape as a worker, `--network none`, uid 1000, the repo mounted ro, the
   report dir mounted ro, an output dir mounted rw) that produces: `git diff
-  --stat` and the full diff against `base_ref`, the changed-path list, HEAD
+  --stat` and the **full diff** against `base_ref` (the `no_secrets` and
+  scope gates consume the diff content, never only the path list), the
+  changed-path list, HEAD
   SHA, `git log --format` of `work_branch`, and a copy of the report
   directory. Git in the collector runs with `GIT_CONFIG_GLOBAL=/dev/null`,
   `GIT_CONFIG_NOSYSTEM=1`, `-c core.fsmonitor= -c diff.external= -c

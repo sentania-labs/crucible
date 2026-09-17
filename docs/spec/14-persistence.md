@@ -4,9 +4,9 @@
 
 | Table | Key columns |
 |---|---|
-| `principals` | id, name, role, token_hash, created_at, disabled_at |
+| `principals` | id, name, role, token_hash, webhook_url (nullable; one configured target may serve all principals in v0.x), webhook_secret_ref, created_at, disabled_at |
 | `policies` | (name, version) PK, document JSONB, created_at, retired_at |
-| `tasks` | id ULID PK, external_id, principal_id, project, title, state, contract_version, policy_name, policy_version, created_at, updated_at, closed_at; UNIQUE (principal_id, external_id) |
+| `tasks` | id ULID PK, external_id, principal_id, project, title, state, contract_version, policy_name, policy_version, head_sha (current collected head), publish_pending (until C4), created_at, updated_at, closed_at; UNIQUE (principal_id, external_id) |
 | `task_contracts` | id, task_id, version, document JSONB, sha256, submitted_at; UNIQUE (task_id, version) |
 | `executions` | id, task_id, role (implement, correct, review), contract_version, harness, model, effort, provider, image, policy snapshot JSONB, state, created_at, ended_at |
 | `attempts` | id, execution_id, number, state, workspace_path, handle (provider ref), identity_sha256, image_digest, started_at, ended_at, exit_code, exit_class, timeout_at, drain_deadline, killed_at, termination_reason |
@@ -15,10 +15,10 @@
 | `heartbeats` | id BIGSERIAL, attempt_id, ts, signal, detail |
 | `events` | seq BIGSERIAL PK, ts, kind, task_id, execution_id, attempt_id, principal, verified, payload JSONB |
 | `log_chunks` | id BIGSERIAL, attempt_id, stream, offset_start, offset_end, ts, content BYTEA |
-| `artifacts` | id, attempt_id, type, path (under artifact root), size, sha256, content_type, created_at |
+| `artifacts` | id, attempt_id, type, filename (logical), path (content-addressed, under artifact root), size, sha256, content_type, principal_id, created_at |
 | `evidence` | id, attempt_id, kind, observed_at, source, verified, payload JSONB, artifact_id |
 | `completion_claims` | attempt_id PK, document JSONB, parsed_ok, parse_errors JSONB |
-| `gate_results` | id, attempt_id, gate, result, evaluated_at, evidence_ids BIGINT[], detail |
+| `gate_results` | id, attempt_id, phase (pre_pr, publication, post_pr), gate, result, evaluated_at, evidence_ids BIGINT[], detail |
 | `acceptance_results` | id, task_id, head_sha, principal_id, verdict, reasoning, superseded_at, created_at |
 | `decisions` | id, task_id, escalation_id, principal_id, verbatim TEXT, resolves, created_at |
 | `escalations` | id, task_id, attempt_id, state, question, opened_at, closed_at |
@@ -50,7 +50,7 @@ where acked_at is null.
 
 Triggers: `events`, `task_contracts`, `release_contracts`, `review_dispositions`, and `ci_decisions` reject UPDATE and DELETE. No table ever holds a token, key, or secret; a CI check asserts no column name matches the secret-name pattern. Writes to
 `executions`, `attempts`, `workers`, `heartbeats`, `gate_results`,
-`completion_claims`, `attempt_metrics`, `supervisor_status`, and `events` rows whose
+`completion_claims`, `attempt_metrics`, `evidence`, `supervisor_status`, and `events` rows whose
 `principal` is `crucible` require a transaction-local `crucible.fenced_token` (set with `SET LOCAL`
 at the start of every supervisor transaction, never per connection, because
 pooled connections would carry a stale value) exactly equal to the token on
@@ -61,7 +61,9 @@ for every attached table).
 The API role writes only `tasks` (submit, start, cancel, amend, close),
 `task_contracts`, `idempotency_keys` (in the same transaction as the
 mutation they record), `acceptance_results`, `decisions`, `artifacts`,
-`wakes` (ack), `policies`, and `routing_policies`; it enqueues everything that touches an attempt for the
+`wakes` (ack), `policies`, `routing_policies`, and `review_reports`; `evidence`
+is the supervisor's alone, so an uploaded artifact or review report becomes
+evidence on the next tick, never inside the request; it enqueues everything that touches an attempt for the
 supervisor.
 
 ## Strategy

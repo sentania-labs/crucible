@@ -30,7 +30,7 @@ ledger.
 | **Evidence** | A typed, verified observation with a pointer to an artifact or an observed fact. Gates consume evidence. | Crucible records, gates evaluate |
 | **CompletionClaim** | The worker's completion report: summary, changed files, local head SHA, checks it ran, criteria mapping, proposed PR title and body, limitations, blockers, follow-ups. A claim, never an acceptance. | Worker authors, Crucible parses |
 | **ReviewReport** | The internal non-author review of a collected head: findings with severity and location, verdict. Produced by a `review` execution or uploaded by Foundry. | Reviewer authors, Crucible stores |
-| **GateResult** | Outcome of one deterministic gate for one attempt or PR head: pass, fail, pending, skipped, error, with the evidence it used. | Crucible |
+| **GateResult** | Outcome of one deterministic gate for one attempt or PR head: pass, fail, pending, skipped, deferred, error, with the evidence it used. | Crucible |
 | **AcceptanceResult** | Foundry's semantic verdict on a collected head: accepted, rejected, needs_more_work, with reasoning. Recorded, never computed, by Crucible. | Foundry |
 | **PullRequest** | The PR Crucible opened for a task: number, URL, base, head SHA history, state, merge SHA, merged by. Crucible is the only writer of the PR. | Crucible |
 | **ExternalReview** | One review round received from an allowlisted external reviewer identity on a PR: reviewer login, reviewed SHA, signal kind, comments, reactions, received time. | GitHub emits, Crucible records |

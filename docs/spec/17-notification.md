@@ -9,6 +9,8 @@ Only when judgment is required or work has stopped needing it:
 | `internal_review_needed` | `awaiting_internal_review` |
 | `gates_passed` | `awaiting_acceptance` |
 | `pre_pr_gates_failed` | `pre_pr_gates_failed` |
+| `needs_more_work` | after a `needs_more_work` verdict, until a correction is attached |
+| `publish_pending` | `awaiting_acceptance` with an accepted PR or branch deliverable, until C4's publisher exists |
 | `blocked` | `blocked` (escalation opened) |
 | `publish_failed` | `publish_failed` |
 | `external_feedback_received` | `external_feedback_received` |
