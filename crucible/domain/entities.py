@@ -131,6 +131,42 @@ class Attempt:
     drain_deadline: datetime | None = None
     killed_at: datetime | None = None
     termination_reason: str | None = None
+    # 10: the final log pull after exit sets this, and cleanup never runs before it.
+    logs_drained_at: datetime | None = None
+    # The resume position of the log stream: the last stored line's timestamp and its
+    # sha256. Docker has no byte offsets and `--since` is inclusive (S8).
+    log_resume_ts: datetime | None = None
+    log_resume_sha256: str | None = None
+    cleaned_up_at: datetime | None = None
+
+
+@dataclass(slots=True)
+class LogChunkRecord:
+    """One appended run of log lines for an attempt (10)."""
+
+    id: int | None
+    attempt_id: str
+    stream: str
+    offset_start: int
+    offset_end: int
+    ts: datetime
+    line_sha256: str
+    content: bytes
+    gzipped: bool = False
+
+
+@dataclass(slots=True)
+class RetentionAction:
+    """One deletion retention performed, naming the policy version that authorized it
+    (16). Deterministic, idempotent, and an event of its own."""
+
+    id: str
+    kind: str
+    subject: str
+    policy_name: str
+    policy_version: int
+    acted_at: datetime
+    detail: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)

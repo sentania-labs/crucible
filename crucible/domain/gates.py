@@ -78,9 +78,9 @@ POST_PR_GATES: frozenset[str] = frozenset(
 )
 ALL_GATES: frozenset[str] = PRE_PR_GATES | PUBLICATION_GATES | POST_PR_GATES
 
-# The two pre-PR gates that need the verifier container (C3, 20). They are evaluated
-# here so the row exists and carries a clear marker, and they never report `pass`.
-DEFERRED_TO_C3: frozenset[str] = frozenset({GateName.VERIFICATION_RAN, GateName.WORKSPACE_CLEAN})
+# C3 shipped the verifier container, so no pre-PR gate is deferred any more. The marker
+# stays so a reader of an older attempt's rows knows what `deferred` meant (11).
+DEFERRED_TO_C3: frozenset[str] = frozenset()
 DEFERRED_MARKER = "deferred:c3-verifier"
 # A gate whose evidence the C2 collector cannot produce says so rather than claiming
 # coverage it does not have. The fake provider does produce a diff, so this marker is
@@ -447,6 +447,72 @@ def ci_unchanged(gi: GateInput) -> GateOutcome:
     return GateOutcome(GateResult.PASS, "no change under a workflow path", (item.id,))
 
 
+def verification_ran(gi: GateInput) -> GateOutcome:
+    """Crucible itself re-ran each required command from the collected tree (11).
+
+    The worker's own check logs are a claim, stored and shown to Foundry; this gate
+    reads only the verifier container's exits."""
+    required = [
+        v
+        for v in gi.contract.get("required_verification", [])
+        if str(v.get("kind", "command")) == "command"
+    ]
+    if not required:
+        return GateOutcome(GateResult.SKIPPED, "the contract requires no command verification")
+    runs = {str(i.payload.get("id")): i for i in gi.of_kind("verification_run")}
+    ids: list[int] = []
+    missing: list[str] = []
+    failed: list[str] = []
+    for check in required:
+        check_id = str(check.get("id"))
+        item = runs.get(check_id)
+        if item is None or not item.payload.get("ran"):
+            missing.append(check_id)
+            if item is not None:
+                ids.append(item.id)
+            continue
+        ids.append(item.id)
+        expect = int(check.get("expect_exit", 0))
+        actual = item.payload.get("exit_code")
+        if actual != expect:
+            failed.append(f"{check_id} exited {actual!r}, expected {expect}")
+    if missing:
+        return GateOutcome(
+            GateResult.FAIL,
+            f"Crucible did not re-run: {sorted(missing)}",
+            tuple(ids),
+        )
+    if failed:
+        return GateOutcome(GateResult.FAIL, "; ".join(sorted(failed)), tuple(ids))
+    return GateOutcome(
+        GateResult.PASS,
+        f"Crucible re-ran {len(required)} required command(s) in a verifier container",
+        tuple(ids),
+    )
+
+
+def workspace_clean(gi: GateInput) -> GateOutcome:
+    """Nothing of this attempt is left running once the collector and verifier are
+    removed (11). The provider's own container list is the evidence."""
+    item = gi.one("workspace_state")
+    if item is None:
+        return _missing("workspace_state")
+    if not item.payload.get("checked"):
+        return GateOutcome(
+            GateResult.FAIL,
+            f"the provider could not check the workspace: {item.payload.get('detail')}",
+            (item.id,),
+        )
+    leftover = [str(x) for x in item.payload.get("leftover", [])]
+    if leftover:
+        return GateOutcome(
+            GateResult.FAIL, f"containers left for this attempt: {sorted(leftover)}", (item.id,)
+        )
+    return GateOutcome(
+        GateResult.PASS, "no container or volume of this attempt is left behind", (item.id,)
+    )
+
+
 def internal_review_recorded(gi: GateInput) -> GateOutcome:
     if not gi.internal_review_required:
         return GateOutcome(
@@ -468,16 +534,6 @@ def internal_review_recorded(gi: GateInput) -> GateOutcome:
     )
 
 
-def _deferred(name: str) -> Callable[[GateInput], GateOutcome]:
-    def evaluate(_gi: GateInput) -> GateOutcome:
-        return GateOutcome(
-            GateResult.PENDING,
-            f"{DEFERRED_MARKER}: {name} needs the verifier container, which arrives in C3",
-        )
-
-    return evaluate
-
-
 PRE_PR_EVALUATORS: dict[str, Callable[[GateInput], GateOutcome]] = {
     GateName.REPORT_PRESENT: report_present,
     GateName.EXIT_CLEAN: exit_clean,
@@ -485,12 +541,12 @@ PRE_PR_EVALUATORS: dict[str, Callable[[GateInput], GateOutcome]] = {
     GateName.SCOPE_CONTAINED: scope_contained,
     GateName.NO_INJECTED_FILES: no_injected_files,
     GateName.NO_SECRETS: no_secrets,
-    GateName.VERIFICATION_RAN: _deferred(GateName.VERIFICATION_RAN),
+    GateName.VERIFICATION_RAN: verification_ran,
     GateName.RUN_EVIDENCE_PRESENT: run_evidence_present,
     GateName.CRITERIA_MAPPED: criteria_mapped,
     GateName.DEPENDENCIES_UNCHANGED: dependencies_unchanged,
     GateName.CI_UNCHANGED: ci_unchanged,
-    GateName.WORKSPACE_CLEAN: _deferred(GateName.WORKSPACE_CLEAN),
+    GateName.WORKSPACE_CLEAN: workspace_clean,
     GateName.INTERNAL_REVIEW_RECORDED: internal_review_recorded,
 }
 

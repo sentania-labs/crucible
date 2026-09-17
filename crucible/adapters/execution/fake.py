@@ -29,6 +29,7 @@ from __future__ import annotations
 import hashlib
 import posixpath
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -41,11 +42,14 @@ from crucible.ports.execution import (
     IsolationLevel,
     LaunchSpec,
     LogChunk,
+    LogOffset,
     Observation,
     ObservationState,
     ProviderCapabilities,
     ProviderError,
+    VerificationRun,
     Workspace,
+    WorkspaceState,
 )
 
 PROVIDER_NAME = "fake"
@@ -68,6 +72,8 @@ Behavior = Literal[
     "injected",
     "secret-leak",
     "no-commits",
+    "verification-fails",
+    "dirty-workspace",
 ]
 BEHAVIORS: frozenset[str] = frozenset(
     {
@@ -87,12 +93,22 @@ BEHAVIORS: frozenset[str] = frozenset(
         "injected",
         "secret-leak",
         "no-commits",
+        "verification-fails",
+        "dirty-workspace",
     }
 )
 
 # Behaviors that exit 0 with a CompletionClaimV1; the gates then tell them apart.
 REPORTING_BEHAVIORS: frozenset[str] = frozenset(
-    {"succeed", "out-of-scope", "injected", "secret-leak", "no-commits"}
+    {
+        "succeed",
+        "out-of-scope",
+        "injected",
+        "secret-leak",
+        "no-commits",
+        "verification-fails",
+        "dirty-workspace",
+    }
 )
 REVIEW_BEHAVIORS: frozenset[str] = frozenset({"review", "review-disapprove"})
 
@@ -135,6 +151,33 @@ def synthetic_diff(paths: tuple[str, ...], behavior: str) -> str:
             f"--- a/{path}\n+++ b/{path}\n@@ -0,0 +1,{body.count(chr(10))} @@\n{body}"
         )
     return "".join(chunks)
+
+
+def verification_runs(contract: dict[str, Any], behavior: str) -> tuple[VerificationRun, ...]:
+    """Crucible's own re-run of every required command (11). The fake verifier agrees
+    with the contract unless the behavior asks it not to."""
+    runs: list[VerificationRun] = []
+    for index, check in enumerate(contract.get("required_verification", [])):
+        if str(check.get("kind", "command")) != "command":
+            continue
+        expect = int(check.get("expect_exit", 0))
+        failed = behavior == "verification-fails" and index == 0
+        runs.append(
+            VerificationRun(
+                id=str(check.get("id")),
+                command=str(check.get("command")),
+                expect_exit=expect,
+                exit_code=expect + 1 if failed else expect,
+                log_tail=f"fake verifier re-ran {check.get('command')!r}",
+            )
+        )
+    return tuple(runs)
+
+
+def workspace_state(behavior: str, attempt_id: str) -> WorkspaceState:
+    if behavior == "dirty-workspace":
+        return WorkspaceState(leftover=(f"crucible-{attempt_id}-leftover",))
+    return WorkspaceState()
 
 
 def default_review_report(spec: LaunchSpec, head_sha: str, verdict: str) -> dict[str, Any]:
@@ -325,11 +368,13 @@ class FakeProvider:
         worker.logs.append(LogChunk("stdout", f"fake worker exit {worker.exit_code}\n".encode()))
         return Observation(ObservationState.EXITED, exit_code=worker.exit_code)
 
-    async def logs(self, h: Handle, since: int) -> list[LogChunk]:
+    async def logs(self, h: Handle, since: LogOffset) -> list[LogChunk]:
         worker = self._workers.get(h.attempt_id)
-        return [] if worker is None else worker.logs[since:]
+        return [] if worker is None else worker.logs[since.index :]
 
-    async def collect(self, h: Handle, ws: Workspace) -> CollectedOutputs:
+    async def collect(
+        self, h: Handle, ws: Workspace, spec: LaunchSpec | None = None
+    ) -> CollectedOutputs:
         worker = self._workers.get(h.attempt_id)
         if worker is None:
             return CollectedOutputs(report=None, report_raw=None, blocked_md=None)
@@ -385,6 +430,8 @@ class FakeProvider:
                 diff_text=synthetic_diff(paths, behavior),
                 bundle=bundle,
                 artifacts=tuple(artifacts),
+                verifications=verification_runs(spec.contract, behavior),
+                workspace_state=workspace_state(behavior, spec.attempt_id),
             )
         if behavior == "blocked" and worker.exit_code == 75:
             return CollectedOutputs(
@@ -415,6 +462,9 @@ class FakeProvider:
     async def cleanup(self, ws: Workspace, policy: CleanupPolicy) -> None:
         self.cleaned.append(ws.attempt_id)
         self._workspaces.pop(ws.attempt_id, None)
+
+    async def retention(self, keep: Sequence[str]) -> int:
+        return 0
 
     async def reconcile(self) -> list[Handle]:
         return [

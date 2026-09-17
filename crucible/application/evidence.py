@@ -301,6 +301,83 @@ def record_collection_evidence(
             },
             artifact_id=artifact_id,
         )
+    # 11: Crucible's own re-run of every required command, in a verifier container from
+    # the collected tree. The worker's logs are a claim; these are the evidence.
+    verification_logs = {a.name: a for a in outputs.artifacts if a.type == "verification_log"}
+    for run in outputs.verifications:
+        verify_artifact_id: str | None = None
+        collected_log = verification_logs.get(f"verify/{run.id}.log")
+        if collected_log is not None and collected_log.content:
+            try:
+                verify_artifact_id = store_artifact(
+                    uow,
+                    clock,
+                    store,
+                    attempt=attempt,
+                    name=collected_log.name,
+                    artifact_type=collected_log.type,
+                    content=collected_log.content,
+                    content_type=collected_log.content_type,
+                ).id
+            except SecretInArtifactError as exc:
+                findings.append({"where": f"artifact:{collected_log.name}", "pattern": exc.pattern})
+        _add(
+            uow,
+            clock,
+            attempt=attempt,
+            kind=EvidenceKind.VERIFICATION_RUN,
+            source=EvidenceSource.CRUCIBLE,
+            payload={
+                "id": run.id,
+                "command": run.command,
+                "expect_exit": run.expect_exit,
+                "exit_code": run.exit_code,
+                "ran": run.ran,
+                "detail": run.detail,
+            },
+            artifact_id=verify_artifact_id,
+        )
+        record_event(
+            uow,
+            clock,
+            EventKind.VERIFICATION_COMPLETED,
+            principal=PRINCIPAL_CRUCIBLE,
+            task_id=task.id,
+            execution_id=attempt.execution_id,
+            attempt_id=attempt.id,
+            payload={
+                "id": run.id,
+                "command": run.command,
+                "exit_code": run.exit_code,
+                "expect_exit": run.expect_exit,
+                "ran": run.ran,
+            },
+        )
+    if outputs.workspace_state is not None:
+        _add(
+            uow,
+            clock,
+            attempt=attempt,
+            kind=EvidenceKind.WORKSPACE_STATE,
+            source=EvidenceSource.CRUCIBLE,
+            payload={
+                "checked": outputs.workspace_state.checked,
+                "leftover": list(outputs.workspace_state.leftover),
+                "detail": outputs.workspace_state.detail,
+            },
+        )
+    # 08: the collector records each file it refused to copy out.
+    for rejection in outputs.copy_rejections:
+        record_event(
+            uow,
+            clock,
+            EventKind.COLLECTOR_REJECTED_FILE,
+            principal=PRINCIPAL_CRUCIBLE,
+            task_id=task.id,
+            execution_id=attempt.execution_id,
+            attempt_id=attempt.id,
+            payload={"reason": rejection.get("reason"), "path": rejection.get("path")},
+        )
     _add(
         uow,
         clock,

@@ -21,6 +21,10 @@ class EvidenceKind(StrEnum):
     REVIEW_RECEIVED = "review_received"
     CHECK_RUN = "check_run"
     SCANNER_RESULT = "scanner_result"
+    # Crucible's own re-run of a required_verification command in a verifier container,
+    # and the provider's answer to "is anything of this attempt still running" (11, C3).
+    VERIFICATION_RUN = "verification_run"
+    WORKSPACE_STATE = "workspace_state"
     ARTIFACT_PRESENT = "artifact_present"
     TRANSCRIPT_MATCH = "transcript_match"
 
