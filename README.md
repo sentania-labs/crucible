@@ -50,14 +50,42 @@ Needs Docker with Compose, and [uv](https://docs.astral.sh/uv/) for the
 developer mode and the test suites.
 
 ```sh
-make up          # postgres, migrations, crucible (api + supervisor) on 127.0.0.1:8080
-make dev         # postgres only; then: uv run crucible serve --all
+make up          # postgres, the two proxies, migrations, crucible on 127.0.0.1:8080
+make dev         # postgres and the proxies; then: uv run crucible serve --all
+make proxies     # the socket proxy and the egress proxy only
 make lint        # ruff, mypy --strict, import-linter
 make test        # unit tier, then the integration tier against postgres:16 in a container
 make smoke       # after `make up`: drive one task end to end; the same script CI and release run
+make e2e-image   # the script-harness worker image the e2e tier runs
+make e2e         # the Docker provider against real containers, no model
 make down
 make reset       # DESTRUCTIVE: down and delete the postgres and artifact volumes
 ```
+
+### The Docker provider
+
+Workers run on a **dedicated rootless Docker daemon** owned by a service user,
+behind `docker-socket-proxy`; Crucible never sees the raw socket. Point the
+Makefile at that daemon, which on a host where the service user has no login
+shell means a wrapper:
+
+```sh
+make e2e DOCKER='sudo -u crucible -H env HOME=/var/lib/crucible-docker \
+  XDG_RUNTIME_DIR=/run/user/$(id -u crucible) \
+  DOCKER_HOST=unix:///run/user/$(id -u crucible)/docker.sock docker'
+```
+
+Nothing else changes: CI has an ordinary daemon and needs none of it. What a
+worker gets is a checkout whose origin resolves nowhere, a read-only identity
+bundle, a writable report directory, `--init`, uid 1000, all capabilities
+dropped, `no-new-privileges`, a read-only root, and an `internal: true` network
+whose only way out is the egress proxy's hostname allowlist. It never receives
+the socket, the proxy endpoint, the database, or another harness's credential,
+and `make e2e` asserts each of those from inside a real worker.
+
+`make proxy-config` writes the egress proxy's allowlist from `EGRESS_ALLOWLIST`;
+Crucible refuses to launch an attempt that needs a hostname the running proxy
+does not permit, rather than letting it fail quietly on the network.
 
 `/v1/ready` reports not ready with "schema drift" when the live schema does not
 match what the code expects (for example a database created by an earlier
@@ -75,7 +103,8 @@ curl -s http://127.0.0.1:8080/v1/ready
 ```
 
 Then `POST /v1/tasks` with a `TaskContractV1` whose `execution_request.provider`
-is `fake` and whose image is `crucible-worker:fake-succeed`, `POST
+is `fake` and whose image is `crucible-worker:fake-succeed` (or `docker` with a
+worker image the policy allowlist admits), `POST
 /v1/tasks/{id}/start`, and watch `GET /v1/tasks/{id}/events`. OpenAPI is at
 `/v1/openapi.json`.
 
