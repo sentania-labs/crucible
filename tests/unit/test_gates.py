@@ -135,7 +135,7 @@ def test_all_pass_on_a_clean_run() -> None:
 
 def test_no_pre_pr_gate_is_deferred_any_more() -> None:
     """C3 shipped the verifier container, so `deferred` is gone for these two (11)."""
-    assert DEFERRED_TO_C3 == frozenset()
+    assert not DEFERRED_TO_C3
     for gate in (GateName.VERIFICATION_RAN, GateName.WORKSPACE_CLEAN):
         assert evaluate_gate(gate, _gi(_passing_evidence())).result is GateResult.PASS
 
@@ -163,9 +163,7 @@ def test_verification_ran_fails_on_a_mismatched_exit() -> None:
         for e in _passing_evidence()
         if not (e.kind == "verification_run" and e.payload.get("id") == "V2")
     ]
-    evidence.append(
-        _ev("verification_run", {"id": "V2", "exit_code": 2, "ran": True}, ident=21)
-    )
+    evidence.append(_ev("verification_run", {"id": "V2", "exit_code": 2, "ran": True}, ident=21))
     outcome = evaluate_gate(GateName.VERIFICATION_RAN, _gi(evidence))
     assert outcome.result is GateResult.FAIL
     assert "V2 exited 2" in outcome.detail

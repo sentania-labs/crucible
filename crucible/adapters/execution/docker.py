@@ -53,6 +53,7 @@ from crucible.ports.execution import (
     REPO_MOUNT,
     REPORT_MOUNT,
     VERIFY_MOUNT,
+    WORK_MOUNT,
     BranchBundle,
     CleanupPolicy,
     CollectedArtifact,
@@ -162,6 +163,9 @@ class DockerProvider:
         self.client = client or DockerClient(config.endpoint, timeout=config.api_timeout_seconds)
         self._launched: dict[str, _Launched] = {}
         self._images: dict[str, str] = {}
+        # The last failing output of each throwaway role, so an environment failure can
+        # say what went wrong rather than only that something did.
+        self.last_error: dict[str, str] = {}
         self._network_ready = False
 
     # ----- helpers -----------------------------------------------------
@@ -175,8 +179,10 @@ class DockerProvider:
     def _daemon_mount(
         self, attempt_id: str, leaf: str, target: str, *, read_only: bool
     ) -> dict[str, Any]:
-        """One mount of a workspace subdirectory, in whichever shape the daemon needs."""
-        relative = f"workspaces/{attempt_id}/{leaf}"
+        """One mount of a workspace subdirectory, in whichever shape the daemon needs.
+
+        An empty leaf is the workspace root itself, which only the preparer gets."""
+        relative = f"workspaces/{attempt_id}/{leaf}".rstrip("/")
         if self.config.mount_kind == "volume":
             return {
                 "Type": "volume",
@@ -301,10 +307,9 @@ class DockerProvider:
         resolved = await self._resolve_image(spec)
 
         local = self._local_origin(url)
-        mounts = [
-            self._daemon_mount(spec.attempt_id, "repo", REPO_MOUNT, read_only=False),
-            self._daemon_mount(spec.attempt_id, "output", OUTPUT_MOUNT, read_only=False),
-        ]
+        # The preparer gets the workspace itself, so git creates the checkout directory
+        # and the container's uid owns it end to end (S9 Test E).
+        mounts = [self._daemon_mount(spec.attempt_id, "", WORK_MOUNT, read_only=False)]
         network = "none"
         env: dict[str, str] = {}
         cache_name: str | None = None
@@ -349,7 +354,8 @@ class DockerProvider:
         )
         if exit_code != 0:
             raise ProviderError(
-                f"the preparer container could not build the checkout (exit {exit_code})"
+                f"the preparer container could not build the checkout (exit {exit_code}): "
+                f"{self.last_error.get(ROLE_PREPARER, '')}"
             )
         try:
             return await asyncio.to_thread(self._finish_prepare, spec, paths, work_branch)
@@ -362,9 +368,9 @@ class DockerProvider:
         cache.chmod(self.config.workspace_dir_mode)
 
     def _make_dirs(self, root: Path) -> dict[str, Path]:
+        """Everything but the checkout: the preparer's git creates that one."""
         paths = {
             "root": root,
-            "repo": root / "repo",
             "identity": root / "identity",
             "report": root / "report",
             "output": root / "output",
@@ -374,6 +380,7 @@ class DockerProvider:
             path.mkdir(parents=True, exist_ok=True)
             if name != "identity":
                 path.chmod(self.config.workspace_dir_mode)
+        paths["repo"] = root / "repo"
         return paths
 
     def _local_origin(self, url: str) -> str | None:
@@ -583,7 +590,9 @@ class DockerProvider:
 
     async def logs(self, h: Handle, since: LogOffset) -> list[LogChunk]:
         try:
-            frames = await self._call(self.client.container_logs, h.ref, since=since.timestamp)
+            frames = await self._call(
+                self.client.container_logs, h.ref, since=_since_param(since.timestamp)
+            )
         except DockerApiError as exc:
             if exc.status == 404:
                 return []
@@ -621,7 +630,11 @@ class DockerProvider:
             timeout=self.config.collector_timeout_seconds,
         )
         bundle_ok = False
-        if collector_exit == 0 and (output / "work_branch.bundle").exists():
+        if (
+            collector_exit == 0
+            and (output / "work_branch.bundle").exists()
+            and (output / "tree").is_dir()
+        ):
             bundle_ok = (
                 await self._run_throwaway(
                     spec,
@@ -1000,6 +1013,21 @@ def _read_verifications(
 
 
 # ----- log resume --------------------------------------------------------
+
+
+def _since_param(timestamp: str | None) -> str | None:
+    """Docker's `since` wants `<seconds>.<nanoseconds>`, not RFC 3339.
+
+    The daemon splits the value on the dot and parses both halves as integers, so an
+    RFC 3339 string is a 500. The stored offset stays RFC 3339 because that is what a
+    reader and a comparison want; this is the wire form."""
+    if not timestamp:
+        return None
+    try:
+        moment = parse_rfc3339(timestamp)
+    except ValueError:
+        return None
+    return f"{int(moment.timestamp())}.{moment.microsecond * 1000:09d}"
 
 
 def _split(frame_stream: str, payload: bytes) -> list[tuple[str, datetime | None, str, bytes]]:

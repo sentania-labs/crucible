@@ -1239,8 +1239,8 @@ class Supervisor:
         )
         try:
             chunks = await provider.logs(handle, offset)
-        except ProviderError:
-            log.warning("log pull failed; the next tick tries again")
+        except ProviderError as exc:
+            log.warning("log pull failed (%s); the next tick tries again", exc)
             return 0
         if not chunks:
             return 0

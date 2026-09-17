@@ -13,6 +13,10 @@ REPO_MOUNT = "/crucible/repo"
 IDENTITY_MOUNT = "/crucible/identity"
 REPORT_MOUNT = "/crucible/report"
 OUTPUT_MOUNT = "/crucible/out"
+# The whole workspace, mounted only into the preparer so git itself creates the
+# checkout directory and owns it (S9 Test E: the uid the daemon gives a container is
+# not the uid a bind source on the host already has).
+WORK_MOUNT = "/crucible/work"
 VERIFY_MOUNT = "/crucible/verify"
 
 

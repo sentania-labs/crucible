@@ -16,6 +16,7 @@ from crucible.ports.execution import (
     REPO_MOUNT,
     REPORT_MOUNT,
     VERIFY_MOUNT,
+    WORK_MOUNT,
 )
 
 CACHE_MOUNT = "/crucible/cache"
@@ -107,8 +108,18 @@ fi
     )
     return f"""set -eu
 {GIT_ENV}
-OUT={OUTPUT_MOUNT}
-REPO={REPO_MOUNT}
+# git ignores `safe.directory` from the command line, and the directories this
+# container reads belong to whichever uid the host gave them, which is not the uid the
+# daemon runs this container as (S9 Test E). The exception therefore goes in a global
+# config file, written here, in this container's own tmpfs, from Crucible's own text.
+# Only the preparer gets it: the collector keeps GIT_CONFIG_GLOBAL=/dev/null, because
+# what it reads is a tree a worker wrote.
+printf '[safe]\n\tdirectory = *\n' > /tmp/gitconfig
+export GIT_CONFIG_GLOBAL=/tmp/gitconfig
+OUT={WORK_MOUNT}/output
+REPO={WORK_MOUNT}/repo
+mkdir -p "$OUT"
+rm -rf "$REPO"
 REFERENCE=""
 {refresh}
 # shellcheck disable=SC2086
@@ -203,6 +214,10 @@ if [ ! -s {OUTPUT_MOUNT}/work_branch.bundle ]; then
   echo "no bundle was produced" >&2
   exit 2
 fi
+# `git bundle verify` checks the bundle's prerequisites against a repository, so it
+# runs from the fresh tree the collector made, which holds base_ref. The mount is
+# read-only and this container runs no command the repository defines.
+cd {OUTPUT_MOUNT}/tree
 {GIT} bundle verify {OUTPUT_MOUNT}/work_branch.bundle
 """
 

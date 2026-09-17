@@ -38,30 +38,35 @@ case "$behavior" in
     exit 75 ;;
 esac
 
+# `curl` exits 0 on any HTTP response, including the egress proxy's own 403, so every
+# probe uses --fail. Control-plane probes also bypass the proxy with --noproxy: the
+# question is whether the worker can reach the socket, the database or the API itself,
+# not whether the proxy will answer for them.
 probe() {
   name=$1; shift
   if "$@" >/dev/null 2>&1; then result=reached; else result=refused; fi
   printf '%s\t%s\n' "$name" "$result" >> "$REPORT/isolation.tsv"
   log "probe $name $result"
 }
+direct() { curl -sS -f --noproxy '*' --max-time 5 "$@"; }
 
 if [ "$behavior" = "isolation" ]; then
   : > "$REPORT/isolation.tsv"
-  probe docker-socket-unix curl -sS --max-time 5 --unix-socket /var/run/docker.sock http://localhost/version
-  probe docker-socket-run curl -sS --max-time 5 --unix-socket /run/docker.sock http://localhost/version
-  probe socket-proxy curl -sS --max-time 5 http://docker-socket-proxy:2375/version
-  probe socket-proxy-ip curl -sS --max-time 5 http://172.17.0.1:2375/version
+  probe docker-socket-unix direct --unix-socket /var/run/docker.sock http://localhost/version
+  probe docker-socket-run direct --unix-socket /run/docker.sock http://localhost/version
+  probe socket-proxy direct http://docker-socket-proxy:2375/version
+  probe socket-proxy-ip direct http://172.17.0.1:2375/version
   probe database sh -c 'exec 3<>/dev/tcp/postgres/5432'
   probe database-gateway sh -c 'exec 3<>/dev/tcp/172.17.0.1/5432'
-  probe crucible-api curl -sS --max-time 5 http://crucible:8080/v1/ready
+  probe crucible-api direct http://crucible:8080/v1/ready
   probe other-credential-codex test -r /home/worker/.codex/auth.json
   probe other-credential-claude test -r /home/worker/.claude/.credentials.json
   probe other-credential-agy test -r /home/worker/.gemini/oauth_creds.json
   probe other-credential-root test -d /var/lib/crucible/credentials
   probe git-push git -C "$REPO" -c credential.helper= push origin HEAD
-  probe egress-not-allowlisted curl -sS --max-time 10 https://example.com/
-  probe egress-direct-by-ip curl -sS --noproxy '*' --max-time 10 https://140.82.112.3/
-  probe egress-direct-by-name curl -sS --noproxy '*' --max-time 10 https://github.com/
+  probe egress-not-allowlisted curl -sS -f --max-time 10 https://example.com/
+  probe egress-direct-by-ip curl -sS -f --noproxy '*' --max-time 10 https://140.82.112.3/
+  probe egress-direct-by-name curl -sS -f --noproxy '*' --max-time 10 https://github.com/
   probe write-root touch /crucible-root-probe
   probe write-identity touch "$ID/probe"
   probe write-usr touch /usr/local/bin/probe
