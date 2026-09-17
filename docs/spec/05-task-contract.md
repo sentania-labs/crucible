@@ -132,8 +132,13 @@ of the previous version's. `required_verification` may not shrink.
 - `repository.name` is registered (04); `base_ref` exists on the remote at
   validation time; `work_branch` matches the repository policy's branch
   pattern and is not a protected branch; both refs contain only
-  `[A-Za-z0-9._/-]`, do not start with `-`, and are refs git itself
-  accepts, because every ref reaches a command line eventually.
+  `[A-Za-z0-9._/-]` and do not start with `-`, because every ref reaches
+  a command line eventually; submit-time validation also applies the
+  rules of `git check-ref-format --branch` it can express without git
+  (no `..`, no `@{`, no component starting with `.` or ending in `.lock`,
+  no trailing `.` or `/`), and the preparer container runs
+  `git check-ref-format --branch` as the final authority, failing the
+  attempt with class `environment` and the ref named if it refuses.
 - `allowed_paths` and `prohibited_paths` are valid globs where `*` stops at
   a path separator and only `**` crosses one (the permissive reading would
   silently widen every contract); the two must not fully overlap.

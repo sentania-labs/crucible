@@ -149,7 +149,9 @@ resolver) that sits on both `crucible-workers` and the outside; the
 provider sets `HTTPS_PROXY`, `HTTP_PROXY`, and `NO_PROXY` in the container
 environment. One egress proxy serves the deployment, so its allowlist is
 deployment-wide: the union over every enabled harness of the adapter's
-declared endpoints plus the policy `egress_allowlist`; Crucible refuses
+declared endpoints, the hostnames of every enabled local model
+`endpoint_url` in the routing policy (05b), and the policy
+`egress_allowlist`; Crucible refuses
 to launch an attempt whose effective allowlist exceeds what the proxy
 was configured with, and a per-attempt proxy is a later hardening. Worker
 `/tmp` is mounted without `noexec` in v0.x because no evidence exists yet
