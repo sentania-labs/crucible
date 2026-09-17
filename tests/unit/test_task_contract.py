@@ -81,7 +81,9 @@ def test_secret_in_string_field_rejected_by_path_only() -> None:
 
 def test_secret_in_nested_list_rejected() -> None:
     doc = contract_document()
-    doc["constraints"]["prohibited_actions"].append("-----BEGIN PRIVATE KEY-----")
+    # Assembled at runtime: .gitleaks.toml now carries the scanner's own header pattern,
+    # and a committed literal would be a finding (12).
+    doc["constraints"]["prohibited_actions"].append("-----BEGIN " + "PRIVATE KEY-----")
     assert any(
         "constraints.prohibited_actions[0]" in e or "private_key_header" in e for e in _errors(doc)
     )
