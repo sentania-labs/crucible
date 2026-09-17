@@ -324,10 +324,13 @@ class Supervisor:
             observed, finished = await self._observe_attempts()
             result.observed, result.finished = observed, finished
             await self._sweep_cancellations()
-            await self._cleanup_step()
-            await self._retention_step()
             await self._db(self._materialize_evidence)
             await self._db(self._evaluate_pending_gates)
+            # After the gates, never before: 16 says nothing a gate consumed is deleted
+            # while the task still needs it, and cleanup only ever runs for an attempt
+            # that recorded logs_drained (08).
+            await self._cleanup_step()
+            await self._retention_step()
             await self._db(self._refresh_attempt_metrics)
             await self._db(self._repeat_stale_escalations)
             result.wakes_delivered = await self._deliver_wakes()

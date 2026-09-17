@@ -47,7 +47,9 @@ async def test_cancel_running_task_drains_then_cancels(
     assert view["latest_attempt"]["exit_class"] == "killed"
     assert view["closed_at"] is not None
     kinds = event_kinds(client, task_id)
-    assert "task_cancel_requested" in kinds and kinds[-1] == "task_cancelled"
+    assert "task_cancel_requested" in kinds
+    task_kinds = [k for k in kinds if k.startswith("task_")]
+    assert task_kinds[-1] == "task_cancelled"
     assert "attempt_cancel_kill" in kinds and "attempt_timeout_kill" not in kinds
     assert "report_parsed" not in kinds
     events = client.get(f"/v1/tasks/{task_id}/events").json()["items"]
