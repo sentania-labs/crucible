@@ -7,6 +7,12 @@ trust the tree it is reading: everything read out of the workspace is data.
 Git in the collector runs with `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`,
 and the `-c` overrides 08 names, so a `.git/config` or a committed hook cannot make it
 run anything.
+
+Nothing a contract carries is ever pasted into a command line as text. Every such value
+is bound to a shell variable from a single-quoted literal and referenced quoted, so a
+ref, a path or a check id is data to `sh` whatever it contains. The contract refuses a
+ref outside `[A-Za-z0-9._/-]` on top of that (05): quoting is what stops it executing,
+validation is what stops it being an option.
 """
 
 from __future__ import annotations
@@ -18,6 +24,17 @@ from crucible.ports.execution import (
     VERIFY_MOUNT,
     WORK_MOUNT,
 )
+
+__all__ = [
+    "BUNDLE_VERIFY_SCRIPT",
+    "MANIFEST",
+    "REPO_MOUNT",
+    "VERIFY_MOUNT",
+    "collector_script",
+    "encode_check_id",
+    "preparer_script",
+    "verifier_script",
+]
 
 CACHE_MOUNT = "/crucible/cache"
 ORIGIN_MOUNT = "/crucible/origin"
@@ -90,7 +107,7 @@ if [ -d "{cache_dir}" ]; then
   {GIT} --git-dir "{cache_dir}" fetch --prune origin || rm -rf "{cache_dir}"
 fi
 if [ ! -d "{cache_dir}" ]; then
-  {GIT} clone --mirror {_quote(url)} "{cache_dir}" || true
+  {GIT} clone --mirror -- "$CLONE_URL" "{cache_dir}" || true
 fi
 if [ -d "{cache_dir}" ]; then
   REFERENCE="--reference {cache_dir} --dissociate"
@@ -100,6 +117,18 @@ fi
         else ""
     )
     resume = "1" if from_remote_branch else "0"
+    # Bound as literals, referenced quoted, and never concatenated into a command.
+    bindings = "\n".join(
+        (
+            f"WORK_BRANCH={_quote(work_branch)}",
+            f"BASE_REF={_quote(base_ref)}",
+            f"CLONE_URL={_quote(url)}",
+            f"ORIGIN_PLACEHOLDER={_quote(origin_placeholder)}",
+            f"AUTHOR_NAME={_quote(author_name)}",
+            f"AUTHOR_EMAIL={_quote(author_email)}",
+            f"IDENTITY_MOUNT={_quote(identity_mount)}",
+        )
+    )
     shim_list = " ".join(_quote(name) for name in shims)
     exclude_block = "\n".join(
         f'grep -qxF {_quote(entry)} "$REPO/.git/info/exclude" '
@@ -116,6 +145,7 @@ fi
 # what it reads is a tree a worker wrote.
 printf '[safe]\n\tdirectory = *\n' > /tmp/gitconfig
 export GIT_CONFIG_GLOBAL=/tmp/gitconfig
+{bindings}
 OUT={WORK_MOUNT}/output
 REPO={WORK_MOUNT}/repo
 mkdir -p "$OUT"
@@ -123,29 +153,29 @@ rm -rf "$REPO"
 REFERENCE=""
 {refresh}
 # shellcheck disable=SC2086
-{GIT} clone --no-hardlinks --no-checkout $REFERENCE {_quote(url)} "$REPO"
+{GIT} clone --no-hardlinks --no-checkout $REFERENCE -- "$CLONE_URL" "$REPO"
 cd "$REPO"
 STARTED=""
-REMOTE_BRANCH="refs/remotes/origin/{work_branch}"
-if [ "{resume}" = "1" ] && {GIT} rev-parse --verify --quiet "$REMOTE_BRANCH" >/dev/null; then
-  {GIT} checkout -B "{work_branch}" "origin/{work_branch}"
-  STARTED="origin/{work_branch}"
+if [ "{resume}" = "1" ] \
+  && {GIT} rev-parse --verify --quiet "refs/remotes/origin/$WORK_BRANCH" >/dev/null; then
+  {GIT} checkout -B "$WORK_BRANCH" "origin/$WORK_BRANCH" --
+  STARTED="origin/$WORK_BRANCH"
 else
-  if {GIT} rev-parse --verify --quiet "refs/remotes/origin/{base_ref}" >/dev/null; then
-    TARGET="refs/remotes/origin/{base_ref}"
-  elif {GIT} rev-parse --verify --quiet "{base_ref}" >/dev/null; then
-    TARGET="{base_ref}"
+  if {GIT} rev-parse --verify --quiet "refs/remotes/origin/$BASE_REF" >/dev/null; then
+    TARGET="refs/remotes/origin/$BASE_REF"
+  elif {GIT} rev-parse --verify --quiet "$BASE_REF" >/dev/null; then
+    TARGET="$BASE_REF"
   else
-    echo "base ref {base_ref} does not exist in the clone" >&2
+    printf 'base ref %s does not exist in the clone\n' "$BASE_REF" >&2
     exit 3
   fi
-  {GIT} checkout -B "{work_branch}" "$TARGET"
-  STARTED="{base_ref}"
+  {GIT} checkout -B "$WORK_BRANCH" "$TARGET" --
+  STARTED="$BASE_REF"
 fi
-{GIT} remote set-url origin {_quote(origin_placeholder)}
-{GIT} remote set-url --push origin {_quote(origin_placeholder)}
-{GIT} config user.name {_quote(author_name)}
-{GIT} config user.email {_quote(author_email)}
+{GIT} remote set-url origin "$ORIGIN_PLACEHOLDER"
+{GIT} remote set-url --push origin "$ORIGIN_PLACEHOLDER"
+{GIT} config user.name "$AUTHOR_NAME"
+{GIT} config user.email "$AUTHOR_EMAIL"
 {GIT} config credential.helper ""
 {GIT} config http.extraHeader ""
 
@@ -154,7 +184,7 @@ fi
 # writes them because the checkout belongs to container uid 1000, which is not the
 # uid the Crucible process runs as in every arrangement (S9 Test E).
 mkdir -p "$REPO/.git/info"
-SHIM_TEXT="Read {identity_mount}/IDENTITY.md first; it is the task contract for this run."
+SHIM_TEXT="Read $IDENTITY_MOUNT/IDENTITY.md first; it is the task contract for this run."
 for shim in {shim_list}; do
   if [ ! -e "$REPO/$shim" ]; then
     printf '%s\\n' "$SHIM_TEXT" > "$REPO/$shim"
@@ -176,11 +206,14 @@ def collector_script(*, base_ref: str, work_branch: str, size_cap_bytes: int) ->
 {GIT_ENV}
 OUT={OUTPUT_MOUNT}
 REPO={REPO_MOUNT}
+WORK_BRANCH={_quote(work_branch)}
+BASE_REF={_quote(base_ref)}
+SIZE_CAP={_quote(str(size_cap_bytes))}
 mkdir -p "$OUT"
 : > "$OUT/copy-rejections.tsv"
 {_COPY_REPORT}
-BASE=$({GIT} -C "$REPO" rev-parse --verify --quiet {base_ref} \
-  || {GIT} -C "$REPO" rev-parse --verify --quiet origin/{base_ref} \
+BASE=$({GIT} -C "$REPO" rev-parse --verify --quiet "$BASE_REF" \
+  || {GIT} -C "$REPO" rev-parse --verify --quiet "origin/$BASE_REF" \
   || echo "")
 printf '%s\\n' "$BASE" > "$OUT/base.txt"
 {GIT} -C "$REPO" rev-parse HEAD > "$OUT/head.txt"
@@ -193,7 +226,7 @@ if [ -n "$BASE" ]; then
   {GIT} -C "$REPO" log --name-only --format='' "$BASE"..HEAD \
     | LC_ALL=C sort -u | sed '/^$/d' > "$OUT/commit-paths.txt" || true
   {GIT} -C "$REPO" bundle create "$OUT/work_branch.bundle" \
-    "$BASE".."{work_branch}" > "$OUT/bundle.log" 2>&1 || true
+    "$BASE..$WORK_BRANCH" > "$OUT/bundle.log" 2>&1 || true
   {GIT} -C "$REPO" rev-list --count "$BASE"..HEAD > "$OUT/commits.txt" \
     || echo 0 > "$OUT/commits.txt"
 else
@@ -203,7 +236,7 @@ fi
 # A fresh tree from the collected state, which is what the verifier runs against (11).
 rm -rf "$OUT/tree"
 {GIT} clone --no-hardlinks --quiet "$REPO" "$OUT/tree" > "$OUT/clone.log" 2>&1 || true
-copy_report "{REPORT_MOUNT}" "$OUT/report" {size_cap_bytes}
+copy_report "{REPORT_MOUNT}" "$OUT/report" "$SIZE_CAP"
 echo done > "$OUT/collector.ok"
 """
 
@@ -222,26 +255,53 @@ cd {OUTPUT_MOUNT}/tree
 """
 
 
+# The characters a verification id may keep in a file name. Everything else is
+# percent-encoded, so two ids that differ only outside this set still get two files:
+# `a/b` becomes `a%2Fb` and `a_b` stays `a_b`, which a plain substitution would have
+# collapsed into one file and one exit code.
+_FILENAME_SAFE = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+MANIFEST = "ids.tsv"
+
+
+def encode_check_id(check_id: str) -> str:
+    """Percent-encode a verification id into a file name, reversibly and injectively."""
+    out: list[str] = []
+    for char in check_id:
+        if char in _FILENAME_SAFE and not (char == "." and not out):
+            out.append(char)
+        else:
+            out.extend(f"%{byte:02X}" for byte in char.encode("utf-8"))
+    return "".join(out) or "%00"
+
+
 def verifier_script(checks: list[tuple[str, str]]) -> str:
     """Re-run each `required_verification` command from the collected tree (11).
 
     Each command's exit and log go to the verify directory, which is the only place
     this container may write besides its own tree copy. The commands come from the
     repository, so this container is the one that runs worker-influenced code: it
-    never sees the collector's output directory, only its own tree."""
+    never sees the collector's output directory, only its own tree.
+
+    The command is executed as the contract gave it, which is the point of the gate.
+    Everything else, the id and the file names it becomes, is bound as a shell variable
+    from a literal and never concatenated into a command."""
     lines = [
         "set -u",
         f"cd {REPO_MOUNT}",
         "export HOME=/home/worker LC_ALL=C",
-        f"mkdir -p {VERIFY_MOUNT}",
+        f"V={_quote(VERIFY_MOUNT)}",
+        'mkdir -p "$V"',
+        f'MANIFEST="$V/{MANIFEST}"',
+        ': > "$MANIFEST"',
     ]
     for check_id, command in checks:
-        safe = check_id.replace("/", "_")
-        lines.append(f"printf '%s\\n' {_quote(command)} > {VERIFY_MOUNT}/{safe}.cmd")
-        lines.append(
-            f"sh -c {_quote(command)} > {VERIFY_MOUNT}/{safe}.log 2>&1; "
-            f"echo $? > {VERIFY_MOUNT}/{safe}.exit"
-        )
+        encoded = encode_check_id(check_id)
+        lines.append(f"ID={_quote(check_id)}")
+        lines.append(f"F={_quote(encoded)}")
+        lines.append(f"CMD={_quote(command)}")
+        lines.append('printf \'%s\\t%s\\n\' "$F" "$ID" >> "$MANIFEST"')
+        lines.append('printf \'%s\\n\' "$CMD" > "$V/$F.cmd"')
+        lines.append('sh -c "$CMD" > "$V/$F.log" 2>&1; echo $? > "$V/$F.exit"')
     lines.append("exit 0")
     return "\n".join(lines) + "\n"
 

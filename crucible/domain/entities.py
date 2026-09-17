@@ -137,6 +137,9 @@ class Attempt:
     # sha256. Docker has no byte offsets and `--since` is inclusive (S8).
     log_resume_ts: datetime | None = None
     log_resume_sha256: str | None = None
+    # Which line at `log_resume_ts` the stored boundary is, counting from 0. Lines can
+    # repeat inside one instant, so the hash alone does not identify the position.
+    log_resume_occurrence: int = 0
     cleaned_up_at: datetime | None = None
 
 
@@ -152,6 +155,7 @@ class LogChunkRecord:
     ts: datetime
     line_sha256: str
     content: bytes
+    occurrence: int = 0
     gzipped: bool = False
 
 

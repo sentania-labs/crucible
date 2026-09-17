@@ -467,7 +467,10 @@ def verification_ran(gi: GateInput) -> GateOutcome:
         check_id = str(check.get("id"))
         item = runs.get(check_id)
         if item is None or not item.payload.get("ran"):
-            missing.append(check_id)
+            # Why it did not run is what a reader needs: a verifier that timed out
+            # reads very differently from one that was never asked.
+            reason = str((item.payload.get("detail") if item else "") or "")
+            missing.append(f"{check_id} ({reason})" if reason else check_id)
             if item is not None:
                 ids.append(item.id)
             continue

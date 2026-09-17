@@ -51,6 +51,7 @@ class EventKind(StrEnum):
     CHECKOUT_LEASE_RELEASED = "checkout_lease_released"
     IMAGE_RESOLVED = "image_resolved"
     COLLECTOR_REJECTED_FILE = "collector_rejected_file"
+    COLLECTION_FAILED = "collection_failed"
     VERIFICATION_COMPLETED = "verification_completed"
     REPORT_PARSED = "report_parsed"
     REPORT_PARSE_FAILED = "report_parse_failed"

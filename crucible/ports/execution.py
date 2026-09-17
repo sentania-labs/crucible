@@ -124,6 +124,9 @@ class LogOffset:
     index: int = 0
     timestamp: str | None = None
     line_sha256: str | None = None
+    # Which line at that timestamp the boundary is, counting from 0. Lines can repeat
+    # inside one instant, so the hash alone does not say which one was last seen.
+    occurrence: int = 0
 
     @property
     def is_start(self) -> bool:
@@ -135,9 +138,10 @@ class LogChunk:
     stream: Literal["stdout", "stderr"]
     content: bytes
     ts: datetime | None = None
-    # The sha256 of the last line in `content`, which together with `ts` is the resume
-    # position for the next pull (10).
+    # The sha256 of the last line in `content` and which line at `ts` it is. The three
+    # together are the resume position for the next pull (10).
     line_sha256: str | None = None
+    occurrence: int = 0
     lines: int = 0
 
 

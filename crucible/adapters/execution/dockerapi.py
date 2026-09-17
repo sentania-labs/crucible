@@ -207,8 +207,13 @@ class DockerClient:
     ) -> list[LogFrame]:
         """stdout and stderr with timestamps, demultiplexed.
 
-        `since` is an RFC 3339 timestamp and Docker treats it as inclusive (S8); the
-        caller drops the overlap by line hash, never by trusting the bound.
+        `since` is a `<seconds>.<nanoseconds>` bound and Docker treats it as inclusive
+        (S8); the caller drops the overlap by line hash, never by trusting the bound.
+
+        Every container Crucible creates has `Tty: false`, so the body is always the
+        8-byte-header multiplexed stream. The content type does not distinguish it:
+        daemons before API 1.42 answer `application/vnd.docker.raw-stream` for both the
+        multiplexed and the TTY case, which is why the header is not what decides.
         """
         params: dict[str, Any] = {"stdout": "1", "stderr": "1", "timestamps": "1"}
         if since:
@@ -217,8 +222,7 @@ class DockerClient:
             "GET", f"/containers/{container_id}/logs", params=params, timeout=timeout
         ) as response:
             raw = response.read()
-            tty = response.getheader("Content-Type") == "application/vnd.docker.raw-stream"
-        return _demux(raw) if not tty else [LogFrame("stdout", raw)]
+        return demultiplex(raw)
 
     def create_network(self, name: str, *, internal: bool) -> str:
         body = {"Name": name, "Driver": "bridge", "Internal": internal, "CheckDuplicate": True}
@@ -260,17 +264,34 @@ def _message(raw: str) -> str:
 _STREAMS = {0: "stdin", 1: "stdout", 2: "stderr"}
 
 
-def _demux(raw: bytes) -> list[LogFrame]:
-    """Split Docker's 8-byte-header multiplexed stream into frames."""
+def demultiplex(raw: bytes) -> list[LogFrame]:
+    """Split Docker's 8-byte-header multiplexed stream into frames.
+
+    A body that is not framed at all (a TTY container, which Crucible never creates,
+    or a daemon that answered differently) is returned whole on stdout rather than
+    dropped: losing a worker's output silently is worse than attributing it loosely.
+    """
     frames: list[LogFrame] = []
     index = 0
     while index + 8 <= len(raw):
-        stream = _STREAMS.get(raw[index], "stdout")
+        header = raw[index]
+        if header not in _STREAMS or raw[index + 1 : index + 4] != b"\x00\x00\x00":
+            # Not a frame header. The body is raw, so nothing here is trustworthy.
+            return [LogFrame("stdout", raw)] if raw else []
         size = int.from_bytes(raw[index + 4 : index + 8], "big")
         start = index + 8
         end = start + size
         if end > len(raw):
+            # A truncated final frame: keep what arrived rather than drop the batch.
+            if start < len(raw):
+                frames.append(_frame(header, raw[start:]))
             break
-        frames.append(LogFrame("stderr" if stream == "stderr" else "stdout", raw[start:end]))
+        frames.append(_frame(header, raw[start:end]))
         index = end
+    if not frames and raw:
+        return [LogFrame("stdout", raw)]
     return frames
+
+
+def _frame(header: int, payload: bytes) -> LogFrame:
+    return LogFrame("stderr" if _STREAMS.get(header) == "stderr" else "stdout", payload)

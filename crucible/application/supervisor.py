@@ -1239,6 +1239,7 @@ class Supervisor:
         offset = LogOffset(
             timestamp=attempt.log_resume_ts.isoformat() if attempt.log_resume_ts else None,
             line_sha256=attempt.log_resume_sha256,
+            occurrence=attempt.log_resume_occurrence,
         )
         try:
             chunks = await provider.logs(handle, offset)
@@ -1269,6 +1270,7 @@ class Supervisor:
                         offset_end=end,
                         ts=chunk.ts or self._clock.now(),
                         line_sha256=chunk.line_sha256 or "",
+                        occurrence=chunk.occurrence,
                         content=chunk.content,
                     )
                 )
@@ -1277,6 +1279,7 @@ class Supervisor:
                 if chunk.ts is not None and chunk.line_sha256:
                     attempt.log_resume_ts = chunk.ts
                     attempt.log_resume_sha256 = chunk.line_sha256
+                    attempt.log_resume_occurrence = chunk.occurrence
             if stored:
                 uow.attempts.save(attempt)
             uow.commit()
@@ -1546,8 +1549,25 @@ class Supervisor:
         await self._pull_logs(attempt, provider, handle)
         await self._db(partial(self._mark_logs_drained, attempt.id))
         spec = await self._db(partial(self._spec_for, attempt))
-        outputs = await provider.collect(handle, self._workspace_for(attempt), spec)
-        await self._db(partial(self._finish_exited, attempt.id, observation.exit_code, outputs))
+        collection_error: str | None = None
+        try:
+            outputs = await provider.collect(handle, self._workspace_for(attempt), spec)
+        except ProviderError as exc:
+            # 16: a provider that failed while producing the outputs is an environment
+            # failure. The attempt still finishes, with nothing collected, so the next
+            # tick does not try the same collection again forever.
+            collection_error = str(exc)
+            outputs = CollectedOutputs(report=None, report_raw=None, blocked_md=None)
+            log.warning("collection failed (%s); the attempt fails as environment", exc)
+        await self._db(
+            partial(
+                self._finish_exited,
+                attempt.id,
+                observation.exit_code,
+                outputs,
+                collection_error,
+            )
+        )
         self._handles.pop(attempt.id, None)
         self._workspaces.pop(attempt.id, None)
         return True
@@ -1703,7 +1723,11 @@ class Supervisor:
             uow.commit()
 
     def _finish_exited(
-        self, attempt_id: str, exit_code: int | None, outputs: CollectedOutputs
+        self,
+        attempt_id: str,
+        exit_code: int | None,
+        outputs: CollectedOutputs,
+        collection_error: str | None = None,
     ) -> None:
         with self._fenced() as uow:
             attempt = uow.attempts.get(attempt_id, for_update=True)
@@ -1721,6 +1745,19 @@ class Supervisor:
                 timed_out=timed_out,
                 killed=killed,
             )
+            if collection_error is not None:
+                # Whatever the worker's own exit said, Crucible has no outputs from it.
+                attempt.exit_class = ExitClass.ENVIRONMENT
+                record_event(
+                    uow,
+                    self._clock,
+                    EventKind.COLLECTION_FAILED,
+                    principal=PRINCIPAL_CRUCIBLE,
+                    task_id=attempt.task_id,
+                    execution_id=attempt.execution_id,
+                    attempt_id=attempt.id,
+                    payload={"detail": collection_error[:1000], "exit_code": exit_code},
+                )
             move_attempt(
                 uow,
                 self._clock,

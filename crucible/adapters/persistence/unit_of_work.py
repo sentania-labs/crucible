@@ -487,6 +487,7 @@ class Attempts:
             logs_drained_at=_dt(row.logs_drained_at),
             log_resume_ts=_dt(row.log_resume_ts),
             log_resume_sha256=row.log_resume_sha256,
+            log_resume_occurrence=row.log_resume_occurrence or 0,
             cleaned_up_at=_dt(row.cleaned_up_at),
         )
 
@@ -514,6 +515,7 @@ class Attempts:
                 logs_drained_at=attempt.logs_drained_at,
                 log_resume_ts=attempt.log_resume_ts,
                 log_resume_sha256=attempt.log_resume_sha256,
+                log_resume_occurrence=attempt.log_resume_occurrence,
                 cleaned_up_at=attempt.cleaned_up_at,
             )
         )
@@ -547,6 +549,7 @@ class Attempts:
                 logs_drained_at=attempt.logs_drained_at,
                 log_resume_ts=attempt.log_resume_ts,
                 log_resume_sha256=attempt.log_resume_sha256,
+                log_resume_occurrence=attempt.log_resume_occurrence,
                 cleaned_up_at=attempt.cleaned_up_at,
             )
         )
@@ -827,6 +830,7 @@ class Logs:
             offset_end=row.offset_end,
             ts=ensure_utc(row.ts),
             line_sha256=row.line_sha256,
+            occurrence=row.occurrence,
             content=gzip.decompress(row.content) if row.gzipped else row.content,
             gzipped=row.gzipped,
         )
@@ -840,6 +844,7 @@ class Logs:
             offset_end=chunk.offset_end,
             ts=chunk.ts,
             line_sha256=chunk.line_sha256,
+            occurrence=chunk.occurrence,
             content=gzip.compress(chunk.content) if gzipped else chunk.content,
             gzipped=gzipped,
         )

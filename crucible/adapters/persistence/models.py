@@ -146,6 +146,7 @@ class AttemptRow(Base):
     logs_drained_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
     log_resume_ts: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
     log_resume_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    log_resume_occurrence: Mapped[int] = mapped_column(Integer, default=0)
     cleaned_up_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
 
 
@@ -162,6 +163,7 @@ class LogChunkRow(Base):
     offset_end: Mapped[int] = mapped_column(BigInteger)
     ts: Mapped[datetime] = mapped_column(TZ)
     line_sha256: Mapped[str] = mapped_column(String(64))
+    occurrence: Mapped[int] = mapped_column(Integer)
     content: Mapped[bytes] = mapped_column(LargeBinary)
     gzipped: Mapped[bool] = mapped_column(Boolean)
 
