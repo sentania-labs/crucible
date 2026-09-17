@@ -8,6 +8,7 @@ is built at runtime.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import os
 import time
@@ -968,43 +969,61 @@ def test_the_probe_uses_the_model_of_the_routing_policy_in_force(
 
 
 def test_the_probe_refuses_rather_than_falling_back_to_a_retired_model(
-    admin_client: TestClient,
+    admin_ctx: AdminContext,
     live_supervisor: Supervisor,
     provider: FakeProvider,
-    tokens: dict[str, str],
 ) -> None:
     """The probe took its model from the routing policy the policy in force names and
     then from the seeded `default-routing` versions 2 and 1, so a policy in force with no
-    enabled model for a harness silently ran a model the operator had disabled. Only the
-    policy in force decides, and no enabled model for the harness is a refusal."""
+    enabled model for a harness silently ran a model the operator had disabled or
+    removed. Only the policy in force decides, and no enabled model for the harness in it
+    is a refusal.
+
+    The policy in force is put in place inside a transaction that is rolled back: the
+    policy tables are not truncated between tests, and a superseding version with a
+    disabled harness would be in force for every test that follows."""
+    from crucible.application.admin.credentials import (  # noqa: PLC0415
+        _probe_model,
+        adapter_for,
+    )
+    from crucible.domain.entities import Policy, RoutingPolicyRecord  # noqa: PLC0415
+
     asyncio.run(live_supervisor.tick())
-    headers = {"Authorization": f"Bearer {tokens['admin']}"}
-    routing = admin_client.get("/v1/routing/default-routing/2").json()["document"]
-    routing["version"] = 3
-    for model in routing["models"]:
-        if model["harness"] == "codex":
-            model["enabled"] = False
-    assert (
-        admin_client.put("/v1/routing/default-routing/3", json=routing, headers=headers).status_code
-        == 200
-    )
-    policy = admin_client.get("/v1/policies/default-software/2").json()["document"]
-    policy["version"] = 3
-    policy["routing"]["policy"] = {"name": "default-routing", "version": 3}
-    assert (
-        admin_client.put(
-            "/v1/policies/default-software/3", json=policy, headers=headers
-        ).status_code
-        == 200
-    )
-    probes_before = len(provider.probe_requests)
-    refused = admin_client.post("/v1/admin/credentials/codex/probe", json={"reason": "onboarding"})
-    assert refused.status_code == 409, refused.text
-    detail = refused.json()["detail"]
-    assert "default-routing version 3" in detail and "no enabled model" in detail
-    # No fallback: the run never reached the provider, so no retired model was invoked.
+    now = SystemClock().now()
+    with admin_ctx.uow_factory() as uow:
+        seeded_routing = uow.routing_policies.get("default-routing", 2)
+        assert seeded_routing is not None
+        routing = copy.deepcopy(seeded_routing.document)
+        routing["version"] = 99
+        for model in routing["models"]:
+            if model["harness"] == "codex":
+                model["enabled"] = False
+        uow.routing_policies.put(
+            RoutingPolicyRecord(
+                name="default-routing", version=99, document=routing, created_at=now
+            )
+        )
+        seeded_policy = uow.policies.get("default-software", 2)
+        assert seeded_policy is not None
+        policy = copy.deepcopy(seeded_policy.document)
+        policy["version"] = 99
+        policy["routing"]["policy"] = {"name": "default-routing", "version": 99}
+        uow.policies.put(
+            Policy(name="default-software", version=99, document=policy, created_at=now)
+        )
+        probes_before = len(provider.probe_requests)
+        with pytest.raises(ApplicationError) as raised:
+            _probe_model(uow, adapter_for(admin_ctx, "codex"), "codex")
+        detail = str(raised.value.detail)
+        assert "default-routing version 99" in detail and "no enabled model" in detail
+        assert "does not fall back" in detail
+        # No fallback: a seeded model the policy in force does not name is never reached.
+        assert "gpt-5.6-luna" not in detail
+        # A harness the policy in force still enables takes its model from that policy.
+        assert (
+            _probe_model(uow, adapter_for(admin_ctx, "claude_code"), "claude_code")
+            == "claude-haiku-4-5"
+        )
+        uow.rollback()
+    # The refusal happened before the provider was asked to run anything.
     assert len(provider.probe_requests) == probes_before
-    # A harness the policy in force still enables is unaffected.
-    ok = admin_client.post("/v1/admin/credentials/claude_code/probe", json={"reason": "onboarding"})
-    assert ok.status_code == 200, ok.text
-    assert "claude-haiku-4-5" in provider.probe_requests[-1].argv
