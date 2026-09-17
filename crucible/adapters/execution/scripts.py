@@ -18,6 +18,9 @@ from crucible.ports.execution import (
     VERIFY_MOUNT,
 )
 
+CACHE_MOUNT = "/crucible/cache"
+ORIGIN_MOUNT = "/crucible/origin"
+
 GIT = (
     "git -c core.fsmonitor= -c diff.external= -c core.pager=cat "
     "-c core.hooksPath=/dev/null -c safe.directory=*"
@@ -55,6 +58,79 @@ copy_report() {
     cat < "$p" > "$dst/$rel"
   done
 }
+"""
+
+
+def preparer_script(
+    *,
+    url: str,
+    base_ref: str,
+    work_branch: str,
+    from_remote_branch: bool,
+    cache_name: str | None,
+    author_name: str,
+    author_email: str,
+    origin_placeholder: str,
+) -> str:
+    """Clone, position, and seal the checkout (08).
+
+    The reference cache is a bare mirror this script refreshes and clones from with
+    `--dissociate`, so the checkout owns its objects and nothing shared is ever
+    mounted into a worker. The origin URL is replaced with a placeholder before the
+    worker sees it, and no credential helper is configured, so a push cannot start.
+    """
+    cache_dir = f"{CACHE_MOUNT}/{cache_name}.git" if cache_name else ""
+    refresh = (
+        f"""
+if [ -d "{cache_dir}" ]; then
+  {GIT} --git-dir "{cache_dir}" fetch --prune origin || rm -rf "{cache_dir}"
+fi
+if [ ! -d "{cache_dir}" ]; then
+  {GIT} clone --mirror {_quote(url)} "{cache_dir}" || true
+fi
+if [ -d "{cache_dir}" ]; then
+  REFERENCE="--reference {cache_dir} --dissociate"
+fi
+"""
+        if cache_name
+        else ""
+    )
+    resume = "1" if from_remote_branch else "0"
+    return f"""set -eu
+{GIT_ENV}
+OUT={OUTPUT_MOUNT}
+REPO={REPO_MOUNT}
+REFERENCE=""
+{refresh}
+# shellcheck disable=SC2086
+{GIT} clone --no-hardlinks --no-checkout $REFERENCE {_quote(url)} "$REPO"
+cd "$REPO"
+STARTED=""
+REMOTE_BRANCH="refs/remotes/origin/{work_branch}"
+if [ "{resume}" = "1" ] && {GIT} rev-parse --verify --quiet "$REMOTE_BRANCH" >/dev/null; then
+  {GIT} checkout -B "{work_branch}" "origin/{work_branch}"
+  STARTED="origin/{work_branch}"
+else
+  if {GIT} rev-parse --verify --quiet "refs/remotes/origin/{base_ref}" >/dev/null; then
+    TARGET="refs/remotes/origin/{base_ref}"
+  elif {GIT} rev-parse --verify --quiet "{base_ref}" >/dev/null; then
+    TARGET="{base_ref}"
+  else
+    echo "base ref {base_ref} does not exist in the clone" >&2
+    exit 3
+  fi
+  {GIT} checkout -B "{work_branch}" "$TARGET"
+  STARTED="{base_ref}"
+fi
+{GIT} remote set-url origin {_quote(origin_placeholder)}
+{GIT} remote set-url --push origin {_quote(origin_placeholder)}
+{GIT} config user.name {_quote(author_name)}
+{GIT} config user.email {_quote(author_email)}
+{GIT} config credential.helper ""
+{GIT} config http.extraHeader ""
+mkdir -p "$OUT"
+{GIT} rev-parse HEAD > "$OUT/prepared-head.txt"
+printf '%s\n' "$STARTED" > "$OUT/started-from.txt"
 """
 
 

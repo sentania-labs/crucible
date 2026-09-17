@@ -79,6 +79,7 @@ LABEL_TASK = "crucible.task"
 LABEL_OWNER = "crucible.owner"
 LABEL_ROLE = "crucible.role"
 ROLE_WORKER = "worker"
+ROLE_PREPARER = "preparer"
 ROLE_COLLECTOR = "collector"
 ROLE_BUNDLE = "bundle-verifier"
 ROLE_VERIFIER = "verifier"
@@ -160,6 +161,7 @@ class DockerProvider:
         self.config = config
         self.client = client or DockerClient(config.endpoint, timeout=config.api_timeout_seconds)
         self._launched: dict[str, _Launched] = {}
+        self._images: dict[str, str] = {}
         self._network_ready = False
 
     # ----- helpers -----------------------------------------------------
@@ -175,6 +177,25 @@ class DockerProvider:
     ) -> dict[str, Any]:
         """One mount of a workspace subdirectory, in whichever shape the daemon needs."""
         relative = f"workspaces/{attempt_id}/{leaf}"
+        if self.config.mount_kind == "volume":
+            return {
+                "Type": "volume",
+                "Source": self.config.artifact_volume,
+                "Target": target,
+                "ReadOnly": read_only,
+                "VolumeOptions": {"Subpath": relative, "NoCopy": True},
+            }
+        host_root = self.config.artifact_host_root or self.config.artifact_root
+        return {
+            "Type": "bind",
+            "Source": f"{host_root.rstrip('/')}/{relative}",
+            "Target": target,
+            "ReadOnly": read_only,
+            "BindOptions": {"Propagation": "rprivate"},
+        }
+
+    def _volume_mount(self, relative: str, target: str, *, read_only: bool) -> dict[str, Any]:
+        """Mount a path under the artifact root that is not a workspace subdirectory."""
         if self.config.mount_kind == "volume":
             return {
                 "Type": "volume",
@@ -268,59 +289,112 @@ class DockerProvider:
         )
 
     async def prepare(self, spec: LaunchSpec) -> Workspace:
-        try:
-            return await asyncio.to_thread(self._prepare_sync, spec)
-        except workspace.WorkspaceError as exc:
-            raise ProviderError(str(exc)) from exc
-
-    def _prepare_sync(self, spec: LaunchSpec) -> Workspace:
         repository = spec.contract.get("repository", {})
         url = spec.repository_url or str(repository.get("url", ""))
         if not url:
-            raise workspace.WorkspaceError("the contract names no repository url")
+            raise ProviderError("the contract names no repository url")
         base_ref = str(repository.get("base_ref", "main"))
         work_branch = str(repository.get("work_branch") or f"crucible/{spec.external_id}")
         root = self._root(spec.attempt_id)
-        if root.exists():
-            shutil.rmtree(root, ignore_errors=True)
-        root.mkdir(parents=True, exist_ok=True)
-        repo = root / "repo"
-        identity = root / "identity"
-        report = root / "report"
-        output = root / "output"
-        verify = root / "verify"
+        await asyncio.to_thread(shutil.rmtree, root, True)
+        paths = await asyncio.to_thread(self._make_dirs, root)
+        resolved = await self._resolve_image(spec)
 
-        cache = None
-        if self.config.use_reference_cache:
-            cache = workspace.refresh_cache(
-                Path(self.config.artifact_root) / "cache",
-                url,
-                hashlib.sha256(url.encode("utf-8")).hexdigest()[:16],
-            )
-        # A `correct` execution, or a retry of work Crucible already pushed, starts from
-        # the remote work_branch head; anything else starts from base_ref (08).
-        from_remote = spec.role == "correct" or bool(
-            spec.contract.get("repository", {}).get("resume_from_work_branch")
-        )
-        started_from = workspace.clone(
-            url=url,
-            destination=repo,
-            cache=cache,
-            base_ref=base_ref,
-            work_branch=work_branch,
-            from_remote_branch=from_remote,
-        )
+        local = self._local_origin(url)
+        mounts = [
+            self._daemon_mount(spec.attempt_id, "repo", REPO_MOUNT, read_only=False),
+            self._daemon_mount(spec.attempt_id, "output", OUTPUT_MOUNT, read_only=False),
+        ]
+        network = "none"
+        env: dict[str, str] = {}
+        cache_name: str | None = None
+        clone_url = url
+        if local is not None:
+            # A repository that already lives in the artifact root (the e2e origin) is
+            # mounted read-only; nothing has to leave the daemon for it.
+            mounts.append(self._volume_mount(local, scripts.ORIGIN_MOUNT, read_only=True))
+            clone_url = scripts.ORIGIN_MOUNT
+        else:
+            if self.config.use_reference_cache:
+                cache_name = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
+                await asyncio.to_thread(self._ensure_cache_dir)
+                mounts.append(self._volume_mount("cache", scripts.CACHE_MOUNT, read_only=False))
+            network, env = self._network_and_env(spec)
+
         git_policy = spec.policy.get("git", {})
-        workspace.seal(
-            repo,
-            author_name=str(git_policy.get("author_name", "crucible-worker")),
-            author_email=str(
-                git_policy.get("author_email", "crucible-worker@users.noreply.github.com")
+        exit_code = await self._run_throwaway(
+            spec,
+            role=ROLE_PREPARER,
+            image=resolved,
+            script=scripts.preparer_script(
+                url=clone_url,
+                base_ref=base_ref,
+                work_branch=work_branch,
+                from_remote_branch=spec.role == "correct"
+                or bool(repository.get("resume_from_work_branch")),
+                cache_name=cache_name,
+                author_name=str(git_policy.get("author_name", "crucible-worker")),
+                author_email=str(
+                    git_policy.get("author_email", "crucible-worker@users.noreply.github.com")
+                ),
+                origin_placeholder=workspace.ORIGIN_PLACEHOLDER,
             ),
+            mounts=mounts,
+            network=network,
+            timeout=self.config.collector_timeout_seconds,
+            env=env,
         )
-        workspace.write_shims(repo, IDENTITY_MOUNT)
+        if exit_code != 0:
+            raise ProviderError(
+                f"the preparer container could not build the checkout (exit {exit_code})"
+            )
+        try:
+            return await asyncio.to_thread(self._finish_prepare, spec, paths, work_branch)
+        except workspace.WorkspaceError as exc:
+            raise ProviderError(str(exc)) from exc
+
+    def _ensure_cache_dir(self) -> None:
+        cache = Path(self.config.artifact_root) / "cache"
+        cache.mkdir(parents=True, exist_ok=True)
+        cache.chmod(self.config.workspace_dir_mode)
+
+    def _make_dirs(self, root: Path) -> dict[str, Path]:
+        paths = {
+            "root": root,
+            "repo": root / "repo",
+            "identity": root / "identity",
+            "report": root / "report",
+            "output": root / "output",
+            "verify": root / "verify",
+        }
+        for name, path in paths.items():
+            path.mkdir(parents=True, exist_ok=True)
+            if name != "identity":
+                path.chmod(self.config.workspace_dir_mode)
+        return paths
+
+    def _local_origin(self, url: str) -> str | None:
+        """The path inside the artifact root a local repository url names, if any."""
+        candidate = url[len("file://") :] if url.startswith("file://") else url
+        if not candidate.startswith("/"):
+            return None
+        root = Path(self.config.artifact_root).resolve()
+        try:
+            return str(Path(candidate).resolve().relative_to(root))
+        except ValueError:
+            return None
+
+    def _finish_prepare(
+        self, spec: LaunchSpec, paths: dict[str, Path], work_branch: str
+    ) -> Workspace:
+        output = paths["output"]
+        head = (output / "prepared-head.txt").read_text(encoding="utf-8").strip()
+        started_from = (output / "started-from.txt").read_text(encoding="utf-8").strip()
+        if not head:
+            raise workspace.WorkspaceError("the preparer produced no HEAD")
+        workspace.write_shims(paths["repo"], IDENTITY_MOUNT)
         _, identity_sha = identity_bundle.write_bundle(
-            identity,
+            paths["identity"],
             contract=spec.contract,
             policy=spec.policy,
             external_id=spec.external_id,
@@ -329,41 +403,49 @@ class DockerProvider:
             network_mode=spec.network,
             report_schema=CompletionClaimV1.model_json_schema(),
         )
-        for directory in (report, output, verify):
-            directory.mkdir(parents=True, exist_ok=True)
-            directory.chmod(self.config.workspace_dir_mode)
-        root.chmod(self.config.workspace_dir_mode)
+        # The preparer's own output files are not evidence; the collector rewrites the
+        # directory after the run and a stale head would only confuse a reader.
+        for leftover in ("prepared-head.txt", "started-from.txt"):
+            (output / leftover).unlink(missing_ok=True)
         return Workspace(
             attempt_id=spec.attempt_id,
-            checkout_path=str(repo),
-            identity_path=str(identity),
-            report_path=str(report),
+            checkout_path=str(paths["repo"]),
+            identity_path=str(paths["identity"]),
+            report_path=str(paths["report"]),
             output_path=str(output),
             identity_sha256=identity_sha,
             work_branch=work_branch,
             started_from=started_from,
         )
 
-    async def launch(self, ws: Workspace, spec: LaunchSpec) -> Handle:
-        await self._ensure_network()
+    async def _resolve_image(self, spec: LaunchSpec) -> str:
+        """Resolve the tag to something immutable, refusing anything the policy or the
+        adapter's tested range does not allow (07, 13)."""
+        cached = self._images.get(spec.image)
+        if cached is not None:
+            return cached
         try:
             image = await self._call(self.client.inspect_image, spec.image)
         except DockerApiError as exc:
             raise ProviderError(f"image {spec.image!r} is not available: {exc.message}") from exc
-        labels = {str(k): str(v) for k, v in (image.get("Config", {}).get("Labels") or {}).items()}
         allowlist = [
             str(p)
             for p in (spec.policy.get("images", {}).get("allowlist") or DEFAULT_IMAGE_ALLOWLIST)
         ] + list(self.config.extra_image_allowlist)
         if not image_allowed(spec.image, allowlist):
             raise ProviderError(f"image {spec.image!r} is outside the policy allowlist")
+        labels = {str(k): str(v) for k, v in (image.get("Config", {}).get("Labels") or {}).items()}
         check = check_image_version(spec.harness, labels)
         if not check.ok:
             raise ProviderError(f"refusing to launch: {check.detail}")
         digests = [str(d) for d in (image.get("RepoDigests") or [])]
-        image_digest = digests[0] if digests else str(image.get("Id", ""))
-        resolved = image_digest if digests else str(image.get("Id", ""))
+        resolved = digests[0] if digests else str(image.get("Id", ""))
+        self._images[spec.image] = resolved
+        return resolved
 
+    async def launch(self, ws: Workspace, spec: LaunchSpec) -> Handle:
+        await self._ensure_network()
+        resolved = await self._resolve_image(spec)
         network, env = self._network_and_env(spec)
         body = self._worker_body(ws, spec, resolved=resolved, network=network, env=env)
         try:
@@ -376,12 +458,12 @@ class DockerProvider:
             await self._call(self.client.start_container, container_id)
         except DockerApiError as exc:
             raise ProviderError(f"could not start the worker: {exc}") from exc
-        self._launched[spec.attempt_id] = _Launched(container_id, image_digest, spec)
+        self._launched[spec.attempt_id] = _Launched(container_id, resolved, spec)
         return Handle(
             provider=self.name,
             ref=container_id,
             attempt_id=spec.attempt_id,
-            image_digest=image_digest,
+            image_digest=resolved,
             name=name,
         )
 
@@ -625,10 +707,11 @@ class DockerProvider:
         network: str,
         timeout: int,
         env: Mapping[str, str] | None = None,
+        image: str | None = None,
     ) -> int:
         """Run one hardened, single-purpose container to completion and remove it."""
         launched = self._launched.get(spec.attempt_id)
-        image = launched.image_digest if launched else spec.image
+        image = image or (launched.image_digest if launched else spec.image)
         host_config = self._hardened(spec, network=network)
         host_config["Mounts"] = mounts
         body: dict[str, Any] = {
