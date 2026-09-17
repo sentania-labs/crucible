@@ -18,6 +18,8 @@ from crucible.adapters.persistence.models import (
     EscalationRow,
     EvidenceRow,
     GateResultRow,
+    HarnessStateRow,
+    ImagePromotionRow,
     PolicyRow,
     ReviewDispositionRow,
     ReviewReportRow,
@@ -36,6 +38,8 @@ from crucible.domain.entities import (
     EscalationState,
     EvidenceRecord,
     GateResultRecord,
+    HarnessState,
+    ImagePromotion,
     Policy,
     ReviewDisposition,
     ReviewReportRecord,
@@ -742,3 +746,98 @@ class AttemptMetricsRepo:
             stmt = stmt.where(AttemptMetricsRow.task_id.in_(list(task_ids)))
         rows = self._s.scalars(stmt.order_by(AttemptMetricsRow.created_at)).all()
         return [self._to_entity(r) for r in rows]
+
+
+# ----- C5: harness administration (07, 25) ---------------------------------
+
+
+class HarnessStates:
+    def __init__(self, session: Session) -> None:
+        self._s = session
+
+    @staticmethod
+    def _to_entity(row: HarnessStateRow) -> HarnessState:
+        return HarnessState(
+            name=row.name,
+            enabled=row.enabled,
+            reason=row.reason,
+            session_compatibility=row.session_compatibility,
+            updated_at=ensure_utc(row.updated_at),
+            updated_by=row.updated_by,
+            mount_mode_observed=row.mount_mode_observed,
+            refresh_requires_rw=row.refresh_requires_rw,
+            last_launch_at=_dt(row.last_launch_at),
+            last_launch_outcome=row.last_launch_outcome,
+            last_auth_failure_at=_dt(row.last_auth_failure_at),
+            last_validated_at=_dt(row.last_validated_at),
+        )
+
+    def get(self, name: str) -> HarnessState | None:
+        row = self._s.get(HarnessStateRow, name)
+        return self._to_entity(row) if row else None
+
+    def list_all(self) -> Sequence[HarnessState]:
+        rows = self._s.scalars(select(HarnessStateRow).order_by(HarnessStateRow.name)).all()
+        return [self._to_entity(r) for r in rows]
+
+    def put(self, state: HarnessState) -> HarnessState:
+        row = self._s.get(HarnessStateRow, state.name)
+        if row is None:
+            row = HarnessStateRow(name=state.name)
+            self._s.add(row)
+        row.enabled = state.enabled
+        row.reason = state.reason
+        row.session_compatibility = state.session_compatibility
+        row.mount_mode_observed = state.mount_mode_observed
+        row.refresh_requires_rw = state.refresh_requires_rw
+        row.last_launch_at = state.last_launch_at
+        row.last_launch_outcome = state.last_launch_outcome
+        row.last_auth_failure_at = state.last_auth_failure_at
+        row.last_validated_at = state.last_validated_at
+        row.updated_at = state.updated_at
+        row.updated_by = state.updated_by
+        self._s.flush()
+        return self._to_entity(row)
+
+
+class ImagePromotions:
+    def __init__(self, session: Session) -> None:
+        self._s = session
+
+    @staticmethod
+    def _to_entity(row: ImagePromotionRow) -> ImagePromotion:
+        return ImagePromotion(
+            digest=row.digest,
+            reference=row.reference,
+            harness=row.harness,
+            harness_version=row.harness_version,
+            state=row.state,
+            updated_at=ensure_utc(row.updated_at),
+            updated_by=row.updated_by,
+            reason=row.reason,
+        )
+
+    def get(self, digest: str) -> ImagePromotion | None:
+        row = self._s.get(ImagePromotionRow, digest)
+        return self._to_entity(row) if row else None
+
+    def list_all(self) -> Sequence[ImagePromotion]:
+        rows = self._s.scalars(
+            select(ImagePromotionRow).order_by(ImagePromotionRow.harness, ImagePromotionRow.digest)
+        ).all()
+        return [self._to_entity(r) for r in rows]
+
+    def put(self, promotion: ImagePromotion) -> ImagePromotion:
+        row = self._s.get(ImagePromotionRow, promotion.digest)
+        if row is None:
+            row = ImagePromotionRow(digest=promotion.digest)
+            self._s.add(row)
+        row.reference = promotion.reference
+        row.harness = promotion.harness
+        row.harness_version = promotion.harness_version
+        row.state = promotion.state
+        row.reason = promotion.reason
+        row.updated_at = promotion.updated_at
+        row.updated_by = promotion.updated_by
+        self._s.flush()
+        return self._to_entity(row)

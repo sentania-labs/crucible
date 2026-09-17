@@ -48,6 +48,8 @@ from crucible.adapters.persistence.records import (
     Escalations,
     Evidences,
     GateResults,
+    HarnessStates,
+    ImagePromotions,
     Policies,
     ReviewReports,
     RoutingPolicies,
@@ -94,8 +96,10 @@ from crucible.ports.repository import (
     FencedTokenRejectedError,
     GateResultRepository,
     GitHubDeliveryRepository,
+    HarnessStateRepository,
     IdempotencyKeyTakenError,
     IdempotencyRepository,
+    ImagePromotionRepository,
     LeaseRepository,
     LogRepository,
     PolicyRepository,
@@ -1101,6 +1105,8 @@ class SqlUnitOfWork:
     ci_certifications: CICertificationRepository
     ci_decisions: CIDecisionRepository
     github_deliveries: GitHubDeliveryRepository
+    harnesses: HarnessStateRepository
+    image_promotions: ImagePromotionRepository
 
     def __init__(self, session_factory: sessionmaker[Session]) -> None:
         self._factory = session_factory
@@ -1149,6 +1155,8 @@ class SqlUnitOfWork:
         self.ci_certifications = CICertifications(s)
         self.ci_decisions = CIDecisions(s)
         self.github_deliveries = GitHubDeliveries(s)
+        self.harnesses = HarnessStates(s)
+        self.image_promotions = ImagePromotions(s)
         return self
 
     def __exit__(

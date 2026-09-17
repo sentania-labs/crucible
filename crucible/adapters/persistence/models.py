@@ -610,3 +610,34 @@ class GitHubDeliveryRow(Base):
     body_sha256: Mapped[str] = mapped_column(String(64))
     normalized: Mapped[dict[str, Any]] = mapped_column(JSONB)
     processed_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
+
+
+# ----- C5: harness administration (07, 25) ---------------------------------
+
+
+class HarnessStateRow(Base):
+    __tablename__ = "harnesses"
+    name: Mapped[str] = mapped_column(String(32), primary_key=True)
+    enabled: Mapped[bool] = mapped_column(Boolean)
+    reason: Mapped[str] = mapped_column(Text)
+    session_compatibility: Mapped[str] = mapped_column(String(16))
+    mount_mode_observed: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    refresh_requires_rw: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    last_launch_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
+    last_launch_outcome: Mapped[str | None] = mapped_column(String(48), nullable=True)
+    last_auth_failure_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
+    last_validated_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(TZ)
+    updated_by: Mapped[str] = mapped_column(String(160))
+
+
+class ImagePromotionRow(Base):
+    __tablename__ = "image_promotions"
+    digest: Mapped[str] = mapped_column(String(160), primary_key=True)
+    reference: Mapped[str] = mapped_column(Text)
+    harness: Mapped[str] = mapped_column(String(32))
+    harness_version: Mapped[str] = mapped_column(String(32))
+    state: Mapped[str] = mapped_column(String(16))
+    reason: Mapped[str] = mapped_column(Text)
+    updated_at: Mapped[datetime] = mapped_column(TZ)
+    updated_by: Mapped[str] = mapped_column(String(160))

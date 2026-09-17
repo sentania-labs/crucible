@@ -145,6 +145,12 @@ class EventKind(StrEnum):
     GITHUB_DELIVERY_RECEIVED = "github_delivery_received"
     GITHUB_DELIVERY_REJECTED = "github_delivery_rejected"
     GITHUB_RATE_LIMITED = "github_rate_limited"
+    # harness administration and credentials (07, 12, 25)
+    HARNESS_REFUSED = "harness_refused"
+    HARNESS_LAUNCH_DEFERRED = "harness_launch_deferred"
+    HARNESS_ENABLED = "harness_enabled"
+    HARNESS_DISABLED = "harness_disabled"
+    CREDENTIAL_SYNCED = "credential_synced"
     # principals and configuration
     PRINCIPAL_CREATED = "principal_created"
     REPOSITORY_REGISTERED = "repository_registered"
