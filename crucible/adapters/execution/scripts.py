@@ -23,7 +23,7 @@ ORIGIN_MOUNT = "/crucible/origin"
 
 GIT = (
     "git -c core.fsmonitor= -c diff.external= -c core.pager=cat "
-    "-c core.hooksPath=/dev/null -c safe.directory=*"
+    "-c core.hooksPath=/dev/null -c 'safe.directory=*'"
 )
 GIT_ENV = (
     "export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 "
@@ -71,6 +71,9 @@ def preparer_script(
     author_name: str,
     author_email: str,
     origin_placeholder: str,
+    shims: tuple[str, ...],
+    exclude_entries: tuple[str, ...],
+    identity_mount: str,
 ) -> str:
     """Clone, position, and seal the checkout (08).
 
@@ -96,6 +99,12 @@ fi
         else ""
     )
     resume = "1" if from_remote_branch else "0"
+    shim_list = " ".join(_quote(name) for name in shims)
+    exclude_block = "\n".join(
+        f'grep -qxF {_quote(entry)} "$REPO/.git/info/exclude" '
+        f"|| printf '%s\\n' {_quote(entry)} >> \"$REPO/.git/info/exclude\""
+        for entry in exclude_entries
+    )
     return f"""set -eu
 {GIT_ENV}
 OUT={OUTPUT_MOUNT}
@@ -128,6 +137,21 @@ fi
 {GIT} config user.email {_quote(author_email)}
 {GIT} config credential.helper ""
 {GIT} config http.extraHeader ""
+
+# 06: a shim only where the checkout has none, and every shim listed in
+# .git/info/exclude so its absence from the diff stays a gate (11). The container
+# writes them because the checkout belongs to container uid 1000, which is not the
+# uid the Crucible process runs as in every arrangement (S9 Test E).
+mkdir -p "$REPO/.git/info"
+SHIM_TEXT="Read {identity_mount}/IDENTITY.md first; it is the task contract for this run."
+for shim in {shim_list}; do
+  if [ ! -e "$REPO/$shim" ]; then
+    printf '%s\\n' "$SHIM_TEXT" > "$REPO/$shim"
+  fi
+done
+touch "$REPO/.git/info/exclude"
+{exclude_block}
+
 mkdir -p "$OUT"
 {GIT} rev-parse HEAD > "$OUT/prepared-head.txt"
 printf '%s\n' "$STARTED" > "$OUT/started-from.txt"

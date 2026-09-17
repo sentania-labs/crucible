@@ -338,6 +338,9 @@ class DockerProvider:
                     git_policy.get("author_email", "crucible-worker@users.noreply.github.com")
                 ),
                 origin_placeholder=workspace.ORIGIN_PLACEHOLDER,
+                shims=workspace.SHIM_NAMES,
+                exclude_entries=workspace.EXCLUDE_ENTRIES,
+                identity_mount=IDENTITY_MOUNT,
             ),
             mounts=mounts,
             network=network,
@@ -392,7 +395,6 @@ class DockerProvider:
         started_from = (output / "started-from.txt").read_text(encoding="utf-8").strip()
         if not head:
             raise workspace.WorkspaceError("the preparer produced no HEAD")
-        workspace.write_shims(paths["repo"], IDENTITY_MOUNT)
         _, identity_sha = identity_bundle.write_bundle(
             paths["identity"],
             contract=spec.contract,
