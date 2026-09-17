@@ -69,7 +69,14 @@ above: the supervisor writes the observation columns (last launch, last
 auth failure) and the admin surface writes the flags and promotion states,
 so two principals write each table and neither is fenced to the supervisor
 lease. Every admin mutation is still an event with its principal and
-reason (25).
+reason (25). These two are the administration tables: the admin surface
+writes `harnesses.enabled` and its reason, `session_compatibility`,
+`mount_mode_observed`, `refresh_requires_rw`, `last_validated_at` and
+`last_auth_failure_at`, and it writes `image_promotions` on a promotion,
+which sets one digest per harness to `default` and the previous default to
+`retained`. There is no separate administrative table and no separate
+administrative log: the audit is the `events` table filtered to the
+administrative kinds (10).
 
 The API role writes only `tasks` (submit, start, cancel, amend, close),
 `task_contracts`, `idempotency_keys` (in the same transaction as the
@@ -101,7 +108,15 @@ supervisor.
   database that was downgraded says so by having the archive table. This is
   the pattern for future revisions. It is not retroactive: earlier
   downgrades (0006, for one) simply delete the event rows of the kinds they
-  remove, which is a known gap, not a promise kept.
+  remove, which is a known gap, not a promise kept. Revision 0009 (C5b)
+  follows the pattern for the ten administrative kinds, into
+  `events_c5b_archive`.
+- A migration that seeds a policy version does not unseed one that is in
+  use. Revision 0009 seeds `default-software` version 2 (naming
+  `default-routing` version 2) beside version 1, because a policy version is
+  immutable once referenced; its downgrade deletes that row only when no task
+  and no retention action names it, and leaves it in place otherwise rather
+  than leaving a dangling reference behind.
 - An applied migration is never edited. Before the first tagged release
   the initial revision may be squashed only together with a documented
   `make reset`; after it, every change is a new revision. Readiness
@@ -115,4 +130,6 @@ supervisor.
   bump that changes stored shape ships with a data migration.
 - Backups are the operator's concern (volume snapshot locally; operator
   tooling on the cluster). `crucible-admin export` produces a portable JSON
-  bundle for the same reason the bootstrap import exists.
+  bundle for the same reason the bootstrap import exists; it and the
+  bootstrap `import` arrive with the ledger handoff (15) in C6, and until
+  then neither command exists (25).
