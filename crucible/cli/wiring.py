@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import socket
 from dataclasses import dataclass
+from functools import partial
 
 from fastapi import FastAPI
 
@@ -21,6 +22,8 @@ from crucible.adapters.harness.registry import default_registry
 from crucible.adapters.notification.webhook import WebhookWakeDeliverer
 from crucible.adapters.persistence.unit_of_work import SqlUnitOfWorkFactory, make_engine
 from crucible.adapters.storage.disk import DiskArtifactStore
+from crucible.application.admin.context import AdminContext, GitHubAppInfo
+from crucible.application.admin.credentials import sweep_retired
 from crucible.application.delivery_tick import DeliveryConfig
 from crucible.application.harnesses import HarnessRegistry
 from crucible.application.supervisor import Supervisor
@@ -44,6 +47,7 @@ class Wiring:
     github: GitHubClient | None = None
     publisher: Publisher | None = None
     harnesses: HarnessRegistry | None = None
+    admin: AdminContext | None = None
 
     def supervisor(self) -> Supervisor:
         s = self.settings.supervisor
@@ -72,6 +76,9 @@ class Wiring:
             harnesses=self.harnesses,
             harness_gates=harness_gates(self.settings),
             credential_sources=credential_sources(self.settings),
+            credential_sweep=(
+                partial(sweep_retired, self.admin) if self.admin is not None else None
+            ),
         )
 
     def app(self) -> FastAPI:
@@ -156,6 +163,29 @@ def wire(settings: Settings) -> Wiring:
         settings.wake.secret,
         timeout_seconds=settings.wake.timeout_seconds,
     )
+    github = github_client(settings)
+    admin = AdminContext(
+        uow_factory=SqlUnitOfWorkFactory(engine),
+        clock=SystemClock(),
+        providers=providers,
+        harnesses=registry,
+        harness_gates=harness_gates(settings),
+        credential_sources=credential_sources(settings),
+        github=github,
+        github_app=GitHubAppInfo(
+            app_id=settings.github.app.app_id,
+            private_key_path=settings.github.app.private_key_path,
+            webhook_secret_path=settings.github.app.webhook_secret_path,
+            webhook_enabled=settings.github.webhook_enabled,
+            api_base=settings.github.api_base,
+        ),
+        artifact_root=settings.service.artifact_root,
+        lease_ttl_seconds=settings.supervisor.lease_ttl_seconds,
+        credential_retention_hours=settings.admin.credential_retention_hours,
+        probe_timeout_seconds=settings.admin.probe_timeout_seconds,
+        login_timeout_seconds=settings.admin.login_timeout_seconds,
+        login_commands={k: tuple(v) for k, v in settings.admin.login_commands.items()},
+    )
     ctx = AppContext(
         uow_factory=SqlUnitOfWorkFactory(engine),
         clock=SystemClock(),
@@ -169,8 +199,8 @@ def wire(settings: Settings) -> Wiring:
         harnesses=registry,
         harness_gates=harness_gates(settings),
         credential_sources=credential_sources(settings),
+        admin=admin,
     )
-    github = github_client(settings)
     publisher: Publisher | None = None
     if docker is not None and github is not None:
         publisher = DockerPublisher(
@@ -195,4 +225,5 @@ def wire(settings: Settings) -> Wiring:
         github=github,
         publisher=publisher,
         harnesses=registry,
+        admin=admin,
     )
