@@ -123,13 +123,16 @@ def validate_title(proposed: str) -> str:
     title = " ".join(proposed.split())
     if not title:
         raise TitleRefusedError("the claim proposes an empty pull request title")
+    # The secret check runs before the length check on purpose: a long title containing
+    # a token would otherwise be refused as "too long", which tells the reader nothing
+    # about the thing that matters.
+    hit = scan_text(title)
+    if hit is not None:
+        raise TitleRefusedError(f"the proposed title matches the {hit} secret pattern")
     if len(title) > MAX_TITLE_LENGTH:
         raise TitleRefusedError(
             f"the proposed title is {len(title)} characters; the limit is {MAX_TITLE_LENGTH}"
         )
-    hit = scan_text(title)
-    if hit is not None:
-        raise TitleRefusedError(f"the proposed title matches the {hit} secret pattern")
     if _CLOSING_RE.search(title):
         raise TitleRefusedError(
             "the proposed title carries a closing keyword; only deliverables[].closes "

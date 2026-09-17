@@ -18,7 +18,7 @@ from typing import Any
 
 from crucible.application.transitions import record_event
 from crucible.domain.entities import GitHubDelivery
-from crucible.domain.events import PRINCIPAL_CRUCIBLE, EventKind
+from crucible.domain.events import PRINCIPAL_GITHUB, EventKind
 from crucible.ports.clock import Clock
 from crucible.ports.repository import UnitOfWork
 
@@ -67,7 +67,7 @@ def store_delivery(
         uow,
         clock,
         EventKind.GITHUB_DELIVERY_RECEIVED,
-        principal=PRINCIPAL_CRUCIBLE,
+        principal=PRINCIPAL_GITHUB,
         payload={
             "delivery_id": delivery_id,
             "event": event,
@@ -86,7 +86,7 @@ def record_unhandled(uow: UnitOfWork, clock: Clock, *, delivery_id: str, event: 
         uow,
         clock,
         EventKind.GITHUB_DELIVERY_RECEIVED,
-        principal=PRINCIPAL_CRUCIBLE,
+        principal=PRINCIPAL_GITHUB,
         payload={
             "delivery_id": delivery_id,
             "event": event,
@@ -106,7 +106,7 @@ def record_rejection(uow: UnitOfWork, clock: Clock, *, event: str, reason: str) 
         uow,
         clock,
         EventKind.GITHUB_DELIVERY_REJECTED,
-        principal=PRINCIPAL_CRUCIBLE,
+        principal=PRINCIPAL_GITHUB,
         payload={
             "event": event,
             "reason": reason,

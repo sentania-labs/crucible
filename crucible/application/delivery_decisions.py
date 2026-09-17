@@ -212,6 +212,7 @@ def record_head_decision(
         task=task,
         reason="recollect",
         new_head=pull_request.head_sha if pull_request else "",
+        principal=principal.name,
     )
     stored = uow.contracts.get(task.id, task.contract_version)
     assert stored is not None

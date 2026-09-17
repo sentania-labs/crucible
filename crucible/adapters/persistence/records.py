@@ -287,6 +287,12 @@ class ReviewReports:
         ).all()
         return [self._to_entity(r) for r in rows]
 
+    def supersede(self, report_id: str, at: datetime) -> None:
+        row = self._s.get(ReviewReportRow, report_id)
+        if row is not None and row.superseded_at is None:
+            row.superseded_at = at
+            self._s.flush()
+
 
 class GateResults:
     def __init__(self, session: Session) -> None:

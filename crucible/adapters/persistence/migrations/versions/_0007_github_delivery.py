@@ -84,8 +84,10 @@ C4_TABLES = (
 )
 
 # 14: everything the supervisor alone writes carries the fenced token. Observation is
-# the supervisor's, so every observed row is fenced; the two decision tables are written
-# by the API on Foundry's behalf and are append-only instead.
+# the supervisor's, so every observed row is fenced. `ci_decisions` is Foundry's and is
+# append-only instead. `github_deliveries` is written by the webhook endpoint, which has
+# no lease and no principal, and is processed by the supervisor afterwards, so it is
+# neither fenced nor append-only (04, 14).
 NEW_FENCED_TABLES = (
     "pull_requests",
     "pull_request_heads",
@@ -94,7 +96,6 @@ NEW_FENCED_TABLES = (
     "review_comments",
     "reactions",
     "ci_certifications",
-    "github_deliveries",
 )
 NEW_APPEND_ONLY_TABLES = ("ci_decisions",)
 

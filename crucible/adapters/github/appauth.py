@@ -76,6 +76,23 @@ def sign_jwt(app_id: int, key: rsa.RSAPrivateKey, *, now: float | None = None) -
     return f"{signing_input}.{_b64(signature)}"
 
 
+@dataclass(slots=True)
+class _CachedToken:
+    """One minted token, held in process memory until shortly before it expires."""
+
+    value: str
+    expires_at: datetime
+    permissions: dict[str, str]
+
+    def issue(self, repository: str) -> InstallationToken:
+        return InstallationToken(
+            self.value,
+            expires_at=self.expires_at,
+            repository=repository,
+            permissions=dict(self.permissions),
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class AppConfig:
     app_id: int
@@ -88,12 +105,16 @@ class AppAuthenticator:
 
     Keeps a per-(installation, repository, permissions) token in memory until shortly
     before it expires. Nothing is written anywhere: the cache is a process dictionary and
-    a restart simply mints again."""
+    a restart simply mints again.
+
+    Each call returns its *own* `InstallationToken`, never the cached one: a caller that
+    discards its token when the job ends must not empty the cache for everyone else,
+    which is exactly the bug a shared object produces."""
 
     def __init__(self, config: AppConfig, transport: Any) -> None:
         self._config = config
         self._transport = transport
-        self._cache: dict[tuple[int, str, str], InstallationToken] = {}
+        self._cache: dict[tuple[int, str, str], _CachedToken] = {}
 
     def _now(self) -> datetime:
         return datetime.now(UTC)
@@ -116,8 +137,7 @@ class AppAuthenticator:
         if cached is not None:
             remaining = (cached.expires_at - self._now()).total_seconds()
             if remaining > TOKEN_REFRESH_MARGIN_SECONDS:
-                return cached
-            cached.discard()
+                return cached.issue(repository)
             self._cache.pop(cache_key, None)
         body: dict[str, Any] = {"repositories": [short]}
         if permissions:
@@ -138,13 +158,13 @@ class AppAuthenticator:
         if not value:
             raise GitHubError(status, "the mint response carried no token")
         expires = _parse_expiry(payload.get("expires_at"))
-        token = InstallationToken(
-            value,
+        entry = _CachedToken(
+            value=value,
             expires_at=expires,
-            repository=repository,
             permissions={str(k): str(v) for k, v in (payload.get("permissions") or {}).items()},
         )
-        self._cache[cache_key] = token
+        self._cache[cache_key] = entry
+        token = entry.issue(repository)
         log.info(
             "installation token minted",
             extra={
@@ -157,8 +177,6 @@ class AppAuthenticator:
         return token
 
     def discard_all(self) -> None:
-        for token in self._cache.values():
-            token.discard()
         self._cache.clear()
 
 

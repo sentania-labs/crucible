@@ -62,7 +62,10 @@ WORKERS_SUBNET = "10.89.0.0/24"
 EGRESS_ALLOWLIST = ("github.com",)
 
 TRUNCATE = (
-    "TRUNCATE retention_actions, log_chunks, attempt_metrics, wakes, review_dispositions, "
+    "TRUNCATE github_deliveries, ci_decisions, ci_certifications, reactions, "
+    "review_comments, external_reviews, external_review_cycles, pull_request_heads, "
+    "pull_requests, retention_actions, log_chunks, attempt_metrics, wakes, "
+    "review_dispositions, "
     "decisions, escalations, acceptance_results, gate_results, review_reports, evidence, "
     "artifacts, idempotency_keys, supervisor_status, completion_claims, leases, events, "
     "attempts, executions, task_contracts, tasks, repositories, principals, policies, "

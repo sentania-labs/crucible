@@ -10,9 +10,8 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import datetime
-from typing import Any, cast
 
-from sqlalchemy import CursorResult, select
+from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -166,7 +165,10 @@ class PullRequestHeads:
 
         A head Crucible pushed and then observed must not become a second row that looks
         like an out-of-band push."""
-        result = self._s.execute(
+        # RETURNING rather than rowcount: an INSERT ... ON CONFLICT DO NOTHING can
+        # report an unknown rowcount, and "unknown" read as truthy would call every
+        # repeat a new head.
+        inserted = self._s.execute(
             pg_insert(PullRequestHeadRow)
             .values(
                 id=head.id,
@@ -176,9 +178,10 @@ class PullRequestHeads:
                 observed_at=head.observed_at,
             )
             .on_conflict_do_nothing(constraint="uq_pull_request_heads_sha")
-        )
+            .returning(PullRequestHeadRow.id)
+        ).scalar_one_or_none()
         self._s.flush()
-        return bool(cast("CursorResult[Any]", result).rowcount)
+        return inserted is not None
 
     def list_for_pull_request(self, pull_request_id: str) -> Sequence[PullRequestHead]:
         rows = self._s.scalars(
@@ -568,7 +571,7 @@ class GitHubDeliveries:
     def add(self, delivery: GitHubDelivery) -> bool:
         """Insert, or report that this delivery id was already stored (04: deduplicated
         by delivery id). GitHub re-delivers, and a redelivery must change nothing."""
-        result = self._s.execute(
+        inserted = self._s.execute(
             pg_insert(GitHubDeliveryRow)
             .values(
                 delivery_id=delivery.delivery_id,
@@ -581,9 +584,10 @@ class GitHubDeliveries:
                 processed_at=delivery.processed_at,
             )
             .on_conflict_do_nothing(index_elements=["delivery_id"])
-        )
+            .returning(GitHubDeliveryRow.delivery_id)
+        ).scalar_one_or_none()
         self._s.flush()
-        return bool(cast("CursorResult[Any]", result).rowcount)
+        return inserted is not None
 
     def get(self, delivery_id: str) -> GitHubDelivery | None:
         row = self._s.get(GitHubDeliveryRow, delivery_id)

@@ -469,7 +469,15 @@ class DeliveryCoordinator:
                     )
                     if pull_request.id in forced:
                         due = True
-                        with_reactions = with_reactions or forced[pull_request.id]
+                        # 23: a review or comment delivery triggers an immediate
+                        # reaction poll for its subject, and while the PR awaits
+                        # external review the reaction *is* the verdict, so any
+                        # delivery about it brings the reaction poll forward.
+                        with_reactions = (
+                            with_reactions
+                            or forced[pull_request.id]
+                            or task.state is TaskState.AWAITING_EXTERNAL_REVIEW
+                        )
                     if not due:
                         continue
                     work = latest_work_attempt(uow, task)

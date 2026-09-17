@@ -5,6 +5,10 @@ from __future__ import annotations
 from enum import StrEnum
 
 PRINCIPAL_CRUCIBLE = "crucible"
+# A webhook delivery has no authenticated principal and is not the supervisor's write:
+# events about one are recorded under GitHub's own name, which is also what keeps them
+# outside the fenced set (14).
+PRINCIPAL_GITHUB = "github"
 
 
 class EventKind(StrEnum):

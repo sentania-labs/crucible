@@ -144,6 +144,12 @@ TASK_TRANSITIONS: frozenset[tuple[TaskState, TaskState]] = frozenset(
         (_S.HEAD_DIVERGED, _S.CANCELLED),
         (_S.READY_FOR_MERGE, _S.MERGED),
         (_S.READY_FOR_MERGE, _S.REJECTED),
+        # 23: "a PR closed without merge moves the task to rejected". 09's table draws
+        # that edge only from ready_for_merge, but a person can close a PR at any point
+        # after it is opened (docs/implementation-notes/c4.md).
+        (_S.AWAITING_EXTERNAL_REVIEW, _S.REJECTED),
+        (_S.EXTERNAL_FEEDBACK_RECEIVED, _S.REJECTED),
+        (_S.AWAITING_CI_CERTIFICATION, _S.REJECTED),
         (_S.MERGED, _S.RELEASE_CANDIDATE),
         (_S.RELEASE_CANDIDATE, _S.RELEASED),
         (_S.RELEASE_CANDIDATE, _S.MERGED),

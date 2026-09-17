@@ -209,7 +209,13 @@ def observe_head(
 
 
 def supersede_for_head(
-    uow: UnitOfWork, clock: Clock, *, task: Task, reason: str, new_head: str
+    uow: UnitOfWork,
+    clock: Clock,
+    *,
+    task: Task,
+    reason: str,
+    new_head: str,
+    principal: str = PRINCIPAL_CRUCIBLE,
 ) -> None:
     """09: the previous head's acceptance, review report, and gate results are marked
     superseded and kept as history. Nothing is deleted; a superseded row is the record
@@ -219,14 +225,13 @@ def supersede_for_head(
     superseded_reports = 0
     for report in uow.review_reports.list_for_task(task.id):
         if report.superseded_at is None and report.head_sha == (task.head_sha or ""):
-            report.superseded_at = now
-            uow.review_reports.add(report)
+            uow.review_reports.supersede(report.id, now)
             superseded_reports += 1
     record_event(
         uow,
         clock,
         EventKind.SUPERSEDED_FOR_HEAD,
-        principal=PRINCIPAL_CRUCIBLE,
+        principal=principal,
         task_id=task.id,
         payload={
             "reason": reason,
