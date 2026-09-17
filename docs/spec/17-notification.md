@@ -29,9 +29,11 @@ Only when judgment is required or work has stopped needing it:
 | `supervisor_takeover` | informational, once |
 | `bootstrap_import_verified` | awaiting commit |
 
-Every wake in the delivery half stands on an observation Crucible
-recorded under the `github` event principal (10), never on an orchestrator
-session being connected.
+Every wake in the delivery half stands on an observation the supervisor
+recorded, under the `crucible` event principal like any other supervisor
+write (10), never on an orchestrator session being connected. A webhook
+delivery only makes that observation happen sooner; the ingress events it
+writes under the `github` principal wake nobody by themselves.
 
 Progress is not a wake. Foundry polls or tails logs when it wants progress.
 Review feedback is never sent to a worker; it is only ever carried to
