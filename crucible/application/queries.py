@@ -13,6 +13,8 @@ from crucible.contracts.api import (
     ArtifactView,
     AttemptSummary,
     AttemptView,
+    CICertificationView,
+    CIDecisionView,
     CompletionClaimView,
     ContractVersionView,
     DecisionView,
@@ -23,8 +25,14 @@ from crucible.contracts.api import (
     EvidenceView,
     ExecutionSummary,
     ExecutionView,
+    ExternalReviewView,
     GateList,
     GateResultView,
+    PullRequestHeadView,
+    PullRequestView,
+    ReactionView,
+    ReviewCommentView,
+    ReviewCycleView,
     ReviewReportView,
     SupervisorView,
     TaskList,
@@ -44,9 +52,11 @@ from crucible.domain.entities import (
     EvidenceRecord,
     Execution,
     GateResultRecord,
+    PullRequestState,
     ReviewReportRecord,
     Wake,
 )
+from crucible.domain.external_review import required_rounds
 from crucible.domain.lifecycle import TaskState
 from crucible.ports.execution import ExecutionProvider
 from crucible.ports.repository import UnitOfWork
@@ -141,9 +151,8 @@ def task_view(uow: UnitOfWork, task_id: str) -> TaskView:
         executions=summaries,
         latest_attempt=latest,
         head_sha=task.head_sha,
-        publish_pending=task.publish_pending,
         gate_summary=gate_summary(uow, task.id),
-        pull_request=None,
+        pull_request=_pr_summary(uow, task.id),
         open_escalations=[
             _escalation_view(e).model_dump(mode="json")
             for e in uow.escalations.list_for_task(task.id)
@@ -394,8 +403,24 @@ def supervisor_view(
         tick_ms=status.tick_ms,
         counts={**status.counts, "wakes_unacked": uow.wakes.count_unacked()},
         providers=[{"name": p.name, **p.capabilities().as_dict()} for p in providers],
-        github=None,
+        github=_github_status(uow),
     )
+
+
+def _github_status(uow: UnitOfWork) -> dict[str, Any]:
+    """23: the observation status `GET /supervisor` reports, with the repositories whose
+    reactions the App cannot read named rather than merely counted."""
+    observed = uow.pull_requests.list_in_states([PullRequestState.OPENING, PullRequestState.OPEN])
+    last_poll = max(
+        (pr.last_polled_at for pr in observed if pr.last_polled_at is not None), default=None
+    )
+    unobservable = sorted({pr.id for pr in observed if not pr.reactions_observable})
+    return {
+        "observed_pull_requests": len(observed),
+        "last_poll_at": last_poll.isoformat() if last_poll else None,
+        "deliveries_pending": uow.github_deliveries.count_unprocessed(),
+        "reactions_unobservable": unobservable,
+    }
 
 
 # ----- C2 views ----------------------------------------------------------------
@@ -608,3 +633,186 @@ def wake_list(
     page = rows[:size]
     next_cursor = encode_cursor(page[-1].id) if len(rows) > size and page else None
     return WakeList(items=[wake_view(uow, w) for w in page], next_cursor=next_cursor)
+
+
+# ----- C4 views: the pull request and what GitHub said about it (04, 23) --------
+
+
+def _pr_summary(uow: UnitOfWork, task_id: str) -> dict[str, Any] | None:
+    """The short form the task view carries; the full record is /pull-request."""
+    pull_request = uow.pull_requests.get_for_task(task_id)
+    if pull_request is None:
+        return None
+    cycles = uow.review_cycles.list_for_pull_request(pull_request.id)
+    comments = uow.review_comments.list_for_pull_request(pull_request.id)
+    dispositions = uow.dispositions.list_for_comments([c.id for c in comments])
+    certifications = uow.ci_certifications.list_for_task(task_id)
+    return {
+        "number": pull_request.number,
+        "url": pull_request.url,
+        "state": pull_request.state.value,
+        "head_sha": pull_request.head_sha,
+        "base_ref": pull_request.base_ref,
+        "merged_at": pull_request.merged_at.isoformat() if pull_request.merged_at else None,
+        "merge_sha": pull_request.merge_sha,
+        "merged_by": pull_request.merged_by,
+        "completed_rounds": sum(1 for c in cycles if c.state == "completed"),
+        "comments": len(comments),
+        "dispositions": len(dispositions),
+        "reactions_observable": pull_request.reactions_observable,
+        "ci_certification": certifications[-1].state if certifications else None,
+    }
+
+
+def pull_request_view(uow: UnitOfWork, task_id: str) -> PullRequestView:
+    task = uow.tasks.get(task_id)
+    if task is None:
+        raise NotFoundError(f"task {task_id} not found")
+    pull_request = uow.pull_requests.get_for_task(task_id)
+    if pull_request is None:
+        raise NotFoundError(f"task {task_id} has no pull request")
+    policy = uow.policies.get(task.policy_name, task.policy_version)
+    required = required_rounds(policy.document) if policy else 1
+    cycles = list(uow.review_cycles.list_for_pull_request(pull_request.id))
+    comments = list(uow.review_comments.list_for_pull_request(pull_request.id))
+    dispositions = {
+        d.review_comment_id: d for d in uow.dispositions.list_for_comments([c.id for c in comments])
+    }
+    certifications = list(uow.ci_certifications.list_for_task(task_id))
+    decisions = list(uow.ci_decisions.list_for_task(task_id))
+    principals = {}
+    for decision in decisions:
+        principal = uow.principals.get(decision.principal_id)
+        principals[decision.principal_id] = principal.name if principal else decision.principal_id
+    gate_rows = [
+        row
+        for row in uow.gate_results.list_for_task(task_id)
+        if row.phase in ("publication", "post_pr")
+    ]
+    return PullRequestView(
+        id=pull_request.id,
+        task_id=task_id,
+        number=pull_request.number,
+        url=pull_request.url,
+        state=pull_request.state.value,
+        base_ref=pull_request.base_ref,
+        work_branch=pull_request.work_branch,
+        head_sha=pull_request.head_sha,
+        title=pull_request.title,
+        body_sha256=pull_request.body_sha256,
+        opened_at=pull_request.opened_at,
+        merged_at=pull_request.merged_at,
+        merge_sha=pull_request.merge_sha,
+        merged_by=pull_request.merged_by,
+        closed_at=pull_request.closed_at,
+        closed_by=pull_request.closed_by,
+        last_polled_at=pull_request.last_polled_at,
+        reactions_observable=pull_request.reactions_observable,
+        completed_rounds=sum(1 for c in cycles if c.state == "completed"),
+        required_rounds=required,
+        heads=[
+            PullRequestHeadView(
+                sha=head.sha, pushed_by=head.pushed_by.value, observed_at=head.observed_at
+            )
+            for head in uow.pull_request_heads.list_for_pull_request(pull_request.id)
+        ],
+        cycles=[
+            ReviewCycleView(
+                id=cycle.id,
+                head_sha=cycle.head_sha,
+                components=list(cycle.components),
+                completed_components=dict(cycle.completed_components),
+                state=cycle.state,
+                trigger=cycle.trigger,
+                opened_at=cycle.opened_at,
+                completed_at=cycle.completed_at,
+            )
+            for cycle in cycles
+        ],
+        external_reviews=[
+            ExternalReviewView(
+                id=review.id,
+                reviewer_login=review.reviewer_login,
+                signal=review.signal,
+                github_id=review.github_id,
+                reviewed_sha=review.reviewed_sha,
+                sha_inferred=review.sha_inferred,
+                state=review.state,
+                accepted=review.accepted,
+                received_at=review.received_at,
+            )
+            for review in uow.external_reviews.list_for_pull_request(pull_request.id)
+        ],
+        comments=[
+            ReviewCommentView(
+                id=comment.id,
+                github_id=comment.github_id,
+                kind=comment.kind,
+                login=comment.login,
+                path=comment.path,
+                line=comment.line,
+                body=comment.body,
+                reviewed_sha=comment.reviewed_sha,
+                created_at=comment.created_at,
+                updated_at=comment.updated_at,
+                disposition=(
+                    {
+                        "disposition": dispositions[comment.id].disposition.value,
+                        "reasoning": dispositions[comment.id].reasoning,
+                        "created_at": dispositions[comment.id].created_at.isoformat(),
+                    }
+                    if comment.id in dispositions
+                    else None
+                ),
+            )
+            for comment in comments
+        ],
+        reactions=[
+            ReactionView(
+                subject_kind=reaction.subject_kind,
+                subject_github_id=reaction.subject_github_id,
+                github_id=reaction.github_id,
+                login=reaction.login,
+                content=reaction.content,
+                observed_at=reaction.observed_at,
+                removed_at=reaction.removed_at,
+            )
+            for reaction in uow.reactions.list_for_pull_request(pull_request.id)
+        ],
+        ci_certifications=[
+            CICertificationView(
+                id=c.id,
+                head_sha=c.head_sha,
+                state=c.state,
+                detail=c.detail,
+                required_checks=list(c.required_checks),
+                check_runs=list(c.check_runs),
+                failure=dict(c.failure),
+                evaluated_at=c.evaluated_at,
+            )
+            for c in certifications
+        ],
+        ci_decisions=[
+            CIDecisionView(
+                id=d.id,
+                cause=d.cause,
+                action=d.action,
+                reasoning=d.reasoning,
+                principal=principals.get(d.principal_id, d.principal_id),
+                created_at=d.created_at,
+            )
+            for d in decisions
+        ],
+        gates=[
+            GateResultView(
+                gate=row.gate,
+                phase=row.phase,
+                result=row.result,
+                detail=row.detail,
+                head_sha=row.head_sha or "",
+                evidence_ids=list(row.evidence_ids),
+                evaluated_at=row.evaluated_at,
+            )
+            for row in gate_rows
+        ],
+    )

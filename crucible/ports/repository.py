@@ -13,6 +13,8 @@ from crucible.domain.entities import (
     Artifact,
     Attempt,
     AttemptMetrics,
+    CICertification,
+    CIDecision,
     CompletionClaimRecord,
     Decision,
     Escalation,
@@ -20,13 +22,21 @@ from crucible.domain.entities import (
     EvidenceRecord,
     Execution,
     ExecutionRole,
+    ExternalReview,
+    ExternalReviewCycle,
     GateResultRecord,
+    GitHubDelivery,
     Lease,
     LogChunkRecord,
     Policy,
     Principal,
+    PullRequest,
+    PullRequestHead,
+    PullRequestState,
+    Reaction,
     Repository,
     RetentionAction,
+    ReviewComment,
     ReviewDisposition,
     ReviewReportRecord,
     RoutingPolicyRecord,
@@ -287,6 +297,99 @@ class DispositionRepository(Protocol):
 
     def get_by_comment(self, review_comment_id: str) -> ReviewDisposition | None: ...
 
+    def list_for_comments(self, comment_ids: Sequence[str]) -> Sequence[ReviewDisposition]: ...
+
+
+# ----- C4: GitHub delivery (14, 23) --------------------------------------
+
+
+class PullRequestRepository(Protocol):
+    def add(self, pull_request: PullRequest) -> None: ...
+
+    def get(self, pull_request_id: str) -> PullRequest | None: ...
+
+    def get_for_task(self, task_id: str, *, for_update: bool = False) -> PullRequest | None: ...
+
+    def save(self, pull_request: PullRequest) -> None: ...
+
+    def list_in_states(self, states: Sequence[PullRequestState]) -> Sequence[PullRequest]: ...
+
+
+class PullRequestHeadRepository(Protocol):
+    def add(self, head: PullRequestHead) -> bool:
+        """True when this (pull request, sha) is new; False when it is already recorded."""
+        ...
+
+    def list_for_pull_request(self, pull_request_id: str) -> Sequence[PullRequestHead]: ...
+
+
+class ExternalReviewCycleRepository(Protocol):
+    def add(self, cycle: ExternalReviewCycle) -> None: ...
+
+    def save(self, cycle: ExternalReviewCycle) -> None: ...
+
+    def list_for_pull_request(self, pull_request_id: str) -> Sequence[ExternalReviewCycle]: ...
+
+
+class ExternalReviewRepository(Protocol):
+    def add(self, review: ExternalReview) -> None: ...
+
+    def get_by_github(
+        self, pull_request_id: str, signal: str, github_id: str
+    ) -> ExternalReview | None: ...
+
+    def list_for_pull_request(self, pull_request_id: str) -> Sequence[ExternalReview]: ...
+
+
+class ReviewCommentRepository(Protocol):
+    def add(self, comment: ReviewComment) -> None: ...
+
+    def save(self, comment: ReviewComment) -> None: ...
+
+    def get(self, comment_id: str) -> ReviewComment | None: ...
+
+    def get_by_github(
+        self, pull_request_id: str, kind: str, github_id: str
+    ) -> ReviewComment | None: ...
+
+    def list_for_pull_request(self, pull_request_id: str) -> Sequence[ReviewComment]: ...
+
+
+class ReactionRepository(Protocol):
+    def add(self, reaction: Reaction) -> None: ...
+
+    def save(self, reaction: Reaction) -> None: ...
+
+    def list_for_pull_request(self, pull_request_id: str) -> Sequence[Reaction]: ...
+
+
+class CICertificationRepository(Protocol):
+    def put(self, certification: CICertification) -> CICertification: ...
+
+    def get_for_head(self, pull_request_id: str, head_sha: str) -> CICertification | None: ...
+
+    def list_for_task(self, task_id: str) -> Sequence[CICertification]: ...
+
+
+class CIDecisionRepository(Protocol):
+    def add(self, decision: CIDecision) -> None: ...
+
+    def list_for_task(self, task_id: str) -> Sequence[CIDecision]: ...
+
+
+class GitHubDeliveryRepository(Protocol):
+    def add(self, delivery: GitHubDelivery) -> bool:
+        """True when stored; False when this delivery id was already seen (04)."""
+        ...
+
+    def get(self, delivery_id: str) -> GitHubDelivery | None: ...
+
+    def list_unprocessed(self, limit: int = 100) -> Sequence[GitHubDelivery]: ...
+
+    def count_unprocessed(self) -> int: ...
+
+    def mark_processed(self, delivery_id: str, at: datetime) -> None: ...
+
 
 class WakeRepository(Protocol):
     def add(self, wake: Wake) -> None: ...
@@ -374,6 +477,15 @@ class UnitOfWork(Protocol):
     dispositions: DispositionRepository
     wakes: WakeRepository
     attempt_metrics: AttemptMetricsRepository
+    pull_requests: PullRequestRepository
+    pull_request_heads: PullRequestHeadRepository
+    review_cycles: ExternalReviewCycleRepository
+    external_reviews: ExternalReviewRepository
+    review_comments: ReviewCommentRepository
+    reactions: ReactionRepository
+    ci_certifications: CICertificationRepository
+    ci_decisions: CIDecisionRepository
+    github_deliveries: GitHubDeliveryRepository
 
     def __enter__(self) -> UnitOfWork: ...
 

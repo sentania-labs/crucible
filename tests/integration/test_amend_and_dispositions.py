@@ -106,20 +106,22 @@ async def test_amend_may_not_turn_a_pull_request_into_an_artifacts_deliverable(
     assert any(e["path"] == "deliverables" for e in r.json()["errors"])
 
 
-async def test_amend_is_refused_once_the_head_is_waiting_for_the_publisher(
+async def test_amend_is_refused_once_the_head_is_publishing(
     client: TestClient, supervisor: Supervisor
 ) -> None:
+    """C4 replaces C2's publish_pending flag with the `publishing` state, which is not
+    amendable: the head is already on its way to the remote (09)."""
     task_id = submit_and_start(client, "crucible-worker:fake-succeed")
     await run_to_settled(supervisor, client, task_id)
     await review_and_settle(supervisor, client, task_id)
     accepted = client.post(
         f"/v1/tasks/{task_id}/accept", json={"verdict": "accepted", "reasoning": "publish it"}
     ).json()
-    assert accepted["publish_pending"] is True
+    assert accepted["state"] == "publishing"
     document = amended(client, task_id, objective="A different objective.")
     r = client.post(f"/v1/tasks/{task_id}/amend", json={"contract": document, "reason": "x"})
-    assert r.status_code == 422
-    assert any("waiting for the publisher" in e["message"] for e in r.json()["errors"])
+    assert r.status_code == 409
+    assert "publishing" in r.json()["detail"]
 
 
 async def test_a_correction_is_refused_once_the_head_is_accepted(
@@ -140,15 +142,17 @@ async def test_a_correction_is_refused_once_the_head_is_accepted(
     )
     document = correction_document(client, task_id, image="crucible-worker:fake-succeed")
     r = client.post(f"/v1/tasks/{task_id}/corrections", json=document)
-    assert r.status_code == 422
-    messages = " ".join(e["message"] for e in r.json()["errors"])
-    assert "current verdict is accepted" in messages
-    assert client.get(f"/v1/tasks/{task_id}").json()["state"] == "awaiting_acceptance"
+    # The accept moved the task to `publishing`, which is not a correctable state: the
+    # accepted head is already being pushed, and correcting it would abandon it (09).
+    assert r.status_code == 409
+    assert "publishing" in r.json()["detail"]
+    assert client.get(f"/v1/tasks/{task_id}").json()["state"] == "publishing"
 
 
-def test_a_disposition_names_c4_because_nothing_records_a_comment_yet(
+def test_a_disposition_needs_a_recorded_review_comment(
     client: TestClient,
 ) -> None:
+    """A disposition attaches to a comment Crucible observed on this task's PR (23)."""
     task_id = submit_and_start(client, "crucible-worker:fake-succeed", start=False)
     r = client.post(
         f"/v1/tasks/{task_id}/dispositions",
@@ -159,7 +163,7 @@ def test_a_disposition_names_c4_because_nothing_records_a_comment_yet(
         },
     )
     assert r.status_code == 404
-    assert "C4" in r.json()["detail"]
+    assert "unknown" in r.json()["detail"]
 
 
 def test_a_disposition_needs_an_orchestrator_principal(

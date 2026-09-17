@@ -13,6 +13,17 @@ from sqlalchemy import Engine, create_engine, delete, func, select, text, update
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
+from crucible.adapters.persistence.delivery import (
+    CICertifications,
+    CIDecisions,
+    ExternalReviewCycles,
+    ExternalReviews,
+    GitHubDeliveries,
+    PullRequestHeads,
+    PullRequests,
+    Reactions,
+    ReviewComments,
+)
 from crucible.adapters.persistence.models import (
     AttemptRow,
     CompletionClaimRow,
@@ -68,6 +79,8 @@ from crucible.ports.repository import (
     ArtifactRepository,
     AttemptMetricsRepository,
     AttemptRepository,
+    CICertificationRepository,
+    CIDecisionRepository,
     ClaimRepository,
     ContractRepository,
     DecisionRepository,
@@ -76,16 +89,23 @@ from crucible.ports.repository import (
     EventRepository,
     EvidenceRepository,
     ExecutionRepository,
+    ExternalReviewCycleRepository,
+    ExternalReviewRepository,
     FencedTokenRejectedError,
     GateResultRepository,
+    GitHubDeliveryRepository,
     IdempotencyKeyTakenError,
     IdempotencyRepository,
     LeaseRepository,
     LogRepository,
     PolicyRepository,
     PrincipalRepository,
+    PullRequestHeadRepository,
+    PullRequestRepository,
+    ReactionRepository,
     RepositoryRegistry,
     RetentionRepository,
+    ReviewCommentRepository,
     ReviewReportRepository,
     RoutingPolicyRepository,
     SupervisorStatusRepository,
@@ -194,6 +214,9 @@ class Repositories:
             installation_id=row.installation_id,
             registered_by=row.registered_by,
             created_at=ensure_utc(row.created_at),
+            external_review_attested=row.external_review_attested,
+            attested_by=row.attested_by,
+            attested_at=ensure_utc(row.attested_at) if row.attested_at else None,
         )
 
     def get_by_name(self, name: str) -> Repository | None:
@@ -219,6 +242,9 @@ class Repositories:
         row.installation_id = repository.installation_id
         row.policy_name = repository.policy_name
         row.registered_by = repository.registered_by
+        row.external_review_attested = repository.external_review_attested
+        row.attested_by = repository.attested_by
+        row.attested_at = repository.attested_at
         self._s.flush()
         return self._to_entity(row)
 
@@ -244,7 +270,6 @@ class Tasks:
             updated_at=ensure_utc(row.updated_at),
             closed_at=_dt(row.closed_at),
             head_sha=row.head_sha,
-            publish_pending=row.publish_pending,
         )
 
     def add(self, task: Task) -> None:
@@ -264,7 +289,6 @@ class Tasks:
                 updated_at=task.updated_at,
                 closed_at=task.closed_at,
                 head_sha=task.head_sha,
-                publish_pending=task.publish_pending,
             )
         )
         self._s.flush()
@@ -294,7 +318,6 @@ class Tasks:
                 updated_at=task.updated_at,
                 closed_at=task.closed_at,
                 head_sha=task.head_sha,
-                publish_pending=task.publish_pending,
             )
         )
 
@@ -1069,6 +1092,15 @@ class SqlUnitOfWork:
     dispositions: DispositionRepository
     wakes: WakeRepository
     attempt_metrics: AttemptMetricsRepository
+    pull_requests: PullRequestRepository
+    pull_request_heads: PullRequestHeadRepository
+    review_cycles: ExternalReviewCycleRepository
+    external_reviews: ExternalReviewRepository
+    review_comments: ReviewCommentRepository
+    reactions: ReactionRepository
+    ci_certifications: CICertificationRepository
+    ci_decisions: CIDecisionRepository
+    github_deliveries: GitHubDeliveryRepository
 
     def __init__(self, session_factory: sessionmaker[Session]) -> None:
         self._factory = session_factory
@@ -1108,6 +1140,15 @@ class SqlUnitOfWork:
         self.dispositions = Dispositions(s)
         self.wakes = Wakes(s)
         self.attempt_metrics = AttemptMetricsRepo(s)
+        self.pull_requests = PullRequests(s)
+        self.pull_request_heads = PullRequestHeads(s)
+        self.review_cycles = ExternalReviewCycles(s)
+        self.external_reviews = ExternalReviews(s)
+        self.review_comments = ReviewComments(s)
+        self.reactions = Reactions(s)
+        self.ci_certifications = CICertifications(s)
+        self.ci_decisions = CIDecisions(s)
+        self.github_deliveries = GitHubDeliveries(s)
         return self
 
     def __exit__(

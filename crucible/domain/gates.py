@@ -581,3 +581,130 @@ def blocking(outcomes: dict[str, GateOutcome]) -> list[str]:
 def waiting_for_review(outcomes: dict[str, GateOutcome]) -> bool:
     outcome = outcomes.get(GateName.INTERNAL_REVIEW_RECORDED)
     return outcome is not None and outcome.result is GateResult.PENDING
+
+
+# ----- publication and post-PR gates (23) --------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class DeliveryInput:
+    """Everything a publication or post-PR gate may look at. Pure data.
+
+    Separate from GateInput because these gates answer questions about the remote, not
+    about the collected tree: the head Crucible pushed, the PR it opened, the review
+    cycles it completed, and the certification it computed."""
+
+    policy: dict[str, Any]
+    accepted_head: str
+    branch_pushed_sha: str | None = None
+    pr_number: int | None = None
+    pr_head_sha: str | None = None
+    pr_state: str = ""
+    completed_rounds: int = 0
+    required_rounds: int = 1
+    undispositioned: tuple[str, ...] = ()
+    comment_count: int = 0
+    certification_state: str = ""
+    certification_detail: str = ""
+    final_sha: tuple[bool, str] | None = None
+
+
+def branch_pushed_at_head(di: DeliveryInput) -> GateOutcome:
+    if not di.branch_pushed_sha:
+        return GateOutcome(GateResult.PENDING, "the work branch has not been pushed yet")
+    if di.branch_pushed_sha != di.accepted_head:
+        return GateOutcome(
+            GateResult.FAIL,
+            f"the remote branch is at {di.branch_pushed_sha}, not the accepted head "
+            f"{di.accepted_head}",
+        )
+    return GateOutcome(GateResult.PASS, f"the remote branch is at {di.accepted_head}")
+
+
+def pr_exists_head_matches(di: DeliveryInput) -> GateOutcome:
+    if di.pr_number is None:
+        return GateOutcome(GateResult.PENDING, "no pull request has been opened for this task")
+    if di.pr_head_sha != di.accepted_head:
+        return GateOutcome(
+            GateResult.FAIL,
+            f"pull request #{di.pr_number} is at {di.pr_head_sha}, not the accepted head "
+            f"{di.accepted_head}",
+        )
+    return GateOutcome(
+        GateResult.PASS, f"pull request #{di.pr_number} is at the accepted head {di.accepted_head}"
+    )
+
+
+def external_review_rounds(di: DeliveryInput) -> GateOutcome:
+    if di.required_rounds <= 0:
+        return GateOutcome(GateResult.SKIPPED, "the policy requires no external review round (05b)")
+    if di.final_sha is not None and not di.final_sha[0]:
+        return GateOutcome(GateResult.PENDING, di.final_sha[1])
+    if di.completed_rounds < di.required_rounds:
+        return GateOutcome(
+            GateResult.PENDING,
+            f"{di.completed_rounds} of {di.required_rounds} review cycle(s) have completed",
+        )
+    return GateOutcome(
+        GateResult.PASS,
+        f"{di.completed_rounds} completed review cycle(s) satisfy the required "
+        f"{di.required_rounds}",
+    )
+
+
+def feedback_dispositions_complete(di: DeliveryInput) -> GateOutcome:
+    if not di.comment_count:
+        return GateOutcome(GateResult.PASS, "no external review comment needs a disposition")
+    if di.undispositioned:
+        return GateOutcome(
+            GateResult.PENDING,
+            f"{len(di.undispositioned)} of {di.comment_count} review comment(s) have no "
+            "recorded disposition",
+        )
+    return GateOutcome(
+        GateResult.PASS, f"every one of {di.comment_count} review comment(s) is dispositioned"
+    )
+
+
+def ci_green_for_head(di: DeliveryInput) -> GateOutcome:
+    mapping = {
+        "green": GateResult.PASS,
+        "failed": GateResult.FAIL,
+        "skipped": GateResult.SKIPPED,
+        "pending": GateResult.PENDING,
+    }
+    result = mapping.get(di.certification_state, GateResult.PENDING)
+    detail = di.certification_detail or "no CI certification has been computed yet"
+    return GateOutcome(result, detail)
+
+
+DELIVERY_EVALUATORS: dict[str, Callable[[DeliveryInput], GateOutcome]] = {
+    GateName.BRANCH_PUSHED_AT_HEAD: branch_pushed_at_head,
+    GateName.PR_EXISTS_HEAD_MATCHES: pr_exists_head_matches,
+    GateName.EXTERNAL_REVIEW_ROUNDS: external_review_rounds,
+    GateName.FEEDBACK_DISPOSITIONS_COMPLETE: feedback_dispositions_complete,
+    GateName.CI_GREEN_FOR_HEAD: ci_green_for_head,
+}
+
+
+def evaluate_delivery(gates: Sequence[str], di: DeliveryInput) -> dict[str, GateOutcome]:
+    """Run the named publication or post-PR gates. An evaluator that raises is `error`."""
+    out: dict[str, GateOutcome] = {}
+    for gate in gates:
+        evaluator = DELIVERY_EVALUATORS.get(gate)
+        if evaluator is None:
+            out[gate] = GateOutcome(GateResult.ERROR, f"no evaluator for gate {gate!r}")
+            continue
+        try:
+            out[gate] = evaluator(di)
+        except Exception as exc:
+            out[gate] = GateOutcome(GateResult.ERROR, f"{type(exc).__name__}: {exc}")
+    return out
+
+
+def configured(policy: dict[str, Any], phase: str, default: frozenset[str]) -> list[str]:
+    """The gates the policy names for a phase; with no policy section, the whole set."""
+    gates = policy.get("gates", {}).get(phase)
+    if gates is None:
+        return sorted(default)
+    return [str(g) for g in gates]

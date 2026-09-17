@@ -26,6 +26,7 @@ from crucible.ports.execution import (
 )
 
 __all__ = [
+    "BUNDLE_MOUNT",
     "BUNDLE_VERIFY_SCRIPT",
     "MANIFEST",
     "REPO_MOUNT",
@@ -33,6 +34,7 @@ __all__ = [
     "collector_script",
     "encode_check_id",
     "preparer_script",
+    "publisher_script",
     "verifier_script",
 ]
 
@@ -308,3 +310,140 @@ def verifier_script(checks: list[tuple[str, str]]) -> str:
 
 def _quote(value: str) -> str:
     return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
+# ----- the publisher (23, S10) -------------------------------------------
+
+BUNDLE_MOUNT = "/crucible/bundle"
+TOKEN_MOUNT = "/run/crucible-token"
+PUBLISH_MOUNT = "/crucible/publish"
+
+# git's credential helper protocol: git writes `protocol=`, `host=` and friends on
+# stdin and reads `username=` and `password=` back. The helper answers only for
+# https on github.com, because a helper that answers unconditionally hands the token
+# to whatever remote git was pointed at (S10). `store` and `erase` are ignored.
+_CRED_HELPER = r"""
+cat > /tmp/cred-helper.sh <<'HELPER'
+#!/bin/sh
+[ "${1:-}" = "get" ] || exit 0
+protocol= host=
+while IFS='=' read -r key value; do
+  [ -z "$key" ] && break
+  case "$key" in
+    protocol) protocol=$value ;;
+    host) host=$value ;;
+  esac
+done
+[ "$protocol" = "https" ] || exit 0
+[ "$host" = "$CRUCIBLE_CREDENTIAL_HOST" ] || exit 0
+printf 'username=x-access-token\n'
+printf 'password=%s\n' "$(cat "$CRUCIBLE_TOKEN_FILE")"
+HELPER
+chmod 0700 /tmp/cred-helper.sh
+"""
+
+
+def publisher_script(
+    *,
+    clone_url: str,
+    work_branch: str,
+    expected_head: str,
+    author_name: str,
+    author_email: str,
+    commit_trailer: str,
+    credential_host: str = "github.com",
+) -> str:
+    """Fetch the branch from the bundle, verify the head, check every commit, push (23).
+
+    The token arrives on stdin and is written to a tmpfs file before anything else
+    happens; `docker cp` cannot reach a tmpfs inside a read-only container and even
+    without `--read-only` it targets the writable layer, which is disk (S10). Nothing
+    here ever carries the value on argv: the credential helper reads the file, and no
+    curl runs at all, because the API calls stay on Crucible's side.
+
+    `GIT_TRACE*` and `GIT_CURL_VERBOSE` print the Authorization header, so the script
+    unsets them rather than trusting the environment it inherited (S10 risks)."""
+    return f"""set -eu
+umask 077
+TOKDIR={_quote(TOKEN_MOUNT)}
+OUT={_quote(PUBLISH_MOUNT)}
+BUNDLE={_quote(BUNDLE_MOUNT)}/work_branch.bundle
+WORK_BRANCH={_quote(work_branch)}
+EXPECTED={_quote(expected_head)}
+CLONE_URL={_quote(clone_url)}
+TRAILER={_quote(commit_trailer)}
+mkdir -p "$OUT"
+cat > "$TOKDIR/token"
+if [ ! -s "$TOKDIR/token" ]; then
+  echo "no token arrived on stdin" > "$OUT/error.txt"; echo no-token > "$OUT/step.txt"; exit 3
+fi
+chmod 0600 "$TOKDIR/token"
+stat -c '%a' "$TOKDIR/token" > "$OUT/token-mode.txt"
+umask 022
+unset GIT_TRACE GIT_TRACE_CURL GIT_CURL_VERBOSE GIT_TRACE_PACKET GIT_TRACE2 || true
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0
+export HOME=/home/worker LC_ALL=C
+export CRUCIBLE_TOKEN_FILE="$TOKDIR/token"
+export CRUCIBLE_CREDENTIAL_HOST={_quote(credential_host)}
+{_CRED_HELPER}
+G="git -c core.hooksPath=/dev/null -c core.pager=cat -c credential.helper= \
+ -c credential.helper=/tmp/cred-helper.sh \
+ -c user.name={_quote(author_name)} -c user.email={_quote(author_email)}"
+cd /home/worker
+echo bundle-verify > "$OUT/step.txt"
+rm -rf publish && mkdir publish && cd publish
+$G init --quiet -b "$WORK_BRANCH" >> "$OUT/publisher.log" 2>&1
+$G bundle verify "$BUNDLE" >> "$OUT/publisher.log" 2>&1
+echo fetch-bundle > "$OUT/step.txt"
+$G fetch --quiet "$BUNDLE" "refs/heads/$WORK_BRANCH:refs/heads/crucible-publish" \
+  >> "$OUT/publisher.log" 2>&1
+HEAD_SHA=$($G rev-parse refs/heads/crucible-publish)
+printf '%s\\n' "$HEAD_SHA" > "$OUT/bundle-head.txt"
+if [ "$HEAD_SHA" != "$EXPECTED" ]; then
+  echo "the bundle head $HEAD_SHA is not the collected head $EXPECTED" > "$OUT/error.txt"
+  echo head-mismatch > "$OUT/step.txt"; exit 4
+fi
+echo remote > "$OUT/step.txt"
+$G remote add origin "$CLONE_URL"
+$G ls-remote origin "refs/heads/$WORK_BRANCH" > "$OUT/ls-remote-before.txt" \
+  2>> "$OUT/publisher.log" || true
+awk '{{print $1}}' "$OUT/ls-remote-before.txt" | head -n 1 > "$OUT/remote-head-before.txt"
+# Every commit the bundle carries must match the policy's author and the attempt
+# trailer, checked here where the commits are, not after they are on the remote.
+echo commit-policy > "$OUT/step.txt"
+REMOTE_BEFORE=$(cat "$OUT/remote-head-before.txt")
+if [ -n "$REMOTE_BEFORE" ]; then
+  $G fetch --quiet origin "refs/heads/$WORK_BRANCH:refs/remotes/origin/$WORK_BRANCH" \
+    >> "$OUT/publisher.log" 2>&1 || true
+  RANGE="refs/remotes/origin/$WORK_BRANCH..refs/heads/crucible-publish"
+else
+  RANGE="refs/heads/crucible-publish"
+fi
+: > "$OUT/author-problems.txt"
+: > "$OUT/trailer-problems.txt"
+for sha in $($G rev-list "$RANGE" 2>/dev/null || true); do
+  who=$($G show -s --format='%ae' "$sha")
+  if [ "$who" != {_quote(author_email)} ]; then
+    printf '%s\\t%s\\n' "$sha" "$who" >> "$OUT/author-problems.txt"
+  fi
+  if ! $G show -s --format='%(trailers:key='"$TRAILER"',valueonly)' "$sha" | grep -q .; then
+    printf '%s\\n' "$sha" >> "$OUT/trailer-problems.txt"
+  fi
+done
+echo push > "$OUT/step.txt"
+# No force, ever. A remote head that is not an ancestor of the bundle head fails here,
+# which is exactly what 23 asks for: record it, wake Foundry, never overwrite.
+if $G push --quiet origin "refs/heads/crucible-publish:refs/heads/$WORK_BRANCH" \
+    2> "$OUT/push.err"; then
+  echo ok > "$OUT/push.txt"
+else
+  echo failed > "$OUT/push.txt"
+  cp "$OUT/push.err" "$OUT/error.txt" 2>/dev/null || true
+  echo push > "$OUT/step.txt"
+  rm -f "$TOKDIR/token"
+  exit 5
+fi
+echo done > "$OUT/step.txt"
+rm -f "$TOKDIR/token"
+exit 0
+"""

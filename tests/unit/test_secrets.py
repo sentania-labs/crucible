@@ -18,7 +18,13 @@ def _join(*parts: str) -> str:
 
 SECRET_FIXTURES: list[tuple[str, str]] = [
     (_join("token ghp_", _repeat("a", 36), " here"), "github_token"),
-    (_join("ghs_", _repeat("B", 36)), "github_token"),
+    # The old 40-character `ghs_` shape and the real 390-character one with dots both
+    # belong to the installation-token pattern now (S10).
+    (_join("ghs_", _repeat("B", 36)), "github_installation_token"),
+    (
+        _join("ghs_", _repeat("aB9._-", 64)),
+        "github_installation_token",
+    ),
     (_join("github_pat_", _repeat("x", 30)), "github_fine_grained_token"),
     (_join("-----BEGIN ", "RSA PRIVATE KEY", "-----"), "private_key_header"),
     (_join("-----BEGIN ", "PRIVATE KEY", "-----"), "private_key_header"),

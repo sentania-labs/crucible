@@ -1,8 +1,8 @@
 """Acceptance (04, 09, 11). Foundry's semantic verdict on a collected head.
 
 Crucible records it and never computes it. An `artifacts` deliverable reaches `accepted`
-here; a `branch` or `pull_request` deliverable records the AcceptanceResult, raises the
-publish-pending flag, and waits in `awaiting_acceptance` for C4's publisher."""
+here; a `branch` or `pull_request` deliverable records the AcceptanceResult and moves to
+`publishing`, where the supervisor pushes the verified head and opens the PR (23)."""
 
 from __future__ import annotations
 
@@ -99,35 +99,22 @@ def record_acceptance(
         return task
     kinds = deliverable_kinds(uow, task)
     if PUBLISHED_DELIVERABLES & set(kinds):
-        # 09 sends these through `publishing`, which is C4. C2 records the acceptance and
-        # leaves the task waiting with a flag, so nothing is accepted unpublished.
-        task.publish_pending = True
-        task.updated_at = now
-        uow.tasks.save(task)
-        record_event(
+        # 09: a `branch` or `pull_request` deliverable goes through `publishing`, where
+        # the supervisor mints a token, pushes the bundle head, and opens or updates the
+        # PR. Nothing is accepted unpublished, and the API does not touch GitHub: the
+        # state change is the request, the supervisor does the work (14).
+        move_task(
             uow,
             clock,
-            EventKind.TASK_PUBLISH_PENDING,
+            task,
+            TaskState.PUBLISHING,
+            EventKind.TASK_PUBLISHING,
             principal=principal.name,
-            task_id=task.id,
             payload={
                 "head_sha": head,
                 "acceptance_id": result.id,
                 "deliverables": kinds,
-                "note": "publishing needs the GitHub publisher, which arrives in C4 (20)",
             },
-        )
-        create_wake(
-            uow,
-            clock,
-            principal_id=task.principal_id,
-            reason=WakeReason.PUBLISH_PENDING,
-            summary=(
-                f"accepted at {head}; the {'/'.join(sorted(set(kinds)))} deliverable waits "
-                "for the publisher, which arrives in C4"
-            ),
-            task=task,
-            raised_by=principal.name,
         )
         return task
     move_task(

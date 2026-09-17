@@ -11,7 +11,7 @@ from crucible.application.auth import mint_token
 from crucible.application.repositories import register_repository
 from crucible.application.transitions import record_event
 from crucible.cli.wiring import wire
-from crucible.contracts.api import RepositoryRegistration
+from crucible.contracts.api import ExternalReviewAttestation, RepositoryRegistration
 from crucible.domain.entities import Role
 from crucible.domain.events import EventKind
 from crucible.logs import configure_logging
@@ -44,6 +44,20 @@ def build_parser() -> argparse.ArgumentParser:
     register.add_argument("--default-branch", default="main")
     register.add_argument("--policy", default="default-software")
     register.add_argument("--installation-id", type=int, default=None)
+    register.add_argument(
+        "--attest-external-review-all-prs",
+        action="store_true",
+        help=(
+            "the operator attests that the external reviewer reviews all pull requests "
+            "on this repository; GitHub exposes the setting nowhere, so registration "
+            "records the attestation (23)"
+        ),
+    )
+    register.add_argument(
+        "--attested-by",
+        default=None,
+        help="who attested, when it is not the invoking operator",
+    )
     return parser
 
 
@@ -105,10 +119,23 @@ def main(argv: list[str] | None = None) -> None:
                     default_branch=args.default_branch,
                     policy_name=args.policy,
                     installation_id=args.installation_id,
+                    external_review=ExternalReviewAttestation(
+                        attested_all_prs=args.attest_external_review_all_prs,
+                        attested_by=args.attested_by,
+                    ),
                 ),
             )
             uow.commit()
-        print(json.dumps({"repository": repo.name, "id": repo.id, "url": repo.url}))
+        print(
+            json.dumps(
+                {
+                    "repository": repo.name,
+                    "id": repo.id,
+                    "url": repo.url,
+                    "external_review_attested": repo.external_review_attested,
+                }
+            )
+        )
         return
 
 

@@ -14,7 +14,13 @@ from crucible.application.acceptance import close_task, record_acceptance
 from crucible.application.cancel_task import cancel_task
 from crucible.application.corrections import amend_task, attach_correction
 from crucible.application.decisions import record_decision, record_disposition
-from crucible.application.queries import task_events, task_list, task_view
+from crucible.application.delivery_decisions import record_ci_decision, record_head_decision
+from crucible.application.queries import (
+    pull_request_view,
+    task_events,
+    task_list,
+    task_view,
+)
 from crucible.application.review import request_review
 from crucible.application.start_task import start_task
 from crucible.application.submit_task import submit_task
@@ -22,10 +28,13 @@ from crucible.contracts.api import (
     AcceptRequest,
     AmendRequest,
     CancelRequest,
+    CIDecisionRequest,
     CloseRequest,
     DecisionRequest,
     DispositionRequest,
     EventList,
+    HeadDecisionRequest,
+    PullRequestView,
     ReviewRequest,
     StartRequest,
     TaskList,
@@ -309,6 +318,69 @@ async def close(
 
     async def produce(uow: UnitOfWork) -> tuple[int, dict[str, Any]]:
         task = close_task(uow, ctx.clock, principal=principal, task_id=task_id, note=body.note)
+        return 200, task_view(uow, task.id).model_dump(mode="json")
+
+    return await with_idempotency(
+        uow_factory=ctx.uow_factory,
+        clock=ctx.clock,
+        principal=principal,
+        key=idempotency_key,
+        body=raw,
+        scope=str(request.url.path),
+        produce=produce,
+    )
+
+
+@router.get("/{task_id}/pull-request", response_model=PullRequestView)
+def get_pull_request(task_id: str, uow: UoW, _principal: Reader) -> PullRequestView:
+    """The PR record with head history, external reviews, dispositions, reactions, and
+    CI certifications (04)."""
+    return pull_request_view(uow, task_id)
+
+
+@router.post("/{task_id}/ci-decision", response_model=TaskView)
+async def ci_decision(
+    task_id: str,
+    body: CIDecisionRequest,
+    request: Request,
+    ctx: Ctx,
+    principal: Orchestrator,
+    idempotency_key: IdemKey = None,
+) -> JSONResponse:
+    raw = await request.body()
+
+    async def produce(uow: UnitOfWork) -> tuple[int, dict[str, Any]]:
+        task = record_ci_decision(
+            uow, ctx.clock, principal=principal, task_id=task_id, request=body
+        )
+        return 200, task_view(uow, task.id).model_dump(mode="json")
+
+    return await with_idempotency(
+        uow_factory=ctx.uow_factory,
+        clock=ctx.clock,
+        principal=principal,
+        key=idempotency_key,
+        body=raw,
+        scope=str(request.url.path),
+        produce=produce,
+    )
+
+
+@router.post("/{task_id}/head-decision", response_model=TaskView)
+async def head_decision(
+    task_id: str,
+    body: HeadDecisionRequest,
+    request: Request,
+    ctx: Ctx,
+    principal: Orchestrator,
+    idempotency_key: IdemKey = None,
+) -> JSONResponse:
+    raw = await request.body()
+
+    async def produce(uow: UnitOfWork) -> tuple[int, dict[str, Any]]:
+        task = record_head_decision(
+            uow, ctx.clock, principal=principal, task_id=task_id, request=body
+        )
         return 200, task_view(uow, task.id).model_dump(mode="json")
 
     return await with_idempotency(

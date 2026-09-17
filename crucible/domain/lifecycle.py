@@ -134,6 +134,12 @@ TASK_TRANSITIONS: frozenset[tuple[TaskState, TaskState]] = frozenset(
         (_S.AWAITING_CI_CERTIFICATION, _S.HEAD_DIVERGED),
         (_S.READY_FOR_MERGE, _S.HEAD_DIVERGED),
         (_S.HEAD_DIVERGED, _S.REPORTED),
+        # A `recollect` decision puts the task back into supervision against the remote
+        # work branch, which is where the divergent head is. 09 draws this edge to
+        # `reported`; C4 re-enters at `scheduled` so the new head gets a claim and the
+        # full pre-PR path rather than gates that fail for want of a report
+        # (docs/implementation-notes/c4.md).
+        (_S.HEAD_DIVERGED, _S.SCHEDULED),
         (_S.HEAD_DIVERGED, _S.REJECTED),
         (_S.HEAD_DIVERGED, _S.CANCELLED),
         (_S.READY_FOR_MERGE, _S.MERGED),

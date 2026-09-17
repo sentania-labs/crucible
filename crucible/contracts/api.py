@@ -8,7 +8,13 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from crucible.contracts.common import SCHEMA_VERSION, Rfc3339, StrictModel
 from crucible.contracts.task_contract import HarnessName, ProviderName
-from crucible.domain.entities import AcceptanceVerdict, DispositionKind
+from crucible.domain.entities import (
+    AcceptanceVerdict,
+    CIAction,
+    CICause,
+    DispositionKind,
+    HeadAction,
+)
 from crucible.domain.exit_class import ExitClass
 from crucible.domain.lifecycle import AttemptState, ExecutionState, TaskState
 
@@ -69,7 +75,6 @@ class TaskView(Response):
     executions: list[ExecutionSummary]
     latest_attempt: AttemptSummary | None
     head_sha: str | None
-    publish_pending: bool
     gate_summary: dict[str, Any]
     pull_request: dict[str, Any] | None
     open_escalations: list[dict[str, Any]]
@@ -210,11 +215,21 @@ class SupervisorView(Response):
     github: dict[str, Any] | None
 
 
+class ExternalReviewAttestation(StrictModel):
+    """23: GitHub exposes the reviewer's "review all pull requests" setting nowhere, so
+    onboarding records the operator's word for it, with who attested and when."""
+
+    attested_all_prs: bool = False
+    attested_by: str | None = None
+    note: str | None = None
+
+
 class RepositoryRegistration(StrictModel):
     url: str = Field(min_length=1)
     default_branch: str = Field(min_length=1)
     policy_name: str = Field(min_length=1)
     installation_id: int | None = None
+    external_review: ExternalReviewAttestation = Field(default_factory=ExternalReviewAttestation)
 
 
 class RepositoryView(Response):
@@ -226,6 +241,9 @@ class RepositoryView(Response):
     installation_id: int | None
     registered_by: str
     created_at: Rfc3339
+    external_review_attested: bool = False
+    attested_by: str | None = None
+    attested_at: Rfc3339 | None = None
 
 
 # ----- C2: review, acceptance, corrections, decisions, wakes, policies, artifacts ----
@@ -276,6 +294,140 @@ class DispositionRequest(StrictModel):
 
 class CloseRequest(StrictModel):
     note: str = Field(min_length=1)
+
+
+# ----- C4: GitHub delivery (04, 23) --------------------------------------
+
+
+class CIDecisionRequest(StrictModel):
+    """Foundry's reading of a CI failure (23). The cause enum is fixed; a rerun is
+    recorded and the operator performs it, because re-running needs Actions write."""
+
+    cause: CICause
+    action: CIAction
+    reasoning: str = Field(min_length=1)
+
+
+class HeadDecisionRequest(StrictModel):
+    """What to do about a head Crucible did not push (09, 23)."""
+
+    action: HeadAction
+    reasoning: str = Field(min_length=1)
+
+
+class PublishRetryRequest(StrictModel):
+    reason: str = Field(min_length=1)
+
+
+class PullRequestHeadView(Response):
+    sha: str
+    pushed_by: str
+    observed_at: Rfc3339
+
+
+class ExternalReviewView(Response):
+    id: str
+    reviewer_login: str
+    signal: str
+    github_id: str
+    reviewed_sha: str | None
+    sha_inferred: bool
+    state: str
+    accepted: bool
+    received_at: Rfc3339
+
+
+class ReviewCommentView(Response):
+    id: str
+    github_id: str
+    kind: str
+    login: str
+    path: str | None
+    line: int | None
+    body: str
+    reviewed_sha: str | None
+    created_at: Rfc3339
+    updated_at: Rfc3339
+    disposition: dict[str, Any] | None = None
+
+
+class ReviewCycleView(Response):
+    id: str
+    head_sha: str
+    components: list[str]
+    completed_components: dict[str, str]
+    state: str
+    trigger: str
+    opened_at: Rfc3339
+    completed_at: Rfc3339 | None
+
+
+class ReactionView(Response):
+    subject_kind: str
+    subject_github_id: str
+    github_id: str
+    login: str
+    content: str
+    observed_at: Rfc3339
+    removed_at: Rfc3339 | None
+
+
+class CICertificationView(Response):
+    id: str
+    head_sha: str
+    state: str
+    detail: str
+    required_checks: list[Any]
+    check_runs: list[Any]
+    failure: dict[str, Any]
+    evaluated_at: Rfc3339
+
+
+class CIDecisionView(Response):
+    id: str
+    cause: str
+    action: str
+    reasoning: str
+    principal: str
+    created_at: Rfc3339
+
+
+class PullRequestView(Response):
+    id: str
+    task_id: str
+    number: int
+    url: str
+    state: str
+    base_ref: str
+    work_branch: str
+    head_sha: str
+    title: str
+    body_sha256: str
+    opened_at: Rfc3339
+    merged_at: Rfc3339 | None
+    merge_sha: str | None
+    merged_by: str | None
+    closed_at: Rfc3339 | None
+    closed_by: str | None
+    last_polled_at: Rfc3339 | None
+    reactions_observable: bool
+    completed_rounds: int
+    required_rounds: int
+    heads: list[PullRequestHeadView]
+    cycles: list[ReviewCycleView]
+    external_reviews: list[ExternalReviewView]
+    comments: list[ReviewCommentView]
+    reactions: list[ReactionView]
+    ci_certifications: list[CICertificationView]
+    ci_decisions: list[CIDecisionView]
+    gates: list[GateResultView]
+
+
+class WebhookAck(Response):
+    delivery_id: str
+    accepted: bool
+    duplicate: bool
+    detail: str
 
 
 class AmendRequest(StrictModel):

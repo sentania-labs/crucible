@@ -27,6 +27,10 @@ class AppContext:
     engine: Engine
     artifact_store: ArtifactStore
     lease_ttl_seconds: int = 30
+    # 23: the webhook receiver is off by default, and its secret is a path Crucible
+    # reads, never a configuration value.
+    github_webhook_enabled: bool = False
+    github_webhook_secret_path: str | None = None
 
 
 def app_context(request: Request) -> AppContext:

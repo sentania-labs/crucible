@@ -47,6 +47,12 @@ class Repository:
     installation_id: int | None
     registered_by: str
     created_at: datetime
+    # 23: the operator's attestation that the external reviewer reviews all pull
+    # requests here. GitHub exposes the setting nowhere, so a registration without it is
+    # accepted only with external_review.required_rounds: 0.
+    external_review_attested: bool = False
+    attested_by: str | None = None
+    attested_at: datetime | None = None
 
 
 @dataclass(slots=True)
@@ -76,9 +82,6 @@ class Task:
     # The head SHA the collector produced for the latest implement or correct attempt.
     # Everything after `reported` is bound to it (09).
     head_sha: str | None = None
-    # `branch` and `pull_request` deliverables stop at awaiting_acceptance in C2: an
-    # accept records the AcceptanceResult and raises this flag for C4's publisher.
-    publish_pending: bool = False
 
 
 @dataclass(slots=True)
@@ -386,3 +389,184 @@ class RoutingPolicyRecord:
     document: dict[str, Any]
     created_at: datetime
     retired_at: datetime | None = None
+
+
+# ----- GitHub delivery (23) ---------------------------------------------
+
+
+class PullRequestState(StrEnum):
+    OPENING = "opening"
+    OPEN = "open"
+    MERGED = "merged"
+    CLOSED = "closed"
+
+
+class PushedBy(StrEnum):
+    CRUCIBLE = "crucible"
+    OTHER = "other"
+
+
+class CertificationStateValue(StrEnum):
+    PENDING = "pending"
+    GREEN = "green"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+
+
+class CICause(StrEnum):
+    FALSE_PRE_PR_EVIDENCE = "false_pre_pr_evidence"
+    WRONG_SHA_CHECKED = "wrong_sha_checked"
+    CORRECTION_WITHOUT_CHECKS = "correction_without_checks"
+    ENVIRONMENT_DRIFT = "environment_drift"
+    FLAKY_TEST = "flaky_test"
+    CRUCIBLE_VERIFICATION_DEFECT = "crucible_verification_defect"
+    CI_INFRASTRUCTURE = "ci_infrastructure"
+    OTHER = "other"
+
+
+class CIAction(StrEnum):
+    RERUN = "rerun"
+    CORRECT = "correct"
+    REJECT = "reject"
+    CANCEL = "cancel"
+
+
+class HeadAction(StrEnum):
+    RECOLLECT = "recollect"
+    REJECT = "reject"
+    CANCEL = "cancel"
+
+
+@dataclass(slots=True)
+class PullRequest:
+    id: str
+    task_id: str
+    repository_id: str
+    number: int
+    url: str
+    base_ref: str
+    work_branch: str
+    state: PullRequestState
+    head_sha: str
+    opened_at: datetime
+    body_sha256: str = ""
+    title: str = ""
+    merged_at: datetime | None = None
+    merge_sha: str | None = None
+    merged_by: str | None = None
+    closed_at: datetime | None = None
+    closed_by: str | None = None
+    last_polled_at: datetime | None = None
+    last_reactions_polled_at: datetime | None = None
+    reactions_observable: bool = True
+    cancelled_at: datetime | None = None
+
+
+@dataclass(slots=True)
+class PullRequestHead:
+    id: str
+    pull_request_id: str
+    sha: str
+    pushed_by: PushedBy
+    observed_at: datetime
+
+
+@dataclass(slots=True)
+class ExternalReviewCycle:
+    """One configured review cycle on one published head (23)."""
+
+    id: str
+    pull_request_id: str
+    head_sha: str
+    components: list[str]
+    completed_components: dict[str, str]
+    state: str
+    opened_at: datetime
+    completed_at: datetime | None = None
+    trigger: str = "publication"
+
+
+@dataclass(slots=True)
+class ExternalReview:
+    id: str
+    pull_request_id: str
+    cycle_id: str | None
+    reviewer_login: str
+    signal: str
+    github_id: str
+    reviewed_sha: str | None
+    body: str
+    body_sha256: str
+    received_at: datetime
+    state: str = ""
+    accepted: bool = False
+    sha_inferred: bool = False
+
+
+@dataclass(slots=True)
+class ReviewComment:
+    id: str
+    pull_request_id: str
+    external_review_id: str | None
+    github_id: str
+    kind: str
+    login: str
+    path: str | None
+    line: int | None
+    body: str
+    body_sha256: str
+    created_at: datetime
+    updated_at: datetime
+    reviewed_sha: str | None = None
+
+
+@dataclass(slots=True)
+class Reaction:
+    id: str
+    pull_request_id: str
+    subject_kind: str
+    subject_github_id: str
+    github_id: str
+    login: str
+    content: str
+    observed_at: datetime
+    created_at: datetime | None = None
+    removed_at: datetime | None = None
+
+
+@dataclass(slots=True)
+class CICertification:
+    id: str
+    pull_request_id: str
+    task_id: str
+    head_sha: str
+    state: str
+    required_checks: list[Any]
+    check_runs: list[Any]
+    failure: dict[str, Any]
+    detail: str
+    evaluated_at: datetime
+
+
+@dataclass(slots=True)
+class CIDecision:
+    id: str
+    task_id: str
+    ci_certification_id: str | None
+    principal_id: str
+    cause: str
+    action: str
+    reasoning: str
+    created_at: datetime
+
+
+@dataclass(slots=True)
+class GitHubDelivery:
+    delivery_id: str
+    event: str
+    action: str
+    repository: str
+    body_sha256: str
+    normalized: dict[str, Any]
+    received_at: datetime
+    processed_at: datetime | None = None

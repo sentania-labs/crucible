@@ -534,6 +534,16 @@ class Dispositions:
         )
         self._s.flush()
 
+    def list_for_comments(self, comment_ids: Sequence[str]) -> Sequence[ReviewDisposition]:
+        if not comment_ids:
+            return []
+        rows = self._s.scalars(
+            select(ReviewDispositionRow).where(
+                ReviewDispositionRow.review_comment_id.in_(list(comment_ids))
+            )
+        ).all()
+        return [self._to_entity(r) for r in rows]
+
     def get_by_comment(self, review_comment_id: str) -> ReviewDisposition | None:
         row = self._s.scalar(
             select(ReviewDispositionRow).where(

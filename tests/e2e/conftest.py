@@ -35,7 +35,7 @@ from crucible.adapters.storage.disk import DiskArtifactStore
 from crucible.application.auth import mint_token
 from crucible.application.repositories import register_repository
 from crucible.application.supervisor import Supervisor
-from crucible.contracts.api import RepositoryRegistration
+from crucible.contracts.api import ExternalReviewAttestation, RepositoryRegistration
 from crucible.domain.entities import Role
 from tests.e2e import daemon
 from tests.e2e.policy import e2e_policy_document, e2e_routing_document
@@ -374,7 +374,12 @@ def register(ctx: AppContext, name: str, url: str) -> None:
             principal_name="tests",
             name=name,
             registration=RepositoryRegistration(
-                url=url, default_branch="main", policy_name="e2e-script"
+                url=url,
+                default_branch="main",
+                policy_name="e2e-script",
+                external_review=ExternalReviewAttestation(
+                    attested_all_prs=True, attested_by="tests"
+                ),
             ),
         )
         uow.commit()
