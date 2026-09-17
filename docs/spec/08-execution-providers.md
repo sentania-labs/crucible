@@ -41,7 +41,11 @@ paths, emit N log lines. Every lifecycle and gate test runs against it.
 
 - Talks to Docker through the socket proxy endpoint, never the raw socket
   (13). API version pinned.
-- `prepare`: take the checkout lease first; then `git clone --reference
+- `prepare`: the supervisor takes the checkout lease (a fenced row the
+  provider cannot write) before calling `prepare`; `prepare` itself runs
+  in a throwaway preparer container (the Crucible image carries no git,
+  and under rootless Docker the checkout must be created by the
+  container uid that will own it) which performs `git clone --reference
   <cache> --dissociate` into `<artifact_root>/workspaces/<attempt>/repo`
   (the cache is a bare repository Crucible refreshes with a short-lived
   installation token that never reaches the workspace; nothing shared is
@@ -78,11 +82,16 @@ paths, emit N log lines. Every lifecycle and gate test runs against it.
   SHA, `git log --format` of `work_branch`, and a copy of the report
   directory. Git in the collector runs with `GIT_CONFIG_GLOBAL=/dev/null`,
   `GIT_CONFIG_NOSYSTEM=1`, `-c core.fsmonitor= -c diff.external= -c
-  core.pager=cat -c core.hooksPath=/dev/null`. The copy step opens every
-  file with `O_NOFOLLOW`, rejects symlinks, hard links, devices, and files
-  above the policy size cap, and records each rejection as an event. The
+  core.pager=cat -c core.hooksPath=/dev/null`. The copy step guarantees that
+  no symlink is followed and no hard link, device, or file above the
+  policy size cap is copied, recording each rejection as an event; the
+  mechanism is the collector's choice (C3 enumerates with `find -P` and
+  copies only regular files, since worker images carry no `O_NOFOLLOW`
+  helper). The
   collector also writes `work_branch.bundle` (`git bundle create` of
-  `base_ref..work_branch`) and Crucible runs `git bundle verify` on it;
+  `base_ref..work_branch`) and a second throwaway container with
+  `--network none` runs `git bundle verify` on it (never the Crucible
+  process, which has no git and must not parse worker-produced files);
   the bundle is the only thing the publisher (23) ever fetches from.
   Everything read from the tree is data.
 - `terminate`: `drain` sends SIGTERM and waits the policy grace; `kill`

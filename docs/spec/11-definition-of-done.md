@@ -147,7 +147,8 @@ consequential ones go to the user as escalations.
 `evidence`: `attempt_id` or `pull_request_id`, `kind` (exit_info,
 diff_paths, diff_content, bundle_head, remote_head, pr_state,
 review_received, check_run, scanner_result, artifact_present,
-claim_parsed, review_report, transcript_match),
+claim_parsed, review_report, verification_run, workspace_state,
+transcript_match),
 `observed_at`, `source` (`crucible`, `github`, or `worker`), `verified`
 (true for `crucible` and for `github` deliveries that passed signature
 verification or came from a poll), `payload`, `artifact_id`. Gates may
