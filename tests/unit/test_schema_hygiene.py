@@ -24,10 +24,10 @@ def test_no_secret_bearing_column_names() -> None:
 
 def test_migration_event_kinds_match_enum() -> None:
     from crucible.adapters.persistence.migrations.versions import (  # noqa: PLC0415
-        _0006_log_occurrence as m,
+        _0007_github_delivery as m,
     )
 
-    # 0006 owns the current CHECK constraint; adding a kind is a new migration (10).
+    # 0007 owns the current CHECK constraint; adding a kind is a new migration (10).
     assert set(m._event_kinds()) == {k.value for k in EventKind}
 
 
@@ -55,5 +55,9 @@ def test_openapi_generates_from_the_pydantic_models() -> None:
         "/v1/wakes",
         "/v1/policies/{name}/{version}",
         "/v1/routing/usage",
+        "/v1/tasks/{task_id}/pull-request",
+        "/v1/tasks/{task_id}/ci-decision",
+        "/v1/tasks/{task_id}/head-decision",
+        "/v1/github/webhook",
     } <= paths
     assert all(p.startswith("/v1/") for p in paths)

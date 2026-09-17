@@ -78,6 +78,49 @@ class DockerSettings(BaseModel):
     extra_image_allowlist: list[str] = Field(default_factory=list)
 
 
+class GitHubAppSettings(BaseModel):
+    """The App's identity and the files Crucible reads to use it (12).
+
+    `app_id` is a public identifier. `private_key_path` and `webhook_secret_path` are
+    paths to files; no key, secret, or token is ever a configuration *value*, and the
+    paths come from configuration precisely so no operator path is ever hardcoded in
+    this repository."""
+
+    app_id: int = 0
+    private_key_path: str | None = None
+    webhook_secret_path: str | None = None
+
+
+class GitHubSettings(BaseModel):
+    """GitHub delivery (12, 23)."""
+
+    enabled: bool = False
+    app: GitHubAppSettings = Field(default_factory=GitHubAppSettings)
+    api_base: str = "https://api.github.com"
+    api_timeout_seconds: float = 20.0
+    # 23 defaults. The reaction poll is part of every cycle, not an extra: GitHub emits
+    # no webhook for a reaction and the reviewer's clean verdict is one.
+    poll_interval_seconds: int = 120
+    reactions_poll_interval_seconds: int = 60
+    # The optional accelerator, off by default on a workstation (Q13).
+    webhook_enabled: bool = False
+    # The publisher container. The image is the attempt's own worker image unless a
+    # deployment pins one; the network is the egress network with github.com allowed.
+    publisher_image: str | None = None
+    # 23 step 3: the publisher runs on an egress network whose allowlist is `github.com`
+    # and `api.github.com` and nothing else. That is a narrower list than the workers'
+    # proxy permits, so the publisher gets its own network and proxy by default; a
+    # deployment that has only one may point this at it deliberately.
+    publisher_network: str = "crucible-publish"
+    publisher_egress_proxy: str | None = None
+    publisher_timeout_seconds: int = 600
+    credential_host: str = "github.com"
+    # 23: posting a comment under Crucible's App identity is refused by the provider and
+    # is not Crucible's act anyway. Off unless a deployment deliberately turns it on.
+    allow_issue_comments: bool = False
+    ci_log_excerpt_bytes: int = 64 * 1024
+
+
 class WakeSettings(BaseModel):
     """Wake delivery (17). The secret comes from the environment and is never stored."""
 
@@ -95,6 +138,7 @@ class Settings(BaseSettings):
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)
     supervisor: SupervisorSettings = Field(default_factory=SupervisorSettings)
     docker: DockerSettings = Field(default_factory=DockerSettings)
+    github: GitHubSettings = Field(default_factory=GitHubSettings)
     wake: WakeSettings = Field(default_factory=WakeSettings)
 
     @classmethod

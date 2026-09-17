@@ -122,22 +122,11 @@ def attach_correction(
                     ),
                 }
             )
-        if task.publish_pending:
-            problems.append(
-                {
-                    "path": "$",
-                    "message": (
-                        "this head was accepted and is waiting for the publisher; "
-                        "correcting it would abandon an accepted head"
-                    ),
-                }
-            )
     if problems:
         raise ContractValidationError("correction failed validation", errors=problems)
     stored = _store_version(uow, clock, task, contract)
     task.contract_version = stored.version
     task.head_sha = None
-    task.publish_pending = False
     uow.tasks.save(task)
     record_event(
         uow,
@@ -250,13 +239,6 @@ def amend_task(
                         ),
                     }
                 )
-        if task.publish_pending:
-            problems.append(
-                {
-                    "path": "$",
-                    "message": "this head was accepted and is waiting for the publisher",
-                }
-            )
     if problems:
         raise ContractValidationError("amendment failed validation", errors=problems)
     stored = _store_version(uow, clock, task, contract)

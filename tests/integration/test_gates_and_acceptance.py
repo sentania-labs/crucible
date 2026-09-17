@@ -67,7 +67,7 @@ async def test_pass_path_reaches_awaiting_acceptance_then_accepted(
     )
     assert accepted.status_code == 200
     body = accepted.json()
-    assert body["state"] == "accepted" and body["publish_pending"] is False
+    assert body["state"] == "accepted"
     assert body["acceptance_results"][0]["verdict"] == "accepted"
     kinds = event_kinds(client, task_id)
     for kind in (
@@ -94,11 +94,11 @@ async def test_deferred_gates_carry_a_marker_and_never_pass(
         assert row["result"] == "pending" and DEFERRED_MARKER in row["detail"]
 
 
-async def test_pull_request_deliverable_stops_at_publish_pending(
+async def test_pull_request_deliverable_enters_publishing(
     client: TestClient, supervisor: Supervisor
 ) -> None:
-    """09 sends a PR deliverable through `publishing`, which is C4; C2 records the
-    acceptance and raises the flag instead."""
+    """09: an accepted PR deliverable goes through `publishing`. Nothing is accepted
+    unpublished, and the API never touches GitHub: the state change is the request."""
     task_id = submit_and_start(client, "crucible-worker:fake-succeed")
     await run_to_settled(supervisor, client, task_id)
     await review_and_settle(supervisor, client, task_id)
@@ -106,10 +106,9 @@ async def test_pull_request_deliverable_stops_at_publish_pending(
         f"/v1/tasks/{task_id}/accept",
         json={"verdict": "accepted", "reasoning": "Good; publish it."},
     ).json()
-    assert body["state"] == "awaiting_acceptance" and body["publish_pending"] is True
-    assert "task_publish_pending" in event_kinds(client, task_id)
-    wakes = client.get("/v1/wakes").json()["items"]
-    assert any(w["reason"] == "publish_pending" for w in wakes)
+    assert body["state"] == "publishing"
+    assert "task_publishing" in event_kinds(client, task_id)
+    assert body["pull_request"] is None
 
 
 async def test_fail_path_scope_contained(client: TestClient, supervisor: Supervisor) -> None:

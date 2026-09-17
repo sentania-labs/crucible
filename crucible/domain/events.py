@@ -5,6 +5,10 @@ from __future__ import annotations
 from enum import StrEnum
 
 PRINCIPAL_CRUCIBLE = "crucible"
+# A webhook delivery has no authenticated principal and is not the supervisor's write:
+# events about one are recorded under GitHub's own name, which is also what keeps them
+# outside the fenced set (14).
+PRINCIPAL_GITHUB = "github"
 
 
 class EventKind(StrEnum):
@@ -100,6 +104,48 @@ class EventKind(StrEnum):
     SUPERVISOR_LEASE_RELEASED = "supervisor_lease_released"
     ORPHAN_REMOVED = "orphan_removed"
     RETENTION_APPLIED = "retention_applied"
+    # publication (23)
+    TASK_PUBLISHING = "task_publishing"
+    PUBLISH_STARTED = "publish_started"
+    INSTALLATION_TOKEN_MINTED = "installation_token_minted"
+    PUBLISHER_STARTED = "publisher_started"
+    PUBLISHER_FINISHED = "publisher_finished"
+    BRANCH_PUSHED = "branch_pushed"
+    PULL_REQUEST_OPENED = "pull_request_opened"
+    PULL_REQUEST_HEAD_UPDATED = "pull_request_head_updated"
+    PUBLISH_COMPLETED = "publish_completed"
+    TASK_PUBLISH_FAILED = "task_publish_failed"
+    TASK_AWAITING_EXTERNAL_REVIEW = "task_awaiting_external_review"
+    TASK_AWAITING_CI_CERTIFICATION = "task_awaiting_ci_certification"
+    # observation (23)
+    PULL_REQUEST_POLLED = "pull_request_polled"
+    PULL_REQUEST_STATE_CHANGED = "pull_request_state_changed"
+    PULL_REQUEST_HEAD_OBSERVED = "pull_request_head_observed"
+    REACTIONS_UNOBSERVABLE = "reactions_unobservable"
+    REACTION_RECEIVED = "reaction_received"
+    REACTION_REMOVED = "reaction_removed"
+    EXTERNAL_REVIEW_RECEIVED = "external_review_received"
+    REVIEW_COMMENT_RECEIVED = "review_comment_received"
+    ISSUE_COMMENT_RECEIVED = "issue_comment_received"
+    EXTERNAL_REVIEW_IGNORED = "external_review_ignored"
+    EXTERNAL_REVIEW_CYCLE_OPENED = "external_review_cycle_opened"
+    EXTERNAL_REVIEW_CYCLE_COMPLETED = "external_review_cycle_completed"
+    EXTERNAL_REVIEW_TRIGGER_NEEDED = "external_review_trigger_needed"
+    TASK_EXTERNAL_FEEDBACK_RECEIVED = "task_external_feedback_received"
+    CHECK_RUN_OBSERVED = "check_run_observed"
+    WORKFLOW_RUN_OBSERVED = "workflow_run_observed"
+    CI_CERTIFICATION_RECORDED = "ci_certification_recorded"
+    TASK_CI_CERTIFICATION_FAILED = "task_ci_certification_failed"
+    CI_DECISION_RECORDED = "ci_decision_recorded"
+    TASK_READY_FOR_MERGE = "task_ready_for_merge"
+    TASK_MERGED = "task_merged"
+    TASK_HEAD_DIVERGED = "task_head_diverged"
+    HEAD_DECISION_RECORDED = "head_decision_recorded"
+    SUPERSEDED_FOR_HEAD = "superseded_for_head"
+    GITHUB_DELIVERY_RECEIVED = "github_delivery_received"
+    GITHUB_DELIVERY_REJECTED = "github_delivery_rejected"
+    GITHUB_RATE_LIMITED = "github_rate_limited"
     # principals and configuration
     PRINCIPAL_CREATED = "principal_created"
     REPOSITORY_REGISTERED = "repository_registered"
+    REPOSITORY_ATTESTATION_RECORDED = "repository_attestation_recorded"

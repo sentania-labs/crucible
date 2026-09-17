@@ -47,7 +47,7 @@ def reconstruct(client: TestClient, task_id: str) -> dict[str, Any]:
     return {
         "state": task["state"],
         "head_sha": task["head_sha"],
-        "publish_pending": task["publish_pending"],
+        "pull_request": task["pull_request"],
         "contract_version": task["contract_version"],
         "contract_versions": [v["version"] for v in task["contract_versions"]],
         "executions": [(e["role"], e["state"]) for e in task["executions"]],
@@ -85,7 +85,7 @@ async def test_a_client_reconstructs_the_whole_run_from_the_api(
     await supervisor.tick()
 
     view = reconstruct(client, task_id)
-    assert view["state"] == "accepted" and view["publish_pending"] is False
+    assert view["state"] == "accepted" and view["pull_request"] is None
     assert view["head_sha"] and len(view["head_sha"]) == 40
     assert view["executions"] == [("implement", "succeeded")]
     assert view["attempts"] == [(1, "succeeded", "completed")]

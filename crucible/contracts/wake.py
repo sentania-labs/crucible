@@ -26,7 +26,17 @@ class WakeReason(StrEnum):
     ESCALATION_STALE = "escalation_stale"
     SUPERVISOR_TAKEOVER = "supervisor_takeover"
     NEEDS_MORE_WORK = "needs_more_work"
-    PUBLISH_PENDING = "publish_pending"
+    # 23 and 17: the delivery half.
+    PUBLISH_FAILED = "publish_failed"
+    EXTERNAL_FEEDBACK_RECEIVED = "external_feedback_received"
+    EXTERNAL_REVIEW_OVERDUE = "external_review_overdue"
+    EXTERNAL_REVIEW_TRIGGER_NEEDED = "external_review_trigger_needed"
+    CI_CERTIFICATION_FAILED = "ci_certification_failed"
+    CI_CERTIFICATION_OVERDUE = "ci_certification_overdue"
+    CI_RERUN_NEEDED = "ci_rerun_needed"
+    HEAD_DIVERGED = "head_diverged"
+    READY_FOR_MERGE = "ready_for_merge"
+    MERGED = "merged"
 
 
 class WakeTask(StrictModel):

@@ -1,8 +1,9 @@
 """Decisions, escalations, and review dispositions (03, 04, 09).
 
 An escalation is opened when a worker blocks; a Decision that references it closes it and
-lets the task be scheduled again. Dispositions exist as rows now; the external review
-comments they refer to arrive with GitHub delivery in C4 (20)."""
+lets the task be scheduled again. A disposition is Foundry's reading of one external
+review comment; Crucible records it, the `feedback_dispositions_complete` gate counts
+them, and nothing is ever forwarded to a worker (ADR 0008)."""
 
 from __future__ import annotations
 
@@ -206,12 +207,18 @@ def record_disposition(
         raise TransitionNotAllowedError(
             f"review comment {request.review_comment_id} already has a disposition"
         )
-    # External reviews and their comments are recorded by the GitHub delivery phase (C4).
-    # Until then nothing produces a comment id, so a disposition has nothing to attach to.
-    raise NotFoundError(
-        f"review comment {request.review_comment_id!r} is unknown: external review recording "
-        "arrives with GitHub delivery in C4 (20)"
-    )
+    comment = uow.review_comments.get(request.review_comment_id)
+    if comment is None:
+        raise NotFoundError(f"review comment {request.review_comment_id!r} is unknown")
+    pull_request = uow.pull_requests.get_for_task(task.id)
+    if pull_request is None or comment.pull_request_id != pull_request.id:
+        raise NotFoundError(
+            f"review comment {request.review_comment_id!r} is not on this task's pull request"
+        )
+    # A `fix` disposition is Foundry's finding, not an instruction to a worker: Crucible
+    # never forwards feedback (ADR 0008). The correction contract that follows is
+    # Foundry's own act through POST /tasks/{id}/corrections.
+    return store_disposition(uow, clock, principal=principal, task_id=task_id, request=request)
 
 
 def store_disposition(

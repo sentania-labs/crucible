@@ -51,6 +51,9 @@ class RepositoryRow(Base):
     policy_name: Mapped[str] = mapped_column(String(128))
     registered_by: Mapped[str] = mapped_column(String(128))
     created_at: Mapped[datetime] = mapped_column(TZ)
+    external_review_attested: Mapped[bool] = mapped_column(Boolean, default=False)
+    attested_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    attested_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
 
 
 class PolicyRow(Base):
@@ -83,7 +86,6 @@ class TaskRow(Base):
     updated_at: Mapped[datetime] = mapped_column(TZ)
     closed_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
     head_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    publish_pending: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 class TaskContractRow(Base):
@@ -423,3 +425,188 @@ class AttemptMetricsRow(Base):
     corrections_after: Mapped[int] = mapped_column(Integer, default=0)
     acceptance_verdict: Mapped[str | None] = mapped_column(String(24), nullable=True)
     created_at: Mapped[datetime] = mapped_column(TZ)
+
+
+# ----- C4: GitHub delivery (14, 23) --------------------------------------
+
+
+class PullRequestRow(Base):
+    __tablename__ = "pull_requests"
+    __table_args__ = (
+        UniqueConstraint("repository_id", "number", name="uq_pull_requests_repo_number"),
+        Index("ix_pull_requests_state", "state"),
+    )
+    id: Mapped[str] = mapped_column(ID, primary_key=True)
+    task_id: Mapped[str] = mapped_column(ID, ForeignKey("tasks.id"), unique=True)
+    repository_id: Mapped[str] = mapped_column(ID, ForeignKey("repositories.id"))
+    number: Mapped[int] = mapped_column(Integer)
+    url: Mapped[str] = mapped_column(Text)
+    base_ref: Mapped[str] = mapped_column(String(255))
+    work_branch: Mapped[str] = mapped_column(String(255))
+    state: Mapped[str] = mapped_column(String(16))
+    head_sha: Mapped[str] = mapped_column(String(64))
+    title: Mapped[str] = mapped_column(Text)
+    body_sha256: Mapped[str] = mapped_column(String(64))
+    opened_at: Mapped[datetime] = mapped_column(TZ)
+    merged_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
+    merge_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    merged_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    closed_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
+    closed_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    last_polled_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
+    last_reactions_polled_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
+    reactions_observable: Mapped[bool] = mapped_column(Boolean, default=True)
+    cancelled_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
+
+
+class PullRequestHeadRow(Base):
+    __tablename__ = "pull_request_heads"
+    __table_args__ = (
+        UniqueConstraint("pull_request_id", "sha", name="uq_pull_request_heads_sha"),
+        Index("ix_pull_request_heads_pr", "pull_request_id"),
+    )
+    id: Mapped[str] = mapped_column(ID, primary_key=True)
+    pull_request_id: Mapped[str] = mapped_column(ID, ForeignKey("pull_requests.id"))
+    sha: Mapped[str] = mapped_column(String(64))
+    pushed_by: Mapped[str] = mapped_column(String(16))
+    observed_at: Mapped[datetime] = mapped_column(TZ)
+
+
+class ExternalReviewCycleRow(Base):
+    __tablename__ = "external_review_cycles"
+    __table_args__ = (Index("ix_external_review_cycles_pr", "pull_request_id", "head_sha"),)
+    id: Mapped[str] = mapped_column(ID, primary_key=True)
+    pull_request_id: Mapped[str] = mapped_column(ID, ForeignKey("pull_requests.id"))
+    head_sha: Mapped[str] = mapped_column(String(64))
+    components: Mapped[list[Any]] = mapped_column(JSONB)
+    completed_components: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    state: Mapped[str] = mapped_column(String(16))
+    trigger: Mapped[str] = mapped_column(String(32))
+    opened_at: Mapped[datetime] = mapped_column(TZ)
+    completed_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
+
+
+class ExternalReviewRow(Base):
+    __tablename__ = "external_reviews"
+    __table_args__ = (
+        UniqueConstraint(
+            "pull_request_id", "signal", "github_id", name="uq_external_reviews_github_id"
+        ),
+        Index("ix_external_reviews_pr", "pull_request_id"),
+    )
+    id: Mapped[str] = mapped_column(ID, primary_key=True)
+    pull_request_id: Mapped[str] = mapped_column(ID, ForeignKey("pull_requests.id"))
+    cycle_id: Mapped[str | None] = mapped_column(
+        ID, ForeignKey("external_review_cycles.id"), nullable=True
+    )
+    reviewer_login: Mapped[str] = mapped_column(String(128))
+    signal: Mapped[str] = mapped_column(String(16))
+    github_id: Mapped[str] = mapped_column(String(64))
+    reviewed_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    sha_inferred: Mapped[bool] = mapped_column(Boolean, default=False)
+    state: Mapped[str] = mapped_column(String(32))
+    body: Mapped[str] = mapped_column(Text)
+    body_sha256: Mapped[str] = mapped_column(String(64))
+    accepted: Mapped[bool] = mapped_column(Boolean, default=False)
+    received_at: Mapped[datetime] = mapped_column(TZ)
+
+
+class ReviewCommentRow(Base):
+    __tablename__ = "review_comments"
+    __table_args__ = (
+        UniqueConstraint(
+            "pull_request_id", "kind", "github_id", name="uq_review_comments_github_id"
+        ),
+        Index("ix_review_comments_pr", "pull_request_id"),
+    )
+    id: Mapped[str] = mapped_column(ID, primary_key=True)
+    pull_request_id: Mapped[str] = mapped_column(ID, ForeignKey("pull_requests.id"))
+    external_review_id: Mapped[str | None] = mapped_column(
+        ID, ForeignKey("external_reviews.id"), nullable=True
+    )
+    github_id: Mapped[str] = mapped_column(String(64))
+    kind: Mapped[str] = mapped_column(String(24))
+    login: Mapped[str] = mapped_column(String(128))
+    path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    line: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    body: Mapped[str] = mapped_column(Text)
+    body_sha256: Mapped[str] = mapped_column(String(64))
+    reviewed_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(TZ)
+    updated_at: Mapped[datetime] = mapped_column(TZ)
+
+
+class ReactionRow(Base):
+    __tablename__ = "reactions"
+    __table_args__ = (
+        UniqueConstraint(
+            "pull_request_id",
+            "subject_kind",
+            "subject_github_id",
+            "github_id",
+            name="uq_reactions_github_id",
+        ),
+        Index("ix_reactions_pr", "pull_request_id"),
+    )
+    id: Mapped[str] = mapped_column(ID, primary_key=True)
+    pull_request_id: Mapped[str] = mapped_column(ID, ForeignKey("pull_requests.id"))
+    subject_kind: Mapped[str] = mapped_column(String(24))
+    subject_github_id: Mapped[str] = mapped_column(String(64))
+    github_id: Mapped[str] = mapped_column(String(64))
+    login: Mapped[str] = mapped_column(String(128))
+    content: Mapped[str] = mapped_column(String(32))
+    created_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
+    observed_at: Mapped[datetime] = mapped_column(TZ)
+    removed_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
+
+
+class CICertificationRow(Base):
+    __tablename__ = "ci_certifications"
+    __table_args__ = (
+        UniqueConstraint("pull_request_id", "head_sha", name="uq_ci_certifications_head"),
+        Index("ix_ci_certifications_task", "task_id"),
+    )
+    id: Mapped[str] = mapped_column(ID, primary_key=True)
+    pull_request_id: Mapped[str] = mapped_column(ID, ForeignKey("pull_requests.id"))
+    task_id: Mapped[str] = mapped_column(ID, ForeignKey("tasks.id"))
+    head_sha: Mapped[str] = mapped_column(String(64))
+    state: Mapped[str] = mapped_column(String(16))
+    required_checks: Mapped[list[Any]] = mapped_column(JSONB)
+    check_runs: Mapped[list[Any]] = mapped_column(JSONB)
+    failure: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    detail: Mapped[str] = mapped_column(Text)
+    evaluated_at: Mapped[datetime] = mapped_column(TZ)
+
+
+class CIDecisionRow(Base):
+    __tablename__ = "ci_decisions"
+    __table_args__ = (Index("ix_ci_decisions_task", "task_id"),)
+    id: Mapped[str] = mapped_column(ID, primary_key=True)
+    task_id: Mapped[str] = mapped_column(ID, ForeignKey("tasks.id"))
+    ci_certification_id: Mapped[str | None] = mapped_column(
+        ID, ForeignKey("ci_certifications.id"), nullable=True
+    )
+    principal_id: Mapped[str] = mapped_column(ID, ForeignKey("principals.id"))
+    cause: Mapped[str] = mapped_column(String(48))
+    action: Mapped[str] = mapped_column(String(16))
+    reasoning: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(TZ)
+
+
+class GitHubDeliveryRow(Base):
+    __tablename__ = "github_deliveries"
+    __table_args__ = (
+        Index(
+            "ix_github_deliveries_unprocessed",
+            "received_at",
+            postgresql_where=text("processed_at IS NULL"),
+        ),
+    )
+    delivery_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    event: Mapped[str] = mapped_column(String(48))
+    action: Mapped[str] = mapped_column(String(48))
+    repository: Mapped[str] = mapped_column(String(255))
+    received_at: Mapped[datetime] = mapped_column(TZ)
+    body_sha256: Mapped[str] = mapped_column(String(64))
+    normalized: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    processed_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)

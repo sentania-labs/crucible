@@ -21,7 +21,7 @@ from crucible.adapters.storage.disk import DiskArtifactStore
 from crucible.application.auth import mint_token
 from crucible.application.repositories import register_repository
 from crucible.application.supervisor import Supervisor
-from crucible.contracts.api import RepositoryRegistration
+from crucible.contracts.api import ExternalReviewAttestation, RepositoryRegistration
 from crucible.domain.entities import Role
 from crucible.ports.notification import DeliveryResult
 from tests.fixtures import REPOSITORY_URL, FakeClock, contract_document
@@ -34,7 +34,9 @@ POSTGRES_IMAGE = (
 )
 
 TRUNCATE = (
-    "TRUNCATE attempt_metrics, wakes, review_dispositions, decisions, escalations, "
+    "TRUNCATE github_deliveries, ci_decisions, ci_certifications, reactions, "
+    "review_comments, external_reviews, external_review_cycles, pull_request_heads, "
+    "pull_requests, attempt_metrics, wakes, review_dispositions, decisions, escalations, "
     "acceptance_results, gate_results, review_reports, evidence, artifacts, "
     "idempotency_keys, supervisor_status, completion_claims, leases, events, "
     "attempts, executions, task_contracts, tasks, repositories, principals RESTART IDENTITY CASCADE"
@@ -143,7 +145,13 @@ def tokens(ctx: AppContext) -> dict[str, str]:
             principal_name="tests",
             name="example-service",
             registration=RepositoryRegistration(
-                url=REPOSITORY_URL, default_branch="main", policy_name="default-software"
+                url=REPOSITORY_URL,
+                default_branch="main",
+                policy_name="default-software",
+                installation_id=1,
+                external_review=ExternalReviewAttestation(
+                    attested_all_prs=True, attested_by="tests"
+                ),
             ),
         )
         uow.commit()

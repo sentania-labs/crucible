@@ -1,0 +1,548 @@
+"""A fake GitHub API server for the integration tier (18, 23).
+
+Real HTTP over loopback, so `RestTransport` and `RestGitHubClient` are exercised rather
+than stubbed: the pagination, the `Link` header, the rate-limit wait, the 403 on the
+PR-level reactions endpoint, and the token hand-over all go through the code that runs
+against api.github.com. CI never touches live GitHub (23).
+
+The shapes come from the endpoints S10 and S12 actually exercised, with the fields 23
+names. Anything Crucible does not read is absent on purpose: a fake that is richer than
+the reader hides a missing field.
+"""
+
+from __future__ import annotations
+
+import json
+import secrets
+import threading
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
+from urllib.parse import parse_qs, urlparse
+
+TOKEN_ALPHABET = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+
+def installation_token_value() -> str:
+    """A token of the shape S10 measured: `ghs_` plus about 390 characters with dots.
+
+    Built at run time from `secrets`, never checked in, so no fixture in this repository
+    is secret-shaped on disk."""
+    body = "".join(secrets.choice(TOKEN_ALPHABET) for _ in range(380))
+    return f"ghs_{body[:120]}.{body[120:260]}_{body[260:]}"
+
+
+def now_iso(offset_seconds: int = 0) -> str:
+    return (datetime.now(UTC) + timedelta(seconds=offset_seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+@dataclass
+class PullRequestState:
+    number: int
+    head_branch: str
+    base_ref: str
+    head_sha: str
+    title: str = ""
+    body: str = ""
+    state: str = "open"
+    merged: bool = False
+    merged_at: str | None = None
+    merge_commit_sha: str | None = None
+    merged_by: str | None = None
+    closed_at: str | None = None
+    draft: bool = False
+    reviews: list[dict[str, Any]] = field(default_factory=list)
+    review_comments: list[dict[str, Any]] = field(default_factory=list)
+    issue_comments: list[dict[str, Any]] = field(default_factory=list)
+    reactions: list[dict[str, Any]] = field(default_factory=list)
+    events: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
+class RepositoryState:
+    full_name: str
+    default_branch: str = "main"
+    branches: dict[str, str] = field(default_factory=lambda: {"main": "0" * 40})
+    pulls: dict[int, PullRequestState] = field(default_factory=dict)
+    check_runs: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    workflow_runs: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    required_checks: list[str] = field(default_factory=list)
+    next_number: int = 1
+    # Object ids never repeat, even after a delete: GitHub's do not either, and a reused
+    # id would make a new reaction look like one Crucible had already recorded.
+    next_object_id: int = 700001
+
+
+class FakeGitHub:
+    """The server's state and the operations tests drive it with."""
+
+    def __init__(self) -> None:
+        self.repositories: dict[str, RepositoryState] = {}
+        self.tokens: set[str] = set()
+        self.calls: list[tuple[str, str]] = []
+        # 23: the App lacks Issues read until the operator adds it, and the PR-level
+        # reactions endpoint is the one call that needs it. Both paths are tested.
+        self.issues_read = True
+        self.rate_limit_once = False
+        self.mint_calls = 0
+        self.workflow_log = b"fake workflow log: the required check failed\n"
+        self.lock = threading.Lock()
+
+    # ----- test-facing helpers ------------------------------------------
+
+    def add_repository(self, full_name: str, **kw: Any) -> RepositoryState:
+        repo = RepositoryState(full_name=full_name, **kw)
+        self.repositories[full_name] = repo
+        return repo
+
+    def push(self, full_name: str, branch: str, sha: str, *, by: str = "crucible") -> None:
+        repo = self.repositories[full_name]
+        repo.branches[branch] = sha
+        for pull in repo.pulls.values():
+            if pull.head_branch == branch and pull.state == "open":
+                pull.head_sha = sha
+        _ = by
+
+    def add_review(
+        self,
+        full_name: str,
+        number: int,
+        *,
+        login: str,
+        state: str = "COMMENTED",
+        body: str = "",
+        commit_id: str | None = None,
+        comments: list[dict[str, Any]] | None = None,
+    ) -> str:
+        repo = self.repositories[full_name]
+        pull = repo.pulls[number]
+        review_id = str(repo.next_object_id)
+        repo.next_object_id += 1
+        pull.reviews.append(
+            {
+                "id": review_id,
+                "user": {"login": login, "type": "Bot"},
+                "state": state,
+                "body": body,
+                "commit_id": commit_id or pull.head_sha,
+                "submitted_at": now_iso(),
+            }
+        )
+        for index, comment in enumerate(comments or []):
+            pull.review_comments.append(
+                {
+                    "id": str(repo.next_object_id + index),
+                    "user": {"login": login, "type": "Bot"},
+                    "body": comment.get("body", ""),
+                    "path": comment.get("path"),
+                    "line": comment.get("line"),
+                    "commit_id": commit_id or pull.head_sha,
+                    "pull_request_review_id": review_id,
+                    "created_at": now_iso(),
+                    "updated_at": now_iso(),
+                }
+            )
+        repo.next_object_id += len(comments or [])
+        return review_id
+
+    def add_reaction(self, full_name: str, number: int, *, login: str, content: str) -> str:
+        repo = self.repositories[full_name]
+        pull = repo.pulls[number]
+        reaction_id = str(repo.next_object_id)
+        repo.next_object_id += 1
+        pull.reactions.append(
+            {
+                "id": reaction_id,
+                "user": {"login": login, "type": "Bot"},
+                "content": content,
+                "created_at": now_iso(),
+            }
+        )
+        return reaction_id
+
+    def remove_reaction(self, full_name: str, number: int, reaction_id: str) -> None:
+        pull = self.repositories[full_name].pulls[number]
+        pull.reactions = [r for r in pull.reactions if r["id"] != reaction_id]
+
+    def add_issue_comment(self, full_name: str, number: int, *, login: str, body: str) -> str:
+        repo = self.repositories[full_name]
+        pull = repo.pulls[number]
+        comment_id = str(repo.next_object_id)
+        repo.next_object_id += 1
+        pull.issue_comments.append(
+            {
+                "id": comment_id,
+                "user": {"login": login, "type": "Bot"},
+                "body": body,
+                "created_at": now_iso(),
+                "updated_at": now_iso(),
+            }
+        )
+        return comment_id
+
+    def set_check(
+        self,
+        full_name: str,
+        sha: str,
+        *,
+        name: str,
+        status: str = "completed",
+        conclusion: str | None = "success",
+        run_id: str = "9001",
+    ) -> None:
+        repo = self.repositories[full_name]
+        runs = repo.check_runs.setdefault(sha, [])
+        for run in runs:
+            if run["name"] == name:
+                run.update({"status": status, "conclusion": conclusion})
+                return
+        runs.append(
+            {
+                "id": run_id,
+                "name": name,
+                "status": status,
+                "conclusion": conclusion,
+                "head_sha": sha,
+                "html_url": f"https://github.com/{full_name}/runs/{run_id}",
+                "app": {"slug": "github-actions"},
+            }
+        )
+
+    def set_workflow_run(
+        self,
+        full_name: str,
+        sha: str,
+        *,
+        name: str,
+        conclusion: str | None,
+        run_id: str = "5150",
+    ) -> None:
+        repo = self.repositories[full_name]
+        repo.workflow_runs.setdefault(sha, []).append(
+            {
+                "id": run_id,
+                "name": name,
+                "status": "completed" if conclusion else "in_progress",
+                "conclusion": conclusion,
+                "head_sha": sha,
+                "html_url": f"https://github.com/{full_name}/actions/runs/{run_id}",
+                "path": ".github/workflows/ci.yml",
+            }
+        )
+
+    def merge(self, full_name: str, number: int, *, by: str, sha: str) -> None:
+        pull = self.repositories[full_name].pulls[number]
+        pull.state = "closed"
+        pull.merged = True
+        pull.merged_at = now_iso()
+        pull.merge_commit_sha = sha
+        pull.merged_by = by
+        pull.closed_at = pull.merged_at
+
+    def close(self, full_name: str, number: int, *, by: str = "") -> None:
+        pull = self.repositories[full_name].pulls[number]
+        pull.state = "closed"
+        pull.closed_at = now_iso()
+        if by:
+            # GitHub records the closer on the issue timeline, not on the pull request.
+            pull.events.append(
+                {"event": "closed", "actor": {"login": by}, "created_at": pull.closed_at}
+            )
+
+
+class _Handler(BaseHTTPRequestHandler):
+    server_version = "fake-github/1.0"
+
+    @property
+    def state(self) -> FakeGitHub:
+        state: FakeGitHub = self.server.state  # type: ignore[attr-defined]
+        return state
+
+    def log_message(self, *args: Any) -> None:  # keep the test output readable
+        return
+
+    def _send(self, status: int, payload: Any, headers: dict[str, str] | None = None) -> None:
+        body = json.dumps(payload).encode("utf-8") if payload is not None else b""
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("x-ratelimit-remaining", "4999")
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
+    def _authorized(self) -> bool:
+        header = self.headers.get("Authorization", "")
+        return header.startswith("Bearer ") and len(header) > 12
+
+    def _body(self) -> Any:
+        length = int(self.headers.get("Content-Length") or 0)
+        if not length:
+            return None
+        return json.loads(self.rfile.read(length).decode("utf-8"))
+
+    # ----- routing ------------------------------------------------------
+
+    def do_GET(self) -> None:
+        self._dispatch("GET")
+
+    def do_POST(self) -> None:
+        self._dispatch("POST")
+
+    def do_PATCH(self) -> None:
+        self._dispatch("PATCH")
+
+    def do_DELETE(self) -> None:
+        self._dispatch("DELETE")
+
+    def _dispatch(self, method: str) -> None:
+        parsed = urlparse(self.path)
+        path = parsed.path
+        query = parse_qs(parsed.query)
+        with self.state.lock:
+            self.state.calls.append((method, path))
+        if not self._authorized():
+            self._send(401, {"message": "Bad credentials"})
+            return
+        if self.state.rate_limit_once:
+            self.state.rate_limit_once = False
+            self._send(
+                403,
+                {"message": "API rate limit exceeded"},
+                {"x-ratelimit-remaining": "0", "retry-after": "1"},
+            )
+            return
+        parts = [p for p in path.split("/") if p]
+        try:
+            self._route(method, parts, query)
+        except KeyError:
+            self._send(404, {"message": "Not Found"})
+
+    def _route(self, method: str, parts: list[str], query: dict[str, list[str]]) -> None:
+        state = self.state
+        if parts[:2] == ["app", "installations"] and parts[-1] == "access_tokens":
+            state.mint_calls += 1
+            token = installation_token_value()
+            state.tokens.add(token)
+            body = self._body() or {}
+            self._send(
+                201,
+                {
+                    "token": token,
+                    "expires_at": now_iso(3600),
+                    "repository_selection": "selected",
+                    "repositories": [
+                        {"full_name": f"owner/{name}"} for name in body.get("repositories", [])
+                    ],
+                    "permissions": body.get(
+                        "permissions",
+                        {
+                            "actions": "read",
+                            "checks": "read",
+                            "contents": "write",
+                            "metadata": "read",
+                            "pull_requests": "write",
+                        },
+                    ),
+                },
+            )
+            return
+        if parts[0] != "repos" or len(parts) < 3:
+            self._send(404, {"message": "Not Found"})
+            return
+        full_name = f"{parts[1]}/{parts[2]}"
+        repo = state.repositories[full_name]
+        rest = parts[3:]
+        if rest[:2] == ["git", "ref"] and rest[2:3] == ["heads"]:
+            branch = "/".join(rest[3:])
+            sha = repo.branches.get(branch)
+            if sha is None:
+                self._send(404, {"message": "Not Found"})
+                return
+            self._send(200, {"ref": f"refs/heads/{branch}", "object": {"sha": sha}})
+            return
+        if rest[:2] == ["git", "refs"] and method == "DELETE":
+            branch = "/".join(rest[3:])
+            repo.branches.pop(branch, None)
+            self._send(204, None)
+            return
+        if rest[:1] == ["pulls"] and len(rest) == 1:
+            if method == "POST":
+                self._create_pull(repo)
+                return
+            self._list_pulls(repo, query)
+            return
+        if rest[:1] == ["pulls"] and rest[1:2] == ["comments"] and rest[3:] == ["reactions"]:
+            self._send(200, [])
+            return
+        if rest[:1] == ["pulls"] and len(rest) >= 2 and rest[1].isdigit():
+            number = int(rest[1])
+            pull = repo.pulls[number]
+            tail = rest[2:]
+            if not tail and method == "GET":
+                self._send(200, self._pull_json(repo, pull))
+                return
+            if not tail and method == "PATCH":
+                body = self._body() or {}
+                if "title" in body:
+                    pull.title = str(body["title"])
+                if "body" in body:
+                    pull.body = str(body["body"])
+                if body.get("state") == "closed":
+                    pull.state = "closed"
+                    pull.closed_at = now_iso()
+                self._send(200, self._pull_json(repo, pull))
+                return
+            if tail == ["reviews"]:
+                self._send(200, pull.reviews)
+                return
+            if tail == ["comments"]:
+                self._send(200, pull.review_comments)
+                return
+        if rest[:1] == ["issues"] and rest[1:2] == ["comments"] and rest[3:] == ["reactions"]:
+            self._send(200, [])
+            return
+        if rest[:1] == ["issues"] and len(rest) >= 2 and rest[1].isdigit():
+            number = int(rest[1])
+            pull = repo.pulls[number]
+            tail = rest[2:]
+            if tail == ["comments"]:
+                if method == "POST":
+                    body = self._body() or {}
+                    comment_id = self.state.add_issue_comment(
+                        repo.full_name,
+                        number,
+                        login="crucible-spike[bot]",
+                        body=str(body.get("body", "")),
+                    )
+                    self._send(201, {"id": comment_id})
+                    return
+                self._send(200, pull.issue_comments)
+                return
+            if tail == ["events"]:
+                self._send(200, pull.events)
+                return
+            if tail == ["reactions"]:
+                # S12: this is the one call that needs Issues read, and the App does not
+                # hold it until the operator adds it.
+                if not self.state.issues_read:
+                    self._send(
+                        403,
+                        {"message": "Resource not accessible by integration"},
+                        {"x-accepted-github-permissions": "issues=read"},
+                    )
+                    return
+                self._send(200, pull.reactions)
+                return
+        if rest[:1] == ["commits"] and len(rest) == 3:
+            sha = rest[1]
+            if rest[2] == "check-runs":
+                self._send(
+                    200,
+                    {
+                        "total_count": len(repo.check_runs.get(sha, [])),
+                        "check_runs": repo.check_runs.get(sha, []),
+                    },
+                )
+                return
+            if rest[2] == "check-suites":
+                self._send(200, {"total_count": 0, "check_suites": []})
+                return
+        if rest[:2] == ["actions", "runs"] and len(rest) == 2:
+            sha = (query.get("head_sha") or [""])[0]
+            runs = repo.workflow_runs.get(sha, [])
+            self._send(200, {"total_count": len(runs), "workflow_runs": runs})
+            return
+        if rest[:2] == ["actions", "runs"] and rest[3:] == ["logs"]:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/zip")
+            payload = self.state.workflow_log
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+        if rest[:1] == ["branches"] and rest[2:] == [
+            "protection",
+            "required_status_checks",
+        ]:
+            if not repo.required_checks:
+                self._send(404, {"message": "Branch not protected"})
+                return
+            self._send(200, {"contexts": repo.required_checks, "checks": []})
+            return
+        if rest[:2] == ["rules", "branches"]:
+            self._send(200, [])
+            return
+        self._send(404, {"message": "Not Found"})
+
+    def _create_pull(self, repo: RepositoryState) -> None:
+        body = self._body() or {}
+        head = str(body.get("head", ""))
+        number = repo.next_number
+        repo.next_number += 1
+        pull = PullRequestState(
+            number=number,
+            head_branch=head,
+            base_ref=str(body.get("base", repo.default_branch)),
+            head_sha=repo.branches.get(head, "0" * 40),
+            title=str(body.get("title", "")),
+            body=str(body.get("body", "")),
+            draft=bool(body.get("draft", False)),
+        )
+        repo.pulls[number] = pull
+        self._send(201, self._pull_json(repo, pull))
+
+    def _list_pulls(self, repo: RepositoryState, query: dict[str, list[str]]) -> None:
+        wanted = (query.get("head") or [""])[0]
+        branch = wanted.split(":", 1)[-1] if wanted else ""
+        rows = [
+            self._pull_json(repo, pull)
+            for pull in repo.pulls.values()
+            if not branch or pull.head_branch == branch
+        ]
+        self._send(200, rows)
+
+    def _pull_json(self, repo: RepositoryState, pull: PullRequestState) -> dict[str, Any]:
+        return {
+            "number": pull.number,
+            "html_url": f"https://github.com/{repo.full_name}/pull/{pull.number}",
+            "state": pull.state,
+            "title": pull.title,
+            "body": pull.body,
+            "draft": pull.draft,
+            "merged": pull.merged,
+            "merged_at": pull.merged_at,
+            "merge_commit_sha": pull.merge_commit_sha,
+            "merged_by": {"login": pull.merged_by} if pull.merged_by else None,
+            "closed_at": pull.closed_at,
+            "mergeable_state": "clean",
+            "head": {"sha": pull.head_sha, "ref": pull.head_branch},
+            "base": {"ref": pull.base_ref},
+        }
+
+
+class FakeGitHubServer:
+    """A running fake on loopback. `url` is what `RestTransport` is pointed at."""
+
+    def __init__(self) -> None:
+        self.state = FakeGitHub()
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        self._server.state = self.state  # type: ignore[attr-defined]
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+
+    def __enter__(self) -> FakeGitHubServer:
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=5)
+
+    @property
+    def url(self) -> str:
+        host, port = self._server.server_address[:2]
+        return f"http://{host!s}:{port}"

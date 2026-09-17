@@ -26,6 +26,7 @@ from crucible.application.decisions import (
     open_escalation,
     repeat_stale_escalation_wakes,
 )
+from crucible.application.delivery_tick import DeliveryConfig, DeliveryCoordinator
 from crucible.application.errors import ApplicationError
 from crucible.application.evidence import record_collection_evidence
 from crucible.application.gates import evaluate_and_advance
@@ -60,6 +61,7 @@ from crucible.domain.entities import (
     Execution,
     ExecutionRole,
     LogChunkRecord,
+    PullRequestState,
     RetentionAction,
     Task,
 )
@@ -90,7 +92,9 @@ from crucible.ports.execution import (
     ProviderError,
     Workspace,
 )
+from crucible.ports.github import GitHubClient
 from crucible.ports.notification import WakeDeliverer
+from crucible.ports.publish import Publisher
 from crucible.ports.repository import FencedTokenRejectedError, UnitOfWork, UnitOfWorkFactory
 
 log = logging.getLogger("crucible.supervisor")
@@ -118,6 +122,8 @@ class TickResult:
     finished: int = 0
     orphans: int = 0
     wakes_delivered: int = 0
+    published: int = 0
+    pull_requests_polled: int = 0
     duration_ms: int = 0
     counts: dict[str, int] = field(default_factory=dict)
 
@@ -147,6 +153,9 @@ class Supervisor:
         holder: str,
         artifact_store: ArtifactStore,
         wake_deliverer: WakeDeliverer | None = None,
+        github: GitHubClient | None = None,
+        publisher: Publisher | None = None,
+        delivery_config: DeliveryConfig | None = None,
         lease_ttl_seconds: int = 30,
         attempt_lease_ttl_seconds: int = 60,
         checkout_lease_ttl_seconds: int = 21600,
@@ -167,6 +176,11 @@ class Supervisor:
         self.fenced_token: int | None = None
         self._handles: dict[str, Handle] = {}
         self._workspaces: dict[str, Workspace] = {}
+        # The delivery half (23). With no GitHub client configured it is inert, which is
+        # what every tier below the live one runs with.
+        self.delivery = DeliveryCoordinator(
+            self, clock, github=github, publisher=publisher, config=delivery_config
+        )
 
     # ----- infrastructure -------------------------------------------------
 
@@ -329,6 +343,11 @@ class Supervisor:
             # After the gates, never before: 16 says nothing a gate consumed is deleted
             # while the task still needs it, and cleanup only ever runs for an attempt
             # that recorded logs_drained (08).
+            # The delivery half (23): publish what acceptance released, then observe
+            # every pull request in an observed state. Both are no-ops without a
+            # configured GitHub client.
+            result.published = await self.delivery.publish()
+            result.pull_requests_polled = await self.delivery.observe()
             await self._cleanup_step()
             await self._retention_step()
             await self._db(self._refresh_attempt_metrics)
@@ -421,9 +440,13 @@ class Supervisor:
                 assert stored is not None
                 # A contract version carrying a correction section runs as a `correct`
                 # execution against the existing branch (09). One execution per version.
+                # So does anything scheduled after a pull request exists, including a
+                # `recollect` decision: the work continues against the remote work
+                # branch, never from base_ref again (09, 23).
                 role = (
                     ExecutionRole.CORRECT
                     if stored.document.get("correction")
+                    or uow.pull_requests.get_for_task(task.id) is not None
                     else ExecutionRole.IMPLEMENT
                 )
                 matching = [
@@ -2259,6 +2282,15 @@ class Supervisor:
                 "attempts_live": len(
                     uow.attempts.list_in_states([AttemptState.RUNNING, AttemptState.TERMINATING])
                 ),
+                # 23: the delivery half's own depths, which `GET /supervisor` reports as
+                # the GitHub observation status.
+                "tasks_publishing": len(uow.tasks.list_by_state(TaskState.PUBLISHING)),
+                "pull_requests_observed": len(
+                    uow.pull_requests.list_in_states(
+                        [PullRequestState.OPENING, PullRequestState.OPEN]
+                    )
+                ),
+                "github_deliveries_pending": uow.github_deliveries.count_unprocessed(),
             }
             status = uow.supervisor_status.get()
             status.holder = self.holder

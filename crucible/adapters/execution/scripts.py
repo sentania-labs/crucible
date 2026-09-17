@@ -26,6 +26,7 @@ from crucible.ports.execution import (
 )
 
 __all__ = [
+    "BUNDLE_MOUNT",
     "BUNDLE_VERIFY_SCRIPT",
     "MANIFEST",
     "REPO_MOUNT",
@@ -33,6 +34,7 @@ __all__ = [
     "collector_script",
     "encode_check_id",
     "preparer_script",
+    "publisher_script",
     "verifier_script",
 ]
 
@@ -308,3 +310,183 @@ def verifier_script(checks: list[tuple[str, str]]) -> str:
 
 def _quote(value: str) -> str:
     return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
+# ----- the publisher (23, S10) -------------------------------------------
+
+BUNDLE_MOUNT = "/crucible/bundle"
+TOKEN_MOUNT = "/run/crucible-token"
+PUBLISH_MOUNT = "/crucible/publish"
+
+# git's credential helper protocol: git writes `protocol=`, `host=` and friends on
+# stdin and reads `username=` and `password=` back. The helper answers only for
+# https on the one configured host, because a helper that answers unconditionally hands
+# the token to whatever remote git was pointed at (S10). `store` and `erase` are ignored.
+#
+# The helper is run through `sh` rather than executed: a Docker tmpfs is mounted
+# `noexec` unless `exec` is asked for, and the publisher's `/tmp` keeps `noexec`. git
+# runs a helper value beginning with `!` through the shell, which is what this uses. The
+# value has spaces, so it lives in a git config file in the container's own tmpfs rather
+# than on a command line, which is the same shape the preparer uses (C3).
+_CRED_HELPER = r"""
+cat > /tmp/cred-helper.sh <<'HELPER'
+#!/bin/sh
+[ "${1:-}" = "get" ] || exit 0
+protocol= host=
+while IFS='=' read -r key value; do
+  [ -z "$key" ] && break
+  case "$key" in
+    protocol) protocol=$value ;;
+    host) host=$value ;;
+  esac
+done
+[ "$protocol" = "https" ] || exit 0
+[ "$host" = "$CRUCIBLE_CREDENTIAL_HOST" ] || exit 0
+printf 'username=x-access-token\n'
+printf 'password=%s\n' "$(cat "$CRUCIBLE_TOKEN_FILE")"
+HELPER
+chmod 0600 /tmp/cred-helper.sh
+{
+  printf '[credential]\n\thelper = "!sh /tmp/cred-helper.sh"\n'
+  printf '[core]\n\thooksPath = /dev/null\n\tpager = cat\n'
+  printf '[user]\n\tname = %s\n\temail = %s\n' \
+    "$CRUCIBLE_AUTHOR_NAME" "$CRUCIBLE_AUTHOR_EMAIL"
+} > /tmp/gitconfig
+chmod 0600 /tmp/gitconfig
+export GIT_CONFIG_GLOBAL=/tmp/gitconfig
+"""
+
+
+def publisher_script(
+    *,
+    clone_url: str,
+    work_branch: str,
+    base_ref: str,
+    expected_head: str,
+    author_name: str,
+    author_email: str,
+    commit_trailer: str,
+    credential_host: str = "github.com",
+) -> str:
+    """Fetch the base from the remote and the branch from the bundle, then push (23).
+
+    The bundle is `base_ref..work_branch`, so it names prerequisite commits and neither
+    `git bundle verify` nor `git fetch` will look at it until the repository has them.
+    The publisher fetches `base_ref` from the real remote first, which is the only tree
+    it ever sees: it never touches the worker's checkout or the worker's `.git`, and the
+    bundle is the only carrier of the worker's commits.
+
+    The token arrives on stdin and is written to a tmpfs file before anything else
+    happens; `docker cp` cannot reach a tmpfs inside a read-only container and even
+    without `--read-only` it targets the writable layer, which is disk (S10). Nothing
+    here ever carries the value on argv: the credential helper reads the file, and no
+    curl runs at all, because the API calls stay on Crucible's side.
+
+    `GIT_TRACE*` and `GIT_CURL_VERBOSE` print the Authorization header, so the script
+    unsets them rather than trusting the environment it inherited (S10 risks)."""
+    return f"""set -eu
+umask 077
+TOKDIR={_quote(TOKEN_MOUNT)}
+OUT={_quote(PUBLISH_MOUNT)}
+BUNDLE={_quote(BUNDLE_MOUNT)}/work_branch.bundle
+WORK_BRANCH={_quote(work_branch)}
+BASE_REF={_quote(base_ref)}
+EXPECTED={_quote(expected_head)}
+CLONE_URL={_quote(clone_url)}
+TRAILER={_quote(commit_trailer)}
+mkdir -p "$OUT"
+cat > "$TOKDIR/token"
+if [ ! -s "$TOKDIR/token" ]; then
+  echo "no token arrived on stdin" > "$OUT/error.txt"; echo no-token > "$OUT/step.txt"; exit 3
+fi
+chmod 0600 "$TOKDIR/token"
+# Back to the ordinary mask before anything is written to the output directory: what
+# lands there is Crucible's own record of the run, and under the rootless daemon this
+# container's uid is not the one that reads it back (S9 Test E).
+umask 022
+stat -c '%a' "$TOKDIR/token" > "$OUT/token-mode.txt"
+unset GIT_TRACE GIT_TRACE_CURL GIT_CURL_VERBOSE GIT_TRACE_PACKET GIT_TRACE2 || true
+export GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0
+export HOME=/home/worker LC_ALL=C
+export CRUCIBLE_TOKEN_FILE="$TOKDIR/token"
+export CRUCIBLE_CREDENTIAL_HOST={_quote(credential_host)}
+export CRUCIBLE_AUTHOR_NAME={_quote(author_name)}
+export CRUCIBLE_AUTHOR_EMAIL={_quote(author_email)}
+{_CRED_HELPER}
+cd /home/worker
+rm -rf publish && mkdir publish && cd publish
+echo init > "$OUT/step.txt"
+git init --quiet -b "$BASE_REF" >> "$OUT/publisher.log" 2>&1
+git remote add origin "$CLONE_URL"
+echo fetch-base > "$OUT/step.txt"
+git fetch --quiet origin "refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF" \
+  >> "$OUT/publisher.log" 2>&1
+echo bundle-verify > "$OUT/step.txt"
+git bundle verify "$BUNDLE" >> "$OUT/publisher.log" 2>&1
+echo fetch-bundle > "$OUT/step.txt"
+git fetch --quiet "$BUNDLE" "refs/heads/$WORK_BRANCH:refs/heads/crucible-publish" \
+  >> "$OUT/publisher.log" 2>&1
+HEAD_SHA=$(git rev-parse refs/heads/crucible-publish)
+printf '%s\n' "$HEAD_SHA" > "$OUT/bundle-head.txt"
+if [ "$HEAD_SHA" != "$EXPECTED" ]; then
+  echo "the bundle head $HEAD_SHA is not the collected head $EXPECTED" > "$OUT/error.txt"
+  echo head-mismatch > "$OUT/step.txt"; exit 4
+fi
+echo ls-remote > "$OUT/step.txt"
+git ls-remote origin "refs/heads/$WORK_BRANCH" > "$OUT/ls-remote-before.txt" \
+  2>> "$OUT/publisher.log" || true
+awk '{{print $1}}' "$OUT/ls-remote-before.txt" | head -n 1 > "$OUT/remote-head-before.txt"
+# Every commit the bundle carries must match the policy's author and the attempt
+# trailer, checked here where the commits are, not after they are on the remote.
+echo commit-policy > "$OUT/step.txt"
+REMOTE_BEFORE=$(cat "$OUT/remote-head-before.txt")
+if [ -n "$REMOTE_BEFORE" ]; then
+  git fetch --quiet origin "refs/heads/$WORK_BRANCH:refs/remotes/origin/$WORK_BRANCH" \
+    >> "$OUT/publisher.log" 2>&1 || true
+  RANGE="refs/remotes/origin/$WORK_BRANCH..refs/heads/crucible-publish"
+else
+  RANGE="refs/remotes/origin/$BASE_REF..refs/heads/crucible-publish"
+fi
+: > "$OUT/author-problems.txt"
+: > "$OUT/trailer-problems.txt"
+for sha in $(git rev-list "$RANGE" 2>/dev/null || true); do
+  who=$(git show -s --format='%ae' "$sha")
+  if [ "$who" != {_quote(author_email)} ]; then
+    printf '%s\t%s\n' "$sha" "$who" >> "$OUT/author-problems.txt"
+  fi
+  if ! git show -s --format='%(trailers:key='"$TRAILER"',valueonly)' "$sha" | grep -q .; then
+    printf '%s\n' "$sha" >> "$OUT/trailer-problems.txt"
+  fi
+done
+if [ -s "$OUT/author-problems.txt" ] || [ -s "$OUT/trailer-problems.txt" ]; then
+  # 23 step 4: verify every commit's author and trailer match policy, *then* push. A
+  # commit signed by someone the policy does not name, or missing the attempt trailer,
+  # is not this attempt's work, and a push is not undoable.
+  AUTHORS=$(wc -l < "$OUT/author-problems.txt")
+  TRAILERS=$(wc -l < "$OUT/trailer-problems.txt")
+  printf 'commit policy refused the push: %s author problem(s), %s trailer problem(s)\n' \
+    "$AUTHORS" "$TRAILERS" > "$OUT/error.txt"
+  echo commit-policy > "$OUT/step.txt"
+  echo refused > "$OUT/push.txt"
+  rm -f "$TOKDIR/token"
+  chmod 0644 "$OUT"/* 2>/dev/null || true
+  exit 6
+fi
+echo push > "$OUT/step.txt"
+# No force, ever. A remote head that is not an ancestor of the bundle head fails here,
+# which is exactly what 23 asks for: record it, wake Foundry, never overwrite.
+if git push --quiet origin "refs/heads/crucible-publish:refs/heads/$WORK_BRANCH" \
+    2> "$OUT/push.err"; then
+  echo ok > "$OUT/push.txt"
+else
+  echo failed > "$OUT/push.txt"
+  cp "$OUT/push.err" "$OUT/error.txt" 2>/dev/null || true
+  echo push > "$OUT/step.txt"
+  rm -f "$TOKDIR/token"
+  exit 5
+fi
+echo done > "$OUT/step.txt"
+rm -f "$TOKDIR/token"
+chmod 0644 "$OUT"/* 2>/dev/null || true
+exit 0
+"""

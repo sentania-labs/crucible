@@ -30,10 +30,14 @@ EXAMPLE = Path(__file__).resolve().parents[2] / "examples" / "policies" / "defau
 
 
 def seeded_policy() -> dict[str, Any]:
-    """The C1 seed as migration 0004 leaves it: the routing section it lacked."""
+    """The C1 seed as migrations 0004 and 0007 leave it: the routing section 0001 lacked,
+    the round counting 0004 corrected, and the accepted signals 0007 corrected."""
     document: dict[str, Any] = copy.deepcopy(m1.DEFAULT_POLICY)
     document["routing"] = {"policy": {"name": "default-routing", "version": 1}}
     document["external_review"]["round_counting"] = "completed_cycles"
+    # 23: the provider's summary comment arrives before any verdict and is edited in
+    # place, so a comment is not a round-completing signal (C4's correction round).
+    document["external_review"]["accepted_signals"] = ["review", "reaction:+1"]
     return document
 
 

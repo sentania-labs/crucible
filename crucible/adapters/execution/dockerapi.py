@@ -11,6 +11,7 @@ even with `EXEC=0`, so the client not having the call is what keeps Crucible hon
 
 from __future__ import annotations
 
+import contextlib
 import json
 import socket
 from collections.abc import Iterator, Mapping, Sequence
@@ -223,6 +224,43 @@ class DockerClient:
         ) as response:
             raw = response.read()
         return demultiplex(raw)
+
+    def write_stdin(self, container_id: str, payload: bytes) -> None:
+        """Hand a value to a running container on its stdin and close the write side.
+
+        This is `docker run -i` through the API: the attach endpoint hijacks the
+        connection and whatever is written reaches the container's stdin. It is how the
+        publisher receives its installation token, because `docker cp` cannot reach a
+        tmpfs inside a `--read-only` container and even without that flag it lands the
+        value on the writable layer, which is disk (S10).
+
+        The value is written to the socket and the socket is closed. It is never in
+        `Env`, in `Cmd`, in a bind source, or in this process's argv.
+        """
+        url = f"/{API_VERSION}/containers/{container_id}/attach?stream=1&stdin=1&stdout=0&stderr=0"
+        conn = self._connect()
+        try:
+            conn.putrequest("POST", url, skip_host=True, skip_accept_encoding=True)
+            conn.putheader("Host", "docker")
+            conn.putheader("Content-Type", "application/vnd.docker.raw-stream")
+            conn.putheader("Connection", "Upgrade")
+            conn.putheader("Upgrade", "tcp")
+            conn.putheader("Content-Length", "0")
+            conn.endheaders()
+            response = conn.getresponse()
+            if response.status not in (101, 200):
+                raw = response.read().decode("utf-8", "replace")
+                raise DockerApiError(response.status, _message(raw), path=url)
+            sock = conn.sock
+            if sock is None:
+                raise DockerApiError(0, "the attach connection carried no socket", path=url)
+            sock.sendall(payload)
+            # Some proxies half-close on their own; the container still sees EOF when
+            # the connection closes below, so a refusal here is not an error.
+            with contextlib.suppress(OSError):
+                sock.shutdown(socket.SHUT_WR)
+        finally:
+            conn.close()
 
     def create_network(self, name: str, *, internal: bool) -> str:
         body = {"Name": name, "Driver": "bridge", "Internal": internal, "CheckDuplicate": True}

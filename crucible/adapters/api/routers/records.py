@@ -70,6 +70,9 @@ def _repo_view(repo: Repository) -> RepositoryView:
         installation_id=repo.installation_id,
         registered_by=repo.registered_by,
         created_at=repo.created_at,
+        external_review_attested=repo.external_review_attested,
+        attested_by=repo.attested_by,
+        attested_at=repo.attested_at,
     )
 
 

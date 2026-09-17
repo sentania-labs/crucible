@@ -7,7 +7,11 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 
 _PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("github_token", re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,}\b")),
+    # An installation token is about 390 characters and contains dots, underscores and
+    # hyphens; the 40-character `ghs_` form most patterns assume matches nothing (S10).
+    # No upper bound, and the separators are inside the class, or the match stops early.
+    ("github_installation_token", re.compile(r"\bghs_[A-Za-z0-9._-]{20,}")),
+    ("github_token", re.compile(r"\b(?:ghp|gho|ghu|ghr)_[A-Za-z0-9]{36,}\b")),
     ("github_fine_grained_token", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{22,}\b")),
     ("private_key_header", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
     ("bearer_token", re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{20,}", re.IGNORECASE)),
@@ -49,3 +53,19 @@ def _walk(value: object, path: str) -> Iterator[SecretMatch]:
 def find_secrets(document: object, root: str = "") -> list[SecretMatch]:
     """Walk a nested document and report every string that matches a secret pattern."""
     return list(_walk(document, root))
+
+
+# What a redaction writes in place of a match. The pattern name is kept so a reader of a
+# redacted log knows what was removed without learning anything about the value.
+REDACTION = "[redacted:{name}]"
+
+
+def redact(text: str) -> str:
+    """Replace every secret-shaped run with a marker naming the pattern (12).
+
+    Best-effort defence in depth, not the control: the control is that no secret value is
+    ever placed where it could be printed. Applied to every user-controlled GitHub text
+    before it is stored (23)."""
+    for name, pattern in _PATTERNS:
+        text = pattern.sub(REDACTION.format(name=name), text)
+    return text

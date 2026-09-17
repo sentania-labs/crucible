@@ -46,6 +46,9 @@ def test_admin_only_repository_registration(ctx: AppContext, tokens: dict[str, s
         "url": "https://github.com/example-org/other",
         "default_branch": "main",
         "policy_name": "default-software",
+        # 23: the default policy requires an external review round, so registration
+        # needs the operator's attestation that the reviewer reviews all PRs here.
+        "external_review": {"attested_all_prs": True, "attested_by": "operator"},
     }
     assert (
         _client(ctx, tokens["orchestrator"]).put("/v1/repositories/other", json=body).status_code
@@ -53,6 +56,7 @@ def test_admin_only_repository_registration(ctx: AppContext, tokens: dict[str, s
     )
     r = _client(ctx, tokens["admin"]).put("/v1/repositories/other", json=body)
     assert r.status_code == 200 and r.json()["registered_by"] == "admin-principal"
+    assert r.json()["external_review_attested"] is True
     assert (
         _client(ctx, tokens["observer"]).get("/v1/repositories/other").json()["url"] == body["url"]
     )
