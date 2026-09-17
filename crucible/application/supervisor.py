@@ -134,6 +134,7 @@ class _Pending:
     execution: Execution
     task: Task
     contract: dict[str, Any]
+    repository_url: str = ""
 
 
 class Supervisor:
@@ -824,7 +825,16 @@ class Supervisor:
                     continue
                 stored = uow.contracts.get(task.id, execution.contract_version)
                 assert stored is not None
-                out.append(_Pending(attempt, execution, task, stored.document))
+                repository = uow.repositories.get(task.repository_id)
+                out.append(
+                    _Pending(
+                        attempt,
+                        execution,
+                        task,
+                        stored.document,
+                        repository.url if repository else "",
+                    )
+                )
         return out
 
     async def _launch_pending(self) -> int:
@@ -843,7 +853,12 @@ class Supervisor:
         return launched
 
     def _build_spec(
-        self, attempt: Attempt, execution: Execution, task: Task, contract: dict[str, Any]
+        self,
+        attempt: Attempt,
+        execution: Execution,
+        task: Task,
+        contract: dict[str, Any],
+        repository_url: str = "",
     ) -> LaunchSpec:
         env: dict[str, str] = {}
         if execution.role is ExecutionRole.REVIEW and task.head_sha:
@@ -862,6 +877,7 @@ class Supervisor:
             network=contract.get("constraints", {}).get("network", "policy"),
             policy=execution.policy_snapshot or {},
             owner=task.principal_id,
+            repository_url=repository_url,
         )
 
     def _spec_for(self, attempt: Attempt) -> LaunchSpec | None:
@@ -874,21 +890,24 @@ class Supervisor:
             stored = uow.contracts.get(task.id, execution.contract_version)
             if stored is None:
                 return None
-            return self._build_spec(attempt, execution, task, stored.document)
+            repository = uow.repositories.get(task.repository_id)
+            return self._build_spec(
+                attempt, execution, task, stored.document, repository.url if repository else ""
+            )
 
     @staticmethod
-    def checkout_key(contract: dict[str, Any], external_id: str) -> str:
+    def checkout_key(contract: dict[str, Any], external_id: str, repository_url: str = "") -> str:
         """One checkout lease per repository url and work branch (10)."""
         repository = contract.get("repository", {})
-        url = str(repository.get("url", ""))
+        url = repository_url or str(repository.get("url", "")) or str(repository.get("name", ""))
         branch = str(repository.get("work_branch") or f"crucible/{external_id}")
         return f"{url}#{branch}"
 
     async def _launch_one(self, item: _Pending) -> bool:
         attempt, execution, task = item.attempt, item.execution, item.task
-        spec = self._build_spec(attempt, execution, task, item.contract)
+        spec = self._build_spec(attempt, execution, task, item.contract, item.repository_url)
         provider = self._provider(execution.provider)
-        key = self.checkout_key(item.contract, task.external_id)
+        key = self.checkout_key(item.contract, task.external_id, item.repository_url)
         if execution.role is not ExecutionRole.REVIEW and not await self._db(
             partial(self._take_checkout_lease, attempt.id, key)
         ):

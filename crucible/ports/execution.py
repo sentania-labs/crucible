@@ -64,6 +64,9 @@ class LaunchSpec:
     policy: dict[str, Any] = field(default_factory=dict)
     # Who the work is for, as the `crucible.owner` container label (08).
     owner: str = "crucible"
+    # The registered repository's clone url. It lives on the Repository row, not in
+    # the contract, so the supervisor puts it here for `prepare` (03, 08).
+    repository_url: str = ""
 
 
 @dataclass(frozen=True, slots=True)

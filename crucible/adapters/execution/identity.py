@@ -195,6 +195,10 @@ def write_bundle(
     files: dict[str, str] = {
         "IDENTITY.md": identity_md,
         "contract.yaml": contract_yaml,
+        # The same document as JSON. 06 names contract.yaml; the JSON copy is what a
+        # worker with jq and no YAML parser reads, and it is byte-for-byte the same
+        # object, so contract.sha256 still covers what the worker was given.
+        "contract.json": json.dumps(contract, indent=2, sort_keys=True) + "\n",
         "contract.sha256": hashlib.sha256(contract_yaml.encode("utf-8")).hexdigest() + "\n",
         "policy.md": render_policy_md(policy, contract),
         "report-schema.json": json.dumps(report_schema, indent=2, sort_keys=True) + "\n",

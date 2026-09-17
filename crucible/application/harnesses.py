@@ -106,8 +106,8 @@ REGISTRY: dict[str, HarnessSpec] = {
     ),
     # The e2e harness (18): a script that reads the identity bundle, writes a report,
     # and exits with a requested code. No model, no credential, no subscription.
-    "script": HarnessSpec(
-        name="script",
+    "script-harness": HarnessSpec(
+        name="script-harness",
         min_version="1.0.0",
         max_version_exclusive="2.0.0",
         endpoints=(),

@@ -275,7 +275,7 @@ class DockerProvider:
 
     def _prepare_sync(self, spec: LaunchSpec) -> Workspace:
         repository = spec.contract.get("repository", {})
-        url = str(repository.get("url", ""))
+        url = spec.repository_url or str(repository.get("url", ""))
         if not url:
             raise workspace.WorkspaceError("the contract names no repository url")
         base_ref = str(repository.get("base_ref", "main"))
