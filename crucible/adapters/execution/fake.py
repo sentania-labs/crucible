@@ -48,8 +48,11 @@ from crucible.ports.execution import (
     LogOffset,
     Observation,
     ObservationState,
+    ProbeRequest,
+    ProbeResult,
     ProviderCapabilities,
     ProviderError,
+    ProviderHealth,
     VerificationRun,
     Workspace,
     WorkspaceState,
@@ -282,6 +285,10 @@ class FakeProvider:
     def __init__(self) -> None:
         # Attempts whose credential copy the supervisor asked to discard (12).
         self.discarded: list[str] = []
+        # Harnesses the administrative probe was run for (25).
+        self.probes: list[str] = []
+        # What `list_images` answers: whatever a test hands it (08, 25).
+        self.images: list[ImageInfo] = []
         self._workers: dict[str, _Worker] = {}
         self._scripts: dict[str, tuple[str, int]] = {}
         self._reports: dict[str, dict[str, Any]] = {}
@@ -485,8 +492,24 @@ class FakeProvider:
         self._workspaces.pop(ws.attempt_id, None)
 
     async def list_images(self) -> list[ImageInfo]:
-        """The fake provider runs behaviours, not images (08): nothing to list."""
-        return []
+        """The fake provider runs behaviours, not images (08): it lists what a test
+        handed it, and nothing by default."""
+        return list(self.images)
+
+    async def probe_credential(self, request: ProbeRequest) -> ProbeResult:
+        """No image and no credential to run (08): the probe records a synthetic
+        success so the administrative services can be exercised without a daemon."""
+        self.probes.append(request.harness)
+        return ProbeResult(
+            exit_code=0,
+            image_digest="sha256:" + "f" * 64,
+            harness_version="fake",
+            duration_seconds=0.0,
+            stdout_tail="OK\n",
+        )
+
+    async def health(self) -> ProviderHealth:
+        return ProviderHealth("ok", {"daemon": "fake"})
 
     async def discard(self, ws: Workspace, spec: LaunchSpec | None = None) -> None:
         """Nothing secret was placed; the call is recorded so a test can assert it."""
