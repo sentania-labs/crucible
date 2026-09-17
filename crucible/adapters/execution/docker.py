@@ -17,6 +17,15 @@ Four containers per attempt:
   command from the collected tree. It is the one container that runs commands the
   repository defines, so it sees its own tree and its own log directory, never the
   collector's output.
+
+The credential (12): the preparer creates an empty `credential` directory in the
+workspace owned by the worker's uid; the provider seeds it with only the named auth
+files through the daemon's archive endpoint before the worker starts, mounts it at the
+path the harness expects (read-only or narrow-writable per the adapter and the
+configuration) with the Crucible-owned templates read-only on top, reads the named files
+back the same way after exit, syncs back only a valid, newer file, and removes the copy
+at once. No credential value is ever in `Env`, in `Cmd`, in a bind source, in a log, or
+in this process's argv.
 """
 
 from __future__ import annotations
@@ -24,11 +33,16 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import io
+import json
 import logging
+import os
 import shutil
+import tarfile
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import UTC, datetime
 from http.client import HTTPException
 from pathlib import Path
 from typing import Any, Literal
@@ -45,8 +59,14 @@ from crucible.adapters.execution.create_policy import (
 from crucible.adapters.execution.create_policy import (
     check as check_create,
 )
-from crucible.adapters.execution.dockerapi import DockerApiError, DockerClient
-from crucible.application.harnesses import REGISTRY, check_image_version, egress_allowlist
+from crucible.adapters.execution.dockerapi import DockerApiError, DockerClient, LogFrame
+from crucible.adapters.harness.registry import default_registry
+from crucible.application.harnesses import (
+    HarnessRegistry,
+    check_image_version,
+    effective_mount_mode,
+    egress_allowlist,
+)
 from crucible.contracts.completion_claim import CompletionClaimV1
 from crucible.domain.time import parse_rfc3339
 from crucible.ports.execution import (
@@ -60,8 +80,12 @@ from crucible.ports.execution import (
     CleanupPolicy,
     CollectedArtifact,
     CollectedOutputs,
+    CredentialFileSync,
+    CredentialSync,
     Handle,
+    ImageInfo,
     IsolationLevel,
+    LaunchRefusedError,
     LaunchSpec,
     LogChunk,
     LogOffset,
@@ -72,6 +96,13 @@ from crucible.ports.execution import (
     VerificationRun,
     Workspace,
     WorkspaceState,
+)
+from crucible.ports.harness import (
+    AuthFile,
+    CredentialSource,
+    CredentialSpec,
+    LaunchContext,
+    MountMode,
 )
 
 log = logging.getLogger("crucible.provider.docker")
@@ -92,6 +123,45 @@ ROLE_CLEANER = "cleaner"
 ROLE_COLLECTOR = "collector"
 ROLE_BUNDLE = "bundle-verifier"
 ROLE_VERIFIER = "verifier"
+# The per-attempt credential copy, as a workspace leaf and the template subdirectory of
+# the identity bundle the read-only files on top of it come from (12).
+CREDENTIAL_LEAF = "credential"
+TEMPLATE_LEAF = "identity/harness"
+WORKER_UID = 1000
+
+# Crucible's launch wrapper (07, 12). The positional parameters are the harness argv.
+# CRUCIBLE_ENV_FROM_FILES names variables to fill from files inside the credential copy:
+# the one exception 07 allows to file-only delivery, resolved here inside the container
+# and never placed in the create request. CRUCIBLE_STDIN_FILES and CRUCIBLE_PROMPT are
+# what the harness reads on stdin; CRUCIBLE_TRANSCRIPT is where its stdout is teed so
+# the stream becomes an artifact. With `pipefail`, the wrapper's exit is the harness's.
+LAUNCH_WRAPPER = r"""set -u
+for pair in ${CRUCIBLE_ENV_FROM_FILES:-}; do
+  var=${pair%%=*}; file=${pair#*=}
+  if [ -r "$file" ]; then
+    value=$(cat "$file")
+    export "$var=$value"
+    unset value
+  fi
+done
+unset CRUCIBLE_ENV_FROM_FILES
+feed() {
+  for f in ${CRUCIBLE_STDIN_FILES:-}; do cat "$f"; printf '\n'; done
+  if [ -n "${CRUCIBLE_PROMPT:-}" ]; then printf '%s\n' "$CRUCIBLE_PROMPT"; fi
+}
+run() {
+  if [ -n "${CRUCIBLE_STDIN_FILES:-}${CRUCIBLE_PROMPT:-}" ]; then
+    feed | "$@"
+  else
+    "$@" </dev/null
+  fi
+}
+if [ -n "${CRUCIBLE_TRANSCRIPT:-}" ]; then
+  run "$@" | tee "$CRUCIBLE_TRANSCRIPT"
+else
+  run "$@"
+fi
+"""
 
 DEFAULT_IMAGE_ALLOWLIST: tuple[str, ...] = (
     "crucible-worker:*",
@@ -131,6 +201,25 @@ class DockerConfig:
     use_reference_cache: bool = True
     max_concurrency: int = 3
     extra_image_allowlist: tuple[str, ...] = field(default=())
+    # The configured credential directory per harness (12). A harness without one falls
+    # back to `<credential_root>/<harness>` when that directory exists.
+    credentials: Mapping[str, CredentialSource] = field(default_factory=dict)
+
+
+# The launch was refused by the adapter's version range or a missing credential (07,
+# 13): the supervisor turns this into a wake rather than a plain environment failure.
+HarnessRefusedError = LaunchRefusedError
+
+
+@dataclass(frozen=True, slots=True)
+class _CredentialCopy:
+    """What was seeded for one attempt: the spec, the source, the effective mode, and
+    the sha256 of each file as seeded (in memory only, never stored)."""
+
+    spec: CredentialSpec
+    source: CredentialSource
+    mode: MountMode
+    seeded: dict[str, str | None]
 
 
 class CollectionFailedError(ProviderError):
@@ -154,6 +243,7 @@ class _Launched:
     container_id: str
     image_digest: str
     spec: LaunchSpec
+    credential: _CredentialCopy | None = None
 
 
 def _mib(value: Any, default: int) -> int:
@@ -182,9 +272,15 @@ class DockerProvider:
 
     name = PROVIDER_NAME
 
-    def __init__(self, config: DockerConfig, client: DockerClient | None = None) -> None:
+    def __init__(
+        self,
+        config: DockerConfig,
+        client: DockerClient | None = None,
+        harnesses: HarnessRegistry | None = None,
+    ) -> None:
         self.config = config
         self.client = client or DockerClient(config.endpoint, timeout=config.api_timeout_seconds)
+        self.harnesses = harnesses or default_registry()
         self._launched: dict[str, _Launched] = {}
         self._images: dict[str, _ResolvedImage] = {}
         # The last failing output of each throwaway role, so an environment failure can
@@ -310,7 +406,7 @@ class DockerProvider:
             network_control=True,
             resource_limits=True,
             shared_disk=True,
-            supports_harnesses=frozenset(REGISTRY),
+            supports_harnesses=frozenset(self.harnesses.names()),
             max_concurrency=self.config.max_concurrency,
         )
 
@@ -422,6 +518,17 @@ class DockerProvider:
         started_from = (output / "started-from.txt").read_text(encoding="utf-8").strip()
         if not head:
             raise workspace.WorkspaceError("the preparer produced no HEAD")
+        # 12: the Crucible-owned templates that go read-only on top of the credential
+        # copy. They live inside the identity bundle so the bundle hash covers them.
+        adapter = self.harnesses.get(spec.harness)
+        credential = adapter.credential_spec() if adapter is not None else None
+        if credential is not None and credential.templates:
+            template_dir = paths["identity"] / "harness"
+            template_dir.mkdir(parents=True, exist_ok=True)
+            for name, content in credential.templates.items():
+                target = template_dir / name
+                target.write_text(content, encoding="utf-8")
+                os.chmod(target, 0o444)
         _, identity_sha = identity_bundle.write_bundle(
             paths["identity"],
             contract=spec.contract,
@@ -479,9 +586,9 @@ class DockerProvider:
         """Every launch, cache hit or not (07, 13)."""
         if not image_allowed(spec.image, self._image_allowlist(spec)):
             raise ProviderError(f"image {spec.image!r} is outside the policy allowlist")
-        check = check_image_version(spec.harness, image.labels)
+        check = check_image_version(self.harnesses, spec.harness, image.labels)
         if not check.ok:
-            raise ProviderError(f"refusing to launch: {check.detail}")
+            raise HarnessRefusedError(f"refusing to launch: {check.detail}")
 
     def _image_allowlist(self, spec: LaunchSpec) -> list[str]:
         return [
@@ -499,12 +606,26 @@ class DockerProvider:
         except CreateRequestRefusedError as exc:
             raise ProviderError(f"create-request policy refused the worker: {exc}") from exc
         name = f"crucible-{spec.attempt_id}"
+        copy = self._credential_copy(spec)
+        container_id = ""
         try:
             container_id = await self._call(self.client.create_container, name, body)
+            if copy is not None:
+                # 12: the copy is seeded through the daemon into the created, not yet
+                # started, container. The files land in the workspace directory the
+                # preparer made, owned by the worker's uid, mode 600.
+                tar, seeded = await asyncio.to_thread(_seed_tar, copy.spec, copy.source)
+                copy = replace(copy, seeded=seeded)
+                await self._call(self.client.put_archive, container_id, copy.spec.mount_target, tar)
             await self._call(self.client.start_container, container_id)
-        except DockerApiError as exc:
+        except (DockerApiError, ProviderError) as exc:
+            if container_id:
+                with contextlib.suppress(Exception):
+                    await self._call(self.client.remove_container, container_id, force=True)
+            if isinstance(exc, ProviderError):
+                raise
             raise ProviderError(f"could not start the worker: {exc}") from exc
-        self._launched[spec.attempt_id] = _Launched(container_id, resolved, spec)
+        self._launched[spec.attempt_id] = _Launched(container_id, resolved, spec, copy)
         return Handle(
             provider=self.name,
             ref=container_id,
@@ -527,6 +648,7 @@ class DockerProvider:
         if spec.network == "none" or network_policy == "none":
             return "none", env
         wanted = egress_allowlist(
+            self.harnesses,
             spec.harness,
             [str(h) for h in (spec.policy.get("network", {}).get("egress_allowlist") or [])],
             [str(h) for h in (spec.contract.get("constraints", {}).get("egress_extra") or [])],
@@ -568,14 +690,13 @@ class DockerProvider:
             self._daemon_mount(spec.attempt_id, "report", REPORT_MOUNT, read_only=False),
             *self._credential_mounts(spec),
         ]
-        harness = REGISTRY.get(spec.harness)
-        command = list(spec.command) or list(harness.command if harness else ())
+        command, launch_env = self._command(spec)
         return {
             "Image": resolved,
             "Cmd": command,
             "User": "1000:1000",
             "WorkingDir": REPO_MOUNT,
-            "Env": [f"{k}={v}" for k, v in sorted(env.items())],
+            "Env": [f"{k}={v}" for k, v in sorted({**env, **launch_env}.items())],
             "Labels": self._labels(spec, ROLE_WORKER),
             "Tty": False,
             "OpenStdin": False,
@@ -584,27 +705,145 @@ class DockerProvider:
             "HostConfig": host_config,
         }
 
-    def _credential_mounts(self, spec: LaunchSpec) -> list[dict[str, Any]]:
-        """One credential directory, for this attempt's harness and no other (12).
+    def _command(self, spec: LaunchSpec) -> tuple[list[str], dict[str, str]]:
+        """The harness argv, wrapped only when the launch needs stdin, a transcript, or
+        a variable filled from a credential file (07). A plain argv stays plain."""
+        argv = list(spec.command)
+        if not argv:
+            adapter = self.harnesses.get(spec.harness)
+            if adapter is not None:
+                argv = list(adapter.build_launch(self._launch_context(spec)).argv)
+        wrapped = bool(spec.env_from_files or spec.stdin_files or spec.stdin_text)
+        wrapped = wrapped or bool(spec.transcript_path)
+        if not wrapped:
+            return argv, {}
+        env: dict[str, str] = {}
+        if spec.env_from_files:
+            env["CRUCIBLE_ENV_FROM_FILES"] = " ".join(
+                f"{var}={path}" for var, path in sorted(spec.env_from_files.items())
+            )
+        if spec.stdin_files:
+            env["CRUCIBLE_STDIN_FILES"] = " ".join(spec.stdin_files)
+        if spec.stdin_text:
+            env["CRUCIBLE_PROMPT"] = spec.stdin_text
+        if spec.transcript_path:
+            env["CRUCIBLE_TRANSCRIPT"] = spec.transcript_path
+        return ["bash", "-o", "pipefail", "-c", LAUNCH_WRAPPER, "crucible-launch", *argv], env
 
-        C3 runs the script harness, which has none. The shape is here so the isolation
-        test can assert that a worker with its own credential mount still cannot see
-        another harness's."""
+    def _launch_context(self, spec: LaunchSpec) -> LaunchContext:
+        return LaunchContext(
+            attempt_id=spec.attempt_id,
+            model=spec.model,
+            effort=spec.effort,
+            timeout_seconds=spec.timeout_seconds,
+            identity_mount=IDENTITY_MOUNT,
+            report_mount=REPORT_MOUNT,
+            repo_mount=REPO_MOUNT,
+            credential_mounted=self._credential_copy(spec) is not None,
+        )
+
+    def _credential_source(self, harness: str) -> CredentialSource | None:
+        configured = self.config.credentials.get(harness)
+        if configured is not None and configured.path:
+            return configured
         root = self.config.credential_root
-        if not root:
+        if root and (Path(root) / harness).is_dir():
+            return CredentialSource(path=str(Path(root) / harness))
+        return None
+
+    def _credential_copy(self, spec: LaunchSpec) -> _CredentialCopy | None:
+        """The credential this attempt's harness needs and where it comes from (12).
+
+        A harness that declares a credential and has no configured source is refused
+        at launch: it would only fail authentication after spending an attempt."""
+        adapter = self.harnesses.get(spec.harness)
+        credential = adapter.credential_spec() if adapter is not None else None
+        if credential is None:
+            return None
+        source = self._credential_source(spec.harness)
+        if source is None:
+            raise HarnessRefusedError(
+                f"refusing to launch: no credential directory is configured for "
+                f"harness {spec.harness!r} (credentials.{spec.harness}.path)"
+            )
+        return _CredentialCopy(
+            spec=credential, source=source, mode=effective_mount_mode(credential, source), seeded={}
+        )
+
+    def _credential_mounts(self, spec: LaunchSpec) -> list[dict[str, Any]]:
+        """The per-attempt copy for this attempt's harness and no other (12), plus the
+        Crucible-owned templates read-only on top of it. The script harness has none."""
+        copy = self._credential_copy(spec)
+        if copy is None:
             return []
-        source = Path(root) / spec.harness
-        if not source.exists():
-            return []
-        host_root = self.config.credential_host_root or root
-        return [
-            {
-                "Type": "bind",
-                "Source": f"{host_root.rstrip('/')}/{spec.harness}",
-                "Target": f"/home/worker/.crucible-credential/{spec.harness}",
-                "ReadOnly": True,
-            }
+        target = copy.spec.mount_target
+        mounts = [
+            self._daemon_mount(
+                spec.attempt_id, CREDENTIAL_LEAF, target, read_only=copy.mode is MountMode.RO
+            )
         ]
+        for name in sorted(copy.spec.templates):
+            mounts.append(
+                self._daemon_mount(
+                    spec.attempt_id, f"{TEMPLATE_LEAF}/{name}", f"{target}/{name}", read_only=True
+                )
+            )
+        return mounts
+
+    async def _sync_credential(
+        self, h: Handle, ws: Workspace, spec: LaunchSpec
+    ) -> CredentialSync | None:
+        """Read the named auth files back out of the stopped worker, write back only a
+        valid, newer one, and remove the copy at once (12).
+
+        `changed` is against the source as it is now, which also covers a collect after
+        a supervisor restart, when the seeded hashes are gone with the process."""
+        launched = self._launched.get(h.attempt_id)
+        copy = launched.credential if launched is not None else self._credential_copy(spec)
+        if copy is None:
+            return None
+        files: list[CredentialFileSync] = []
+        for auth in copy.spec.auth_files:
+            inside = f"{copy.spec.mount_target}/{auth.name}"
+            try:
+                raw = await self._call(self.client.get_archive, h.ref, inside)
+            except DockerApiError as exc:
+                files.append(
+                    CredentialFileSync(auth.name, False, False, False, False, f"read failed: {exc}")
+                )
+                continue
+            data = _single_file(raw) if raw else None
+            if data is None:
+                files.append(
+                    CredentialFileSync(
+                        auth.name, False, False, False, False, "absent after the run"
+                    )
+                )
+                continue
+            files.append(await asyncio.to_thread(_sync_one, copy, auth, data))
+        removed = False
+        try:
+            await self._remove_through_daemon(ws, spec, [CREDENTIAL_LEAF])
+            removed = not (self._root(h.attempt_id) / CREDENTIAL_LEAF).exists()
+        except Exception as exc:  # the sync is recorded whatever the removal did
+            log.warning("credential copy removal failed", extra={"error": str(exc)})
+        return CredentialSync(
+            harness=copy.spec.harness,
+            mount_mode=copy.mode.value,
+            files=tuple(files),
+            removed=removed,
+            detail=(
+                "" if copy.seeded else "seeded hashes unknown; changed is against the source now"
+            ),
+        )
+
+    async def _worker_tails(self, container_id: str) -> tuple[str, str]:
+        """The last bytes of the worker's own stdout and stderr, for classification (S5)."""
+        try:
+            frames = await self._call(self.client.container_logs, container_id)
+        except (DockerApiError, TimeoutError, OSError, HTTPException):
+            return "", ""
+        return _tails(frames, self.config.log_tail_bytes)
 
     async def observe(self, h: Handle) -> Observation:
         try:
@@ -650,6 +889,9 @@ class DockerProvider:
         work_branch = ws.work_branch or str(
             repository.get("work_branch") or f"crucible/{spec.external_id}"
         )
+        # 12: the credential copy is read back and removed before anything else runs.
+        credential_sync = await self._sync_credential(h, ws, spec)
+        stdout_tail, stderr_tail = await self._worker_tails(h.ref)
         collector_exit = await self._run_throwaway(
             spec,
             role=ROLE_COLLECTOR,
@@ -712,8 +954,8 @@ class DockerProvider:
             report=outputs.report,
             report_raw=outputs.report_raw,
             blocked_md=outputs.blocked_md,
-            stdout_tail=outputs.stdout_tail,
-            stderr_tail=outputs.stderr_tail,
+            stdout_tail=stdout_tail,
+            stderr_tail=stderr_tail,
             diff_paths=outputs.diff_paths,
             diff_text=outputs.diff_text,
             bundle=outputs.bundle,
@@ -721,6 +963,7 @@ class DockerProvider:
             verifications=outputs.verifications,
             workspace_state=state,
             copy_rejections=outputs.copy_rejections,
+            credential_sync=credential_sync,
         )
 
     async def _run_verifier(self, spec: LaunchSpec) -> tuple[VerificationRun, ...]:
@@ -884,9 +1127,9 @@ class DockerProvider:
         leaves = (
             ("",)
             if policy is CleanupPolicy.DELETE
-            # keep_diff_only: the checkout and the verifier's tree go, the collected
-            # evidence (diff, bundle, report copy, verifier logs) stays.
-            else ("repo", "output/tree")
+            # keep_diff_only: the checkout, the verifier's tree and any credential copy
+            # go; the collected evidence (diff, bundle, report copy, verifier logs) stays.
+            else ("repo", "output/tree", CREDENTIAL_LEAF)
         )
         for leaf in leaves:
             await asyncio.to_thread(shutil.rmtree, root / leaf if leaf else root, True)
@@ -970,6 +1213,29 @@ class DockerProvider:
                 await self._call(self.client.remove_container, str(row["Id"]), force=True)
                 removed += 1
         return removed
+
+    async def list_images(self) -> list[ImageInfo]:
+        """Every image on the daemon that carries the `crucible.harness` label (13)."""
+        try:
+            rows = await self._call(self.client.list_images, {"label": ["crucible.harness"]})
+        except DockerApiError as exc:
+            raise ProviderError(f"image listing failed: {exc}") from exc
+        images: list[ImageInfo] = []
+        for row in rows:
+            labels = {str(k): str(v) for k, v in (row.get("Labels") or {}).items()}
+            digests = [str(d) for d in (row.get("RepoDigests") or [])]
+            tags = [str(t) for t in (row.get("RepoTags") or []) if t and t != "<none>:<none>"]
+            for reference in tags or [str(row.get("Id", ""))]:
+                images.append(
+                    ImageInfo(
+                        reference=reference,
+                        digest=digests[0] if digests else str(row.get("Id", "")),
+                        harness=labels.get("crucible.harness"),
+                        harness_version=labels.get("crucible.harness_version"),
+                        labels=labels,
+                    )
+                )
+        return sorted(images, key=lambda i: i.reference)
 
 
 # ----- reading what the collector wrote ---------------------------------
@@ -1248,4 +1514,182 @@ def _chunk(
         line_sha256=last[1],
         occurrence=last[2],
         lines=count,
+    )
+
+
+# ----- the credential copy (12) --------------------------------------------
+
+
+def _seed_tar(
+    spec: CredentialSpec, source: CredentialSource
+) -> tuple[bytes, dict[str, str | None]]:
+    """A tar of the named auth files, owned by the worker's uid, mode 600, plus an
+    empty mount point for each template. Built in memory; the bytes go to the daemon
+    and the hashes stay with the provider. A required file that is missing refuses the
+    launch rather than seeding a copy that cannot authenticate."""
+    buffer = io.BytesIO()
+    hashes: dict[str, str | None] = {}
+    now = int(time.time())
+    with tarfile.open(fileobj=buffer, mode="w") as tar:
+        directories: set[str] = set()
+
+        def ensure_dirs(name: str) -> None:
+            parts = name.split("/")[:-1]
+            for index in range(1, len(parts) + 1):
+                directory = "/".join(parts[:index])
+                if directory in directories:
+                    continue
+                directories.add(directory)
+                info = tarfile.TarInfo(directory)
+                info.type = tarfile.DIRTYPE
+                info.mode = 0o700
+                info.uid = info.gid = WORKER_UID
+                info.mtime = now
+                tar.addfile(info)
+
+        for auth in spec.auth_files:
+            path = spec.source_path(source.path, auth.name)
+            try:
+                data = path.read_bytes()
+            except OSError as exc:
+                if auth.required:
+                    raise HarnessRefusedError(
+                        f"refusing to launch: the credential for {spec.harness!r} is missing "
+                        f"its auth file {auth.name!r} ({type(exc).__name__})"
+                    ) from exc
+                hashes[auth.name] = None
+                continue
+            ensure_dirs(auth.name)
+            info = tarfile.TarInfo(auth.name)
+            info.size = len(data)
+            info.mode = 0o600
+            info.uid = info.gid = WORKER_UID
+            info.mtime = now
+            tar.addfile(info, io.BytesIO(data))
+            hashes[auth.name] = hashlib.sha256(data).hexdigest()
+        for name in spec.templates:
+            # The read-only template mounts on top of this placeholder, so the mount
+            # point exists with the worker's ownership rather than the daemon's.
+            ensure_dirs(name)
+            info = tarfile.TarInfo(name)
+            info.size = 0
+            info.mode = 0o444
+            info.uid = info.gid = WORKER_UID
+            info.mtime = now
+            tar.addfile(info, io.BytesIO(b""))
+    return buffer.getvalue(), hashes
+
+
+def _single_file(raw: bytes) -> bytes | None:
+    """The first regular file in a tar the daemon returned for one path."""
+    try:
+        with tarfile.open(fileobj=io.BytesIO(raw), mode="r") as tar:
+            for member in tar:
+                if member.isreg():
+                    extracted = tar.extractfile(member)
+                    return extracted.read() if extracted is not None else None
+    except tarfile.TarError:
+        return None
+    return None
+
+
+def _dig(document: Any, path: tuple[str, ...]) -> Any:
+    current = document
+    for key in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def _issued_at(document: Any, path: tuple[str, ...] | None) -> datetime | None:
+    if path is None:
+        return None
+    value = _dig(document, path)
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return parse_rfc3339(value)
+    except ValueError:
+        pass
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+def _sync_one(copy: _CredentialCopy, auth: AuthFile, data: bytes) -> CredentialFileSync:
+    """Decide one file's sync-back (12): changed against the source, valid JSON shape,
+    newer issued-at than the source, then an atomic replace, mode 600."""
+    target = copy.spec.source_path(copy.source.path, auth.name)
+    try:
+        current = target.read_bytes()
+    except OSError:
+        current = None
+    changed = current is None or hashlib.sha256(data).digest() != hashlib.sha256(current).digest()
+    if not changed:
+        return CredentialFileSync(auth.name, True, False, True, False, "unchanged")
+    if not auth.sync_back:
+        return CredentialFileSync(
+            auth.name, True, True, True, False, "changed; state, never written back"
+        )
+    new_document: Any = None
+    if auth.json:
+        try:
+            new_document = json.loads(data.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            new_document = None
+        valid = isinstance(new_document, dict) and all(
+            key in new_document for key in auth.json_keys
+        )
+        if not valid:
+            return CredentialFileSync(
+                auth.name, True, True, False, False, "changed; not the expected JSON shape"
+            )
+    if auth.issued_at is None:
+        return CredentialFileSync(
+            auth.name, True, True, True, False, "changed; no issued-at field to order by"
+        )
+    newer = _issued_at(new_document, auth.issued_at)
+    if newer is None:
+        return CredentialFileSync(
+            auth.name, True, True, True, False, "changed; the copy carries no issued-at"
+        )
+    old_document: Any = None
+    if current is not None:
+        with contextlib.suppress(UnicodeDecodeError, ValueError):
+            old_document = json.loads(current.decode("utf-8"))
+    older = _issued_at(old_document, auth.issued_at)
+    if older is not None and newer <= older:
+        return CredentialFileSync(
+            auth.name, True, True, True, False, "changed; not newer than the source"
+        )
+    temporary = target.with_name(target.name + ".crucible-sync")
+    try:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, target)
+    except OSError as exc:
+        with contextlib.suppress(OSError):
+            temporary.unlink()
+        return CredentialFileSync(
+            auth.name, True, True, True, False, f"changed; write back failed: {type(exc).__name__}"
+        )
+    return CredentialFileSync(
+        auth.name, True, True, True, True, "changed; newer issued-at, written back"
+    )
+
+
+def _tails(frames: Sequence[LogFrame], limit: int) -> tuple[str, str]:
+    out: dict[str, bytearray] = {"stdout": bytearray(), "stderr": bytearray()}
+    for frame in frames:
+        out["stderr" if frame.stream == "stderr" else "stdout"].extend(frame.payload)
+    return (
+        bytes(out["stdout"][-limit:]).decode("utf-8", "replace"),
+        bytes(out["stderr"][-limit:]).decode("utf-8", "replace"),
     )

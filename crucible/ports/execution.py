@@ -71,6 +71,16 @@ class LaunchSpec:
     # The registered repository's clone url. It lives on the Repository row, not in
     # the contract, so the supervisor puts it here for `prepare` (03, 08).
     repository_url: str = ""
+    # The harness adapter's launch shape (07). `env_from_files` maps a variable name to
+    # a container path the provider resolves at container start: the one way a value
+    # from a credential file reaches the harness environment, never through `Env`.
+    env_from_files: dict[str, str] = field(default_factory=dict)
+    # What the harness reads on stdin: these files, in order, then this text.
+    stdin_files: tuple[str, ...] = ()
+    stdin_text: str = ""
+    # Where the provider tees the harness's stdout, so the transcript is an artifact.
+    transcript_path: str | None = None
+    effort: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,6 +234,68 @@ class CollectedOutputs:
     # Rejections the collector made while copying the report directory out: symlinks,
     # hard links, devices, and files above the size cap (08). Each becomes an event.
     copy_rejections: tuple[dict[str, str], ...] = ()
+    # What the sync-back of the per-attempt credential copy did, when there was one (12).
+    credential_sync: CredentialSync | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CredentialFileSync:
+    """One named auth file after the run (12): present in the copy, changed against the
+    source, valid in shape, and written back or not, with the reason. Never a value."""
+
+    name: str
+    present: bool
+    changed: bool
+    valid: bool
+    synced: bool
+    reason: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "present": self.present,
+            "changed": self.changed,
+            "valid": self.valid,
+            "synced": self.synced,
+            "reason": self.reason,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class CredentialSync:
+    """What the sync-back of a per-attempt credential copy did (12)."""
+
+    harness: str
+    mount_mode: str
+    files: tuple[CredentialFileSync, ...]
+    removed: bool
+    detail: str = ""
+
+    @property
+    def changed(self) -> bool:
+        return any(f.changed for f in self.files)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "harness": self.harness,
+            "mount_mode": self.mount_mode,
+            "changed": self.changed,
+            "removed": self.removed,
+            "files": [f.as_dict() for f in self.files],
+            "detail": self.detail,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ImageInfo:
+    """A worker image the provider can see (13): its reference, its digest, and the
+    harness and version its labels declare."""
+
+    reference: str
+    digest: str
+    harness: str | None
+    harness_version: str | None
+    labels: dict[str, str] = field(default_factory=dict)
 
 
 class CleanupPolicy(StrEnum):
@@ -234,6 +306,12 @@ class CleanupPolicy(StrEnum):
 
 class ProviderError(Exception):
     """A provider failed before or while the harness ran (exit class environment)."""
+
+
+class LaunchRefusedError(ProviderError):
+    """A launch the provider refused on purpose (07, 13): the image's harness version is
+    outside the adapter's tested range, or the harness has no credential to run with.
+    The supervisor turns this into a wake, not a retry."""
 
 
 class ExecutionProvider(Protocol):
@@ -264,4 +342,8 @@ class ExecutionProvider(Protocol):
     async def retention(self, keep: Sequence[str]) -> int:
         """Remove provider-side leavings for attempts that are gone (16). Returns the
         count removed. A provider with nothing to remove returns 0."""
+        ...
+
+    async def list_images(self) -> list[ImageInfo]:
+        """The worker images this provider can run, with their labels (13, 25)."""
         ...

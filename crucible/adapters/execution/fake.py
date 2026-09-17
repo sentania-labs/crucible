@@ -39,6 +39,7 @@ from crucible.ports.execution import (
     CollectedArtifact,
     CollectedOutputs,
     Handle,
+    ImageInfo,
     IsolationLevel,
     LaunchSpec,
     LogChunk,
@@ -464,6 +465,10 @@ class FakeProvider:
     ) -> None:
         self.cleaned.append(ws.attempt_id)
         self._workspaces.pop(ws.attempt_id, None)
+
+    async def list_images(self) -> list[ImageInfo]:
+        """The fake provider runs behaviours, not images (08): nothing to list."""
+        return []
 
     async def retention(self, keep: Sequence[str]) -> int:
         return 0

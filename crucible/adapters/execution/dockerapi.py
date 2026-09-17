@@ -262,6 +262,57 @@ class DockerClient:
         finally:
             conn.close()
 
+    def put_archive(self, container_id: str, path: str, tar: bytes) -> None:
+        """Extract a tar into a container path (`docker cp -` by another name).
+
+        This is how the per-attempt credential copy is seeded (12): the container is
+        created, not started, its credential mount is in place, and the daemon extracts
+        the named auth files into it with the ownership the tar headers carry. The value
+        travels in the request body and nowhere else: not in `Env`, not in `Cmd`, not on
+        a command line, not through this process's argv."""
+        url = f"/{API_VERSION}/containers/{container_id}/archive?{urlencode({'path': path})}"
+        conn = self._connect()
+        try:
+            conn.request(
+                "PUT",
+                url,
+                body=tar,
+                headers={"Content-Type": "application/x-tar", "Host": "docker"},
+            )
+            response = conn.getresponse()
+            raw = response.read()
+            if response.status >= 400:
+                raise DockerApiError(
+                    response.status, _message(raw.decode("utf-8", "replace")), path=url
+                )
+        finally:
+            conn.close()
+
+    def get_archive(self, container_id: str, path: str) -> bytes | None:
+        """A tar of one path inside a container, or None when it is not there.
+
+        Works on a stopped container: the daemon mounts its volumes and binds for the
+        copy. This is how the named auth files come back for the sync-back (12)."""
+        try:
+            with self._request(
+                "GET", f"/containers/{container_id}/archive", params={"path": path}
+            ) as response:
+                return response.read()
+        except DockerApiError as exc:
+            if exc.status == 404:
+                return None
+            raise
+
+    def list_images(
+        self, filters: Mapping[str, Sequence[str]] | None = None
+    ) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {}
+        if filters:
+            params["filters"] = json.dumps({k: list(v) for k, v in filters.items()})
+        data = self._json("GET", "/images/json", params=params)
+        assert isinstance(data, list)
+        return [row for row in data if isinstance(row, dict)]
+
     def create_network(self, name: str, *, internal: bool) -> str:
         body = {"Name": name, "Driver": "bridge", "Internal": internal, "CheckDuplicate": True}
         try:

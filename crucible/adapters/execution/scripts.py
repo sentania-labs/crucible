@@ -195,6 +195,12 @@ done
 touch "$REPO/.git/info/exclude"
 {exclude_block}
 
+# 12: the per-attempt credential copy lives here, created by this container so it
+# belongs to the worker's own uid with no other reader (S9 Test E). The provider seeds
+# it through the daemon before the worker starts and removes it right after the
+# sync-back.
+mkdir -m 0700 -p {WORK_MOUNT}/credential
+
 mkdir -p "$OUT"
 {GIT} rev-parse HEAD > "$OUT/prepared-head.txt"
 printf '%s\n' "$STARTED" > "$OUT/started-from.txt"
