@@ -124,6 +124,20 @@ source = "directory"
 path = "/var/lib/crucible/credentials/agy"            # .gemini/antigravity-cli/antigravity-oauth-token
 mount_mode = "rw-narrow"   # the CLI rotated its token on the first run past expiry (C5 live run)
 
+# Administration (25, C5b): the same operations behind `/v1/admin` and `crucible-admin`.
+# A rotated credential's previous directory is kept for `credential_retention_hours`
+# beside the live one, then shredded on the supervisor's retention tick; remove shreds
+# at once. The probe runs the harness's hardened image with the dedicated credential
+# for at most `probe_timeout_seconds` and records only the exit class, the harness
+# version, the image digest and whether an auth file changed. `login` drives the CLI's
+# login through a pty and prints the URL and the code it shows; the token file is
+# written mode 600 and never displayed. Each CLI's login command may be overridden
+# (`login_commands.<harness>`) for a CLI that moved; the defaults are the shipped ones.
+[admin]
+credential_retention_hours = 24
+probe_timeout_seconds = 120
+login_timeout_seconds = 900    # Codex's device code lasts 15 minutes; AGY's 60 seconds
+
 # Harness enablement (25, S1b). A launch needs this gate and the administrator's runtime
 # flag (`crucible-admin harnesses enable`, C5b; seeded the same way by migration 0008).
 # A harness ships disabled until its dedicated Crucible session has refreshed on the
