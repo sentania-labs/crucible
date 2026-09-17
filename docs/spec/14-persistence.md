@@ -28,6 +28,8 @@
 | `bootstrap_imports` | id, source_sha256, manifest JSONB, verified_at, committed_at, state |
 | `repositories` | id, name UNIQUE, url, default_branch, installation_id, policy_name, registered_by, created_at |
 | `worker_images` | digest PK, reference, harness, harness_version, build_inputs_sha256, promotion_state, promoted_at, promoted_by |
+| `harnesses` | name PK, enabled (the administrator's flag, 25), reason, session_compatibility (unverified, verified, failed), mount_mode_observed, refresh_requires_rw, last_launch_at, last_launch_outcome, last_auth_failure_at, last_validated_at, updated_at, updated_by |
+| `image_promotions` | digest PK, reference, harness, harness_version, state (candidate, default, retained), reason, updated_at, updated_by |
 | `review_reports` | id, task_id, head_sha, reviewer_kind, reviewer_attempt_id, reviewer_principal_id, document JSONB, artifact_id, created_at |
 | `pull_requests` | id, task_id UNIQUE, repository_id, number, url, base_ref, work_branch, state, head_sha, title, opened_at, merged_at, merge_sha, merged_by, closed_at, closed_by, last_polled_at, last_reactions_polled_at, reactions_observable, cancelled_at, body_sha256; UNIQUE (repository_id, number) |
 | `pull_request_heads` | id, pull_request_id, sha, pushed_by (crucible, other), observed_at |
@@ -42,7 +44,7 @@
 | `release_contracts` | id, external_id, repository_id, target_branch, target_sha, version, tag, document JSONB, sha256, authorization_decision_id, submitted_at |
 | `releases` | id, release_contract_id UNIQUE, state, tag_sha, tagged_at, workflow_run_url, conclusion, ended_at |
 | `routing_policies` | (name, version) PK, document JSONB, created_at, retired_at |
-| `attempt_metrics` | attempt_id PK, model, harness, endpoint_kind, pool, wall_ms, tokens_in, tokens_out, cost_units, cost_source (harness_reported, none), exit_class, gates_passed, gates_failed, corrections_after, acceptance_verdict |
+| `attempt_metrics` | attempt_id PK, model, model_reported (the model the transcript named, null when the harness named none), harness, endpoint_kind, pool, wall_ms, tokens_in, tokens_out, cost_units, cost_source (harness_reported, none), exit_class, gates_passed, gates_failed, corrections_after, acceptance_verdict |
 | `retention_actions` | id, policy_name, policy_version, kind, target, performed_at, event_seq |
 
 Indexes: tasks (state), (principal_id, updated_at); events (task_id, seq);
@@ -62,6 +64,13 @@ the current `supervisor` lease row, read `FOR SHARE` so a takeover cannot
 interleave; a BEFORE trigger rejects anything else (the principal check is
 nested inside the trigger body because PL/pgSQL compiles `NEW.principal`
 for every attached table).
+`harnesses` and `image_promotions` are the exception to the fencing rule
+above: the supervisor writes the observation columns (last launch, last
+auth failure) and the admin surface writes the flags and promotion states,
+so two principals write each table and neither is fenced to the supervisor
+lease. Every admin mutation is still an event with its principal and
+reason (25).
+
 The API role writes only `tasks` (submit, start, cancel, amend, close),
 `task_contracts`, `idempotency_keys` (in the same transaction as the
 mutation they record), `acceptance_results`, `decisions`, `artifacts`,
