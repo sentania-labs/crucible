@@ -19,7 +19,12 @@ SKIPPED = "skipped"
 FAILING_CONCLUSIONS: frozenset[str] = frozenset(
     {"failure", "cancelled", "timed_out", "action_required", "stale", "startup_failure"}
 )
-PASSING_CONCLUSIONS: frozenset[str] = frozenset({SUCCESS, NEUTRAL, SKIPPED})
+# 23: "green means the set is non-empty and every member concluded `success`". A member
+# that concluded `neutral` or `skipped` is neither a success nor a failure, so it leaves
+# the set pending and the timeout wakes Foundry. A `skipped` run is still excluded from
+# the *observed* fallback set (23), which is a different question: it cannot make a set
+# out of nothing, but once a check is required, skipping it is not passing it.
+PASSING_CONCLUSIONS: frozenset[str] = frozenset({SUCCESS})
 
 
 class CertificationState(StrEnum):

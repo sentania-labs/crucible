@@ -111,7 +111,6 @@ external_review:
   require_feedback_disposition: true
   accepted_signals:
   - review
-  - comment
   - reaction:+1
   round_counting: completed_cycles
   wait_timeout_hours: 24

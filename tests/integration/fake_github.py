@@ -56,6 +56,7 @@ class PullRequestState:
     review_comments: list[dict[str, Any]] = field(default_factory=list)
     issue_comments: list[dict[str, Any]] = field(default_factory=list)
     reactions: list[dict[str, Any]] = field(default_factory=list)
+    events: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -85,6 +86,7 @@ class FakeGitHub:
         self.issues_read = True
         self.rate_limit_once = False
         self.mint_calls = 0
+        self.workflow_log = b"fake workflow log: the required check failed\n"
         self.lock = threading.Lock()
 
     # ----- test-facing helpers ------------------------------------------
@@ -238,10 +240,15 @@ class FakeGitHub:
         pull.merged_by = by
         pull.closed_at = pull.merged_at
 
-    def close(self, full_name: str, number: int) -> None:
+    def close(self, full_name: str, number: int, *, by: str = "") -> None:
         pull = self.repositories[full_name].pulls[number]
         pull.state = "closed"
         pull.closed_at = now_iso()
+        if by:
+            # GitHub records the closer on the issue timeline, not on the pull request.
+            pull.events.append(
+                {"event": "closed", "actor": {"login": by}, "created_at": pull.closed_at}
+            )
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -415,6 +422,9 @@ class _Handler(BaseHTTPRequestHandler):
                     return
                 self._send(200, pull.issue_comments)
                 return
+            if tail == ["events"]:
+                self._send(200, pull.events)
+                return
             if tail == ["reactions"]:
                 # S12: this is the one call that needs Issues read, and the App does not
                 # hold it until the operator adds it.
@@ -449,7 +459,7 @@ class _Handler(BaseHTTPRequestHandler):
         if rest[:2] == ["actions", "runs"] and rest[3:] == ["logs"]:
             self.send_response(200)
             self.send_header("Content-Type", "application/zip")
-            payload = b"fake workflow log: the required check failed\n"
+            payload = self.state.workflow_log
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
             self.wfile.write(payload)

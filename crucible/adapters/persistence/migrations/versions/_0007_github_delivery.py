@@ -11,6 +11,8 @@ Revises: 0006_log_occurrence
 
 from __future__ import annotations
 
+import json
+
 import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects.postgresql import JSONB
@@ -99,9 +101,25 @@ NEW_FENCED_TABLES = (
 )
 NEW_APPEND_ONLY_TABLES = ("ci_decisions",)
 
+# Where a downgrade puts the C4 event rows. The revisions below this one recreate the
+# event-kind CHECK in its validating form, which C4 rows cannot satisfy, and they are
+# applied revisions this one may not edit. Deleting the rows to make a constraint fit
+# would destroy the audit log, so they are moved aside instead and moved back on the way
+# up. Nothing is lost either way, and a database that was downgraded says so by having
+# this table.
+EVENT_ARCHIVE = "events_c4_archive"
+
 
 def _event_kinds() -> list[str]:
     return [*c3_event_kinds(), *C4_EVENT_KINDS]
+
+
+def _archive_exists(connection: sa.engine.Connection) -> bool:
+    return bool(
+        connection.execute(
+            sa.text("SELECT to_regclass(:name) IS NOT NULL"), {"name": f"public.{EVENT_ARCHIVE}"}
+        ).scalar()
+    )
 
 
 def upgrade() -> None:
@@ -114,8 +132,6 @@ def upgrade() -> None:
     op.alter_column("repositories", "external_review_attested", server_default=None)
     op.add_column("repositories", sa.Column("attested_by", sa.String(128), nullable=True))
     op.add_column("repositories", sa.Column("attested_at", TZ, nullable=True))
-    # C2's flag; the `publishing` state replaces it (09).
-    op.drop_column("tasks", "publish_pending")
 
     op.drop_constraint("ck_events_kind", "events", type_="check")
     allowed = ", ".join(f"'{k}'" for k in _event_kinds())
@@ -123,6 +139,98 @@ def upgrade() -> None:
         f"ALTER TABLE events ADD CONSTRAINT ck_events_kind CHECK (kind IN ({allowed})) NOT VALID"
     )
     op.execute("ALTER TABLE events VALIDATE CONSTRAINT ck_events_kind")
+
+    # Put back anything a previous downgrade moved aside. The constraint above already
+    # allows these kinds again, which is why this runs here and not earlier.
+    connection = op.get_bind()
+    if _archive_exists(connection):
+        op.execute("ALTER TABLE events DISABLE TRIGGER trg_events_append_only")
+        op.execute(
+            f"INSERT INTO events (seq, ts, kind, task_id, execution_id, attempt_id, "
+            f"principal, verified, payload) SELECT seq, ts, kind, task_id, execution_id, "
+            f"attempt_id, principal, verified, payload FROM {EVENT_ARCHIVE}"
+        )
+        op.execute("ALTER TABLE events ENABLE TRIGGER trg_events_append_only")
+        op.execute(
+            "SELECT setval('events_seq_seq', GREATEST("
+            "(SELECT COALESCE(MAX(seq), 1) FROM events), 1))"
+        )
+        op.execute(f"DROP TABLE {EVENT_ARCHIVE}")
+
+    # C2's flag becomes the `publishing` state (09). A task accepted under C2 is waiting
+    # in `awaiting_acceptance` with the flag raised and would be stranded by a bare drop,
+    # so it is moved first, with the event the transition owes it. The event kind is
+    # already allowed by the constraint above, which is why this runs after it.
+    connection = op.get_bind()
+    stranded = connection.execute(
+        sa.text(
+            "SELECT id, head_sha FROM tasks "
+            "WHERE publish_pending AND state = 'awaiting_acceptance' FOR UPDATE"
+        )
+    ).all()
+    if stranded:
+        # A migration holds no supervisor lease, and `events` is fenced to the
+        # supervisor. The fence exists to stop a second *supervisor* writing, not a
+        # migration, so it stands down for exactly this insert and nothing else.
+        op.execute("ALTER TABLE events DISABLE TRIGGER trg_events_fenced")
+    for task_id, head_sha in stranded:
+        connection.execute(
+            sa.text("UPDATE tasks SET state = 'publishing', updated_at = now() WHERE id = :id"),
+            {"id": task_id},
+        )
+        connection.execute(
+            sa.text(
+                "INSERT INTO events (ts, kind, task_id, principal, verified, payload) "
+                "VALUES (now(), 'task_publishing', :task_id, 'crucible', true, "
+                "CAST(:payload AS jsonb))"
+            ),
+            {
+                "task_id": task_id,
+                "payload": json.dumps(
+                    {
+                        "from": "awaiting_acceptance",
+                        "to": "publishing",
+                        "head_sha": head_sha,
+                        "note": (
+                            "migrated from C2's publish_pending flag by revision "
+                            "0007_github_delivery"
+                        ),
+                    }
+                ),
+            },
+        )
+    if stranded:
+        op.execute("ALTER TABLE events ENABLE TRIGGER trg_events_fenced")
+    op.drop_column("tasks", "publish_pending")
+
+    # 23: the provider's summary comment is edited in place and never counts as a round,
+    # but it arrives before any verdict exists and the C1 seed lists `comment` as an
+    # accepted signal, so it completed the cycle before the review did. 0001 is applied
+    # and is never edited, so the correction is data here: read, modify, write back, so
+    # a missing row is an error rather than a silent half-application, and an operator's
+    # own edit to the list is left alone.
+    policy_row = connection.execute(
+        sa.text("SELECT document FROM policies WHERE name = :name AND version = :version"),
+        {"name": "default-software", "version": 1},
+    ).scalar_one_or_none()
+    if policy_row is None:
+        raise RuntimeError(
+            "policy default-software/1 is missing; revision 0001 seeds it and 0007 corrects it"
+        )
+    document = dict(policy_row)
+    external_review = document.get("external_review")
+    if not isinstance(external_review, dict):
+        raise RuntimeError("policy default-software/1 has no external_review section to correct")
+    signals = external_review.get("accepted_signals")
+    if isinstance(signals, list) and set(signals) == {"review", "comment", "reaction:+1"}:
+        external_review["accepted_signals"] = ["review", "reaction:+1"]
+        connection.execute(
+            sa.text(
+                "UPDATE policies SET document = CAST(:document AS jsonb) "
+                "WHERE name = :name AND version = :version"
+            ),
+            {"document": json.dumps(document), "name": "default-software", "version": 1},
+        )
 
     op.create_table(
         "pull_requests",
@@ -356,15 +464,44 @@ def downgrade() -> None:
         sa.Column("publish_pending", sa.Boolean, nullable=False, server_default=sa.false()),
     )
     op.alter_column("tasks", "publish_pending", server_default=None)
+
+    connection = op.get_bind()
+    policy_row = connection.execute(
+        sa.text("SELECT document FROM policies WHERE name = :name AND version = :version"),
+        {"name": "default-software", "version": 1},
+    ).scalar_one_or_none()
+    if policy_row is not None:
+        document = dict(policy_row)
+        external_review = document.get("external_review")
+        if isinstance(external_review, dict) and set(
+            external_review.get("accepted_signals") or []
+        ) == {"review", "reaction:+1"}:
+            external_review["accepted_signals"] = ["review", "comment", "reaction:+1"]
+            connection.execute(
+                sa.text(
+                    "UPDATE policies SET document = CAST(:document AS jsonb) "
+                    "WHERE name = :name AND version = :version"
+                ),
+                {"document": json.dumps(document), "name": "default-software", "version": 1},
+            )
     op.drop_column("repositories", "attested_at")
     op.drop_column("repositories", "attested_by")
     op.drop_column("repositories", "external_review_attested")
 
-    op.drop_constraint("ck_events_kind", "events", type_="check")
-    kinds = ", ".join(f"'{k}'" for k in _event_kinds() if k not in C4_EVENT_KINDS)
+    # `events` is the audit log, and no downgrade deletes audit rows to make a constraint
+    # fit. The revisions below this one recreate the CHECK in its validating form, so the
+    # C4 rows are moved into an archive table this migration leaves behind, and 0007's
+    # upgrade moves them back. The append-only trigger stands down for exactly the move.
     gone = ", ".join(f"'{k}'" for k in C4_EVENT_KINDS)
-    # `events` is append-only, so the trigger stands down for exactly this statement.
+    # `LIKE events` without INCLUDING DEFAULTS: copying the default would make the
+    # archive depend on `events_seq_seq`, and revision 0001's downgrade could then not
+    # drop `events` at all.
+    op.execute(f"CREATE TABLE IF NOT EXISTS {EVENT_ARCHIVE} (LIKE events)")
     op.execute("ALTER TABLE events DISABLE TRIGGER trg_events_append_only")
+    op.execute(f"INSERT INTO {EVENT_ARCHIVE} SELECT * FROM events WHERE kind IN ({gone})")
     op.execute(f"DELETE FROM events WHERE kind IN ({gone})")
     op.execute("ALTER TABLE events ENABLE TRIGGER trg_events_append_only")
+
+    op.drop_constraint("ck_events_kind", "events", type_="check")
+    kinds = ", ".join(f"'{k}'" for k in _event_kinds() if k not in C4_EVENT_KINDS)
     op.create_check_constraint("ck_events_kind", "events", f"kind IN ({kinds})")

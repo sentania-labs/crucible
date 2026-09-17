@@ -25,6 +25,16 @@ DEFAULT_COMPONENTS: tuple[str, ...] = ("code",)
 DEFAULT_REVIEWER_LOGINS: tuple[str, ...] = ("chatgpt-codex-connector[bot]",)
 CLEAN_REACTION = "+1"
 PICKUP_REACTION = "eyes"
+# 23: "the bot's summary comment is edited in place and never counts as a round; the
+# review object, its comments, or the bot's no-findings comment do". The summary comment
+# arrives within about ten seconds of the pull request opening, minutes before the
+# verdict, and is then edited (S12). Counting it as a round completes the cycle before
+# any review exists, so a comment is not a round-completing signal by default.
+DEFAULT_ACCEPTED_SIGNALS: frozenset[str] = frozenset({"reaction:+1", "review"})
+# The HTML marker the provider puts at the top of that summary comment (S12, PR #1 on
+# the live record). A comment carrying it is never a round, even where a policy has
+# deliberately added `comment` to `accepted_signals`.
+SUMMARY_MARKER = "codex-pull-request-review-summary"
 
 
 class SignalKind(StrEnum):
@@ -99,8 +109,13 @@ def accepted_signals(policy: dict[str, object]) -> frozenset[str]:
     section = policy.get("external_review")
     raw = section.get("accepted_signals") if isinstance(section, dict) else None
     if not raw or not isinstance(raw, list):
-        return frozenset({"reaction:+1", "review", "comment"})
+        return DEFAULT_ACCEPTED_SIGNALS
     return frozenset(str(s) for s in raw)
+
+
+def is_provider_summary(body: str) -> bool:
+    """The provider's own summary comment, by the marker it writes into the body (S12)."""
+    return SUMMARY_MARKER in body.lower()
 
 
 def required_rounds(policy: dict[str, object]) -> int:
@@ -118,6 +133,11 @@ def is_accepted(signal: Signal, policy: dict[str, object]) -> bool:
     allowed = accepted_signals(policy)
     if signal.kind is SignalKind.REACTION:
         return f"reaction:{signal.content}" in allowed
+    if signal.kind is SignalKind.COMMENT and is_provider_summary(signal.body):
+        # 23: the summary comment is edited in place and never counts as a round. It is
+        # recorded like any other comment; it just cannot complete a cycle, even under a
+        # policy that accepts comments generally.
+        return False
     return signal.kind.value in allowed
 
 

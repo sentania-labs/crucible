@@ -603,6 +603,11 @@ class DeliveryInput:
     completed_rounds: int = 0
     required_rounds: int = 1
     undispositioned: tuple[str, ...] = ()
+    # Comments whose current disposition is `fix`. 09 advances out of
+    # `external_feedback_received` only when every comment is dispositioned *and none is
+    # fix*: a `fix` is Foundry saying the work is not done, and what follows it is a
+    # correction, not advancement.
+    fix_dispositions: tuple[str, ...] = ()
     comment_count: int = 0
     certification_state: str = ""
     certification_detail: str = ""
@@ -653,6 +658,12 @@ def external_review_rounds(di: DeliveryInput) -> GateOutcome:
 
 
 def feedback_dispositions_complete(di: DeliveryInput) -> GateOutcome:
+    if di.fix_dispositions:
+        return GateOutcome(
+            GateResult.PENDING,
+            f"{len(di.fix_dispositions)} review comment(s) are dispositioned `fix`; the "
+            "task waits for the correction that addresses them (09)",
+        )
     if not di.comment_count:
         return GateOutcome(GateResult.PASS, "no external review comment needs a disposition")
     if di.undispositioned:
@@ -662,7 +673,8 @@ def feedback_dispositions_complete(di: DeliveryInput) -> GateOutcome:
             "recorded disposition",
         )
     return GateOutcome(
-        GateResult.PASS, f"every one of {di.comment_count} review comment(s) is dispositioned"
+        GateResult.PASS,
+        f"every one of {di.comment_count} review comment(s) is dispositioned and none is fix",
     )
 
 

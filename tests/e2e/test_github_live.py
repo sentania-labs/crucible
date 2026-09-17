@@ -12,13 +12,14 @@ all configured, so a partial run is never mistaken for a pass.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import text
+from sqlalchemy import Engine, text
 
 from crucible.adapters.api.app import create_app
 from crucible.adapters.api.deps import AppContext
@@ -263,17 +264,21 @@ async def test_a_task_reaches_a_real_pull_request_and_a_real_merge(
     # the title or the body, and neither carries an unauthorized closing keyword.
     assert scan_text(live.title) is None
 
-    # 23 and S12: the App holds no Issues read, so the one place a clean external review
-    # appears is unreadable. The poll records that and carries on, which is what this
-    # asserts live; the round logic itself is covered against the fake server.
-    assert record["reactions_observable"] in (True, False)
-    if not record["reactions_observable"]:
-        assert "reactions_unobservable" in [
-            e["kind"]
-            for e in live_client.get(f"/v1/tasks/{task_id}/events", params={"limit": 200}).json()[
-                "items"
-            ]
+    # 23 and S12: the PR-level reactions endpoint is the one place a clean external
+    # review appears, and it needs Issues read. Either it is readable, in which case the
+    # poll recorded the reactions it saw, or it is not, in which case the poll recorded
+    # that and carried on. Both are asserted; neither is allowed to pass silently.
+    observed_kinds = [
+        e["kind"]
+        for e in live_client.get(f"/v1/tasks/{task_id}/events", params={"limit": 200}).json()[
+            "items"
         ]
+    ]
+    if record["reactions_observable"]:
+        assert "reactions_unobservable" not in observed_kinds
+        assert "pull_request_polled" in observed_kinds
+    else:
+        assert "reactions_unobservable" in observed_kinds
 
     ready = await run_until(
         live_supervisor,
@@ -315,6 +320,89 @@ async def test_a_task_reaches_a_real_pull_request_and_a_real_merge(
         "pull_request_polled",
     ):
         assert kind in kinds, kind
+
+
+@pytest.mark.skipif(
+    github_live.review_wait_seconds() == 0,
+    reason=(
+        f"set {github_live.WAIT_FOR_REVIEW_ENV} to a number of seconds to wait for a real "
+        "external review round; the provider takes about 100 s (S12)"
+    ),
+)
+async def test_a_real_external_review_round_completes_the_cycle(
+    ctx: AppContext,
+    live_client: TestClient,
+    live_supervisor: Supervisor,
+    live_config: LiveConfig,
+    github: RestGitHubClient,
+    mirror: str,
+    cleanup: github_live.Cleanup,
+    worker_image: str,
+    engine: Engine,
+) -> None:
+    """Opt-in: publish, then wait for the provider's own round on a real pull request.
+
+    S12 measured pickup at 11 s and completion at 101 s, and the completion signal is a
+    `+1` reaction on the pull request, which needs Issues read on the App. The wait is
+    bounded and the reason for a timeout is the observation itself, not a bare failure.
+    """
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE policies SET document = jsonb_set(jsonb_set(document, "
+                "'{external_review,required_rounds}', '1'), '{gates,skipped}', '[]') "
+                "WHERE name = 'e2e-script' AND version = 1"
+            )
+        )
+    register(ctx, live_config, mirror)
+    external_id = f"C4R-{RUN_ID}"
+    cleanup.add_branch(github_live.branch_for(external_id))
+    document = live_contract(external_id, live_config, worker_image)
+    task_id = submit_and_start(live_client, document)
+    await run_until(
+        live_supervisor, live_client, task_id, {"awaiting_internal_review"}, max_ticks=60
+    )
+    upload_review(live_client, task_id)
+    await run_until(live_supervisor, live_client, task_id, {"awaiting_acceptance"}, max_ticks=20)
+    view = live_client.get(f"/v1/tasks/{task_id}").json()
+    live_client.post(
+        f"/v1/tasks/{task_id}/accept",
+        json={
+            "verdict": "accepted",
+            "reasoning": "publish it so the provider has something to review",
+            "head_sha": view["head_sha"],
+        },
+    )
+    await run_until(
+        live_supervisor,
+        live_client,
+        task_id,
+        {"awaiting_external_review", "publish_failed"},
+        max_ticks=20,
+        pause=2.0,
+    )
+    record = live_client.get(f"/v1/tasks/{task_id}/pull-request").json()
+    cleanup.add_pull_request(int(record["number"]))
+    print(f"live review round on: {record['url']}")
+
+    deadline = time.monotonic() + github_live.review_wait_seconds()
+    while time.monotonic() < deadline:
+        await live_supervisor.tick()
+        record = live_client.get(f"/v1/tasks/{task_id}/pull-request").json()
+        if record["completed_rounds"] >= 1:
+            break
+        time.sleep(10)
+    assert record["reactions_observable"], (
+        "the App still cannot read reactions on the pull request, which is the only "
+        "place a clean result appears (23, S12)"
+    )
+    assert record["completed_rounds"] >= 1, (
+        f"no round completed within {github_live.review_wait_seconds()} s; "
+        f"reactions seen: {record['reactions']}, reviews: {record['external_reviews']}"
+    )
+    accepted = [r for r in record["external_reviews"] if r["accepted"]]
+    assert accepted, record["external_reviews"]
+    print(f"live round completed by: {[(r['signal'], r['reviewer_login']) for r in accepted]}")
 
 
 async def test_no_token_reaches_the_daemon_the_logs_or_the_database(

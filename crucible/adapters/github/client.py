@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -161,6 +162,28 @@ class RestGitHubClient:
             if isinstance(row, dict)
         )
 
+    def closed_by(self, token: InstallationToken, *, repository: str, number: int) -> str | None:
+        """Who closed the pull request, from the issue events timeline.
+
+        `GET /pulls/{n}` carries `merged_by` but no closer, so 23's "with the closer
+        recorded" needs this second call. It is best effort: on a permission refusal the
+        close is still recorded, with no actor, rather than the observation failing."""
+        try:
+            rows = self._http.paginate(
+                f"/repos/{repository}/issues/{number}/events", bearer=token.reveal()
+            )
+        except GitHubError as exc:
+            if exc.status in (403, 404):
+                return None
+            raise
+        for row in reversed(rows):
+            if isinstance(row, dict) and row.get("event") == "closed":
+                actor = row.get("actor")
+                if isinstance(actor, dict) and actor.get("login"):
+                    return str(actor["login"])
+                return None
+        return None
+
     def _comment_reactions(
         self, token: InstallationToken, *, repository: str, comments: Sequence[CommentRecord]
     ) -> list[ReactionRecord]:
@@ -199,6 +222,9 @@ class RestGitHubClient:
         an accelerator rather than a second source of truth."""
         notes: list[str] = []
         pr = self.get_pull_request(token, repository=repository, number=number)
+        if pr.state == "closed" and not pr.merged:
+            closer = self.closed_by(token, repository=repository, number=number)
+            pr = replace(pr, closed_by=closer)
         reviews = tuple(
             normalize.review(row)
             for row in self._http.paginate(
@@ -353,12 +379,19 @@ class RestGitHubClient:
         number: int,
         title: str | None = None,
         body: str | None = None,
+        base_ref: str | None = None,
     ) -> PullRequestRef:
+        """Title, body, and base. `draft` is deliberately absent: GitHub does not accept
+        it on this endpoint, so a draft mismatch on a reused pull request is reported and
+        refused rather than silently tolerated (see the publisher)."""
         fields: dict[str, Any] = {}
         if title is not None:
             fields["title"] = title
         if body is not None:
             fields["body"] = body
+        if base_ref is not None:
+            check_ref(base_ref, field="base_ref")
+            fields["base"] = base_ref
         if not fields:
             return self.get_pull_request(token, repository=repository, number=number)
         status, payload, _ = self._http.request(
@@ -372,7 +405,7 @@ class RestGitHubClient:
         self, token: InstallationToken, *, repository: str, number: int, body: str
     ) -> str:
         """23: off by default. The external-review trigger is posted by the orchestrator
-        under the operator's account, and an App-authored `@codex review` is refused by
+        under the operator's account, and an App-authored trigger comment is refused by
         the provider anyway (S12 run 1). This exists for a repository that configures
         Crucible to post something else, and it refuses until that is turned on."""
         if not self.allow_issue_comments:

@@ -106,6 +106,22 @@ def test_a_failure_conclusion_fails_and_names_the_check() -> None:
         assert result.failures[0].name == "build"
 
 
+def test_neutral_and_skipped_are_not_green() -> None:
+    """23: green means every member concluded `success`. A required check that came back
+    `neutral` or `skipped` concluded neither successfully nor in failure, so the set is
+    pending and the timeout wakes Foundry."""
+    for conclusion in ("neutral", "skipped"):
+        result = certify(
+            policy(required_checks=["build"]),
+            head_sha=HEAD,
+            branch_protection=[],
+            observed=[check("build", conclusion)],
+        )
+        assert result.state is CertificationState.PENDING, conclusion
+        assert result.pending == ("build",)
+        assert not result.failures
+
+
 def test_a_running_check_is_pending_not_failed() -> None:
     result = certify(
         policy(required_checks=["build"]),

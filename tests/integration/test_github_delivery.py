@@ -239,8 +239,43 @@ async def test_no_installation_token_reaches_any_record(
     blob = "\n".join(haystacks)
     for token in publisher.tokens_seen:
         assert token not in blob
-        # A positive control: the search would find the value if it were there.
-        assert token in f"{blob}\n{token}"
+
+    # The positive control plants a token in a real column through a real write, runs
+    # the same search over the same tables, and rolls back. A control that concatenates
+    # the needle onto the haystack proves only that Python can find a substring.
+    planted = publisher.tokens_seen[0]
+    with engine.connect() as connection:
+        transaction = connection.begin()
+        # A real row in a real table, through a real insert, with the whole 390-character
+        # value: a truncated plant would make the control test truncation rather than the
+        # search, and a concatenated one would test nothing at all.
+        connection.execute(
+            text(
+                "INSERT INTO artifacts (id, attempt_id, task_id, type, filename, path, "
+                "size, sha256, content_type, created_by, created_at) VALUES "
+                "(:id, NULL, :task, 'control', :value, 'x', 0, :digest, 'text/plain', "
+                "'tests', now())"
+            ),
+            {
+                "id": "01CONTROL0000000000000000",
+                "task": task_id,
+                "value": planted,
+                "digest": "0" * 64,
+            },
+        )
+        control: list[str] = []
+        for table_name, column_name in rows:
+            values = connection.execute(
+                text(f'SELECT CAST("{column_name}" AS TEXT) FROM "{table_name}"')
+            ).scalars()
+            control.extend(str(v) for v in values if v is not None)
+        assert planted in "\n".join(control), "the search cannot find a planted token"
+        transaction.rollback()
+    with engine.connect() as connection:
+        left = connection.execute(
+            text("SELECT count(*) FROM artifacts WHERE type = 'control'")
+        ).scalar_one()
+    assert left == 0, "the control's plant was not rolled back"
     minted = [e for e in events["items"] if e["kind"] == "installation_token_minted"]
     assert minted and "expires_at" in minted[0]["payload"]
     # The event records the expiry and the job, never the value (12).
@@ -688,9 +723,19 @@ def test_a_valid_delivery_is_stored_normalized_and_deduplicated(
     delivery_id, digest, normalized = rows[0]
     assert delivery_id == "d-3" and len(digest) == 64
     assert normalized["pull_request"]["head_sha"] == "c" * 40
-    # Only the fields Crucible uses survive; the raw body is never stored.
-    assert "html_url" not in json.dumps(normalized) or "pull/1" in json.dumps(normalized)
-    assert "user" not in normalized
+    # Only the fields Crucible uses survive, and the raw body is never stored: the
+    # normalized record has exactly the keys the reader reads.
+    assert set(normalized) == {"pull_request", "sender"}
+    assert set(normalized["pull_request"]) == {
+        "number",
+        "head_sha",
+        "state",
+        "merged",
+        "merged_by",
+        "merge_commit_sha",
+        "base_ref",
+        "url",
+    }
 
 
 def test_a_review_body_carrying_a_secret_is_redacted_before_storage(
@@ -798,3 +843,260 @@ async def test_a_second_tick_with_nothing_new_changes_nothing(
     new = [e["kind"] for e in after[len(before) :]]
     # The poll itself is an event; nothing else about the task changes.
     assert set(new) <= {"pull_request_polled"}
+
+
+# ----- the C4 correction round ------------------------------------------
+
+
+async def test_commit_policy_refuses_the_push_and_lands_in_publish_failed(
+    client: TestClient, delivery_supervisor: Supervisor, publisher: FakePublisher
+) -> None:
+    """23 step 4: the author and trailer check stops the push. The problems reach the
+    event and the wake, and nothing is on the remote."""
+    publisher.refuse_push = "commit policy refused the push"
+    publisher.refuse_step = "commit-policy"
+    publisher.author_problems = ("deadbeef\tsomeone@example.invalid",)
+    publisher.trailer_problems = ("deadbeef",)
+    task_id = submit_and_start(client, "crucible-worker:fake-succeed")
+    await run_to_settled(delivery_supervisor, client, task_id)
+    await review_and_settle(delivery_supervisor, client, task_id)
+    client.post(
+        f"/v1/tasks/{task_id}/accept", json={"verdict": "accepted", "reasoning": "publish it"}
+    )
+    await delivery_supervisor.tick()
+    assert client.get(f"/v1/tasks/{task_id}").json()["state"] == "publish_failed"
+    failed = [
+        e
+        for e in client.get(f"/v1/tasks/{task_id}/events", params={"limit": 200}).json()["items"]
+        if e["kind"] == "task_publish_failed"
+    ]
+    assert failed and failed[-1]["payload"]["step"] == "commit-policy"
+    assert failed[-1]["payload"]["author_problems"]
+    assert failed[-1]["payload"]["trailer_problems"]
+    assert not publisher.pushes
+
+
+async def test_a_fix_disposition_holds_the_task_until_a_correction(
+    client: TestClient, delivery_supervisor: Supervisor, github: FakeGitHubServer
+) -> None:
+    """09: advancement needs every comment dispositioned and none of them fix."""
+    task_id, view = await publish(client, delivery_supervisor)
+    github.state.add_review(
+        REPOSITORY,
+        1,
+        login=REVIEWER,
+        body="Codex Review. Reviewed commit: " + view["head_sha"],
+        comments=[{"body": "P1 this is wrong", "path": "src/app.txt", "line": 1}],
+    )
+    await delivery_supervisor.tick()
+    record = pr(client, task_id)
+    client.post(
+        f"/v1/tasks/{task_id}/dispositions",
+        json={
+            "review_comment_id": record["comments"][0]["id"],
+            "disposition": "fix",
+            "reasoning": "The reviewer is right and the work is not done.",
+        },
+    )
+    await delivery_supervisor.tick()
+    assert client.get(f"/v1/tasks/{task_id}").json()["state"] == "external_feedback_received"
+    assert gate(pr(client, task_id), "feedback_dispositions_complete") == "pending"
+
+
+async def test_the_provider_summary_comment_does_not_complete_a_cycle(
+    client: TestClient, delivery_supervisor: Supervisor, github: FakeGitHubServer
+) -> None:
+    """S12's real shape: the summary comment arrives seconds after the pull request opens
+    and is edited when the verdict lands. Counting it would complete the round before any
+    review exists."""
+    task_id, _ = await publish(client, delivery_supervisor)
+    github.state.add_issue_comment(
+        REPOSITORY,
+        1,
+        login=REVIEWER,
+        body=(
+            "<!-- codex-pull-request-review-summary -->\n## Codex Review Summary\n\n"
+            "This comment shows the latest Codex review activity."
+        ),
+    )
+    await delivery_supervisor.tick()
+    record = pr(client, task_id)
+    assert record["completed_rounds"] == 0
+    assert [c["state"] for c in record["cycles"]] == ["open"]
+    assert client.get(f"/v1/tasks/{task_id}").json()["state"] == "awaiting_external_review"
+    assert [r["accepted"] for r in record["external_reviews"]] == [False]
+
+
+async def test_a_reused_pull_request_that_does_not_match_the_contract_fails_publication(
+    client: TestClient, delivery_supervisor: Supervisor, github: FakeGitHubServer
+) -> None:
+    """A pull request retargeted to another base, or left a draft, delivers something
+    else. Crucible reports it and refuses rather than advancing."""
+    task_id, view = await publish(client, delivery_supervisor)
+    github.state.add_review(
+        REPOSITORY,
+        1,
+        login=REVIEWER,
+        body="Codex Review. Reviewed commit: " + view["head_sha"],
+        comments=[{"body": "P2 a finding", "path": "src/app.txt", "line": 1}],
+    )
+    await delivery_supervisor.tick()
+    assert client.get(f"/v1/tasks/{task_id}").json()["state"] == "external_feedback_received"
+    # Someone retargets the pull request while the correction is being made.
+    github.state.repositories[REPOSITORY].pulls[1].base_ref = "release/1.x"
+    document = correction_document(client, task_id, image="crucible-worker:fake-succeed")
+    assert client.post(f"/v1/tasks/{task_id}/corrections", json=document).status_code == 200
+    await run_to_settled(delivery_supervisor, client, task_id)
+    client.post(
+        f"/v1/tasks/{task_id}/accept", json={"verdict": "accepted", "reasoning": "corrected"}
+    )
+    await delivery_supervisor.tick()
+    assert client.get(f"/v1/tasks/{task_id}").json()["state"] == "publish_failed"
+    failed = [
+        e
+        for e in client.get(f"/v1/tasks/{task_id}/events", params={"limit": 200}).json()["items"]
+        if e["kind"] == "task_publish_failed"
+    ]
+    assert "base_ref" in failed[-1]["payload"]["detail"]
+
+
+async def test_two_required_rounds_return_the_task_to_awaiting_external_review(
+    ctx: AppContext,
+    client: TestClient,
+    delivery_supervisor: Supervisor,
+    github: FakeGitHubServer,
+    engine: Engine,
+) -> None:
+    """09: with rounds outstanding the task goes back to `awaiting_external_review`, and
+    `retrigger_after_correction` wakes the orchestrator to post the trigger."""
+    # `policies` is not truncated between tests, so this one puts the document back.
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE policies SET document = jsonb_set(jsonb_set(document, "
+                "'{external_review,required_rounds}', '2'), "
+                "'{external_review,retrigger_after_correction}', 'true') "
+                "WHERE name = 'default-software' AND version = 1"
+            )
+        )
+    try:
+        task_id, _ = await publish(client, delivery_supervisor)
+        github.state.add_reaction(REPOSITORY, 1, login=REVIEWER, content="+1")
+        await delivery_supervisor.tick()
+        assert client.get(f"/v1/tasks/{task_id}").json()["state"] == "awaiting_external_review"
+        record = pr(client, task_id)
+        assert record["completed_rounds"] == 1 and record["required_rounds"] == 2
+        # A second cycle is open on this head for the round still outstanding.
+        assert [c["state"] for c in record["cycles"]] == ["completed", "open"]
+        reasons = [w["reason"] for w in client.get("/v1/wakes").json()["items"]]
+        assert "external_review_trigger_needed" in reasons
+        assert "external_review_trigger_needed" in event_kinds(client, task_id)
+    finally:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE policies SET document = jsonb_set(jsonb_set(document, "
+                    "'{external_review,required_rounds}', '1'), "
+                    "'{external_review,retrigger_after_correction}', 'false') "
+                    "WHERE name = 'default-software' AND version = 1"
+                )
+            )
+    _ = ctx
+
+
+async def test_a_ci_log_excerpt_is_redacted_before_it_is_stored(
+    client: TestClient, delivery_supervisor: Supervisor, github: FakeGitHubServer, engine: Engine
+) -> None:
+    """12: a workflow log is text the repository controls, and it lands in a stored row."""
+    value = installation_token_value()
+    github.state.workflow_log = f"the job printed {value}\n".encode()
+    task_id, view = await green(client, delivery_supervisor, github)
+    github.state.repositories[REPOSITORY].required_checks = ["build"]
+    github.state.set_check(REPOSITORY, view["head_sha"], name="build", conclusion="failure")
+    github.state.set_workflow_run(REPOSITORY, view["head_sha"], name="ci", conclusion="failure")
+    await delivery_supervisor.tick()
+    await delivery_supervisor.tick()
+    with engine.begin() as connection:
+        failures = connection.execute(
+            text("SELECT CAST(failure AS TEXT) FROM ci_certifications")
+        ).scalars()
+        blob = "\n".join(str(f) for f in failures)
+    assert value not in blob
+    assert "[redacted:github_installation_token]" in blob
+    _ = task_id
+
+
+async def test_a_task_is_not_overdue_the_moment_it_enters_a_waiting_state(
+    client: TestClient, delivery_supervisor: Supervisor, github: FakeGitHubServer, clock: FakeClock
+) -> None:
+    """The clock starts when the task entered the state, not when the pull request was
+    opened: a correction on an old pull request must not be overdue on its first poll."""
+    task_id, _ = await publish(client, delivery_supervisor)
+    # Three days pass while the pull request is open, then the task enters certification.
+    clock.advance(3 * 24 * 3600)
+    github.state.add_reaction(REPOSITORY, 1, login=REVIEWER, content="+1")
+    await delivery_supervisor.tick()
+    assert client.get(f"/v1/tasks/{task_id}").json()["state"] == "awaiting_ci_certification"
+    reasons = [w["reason"] for w in client.get("/v1/wakes").json()["items"]]
+    assert "ci_certification_overdue" not in reasons
+    # And it does become overdue once the wait itself is long enough.
+    clock.advance(7 * 3600)
+    await delivery_supervisor.tick()
+    reasons = [w["reason"] for w in client.get("/v1/wakes").json()["items"]]
+    assert "ci_certification_overdue" in reasons
+
+
+async def test_a_pull_request_closed_unmerged_records_who_closed_it(
+    client: TestClient, delivery_supervisor: Supervisor, github: FakeGitHubServer
+) -> None:
+    """23: "a PR closed without merge moves the task to rejected with the closer
+    recorded". The closer is not on the pull request object; it is a timeline event."""
+    task_id, _ = await publish(client, delivery_supervisor)
+    github.state.close(REPOSITORY, 1, by="sentania")
+    await delivery_supervisor.tick()
+    assert client.get(f"/v1/tasks/{task_id}").json()["state"] == "rejected"
+    assert pr(client, task_id)["closed_by"] == "sentania"
+
+
+def test_a_delivery_body_over_the_limit_is_refused_before_it_is_read(
+    webhook_client: TestClient, engine: Engine
+) -> None:
+    """The HMAC is over the raw body, so the body is read before it can be verified: an
+    unauthenticated caller decides how much this endpoint reads unless it decides first."""
+    body = b'{"padding":"' + b"x" * (2 * 1024 * 1024) + b'"}'
+    response = webhook_client.post(
+        "/v1/github/webhook",
+        content=body,
+        headers={
+            "X-GitHub-Event": "pull_request",
+            "X-GitHub-Delivery": "d-big",
+            "X-Hub-Signature-256": signed(WEBHOOK_SECRET, body),
+        },
+    )
+    assert response.status_code == 401
+    with engine.begin() as connection:
+        assert connection.execute(text("SELECT count(*) FROM github_deliveries")).scalar() == 0
+
+
+def test_a_rejected_delivery_does_not_record_the_event_name_it_claims(
+    webhook_client: TestClient, engine: Engine
+) -> None:
+    """23 stores nothing of a rejected delivery, and that includes the headers it chose."""
+    body = delivery_body(1, "c" * 40)
+    response = webhook_client.post(
+        "/v1/github/webhook",
+        content=body,
+        headers={
+            "X-GitHub-Event": "<script>alert(1)</script>",
+            "X-GitHub-Delivery": "d-evil",
+            "X-Hub-Signature-256": signed("the-wrong-secret", body),
+        },
+    )
+    assert response.status_code == 401
+    with engine.begin() as connection:
+        payloads = connection.execute(
+            text("SELECT CAST(payload AS TEXT) FROM events WHERE kind = 'github_delivery_rejected'")
+        ).scalars()
+        blob = "\n".join(str(p) for p in payloads)
+    assert "script" not in blob
+    assert "unrecognized" in blob

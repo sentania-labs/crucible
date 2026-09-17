@@ -47,6 +47,7 @@ from crucible.domain.events import PRINCIPAL_CRUCIBLE, EventKind
 from crucible.domain.external_review import completed_rounds
 from crucible.domain.lifecycle import TaskState
 from crucible.domain.publication import body_sha256
+from crucible.domain.secrets import redact
 from crucible.ports.clock import Clock
 from crucible.ports.github import GitHubClient, GitHubError, InstallationToken
 from crucible.ports.publish import Publisher, PublishRequest
@@ -274,8 +275,33 @@ class DeliveryCoordinator:
                     number=ref.number,
                     title=plan.title,
                     body=plan.body,
+                    base_ref=plan.base_ref,
                 )
             resolved = ref
+            # A reused pull request has to match the contract, not merely carry the new
+            # head: a PR retargeted to another base, or left as a draft the contract did
+            # not ask for, delivers something else. Neither is force-corrected; the
+            # publication fails and Foundry decides (23).
+            mismatch: list[str] = []
+            if resolved.base_ref != plan.base_ref:
+                mismatch.append(
+                    f"base_ref is {resolved.base_ref!r}, the contract says {plan.base_ref!r}"
+                )
+            if resolved.draft != plan.draft:
+                mismatch.append(f"draft is {resolved.draft}, the contract says {plan.draft}")
+            if mismatch:
+                await self._host._db(
+                    lambda: self._fail(
+                        plan,
+                        step="github",
+                        detail=(
+                            f"pull request #{resolved.number} does not match the "
+                            f"contract: {'; '.join(mismatch)}"
+                        ),
+                        extra={"pull_request": resolved.number},
+                    )
+                )
+                return False
             await self._host._db(lambda: self._finish(plan, ref=resolved))
             return True
         except GitHubError as exc:
@@ -327,9 +353,9 @@ class DeliveryCoordinator:
                     "remote_head_before": outcome.remote_head_before,
                     "author_problems": list(outcome.author_problems),
                     "trailer_problems": list(outcome.trailer_problems),
+                    # Both already redacted by the publisher adapter (12); truncated
+                    # here so one failing container cannot fill the event log.
                     "detail": outcome.detail[:500],
-                    # Crucible's own container output. The token is never printed, and
-                    # the script unsets every git trace that would print the header.
                     "log_tail": outcome.log_tail[-2000:],
                 },
             )
@@ -562,7 +588,10 @@ class DeliveryCoordinator:
                     run_id=plan.failed_run_id,
                     limit_bytes=self.config.ci_log_excerpt_bytes,
                 )
-                excerpt = raw.decode("utf-8", "replace")[-4000:] if raw else ""
+                # 12: a workflow log is text the repository controls, and it lands in
+                # `ci_certifications.failure`. It is scanned and redacted at the fetch
+                # site, before anything can store it.
+                excerpt = redact(raw.decode("utf-8", "replace")[-4000:]) if raw else ""
         except GitHubError as exc:
             failure = exc
             await self._host._db(lambda: self._record_poll_error(plan, failure))
@@ -595,7 +624,7 @@ class DeliveryCoordinator:
     def _apply(self, plan: PollPlan, observation: Any, excerpt: str) -> None:
         with self._host._fenced() as uow:
             task = uow.tasks.get(plan.task_id, for_update=True)
-            pull_request = uow.pull_requests.get(plan.pull_request_id)
+            pull_request = uow.pull_requests.get(plan.pull_request_id, for_update=True)
             if task is None or pull_request is None:
                 return
             apply_observation(
@@ -623,7 +652,7 @@ class DeliveryCoordinator:
                 TaskState.AWAITING_EXTERNAL_REVIEW,
             ):
                 for task in uow.tasks.list_by_state(state, for_update=True):
-                    pull_request = uow.pull_requests.get_for_task(task.id)
+                    pull_request = uow.pull_requests.get_for_task(task.id, for_update=True)
                     if pull_request is None:
                         continue
                     work = latest_work_attempt(uow, task)

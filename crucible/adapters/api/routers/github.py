@@ -21,6 +21,7 @@ from crucible.adapters.api.deps import Ctx, UoW
 from crucible.adapters.github.webhook import (
     DELIVERY_HEADER,
     EVENT_HEADER,
+    HANDLED_EVENTS,
     SIGNATURE_HEADER,
     SignatureError,
     normalize_delivery,
@@ -35,6 +36,12 @@ from crucible.application.github_ingress import (
 from crucible.contracts.api import WebhookAck
 
 router = APIRouter(prefix="/github")
+
+# GitHub's own limit is 25 MiB; nothing Crucible reads from a delivery is anywhere near
+# it. The body is read before the signature can be checked (the HMAC is over the raw
+# body), so an unauthenticated caller decides how much this endpoint reads unless the
+# endpoint decides first.
+MAX_BODY_BYTES = 1024 * 1024
 
 
 def _secret(ctx: Ctx) -> str:
@@ -61,15 +68,33 @@ async def webhook(
             "the GitHub webhook receiver is off in this deployment; polling is the "
             "complete observation path and this endpoint is only an accelerator (23)"
         )
-    event = x_github_event or ""
-    raw = await request.body()
+    # Nothing about an unverified delivery is trusted, and that includes the event name
+    # it claims: the rejection records it only when it is one Crucible handles, so an
+    # unauthenticated caller cannot choose what goes into an event row (23 stores
+    # nothing of a rejected delivery).
+    claimed = x_github_event or ""
+    event = claimed if claimed in HANDLED_EVENTS else "unrecognized"
+    declared = request.headers.get("content-length")
+    if declared is not None and declared.isdigit() and int(declared) > MAX_BODY_BYTES:
+        record_rejection(uow, ctx.clock, event=event, reason="body over the size limit")
+        uow.commit()
+        raise UnauthorizedError("the delivery body is over the size limit")
+    raw = b""
+    async for chunk in request.stream():
+        raw += chunk
+        if len(raw) > MAX_BODY_BYTES:
+            record_rejection(uow, ctx.clock, event=event, reason="body over the size limit")
+            uow.commit()
+            raise UnauthorizedError("the delivery body is over the size limit")
     try:
         verify_signature(_secret(ctx), raw, x_hub_signature_256)
     except SignatureError as exc:
         record_rejection(uow, ctx.clock, event=event, reason=str(exc))
         uow.commit()
         raise UnauthorizedError(str(exc)) from exc
-    delivery_id = (x_github_delivery or "").strip()
+    # Verified from here: the headers are GitHub's, so the claimed event name is usable.
+    event = claimed
+    delivery_id = (x_github_delivery or "").strip()[:64]
     if not delivery_id:
         record_rejection(uow, ctx.clock, event=event, reason="no delivery id")
         uow.commit()

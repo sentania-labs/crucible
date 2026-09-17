@@ -39,6 +39,7 @@ from crucible.adapters.execution.docker import (
     DockerProvider,
 )
 from crucible.adapters.execution.dockerapi import DockerApiError
+from crucible.domain.secrets import redact
 from crucible.ports.execution import LaunchSpec
 from crucible.ports.github import InstallationToken
 from crucible.ports.publish import PublishOutcome, PublishRequest
@@ -46,6 +47,9 @@ from crucible.ports.publish import PublishOutcome, PublishRequest
 log = logging.getLogger("crucible.publisher")
 
 ROLE_PUBLISHER = "publisher"
+# The script's own exit for "every commit was checked and at least one failed policy".
+# Distinct from a failed push, because nothing was attempted against the remote.
+COMMIT_POLICY_REFUSED = 6
 # S10: a token is valid for an hour whatever the container does, so a publisher that
 # outlives ten minutes is treated as failed rather than left to hold one.
 MAX_PUBLISHER_SECONDS = 600
@@ -53,7 +57,12 @@ MAX_PUBLISHER_SECONDS = 600
 
 @dataclass(frozen=True, slots=True)
 class PublisherConfig:
-    network: str = "crucible-workers"
+    """23 step 3: the egress network with an allowlist of `github.com` and
+    `api.github.com` only. `network` defaults to the publisher's own, not the workers',
+    because the workers' proxy permits every model endpoint a harness needs and a
+    container holding a GitHub credential has no business reaching any of them."""
+
+    network: str = "crucible-publish"
     egress_proxy: str | None = None
     no_proxy: str = "localhost,127.0.0.1"
     credential_host: str = "github.com"
@@ -67,6 +76,7 @@ class DockerPublisher:
     def __init__(self, provider: DockerProvider, config: PublisherConfig | None = None) -> None:
         self._provider = provider
         self.config = config or PublisherConfig()
+        self._network_ready = False
 
     @property
     def _client(self) -> Any:
@@ -75,8 +85,22 @@ class DockerPublisher:
     def _root(self, attempt_id: str) -> Path:
         return Path(self._provider.config.artifact_root) / "publish" / attempt_id
 
+    async def _ensure_network(self) -> None:
+        """The publisher's own internal network. `internal` means no default route: the
+        only way out is the proxy this network is joined to, which is the point."""
+        if self._network_ready or self.config.network in ("none", ""):
+            return
+        try:
+            await asyncio.to_thread(self._client.inspect_network, self.config.network)
+        except DockerApiError as exc:
+            if exc.status != 404:
+                raise
+            await asyncio.to_thread(self._client.create_network, self.config.network, internal=True)
+        self._network_ready = True
+
     async def push(self, request: PublishRequest, token: InstallationToken) -> PublishOutcome:
         """Run one publisher container to completion and report what it did."""
+        await self._ensure_network()
         root = self._root(request.attempt_id)
         await asyncio.to_thread(shutil.rmtree, root, True)
         await asyncio.to_thread(self._stage, root, request.bundle_path)
@@ -224,8 +248,15 @@ class DockerPublisher:
     def _read_outcome(self, root: Path, exit_code: int) -> PublishOutcome:
         step = _read(root / "step.txt") or "unknown"
         head = _read(root / "bundle-head.txt")
-        detail = _read(root / "error.txt")
+        detail = redact(_read(root / "error.txt"))
         pushed = _read(root / "push.txt") == "ok" and exit_code == 0
+        authors = tuple(_lines(root / "author-problems.txt"))
+        trailers = tuple(_lines(root / "trailer-problems.txt"))
+        if exit_code == COMMIT_POLICY_REFUSED and not detail:
+            detail = (
+                f"commit policy refused the push: {len(authors)} author problem(s), "
+                f"{len(trailers)} trailer problem(s); nothing was pushed"
+            )
         return PublishOutcome(
             pushed=pushed,
             head_sha=head,
@@ -233,9 +264,11 @@ class DockerPublisher:
             detail=detail,
             exit_code=exit_code,
             remote_head_before=_read(root / "remote-head-before.txt"),
-            log_tail=_read(root / "publisher.log", limit=8000)[-8000:],
-            trailer_problems=tuple(_lines(root / "trailer-problems.txt")),
-            author_problems=tuple(_lines(root / "author-problems.txt")),
+            # Crucible's own container output, redacted before it is recorded: git can
+            # be made to print a header and a remote can answer with anything (12).
+            log_tail=redact(_read(root / "publisher.log", limit=8000)[-8000:]),
+            trailer_problems=trailers,
+            author_problems=authors,
         )
 
     async def cleanup(self, attempt_ids: Sequence[str]) -> int:

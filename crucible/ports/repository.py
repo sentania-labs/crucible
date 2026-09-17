@@ -311,7 +311,7 @@ class DispositionRepository(Protocol):
 class PullRequestRepository(Protocol):
     def add(self, pull_request: PullRequest) -> None: ...
 
-    def get(self, pull_request_id: str) -> PullRequest | None: ...
+    def get(self, pull_request_id: str, *, for_update: bool = False) -> PullRequest | None: ...
 
     def get_for_task(self, task_id: str, *, for_update: bool = False) -> PullRequest | None: ...
 
@@ -337,7 +337,9 @@ class ExternalReviewCycleRepository(Protocol):
 
 
 class ExternalReviewRepository(Protocol):
-    def add(self, review: ExternalReview) -> None: ...
+    def add(self, review: ExternalReview) -> bool:
+        """True when stored; False when this signal was already recorded."""
+        ...
 
     def get_by_github(
         self, pull_request_id: str, signal: str, github_id: str
@@ -347,7 +349,9 @@ class ExternalReviewRepository(Protocol):
 
 
 class ReviewCommentRepository(Protocol):
-    def add(self, comment: ReviewComment) -> None: ...
+    def add(self, comment: ReviewComment) -> bool:
+        """True when stored; False when this comment was already recorded."""
+        ...
 
     def save(self, comment: ReviewComment) -> None: ...
 
@@ -361,7 +365,9 @@ class ReviewCommentRepository(Protocol):
 
 
 class ReactionRepository(Protocol):
-    def add(self, reaction: Reaction) -> None: ...
+    def add(self, reaction: Reaction) -> bool:
+        """True when stored; False when this reaction was already recorded."""
+        ...
 
     def save(self, reaction: Reaction) -> None: ...
 

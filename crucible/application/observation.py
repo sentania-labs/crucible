@@ -31,6 +31,7 @@ from crucible.domain.certification import (
 )
 from crucible.domain.entities import (
     CICertification,
+    DispositionKind,
     ExternalReview,
     ExternalReviewCycle,
     GateResultRecord,
@@ -304,7 +305,7 @@ def record_reactions(
                 uow.reactions.save(existing)
                 result.changed = True
             continue
-        uow.reactions.add(
+        if not uow.reactions.add(
             Reaction(
                 id=new_id(),
                 pull_request_id=pull_request.id,
@@ -316,7 +317,10 @@ def record_reactions(
                 created_at=observed.created_at,
                 observed_at=now,
             )
-        )
+        ):
+            # Already recorded by an earlier tick this one did not see. Nothing new
+            # happened, so nothing is recorded and nothing becomes a signal.
+            continue
         record_event(
             uow,
             clock,
@@ -462,7 +466,8 @@ def record_comments(
             created_at=comment.created_at,
             updated_at=comment.updated_at or now,
         )
-        uow.review_comments.add(row)
+        if not uow.review_comments.add(row):
+            continue
         record_event(
             uow,
             clock,
@@ -483,7 +488,10 @@ def record_comments(
             },
         )
         result.changed = True
-        result.new_comments += 1
+        if comment.kind == "review_comment" and comment.login in allowlist:
+            # Only what the dispositions gate counts: a comment from another login, or a
+            # standalone issue comment, is recorded and asks nothing of Foundry.
+            result.new_comments += 1
         # An inline review comment belongs to its review object, which carries the
         # round; only a standalone comment is a signal of its own.
         if comment.kind == "issue_comment":
@@ -559,7 +567,8 @@ def attach_signals(
             sha_inferred=inferred,
         )
         if not accepted:
-            uow.external_reviews.add(review)
+            if not uow.external_reviews.add(review):
+                continue
             record_event(
                 uow,
                 clock,
@@ -582,7 +591,8 @@ def attach_signals(
         target = _cycle_for(open_rows, reviewed_sha)
         if target is not None:
             review.cycle_id = target.id
-        uow.external_reviews.add(review)
+        if not uow.external_reviews.add(review):
+            continue
         record_event(
             uow,
             clock,
@@ -862,9 +872,14 @@ def evaluate_delivery_gates(
     )
     allowlist = reviewer_logins(policy)
     needing = [c for c in comments if c.login in allowlist and c.kind == "review_comment"]
-    dispositioned = {
-        d.review_comment_id for d in uow.dispositions.list_for_comments([c.id for c in needing])
-    }
+    recorded = list(uow.dispositions.list_for_comments([c.id for c in needing]))
+    dispositioned = {d.review_comment_id for d in recorded}
+    # 09: advancement needs every comment dispositioned *and none of them fix*. A `fix`
+    # is Foundry saying the work is not done; what follows it is a correction contract,
+    # which clears it by replacing the head the comments belong to.
+    fix_dispositions = tuple(
+        d.review_comment_id for d in recorded if d.disposition is DispositionKind.FIX
+    )
     cycles = (
         [to_cycle(row) for row in uow.review_cycles.list_for_pull_request(pull_request.id)]
         if pull_request
@@ -901,6 +916,7 @@ def evaluate_delivery_gates(
         completed_rounds=completed_rounds(cycles),
         required_rounds=required_rounds(policy),
         undispositioned=tuple(c.id for c in needing if c.id not in dispositioned),
+        fix_dispositions=fix_dispositions,
         comment_count=len(needing),
         certification_state=certification.state if certification else "",
         certification_detail=certification.detail if certification else "",
@@ -943,6 +959,7 @@ def evaluate_delivery_gates(
         "completed_rounds": di.completed_rounds,
         "required_rounds": di.required_rounds,
         "undispositioned": list(di.undispositioned),
+        "fix_dispositions": list(di.fix_dispositions),
     }
     if changed:
         record_event(
@@ -970,15 +987,14 @@ def advance_delivery(
 ) -> None:
     """Move the task on what the gates now say (09)."""
     results = gates.get("results", {})
-    review_ok = results.get("external_review_rounds") in (
-        GateResult.PASS.value,
-        GateResult.SKIPPED.value,
-    )
     dispositions_ok = results.get("feedback_dispositions_complete") in (
         GateResult.PASS.value,
         GateResult.SKIPPED.value,
     )
     if task.state is TaskState.AWAITING_EXTERNAL_REVIEW and result.accepted_signals:
+        # 09: a signal moves the task to `external_feedback_received` whatever the round
+        # count says. Whether it then advances, and to where, is the dispositions gate's
+        # answer and `advance_from_feedback`'s branch, never this condition.
         move_task(
             uow,
             clock,
@@ -997,9 +1013,10 @@ def advance_delivery(
             f"#{pull_request.number} at {pull_request.head_sha}: "
             f"{result.new_comments} comment(s), 0 dispositions recorded"
         )
-        if result.new_comments == 0 and review_ok:
+        if result.new_comments == 0 and dispositions_ok:
             # 23: a round with no findings has nothing to disposition. Crucible records
-            # it and advances without a wake for judgment.
+            # it and advances without a wake for judgment; with rounds still outstanding
+            # `advance_from_feedback` sends it back to wait for the next one.
             advance_from_feedback(
                 uow, clock, task=task, pull_request=pull_request, gates=gates, policy=policy
             )
@@ -1017,7 +1034,7 @@ def advance_delivery(
             },
         )
         return
-    if task.state is TaskState.EXTERNAL_FEEDBACK_RECEIVED and review_ok and dispositions_ok:
+    if task.state is TaskState.EXTERNAL_FEEDBACK_RECEIVED and dispositions_ok:
         advance_from_feedback(
             uow, clock, task=task, pull_request=pull_request, gates=gates, policy=policy
         )
@@ -1130,7 +1147,7 @@ def maybe_request_trigger(
 ) -> None:
     """23: with `retrigger_after_correction`, Crucible wakes the orchestrator to post the
     trigger under the operator's account. Crucible never posts it: an App-authored
-    `@codex review` is refused by the provider, and it is not Crucible's act (S12)."""
+    trigger comment is refused by the provider, and it is not Crucible's act (S12)."""
     section = policy.get("external_review", {})
     if not isinstance(section, dict) or not section.get("retrigger_after_correction"):
         return
@@ -1210,20 +1227,26 @@ def repeat_overdue_wakes(
     pull_request: PullRequest,
     policy: dict[str, Any],
 ) -> bool:
-    """Nothing received is overdue silently (23). A repeat wake, no state change."""
+    """Nothing received is overdue silently (23). A repeat wake, no state change.
+
+    The clock starts when the task entered the state it is waiting in, not when the pull
+    request was opened: a correction on a three-day-old pull request enters certification
+    with nothing outstanding yet, and measuring from `opened_at` would call it overdue on
+    its first poll."""
     now = clock.now()
     if task.state is TaskState.AWAITING_EXTERNAL_REVIEW:
         hours = wait_timeout_hours(policy, "external_review", DEFAULT_EXTERNAL_TIMEOUT_HOURS)
         reason = WakeReason.EXTERNAL_REVIEW_OVERDUE
-        since = pull_request.opened_at
+        entered = EventKind.TASK_AWAITING_EXTERNAL_REVIEW
         what = "an external review signal"
     elif task.state is TaskState.AWAITING_CI_CERTIFICATION:
         hours = wait_timeout_hours(policy, "ci_certification", DEFAULT_CI_TIMEOUT_HOURS)
         reason = WakeReason.CI_CERTIFICATION_OVERDUE
-        since = pull_request.opened_at
+        entered = EventKind.TASK_AWAITING_CI_CERTIFICATION
         what = "a required check conclusion"
     else:
         return False
+    since = waiting_since(uow, task, entered, fallback=pull_request.opened_at)
     if now - since < timedelta(hours=hours):
         return False
     latest = _latest_wake_at(uow, task, reason.value)
@@ -1242,6 +1265,13 @@ def repeat_overdue_wakes(
         extra_links={"pull_request": f"/v1/tasks/{task.id}/pull-request"},
     )
     return True
+
+
+def waiting_since(uow: UnitOfWork, task: Task, kind: EventKind, *, fallback: datetime) -> datetime:
+    """When the task entered the state it is waiting in. Each transition writes its event
+    in the same transaction as the state change (09), so the event is the record."""
+    event = uow.events.latest_for_task_kind(task.id, kind.value)
+    return event.ts if event is not None else fallback
 
 
 def _latest_wake_at(uow: UnitOfWork, task: Task, reason: str) -> datetime | None:

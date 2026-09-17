@@ -107,7 +107,12 @@ class GitHubSettings(BaseModel):
     # The publisher container. The image is the attempt's own worker image unless a
     # deployment pins one; the network is the egress network with github.com allowed.
     publisher_image: str | None = None
-    publisher_network: str | None = None
+    # 23 step 3: the publisher runs on an egress network whose allowlist is `github.com`
+    # and `api.github.com` and nothing else. That is a narrower list than the workers'
+    # proxy permits, so the publisher gets its own network and proxy by default; a
+    # deployment that has only one may point this at it deliberately.
+    publisher_network: str = "crucible-publish"
+    publisher_egress_proxy: str | None = None
     publisher_timeout_seconds: int = 600
     credential_host: str = "github.com"
     # 23: posting a comment under Crucible's App identity is refused by the provider and

@@ -86,7 +86,11 @@ credential_host = "github.com"        # the only host the publisher's credential
 publisher_timeout_seconds = 600       # a publisher that outlives this is failed, token and all (S10)
 ci_log_excerpt_bytes = 65536          # what a CI failure record keeps of the run log
 # publisher_image = "crucible-worker:script-harness-1.0.0-6a2bee03d6f1"  # default: the attempt's image
-# publisher_network = "crucible-workers"                                 # default: the workers network
+# 23 step 3: the publisher's own egress network, with an allowlist of github.com and
+# api.github.com and nothing else. Deliberately not the workers' network, whose proxy
+# permits every model endpoint a harness needs.
+publisher_network = "crucible-publish"
+publisher_egress_proxy = "http://publish-proxy:3128"
 allow_issue_comments = false          # 23: the external-review trigger is the orchestrator's act
 
 [github.app]

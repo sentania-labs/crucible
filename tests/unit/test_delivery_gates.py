@@ -72,6 +72,26 @@ def test_dispositions_are_complete_when_there_is_nothing_to_disposition() -> Non
     assert run(GateName.FEEDBACK_DISPOSITIONS_COMPLETE, comment_count=2)[0] is GateResult.PASS
 
 
+def test_a_fix_disposition_holds_the_gate_however_complete_the_set_is() -> None:
+    """09: advancement needs every comment dispositioned *and none of them fix*. A fix is
+    Foundry saying the work is not done, and what follows it is a correction."""
+    result, detail = run(
+        GateName.FEEDBACK_DISPOSITIONS_COMPLETE,
+        comment_count=2,
+        fix_dispositions=("c1",),
+    )
+    assert result is GateResult.PENDING
+    assert "fix" in detail and "correction" in detail
+    # Even with nothing outstanding, and even with no comments counted at all.
+    assert (
+        run(GateName.FEEDBACK_DISPOSITIONS_COMPLETE, fix_dispositions=("c1",))[0]
+        is GateResult.PENDING
+    )
+    # And it passes once none of them is fix.
+    result, detail = run(GateName.FEEDBACK_DISPOSITIONS_COMPLETE, comment_count=2)
+    assert result is GateResult.PASS and "none is fix" in detail
+
+
 def test_ci_green_for_head_mirrors_the_certification_state() -> None:
     for state, expected in (
         ("green", GateResult.PASS),

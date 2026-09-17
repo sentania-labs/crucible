@@ -110,6 +110,8 @@ class PullRequestRef:
     merge_commit_sha: str | None = None
     merged_by: str | None = None
     closed_at: datetime | None = None
+    # `GET /pulls/{n}` carries no closer; the client fills this from the issue events
+    # timeline when a pull request is observed closed and unmerged (23).
     closed_by: str | None = None
     mergeable_state: str = ""
     title: str = ""
@@ -220,6 +222,7 @@ class GitHubClient(Protocol):
         number: int,
         title: str | None = None,
         body: str | None = None,
+        base_ref: str | None = None,
     ) -> PullRequestRef: ...
 
     def observe(
@@ -251,6 +254,10 @@ class GitHubClient(Protocol):
     ) -> str:
         """Gated off by configuration on the default path (23): the trigger comment is
         the orchestrator's act under the operator's account, never Crucible's."""
+        ...
+
+    def closed_by(self, token: InstallationToken, *, repository: str, number: int) -> str | None:
+        """Who closed the pull request, or None when it is not observable."""
         ...
 
     def delete_ref(self, token: InstallationToken, *, repository: str, ref: str) -> None:

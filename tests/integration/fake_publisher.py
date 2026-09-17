@@ -22,8 +22,12 @@ class FakePublisher:
 
     github: FakeGitHub
     repository: str
-    # Set by a test to make the push fail the way an out-of-band remote move does (23).
+    # Set by a test to make the push fail the way an out-of-band remote move does (23),
+    # or the way the commit-policy check does before the push is attempted at all.
     refuse_push: str = ""
+    refuse_step: str = "push"
+    author_problems: tuple[str, ...] = ()
+    trailer_problems: tuple[str, ...] = ()
     pushes: list[tuple[str, str]] = field(default_factory=list)
     tokens_seen: list[str] = field(default_factory=list)
     bundle_paths: list[str] = field(default_factory=list)
@@ -45,10 +49,12 @@ class FakePublisher:
             return PublishOutcome(
                 pushed=False,
                 head_sha=request.expected_head,
-                step="push",
+                step=self.refuse_step,
                 detail=self.refuse_push,
-                exit_code=5,
+                exit_code=6 if self.refuse_step == "commit-policy" else 5,
                 remote_head_before=before,
+                author_problems=self.author_problems,
+                trailer_problems=self.trailer_problems,
             )
         self.github.push(self.repository, request.work_branch, request.expected_head)
         self.pushes.append((request.work_branch, request.expected_head))

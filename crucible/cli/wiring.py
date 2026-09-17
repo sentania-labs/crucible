@@ -144,8 +144,11 @@ def wire(settings: Settings) -> Wiring:
         publisher = DockerPublisher(
             docker,
             PublisherConfig(
-                network=settings.github.publisher_network or settings.docker.workers_network,
-                egress_proxy=settings.docker.egress_proxy,
+                # 23 step 3: the publisher's own egress network, not the workers'.
+                network=settings.github.publisher_network,
+                egress_proxy=(
+                    settings.github.publisher_egress_proxy or settings.docker.egress_proxy
+                ),
                 no_proxy=settings.docker.no_proxy,
                 credential_host=settings.github.credential_host,
                 timeout_seconds=settings.github.publisher_timeout_seconds,

@@ -458,6 +458,20 @@ for sha in $(git rev-list "$RANGE" 2>/dev/null || true); do
     printf '%s\n' "$sha" >> "$OUT/trailer-problems.txt"
   fi
 done
+if [ -s "$OUT/author-problems.txt" ] || [ -s "$OUT/trailer-problems.txt" ]; then
+  # 23 step 4: verify every commit's author and trailer match policy, *then* push. A
+  # commit signed by someone the policy does not name, or missing the attempt trailer,
+  # is not this attempt's work, and a push is not undoable.
+  AUTHORS=$(wc -l < "$OUT/author-problems.txt")
+  TRAILERS=$(wc -l < "$OUT/trailer-problems.txt")
+  printf 'commit policy refused the push: %s author problem(s), %s trailer problem(s)\n' \
+    "$AUTHORS" "$TRAILERS" > "$OUT/error.txt"
+  echo commit-policy > "$OUT/step.txt"
+  echo refused > "$OUT/push.txt"
+  rm -f "$TOKDIR/token"
+  chmod 0644 "$OUT"/* 2>/dev/null || true
+  exit 6
+fi
 echo push > "$OUT/step.txt"
 # No force, ever. A remote head that is not an ancestor of the bundle head fails here,
 # which is exactly what 23 asks for: record it, wake Foundry, never overwrite.

@@ -31,6 +31,10 @@ from crucible.ports.github import InstallationToken
 APP_JSON_ENV = "CRUCIBLE_GITHUB_APP_JSON"
 APP_KEY_ENV = "CRUCIBLE_GITHUB_APP_KEY"
 TARGET_ENV = "CRUCIBLE_GITHUB_TARGET_REPO"
+# Opt in to waiting for a real external review round. The provider takes about 100
+# seconds to answer (S12), and the answer needs Issues read on the App, so this is off
+# unless an operator asks for it: `CRUCIBLE_GITHUB_WAIT_FOR_REVIEW=300`.
+WAIT_FOR_REVIEW_ENV = "CRUCIBLE_GITHUB_WAIT_FOR_REVIEW"
 API_BASE = os.environ.get("CRUCIBLE_GITHUB_API_BASE", "https://api.github.com")
 BRANCH_PREFIX = "crucible/C4-"
 
@@ -151,6 +155,12 @@ def seed_mirror(root: Path, config: LiveConfig) -> str:
         path.chmod(0o755 if path.is_dir() else 0o644)
     bare.chmod(0o755)
     return str(bare)
+
+
+def review_wait_seconds() -> int:
+    """How long the live tier waits for a real review round, or 0 for not at all."""
+    raw = os.environ.get(WAIT_FOR_REVIEW_ENV, "").strip()
+    return int(raw) if raw.isdigit() else 0
 
 
 def run_id() -> str:

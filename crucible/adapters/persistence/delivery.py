@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -104,8 +104,11 @@ class PullRequests:
         )
         self._s.flush()
 
-    def get(self, pull_request_id: str) -> PullRequest | None:
-        row = self._s.get(PullRequestRow, pull_request_id)
+    def get(self, pull_request_id: str, *, for_update: bool = False) -> PullRequest | None:
+        stmt = select(PullRequestRow).where(PullRequestRow.id == pull_request_id)
+        if for_update:
+            stmt = stmt.with_for_update()
+        row = self._s.scalars(stmt).one_or_none()
         return self._to_entity(row) if row else None
 
     def get_for_task(self, task_id: str, *, for_update: bool = False) -> PullRequest | None:
@@ -266,9 +269,15 @@ class ExternalReviews:
             sha_inferred=row.sha_inferred,
         )
 
-    def add(self, review: ExternalReview) -> None:
-        self._s.add(
-            ExternalReviewRow(
+    def add(self, review: ExternalReview) -> bool:
+        """Insert, or report that this signal is already recorded.
+
+        A poll can see the same object twice in one batch, and GitHub re-delivers. An
+        IntegrityError here would roll back the whole tick, so the duplicate is a no-op
+        and the caller learns which it was."""
+        inserted = self._s.execute(
+            pg_insert(ExternalReviewRow)
+            .values(
                 id=review.id,
                 pull_request_id=review.pull_request_id,
                 cycle_id=review.cycle_id,
@@ -283,8 +292,11 @@ class ExternalReviews:
                 accepted=review.accepted,
                 received_at=review.received_at,
             )
-        )
+            .on_conflict_do_nothing(constraint="uq_external_reviews_github_id")
+            .returning(ExternalReviewRow.id)
+        ).scalar_one_or_none()
         self._s.flush()
+        return inserted is not None
 
     def get_by_github(
         self, pull_request_id: str, signal: str, github_id: str
@@ -329,9 +341,11 @@ class ReviewComments:
             reviewed_sha=row.reviewed_sha,
         )
 
-    def add(self, comment: ReviewComment) -> None:
-        self._s.add(
-            ReviewCommentRow(
+    def add(self, comment: ReviewComment) -> bool:
+        """Insert, or report that this comment is already recorded (see ExternalReviews)."""
+        inserted = self._s.execute(
+            pg_insert(ReviewCommentRow)
+            .values(
                 id=comment.id,
                 pull_request_id=comment.pull_request_id,
                 external_review_id=comment.external_review_id,
@@ -346,8 +360,11 @@ class ReviewComments:
                 created_at=comment.created_at,
                 updated_at=comment.updated_at,
             )
-        )
+            .on_conflict_do_nothing(constraint="uq_review_comments_github_id")
+            .returning(ReviewCommentRow.id)
+        ).scalar_one_or_none()
         self._s.flush()
+        return inserted is not None
 
     def save(self, comment: ReviewComment) -> None:
         """An issue comment the reviewer edits in place is a change, not a new object
@@ -405,9 +422,11 @@ class Reactions:
             removed_at=_dt(row.removed_at),
         )
 
-    def add(self, reaction: Reaction) -> None:
-        self._s.add(
-            ReactionRow(
+    def add(self, reaction: Reaction) -> bool:
+        """Insert, or report that this reaction is already recorded (see ExternalReviews)."""
+        inserted = self._s.execute(
+            pg_insert(ReactionRow)
+            .values(
                 id=reaction.id,
                 pull_request_id=reaction.pull_request_id,
                 subject_kind=reaction.subject_kind,
@@ -419,8 +438,11 @@ class Reactions:
                 observed_at=reaction.observed_at,
                 removed_at=reaction.removed_at,
             )
-        )
+            .on_conflict_do_nothing(constraint="uq_reactions_github_id")
+            .returning(ReactionRow.id)
+        ).scalar_one_or_none()
         self._s.flush()
+        return inserted is not None
 
     def save(self, reaction: Reaction) -> None:
         row = self._s.get(ReactionRow, reaction.id)
@@ -467,8 +489,11 @@ class CICertifications:
             )
         ).one_or_none()
         if row is None:
-            self._s.add(
-                CICertificationRow(
+            # One row per (pull request, head). A concurrent tick that inserted it first
+            # must not roll this one back: the insert yields, and the value is read back.
+            inserted = self._s.execute(
+                pg_insert(CICertificationRow)
+                .values(
                     id=certification.id,
                     pull_request_id=certification.pull_request_id,
                     task_id=certification.task_id,
@@ -480,9 +505,18 @@ class CICertifications:
                     detail=certification.detail,
                     evaluated_at=certification.evaluated_at,
                 )
-            )
+                .on_conflict_do_nothing(constraint="uq_ci_certifications_head")
+                .returning(CICertificationRow.id)
+            ).scalar_one_or_none()
             self._s.flush()
-            return certification
+            if inserted is not None:
+                return certification
+            row = self._s.scalars(
+                select(CICertificationRow).where(
+                    CICertificationRow.pull_request_id == certification.pull_request_id,
+                    CICertificationRow.head_sha == certification.head_sha,
+                )
+            ).one()
         row.state = certification.state
         row.required_checks = list(certification.required_checks)
         row.check_runs = list(certification.check_runs)
@@ -603,7 +637,14 @@ class GitHubDeliveries:
         return [self._to_entity(r) for r in rows]
 
     def count_unprocessed(self) -> int:
-        return len(self.list_unprocessed(limit=1000))
+        return int(
+            self._s.scalar(
+                select(func.count())
+                .select_from(GitHubDeliveryRow)
+                .where(GitHubDeliveryRow.processed_at.is_(None))
+            )
+            or 0
+        )
 
     def mark_processed(self, delivery_id: str, at: datetime) -> None:
         row = self._s.get(GitHubDeliveryRow, delivery_id)

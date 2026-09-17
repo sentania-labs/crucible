@@ -42,10 +42,23 @@ _CLOSING_RE = re.compile(
 _REF_RE = re.compile(
     r"\A(?:[\w.-]+/[\w.-]+)?#\d+\Z|\Ahttps://github\.com/[\w.-]+/[\w.-]+/issues/\d+\Z"
 )
+# An at-mention is a mutation too: it notifies a person, subscribes a team, and, for a
+# provider whose reviewer answers its own name, triggers a review under whatever
+# identity opened the pull request. 23 makes the trigger the orchestrator's act under
+# the operator's account, so a mention that reached the body through worker-asserted
+# text would be Crucible performing it instead. Every `@name` is defanged.
+# Backticks are not protection: the provider that answered PR #22 read the raw text, not
+# the rendered HTML, so a mention quoted as code triggered it anyway.
+_MENTION_RE = re.compile(r"(?<!\w)@(?=[A-Za-z0-9][\w-]*)")
 
 
 class TitleRefusedError(ValueError):
     """The claim's proposed title cannot be used as a PR title (23)."""
+
+
+class BodyRefusedError(ValueError):
+    """The rendered body cannot be sent. Raised rather than edited: a body Crucible
+    quietly rewrote is a claim it did not make (23)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,11 +123,20 @@ def defang_closing_keywords(text: str) -> str:
     return _CLOSING_RE.sub(lambda m: "\\" + m.group(1) + m.group(2), text)
 
 
+def defang_mentions(text: str) -> str:
+    """Neutralize every at-mention. A backslash before the `@` stops GitHub reading it as
+    a mention and keeps the word readable, which matters because the text this runs over
+    is a worker's own summary of its limitations and risks."""
+    return _MENTION_RE.sub("\\@", text)
+
+
 def sanitize(text: str) -> str:
-    """Redact secrets, then defang closing keywords. Order matters: a redaction marker
-    must not reintroduce a keyword, and it cannot, but a secret containing `fixes #1`
-    would otherwise survive the defanging as part of the value."""
-    return defang_closing_keywords(redact(text))
+    """Redact secrets, then defang closing keywords and at-mentions.
+
+    Order matters: a redaction marker must not reintroduce a keyword, and it cannot, but
+    a secret containing `fixes #1` would otherwise survive the defanging as part of the
+    value."""
+    return defang_mentions(defang_closing_keywords(redact(text)))
 
 
 def validate_title(proposed: str) -> str:
@@ -137,6 +159,11 @@ def validate_title(proposed: str) -> str:
         raise TitleRefusedError(
             "the proposed title carries a closing keyword; only deliverables[].closes "
             "may close an issue (23)"
+        )
+    if _MENTION_RE.search(title):
+        raise TitleRefusedError(
+            "the proposed title carries an at-mention; a mention notifies people and can "
+            "trigger the external reviewer under Crucible's identity (23)"
         )
     if "\n" in proposed or "\r" in proposed:
         raise TitleRefusedError("a pull request title is one line")
@@ -166,7 +193,7 @@ def _bullets(title: str, items: Sequence[str], *, note: str = "") -> list[str]:
 def render_body(body: BodyInput) -> str:
     """The pull request body, from the contract and verified evidence only (23)."""
     lines: list[str] = [
-        f"## Objective ({body.external_id})",
+        f"## Objective ({_cell(body.external_id)})",
         "",
         sanitize(body.objective),
         "",
@@ -248,6 +275,14 @@ def render_body(body: BodyInput) -> str:
     if len(text.encode("utf-8")) > MAX_BODY_BYTES:
         text = text.encode("utf-8")[:MAX_BODY_BYTES].decode("utf-8", "ignore")
         text += "\n\n(body truncated by Crucible at the GitHub size limit)\n"
+    # Every field was sanitized on the way in; this is the check on the assembly rather
+    # than on its parts, because a body is what actually leaves (12). A hit here is a
+    # defect in this module, so it refuses rather than redacting after the fact.
+    hit = scan_text(text)
+    if hit is not None:
+        raise BodyRefusedError(
+            f"the rendered body matches the {hit} secret pattern; nothing is sent"
+        )
     return text
 
 

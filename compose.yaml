@@ -74,6 +74,18 @@ services:
       - default
       - crucible-workers
 
+  # The publisher's only way out (23 step 3). A separate proxy from the workers' one
+  # because its allowlist is narrower: the one container that holds a GitHub credential
+  # reaches GitHub and nothing else.
+  publish-proxy:
+    image: ubuntu/squid@sha256:6a097f68bae708cedbabd6188d68c7e2e7a38cedd05a176e1cc0ba29e3bbe029
+    restart: unless-stopped
+    volumes:
+      - ./var/egress/squid-publish.conf:/etc/squid/squid.conf:ro
+    networks:
+      - default
+      - crucible-publish
+
   migrate:
     # Checked-in defaults track `latest`; a deployment pins an exact tag and that
     # pin lives in the deployment repo, not here (sdlc skill).
@@ -130,6 +142,8 @@ services:
       # The accelerator, off by default on a workstation: polling is the complete
       # observation path and GitHub cannot reach a laptop anyway (Q13, 23).
       CRUCIBLE_GITHUB__WEBHOOK_ENABLED: "${CRUCIBLE_GITHUB_WEBHOOK_ENABLED:-false}"
+      CRUCIBLE_GITHUB__PUBLISHER_NETWORK: crucible-publish
+      CRUCIBLE_GITHUB__PUBLISHER_EGRESS_PROXY: http://publish-proxy:3128
     volumes:
       - crucible-artifacts:/var/lib/crucible/artifacts
       # The App private key and the webhook secret, read-only, on this container only
@@ -153,11 +167,19 @@ services:
         condition: service_started
       egress-proxy:
         condition: service_started
+      publish-proxy:
+        condition: service_started
 
 networks:
   default:
   # internal: no default route, no resolver, and no reach to postgres, crucible or the
   # socket proxy (13, S4). The egress proxy sits on both sides and is the only way out.
+  crucible-publish:
+    name: crucible-publish
+    internal: true
+    ipam:
+      config:
+        - subnet: ${CRUCIBLE_PUBLISH_SUBNET:-10.88.1.0/24}
   crucible-workers:
     name: crucible-workers
     internal: true

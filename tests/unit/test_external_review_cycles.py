@@ -7,10 +7,12 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from crucible.domain.external_review import (
+    SUMMARY_MARKER,
     Cycle,
     CycleState,
     Signal,
     SignalKind,
+    accepted_signals,
     apply_signal,
     completed_rounds,
     component_for,
@@ -30,10 +32,11 @@ def policy(**overrides: object) -> dict[str, object]:
     section: dict[str, object] = {
         "reviewer_logins": [REVIEWER],
         "required_rounds": 1,
-        "accepted_signals": ["reaction:+1", "review", "comment"],
+        # 05b's default after C4's correction round: a comment is not a round.
+        "accepted_signals": ["reaction:+1", "review"],
         "components": ["code"],
     }
-    section.update(overrides)
+    section.update({k: v for k, v in overrides.items() if v is not None})
     return {"external_review": section}
 
 
@@ -65,6 +68,50 @@ def test_defaults_come_from_the_policy_and_fall_back_to_05b() -> None:
     assert configured_components({}) == ("code",)
     assert reviewer_logins({}) == frozenset({REVIEWER})
     assert required_rounds({}) == 1
+
+
+def comment(body: str = "findings", login: str = REVIEWER) -> Signal:
+    return Signal(
+        kind=SignalKind.COMMENT,
+        login=login,
+        github_id="800001",
+        created_at=T0,
+        body=body,
+        has_findings=True,
+    )
+
+
+def test_an_issue_comment_is_not_a_round_by_default() -> None:
+    """23: the summary comment is edited in place and never counts as a round; the
+    review object carries it. The provider posts that comment within seconds of the pull
+    request opening, minutes before any verdict exists."""
+    assert "comment" not in accepted_signals({})
+    assert accepted_signals({}) == frozenset({"reaction:+1", "review"})
+    assert not is_accepted(comment(), policy(accepted_signals=None))
+    assert not is_accepted(comment(), {})
+
+
+def test_the_provider_summary_comment_is_never_a_round_even_where_comments_count() -> None:
+    """The real shape S12 recorded: an HTML marker, a heading, and a placeholder that is
+    edited later. A policy that accepts comments generally still must not count it."""
+    summary = (
+        f"<!-- {SUMMARY_MARKER} -->\n## Codex Review Summary\n\n"
+        "This comment shows the latest Codex review activity."
+    )
+    accepting = policy(accepted_signals=["reaction:+1", "review", "comment"])
+    assert is_accepted(comment("a real finding"), accepting)
+    assert not is_accepted(comment(summary), accepting)
+
+
+def test_a_cycle_stays_open_through_the_summary_comment() -> None:
+    summary = f"<!-- {SUMMARY_MARKER} --> Codex Review Summary"
+    accepting = policy(accepted_signals=["reaction:+1", "review", "comment"])
+    open_cycle = cycle()
+    signal = comment(summary)
+    assert not is_accepted(signal, accepting)
+    # Nothing attaches it, so the cycle is still waiting for the verdict.
+    assert completed_rounds([open_cycle]) == 0
+    assert open_cycle.state is CycleState.OPEN
 
 
 def test_only_an_allowlisted_login_is_accepted() -> None:
