@@ -76,7 +76,11 @@ class PublishPlan:
     head_sha: str
     repository_id: str
     repository_name: str
-    repository_url: str
+    # Where the publisher pushes. Derived from the registered repository's API name, not
+    # from its clone url: `repositories.url` is where Crucible's own containers *fetch*
+    # from, which in a developer arrangement is a local mirror of a repository they hold
+    # no credential for (docs/implementation-notes/c4.md).
+    push_url: str
     installation_id: int | None
     base_ref: str
     work_branch: str
@@ -93,14 +97,27 @@ class PublishPlan:
 
 
 def repository_slug(repository: Repository) -> str:
-    """`owner/name` from the registered clone url, which is what the API path needs."""
+    """`owner/name`, which is what every API path needs.
+
+    Taken from the clone url when that is a GitHub url, and from the registered name
+    otherwise, so a repository whose url is a local mirror still resolves to the
+    repository the App is installed on."""
     url = repository.url.rstrip("/")
-    if url.endswith(".git"):
-        url = url[: -len(".git")]
-    parts = [p for p in url.replace(":", "/").split("/") if p]
-    if len(parts) >= 2:
-        return f"{parts[-2]}/{parts[-1]}"
-    return repository.name
+    if "github.com" in url:
+        if url.endswith(".git"):
+            url = url[: -len(".git")]
+        parts = [p for p in url.replace(":", "/").split("/") if p]
+        if len(parts) >= 2:
+            return f"{parts[-2]}/{parts[-1]}"
+    return repository.name.strip("/")
+
+
+def push_url_for(repository: Repository, *, host: str = "github.com") -> str:
+    """The https remote the publisher pushes to."""
+    url = repository.url.rstrip("/")
+    if "github.com" in url:
+        return url if url.endswith(".git") else f"{url}.git"
+    return f"https://{host}/{repository_slug(repository)}.git"
 
 
 def verified_checks(uow: UnitOfWork, attempt_id: str) -> tuple[VerifiedCheck, ...]:
@@ -246,7 +263,7 @@ def build_plan(uow: UnitOfWork, task: Task, work: tuple[Attempt, Execution]) -> 
         head_sha=task.head_sha or "",
         repository_id=repository.id,
         repository_name=repository_slug(repository),
-        repository_url=repository.url,
+        push_url=push_url_for(repository),
         installation_id=repository.installation_id,
         base_ref=base_ref,
         work_branch=work_branch,

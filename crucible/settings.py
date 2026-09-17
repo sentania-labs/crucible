@@ -78,18 +78,24 @@ class DockerSettings(BaseModel):
     extra_image_allowlist: list[str] = Field(default_factory=list)
 
 
-class GitHubSettings(BaseModel):
-    """GitHub delivery (12, 23).
+class GitHubAppSettings(BaseModel):
+    """The App's identity and the files Crucible reads to use it (12).
 
-    `private_key_path` and `webhook_secret_path` are paths to files Crucible reads; no
-    key, secret, or token is ever a configuration *value*. The paths come from
-    configuration precisely so that no operator path is ever hardcoded in the
-    repository."""
+    `app_id` is a public identifier. `private_key_path` and `webhook_secret_path` are
+    paths to files; no key, secret, or token is ever a configuration *value*, and the
+    paths come from configuration precisely so no operator path is ever hardcoded in
+    this repository."""
 
-    enabled: bool = False
     app_id: int = 0
     private_key_path: str | None = None
     webhook_secret_path: str | None = None
+
+
+class GitHubSettings(BaseModel):
+    """GitHub delivery (12, 23)."""
+
+    enabled: bool = False
+    app: GitHubAppSettings = Field(default_factory=GitHubAppSettings)
     api_base: str = "https://api.github.com"
     api_timeout_seconds: float = 20.0
     # 23 defaults. The reaction poll is part of every cycle, not an extra: GitHub emits

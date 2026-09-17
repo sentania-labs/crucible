@@ -26,7 +26,7 @@ EGRESS_ALLOWLIST ?= github.com objects.githubusercontent.com pypi.org files.pyth
 WORKERS_SUBNET ?= 10.88.0.0/24
 
 .PHONY: up dev down reset lint scan scan-tree scan-history smoke test test-unit \
-	test-integration e2e e2e-image build proxy-config proxies preflight
+	test-integration e2e e2e-github e2e-image build proxy-config proxies preflight
 
 up: preflight proxy-config ## normal mode: postgres, proxies, migrate, crucible
 	@test -f .env || cp .env.example .env
@@ -120,6 +120,28 @@ e2e: ## the Docker-provider end-to-end tier (18): real containers, no model
 	CRUCIBLE_E2E_DOCKER="$(DOCKER)" \
 	CRUCIBLE_E2E_DOCKER_SOCKET="$(CRUCIBLE_DOCKER_SOCKET)" \
 	$(UV) run pytest tests/e2e -q -m e2e
+
+# The live GitHub tier (23). Local only, never in CI: it mints a real installation token
+# from the mounted App key and opens a real pull request on one throwaway repository,
+# then deletes every branch and closes every pull request it created. It never touches
+# the default branch. The three variables below name files and a repository; no key,
+# token, or secret is ever a value here.
+#
+#   make e2e-github \
+#     CRUCIBLE_GITHUB_APP_JSON=~/path/to/app.json \
+#     CRUCIBLE_GITHUB_APP_KEY=~/path/to/app.pem \
+#     CRUCIBLE_GITHUB_TARGET_REPO=owner/throwaway
+e2e-github: ## the live GitHub tier: a real App against a throwaway repository
+	$(UV) sync --frozen --quiet
+	@test -n "$(CRUCIBLE_GITHUB_APP_JSON)" || { echo "set CRUCIBLE_GITHUB_APP_JSON"; exit 2; }
+	@test -n "$(CRUCIBLE_GITHUB_APP_KEY)" || { echo "set CRUCIBLE_GITHUB_APP_KEY"; exit 2; }
+	@test -n "$(CRUCIBLE_GITHUB_TARGET_REPO)" || { echo "set CRUCIBLE_GITHUB_TARGET_REPO"; exit 2; }
+	CRUCIBLE_E2E_DOCKER="$(DOCKER)" \
+	CRUCIBLE_E2E_DOCKER_SOCKET="$(CRUCIBLE_DOCKER_SOCKET)" \
+	CRUCIBLE_GITHUB_APP_JSON="$(CRUCIBLE_GITHUB_APP_JSON)" \
+	CRUCIBLE_GITHUB_APP_KEY="$(CRUCIBLE_GITHUB_APP_KEY)" \
+	CRUCIBLE_GITHUB_TARGET_REPO="$(CRUCIBLE_GITHUB_TARGET_REPO)" \
+	$(UV) run pytest tests/e2e -q -m e2e_github
 
 build:
 	docker build -t crucible:dev .

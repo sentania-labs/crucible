@@ -190,7 +190,7 @@ class DeliveryCoordinator:
                     attempt_id=plan.attempt_id,
                     task_id=plan.task_id,
                     owner=plan.external_id,
-                    repository_url=plan.repository_url,
+                    repository_url=plan.push_url,
                     work_branch=plan.work_branch,
                     expected_head=plan.head_sha,
                     bundle_path=plan.bundle_path,

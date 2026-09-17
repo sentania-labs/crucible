@@ -118,8 +118,24 @@ services:
       # as JSON, and the list here must be the one `make proxy-config` gave squid.
       CRUCIBLE_DOCKER__EGRESS_ALLOWLIST: >-
         ${CRUCIBLE_EGRESS_ALLOWLIST:-["github.com","objects.githubusercontent.com","pypi.org","files.pythonhosted.org","registry.npmjs.org","api.anthropic.com","api.openai.com","auth.openai.com","daily-cloudcode-pa.googleapis.com","oauth2.googleapis.com"]}
+      # GitHub delivery (12, 23). Off until an App is configured. The App id is a public
+      # identifier and the two secrets are *paths* to files in the credential directory
+      # mounted below, which only this container ever sees: no worker, collector,
+      # verifier or publisher mounts it. Installation tokens are minted per job and live
+      # in memory and in the publisher's tmpfs, never here.
+      CRUCIBLE_GITHUB__ENABLED: "${CRUCIBLE_GITHUB_ENABLED:-false}"
+      CRUCIBLE_GITHUB__APP__APP_ID: "${CRUCIBLE_GITHUB_APP_ID:-0}"
+      CRUCIBLE_GITHUB__APP__PRIVATE_KEY_PATH: /var/lib/crucible/credentials/github/app.pem
+      CRUCIBLE_GITHUB__APP__WEBHOOK_SECRET_PATH: /var/lib/crucible/credentials/github/webhook.secret
+      # The accelerator, off by default on a workstation: polling is the complete
+      # observation path and GitHub cannot reach a laptop anyway (Q13, 23).
+      CRUCIBLE_GITHUB__WEBHOOK_ENABLED: "${CRUCIBLE_GITHUB_WEBHOOK_ENABLED:-false}"
     volumes:
       - crucible-artifacts:/var/lib/crucible/artifacts
+      # The App private key and the webhook secret, read-only, on this container only
+      # (12). CRUCIBLE_CREDENTIAL_ROOT defaults to a directory that does not exist, so
+      # a stack with no App configured starts with nothing mounted there.
+      - ${CRUCIBLE_CREDENTIAL_ROOT:-./var/credentials}:/var/lib/crucible/credentials:ro
     ports:
       - "127.0.0.1:${CRUCIBLE_PORT:-8080}:8080"
     healthcheck:

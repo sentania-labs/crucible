@@ -100,11 +100,15 @@ def github_client(settings: Settings) -> GitHubClient | None:
     """The GitHub adapter, when the App is configured. The key is a path Crucible reads
     to sign a JWT in memory; nothing about it is a configuration value (12)."""
     g = settings.github
-    if not g.enabled or not g.app_id or not g.private_key_path:
+    if not g.enabled or not g.app.app_id or not g.app.private_key_path:
         return None
     transport = RestTransport(g.api_base, timeout=g.api_timeout_seconds)
     authenticator = AppAuthenticator(
-        AppConfig(app_id=g.app_id, private_key_path=g.private_key_path, api_base=g.api_base),
+        AppConfig(
+            app_id=g.app.app_id,
+            private_key_path=g.app.private_key_path,
+            api_base=g.api_base,
+        ),
         transport,
     )
     return RestGitHubClient(authenticator, transport, allow_issue_comments=g.allow_issue_comments)
@@ -132,7 +136,7 @@ def wire(settings: Settings) -> Wiring:
         artifact_store=artifact_store,
         lease_ttl_seconds=settings.supervisor.lease_ttl_seconds,
         github_webhook_enabled=settings.github.webhook_enabled,
-        github_webhook_secret_path=settings.github.webhook_secret_path,
+        github_webhook_secret_path=settings.github.app.webhook_secret_path,
     )
     github = github_client(settings)
     publisher: Publisher | None = None

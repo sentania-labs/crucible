@@ -249,7 +249,8 @@ class _Handler(BaseHTTPRequestHandler):
 
     @property
     def state(self) -> FakeGitHub:
-        return self.server.state  # type: ignore[attr-defined]
+        state: FakeGitHub = self.server.state  # type: ignore[attr-defined]
+        return state
 
     def log_message(self, *args: Any) -> None:  # keep the test output readable
         return
@@ -534,4 +535,4 @@ class FakeGitHubServer:
     @property
     def url(self) -> str:
         host, port = self._server.server_address[:2]
-        return f"http://{host}:{port}"
+        return f"http://{host!s}:{port}"

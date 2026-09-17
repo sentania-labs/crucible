@@ -78,6 +78,7 @@ asyncio_default_fixture_loop_scope = "function"
 markers = [
     "integration: needs a PostgreSQL container",
     "e2e: needs a Docker daemon, the proxies, and the script-harness worker image (18)",
+    "e2e_github: the live GitHub tier (23): the App key, a throwaway repository, local only",
 ]
 filterwarnings = ["error::DeprecationWarning:crucible.*"]
 
