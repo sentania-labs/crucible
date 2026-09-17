@@ -165,8 +165,8 @@ build of this branch). Before the first tagged release the answer is
 
 ```sh
 docker compose exec crucible crucible-admin token create --principal foundry --role orchestrator
-docker compose exec crucible crucible-admin repository register --name example-service \
-  --url https://github.com/example-org/example-service \
+docker compose exec crucible crucible-admin --reason "onboarding" repository register \
+  --name example-service --url https://github.com/example-org/example-service \
   --installation-id 0 --attest-external-review-all-prs
 curl -s http://127.0.0.1:8080/v1/ready
 ```
