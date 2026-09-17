@@ -11,8 +11,7 @@ from typing import Any
 from crucible.application.admin.context import (
     AdminContext,
     admin_event,
-    require_live_supervisor,
-    require_reason,
+    guard_mutation,
 )
 from crucible.application.errors import ConflictError
 from crucible.domain.events import EventKind
@@ -86,8 +85,7 @@ def check(
 ) -> dict[str, Any]:
     """25: mint an installation token per registered repository and discard it. The
     result per repository is a boolean and an error class; never a token."""
-    reason = require_reason(reason)
-    require_live_supervisor(ctx, uow)
+    reason = guard_mutation(ctx, uow, reason, principal=principal, operation="github check")
     if ctx.github is None:
         raise ConflictError("GitHub delivery is not configured (github.enabled)")
     results: list[dict[str, Any]] = []

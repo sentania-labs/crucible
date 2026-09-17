@@ -30,16 +30,27 @@ ADMIN_KINDS: frozenset[str] = frozenset(
 )
 
 
+PAGE_SIZE = 200
+MAX_PAGES = 20
+
+
 def tail(uow: UnitOfWork, *, cursor: int | None, limit: int) -> dict[str, Any]:
-    """Admin events after the cursor, oldest first; `next_cursor` is the last seq."""
+    """Admin events after the cursor, oldest first.
+
+    `next_cursor` is how far the scan reached, not the last matching item. The stream
+    holds every kind of event, so a stretch of non-admin events longer than the scan
+    budget yields an empty page; a cursor taken from the last item would then sit where
+    it already was and every later admin event would be unreachable. The scan position
+    always moves forward, so the next call resumes past the gap.
+    """
     items: list[dict[str, Any]] = []
     after = cursor or 0
-    pages = 0
-    while len(items) < limit and pages < 20:
-        batch = uow.events.list_global(after_seq=after, kind=None, since=None, limit=200)
+    for _ in range(MAX_PAGES):
+        if len(items) >= limit:
+            break
+        batch = uow.events.list_global(after_seq=after, kind=None, since=None, limit=PAGE_SIZE)
         if not batch:
             break
-        pages += 1
         for event in batch:
             after = event.seq or after
             if event.kind in ADMIN_KINDS:
@@ -54,5 +65,4 @@ def tail(uow: UnitOfWork, *, cursor: int | None, limit: int) -> dict[str, Any]:
                 )
                 if len(items) >= limit:
                     break
-    next_cursor = items[-1]["seq"] if items else (cursor or 0)
-    return {"items": items, "next_cursor": next_cursor}
+    return {"items": items, "next_cursor": after}

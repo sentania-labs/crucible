@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -22,6 +23,7 @@ from crucible.adapters.api.deps import AppContext
 from crucible.adapters.clock import SystemClock
 from crucible.adapters.execution.fake import FakeProvider
 from crucible.application.admin.context import AdminContext
+from crucible.application.errors import ApplicationError
 from crucible.application.supervisor import Supervisor
 from crucible.cli import admin as cli
 from crucible.domain.entities import Role
@@ -64,19 +66,48 @@ def seed_credentials(root: Path) -> dict[str, CredentialSource]:
     return {name: CredentialSource(str(root / name)) for name in ("claude_code", "codex", "agy")}
 
 
-def fake_login_cli(root: Path) -> dict[str, tuple[str, ...]]:
-    path = root / "fake-login"
-    path.write_text(
+# One script per harness, because the three flows differ in exactly the way the driver
+# has to tell apart: Claude Code prompts for a pasted code and then prints a token once,
+# Codex prints a device code and never prompts, AGY prompts and prints no token. A single
+# script for all three let the Codex leg pass on the banner line without ever reaching the
+# paste path. The phrases follow the real CLIs (S1b transcripts); the token is built here.
+FAKE_LOGIN_SCRIPTS: dict[str, str] = {
+    "claude_code": (
         "#!/bin/bash\n"
-        'echo "Visit https://example.invalid/device and enter code ABCD-EFGH"\n'
+        'echo "Visit https://example.invalid/device to authorize, then enter the code here"\n'
         'printf "Paste the code: "\n'
         "read -t 30 -r code\n"
-        f'echo "token: {_token("sk-ant-oat01-")}"\n'
-        "exit 0\n",
-        encoding="utf-8",
-    )
-    path.chmod(0o755)
-    return {name: (str(path),) for name in ("claude_code", "codex", "agy")}
+        'echo "token: TOKEN_PLACEHOLDER"\n'
+        "exit 0\n"
+    ),
+    "codex": (
+        "#!/bin/bash\n"
+        'echo "Open https://example.invalid/device in a browser"\n'
+        'echo "Your code is ABCD-EFGH (it expires in 15 minutes)"\n'
+        'echo "Waiting for authorization..."\n'
+        "exit 0\n"
+    ),
+    "agy": (
+        "#!/bin/bash\n"
+        'echo "Sign in at https://example.invalid/oauth and copy the code shown"\n'
+        'printf "Enter the code: "\n'
+        "read -t 30 -r code\n"
+        'echo "Signed in."\n'
+        "exit 0\n"
+    ),
+}
+
+
+def fake_login_cli(root: Path) -> dict[str, tuple[str, ...]]:
+    commands: dict[str, tuple[str, ...]] = {}
+    for name, script in FAKE_LOGIN_SCRIPTS.items():
+        path = root / f"fake-login-{name}"
+        path.write_text(
+            script.replace("TOKEN_PLACEHOLDER", _token("sk-ant-oat01-")), encoding="utf-8"
+        )
+        path.chmod(0o755)
+        commands[name] = (str(path),)
+    return commands
 
 
 @pytest.fixture
@@ -299,8 +330,10 @@ def test_credentials_rotate_and_remove_through_api_and_cli(
     assert new_secret in swapped and swapped != old_token
     retired = credential_root / rotated["retained_as"]
     assert (retired / "auth.json").read_text(encoding="utf-8") == old_token
-    # The staging copy was shredded once the swap landed.
-    assert list(incoming.iterdir()) == []
+    # The caller's directory is untouched: Crucible copies it and never destroys a path
+    # the operator named outside its own credential root.
+    assert (incoming / "auth.json").read_text(encoding="utf-8").strip()
+    assert rotated["source_kept"] == str(incoming)
     assert new_secret not in json.dumps(rotated) and old_token not in json.dumps(rotated)
 
     # Retention is 0 h here: the retired directory is shredded by the sweep.
@@ -348,10 +381,17 @@ def test_login_through_api_and_cli_against_the_fake_cli(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     asyncio.run(live_supervisor.tick())
-    started = admin_client.post(
+    refused = admin_client.post(
         "/v1/admin/credentials/claude_code/login", json={"reason": "onboarding"}
+    )
+    assert refused.status_code == 409, refused.text
+    assert "already passes the shape check" in refused.json()["detail"]
+    started = admin_client.post(
+        "/v1/admin/credentials/claude_code/login",
+        json={"reason": "onboarding", "replace": True},
     ).json()
     assert "captured to oauth-token" in started["window"]
+    assert started["retained_as"].startswith("claude_code.retired-")
     for _ in range(100):
         state = admin_client.get("/v1/admin/credentials/claude_code/login").json()
         if state["state"] == "waiting_for_code":
@@ -366,7 +406,9 @@ def test_login_through_api_and_cli_against_the_fake_cli(
         time.sleep(0.05)
     assert state["state"] == "finished", state
     assert state["token_written"] is True
-    finished = admin_client.post("/v1/admin/credentials/claude_code/login/finish").json()
+    finished = admin_client.post(
+        "/v1/admin/credentials/claude_code/login/finish", json={"reason": "onboarded"}
+    ).json()
     assert finished["shape"]["ok"]
     assert "sk-ant-" not in json.dumps(finished) + json.dumps(state)
 
@@ -379,6 +421,7 @@ def test_login_through_api_and_cli_against_the_fake_cli(
         "login",
         "--harness",
         "codex",
+        "--replace",
         capsys=capsys,
     )
     assert result["login"]["state"] == "finished" and result["login"]["code"] == "ABCD-EFGH"
@@ -454,13 +497,27 @@ def test_providers_github_audit_status_and_capabilities(
     with pytest.raises(SystemExit):
         cli.main(["--config", str(config_file), "--reason", "x", "github", "check"])
 
+    # A registration under /admin is a mutation like any other: a reason, and a live lease.
+    assert (
+        admin_client.put(
+            "/v1/admin/repositories/second",
+            json={"url": "https://github.com/example-org/second", "attested_all_prs": True},
+        ).status_code
+        == 422
+    )
     registered = admin_client.put(
         "/v1/admin/repositories/second",
-        json={"url": "https://github.com/example-org/second", "attested_all_prs": True},
+        json={
+            "url": "https://github.com/example-org/second",
+            "attested_all_prs": True,
+            "reason": "onboarding the second repository",
+        },
     ).json()
     assert registered["repository"] == "second"
-    run_cli(
+    from_cli = run_cli(
         config_file,
+        "--reason",
+        "onboarding the third repository",
         "repositories",
         "register",
         "--name",
@@ -470,6 +527,14 @@ def test_providers_github_audit_status_and_capabilities(
         "--attest-external-review-all-prs",
         capsys=capsys,
     )
+    # One service, one document: the two entry points differ only in the values.
+    assert set(from_cli) == set(registered)
+    registration_events = [
+        e
+        for e in admin_client.get("/v1/admin/audit", params={"limit": 200}).json()["items"]
+        if e["kind"] == "repository_registered" and e["payload"]["repository"] == "second"
+    ]
+    assert registration_events[0]["payload"]["reason"] == "onboarding the second repository"
 
     document = admin_client.get("/v1/admin/status").json()
     assert set(document) == {
@@ -548,3 +613,180 @@ def test_the_cli_remote_mode_builds_the_same_calls(monkeypatch: pytest.MonkeyPat
         ("GET", "/v1/admin/audit?limit=10&cursor=5", None),
     ]
     assert Role.ADMIN.value == "admin"
+
+
+# ----- the correction round ----------------------------------------------------------
+
+
+def test_a_secret_shaped_reason_is_refused_on_both_entry_points(
+    admin_client: TestClient,
+    live_supervisor: Supervisor,
+    config_file: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """B2: the reason is written to the append-only event log and served back by
+    `GET /admin/audit`, so a pasted token would be stored for ever."""
+    asyncio.run(live_supervisor.tick())
+    secret = _token("sk-ant-oat01-")
+    response = admin_client.post(
+        "/v1/admin/harnesses/agy/disable", json={"reason": f"rotating {secret}"}
+    )
+    assert response.status_code == 422, response.text
+    assert response.json()["errors"][0]["path"] == "reason"
+    assert secret not in response.text
+    with pytest.raises(SystemExit):
+        cli.main(
+            [
+                "--config",
+                str(config_file),
+                "--reason",
+                f"rotating {secret}",
+                "harnesses",
+                "disable",
+                "agy",
+            ]
+        )
+    err = capsys.readouterr().err
+    assert "contract-validation" in err or "reason" in err
+    assert secret not in err
+    kinds = audit_kinds(admin_client)
+    assert ("admin_refused", "admin-principal") in kinds, kinds
+    assert secret not in json.dumps(
+        admin_client.get("/v1/admin/audit", params={"limit": 200}).json()
+    )
+
+
+def test_registering_a_repository_takes_both_guards_on_both_entry_points(
+    admin_client: TestClient,
+    live_supervisor: Supervisor,
+    config_file: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """B3: the admin route called the legacy service directly, so it registered with no
+    reason and with the supervisor down."""
+    body = {"url": "https://github.com/example-org/guarded", "attested_all_prs": True}
+    down = admin_client.put("/v1/admin/repositories/guarded", json={**body, "reason": "x"})
+    assert down.status_code == 503, down.text
+    with pytest.raises(SystemExit):
+        cli.main(
+            [
+                "--config",
+                str(config_file),
+                "--reason",
+                "x",
+                "repositories",
+                "register",
+                "--name",
+                "guarded-cli",
+                "--url",
+                "https://github.com/example-org/guarded-cli",
+                "--attest-external-review-all-prs",
+            ]
+        )
+    assert "supervisor-not-live" in capsys.readouterr().err
+    asyncio.run(live_supervisor.tick())
+    assert admin_client.put("/v1/admin/repositories/guarded", json=body).status_code == 422
+    with pytest.raises(SystemExit):
+        cli.main(
+            [
+                "--config",
+                str(config_file),
+                "repositories",
+                "register",
+                "--name",
+                "guarded-cli",
+                "--url",
+                "https://github.com/example-org/guarded-cli",
+                "--attest-external-review-all-prs",
+            ]
+        )
+    assert "reason" in capsys.readouterr().err
+
+
+def test_finishing_a_login_takes_both_guards(
+    admin_client: TestClient,
+    live_supervisor: Supervisor,
+    credential_root: Path,
+) -> None:
+    """B4: it writes session_compatibility and clears last_validated_at, so it is a
+    mutation and was the one without the guards."""
+    no_lease = admin_client.post(
+        "/v1/admin/credentials/codex/login/finish", json={"reason": "done"}
+    )
+    assert no_lease.status_code == 503, no_lease.text
+    asyncio.run(live_supervisor.tick())
+    no_reason = admin_client.post("/v1/admin/credentials/codex/login/finish", json={})
+    assert no_reason.status_code == 422, no_reason.text
+    assert no_reason.json()["errors"][0]["path"] == "reason"
+
+
+def test_a_failed_swap_leaves_the_configured_directory_exactly_as_it_was(
+    admin_ctx: AdminContext,
+    live_supervisor: Supervisor,
+    credential_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B6: the swap is two renames. When the second failed the configured path was gone,
+    the exception propagated before any event, and every later launch failed on a missing
+    credential with nothing in the audit to say why."""
+    import crucible.application.admin.credentials as credentials_module  # noqa: PLC0415
+
+    asyncio.run(live_supervisor.tick())
+    before = (credential_root / "codex" / "auth.json").read_text(encoding="utf-8")
+    incoming = tmp_path / "incoming-rollback"
+    incoming.mkdir()
+    (incoming / "auth.json").write_text(
+        json.dumps(
+            {"tokens": {"refresh_token": _token("eyJ", 60)}, "last_refresh": "2026-09-17T03:00:00Z"}
+        ),
+        encoding="utf-8",
+    )
+    real_rename = os.rename
+    calls = {"n": 0}
+
+    def failing(src: str | os.PathLike[str], dst: str | os.PathLike[str]) -> None:
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise OSError(18, "Invalid cross-device link")
+        real_rename(src, dst)
+
+    monkeypatch.setattr(os, "rename", failing)
+    with admin_ctx.uow_factory() as uow, pytest.raises(ApplicationError) as caught:
+        credentials_module.rotate(
+            admin_ctx,
+            uow,
+            principal="admin-principal",
+            harness="codex",
+            new_path=str(incoming),
+            reason="a swap that fails",
+        )
+    assert "rolled back" in str(caught.value.detail)
+    monkeypatch.undo()
+    assert (credential_root / "codex" / "auth.json").read_text(encoding="utf-8") == before
+    assert not any(p.name.startswith("codex.incoming-") for p in credential_root.iterdir())
+    assert not any(p.name.startswith("codex.retired-") for p in credential_root.iterdir())
+    assert (incoming / "auth.json").is_file(), "the caller's directory is never touched"
+
+
+def test_a_probe_that_times_out_makes_a_validated_credential_invalid(
+    admin_client: TestClient,
+    live_supervisor: Supervisor,
+    provider: FakeProvider,
+) -> None:
+    """S4: when the shape check passed and the probe did not, nothing recorded the
+    failure, so a previously validated credential still read as validated."""
+    asyncio.run(live_supervisor.tick())
+    first = admin_client.post(
+        "/v1/admin/credentials/codex/validate", json={"reason": "first pass"}
+    ).json()
+    assert first["validated"] is True
+    assert first["credential"]["state"] == "validated"
+    provider.probe_outcome = "timeout"
+    second = admin_client.post(
+        "/v1/admin/credentials/codex/validate", json={"reason": "after the timeout"}
+    ).json()
+    assert second["validated"] is False
+    assert second["probe"]["exit_class"] == "timeout"
+    assert second["credential"]["state"] == "invalid", second["credential"]
+    assert admin_client.get("/v1/admin/credentials/codex").json()["state"] == "invalid"

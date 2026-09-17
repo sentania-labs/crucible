@@ -8,8 +8,7 @@ from typing import Any
 from crucible.application.admin.context import (
     AdminContext,
     admin_event,
-    require_live_supervisor,
-    require_reason,
+    guard_mutation,
 )
 from crucible.application.admin.harnesses import list_images as provider_images
 from crucible.application.errors import NotFoundError
@@ -35,8 +34,7 @@ def _find(images: list[tuple[str, ImageInfo]], digest: str) -> ImageInfo:
 async def promote(
     ctx: AdminContext, uow: UnitOfWork, *, principal: str, digest: str, reason: str | None
 ) -> dict[str, Any]:
-    reason = require_reason(reason)
-    require_live_supervisor(ctx, uow)
+    reason = guard_mutation(ctx, uow, reason, principal=principal, operation="images promote")
     image = _find(await provider_images(ctx), digest)
     if not image.harness:
         raise NotFoundError(f"image {image.reference} carries no crucible.harness label")

@@ -109,11 +109,23 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.execute(
-        sa.text("DELETE FROM policies WHERE name = :name AND version = 2").bindparams(
-            name="default-software"
+    # 14: a policy version a task was admitted under is immutable, so the seeded row goes
+    # only when nothing points at it. A task or a retention action naming it keeps it,
+    # and the downgrade says so rather than leaving a dangling reference behind.
+    connection = op.get_bind()
+    referenced = connection.execute(
+        sa.text(
+            "SELECT (EXISTS (SELECT 1 FROM tasks WHERE policy_name = :name "
+            "AND policy_version = 2) OR EXISTS (SELECT 1 FROM retention_actions "
+            "WHERE policy_name = :name AND policy_version = 2))"
+        ).bindparams(name="default-software")
+    ).scalar()
+    if not referenced:
+        op.execute(
+            sa.text("DELETE FROM policies WHERE name = :name AND version = 2").bindparams(
+                name="default-software"
+            )
         )
-    )
     # The audit log is never deleted to make a constraint fit (c4.md decision 36).
     gone = ", ".join(f"'{k}'" for k in C5B_EVENT_KINDS)
     op.execute(f"CREATE TABLE IF NOT EXISTS {EVENT_ARCHIVE} (LIKE events)")

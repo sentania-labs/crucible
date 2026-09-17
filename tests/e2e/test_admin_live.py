@@ -95,15 +95,30 @@ def scratch_root(artifact_root: Path, dedicated_root: Path) -> Iterator[Path]:
     root = artifact_root / f"scratch-credentials-{RUN_ID}"
     root.mkdir(mode=0o700)
     for harness in ALL_HARNESSES:
-        shutil.copytree(dedicated_root / harness, root / harness, symlinks=False)
+        # symlinks=True, and not by taste: the Codex directory carries symlinks into the
+        # operator's daily-use `~/.codex` release tree, and dereferencing them would read
+        # and copy exactly what 12 says is never read, as well as making this copy's size
+        # and validity depend on whether that CLI happened to update. The links are copied
+        # as links and never followed.
+        shutil.copytree(dedicated_root / harness, root / harness, symlinks=True)
         os.chmod(root / harness, 0o700)
     yield root
-    from crucible.application.admin.credentials import shred_tree  # noqa: PLC0415
+    from crucible.application.admin.credentials import (  # noqa: PLC0415
+        ShredIncompleteError,
+        shred_tree,
+    )
 
     for path in root.iterdir():
         if path.is_dir():
-            shred_tree(path, keep_root=False)
+            try:
+                shred_tree(path, keep_root=False)
+            except ShredIncompleteError as exc:
+                # Never silent: the scratch copies hold credential bytes, so a shred that
+                # did not finish is printed and then forced, and the assertion below is
+                # what says nothing was left behind.
+                print(f"admin-live: scratch shred incomplete: {exc.detail}")
     shutil.rmtree(root, ignore_errors=True)
+    assert not root.exists() or not any(p.is_file() for p in root.rglob("*"))
 
 
 def _provider(docker_config: DockerConfig, sources: dict[str, CredentialSource]) -> DockerProvider:
@@ -465,7 +480,7 @@ def test_every_other_operation_through_api_and_cli_on_the_live_stack(
         assert validated["validated"] is True, validated
         # rotate the scratch codex copy with a prepared directory (a copy of itself)
         incoming = artifact_root / f"incoming-codex-{RUN_ID}"
-        shutil.copytree(scratch_root / "codex", incoming)
+        shutil.copytree(scratch_root / "codex", incoming, symlinks=True)
         rotated = admin.post(
             "/v1/admin/credentials/codex/rotate",
             json={"reason": "live rotate", "new_path": str(incoming)},
@@ -473,7 +488,10 @@ def test_every_other_operation_through_api_and_cli_on_the_live_stack(
         assert rotated.status_code == 200, rotated.text
         retained = scratch_root / rotated.json()["retained_as"]
         assert retained.is_dir() and (scratch_root / "codex" / "auth.json").is_file()
-        assert list(incoming.iterdir()) == [], "the staging copy was shredded"
+        # The caller's directory is untouched: rotate copies it and shreds nothing
+        # outside the configured credential root.
+        assert (incoming / "auth.json").is_file(), "the caller's directory was destroyed"
+        assert rotated.json()["source_kept"] == str(incoming)
         from crucible.application.admin.credentials import sweep_retired  # noqa: PLC0415
 
         time.sleep(1.1)

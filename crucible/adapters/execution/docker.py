@@ -1314,43 +1314,10 @@ class DockerProvider:
         )
         root = self._root(probe_id)
         await asyncio.to_thread(shutil.rmtree, root, True)
-        paths = await asyncio.to_thread(self._make_dirs, root)
-        resolved = await self._resolve_image(spec)
+        # 25: the probe removes everything. The preparer, the image resolution and the
+        # identity writes can each fail, so they are inside the same try whose finally
+        # removes the containers and the workspace; nothing is seeded before this point.
         started = time.monotonic()
-        # The preparer's role, reduced to what a probe needs: the directories the worker's
-        # own uid must own, the credential leaf mode 700 (12, S9 Test E).
-        code = await self._run_throwaway(
-            spec,
-            role=ROLE_PREPARER,
-            image=resolved,
-            script=(
-                f"set -eu; mkdir -p {WORK_MOUNT}/repo {WORK_MOUNT}/report; "
-                f"mkdir -m 0700 -p {WORK_MOUNT}/{CREDENTIAL_LEAF}\n"
-            ),
-            mounts=[self._daemon_mount(probe_id, "", WORK_MOUNT, read_only=False)],
-            network="none",
-            timeout=60,
-        )
-        if code != 0:
-            raise ProviderError(f"the probe could not prepare its workspace (exit {code})")
-        adapter = self.harnesses.get(request.harness)
-        credential = adapter.credential_spec() if adapter is not None else None
-        identity = paths["identity"]
-        (identity / "IDENTITY.md").write_text(request.identity_text, encoding="utf-8")
-        os.chmod(identity / "IDENTITY.md", 0o444)
-        if credential is not None and credential.templates:
-            template_dir = identity / "harness"
-            template_dir.mkdir(parents=True, exist_ok=True)
-            for name, content in credential.templates.items():
-                (template_dir / name).write_text(content, encoding="utf-8")
-                os.chmod(template_dir / name, 0o444)
-        ws = Workspace(
-            attempt_id=probe_id,
-            checkout_path=str(paths["repo"]),
-            identity_path=str(identity),
-            report_path=str(paths["report"]),
-            output_path=str(paths["output"]),
-        )
         timed_out = False
         exit_code: int | None = None
         oom = False
@@ -1358,7 +1325,46 @@ class DockerProvider:
         sync = None
         detail = ""
         handle: Handle | None = None
+        resolved = ""
+        ws: Workspace | None = None
         try:
+            paths = await asyncio.to_thread(self._make_dirs, root)
+            ws = Workspace(
+                attempt_id=probe_id,
+                checkout_path=str(paths["repo"]),
+                identity_path=str(paths["identity"]),
+                report_path=str(paths["report"]),
+                output_path=str(paths["output"]),
+            )
+            resolved = await self._resolve_image(spec)
+            started = time.monotonic()
+            # The preparer's role, reduced to what a probe needs: the directories the worker's
+            # own uid must own, the credential leaf mode 700 (12, S9 Test E).
+            code = await self._run_throwaway(
+                spec,
+                role=ROLE_PREPARER,
+                image=resolved,
+                script=(
+                    f"set -eu; mkdir -p {WORK_MOUNT}/repo {WORK_MOUNT}/report; "
+                    f"mkdir -m 0700 -p {WORK_MOUNT}/{CREDENTIAL_LEAF}\n"
+                ),
+                mounts=[self._daemon_mount(probe_id, "", WORK_MOUNT, read_only=False)],
+                network="none",
+                timeout=60,
+            )
+            if code != 0:
+                raise ProviderError(f"the probe could not prepare its workspace (exit {code})")
+            adapter = self.harnesses.get(request.harness)
+            credential = adapter.credential_spec() if adapter is not None else None
+            identity = paths["identity"]
+            (identity / "IDENTITY.md").write_text(request.identity_text, encoding="utf-8")
+            os.chmod(identity / "IDENTITY.md", 0o444)
+            if credential is not None and credential.templates:
+                template_dir = identity / "harness"
+                template_dir.mkdir(parents=True, exist_ok=True)
+                for name, content in credential.templates.items():
+                    (template_dir / name).write_text(content, encoding="utf-8")
+                    os.chmod(template_dir / name, 0o444)
             handle = await self.launch(ws, spec)
             try:
                 exit_code = int(
@@ -1386,8 +1392,11 @@ class DockerProvider:
             for row in await self._containers_for(probe_id):
                 with contextlib.suppress(Exception):
                     await self._call(self.client.remove_container, str(row["Id"]), force=True)
+            if ws is not None:
+                with contextlib.suppress(Exception):
+                    await self.cleanup(ws, CleanupPolicy.DELETE, spec)
             with contextlib.suppress(Exception):
-                await self.cleanup(ws, CleanupPolicy.DELETE, spec)
+                await asyncio.to_thread(shutil.rmtree, root, True)
             self._launched.pop(probe_id, None)
         labels = self._images.get(spec.image)
         return ProbeResult(

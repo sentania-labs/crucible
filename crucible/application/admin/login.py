@@ -16,6 +16,7 @@ import os
 import pty
 import re
 import select
+import shutil
 import subprocess
 import threading
 import time
@@ -27,10 +28,14 @@ from typing import Any
 from crucible.application.admin.context import (
     AdminContext,
     admin_event,
-    require_live_supervisor,
-    require_reason,
+    guard_mutation,
 )
-from crucible.application.admin.credentials import check_shape, source_for, spec_for
+from crucible.application.admin.credentials import (
+    RETIRED_MARK,
+    check_shape,
+    source_for,
+    spec_for,
+)
 from crucible.application.errors import ConflictError
 from crucible.domain.events import EventKind
 from crucible.domain.secrets import redact
@@ -39,7 +44,14 @@ from crucible.ports.repository import UnitOfWork
 URL_RE = re.compile(r"https?://[^\s'\"<>]+")
 # A device or one-time code the CLI shows for the operator to enter elsewhere.
 CODE_RE = re.compile(r"\b([A-Z0-9]{4,5}-[A-Z0-9]{4,6})\b")
-PASTE_RE = re.compile(r"(paste|enter).{0,40}(code|token)|code\s*:\s*$", re.IGNORECASE)
+# The CLI is ready for the code when it has printed a prompt: a line that ends in a
+# prompt character with no newline after it. Matching the words alone flipped the session
+# to `waiting_for_code` on informational text ("visit the URL and enter the code"), before
+# the CLI was reading, and the pasted code went nowhere.
+PASTE_RE = re.compile(
+    r"(?:(?:paste|enter)[^\n]{0,40}(?:code|token)[^\n]{0,20}|code|token)\s*[:>?]\s*$",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,15 +183,24 @@ def run_login(
     }
     master, slave = pty.openpty()
     try:
-        process = subprocess.Popen(
-            list(argv or flow.argv),
-            stdin=slave,
-            stdout=slave,
-            stderr=slave,
-            env=env,
-            close_fds=True,
-            start_new_session=True,
-        )
+        try:
+            process = subprocess.Popen(
+                list(argv or flow.argv),
+                stdin=slave,
+                stdout=slave,
+                stderr=slave,
+                env=env,
+                close_fds=True,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            # The CLI is not on this host. Without this the session stayed `starting` for
+            # ever and every later login for the harness was refused as in progress.
+            os.close(master)
+            session.state = "failed"
+            session.exit_code = None
+            session.error = f"could not start {(argv or flow.argv)[0]}: {exc.strerror or exc}"
+            return session
     finally:
         os.close(slave)
     token_re = (
@@ -302,19 +323,46 @@ class LoginRegistry:
         if existing is not None and existing.state not in ("finished", "failed"):
             raise ConflictError(f"a login for {harness} is already in progress")
         flow = FLOWS[harness]
+        argv = ctx.login_commands.get(harness) or flow.argv
+        if shutil.which(argv[0]) is None and not Path(argv[0]).exists():
+            # The login drives the harness's own CLI, and only the worker images carry
+            # the three; the Crucible service image carries none (13). Refusing here is
+            # the difference between a clear message and a session that never finishes.
+            raise ConflictError(
+                f"{argv[0]} is not installed on this host, so the {harness} login cannot "
+                "run here; run `crucible-admin credentials login` in local mode on a host "
+                f"that has {argv[0]}"
+            )
         session = LoginSession(harness=harness, started_at=time.time())
         self._sessions[harness] = session
-        argv = ctx.login_commands.get(harness)
         thread = threading.Thread(
-            target=run_login,
-            args=(flow, directory),
-            kwargs={"session": session, "argv": argv, "timeout": ctx.login_timeout_seconds},
+            target=self._run,
+            args=(flow, directory, session, ctx.login_commands.get(harness)),
+            kwargs={"timeout": ctx.login_timeout_seconds},
             daemon=True,
             name=f"login-{harness}",
         )
         self._threads[harness] = thread
         thread.start()
         return session
+
+    @staticmethod
+    def _run(
+        flow: LoginFlow,
+        directory: str,
+        session: LoginSession,
+        argv: tuple[str, ...] | None,
+        *,
+        timeout: float,
+    ) -> None:
+        """Whatever happens in the thread, the session ends in a terminal state: a
+        session stuck in `starting` blocks every later login for that harness."""
+        try:
+            run_login(flow, directory, session=session, argv=argv, timeout=timeout)
+        except Exception as exc:  # the thread has nowhere to raise
+            session.state = "failed"
+            if session.error is None:
+                session.error = f"the login driver failed: {type(exc).__name__}: {exc}"
 
 
 def start_login(
@@ -325,16 +373,25 @@ def start_login(
     principal: str,
     harness: str,
     reason: str | None,
+    replace: bool = False,
 ) -> dict[str, Any]:
     """25 steps 1 to 3: the dedicated directory, the CLI's own login pointed at it, the
-    URL and code for the operator. The windows are stated before anything runs."""
-    reason = require_reason(reason)
-    require_live_supervisor(ctx, uow)
+    URL and code for the operator. The windows are stated before anything runs.
+
+    A login writes into the configured directory, so an existing credential that still
+    passes the shape check is not overwritten silently: `replace` retires it the way
+    rotate does (renamed aside, shredded by the retention sweep) before the CLI runs."""
+    reason = guard_mutation(
+        ctx, uow, reason, principal=principal, operation=f"credentials login {harness}"
+    )
     if harness not in FLOWS:
         raise ConflictError(f"harness {harness!r} has no interactive login flow")
-    spec_for(ctx, harness)
+    spec = spec_for(ctx, harness)
     source = source_for(ctx, harness)
     flow = FLOWS[harness]
+    retired = _retire_existing(
+        ctx, uow, spec, source, principal=principal, harness=harness, reason=reason, replace=replace
+    )
     session = registry.start(ctx, harness, source.path)
     admin_event(
         uow,
@@ -347,8 +404,55 @@ def start_login(
         harness=harness,
         window=flow.window,
         command=list(ctx.login_commands.get(harness) or flow.argv),
+        retained_as=retired,
     )
-    return {"harness": harness, "window": flow.window, **session.as_dict()}
+    return {
+        "harness": harness,
+        "window": flow.window,
+        "retained_as": retired,
+        **session.as_dict(),
+    }
+
+
+def _retire_existing(
+    ctx: AdminContext,
+    uow: UnitOfWork,
+    spec: Any,
+    source: Any,
+    *,
+    principal: str,
+    harness: str,
+    reason: str,
+    replace: bool,
+) -> str | None:
+    """Refuse to overwrite a credential that still passes the shape check; with
+    `replace`, move it aside under rotate's retained name so the retention sweep shreds
+    it on its own schedule. Nothing is shredded here and nothing is read."""
+    current = Path(source.path)
+    if not current.is_dir() or not check_shape(spec, source.path).ok:
+        return None
+    if not replace:
+        raise ConflictError(
+            f"the {harness} credential already passes the shape check; a login would "
+            "overwrite it. Pass replace to retain and replace it, or use rotate to swap "
+            "in a prepared directory"
+        )
+    stamp = ctx.clock.now().strftime("%Y%m%dT%H%M%SZ")
+    retired = current.with_name(current.name + RETIRED_MARK + stamp)
+    os.rename(current, retired)
+    admin_event(
+        uow,
+        ctx,
+        EventKind.CREDENTIAL_ROTATED,
+        principal=principal,
+        reason=f"login --replace: {reason}",
+        before={"state": "present"},
+        after={"state": "retained"},
+        harness=harness,
+        retained_as=retired.name,
+        retention_hours=ctx.credential_retention_hours,
+    )
+    return retired.name
 
 
 def login_status(registry: LoginRegistry, harness: str) -> dict[str, Any]:
@@ -373,9 +477,16 @@ def finish_login(
     *,
     principal: str,
     harness: str,
+    reason: str | None = None,
 ) -> dict[str, Any]:
     """25 step 4 after the CLI exits: validate the resulting structure and record only
-    the result. The probe (steps 5 to 8) is `credentials validate`."""
+    the result. The probe (steps 5 to 8) is `credentials validate`.
+
+    It writes `session_compatibility` and clears `last_validated_at`, so it is a mutation
+    and takes the same two guards as every other one."""
+    reason = guard_mutation(
+        ctx, uow, reason, principal=principal, operation=f"credentials login finish {harness}"
+    )
     session = registry.get(harness)
     if session is None or session.state not in ("finished", "failed"):
         raise ConflictError(f"the login for {harness} has not finished")
@@ -393,7 +504,7 @@ def finish_login(
         ctx,
         EventKind.CREDENTIAL_LOGIN_FINISHED,
         principal=principal,
-        reason="login finished",
+        reason=reason,
         before=None,
         after={"shape_ok": shape.ok, "session_compatibility": "unverified"},
         harness=harness,

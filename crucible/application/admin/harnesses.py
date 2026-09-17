@@ -6,8 +6,7 @@ from typing import Any
 
 from crucible.application.admin.context import (
     AdminContext,
-    require_live_supervisor,
-    require_reason,
+    guard_mutation,
 )
 from crucible.application.errors import NotFoundError
 from crucible.application.harness_views import harness_list
@@ -88,8 +87,13 @@ def set_enabled(
 ) -> dict[str, Any]:
     """25: configuration retained; running attempts finish (nothing here touches them);
     new launches are refused with a wake by the registry (07)."""
-    reason = require_reason(reason)
-    require_live_supervisor(ctx, uow)
+    reason = guard_mutation(
+        ctx,
+        uow,
+        reason,
+        principal=principal,
+        operation=f"harnesses {'enable' if enabled else 'disable'}",
+    )
     if ctx.harnesses.get(harness) is None:
         raise NotFoundError(f"no adapter declares harness {harness!r}")
     # set_harness_enabled records the harness_enabled or harness_disabled event with

@@ -10,6 +10,7 @@ it is accepted only when the repository's policy asks for no external review rou
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 from crucible.application.errors import ContractValidationError, NotFoundError
@@ -30,6 +31,8 @@ def register_repository(
     principal_name: str,
     name: str,
     registration: RepositoryRegistration,
+    reason: str | None = None,
+    before: Mapping[str, Any] | None = None,
 ) -> Repository:
     versions = list(uow.policies.list_versions(registration.policy_name))
     policy = max(versions, key=lambda p: p.version) if versions else None
@@ -85,6 +88,9 @@ def register_repository(
             # discovery calls off the token-minting hot path (S10 follow-up 5).
             "installation_id": repository.installation_id,
             "external_review_attested": repository.external_review_attested,
+            # The administrative path (25) supplies both; 04's own path supplies neither.
+            **({"reason": reason} if reason else {}),
+            **({"before": dict(before)} if before is not None else {}),
         },
     )
     if attestation.attested_all_prs:

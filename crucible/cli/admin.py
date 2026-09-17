@@ -1,8 +1,15 @@
 """`crucible-admin` (25): every row of the operations table, through the same application
 services the API calls. Local mode runs them in process against the configured
 database and daemon; `--api-url` with a token runs the same operations against a
-running API. Four operations are CLI-only by design (`migrate`, `token create`, and the
-bootstrap import and export of 15). Results go to stdout as JSON; logs to stderr."""
+running API. Results go to stdout as JSON; logs to stderr.
+
+Two gaps are deliberate and named here rather than implied. 25 lists four CLI-only
+operations; `migrate` and `token create` are below, and the bootstrap `import` and
+`export` of 15 and 14 are not implemented in this phase (c5.md C5b). And `credentials
+login` runs the harness's own CLI, so it works only where that CLI is installed: local
+mode on a host that has it. The Crucible service image carries none of the three, so the
+API form of login refuses there with that reason rather than hanging.
+"""
 
 from __future__ import annotations
 
@@ -19,12 +26,12 @@ from typing import Any
 from crucible.adapters.persistence.migrate import head_revision, upgrade
 from crucible.application.admin import audit, credentials, github, harnesses, images, login
 from crucible.application.admin import providers as providers_admin
+from crucible.application.admin import repositories as repositories_admin
 from crucible.application.admin import status as status_admin
 from crucible.application.admin.context import AdminContext
 from crucible.application.admin.login import LoginRegistry
 from crucible.application.auth import mint_token
 from crucible.application.errors import ApplicationError
-from crucible.application.repositories import register_repository
 from crucible.application.transitions import record_event
 from crucible.cli.wiring import Wiring, wire
 from crucible.contracts.api import ExternalReviewAttestation, RepositoryRegistration
@@ -79,12 +86,26 @@ def build_parser() -> argparse.ArgumentParser:
 
     c = sub.add_parser("credentials", help="validate, probe, login, rotate, remove")
     c_sub = c.add_subparsers(dest="credential_command", required=True)
-    for verb in ("status", "validate", "probe", "login", "remove"):
+    for verb in ("status", "validate", "probe", "remove"):
         p = c_sub.add_parser(verb)
         p.add_argument("--harness", required=True)
+    login_cmd = c_sub.add_parser(
+        "login",
+        help="run the harness's own login (needs that CLI on this host; see the module docstring)",
+    )
+    login_cmd.add_argument("--harness", required=True)
+    login_cmd.add_argument(
+        "--replace",
+        action="store_true",
+        help="retain and shred the existing credential first; refused without it when one is valid",
+    )
     rotate = c_sub.add_parser("rotate")
     rotate.add_argument("--harness", required=True)
-    rotate.add_argument("--new-path", required=True, help="a prepared directory to swap in")
+    rotate.add_argument(
+        "--new-path",
+        required=True,
+        help="a prepared directory to copy in; it is left untouched and is yours to dispose of",
+    )
 
     i = sub.add_parser("images", help="list and promote")
     i_sub = i.add_subparsers(dest="image_command", required=True)
@@ -211,7 +232,11 @@ def _remote(args: argparse.Namespace, remote: Remote) -> None:
 
 
 def _remote_login(args: argparse.Namespace, remote: Remote, reason: dict[str, str]) -> None:
-    started = remote.call("POST", f"/v1/admin/credentials/{args.harness}/login", reason)
+    started = remote.call(
+        "POST",
+        f"/v1/admin/credentials/{args.harness}/login",
+        {**reason, "replace": bool(getattr(args, "replace", False))},
+    )
     print(started["window"], file=sys.stderr)
     shown: set[str] = set()
     while True:
@@ -226,7 +251,7 @@ def _remote_login(args: argparse.Namespace, remote: Remote, reason: dict[str, st
         elif state["state"] in ("finished", "failed"):
             break
         time.sleep(1)
-    _emit(remote.call("POST", f"/v1/admin/credentials/{args.harness}/login/finish"))
+    _emit(remote.call("POST", f"/v1/admin/credentials/{args.harness}/login/finish", reason))
 
 
 # ----- local mode --------------------------------------------------------------
@@ -236,7 +261,13 @@ def _local_login(args: argparse.Namespace, wiring: Wiring, admin: AdminContext) 
     registry = LoginRegistry()
     with wiring.ctx.uow_factory() as uow:
         started = login.start_login(
-            admin, uow, registry, principal=CLI_PRINCIPAL, harness=args.harness, reason=args.reason
+            admin,
+            uow,
+            registry,
+            principal=CLI_PRINCIPAL,
+            harness=args.harness,
+            reason=args.reason,
+            replace=getattr(args, "replace", False),
         )
         uow.commit()
     print(started["window"], file=sys.stderr)
@@ -254,7 +285,7 @@ def _local_login(args: argparse.Namespace, wiring: Wiring, admin: AdminContext) 
         print(line, file=sys.stderr)
     with wiring.ctx.uow_factory() as uow:
         result = login.finish_login(
-            admin, uow, registry, principal=CLI_PRINCIPAL, harness=args.harness
+            admin, uow, registry, principal=CLI_PRINCIPAL, harness=args.harness, reason=args.reason
         )
         uow.commit()
     _emit(result)
@@ -385,7 +416,10 @@ def main(argv: list[str] | None = None) -> None:
         if args.command == "token":
             _token(args, wiring)
         elif args.command in ("repository", "repositories"):
-            _register(args, wiring)
+            if wiring.admin is None:
+                print("the administrative surface is not configured", file=sys.stderr)
+                sys.exit(2)
+            _register(args, wiring, wiring.admin)
         else:
             _local(args, wiring)
     except ApplicationError as exc:
@@ -427,12 +461,13 @@ def _token(args: argparse.Namespace, wiring: Wiring) -> None:
     )
 
 
-def _register(args: argparse.Namespace, wiring: Wiring) -> None:
+def _register(args: argparse.Namespace, wiring: Wiring, admin: AdminContext) -> None:
+    """The same guarded service the API route calls, returning the same document."""
     with wiring.ctx.uow_factory() as uow:
-        repo = register_repository(
+        result = repositories_admin.register(
+            admin,
             uow,
-            wiring.ctx.clock,
-            principal_name=CLI_PRINCIPAL,
+            principal=CLI_PRINCIPAL,
             name=args.name,
             registration=RepositoryRegistration(
                 url=args.url,
@@ -444,16 +479,10 @@ def _register(args: argparse.Namespace, wiring: Wiring) -> None:
                     attested_by=args.attested_by,
                 ),
             ),
+            reason=args.reason,
         )
         uow.commit()
-    _emit(
-        {
-            "repository": repo.name,
-            "id": repo.id,
-            "url": repo.url,
-            "external_review_attested": repo.external_review_attested,
-        }
-    )
+    _emit(result)
 
 
 if __name__ == "__main__":

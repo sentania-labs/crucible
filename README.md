@@ -134,7 +134,7 @@ crucible-admin --reason "refresh unverified" harnesses disable codex
 crucible-admin credentials status --harness claude_code      # presence, permissions, expiry class
 crucible-admin credentials validate --harness claude_code    # shape and expiry, no network
 crucible-admin credentials probe --harness claude_code       # bounded run of the hardened image
-crucible-admin credentials login --harness codex             # prints the URL and the code; token file mode 600
+crucible-admin --reason "..." credentials login --harness codex   # prints the URL and the code; token file mode 600
 crucible-admin --reason "..." credentials rotate --harness agy --new-path /path/to/staged
 crucible-admin --reason "..." credentials remove --harness codex
 crucible-admin images list
@@ -144,6 +144,13 @@ crucible-admin github status
 crucible-admin github check                                  # mints and discards a token per registered repository
 crucible-admin audit tail --limit 50
 ```
+
+`credentials login` drives the harness's own CLI, so it runs where that CLI is
+installed: local mode on a host that has it. The Crucible service image carries none of
+the three (it is not a worker image), so the API form refuses there and says so. A
+login refuses to overwrite a credential that still passes the shape check unless
+`--replace` is given, which retires the old one first. `rotate` copies the directory you
+name and leaves it in place; disposing of it is yours to do.
 
 Orchestrators read `GET /v1/capabilities`: which harnesses and images are enabled,
 providers and GitHub reachable, and the worker, task and wake counts, nothing more.

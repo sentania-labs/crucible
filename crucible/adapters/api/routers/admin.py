@@ -11,10 +11,10 @@ from fastapi import APIRouter, Body, Query
 from crucible.adapters.api.deps import Admin, Ctx, Orchestrator, UoW
 from crucible.application.admin import audit, credentials, github, harnesses, images, login
 from crucible.application.admin import providers as providers_admin
+from crucible.application.admin import repositories as repositories_admin
 from crucible.application.admin import status as status_admin
 from crucible.application.admin.context import AdminContext
 from crucible.application.errors import ConflictError
-from crucible.application.repositories import register_repository
 from crucible.contracts.api import ExternalReviewAttestation, RepositoryRegistration
 
 router = APIRouter()
@@ -27,7 +27,12 @@ def _admin(ctx: Ctx) -> AdminContext:
 
 
 def _reason(body: dict[str, Any] | None) -> str | None:
-    return str((body or {}).get("reason", "")) or None
+    """Only a non-empty string is a reason. A JSON null stringifies to "None" and a zero
+    to "0", and both would pass the guard as a reason nobody wrote."""
+    value = (body or {}).get("reason")
+    if isinstance(value, str) and value.strip():
+        return value
+    return None
 
 
 @router.get("/admin/status")
@@ -115,7 +120,12 @@ def admin_login(
 ) -> dict[str, Any]:
     """25: starts the harness's own login pointed at the dedicated directory and returns
     the device or browser URL; poll with GET, submit a pasted code with /login/code,
-    and finish with /login/finish once the CLI has exited."""
+    and finish with /login/finish once the CLI has exited. `replace` is required when a
+    credential that still passes the shape check is in place, and retains it first.
+
+    The login runs the harness's own CLI, which lives in the worker images and not in the
+    Crucible service image, so on a normal deployment this refuses with that reason and
+    the operator runs `crucible-admin credentials login` where the CLI is (c5.md)."""
     result = login.start_login(
         _admin(ctx),
         uow,
@@ -123,6 +133,7 @@ def admin_login(
         principal=principal.name,
         harness=harness,
         reason=_reason(body),
+        replace=bool(body.get("replace", False)),
     )
     uow.commit()
     return result
@@ -141,9 +152,16 @@ def admin_login_code(
 
 
 @router.post("/admin/credentials/{harness}/login/finish")
-def admin_login_finish(harness: str, ctx: Ctx, uow: UoW, principal: Admin) -> dict[str, Any]:
+def admin_login_finish(
+    harness: str, ctx: Ctx, uow: UoW, principal: Admin, body: Annotated[dict[str, Any], Body()]
+) -> dict[str, Any]:
     result = login.finish_login(
-        _admin(ctx), uow, ctx.logins, principal=principal.name, harness=harness
+        _admin(ctx),
+        uow,
+        ctx.logins,
+        principal=principal.name,
+        harness=harness,
+        reason=_reason(body),
     )
     uow.commit()
     return result
@@ -219,7 +237,8 @@ def admin_register_repository(
     name: str, ctx: Ctx, uow: UoW, principal: Admin, body: Annotated[dict[str, Any], Body()]
 ) -> dict[str, Any]:
     """25 and 04: the same registration as PUT /repositories/{name}, under /admin so the
-    table's every row has an admin path."""
+    table's every row has an admin path, and so under the two administrative rules: a
+    reason and a live supervisor lease."""
     registration = RepositoryRegistration(
         url=str(body.get("url", "")),
         default_branch=str(body.get("default_branch", "main")),
@@ -230,11 +249,16 @@ def admin_register_repository(
             attested_by=body.get("attested_by"),
         ),
     )
-    repo = register_repository(
-        uow, ctx.clock, principal_name=principal.name, name=name, registration=registration
+    result = repositories_admin.register(
+        _admin(ctx),
+        uow,
+        principal=principal.name,
+        name=name,
+        registration=registration,
+        reason=_reason(body),
     )
     uow.commit()
-    return {"repository": repo.name, "id": repo.id, "url": repo.url}
+    return result
 
 
 @router.get("/admin/audit")
