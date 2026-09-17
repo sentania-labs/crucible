@@ -14,6 +14,7 @@ the driver.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shutil
@@ -44,7 +45,7 @@ from crucible.domain.entities import Role
 from crucible.domain.secrets import scan_text
 from crucible.ports.harness import CredentialSource, MountMode
 from tests.e2e import github_live
-from tests.e2e.conftest import RUN_ID
+from tests.e2e.conftest import EGRESS_ALLOWLIST, NET_WORKERS, RUN_ID
 from tests.e2e.test_live_harness import (
     ALL_HARNESSES,
     CREDENTIAL_ROOT_ENV,
@@ -217,8 +218,11 @@ def _config_file(
         'mount_kind = "bind"',
         f'artifact_host_root = "{artifact_root}"',
         'artifact_volume = ""',
-        f'workers_network = "{stack["workers_network"]}"',
+        f'workers_network = "{NET_WORKERS}"',
         f'egress_proxy = "{stack["egress_proxy"]}"',
+        f"egress_allowlist = {json.dumps(list(EGRESS_ALLOWLIST))}",
+        f'credential_root = "{artifact_root / "credentials"}"',
+        f'credential_host_root = "{artifact_root / "credentials"}"',
         "workspace_dir_mode = 511",
         "use_reference_cache = false",
         "[service]",
@@ -247,6 +251,42 @@ def _quiet_cli_logging(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cli, "configure_logging", lambda *a, **k: None)
 
 
+def _seed_policies(ctx: AppContext, admin_token: str) -> None:
+    """The e2e database is truncated, so the seeded routing policy (migration 0008) and
+    the seeded default-software version 2 (migration 0009) are uploaded here as the
+    migrations ship them: the probe's model comes from the routing policy, and the
+    GitHub check registers a repository against the policy."""
+    from crucible.adapters.persistence.migrations.versions import (  # noqa: PLC0415
+        _0008_harness_adapters as m8,
+    )
+    from tests.unit.test_policy_schema import seeded_policy_v2  # noqa: PLC0415
+
+    routing = m8.VERIFIED_ROUTING
+    policy = seeded_policy_v2()
+    with _client(ctx, admin_token) as admin:
+        response = admin.put(f"/v1/routing/{routing['name']}/{routing['version']}", json=routing)
+        assert response.status_code == 200, response.text
+        response = admin.put(f"/v1/policies/{policy['name']}/{policy['version']}", json=policy)
+        assert response.status_code == 200, response.text
+
+
+def _promote_pins(ctx: AppContext, provider: DockerProvider, admin_token: str) -> None:
+    """The pinned images must be the only ones the probe can choose, or it refuses; a
+    daemon carrying older builds beside the pins gets the pins promoted."""
+    for harness in ALL_HARNESSES:
+        images = [i for i in asyncio.run(provider.list_images()) if i.harness == harness]
+        if len({i.reference for i in images}) > 1:
+            from tests.e2e import daemon  # noqa: PLC0415
+
+            pinned = daemon.manifest_pins()[harness]
+            with _client(ctx, admin_token) as admin:
+                promoted = admin.post(
+                    f"/v1/admin/images/{pinned}/promote",
+                    json={"reason": "e2e-admin: the manifest pin is the probe's image"},
+                )
+                assert promoted.status_code == 200, promoted.text
+
+
 def _supervisor(ctx: AppContext, provider: DockerProvider) -> Supervisor:
     return Supervisor(
         ctx.uow_factory,
@@ -259,7 +299,7 @@ def _supervisor(ctx: AppContext, provider: DockerProvider) -> Supervisor:
     )
 
 
-async def test_the_probe_runs_live_for_each_harness_through_api_and_cli(
+def test_the_probe_runs_live_for_each_harness_through_api_and_cli(
     probe_ctx: AppContext,
     stack: dict[str, Any],
     artifact_root: Path,
@@ -270,23 +310,12 @@ async def test_the_probe_runs_live_for_each_harness_through_api_and_cli(
 ) -> None:
     provider = probe_ctx.providers[0]
     assert isinstance(provider, DockerProvider)
-    await _supervisor(probe_ctx, provider).tick()
+    asyncio.run(_supervisor(probe_ctx, provider).tick())
     tokens = _tokens(probe_ctx)
     assert probe_ctx.admin is not None
     config = _config_file(artifact_root, migrated, stack, probe_ctx.admin.credential_sources)
-    # The pinned images must be the only ones the probe can choose, or it refuses.
-    for harness in ALL_HARNESSES:
-        images = [i for i in await provider.list_images() if i.harness == harness]
-        if len({i.reference for i in images}) > 1:
-            from tests.e2e import daemon  # noqa: PLC0415
-
-            pinned = daemon.manifest_pins()[harness]
-            with _client(probe_ctx, tokens["admin"]) as admin:
-                promoted = admin.post(
-                    f"/v1/admin/images/{pinned}/promote",
-                    json={"reason": "e2e-admin: the manifest pin is the probe's image"},
-                )
-                assert promoted.status_code == 200, promoted.text
+    _seed_policies(probe_ctx, tokens["admin"])
+    _promote_pins(probe_ctx, provider, tokens["admin"])
     entries: list[dict[str, Any]] = []
     with _client(probe_ctx, tokens["admin"]) as admin:
         for index, harness in enumerate(ALL_HARNESSES):
@@ -379,7 +408,7 @@ async def test_the_probe_runs_live_for_each_harness_through_api_and_cli(
         ), status["credentials"]
 
 
-async def test_every_other_operation_through_api_and_cli_on_the_live_stack(
+def test_every_other_operation_through_api_and_cli_on_the_live_stack(
     scratch_ctx: AppContext,
     stack: dict[str, Any],
     artifact_root: Path,
@@ -389,10 +418,12 @@ async def test_every_other_operation_through_api_and_cli_on_the_live_stack(
 ) -> None:
     provider = scratch_ctx.providers[0]
     assert isinstance(provider, DockerProvider)
-    await _supervisor(scratch_ctx, provider).tick()
+    asyncio.run(_supervisor(scratch_ctx, provider).tick())
     tokens = _tokens(scratch_ctx)
     assert scratch_ctx.admin is not None
     config = _config_file(artifact_root, migrated, stack, scratch_ctx.admin.credential_sources)
+    _seed_policies(scratch_ctx, tokens["admin"])
+    _promote_pins(scratch_ctx, provider, tokens["admin"])
     with _client(scratch_ctx, tokens["admin"]) as admin:
         # harnesses: list, disable, enable
         listed = admin.get("/v1/admin/harnesses").json()["items"]
@@ -410,7 +441,9 @@ async def test_every_other_operation_through_api_and_cli_on_the_live_stack(
             ]
             is True
         )
-        # validate (shape plus the bounded probe) on the scratch copy, through the CLI
+        # validate (shape plus the bounded probe) on the scratch copy, through the CLI.
+        # AGY: its window is per request, so this stays independent of the other two
+        # subscriptions' five-hour windows (the probe test covers all three).
         validated = _cli(
             config,
             "--reason",
@@ -418,18 +451,18 @@ async def test_every_other_operation_through_api_and_cli_on_the_live_stack(
             "credentials",
             "validate",
             "--harness",
-            "claude_code",
+            "agy",
             capsys=capsys,
         )
-        assert validated["validated"] is True, validated
         _record(
             {
-                "harness": "claude_code",
+                "harness": "agy",
                 "entry_point": "cli validate",
                 "started_local": _local(datetime.now(UTC)),
-                **validated["probe"],
+                **(validated["probe"] or {}),
             }
         )
+        assert validated["validated"] is True, validated
         # rotate the scratch codex copy with a prepared directory (a copy of itself)
         incoming = artifact_root / f"incoming-codex-{RUN_ID}"
         shutil.copytree(scratch_root / "codex", incoming)

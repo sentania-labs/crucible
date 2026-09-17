@@ -321,7 +321,7 @@ async def _probe_async(
     launch = adapter.build_launch(
         LaunchContext(
             attempt_id="probe",
-            model=_probe_model(uow, harness),
+            model=_probe_model(uow, adapter, harness),
             effort=None,
             timeout_seconds=ctx.probe_timeout_seconds,
             identity_mount=IDENTITY_MOUNT,
@@ -407,23 +407,52 @@ def record_event_probe(
     )
 
 
-def _probe_model(uow: UnitOfWork, harness: str) -> str:
-    """The cheapest enabled model the seeded routing policy names for the harness, so a
-    probe never runs on a frontier model; the adapter's own default when none is listed."""
-    best: tuple[int, str] | None = None
-    order = {"small": 0, "mid": 1, "frontier": 2}
+def _routing_documents(uow: UnitOfWork) -> list[dict[str, Any]]:
+    """The routing policy the newest `default-software` names first, then the seeded
+    `default-routing` versions, newest first."""
+    documents: list[dict[str, Any]] = []
+    seen: set[tuple[str, int]] = set()
+    versions = list(uow.policies.list_versions("default-software"))
+    if versions:
+        newest = max(versions, key=lambda p: p.version)
+        ref = newest.document.get("routing", {}).get("policy", {})
+        if isinstance(ref, dict) and ref.get("name") and ref.get("version") is not None:
+            record = uow.routing_policies.get(str(ref["name"]), int(ref["version"]))
+            if record is not None:
+                documents.append(record.document)
+                seen.add((str(ref["name"]), int(ref["version"])))
     for version in (2, 1):
-        record = uow.routing_policies.get("default-routing", version)
-        if record is None:
+        if ("default-routing", version) in seen:
             continue
-        for model in record.document.get("models", []):
+        record = uow.routing_policies.get("default-routing", version)
+        if record is not None:
+            documents.append(record.document)
+    return documents
+
+
+def _probe_model(uow: UnitOfWork, adapter: HarnessAdapter, harness: str) -> str:
+    """The cheapest enabled model the routing policy names for the harness, so a probe
+    never runs on a frontier model. A harness without a model flag (the script harness)
+    needs none. Otherwise a routing policy without an enabled model for the harness is a
+    refusal: the CLIs reject an unknown model name, so guessing one would only produce
+    a crash that says nothing about the credential (AGY did exactly that, C5b live run).
+    """
+    if not adapter.capabilities().model_flag:
+        return "none"
+    order = {"small": 0, "mid": 1, "frontier": 2}
+    for document in _routing_documents(uow):
+        best: tuple[int, str] | None = None
+        for model in document.get("models", []):
             if model.get("harness") == harness and model.get("enabled"):
                 rank = order.get(str(model.get("capability")), 3)
                 if best is None or rank < best[0]:
                     best = (rank, str(model["id"]))
         if best is not None:
-            break
-    return best[1] if best else "default"
+            return best[1]
+    raise CredentialAdminError(
+        f"no routing policy names an enabled model for harness {harness!r}; the probe "
+        "needs one (upload a routing policy or enable a model in it)"
+    )
 
 
 async def probe(
