@@ -80,7 +80,20 @@ Claude Code, Codex, AGY adapters; credential mounts per S1 outcome; report
 parsing from real runs; version range declarations and refusal; `GET
 /harnesses` and `GET /images`. Acceptance: `e2e-live` passes for each
 harness on a trivial task that reaches `ready_for_merge` on the throwaway
-repository.
+repository. Delivered in two parts: C5a is the adapter port, the three real
+adapters and the script harness behind it, the per-attempt credential copy
+(12), report parsing and exit classification from real runs, version
+pinning with refusal, `GET /harnesses` and `GET /images`, and the
+`e2e-live` tier; C5b is the admin API and credential onboarding (25).
+
+**C5a delivered 2026-09-17.** Live evidence: `make e2e-live` takes a
+trivial task through each enabled harness in its hardened image with the
+credential seeded into a per-attempt copy owned by the worker's uid, to
+`ready_for_merge` on the throwaway repository, with no credential value
+found in the create request, the events, any text column, the log chunks,
+the artifact store, or the pull request.
+
+**C5b in progress.**
 
 ## Phase C6: bootstrap import and readiness
 

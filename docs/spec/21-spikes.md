@@ -21,6 +21,16 @@ C1 starts. S9 and S10 run first.
 | S1b | Does establishing and using Crucible's dedicated Claude Code, Codex, and AGY credential sessions leave the operator's normal interactive sessions valid, including across a Crucible-side refresh? | Per harness: confirm the operator's session works; log in directly into Crucible's dedicated directory; run a trivial prompt with it; confirm the operator's session; cause or observe a Crucible refresh where practical; confirm the operator's session again. Record only success or failure, timestamps, harness versions, auth-file hashes, and refresh behavior; never token values; never copy credentials | Pass per harness, or stop and escalate on the first invalidation; no retries, no copying. Blocking prerequisite for enabling that harness in C5 |
 | S13 | Can Codex or AGY run a task against a local OpenAI-compatible model server (RTX 9060 now, DGX Spark when it arrives) inside the worker container with the same identity, report, and gate contracts, and how do quality, speed, and cost compare on a fixed task set? | Stand up the local server on the host, allowlist it in the egress proxy, run three fixed tasks per model, collect AttemptMetrics | Documented per model; routing policy entries enabled or left disabled with the reason |
 
+S1b status, as the C5a live runs left it: Claude Code and AGY are
+**verified** for daily-session compatibility and enabled; Codex is not.
+AGY's step 5, a Crucible-side refresh, was observed on 2026-09-17 at 00:50
+CDT when the first run past the token's one-hour expiry rotated it, and
+step 6, the operator's own session answering and refreshing normally
+afterwards, was confirmed at 06:32 CDT. Codex's step 5 is still pending:
+its auth file was unchanged on every C5a run, the token still valid from
+the login, so no Crucible-side refresh has been observed and Codex ships
+disabled in both gates (25) until one is.
+
 Spike results go in `docs/spikes/S<n>.md` with commands, output excerpts,
 and the decision. Credentials used during spikes are the operator's own
 host directories, copied to a scratch location and deleted after; nothing
