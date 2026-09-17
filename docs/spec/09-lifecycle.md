@@ -178,8 +178,9 @@ state before `tagging`.
 ## Gate
 
 Per attempt (pre-PR) or per PR head (publication, post-PR) per gate:
-`pending` -> `pass` | `fail` | `skipped` | `error` (evaluator could not
-run; treated as fail). Pre-PR gates evaluate once per collected head.
+`pending` -> `pass` | `fail` | `skipped` | `deferred` (no evaluator in
+this phase yet; non-blocking, never pass; 11) | `error` (evaluator could
+not run; treated as fail). Pre-PR gates evaluate once per collected head.
 Post-PR gates re-evaluate each reconcile tick and on every processed GitHub
 delivery for the head until they resolve or the task is terminal.
 

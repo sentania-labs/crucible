@@ -113,11 +113,20 @@ it cannot check stays with Foundry or the user.
 | `feedback_dispositions_complete` | every received review comment has a ReviewDisposition; `skipped` when `require_feedback_disposition` is false | dispositions |
 | `ci_green_for_head` | the required-check set (23) is non-empty and every member concluded success on the accepted head; `pending` while any is queued or running **or while the set is empty**, so a head with no observed runs never passes; `fail` on any failure. Only `allow_no_ci: true` turns the empty set into `skipped` | CICertification |
 
-Two evaluation rules: a pre-PR gate whose evidence is absent after
-collection is `fail`, not `pending`, so a failed attempt reaches
-`pre_pr_gates_failed` unambiguously; gates deferred to a later phase
-(`verification_ran`, `workspace_clean` until C3) carry an explicit
-`deferred` marker and can never report `pass`. The reviewer identity used
+Three evaluation rules. A pre-PR gate whose evidence is produced by
+collection (`report_present`, `exit_clean`, `commits_present`,
+`scope_contained`, `no_injected_files`, `no_secrets`,
+`run_evidence_present`, `criteria_mapped`, `dependencies_unchanged`,
+`ci_unchanged`) and is absent after collection is `fail`, not `pending`,
+so a failed attempt reaches `pre_pr_gates_failed` unambiguously.
+`internal_review_recorded` is the one pre-PR gate whose evidence arrives
+after collection; it stays `pending` and the task waits in
+`awaiting_internal_review`. A gate whose evaluator belongs to a later
+phase (`verification_ran` and `workspace_clean` until C3's verifier
+container exists) reports `deferred` (09): it is non-blocking for
+`gates_passed`, is shown to Foundry with the phase that will implement
+it, and can never report `pass`; once the evaluator ships, the gate
+evaluates normally and `deferred` is no longer a possible result. The reviewer identity used
 by `internal_review_recorded` and `reviewer_must_not_be_author` is the
 authenticated principal that uploaded the report or the review attempt
 that produced it, never the identity the document claims.
