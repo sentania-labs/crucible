@@ -50,6 +50,33 @@ pointed at it, validation, a bounded probe in the hardened image, and the
 daily-session compatibility test (21, S1b) before the harness is enabled.
 The operator's daily-use directories are never copied.
 
+The credential root and the per-harness directory under it are created by
+the operator or by the deployment script, owned by the Crucible service
+user, mode 0700, before the stack starts (13). Crucible does not create
+them, and it refuses at startup when a configured credential directory is
+not owned by the service user or is not 0700.
+
+An administrative record never carries a credential value, and the audit is
+served back through the API, so the reason string and the whole assembled
+event payload of every administrative mutation are scanned before they are
+written. A secret-shaped reason is refused with the pattern named and the
+value never quoted, rather than being stored or quietly redacted: an
+operator who pasted a token where a sentence belonged needs to know it
+landed nowhere, because what they do next is revoke it (25).
+
+Removing or retiring a credential directory means shredding it: a zero
+overwrite of every regular file, then removal. On a copy-on-write filesystem
+that is best effort about whether the old bytes are really gone, and that
+limit is accepted. It is not best effort about whether it finished. A
+directory it cannot read, an entry that is neither a regular file, a symlink
+nor a directory (a socket or a fifo), a directory that is not empty when it
+is reached, and a file the harness CLI writes in the middle of the walk must
+none of them leave data behind silently. The walk is bottom-up, records
+rather than stops at the first thing it cannot remove, runs a second pass so
+a file written mid-walk is absorbed, and raises naming exactly what remains.
+The retention sweep records such a failure and carries on to the other
+directories.
+
 ## Credential sources (config, sanitized example in `examples/config/`)
 
 ```toml
@@ -73,6 +100,9 @@ app_id = 0                     # public identifier, not a secret
 private_key_path = "/var/lib/crucible/credentials/github/app.pem"   # mounted read-only; never mounted into any worker
 webhook_secret_path = "/var/lib/crucible/credentials/github/webhook.secret"
 ```
+
+Every `path` above is a directory that already exists when Crucible starts,
+owned by the service user and mode 0700 (13).
 
 Subscription authentication is the requirement for harnesses: each harness
 is logged in once by the operator (interactive login) **into Crucible's
