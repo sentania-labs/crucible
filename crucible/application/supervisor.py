@@ -14,11 +14,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from functools import partial
+from pathlib import Path
 from typing import Any, ClassVar, TypeVar
 
 from crucible.application.decisions import (
@@ -30,6 +31,12 @@ from crucible.application.delivery_tick import DeliveryConfig, DeliveryCoordinat
 from crucible.application.errors import ApplicationError
 from crucible.application.evidence import record_collection_evidence
 from crucible.application.gates import evaluate_and_advance
+from crucible.application.harnesses import (
+    HarnessRegistry,
+    effective_mount_mode,
+    record_credential_observation,
+    record_launch_outcome,
+)
 from crucible.application.review import (
     author_attempt_ids,
     latest_work_attempt,
@@ -81,10 +88,14 @@ from crucible.logs import log_context
 from crucible.ports.artifacts import ArtifactStore
 from crucible.ports.clock import Clock
 from crucible.ports.execution import (
+    IDENTITY_MOUNT,
+    REPO_MOUNT,
+    REPORT_MOUNT,
     CleanupPolicy,
     CollectedOutputs,
     ExecutionProvider,
     Handle,
+    LaunchRefusedError,
     LaunchSpec,
     LogChunk,
     LogOffset,
@@ -93,6 +104,15 @@ from crucible.ports.execution import (
     Workspace,
 )
 from crucible.ports.github import GitHubClient
+from crucible.ports.harness import (
+    CredentialSource,
+    ExitInfo,
+    HarnessGate,
+    HarnessUnavailableError,
+    LaunchContext,
+    MountMode,
+    ParsedReport,
+)
 from crucible.ports.notification import WakeDeliverer
 from crucible.ports.publish import Publisher
 from crucible.ports.repository import FencedTokenRejectedError, UnitOfWork, UnitOfWorkFactory
@@ -102,6 +122,9 @@ T = TypeVar("T")
 
 TERMINATION_TIMEOUT = "timeout"
 TERMINATION_CANCEL = "cancel"
+# A launch the registry or the provider refused (07): recorded so the retry rule knows
+# not to try the same refusal again.
+TERMINATION_REFUSED = "harness_refused"
 
 # 16 defaults, used when the policy names none.
 DEFAULT_LOG_RETENTION_DAYS = 90
@@ -160,10 +183,19 @@ class Supervisor:
         attempt_lease_ttl_seconds: int = 60,
         checkout_lease_ttl_seconds: int = 21600,
         grace_seconds: int = 60,
+        harnesses: HarnessRegistry | None = None,
+        harness_gates: Mapping[str, HarnessGate] | None = None,
+        credential_sources: Mapping[str, CredentialSource] | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._providers = providers
         self._clock = clock
+        # 07: the adapters. Without a registry the launch spec carries the execution's
+        # names and nothing harness-specific, which is the C3 shape the fake provider
+        # runs; every real deployment injects one (cli/wiring.py).
+        self._harnesses = harnesses
+        self._harness_gates: dict[str, HarnessGate] = dict(harness_gates or {})
+        self._credential_sources: dict[str, CredentialSource] = dict(credential_sources or {})
         self._artifacts = artifact_store
         self._wakes = wake_deliverer
         self.holder = holder
@@ -889,7 +921,7 @@ class Supervisor:
         env: dict[str, str] = {}
         if execution.role is ExecutionRole.REVIEW and task.head_sha:
             env["CRUCIBLE_REVIEW_HEAD_SHA"] = task.head_sha
-        return LaunchSpec(
+        spec = LaunchSpec(
             attempt_id=attempt.id,
             task_id=task.id,
             external_id=task.external_id,
@@ -904,6 +936,33 @@ class Supervisor:
             policy=execution.policy_snapshot or {},
             owner=task.principal_id,
             repository_url=repository_url,
+            effort=execution.effort,
+        )
+        adapter = self._harnesses.get(execution.harness) if self._harnesses else None
+        if adapter is None:
+            return spec
+        # 07: the adapter's launch shape. Argv carries the pointer; the identity and
+        # the contract are files; a credential value is never in any of it.
+        launch = adapter.build_launch(
+            LaunchContext(
+                attempt_id=attempt.id,
+                model=execution.model,
+                effort=execution.effort,
+                timeout_seconds=execution.timeout_seconds,
+                identity_mount=IDENTITY_MOUNT,
+                report_mount=REPORT_MOUNT,
+                repo_mount=REPO_MOUNT,
+                credential_mounted=adapter.credential_spec() is not None,
+            )
+        )
+        return replace(
+            spec,
+            command=tuple(launch.argv),
+            env={**env, **launch.env},
+            env_from_files=dict(launch.env_from_files),
+            stdin_files=tuple(launch.stdin_files),
+            stdin_text=launch.stdin_text,
+            transcript_path=launch.transcript_path,
         )
 
     def _spec_for(self, attempt: Attempt) -> LaunchSpec | None:
@@ -929,8 +988,55 @@ class Supervisor:
         branch = str(repository.get("work_branch") or f"crucible/{external_id}")
         return f"{url}#{branch}"
 
+    def _harness_gate(self, execution: Execution) -> str | None:
+        """07 and 25: the registry's answer for this execution's harness, as a refusal
+        reason or None. Unknown and disabled names are refused with a wake."""
+        if self._harnesses is None:
+            return None
+        with self._uow_factory() as uow:
+            state = uow.harnesses.get(execution.harness)
+        try:
+            self._harnesses.resolve(execution.harness, gates=self._harness_gates, state=state)
+        except HarnessUnavailableError as exc:
+            return exc.reason
+        return None
+
+    def _harness_busy(self, execution: Execution) -> str | None:
+        """05b: per-harness concurrency, which is 1 whenever the credential mounts
+        rw-narrow (12). A launch over the limit waits; it is not a failure."""
+        policy = execution.policy_snapshot or {}
+        limit = int(
+            (policy.get("concurrency", {}).get("per_harness") or {}).get(execution.harness, 1)
+        )
+        adapter = self._harnesses.get(execution.harness) if self._harnesses else None
+        credential = adapter.credential_spec() if adapter is not None else None
+        if credential is not None:
+            source = self._credential_sources.get(execution.harness)
+            if effective_mount_mode(credential, source) is MountMode.RW_NARROW:
+                limit = 1
+        with self._uow_factory() as uow:
+            live = uow.attempts.list_in_states(
+                [AttemptState.PREPARING, AttemptState.LAUNCHING, AttemptState.RUNNING]
+            )
+            running = 0
+            for other in live:
+                other_execution = uow.executions.get(other.execution_id)
+                if other_execution is not None and other_execution.harness == execution.harness:
+                    running += 1
+        if running >= limit:
+            return f"{running} of {limit} {execution.harness} worker(s) already running"
+        return None
+
     async def _launch_one(self, item: _Pending) -> bool:
         attempt, execution, task = item.attempt, item.execution, item.task
+        refusal = await self._db(partial(self._harness_gate, execution))
+        if refusal is not None:
+            await self._db(partial(self._refuse_launch, attempt.id, "registry", refusal))
+            return False
+        busy = await self._db(partial(self._harness_busy, execution))
+        if busy is not None:
+            await self._db(partial(self._defer_launch, attempt.id, busy))
+            return False
         spec = self._build_spec(attempt, execution, task, item.contract, item.repository_url)
         provider = self._provider(execution.provider)
         key = self.checkout_key(item.contract, task.external_id, item.repository_url)
@@ -944,6 +1050,9 @@ class Supervisor:
             return False
         try:
             ws = await provider.prepare(spec)
+        except LaunchRefusedError as exc:
+            await self._db(partial(self._refuse_launch, attempt.id, "prepare", str(exc)))
+            return False
         except ProviderError as exc:
             detail = str(exc)
             await self._db(partial(self._environment_failure, attempt.id, "prepare", detail))
@@ -954,6 +1063,9 @@ class Supervisor:
             return False
         try:
             handle = await provider.launch(ws, spec)
+        except LaunchRefusedError as exc:
+            await self._db(partial(self._refuse_launch, attempt.id, "launch", str(exc)))
+            return False
         except ProviderError as exc:
             detail = str(exc)
             await self._db(partial(self._environment_failure, attempt.id, "launch", detail))
@@ -1135,6 +1247,80 @@ class Supervisor:
         with self._fenced() as uow:
             attempt = uow.attempts.get(attempt_id, for_update=True)
             assert attempt is not None
+            attempt.exit_class = ExitClass.ENVIRONMENT
+            attempt.ended_at = self._clock.now()
+            move_attempt(
+                uow,
+                self._clock,
+                attempt,
+                AttemptState.COLLECTED,
+                EventKind.ATTEMPT_COLLECTED,
+                payload={"stage": stage, "detail": detail, "exit_class": ExitClass.ENVIRONMENT},
+            )
+            self._record_bare_evidence(uow, attempt)
+            self._classify_and_finish(uow, attempt, None)
+            uow.commit()
+
+    def _defer_launch(self, attempt_id: str, detail: str) -> None:
+        """The attempt stays pending; one event says why it did not launch this tick."""
+        with self._fenced() as uow:
+            attempt = uow.attempts.get(attempt_id)
+            assert attempt is not None
+            latest = uow.events.latest_for_task_kind(
+                attempt.task_id, EventKind.HARNESS_LAUNCH_DEFERRED.value
+            )
+            if latest is not None and latest.payload.get("attempt_id") == attempt.id:
+                return
+            record_event(
+                uow,
+                self._clock,
+                EventKind.HARNESS_LAUNCH_DEFERRED,
+                principal=PRINCIPAL_CRUCIBLE,
+                task_id=attempt.task_id,
+                execution_id=attempt.execution_id,
+                attempt_id=attempt.id,
+                payload={"attempt_id": attempt.id, "detail": detail},
+            )
+            uow.commit()
+
+    def _refuse_launch(self, attempt_id: str, stage: str, detail: str) -> None:
+        """07, 13, 25: an unknown or disabled harness, a version outside the tested
+        range, or a missing credential. A refusal, never a warning: the attempt ends as
+        an environment failure that does not retry, and Foundry is woken."""
+        with self._fenced() as uow:
+            attempt = uow.attempts.get(attempt_id, for_update=True)
+            assert attempt is not None
+            task = uow.tasks.get(attempt.task_id, for_update=True)
+            execution = uow.executions.get(attempt.execution_id)
+            assert task is not None and execution is not None
+            attempt.termination_reason = TERMINATION_REFUSED
+            record_event(
+                uow,
+                self._clock,
+                EventKind.HARNESS_REFUSED,
+                principal=PRINCIPAL_CRUCIBLE,
+                task_id=attempt.task_id,
+                execution_id=attempt.execution_id,
+                attempt_id=attempt.id,
+                payload={"harness": execution.harness, "stage": stage, "detail": detail[:1000]},
+            )
+            create_wake(
+                uow,
+                self._clock,
+                principal_id=task.principal_id,
+                reason=WakeReason.HARNESS_UNAVAILABLE,
+                summary=f"launch refused for harness {execution.harness}: {detail[:500]}",
+                task=task,
+                attempt_id=attempt.id,
+                extra_links={"harnesses": "/v1/harnesses"},
+            )
+            record_launch_outcome(
+                uow,
+                self._clock,
+                name=execution.harness,
+                outcome="refused",
+                at=self._clock.now(),
+            )
             attempt.exit_class = ExitClass.ENVIRONMENT
             attempt.ended_at = self._clock.now()
             move_attempt(
@@ -1761,13 +1947,35 @@ class Supervisor:
             attempt.ended_at = self._clock.now()
             timed_out = attempt.termination_reason == TERMINATION_TIMEOUT
             killed = attempt.termination_reason == TERMINATION_CANCEL
-            attempt.exit_class = classify_exit(
+            execution = uow.executions.get(attempt.execution_id)
+            assert execution is not None
+            exit_info = ExitInfo(
                 exit_code=exit_code,
                 report_present=outputs.report is not None,
                 blocked_present=outputs.blocked_md is not None,
                 timed_out=timed_out,
                 killed=killed,
             )
+            adapter = self._harnesses.get(execution.harness) if self._harnesses else None
+            if adapter is not None:
+                # 07 and S5: the adapter classifies from the code and both tails.
+                attempt.exit_class = adapter.classify_exit(
+                    exit_info, outputs.stdout_tail, outputs.stderr_tail
+                )
+            else:
+                attempt.exit_class = classify_exit(
+                    exit_code=exit_code,
+                    report_present=outputs.report is not None,
+                    blocked_present=outputs.blocked_md is not None,
+                    timed_out=timed_out,
+                    killed=killed,
+                )
+            parsed: ParsedReport | None = None
+            if adapter is not None and attempt.workspace_path:
+                report_dir = Path(attempt.workspace_path) / "output" / "report"
+                if report_dir.is_dir():
+                    parsed = adapter.parse_report(report_dir, exit_info)
+            self._record_credential_sync(uow, attempt, execution, outputs)
             if collection_error is not None:
                 # Whatever the worker's own exit said, Crucible has no outputs from it.
                 attempt.exit_class = ExitClass.ENVIRONMENT
@@ -1793,8 +2001,6 @@ class Supervisor:
                     "termination_reason": attempt.termination_reason,
                 },
             )
-            execution = uow.executions.get(attempt.execution_id)
-            assert execution is not None
             if execution.role is ExecutionRole.REVIEW:
                 self._finish_review_attempt(uow, attempt, outputs)
                 uow.leases.release_attempt_lease(attempt.id)
@@ -1873,8 +2079,83 @@ class Supervisor:
                 task.updated_at = self._clock.now()
                 uow.tasks.save(task)
             self._record_wall_time(uow, attempt)
+            if parsed is not None:
+                self._record_harness_metrics(uow, attempt, parsed)
             self._classify_and_finish(uow, attempt, blocked_text, claim_ok=claim_ok)
             uow.commit()
+
+    def _record_credential_sync(
+        self, uow: UnitOfWork, attempt: Attempt, execution: Execution, outputs: CollectedOutputs
+    ) -> None:
+        """12 and 25: what the sync-back did, as an event and on the harness row. Names,
+        booleans and reasons; never a value."""
+        now = self._clock.now()
+        auth_failure = attempt.exit_class is ExitClass.AUTH_FAILURE
+        record_launch_outcome(
+            uow,
+            self._clock,
+            name=execution.harness,
+            outcome=attempt.exit_class.value if attempt.exit_class else "unknown",
+            at=now,
+            auth_failure=auth_failure,
+        )
+        sync = outputs.credential_sync
+        if sync is None:
+            return
+        record_event(
+            uow,
+            self._clock,
+            EventKind.CREDENTIAL_SYNCED,
+            principal=PRINCIPAL_CRUCIBLE,
+            task_id=attempt.task_id,
+            execution_id=attempt.execution_id,
+            attempt_id=attempt.id,
+            payload=sync.as_dict(),
+        )
+        record_credential_observation(
+            uow,
+            self._clock,
+            name=execution.harness,
+            mount_mode=MountMode(sync.mount_mode),
+            changed=sync.changed,
+            at=now,
+        )
+
+    def _record_harness_metrics(
+        self, uow: UnitOfWork, attempt: Attempt, parsed: ParsedReport
+    ) -> None:
+        """05b: what the transcript said about tokens and cost, on the metrics row the
+        pools count. A harness that reports nothing leaves null, and the pool counts
+        attempts (routing.py)."""
+        metrics = uow.attempt_metrics.get(attempt.id)
+        if metrics is None:
+            return
+        reported = parsed.metrics
+        if reported.tokens_in is not None:
+            metrics.tokens_in = reported.tokens_in
+        if reported.tokens_out is not None:
+            metrics.tokens_out = reported.tokens_out
+        if reported.cost_usd is not None:
+            metrics.cost_units = reported.cost_usd
+        if reported.source != "none":
+            metrics.cost_source = reported.source
+        uow.attempt_metrics.put(metrics)
+        record_event(
+            uow,
+            self._clock,
+            EventKind.ATTEMPT_METRICS_RECORDED,
+            principal=PRINCIPAL_CRUCIBLE,
+            task_id=attempt.task_id,
+            execution_id=attempt.execution_id,
+            attempt_id=attempt.id,
+            payload={
+                **reported.as_dict(),
+                "model_requested": metrics.model,
+                "transcript_lines": parsed.transcript_lines,
+                "transcript": parsed.transcript_name,
+                "progress_lines": len(parsed.progress),
+            },
+        )
 
     def _record_wall_time(self, uow: UnitOfWork, attempt: Attempt) -> None:
         metrics = uow.attempt_metrics.get(attempt.id)
@@ -2042,6 +2323,9 @@ class Supervisor:
             ExitClass.LOST,
             ExitClass.AUTH_FAILURE,
         )
+        if attempt.termination_reason == TERMINATION_REFUSED:
+            # 07: a refused launch would be refused again; Foundry has the wake.
+            retryable = False
         if retryable and attempt.number < execution.max_attempts:
             nxt = self._create_attempt(uow, execution, number=attempt.number + 1)
             move_task(

@@ -78,6 +78,26 @@ class DockerSettings(BaseModel):
     extra_image_allowlist: list[str] = Field(default_factory=list)
 
 
+class CredentialSettings(BaseModel):
+    """One harness's credential directory (12). `path` is a directory Crucible reads and
+    seeds per-attempt copies from; no value is ever configuration. `mount_mode` may raise
+    the adapter's declared minimum to `rw-narrow` and never lowers it (25 step 7)."""
+
+    source: Literal["directory"] = "directory"
+    path: str | None = None
+    mount_mode: Literal["ro", "rw-narrow"] | None = None
+
+
+class HarnessSettings(BaseModel):
+    """The operator's configuration gate for a harness (25). A harness whose dedicated
+    session compatibility is unverified ships disabled with the reason recorded (S1b);
+    the runtime enable flag an administrator flips lives in the database beside it, and
+    a launch needs both."""
+
+    enabled: bool = True
+    reason: str = ""
+
+
 class GitHubAppSettings(BaseModel):
     """The App's identity and the files Crucible reads to use it (12).
 
@@ -140,6 +160,8 @@ class Settings(BaseSettings):
     docker: DockerSettings = Field(default_factory=DockerSettings)
     github: GitHubSettings = Field(default_factory=GitHubSettings)
     wake: WakeSettings = Field(default_factory=WakeSettings)
+    credentials: dict[str, CredentialSettings] = Field(default_factory=dict)
+    harnesses: dict[str, HarnessSettings] = Field(default_factory=dict)
 
     @classmethod
     def settings_customise_sources(

@@ -15,10 +15,12 @@ from sqlalchemy import Engine, text
 from crucible.adapters.api.app import create_app
 from crucible.adapters.api.deps import AppContext
 from crucible.adapters.execution.fake import FakeProvider
+from crucible.adapters.harness.registry import default_registry
 from crucible.adapters.persistence import migrate
 from crucible.adapters.persistence.unit_of_work import SqlUnitOfWorkFactory, make_engine
 from crucible.adapters.storage.disk import DiskArtifactStore
 from crucible.application.auth import mint_token
+from crucible.application.harnesses import set_harness_enabled
 from crucible.application.repositories import register_repository
 from crucible.application.supervisor import Supervisor
 from crucible.contracts.api import ExternalReviewAttestation, RepositoryRegistration
@@ -121,6 +123,20 @@ def ctx(
     artifact_store: DiskArtifactStore,
     migrated: str,
 ) -> AppContext:
+    # The seeded defaults ship codex and agy disabled (S1b). The fake provider runs no
+    # credential, so the tier enables them through the same service the admin surface
+    # calls, with the reason recorded as an event.
+    with uow_factory() as uow:
+        for name in ("codex", "agy"):
+            set_harness_enabled(
+                uow,
+                clock,
+                principal_name="tests",
+                name=name,
+                enabled=True,
+                reason="integration tier: the fake provider runs no credential",
+            )
+        uow.commit()
     return AppContext(
         uow_factory=uow_factory,
         clock=clock,
@@ -128,6 +144,7 @@ def ctx(
         database_url=migrated,
         engine=engine,
         artifact_store=artifact_store,
+        harnesses=default_registry(),
     )
 
 
@@ -177,6 +194,7 @@ def make_supervisor(
         wake_deliverer=kw.pop("wake_deliverer", None),
         lease_ttl_seconds=kw.pop("lease_ttl_seconds", 30),
         grace_seconds=kw.pop("grace_seconds", 60),
+        harnesses=kw.pop("harnesses", ctx.harnesses),
         **kw,
     )
 

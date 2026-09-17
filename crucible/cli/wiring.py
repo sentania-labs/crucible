@@ -17,15 +17,18 @@ from crucible.adapters.execution.publisher import DockerPublisher, PublisherConf
 from crucible.adapters.github.appauth import AppAuthenticator, AppConfig
 from crucible.adapters.github.client import RestGitHubClient
 from crucible.adapters.github.transport import RestTransport
+from crucible.adapters.harness.registry import default_registry
 from crucible.adapters.notification.webhook import WebhookWakeDeliverer
 from crucible.adapters.persistence.unit_of_work import SqlUnitOfWorkFactory, make_engine
 from crucible.adapters.storage.disk import DiskArtifactStore
 from crucible.application.delivery_tick import DeliveryConfig
+from crucible.application.harnesses import HarnessRegistry
 from crucible.application.supervisor import Supervisor
 from crucible.domain.ids import new_id
 from crucible.ports.artifacts import ArtifactStore
 from crucible.ports.execution import ExecutionProvider
 from crucible.ports.github import GitHubClient
+from crucible.ports.harness import CredentialSource, HarnessGate, MountMode
 from crucible.ports.notification import WakeDeliverer
 from crucible.ports.publish import Publisher
 from crucible.settings import Settings
@@ -40,6 +43,7 @@ class Wiring:
     wake_deliverer: WakeDeliverer
     github: GitHubClient | None = None
     publisher: Publisher | None = None
+    harnesses: HarnessRegistry | None = None
 
     def supervisor(self) -> Supervisor:
         s = self.settings.supervisor
@@ -65,10 +69,33 @@ class Wiring:
             attempt_lease_ttl_seconds=s.attempt_lease_ttl_seconds,
             checkout_lease_ttl_seconds=s.checkout_lease_ttl_seconds,
             grace_seconds=s.grace_seconds,
+            harnesses=self.harnesses,
+            harness_gates=harness_gates(self.settings),
+            credential_sources=credential_sources(self.settings),
         )
 
     def app(self) -> FastAPI:
         return create_app(self.ctx)
+
+
+def credential_sources(settings: Settings) -> dict[str, CredentialSource]:
+    """12: where each harness's credential directory is. Paths, never values."""
+    out: dict[str, CredentialSource] = {}
+    for name, entry in settings.credentials.items():
+        if entry.path:
+            out[name] = CredentialSource(
+                path=entry.path,
+                mount_mode=MountMode(entry.mount_mode) if entry.mount_mode else None,
+            )
+    return out
+
+
+def harness_gates(settings: Settings) -> dict[str, HarnessGate]:
+    """25: the operator's configuration gate per harness, with its reason."""
+    return {
+        name: HarnessGate(enabled=entry.enabled, reason=entry.reason)
+        for name, entry in settings.harnesses.items()
+    }
 
 
 def docker_config(settings: Settings) -> DockerConfig:
@@ -93,6 +120,7 @@ def docker_config(settings: Settings) -> DockerConfig:
         use_reference_cache=d.use_reference_cache,
         max_concurrency=d.max_concurrency,
         extra_image_allowlist=tuple(d.extra_image_allowlist),
+        credentials=credential_sources(settings),
     )
 
 
@@ -116,10 +144,11 @@ def github_client(settings: Settings) -> GitHubClient | None:
 
 def wire(settings: Settings) -> Wiring:
     engine = make_engine(settings.database.url)
+    registry = default_registry()
     providers: dict[str, ExecutionProvider] = {"fake": FakeProvider()}
     docker: DockerProvider | None = None
     if settings.docker.enabled:
-        docker = DockerProvider(docker_config(settings))
+        docker = DockerProvider(docker_config(settings), harnesses=registry)
         providers["docker"] = docker
     artifact_store = DiskArtifactStore(settings.service.artifact_root)
     wake_deliverer = WebhookWakeDeliverer(
@@ -137,6 +166,9 @@ def wire(settings: Settings) -> Wiring:
         lease_ttl_seconds=settings.supervisor.lease_ttl_seconds,
         github_webhook_enabled=settings.github.webhook_enabled,
         github_webhook_secret_path=settings.github.app.webhook_secret_path,
+        harnesses=registry,
+        harness_gates=harness_gates(settings),
+        credential_sources=credential_sources(settings),
     )
     github = github_client(settings)
     publisher: Publisher | None = None
@@ -162,4 +194,5 @@ def wire(settings: Settings) -> Wiring:
         wake_deliverer=wake_deliverer,
         github=github,
         publisher=publisher,
+        harnesses=registry,
     )
