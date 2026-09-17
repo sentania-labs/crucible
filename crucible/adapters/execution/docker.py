@@ -81,6 +81,7 @@ LABEL_OWNER = "crucible.owner"
 LABEL_ROLE = "crucible.role"
 ROLE_WORKER = "worker"
 ROLE_PREPARER = "preparer"
+ROLE_CLEANER = "cleaner"
 ROLE_COLLECTOR = "collector"
 ROLE_BUNDLE = "bundle-verifier"
 ROLE_VERIFIER = "verifier"
@@ -779,20 +780,53 @@ class DockerProvider:
             if exc.status != 404:
                 raise ProviderError(f"terminate failed: {exc}") from exc
 
-    async def cleanup(self, ws: Workspace, policy: CleanupPolicy) -> None:
+    async def cleanup(
+        self, ws: Workspace, policy: CleanupPolicy, spec: LaunchSpec | None = None
+    ) -> None:
         """Only ever called for an attempt that recorded `logs_drained` (08)."""
         for row in await self._containers_for(ws.attempt_id):
             await self._call(self.client.remove_container, str(row["Id"]), force=True)
         root = self._root(ws.attempt_id)
         if policy is CleanupPolicy.KEEP:
             return
-        if policy is CleanupPolicy.DELETE:
-            await asyncio.to_thread(shutil.rmtree, root, True)
+        leaves = (
+            ("",)
+            if policy is CleanupPolicy.DELETE
+            # keep_diff_only: the checkout and the verifier's tree go, the collected
+            # evidence (diff, bundle, report copy, verifier logs) stays.
+            else ("repo", "output/tree")
+        )
+        for leaf in leaves:
+            await asyncio.to_thread(shutil.rmtree, root / leaf if leaf else root, True)
+        left = [leaf for leaf in leaves if (root / leaf if leaf else root).exists()]
+        if left:
+            # The tree belongs to the container's uid, which is not Crucible's in every
+            # arrangement (S9 Test E), so what the daemon made, the daemon removes.
+            await self._remove_through_daemon(ws, spec, left)
+
+    async def _remove_through_daemon(
+        self, ws: Workspace, spec: LaunchSpec | None, leaves: Sequence[str]
+    ) -> None:
+        launched = self._launched.get(ws.attempt_id)
+        spec = spec or (launched.spec if launched else None)
+        if spec is None:
+            log.warning(
+                "workspace left in place: no launch spec to remove it with",
+                extra={"attempt_id": ws.attempt_id},
+            )
             return
-        # keep_diff_only: the checkout and the fresh tree go, the collected evidence
-        # (diff, bundle, report copy, verifier logs) stays.
-        for leaf in ("repo", "output/tree"):
-            await asyncio.to_thread(shutil.rmtree, root / leaf, True)
+        targets = " ".join(
+            f'"{WORK_MOUNT}/{leaf}"' if leaf else f'"{WORK_MOUNT}"/* "{WORK_MOUNT}"/.[!.]*'
+            for leaf in leaves
+        )
+        await self._run_throwaway(
+            spec,
+            role=ROLE_CLEANER,
+            script=f"rm -rf {targets} 2>/dev/null; exit 0\n",
+            mounts=[self._daemon_mount(ws.attempt_id, "", WORK_MOUNT, read_only=False)],
+            network="none",
+            timeout=120,
+        )
 
     async def _containers_for(self, attempt_id: str) -> list[dict[str, Any]]:
         try:

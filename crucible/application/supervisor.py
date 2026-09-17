@@ -1342,7 +1342,8 @@ class Supervisor:
                 "keep_diff_only": CleanupPolicy.KEEP_DIFF_ONLY,
             }.get(choice, CleanupPolicy.KEEP)
             try:
-                await provider.cleanup(self._workspace_for(attempt), policy)
+                spec = await self._db(partial(self._spec_for, attempt))
+                await provider.cleanup(self._workspace_for(attempt), policy, spec)
             except ProviderError:
                 log.exception("cleanup failed; the next tick tries again")
                 continue

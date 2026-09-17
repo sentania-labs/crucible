@@ -115,6 +115,23 @@ def artifact_root() -> Iterator[Path]:
     (root / "e2e-repos").mkdir()
     (root / "e2e-repos").chmod(0o777)
     yield root
+    # Container-written files belong to a uid this process is not (S9 Test E), so the
+    # daemon removes what the daemon made, then the empty shell goes locally.
+    if os.environ.get("CRUCIBLE_E2E_KEEP"):
+        return
+    daemon.run(
+        "run",
+        "--rm",
+        "--user",
+        "0:0",
+        "-v",
+        f"{root}:/x",
+        POSTGRES_IMAGE,
+        "sh",
+        "-c",
+        "rm -rf /x/* /x/.[!.]*",
+        check=False,
+    )
     shutil.rmtree(root, ignore_errors=True)
 
 

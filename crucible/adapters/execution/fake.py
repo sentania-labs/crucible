@@ -459,7 +459,9 @@ class FakeProvider:
         worker.exit_code = 137
         worker.killed = True
 
-    async def cleanup(self, ws: Workspace, policy: CleanupPolicy) -> None:
+    async def cleanup(
+        self, ws: Workspace, policy: CleanupPolicy, spec: LaunchSpec | None = None
+    ) -> None:
         self.cleaned.append(ws.attempt_id)
         self._workspaces.pop(ws.attempt_id, None)
 
