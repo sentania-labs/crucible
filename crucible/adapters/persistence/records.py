@@ -697,6 +697,7 @@ class AttemptMetricsRepo:
             tokens_out=row.tokens_out,
             cost_units=row.cost_units,
             cost_source=row.cost_source,
+            model_reported=row.model_reported,
             exit_class=row.exit_class,
             gates_passed=row.gates_passed,
             gates_failed=row.gates_failed,
@@ -723,6 +724,7 @@ class AttemptMetricsRepo:
         row.tokens_out = metrics.tokens_out
         row.cost_units = metrics.cost_units
         row.cost_source = metrics.cost_source
+        row.model_reported = metrics.model_reported
         row.exit_class = metrics.exit_class
         row.gates_passed = metrics.gates_passed
         row.gates_failed = metrics.gates_failed

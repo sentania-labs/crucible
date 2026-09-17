@@ -273,6 +273,8 @@ class FakeProvider:
     name = PROVIDER_NAME
 
     def __init__(self) -> None:
+        # Attempts whose credential copy the supervisor asked to discard (12).
+        self.discarded: list[str] = []
         self._workers: dict[str, _Worker] = {}
         self._scripts: dict[str, tuple[str, int]] = {}
         self._reports: dict[str, dict[str, Any]] = {}
@@ -469,6 +471,10 @@ class FakeProvider:
     async def list_images(self) -> list[ImageInfo]:
         """The fake provider runs behaviours, not images (08): nothing to list."""
         return []
+
+    async def discard(self, ws: Workspace, spec: LaunchSpec | None = None) -> None:
+        """Nothing secret was placed; the call is recorded so a test can assert it."""
+        self.discarded.append(ws.attempt_id)
 
     async def retention(self, keep: Sequence[str]) -> int:
         return 0

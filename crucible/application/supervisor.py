@@ -83,7 +83,7 @@ from crucible.domain.lifecycle import (
     IllegalTransitionError,
     TaskState,
 )
-from crucible.domain.secrets import find_secrets
+from crucible.domain.secrets import find_secrets, redact
 from crucible.logs import log_context
 from crucible.ports.artifacts import ArtifactStore
 from crucible.ports.clock import Clock
@@ -1015,8 +1015,17 @@ class Supervisor:
             if effective_mount_mode(credential, source) is MountMode.RW_NARROW:
                 limit = 1
         with self._uow_factory() as uow:
+            # An attempt holds its credential copy until collect has synced it back and
+            # removed it, which is after `exited`: a second seeding before that is the
+            # refresh race 12 gives as the reason for the cap.
             live = uow.attempts.list_in_states(
-                [AttemptState.PREPARING, AttemptState.LAUNCHING, AttemptState.RUNNING]
+                [
+                    AttemptState.PREPARING,
+                    AttemptState.LAUNCHING,
+                    AttemptState.RUNNING,
+                    AttemptState.TERMINATING,
+                    AttemptState.EXITED,
+                ]
             )
             running = 0
             for other in live:
@@ -1075,16 +1084,31 @@ class Supervisor:
         try:
             handle = await provider.launch(ws, spec)
         except LaunchRefusedError as exc:
+            await self._discard(provider, ws, spec)
             await self._db(partial(self._refuse_launch, attempt.id, "launch", str(exc)))
             return False
         except ProviderError as exc:
             detail = str(exc)
+            await self._discard(provider, ws, spec)
             await self._db(partial(self._environment_failure, attempt.id, "launch", detail))
             return False
         self._handles[attempt.id] = handle
         await self._db(partial(self._mark_running, attempt.id, handle))
         log.info("attempt launched", extra={"handle": handle.ref, "provider": provider.name})
         return True
+
+    async def _discard(
+        self, provider: ExecutionProvider, ws: Workspace | None, spec: LaunchSpec | None
+    ) -> None:
+        """12: an attempt that will never be collected still had a credential copy seeded
+        for it; the provider removes it now, because cleanup only visits attempts whose
+        logs were drained and retention never looks at a workspace it did not."""
+        if ws is None:
+            return
+        try:
+            await provider.discard(ws, spec)
+        except Exception:  # the attempt still ends; the leak is logged, not hidden
+            log.exception("credential copy discard failed", extra={"attempt_id": ws.attempt_id})
 
     def _mark_preparing(self, attempt_id: str) -> bool:
         """Begin the launch, unless the task was cancelled after the attempt was listed."""
@@ -1480,7 +1504,13 @@ class Supervisor:
             for chunk in chunks:
                 if not chunk.content:
                     continue
-                end = offset + len(chunk.content)
+                # 12: provider log capture passes through the redaction filter before
+                # storage. The resume position keeps the hash of the raw line, which is
+                # what the daemon's stream is compared against on the next pull.
+                text = chunk.content.decode("utf-8", "replace")
+                cleaned = redact(text)
+                content = chunk.content if cleaned == text else cleaned.encode("utf-8")
+                end = offset + len(content)
                 uow.logs.append(
                     LogChunkRecord(
                         id=None,
@@ -1491,7 +1521,7 @@ class Supervisor:
                         ts=chunk.ts or self._clock.now(),
                         line_sha256=chunk.line_sha256 or "",
                         occurrence=chunk.occurrence,
-                        content=chunk.content,
+                        content=content,
                     )
                 )
                 offset = end
@@ -1761,7 +1791,13 @@ class Supervisor:
             await self._db(partial(self._renew_attempt_lease, attempt.id))
             return False
         if observation.state is ObservationState.LOST:
-            # Nothing more can arrive from a worker the provider cannot see.
+            # Nothing more can arrive from a worker the provider cannot see, and its
+            # credential copy will never be synced: remove it now (12).
+            await self._discard(
+                provider,
+                self._workspace_for(attempt),
+                await self._db(partial(self._spec_for, attempt)),
+            )
             await self._db(partial(self._mark_logs_drained, attempt.id))
             await self._db(partial(self._finish_lost, attempt.id, observation.detail))
             return True
@@ -2142,6 +2178,10 @@ class Supervisor:
         if metrics is None:
             return
         reported = parsed.metrics
+        if reported.model is not None:
+            # The model that answered, beside the one the contract named: a harness that
+            # silently substituted one is visible to pool accounting and history (05b).
+            metrics.model_reported = reported.model
         if reported.tokens_in is not None:
             metrics.tokens_in = reported.tokens_in
         if reported.tokens_out is not None:

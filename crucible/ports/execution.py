@@ -347,3 +347,9 @@ class ExecutionProvider(Protocol):
     async def list_images(self) -> list[ImageInfo]:
         """The worker images this provider can run, with their labels (13, 25)."""
         ...
+
+    async def discard(self, ws: Workspace, spec: LaunchSpec | None = None) -> None:
+        """Remove anything secret the provider placed for an attempt that will never be
+        collected: a launch that failed after the credential was seeded, or a worker
+        that was lost (12). Cleanup is separate and may never run for such an attempt."""
+        ...

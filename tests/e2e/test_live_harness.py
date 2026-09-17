@@ -20,6 +20,8 @@ Inputs, all paths, names or flags:
     CRUCIBLE_LIVE_CREDENTIAL_ROOT   the dedicated root holding claude_code/, codex/, agy/
     CRUCIBLE_LIVE_HARNESSES         comma list; default all three
     CRUCIBLE_LIVE_MODELS            optional JSON {harness: model} overriding the defaults
+    CRUCIBLE_LIVE_IMAGES            optional JSON {harness: image tag}; default the newest
+                                    local crucible-worker:<harness>-* tag by name
     CRUCIBLE_LIVE_AGY_MOUNT_MODE    ro (the adapter's minimum) or rw-narrow; default
                                     rw-narrow so a token refresh is observed, not lost
     CRUCIBLE_LIVE_REPORT            where the JSON summary of every run is appended
@@ -76,13 +78,14 @@ LOCAL_TZ = ZoneInfo("America/Chicago")
 # The cheapest model each harness offers that completes a trivial task: routing's rule
 # that trivial work never goes to a frontier model (05b). Overridable per run.
 # Verified by the C5 live runs. Codex with a ChatGPT-plan login refuses the codex-suffixed
-# ids and gpt-5.6; gpt-5.6-luna and -terra are accepted but fail closed without the
-# code-mode host the image does not carry. AGY's effort is part of the id.
+# ids and gpt-5.6; the 5.6 family needs the code-mode host the image carries since the
+# correction round. AGY's effort is part of the id.
 DEFAULT_MODELS = {
     "claude_code": "claude-haiku-4-5",
-    "codex": "gpt-5.5",
+    "codex": "gpt-5.6-luna",
     "agy": "gemini-3.8-flash-low",
 }
+IMAGES_ENV = "CRUCIBLE_LIVE_IMAGES"
 # AGY 1.2.4 refuses --effort for gemini-3.1-flash-lite (found live), so none is passed.
 EFFORT = {"claude_code": None, "codex": "low", "agy": None}
 ALL_HARNESSES = ("claude_code", "codex", "agy")
@@ -122,6 +125,11 @@ def _models() -> dict[str, str]:
     if override:
         models.update({str(k): str(v) for k, v in json.loads(override).items()})
     return models
+
+
+def _images() -> dict[str, str]:
+    override = os.environ.get(IMAGES_ENV, "").strip()
+    return {str(k): str(v) for k, v in json.loads(override).items()} if override else {}
 
 
 def _local(moment: datetime) -> str:
@@ -497,7 +505,7 @@ async def test_a_trivial_task_reaches_ready_for_merge_live(
     engine: Engine,
     artifact_root: Path,
 ) -> None:
-    image = daemon.image_tag(f"crucible-worker:{harness}-")
+    image = _images().get(harness) or daemon.image_tag(f"crucible-worker:{harness}-")
     model = _models()[harness]
     secrets = _secret_values(credential_root, harness)
     assert secrets, f"no credential files found for {harness} under the configured root"

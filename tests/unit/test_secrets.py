@@ -44,6 +44,7 @@ SECRET_FIXTURES: list[tuple[str, str]] = [
     (_join("sk-ant-", "oat01-", _repeat("k", 40)), "anthropic_oauth_token"),
     (_join("ya29.", "a0AfH6SM", _repeat("g", 40)), "google_oauth_access_token"),
     (_join("1//", "0gABCDEF", _repeat("r", 40)), "google_oauth_refresh_token"),
+    (_join("ab", ".", "c", ".", _repeat("K9_-", 40)), "codex_refresh_token"),
 ]
 
 
@@ -75,3 +76,36 @@ def test_find_secrets_reports_path_not_value() -> None:
     matches = find_secrets(doc)
     assert [(m.path, m.pattern) for m in matches] == [("a.b[1]", "github_token")]
     assert "ccc" not in repr(matches)
+
+
+def test_gitleaks_config_carries_every_scanner_pattern() -> None:
+    """12: `make scan` runs gitleaks, whose default rules miss the harness token shapes.
+    `.gitleaks.toml` extends them with the scanner's own patterns, and this holds the
+    two equal so a pattern added to one cannot be missing from the other."""
+    import re  # noqa: PLC0415
+    import tomllib  # noqa: PLC0415
+    from pathlib import Path  # noqa: PLC0415
+
+    from crucible.domain.secrets import _PATTERNS  # noqa: PLC0415
+
+    config = tomllib.loads(
+        (Path(__file__).resolve().parents[2] / ".gitleaks.toml").read_text(encoding="utf-8")
+    )
+    assert config["extend"]["useDefault"] is True
+    rules = {rule["id"]: rule["regex"] for rule in config["rules"]}
+    expected = {}
+    for name, pattern in _PATTERNS:
+        regex = pattern.pattern
+        if pattern.flags & re.IGNORECASE:
+            regex = "(?i)" + regex
+        expected[f"crucible-{name.replace('_', '-')}"] = regex
+    assert rules == expected
+
+
+def test_codex_refresh_token_shape_matches_and_a_jwt_or_a_version_does_not() -> None:
+    from crucible.domain.secrets import scan_text  # noqa: PLC0415
+
+    token = _join("ab", ".", "c", ".", _repeat("Q7", 60), "_-", _repeat("z", 40))
+    assert scan_text(token) == "codex_refresh_token"
+    assert scan_text("version 0.153.4 of the CLI") is None
+    assert scan_text("a.b.c") is None

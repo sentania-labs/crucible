@@ -233,7 +233,7 @@ def credential_state(
                 mode,
                 fingerprint,
                 tuple(files),
-                f"last auth failure {state.last_auth_failure_at.isoformat()}",
+                "the last launch failed authentication; see last_auth_failure_at",
             )
     if state is not None and state.last_validated_at is not None:
         return CredentialState("validated", mode, fingerprint, tuple(files))

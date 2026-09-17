@@ -17,11 +17,17 @@ _PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("bearer_token", re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{20,}", re.IGNORECASE)),
     ("aws_access_key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
     # The shapes the three harness CLIs write into their auth files (12, S1, S1b): the
-    # Claude Code long-lived token, the Google OAuth access and refresh tokens AGY keeps
-    # beside a JWT id token (the jwt pattern below covers that one and Codex's tokens).
+    # Claude Code long-lived token; the Google OAuth access and refresh tokens AGY keeps
+    # beside a JWT id token (the jwt pattern covers that one); Codex's id and access
+    # tokens are JWTs and its refresh token is not: two short base64url segments and one
+    # long one, dot-separated, with no JWT header (shape from a real auth.json, C5).
     ("anthropic_oauth_token", re.compile(r"\bsk-ant-[A-Za-z0-9_-]{20,}")),
     ("google_oauth_access_token", re.compile(r"\bya29\.[A-Za-z0-9._-]{20,}")),
     ("google_oauth_refresh_token", re.compile(r"\b1//[A-Za-z0-9_-]{20,}")),
+    (
+        "codex_refresh_token",
+        re.compile(r"\b[A-Za-z0-9]{1,8}\.[A-Za-z0-9]{1,8}\.[A-Za-z0-9_-]{100,}"),
+    ),
     ("openai_style_key", re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b")),
     ("slack_token", re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}\b")),
     ("jwt", re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b")),

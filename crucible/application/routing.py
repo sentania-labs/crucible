@@ -258,6 +258,7 @@ def history(
             "attempt_id": m.attempt_id,
             "task_id": m.task_id,
             "model": m.model,
+            "model_reported": m.model_reported,
             "harness": m.harness,
             "endpoint_kind": m.endpoint_kind,
             "pool": m.pool,

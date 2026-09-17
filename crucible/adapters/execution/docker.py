@@ -608,6 +608,7 @@ class DockerProvider:
         name = f"crucible-{spec.attempt_id}"
         copy = self._credential_copy(spec)
         container_id = ""
+        seeded_on_disk = False
         try:
             container_id = await self._call(self.client.create_container, name, body)
             if copy is not None:
@@ -617,11 +618,17 @@ class DockerProvider:
                 tar, seeded = await asyncio.to_thread(_seed_tar, copy.spec, copy.source)
                 copy = replace(copy, seeded=seeded)
                 await self._call(self.client.put_archive, container_id, copy.spec.mount_target, tar)
+                seeded_on_disk = True
             await self._call(self.client.start_container, container_id)
         except (DockerApiError, ProviderError) as exc:
             if container_id:
                 with contextlib.suppress(Exception):
                     await self._call(self.client.remove_container, container_id, force=True)
+            if seeded_on_disk:
+                # The files are in the workspace leaf whether or not the worker started,
+                # and nothing later would visit an attempt that never ran (12).
+                with contextlib.suppress(Exception):
+                    await self._remove_through_daemon(ws, spec, [CREDENTIAL_LEAF])
             if isinstance(exc, ProviderError):
                 raise
             raise ProviderError(f"could not start the worker: {exc}") from exc
@@ -1134,6 +1141,17 @@ class DockerProvider:
             if exc.status != 404:
                 raise ProviderError(f"terminate failed: {exc}") from exc
 
+    async def discard(self, ws: Workspace, spec: LaunchSpec | None = None) -> None:
+        """Remove the credential copy of an attempt that will never be collected (12):
+        a launch that failed after seeding, or a worker the daemon lost. Nothing else
+        of the workspace is touched; cleanup decides that later, or never."""
+        root = self._root(ws.attempt_id)
+        if not (root / CREDENTIAL_LEAF).exists():
+            return
+        await asyncio.to_thread(shutil.rmtree, root / CREDENTIAL_LEAF, True)
+        if (root / CREDENTIAL_LEAF).exists():
+            await self._remove_through_daemon(ws, spec, [CREDENTIAL_LEAF])
+
     async def cleanup(
         self, ws: Workspace, policy: CleanupPolicy, spec: LaunchSpec | None = None
     ) -> None:
@@ -1142,14 +1160,14 @@ class DockerProvider:
             await self._call(self.client.remove_container, str(row["Id"]), force=True)
         root = self._root(ws.attempt_id)
         if policy is CleanupPolicy.KEEP:
-            return
-        leaves = (
-            ("",)
-            if policy is CleanupPolicy.DELETE
+            # A kept workspace keeps its evidence, never its credential copy (12).
+            leaves: tuple[str, ...] = (CREDENTIAL_LEAF,)
+        elif policy is CleanupPolicy.DELETE:
+            leaves = ("",)
+        else:
             # keep_diff_only: the checkout, the verifier's tree and any credential copy
             # go; the collected evidence (diff, bundle, report copy, verifier logs) stays.
-            else ("repo", "output/tree", CREDENTIAL_LEAF)
-        )
+            leaves = ("repo", "output/tree", CREDENTIAL_LEAF)
         for leaf in leaves:
             await asyncio.to_thread(shutil.rmtree, root / leaf if leaf else root, True)
         left = [leaf for leaf in leaves if (root / leaf if leaf else root).exists()]

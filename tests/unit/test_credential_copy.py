@@ -29,11 +29,12 @@ from crucible.adapters.execution.docker import (
     _seed_tar,
     _sync_one,
 )
+from crucible.adapters.execution.dockerapi import DockerApiError
 from crucible.adapters.harness.agy import AgyAdapter
 from crucible.adapters.harness.claude_code import ClaudeCodeAdapter
 from crucible.adapters.harness.codex import CodexAdapter
 from crucible.domain.secrets import scan_text
-from crucible.ports.execution import LaunchRefusedError, LaunchSpec, Workspace
+from crucible.ports.execution import LaunchRefusedError, LaunchSpec, ProviderError, Workspace
 from crucible.ports.harness import CredentialSource, MountMode
 from tests.fixtures import contract_document
 
@@ -571,3 +572,57 @@ def test_rw_narrow_policy_set_matches_the_adapters_declared_minimums() -> None:
         and credential.minimum_mode is MountMode.RW_NARROW
     }
     assert declared == RW_NARROW_HARNESSES
+
+
+# ----- a launch that fails after seeding leaves no copy behind (review I1) --------
+
+
+class FailingStartClient(ReadBackClient):
+    def __init__(self) -> None:
+        super().__init__(answer=None)
+        self.cleaner_scripts: list[str] = []
+
+    def create_container(self, name: str, body: dict[str, Any]) -> str:
+        if body["Labels"].get("crucible.role") == "cleaner":
+            self.cleaner_scripts.append(body["Cmd"][-1])
+        return super().create_container(name, body)
+
+    def start_container(self, container_id: str) -> None:
+        if (
+            self.created[int(container_id.split("-")[1]) - 1]["body"]["Labels"].get("crucible.role")
+            == "worker"
+        ):
+            raise DockerApiError(500, "no such image layer")
+        super().start_container(container_id)
+
+
+async def test_a_start_that_fails_after_seeding_removes_the_copy_through_the_daemon(
+    tmp_path: Path,
+) -> None:
+    source = codex_source(tmp_path)
+    client = FailingStartClient()
+    provider = DockerProvider(
+        config(tmp_path, codex=CredentialSource(str(source))),
+        client=client,  # type: ignore[arg-type]
+    )
+    launch = spec()
+    ws = workspace(tmp_path, launch.attempt_id)
+    with pytest.raises(ProviderError, match="could not start the worker"):
+        await provider.launch(ws, launch)
+    assert len(client.archives) == 1, "the copy was seeded before the start failed"
+    assert client.removed and client.removed[0] == "container-1"
+    assert client.cleaner_scripts, "no cleaner ran to remove the seeded copy"
+    assert "credential" in client.cleaner_scripts[0]
+
+
+async def test_discard_removes_only_the_credential_leaf(tmp_path: Path) -> None:
+    client = ReadBackClient(answer=None)
+    provider = DockerProvider(config(tmp_path), client=client)  # type: ignore[arg-type]
+    launch = spec("script-harness", image="crucible-worker:script-harness-1.0.0-abc")
+    ws = workspace(tmp_path, launch.attempt_id)
+    leaf = Path(ws.checkout_path).parent / "credential"
+    (leaf / "auth.json").write_bytes(b"{}")
+    (Path(ws.report_path) / "keep.txt").write_bytes(b"x")
+    await provider.discard(ws, launch)
+    assert not leaf.exists()
+    assert (Path(ws.report_path) / "keep.txt").exists()

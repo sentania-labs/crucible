@@ -39,8 +39,10 @@ def _disable(ctx: AppContext, name: str, reason: str) -> None:
 async def test_a_disabled_harness_is_refused_with_a_wake_and_no_retry(
     ctx: AppContext, client: TestClient, supervisor: Supervisor
 ) -> None:
-    _disable(ctx, "codex", "rotating the dedicated credential")
+    # Disabled after submit: at submit the gate is a contract problem (review I8); a
+    # harness disabled while a task is scheduled is what the launch-time refusal is for.
     task_id = submit_and_start(client, "crucible-worker:fake-succeed")
+    _disable(ctx, "codex", "rotating the dedicated credential")
     assert await run_to_settled(supervisor, client, task_id) == "pre_pr_gates_failed"
     kinds = event_kinds(client, task_id)
     assert "harness_refused" in kinds
@@ -146,6 +148,105 @@ async def test_per_harness_concurrency_defers_the_second_launch(
         json={"reason": "free the harness", "verbatim": "cancel it", "decided_by": "tests"},
     )
     assert cancel.status_code == 200, cancel.text
+    # The hang ignores the drain; past the grace it is killed, exits, and is collected,
+    # and only then does the cap release the second launch (review I2).
+    await supervisor.tick()
+    ctx.clock.advance(61)  # type: ignore[attr-defined]
+    for _ in range(3):
+        await supervisor.tick()
     assert await run_to_settled(supervisor, client, second, max_ticks=40) == (
         "awaiting_internal_review"
     )
+
+
+async def test_a_disabled_harness_is_a_contract_problem_at_submit(
+    ctx: AppContext, client: TestClient
+) -> None:
+    """25 (review I8): refused with the reason when the contract is submitted, not a
+    task later at launch."""
+    _disable(ctx, "codex", "rotating the dedicated credential")
+    from tests.fixtures import contract_document  # noqa: PLC0415
+
+    response = client.post("/v1/tasks", json=contract_document())
+    assert response.status_code == 422, response.text
+    problems = response.json()["errors"]
+    assert any(
+        p["path"] == "execution_request.harness" and "rotating" in p["message"] for p in problems
+    ), problems
+
+
+async def test_the_cap_holds_until_the_copy_is_synced_and_removed(
+    ctx: AppContext, client: TestClient, provider: FakeProvider
+) -> None:
+    """12 (review I2): an attempt in terminating or exited still holds its credential
+    copy, so a second seeding must wait for collect."""
+    from crucible.domain.lifecycle import AttemptState  # noqa: PLC0415
+
+    supervisor = make_supervisor(ctx, provider)
+    first = submit_and_start(client, "crucible-worker:fake-hang", external_id="EX-0001")
+    await supervisor.tick()
+    await supervisor.tick()
+    view = client.get(f"/v1/tasks/{first}").json()
+    attempt_id = view["latest_attempt"]["id"]
+    assert view["latest_attempt"]["state"] == "running"
+    with ctx.uow_factory() as uow:
+        execution = uow.executions.get(view["executions"][0]["id"])
+        assert execution is not None
+        assert supervisor._harness_busy(execution) is not None
+    for state in (AttemptState.TERMINATING, AttemptState.EXITED):
+        with supervisor._fenced() as uow:
+            attempt = uow.attempts.get(attempt_id, for_update=True)
+            assert attempt is not None
+            attempt.state = state
+            uow.attempts.save(attempt)
+            uow.commit()
+        with ctx.uow_factory() as uow:
+            assert supervisor._harness_busy(execution) is not None, state
+    with supervisor._fenced() as uow:
+        attempt = uow.attempts.get(attempt_id, for_update=True)
+        assert attempt is not None
+        attempt.state = AttemptState.COLLECTED
+        uow.attempts.save(attempt)
+        uow.commit()
+    with ctx.uow_factory() as uow:
+        assert supervisor._harness_busy(execution) is None
+
+
+async def test_a_lost_worker_has_its_credential_copy_discarded(
+    ctx: AppContext, client: TestClient, provider: FakeProvider, supervisor: Supervisor
+) -> None:
+    """12 (review I1): a lost worker is never collected, so the provider is told to
+    discard its copy."""
+    task_id = submit_and_start(client, "crucible-worker:fake-vanish-1")
+    await run_to_settled(supervisor, client, task_id)
+    attempt_id = client.get(f"/v1/tasks/{task_id}").json()["executions"][0]["attempts"][0]["id"]
+    assert attempt_id in provider.discarded
+
+
+async def test_a_token_shaped_worker_log_line_is_stored_redacted(
+    ctx: AppContext, client: TestClient, supervisor: Supervisor
+) -> None:
+    """12 (review I5): provider log capture passes through the redaction filter."""
+    from sqlalchemy import text  # noqa: PLC0415
+
+    from crucible.ports.execution import LogChunk  # noqa: PLC0415
+
+    token = "sk-ant-" + "oat01-" + "x" * 40
+    line = f"auth: using {token} for the session\n".encode()
+    task_id = submit_and_start(client, "crucible-worker:fake-hang")
+    await supervisor.tick()
+    await supervisor.tick()
+    attempt_id = client.get(f"/v1/tasks/{task_id}").json()["latest_attempt"]["id"]
+    stored = supervisor._store_logs(attempt_id, (LogChunk("stdout", line, lines=1),))
+    assert stored == 1
+    with ctx.engine.begin() as connection:
+        rows = (
+            connection.execute(
+                text("SELECT content FROM log_chunks WHERE attempt_id = :id"), {"id": attempt_id}
+            )
+            .scalars()
+            .all()
+        )
+    blob = b"".join(bytes(r) for r in rows).decode("utf-8", "replace")
+    assert token not in blob
+    assert "[redacted:anthropic_oauth_token]" in blob

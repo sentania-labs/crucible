@@ -374,6 +374,8 @@ class AttemptMetrics:
     tokens_out: int | None = None
     cost_units: float | None = None
     cost_source: str = "none"
+    # The model the harness's own transcript named, when it did (05b, C5).
+    model_reported: str | None = None
     exit_class: str | None = None
     gates_passed: int = 0
     gates_failed: int = 0

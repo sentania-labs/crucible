@@ -53,7 +53,7 @@ QUOTA_PATTERNS = base.patterns(
     "quota exceeded",
     "Quota exceeded",
     "rate limit exceeded",
-    "429",
+    "Too Many Requests",
 )
 
 

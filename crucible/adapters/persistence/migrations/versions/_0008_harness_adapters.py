@@ -3,7 +3,8 @@ reason, session compatibility, what runs observed about the credential) and the 
 promotion table (13), plus the event kinds the registry and the credential sync write.
 
 Seeded defaults follow S1b: Claude Code's dedicated session is verified and enabled;
-Codex and AGY stay disabled until their Crucible-side refresh has been observed and the
+AGY completed the Crucible-side refresh and the operator's confirmation during C5 and is
+enabled; Codex stays disabled until its Crucible-side refresh has been observed and the
 operator's own session confirmed afterwards; the script harness has no credential and
 is enabled for the e2e tier.
 
@@ -43,12 +44,13 @@ EVENT_ARCHIVE = "events_c5_archive"
 
 UNVERIFIED_REASON = (
     "unverified: the dedicated session's Crucible-side token refresh has not yet been "
-    "observed, so daily-session compatibility is not established (S1b steps 5 and 6)"
+    "observed (S1b step 5), so the operator's session cannot be confirmed after it (step 6)"
 )
+AGY_REASON = "session_compatibility verified: the dedicated session refreshed on the Crucible side at 00:50 CDT on 2026-09-17 (S1b step 5) and the operator's own session answered and refreshed normally afterwards at 06:32 CDT (step 6)"
 SEED = (
     ("claude_code", True, "session_compatibility verified (S1b); enabled for workers", "verified"),
     ("codex", False, UNVERIFIED_REASON, "unverified"),
-    ("agy", False, UNVERIFIED_REASON, "unverified"),
+    ("agy", True, AGY_REASON, "verified"),
     ("script-harness", True, "the e2e tier's harness (18): no model, no credential", "verified"),
 )
 
@@ -86,7 +88,13 @@ VERIFIED_ROUTING = {
         _model("claude-haiku-4-5", "claude_code", "small", "low", "fast", "anthropic-sub"),
         _model("claude-sonnet-5", "claude_code", "mid", "medium", "fast", "anthropic-sub"),
         _model("claude-fable-5-1", "claude_code", "frontier", "high", "medium", "anthropic-sub"),
-        _model("gpt-5.5", "codex", "mid", "medium", "medium", "openai-sub"),
+        # The operator's Codex roster (2026-09-17 07:05 CDT): Luna and Terra for trivial
+        # and standard work, Sol and Astra as frontier; nothing older and no mini. The
+        # ids are the CLI's own listing (c5.md); the cost classes are Foundry's tiering.
+        _model("gpt-5.6-luna", "codex", "small", "low", "fast", "openai-sub"),
+        _model("gpt-5.6-terra", "codex", "mid", "medium", "medium", "openai-sub"),
+        _model("gpt-5.6-sol", "codex", "frontier", "high", "medium", "openai-sub"),
+        _model("gpt-6-astra", "codex", "frontier", "high", "slow", "openai-sub"),
         _model("gemini-3.8-flash-low", "agy", "small", "low", "fast", "google-sub"),
         _model("gemini-3.8-flash-high", "agy", "mid", "medium", "medium", "google-sub"),
         _model("gemini-3.1-pro-high", "agy", "frontier", "high", "slow", "google-sub"),
@@ -163,6 +171,8 @@ def upgrade() -> None:
             ).bindparams(name=name, enabled=enabled, reason=reason, compatibility=compatibility)
         )
 
+    # 05b: the model the transcript named, beside the one the contract requested.
+    op.add_column("attempt_metrics", sa.Column("model_reported", sa.String(128), nullable=True))
     op.execute(
         sa.text(
             "INSERT INTO routing_policies (name, version, document, created_at) "
@@ -196,6 +206,7 @@ def upgrade() -> None:
 def downgrade() -> None:
     for table in C5_TABLES:
         op.drop_table(table)
+    op.drop_column("attempt_metrics", "model_reported")
     op.execute(
         sa.text(
             "DELETE FROM routing_policies WHERE name = :name AND version = :version"

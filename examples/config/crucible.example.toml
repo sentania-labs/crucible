@@ -125,18 +125,19 @@ mount_mode = "rw-narrow"   # the CLI rotated its token on the first run past exp
 # flag (`crucible-admin harnesses enable`, C5b; seeded the same way by migration 0008).
 # A harness ships disabled until its dedicated Crucible session has refreshed on the
 # Crucible side and the operator's own session was confirmed valid afterwards (S1b
-# steps 5 and 6). Claude Code's long-lived token has no refresh, so it is verified.
+# steps 5 and 6). Claude Code's long-lived token has no refresh, so it is verified; AGY
+# completed both steps during C5; Codex's dedicated token has not refreshed yet.
 [harnesses.claude_code]
 enabled = true
 reason = "session_compatibility verified (S1b)"
 
 [harnesses.codex]
 enabled = false
-reason = "unverified: the dedicated session's Crucible-side refresh has not been observed and the operator's session confirmed after it (S1b steps 5 and 6)"
+reason = "unverified: the dedicated session's Crucible-side refresh has not been observed (S1b step 5), so the operator's session cannot yet be confirmed after it (step 6)"
 
 [harnesses.agy]
-enabled = false
-reason = "unverified: the dedicated session's Crucible-side refresh has not been observed and the operator's session confirmed after it (S1b steps 5 and 6)"
+enabled = true
+reason = "session_compatibility verified: the dedicated session refreshed on the Crucible side at 00:50 CDT on 2026-09-17 (S1b step 5) and the operator's own session answered and refreshed normally afterwards at 06:32 CDT (step 6)"
 
 [wake.foundry]
 mode = "poll"          # or "webhook"

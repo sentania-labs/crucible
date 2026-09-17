@@ -419,6 +419,7 @@ class AttemptMetricsRow(Base):
     tokens_out: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     cost_units: Mapped[float | None] = mapped_column(Float, nullable=True)
     cost_source: Mapped[str] = mapped_column(String(24))
+    model_reported: Mapped[str | None] = mapped_column(String(128), nullable=True)
     exit_class: Mapped[str | None] = mapped_column(String(32), nullable=True)
     gates_passed: Mapped[int] = mapped_column(Integer, default=0)
     gates_failed: Mapped[int] = mapped_column(Integer, default=0)

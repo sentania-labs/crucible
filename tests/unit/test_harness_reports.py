@@ -254,3 +254,14 @@ def test_the_deterministic_table_holds_before_any_pattern() -> None:
     assert adapter.classify_exit(ExitInfo(exit_code=137, oom_killed=True), "", "") is (
         ExitClass.ENVIRONMENT
     )
+
+
+def test_a_bare_number_in_a_crashed_agy_tail_is_not_quota() -> None:
+    """A line number or a token count is three digits too; the quota class needs the
+    provider's own words."""
+    tail = '{"event":"step_update","step_update":{"error":"panic at foo.js:429 (line 1429)"}}\n'
+    assert AgyAdapter().classify_exit(ExitInfo(exit_code=1), tail, "") is ExitClass.CRASHED
+    assert (
+        AgyAdapter().classify_exit(ExitInfo(exit_code=1), '{"error":"429 Too Many Requests"}', "")
+        is ExitClass.QUOTA_EXHAUSTED
+    )

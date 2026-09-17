@@ -55,7 +55,14 @@ async def submit(
     document: Any = await request.json() if body else {}
 
     async def produce(uow: UnitOfWork) -> tuple[int, dict[str, Any]]:
-        task, _ = submit_task(uow, ctx.clock, principal=principal, body=document)
+        task, _ = submit_task(
+            uow,
+            ctx.clock,
+            principal=principal,
+            body=document,
+            harnesses=ctx.harnesses,
+            harness_gates=ctx.harness_gates,
+        )
         return 201, task_view(uow, task.id).model_dump(mode="json")
 
     return await with_idempotency(
