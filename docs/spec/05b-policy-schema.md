@@ -115,7 +115,7 @@ external_review:
   retrigger_after_correction: false
   require_review_on_final_sha: false
   require_feedback_disposition: true
-  accepted_signals: ["reaction:+1", "review", "comment"]  # from an allowlisted login only; +1 is the durable "no findings" signal (S12 rerun)
+  accepted_signals: ["reaction:+1", "review"]  # from an allowlisted login only; +1 is the durable "no findings" signal (S12 rerun); "comment" is opt-in
   components: ["code"]                 # review components in one cycle; ["code", "security"] where the repo runs both
   round_counting: "completed_cycles"   # a round is one completed cycle (all components terminal) on a published head
   wait_timeout_hours: 24               # then wake Foundry with reason external_review_overdue
@@ -166,6 +166,16 @@ retention:
 - `network.egress_allowlist` entries are hostnames, no wildcards in v0.x.
 - `external_review.required_rounds: 0` makes the external review gates
   `skipped`; `reviewer_logins` must be non-empty when rounds are above 0.
+- `external_review.accepted_signals` does not carry `comment` by default.
+  The provider posts its summary comment within about ten seconds of the
+  PR opening, minutes before any verdict, and edits it in place when the
+  review lands (S12), so a comment accepted by default completes the cycle
+  before there is anything to complete. A repository may add `comment`
+  deliberately; even then a comment carrying the provider's summary marker
+  is never a round (23).
+- `external_review.components` lists the components one cycle expects and
+  defaults to `["code"]`. The cycle logic depends on it being present, so
+  a repository running code and security review sets both.
 - `ci_certification.allow_no_ci: true` and `deliverables.allow_branch_only:
   true` may only be set by an `operator` or `admin` principal and are
   recorded as decisions.

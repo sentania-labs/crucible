@@ -6,7 +6,7 @@
 |---|---|
 | `principals` | id, name, role, token_hash, webhook_url (nullable; one configured target may serve all principals in v0.x), webhook_secret_ref, created_at, disabled_at |
 | `policies` | (name, version) PK, document JSONB, created_at, retired_at |
-| `tasks` | id ULID PK, external_id, principal_id, project, title, state, contract_version, policy_name, policy_version, head_sha (current collected head), publish_pending (until C4), created_at, updated_at, closed_at; UNIQUE (principal_id, external_id) |
+| `tasks` | id ULID PK, external_id, principal_id, project, title, state, contract_version, policy_name, policy_version, head_sha (current collected head), created_at, updated_at, closed_at; UNIQUE (principal_id, external_id) |
 | `task_contracts` | id, task_id, version, document JSONB, sha256, submitted_at; UNIQUE (task_id, version) |
 | `executions` | id, task_id, role (implement, correct, review), contract_version, harness, model, effort, provider, image, policy snapshot JSONB, state, created_at, ended_at |
 | `attempts` | id, execution_id, number, state, workspace_path, handle (provider ref), identity_sha256, image_digest, started_at, ended_at, exit_code, exit_class, timeout_at, drain_deadline, killed_at, termination_reason |
@@ -29,15 +29,16 @@
 | `repositories` | id, name UNIQUE, url, default_branch, installation_id, policy_name, registered_by, created_at |
 | `worker_images` | digest PK, reference, harness, harness_version, build_inputs_sha256, promotion_state, promoted_at, promoted_by |
 | `review_reports` | id, task_id, head_sha, reviewer_kind, reviewer_attempt_id, reviewer_principal_id, document JSONB, artifact_id, created_at |
-| `pull_requests` | id, task_id UNIQUE, repository_id, number, url, base_ref, state, opened_at, merged_at, merge_sha, merged_by, closed_by, body_sha256 |
+| `pull_requests` | id, task_id UNIQUE, repository_id, number, url, base_ref, work_branch, state, head_sha, title, opened_at, merged_at, merge_sha, merged_by, closed_at, closed_by, last_polled_at, last_reactions_polled_at, reactions_observable, cancelled_at, body_sha256; UNIQUE (repository_id, number) |
 | `pull_request_heads` | id, pull_request_id, sha, pushed_by (crucible, other), observed_at |
-| `external_reviews` | id, pull_request_id, reviewer_login, signal, github_id, reviewed_sha, body, received_at |
-| `review_comments` | id, external_review_id, github_id, path, line, body (stored only after secret scanning and redaction), body_sha256, created_at |
+| `external_review_cycles` | id, pull_request_id, head_sha, components JSONB, completed_components JSONB, state (open, completed, superseded), trigger, opened_at, completed_at |
+| `external_reviews` | id, pull_request_id, cycle_id, reviewer_login, signal (review, comment, reaction), github_id, reviewed_sha, sha_inferred (a reaction carries no commit id; the binding is inferred), state, body (stored only after secret scanning and redaction), body_sha256, accepted, received_at |
+| `review_comments` | id, pull_request_id, external_review_id, github_id, kind, login, path, line, body (stored only after secret scanning and redaction), body_sha256, reviewed_sha, created_at, updated_at |
 | `review_dispositions` | id, review_comment_id UNIQUE, principal_id, disposition, reasoning, created_at |
 | `ci_certifications` | id, pull_request_id, head_sha, state, required_checks JSONB, check_runs JSONB, failure JSONB (check, workflow, job, log artifact), evaluated_at |
 | `ci_decisions` | id, task_id, ci_certification_id, principal_id, cause, action, reasoning, created_at |
 | `github_deliveries` | delivery_id PK, event, action, received_at, body_sha256, normalized JSONB (scanned and redacted fields only; never the raw body), processed_at |
-| `reactions` | id, subject_kind (pull_request, review, comment), subject_github_id, github_id, login, content, observed_at |
+| `reactions` | id, pull_request_id, subject_kind (pull_request, review, review_comment, issue_comment), subject_github_id, github_id, login, content, created_at, observed_at, removed_at (the observation time at which the reaction was gone, never a claim that it was deleted) |
 | `release_contracts` | id, external_id, repository_id, target_branch, target_sha, version, tag, document JSONB, sha256, authorization_decision_id, submitted_at |
 | `releases` | id, release_contract_id UNIQUE, state, tag_sha, tagged_at, workflow_run_url, conclusion, ended_at |
 | `routing_policies` | (name, version) PK, document JSONB, created_at, retired_at |
@@ -50,7 +51,10 @@ where acked_at is null.
 
 Triggers: `events`, `task_contracts`, `release_contracts`, `review_dispositions`, and `ci_decisions` reject UPDATE and DELETE. No table ever holds a token, key, or secret; a CI check asserts no column name matches the secret-name pattern. Writes to
 `executions`, `attempts`, `workers`, `heartbeats`, `gate_results`,
-`completion_claims`, `attempt_metrics`, `evidence`, `log_chunks`, `retention_actions`, `supervisor_status`, and `events` rows whose
+`completion_claims`, `attempt_metrics`, `evidence`, `log_chunks`, `retention_actions`, `supervisor_status`,
+`pull_requests`, `pull_request_heads`, `external_review_cycles`,
+`external_reviews`, `review_comments`, `reactions`, `ci_certifications`,
+and `events` rows whose
 `principal` is `crucible` require a transaction-local `crucible.fenced_token` (set with `SET LOCAL`
 at the start of every supervisor transaction, never per connection, because
 pooled connections would carry a stale value) exactly equal to the token on
@@ -61,7 +65,11 @@ for every attached table).
 The API role writes only `tasks` (submit, start, cancel, amend, close),
 `task_contracts`, `idempotency_keys` (in the same transaction as the
 mutation they record), `acceptance_results`, `decisions`, `artifacts`,
-`wakes` (ack), `policies`, `routing_policies`, and `review_reports`; `evidence`
+`wakes` (ack), `policies`, `routing_policies`, `review_reports`, and
+`github_deliveries` (the webhook endpoint holds no supervisor lease and has
+no authenticated principal, so a delivery is neither fenced nor append-only;
+the supervisor processes it afterwards, and its events are recorded under
+the principal `github` rather than `crucible` for the same reason); `evidence`
 is the supervisor's alone, so an uploaded artifact or review report becomes
 evidence on the next tick, never inside the request; it enqueues everything that touches an attempt for the
 supervisor.
@@ -76,6 +84,15 @@ supervisor.
   refuses to serve if the head revision is not applied, and `/ready` reports
   it.
 - Down migrations required for every revision in v0.x.
+- A down migration that narrows the event-kind constraint has to deal with
+  the rows the newer kinds wrote. Revision 0007 (C4) **archives** them: it
+  copies every C4 event row into `events_c4_archive`, removes them from
+  `events`, recreates the older constraint in its ordinary validating form,
+  and its upgrade moves the rows back. Nothing is lost either way, and a
+  database that was downgraded says so by having the archive table. This is
+  the pattern for future revisions. It is not retroactive: earlier
+  downgrades (0006, for one) simply delete the event rows of the kinds they
+  remove, which is a known gap, not a promise kept.
 - An applied migration is never edited. Before the first tagged release
   the initial revision may be squashed only together with a documented
   `make reset`; after it, every change is a new revision. Readiness

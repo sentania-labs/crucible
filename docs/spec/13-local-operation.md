@@ -10,12 +10,17 @@ sessions; nothing here assumes Foundry is a service.
 |---|---|---|---|
 | `postgres` | `postgres:16` pinned by digest | authoritative state | volume `crucible-pg` |
 | `docker-socket-proxy` | `tecnativa/docker-socket-proxy` pinned by digest, or an equivalent | reduced Docker API surface | no |
-| `egress-proxy` | a small CONNECT proxy image pinned by digest | worker and publisher egress allowlist | no |
+| `egress-proxy` | a small CONNECT proxy image pinned by digest | worker egress allowlist | no |
+| `publish-proxy` | the same CONNECT proxy image | publisher egress allowlist, narrower than the workers' | no |
 | `crucible` | `ghcr.io/sentania-labs/crucible:<tag>` | api + supervisor (`serve --all`) | volume `crucible-artifacts` |
 
 Workers, collectors, verifiers, and publishers are not Compose services.
-They are containers Crucible creates through the proxy, on the
-`crucible-workers` network, labeled with the attempt or job. `docker
+They are containers Crucible creates through the proxy, labeled with the
+attempt or job. Workers, collectors, and verifiers sit on the
+`crucible-workers` network; the publisher sits on `crucible-publish`, its
+own internal network with its own proxy, because the one container that
+holds a GitHub credential must not reach the model endpoints the workers'
+allowlist permits (23). `docker
 compose down` does not remove running workers by design; `crucible-admin
 drain` does.
 
@@ -165,7 +170,9 @@ wanted; telemetry to Datadog denied); Codex `api.openai.com`,
 `daily-cloudcode-pa.googleapis.com`, `oauth2.googleapis.com`. Everything
 else each CLI tried (experiment flags, update checks, browser downloads)
 is denied. The
-publisher's allowlist is `github.com` and `api.github.com` only. `network:
+publisher's allowlist is `github.com` and `api.github.com` only, and it is
+a separate proxy on a separate network rather than an entry on the
+workers' list. `network:
 none` gives `--network none` and no proxy. Crucible never programs host
 firewall rules.
 

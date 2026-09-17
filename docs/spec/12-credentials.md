@@ -119,7 +119,18 @@ recorded; its value is not.
 
 Provider log capture passes through a redaction filter with the same
 patterns as the secret scanner plus the known shape of each harness's
-tokens and of GitHub installation tokens. Redaction is best-effort defense
+tokens and of GitHub installation tokens. The installation-token pattern is
+the literal `ghs_` followed by at least 20 characters from
+`[A-Za-z0-9._-]`, with no upper bound: the real value is about 390
+characters and contains dots, so the fixed-length 40-character form most
+published patterns assume matches nothing (S10).
+
+Redaction is not only a log filter. Everything a repository controls is
+redacted at the point Crucible reads it, before it reaches a stored row: a
+CI log excerpt fetched through the Actions read permission, the publisher
+container's own output, the remote's refusal message on a failed push, and
+every review body, comment body, and PR title arriving by poll or webhook
+(23). Redaction is best-effort defense
 in depth, not the control: the control is that no secret value is ever
 placed where a worker would print it, except its own harness credential,
 which lives in a file it has no reason to cat.

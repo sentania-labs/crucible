@@ -4,9 +4,20 @@
 
 Append-only table `events` with a global monotonic `seq` (BIGSERIAL), `ts`,
 `kind`, `task_id`, `execution_id`, `attempt_id`, `principal` (who caused it:
-`crucible`, an API principal, `github` for verified deliveries and polls,
-or `worker:<attempt>`), `payload` (JSONB, schema per kind), and `verified`
-(false for anything a worker asserted). Every outward-facing GitHub action
+`crucible`, an API principal, `github`, or `worker:<attempt>`), `payload`
+(JSONB, schema per kind), and `verified` (false for anything a worker
+asserted). `github` is the principal for **webhook ingress only**: the
+events recording that a delivery was received, that its event was outside
+the handled set, or that it was rejected. It is a third case rather than a
+shade of `crucible` on purpose: an event whose principal is `crucible` is
+fenced to the supervisor lease (14), and the webhook endpoint holds no
+lease and authenticates no caller. Polling is the supervisor's own work, so
+every polled observation and everything derived from one (head changed,
+review received, reaction received, check concluded, PR closed or merged)
+is recorded under `crucible`, fenced like any other supervisor write. A
+rejected delivery's event carries the reason and, for the claimed event
+name, only one of the handled set or `unrecognized`; nothing else an
+unauthenticated caller chose is stored. Every outward-facing GitHub action
 is two events: `github_call_started` and `github_call_completed` or
 `github_call_failed`, with the endpoint, repository, and response class,
 never a token.

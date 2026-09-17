@@ -68,6 +68,11 @@ with the script harness (no subscription needed). Acceptance: a
 script-harness task goes from submit to `merged` with one simulated
 external review round and one correction; a forced CI failure lands in
 `ci_certification_failed` with evidence and no retry.
+**Delivered 2026-09-16.** Live evidence: `make e2e-github` takes a
+script-harness task on a throwaway GitHub repository from submit through
+publication, PR open with the rendered body, polled observation, CI
+certification, and an observed merge, with the installation token absent
+from every location still readable once the publisher container is gone.
 
 ## Phase C5: harness adapters live
 
