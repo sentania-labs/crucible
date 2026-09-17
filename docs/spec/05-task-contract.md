@@ -131,7 +131,9 @@ of the previous version's. `required_verification` may not shrink.
 - `external_id` unique within the submitting principal's namespace.
 - `repository.name` is registered (04); `base_ref` exists on the remote at
   validation time; `work_branch` matches the repository policy's branch
-  pattern and is not a protected branch.
+  pattern and is not a protected branch; both refs contain only
+  `[A-Za-z0-9._/-]`, do not start with `-`, and are refs git itself
+  accepts, because every ref reaches a command line eventually.
 - `allowed_paths` and `prohibited_paths` are valid globs where `*` stops at
   a path separator and only `**` crosses one (the permissive reading would
   silently widen every contract); the two must not fully overlap.
