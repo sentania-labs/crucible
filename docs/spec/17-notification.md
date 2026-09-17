@@ -10,13 +10,14 @@ Only when judgment is required or work has stopped needing it:
 | `gates_passed` | `awaiting_acceptance` |
 | `pre_pr_gates_failed` | `pre_pr_gates_failed` |
 | `needs_more_work` | after a `needs_more_work` verdict, until a correction is attached |
-| `publish_pending` | `awaiting_acceptance` with an accepted PR or branch deliverable, until C4's publisher exists |
 | `blocked` | `blocked` (escalation opened) |
 | `publish_failed` | `publish_failed` |
 | `external_feedback_received` | `external_feedback_received` |
 | `external_review_overdue` | repeat, no state change |
+| `external_review_trigger_needed` | `awaiting_external_review` on a head whose cycle needs the orchestrator's trigger under the operator's account (23) |
 | `ci_certification_failed` | `ci_certification_failed` |
 | `ci_certification_overdue` | repeat, no state change |
+| `ci_rerun_needed` | after a `ci-decision rerun`: Crucible records the intent, the operator re-runs it on GitHub (the App holds no Actions write) |
 | `head_diverged` | `head_diverged` (decision required) |
 | `ready_for_merge` | `ready_for_merge` |
 | `merged` | `merged` (informational) |
@@ -27,6 +28,10 @@ Only when judgment is required or work has stopped needing it:
 | `escalation_stale` | repeat |
 | `supervisor_takeover` | informational, once |
 | `bootstrap_import_verified` | awaiting commit |
+
+Every wake in the delivery half stands on an observation Crucible
+recorded under the `github` event principal (10), never on an orchestrator
+session being connected.
 
 Progress is not a wake. Foundry polls or tails logs when it wants progress.
 Review feedback is never sent to a worker; it is only ever carried to
