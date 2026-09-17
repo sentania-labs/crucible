@@ -502,52 +502,74 @@ def record_event_probe(
     )
 
 
-def _routing_documents(uow: UnitOfWork) -> list[dict[str, Any]]:
-    """The routing policy the newest `default-software` names first, then the seeded
-    `default-routing` versions, newest first."""
-    documents: list[dict[str, Any]] = []
-    seen: set[tuple[str, int]] = set()
-    versions = list(uow.policies.list_versions("default-software"))
-    if versions:
-        newest = max(versions, key=lambda p: p.version)
-        ref = newest.document.get("routing", {}).get("policy", {})
-        if isinstance(ref, dict) and ref.get("name") and ref.get("version") is not None:
-            record = uow.routing_policies.get(str(ref["name"]), int(ref["version"]))
-            if record is not None:
-                documents.append(record.document)
-                seen.add((str(ref["name"]), int(ref["version"])))
-    for version in (2, 1):
-        if ("default-routing", version) in seen:
-            continue
-        record = uow.routing_policies.get("default-routing", version)
-        if record is not None:
-            documents.append(record.document)
-    return documents
+def _routing_document(uow: UnitOfWork) -> tuple[dict[str, Any] | None, str]:
+    """The one routing policy the policy in force names, and where it came from.
+
+    Only that one. The earlier form appended the seeded `default-routing` versions 2 and 1
+    after it, so a policy in force whose routing policy had no enabled model for a harness
+    fell through to an older seeded policy and the probe ran a model the operator had
+    disabled or removed. A routing policy that is not the one in force is not a fallback;
+    it is a policy the operator superseded."""
+    versions = [p for p in uow.policies.list_versions("default-software") if p.retired_at is None]
+    if not versions:
+        return None, "no default-software policy is in force"
+    newest = max(versions, key=lambda p: p.version)
+    routing = newest.document.get("routing") or {}
+    ref = routing.get("policy") if isinstance(routing, dict) else None
+    if not (isinstance(ref, dict) and ref.get("name") and ref.get("version") is not None):
+        return None, f"default-software version {newest.version} names no routing policy"
+    name = str(ref["name"])
+    try:
+        version = int(ref["version"])
+    except (TypeError, ValueError):
+        return None, (
+            f"default-software version {newest.version} names routing policy {name} with a "
+            "version that is not a number"
+        )
+    record = uow.routing_policies.get(name, version)
+    if record is None or record.retired_at is not None:
+        # A retired routing policy is one the operator took out of service, which is one
+        # of the two ways they retire a model; it is not in force either.
+        return None, (
+            f"routing policy {name} version {version}, which default-software version "
+            f"{newest.version} names, is " + ("retired" if record is not None else "not stored")
+        )
+    return record.document, f"{name} version {version}"
 
 
 def _probe_model(uow: UnitOfWork, adapter: HarnessAdapter, harness: str) -> str:
-    """The cheapest enabled model the routing policy names for the harness, so a probe
-    never runs on a frontier model. A harness without a model flag (the script harness)
-    needs none. Otherwise a routing policy without an enabled model for the harness is a
-    refusal: the CLIs reject an unknown model name, so guessing one would only produce
-    a crash that says nothing about the credential (AGY did exactly that, C5b live run).
+    """The cheapest enabled model the routing policy in force names for the harness, so a
+    probe never runs on a frontier model and never on a model the operator retired. A
+    harness without a model flag (the script harness) needs none. Otherwise a routing
+    policy without an enabled model for the harness is a refusal: the CLIs reject an
+    unknown model name, so guessing one would only produce a crash that says nothing
+    about the credential (AGY did exactly that, C5b live run), and reaching past the
+    policy in force to an older one would run a model the operator disabled.
     """
     if not adapter.capabilities().model_flag:
         return "none"
+    document, where = _routing_document(uow)
+    if document is None:
+        raise CredentialAdminError(
+            f"the probe needs the routing policy the policy in force names, and {where}; "
+            "put a policy in force that names a stored routing policy"
+        )
     order = {"small": 0, "mid": 1, "frontier": 2}
-    for document in _routing_documents(uow):
-        best: tuple[int, str] | None = None
-        for model in document.get("models", []):
-            if model.get("harness") == harness and model.get("enabled"):
-                rank = order.get(str(model.get("capability")), 3)
-                if best is None or rank < best[0]:
-                    best = (rank, str(model["id"]))
-        if best is not None:
-            return best[1]
-    raise CredentialAdminError(
-        f"no routing policy names an enabled model for harness {harness!r}; the probe "
-        "needs one (upload a routing policy or enable a model in it)"
-    )
+    best: tuple[int, str] | None = None
+    for model in document.get("models", []):
+        if model.get("harness") == harness and model.get("enabled"):
+            rank = order.get(str(model.get("capability")), 3)
+            if best is None or rank < best[0]:
+                best = (rank, str(model["id"]))
+    if best is None:
+        raise CredentialAdminError(
+            f"routing policy {where}, which the policy in force names, has no enabled "
+            f"model for harness {harness!r}; the probe needs one (enable a model for it, "
+            "or put a policy in force that names a routing policy with one). The probe "
+            "does not fall back to an older routing policy, because that would run a "
+            "model the operator disabled or removed"
+        )
+    return best[1]
 
 
 async def probe(
@@ -706,9 +728,27 @@ def rotate(
     staged = current.with_name(current.name + INCOMING_MARK + stamp)
     if incoming.resolve() == current.resolve():
         raise CredentialAdminError("the new directory is the configured directory itself")
-    # Stage beside the target so the final step is one rename on one filesystem.
-    shutil.copytree(incoming, staged, symlinks=False)
-    _tighten(staged)
+    # Stage beside the target so the final step is one rename on one filesystem. A copy
+    # or a chmod that fails leaves a full copy of the credential at `<path>.incoming-`,
+    # which no retention sweep matches, so it is shredded here instead of living on. The
+    # staging directory is created exclusively first, so what is shredded is only ever
+    # what this call made: the stamp is one second wide, and shredding a name that was
+    # already there would destroy another rotate's copy.
+    try:
+        os.mkdir(staged, 0o700)
+    except FileExistsError as exc:
+        raise CredentialAdminError(
+            f"a staging directory from an earlier rotate is already at {staged.name}; "
+            "leave it for the operator to look at rather than overwriting it"
+        ) from exc
+    try:
+        shutil.copytree(incoming, staged, symlinks=False, dirs_exist_ok=True)
+        _tighten(staged)
+    except Exception:
+        with contextlib.suppress(Exception):
+            if staged.is_dir():
+                shred_tree(staged, keep_root=False)
+        raise
     retired = current.with_name(current.name + RETIRED_MARK + stamp)
     _swap(ctx, current, retired, staged, principal=principal, harness=harness)
     state = uow.harnesses.get(harness)

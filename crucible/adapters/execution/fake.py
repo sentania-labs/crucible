@@ -287,6 +287,8 @@ class FakeProvider:
         self.discarded: list[str] = []
         # Harnesses the administrative probe was run for (25).
         self.probes: list[str] = []
+        # The whole request of each probe, so a test can see which model it would run.
+        self.probe_requests: list[ProbeRequest] = []
         # "completed", "timeout" or "auth_failure": what the next probe reports.
         self.probe_outcome = "completed"
         # What `list_images` answers: whatever a test hands it (08, 25).
@@ -505,6 +507,7 @@ class FakeProvider:
         instead, which is how a test sees the difference between a probe that decided
         nothing and one that decided the credential is bad."""
         self.probes.append(request.harness)
+        self.probe_requests.append(request)
         if self.probe_outcome == "auth_failure":
             return ProbeResult(
                 exit_code=1,

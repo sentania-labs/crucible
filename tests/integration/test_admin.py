@@ -8,6 +8,7 @@ is built at runtime.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import os
 import time
@@ -853,3 +854,263 @@ def credentials_module_probe(ctx: AdminContext, uow: Any, *, harness: str, reaso
     return credentials_module.probe(
         ctx, uow, principal="admin-principal", harness=harness, reason=reason
     )
+
+
+# ----- the second correction round --------------------------------------------------
+
+
+def test_a_login_that_cannot_run_refuses_with_the_credential_still_at_its_path(
+    admin_client: TestClient,
+    admin_ctx: AdminContext,
+    live_supervisor: Supervisor,
+    credential_root: Path,
+    tmp_path: Path,
+) -> None:
+    """The harness CLIs are in the worker images and not in the Crucible service image
+    (13), so on a normal deployment every login refuses on the missing executable. That
+    refusal used to happen after the retire, which renamed a valid credential out of the
+    configured path and left the retention sweep free to shred it. Nothing moves until
+    every precondition that can refuse has been checked."""
+    asyncio.run(live_supervisor.tick())
+    admin_ctx.login_commands["agy"] = (str(tmp_path / "no-such-cli"),)
+    before = {
+        path.relative_to(credential_root): path.read_bytes()
+        for path in (credential_root / "agy").rglob("*")
+        if path.is_file()
+    }
+    assert before, "the fixture credential is the thing under test"
+    refused = admin_client.post(
+        "/v1/admin/credentials/agy/login", json={"reason": "onboarding", "replace": True}
+    )
+    assert refused.status_code == 409, refused.text
+    assert "is not installed on this host" in refused.json()["detail"]
+    after = {
+        path.relative_to(credential_root): path.read_bytes()
+        for path in (credential_root / "agy").rglob("*")
+        if path.is_file()
+    }
+    assert after == before
+    assert not [p for p in credential_root.iterdir() if p.name.startswith("agy.retired-")]
+    # The credential is still the harness's credential: present at the configured path,
+    # not `absent`, which is what a retire with no login behind it would have left.
+    assert admin_client.get("/v1/admin/credentials/agy").json()["state"] != "absent"
+
+
+def test_a_start_that_fails_after_the_retire_puts_the_credential_back(
+    admin_ctx: AdminContext,
+    admin_client: TestClient,
+    live_supervisor: Supervisor,
+    credential_root: Path,
+) -> None:
+    """The failure path is safe, not merely unlikely: the retire is a rename and a rename
+    does not roll back with the transaction. A start that fails after a successful retire
+    renames the credential back and records the failure."""
+    from crucible.application.admin.login import start_login  # noqa: PLC0415
+
+    asyncio.run(live_supervisor.tick())
+    live = credential_root / "codex" / "auth.json"
+    before = live.read_text(encoding="utf-8")
+
+    class StartFails:
+        """Every precondition passes and the start itself falls over: the daemon thread
+        could not be created, the CLI vanished between the check and the spawn."""
+
+        def resolve(self, _ctx: AdminContext, _harness: str) -> tuple[str, ...]:
+            return ("codex",)
+
+        def start(self, _ctx: AdminContext, _harness: str, _directory: str) -> None:
+            raise RuntimeError("the login thread could not be started")
+
+        def get(self, _harness: str) -> None:
+            return None
+
+    with admin_ctx.uow_factory() as uow:
+        with pytest.raises(ApplicationError) as raised:
+            start_login(
+                admin_ctx,
+                uow,
+                StartFails(),  # type: ignore[arg-type]
+                principal="admin-principal",
+                harness="codex",
+                reason="onboarding",
+                replace=True,
+            )
+        # The caller's transaction rolls back with the exception and takes the retire
+        # event with it; the directory has to come back on its own.
+        uow.rollback()
+    assert "put back at its configured path" in str(raised.value.detail)
+    assert live.read_text(encoding="utf-8") == before
+    assert not [p for p in credential_root.iterdir() if p.name.startswith("codex.retired-")]
+    assert admin_client.get("/v1/admin/credentials/codex").json()["state"] != "absent"
+    refusals = [
+        e
+        for e in admin_client.get("/v1/admin/audit", params={"limit": 200}).json()["items"]
+        if e["kind"] == "admin_refused"
+    ]
+    assert any(
+        r["payload"]["operation"] == "credentials login codex"
+        and "renamed back to the configured path" in r["payload"]["detail"]
+        for r in refusals
+    ), refusals
+
+
+def test_the_probe_uses_the_model_of_the_routing_policy_in_force(
+    admin_client: TestClient,
+    live_supervisor: Supervisor,
+    provider: FakeProvider,
+) -> None:
+    """The seeded `default-software` version 2 names `default-routing` version 2, whose
+    cheapest enabled codex model is `gpt-5.6-luna`."""
+    asyncio.run(live_supervisor.tick())
+    response = admin_client.post("/v1/admin/credentials/codex/probe", json={"reason": "onboarding"})
+    assert response.status_code == 200, response.text
+    assert provider.probe_requests[-1].harness == "codex"
+    assert "gpt-5.6-luna" in provider.probe_requests[-1].argv
+
+
+def test_the_probe_refuses_rather_than_falling_back_to_a_retired_model(
+    admin_ctx: AdminContext,
+    live_supervisor: Supervisor,
+    provider: FakeProvider,
+) -> None:
+    """The probe took its model from the routing policy the policy in force names and
+    then from the seeded `default-routing` versions 2 and 1, so a policy in force with no
+    enabled model for a harness silently ran a model the operator had disabled or
+    removed. Only the policy in force decides, and no enabled model for the harness in it
+    is a refusal.
+
+    The policy in force is put in place inside a transaction that is rolled back: the
+    policy tables are not truncated between tests, and a superseding version with a
+    disabled harness would be in force for every test that follows."""
+    from crucible.application.admin.credentials import (  # noqa: PLC0415
+        _probe_model,
+        adapter_for,
+    )
+    from crucible.domain.entities import Policy, RoutingPolicyRecord  # noqa: PLC0415
+
+    asyncio.run(live_supervisor.tick())
+    now = SystemClock().now()
+    with admin_ctx.uow_factory() as uow:
+        seeded_routing = uow.routing_policies.get("default-routing", 2)
+        assert seeded_routing is not None
+        routing = copy.deepcopy(seeded_routing.document)
+        routing["version"] = 99
+        for model in routing["models"]:
+            if model["harness"] == "codex":
+                model["enabled"] = False
+        uow.routing_policies.put(
+            RoutingPolicyRecord(
+                name="default-routing", version=99, document=routing, created_at=now
+            )
+        )
+        seeded_policy = uow.policies.get("default-software", 2)
+        assert seeded_policy is not None
+        policy = copy.deepcopy(seeded_policy.document)
+        policy["version"] = 99
+        policy["routing"]["policy"] = {"name": "default-routing", "version": 99}
+        uow.policies.put(
+            Policy(name="default-software", version=99, document=policy, created_at=now)
+        )
+        probes_before = len(provider.probe_requests)
+        # Through the service the operator calls, not just the selector inside it.
+        with pytest.raises(ApplicationError) as raised:
+            asyncio.run(
+                credentials_module_probe(
+                    admin_ctx, uow, harness="codex", reason="after retiring the codex models"
+                )
+            )
+        detail = str(raised.value.detail)
+        assert "default-routing version 99" in detail and "no enabled model" in detail
+        assert "does not fall back" in detail
+        # No fallback: a seeded model the policy in force does not name is never reached.
+        assert "gpt-5.6-luna" not in detail
+        # A harness the policy in force still enables takes its model from that policy.
+        assert (
+            _probe_model(uow, adapter_for(admin_ctx, "claude_code"), "claude_code")
+            == "claude-haiku-4-5"
+        )
+        uow.rollback()
+    # The refusal happened before the provider was asked to run anything.
+    assert len(provider.probe_requests) == probes_before
+
+
+def test_a_read_only_credential_directory_is_still_replaceable(
+    admin_client: TestClient,
+    live_supervisor: Supervisor,
+    credential_root: Path,
+) -> None:
+    """A replacement renames the directory aside and the CLI creates a fresh one, so only
+    the credential root has to be writable. Requiring the directory itself refused an
+    operator who deliberately holds a credential directory read-only, and it refused with
+    a reason that was not the real precondition.
+
+    The refusal each precondition gives is its own: an existing credential with no
+    `replace` is refused for being an existing credential, not for a mode."""
+    asyncio.run(live_supervisor.tick())
+    live = credential_root / "claude_code"
+    old_token = (live / "oauth-token").read_text(encoding="utf-8")
+    live.chmod(0o500)
+    try:
+        refused = admin_client.post(
+            "/v1/admin/credentials/claude_code/login", json={"reason": "onboarding"}
+        )
+        assert refused.status_code == 409, refused.text
+        detail = refused.json()["detail"]
+        assert "already passes the shape check" in detail
+        assert "not writable" not in detail
+
+        started = admin_client.post(
+            "/v1/admin/credentials/claude_code/login",
+            json={"reason": "onboarding", "replace": True},
+        )
+        assert started.status_code == 200, started.text
+        retained = started.json()["retained_as"]
+        assert retained.startswith("claude_code.retired-")
+        for _ in range(100):
+            state = admin_client.get("/v1/admin/credentials/claude_code/login").json()
+            if state["state"] == "waiting_for_code":
+                break
+            time.sleep(0.05)
+        admin_client.post(
+            "/v1/admin/credentials/claude_code/login/code", json={"code": "ABCD-EFGH"}
+        )
+        for _ in range(100):
+            state = admin_client.get("/v1/admin/credentials/claude_code/login").json()
+            if state["state"] in ("finished", "failed"):
+                break
+            time.sleep(0.05)
+        assert state["state"] == "finished", state
+        # The credential is at its configured path, and it is the new one.
+        new_token = (live / "oauth-token").read_text(encoding="utf-8")
+        assert new_token.strip() and new_token != old_token
+        assert (credential_root / retained / "oauth-token").read_text(encoding="utf-8") == old_token
+        assert admin_client.get("/v1/admin/credentials/claude_code").json()["state"] != "absent"
+    finally:
+        # The temporary tree has to be removable again whatever the test did.
+        for path in (live, *credential_root.glob("claude_code.retired-*")):
+            if path.is_dir():
+                path.chmod(0o700)
+
+
+def test_a_login_that_reuses_an_unwritable_directory_says_so(
+    admin_client: TestClient,
+    live_supervisor: Supervisor,
+    credential_root: Path,
+) -> None:
+    """The directory check still exists for the path that keeps it: nothing at the
+    configured path passes the shape check, so the login writes into the directory as it
+    stands, and an unwritable one is refused for exactly that."""
+    asyncio.run(live_supervisor.tick())
+    live = credential_root / "codex"
+    (live / "auth.json").unlink()
+    live.chmod(0o500)
+    try:
+        refused = admin_client.post(
+            "/v1/admin/credentials/codex/login", json={"reason": "onboarding"}
+        )
+        assert refused.status_code == 409, refused.text
+        detail = refused.json()["detail"]
+        assert "is not writable" in detail and str(live) in detail
+        assert "already passes the shape check" not in detail
+    finally:
+        live.chmod(0o700)
