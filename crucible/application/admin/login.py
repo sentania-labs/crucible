@@ -30,6 +30,7 @@ from crucible.application.admin.context import (
     admin_event,
     guard_mutation,
     record_refusal,
+    refuse_secret_shaped,
 )
 from crucible.application.admin.credentials import (
     RETIRED_MARK,
@@ -343,19 +344,28 @@ class LoginRegistry:
         return argv
 
     def start(self, ctx: AdminContext, harness: str, directory: str) -> LoginSession:
-        self.resolve(ctx, harness)
+        argv = self.resolve(ctx, harness)
         flow = FLOWS[harness]
         session = LoginSession(harness=harness, started_at=time.time())
         self._sessions[harness] = session
         thread = threading.Thread(
             target=self._run,
-            args=(flow, directory, session, ctx.login_commands.get(harness)),
+            args=(flow, directory, session, argv),
             kwargs={"timeout": ctx.login_timeout_seconds},
             daemon=True,
             name=f"login-{harness}",
         )
         self._threads[harness] = thread
-        thread.start()
+        try:
+            thread.start()
+        except Exception as exc:
+            # A registered session that never reaches a terminal state refuses every later
+            # login for the harness as one already in progress (correction 17), and a
+            # thread that could not be created is exactly that case.
+            session.state = "failed"
+            session.error = f"the login thread could not be started: {type(exc).__name__}"
+            self._threads.pop(harness, None)
+            raise
         return session
 
     @staticmethod
@@ -410,8 +420,11 @@ def start_login(
     flow = FLOWS[harness]
     # Every refusal first: the harness is known, the credential spec and directory are
     # configured, the CLI exists, no login is already running, the directory can be
-    # written, and `replace` is set when a credential is there to be replaced.
-    registry.resolve(ctx, harness)
+    # written, and `replace` is set when a credential is there to be replaced. The event
+    # this call ends with refuses a secret-shaped payload, so its one configured field is
+    # scanned here too rather than after the credential has moved.
+    argv = registry.resolve(ctx, harness)
+    refuse_secret_shaped(" ".join(argv), field="login command")
     _check_writable(source, harness=harness)
     replaceable = _check_replaceable(spec, source, harness=harness, replace=replace)
     retired = (
@@ -424,18 +437,19 @@ def start_login(
     except Exception as exc:
         if retired is None:
             raise
-        _restore_retired(
-            ctx,
-            source,
-            retired,
-            principal=principal,
-            harness=harness,
-            detail=f"{type(exc).__name__}: {exc}",
+        restored = _restore_retired(
+            ctx, source, retired, principal=principal, harness=harness, failure=type(exc).__name__
         )
         raise CredentialAdminError(
-            f"the {harness} login could not start ({type(exc).__name__}) after the "
-            "existing credential had been retired, so it was put back at its configured "
-            f"path: {exc}"
+            f"the {harness} login could not start ({type(exc).__name__}) after the existing "
+            + (
+                "credential had been retired, so it was put back at its configured path"
+                if restored
+                else f"credential had been retired, and it could not be put back: it is at "
+                f"{retired} and the configured path is not the credential. Move it back or "
+                "rotate a prepared directory in before the retention sweep shreds it"
+            )
+            + f": {exc}"
         ) from exc
     admin_event(
         uow,
@@ -447,7 +461,7 @@ def start_login(
         after=None,
         harness=harness,
         window=flow.window,
-        command=list(ctx.login_commands.get(harness) or flow.argv),
+        command=list(argv),
         retained_as=retired,
     )
     return {
@@ -461,7 +475,9 @@ def start_login(
 def _check_writable(source: Any, *, harness: str) -> None:
     """The login creates the directory and the retire renames it, both inside the
     parent. A parent that cannot be written is a refusal, and it is one that has to be
-    raised before the retire rather than discovered by it."""
+    raised before the retire rather than discovered by it. `os.access` answers for the
+    real uid, so this is the clear message rather than a guarantee: the rename itself is
+    still the authority, which is why a failed start is restored."""
     current = Path(source.path)
     parent = current.parent
     if not parent.is_dir():
@@ -484,7 +500,8 @@ def _check_writable(source: Any, *, harness: str) -> None:
 def _check_replaceable(spec: Any, source: Any, *, harness: str, replace: bool) -> bool:
     """Whether a credential that still passes the shape check is at the configured path,
     and therefore has to be retired before the login writes over it. Refuses when one is
-    there and `replace` was not given. Reads nothing and moves nothing."""
+    there and `replace` was not given. Moves nothing: the shape check parses the named
+    auth files and no value leaves it (12)."""
     current = Path(source.path)
     if not current.is_dir() or not check_shape(spec, source.path).ok:
         return False
@@ -535,41 +552,50 @@ def _restore_retired(
     *,
     principal: str,
     harness: str,
-    detail: str,
-) -> None:
+    failure: str,
+) -> bool:
     """The start failed after the credential had been moved aside, so put it back at the
     configured path: a credential is never left off its path because a later step failed.
+    Returns whether it is back, because the caller's message to the operator is only true
+    if it is.
 
     The caller's transaction rolls back with the exception and takes the retire event with
     it, but a rename does not roll back, so the undo is here and the failure is recorded
-    through a unit of work of its own, the way a failed rotate records its own."""
+    through a unit of work of its own, the way a failed rotate records its own.
+
+    Nothing at the configured path is removed to make room. A concurrent login that has
+    already created the directory owns it, and renaming the retained copy over it would
+    mix two credentials; the operator is told instead, which is recoverable, while a
+    destroyed directory is not."""
     current = Path(source.path)
     retired = current.with_name(retired_name)
     restored = False
+    problem = ""
     try:
-        if retired.is_dir():
-            if current.is_dir() and not any(current.iterdir()):
-                # Nothing has been written into it yet; the login never ran.
-                current.rmdir()
-            if not current.exists():
-                os.rename(retired, current)
-                restored = True
+        if not retired.is_dir():
+            problem = "the retired directory is not where it was left"
+        elif current.exists():
+            problem = "something else is at the configured path already"
+        else:
+            os.rename(retired, current)
+            restored = True
     except OSError as exc:
-        detail = f"{detail}; the credential could not be put back: {type(exc).__name__}"
+        problem = f"the rename back failed with {type(exc).__name__}"
     record_refusal(
         ctx,
         principal=principal,
         operation=f"credentials login {harness}",
         detail=(
-            f"the login failed to start after the credential was retired ({detail}); "
+            f"the login failed to start ({failure}) after the credential was retired; "
             + (
                 f"{retired_name} was renamed back to the configured path"
                 if restored
-                else f"{retired_name} is still retired and the configured path is not "
-                "the credential"
+                else f"{retired_name} is still retired and the configured path is not the "
+                f"credential, because {problem}"
             )
         ),
     )
+    return restored
 
 
 def login_status(registry: LoginRegistry, harness: str) -> dict[str, Any]:

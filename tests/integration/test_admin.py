@@ -1012,8 +1012,13 @@ def test_the_probe_refuses_rather_than_falling_back_to_a_retired_model(
             Policy(name="default-software", version=99, document=policy, created_at=now)
         )
         probes_before = len(provider.probe_requests)
+        # Through the service the operator calls, not just the selector inside it.
         with pytest.raises(ApplicationError) as raised:
-            _probe_model(uow, adapter_for(admin_ctx, "codex"), "codex")
+            asyncio.run(
+                credentials_module_probe(
+                    admin_ctx, uow, harness="codex", reason="after retiring the codex models"
+                )
+            )
         detail = str(raised.value.detail)
         assert "default-routing version 99" in detail and "no enabled model" in detail
         assert "does not fall back" in detail

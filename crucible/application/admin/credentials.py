@@ -510,19 +510,29 @@ def _routing_document(uow: UnitOfWork) -> tuple[dict[str, Any] | None, str]:
     fell through to an older seeded policy and the probe ran a model the operator had
     disabled or removed. A routing policy that is not the one in force is not a fallback;
     it is a policy the operator superseded."""
-    versions = list(uow.policies.list_versions("default-software"))
+    versions = [p for p in uow.policies.list_versions("default-software") if p.retired_at is None]
     if not versions:
         return None, "no default-software policy is in force"
     newest = max(versions, key=lambda p: p.version)
-    ref = newest.document.get("routing", {}).get("policy", {})
+    routing = newest.document.get("routing") or {}
+    ref = routing.get("policy") if isinstance(routing, dict) else None
     if not (isinstance(ref, dict) and ref.get("name") and ref.get("version") is not None):
         return None, f"default-software version {newest.version} names no routing policy"
-    name, version = str(ref["name"]), int(ref["version"])
+    name = str(ref["name"])
+    try:
+        version = int(ref["version"])
+    except (TypeError, ValueError):
+        return None, (
+            f"default-software version {newest.version} names routing policy {name} with a "
+            "version that is not a number"
+        )
     record = uow.routing_policies.get(name, version)
-    if record is None:
+    if record is None or record.retired_at is not None:
+        # A retired routing policy is one the operator took out of service, which is one
+        # of the two ways they retire a model; it is not in force either.
         return None, (
             f"routing policy {name} version {version}, which default-software version "
-            f"{newest.version} names, is not stored"
+            f"{newest.version} names, is " + ("retired" if record is not None else "not stored")
         )
     return record.document, f"{name} version {version}"
 
@@ -720,9 +730,19 @@ def rotate(
         raise CredentialAdminError("the new directory is the configured directory itself")
     # Stage beside the target so the final step is one rename on one filesystem. A copy
     # or a chmod that fails leaves a full copy of the credential at `<path>.incoming-`,
-    # which no retention sweep matches, so it is shredded here instead of living on.
+    # which no retention sweep matches, so it is shredded here instead of living on. The
+    # staging directory is created exclusively first, so what is shredded is only ever
+    # what this call made: the stamp is one second wide, and shredding a name that was
+    # already there would destroy another rotate's copy.
     try:
-        shutil.copytree(incoming, staged, symlinks=False)
+        os.mkdir(staged, 0o700)
+    except FileExistsError as exc:
+        raise CredentialAdminError(
+            f"a staging directory from an earlier rotate is already at {staged.name}; "
+            "leave it for the operator to look at rather than overwriting it"
+        ) from exc
+    try:
+        shutil.copytree(incoming, staged, symlinks=False, dirs_exist_ok=True)
         _tighten(staged)
     except Exception:
         with contextlib.suppress(Exception):

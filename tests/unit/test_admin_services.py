@@ -9,6 +9,7 @@ import json
 import os
 import stat
 import subprocess
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -284,6 +285,32 @@ def test_the_registry_refuses_a_login_whose_cli_is_not_installed_and_accepts_a_r
         else:  # pragma: no cover - the binary does not exist
             raise AssertionError("the registry started a login with no CLI")
     assert registry.get("codex") is None
+
+
+def test_a_thread_that_cannot_start_leaves_no_login_in_progress(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """The registry records the session before it starts the thread, so a thread that
+    cannot be created used to leave a session in `starting` for ever and refuse every
+    later login for that harness as one already in progress (correction 17's failure mode,
+    reached by the other path)."""
+    from crucible.application.admin.login import LoginRegistry  # noqa: PLC0415
+
+    cli = fake_cli(tmp_path, "fake-login", "#!/bin/bash\nexit 0\n")
+    ctx = _bare_context(login_commands={"codex": (cli,)})
+    registry = LoginRegistry()
+
+    def no_thread(self: Any) -> None:
+        raise RuntimeError("cannot create a thread")
+
+    monkeypatch.setattr(threading.Thread, "start", no_thread)
+    with pytest.raises(RuntimeError):
+        registry.start(ctx, "codex", str(tmp_path / "codex"))
+    session = registry.get("codex")
+    assert session is not None and session.state == "failed"
+    # The next attempt is refused on its own merits, not as one already in progress.
+    monkeypatch.undo()
+    registry.start(ctx, "codex", str(tmp_path / "codex"))
 
 
 def test_a_session_that_raises_in_its_thread_still_ends_terminal(tmp_path: Path) -> None:
