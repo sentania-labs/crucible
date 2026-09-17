@@ -93,19 +93,19 @@ instead of a bearer token (below).
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET/PUT | `/policies/{name}/{version}` | Read or upload a policy document. Versions are immutable once referenced. |
+| GET/PUT | `/policies/{name}/{version}` | Read or upload a policy document. Versions are immutable once referenced. The shipped seed is `default-software` version 2, which names `default-routing` version 2 (05b); version 1 stays beside it for the tasks admitted under it. Where an endpoint takes a policy without a version, the newest version applies. |
 | GET/PUT | `/repositories/{name}` | Register a target repository: URL, installation reference, default branch, policy, and the operator's attestation that the external reviewer reviews all pull requests there (23). Admin. Never carries a credential. |
 | GET | `/harnesses` | Supported harnesses: adapter supported version range, installed versions per image, credential requirements, capability flags. |
 | GET | `/images` | Worker images known to Crucible: harness, version, digest, promotion state. |
 | POST | `/images/{digest}/promote` | Set promotion state (`default`, `retained`, `retired`). Admin; records the decision. |
 | GET | `/providers` | Registered execution providers and their capabilities. |
 | GET/PUT | `/routing/{name}/{version}` | Read or upload a routing policy (05b). Admin. |
-| GET | `/routing/usage` | Per-pool usage in the current window, from AttemptMetrics. |
+| GET | `/routing/usage` | Per-pool usage in the current window, from AttemptMetrics, read through the routing policy the newest version of the named policy points at; `?policy_version=` selects another. |
 | GET | `/routing/history` | Per-model outcomes: `?model=&project=&since=`; wall time, cost where reported, exit class, gates passed, corrections, acceptance. Foundry reads this before selecting. |
 
 ### Administration
 
-`/v1/admin/*`, admin role, versioned with the rest: status, harnesses, credentials (validate, probe, login, rotate, remove), images, providers, github, repositories, audit. Detail in 25. `GET /v1/capabilities` gives orchestrator principals the sanitized read-only subset Foundry needs to report an unavailable capability.
+`/v1/admin/*`, admin role, versioned with the rest: status, harnesses, credentials (validate, probe, login, rotate, remove), images, providers, github, repositories, audit. Every mutation there takes a reason and needs a live supervisor lease, and repository registration through `PUT /v1/admin/repositories/{name}` is one of them; the `PUT /repositories/{name}` above is the older non-administrative form and is unchanged. Detail in 25. `GET /v1/capabilities` gives orchestrator principals the sanitized read-only subset Foundry needs to report an unavailable capability.
 
 ### GitHub ingress
 

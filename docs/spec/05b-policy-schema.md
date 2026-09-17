@@ -9,8 +9,8 @@ default in code. The values below are the operator's initial defaults
 ```yaml
 schema_version: "1.0"
 name: "default-software"
-version: 1
-description: "Software repositories consumed by something else: branch, PR, merge, tag."
+version: 2                             # version 1 is the same document naming routing version 1
+description: "Software repositories consumed by something else: branch, PR, merge, tag."   # the seeded row's own description names the version and what changed in it
 
 limits:
   timeout_seconds: { min: 300, max: 14400, default: 3600 }
@@ -47,7 +47,7 @@ network:
   harness_endpoints: "from-harness"    # each adapter contributes its model endpoints (S6)
 
 routing:                               # see RoutingPolicyV1 below; this names which one applies
-  policy: { name: "default-routing", version: 1 }   # the shipped default-software v1 names v1; see below
+  policy: { name: "default-routing", version: 2 }   # default-software v2 names routing v2; v1 named routing v1
 
 images:
   allowlist: ["crucible-worker:*", "ghcr.io/sentania-labs/crucible-worker:*"]
@@ -256,11 +256,14 @@ carry `endpoint: local` and an `endpoint_url` on the DGX Spark and the RTX
 for them below already hold.
 
 Model ids are what the harness accepts. Which routing version a deployment
-uses is the policy's own choice, and today's shipped `default-software`
-version 1 names `default-routing` version 1. A `default-software` version 2
-naming `default-routing` version 2 is the pending step (C5b), once the
-operator settles the cost classes; until it is uploaded, version 2 is seeded
-and available but not in force. The Codex pool in version 2 is exactly the
+uses is the policy's own choice. `default-software` version 2, seeded by
+migration 0009 (C5b), is version 1's document naming `default-routing`
+version 2, and it is the version the shipped example policy, the example
+contract, the compose smoke, the fixtures, and the tiers all reference, so
+the verified roster is what a fresh deployment routes with. Version 1 stays
+beside it naming `default-routing` version 1, because a policy version is
+immutable once referenced. Where a caller names no version, the newest
+version of the policy is the one that applies. The Codex pool in version 2 is exactly the
 operator's roster decision: `gpt-5.6-luna` small, `gpt-5.6-terra` mid, `gpt-5.6-sol` and
 `gpt-6-astra` frontier. Nothing older and no mini; `gpt-5.5` is a recorded
 fallback outside the pool. The ids come from the CLI's own listing, the cost
