@@ -46,8 +46,14 @@ supervisor held the lease; it is written outside the refused caller's
 transaction, since that transaction rolls back, and best effort, since a
 refusal is never made worse by a failure to record it. Harness enable and
 disable keep the `harness_enabled` and `harness_disabled` kinds above.
-`GET /admin/audit` is this stream filtered to those kinds and nothing else:
-there is no second administrative log. Events are
+
+`GET /admin/audit` is this stream filtered to the kinds an administrator
+caused, and there is no second administrative log. The filter is the ten
+kinds above plus `harness_enabled` and `harness_disabled`, `principal_created`,
+`repository_registered` and `repository_attestation_recorded`, and
+`policy_uploaded` and `routing_policy_uploaded`: administration is wider than
+the credential surface, and a client that assumed only the credential kinds
+would reject valid pages. Events are
 never updated or deleted. Retention: forever in v0.x (volume is small); archival to object
 storage is a later policy.
 

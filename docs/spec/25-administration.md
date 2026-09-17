@@ -251,9 +251,33 @@ collapses the authority boundary between them.
 
 Read `/v1/admin/status` parts that its role permits (orchestrator role
 gets `harnesses`, `providers`, `github` health, `workers`, `tasks`, `wakes`
-read-only through `GET /v1/capabilities`, reduced to harness and image
-enablement, provider and GitHub reachability, and counts of workers, tasks
-and wakes: no path, no fingerprint, no auth file name, no expiry time), and
-report to the operator that
+read-only through `GET /v1/capabilities`), and report to the operator that
 a harness is disabled, a credential is invalid or unverified, or a provider
 is unavailable. It never calls the mutation endpoints.
+
+`GET /v1/capabilities` is the status document's `harnesses`, `providers`,
+`github`, `workers`, `tasks` and `wakes` parts, with two reductions and
+nothing else removed:
+
+- each harness keeps both enablement gates and their reasons, its supported
+  range, its concurrency limit and use, its last launch outcome, and the
+  images known for it with their references, versions, digests and promotion
+  states, but its credential is reduced to `state` and
+  `session_compatibility`. No path, no fingerprint, no auth file name, no
+  expiry, no validation timestamp;
+- `github` is reduced to whether an App is configured, whether its key is
+  present, and per registered repository whether the installation covers it.
+  No App id, no key fingerprint, no mint or failure timestamps.
+
+`workers`, `tasks` and `wakes` are the status document's own parts, not
+counts: the active attempts with attempt and task ids, external id, state,
+harness, model, image digest, start time and last heartbeat; task counts by
+state together with the id, external id and update time of every task in
+`blocked`, `pre_pr_gates_failed`, `publish_failed`,
+`ci_certification_failed` and `head_diverged`; and pending wakes as a count
+per principal with the oldest pending timestamp and the total unacked. That
+is what an orchestrator needs to say which of its tasks is stuck and why,
+and it is its own work: the ids, models and image digests are of tasks it
+submitted and attempts Crucible ran for them. Nothing in the response is a
+credential, a token, a key, a path, or a file name, and the view is
+read-only.
