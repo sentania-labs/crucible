@@ -471,3 +471,103 @@ def test_the_wrapper_with_nothing_on_stdin_closes_it(tmp_path: Path) -> None:
     completed = run_wrapper(tmp_path, [str(harness), "a"], {})
     assert completed.returncode == 0
     assert "STDIN<>" in completed.stdout and "ARGS<a>" in completed.stdout
+
+
+# ----- what a worker can leave at the credential path (review findings) ----------
+
+
+class ReadBackClient(StubClient):
+    """A stub whose archive read-back answers with what the worker left behind."""
+
+    def __init__(self, answer: Any) -> None:
+        super().__init__()
+        self.answer = answer
+        self.logs_calls = 0
+
+    def get_archive(self, container_id: str, path: str, *, limit: int = 1024 * 1024) -> Any:
+        return self.answer
+
+    def container_logs(self, container_id: str, **kw: Any) -> list[Any]:
+        return []
+
+    def list_containers(self, **kw: Any) -> list[dict[str, Any]]:
+        return []
+
+    def wait_container(self, container_id: str, *, timeout: float) -> int:
+        return 0
+
+
+async def _sync_with(tmp_path: Path, answer: Any) -> Any:
+    from crucible.ports.execution import Handle  # noqa: PLC0415
+
+    source = codex_source(tmp_path)
+    client = ReadBackClient(answer)
+    provider = DockerProvider(
+        config(tmp_path, codex=CredentialSource(str(source))),
+        client=client,  # type: ignore[arg-type]
+    )
+    launch = spec()
+    ws = workspace(tmp_path, launch.attempt_id)
+    handle = Handle(provider="docker", ref="worker", attempt_id=launch.attempt_id)
+    before = (source / "auth.json").read_bytes()
+    sync = await provider._sync_credential(handle, ws, launch)
+    assert (source / "auth.json").read_bytes() == before, "the source was never written"
+    assert sync is not None
+    return sync.files[0]
+
+
+async def test_an_oversized_read_back_is_never_parsed(tmp_path: Path) -> None:
+    from crucible.adapters.execution.dockerapi import ArchiveFile  # noqa: PLC0415
+
+    result = await _sync_with(tmp_path, ArchiveFile(b"", {"mode": 0o600}, truncated=True))
+    assert result.changed and not result.valid and not result.synced
+    assert "read limit" in result.reason
+
+
+async def test_a_symlink_at_the_credential_path_is_refused_by_the_stat_header(
+    tmp_path: Path,
+) -> None:
+    from crucible.adapters.execution.dockerapi import ArchiveFile  # noqa: PLC0415
+
+    # A tar whose one member claims to be a regular file, as the daemon would return
+    # for a followed link; the stat header says symlink and that is what decides.
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as tar:
+        payload = json.dumps({"tokens": {}, "last_refresh": "2027-01-01T00:00:00Z"}).encode()
+        info = tarfile.TarInfo("auth.json")
+        info.size = len(payload)
+        tar.addfile(info, io.BytesIO(payload))
+    symlink_mode = 1 << 27
+    result = await _sync_with(
+        tmp_path, ArchiveFile(buffer.getvalue(), {"mode": symlink_mode | 0o777}, truncated=False)
+    )
+    assert result.changed and not result.valid and not result.synced
+    assert "not a regular file" in result.reason
+
+
+def test_the_archive_stat_header_is_decoded_and_a_regular_file_recognized() -> None:
+    import base64  # noqa: PLC0415
+
+    from crucible.adapters.execution.dockerapi import ArchiveFile, _path_stat  # noqa: PLC0415
+
+    header = base64.b64encode(json.dumps({"name": "auth.json", "mode": 0o600}).encode()).decode()
+    assert ArchiveFile(b"", _path_stat(header)).is_regular
+    assert not ArchiveFile(b"", _path_stat(None)).is_regular
+    assert not ArchiveFile(b"", {"mode": (1 << 31) | 0o755}).is_regular
+    assert _path_stat("not base64!!") == {}
+
+
+def test_rw_narrow_policy_set_matches_the_adapters_declared_minimums() -> None:
+    """policies.py validates the concurrency cap from a static set; the launch-time cap
+    comes from each adapter's minimum. The two must agree or a harness could be
+    validated at a cap its credential handling does not allow."""
+    from crucible.adapters.harness.registry import default_registry  # noqa: PLC0415
+    from crucible.application.policies import RW_NARROW_HARNESSES  # noqa: PLC0415
+
+    declared = {
+        adapter.name
+        for adapter in default_registry()
+        if (credential := adapter.credential_spec()) is not None
+        and credential.minimum_mode is MountMode.RW_NARROW
+    }
+    assert declared == RW_NARROW_HARNESSES

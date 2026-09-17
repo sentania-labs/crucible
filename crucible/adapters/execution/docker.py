@@ -806,13 +806,32 @@ class DockerProvider:
         for auth in copy.spec.auth_files:
             inside = f"{copy.spec.mount_target}/{auth.name}"
             try:
-                raw = await self._call(self.client.get_archive, h.ref, inside)
+                archive = await self._call(self.client.get_archive, h.ref, inside)
             except DockerApiError as exc:
                 files.append(
                     CredentialFileSync(auth.name, False, False, False, False, f"read failed: {exc}")
                 )
                 continue
-            data = _single_file(raw) if raw else None
+            if archive is not None and archive.truncated:
+                # A worker owns its copy and left something larger than any auth file
+                # at this path. Nothing that size is parsed, let alone written back.
+                files.append(
+                    CredentialFileSync(
+                        auth.name, True, True, False, False, "changed; larger than the read limit"
+                    )
+                )
+                continue
+            if archive is not None and archive.stat and not archive.is_regular:
+                # The daemon says the path is not a regular file. A symlink here is a
+                # worker substituting some other file's bytes for its credential; the
+                # bytes are not looked at and the source is left alone.
+                files.append(
+                    CredentialFileSync(
+                        auth.name, True, True, False, False, "changed; not a regular file"
+                    )
+                )
+                continue
+            data = _single_file(archive.tar) if archive is not None else None
             if data is None:
                 files.append(
                     CredentialFileSync(
