@@ -8,7 +8,9 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import text
 
+from crucible.adapters.api.deps import AppContext
 from crucible.adapters.execution.fake import FakeProvider
 from crucible.application.supervisor import Supervisor
 from crucible.domain.gates import GateName
@@ -155,7 +157,7 @@ async def test_a_lost_review_execution_does_not_strand_the_task(
 
 
 async def test_a_review_execution_refused_by_the_quota_does_not_strand_the_task(
-    ctx: Any, provider: FakeProvider, client: TestClient, tokens: dict[str, str]
+    ctx: AppContext, provider: FakeProvider, client: TestClient, tokens: dict[str, str]
 ) -> None:
     """05b: the authoritative pool check happens at launch. A refused review execution
     ends on the review path like any other, rather than attempting `reported`."""
@@ -180,14 +182,9 @@ async def test_a_review_execution_refused_by_the_quota_does_not_strand_the_task(
         client.put("/v1/policies/default-software/2", json=policy, headers=admin).status_code == 200
     )
 
-    with ctx.uow_factory() as uow:
-        execution = uow.executions.list_for_task(task_id)[0]
-        execution.policy_snapshot = policy
-        uow.session.get(type(uow.session.get.__self__), None) if False else None
-    # The review execution snapshots the policy the task names, so point the task at v2.
+    # The review execution snapshots the policy the task names, so point the task at the
+    # version whose pool is now tight. `tasks` is the API role's table (14).
     with ctx.engine.begin() as conn:
-        from sqlalchemy import text  # noqa: PLC0415
-
         conn.execute(text("UPDATE tasks SET policy_version = 2 WHERE id = :id"), {"id": task_id})
 
     assert (
