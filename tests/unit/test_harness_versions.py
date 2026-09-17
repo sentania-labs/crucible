@@ -4,7 +4,15 @@ from __future__ import annotations
 
 import pytest
 
-from crucible.application.harnesses import REGISTRY, check_image_version, egress_allowlist
+from crucible.adapters.harness.registry import default_registry
+from crucible.application.harnesses import check_image_version as _check
+from crucible.application.harnesses import egress_allowlist
+
+REGISTRY = default_registry()
+
+
+def check_image_version(harness: str, labels: dict[str, str]):  # type: ignore[no-untyped-def]
+    return _check(REGISTRY, harness, labels)
 
 
 def labels(harness: str, version: str) -> dict[str, str]:
@@ -44,16 +52,16 @@ def test_an_unparsable_version_is_refused() -> None:
 
 
 def test_the_script_harness_is_declared_for_the_e2e_tier() -> None:
-    spec = REGISTRY["script-harness"]
-    assert spec.supports("1.0.0")
+    adapter = REGISTRY.require("script-harness")
+    assert adapter.supported_versions.supports("1.0.0")
     # 18: no model, so no endpoint it must reach.
-    assert spec.endpoints == ()
+    assert adapter.capabilities().endpoints == ()
 
 
 def test_the_allowlist_is_the_union_of_policy_and_adapter_endpoints() -> None:
     """13: the worker allowlist is the policy's list plus the adapter's endpoints (S6)."""
-    hosts = egress_allowlist("claude_code", ["github.com", "pypi.org"], [])
+    hosts = egress_allowlist(REGISTRY, "claude_code", ["github.com", "pypi.org"], [])
     assert hosts == ("api.anthropic.com", "github.com", "pypi.org")
     # A local model endpoint the routing policy names is added for that attempt (05b).
-    hosts = egress_allowlist("codex", ["github.com"], ["spark.example.internal"])
+    hosts = egress_allowlist(REGISTRY, "codex", ["github.com"], ["spark.example.internal"])
     assert "spark.example.internal" in hosts and "api.openai.com" in hosts

@@ -16,6 +16,12 @@ _PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("private_key_header", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
     ("bearer_token", re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{20,}", re.IGNORECASE)),
     ("aws_access_key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    # The shapes the three harness CLIs write into their auth files (12, S1, S1b): the
+    # Claude Code long-lived token, the Google OAuth access and refresh tokens AGY keeps
+    # beside a JWT id token (the jwt pattern below covers that one and Codex's tokens).
+    ("anthropic_oauth_token", re.compile(r"\bsk-ant-[A-Za-z0-9_-]{20,}")),
+    ("google_oauth_access_token", re.compile(r"\bya29\.[A-Za-z0-9._-]{20,}")),
+    ("google_oauth_refresh_token", re.compile(r"\b1//[A-Za-z0-9_-]{20,}")),
     ("openai_style_key", re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b")),
     ("slack_token", re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}\b")),
     ("jwt", re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b")),
