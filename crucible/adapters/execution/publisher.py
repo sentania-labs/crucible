@@ -83,6 +83,7 @@ class DockerPublisher:
         script = scripts.publisher_script(
             clone_url=request.repository_url,
             work_branch=request.work_branch,
+            base_ref=request.base_ref,
             expected_head=request.expected_head,
             author_name=request.author_name,
             author_email=request.author_email,
@@ -108,7 +109,13 @@ class DockerPublisher:
         exit_code = -1
         try:
             try:
-                check_create(body, self._provider._create_policy(request_spec(request)))
+                # The image is the attempt's own resolved digest, which the policy
+                # allowlist admits by tag; the provider resolves it the same way for
+                # every throwaway container it creates.
+                check_create(
+                    body,
+                    self._provider._create_policy(request_spec(request), resolved=request.image),
+                )
             except CreateRequestRefusedError as exc:
                 return PublishOutcome(
                     pushed=False,

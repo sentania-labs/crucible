@@ -640,6 +640,13 @@ def _cycle_for(rows: list[ExternalReviewCycle], head_sha: str) -> ExternalReview
 # ----- CI certification ---------------------------------------------------
 
 
+def _source(name: str) -> CheckSource:
+    try:
+        return CheckSource(name)
+    except ValueError:
+        return CheckSource.CHECK_RUN
+
+
 def observed_checks(observation: Observation) -> tuple[ObservedCheck, ...]:
     return tuple(
         ObservedCheck(
@@ -647,9 +654,7 @@ def observed_checks(observation: Observation) -> tuple[ObservedCheck, ...]:
             status=check.status,
             conclusion=check.conclusion,
             head_sha=check.head_sha,
-            source=CheckSource.WORKFLOW_RUN
-            if check.source == "workflow_run"
-            else CheckSource.CHECK_RUN,
+            source=_source(check.source),
             url=check.url,
             external_id=check.external_id,
             workflow=check.workflow,

@@ -32,6 +32,11 @@ class CertificationState(StrEnum):
 class CheckSource(StrEnum):
     CHECK_RUN = "check_run"
     WORKFLOW_RUN = "workflow_run"
+    # A suite is a container for check runs, not a check. It is observed and recorded
+    # (23 asks for both), but it never becomes a member of the required set: an App that
+    # creates a suite on every head and never runs anything in it would otherwise hold
+    # every task in `pending` for ever.
+    CHECK_SUITE = "check_suite"
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,7 +115,8 @@ def resolve_required(
         dict.fromkeys(
             check.name
             for check in observed
-            if not (check.concluded and check.conclusion == SKIPPED)
+            if check.source is not CheckSource.CHECK_SUITE
+            and not (check.concluded and check.conclusion == SKIPPED)
         )
     )
     return names, "observed"

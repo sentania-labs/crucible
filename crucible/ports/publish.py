@@ -32,6 +32,7 @@ class PublishRequest:
     owner: str
     repository_url: str
     work_branch: str
+    base_ref: str
     expected_head: str
     bundle_path: str
     image: str

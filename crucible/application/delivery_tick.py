@@ -192,6 +192,7 @@ class DeliveryCoordinator:
                     owner=plan.external_id,
                     repository_url=plan.push_url,
                     work_branch=plan.work_branch,
+                    base_ref=plan.base_ref,
                     expected_head=plan.head_sha,
                     bundle_path=plan.bundle_path,
                     image=self.config.publisher_image or plan.image,
@@ -327,6 +328,9 @@ class DeliveryCoordinator:
                     "author_problems": list(outcome.author_problems),
                     "trailer_problems": list(outcome.trailer_problems),
                     "detail": outcome.detail[:500],
+                    # Crucible's own container output. The token is never printed, and
+                    # the script unsets every git trace that would print the header.
+                    "log_tail": outcome.log_tail[-2000:],
                 },
             )
             uow.commit()

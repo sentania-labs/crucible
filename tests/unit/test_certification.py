@@ -127,6 +127,20 @@ def test_a_later_run_of_the_same_name_is_what_counts() -> None:
     assert result.state is CertificationState.GREEN
 
 
+def test_a_check_suite_is_recorded_but_never_becomes_a_required_check() -> None:
+    """An App that opens a suite on every head and runs nothing in it would otherwise
+    hold every task in `pending` for ever (observed live on the throwaway repository)."""
+    suite = check("suite:claude", None, status="queued", source=CheckSource.CHECK_SUITE)
+    required, source = resolve_required(policy(), branch_protection=[], observed=[suite])
+    assert required == () and source == "observed"
+    result = certify(
+        policy(allow_no_ci=True), head_sha=HEAD, branch_protection=[], observed=[suite]
+    )
+    assert result.state is CertificationState.SKIPPED
+    # It is still recorded as something observed on the head (23).
+    assert result.observed == (suite,)
+
+
 def test_a_workflow_run_counts_alongside_a_check_run() -> None:
     result = certify(
         policy(),

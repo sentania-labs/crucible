@@ -149,9 +149,23 @@ def live_contract(external_id: str, live_config: LiveConfig, image: str) -> dict
 def live_policy() -> dict[str, Any]:
     document = e2e_policy_document()
     document["repository"]["required_checks"] = ["echo lint ok", "echo test ok", "echo scan ok"]
-    # This repository has no CI of its own; the task waits in certification and the
-    # timeout wakes Foundry, which is the behaviour 23 asks for and what this asserts.
     document["network"]["egress_allowlist"] = ["github.com"]
+    # 05b: `required_rounds: 0` makes the external review gates skipped. The reviewer's
+    # clean verdict on this repository is a reaction on the pull request, and the App
+    # holds no Issues read yet, so no live round is observable; the round logic is
+    # covered against the fake server in both shapes. This tier's subject is
+    # publication, observation, and the merge.
+    document["external_review"]["required_rounds"] = 0
+    # 05b: with no round required, the two external review gates move to `skipped`.
+    document["gates"]["post_pr"] = ["ci_green_for_head"]
+    document["gates"]["skipped"] = [
+        "external_review_rounds",
+        "feedback_dispositions_complete",
+    ]
+    # The throwaway repository has no CI. An empty required set is pending, never green
+    # (23), so a tier that wants to reach `ready_for_merge` has to say so explicitly,
+    # which is an operator-recorded policy decision and is what this is.
+    document["ci_certification"]["allow_no_ci"] = True
     return document
 
 
@@ -217,14 +231,16 @@ async def test_a_task_reaches_a_real_pull_request_and_a_real_merge(
         live_supervisor,
         live_client,
         task_id,
-        {"awaiting_external_review", "awaiting_ci_certification", "publish_failed"},
+        {"awaiting_ci_certification", "ready_for_merge", "publish_failed"},
         max_ticks=20,
         pause=2.0,
     )
     events = live_client.get(f"/v1/tasks/{task_id}/events", params={"limit": 200}).json()
-    assert state != "publish_failed", [
-        e for e in events["items"] if e["kind"] == "task_publish_failed"
-    ]
+    assert state != "publish_failed", "\n".join(
+        str(e["payload"])
+        for e in events["items"]
+        if e["kind"] in ("task_publish_failed", "publisher_finished")
+    )
     record = live_client.get(f"/v1/tasks/{task_id}/pull-request").json()
     cleanup.add_pull_request(int(record["number"]))
     print(f"live pull request: {record['url']} at {record['head_sha']}")
@@ -247,24 +263,43 @@ async def test_a_task_reaches_a_real_pull_request_and_a_real_merge(
     # the title or the body, and neither carries an unauthorized closing keyword.
     assert scan_text(live.title) is None
 
-    # 23: no external review is expected on this run within the tier's patience, so the
-    # round is not what this asserts. The merge observation is.
+    # 23 and S12: the App holds no Issues read, so the one place a clean external review
+    # appears is unreadable. The poll records that and carries on, which is what this
+    # asserts live; the round logic itself is covered against the fake server.
+    assert record["reactions_observable"] in (True, False)
+    if not record["reactions_observable"]:
+        assert "reactions_unobservable" in [
+            e["kind"]
+            for e in live_client.get(f"/v1/tasks/{task_id}/events", params={"limit": 200}).json()[
+                "items"
+            ]
+        ]
+
+    ready = await run_until(
+        live_supervisor,
+        live_client,
+        task_id,
+        {"ready_for_merge", "rejected"},
+        max_ticks=20,
+        pause=2.0,
+    )
+    assert ready == "ready_for_merge"
+    certification = live_client.get(f"/v1/tasks/{task_id}/pull-request").json()[
+        "ci_certifications"
+    ][-1]
+    assert certification["state"] == "skipped", certification
+
     status, payload = github_live.merge_with_app_token(
         github, live_config, record["number"], sha=view["head_sha"]
     )
     assert status == 200, payload
     merged = await run_until(
-        live_supervisor,
-        live_client,
-        task_id,
-        {"merged", "ready_for_merge", "rejected"},
-        max_ticks=30,
-        pause=2.0,
+        live_supervisor, live_client, task_id, {"merged", "rejected"}, max_ticks=30, pause=2.0
     )
     final = live_client.get(f"/v1/tasks/{task_id}/pull-request").json()
     assert final["state"] == "merged", final
-    assert final["merge_sha"]
-    assert merged in ("merged", "ready_for_merge")
+    assert final["merge_sha"] and final["merged_by"]
+    assert merged == "merged"
     kinds = [
         e["kind"]
         for e in live_client.get(f"/v1/tasks/{task_id}/events", params={"limit": 200}).json()[
@@ -319,11 +354,12 @@ async def test_no_token_reaches_the_daemon_the_logs_or_the_database(
         live_supervisor,
         live_client,
         task_id,
-        {"awaiting_external_review", "awaiting_ci_certification", "publish_failed"},
+        {"awaiting_ci_certification", "ready_for_merge", "publish_failed"},
         max_ticks=20,
         pause=2.0,
     )
     record = live_client.get(f"/v1/tasks/{task_id}/pull-request").json()
+    assert "number" in record, record
     cleanup.add_pull_request(int(record["number"]))
 
     haystack: list[str] = []
@@ -347,8 +383,20 @@ async def test_no_token_reaches_the_daemon_the_logs_or_the_database(
     assert "ghs_" not in blob
     # And the publisher's output directory kept no copy of it either.
     publish_root = Path(provider.config.artifact_root) / "publish"
+    read = 0
+    unreadable: list[str] = []
     for path in publish_root.rglob("*"):
-        if path.is_file():
+        if not path.is_file():
+            continue
+        try:
             content = path.read_bytes()[:1_000_000].decode("utf-8", "replace")
-            assert "ghs_" not in content, path
-            assert scan_text(content) is None, path
+        except OSError:
+            # A file the container's uid left behind that this process cannot read is
+            # counted, never silently skipped: an empty scan is not a clean scan (S10).
+            unreadable.append(str(path))
+            continue
+        read += 1
+        assert "ghs_" not in content, path
+        assert scan_text(content) is None, path
+    assert read, f"nothing in {publish_root} was readable; an empty scan is not a pass"
+    assert not unreadable, unreadable
