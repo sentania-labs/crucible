@@ -215,6 +215,57 @@ class SupervisorView(Response):
     github: dict[str, Any] | None
 
 
+class HarnessCredentialView(Response):
+    """25: sanitized. State, mode, a fingerprint of file names and sizes, timestamps."""
+
+    state: str
+    mount_mode: str | None
+    source_fingerprint: str | None
+    files: list[dict[str, Any]]
+    detail: str
+    session_compatibility: str
+    refresh_requires_rw: bool | None
+    mount_mode_observed: str | None
+    last_validated_at: Rfc3339 | None
+    last_auth_failure_at: Rfc3339 | None
+    last_launch_at: Rfc3339 | None
+    last_launch_outcome: str | None
+
+
+class HarnessView(Response):
+    """07 and 13: installed and supported versions, the enable flags, the credential."""
+
+    name: str
+    enabled: bool
+    enabled_by_configuration: bool
+    enabled_by_administrator: bool
+    reason: str
+    supported_versions: str
+    installed_versions: list[str]
+    capabilities: dict[str, Any]
+    credential: HarnessCredentialView
+
+
+class HarnessList(Response):
+    items: list[HarnessView]
+
+
+class ImageView(Response):
+    """13: a worker image the provider can see, with its promotion state."""
+
+    reference: str
+    digest: str
+    harness: str | None
+    harness_version: str | None
+    supported: bool
+    promotion_state: str
+    provider: str
+
+
+class ImageList(Response):
+    items: list[ImageView]
+
+
 class ExternalReviewAttestation(StrictModel):
     """23: GitHub exposes the reviewer's "review all pull requests" setting nowhere, so
     onboarding records the operator's word for it, with who attested and when."""

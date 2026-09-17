@@ -1,0 +1,107 @@
+"""`GET /harnesses` and `GET /images` (07, 13, 25): installed and supported versions,
+the enable flags with their reasons, the sanitized credential state, and the images a
+provider can see with their promotion state. Read-only; the mutations are C5b."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+
+from crucible.application.harnesses import HarnessRegistry, credential_state
+from crucible.contracts.api import (
+    HarnessCredentialView,
+    HarnessList,
+    HarnessView,
+    ImageList,
+    ImageView,
+)
+from crucible.domain.entities import HarnessState
+from crucible.ports.execution import ImageInfo
+from crucible.ports.harness import CredentialSource, HarnessGate, SessionCompatibility
+from crucible.ports.repository import UnitOfWork
+
+
+def harness_list(
+    uow: UnitOfWork,
+    registry: HarnessRegistry | None,
+    *,
+    gates: Mapping[str, HarnessGate],
+    sources: Mapping[str, CredentialSource],
+    images: Sequence[ImageInfo],
+) -> HarnessList:
+    if registry is None:
+        return HarnessList(items=[])
+    states: dict[str, HarnessState] = {s.name: s for s in uow.harnesses.list_all()}
+    items: list[HarnessView] = []
+    for adapter in registry:
+        state = states.get(adapter.name)
+        gate = gates.get(adapter.name, HarnessGate())
+        by_admin = state.enabled if state is not None else True
+        installed = sorted(
+            {
+                str(i.harness_version)
+                for i in images
+                if i.harness == adapter.name and i.harness_version
+            }
+        )
+        credential = credential_state(adapter.credential_spec(), sources.get(adapter.name), state)
+        reasons = [
+            r for r in (gate.reason if not gate.enabled else "", state.reason if state else "") if r
+        ]
+        items.append(
+            HarnessView(
+                name=adapter.name,
+                enabled=gate.enabled and by_admin,
+                enabled_by_configuration=gate.enabled,
+                enabled_by_administrator=by_admin,
+                reason="; ".join(reasons),
+                supported_versions=adapter.supported_versions.text,
+                installed_versions=installed,
+                capabilities=adapter.capabilities().as_dict(),
+                credential=HarnessCredentialView(
+                    **credential.as_dict(),
+                    session_compatibility=(
+                        state.session_compatibility
+                        if state is not None
+                        else SessionCompatibility.UNVERIFIED.value
+                    ),
+                    refresh_requires_rw=state.refresh_requires_rw if state else None,
+                    mount_mode_observed=state.mount_mode_observed if state else None,
+                    last_validated_at=state.last_validated_at if state else None,
+                    last_auth_failure_at=state.last_auth_failure_at if state else None,
+                    last_launch_at=state.last_launch_at if state else None,
+                    last_launch_outcome=state.last_launch_outcome if state else None,
+                ),
+            )
+        )
+    return HarnessList(items=items)
+
+
+def image_list(
+    uow: UnitOfWork,
+    registry: HarnessRegistry | None,
+    images: Sequence[tuple[str, ImageInfo]],
+) -> ImageList:
+    """Every labelled image, with the promotion state the table records (13). An image
+    no admin act has touched is a `candidate`."""
+    promotions = {p.digest: p for p in uow.image_promotions.list_all()}
+    items: list[ImageView] = []
+    for provider_name, image in images:
+        adapter = registry.get(image.harness) if registry and image.harness else None
+        supported = bool(
+            adapter is not None
+            and image.harness_version
+            and adapter.supported_versions.supports(image.harness_version)
+        )
+        promotion = promotions.get(image.digest)
+        items.append(
+            ImageView(
+                reference=image.reference,
+                digest=image.digest,
+                harness=image.harness,
+                harness_version=image.harness_version,
+                supported=supported,
+                promotion_state=promotion.state if promotion else "candidate",
+                provider=provider_name,
+            )
+        )
+    return ImageList(items=items)
