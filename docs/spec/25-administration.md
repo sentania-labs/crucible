@@ -39,7 +39,7 @@ resource.
 
 | Part | Fields |
 |---|---|
-| `harnesses[]` | name, enabled, adapter supported range, images known (reference, harness version, digest, promotion state), credential status (below), concurrency limit and current use, last launch outcome |
+| `harnesses[]` | name, both enablement gates with the reason each carries, adapter supported range, images known (reference, harness version, digest, promotion state), credential status (below), concurrency limit and current use, last launch outcome |
 | `credentials[harness]` | `state`: `absent`, `configured` (files present, shape unchecked), `invalid` (shape or probe failed), `validated` (probe succeeded); `mount_mode` (`ro`, `rw-narrow`); `last_validated_at`; `last_auth_failure_at` and its exit class; `refresh_verified` (bool, from the compatibility test); `source_fingerprint` (sha256 of the file **names and sizes**, never contents); `session_compatibility`: `unverified`, `verified`, `failed` |
 | `providers[]` | name, capabilities, `health`: `ok`, `degraded`, `unavailable` with detail (daemon reachable, proxy reachable, network present, disk headroom) |
 | `github` | App id and slug (public), key present (bool), key fingerprint (sha256 of the public key), installations visible, per registered repository: installation covers it, last successful token mint, last API failure, webhook enabled |
@@ -55,7 +55,7 @@ resource.
 | Operation | API | CLI | Notes |
 |---|---|---|---|
 | list harnesses | `GET /admin/harnesses` | `harnesses list` | |
-| disable or enable a harness | `POST /admin/harnesses/{name}/disable` and `/enable` | `harnesses disable|enable` | configuration retained; running attempts finish; new launches refused with a wake |
+| disable or enable a harness | `POST /admin/harnesses/{name}/disable` and `/enable` | `harnesses disable|enable` | flips the administrator's flag only; configuration retained; running attempts finish; new launches refused with a wake |
 | validate a credential | `POST /admin/credentials/{harness}/validate` | `credentials validate --harness` | shape check of the named auth files, then a bounded probe (below); returns state and timestamps only |
 | bounded auth probe | `POST /admin/credentials/{harness}/probe` | `credentials probe --harness` | launches the hardened worker image with the credential mounted, runs a one-line prompt with a 120 s timeout, records exit class, harness version, image digest, whether auth files changed (by hash), removes everything; never shows output beyond the exit class |
 | onboard a credential | `POST /admin/credentials/{harness}/login` (starts) | `credentials login --harness` | interactive flow below; the API form returns the device or browser URL and polls for completion |
@@ -70,6 +70,27 @@ resource.
 Every mutation requires a `reason` string, records the principal, and is
 refused when the supervisor lease is not held by a live instance (so a
 stale instance cannot administer).
+
+## Harness enablement: two gates
+
+A harness is available for a launch only when **both** gates say so, and
+each carries its own reason string:
+
+1. **Configuration**, the operator's static gate: a `[harnesses.<name>]`
+   section exists in Crucible's configuration. Changing it is an operator
+   edit and a restart.
+2. **The administrator's flag**, the runtime gate: the harness's row, which
+   `harnesses enable` and `harnesses disable` flip through the admin
+   surface without touching configuration.
+
+Either gate saying no refuses the launch, and the refusal names which gate
+and the reason it carries. `GET /admin/harnesses` reports both gates and
+both reasons, so "disabled" is never ambiguous about who disabled it. A
+refusal is terminal for that attempt: it ends as `environment` with a
+`harness_refused` event and a `harness_unavailable` wake, and the retry
+rule skips it, because the same refusal would come back (16). A harness
+disabled at the time a contract is submitted is a contract problem then
+(05b), not a refusal a task discovers later.
 
 ## Credential onboarding workflow
 
@@ -94,10 +115,9 @@ stale instance cannot administer).
    harness version, image digest, timestamp, and whether the auth files
    changed during the probe (which sets `refresh_requires_rw`).
 7. Report whether the credential requires writable refresh state and set
-   `mount_mode` to the stricter of the adapter's declared minimum (07;
-   Codex is `rw-narrow` from the start because a read-only config
-   directory fails before auth) and what the probe observed (`rw-narrow`
-   when the probe changed files). A probe that changes nothing never
+   `mount_mode` to the stricter of the adapter's declared minimum (07; all
+   three harnesses declare `rw-narrow`) and what the probe observed
+   (`rw-narrow` when the probe changed files). A probe that changes nothing never
    lowers the adapter's minimum.
 8. Remove all probe resources.
 9. Mark `session_compatibility: unverified` until the daily-session
