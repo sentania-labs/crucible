@@ -132,8 +132,9 @@ of the previous version's. `required_verification` may not shrink.
 - `repository.name` is registered (04); `base_ref` exists on the remote at
   validation time; `work_branch` matches the repository policy's branch
   pattern and is not a protected branch.
-- `allowed_paths` and `prohibited_paths` are valid globs; the two must not
-  fully overlap.
+- `allowed_paths` and `prohibited_paths` are valid globs where `*` stops at
+  a path separator and only `**` crosses one (the permissive reading would
+  silently widen every contract); the two must not fully overlap.
 - Every `acceptance_criteria.id` and `required_verification.id` unique.
 - `required_verification` includes every command the repository policy's
   `repository.required_checks` lists (05b); missing ones are a 422 naming

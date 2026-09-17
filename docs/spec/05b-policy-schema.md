@@ -160,7 +160,9 @@ retention:
   set defined in 11 and 23; a gate in none of them is an error.
 - `retry.eligible_classes` is a subset of the `ExitClass` enum (07).
 - `concurrency.per_harness` must be 1 for any harness whose credential
-  `mount_mode` is `rw-narrow` (12); the API rejects the policy otherwise.
+  `mount_mode` is `rw-narrow`; the mount mode comes from Crucible's
+  credential configuration (12, 25), not from the policy, so the check
+  runs against the configured credential sources at upload and at launch.
 - `network.egress_allowlist` entries are hostnames, no wildcards in v0.x.
 - `external_review.required_rounds: 0` makes the external review gates
   `skipped`; `reviewer_logins` must be non-empty when rounds are above 0.
