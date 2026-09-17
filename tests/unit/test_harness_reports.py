@@ -132,24 +132,31 @@ def test_codex_metrics_sum_over_turns(tmp_path: Path) -> None:
 
 
 def test_agy_metrics_come_from_the_result_line(tmp_path: Path) -> None:
+    """The shape the 1.2.4 CLI emitted in the C5 live run: `event` keyed, the body
+    nested under the event's name, usage as input and output tokens."""
     write_lines(
         tmp_path / "transcript.jsonl",
         [
-            {"type": "init", "cwd": "/crucible/repo"},
+            {"event": "init", "init": {"cwd": "/crucible/repo"}},
+            {"event": "step_update", "step_update": {"step_index": 1, "state": "DONE"}},
             {
-                "type": "result",
-                "status": "SUCCESS",
-                "usage": {"prompt_tokens": 900, "completion_tokens": 30},
+                "event": "result",
+                "result": {
+                    "status": "SUCCESS",
+                    "response": "done",
+                    "usage": {"input_tokens": 900, "output_tokens": 30, "thinking_tokens": 5},
+                },
             },
         ],
     )
     parsed = AgyAdapter().parse_report(tmp_path, ExitInfo(exit_code=0))
     assert (parsed.metrics.tokens_in, parsed.metrics.tokens_out) == (900, 30)
+    assert parsed.transcript_lines == 3
 
 
 def test_a_harness_that_reports_nothing_leaves_null(tmp_path: Path) -> None:
     """05b: null counts make the pool fall back to counting attempts."""
-    write_lines(tmp_path / "transcript.jsonl", [{"type": "result", "status": "SUCCESS"}])
+    write_lines(tmp_path / "transcript.jsonl", [{"event": "result", "result": {"status": "OK"}}])
     parsed = AgyAdapter().parse_report(tmp_path, ExitInfo(exit_code=0))
     assert parsed.metrics.tokens_in is None and parsed.metrics.tokens_out is None
     assert ScriptHarnessAdapter().parse_report(tmp_path, exit_ok()).metrics.source == "none"

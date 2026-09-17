@@ -22,7 +22,7 @@ export CRUCIBLE_DOCKER_SOCKET
 # and the adapters' declared model endpoints (13, S6). `proxy-config` writes the squid
 # configuration from this list and Crucible refuses to launch an attempt that needs a
 # host the running proxy does not permit.
-EGRESS_ALLOWLIST ?= github.com objects.githubusercontent.com pypi.org files.pythonhosted.org registry.npmjs.org api.anthropic.com api.openai.com auth.openai.com chatgpt.com daily-cloudcode-pa.googleapis.com oauth2.googleapis.com
+EGRESS_ALLOWLIST ?= github.com objects.githubusercontent.com pypi.org files.pythonhosted.org registry.npmjs.org api.anthropic.com api.openai.com auth.openai.com chatgpt.com daily-cloudcode-pa.googleapis.com oauth2.googleapis.com www.googleapis.com lh3.googleusercontent.com
 WORKERS_SUBNET ?= 10.88.0.0/24
 
 # The publisher's own allowlist (23 step 3). It is deliberately not the workers' list:
@@ -205,7 +205,7 @@ e2e-live: ## the live harness tier: real harness images, the dedicated credentia
 	CRUCIBLE_E2E_DOCKER_SOCKET="$(CRUCIBLE_DOCKER_SOCKET)" \
 	CRUCIBLE_LIVE_CREDENTIAL_ROOT="$(CRUCIBLE_LIVE_CREDENTIAL_ROOT)" \
 	CRUCIBLE_LIVE_HARNESSES="$(HARNESS)" \
-	CRUCIBLE_LIVE_MODELS="$(CRUCIBLE_LIVE_MODELS)" \
+	CRUCIBLE_LIVE_MODELS='$(CRUCIBLE_LIVE_MODELS)' \
 	CRUCIBLE_LIVE_AGY_MOUNT_MODE="$(CRUCIBLE_LIVE_AGY_MOUNT_MODE)" \
 	CRUCIBLE_LIVE_REPORT="$(CRUCIBLE_LIVE_REPORT)" \
 	CRUCIBLE_GITHUB_APP_JSON="$(CRUCIBLE_GITHUB_APP_JSON)" \

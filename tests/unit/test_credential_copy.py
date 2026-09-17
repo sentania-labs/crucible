@@ -218,16 +218,18 @@ async def test_the_create_request_names_the_variable_and_the_path_never_the_valu
     )
 
 
-async def test_agy_mounts_read_only_by_default_and_rw_narrow_when_configured(
+async def test_agy_mounts_rw_narrow_and_a_configured_ro_never_lowers_it(
     tmp_path: Path,
 ) -> None:
+    """12 and 25 step 7: rw-narrow since the live run showed the token rotating; the
+    configuration may not lower the adapter's minimum."""
     source = tmp_path / "credentials" / "agy"
     (source / ".gemini" / "antigravity-cli").mkdir(parents=True)
     (source / ".gemini" / "antigravity-cli" / "antigravity-oauth-token").write_text(
         json.dumps({"token": {"access_token": _token("ya29."), "expiry": "2026-09-17T00:00:00Z"}}),
         encoding="utf-8",
     )
-    for mode, expected in ((None, True), (MountMode.RW_NARROW, False)):
+    for mode, expected in ((None, False), (MountMode.RO, False), (MountMode.RW_NARROW, False)):
         client = StubClient("agy", "1.2.4")
         provider = DockerProvider(
             config(tmp_path, agy=CredentialSource(str(source), mode)),

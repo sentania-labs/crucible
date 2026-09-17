@@ -75,12 +75,16 @@ LOCAL_TZ = ZoneInfo("America/Chicago")
 
 # The cheapest model each harness offers that completes a trivial task: routing's rule
 # that trivial work never goes to a frontier model (05b). Overridable per run.
+# Verified by the C5 live runs. Codex with a ChatGPT-plan login refuses the codex-suffixed
+# ids and gpt-5.6; gpt-5.6-luna and -terra are accepted but fail closed without the
+# code-mode host the image does not carry. AGY's effort is part of the id.
 DEFAULT_MODELS = {
     "claude_code": "claude-haiku-4-5",
-    "codex": "gpt-5.4-mini",
-    "agy": "gemini-3.1-flash-lite",
+    "codex": "gpt-5.5",
+    "agy": "gemini-3.8-flash-low",
 }
-EFFORT = {"claude_code": None, "codex": "low", "agy": "low"}
+# AGY 1.2.4 refuses --effort for gemini-3.1-flash-lite (found live), so none is passed.
+EFFORT = {"claude_code": None, "codex": "low", "agy": None}
 ALL_HARNESSES = ("claude_code", "codex", "agy")
 
 

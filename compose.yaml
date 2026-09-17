@@ -129,7 +129,7 @@ services:
       # A JSON array: pydantic-settings decodes a complex field from the environment
       # as JSON, and the list here must be the one `make proxy-config` gave squid.
       CRUCIBLE_DOCKER__EGRESS_ALLOWLIST: >-
-        ${CRUCIBLE_EGRESS_ALLOWLIST:-["github.com","objects.githubusercontent.com","pypi.org","files.pythonhosted.org","registry.npmjs.org","api.anthropic.com","api.openai.com","auth.openai.com","chatgpt.com","daily-cloudcode-pa.googleapis.com","oauth2.googleapis.com"]}
+        ${CRUCIBLE_EGRESS_ALLOWLIST:-["github.com","objects.githubusercontent.com","pypi.org","files.pythonhosted.org","registry.npmjs.org","api.anthropic.com","api.openai.com","auth.openai.com","chatgpt.com","daily-cloudcode-pa.googleapis.com","oauth2.googleapis.com","www.googleapis.com","lh3.googleusercontent.com"]}
       # GitHub delivery (12, 23). Off until an App is configured. The App id is a public
       # identifier and the two secrets are *paths* to files in the credential directory
       # mounted below, which only this container ever sees: no worker, collector,

@@ -69,6 +69,8 @@ EGRESS_ALLOWLIST = (
     "chatgpt.com",
     "daily-cloudcode-pa.googleapis.com",
     "oauth2.googleapis.com",
+    "www.googleapis.com",
+    "lh3.googleusercontent.com",
 )
 
 TRUNCATE = (

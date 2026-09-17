@@ -13,6 +13,8 @@ Revises: 0007_github_delivery
 
 from __future__ import annotations
 
+import json
+
 import sqlalchemy as sa
 from alembic import op
 
@@ -49,6 +51,57 @@ SEED = (
     ("agy", False, UNVERIFIED_REASON, "unverified"),
     ("script-harness", True, "the e2e tier's harness (18): no model, no credential", "verified"),
 )
+
+
+# 05b and C5 requirement 6: a routing policy whose model ids are the ones the live runs
+# verified per harness. Version 1 stays (a policy version references it and is
+# immutable, 05b); a deployment's policy names version 2 to use these. Cost classes are
+# the operator's routing labels, not provider prices.
+def _model(
+    model_id: str, harness: str, capability: str, cost: str, speed: str, pool: str
+) -> dict[str, object]:
+    return {
+        "id": model_id,
+        "harness": harness,
+        "endpoint": "subscription",
+        "capability": capability,
+        "cost": cost,
+        "speed": speed,
+        "pool": pool,
+        "weight": 1,
+        "enabled": True,
+    }
+
+
+VERIFIED_ROUTING = {
+    "schema_version": "1.0",
+    "name": "default-routing",
+    "version": 2,
+    "tiers": {
+        "trivial": {"allowed_capability": ["small", "mid"], "prefer": ["small"]},
+        "standard": {"allowed_capability": ["mid", "small"], "prefer": ["mid"]},
+        "complex": {"allowed_capability": ["frontier", "mid"], "prefer": ["frontier"]},
+    },
+    "models": [
+        _model("claude-haiku-4-5", "claude_code", "small", "low", "fast", "anthropic-sub"),
+        _model("claude-sonnet-5", "claude_code", "mid", "medium", "fast", "anthropic-sub"),
+        _model("claude-fable-5-1", "claude_code", "frontier", "high", "medium", "anthropic-sub"),
+        _model("gpt-5.5", "codex", "mid", "medium", "medium", "openai-sub"),
+        _model("gemini-3.8-flash-low", "agy", "small", "low", "fast", "google-sub"),
+        _model("gemini-3.8-flash-high", "agy", "mid", "medium", "medium", "google-sub"),
+        _model("gemini-3.1-pro-high", "agy", "frontier", "high", "slow", "google-sub"),
+    ],
+    "pools": {
+        "anthropic-sub": {"window": "5h", "budget_units": "tokens_out", "soft_limit": 0},
+        "openai-sub": {"window": "5h", "budget_units": "tokens_out", "soft_limit": 0},
+        "google-sub": {"window": "5h", "budget_units": "attempts", "soft_limit": 0},
+    },
+    "rotation": {
+        "strategy": "weighted-least-recent",
+        "quality_feedback": True,
+        "quality_window": 20,
+    },
+}
 
 
 def _event_kinds() -> list[str]:
@@ -110,6 +163,13 @@ def upgrade() -> None:
             ).bindparams(name=name, enabled=enabled, reason=reason, compatibility=compatibility)
         )
 
+    op.execute(
+        sa.text(
+            "INSERT INTO routing_policies (name, version, document, created_at) "
+            "VALUES (:name, :version, CAST(:document AS jsonb), now()) ON CONFLICT DO NOTHING"
+        ).bindparams(name="default-routing", version=2, document=json.dumps(VERIFIED_ROUTING))
+    )
+
     op.drop_constraint("ck_events_kind", "events", type_="check")
     allowed = ", ".join(f"'{k}'" for k in _event_kinds())
     op.execute(
@@ -136,6 +196,11 @@ def upgrade() -> None:
 def downgrade() -> None:
     for table in C5_TABLES:
         op.drop_table(table)
+    op.execute(
+        sa.text(
+            "DELETE FROM routing_policies WHERE name = :name AND version = :version"
+        ).bindparams(name="default-routing", version=2)
+    )
     # The audit log is never deleted to make a constraint fit (c4.md decision 36): the C5
     # rows move to an archive this migration leaves behind, and its upgrade moves them
     # back. The append-only trigger stands down for exactly the move.

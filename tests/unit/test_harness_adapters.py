@@ -4,6 +4,7 @@ as a pointer, no secret anywhere in argv or env, and the credential spec each de
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -148,17 +149,17 @@ def test_credential_specs_name_only_the_auth_files_s1_recorded() -> None:
 
     agy = AgyAdapter().credential_spec()
     assert [f.name for f in agy.auth_files] == ["antigravity-cli/antigravity-oauth-token"]
-    assert agy.minimum_mode is MountMode.RO
+    assert agy.minimum_mode is MountMode.RW_NARROW
     assert agy.source_subdir == ".gemini" and agy.mount_target == "/home/worker/.gemini"
     assert agy.auth_files[0].issued_at == ("token", "expiry")
 
 
 def test_configuration_may_raise_the_mount_mode_and_never_lower_it() -> None:
     """25 step 7."""
-    agy = AgyAdapter().credential_spec()
-    assert effective_mount_mode(agy, None) is MountMode.RO
-    assert effective_mount_mode(agy, CredentialSource("/x")) is MountMode.RO
-    assert effective_mount_mode(agy, CredentialSource("/x", MountMode.RW_NARROW)) is (
+    ro_minimum = replace(AgyAdapter().credential_spec(), minimum_mode=MountMode.RO)
+    assert effective_mount_mode(ro_minimum, None) is MountMode.RO
+    assert effective_mount_mode(ro_minimum, CredentialSource("/x")) is MountMode.RO
+    assert effective_mount_mode(ro_minimum, CredentialSource("/x", MountMode.RW_NARROW)) is (
         MountMode.RW_NARROW
     )
     codex = CodexAdapter().credential_spec()

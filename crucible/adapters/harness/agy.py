@@ -7,11 +7,11 @@ is the kernel's 128 KiB, S3) and the bundle travels by `--add-dir`. `--print-tim
 defaults to five minutes in the CLI, so it is set to the attempt's own timeout.
 
 Credential: the token file under `.gemini/antigravity-cli/`, mounted at the CLI's
-config directory. The adapter's minimum is `ro` (12): AGY refreshes in memory once the
-access token is past its one-hour expiry, and S1 saw the read-only mount refuse the
-save while the run still completed. The probe and the live tier record whether a run
-rotated the token; when one does, the configured mount mode becomes rw-narrow and the
-file syncs back by the newer `token.expiry`.
+config directory. 12 started it at `ro` pending evidence: AGY refreshes in memory once
+the access token is past its one-hour expiry, and S1 saw the read-only mount refuse the
+save. The C5 live run supplied the evidence: the first Crucible-side run after the
+expiry rotated the token and the copy carried a newer `token.expiry`, so the minimum is
+rw-narrow and the file syncs back by that field.
 """
 
 from __future__ import annotations
@@ -67,7 +67,17 @@ class AgyAdapter:
             model_flag=True,
             effort_flag=True,
             transcript_format=TranscriptFormat.STREAM_JSON,
-            endpoints=("daily-cloudcode-pa.googleapis.com", "oauth2.googleapis.com"),
+            # S6 named the model API and the OAuth refresh grant. The C5 live runs added
+            # two more: the CLI's eligibility check calls the userinfo endpoint on
+            # www.googleapis.com and then fetches the account's profile picture from
+            # lh3.googleusercontent.com before any turn, and fails closed when either
+            # is refused.
+            endpoints=(
+                "daily-cloudcode-pa.googleapis.com",
+                "lh3.googleusercontent.com",
+                "oauth2.googleapis.com",
+                "www.googleapis.com",
+            ),
             shim="AGENTS.md",
         )
 
@@ -81,7 +91,10 @@ class AgyAdapter:
                     TOKEN_FILE, json=True, json_keys=("token",), issued_at=("token", "expiry")
                 ),
             ),
-            minimum_mode=MountMode.RO,
+            # rw-narrow since the C5 live run: the first Crucible-side run after the
+            # one-hour expiry refreshed the token and the copy carried a newer expiry,
+            # which the sync-back wrote to the source (12: "would make it rw-narrow").
+            minimum_mode=MountMode.RW_NARROW,
             config_dir_env=None,
             templates={},
             login_hint=(
@@ -137,16 +150,22 @@ def _usage(event: dict[str, Any]) -> tuple[int | None, int | None]:
 
 
 def _metrics(transcript: Path) -> tuple[ReportMetrics, int]:
-    """The final `result` line carries the token usage (S3); `init` names the model."""
+    """The final `result` line carries the token usage (S3); `init` names the model.
+
+    The 1.2.4 stream keys each line as `{"event": "result", "result": {...}}` (found
+    live); S3's description read it as `type`. Both shapes are accepted."""
     model: str | None = None
     tokens_in: int | None = None
     tokens_out: int | None = None
     count = 0
     for event in base.json_lines(transcript):
         count += 1
-        if isinstance(event.get("model"), str):
-            model = str(event["model"])
-        if event.get("type") == "result":
-            tokens_in, tokens_out = _usage(event)
+        kind = str(event.get("event") or event.get("type") or "")
+        nested = event.get(kind)
+        body: dict[str, Any] = nested if isinstance(nested, dict) else event
+        if isinstance(body.get("model"), str):
+            model = str(body["model"])
+        if kind == "result":
+            tokens_in, tokens_out = _usage(body)
     source = "harness_transcript" if count else "none"
     return ReportMetrics(model, tokens_in, tokens_out, None, source), count

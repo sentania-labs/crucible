@@ -42,6 +42,8 @@ egress_allowlist = [
     "chatgpt.com",
     "daily-cloudcode-pa.googleapis.com",
     "oauth2.googleapis.com",
+    "www.googleapis.com",
+    "lh3.googleusercontent.com",
 ]
 no_proxy = "localhost,127.0.0.1"
 
@@ -117,7 +119,7 @@ mount_mode = "rw-narrow"
 [credentials.agy]
 source = "directory"
 path = "/var/lib/crucible/credentials/agy"            # .gemini/antigravity-cli/antigravity-oauth-token
-mount_mode = "ro"      # the adapter's minimum; see c5.md for what the live run observed
+mount_mode = "rw-narrow"   # the CLI rotated its token on the first run past expiry (C5 live run)
 
 # Harness enablement (25, S1b). A launch needs this gate and the administrator's runtime
 # flag (`crucible-admin harnesses enable`, C5b; seeded the same way by migration 0008).
