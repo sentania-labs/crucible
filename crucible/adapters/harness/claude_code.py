@@ -56,6 +56,13 @@ QUOTA_PATTERNS = base.patterns(
     "out of extra usage",
     "rate_limit_error",
     "Credit balance is too low",
+    # What the CLI actually emits when the subscription window is used up (first live
+    # sample, C5b, 08:58 CDT on 2026-09-17): a `rate_limit_event` whose status is
+    # "rejected", with `out_of_credits` as the overage reason, then a synthetic result
+    # with `terminal_reason` `api_error` and exit 1. A `rate_limit_event` alone is not a
+    # signal; the CLI emits one with status "allowed" on ordinary runs.
+    '"status":"rejected"',
+    "out_of_credits",
 )
 
 
