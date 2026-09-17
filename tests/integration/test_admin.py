@@ -853,3 +853,158 @@ def credentials_module_probe(ctx: AdminContext, uow: Any, *, harness: str, reaso
     return credentials_module.probe(
         ctx, uow, principal="admin-principal", harness=harness, reason=reason
     )
+
+
+# ----- the second correction round --------------------------------------------------
+
+
+def test_a_login_that_cannot_run_refuses_with_the_credential_still_at_its_path(
+    admin_client: TestClient,
+    admin_ctx: AdminContext,
+    live_supervisor: Supervisor,
+    credential_root: Path,
+    tmp_path: Path,
+) -> None:
+    """The harness CLIs are in the worker images and not in the Crucible service image
+    (13), so on a normal deployment every login refuses on the missing executable. That
+    refusal used to happen after the retire, which renamed a valid credential out of the
+    configured path and left the retention sweep free to shred it. Nothing moves until
+    every precondition that can refuse has been checked."""
+    asyncio.run(live_supervisor.tick())
+    admin_ctx.login_commands["agy"] = (str(tmp_path / "no-such-cli"),)
+    before = {
+        path.relative_to(credential_root): path.read_bytes()
+        for path in (credential_root / "agy").rglob("*")
+        if path.is_file()
+    }
+    assert before, "the fixture credential is the thing under test"
+    refused = admin_client.post(
+        "/v1/admin/credentials/agy/login", json={"reason": "onboarding", "replace": True}
+    )
+    assert refused.status_code == 409, refused.text
+    assert "is not installed on this host" in refused.json()["detail"]
+    after = {
+        path.relative_to(credential_root): path.read_bytes()
+        for path in (credential_root / "agy").rglob("*")
+        if path.is_file()
+    }
+    assert after == before
+    assert not [p for p in credential_root.iterdir() if p.name.startswith("agy.retired-")]
+    # The credential is still the harness's credential: present at the configured path,
+    # not `absent`, which is what a retire with no login behind it would have left.
+    assert admin_client.get("/v1/admin/credentials/agy").json()["state"] != "absent"
+
+
+def test_a_start_that_fails_after_the_retire_puts_the_credential_back(
+    admin_ctx: AdminContext,
+    admin_client: TestClient,
+    live_supervisor: Supervisor,
+    credential_root: Path,
+) -> None:
+    """The failure path is safe, not merely unlikely: the retire is a rename and a rename
+    does not roll back with the transaction. A start that fails after a successful retire
+    renames the credential back and records the failure."""
+    from crucible.application.admin.login import start_login  # noqa: PLC0415
+
+    asyncio.run(live_supervisor.tick())
+    live = credential_root / "codex" / "auth.json"
+    before = live.read_text(encoding="utf-8")
+
+    class StartFails:
+        """Every precondition passes and the start itself falls over: the daemon thread
+        could not be created, the CLI vanished between the check and the spawn."""
+
+        def resolve(self, _ctx: AdminContext, _harness: str) -> tuple[str, ...]:
+            return ("codex",)
+
+        def start(self, _ctx: AdminContext, _harness: str, _directory: str) -> None:
+            raise RuntimeError("the login thread could not be started")
+
+        def get(self, _harness: str) -> None:
+            return None
+
+    with admin_ctx.uow_factory() as uow:
+        with pytest.raises(ApplicationError) as raised:
+            start_login(
+                admin_ctx,
+                uow,
+                StartFails(),  # type: ignore[arg-type]
+                principal="admin-principal",
+                harness="codex",
+                reason="onboarding",
+                replace=True,
+            )
+        # The caller's transaction rolls back with the exception and takes the retire
+        # event with it; the directory has to come back on its own.
+        uow.rollback()
+    assert "put back at its configured path" in str(raised.value.detail)
+    assert live.read_text(encoding="utf-8") == before
+    assert not [p for p in credential_root.iterdir() if p.name.startswith("codex.retired-")]
+    assert admin_client.get("/v1/admin/credentials/codex").json()["state"] != "absent"
+    refusals = [
+        e
+        for e in admin_client.get("/v1/admin/audit", params={"limit": 200}).json()["items"]
+        if e["kind"] == "admin_refused"
+    ]
+    assert any(
+        r["payload"]["operation"] == "credentials login codex"
+        and "renamed back to the configured path" in r["payload"]["detail"]
+        for r in refusals
+    ), refusals
+
+
+def test_the_probe_uses_the_model_of_the_routing_policy_in_force(
+    admin_client: TestClient,
+    live_supervisor: Supervisor,
+    provider: FakeProvider,
+) -> None:
+    """The seeded `default-software` version 2 names `default-routing` version 2, whose
+    cheapest enabled codex model is `gpt-5.6-luna`."""
+    asyncio.run(live_supervisor.tick())
+    response = admin_client.post("/v1/admin/credentials/codex/probe", json={"reason": "onboarding"})
+    assert response.status_code == 200, response.text
+    assert provider.probe_requests[-1].harness == "codex"
+    assert "gpt-5.6-luna" in provider.probe_requests[-1].argv
+
+
+def test_the_probe_refuses_rather_than_falling_back_to_a_retired_model(
+    admin_client: TestClient,
+    live_supervisor: Supervisor,
+    provider: FakeProvider,
+    tokens: dict[str, str],
+) -> None:
+    """The probe took its model from the routing policy the policy in force names and
+    then from the seeded `default-routing` versions 2 and 1, so a policy in force with no
+    enabled model for a harness silently ran a model the operator had disabled. Only the
+    policy in force decides, and no enabled model for the harness is a refusal."""
+    asyncio.run(live_supervisor.tick())
+    headers = {"Authorization": f"Bearer {tokens['admin']}"}
+    routing = admin_client.get("/v1/routing/default-routing/2").json()["document"]
+    routing["version"] = 3
+    for model in routing["models"]:
+        if model["harness"] == "codex":
+            model["enabled"] = False
+    assert (
+        admin_client.put("/v1/routing/default-routing/3", json=routing, headers=headers).status_code
+        == 200
+    )
+    policy = admin_client.get("/v1/policies/default-software/2").json()["document"]
+    policy["version"] = 3
+    policy["routing"]["policy"] = {"name": "default-routing", "version": 3}
+    assert (
+        admin_client.put(
+            "/v1/policies/default-software/3", json=policy, headers=headers
+        ).status_code
+        == 200
+    )
+    probes_before = len(provider.probe_requests)
+    refused = admin_client.post("/v1/admin/credentials/codex/probe", json={"reason": "onboarding"})
+    assert refused.status_code == 409, refused.text
+    detail = refused.json()["detail"]
+    assert "default-routing version 3" in detail and "no enabled model" in detail
+    # No fallback: the run never reached the provider, so no retired model was invoked.
+    assert len(provider.probe_requests) == probes_before
+    # A harness the policy in force still enables is unaffected.
+    ok = admin_client.post("/v1/admin/credentials/claude_code/probe", json={"reason": "onboarding"})
+    assert ok.status_code == 200, ok.text
+    assert "claude-haiku-4-5" in provider.probe_requests[-1].argv
