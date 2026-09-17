@@ -131,10 +131,10 @@ jobs:
           echo "image label: $LABEL"
           [ "$LABEL" = "${VERSION}" ]
 
-      # Gate 3. Boot the exact image that is about to be published, the way an
-      # operator boots it, and drive one task end to end. This is the last gate
-      # before the artifact leaves the repository.
-      - name: compose smoke against the built image
+      # Gate 3, part one. Boot the exact image that is about to be published,
+      # the way an operator boots it, and prove the running containers are that
+      # image. Part two drives a task through it.
+      - name: boot the built image and prove it is the candidate
         env:
           CRUCIBLE_IMAGE: ghcr.io/sentania-labs/crucible:${{ env.VERSION }}
         run: |
@@ -172,42 +172,17 @@ jobs:
               exit 1
             fi
           done
-          curl -fsS http://127.0.0.1:8080/v1/ready
-          HEALTH=$(curl -fsS http://127.0.0.1:8080/v1/health)
-          echo "health: $HEALTH"
-          printf '%s' "$HEALTH" | python3 -c 'import json,os,sys; v=json.load(sys.stdin)["version"]; print("reported version:", v); sys.exit(0 if v == os.environ["VERSION"] else 1)'
-          TOKEN=$(docker compose exec -T crucible crucible-admin token create --principal release --role orchestrator | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
-          docker compose exec -T crucible crucible-admin repository register --name example-service --url https://github.com/example-org/example-service >/dev/null
-          BODY=$(python3 - <<'PY'
-          import json
-          print(json.dumps({
-            "schema_version": "1.0", "external_id": "REL-1", "title": "Release smoke", "project": "example-service",
-            "parent_external_id": None,
-            "repository": {"name": "example-service", "base_ref": "main", "work_branch": "crucible/REL-1"},
-            "scope": {"allowed_paths": ["src/**"], "prohibited_paths": [".github/**"], "may_add_dependencies": False, "may_modify_ci": False},
-            "objective": "Prove the published image.", "context": [], "project_instructions": [],
-            "acceptance_criteria": [{"id": "AC1", "text": "The task reaches reported."}],
-            "required_verification": [{"id": "V1", "command": "make lint", "expect_exit": 0}, {"id": "V2", "command": "make test", "expect_exit": 0}, {"id": "V3", "command": "make scan", "expect_exit": 0}],
-            "constraints": {"prohibited_actions": [], "network": "policy"},
-            "deliverables": [{"kind": "pull_request", "target": "main", "draft": False, "closes": []}],
-            "reporting": {"report_schema": "CompletionClaimV1", "report_dir": "/crucible/report", "progress_events": True},
-            "escalation": {"conditions": [], "action": "write report/blocked.md with the question and exit 75"},
-            "policy": {"name": "default-software", "version": 1},
-            "execution_request": {"harness": "codex", "model": "fake-model", "effort": "high", "provider": "fake", "image": "crucible-worker:fake-succeed", "timeout_seconds": 600, "rationale": "release smoke"},
-            "lifecycle": {"max_attempts": 2, "retry_on": ["environment", "lost"], "cleanup": "policy"},
-            "correction": None}))
-          PY
-          )
-          TASK=$(curl -fsS -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d "$BODY" http://127.0.0.1:8080/v1/tasks | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
-          curl -fsS -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"harness":"codex","model":"fake-model","provider":"fake","image":"crucible-worker:fake-succeed","policy_version":1}' "http://127.0.0.1:8080/v1/tasks/$TASK/start" >/dev/null
-          STATE=unknown
-          for _ in $(seq 1 30); do
-            STATE=$(curl -fsS -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:8080/v1/tasks/$TASK" | python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])')
-            [ "$STATE" = reported ] && break
-            sleep 2
-          done
-          echo "task state: $STATE"
-          [ "$STATE" = reported ]
+          echo "candidate image confirmed; handing off to the shared smoke"
+
+      # The smoke body itself is tools/smoke/compose_smoke.py, the same file CI
+      # runs on every pull request. It is not copied here: the v0.2.0 run
+      # (35167333375) failed because the copy that used to live in this file was
+      # still written for the pre-C2 task contract.
+      - name: the shared compose smoke
+        env:
+          CRUCIBLE_IMAGE: ghcr.io/sentania-labs/crucible:${{ env.VERSION }}
+          CRUCIBLE_SMOKE_EXPECT_VERSION: ${{ env.VERSION }}
+        run: make smoke
 
       - name: logs on failure
         if: failure()

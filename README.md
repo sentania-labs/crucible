@@ -54,6 +54,7 @@ make up          # postgres, migrations, crucible (api + supervisor) on 127.0.0.
 make dev         # postgres only; then: uv run crucible serve --all
 make lint        # ruff, mypy --strict, import-linter
 make test        # unit tier, then the integration tier against postgres:16 in a container
+make smoke       # after `make up`: drive one task end to end; the same script CI and release run
 make down
 make reset       # DESTRUCTIVE: down and delete the postgres and artifact volumes
 ```

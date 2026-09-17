@@ -44,8 +44,8 @@ real Docker daemon. Each step gates the next:
    published v0.1.0. Compose will still build when an image is absent, because
    the services carry a `build:` section, so the step compares the running
    containers' image IDs against the freshly built one rather than trusting the
-   pull policy. It then checks `/v1/ready`, asserts `/v1/health` reports the
-   tagged version, and drives one task through the fake provider to `reported`.
+   pull policy. It then runs `make smoke`, which is
+   `tools/smoke/compose_smoke.py`, the same file CI runs on every pull request.
 5. **Publish.** Whether the version already exists is decided by the registry
    API, where only an explicit HTTP 404 means absent: a blip, a rate limit or an
    auth failure stops the job rather than being read as "not published". An
@@ -110,6 +110,51 @@ genuinely absent from the local daemon, which is the same condition:
   running containers' image IDs still match the freshly built candidate, and
   `/v1/health` reports the derived version.
 
+## Second live run: the smoke that only existed in two places
+
+The v0.2.0 run (`35167333375`) failed at the smoke step. The task submit
+returned HTTP 422 and the step died inside `json.load`, parsing an empty body,
+so the log showed a traceback and not a reason.
+
+The reason was drift. `release.yml` carried its own copy of the compose smoke,
+written against the C1 task contract: no `execution_request.tier`, a `model`
+that is not a routing entry, a `pull_request` deliverable, and a wait for the
+`reported` state. C2 changed the contract and the lifecycle and updated the copy
+in `ci.yml` only. Every pull request in C2 was green, because CI was exercising
+the corrected copy while the release path still held the stale one. The
+duplication is what made a correction-without-rerunning-every-consumer possible;
+the 422 was only the symptom.
+
+Same outcome as the first run: the gates held, nothing was published, no release
+was created, the cost was a burnt tag.
+
+The fix is one definition. `tools/smoke/compose_smoke.py` is the whole smoke,
+`make smoke` runs it, and both workflows call that target. CI's `compose-smoke`
+job runs it with the same environment as the release path: the release step adds
+`CRUCIBLE_IMAGE`, which pins compose to the candidate, and
+`CRUCIBLE_SMOKE_EXPECT_VERSION`, which asserts `/v1/health` reports the tag.
+Nothing else differs, so a contract change that would break the release now
+fails the pull request that introduces it.
+
+The script reports the method, URL, HTTP status and response body on any
+non-2xx, so the next contract mismatch reads as a 422 carrying the server's
+validation error instead of a JSON traceback. A missing field in a response is
+reported the same way rather than as a `KeyError`, a task that lands in a dead
+end such as `blocked` or `pre_pr_gates_failed` fails immediately instead of
+waiting out the poll budget and reporting as stuck, and the output of
+`crucible-admin token create` is never echoed into a failure message, because a
+failed release run is a public log.
+
+The release path drives an `artifacts` deliverable to `accepted`, where its old
+copy drove a `pull_request` deliverable to `reported`. That is deliberate: in C2
+only an `artifacts` deliverable reaches `accepted`, so the shared smoke exercises
+the longer path, through gate evaluation, a non-author internal review and
+acceptance, rather than stopping at the report.
+
+The release workflow keeps the guards that are genuinely release-only: the
+supporting-image pre-pull, `--pull never`, the running-container image ID
+assertion, and the fail-closed GHCR manifest check.
+
 ## Who pushes the tag
 
 `on: push: tags` does not fire for a tag pushed with the default `GITHUB_TOKEN`.
@@ -119,9 +164,6 @@ A tag pushed by a human from a workstation triggers the workflow normally.
 
 ## Known gaps
 
-- The compose smoke body in `release.yml` is a copy of the one in `ci.yml`
-  rather than a shared script. They will diverge the first time the task
-  contract schema changes.
 - No test asserts that `/v1/health` reports the derived version. The only guard
   is the release workflow's own check, which runs after the tag is public but
   before anything is published.
