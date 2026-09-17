@@ -346,6 +346,7 @@ class ArtifactView(Response):
     attempt_id: str | None
     task_id: str | None
     type: str
+    filename: str
     size: int
     sha256: str
     content_type: str

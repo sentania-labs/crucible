@@ -201,6 +201,9 @@ class Artifact:
     attempt_id: str | None
     task_id: str | None
     type: str
+    # The name the producer gave it, which is what a contract's required_verification
+    # names. `path` is where the bytes landed, which is the content digest (14).
+    filename: str
     path: str
     size: int
     sha256: str

@@ -70,13 +70,14 @@ def store_artifact(
     """Scan, store content-addressed, and record the row. Raises on a secret match."""
     blob = store.put(content)
     existing = uow.artifacts.find_by_sha256(blob.sha256, attempt.id)
-    if existing is not None and existing.type == artifact_type:
+    if existing is not None and existing.type == artifact_type and existing.filename == name:
         return existing
     artifact = Artifact(
         id=new_id(),
         attempt_id=attempt.id,
         task_id=attempt.task_id,
         type=artifact_type,
+        filename=name,
         path=blob.path,
         size=blob.size,
         sha256=blob.sha256,

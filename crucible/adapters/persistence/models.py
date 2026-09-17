@@ -224,6 +224,7 @@ class ArtifactRow(Base):
     attempt_id: Mapped[str | None] = mapped_column(ID, ForeignKey("attempts.id"), nullable=True)
     task_id: Mapped[str | None] = mapped_column(ID, ForeignKey("tasks.id"), nullable=True)
     type: Mapped[str] = mapped_column(String(64))
+    filename: Mapped[str] = mapped_column(Text)
     path: Mapped[str] = mapped_column(Text)
     size: Mapped[int] = mapped_column(BigInteger)
     sha256: Mapped[str] = mapped_column(String(64))

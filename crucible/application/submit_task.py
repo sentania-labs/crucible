@@ -159,13 +159,23 @@ def _check_against_registry(
                             "is not an issue in the contract's repository",
                         )
                     )
-    if contract.correction is not None:
-        problems.append(
-            _problem("correction", "must be null on submit; corrections use /corrections")
-        )
     if contract.lifecycle.retry_on and ExitClass.COMPLETED in contract.lifecycle.retry_on:
         problems.append(_problem("lifecycle.retry_on", "completed is never retried"))
     return problems, policy
+
+
+def validate_against_registry(
+    uow: UnitOfWork, clock: Clock, contract: TaskContractV1
+) -> list[Problem]:
+    """Every submit-time rule of 05 that needs the registry: the repository, the policy
+    and its caps, the image allowlist, the provider and harness, the routing entry, and
+    the quota. A later contract version has to satisfy the same rules the first one did."""
+    repository = uow.repositories.get_by_name(contract.repository.name)
+    policy = uow.policies.get(contract.policy.name, contract.policy.version)
+    problems, checked_policy = _check_against_registry(contract, repository, policy)
+    if checked_policy is not None:
+        problems.extend(_check_routing(uow, clock, contract, checked_policy))
+    return problems
 
 
 def submit_task(
@@ -173,10 +183,11 @@ def submit_task(
 ) -> tuple[Task, TaskContract]:
     contract = parse_contract(body)
     repository = uow.repositories.get_by_name(contract.repository.name)
-    policy = uow.policies.get(contract.policy.name, contract.policy.version)
-    problems, checked_policy = _check_against_registry(contract, repository, policy)
-    if checked_policy is not None:
-        problems.extend(_check_routing(uow, clock, contract, checked_policy))
+    problems = validate_against_registry(uow, clock, contract)
+    if contract.correction is not None:
+        problems.append(
+            _problem("correction", "must be null on submit; corrections use /corrections")
+        )
     if problems:
         # The request transaction rolls back; the API records this event on its own.
         rejection = Event(

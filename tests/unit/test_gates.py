@@ -300,6 +300,42 @@ def test_a_single_star_does_not_cross_a_separator(pattern: str, path: str, match
     assert (outcome.result is GateResult.PASS) is matches
 
 
+def test_an_uploaded_artifact_satisfies_run_evidence_present() -> None:
+    """An orchestrator upload names the contract's path; the bytes live at a digest.
+    The gate compares the name, or an upload could never satisfy it."""
+    evidence = [e for e in _passing_evidence() if e.payload.get("role") != "run_evidence"]
+    evidence.append(
+        _ev(
+            "artifact_present",
+            {
+                "role": "run_evidence",
+                "path": "report/run-evidence.md",
+                "stored_at": "blobs/ab/cd/" + "e" * 64,
+                "size": 48,
+                "uploaded_by": "foundry",
+            },
+            ident=9,
+        )
+    )
+    outcome = evaluate_gate(GateName.RUN_EVIDENCE_PRESENT, _gi(evidence))
+    assert outcome.result is GateResult.PASS
+    assert outcome.evidence_ids == (9,)
+
+
+def test_a_stored_path_alone_does_not_satisfy_run_evidence_present() -> None:
+    """The content-addressed path is not the name the contract asked for."""
+    evidence = [e for e in _passing_evidence() if e.payload.get("role") != "run_evidence"]
+    evidence.append(
+        _ev(
+            "artifact_present",
+            {"role": "run_evidence", "path": "blobs/ab/cd/" + "e" * 64, "size": 48},
+            ident=9,
+        )
+    )
+    outcome = evaluate_gate(GateName.RUN_EVIDENCE_PRESENT, _gi(evidence))
+    assert outcome.result is GateResult.FAIL and "report/run-evidence.md" in outcome.detail
+
+
 def test_run_evidence_matches_the_path_not_the_basename() -> None:
     evidence = _passing_evidence()
     evidence[5] = _ev(

@@ -14,7 +14,7 @@ from crucible.application.errors import (
     NotFoundError,
     TransitionNotAllowedError,
 )
-from crucible.application.submit_task import parse_contract
+from crucible.application.submit_task import parse_contract, validate_against_registry
 from crucible.application.transitions import move_task, record_event
 from crucible.contracts.common import to_document
 from crucible.contracts.task_contract import (
@@ -89,8 +89,23 @@ def attach_correction(
             "a correction version carries a correction section",
             errors=[{"path": "correction", "message": "must not be null on a correction"}],
         )
+    if contract.correction.of_version != task.contract_version:
+        raise ContractValidationError(
+            "a correction corrects the version the task is on",
+            errors=[
+                {
+                    "path": "correction.of_version",
+                    "message": (
+                        f"the task is on version {task.contract_version}; "
+                        f"the correction names {contract.correction.of_version}"
+                    ),
+                }
+            ],
+        )
     previous = _previous(uow, task, contract.correction.of_version)
-    problems: list[dict[str, Any]] = correction_narrows(previous, contract)
+    # 3: a correction is a contract version, so it satisfies every submit-time rule.
+    problems: list[dict[str, Any]] = validate_against_registry(uow, clock, contract)
+    problems.extend(correction_narrows(previous, contract))
     if task.state is TaskState.AWAITING_ACCEPTANCE:
         # The current verdict only. A needs_more_work that a later accept superseded is
         # not a standing request for more work.
@@ -183,7 +198,7 @@ def amend_task(
             errors=[{"path": "correction", "message": "must be null on an amendment"}],
         )
     previous = _previous(uow, task, task.contract_version)
-    problems: list[dict[str, Any]] = []
+    problems: list[dict[str, Any]] = validate_against_registry(uow, clock, contract)
     if contract.external_identity_fields() != previous.external_identity_fields():
         problems.append(
             {
@@ -207,6 +222,34 @@ def amend_task(
                     ),
                 }
             )
+        # The gate results are the proof, and they were evaluated against this version's
+        # acceptance criteria and required verification. Changing either would leave a
+        # `pass` standing for a question that was never asked. A correction re-runs the
+        # work and re-evaluates the gates, so that is the path for a proof-affecting
+        # change; an amendment here is refused naming the field (09, 11).
+        for field, before, after in (
+            (
+                "acceptance_criteria",
+                [(c.id, c.text) for c in previous.acceptance_criteria],
+                [(c.id, c.text) for c in contract.acceptance_criteria],
+            ),
+            (
+                "required_verification",
+                [v.model_dump(mode="json") for v in previous.required_verification],
+                [v.model_dump(mode="json") for v in contract.required_verification],
+            ),
+        ):
+            if before != after:
+                problems.append(
+                    {
+                        "path": field,
+                        "message": (
+                            f"{field} is the question the recorded gate results answered "
+                            "for this head; change it through a correction, which re-runs "
+                            "the work and re-evaluates the gates"
+                        ),
+                    }
+                )
         if task.publish_pending:
             problems.append(
                 {

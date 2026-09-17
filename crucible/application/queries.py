@@ -534,6 +534,7 @@ def _artifact_view(a: Artifact) -> ArtifactView:
         attempt_id=a.attempt_id,
         task_id=a.task_id,
         type=a.type,
+        filename=a.filename,
         size=a.size,
         sha256=a.sha256,
         content_type=a.content_type,

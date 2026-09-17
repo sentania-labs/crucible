@@ -26,6 +26,7 @@ class EventKind(StrEnum):
     EXECUTION_SUCCEEDED = "execution_succeeded"
     EXECUTION_FAILED = "execution_failed"
     EXECUTION_CANCELLED = "execution_cancelled"
+    EXECUTION_RESUMED = "execution_resumed"
     # attempt
     ATTEMPT_CREATED = "attempt_created"
     ATTEMPT_PREPARING = "attempt_preparing"

@@ -66,6 +66,7 @@ from crucible.domain.exit_class import ExitClass, classify_exit
 from crucible.domain.ids import new_id
 from crucible.domain.lifecycle import (
     ATTEMPT_TERMINAL,
+    EXECUTION_TERMINAL,
     AttemptState,
     ExecutionState,
     IllegalTransitionError,
@@ -402,10 +403,35 @@ class Supervisor:
                     if stored.document.get("correction")
                     else ExecutionRole.IMPLEMENT
                 )
-                if any(
-                    e.contract_version == task.contract_version and e.role is role
+                matching = [
+                    e
                     for e in uow.executions.list_for_task(task.id)
-                ):
+                    if e.contract_version == task.contract_version and e.role is role
+                ]
+                # A task is scheduled again by a decision on a blocked task (09) as well
+                # as by a correction. Being scheduled always means new work: a further
+                # attempt on the execution that is still open, or a fresh execution when
+                # every one for this version has ended.
+                open_execution = next(
+                    (e for e in matching if e.state not in EXECUTION_TERMINAL), None
+                )
+                if open_execution is not None:
+                    attempts_so_far = uow.attempts.list_for_execution(open_execution.id)
+                    number = max((a.number for a in attempts_so_far), default=0) + 1
+                    self._create_attempt(uow, open_execution, number=number)
+                    record_event(
+                        uow,
+                        self._clock,
+                        EventKind.EXECUTION_RESUMED,
+                        principal=PRINCIPAL_CRUCIBLE,
+                        task_id=task.id,
+                        execution_id=open_execution.id,
+                        payload={
+                            "role": open_execution.role.value,
+                            "contract_version": open_execution.contract_version,
+                            "attempt_number": number,
+                        },
+                    )
                     continue
                 policy = uow.policies.get(task.policy_name, task.policy_version)
                 assert policy is not None
@@ -582,8 +608,10 @@ class Supervisor:
                         verified=True,
                         payload={
                             "role": ROLE_RUN_EVIDENCE,
-                            "path": artifact.path,
-                            "name": artifact.type,
+                            # The gate compares the name the contract asked for, not the
+                            # content-addressed path the bytes landed at.
+                            "path": artifact.filename,
+                            "stored_at": artifact.path,
                             "size": artifact.size,
                             "uploaded_by": artifact.created_by,
                         },
@@ -1438,6 +1466,19 @@ class Supervisor:
                 EventKind.EXECUTION_FAILED,
                 payload={"role": "review", "detail": detail},
             )
+            create_wake(
+                uow,
+                self._clock,
+                principal_id=task.principal_id,
+                reason=WakeReason.ATTEMPT_FAILED,
+                summary=(
+                    f"the review execution produced no usable ReviewReportV1 ({detail}); "
+                    f"{task.head_sha} still has no non-author review"
+                ),
+                task=task,
+                attempt_id=attempt.id,
+                extra_links={"review": f"/v1/tasks/{task.id}/review"},
+            )
         work = latest_work_attempt(uow, task)
         if work is not None:
             work_attempt, work_execution = work
@@ -1458,6 +1499,12 @@ class Supervisor:
         execution = uow.executions.get(attempt.execution_id, for_update=True)
         task = uow.tasks.get(attempt.task_id, for_update=True)
         assert execution is not None and task is not None
+        if execution.role is ExecutionRole.REVIEW:
+            # A review execution that never produced a report (prepare or launch failed,
+            # the worker was lost, the quota refused it) has no path to `reported`: the
+            # task is waiting in awaiting_internal_review and 09 gives it no such edge.
+            self._finish_failed_review(uow, attempt, execution, task)
+            return
         exit_class = attempt.exit_class or ExitClass.UNKNOWN
         if exit_class is ExitClass.COMPLETED and claim_ok:
             move_attempt(
@@ -1543,6 +1590,50 @@ class Supervisor:
             },
         )
         self._task_reported(uow, task, attempt, exit_class, common)
+
+    def _finish_failed_review(
+        self, uow: UnitOfWork, attempt: Attempt, execution: Execution, task: Task
+    ) -> None:
+        """A review execution that produced no ReviewReportV1 ends without moving the task.
+
+        09: a review execution's outcome does not change task state by itself. The task
+        stays in `awaiting_internal_review` and Foundry is woken, so the review can be
+        asked for again rather than the tick failing on an illegal transition forever."""
+        exit_class = attempt.exit_class or ExitClass.UNKNOWN
+        if attempt.state not in ATTEMPT_TERMINAL:
+            move_attempt(
+                uow,
+                self._clock,
+                attempt,
+                AttemptState.FAILED,
+                EventKind.ATTEMPT_FAILED,
+                payload={"role": "review", "exit_class": exit_class.value},
+            )
+        if execution.state not in EXECUTION_TERMINAL:
+            move_execution(
+                uow,
+                self._clock,
+                execution,
+                ExecutionState.FAILED,
+                EventKind.EXECUTION_FAILED,
+                payload={"role": "review", "exit_class": exit_class.value},
+            )
+        if task.state in (TaskState.CANCELLING, TaskState.CANCELLED):
+            self._finish_cancelling(uow, task)
+            return
+        create_wake(
+            uow,
+            self._clock,
+            principal_id=task.principal_id,
+            reason=WakeReason.ATTEMPT_FAILED,
+            summary=(
+                f"the review execution ended {exit_class.value} without a ReviewReportV1; "
+                f"{task.head_sha} still has no non-author review"
+            ),
+            task=task,
+            attempt_id=attempt.id,
+            extra_links={"review": f"/v1/tasks/{task.id}/review"},
+        )
 
     # Exit classes that wake Foundry once no retry remains (17).
     _FAILURE_WAKE_REASONS: ClassVar[dict[ExitClass, WakeReason]] = {

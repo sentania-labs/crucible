@@ -291,8 +291,8 @@ class FakeProvider:
 
     async def launch(self, ws: Workspace, spec: LaunchSpec) -> Handle:
         behavior, after = self._behavior_for(spec)
-        if spec.role == "review" and behavior not in REVIEW_BEHAVIORS:
-            behavior = "review"
+        # The image tag decides, for a review execution as for any other: a review that
+        # crashes or vanishes is exactly what the review failure paths have to survive.
         review_head = spec.env.get("CRUCIBLE_REVIEW_HEAD_SHA")
         if review_head:
             self._review_heads[spec.attempt_id] = review_head
