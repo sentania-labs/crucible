@@ -31,9 +31,10 @@ def register_repository(
     name: str,
     registration: RepositoryRegistration,
 ) -> Repository:
-    policy = uow.policies.get(registration.policy_name, 1)
+    versions = list(uow.policies.list_versions(registration.policy_name))
+    policy = max(versions, key=lambda p: p.version) if versions else None
     if policy is None:
-        raise NotFoundError(f"policy {registration.policy_name!r} has no version 1")
+        raise NotFoundError(f"policy {registration.policy_name!r} has no version")
     attestation = registration.external_review
     rounds = required_rounds(policy.document)
     if rounds > 0 and not attestation.attested_all_prs:

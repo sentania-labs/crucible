@@ -181,7 +181,7 @@ def task_contract(external_id: str) -> dict[str, Any]:
             "conditions": [],
             "action": "write report/blocked.md with the question and exit 75",
         },
-        "policy": {"name": "default-software", "version": 1},
+        "policy": {"name": "default-software", "version": 2},
         # claude_code: the one harness that ships enabled (25, S1b); a disabled one is
         # refused at submit, which is the gate working, not the smoke's subject. The
         # model is the seeded routing policy's mid entry, which the trivial tier allows.
@@ -328,7 +328,7 @@ def smoke(
             "model": "claude-sonnet-5",
             "provider": "fake",
             "image": "crucible-worker:fake-succeed",
-            "policy_version": 1,
+            "policy_version": 2,
         },
     )
     log("started")

@@ -219,14 +219,15 @@ event, or the database. Workers hold no GitHub credential at all.
 Policies and the routing policy they name are documents, not defaults in code:
 
 ```sh
-GET  /v1/policies/default-software/1    # every tunable the specification mentions
+GET  /v1/policies/default-software/2    # every tunable the specification mentions
 PUT  /v1/policies/{name}/{version}      # admin; a version a task references is immutable
-GET  /v1/routing/default-routing/1      # the models Foundry may name, per tier
+GET  /v1/routing/default-routing/2      # the models Foundry may name, per tier
 GET  /v1/routing/usage                  # per-pool usage in the current window
 GET  /v1/routing/history?model=&project=  # what each model actually did
 ```
 
-`examples/policies/default-software.yaml` is the seeded default, verbatim.
+`examples/policies/default-software.yaml` is the seeded default (version 2), verbatim;
+version 1, the C1 seed, names the placeholder routing policy and stays for reference.
 
 ## Releases
 

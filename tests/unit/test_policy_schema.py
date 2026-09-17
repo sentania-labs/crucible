@@ -17,6 +17,9 @@ from crucible.adapters.persistence.migrations.versions import (
 from crucible.adapters.persistence.migrations.versions import (
     _0004_gates_and_acceptance as m4,
 )
+from crucible.adapters.persistence.migrations.versions import (
+    _0009_administration as m9,
+)
 from crucible.contracts.policy import (
     PolicyV1,
     RoutingPolicyV1,
@@ -41,17 +44,33 @@ def seeded_policy() -> dict[str, Any]:
     return document
 
 
+def seeded_policy_v2() -> dict[str, Any]:
+    """default-software version 2 as migration 0009 seeds it (C5b): version 1 naming
+    default-routing version 2, the verified roster."""
+    document = seeded_policy()
+    document["version"] = 2
+    document["description"] = m9.POLICY_V2_DESCRIPTION
+    document["routing"] = {"policy": {"name": "default-routing", "version": 2}}
+    return document
+
+
 def test_the_seeded_policy_validates() -> None:
     policy = parse_policy(seeded_policy())
     assert policy.name == "default-software" and policy.version == 1
     assert policy.operator_only_settings() == []
 
 
+def test_the_seeded_policy_v2_validates() -> None:
+    policy = parse_policy(seeded_policy_v2())
+    assert policy.version == 2 and policy.routing.policy.version == 2
+
+
 def test_the_example_policy_matches_the_seed() -> None:
+    """The shipped example is the current seed, version 2."""
     document = yaml.safe_load(EXAMPLE.read_text())
     parse_policy(document)
     assert json.loads(json.dumps(document, sort_keys=True)) == json.loads(
-        json.dumps(seeded_policy(), sort_keys=True)
+        json.dumps(seeded_policy_v2(), sort_keys=True)
     )
 
 
