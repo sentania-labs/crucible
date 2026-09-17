@@ -33,7 +33,7 @@ egress allowlist. Initial mitigations:
 - strict egress allowlist, so the credential can only be used against the
   harness's own endpoints;
 - narrow disposable credential copies, removed immediately after validated
-  sync (16);
+  sync and on every path that skips it (16);
 - secret redaction on logs and scanning on artifacts;
 - no cross-harness credential access;
 - per-harness concurrency of one.
@@ -64,9 +64,9 @@ mount_mode = "rw-narrow"       # the CLI writes session and log state beside its
 [credentials.agy]
 source = "directory"
 path = "/var/lib/crucible/credentials/agy"
-mount_mode = "ro"      # S1: AGY refreshes in memory per run from the mounted refresh token and
-                               # wrote nothing back; ro holds until an authenticated C3 re-run shows
-                               # a rotated refresh token, which would make it rw-narrow like Codex
+mount_mode = "rw-narrow"       # the first Crucible-side run past the one-hour expiry rotated the
+                               # token and the copy carried a newer expiry, which is the evidence
+                               # S1 left open; the token file syncs back by that field
 
 [github.app]
 app_id = 0                     # public identifier, not a secret
@@ -83,16 +83,42 @@ daily-use directory: S1 showed Codex and AGY refresh their tokens on
 their own during a run, and a refresh from a copy races the operator's
 own session. No commercial API keys.
 
-`rw-narrow` means: a per-attempt Docker volume seeded with **only the named
-auth files** of that harness (the adapter's `credential_spec` lists them),
-mounted writable at the paths the harness expects. Everything else the
+`rw-narrow` means: a per-attempt copy holding **only the named auth files**
+of that harness (the adapter's `credential_spec` lists them), owned by the
+worker's uid and mode 600, mounted writable at the paths the harness
+expects. The requirement is the copy's properties, not its mechanism: only
+the named files, readable by no other user, never shared between attempts,
+and removed as soon as the sync-back is done. The Docker provider makes it a
+per-attempt directory in the attempt's workspace rather than a named volume,
+because a named volume cannot be removed while the worker container still
+exists and the worker has to outlive the run until its logs are drained (08).
+
+The value never travels through a mount the Crucible process reads. The
+provider seeds the copy through the daemon's container archive endpoint into
+the created, not yet started, worker, and reads it back through the same
+endpoint after the worker exits; the bytes are in the request body and
+nowhere else, not in `Env`, not in `Cmd`, not in a bind source, and not in
+Crucible's own argv. Everything else the
 harness reads from its config directory (settings, hooks, MCP definitions,
 instruction files) is mounted read-only from a Crucible-owned template, so
 a worker cannot plant a hook or a server definition that a later worker
 inherits. On clean exit, Crucible validates each named auth file's JSON
 shape and syncs back only those files, choosing by the newest issued-at
-timestamp inside the token, never by exit order; then the volume is removed
-at once. Per-harness concurrency is 1 whenever `rw-narrow` is in effect
+timestamp inside the token, never by exit order; a file that is not the
+expected shape, or not newer than the source as it stands, is recorded and
+not written. A file the adapter marks as state rather than a credential is
+seeded and never written back. Then the copy is removed
+at once.
+
+The copy is removed on **every** path, not only the clean one: a start that
+failed after seeding, a worker the daemon lost, and a transport failure
+during the read-back all remove it, the last from a `finally` path so a
+repeatedly failing read-back cannot leave it on disk for a retry to find.
+Cleanup removes it under every retention policy, `keep` included, so 08's
+"keep or delete the workspace per policy" never keeps the credential copy.
+A harness counts against its concurrency cap until its copy has been synced
+back and removed, which is after the attempt is `exited`: a second seeding
+from the source before that is the refresh race below. Per-harness concurrency is 1 whenever `rw-narrow` is in effect
 (05b enforces this), because refresh tokens rotate and two concurrent
 refreshes leave one worker with a revoked token and every later worker
 locked out. Spike S1 records what each harness actually writes and where.
@@ -119,7 +145,14 @@ recorded; its value is not.
 
 Provider log capture passes through a redaction filter with the same
 patterns as the secret scanner plus the known shape of each harness's
-tokens and of GitHub installation tokens. The installation-token pattern is
+tokens and of GitHub installation tokens. Worker log chunks are redacted
+before they are stored, not on the way out; the resume position keeps the
+hash of the raw line, which is what the provider's stream is compared
+against (10). The harness token shapes the scanner knows include Codex's
+refresh token, which is not a JWT: two short base64url segments and one
+long one. `.gitleaks.toml` extends the scanner's default rules with every
+pattern the scanner carries, so `make scan` and the CI scan job catch the
+same shapes, and a test holds the two lists equal. The installation-token pattern is
 the literal `ghs_` followed by at least 20 characters from
 `[A-Za-z0-9._-]`, with no upper bound: the real value is about 390
 characters and contains dots, so the fixed-length 40-character form most
