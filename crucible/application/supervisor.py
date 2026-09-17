@@ -187,6 +187,7 @@ class Supervisor:
         harnesses: HarnessRegistry | None = None,
         harness_gates: Mapping[str, HarnessGate] | None = None,
         credential_sources: Mapping[str, CredentialSource] | None = None,
+        credential_sweep: Callable[[UnitOfWork], int] | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._providers = providers
@@ -197,6 +198,9 @@ class Supervisor:
         self._harnesses = harnesses
         self._harness_gates: dict[str, HarnessGate] = dict(harness_gates or {})
         self._credential_sources: dict[str, CredentialSource] = dict(credential_sources or {})
+        # 25: rotated-out credential directories are shredded once their retention
+        # window has elapsed; the retention step calls this with the fenced unit of work.
+        self._credential_sweep = credential_sweep
         self._artifacts = artifact_store
         self._wakes = wake_deliverer
         self.holder = holder
@@ -1670,6 +1674,8 @@ class Supervisor:
         with self._fenced() as uow:
             now = self._clock.now()
             applied = 0
+            if self._credential_sweep is not None:
+                applied += self._credential_sweep(uow)
 
             def act(
                 kind: str, subject: str, name: str, version: int, detail: dict[str, Any]

@@ -68,11 +68,17 @@ def routing_usage(
     uow: UoW,
     _principal: Reader,
     policy: str = "default-software",
-    policy_version: int = 1,
+    policy_version: int | None = None,
 ) -> RoutingUsageView:
-    stored = uow.policies.get(policy, policy_version)
+    """Without `policy_version` the newest version of the policy is used, so the report
+    follows the routing policy new tasks are admitted against."""
+    if policy_version is None:
+        versions = list(uow.policies.list_versions(policy))
+        stored = max(versions, key=lambda p: p.version) if versions else None
+    else:
+        stored = uow.policies.get(policy, policy_version)
     if stored is None:
-        raise NotFoundError(f"policy {policy}/{policy_version} does not exist")
+        raise NotFoundError(f"policy {policy}/{policy_version or 'latest'} does not exist")
     routing = load_routing(uow, stored.document)
     if routing is None:
         raise NotFoundError("the policy names a routing policy that is not uploaded")

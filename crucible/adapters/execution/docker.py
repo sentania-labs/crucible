@@ -68,6 +68,7 @@ from crucible.application.harnesses import (
     egress_allowlist,
 )
 from crucible.contracts.completion_claim import CompletionClaimV1
+from crucible.domain.ids import new_id
 from crucible.domain.time import parse_rfc3339
 from crucible.ports.execution import (
     IDENTITY_MOUNT,
@@ -91,8 +92,11 @@ from crucible.ports.execution import (
     LogOffset,
     Observation,
     ObservationState,
+    ProbeRequest,
+    ProbeResult,
     ProviderCapabilities,
     ProviderError,
+    ProviderHealth,
     VerificationRun,
     Workspace,
     WorkspaceState,
@@ -1258,6 +1262,155 @@ class DockerProvider:
                 await self._call(self.client.remove_container, str(row["Id"]), force=True)
                 removed += 1
         return removed
+
+    async def health(self) -> ProviderHealth:
+        """25: daemon reachable through the proxy, workers network present, disk headroom."""
+        checks: dict[str, Any] = {}
+        state = "ok"
+        try:
+            checks["daemon"] = await self._call(self.client.ping)
+        except Exception as exc:
+            checks["daemon"] = f"unreachable: {type(exc).__name__}"
+            return ProviderHealth("unavailable", checks)
+        try:
+            await self._call(self.client.inspect_network, self.config.workers_network)
+            checks["network"] = self.config.workers_network
+        except Exception:
+            checks["network"] = "absent"
+            state = "degraded"
+        try:
+            usage = shutil.disk_usage(self.config.artifact_root)
+            checks["disk_free_bytes"] = usage.free
+            if usage.free < 2 * 1024**3:
+                state = "degraded"
+        except OSError:
+            checks["disk_free_bytes"] = None
+            state = "degraded"
+        return ProviderHealth(state, checks)
+
+    async def probe_credential(self, request: ProbeRequest) -> ProbeResult:
+        """25: the bounded auth probe. The same launch path as a worker (the hardened
+        shape, the credential copy seeded and mounted, the wrapper), a one-line prompt
+        with a hard timeout, the named files read back and synced, then everything
+        removed: the container, the copy, the workspace."""
+        probe_id = f"probe{new_id()}"[:26]
+        spec = LaunchSpec(
+            attempt_id=probe_id,
+            task_id=probe_id,
+            external_id="probe",
+            role="probe",
+            harness=request.harness,
+            model="probe",
+            image=request.image,
+            timeout_seconds=request.timeout_seconds,
+            contract={"repository": {}},
+            env=dict(request.env),
+            command=tuple(request.argv),
+            policy=request.policy,
+            owner="crucible-admin",
+            env_from_files=dict(request.env_from_files),
+            stdin_files=tuple(request.stdin_files),
+            stdin_text=request.stdin_text,
+        )
+        root = self._root(probe_id)
+        await asyncio.to_thread(shutil.rmtree, root, True)
+        # 25: the probe removes everything. The preparer, the image resolution and the
+        # identity writes can each fail, so they are inside the same try whose finally
+        # removes the containers and the workspace; nothing is seeded before this point.
+        started = time.monotonic()
+        timed_out = False
+        exit_code: int | None = None
+        oom = False
+        stdout_tail = stderr_tail = ""
+        sync = None
+        detail = ""
+        handle: Handle | None = None
+        resolved = ""
+        ws: Workspace | None = None
+        try:
+            paths = await asyncio.to_thread(self._make_dirs, root)
+            ws = Workspace(
+                attempt_id=probe_id,
+                checkout_path=str(paths["repo"]),
+                identity_path=str(paths["identity"]),
+                report_path=str(paths["report"]),
+                output_path=str(paths["output"]),
+            )
+            resolved = await self._resolve_image(spec)
+            started = time.monotonic()
+            # The preparer's role, reduced to what a probe needs: the directories the worker's
+            # own uid must own, the credential leaf mode 700 (12, S9 Test E).
+            code = await self._run_throwaway(
+                spec,
+                role=ROLE_PREPARER,
+                image=resolved,
+                script=(
+                    f"set -eu; mkdir -p {WORK_MOUNT}/repo {WORK_MOUNT}/report; "
+                    f"mkdir -m 0700 -p {WORK_MOUNT}/{CREDENTIAL_LEAF}\n"
+                ),
+                mounts=[self._daemon_mount(probe_id, "", WORK_MOUNT, read_only=False)],
+                network="none",
+                timeout=60,
+            )
+            if code != 0:
+                raise ProviderError(f"the probe could not prepare its workspace (exit {code})")
+            adapter = self.harnesses.get(request.harness)
+            credential = adapter.credential_spec() if adapter is not None else None
+            identity = paths["identity"]
+            (identity / "IDENTITY.md").write_text(request.identity_text, encoding="utf-8")
+            os.chmod(identity / "IDENTITY.md", 0o444)
+            if credential is not None and credential.templates:
+                template_dir = identity / "harness"
+                template_dir.mkdir(parents=True, exist_ok=True)
+                for name, content in credential.templates.items():
+                    (template_dir / name).write_text(content, encoding="utf-8")
+                    os.chmod(template_dir / name, 0o444)
+            handle = await self.launch(ws, spec)
+            try:
+                exit_code = int(
+                    await self._call(
+                        self.client.wait_container,
+                        handle.ref,
+                        timeout=float(request.timeout_seconds),
+                    )
+                )
+            except (TimeoutError, OSError, HTTPException, DockerApiError) as exc:
+                timed_out = True
+                detail = (
+                    f"the probe did not finish within {request.timeout_seconds}s "
+                    f"({type(exc).__name__})"
+                )
+                with contextlib.suppress(Exception):
+                    await self._call(self.client.kill_container, handle.ref)
+            observation = await self.observe(handle)
+            if observation.state is ObservationState.EXITED:
+                exit_code = observation.exit_code if exit_code is None else exit_code
+                oom = observation.oom_killed
+            stdout_tail, stderr_tail = await self._worker_tails(handle.ref)
+            sync = await self._sync_credential(handle, ws, spec)
+        finally:
+            for row in await self._containers_for(probe_id):
+                with contextlib.suppress(Exception):
+                    await self._call(self.client.remove_container, str(row["Id"]), force=True)
+            if ws is not None:
+                with contextlib.suppress(Exception):
+                    await self.cleanup(ws, CleanupPolicy.DELETE, spec)
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(shutil.rmtree, root, True)
+            self._launched.pop(probe_id, None)
+        labels = self._images.get(spec.image)
+        return ProbeResult(
+            exit_code=exit_code,
+            image_digest=resolved,
+            harness_version=labels.labels.get("crucible.harness_version") if labels else None,
+            duration_seconds=time.monotonic() - started,
+            timed_out=timed_out,
+            oom_killed=oom,
+            stdout_tail=stdout_tail,
+            stderr_tail=stderr_tail,
+            credential_sync=sync,
+            detail=detail,
+        )
 
     async def list_images(self) -> list[ImageInfo]:
         """Every image on the daemon that carries the `crucible.harness` label (13)."""

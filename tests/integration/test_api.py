@@ -145,10 +145,10 @@ def test_start_disagreeing_with_contract_is_422(client: TestClient) -> None:
         f"/v1/tasks/{task_id}/start",
         json={
             "harness": "claude_code",
-            "model": "gpt-5-codex-mini",
+            "model": "gpt-5.6-luna",
             "provider": "fake",
             "image": "crucible-worker:fake-succeed",
-            "policy_version": 1,
+            "policy_version": 2,
         },
     )
     assert r.status_code == 422 and any(e["path"] == "harness" for e in r.json()["errors"])
@@ -156,10 +156,10 @@ def test_start_disagreeing_with_contract_is_422(client: TestClient) -> None:
         f"/v1/tasks/{task_id}/start",
         json={
             "harness": "codex",
-            "model": "gpt-5-codex-mini",
+            "model": "gpt-5.6-luna",
             "provider": "fake",
             "image": "crucible-worker:fake-succeed",
-            "policy_version": 1,
+            "policy_version": 2,
             "overrides": {"model": "x"},
         },
     )
@@ -171,10 +171,10 @@ def test_start_twice_is_409(client: TestClient) -> None:
     task_id = client.post("/v1/tasks", json=contract_document()).json()["id"]
     body = {
         "harness": "codex",
-        "model": "gpt-5-codex-mini",
+        "model": "gpt-5.6-luna",
         "provider": "fake",
         "image": "crucible-worker:fake-succeed",
-        "policy_version": 1,
+        "policy_version": 2,
     }
     assert client.post(f"/v1/tasks/{task_id}/start", json=body).status_code == 200
     r = client.post(f"/v1/tasks/{task_id}/start", json=body)

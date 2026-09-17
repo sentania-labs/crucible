@@ -24,10 +24,10 @@ def test_no_secret_bearing_column_names() -> None:
 
 def test_migration_event_kinds_match_enum() -> None:
     from crucible.adapters.persistence.migrations.versions import (  # noqa: PLC0415
-        _0008_harness_adapters as m,
+        _0009_administration as m,
     )
 
-    # 0008 owns the current CHECK constraint; adding a kind is a new migration (10).
+    # 0009 owns the current CHECK constraint; adding a kind is a new migration (10).
     assert set(m._event_kinds()) == {k.value for k in EventKind}
 
 

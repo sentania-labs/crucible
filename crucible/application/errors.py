@@ -72,6 +72,15 @@ class IdempotencyKeyReuseError(ApplicationError):
     title = "Idempotency-Key reused with a different body"
 
 
+class SupervisorNotLiveError(ApplicationError):
+    """25: an administrative mutation is refused when no live supervisor holds the lease,
+    so a stale instance cannot administer."""
+
+    slug = "supervisor-not-live"
+    status = 503
+    title = "No live supervisor holds the lease"
+
+
 class IdempotencyInProgressError(ApplicationError):
     slug = "idempotency-in-progress"
     status = 409

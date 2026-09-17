@@ -227,6 +227,10 @@ class Repositories:
         row = self._s.scalar(select(RepositoryRow).where(RepositoryRow.name == name))
         return self._to_entity(row) if row else None
 
+    def list_all(self) -> Sequence[Repository]:
+        rows = self._s.scalars(select(RepositoryRow).order_by(RepositoryRow.name)).all()
+        return [self._to_entity(r) for r in rows]
+
     def get(self, repository_id: str) -> Repository | None:
         row = self._s.get(RepositoryRow, repository_id)
         return self._to_entity(row) if row else None

@@ -25,21 +25,23 @@ def admin(tokens: dict[str, str]) -> dict[str, str]:
 
 
 def test_read_the_seeded_policy_and_routing_policy(client: TestClient) -> None:
-    body = client.get("/v1/policies/default-software/1").json()
+    body = client.get("/v1/policies/default-software/2").json()
     assert body["name"] == "default-software" and body["referenced"] is False
-    assert body["document"]["routing"]["policy"]["name"] == "default-routing"
-    routing = client.get("/v1/routing/default-routing/1").json()
-    assert any(m["id"] == "gpt-5-codex-mini" for m in routing["document"]["models"])
+    assert body["document"]["routing"]["policy"] == {"name": "default-routing", "version": 2}
+    routing = client.get("/v1/routing/default-routing/2").json()
+    assert any(m["id"] == "gpt-5.6-luna" for m in routing["document"]["models"])
 
 
 def test_upload_a_new_policy_version(client: TestClient, tokens: dict[str, str]) -> None:
-    document = seeded_policy()
-    document["version"] = 2
+    # `policies` is not truncated between tests and the usage report follows the newest
+    # version, so the upload derives from the current seed (version 2, routing version 2).
+    document = client.get("/v1/policies/default-software/2").json()["document"]
+    document["version"] = 3
     document["limits"]["grace_seconds"] = 45
-    r = client.put("/v1/policies/default-software/2", json=document, headers=admin(tokens))
+    r = client.put("/v1/policies/default-software/3", json=document, headers=admin(tokens))
     assert r.status_code == 200, r.text
     assert (
-        client.get("/v1/policies/default-software/2").json()["document"]["limits"]["grace_seconds"]
+        client.get("/v1/policies/default-software/3").json()["document"]["limits"]["grace_seconds"]
         == 45
     )
 
@@ -176,26 +178,26 @@ def test_a_referenced_policy_version_is_immutable(
     client: TestClient, tokens: dict[str, str]
 ) -> None:
     client.post("/v1/tasks", json=contract_document())
-    document = seeded_policy()
-    r = client.put("/v1/policies/default-software/1", json=document, headers=admin(tokens))
+    document = client.get("/v1/policies/default-software/2").json()["document"]
+    r = client.put("/v1/policies/default-software/2", json=document, headers=admin(tokens))
     assert r.status_code == 409
     assert "immutable" in r.json()["detail"]
-    assert client.get("/v1/policies/default-software/1").json()["referenced"] is True
+    assert client.get("/v1/policies/default-software/2").json()["referenced"] is True
 
 
 def test_a_referenced_routing_policy_is_immutable(
     client: TestClient, tokens: dict[str, str]
 ) -> None:
-    document = client.get("/v1/routing/default-routing/1").json()["document"]
-    r = client.put("/v1/routing/default-routing/1", json=document, headers=admin(tokens))
+    document = client.get("/v1/routing/default-routing/2").json()["document"]
+    r = client.put("/v1/routing/default-routing/2", json=document, headers=admin(tokens))
     assert r.status_code == 409
 
 
 def test_upload_a_new_routing_policy_version(client: TestClient, tokens: dict[str, str]) -> None:
-    document = copy.deepcopy(client.get("/v1/routing/default-routing/1").json()["document"])
-    document["version"] = 2
+    document = copy.deepcopy(client.get("/v1/routing/default-routing/2").json()["document"])
+    document["version"] = 3
     document["models"][1]["enabled"] = False
-    r = client.put("/v1/routing/default-routing/2", json=document, headers=admin(tokens))
+    r = client.put("/v1/routing/default-routing/3", json=document, headers=admin(tokens))
     assert r.status_code == 200, r.text
 
 
@@ -204,7 +206,7 @@ def test_upload_a_new_routing_policy_version(client: TestClient, tokens: dict[st
     [
         ({"model": "no-such-model"}, "execution_request.model"),
         ({"model": "claude-sonnet-5"}, "execution_request.harness"),
-        ({"model": "gpt-5-codex", "tier": "trivial"}, "execution_request.model"),
+        ({"model": "gpt-5.6-sol", "tier": "trivial"}, "execution_request.model"),
         ({"model": "local-rtx-small", "tier": "trivial"}, "execution_request.model"),
     ],
 )
@@ -223,22 +225,18 @@ def test_a_complex_tier_may_name_a_frontier_model(client: TestClient) -> None:
     document["execution_request"] = {
         **document["execution_request"],
         "tier": "complex",
-        "model": "gpt-5-codex",
+        "model": "gpt-5.6-sol",
     }
     assert client.post("/v1/tasks", json=document).status_code == 201
 
 
 def test_routing_usage_reports_every_pool(client: TestClient) -> None:
-    body = client.get("/v1/routing/usage").json()
-    assert body["routing_policy"] == {"name": "default-routing", "version": 1}
+    # Without `policy_version` the report follows the newest policy version; this module
+    # uploads several, so the seeded version 2 is named explicitly.
+    body = client.get("/v1/routing/usage", params={"policy_version": 2}).json()
+    assert body["routing_policy"] == {"name": "default-routing", "version": 2}
     pools = {p["pool"]: p for p in body["pools"]}
-    assert set(pools) == {
-        "anthropic-sub",
-        "openai-sub",
-        "google-sub",
-        "local-rtx",
-        "local-spark",
-    }
+    assert set(pools) == {"anthropic-sub", "openai-sub", "google-sub"}
     assert pools["openai-sub"]["soft_limit"] == 0
     assert pools["openai-sub"]["over_soft_limit"] is False
 
@@ -249,7 +247,8 @@ async def test_usage_counts_attempts_when_no_tokens_are_reported(
     """05b: a harness that reports no token counts falls back to counting attempts."""
     task_id = submit_and_start(client, "crucible-worker:fake-succeed")
     await run_to_settled(supervisor, client, task_id)
-    pools = {p["pool"]: p for p in client.get("/v1/routing/usage").json()["pools"]}
+    usage = client.get("/v1/routing/usage", params={"policy_version": 2}).json()
+    pools = {p["pool"]: p for p in usage["pools"]}
     openai = pools["openai-sub"]
     assert openai["attempts"] == 1
     assert openai["fallback_to_attempts"] is True and openai["counting"] == "attempts"
@@ -260,9 +259,9 @@ async def test_routing_history_filters_by_model_and_project(
 ) -> None:
     task_id = submit_and_start(client, "crucible-worker:fake-succeed")
     await run_to_settled(supervisor, client, task_id)
-    assert client.get("/v1/routing/history", params={"model": "gpt-5-codex"}).json()["items"] == []
+    assert client.get("/v1/routing/history", params={"model": "gpt-5.6-sol"}).json()["items"] == []
     rows = client.get(
-        "/v1/routing/history", params={"model": "gpt-5-codex-mini", "project": "example-service"}
+        "/v1/routing/history", params={"model": "gpt-5.6-luna", "project": "example-service"}
     ).json()["items"]
     assert len(rows) == 1 and rows[0]["task_id"] == task_id
     assert client.get("/v1/routing/history", params={"project": "nothing"}).json()["items"] == []

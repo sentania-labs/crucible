@@ -80,7 +80,7 @@ def test_the_fake_reviewer_produces_a_valid_report() -> None:
         external_id="EX-0001",
         role="review",
         harness="codex",
-        model="gpt-5-codex-mini",
+        model="gpt-5.6-luna",
         image="crucible-worker:fake-review",
         timeout_seconds=60,
         contract=contract_document(),

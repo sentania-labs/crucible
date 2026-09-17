@@ -9,6 +9,8 @@ from typing import Annotated
 from fastapi import Depends, Header, Request
 from sqlalchemy import Engine
 
+from crucible.application.admin.context import AdminContext
+from crucible.application.admin.login import LoginRegistry
 from crucible.application.auth import authenticate
 from crucible.application.errors import ForbiddenError, UnauthorizedError
 from crucible.application.harnesses import HarnessRegistry
@@ -38,6 +40,9 @@ class AppContext:
     harnesses: HarnessRegistry | None = None
     harness_gates: dict[str, HarnessGate] = field(default_factory=dict)
     credential_sources: dict[str, CredentialSource] = field(default_factory=dict)
+    # 25: the administrative services and the in-progress logins of this process.
+    admin: AdminContext | None = None
+    logins: LoginRegistry = field(default_factory=LoginRegistry)
 
 
 def app_context(request: Request) -> AppContext:

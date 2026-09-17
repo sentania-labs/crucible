@@ -213,10 +213,19 @@ def test_agy_exit_1_with_a_well_formed_result_line_classifies_on_its_text() -> N
             ClaudeCodeAdapter(),
             '{"type":"result","is_error":true,"result":"You\'ve hit your usage limit"}',
         ),
+        (
+            # The live sample (C5b): the window used up, then a synthetic result.
+            ClaudeCodeAdapter(),
+            '{"type":"rate_limit_event","rate_limit_info":{"status":"rejected",'
+            '"rateLimitType":"five_hour","overageStatus":"rejected",'
+            '"overageDisabledReason":"out_of_credits","isUsingOverage":false}}\n'
+            '{"type":"result","subtype":"success","is_error":false,"duration_api_ms":0,'
+            '"total_cost_usd":0,"terminal_reason":"api_error"}',
+        ),
         (CodexAdapter(), '{"type":"turn.failed","error":{"code":"usage_limit_reached"}}'),
         (AgyAdapter(), '{"type":"result","status":"ERROR","error":"RESOURCE_EXHAUSTED: quota"}'),
     ],
-    ids=["claude_code", "codex", "agy"],
+    ids=["claude_code", "claude_code_live_window", "codex", "agy"],
 )
 def test_quota_exhaustion_from_the_tails(adapter: HarnessAdapter, tail: str) -> None:
     assert adapter.classify_exit(ExitInfo(exit_code=1), tail, "") is ExitClass.QUOTA_EXHAUSTED
