@@ -84,13 +84,15 @@ supervisor.
   refuses to serve if the head revision is not applied, and `/ready` reports
   it.
 - Down migrations required for every revision in v0.x.
-- A down migration never deletes an audit row. Where an earlier revision's
-  constraint cannot admit rows a later one wrote, the down migration moves
-  those rows aside (C4 puts its event rows in `events_c4_archive` and the
-  up migration moves them back) and reinstates the old constraint `NOT
-  VALID` without validating it, so existing rows survive and new rows obey
-  the older list. A database that was downgraded says so by having the
-  archive table.
+- A down migration that narrows the event-kind constraint has to deal with
+  the rows the newer kinds wrote. Revision 0007 (C4) **archives** them: it
+  copies every C4 event row into `events_c4_archive`, removes them from
+  `events`, recreates the older constraint in its ordinary validating form,
+  and its upgrade moves the rows back. Nothing is lost either way, and a
+  database that was downgraded says so by having the archive table. This is
+  the pattern for future revisions. It is not retroactive: earlier
+  downgrades (0006, for one) simply delete the event rows of the kinds they
+  remove, which is a known gap, not a promise kept.
 - An applied migration is never edited. Before the first tagged release
   the initial revision may be squashed only together with a documented
   `make reset`; after it, every change is a new revision. Readiness
