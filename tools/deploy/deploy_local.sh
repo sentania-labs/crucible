@@ -218,7 +218,23 @@ fi
 if [ -z "$password" ] || [ "$password" = "CHANGE_ME" ]; then
   # Alphanumeric only: compose interpolates '$' in a .env value, and a password that
   # changes meaning between the file and the container is a debugging afternoon.
-  password="$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 40)"
+  #
+  # Neither end of this pipeline can be killed by SIGPIPE: `head -c 512` exits on its
+  # own after 512 bytes and `tr` reads that to EOF. The obvious shape,
+  # `tr -dc ... < /dev/urandom | head -c 40`, is a trap: `head` closes the pipe as soon
+  # as it has 40 characters, `tr` dies with 141, and `set -o pipefail` turns that into a
+  # failed deployment before .env is ever written. It only bites on a fresh deployment,
+  # because an existing .env skips this branch entirely. 512 random bytes yield about
+  # 320 alphanumerics, so one pass is effectively always enough; the loop is there so
+  # that an improbably poor draw extends rather than fails.
+  password=""
+  attempt=0
+  while [ "${#password}" -lt 40 ] && [ "$attempt" -lt 8 ]; do
+    attempt=$((attempt + 1))
+    chunk="$(head -c 512 /dev/urandom | LC_ALL=C tr -dc 'A-Za-z0-9')"
+    password="${password}${chunk}"
+  done
+  password="${password:0:40}"
   [ "${#password}" -eq 40 ] || { echo "deploy-local: could not generate a password" >&2; exit 2; }
   echo "deploy-local: generated a new POSTGRES_PASSWORD in $env_file (not printed)"
 else
