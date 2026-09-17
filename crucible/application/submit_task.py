@@ -10,6 +10,7 @@ from pydantic import ValidationError
 
 from crucible.application.errors import ContractValidationError, DuplicateExternalIdError
 from crucible.application.registry import REGISTERED_HARNESSES, REGISTERED_PROVIDERS
+from crucible.application.routing import check_quota, check_selection, load_routing
 from crucible.application.transitions import record_event
 from crucible.contracts.common import to_document
 from crucible.contracts.task_contract import TaskContractV1, contract_sha256
@@ -38,6 +39,34 @@ def parse_contract(body: object) -> TaskContractV1:
             for err in exc.errors(include_url=False, include_input=False)
         ]
         raise ContractValidationError("task contract failed validation", errors=problems) from None
+
+
+def _check_routing(
+    uow: UnitOfWork, clock: Clock, contract: TaskContractV1, policy: Policy
+) -> list[Problem]:
+    """05, 05b: the model must be an enabled routing entry the tier allows, and its quota
+    pool must not be over its soft limit. The submit check is advisory; the launch check
+    is authoritative."""
+    routing = load_routing(uow, policy.document)
+    if routing is None:
+        ref = policy.document.get("routing", {}).get("policy", {})
+        return [
+            _problem(
+                "policy.routing",
+                f"routing policy {ref.get('name')}/{ref.get('version')} is not uploaded",
+            )
+        ]
+    request = contract.execution_request
+    problems = check_selection(
+        routing,
+        tier=request.tier.value,
+        harness=request.harness.value,
+        model_id=request.model,
+    )
+    quota = check_quota(uow, routing, model_id=request.model, now=clock.now())
+    if quota is not None:
+        problems.append(quota)
+    return problems
 
 
 def _check_against_registry(
@@ -130,13 +159,23 @@ def _check_against_registry(
                             "is not an issue in the contract's repository",
                         )
                     )
-    if contract.correction is not None:
-        problems.append(
-            _problem("correction", "must be null on submit; corrections use /corrections")
-        )
     if contract.lifecycle.retry_on and ExitClass.COMPLETED in contract.lifecycle.retry_on:
         problems.append(_problem("lifecycle.retry_on", "completed is never retried"))
     return problems, policy
+
+
+def validate_against_registry(
+    uow: UnitOfWork, clock: Clock, contract: TaskContractV1
+) -> list[Problem]:
+    """Every submit-time rule of 05 that needs the registry: the repository, the policy
+    and its caps, the image allowlist, the provider and harness, the routing entry, and
+    the quota. A later contract version has to satisfy the same rules the first one did."""
+    repository = uow.repositories.get_by_name(contract.repository.name)
+    policy = uow.policies.get(contract.policy.name, contract.policy.version)
+    problems, checked_policy = _check_against_registry(contract, repository, policy)
+    if checked_policy is not None:
+        problems.extend(_check_routing(uow, clock, contract, checked_policy))
+    return problems
 
 
 def submit_task(
@@ -144,8 +183,11 @@ def submit_task(
 ) -> tuple[Task, TaskContract]:
     contract = parse_contract(body)
     repository = uow.repositories.get_by_name(contract.repository.name)
-    policy = uow.policies.get(contract.policy.name, contract.policy.version)
-    problems, _ = _check_against_registry(contract, repository, policy)
+    problems = validate_against_registry(uow, clock, contract)
+    if contract.correction is not None:
+        problems.append(
+            _problem("correction", "must be null on submit; corrections use /corrections")
+        )
     if problems:
         # The request transaction rolls back; the API records this event on its own.
         rejection = Event(

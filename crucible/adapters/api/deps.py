@@ -12,6 +12,7 @@ from sqlalchemy import Engine
 from crucible.application.auth import authenticate
 from crucible.application.errors import ForbiddenError, UnauthorizedError
 from crucible.domain.entities import Principal, Role
+from crucible.ports.artifacts import ArtifactStore
 from crucible.ports.clock import Clock
 from crucible.ports.execution import ExecutionProvider
 from crucible.ports.repository import UnitOfWork, UnitOfWorkFactory
@@ -24,6 +25,7 @@ class AppContext:
     providers: list[ExecutionProvider]
     database_url: str
     engine: Engine
+    artifact_store: ArtifactStore
     lease_ttl_seconds: int = 30
 
 
@@ -57,6 +59,19 @@ def require_mutating(principal: Annotated[Principal, Depends(current_principal)]
     return principal
 
 
+def require_orchestrator(principal: Annotated[Principal, Depends(current_principal)]) -> Principal:
+    """04: the orchestrator surface, which an operator principal may also use."""
+    if principal.role not in (Role.ORCHESTRATOR, Role.OPERATOR):
+        raise ForbiddenError("orchestrator or operator role required")
+    return principal
+
+
+def require_operator(principal: Annotated[Principal, Depends(current_principal)]) -> Principal:
+    if principal.role not in (Role.OPERATOR, Role.ADMIN):
+        raise ForbiddenError("operator or admin role required")
+    return principal
+
+
 def require_admin(principal: Annotated[Principal, Depends(current_principal)]) -> Principal:
     if principal.role is not Role.ADMIN:
         raise ForbiddenError("admin role required")
@@ -68,3 +83,5 @@ Ctx = Annotated[AppContext, Depends(app_context)]
 Reader = Annotated[Principal, Depends(current_principal)]
 Mutator = Annotated[Principal, Depends(require_mutating)]
 Admin = Annotated[Principal, Depends(require_admin)]
+Orchestrator = Annotated[Principal, Depends(require_orchestrator)]
+Operator = Annotated[Principal, Depends(require_operator)]

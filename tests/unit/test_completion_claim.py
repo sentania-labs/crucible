@@ -11,6 +11,7 @@ def _spec() -> LaunchSpec:
         attempt_id="a",
         task_id="t",
         external_id="EX-0001",
+        role="implement",
         harness="codex",
         model="m",
         image="crucible-worker:fake-succeed",

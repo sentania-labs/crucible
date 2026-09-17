@@ -13,11 +13,35 @@ from crucible.adapters.execution.fake import FakeProvider
 from crucible.application.supervisor import Supervisor
 from crucible.ports.execution import LaunchSpec
 from tests.fixtures import FakeClock, contract_document
-from tests.integration.conftest import event_kinds, make_supervisor, run_until, submit_and_start
+from tests.integration.conftest import (
+    ARTIFACTS_DELIVERABLE,
+    event_kinds,
+    make_supervisor,
+    review_and_settle,
+    run_to_settled,
+    submit_and_start,
+)
 
 pytestmark = pytest.mark.integration
 
-STATE_TABLES = ("tasks", "executions", "attempts", "events", "completion_claims", "task_contracts")
+STATE_TABLES = (
+    "tasks",
+    "executions",
+    "attempts",
+    "events",
+    "completion_claims",
+    "task_contracts",
+    # C2 record tables (14): reconciliation must not touch these a second time either.
+    "artifacts",
+    "evidence",
+    "gate_results",
+    "review_reports",
+    "acceptance_results",
+    "decisions",
+    "escalations",
+    "wakes",
+    "attempt_metrics",
+)
 
 
 def snapshot(engine: Engine) -> dict[str, list[Any]]:
@@ -33,13 +57,47 @@ async def test_reconcile_twice_changes_nothing_after_completion(
     client: TestClient, supervisor: Supervisor, engine: Engine
 ) -> None:
     task_id = submit_and_start(client, "crucible-worker:fake-succeed")
-    assert await run_until(supervisor, client, task_id, {"reported"}) == "reported"
+    assert await run_to_settled(supervisor, client, task_id) == "awaiting_internal_review"
     before = snapshot(engine)
     await supervisor.reconcile()
     middle = snapshot(engine)
     await supervisor.reconcile()
     after = snapshot(engine)
     assert before == middle == after
+
+
+async def test_reconcile_twice_changes_nothing_after_acceptance(
+    client: TestClient, supervisor: Supervisor, engine: Engine
+) -> None:
+    """The gate, evidence, wake, and metrics rows settle exactly once (10)."""
+    task_id = submit_and_start(
+        client, "crucible-worker:fake-succeed", deliverables=ARTIFACTS_DELIVERABLE
+    )
+    await run_to_settled(supervisor, client, task_id)
+    assert await review_and_settle(supervisor, client, task_id) == "awaiting_acceptance"
+    client.post(
+        f"/v1/tasks/{task_id}/accept",
+        json={"verdict": "accepted", "reasoning": "It does what the contract asked."},
+    )
+    await supervisor.tick()
+    before = snapshot(engine)
+    await supervisor.reconcile()
+    middle = snapshot(engine)
+    await supervisor.reconcile()
+    after = snapshot(engine)
+    assert before == middle == after
+
+
+async def test_reconcile_twice_changes_nothing_after_a_gate_failure(
+    client: TestClient, supervisor: Supervisor, engine: Engine
+) -> None:
+    task_id = submit_and_start(client, "crucible-worker:fake-out-of-scope")
+    assert await run_to_settled(supervisor, client, task_id) == "pre_pr_gates_failed"
+    await supervisor.tick()
+    before = snapshot(engine)
+    await supervisor.reconcile()
+    await supervisor.reconcile()
+    assert snapshot(engine) == before
 
 
 async def test_reconcile_twice_changes_nothing_mid_attempt(
@@ -73,7 +131,7 @@ async def test_supervisor_restart_mid_attempt(
     clock.advance(31)
     b = make_supervisor(ctx, provider, holder="sup-b", lease_ttl_seconds=30)
     assert (await b.tick()).held
-    assert await run_until(b, client, task_id, {"reported"}) == "reported"
+    assert await run_to_settled(b, client, task_id) == "awaiting_internal_review"
     view = client.get(f"/v1/tasks/{task_id}").json()
     attempts = [x for e in view["executions"] for x in e["attempts"]]
     assert len(attempts) == 1 and attempts[0]["id"] == attempt["id"]
@@ -112,7 +170,7 @@ async def test_restart_between_launch_and_running_adopts_the_worker(
     await b.tick()
     kinds = event_kinds(client, task_id)
     assert "attempt_adopted" in kinds
-    assert await run_until(b, client, task_id, {"reported"}) == "reported"
+    assert await run_to_settled(b, client, task_id) == "awaiting_internal_review"
 
 
 async def test_orphan_handle_is_removed(
@@ -122,6 +180,7 @@ async def test_orphan_handle_is_removed(
         attempt_id="01ARZ3NDEKTSV4RRFFQ69G5FAV",
         task_id="none",
         external_id="ORPHAN",
+        role="implement",
         harness="codex",
         model="m",
         image="crucible-worker:fake-hang",
@@ -147,7 +206,7 @@ async def test_worker_removed_out_of_band_is_lost(
     await supervisor.tick()
     (attempt,) = client.get(f"/v1/tasks/{task_id}").json()["executions"][0]["attempts"]
     provider.remove_out_of_band(str(attempt["id"]))
-    assert await run_until(supervisor, client, task_id, {"reported"}) == "reported"
+    assert await run_to_settled(supervisor, client, task_id) == "pre_pr_gates_failed"
     assert "attempt_lost" in event_kinds(client, task_id)
 
 
@@ -183,7 +242,7 @@ async def test_stranded_launch_without_handle_is_environment_failure(
         x for e in client.get(f"/v1/tasks/{task_id}").json()["executions"] for x in e["attempts"]
     ]
     assert attempts[0]["exit_class"] == "environment" and len(attempts) == 2
-    assert await run_until(b, client, task_id, {"reported"}) == "reported"
+    assert await run_to_settled(b, client, task_id) == "awaiting_internal_review"
 
 
 async def test_worker_surviving_kill_is_killed_again(
@@ -202,7 +261,7 @@ async def test_worker_surviving_kill_is_killed_again(
     assert worker.kills == 1, "first kill issued at the grace deadline"
     await supervisor.tick()
     assert worker.kills == 2 and worker.drains == 1, "re-killed, never re-drained"
-    assert await run_until(supervisor, client, task_id, {"reported"}) == "reported"
+    assert await run_to_settled(supervisor, client, task_id) == "pre_pr_gates_failed"
     kinds = event_kinds(client, task_id)
     assert kinds.count("attempt_timeout_drain") == 1 and kinds.count("attempt_timeout_kill") == 1
 
@@ -274,7 +333,7 @@ async def test_crash_before_prepare_is_environment_on_reconcile(
     first = client.get(f"/v1/attempts/{attempt_id}").json()
     assert first["state"] == "failed" and first["exit_class"] == "environment"
     assert "task_retry_scheduled" in event_kinds(client, task_id)
-    assert await run_until(b, client, task_id, {"reported"}) == "reported"
+    assert await run_to_settled(b, client, task_id) == "awaiting_internal_review"
     attempts = _attempts(client, task_id)
     assert [a["number"] for a in attempts] == [1, 2] and attempts[1]["state"] == "succeeded"
 
@@ -295,7 +354,7 @@ async def test_crash_before_launch_is_environment_on_reconcile(
     events = client.get(f"/v1/tasks/{task_id}/events").json()["items"]
     collected = next(e for e in events if e["kind"] == "attempt_collected")
     assert collected["payload"]["stage"] == "reconcile"
-    assert await run_until(b, client, task_id, {"reported"}) == "reported"
+    assert await run_to_settled(b, client, task_id) == "awaiting_internal_review"
     assert len(_attempts(client, task_id)) == 2
 
 
@@ -314,7 +373,7 @@ async def test_crash_after_launch_adopts_the_worker_on_reconcile(
     assert adopted["state"] == "running" and adopted["handle"] == f"fake-{attempt_id}"
     assert adopted["lease"]["holder"] == "sup-b"
     assert "attempt_adopted" in event_kinds(client, task_id)
-    assert await run_until(b, client, task_id, {"reported"}) == "reported"
+    assert await run_to_settled(b, client, task_id) == "awaiting_internal_review"
     attempts = _attempts(client, task_id)
     assert len(attempts) == 1 and attempts[0]["state"] == "succeeded"
 
@@ -331,5 +390,5 @@ async def test_crash_after_launch_with_a_vanished_worker_is_environment(
     await b.tick()
     first = client.get(f"/v1/attempts/{attempt_id}").json()
     assert first["state"] == "failed" and first["exit_class"] == "environment"
-    assert await run_until(b, client, task_id, {"reported"}) == "reported"
+    assert await run_to_settled(b, client, task_id) == "awaiting_internal_review"
     assert len(_attempts(client, task_id)) == 2

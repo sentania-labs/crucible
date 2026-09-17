@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 from crucible.adapters.execution.fake import FakeProvider
 from crucible.application.supervisor import Supervisor
 from tests.fixtures import FakeClock
-from tests.integration.conftest import event_kinds, run_until, submit_and_start
+from tests.integration.conftest import event_kinds, run_to_settled, run_until, submit_and_start
 
 pytestmark = pytest.mark.integration
 
@@ -20,7 +20,7 @@ def _attempts(client: TestClient, task_id: str) -> list[dict[str, object]]:
 
 async def test_crash_no_retry(client: TestClient, supervisor: Supervisor) -> None:
     task_id = submit_and_start(client, "crucible-worker:fake-crash")
-    assert await run_until(supervisor, client, task_id, {"reported"}) == "reported"
+    assert await run_to_settled(supervisor, client, task_id) == "pre_pr_gates_failed"
     attempts = _attempts(client, task_id)
     assert len(attempts) == 1
     assert attempts[0]["exit_class"] == "crashed" and attempts[0]["state"] == "failed"
@@ -30,7 +30,7 @@ async def test_crash_no_retry(client: TestClient, supervisor: Supervisor) -> Non
 
 async def test_completed_without_report(client: TestClient, supervisor: Supervisor) -> None:
     task_id = submit_and_start(client, "crucible-worker:fake-succeed-noreport")
-    assert await run_until(supervisor, client, task_id, {"reported"}) == "reported"
+    assert await run_to_settled(supervisor, client, task_id) == "pre_pr_gates_failed"
     (attempt,) = _attempts(client, task_id)
     assert attempt["exit_class"] == "completed_without_report" and attempt["state"] == "failed"
     assert "report_parsed" not in event_kinds(client, task_id)
@@ -52,14 +52,14 @@ async def test_exit_75_without_blocked_md_is_failure(
     client: TestClient, supervisor: Supervisor
 ) -> None:
     task_id = submit_and_start(client, "crucible-worker:fake-blocked-nofile")
-    assert await run_until(supervisor, client, task_id, {"reported"}) == "reported"
+    assert await run_to_settled(supervisor, client, task_id) == "pre_pr_gates_failed"
     (attempt,) = _attempts(client, task_id)
     assert attempt["exit_class"] == "crashed"
 
 
 async def test_environment_retries_then_reports(client: TestClient, supervisor: Supervisor) -> None:
     task_id = submit_and_start(client, "crucible-worker:fake-environment")
-    assert await run_until(supervisor, client, task_id, {"reported"}) == "reported"
+    assert await run_to_settled(supervisor, client, task_id) == "pre_pr_gates_failed"
     attempts = _attempts(client, task_id)
     assert [a["number"] for a in attempts] == [1, 2]
     assert all(a["exit_class"] == "environment" for a in attempts)
@@ -73,7 +73,7 @@ async def test_lost_retries_when_contract_allows(
     client: TestClient, supervisor: Supervisor
 ) -> None:
     task_id = submit_and_start(client, "crucible-worker:fake-vanish-2")
-    assert await run_until(supervisor, client, task_id, {"reported"}) == "reported"
+    assert await run_to_settled(supervisor, client, task_id) == "pre_pr_gates_failed"
     attempts = _attempts(client, task_id)
     assert len(attempts) == 2 and all(a["exit_class"] == "lost" for a in attempts)
     assert event_kinds(client, task_id).count("attempt_lost") == 2
@@ -87,7 +87,7 @@ async def test_lost_no_retry_when_contract_excludes_it(
         "crucible-worker:fake-vanish-2",
         lifecycle={"max_attempts": 3, "retry_on": ["environment"], "cleanup": "policy"},
     )
-    assert await run_until(supervisor, client, task_id, {"reported"}) == "reported"
+    assert await run_to_settled(supervisor, client, task_id) == "pre_pr_gates_failed"
     assert len(_attempts(client, task_id)) == 1
 
 
@@ -97,7 +97,7 @@ async def test_prepare_failure_is_environment(client: TestClient, supervisor: Su
         "crucible-worker:fake-prepare-fails",
         lifecycle={"max_attempts": 1, "retry_on": [], "cleanup": "policy"},
     )
-    assert await run_until(supervisor, client, task_id, {"reported"}) == "reported"
+    assert await run_to_settled(supervisor, client, task_id) == "pre_pr_gates_failed"
     (attempt,) = _attempts(client, task_id)
     assert attempt["exit_class"] == "environment"
     kinds = event_kinds(client, task_id)
@@ -123,7 +123,7 @@ async def test_timeout_drains_then_kills(
     clock.advance(60)
     await supervisor.tick()
     assert worker.kills == 1
-    assert await run_until(supervisor, client, task_id, {"reported"}) == "reported"
+    assert await run_to_settled(supervisor, client, task_id) == "pre_pr_gates_failed"
     (attempt,) = _attempts(client, task_id)
     assert attempt["exit_class"] == "timeout" and attempt["exit_code"] == 137
     kinds = event_kinds(client, task_id)
@@ -146,6 +146,7 @@ async def test_report_with_secret_is_redacted(
         attempt_id="x",
         task_id="t",
         external_id="EX-0001",
+        role="implement",
         harness="codex",
         model="m",
         image="i",
@@ -156,7 +157,7 @@ async def test_report_with_secret_is_redacted(
     report["summary"] = "pushed with ghp_" + "k" * 36
     provider.set_report("EX-0001", report)
     task_id = submit_and_start(client, "crucible-worker:fake-succeed")
-    assert await run_until(supervisor, client, task_id, {"reported"}) == "reported"
+    assert await run_to_settled(supervisor, client, task_id) == "pre_pr_gates_failed"
     (attempt,) = _attempts(client, task_id)
     stored = client.get(f"/v1/attempts/{attempt['id']}").json()["report"]
     assert stored["parsed_ok"] is False and stored["document"] == {"redacted": True}

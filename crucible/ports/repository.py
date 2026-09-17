@@ -9,17 +9,29 @@ from types import TracebackType
 from typing import Any, Protocol
 
 from crucible.domain.entities import (
+    AcceptanceResult,
+    Artifact,
     Attempt,
+    AttemptMetrics,
     CompletionClaimRecord,
+    Decision,
+    Escalation,
     Event,
+    EvidenceRecord,
     Execution,
+    ExecutionRole,
+    GateResultRecord,
     Lease,
     Policy,
     Principal,
     Repository,
+    ReviewDisposition,
+    ReviewReportRecord,
+    RoutingPolicyRecord,
     SupervisorStatus,
     Task,
     TaskContract,
+    Wake,
 )
 from crucible.domain.lifecycle import AttemptState, ExecutionState, TaskState
 
@@ -48,6 +60,22 @@ class RepositoryRegistry(Protocol):
 
 class PolicyRepository(Protocol):
     def get(self, name: str, version: int) -> Policy | None: ...
+
+    def put(self, policy: Policy) -> Policy: ...
+
+    def list_versions(self, name: str) -> Sequence[Policy]: ...
+
+    def is_referenced(self, name: str, version: int) -> bool:
+        """True once a task names this version; a referenced version is immutable (05b)."""
+        ...
+
+
+class RoutingPolicyRepository(Protocol):
+    def get(self, name: str, version: int) -> RoutingPolicyRecord | None: ...
+
+    def put(self, policy: RoutingPolicyRecord) -> RoutingPolicyRecord: ...
+
+    def is_referenced(self, name: str, version: int) -> bool: ...
 
 
 class TaskRepository(Protocol):
@@ -85,6 +113,8 @@ class ContractRepository(Protocol):
 class ExecutionRepository(Protocol):
     def add(self, execution: Execution) -> None: ...
 
+    def list_for_task_by_role(self, task_id: str, role: ExecutionRole) -> Sequence[Execution]: ...
+
     def get(self, execution_id: str, *, for_update: bool = False) -> Execution | None: ...
 
     def save(self, execution: Execution) -> None: ...
@@ -112,6 +142,10 @@ class AttemptRepository(Protocol):
 
 class EventRepository(Protocol):
     def append(self, event: Event) -> Event: ...
+
+    def latest_for_task_kind(self, task_id: str, kind: str) -> Event | None:
+        """The most recent event of one kind, so a busy task's request is still found."""
+        ...
 
     def list_for_task(self, task_id: str, *, after_seq: int, limit: int) -> Sequence[Event]: ...
 
@@ -146,6 +180,98 @@ class ClaimRepository(Protocol):
     def put(self, record: CompletionClaimRecord) -> None: ...
 
     def get(self, attempt_id: str) -> CompletionClaimRecord | None: ...
+
+
+class ArtifactRepository(Protocol):
+    def add(self, artifact: Artifact) -> None: ...
+
+    def get(self, artifact_id: str) -> Artifact | None: ...
+
+    def list_for_attempt(self, attempt_id: str) -> Sequence[Artifact]: ...
+
+    def find_by_sha256(self, sha256: str, attempt_id: str | None) -> Artifact | None: ...
+
+
+class EvidenceRepository(Protocol):
+    def add(self, evidence: EvidenceRecord) -> EvidenceRecord: ...
+
+    def list_for_attempt(self, attempt_id: str) -> Sequence[EvidenceRecord]: ...
+
+    def list_for_task(self, task_id: str) -> Sequence[EvidenceRecord]: ...
+
+
+class ReviewReportRepository(Protocol):
+    def add(self, report: ReviewReportRecord) -> None: ...
+
+    def get(self, report_id: str) -> ReviewReportRecord | None: ...
+
+    def list_for_task(self, task_id: str) -> Sequence[ReviewReportRecord]: ...
+
+
+class GateResultRepository(Protocol):
+    def put(self, result: GateResultRecord) -> None: ...
+
+    def list_for_attempt(self, attempt_id: str) -> Sequence[GateResultRecord]: ...
+
+    def list_for_task(self, task_id: str) -> Sequence[GateResultRecord]: ...
+
+
+class AcceptanceRepository(Protocol):
+    def add(self, result: AcceptanceResult) -> None: ...
+
+    def list_for_task(self, task_id: str) -> Sequence[AcceptanceResult]: ...
+
+    def supersede_for_task(self, task_id: str, at: datetime) -> None: ...
+
+
+class DecisionRepository(Protocol):
+    def add(self, decision: Decision) -> None: ...
+
+    def list_for_task(self, task_id: str) -> Sequence[Decision]: ...
+
+
+class EscalationRepository(Protocol):
+    def add(self, escalation: Escalation) -> None: ...
+
+    def get(self, escalation_id: str, *, for_update: bool = False) -> Escalation | None: ...
+
+    def save(self, escalation: Escalation) -> None: ...
+
+    def list_for_task(self, task_id: str) -> Sequence[Escalation]: ...
+
+    def list_open(self) -> Sequence[Escalation]: ...
+
+
+class DispositionRepository(Protocol):
+    def add(self, disposition: ReviewDisposition) -> None: ...
+
+    def get_by_comment(self, review_comment_id: str) -> ReviewDisposition | None: ...
+
+
+class WakeRepository(Protocol):
+    def add(self, wake: Wake) -> None: ...
+
+    def get(self, wake_id: str, *, for_update: bool = False) -> Wake | None: ...
+
+    def save(self, wake: Wake) -> None: ...
+
+    def list_for_principal(
+        self, principal_id: str, *, since: datetime | None, include_acked: bool, limit: int
+    ) -> Sequence[Wake]: ...
+
+    def list_undelivered(self, now: datetime) -> Sequence[Wake]: ...
+
+    def count_unacked(self) -> int: ...
+
+
+class AttemptMetricsRepository(Protocol):
+    def put(self, metrics: AttemptMetrics) -> None: ...
+
+    def get(self, attempt_id: str) -> AttemptMetrics | None: ...
+
+    def list_since(
+        self, *, since: datetime | None, model: str | None, task_ids: Sequence[str] | None
+    ) -> Sequence[AttemptMetrics]: ...
 
 
 class SupervisorStatusRepository(Protocol):
@@ -188,6 +314,17 @@ class UnitOfWork(Protocol):
     claims: ClaimRepository
     supervisor_status: SupervisorStatusRepository
     idempotency: IdempotencyRepository
+    routing_policies: RoutingPolicyRepository
+    artifacts: ArtifactRepository
+    evidence: EvidenceRepository
+    review_reports: ReviewReportRepository
+    gate_results: GateResultRepository
+    acceptance: AcceptanceRepository
+    decisions: DecisionRepository
+    escalations: EscalationRepository
+    dispositions: DispositionRepository
+    wakes: WakeRepository
+    attempt_metrics: AttemptMetricsRepository
 
     def __enter__(self) -> UnitOfWork: ...
 

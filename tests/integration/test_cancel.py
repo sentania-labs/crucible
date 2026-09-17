@@ -5,8 +5,16 @@ from fastapi.testclient import TestClient
 
 from crucible.adapters.execution.fake import FakeProvider
 from crucible.application.supervisor import Supervisor
+from crucible.domain.lifecycle import IllegalTransitionError, TaskState, check_transition
 from tests.fixtures import FakeClock
-from tests.integration.conftest import event_kinds, run_until, submit_and_start
+from tests.integration.conftest import (
+    ARTIFACTS_DELIVERABLE,
+    event_kinds,
+    review_and_settle,
+    run_to_settled,
+    run_until,
+    submit_and_start,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -131,15 +139,44 @@ async def test_cancel_with_partial_report_is_not_parsed(
     assert collected["payload"]["partial_report_kept_unparsed"] is True
 
 
-async def test_cancel_reported_task_is_rejected(client: TestClient, supervisor: Supervisor) -> None:
+async def test_cancel_waiting_task_is_accepted(client: TestClient, supervisor: Supervisor) -> None:
+    """09 lists awaiting_internal_review among the states a cancel may take at once."""
     task_id = submit_and_start(client, "crucible-worker:fake-succeed")
-    assert await run_until(supervisor, client, task_id, {"reported"}) == "reported"
+    assert await run_to_settled(supervisor, client, task_id) == "awaiting_internal_review"
+    r = client.post(f"/v1/tasks/{task_id}/cancel", json=CANCEL)
+    assert r.status_code == 200 and r.json()["state"] == "cancelled"
+
+
+async def test_cancel_from_a_state_the_table_forbids_is_409(
+    client: TestClient, supervisor: Supervisor
+) -> None:
+    """09 gives `accepted` no cancel edge. The API refuses with a problem document and
+    records the rejection as an event, and the task keeps its state."""
+    task_id = submit_and_start(
+        client, "crucible-worker:fake-succeed", deliverables=ARTIFACTS_DELIVERABLE
+    )
+    await run_to_settled(supervisor, client, task_id)
+    assert await review_and_settle(supervisor, client, task_id) == "awaiting_acceptance"
+    accepted = client.post(
+        f"/v1/tasks/{task_id}/accept",
+        json={"verdict": "accepted", "reasoning": "It does what the contract asked."},
+    )
+    assert accepted.json()["state"] == "accepted"
+
     r = client.post(f"/v1/tasks/{task_id}/cancel", json=CANCEL)
     assert r.status_code == 409
     assert r.headers["content-type"].startswith("application/problem+json")
     body = r.json()
     assert body["type"] == "urn:crucible:problem:transition-not-allowed"
-    assert "reported -> cancelled" in body["detail"]
-    events = client.get(f"/v1/tasks/{task_id}/events").json()["items"]
+    assert "accepted -> cancelled" in body["detail"]
+    assert client.get(f"/v1/tasks/{task_id}").json()["state"] == "accepted"
+    events = client.get(f"/v1/tasks/{task_id}/events", params={"limit": 200}).json()["items"]
     rejected = [e for e in events if e["kind"] == "transition_rejected"]
     assert len(rejected) == 1 and rejected[0]["payload"]["to"] == "cancelled"
+
+
+def test_reported_has_no_cancel_edge(client: TestClient) -> None:
+    """The transient states between `running` and a resting state are not cancellable."""
+    for state in (TaskState.REPORTED, TaskState.GATES_PASSED):
+        with pytest.raises(IllegalTransitionError):
+            check_transition("task", "t", state, TaskState.CANCELLED)

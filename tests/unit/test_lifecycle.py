@@ -6,10 +6,12 @@ import pytest
 
 from crucible.domain.lifecycle import (
     ATTEMPT_TRANSITIONS,
+    ESCALATION_TRANSITIONS,
     EXECUTION_TRANSITIONS,
     TASK_TERMINAL,
     TASK_TRANSITIONS,
     AttemptState,
+    EscalationState,
     ExecutionState,
     IllegalTransitionError,
     TaskState,
@@ -97,3 +99,57 @@ def test_attempt_table() -> None:
     assert not is_allowed("attempt", AttemptState.EXITED, AttemptState.SUCCEEDED)
     assert not is_allowed("attempt", AttemptState.SUCCEEDED, AttemptState.PENDING)
     assert (AttemptState.PENDING, AttemptState.RUNNING) not in ATTEMPT_TRANSITIONS
+
+
+# ----- C2: the supervision half past `reported`, and escalations ---------------
+
+
+@pytest.mark.parametrize(
+    ("current", "target"),
+    [
+        (TaskState.REPORTED, TaskState.PRE_PR_GATES_FAILED),
+        (TaskState.REPORTED, TaskState.AWAITING_INTERNAL_REVIEW),
+        (TaskState.AWAITING_INTERNAL_REVIEW, TaskState.GATES_PASSED),
+        (TaskState.GATES_PASSED, TaskState.AWAITING_ACCEPTANCE),
+        (TaskState.AWAITING_ACCEPTANCE, TaskState.ACCEPTED),
+        (TaskState.AWAITING_ACCEPTANCE, TaskState.REJECTED),
+        (TaskState.AWAITING_ACCEPTANCE, TaskState.SCHEDULED),
+        (TaskState.PRE_PR_GATES_FAILED, TaskState.SCHEDULED),
+        (TaskState.PRE_PR_GATES_FAILED, TaskState.REJECTED),
+        (TaskState.ACCEPTED, TaskState.CLOSED),
+        (TaskState.AWAITING_INTERNAL_REVIEW, TaskState.CANCELLED),
+        (TaskState.AWAITING_ACCEPTANCE, TaskState.CANCELLED),
+        (TaskState.PRE_PR_GATES_FAILED, TaskState.CANCELLED),
+    ],
+)
+def test_c2_task_allowed(current: TaskState, target: TaskState) -> None:
+    check_transition("task", "t", current, target)
+
+
+@pytest.mark.parametrize(
+    ("current", "target"),
+    [
+        (TaskState.REPORTED, TaskState.AWAITING_ACCEPTANCE),
+        (TaskState.GATES_PASSED, TaskState.ACCEPTED),
+        (TaskState.AWAITING_INTERNAL_REVIEW, TaskState.AWAITING_ACCEPTANCE),
+        (TaskState.AWAITING_ACCEPTANCE, TaskState.GATES_PASSED),
+        (TaskState.PRE_PR_GATES_FAILED, TaskState.ACCEPTED),
+        (TaskState.PRE_PR_GATES_FAILED, TaskState.GATES_PASSED),
+        (TaskState.REJECTED, TaskState.SCHEDULED),
+        (TaskState.ACCEPTED, TaskState.AWAITING_ACCEPTANCE),
+        # Only Foundry's acceptance reaches `accepted`; gates alone never do (11).
+        (TaskState.GATES_PASSED, TaskState.PUBLISHING),
+    ],
+)
+def test_c2_task_disallowed(current: TaskState, target: TaskState) -> None:
+    with pytest.raises(IllegalTransitionError):
+        check_transition("task", "t", current, target)
+
+
+def test_escalation_table() -> None:
+    check_transition("escalation", "e", EscalationState.OPEN, EscalationState.ANSWERED)
+    check_transition("escalation", "e", EscalationState.ANSWERED, EscalationState.CLOSED)
+    check_transition("escalation", "e", EscalationState.OPEN, EscalationState.CLOSED)
+    assert not is_allowed("escalation", EscalationState.CLOSED, EscalationState.OPEN)
+    assert not is_allowed("escalation", EscalationState.ANSWERED, EscalationState.OPEN)
+    assert len(ESCALATION_TRANSITIONS) == 3

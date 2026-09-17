@@ -1,5 +1,6 @@
-"""Acceptance for C1: a submitted task runs through the fake provider to reported and the
-event log tells the whole story."""
+"""Acceptance for C1, carried into C2: a submitted task runs through the fake provider,
+its pre-PR gates are evaluated on the collected head, and the event log tells the whole
+story. The C2 pass path continues in tests/integration/test_gates_and_acceptance.py."""
 
 from __future__ import annotations
 
@@ -7,15 +8,15 @@ import pytest
 from fastapi.testclient import TestClient
 
 from crucible.application.supervisor import Supervisor
-from tests.integration.conftest import event_kinds, run_until, submit_and_start
+from tests.integration.conftest import event_kinds, run_to_settled, submit_and_start
 
 pytestmark = pytest.mark.integration
 
 
 async def test_submit_start_run_to_reported(client: TestClient, supervisor: Supervisor) -> None:
     task_id = submit_and_start(client, "crucible-worker:fake-succeed-2")
-    state = await run_until(supervisor, client, task_id, {"reported"})
-    assert state == "reported"
+    state = await run_to_settled(supervisor, client, task_id)
+    assert state == "awaiting_internal_review"
 
     view = client.get(f"/v1/tasks/{task_id}").json()
     assert view["schema_version"] == "1.0"
@@ -38,14 +39,21 @@ async def test_submit_start_run_to_reported(client: TestClient, supervisor: Supe
         "attempt_preparing",
         "execution_active",
         "task_running",
+        "quota_reserved",
         "attempt_launching",
         "attempt_running",
         "attempt_exited",
         "report_parsed",
         "attempt_collected",
+        "artifact_stored",
+        "artifact_stored",
+        "evidence_recorded",
         "attempt_succeeded",
         "execution_succeeded",
         "task_reported",
+        "gates_evaluated",
+        "task_awaiting_internal_review",
+        "wake_created",
     ]
     events = client.get(f"/v1/tasks/{task_id}/events").json()["items"]
     principals = {e["kind"]: e["principal"] for e in events}

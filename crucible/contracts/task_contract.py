@@ -22,6 +22,14 @@ class HarnessName(StrEnum):
     AGY = "agy"
 
 
+class TaskTier(StrEnum):
+    """Foundry assigns the tier; the routing policy bounds what it may then name (05b)."""
+
+    TRIVIAL = "trivial"
+    STANDARD = "standard"
+    COMPLEX = "complex"
+
+
 class ProviderName(StrEnum):
     FAKE = "fake"
     DOCKER = "docker"
@@ -131,6 +139,7 @@ class PolicyRef(StrictModel):
 
 
 class ExecutionRequest(StrictModel):
+    tier: TaskTier
     harness: HarnessName
     model: str = Field(min_length=1)
     effort: str | None = None
@@ -216,6 +225,16 @@ class TaskContractV1(StrictModel):
             )
         return self
 
+    def external_identity_fields(self) -> tuple[str, str, str, str, int]:
+        """What a correction version must keep identical to the version it corrects."""
+        return (
+            self.external_id,
+            self.repository.name,
+            self.repository.work_branch,
+            self.policy.name,
+            self.policy.version,
+        )
+
     @property
     def verification_commands(self) -> list[str]:
         return [v.command for v in self.required_verification if isinstance(v, CommandVerification)]
@@ -225,3 +244,54 @@ def contract_sha256(document: dict[str, Any]) -> str:
     """SHA-256 over the canonical JSON of the document as stored."""
     canonical = json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def correction_narrows(
+    previous: TaskContractV1, correction: TaskContractV1
+) -> list[dict[str, Any]]:
+    """05: a correction version may narrow scope and objective but never widen them, and
+    required_verification may not shrink. Returns the problems, empty when it narrows."""
+    problems: list[dict[str, Any]] = []
+    prev_allowed = set(previous.scope.allowed_paths)
+    new_allowed = set(correction.scope.allowed_paths)
+    widened = sorted(new_allowed - prev_allowed)
+    if widened:
+        problems.append(
+            {
+                "path": "scope.allowed_paths",
+                "message": f"a correction may not widen scope; new paths: {widened}",
+            }
+        )
+    dropped_prohibitions = sorted(
+        set(previous.scope.prohibited_paths) - set(correction.scope.prohibited_paths)
+    )
+    if dropped_prohibitions:
+        problems.append(
+            {
+                "path": "scope.prohibited_paths",
+                "message": f"a correction may not drop prohibitions: {dropped_prohibitions}",
+            }
+        )
+    for flag in ("may_add_dependencies", "may_modify_ci"):
+        if getattr(correction.scope, flag) and not getattr(previous.scope, flag):
+            problems.append(
+                {"path": f"scope.{flag}", "message": "a correction may not widen scope"}
+            )
+    prev_checks = {v.id for v in previous.required_verification}
+    new_checks = {v.id for v in correction.required_verification}
+    missing = sorted(prev_checks - new_checks)
+    if missing:
+        problems.append(
+            {
+                "path": "required_verification",
+                "message": f"required_verification may not shrink; missing: {missing}",
+            }
+        )
+    if correction.external_identity_fields() != previous.external_identity_fields():
+        problems.append(
+            {
+                "path": "external_id",
+                "message": "a correction keeps external_id, repository, and policy identical",
+            }
+        )
+    return problems

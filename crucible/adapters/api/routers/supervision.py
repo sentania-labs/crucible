@@ -2,14 +2,31 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Response
+from datetime import datetime
+from typing import Annotated
+
+from fastapi import APIRouter, Query, Response
 from sqlalchemy import text
 
 from crucible import __version__
-from crucible.adapters.api.deps import Ctx, Reader, UoW
+from crucible.adapters.api.deps import Ctx, Mutator, Reader, UoW
 from crucible.adapters.persistence.migrate import is_current
-from crucible.application.queries import supervisor_health, supervisor_view
-from crucible.contracts.api import HealthView, ReadyCheck, ReadyView, SupervisorView
+from crucible.application.queries import (
+    supervisor_health,
+    supervisor_view,
+    wake_list,
+    wake_view,
+)
+from crucible.application.wakes import ack_wake
+from crucible.contracts.api import (
+    HealthView,
+    ReadyCheck,
+    ReadyView,
+    SupervisorView,
+    WakeAckRequest,
+    WakeList,
+    WakeView,
+)
 
 router = APIRouter()
 
@@ -49,3 +66,28 @@ def ready(ctx: Ctx, response: Response) -> ReadyView:
 @router.get("/supervisor", response_model=SupervisorView)
 def supervisor_status(ctx: Ctx, uow: UoW, _principal: Reader) -> SupervisorView:
     return supervisor_view(uow, ctx.providers, ctx.clock.now(), ctx.lease_ttl_seconds)
+
+
+@router.get("/wakes", response_model=WakeList)
+def list_wakes(
+    uow: UoW,
+    principal: Reader,
+    since: datetime | None = None,
+    include_acked: bool = False,
+    limit: Annotated[int | None, Query(ge=1, le=200)] = None,
+) -> WakeList:
+    """Pending wakes for the caller's principal (04, 17). Poll is the durable fallback."""
+    return wake_list(
+        uow,
+        principal_id=principal.id,
+        since=since,
+        include_acked=include_acked,
+        limit=limit,
+    )
+
+
+@router.post("/wakes/{wake_id}/ack", response_model=WakeView)
+def ack(wake_id: str, body: WakeAckRequest, ctx: Ctx, uow: UoW, principal: Mutator) -> WakeView:
+    wake = ack_wake(uow, ctx.clock, principal=principal, wake_id=wake_id, note=body.note)
+    uow.commit()
+    return wake_view(uow, wake)

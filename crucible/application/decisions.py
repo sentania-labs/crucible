@@ -1,0 +1,247 @@
+"""Decisions, escalations, and review dispositions (03, 04, 09).
+
+An escalation is opened when a worker blocks; a Decision that references it closes it and
+lets the task be scheduled again. Dispositions exist as rows now; the external review
+comments they refer to arrive with GitHub delivery in C4 (20)."""
+
+from __future__ import annotations
+
+from datetime import timedelta
+
+from crucible.application.errors import ForbiddenError, NotFoundError, TransitionNotAllowedError
+from crucible.application.transitions import move_task, record_event
+from crucible.application.wakes import create_wake
+from crucible.contracts.api import DecisionRequest, DispositionRequest
+from crucible.contracts.wake import WakeReason
+from crucible.domain.entities import (
+    Decision,
+    Escalation,
+    EscalationState,
+    Principal,
+    ReviewDisposition,
+    Role,
+    Task,
+)
+from crucible.domain.events import PRINCIPAL_CRUCIBLE, EventKind
+from crucible.domain.ids import new_id
+from crucible.domain.lifecycle import TaskState, check_transition
+from crucible.ports.clock import Clock
+from crucible.ports.repository import UnitOfWork
+
+DEFAULT_ESCALATION_STALE_HOURS = 24
+OPERATOR_ONLY_DECISION_KINDS = frozenset({"release_authorization"})
+
+
+def open_escalation(
+    uow: UnitOfWork, clock: Clock, *, task: Task, attempt_id: str | None, question: str
+) -> Escalation:
+    """09: entering `blocked` opens an escalation and creates a wake."""
+    now = clock.now()
+    escalation = Escalation(
+        id=new_id(),
+        task_id=task.id,
+        attempt_id=attempt_id,
+        state=EscalationState.OPEN,
+        question=question,
+        opened_at=now,
+        last_wake_at=now,
+    )
+    uow.escalations.add(escalation)
+    record_event(
+        uow,
+        clock,
+        EventKind.ESCALATION_OPENED,
+        principal=PRINCIPAL_CRUCIBLE,
+        task_id=task.id,
+        attempt_id=attempt_id,
+        payload={"escalation_id": escalation.id, "question": question},
+    )
+    create_wake(
+        uow,
+        clock,
+        principal_id=task.principal_id,
+        reason=WakeReason.BLOCKED,
+        summary=f"the worker blocked and opened escalation {escalation.id}",
+        task=task,
+        attempt_id=attempt_id,
+        extra_links={"decisions": f"/v1/tasks/{task.id}/decisions"},
+    )
+    return escalation
+
+
+def repeat_stale_escalation_wakes(uow: UnitOfWork, clock: Clock, *, stale_hours: int) -> int:
+    """An escalation older than `escalation_stale_hours` produces a repeat wake (09)."""
+    now = clock.now()
+    repeated = 0
+    for escalation in uow.escalations.list_open():
+        last = escalation.last_wake_at or escalation.opened_at
+        if now - last < timedelta(hours=stale_hours):
+            continue
+        task = uow.tasks.get(escalation.task_id)
+        if task is None:
+            continue
+        create_wake(
+            uow,
+            clock,
+            principal_id=task.principal_id,
+            reason=WakeReason.ESCALATION_STALE,
+            summary=(
+                f"escalation {escalation.id} has been open since "
+                f"{escalation.opened_at.isoformat()} with no decision"
+            ),
+            task=task,
+            attempt_id=escalation.attempt_id,
+        )
+        escalation.last_wake_at = now
+        uow.escalations.save(escalation)
+        repeated += 1
+    return repeated
+
+
+def record_decision(
+    uow: UnitOfWork, clock: Clock, *, principal: Principal, task_id: str, request: DecisionRequest
+) -> Task:
+    task = uow.tasks.get(task_id, for_update=True)
+    if task is None:
+        raise NotFoundError(f"task {task_id} not found")
+    if request.kind in OPERATOR_ONLY_DECISION_KINDS and principal.role not in (
+        Role.OPERATOR,
+        Role.ADMIN,
+    ):
+        raise ForbiddenError(f"decision kind {request.kind!r} is operator-only (04)")
+    escalation = None
+    if request.escalation_id is not None:
+        escalation = uow.escalations.get(request.escalation_id, for_update=True)
+        if escalation is None or escalation.task_id != task.id:
+            raise NotFoundError(f"escalation {request.escalation_id} not found on this task")
+        # Validated before anything is written: 11 level 4 says the verbatim words are the
+        # record, and a refusal after the insert would roll them back with the rest.
+        check_transition("escalation", escalation.id, escalation.state, EscalationState.ANSWERED)
+    if request.reschedule and task.state is not TaskState.BLOCKED:
+        raise TransitionNotAllowedError(
+            f"reschedule applies to a blocked task; task is {task.state.value}"
+        )
+    decision = Decision(
+        id=new_id(),
+        task_id=task.id,
+        escalation_id=escalation.id if escalation else None,
+        principal_id=principal.id,
+        kind=request.kind,
+        verbatim=request.verbatim,
+        resolves=request.resolves,
+        created_at=clock.now(),
+    )
+    uow.decisions.add(decision)
+    record_event(
+        uow,
+        clock,
+        EventKind.DECISION_RECORDED,
+        principal=principal.name,
+        task_id=task.id,
+        payload={
+            "decision_id": decision.id,
+            "kind": decision.kind,
+            "escalation_id": decision.escalation_id,
+            "resolves": decision.resolves,
+            "verbatim": decision.verbatim,
+        },
+    )
+    if escalation is not None:
+        for target, kind in (
+            (EscalationState.ANSWERED, EventKind.ESCALATION_ANSWERED),
+            (EscalationState.CLOSED, EventKind.ESCALATION_CLOSED),
+        ):
+            escalation.state = target
+            if target is EscalationState.CLOSED:
+                escalation.closed_at = clock.now()
+            escalation.decision_id = decision.id
+            uow.escalations.save(escalation)
+            record_event(
+                uow,
+                clock,
+                kind,
+                principal=principal.name,
+                task_id=task.id,
+                payload={"escalation_id": escalation.id, "decision_id": decision.id},
+            )
+    if request.reschedule:
+        stored = uow.contracts.get(task.id, task.contract_version)
+        assert stored is not None
+        request_body = stored.document["execution_request"]
+        move_task(
+            uow,
+            clock,
+            task,
+            TaskState.SCHEDULED,
+            EventKind.TASK_SCHEDULED,
+            principal=principal.name,
+            payload={
+                "decision_id": decision.id,
+                "contract_version": task.contract_version,
+                "harness": request_body["harness"],
+                "model": request_body["model"],
+                "provider": request_body["provider"],
+                "image": request_body["image"],
+                "policy": {"name": task.policy_name, "version": task.policy_version},
+            },
+        )
+    return task
+
+
+def record_disposition(
+    uow: UnitOfWork,
+    clock: Clock,
+    *,
+    principal: Principal,
+    task_id: str,
+    request: DispositionRequest,
+) -> ReviewDisposition:
+    task = uow.tasks.get(task_id)
+    if task is None:
+        raise NotFoundError(f"task {task_id} not found")
+    if principal.role not in (Role.ORCHESTRATOR, Role.OPERATOR):
+        raise ForbiddenError("only an orchestrator or operator principal records dispositions")
+    existing = uow.dispositions.get_by_comment(request.review_comment_id)
+    if existing is not None:
+        raise TransitionNotAllowedError(
+            f"review comment {request.review_comment_id} already has a disposition"
+        )
+    # External reviews and their comments are recorded by the GitHub delivery phase (C4).
+    # Until then nothing produces a comment id, so a disposition has nothing to attach to.
+    raise NotFoundError(
+        f"review comment {request.review_comment_id!r} is unknown: external review recording "
+        "arrives with GitHub delivery in C4 (20)"
+    )
+
+
+def store_disposition(
+    uow: UnitOfWork,
+    clock: Clock,
+    *,
+    principal: Principal,
+    task_id: str,
+    request: DispositionRequest,
+) -> ReviewDisposition:
+    """The row-writing half, kept separate so C4 can call it once comments exist."""
+    disposition = ReviewDisposition(
+        id=new_id(),
+        review_comment_id=request.review_comment_id,
+        principal_id=principal.id,
+        disposition=request.disposition,
+        reasoning=request.reasoning,
+        created_at=clock.now(),
+    )
+    uow.dispositions.add(disposition)
+    record_event(
+        uow,
+        clock,
+        EventKind.DISPOSITION_RECORDED,
+        principal=principal.name,
+        task_id=task_id,
+        payload={
+            "disposition_id": disposition.id,
+            "review_comment_id": disposition.review_comment_id,
+            "disposition": disposition.disposition.value,
+        },
+    )
+    return disposition

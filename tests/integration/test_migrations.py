@@ -79,6 +79,46 @@ def test_fresh_schema_has_no_drift(migrated: str) -> None:
     engine.dispose()
 
 
+def test_0004_creates_the_c2_tables_and_seeds_the_routing_policy(migrated: str) -> None:
+    engine = make_engine(migrated)
+    names = set(inspect(engine).get_table_names())
+    assert {
+        "routing_policies",
+        "artifacts",
+        "evidence",
+        "review_reports",
+        "gate_results",
+        "acceptance_results",
+        "escalations",
+        "decisions",
+        "review_dispositions",
+        "wakes",
+        "attempt_metrics",
+    } <= names
+    with engine.connect() as conn:
+        assert conn.execute(text("SELECT count(*) FROM routing_policies")).scalar() == 1
+        routing = conn.execute(
+            text("SELECT document -> 'routing' FROM policies WHERE name = 'default-software'")
+        ).scalar()
+    assert routing == {"policy": {"name": "default-routing", "version": 1}}
+    engine.dispose()
+
+
+def test_0004_down_and_up(database_url: str) -> None:
+    """Down migrations are required for every revision in v0.x (14)."""
+    engine = make_engine(database_url)
+    migrate.downgrade(database_url, "0003_idempotency_reservation")
+    names = set(inspect(engine).get_table_names())
+    assert "gate_results" not in names and "wakes" not in names
+    assert "head_sha" not in {c["name"] for c in inspect(engine).get_columns("tasks")}
+    migrate.upgrade(database_url)
+    names = set(inspect(engine).get_table_names())
+    assert {"gate_results", "wakes", "attempt_metrics"} <= names
+    ok, detail = migrate.is_current(engine, database_url)
+    assert ok, detail
+    engine.dispose()
+
+
 def test_0002_down_and_up(database_url: str) -> None:
     engine = make_engine(database_url)
     migrate.downgrade(database_url, "0001_walking_skeleton")

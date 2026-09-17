@@ -73,28 +73,48 @@ jobs:
             "repository": {"name": "example-service", "base_ref": "main", "work_branch": "crucible/CI-1"},
             "scope": {"allowed_paths": ["src/**"], "prohibited_paths": [".github/**"], "may_add_dependencies": False, "may_modify_ci": False},
             "objective": "Prove the compose stack.", "context": [], "project_instructions": [],
-            "acceptance_criteria": [{"id": "AC1", "text": "The task reaches reported."}],
-            "required_verification": [{"id": "V1", "command": "make lint", "expect_exit": 0}, {"id": "V2", "command": "make test", "expect_exit": 0}, {"id": "V3", "command": "make scan", "expect_exit": 0}],
+            "acceptance_criteria": [{"id": "AC1", "text": "The task reaches awaiting_acceptance."}],
+            "required_verification": [{"id": "V1", "command": "make lint", "expect_exit": 0}, {"id": "V2", "command": "make test", "expect_exit": 0}, {"id": "V3", "command": "make scan", "expect_exit": 0}, {"id": "V4", "kind": "artifact", "path": "report/run-evidence.md"}],
             "constraints": {"prohibited_actions": [], "network": "policy"},
-            "deliverables": [{"kind": "pull_request", "target": "main", "draft": False, "closes": []}],
+            "deliverables": [{"kind": "artifacts", "target": None, "draft": False, "closes": []}],
             "reporting": {"report_schema": "CompletionClaimV1", "report_dir": "/crucible/report", "progress_events": True},
             "escalation": {"conditions": [], "action": "write report/blocked.md with the question and exit 75"},
             "policy": {"name": "default-software", "version": 1},
-            "execution_request": {"harness": "codex", "model": "fake-model", "effort": "high", "provider": "fake", "image": "crucible-worker:fake-succeed", "timeout_seconds": 600, "rationale": "ci"},
+            "execution_request": {"tier": "standard", "harness": "codex", "model": "gpt-5-codex-mini", "effort": "high", "provider": "fake", "image": "crucible-worker:fake-succeed", "timeout_seconds": 600, "rationale": "ci"},
             "lifecycle": {"max_attempts": 2, "retry_on": ["environment", "lost"], "cleanup": "policy"},
             "correction": None}))
           PY
           )
           TASK=$(curl -fsS -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d "$BODY" http://127.0.0.1:8080/v1/tasks | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
-          curl -fsS -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"harness":"codex","model":"fake-model","provider":"fake","image":"crucible-worker:fake-succeed","policy_version":1}' "http://127.0.0.1:8080/v1/tasks/$TASK/start" >/dev/null
-          for i in $(seq 1 30); do
-            STATE=$(curl -fsS -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:8080/v1/tasks/$TASK" | python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])')
-            [ "$STATE" = reported ] && break
-            sleep 2
-          done
-          echo "task state: $STATE"
-          [ "$STATE" = reported ]
-          curl -fsS -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:8080/v1/tasks/$TASK/events" | python3 -c 'import json,sys; [print(e["seq"], e["kind"]) for e in json.load(sys.stdin)["items"]]'
+          curl -fsS -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"harness":"codex","model":"gpt-5-codex-mini","provider":"fake","image":"crucible-worker:fake-succeed","policy_version":1}' "http://127.0.0.1:8080/v1/tasks/$TASK/start" >/dev/null
+
+          state() { curl -fsS -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:8080/v1/tasks/$TASK" | python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])'; }
+          await_state() {
+            for _ in $(seq 1 30); do
+              STATE=$(state)
+              [ "$STATE" = "$1" ] && return 0
+              sleep 2
+            done
+            echo "task stuck in $STATE, wanted $1" >&2
+            return 1
+          }
+
+          await_state awaiting_internal_review
+          echo "gates evaluated on the collected head"
+          curl -fsS -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:8080/v1/tasks/$TASK" \
+            | python3 -c 'import json,sys; d=json.load(sys.stdin); print(json.dumps(d["gate_summary"], indent=2)); assert d["gate_summary"]["failing"] == [], d["gate_summary"]'
+
+          HEAD=$(curl -fsS -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:8080/v1/tasks/$TASK" | python3 -c 'import json,sys; print(json.load(sys.stdin)["head_sha"])')
+          REVIEW=$(HEAD="$HEAD" python3 -c 'import json,os; print(json.dumps({"report": {"schema_version": "1.0", "task_external_id": "CI-1", "reviewed_head_sha": os.environ["HEAD"], "reviewer": {"kind": "orchestrator", "principal": "ci"}, "verdict": "approve", "findings": [], "summary": "CI non-author review."}}))')
+          curl -fsS -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d "$REVIEW" "http://127.0.0.1:8080/v1/tasks/$TASK/review" >/dev/null
+          await_state awaiting_acceptance
+
+          curl -fsS -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"verdict":"accepted","reasoning":"CI smoke: the gates passed and the review is recorded."}' "http://127.0.0.1:8080/v1/tasks/$TASK/accept" >/dev/null
+          await_state accepted
+
+          echo "wakes waiting for poll:"
+          curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/v1/wakes | python3 -c 'import json,sys; [print(w["reason"], "-", w["summary"]) for w in json.load(sys.stdin)["items"]]'
+          curl -fsS -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:8080/v1/tasks/$TASK/events?limit=200" | python3 -c 'import json,sys; [print(e["seq"], e["kind"]) for e in json.load(sys.stdin)["items"]]'
       - name: logs on failure
         if: failure()
         run: docker compose logs

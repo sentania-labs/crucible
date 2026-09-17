@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from crucible.contracts.common import SCHEMA_VERSION, Rfc3339, StrictModel
 from crucible.contracts.task_contract import HarnessName, ProviderName
+from crucible.domain.entities import AcceptanceVerdict, DispositionKind
 from crucible.domain.exit_class import ExitClass
 from crucible.domain.lifecycle import AttemptState, ExecutionState, TaskState
 
@@ -67,9 +68,15 @@ class TaskView(Response):
     contract: dict[str, Any]
     executions: list[ExecutionSummary]
     latest_attempt: AttemptSummary | None
+    head_sha: str | None
+    publish_pending: bool
     gate_summary: dict[str, Any]
     pull_request: dict[str, Any] | None
     open_escalations: list[dict[str, Any]]
+    review_reports: list[dict[str, Any]]
+    acceptance_results: list[dict[str, Any]]
+    decisions: list[dict[str, Any]]
+    unacked_wakes: int
 
 
 class TaskListItem(Response):
@@ -219,3 +226,209 @@ class RepositoryView(Response):
     installation_id: int | None
     registered_by: str
     created_at: Rfc3339
+
+
+# ----- C2: review, acceptance, corrections, decisions, wakes, policies, artifacts ----
+
+
+class ReviewExecutionRequest(StrictModel):
+    """Ask Crucible to run a `review` execution on the collected head (04, 11)."""
+
+    harness: HarnessName
+    model: str = Field(min_length=1)
+    provider: ProviderName
+    image: str = Field(min_length=1)
+    effort: str | None = None
+    timeout_seconds: int = Field(ge=1)
+    rationale: str = Field(min_length=1)
+
+
+class ReviewRequest(StrictModel):
+    report: dict[str, Any] | None = None
+    execution: ReviewExecutionRequest | None = None
+
+    @model_validator(mode="after")
+    def _exactly_one(self) -> ReviewRequest:
+        if (self.report is None) == (self.execution is None):
+            raise ValueError("name exactly one of report or execution")
+        return self
+
+
+class AcceptRequest(StrictModel):
+    verdict: AcceptanceVerdict
+    reasoning: str = Field(min_length=1)
+    head_sha: str | None = None
+
+
+class DecisionRequest(StrictModel):
+    kind: str = Field(min_length=1, max_length=48)
+    verbatim: str = Field(min_length=1, description="The deciding principal's own words.")
+    resolves: str = Field(min_length=1)
+    escalation_id: str | None = None
+    reschedule: bool = False
+
+
+class DispositionRequest(StrictModel):
+    review_comment_id: str = Field(min_length=1, max_length=64)
+    disposition: DispositionKind
+    reasoning: str = Field(min_length=1)
+
+
+class CloseRequest(StrictModel):
+    note: str = Field(min_length=1)
+
+
+class AmendRequest(StrictModel):
+    contract: dict[str, Any]
+    reason: str = Field(min_length=1)
+
+
+class WakeAckRequest(StrictModel):
+    note: str = Field(min_length=1, description="What Foundry did about it.")
+
+
+class WakeView(Response):
+    id: str
+    principal: str
+    reason: str
+    task_id: str | None
+    summary: str
+    payload: dict[str, Any]
+    created_at: Rfc3339
+    attempts: int
+    delivered_at: Rfc3339 | None
+    acked_at: Rfc3339 | None
+    ack_note: str | None
+    next_attempt_at: Rfc3339 | None
+    last_error: str | None
+    gave_up_at: Rfc3339 | None
+
+
+class WakeList(Response):
+    items: list[WakeView]
+    next_cursor: str | None
+
+
+class GateResultView(Response):
+    gate: str
+    phase: str
+    result: str
+    detail: str
+    head_sha: str
+    evidence_ids: list[int]
+    evaluated_at: Rfc3339
+
+
+class GateList(Response):
+    attempt_id: str
+    head_sha: str | None
+    items: list[GateResultView]
+    counts: dict[str, int]
+
+
+class EvidenceView(Response):
+    id: int
+    attempt_id: str | None
+    kind: str
+    source: str
+    verified: bool
+    observed_at: Rfc3339
+    payload: dict[str, Any]
+    artifact_id: str | None
+
+
+class EvidenceList(Response):
+    items: list[EvidenceView]
+
+
+class ArtifactView(Response):
+    id: str
+    attempt_id: str | None
+    task_id: str | None
+    type: str
+    filename: str
+    size: int
+    sha256: str
+    content_type: str
+    created_by: str
+    created_at: Rfc3339
+
+
+class ArtifactList(Response):
+    items: list[ArtifactView]
+
+
+class ReviewReportView(Response):
+    id: str
+    task_id: str
+    head_sha: str
+    reviewer_kind: str
+    reviewer_attempt_id: str | None
+    reviewer_principal: str | None
+    verdict: str
+    findings: int
+    document: dict[str, Any]
+    created_at: Rfc3339
+
+
+class AcceptanceView(Response):
+    id: str
+    head_sha: str
+    principal: str
+    verdict: str
+    reasoning: str
+    superseded_at: Rfc3339 | None
+    created_at: Rfc3339
+
+
+class DecisionView(Response):
+    id: str
+    kind: str
+    principal: str
+    verbatim: str
+    resolves: str
+    escalation_id: str | None
+    created_at: Rfc3339
+
+
+class EscalationView(Response):
+    id: str
+    state: str
+    question: str
+    attempt_id: str | None
+    opened_at: Rfc3339
+    closed_at: Rfc3339 | None
+    decision_id: str | None
+
+
+class PolicyView(Response):
+    name: str
+    version: int
+    document: dict[str, Any]
+    referenced: bool
+    created_at: Rfc3339
+    retired_at: Rfc3339 | None
+
+
+class RoutingPolicyView(Response):
+    name: str
+    version: int
+    document: dict[str, Any]
+    created_at: Rfc3339
+    retired_at: Rfc3339 | None
+
+
+class RoutingUsageView(Response):
+    routing_policy: dict[str, Any]
+    pools: list[dict[str, Any]]
+
+
+class RoutingHistoryView(Response):
+    items: list[dict[str, Any]]
+
+
+class CompletionClaimView(Response):
+    attempt_id: str
+    parsed_ok: bool
+    parse_errors: list[dict[str, Any]]
+    document: dict[str, Any]

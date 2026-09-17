@@ -43,6 +43,14 @@ class SupervisorSettings(BaseModel):
     holder: str | None = None
 
 
+class WakeSettings(BaseModel):
+    """Wake delivery (17). The secret comes from the environment and is never stored."""
+
+    webhook_url: str | None = None
+    secret: str | None = None
+    timeout_seconds: float = 5.0
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="CRUCIBLE_", env_nested_delimiter="__", extra="ignore", toml_file=None
@@ -51,6 +59,7 @@ class Settings(BaseSettings):
     service: ServiceSettings = Field(default_factory=ServiceSettings)
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)
     supervisor: SupervisorSettings = Field(default_factory=SupervisorSettings)
+    wake: WakeSettings = Field(default_factory=WakeSettings)
 
     @classmethod
     def settings_customise_sources(
