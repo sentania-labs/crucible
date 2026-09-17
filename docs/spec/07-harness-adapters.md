@@ -8,7 +8,7 @@ run back into a parsed report. Adapters contain no lifecycle logic.
 
 ```python
 class HarnessAdapter(Protocol):
-    name: HarnessName                     # "claude_code" | "codex" | "agy"
+    name: HarnessName                     # "claude_code" | "codex" | "agy" | "script-harness" (e2e only, 18)
     supported_versions: VersionRange      # tested range; launch refused outside it
     def capabilities(self) -> HarnessCapabilities: ...
     def credential_spec(self) -> CredentialSpec: ...

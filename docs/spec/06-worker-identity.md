@@ -9,6 +9,7 @@ read-only into the worker, and never writes it into the repository.
 identity/
   IDENTITY.md          rendered role, objective, boundaries, reporting protocol
   contract.yaml        the TaskContractV1 verbatim
+  contract.json        the same document as JSON (worker images have jq, no YAML parser)
   contract.sha256
   project/             copies or references of project_instructions entries
   skills/<name>/       only the skills the contract names
