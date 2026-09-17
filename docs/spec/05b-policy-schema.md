@@ -28,7 +28,7 @@ retry:
 
 concurrency:
   per_provider: 3
-  per_harness: { claude_code: 1, codex: 1, agy: 1 }   # 1 while writable auth state is shared or synchronized
+  per_harness: { claude_code: 1, codex: 1, agy: 1 }   # all three mount rw-narrow, so all three are 1
 
 resources:
   cpus: 2
@@ -47,7 +47,7 @@ network:
   harness_endpoints: "from-harness"    # each adapter contributes its model endpoints (S6)
 
 routing:                               # see RoutingPolicyV1 below; this names which one applies
-  policy: { name: "default-routing", version: 1 }
+  policy: { name: "default-routing", version: 1 }   # the shipped default-software v1 names v1; see below
 
 images:
   allowlist: ["crucible-worker:*", "ghcr.io/sentania-labs/crucible-worker:*"]
@@ -163,6 +163,16 @@ retention:
   `mount_mode` is `rw-narrow`; the mount mode comes from Crucible's
   credential configuration (12, 25), not from the policy, so the check
   runs against the configured credential sources at upload and at launch.
+  All three real harnesses mount `rw-narrow`, so all three are capped at 1.
+- The per-harness cap is checked **after** the checkout lease (10), not
+  before. The lease is the older and more specific rule: an attempt whose
+  checkout another attempt holds should be told that, not held back by a
+  cap it never reached. Only a launch that could take the checkout is
+  measured against the cap. A launch over the cap waits and records
+  `harness_launch_deferred`; it is not a failure.
+- An attempt counts against the cap until its credential copy has been
+  synced back and removed, which is after `exited` (12), so `terminating`
+  and `exited` attempts are still busy.
 - `network.egress_allowlist` entries are hostnames, no wildcards in v0.x.
 - `external_review.required_rounds: 0` makes the external review gates
   `skipped`; `reviewer_logins` must be non-empty when rounds are above 0.
@@ -198,41 +208,64 @@ contract cannot change them.
 Uploaded and versioned like a policy. Foundry selects from it; Crucible
 never selects, but refuses a contract whose model is absent or disabled,
 whose harness does not match the entry, or whose quota pool is exhausted,
-and reports per-pool usage on `GET /routing/usage`. The operator's
+and reports per-pool usage on `GET /routing/usage`. A harness that is
+disabled, by configuration or by the administrator's flag (25), is likewise
+a contract problem at submit on `execution_request.harness`, answered 422
+with the reason, not a refusal the task discovers later. The operator's
 direction (2026-09-16): rotate work across providers by capability, cost,
 and speed; never spend frontier models on simple work; local models carry
 routine work once they exist.
 
+`default-routing` version 2, as seeded, is the document below. Version 1
+stays beside it because a policy version references it and a version is
+immutable; version 1's ids were placeholders, version 2's are the ones the
+CLIs themselves list.
+
 ```yaml
 schema_version: "1.0"
 name: "default-routing"
-version: 1
+version: 2
 tiers:                                 # task tiers Foundry assigns in the contract's execution_request.tier
   trivial:   { allowed_capability: ["small", "mid"],  prefer: ["small"] }     # frontier is refused, not merely dispreferred
   standard:  { allowed_capability: ["mid", "small"],  prefer: ["mid"] }       # a task that truly needs frontier is marked complex
   complex:   { allowed_capability: ["frontier", "mid"], prefer: ["frontier"] }
-models:
-  - { id: "claude-fable-5-1",      harness: claude_code, endpoint: subscription, capability: frontier, cost: high,  speed: medium, pool: anthropic-sub, weight: 1, enabled: true }
-  - { id: "claude-sonnet-5",       harness: claude_code, endpoint: subscription, capability: mid,      cost: medium, speed: fast,  pool: anthropic-sub, weight: 2, enabled: true }
-  - { id: "gpt-5-codex",           harness: codex,       endpoint: subscription, capability: frontier, cost: high,  speed: medium, pool: openai-sub,    weight: 1, enabled: true }
-  - { id: "gpt-5-codex-mini",      harness: codex,       endpoint: subscription, capability: mid,      cost: medium, speed: fast,  pool: openai-sub,    weight: 2, enabled: true }
-  - { id: "gemini-3-pro",          harness: agy,         endpoint: subscription, capability: mid,      cost: medium, speed: fast,  pool: google-sub,    weight: 2, enabled: true }
-  - { id: "local-spark-large",     harness: codex,       endpoint: local, endpoint_url: "http://spark.example.internal:8000/v1", capability: mid,   cost: none, speed: medium, pool: local-spark, weight: 3, enabled: false }   # DGX Spark, when present
-  - { id: "local-rtx-small",       harness: codex,       endpoint: local, endpoint_url: "http://rtx.example.internal:8000/v1",   capability: small, cost: none, speed: fast,   pool: local-rtx,   weight: 3, enabled: false }   # RTX 9060 16 GB
+models:                                # every entry weight 1: rotation is least-recent until the outcomes say otherwise
+  - { id: "claude-haiku-4-5",      harness: claude_code, endpoint: subscription, capability: small,    cost: low,    speed: fast,   pool: anthropic-sub, weight: 1, enabled: true }
+  - { id: "claude-sonnet-5",       harness: claude_code, endpoint: subscription, capability: mid,      cost: medium, speed: fast,   pool: anthropic-sub, weight: 1, enabled: true }
+  - { id: "claude-fable-5-1",      harness: claude_code, endpoint: subscription, capability: frontier, cost: high,   speed: medium, pool: anthropic-sub, weight: 1, enabled: true }
+  - { id: "gpt-5.6-luna",          harness: codex,       endpoint: subscription, capability: small,    cost: low,    speed: fast,   pool: openai-sub,    weight: 1, enabled: true }
+  - { id: "gpt-5.6-terra",         harness: codex,       endpoint: subscription, capability: mid,      cost: medium, speed: medium, pool: openai-sub,    weight: 1, enabled: true }
+  - { id: "gpt-5.6-sol",           harness: codex,       endpoint: subscription, capability: frontier, cost: high,   speed: medium, pool: openai-sub,    weight: 1, enabled: true }
+  - { id: "gpt-6-astra",           harness: codex,       endpoint: subscription, capability: frontier, cost: high,   speed: slow,   pool: openai-sub,    weight: 1, enabled: true }
+  - { id: "gemini-3.8-flash-low",  harness: agy,         endpoint: subscription, capability: small,    cost: low,    speed: fast,   pool: google-sub,    weight: 1, enabled: true }
+  - { id: "gemini-3.8-flash-high", harness: agy,         endpoint: subscription, capability: mid,      cost: medium, speed: medium, pool: google-sub,    weight: 1, enabled: true }
+  - { id: "gemini-3.1-pro-high",   harness: agy,         endpoint: subscription, capability: frontier, cost: high,   speed: slow,   pool: google-sub,    weight: 1, enabled: true }
 pools:                                 # budget_units is one of attempts | tokens_out | cost_units, all recorded in AttemptMetrics
   anthropic-sub: { window: "5h", budget_units: "tokens_out", soft_limit: 0 }   # 0 means observe only until measured
   openai-sub:    { window: "5h", budget_units: "tokens_out", soft_limit: 0 }
-  google-sub:    { window: "24h", budget_units: "tokens_out", soft_limit: 0 }
-  local-spark:   { window: "1h", budget_units: "attempts", soft_limit: 0 }
-  local-rtx:     { window: "1h", budget_units: "attempts", soft_limit: 0 }
+  google-sub:    { window: "5h", budget_units: "attempts", soft_limit: 0 }
 rotation:
   strategy: "weighted-least-recent"    # among models allowed for the tier, prefer the preferred capability, then the least recently used, weighted
   quality_feedback: true               # a model whose last N attempts on this project ended in gate failures or corrections drops one preference step
-  quality_window: 10
+  quality_window: 20
 ```
 
-Model ids are what the harness accepts; they are illustrative here and
-the operator's private routing policy holds the real ones. A `local`
+Version 2 carries subscription entries only. Local model entries, which
+carry `endpoint: local` and an `endpoint_url` on the DGX Spark and the RTX
+9060, join a later version with their own pools once S13 has run; the rules
+for them below already hold.
+
+Model ids are what the harness accepts. Which routing version a deployment
+uses is the policy's own choice, and today's shipped `default-software`
+version 1 names `default-routing` version 1. A `default-software` version 2
+naming `default-routing` version 2 is the pending step (C5b), once the
+operator settles the cost classes; until it is uploaded, version 2 is seeded
+and available but not in force. The Codex pool in version 2 is exactly the
+operator's roster decision: `gpt-5.6-luna` small, `gpt-5.6-terra` mid, `gpt-5.6-sol` and
+`gpt-6-astra` frontier. Nothing older and no mini; `gpt-5.5` is a recorded
+fallback outside the pool. The ids come from the CLI's own listing, the cost
+and speed classes are Foundry's tiering. AGY carries its effort inside the
+model id (07), which is why the Flash entries differ only by suffix. A `local`
 entry must carry `endpoint_url`; Crucible passes it to the adapter's
 launch context and adds its hostname to that attempt's egress allowlist.
 A pool's `budget_units` must be a unit AttemptMetrics records; when a
@@ -255,5 +288,7 @@ to `launching`; if the pool crossed its soft limit since submit, the
 attempt is refused with class `quota_exhausted` and Foundry is woken. Foundry
 records the tier and the chosen model with its rationale in the contract
 (05); Crucible records the outcome in AttemptMetrics (03, 14) and exposes
-`GET /routing/history?model=&project=` so the next selection is informed.
+`GET /routing/history?model=&project=`, which returns both the model the
+contract requested and the model the transcript named (14), so the next
+selection is informed.
 Selection itself stays a Foundry judgment; the policy bounds it.

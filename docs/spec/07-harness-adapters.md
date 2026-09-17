@@ -34,7 +34,10 @@ never retry.
 
 - Non-interactive only. No TTY. Permission prompts disabled by the harness's
   own flag; the container is the boundary (12).
-- Auth failures are classified from both stdout and stderr tails (S5).
+- Auth failures are classified from both stdout and stderr tails (S5),
+  and only on a non-zero exit: the auth and quota patterns never turn a
+  successful run into a failure, and never reclassify a termination
+  Crucible performed.
 - Codex is launched with `--disable plugins` so it does not contact
   github.com or chatgpt.com for plugin sync (S6).
 - The task contract and identity are delivered as files. Argv carries only
@@ -47,7 +50,12 @@ never retry.
   tested with; the worker image carries the installed version in a label;
   the attempt records the image digest it ran; `GET /harnesses` reports
   installed and supported versions. A combination outside the range is a
-  launch-time refusal with a wake, not a warning. Harness CLIs never
+  launch-time refusal with a wake, not a warning. The image must also
+  carry a `crucible.harness` label equal to the harness the execution
+  asks for; an image that names no harness, or names a different one, is
+  refused before anything is seeded, whatever its version label says. An
+  image is never launched with a credential on the strength of a version
+  label alone. Harness CLIs never
   self-update inside a worker: each image sets the CLI's auto-update
   opt-out and the root filesystem is read-only (13, S11).
 - Retries and corrections keep the image digest of the task's first
@@ -62,16 +70,22 @@ never retry.
   --output-format stream-json --verbose --model <model>` with the prompt on
   stdin: "Read /crucible/identity/IDENTITY.md and execute the task."
   (`stream-json` requires `--verbose` in print mode.)
-- Credentials: subscription OAuth state. Two files are the credential: the
-  credentials file inside the CLI's config directory and the top-level
-  state file the CLI keeps beside it in the home directory. Both are
-  `rw-narrow` (12) because the CLI refreshes tokens in place; the rest of
-  the config directory (settings, hooks, MCP definitions) is mounted
-  read-only from a Crucible-owned template. If the operator uses the CLI's
-  long-lived token command instead, that token is delivered through the
-  CLI's documented environment variable from the mounted file at container
-  start, as the one exception to file-only delivery, and S1 records which
-  path is in use.
+- Credentials: subscription OAuth state. Crucible's dedicated session uses
+  the CLI's long-lived token (S1b), kept as the file `oauth-token` in the
+  credential directory, with the top-level state file `.claude.json`
+  seeded beside it so the CLI finds the state it expects, and
+  `CLAUDE_CONFIG_DIR` pointed at the mounted copy so both live in one
+  directory. The token reaches the CLI through its documented environment
+  variable, read from the mounted file at container start, as the one
+  exception to file-only delivery. Neither file is written back: the
+  long-lived token does not refresh, and `.claude.json` is state the CLI
+  rewrites on every run, not a credential. The mount is `rw-narrow` (12)
+  because the CLI writes that state in place. The rest of the config
+  directory (settings, hooks, MCP definitions) is mounted read-only from a
+  Crucible-owned template.
+- Endpoints: `api.anthropic.com` (plus `mcp-proxy.anthropic.com` only if
+  account MCP connectors are wanted). Confirmed by a task completed
+  through the filtering proxy, so the list is no longer provisional.
 - Shim: none if the checkout has a `CLAUDE.md`; otherwise a one-line
   untracked `CLAUDE.md` pointing at the identity file.
 - Stream-json lines are parsed into progress events (tool use, text) at low
@@ -93,31 +107,66 @@ never retry.
   writes session and log state beside its auth file, so a read-only mount
   fails before auth is tested. Only the auth file syncs back (12).
 - Shim: untracked `AGENTS.md` if absent.
+- Endpoints: `api.openai.com`, `auth.openai.com`, and `chatgpt.com`.
+  `chatgpt.com` is required, not conditional: with a ChatGPT-plan login
+  (`auth_mode = chatgpt`) that host is the backend, and a run without it
+  reconnects until it is permitted and never reaches the model.
+  `ab.chatgpt.com` stays denied.
+- The worker image carries the code-mode host companion binary the CLI
+  spawns for the 5.6 model family; without it those models fail closed.
+  It is an asset of the same pinned CLI release and is pinned by the
+  tarball's checksum like the CLI itself (13).
 - Output: run with `--json` and `-o /crucible/report/codex-last-message.md`;
   the JSON event stream is stored as the transcript artifact, the last
   message as a summary artifact; the report file is the fact.
 
 ## AGY
 
-- Launch: `agy -p "<pointer>" --model <model> --effort <effort>
+- Launch: `agy -p "<pointer>" --model <model> [--effort <effort>]
   --dangerously-skip-permissions --add-dir /crucible/identity
-  --output-format stream-json`, as observed in the CLI's own `--help` on the
+  --output-format stream-json --print-timeout <attempt timeout>`, as
+  observed in the CLI's own `--help` on the
   reference install; S3 confirmed the flags and stream-json output. The
   argv ceiling is the kernel's 128 KiB per argument (S3), so the prompt
   is under 1 KB by construction and the bundle travels by `--add-dir`.
-- Credentials: `credential:agy` mounted to the Gemini config dir.
+  `--print-timeout` defaults to five minutes in the CLI, which would cut a
+  longer task, so it follows the attempt's own timeout. `--effort` is not
+  a separate flag for every model: the Flash models carry the effort inside
+  the model id (the low-effort Flash model is `gemini-3.8-flash-low`) and
+  refuse the flag, so no effort is passed for them.
+- Credentials: `credential:agy` mounted to the Gemini config dir,
+  `rw-narrow` (12): the first Crucible-side run past the token's one-hour
+  expiry refreshed it in place and the copy carried a newer expiry, so the
+  token file syncs back by that field.
+- Endpoints: `daily-cloudcode-pa.googleapis.com`, `oauth2.googleapis.com`,
+  `www.googleapis.com`, and `lh3.googleusercontent.com`. The last two are
+  the CLI's eligibility check, which calls the userinfo endpoint and then
+  fetches the account's profile picture before any turn and fails closed
+  when either is refused. Neither is a model endpoint; both are what the
+  CLI needs. The list is no longer provisional.
 - Shim: untracked `AGENTS.md` if absent (AGY reads `AGENTS.md`; it does not
   read `GEMINI.md` reliably in headless mode per the operator's setup notes).
-- Output: stream-json parsed like Claude Code's.
+- Templates: none. AGY's config directory carries no settings file the
+  adapter needs to pin, so nothing is mounted read-only on top of the copy
+  and `config/` is not seeded.
+- Output: stream-json parsed like Claude Code's, keyed by `event` rather
+  than `type` (`{"event": "result", "result": {...}}`); the adapter reads
+  both keys.
 
 ## Report parsing (all harnesses)
 
 `/crucible/report/report.yaml` is parsed against `CompletionClaimV1` from
-the collector's copy (08). Missing file with exit 0 is
-`completed_without_report`, a hard failure of the report gate, never a
-success. `blocked.md` with exit 75 produces an escalation and moves the task
-to `blocked`; exit 75 without it is `failed`. Progress lines are ingested as events with the
-worker as source and marked `unverified`.
+the collector's copy (08). A missing file with exit 0 is
+`completed_without_report`. A file that is present but does not parse is
+recorded as `report_parse_failed` with the parser's errors and
+`report_present` true; it is never recorded as "no report". Either way the
+report gate fails hard and neither is a success; what differs is that the
+record says which happened. `blocked.md` with exit 75 produces an escalation
+and moves the task
+to `blocked`; exit 75 without it is `failed`. Progress lines are ingested as
+`worker_progress` events under the principal `worker` and marked
+`unverified`, at most 200 per attempt and 1000 characters per line, each
+line redacted before it is stored (12).
 
 ## Local model endpoints
 

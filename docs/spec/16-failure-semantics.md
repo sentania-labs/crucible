@@ -6,7 +6,7 @@
 |---|---|---|
 | `completed` | exit 0 and report present | gates |
 | `blocked` | exit 75, `blocked.md` present | escalation, wake, task `blocked` |
-| `environment` | exit 70, or provider failed before the harness ran | retry if attempts remain; else `failed` |
+| `environment` | exit 70, the provider failed before the harness ran, the kernel killed the worker out of memory (exit 137 with the daemon's OOM flag), or the harness was refused | retry if attempts remain; else `failed`. A harness refusal (07, 25) is the exception: it is never retried, because the same refusal would come back |
 | `auth_failure` | harness reported auth problem (adapter classified) | retry per policy (`retry.auth_failure_max`, after `auth_retry_delay_seconds`); wake regardless |
 | `quota_exhausted` | harness reported rate or quota limit | not retry-eligible by default; task `reported` with the class visible; wake (Foundry may choose another harness) |
 | `timeout` | contract timeout or stall | no retry; gates run on what exists; wake |
@@ -71,7 +71,13 @@ person. An open PR is never closed by Crucible on cancel.
 | `workspace_on_success` | delete, keep, keep_diff_only | keep_diff_only |
 | `workspace_on_failure` | delete, keep | keep |
 | `container_remove` | always, on_success, never | always, after `logs_drained` |
-| `credential_volume_remove` | immediately_after_validated_sync | immediately_after_validated_sync |
+| `credential_volume_remove` | immediately_after_validated_sync | immediately_after_validated_sync (the field keeps its name; the copy is a directory, 12) |
+
+The credential copy is not subject to `workspace_on_success` or
+`workspace_on_failure`: it is removed under every option, `keep` included,
+and on every path that never reaches a validated sync at all, including a
+start that failed after seeding, a worker the provider lost, and a
+transport failure during the read-back (12).
 
 A cleanup pass runs each reconcile tick. Every deletion is an event and a
 `RetentionAction` row naming the policy version that authorized it.
@@ -86,7 +92,7 @@ Nothing that a gate consumed is deleted before the task is terminal.
 | diffs and artifact metadata | indefinite; artifact bytes size-capped per attempt by policy |
 | worker logs and transcripts | 90 days, then deleted with an event |
 | completed worker workspaces | 14 days |
-| temporary credential volumes | removed immediately after validated synchronization and attempt cleanup |
+| per-attempt credential copies | removed immediately after validated synchronization, and on every path that skips it |
 | wakes | 30 days after ack |
 | bootstrap SQLite archive | 180 days |
 

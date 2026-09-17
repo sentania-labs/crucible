@@ -54,7 +54,10 @@ requirement.
 One base image per harness version, built from `images/<harness>/Dockerfile`:
 Debian slim, non-root `worker` (uid 1000), git, curl, jq, the harness CLI
 at a pinned version, and nothing else. No `gh`: workers have no GitHub
-credential to use it with. Labels: `org.opencontainers.image.version`,
+credential to use it with. Where a CLI needs a companion binary to work at
+all, as Codex does for the 5.6 model family, the companion ships in the same
+image from the same pinned release, fetched by URL and verified against a
+recorded sha256 of the tarball, with its mtime set to the epoch (07, S11). Labels: `org.opencontainers.image.version`,
 `crucible.harness`, `crucible.harness_version`, `crucible.build_inputs`
 (hash). Reproducible: pinned base digest, pinned package versions,
 `SOURCE_DATE_EPOCH`. Project-specific toolchains come from a per-project
@@ -70,6 +73,17 @@ Rules:
   honors `AGY_CLI_DISABLE_AUTO_UPDATE=1`; Codex has no environment
   variable, only the config key `check_for_update_on_startup=false`, which
   the Codex adapter passes at launch. S11 re-confirms on each promotion.
+- Every harness's image is a **declared pin**, never "the newest". Every
+  reproducible image carries the same `SOURCE_DATE_EPOCH` creation time, so
+  two tags of one harness tie and a choice by creation time is arbitrary;
+  a live run picked a stale tag exactly that way. `images/build.sh` writes
+  `images/manifest.env` with the tag and OCI manifest digest per harness,
+  and the e2e and live tiers read it. Recording is not a build input, so
+  writing the manifest never changes a tag. A launch is refused when more
+  than one tag matches a harness and the manifest pins none.
+- An image is launched with a harness's credential only when it carries a
+  `crucible.harness` label equal to the requested harness (07). No label,
+  or a different one, is a refusal before anything is seeded.
 - Every attempt records the image digest it ran, resolved at launch.
   Retries and corrections of a task keep that digest unless Foundry
   explicitly authorizes a different image in the correction contract.
@@ -79,7 +93,21 @@ Rules:
   with a wake, never a warning.
 - Images are built locally in C3 and C5. Versioned, digest-pinned images
   publish to `ghcr.io/sentania-labs/crucible-worker` once the live harness
-  phase and the release workflow exist.
+  phase and the release workflow exist. The four images the C5a rebuild
+  produced on the rootless daemon, with `images/manifest.env` as the
+  authoritative record:
+
+  | Harness | Tag |
+  |---|---|
+  | `claude_code` | `crucible-worker:claude_code-2.1.273-8b75176f203e` |
+  | `codex` | `crucible-worker:codex-0.153.4-ce72fc1b2e20` |
+  | `agy` | `crucible-worker:agy-1.2.4-26838f92302b` |
+  | `script-harness` | `crucible-worker:script-harness-1.0.0-34cf5b56ca5a` |
+
+  `build.sh` is itself a hashed build input, so editing it retags every
+  image; the previous tags stay on the daemon as the rollback. CI builds
+  the script image from the same inputs and so gets the same tag, which is
+  how its e2e job and the pin agree without a push.
 
 Image promotion (a Crucible repository process, C8):
 
@@ -160,16 +188,20 @@ declared endpoints, the hostnames of every enabled local model
 to launch an attempt whose effective allowlist exceeds what the proxy
 was configured with, and a per-attempt proxy is a later hardening. Worker
 `/tmp` is mounted without `noexec` in v0.x because no evidence exists yet
-that the real harnesses never execute from it; C5 tests each harness with
-`noexec` and 13 is updated with the result. From S6
-(Claude Code and the others provisional until an authenticated run
-completes through the filter in C3): Claude Code `api.anthropic.com`
-(plus `mcp-proxy.anthropic.com` only if account MCP connectors are
-wanted; telemetry to Datadog denied); Codex `api.openai.com`,
-`auth.openai.com`, possibly `chatgpt.com`; AGY
-`daily-cloudcode-pa.googleapis.com`, `oauth2.googleapis.com`. Everything
-else each CLI tried (experiment flags, update checks, browser downloads)
-is denied. The
+that the real harnesses never execute from it. C5a did not test it; the
+test against each real harness is carried forward and this section is
+updated with the result. From S6, as each list stood after an authenticated task completed through
+the filter (so none of them is provisional any more): Claude Code
+`api.anthropic.com` (plus `mcp-proxy.anthropic.com` only if account MCP
+connectors are wanted; telemetry to Datadog denied); Codex
+`api.openai.com`, `auth.openai.com`, and `chatgpt.com`, which a
+ChatGPT-plan login requires rather than merely prefers; AGY
+`daily-cloudcode-pa.googleapis.com`, `oauth2.googleapis.com`,
+`www.googleapis.com`, and `lh3.googleusercontent.com`, the last two for the
+CLI's eligibility check, which fails closed without them. Everything
+else each CLI tried (experiment flags, update checks, browser downloads,
+`ab.chatgpt.com`, `antigravity-unleash.goog`, `play.googleapis.com`) is
+denied, and the runs complete without them. The
 publisher's allowlist is `github.com` and `api.github.com` only, and it is
 a separate proxy on a separate network rather than an entry on the
 workers' list. `network:
@@ -187,7 +219,14 @@ delivery in memory before anything is stored (23).
 ## Filesystem
 
 Read-only root, tmpfs `/tmp` and `/home/worker` (size-limited), repo mount
-rw, identity ro, one credential mount, report dir rw. Nothing else.
+rw, identity ro, the credential mount, report dir rw. Nothing else. The
+credential mount is one writable mount plus the Crucible-owned template
+files, each bind-mounted read-only at its own path **inside** the credential
+directory, on top of the copy (12). A template is Crucible's own file from
+the identity bundle, not a second credential: it is written into the bundle
+before the bundle is hashed, so the identity hash covers it, and it is what
+stops a worker planting a hook, an MCP server definition, or a plugin that a
+later worker would inherit.
 
 ## Resource limits
 

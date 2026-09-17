@@ -24,7 +24,7 @@ Only when judgment is required or work has stopped needing it:
 | `release_gates_failed`, `release_succeeded`, `release_workflow_failed` | release lifecycle (24) |
 | `attempt_failed`, `timed_out`, `lost` with no retry remaining | `reported` |
 | `quota_exhausted`, `auth_failure` | any |
-| `harness_version_unsupported` | launch refused |
+| `harness_unavailable` | launch refused: the harness is unknown, disabled by either gate (25), outside the adapter's tested version range, or has no credential. Terminal for the attempt; the retry rule skips it because the same refusal would come back |
 | `escalation_stale` | repeat |
 | `supervisor_takeover` | informational, once |
 | `bootstrap_import_verified` | awaiting commit |
