@@ -268,7 +268,7 @@ def _wait_for_postgres(url: str, *, attempts: int = 120) -> None:
 @pytest.fixture(scope="session")
 def worker_image() -> str:
     return os.environ.get("CRUCIBLE_E2E_IMAGE") or daemon.image_tag(
-        "crucible-worker:script-harness-"
+        "crucible-worker:script-harness-", harness="script-harness"
     )
 
 

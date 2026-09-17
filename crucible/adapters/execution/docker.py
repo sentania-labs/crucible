@@ -804,55 +804,19 @@ class DockerProvider:
         valid, newer one, and remove the copy at once (12).
 
         `changed` is against the source as it is now, which also covers a collect after
-        a supervisor restart, when the seeded hashes are gone with the process."""
+        a supervisor restart, when the seeded hashes are gone with the process. The
+        removal is in a `finally` path: a daemon that keeps failing the read-back must
+        not keep the files on disk for as long as it fails."""
         launched = self._launched.get(h.attempt_id)
         copy = launched.credential if launched is not None else self._credential_copy(spec)
         if copy is None:
             return None
         files: list[CredentialFileSync] = []
-        for auth in copy.spec.auth_files:
-            inside = f"{copy.spec.mount_target}/{auth.name}"
-            try:
-                archive = await self._call(self.client.get_archive, h.ref, inside)
-            except DockerApiError as exc:
-                files.append(
-                    CredentialFileSync(auth.name, False, False, False, False, f"read failed: {exc}")
-                )
-                continue
-            if archive is not None and archive.truncated:
-                # A worker owns its copy and left something larger than any auth file
-                # at this path. Nothing that size is parsed, let alone written back.
-                files.append(
-                    CredentialFileSync(
-                        auth.name, True, True, False, False, "changed; larger than the read limit"
-                    )
-                )
-                continue
-            if archive is not None and archive.stat and not archive.is_regular:
-                # The daemon says the path is not a regular file. A symlink here is a
-                # worker substituting some other file's bytes for its credential; the
-                # bytes are not looked at and the source is left alone.
-                files.append(
-                    CredentialFileSync(
-                        auth.name, True, True, False, False, "changed; not a regular file"
-                    )
-                )
-                continue
-            data = _single_file(archive.tar) if archive is not None else None
-            if data is None:
-                files.append(
-                    CredentialFileSync(
-                        auth.name, False, False, False, False, "absent after the run"
-                    )
-                )
-                continue
-            files.append(await asyncio.to_thread(_sync_one, copy, auth, data))
-        removed = False
         try:
-            await self._remove_through_daemon(ws, spec, [CREDENTIAL_LEAF])
-            removed = not (self._root(h.attempt_id) / CREDENTIAL_LEAF).exists()
-        except Exception as exc:  # the sync is recorded whatever the removal did
-            log.warning("credential copy removal failed", extra={"error": str(exc)})
+            for auth in copy.spec.auth_files:
+                files.append(await self._sync_file(h, copy, auth))
+        finally:
+            removed = await self._remove_credential_copy(h, ws, spec)
         return CredentialSync(
             harness=copy.spec.harness,
             mount_mode=copy.mode.value,
@@ -862,6 +826,46 @@ class DockerProvider:
                 "" if copy.seeded else "seeded hashes unknown; changed is against the source now"
             ),
         )
+
+    async def _remove_credential_copy(self, h: Handle, ws: Workspace, spec: LaunchSpec) -> bool:
+        try:
+            await self._remove_through_daemon(ws, spec, [CREDENTIAL_LEAF])
+            return not (self._root(h.attempt_id) / CREDENTIAL_LEAF).exists()
+        except Exception as exc:  # the sync is recorded whatever the removal did
+            log.warning("credential copy removal failed", extra={"error": str(exc)})
+            return False
+
+    async def _sync_file(
+        self, h: Handle, copy: _CredentialCopy, auth: AuthFile
+    ) -> CredentialFileSync:
+        """One named file: read back, checked, and written back or not (12). A failure
+        to read, on the API or on the transport, is a recorded outcome, never an
+        exception past the removal."""
+        inside = f"{copy.spec.mount_target}/{auth.name}"
+        try:
+            archive = await self._call(self.client.get_archive, h.ref, inside)
+        except (DockerApiError, TimeoutError, OSError, HTTPException) as exc:
+            detail = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+            return CredentialFileSync(
+                auth.name, False, False, False, False, f"read failed: {detail}"
+            )
+        if archive is not None and archive.truncated:
+            # A worker owns its copy and left something larger than any auth file at
+            # this path. Nothing that size is parsed, let alone written back.
+            return CredentialFileSync(
+                auth.name, True, True, False, False, "changed; larger than the read limit"
+            )
+        if archive is not None and archive.stat and not archive.is_regular:
+            # The daemon says the path is not a regular file. A symlink here is a worker
+            # substituting some other file's bytes for its credential; the bytes are not
+            # looked at and the source is left alone.
+            return CredentialFileSync(
+                auth.name, True, True, False, False, "changed; not a regular file"
+            )
+        data = _single_file(archive.tar) if archive is not None else None
+        if data is None:
+            return CredentialFileSync(auth.name, False, False, False, False, "absent after the run")
+        return await asyncio.to_thread(_sync_one, copy, auth, data)
 
     async def _worker_tails(self, container_id: str) -> tuple[str, str]:
         """The last bytes of the worker's own stdout and stderr, for classification (S5)."""
@@ -883,11 +887,15 @@ class DockerProvider:
         if status in ("created", "running", "restarting", "paused", "removing"):
             return Observation(ObservationState.RUNNING, detail=status)
         detail = status
-        if state.get("OOMKilled"):
+        oom = bool(state.get("OOMKilled"))
+        if oom:
             # S5: 137 with OOMKilled is an environment failure, not a kill Crucible sent.
             detail = f"{status}:oom_killed"
         return Observation(
-            ObservationState.EXITED, exit_code=int(state.get("ExitCode", -1)), detail=detail
+            ObservationState.EXITED,
+            exit_code=int(state.get("ExitCode", -1)),
+            detail=detail,
+            oom_killed=oom,
         )
 
     async def logs(self, h: Handle, since: LogOffset) -> list[LogChunk]:

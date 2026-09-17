@@ -57,6 +57,9 @@ report_size_cap_bytes = 10485760      # the collector refuses to copy a larger f
 use_reference_cache = true            # a bare mirror to clone from with --dissociate
 max_concurrency = 3                   # 05b concurrency.per_provider
 # extra_image_allowlist = ["crucible-worker:script-harness-*"]   # the e2e image (18)
+# Which tag a contract names for each harness is images/manifest.env, written by
+# images/build.sh: the declared pin. Reproducible images all carry the same creation
+# time, so no tool may pick one as "the newest" (13, C5).
 
 [supervisor]
 tick_seconds = 5

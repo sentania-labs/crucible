@@ -20,8 +20,9 @@ Inputs, all paths, names or flags:
     CRUCIBLE_LIVE_CREDENTIAL_ROOT   the dedicated root holding claude_code/, codex/, agy/
     CRUCIBLE_LIVE_HARNESSES         comma list; default all three
     CRUCIBLE_LIVE_MODELS            optional JSON {harness: model} overriding the defaults
-    CRUCIBLE_LIVE_IMAGES            optional JSON {harness: image tag}; default the newest
-                                    local crucible-worker:<harness>-* tag by name
+    CRUCIBLE_LIVE_IMAGES            optional JSON {harness: image tag}; default the pin
+                                    in images/manifest.env (never "the newest": every
+                                    reproducible image has the same creation time)
     CRUCIBLE_LIVE_AGY_MOUNT_MODE    ro (the adapter's minimum) or rw-narrow; default
                                     rw-narrow so a token refresh is observed, not lost
     CRUCIBLE_LIVE_REPORT            where the JSON summary of every run is appended
@@ -505,7 +506,9 @@ async def test_a_trivial_task_reaches_ready_for_merge_live(
     engine: Engine,
     artifact_root: Path,
 ) -> None:
-    image = _images().get(harness) or daemon.image_tag(f"crucible-worker:{harness}-")
+    image = _images().get(harness) or daemon.image_tag(
+        f"crucible-worker:{harness}-", harness=harness
+    )
     model = _models()[harness]
     secrets = _secret_values(credential_root, harness)
     assert secrets, f"no credential files found for {harness} under the configured root"

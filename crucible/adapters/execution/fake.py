@@ -8,6 +8,7 @@ optionally followed by `-<n>` observations before the scripted exit. Behaviors:
 - blocked            exit 75 with blocked.md
 - blocked-nofile     exit 75 without blocked.md (a plain failure)
 - crash              exit 1, no report
+- oom                exit 137 with the kernel's OOM kill flagged (environment, S5)
 - environment        exit 70
 - hang               never exits; ignores drain, dies on kill
 - immortal           ignores drain and the first kill, dies on the second kill
@@ -62,6 +63,7 @@ Behavior = Literal[
     "blocked",
     "blocked-nofile",
     "crash",
+    "oom",
     "environment",
     "hang",
     "immortal",
@@ -83,6 +85,7 @@ BEHAVIORS: frozenset[str] = frozenset(
         "blocked",
         "blocked-nofile",
         "crash",
+        "oom",
         "environment",
         "hang",
         "immortal",
@@ -218,6 +221,7 @@ class _Worker:
     drains: int = 0
     kills: int = 0
     logs: list[LogChunk] = field(default_factory=list)
+    oom_killed: bool = False
 
 
 def default_report(
@@ -366,10 +370,14 @@ class FakeProvider:
             "blocked": 75,
             "blocked-nofile": 75,
             "crash": 1,
+            "oom": 137,
             "environment": 70,
         }.get(worker.behavior, 0)
         worker.logs.append(LogChunk("stdout", f"fake worker exit {worker.exit_code}\n".encode()))
-        return Observation(ObservationState.EXITED, exit_code=worker.exit_code)
+        worker.oom_killed = worker.behavior == "oom"
+        return Observation(
+            ObservationState.EXITED, exit_code=worker.exit_code, oom_killed=worker.oom_killed
+        )
 
     async def logs(self, h: Handle, since: LogOffset) -> list[LogChunk]:
         worker = self._workers.get(h.attempt_id)

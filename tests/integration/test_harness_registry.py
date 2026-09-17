@@ -250,3 +250,38 @@ async def test_a_token_shaped_worker_log_line_is_stored_redacted(
     blob = b"".join(bytes(r) for r in rows).decode("utf-8", "replace")
     assert token not in blob
     assert "[redacted:anthropic_oauth_token]" in blob
+
+
+async def test_progress_lines_become_unverified_worker_events(
+    ctx: AppContext, client: TestClient, supervisor: Supervisor
+) -> None:
+    """07 (review C4): each progress line is an event with the worker as source, never
+    verified, bounded and redacted."""
+    from crucible.application.harnesses import ingest_progress  # noqa: PLC0415
+
+    task_id = submit_and_start(client, "crucible-worker:fake-succeed")
+    await run_to_settled(supervisor, client, task_id)
+    view = client.get(f"/v1/tasks/{task_id}").json()
+    attempt = view["latest_attempt"]
+    token = "sk-ant-" + "oat01-" + "x" * 40
+    with ctx.uow_factory() as uow:
+        count = ingest_progress(
+            uow,
+            ctx.clock,
+            attempt_id=attempt["id"],
+            task_id=task_id,
+            execution_id=view["executions"][0]["id"],
+            progress=[
+                {"milestone": "read identity"},
+                {"milestone": "edited file", "note": f"using {token}"},
+            ],
+        )
+        uow.commit()
+    assert count == 2
+    events = client.get(f"/v1/tasks/{task_id}/events", params={"limit": 200}).json()["items"]
+    progress = [e for e in events if e["kind"] == "worker_progress"]
+    assert len(progress) == 2
+    assert all(e["principal"] == "worker" and e["verified"] is False for e in progress)
+    assert "read identity" in progress[0]["payload"]["line"]
+    assert token not in progress[1]["payload"]["line"]
+    assert "[redacted:anthropic_oauth_token]" in progress[1]["payload"]["line"]

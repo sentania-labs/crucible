@@ -37,6 +37,7 @@ C5_EVENT_KINDS = (
     "harness_enabled",
     "harness_disabled",
     "credential_synced",
+    "worker_progress",
 )
 
 C5_TABLES = ("image_promotions", "harnesses")

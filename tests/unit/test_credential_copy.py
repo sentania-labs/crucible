@@ -626,3 +626,37 @@ async def test_discard_removes_only_the_credential_leaf(tmp_path: Path) -> None:
     await provider.discard(ws, launch)
     assert not leaf.exists()
     assert (Path(ws.report_path) / "keep.txt").exists()
+
+
+class TransportFailingClient(ReadBackClient):
+    """The archive read-back dies on the transport, not on the API (review C2)."""
+
+    def __init__(self) -> None:
+        super().__init__(answer=None)
+        self.cleaner_scripts: list[str] = []
+
+    def get_archive(self, container_id: str, path: str, *, limit: int = 1024 * 1024) -> Any:
+        raise TimeoutError("timed out")
+
+    def create_container(self, name: str, body: dict[str, Any]) -> str:
+        if body["Labels"].get("crucible.role") == "cleaner":
+            self.cleaner_scripts.append(body["Cmd"][-1])
+        return super().create_container(name, body)
+
+
+async def test_a_transport_failure_during_read_back_still_removes_the_copy(tmp_path: Path) -> None:
+    from crucible.ports.execution import Handle  # noqa: PLC0415
+
+    source = codex_source(tmp_path)
+    client = TransportFailingClient()
+    provider = DockerProvider(
+        config(tmp_path, codex=CredentialSource(str(source))),
+        client=client,  # type: ignore[arg-type]
+    )
+    launch = spec()
+    ws = workspace(tmp_path, launch.attempt_id)
+    handle = Handle(provider="docker", ref="worker", attempt_id=launch.attempt_id)
+    sync = await provider._sync_credential(handle, ws, launch)
+    assert sync is not None
+    assert [f.reason for f in sync.files] == ["read failed: TimeoutError: timed out"]
+    assert client.cleaner_scripts and "credential" in client.cleaner_scripts[0]

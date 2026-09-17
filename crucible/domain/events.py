@@ -9,6 +9,9 @@ PRINCIPAL_CRUCIBLE = "crucible"
 # events about one are recorded under GitHub's own name, which is also what keeps them
 # outside the fenced set (14).
 PRINCIPAL_GITHUB = "github"
+# A worker's own progress lines are recorded under its name and never verified (07):
+# they are claims the worker made about itself, ingested as data.
+PRINCIPAL_WORKER = "worker"
 
 
 class EventKind(StrEnum):
@@ -151,6 +154,7 @@ class EventKind(StrEnum):
     HARNESS_ENABLED = "harness_enabled"
     HARNESS_DISABLED = "harness_disabled"
     CREDENTIAL_SYNCED = "credential_synced"
+    WORKER_PROGRESS = "worker_progress"
     # principals and configuration
     PRINCIPAL_CREATED = "principal_created"
     REPOSITORY_REGISTERED = "repository_registered"

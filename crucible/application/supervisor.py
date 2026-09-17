@@ -34,6 +34,7 @@ from crucible.application.gates import evaluate_and_advance
 from crucible.application.harnesses import (
     HarnessRegistry,
     effective_mount_mode,
+    ingest_progress,
     record_credential_observation,
     record_launch_outcome,
 )
@@ -1822,6 +1823,7 @@ class Supervisor:
                 observation.exit_code,
                 outputs,
                 collection_error,
+                observation.oom_killed,
             )
         )
         self._handles.pop(attempt.id, None)
@@ -1984,6 +1986,7 @@ class Supervisor:
         exit_code: int | None,
         outputs: CollectedOutputs,
         collection_error: str | None = None,
+        oom_killed: bool = False,
     ) -> None:
         with self._fenced() as uow:
             attempt = uow.attempts.get(attempt_id, for_update=True)
@@ -2000,6 +2003,7 @@ class Supervisor:
                 exit_code=exit_code,
                 report_present=outputs.report is not None,
                 blocked_present=outputs.blocked_md is not None,
+                oom_killed=oom_killed,
                 timed_out=timed_out,
                 killed=killed,
             )
@@ -2017,6 +2021,8 @@ class Supervisor:
                     timed_out=timed_out,
                     killed=killed,
                 )
+                if oom_killed and not (timed_out or killed):
+                    attempt.exit_class = ExitClass.ENVIRONMENT
             parsed: ParsedReport | None = None
             if adapter is not None and attempt.workspace_path:
                 report_dir = Path(attempt.workspace_path) / "output" / "report"
@@ -2046,6 +2052,7 @@ class Supervisor:
                     "exit_code": exit_code,
                     "exit_class": attempt.exit_class.value,
                     "termination_reason": attempt.termination_reason,
+                    "oom_killed": oom_killed,
                 },
             )
             if execution.role is ExecutionRole.REVIEW:
@@ -2128,6 +2135,15 @@ class Supervisor:
             self._record_wall_time(uow, attempt)
             if parsed is not None:
                 self._record_harness_metrics(uow, attempt, parsed)
+                if parsed.progress:
+                    ingest_progress(
+                        uow,
+                        self._clock,
+                        attempt_id=attempt.id,
+                        task_id=attempt.task_id,
+                        execution_id=attempt.execution_id,
+                        progress=parsed.progress,
+                    )
             self._classify_and_finish(uow, attempt, blocked_text, claim_ok=claim_ok)
             uow.commit()
 

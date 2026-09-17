@@ -163,3 +163,18 @@ async def test_report_with_secret_is_redacted(
     assert stored["parsed_ok"] is False and stored["document"] == {"redacted": True}
     assert "kkkk" not in client.get(f"/v1/attempts/{attempt['id']}").text
     assert attempt["exit_class"] == "completed_without_report"
+
+
+async def test_an_oom_killed_worker_is_environment_and_retries(
+    client: TestClient, supervisor: Supervisor
+) -> None:
+    """S5 (review C3): exit 137 with the kernel's OOM kill is an environment failure,
+    not a crash, so the contract's retry rule applies."""
+    task_id = submit_and_start(client, "crucible-worker:fake-oom")
+    assert await run_to_settled(supervisor, client, task_id) == "pre_pr_gates_failed"
+    attempts = _attempts(client, task_id)
+    assert [a["number"] for a in attempts] == [1, 2]
+    assert all(a["exit_class"] == "environment" and a["exit_code"] == 137 for a in attempts)
+    events = client.get(f"/v1/tasks/{task_id}/events", params={"limit": 200}).json()["items"]
+    exited = [e for e in events if e["kind"] == "attempt_exited"]
+    assert exited and all(e["payload"]["oom_killed"] is True for e in exited)

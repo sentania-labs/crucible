@@ -15,7 +15,8 @@ that record what runs observed about a credential.
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Iterable, Iterator, Mapping
+import json
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -23,7 +24,8 @@ from typing import Any
 
 from crucible.application.transitions import record_event
 from crucible.domain.entities import HarnessState
-from crucible.domain.events import PRINCIPAL_CRUCIBLE, EventKind
+from crucible.domain.events import PRINCIPAL_CRUCIBLE, PRINCIPAL_WORKER, EventKind
+from crucible.domain.secrets import redact
 from crucible.ports.clock import Clock
 from crucible.ports.harness import (
     CredentialSource,
@@ -126,7 +128,13 @@ def check_image_version(
     endpoints = adapter.capabilities().endpoints
     labelled = labels.get("crucible.harness")
     installed = labels.get("crucible.harness_version")
-    if labelled is not None and labelled != harness:
+    if not labelled:
+        # 13: an image that does not say which harness it carries is not launched with
+        # any harness's credential, whatever its version label says.
+        return HarnessCheck(
+            False, "the image carries no crucible.harness label", installed, supported, endpoints
+        )
+    if labelled != harness:
         return HarnessCheck(
             False,
             f"the image declares harness {labelled!r}, the execution asks for {harness!r}",
@@ -250,6 +258,46 @@ def fingerprint_directory(root: Path, names: Iterable[str]) -> str | None:
             return None
         digest.update(f"{name}:{size}\n".encode())
     return digest.hexdigest()
+
+
+# ----- progress lines (07) ----------------------------------------------------
+
+PROGRESS_MAX_LINES = 200
+PROGRESS_MAX_CHARS = 1000
+
+
+def ingest_progress(
+    uow: UnitOfWork,
+    clock: Clock,
+    *,
+    attempt_id: str,
+    task_id: str,
+    execution_id: str,
+    progress: Sequence[Mapping[str, Any]],
+) -> int:
+    """07: progress lines the worker wrote are events with the worker as source, marked
+    unverified. Bounded per attempt and per line, and redacted line by line, because
+    the file is the worker's and its content is data. Returns the count recorded."""
+    recorded = 0
+    for index, entry in enumerate(progress[:PROGRESS_MAX_LINES]):
+        line = redact(json.dumps(dict(entry), sort_keys=True, default=str))
+        record_event(
+            uow,
+            clock,
+            EventKind.WORKER_PROGRESS,
+            principal=PRINCIPAL_WORKER,
+            task_id=task_id,
+            execution_id=execution_id,
+            attempt_id=attempt_id,
+            payload={
+                "index": index,
+                "line": line[:PROGRESS_MAX_CHARS],
+                "truncated": len(line) > PROGRESS_MAX_CHARS,
+            },
+            verified=False,
+        )
+        recorded += 1
+    return recorded
 
 
 # ----- state services (25): the same functions the admin API and CLI call ------

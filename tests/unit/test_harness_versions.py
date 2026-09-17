@@ -65,3 +65,16 @@ def test_the_allowlist_is_the_union_of_policy_and_adapter_endpoints() -> None:
     # A local model endpoint the routing policy names is added for that attempt (05b).
     hosts = egress_allowlist(REGISTRY, "codex", ["github.com"], ["spark.example.internal"])
     assert "spark.example.internal" in hosts and "api.openai.com" in hosts
+
+
+def test_an_image_with_no_harness_label_is_refused_before_launch() -> None:
+    """13 (review C1): an image that does not say which harness it carries never runs
+    with any harness's credential, whatever its version label says."""
+    check = check_image_version("codex", {"crucible.harness_version": "0.153.4"})
+    assert not check.ok and "no crucible.harness label" in check.detail
+    check = check_image_version(
+        "codex", {"crucible.harness": "", "crucible.harness_version": "0.153.4"}
+    )
+    assert not check.ok and "no crucible.harness label" in check.detail
+    assert not check_image_version("codex", labels("claude_code", "0.153.4")).ok
+    assert check_image_version("codex", labels("codex", "0.153.4")).ok

@@ -120,6 +120,9 @@ class Observation:
     state: ObservationState
     exit_code: int | None = None
     detail: str | None = None
+    # S5: 137 with the kernel's OOM kill is an environment failure, not a crash and not
+    # a kill Crucible sent. Carried as a flag so classification never parses `detail`.
+    oom_killed: bool = False
 
 
 @dataclass(frozen=True, slots=True)
