@@ -52,6 +52,27 @@ fi
 mkdir -p "$out"
 created=$(date -u -d "@$SOURCE_DATE_EPOCH" +%Y-%m-%dT%H:%M:%SZ)
 
+# images/manifest.env is the declared pin per harness: the tag and manifest digest the
+# last build here produced. Every reproducible image carries the same SOURCE_DATE_EPOCH
+# creation time, so nothing downstream may pick an image by "newest"; the e2e and live
+# tiers and the operator's contracts read this file instead (13, C5). The manifest is
+# not a build input, so recording a build never changes its tag.
+manifest="${MANIFEST:-$here/manifest.env}"
+record_manifest() {
+    local key tag digest tmp
+    key=$(printf '%s' "$1" | tr 'a-z-' 'A-Z_')
+    tag=$2; digest=$3
+    tmp=$(mktemp)
+    if [ -f "$manifest" ]; then
+        grep -v -E "^${key}(_DIGEST)?=" "$manifest" > "$tmp" || true
+    else
+        printf '# Written by images/build.sh: the tag and OCI manifest digest each harness image\n# carries. The declared pin the tiers read; never chosen by creation time (13, C5).\n' > "$tmp"
+    fi
+    printf '%s=%s\n%s_DIGEST=%s\n' "$key" "$tag" "$key" "$digest" >> "$tmp"
+    { grep '^#' "$tmp"; grep -v '^#' "$tmp" | sort; } > "$manifest"
+    rm -f "$tmp"
+}
+
 for harness in "${harnesses[@]}"; do
     dir="$here/$harness"
     dockerfile="$dir/Dockerfile"
@@ -88,4 +109,5 @@ for harness in "${harnesses[@]}"; do
     id=$(docker image inspect -f '{{.Id}}' "$tag")
     size=$(docker image inspect -f '{{.Size}}' "$tag")
     printf '%s digest=%s id=%s size=%s\n' "$tag" "$digest" "$id" "$size"
+    record_manifest "$harness" "$tag" "$digest"
 done

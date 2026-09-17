@@ -25,7 +25,9 @@ from crucible.domain.ids import new_id
 from crucible.ports.clock import Clock
 from crucible.ports.repository import UnitOfWork
 
-RW_NARROW_HARNESSES: frozenset[str] = frozenset({"claude_code", "codex"})
+# Every real harness mounts its credential rw-narrow (12, 07): Claude Code and Codex from
+# the start, AGY since the C5 live run showed its token rotating.
+RW_NARROW_HARNESSES: frozenset[str] = frozenset({"claude_code", "codex", "agy"})
 
 
 def _problems(exc: ValidationError) -> list[dict[str, Any]]:

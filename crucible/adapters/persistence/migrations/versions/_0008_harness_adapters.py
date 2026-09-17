@@ -1,0 +1,227 @@
+"""C5: harness adapters live. The per-harness runtime record (enable flag with its
+reason, session compatibility, what runs observed about the credential) and the image
+promotion table (13), plus the event kinds the registry and the credential sync write.
+
+Seeded defaults follow S1b: Claude Code's dedicated session is verified and enabled;
+AGY completed the Crucible-side refresh and the operator's confirmation during C5 and is
+enabled; Codex stays disabled until its Crucible-side refresh has been observed and the
+operator's own session confirmed afterwards; the script harness has no credential and
+is enabled for the e2e tier.
+
+Revision ID: 0008_harness_adapters
+Revises: 0007_github_delivery
+"""
+
+from __future__ import annotations
+
+import json
+
+import sqlalchemy as sa
+from alembic import op
+
+from crucible.adapters.persistence.migrations.versions._0007_github_delivery import (
+    _event_kinds as c4_event_kinds,
+)
+
+revision = "0008_harness_adapters"
+down_revision = "0007_github_delivery"
+branch_labels = None
+depends_on = None
+
+TZ = sa.DateTime(timezone=True)
+
+# Adding a kind is a migration (10). Keep this list in step with crucible.domain.events.
+C5_EVENT_KINDS = (
+    "harness_refused",
+    "harness_launch_deferred",
+    "harness_enabled",
+    "harness_disabled",
+    "credential_synced",
+    "worker_progress",
+)
+
+C5_TABLES = ("image_promotions", "harnesses")
+EVENT_ARCHIVE = "events_c5_archive"
+
+UNVERIFIED_REASON = (
+    "unverified: the dedicated session's Crucible-side token refresh has not yet been "
+    "observed (S1b step 5), so the operator's session cannot be confirmed after it (step 6)"
+)
+AGY_REASON = "session_compatibility verified: the dedicated session refreshed on the Crucible side at 00:50 CDT on 2026-09-17 (S1b step 5) and the operator's own session answered and refreshed normally afterwards at 06:32 CDT (step 6)"
+SEED = (
+    ("claude_code", True, "session_compatibility verified (S1b); enabled for workers", "verified"),
+    ("codex", False, UNVERIFIED_REASON, "unverified"),
+    ("agy", True, AGY_REASON, "verified"),
+    ("script-harness", True, "the e2e tier's harness (18): no model, no credential", "verified"),
+)
+
+
+# 05b and C5 requirement 6: a routing policy whose model ids are the ones the live runs
+# verified per harness. Version 1 stays (a policy version references it and is
+# immutable, 05b); a deployment's policy names version 2 to use these. Cost classes are
+# the operator's routing labels, not provider prices.
+def _model(
+    model_id: str, harness: str, capability: str, cost: str, speed: str, pool: str
+) -> dict[str, object]:
+    return {
+        "id": model_id,
+        "harness": harness,
+        "endpoint": "subscription",
+        "capability": capability,
+        "cost": cost,
+        "speed": speed,
+        "pool": pool,
+        "weight": 1,
+        "enabled": True,
+    }
+
+
+VERIFIED_ROUTING = {
+    "schema_version": "1.0",
+    "name": "default-routing",
+    "version": 2,
+    "tiers": {
+        "trivial": {"allowed_capability": ["small", "mid"], "prefer": ["small"]},
+        "standard": {"allowed_capability": ["mid", "small"], "prefer": ["mid"]},
+        "complex": {"allowed_capability": ["frontier", "mid"], "prefer": ["frontier"]},
+    },
+    "models": [
+        _model("claude-haiku-4-5", "claude_code", "small", "low", "fast", "anthropic-sub"),
+        _model("claude-sonnet-5", "claude_code", "mid", "medium", "fast", "anthropic-sub"),
+        _model("claude-fable-5-1", "claude_code", "frontier", "high", "medium", "anthropic-sub"),
+        # The operator's Codex roster (2026-09-17 07:05 CDT): Luna and Terra for trivial
+        # and standard work, Sol and Astra as frontier; nothing older and no mini. The
+        # ids are the CLI's own listing (c5.md); the cost classes are Foundry's tiering.
+        _model("gpt-5.6-luna", "codex", "small", "low", "fast", "openai-sub"),
+        _model("gpt-5.6-terra", "codex", "mid", "medium", "medium", "openai-sub"),
+        _model("gpt-5.6-sol", "codex", "frontier", "high", "medium", "openai-sub"),
+        _model("gpt-6-astra", "codex", "frontier", "high", "slow", "openai-sub"),
+        _model("gemini-3.8-flash-low", "agy", "small", "low", "fast", "google-sub"),
+        _model("gemini-3.8-flash-high", "agy", "mid", "medium", "medium", "google-sub"),
+        _model("gemini-3.1-pro-high", "agy", "frontier", "high", "slow", "google-sub"),
+    ],
+    "pools": {
+        "anthropic-sub": {"window": "5h", "budget_units": "tokens_out", "soft_limit": 0},
+        "openai-sub": {"window": "5h", "budget_units": "tokens_out", "soft_limit": 0},
+        "google-sub": {"window": "5h", "budget_units": "attempts", "soft_limit": 0},
+    },
+    "rotation": {
+        "strategy": "weighted-least-recent",
+        "quality_feedback": True,
+        "quality_window": 20,
+    },
+}
+
+
+def _event_kinds() -> list[str]:
+    return [*c4_event_kinds(), *C5_EVENT_KINDS]
+
+
+def _archive_exists(connection: sa.engine.Connection) -> bool:
+    return bool(
+        connection.execute(
+            sa.text("SELECT to_regclass(:name) IS NOT NULL"), {"name": f"public.{EVENT_ARCHIVE}"}
+        ).scalar()
+    )
+
+
+def upgrade() -> None:
+    op.create_table(
+        "harnesses",
+        sa.Column("name", sa.String(32), primary_key=True),
+        sa.Column("enabled", sa.Boolean, nullable=False),
+        sa.Column("reason", sa.Text, nullable=False),
+        sa.Column("session_compatibility", sa.String(16), nullable=False),
+        sa.Column("mount_mode_observed", sa.String(16), nullable=True),
+        sa.Column("refresh_requires_rw", sa.Boolean, nullable=True),
+        sa.Column("last_launch_at", TZ, nullable=True),
+        sa.Column("last_launch_outcome", sa.String(48), nullable=True),
+        sa.Column("last_auth_failure_at", TZ, nullable=True),
+        sa.Column("last_validated_at", TZ, nullable=True),
+        sa.Column("updated_at", TZ, nullable=False),
+        sa.Column("updated_by", sa.String(160), nullable=False),
+        sa.CheckConstraint(
+            "session_compatibility IN ('unverified', 'verified', 'failed')",
+            name="ck_harnesses_session_compatibility",
+        ),
+        sa.CheckConstraint(
+            "mount_mode_observed IS NULL OR mount_mode_observed IN ('ro', 'rw-narrow')",
+            name="ck_harnesses_mount_mode",
+        ),
+    )
+    op.create_table(
+        "image_promotions",
+        sa.Column("digest", sa.String(160), primary_key=True),
+        sa.Column("reference", sa.Text, nullable=False),
+        sa.Column("harness", sa.String(32), nullable=False),
+        sa.Column("harness_version", sa.String(32), nullable=False),
+        sa.Column("state", sa.String(16), nullable=False),
+        sa.Column("reason", sa.Text, nullable=False),
+        sa.Column("updated_at", TZ, nullable=False),
+        sa.Column("updated_by", sa.String(160), nullable=False),
+        sa.CheckConstraint(
+            "state IN ('candidate', 'default', 'retained')", name="ck_image_promotions_state"
+        ),
+    )
+    for name, enabled, reason, compatibility in SEED:
+        op.execute(
+            sa.text(
+                "INSERT INTO harnesses (name, enabled, reason, session_compatibility, "
+                "updated_at, updated_by) VALUES (:name, :enabled, :reason, :compatibility, "
+                "now(), 'migration')"
+            ).bindparams(name=name, enabled=enabled, reason=reason, compatibility=compatibility)
+        )
+
+    # 05b: the model the transcript named, beside the one the contract requested.
+    op.add_column("attempt_metrics", sa.Column("model_reported", sa.String(128), nullable=True))
+    op.execute(
+        sa.text(
+            "INSERT INTO routing_policies (name, version, document, created_at) "
+            "VALUES (:name, :version, CAST(:document AS jsonb), now()) ON CONFLICT DO NOTHING"
+        ).bindparams(name="default-routing", version=2, document=json.dumps(VERIFIED_ROUTING))
+    )
+
+    op.drop_constraint("ck_events_kind", "events", type_="check")
+    allowed = ", ".join(f"'{k}'" for k in _event_kinds())
+    op.execute(
+        f"ALTER TABLE events ADD CONSTRAINT ck_events_kind CHECK (kind IN ({allowed})) NOT VALID"
+    )
+    op.execute("ALTER TABLE events VALIDATE CONSTRAINT ck_events_kind")
+
+    connection = op.get_bind()
+    if _archive_exists(connection):
+        op.execute("ALTER TABLE events DISABLE TRIGGER trg_events_append_only")
+        op.execute(
+            f"INSERT INTO events (seq, ts, kind, task_id, execution_id, attempt_id, "
+            f"principal, verified, payload) SELECT seq, ts, kind, task_id, execution_id, "
+            f"attempt_id, principal, verified, payload FROM {EVENT_ARCHIVE}"
+        )
+        op.execute("ALTER TABLE events ENABLE TRIGGER trg_events_append_only")
+        op.execute(
+            "SELECT setval('events_seq_seq', GREATEST("
+            "(SELECT COALESCE(MAX(seq), 1) FROM events), 1))"
+        )
+        op.execute(f"DROP TABLE {EVENT_ARCHIVE}")
+
+
+def downgrade() -> None:
+    for table in C5_TABLES:
+        op.drop_table(table)
+    op.drop_column("attempt_metrics", "model_reported")
+    op.execute(
+        sa.text(
+            "DELETE FROM routing_policies WHERE name = :name AND version = :version"
+        ).bindparams(name="default-routing", version=2)
+    )
+    # The audit log is never deleted to make a constraint fit (c4.md decision 36): the C5
+    # rows move to an archive this migration leaves behind, and its upgrade moves them
+    # back. The append-only trigger stands down for exactly the move.
+    gone = ", ".join(f"'{k}'" for k in C5_EVENT_KINDS)
+    op.execute(f"CREATE TABLE IF NOT EXISTS {EVENT_ARCHIVE} (LIKE events)")
+    op.execute("ALTER TABLE events DISABLE TRIGGER trg_events_append_only")
+    op.execute(f"INSERT INTO {EVENT_ARCHIVE} SELECT * FROM events WHERE kind IN ({gone})")
+    op.execute(f"DELETE FROM events WHERE kind IN ({gone})")
+    op.execute("ALTER TABLE events ENABLE TRIGGER trg_events_append_only")
+    op.drop_constraint("ck_events_kind", "events", type_="check")
+    kinds = ", ".join(f"'{k}'" for k in _event_kinds() if k not in C5_EVENT_KINDS)
+    op.create_check_constraint("ck_events_kind", "events", f"kind IN ({kinds})")

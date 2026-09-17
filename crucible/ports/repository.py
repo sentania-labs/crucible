@@ -26,6 +26,8 @@ from crucible.domain.entities import (
     ExternalReviewCycle,
     GateResultRecord,
     GitHubDelivery,
+    HarnessState,
+    ImagePromotion,
     Lease,
     LogChunkRecord,
     Policy,
@@ -441,6 +443,24 @@ class SupervisorStatusRepository(Protocol):
     def write(self, status: SupervisorStatus) -> None: ...
 
 
+class HarnessStateRepository(Protocol):
+    """The runtime record per harness (25): enable flag, compatibility, observations."""
+
+    def get(self, name: str) -> HarnessState | None: ...
+
+    def list_all(self) -> Sequence[HarnessState]: ...
+
+    def put(self, state: HarnessState) -> HarnessState: ...
+
+
+class ImagePromotionRepository(Protocol):
+    def get(self, digest: str) -> ImagePromotion | None: ...
+
+    def list_all(self) -> Sequence[ImagePromotion]: ...
+
+    def put(self, promotion: ImagePromotion) -> ImagePromotion: ...
+
+
 class IdempotencyKeyTakenError(Exception):
     """The (principal, key) row already exists; read it back in a fresh transaction."""
 
@@ -497,6 +517,8 @@ class UnitOfWork(Protocol):
     ci_certifications: CICertificationRepository
     ci_decisions: CIDecisionRepository
     github_deliveries: GitHubDeliveryRepository
+    harnesses: HarnessStateRepository
+    image_promotions: ImagePromotionRepository
 
     def __enter__(self) -> UnitOfWork: ...
 

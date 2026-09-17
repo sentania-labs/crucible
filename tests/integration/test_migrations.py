@@ -108,7 +108,18 @@ def test_0004_creates_the_c2_tables_and_seeds_the_routing_policy(migrated: str) 
         "attempt_metrics",
     } <= names
     with engine.connect() as conn:
-        assert conn.execute(text("SELECT count(*) FROM routing_policies")).scalar() == 1
+        # 0004 seeds version 1; 0008 adds version 2 with the model ids the C5 live runs
+        # verified, so at head there are two and the policy still names version 1.
+        versions = (
+            conn.execute(
+                text(
+                    "SELECT version FROM routing_policies WHERE name = 'default-routing' ORDER BY 1"
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert versions == [1, 2]
         routing = conn.execute(
             text("SELECT document -> 'routing' FROM policies WHERE name = 'default-software'")
         ).scalar()

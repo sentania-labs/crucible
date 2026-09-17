@@ -1,119 +1,111 @@
-"""Harness declarations: tested version range, egress endpoints, and launch argv (07).
+"""The harness registry and its administration (07, 13, 25).
 
-The adapters themselves go live in C5. What C3 needs from them is the part the Docker
-provider consults at launch: which harness versions an image may carry, which hostnames
-that harness must reach, and what to run. A combination outside the range is a
-launch-time refusal, never a warning (07, 13).
+The registry resolves a harness name to an adapter and refuses an unknown or disabled
+name with a reason the supervisor turns into a wake. A harness is launchable only when
+the operator's configuration gate and the admin's runtime flag both say so: the gate
+ships closed for a harness whose dedicated session is unverified (S1b), and the flag is
+what `crucible-admin harnesses disable` flips without touching configuration.
+
+Also here: the image-version check every launch runs (a combination outside the tested
+range is a refusal, never a warning), the egress allowlist a worker gets (the union of
+the policy's list and the adapter's declared endpoints, S6), and the state services
+that record what runs observed about a credential.
 """
 
 from __future__ import annotations
 
-import re
+import hashlib
+import json
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Any
 
-from crucible.ports.execution import IDENTITY_MOUNT, REPORT_MOUNT
+from crucible.application.transitions import record_event
+from crucible.domain.entities import HarnessState
+from crucible.domain.events import PRINCIPAL_CRUCIBLE, PRINCIPAL_WORKER, EventKind
+from crucible.domain.secrets import redact
+from crucible.ports.clock import Clock
+from crucible.ports.harness import (
+    CredentialSource,
+    CredentialSpec,
+    HarnessAdapter,
+    HarnessGate,
+    HarnessUnavailableError,
+    MountMode,
+    SessionCompatibility,
+)
+from crucible.ports.repository import UnitOfWork
 
-_VERSION = re.compile(r"^(\d+)\.(\d+)\.(\d+)")
+__all__ = [
+    "CredentialState",
+    "HarnessCheck",
+    "HarnessRegistry",
+    "HarnessUnavailableError",
+    "UnsupportedHarnessVersionError",
+    "check_image_version",
+    "credential_state",
+    "effective_mount_mode",
+    "egress_allowlist",
+    "record_credential_observation",
+    "record_launch_outcome",
+    "set_harness_enabled",
+]
 
 
 class UnsupportedHarnessVersionError(Exception):
     """The image's harness version is outside the adapter's tested range (07)."""
 
 
-def parse_version(value: str) -> tuple[int, int, int]:
-    match = _VERSION.match(value.strip())
-    if match is None:
-        raise ValueError(f"not a version: {value!r}")
-    return int(match.group(1)), int(match.group(2)), int(match.group(3))
+class HarnessRegistry:
+    """The adapters by name, and the two enable gates a launch has to pass."""
 
+    def __init__(self, adapters: Iterable[HarnessAdapter]) -> None:
+        self._adapters: dict[str, HarnessAdapter] = {a.name: a for a in adapters}
 
-@dataclass(frozen=True, slots=True)
-class HarnessSpec:
-    """One harness as the provider needs it."""
+    def __iter__(self) -> Iterator[HarnessAdapter]:
+        return iter(self._adapters.values())
 
-    name: str
-    # Tested range, inclusive lower bound and exclusive upper bound (07).
-    min_version: str
-    max_version_exclusive: str
-    # The model and auth hostnames this harness must reach, from S6. The worker's
-    # allowlist is the union of these and the policy's egress_allowlist (13).
-    endpoints: tuple[str, ...] = ()
-    command: tuple[str, ...] = ()
-    # Argv carries only a short pointer; the bundle travels as files (07, S3).
-    prompt: str = f"Read {IDENTITY_MOUNT}/IDENTITY.md and execute the task."
+    def __contains__(self, name: object) -> bool:
+        return name in self._adapters
 
-    def supports(self, version: str) -> bool:
-        try:
-            found = parse_version(version)
-        except ValueError:
-            return False
-        return parse_version(self.min_version) <= found < parse_version(self.max_version_exclusive)
+    def names(self) -> tuple[str, ...]:
+        return tuple(self._adapters)
 
-    def range_text(self) -> str:
-        return f">={self.min_version},<{self.max_version_exclusive}"
+    def get(self, name: str) -> HarnessAdapter | None:
+        return self._adapters.get(name)
 
+    def require(self, name: str) -> HarnessAdapter:
+        adapter = self._adapters.get(name)
+        if adapter is None:
+            raise HarnessUnavailableError(name, "no adapter declares this harness")
+        return adapter
 
-REGISTRY: dict[str, HarnessSpec] = {
-    "claude_code": HarnessSpec(
-        name="claude_code",
-        min_version="2.1.0",
-        max_version_exclusive="2.2.0",
-        endpoints=("api.anthropic.com",),
-        command=(
-            "claude",
-            "-p",
-            "--permission-mode",
-            "bypassPermissions",
-            "--append-system-prompt-file",
-            f"{IDENTITY_MOUNT}/IDENTITY.md",
-            "--output-format",
-            "stream-json",
-            "--verbose",
-        ),
-    ),
-    "codex": HarnessSpec(
-        name="codex",
-        min_version="0.153.0",
-        max_version_exclusive="0.154.0",
-        endpoints=("api.openai.com", "auth.openai.com"),
-        command=(
-            "codex",
-            "exec",
-            "--dangerously-bypass-approvals-and-sandbox",
-            "--disable",
-            "plugins",
-            "-c",
-            "check_for_update_on_startup=false",
-            "--json",
-            "-o",
-            f"{REPORT_MOUNT}/codex-last-message.md",
-        ),
-    ),
-    "agy": HarnessSpec(
-        name="agy",
-        min_version="1.2.0",
-        max_version_exclusive="1.3.0",
-        endpoints=("daily-cloudcode-pa.googleapis.com", "oauth2.googleapis.com"),
-        command=(
-            "agy",
-            "-p",
-            "--dangerously-skip-permissions",
-            "--add-dir",
-            IDENTITY_MOUNT,
-            "--output-format",
-            "stream-json",
-        ),
-    ),
-    # The e2e harness (18): a script that reads the identity bundle, writes a report,
-    # and exits with a requested code. No model, no credential, no subscription.
-    "script-harness": HarnessSpec(
-        name="script-harness",
-        min_version="1.0.0",
-        max_version_exclusive="2.0.0",
-        endpoints=(),
-        command=("crucible-script-harness",),
-    ),
-}
+    def resolve(
+        self,
+        name: str,
+        *,
+        gates: Mapping[str, HarnessGate] | None = None,
+        state: HarnessState | None = None,
+    ) -> HarnessAdapter:
+        """The adapter for a launch, or a refusal with the reason (07, 25).
+
+        `gates` is the operator's configuration; `state` is the admin's runtime row. A
+        harness with no row is enabled by default, so a registry test without a
+        database behaves like a fresh deployment's seeded defaults for the verified
+        harness."""
+        adapter = self.require(name)
+        gate = (gates or {}).get(name)
+        if gate is not None and not gate.enabled:
+            raise HarnessUnavailableError(
+                name, f"disabled in configuration: {gate.reason or 'no reason recorded'}"
+            )
+        if state is not None and not state.enabled:
+            raise HarnessUnavailableError(
+                name, f"disabled by an administrator: {state.reason or 'no reason recorded'}"
+            )
+        return adapter
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,50 +117,293 @@ class HarnessCheck:
     endpoints: tuple[str, ...] = field(default=())
 
 
-def check_image_version(harness: str, labels: dict[str, str]) -> HarnessCheck:
+def check_image_version(
+    registry: HarnessRegistry, harness: str, labels: Mapping[str, str]
+) -> HarnessCheck:
     """Compare the image's `crucible.harness_version` label with the tested range (13)."""
-    spec = REGISTRY.get(harness)
-    if spec is None:
+    adapter = registry.get(harness)
+    if adapter is None:
         return HarnessCheck(False, f"no adapter declares harness {harness!r}")
+    supported = adapter.supported_versions.text
+    endpoints = adapter.capabilities().endpoints
     labelled = labels.get("crucible.harness")
     installed = labels.get("crucible.harness_version")
-    if labelled is not None and labelled != harness:
+    if not labelled:
+        # 13: an image that does not say which harness it carries is not launched with
+        # any harness's credential, whatever its version label says.
+        return HarnessCheck(
+            False, "the image carries no crucible.harness label", installed, supported, endpoints
+        )
+    if labelled != harness:
         return HarnessCheck(
             False,
             f"the image declares harness {labelled!r}, the execution asks for {harness!r}",
             installed,
-            spec.range_text(),
-            spec.endpoints,
+            supported,
+            endpoints,
         )
     if not installed:
         return HarnessCheck(
-            False,
-            "the image carries no crucible.harness_version label",
-            None,
-            spec.range_text(),
-            spec.endpoints,
+            False, "the image carries no crucible.harness_version label", None, supported, endpoints
         )
-    if not spec.supports(installed):
+    if not adapter.supported_versions.supports(installed):
         return HarnessCheck(
             False,
-            f"harness {harness} {installed} is outside the tested range {spec.range_text()}",
+            f"harness {harness} {installed} is outside the tested range {supported}",
             installed,
-            spec.range_text(),
-            spec.endpoints,
+            supported,
+            endpoints,
         )
     return HarnessCheck(
         True,
-        f"harness {harness} {installed} is inside {spec.range_text()}",
+        f"harness {harness} {installed} is inside {supported}",
         installed,
-        spec.range_text(),
-        spec.endpoints,
+        supported,
+        endpoints,
     )
 
 
-def egress_allowlist(harness: str, policy_hosts: list[str], extra: list[str]) -> tuple[str, ...]:
+def egress_allowlist(
+    registry: HarnessRegistry, harness: str, policy_hosts: list[str], extra: list[str]
+) -> tuple[str, ...]:
     """The union of the policy's allowlist and the adapter's declared endpoints (13)."""
-    spec = REGISTRY.get(harness)
+    adapter = registry.get(harness)
     hosts = set(policy_hosts) | set(extra)
-    if spec is not None:
-        hosts |= set(spec.endpoints)
+    if adapter is not None:
+        hosts |= set(adapter.capabilities().endpoints)
     return tuple(sorted(h for h in hosts if h))
+
+
+def effective_mount_mode(spec: CredentialSpec, source: CredentialSource | None) -> MountMode:
+    """The stricter of the adapter's declared minimum and what the operator configured
+    (25 step 7). A configuration never lowers the adapter's minimum."""
+    configured = source.mount_mode if source is not None else None
+    if spec.minimum_mode is MountMode.RW_NARROW or configured is MountMode.RW_NARROW:
+        return MountMode.RW_NARROW
+    return MountMode.RO
+
+
+# ----- credential status, sanitized (25) ---------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class CredentialState:
+    """What `GET /harnesses` says about a credential: never a value (25)."""
+
+    state: str
+    mount_mode: str | None
+    source_fingerprint: str | None
+    files: tuple[dict[str, Any], ...]
+    detail: str = ""
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "state": self.state,
+            "mount_mode": self.mount_mode,
+            "source_fingerprint": self.source_fingerprint,
+            "files": [dict(f) for f in self.files],
+            "detail": self.detail,
+        }
+
+
+def credential_state(
+    spec: CredentialSpec | None, source: CredentialSource | None, state: HarnessState | None
+) -> CredentialState:
+    """`absent`, `configured`, `invalid` or `validated` from the files' presence and the
+    recorded observations. The fingerprint is a sha256 of names and sizes only."""
+    if spec is None:
+        return CredentialState("not_required", None, None, (), "this harness needs no credential")
+    if source is None or not source.path:
+        return CredentialState("absent", None, None, (), "no credential path is configured")
+    mode = effective_mount_mode(spec, source).value
+    files: list[dict[str, Any]] = []
+    missing: list[str] = []
+    digest = hashlib.sha256()
+    for auth in spec.auth_files:
+        path = spec.source_path(source.path, auth.name)
+        try:
+            size = path.stat().st_size
+        except OSError:
+            files.append({"name": auth.name, "present": False, "required": auth.required})
+            if auth.required:
+                missing.append(auth.name)
+            continue
+        files.append({"name": auth.name, "present": True, "required": auth.required, "size": size})
+        digest.update(f"{auth.name}:{size}\n".encode())
+    if missing:
+        return CredentialState("absent", mode, None, tuple(files), f"missing: {', '.join(missing)}")
+    fingerprint = digest.hexdigest()
+    if state is not None and state.last_auth_failure_at is not None:
+        last_ok = state.last_validated_at or state.last_launch_at
+        if last_ok is None or state.last_auth_failure_at >= last_ok:
+            return CredentialState(
+                "invalid",
+                mode,
+                fingerprint,
+                tuple(files),
+                "the last launch failed authentication; see last_auth_failure_at",
+            )
+    if state is not None and state.last_validated_at is not None:
+        return CredentialState("validated", mode, fingerprint, tuple(files))
+    return CredentialState("configured", mode, fingerprint, tuple(files))
+
+
+def fingerprint_directory(root: Path, names: Iterable[str]) -> str | None:
+    """sha256 over `name:size` of the named files, in order; None when any is missing."""
+    digest = hashlib.sha256()
+    for name in names:
+        try:
+            size = (root / name).stat().st_size
+        except OSError:
+            return None
+        digest.update(f"{name}:{size}\n".encode())
+    return digest.hexdigest()
+
+
+# ----- progress lines (07) ----------------------------------------------------
+
+PROGRESS_MAX_LINES = 200
+PROGRESS_MAX_CHARS = 1000
+
+
+def ingest_progress(
+    uow: UnitOfWork,
+    clock: Clock,
+    *,
+    attempt_id: str,
+    task_id: str,
+    execution_id: str,
+    progress: Sequence[Mapping[str, Any]],
+) -> int:
+    """07: progress lines the worker wrote are events with the worker as source, marked
+    unverified. Bounded per attempt and per line, and redacted line by line, because
+    the file is the worker's and its content is data. Returns the count recorded."""
+    recorded = 0
+    for index, entry in enumerate(progress[:PROGRESS_MAX_LINES]):
+        line = redact(json.dumps(dict(entry), sort_keys=True, default=str))
+        record_event(
+            uow,
+            clock,
+            EventKind.WORKER_PROGRESS,
+            principal=PRINCIPAL_WORKER,
+            task_id=task_id,
+            execution_id=execution_id,
+            attempt_id=attempt_id,
+            payload={
+                "index": index,
+                "line": line[:PROGRESS_MAX_CHARS],
+                "truncated": len(line) > PROGRESS_MAX_CHARS,
+            },
+            verified=False,
+        )
+        recorded += 1
+    return recorded
+
+
+# ----- state services (25): the same functions the admin API and CLI call ------
+
+
+def _summary(state: HarnessState) -> dict[str, Any]:
+    return {
+        "enabled": state.enabled,
+        "reason": state.reason,
+        "session_compatibility": state.session_compatibility,
+        "mount_mode_observed": state.mount_mode_observed,
+        "refresh_requires_rw": state.refresh_requires_rw,
+    }
+
+
+def _ensure_state(uow: UnitOfWork, clock: Clock, name: str) -> HarnessState:
+    state = uow.harnesses.get(name)
+    if state is None:
+        state = HarnessState(
+            name=name,
+            enabled=True,
+            reason="",
+            session_compatibility=SessionCompatibility.UNVERIFIED.value,
+            updated_at=clock.now(),
+            updated_by=PRINCIPAL_CRUCIBLE,
+        )
+    return state
+
+
+def set_harness_enabled(
+    uow: UnitOfWork,
+    clock: Clock,
+    *,
+    principal_name: str,
+    name: str,
+    enabled: bool,
+    reason: str,
+    session_compatibility: SessionCompatibility | None = None,
+) -> HarnessState:
+    """Enable or disable a harness (25): configuration retained, running attempts finish,
+    new launches refused with a wake. Every change is an event with the principal, the
+    reason, and a before-and-after summary that carries no value."""
+    if not reason.strip():
+        raise ValueError("a reason is required to enable or disable a harness")
+    state = _ensure_state(uow, clock, name)
+    before = _summary(state)
+    state.enabled = enabled
+    state.reason = reason.strip()
+    if session_compatibility is not None:
+        state.session_compatibility = session_compatibility.value
+    state.updated_at = clock.now()
+    state.updated_by = principal_name
+    uow.harnesses.put(state)
+    record_event(
+        uow,
+        clock,
+        EventKind.HARNESS_ENABLED if enabled else EventKind.HARNESS_DISABLED,
+        principal=principal_name,
+        payload={
+            "harness": name,
+            "reason": state.reason,
+            "before": before,
+            "after": _summary(state),
+        },
+    )
+    return state
+
+
+def record_launch_outcome(
+    uow: UnitOfWork,
+    clock: Clock,
+    *,
+    name: str,
+    outcome: str,
+    at: datetime,
+    auth_failure: bool = False,
+) -> HarnessState:
+    """What the last launch of this harness came to (25 status: last launch outcome)."""
+    state = _ensure_state(uow, clock, name)
+    state.last_launch_at = at
+    state.last_launch_outcome = outcome
+    if auth_failure:
+        state.last_auth_failure_at = at
+    state.updated_at = clock.now()
+    uow.harnesses.put(state)
+    return state
+
+
+def record_credential_observation(
+    uow: UnitOfWork,
+    clock: Clock,
+    *,
+    name: str,
+    mount_mode: MountMode,
+    changed: bool,
+    at: datetime,
+) -> HarnessState:
+    """A run's observation of its credential copy (12, 25 step 6): whether the named
+    auth files changed. A change under any mode means refresh needs writable state; a
+    run that changes nothing never lowers what was observed before."""
+    state = _ensure_state(uow, clock, name)
+    state.mount_mode_observed = mount_mode.value
+    if changed:
+        state.refresh_requires_rw = True
+    elif state.refresh_requires_rw is None:
+        state.refresh_requires_rw = False
+    state.updated_at = clock.now()
+    uow.harnesses.put(state)
+    return state

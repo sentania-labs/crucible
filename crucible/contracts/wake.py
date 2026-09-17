@@ -37,6 +37,9 @@ class WakeReason(StrEnum):
     HEAD_DIVERGED = "head_diverged"
     READY_FOR_MERGE = "ready_for_merge"
     MERGED = "merged"
+    # 07 and 25: a launch refused because the harness is unknown, disabled, or its image
+    # carries a version outside the adapter's tested range.
+    HARNESS_UNAVAILABLE = "harness_unavailable"
 
 
 class WakeTask(StrictModel):

@@ -19,6 +19,7 @@ import shlex
 import subprocess
 import time
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Any
 
 
@@ -71,13 +72,50 @@ def wait_for_port(container: str, port: int, *, attempts: int = 60) -> None:
     raise RuntimeError(f"{container} never started")
 
 
-def image_tag(prefix: str) -> str:
-    """The most recent local image whose tag starts with the prefix."""
+MANIFEST = Path(__file__).resolve().parents[2] / "images" / "manifest.env"
+
+
+def manifest_pins() -> dict[str, str]:
+    """The declared image per harness from images/manifest.env, written by build.sh (13).
+
+    Every reproducible image carries the same SOURCE_DATE_EPOCH creation time, so no
+    tier picks an image by "newest": two tags of one harness tie, and the choice would
+    be arbitrary (found by Foundry on 2026-09-17 at 07:26 CDT)."""
+    pins: dict[str, str] = {}
+    if not MANIFEST.is_file():
+        return pins
+    for line in MANIFEST.read_text(encoding="utf-8").splitlines():
+        if not line or line.startswith("#") or "=" not in line or line.endswith("_DIGEST"):
+            continue
+        key, value = line.split("=", 1)
+        if key.endswith("_DIGEST"):
+            continue
+        pins[key.lower().replace("_", "-") if key == "SCRIPT_HARNESS" else key.lower()] = value
+    return pins
+
+
+def image_tag(prefix: str, *, harness: str | None = None) -> str:
+    """The image for a harness: the manifest's pin when it names one that the daemon
+    has; otherwise the one local tag with the prefix. More than one match and no pin is
+    a refusal, never a guess."""
     out = run("images", "--format", "{{.Repository}}:{{.Tag}}")
     tags = [t for t in out.split() if t.startswith(prefix)]
+    name = harness or prefix.removeprefix("crucible-worker:").rstrip("-")
+    pinned = manifest_pins().get(name)
+    if pinned:
+        if pinned in tags:
+            return pinned
+        raise RuntimeError(
+            f"images/manifest.env pins {pinned} for {name} but the daemon has no such tag; "
+            "build it with images/build.sh"
+        )
     if not tags:
         raise RuntimeError(f"no image tagged {prefix}*; build it with `make e2e-image` (18)")
-    return sorted(tags)[-1]
+    if len(tags) > 1:
+        raise RuntimeError(
+            f"{len(tags)} images match {prefix}* and images/manifest.env pins none: {tags}"
+        )
+    return tags[0]
 
 
 def logs(container: str, *, tail: int = 200) -> str:

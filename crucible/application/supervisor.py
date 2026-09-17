@@ -14,11 +14,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from functools import partial
+from pathlib import Path
 from typing import Any, ClassVar, TypeVar
 
 from crucible.application.decisions import (
@@ -30,6 +31,13 @@ from crucible.application.delivery_tick import DeliveryConfig, DeliveryCoordinat
 from crucible.application.errors import ApplicationError
 from crucible.application.evidence import record_collection_evidence
 from crucible.application.gates import evaluate_and_advance
+from crucible.application.harnesses import (
+    HarnessRegistry,
+    effective_mount_mode,
+    ingest_progress,
+    record_credential_observation,
+    record_launch_outcome,
+)
 from crucible.application.review import (
     author_attempt_ids,
     latest_work_attempt,
@@ -76,15 +84,19 @@ from crucible.domain.lifecycle import (
     IllegalTransitionError,
     TaskState,
 )
-from crucible.domain.secrets import find_secrets
+from crucible.domain.secrets import find_secrets, redact
 from crucible.logs import log_context
 from crucible.ports.artifacts import ArtifactStore
 from crucible.ports.clock import Clock
 from crucible.ports.execution import (
+    IDENTITY_MOUNT,
+    REPO_MOUNT,
+    REPORT_MOUNT,
     CleanupPolicy,
     CollectedOutputs,
     ExecutionProvider,
     Handle,
+    LaunchRefusedError,
     LaunchSpec,
     LogChunk,
     LogOffset,
@@ -93,6 +105,15 @@ from crucible.ports.execution import (
     Workspace,
 )
 from crucible.ports.github import GitHubClient
+from crucible.ports.harness import (
+    CredentialSource,
+    ExitInfo,
+    HarnessGate,
+    HarnessUnavailableError,
+    LaunchContext,
+    MountMode,
+    ParsedReport,
+)
 from crucible.ports.notification import WakeDeliverer
 from crucible.ports.publish import Publisher
 from crucible.ports.repository import FencedTokenRejectedError, UnitOfWork, UnitOfWorkFactory
@@ -102,6 +123,9 @@ T = TypeVar("T")
 
 TERMINATION_TIMEOUT = "timeout"
 TERMINATION_CANCEL = "cancel"
+# A launch the registry or the provider refused (07): recorded so the retry rule knows
+# not to try the same refusal again.
+TERMINATION_REFUSED = "harness_refused"
 
 # 16 defaults, used when the policy names none.
 DEFAULT_LOG_RETENTION_DAYS = 90
@@ -160,10 +184,19 @@ class Supervisor:
         attempt_lease_ttl_seconds: int = 60,
         checkout_lease_ttl_seconds: int = 21600,
         grace_seconds: int = 60,
+        harnesses: HarnessRegistry | None = None,
+        harness_gates: Mapping[str, HarnessGate] | None = None,
+        credential_sources: Mapping[str, CredentialSource] | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._providers = providers
         self._clock = clock
+        # 07: the adapters. Without a registry the launch spec carries the execution's
+        # names and nothing harness-specific, which is the C3 shape the fake provider
+        # runs; every real deployment injects one (cli/wiring.py).
+        self._harnesses = harnesses
+        self._harness_gates: dict[str, HarnessGate] = dict(harness_gates or {})
+        self._credential_sources: dict[str, CredentialSource] = dict(credential_sources or {})
         self._artifacts = artifact_store
         self._wakes = wake_deliverer
         self.holder = holder
@@ -889,7 +922,7 @@ class Supervisor:
         env: dict[str, str] = {}
         if execution.role is ExecutionRole.REVIEW and task.head_sha:
             env["CRUCIBLE_REVIEW_HEAD_SHA"] = task.head_sha
-        return LaunchSpec(
+        spec = LaunchSpec(
             attempt_id=attempt.id,
             task_id=task.id,
             external_id=task.external_id,
@@ -904,6 +937,33 @@ class Supervisor:
             policy=execution.policy_snapshot or {},
             owner=task.principal_id,
             repository_url=repository_url,
+            effort=execution.effort,
+        )
+        adapter = self._harnesses.get(execution.harness) if self._harnesses else None
+        if adapter is None:
+            return spec
+        # 07: the adapter's launch shape. Argv carries the pointer; the identity and
+        # the contract are files; a credential value is never in any of it.
+        launch = adapter.build_launch(
+            LaunchContext(
+                attempt_id=attempt.id,
+                model=execution.model,
+                effort=execution.effort,
+                timeout_seconds=execution.timeout_seconds,
+                identity_mount=IDENTITY_MOUNT,
+                report_mount=REPORT_MOUNT,
+                repo_mount=REPO_MOUNT,
+                credential_mounted=adapter.credential_spec() is not None,
+            )
+        )
+        return replace(
+            spec,
+            command=tuple(launch.argv),
+            env={**env, **launch.env},
+            env_from_files=dict(launch.env_from_files),
+            stdin_files=tuple(launch.stdin_files),
+            stdin_text=launch.stdin_text,
+            transcript_path=launch.transcript_path,
         )
 
     def _spec_for(self, attempt: Attempt) -> LaunchSpec | None:
@@ -929,14 +989,81 @@ class Supervisor:
         branch = str(repository.get("work_branch") or f"crucible/{external_id}")
         return f"{url}#{branch}"
 
+    def _harness_gate(self, execution: Execution) -> str | None:
+        """07 and 25: the registry's answer for this execution's harness, as a refusal
+        reason or None. Unknown and disabled names are refused with a wake."""
+        if self._harnesses is None:
+            return None
+        with self._uow_factory() as uow:
+            state = uow.harnesses.get(execution.harness)
+        try:
+            self._harnesses.resolve(execution.harness, gates=self._harness_gates, state=state)
+        except HarnessUnavailableError as exc:
+            return exc.reason
+        return None
+
+    def _harness_busy(self, execution: Execution) -> str | None:
+        """05b: per-harness concurrency, which is 1 whenever the credential mounts
+        rw-narrow (12). A launch over the limit waits; it is not a failure."""
+        policy = execution.policy_snapshot or {}
+        limit = int(
+            (policy.get("concurrency", {}).get("per_harness") or {}).get(execution.harness, 1)
+        )
+        adapter = self._harnesses.get(execution.harness) if self._harnesses else None
+        credential = adapter.credential_spec() if adapter is not None else None
+        if credential is not None:
+            source = self._credential_sources.get(execution.harness)
+            if effective_mount_mode(credential, source) is MountMode.RW_NARROW:
+                limit = 1
+        with self._uow_factory() as uow:
+            # An attempt holds its credential copy until collect has synced it back and
+            # removed it, which is after `exited`: a second seeding before that is the
+            # refresh race 12 gives as the reason for the cap.
+            live = uow.attempts.list_in_states(
+                [
+                    AttemptState.PREPARING,
+                    AttemptState.LAUNCHING,
+                    AttemptState.RUNNING,
+                    AttemptState.TERMINATING,
+                    AttemptState.EXITED,
+                ]
+            )
+            running = 0
+            for other in live:
+                other_execution = uow.executions.get(other.execution_id)
+                if other_execution is not None and other_execution.harness == execution.harness:
+                    running += 1
+        if running >= limit:
+            return f"{running} of {limit} {execution.harness} worker(s) already running"
+        return None
+
+    def _checkout_lease_free(self, attempt_id: str, key: str) -> bool:
+        with self._uow_factory() as uow:
+            held = uow.leases.get_checkout_lease(key)
+        return held is None or held.holder == attempt_id or held.expires_at <= self._clock.now()
+
     async def _launch_one(self, item: _Pending) -> bool:
         attempt, execution, task = item.attempt, item.execution, item.task
+        refusal = await self._db(partial(self._harness_gate, execution))
+        if refusal is not None:
+            # The same path an environment failure at prepare takes: the attempt and the
+            # execution become active first, so the refusal can end them.
+            if await self._db(partial(self._mark_preparing, attempt.id)):
+                await self._db(partial(self._refuse_launch, attempt.id, "registry", refusal))
+            return False
         spec = self._build_spec(attempt, execution, task, item.contract, item.repository_url)
         provider = self._provider(execution.provider)
         key = self.checkout_key(item.contract, task.external_id, item.repository_url)
-        if execution.role is not ExecutionRole.REVIEW and not await self._db(
-            partial(self._take_checkout_lease, attempt.id, key)
-        ):
+        review = execution.role is ExecutionRole.REVIEW
+        # 10 first, then 05b: an attempt whose checkout another attempt holds waits on
+        # the lease and says so; only a launch that could take the checkout is held back
+        # by the per-harness cap.
+        if review or await self._db(partial(self._checkout_lease_free, attempt.id, key)):
+            busy = await self._db(partial(self._harness_busy, execution))
+            if busy is not None:
+                await self._db(partial(self._defer_launch, attempt.id, busy))
+                return False
+        if not review and not await self._db(partial(self._take_checkout_lease, attempt.id, key)):
             # A second attempt on the same repository and branch waits; it is not a
             # failure, and nothing of the holder's checkout is disturbed (10).
             return False
@@ -944,6 +1071,9 @@ class Supervisor:
             return False
         try:
             ws = await provider.prepare(spec)
+        except LaunchRefusedError as exc:
+            await self._db(partial(self._refuse_launch, attempt.id, "prepare", str(exc)))
+            return False
         except ProviderError as exc:
             detail = str(exc)
             await self._db(partial(self._environment_failure, attempt.id, "prepare", detail))
@@ -954,14 +1084,32 @@ class Supervisor:
             return False
         try:
             handle = await provider.launch(ws, spec)
+        except LaunchRefusedError as exc:
+            await self._discard(provider, ws, spec)
+            await self._db(partial(self._refuse_launch, attempt.id, "launch", str(exc)))
+            return False
         except ProviderError as exc:
             detail = str(exc)
+            await self._discard(provider, ws, spec)
             await self._db(partial(self._environment_failure, attempt.id, "launch", detail))
             return False
         self._handles[attempt.id] = handle
         await self._db(partial(self._mark_running, attempt.id, handle))
         log.info("attempt launched", extra={"handle": handle.ref, "provider": provider.name})
         return True
+
+    async def _discard(
+        self, provider: ExecutionProvider, ws: Workspace | None, spec: LaunchSpec | None
+    ) -> None:
+        """12: an attempt that will never be collected still had a credential copy seeded
+        for it; the provider removes it now, because cleanup only visits attempts whose
+        logs were drained and retention never looks at a workspace it did not."""
+        if ws is None:
+            return
+        try:
+            await provider.discard(ws, spec)
+        except Exception:  # the attempt still ends; the leak is logged, not hidden
+            log.exception("credential copy discard failed", extra={"attempt_id": ws.attempt_id})
 
     def _mark_preparing(self, attempt_id: str) -> bool:
         """Begin the launch, unless the task was cancelled after the attempt was listed."""
@@ -1149,6 +1297,80 @@ class Supervisor:
             self._classify_and_finish(uow, attempt, None)
             uow.commit()
 
+    def _defer_launch(self, attempt_id: str, detail: str) -> None:
+        """The attempt stays pending; one event says why it did not launch this tick."""
+        with self._fenced() as uow:
+            attempt = uow.attempts.get(attempt_id)
+            assert attempt is not None
+            latest = uow.events.latest_for_task_kind(
+                attempt.task_id, EventKind.HARNESS_LAUNCH_DEFERRED.value
+            )
+            if latest is not None and latest.payload.get("attempt_id") == attempt.id:
+                return
+            record_event(
+                uow,
+                self._clock,
+                EventKind.HARNESS_LAUNCH_DEFERRED,
+                principal=PRINCIPAL_CRUCIBLE,
+                task_id=attempt.task_id,
+                execution_id=attempt.execution_id,
+                attempt_id=attempt.id,
+                payload={"attempt_id": attempt.id, "detail": detail},
+            )
+            uow.commit()
+
+    def _refuse_launch(self, attempt_id: str, stage: str, detail: str) -> None:
+        """07, 13, 25: an unknown or disabled harness, a version outside the tested
+        range, or a missing credential. A refusal, never a warning: the attempt ends as
+        an environment failure that does not retry, and Foundry is woken."""
+        with self._fenced() as uow:
+            attempt = uow.attempts.get(attempt_id, for_update=True)
+            assert attempt is not None
+            task = uow.tasks.get(attempt.task_id, for_update=True)
+            execution = uow.executions.get(attempt.execution_id)
+            assert task is not None and execution is not None
+            attempt.termination_reason = TERMINATION_REFUSED
+            record_event(
+                uow,
+                self._clock,
+                EventKind.HARNESS_REFUSED,
+                principal=PRINCIPAL_CRUCIBLE,
+                task_id=attempt.task_id,
+                execution_id=attempt.execution_id,
+                attempt_id=attempt.id,
+                payload={"harness": execution.harness, "stage": stage, "detail": detail[:1000]},
+            )
+            create_wake(
+                uow,
+                self._clock,
+                principal_id=task.principal_id,
+                reason=WakeReason.HARNESS_UNAVAILABLE,
+                summary=f"launch refused for harness {execution.harness}: {detail[:500]}",
+                task=task,
+                attempt_id=attempt.id,
+                extra_links={"harnesses": "/v1/harnesses"},
+            )
+            record_launch_outcome(
+                uow,
+                self._clock,
+                name=execution.harness,
+                outcome="refused",
+                at=self._clock.now(),
+            )
+            attempt.exit_class = ExitClass.ENVIRONMENT
+            attempt.ended_at = self._clock.now()
+            move_attempt(
+                uow,
+                self._clock,
+                attempt,
+                AttemptState.COLLECTED,
+                EventKind.ATTEMPT_COLLECTED,
+                payload={"stage": stage, "detail": detail, "exit_class": ExitClass.ENVIRONMENT},
+            )
+            self._record_bare_evidence(uow, attempt)
+            self._classify_and_finish(uow, attempt, None)
+            uow.commit()
+
     def _record_bare_evidence(self, uow: UnitOfWork, attempt: Attempt) -> None:
         """An attempt that produced nothing still records its exit, so the gates that
         read it fail rather than wait (09, 11)."""
@@ -1283,7 +1505,13 @@ class Supervisor:
             for chunk in chunks:
                 if not chunk.content:
                     continue
-                end = offset + len(chunk.content)
+                # 12: provider log capture passes through the redaction filter before
+                # storage. The resume position keeps the hash of the raw line, which is
+                # what the daemon's stream is compared against on the next pull.
+                text = chunk.content.decode("utf-8", "replace")
+                cleaned = redact(text)
+                content = chunk.content if cleaned == text else cleaned.encode("utf-8")
+                end = offset + len(content)
                 uow.logs.append(
                     LogChunkRecord(
                         id=None,
@@ -1294,7 +1522,7 @@ class Supervisor:
                         ts=chunk.ts or self._clock.now(),
                         line_sha256=chunk.line_sha256 or "",
                         occurrence=chunk.occurrence,
-                        content=chunk.content,
+                        content=content,
                     )
                 )
                 offset = end
@@ -1564,7 +1792,13 @@ class Supervisor:
             await self._db(partial(self._renew_attempt_lease, attempt.id))
             return False
         if observation.state is ObservationState.LOST:
-            # Nothing more can arrive from a worker the provider cannot see.
+            # Nothing more can arrive from a worker the provider cannot see, and its
+            # credential copy will never be synced: remove it now (12).
+            await self._discard(
+                provider,
+                self._workspace_for(attempt),
+                await self._db(partial(self._spec_for, attempt)),
+            )
             await self._db(partial(self._mark_logs_drained, attempt.id))
             await self._db(partial(self._finish_lost, attempt.id, observation.detail))
             return True
@@ -1589,6 +1823,7 @@ class Supervisor:
                 observation.exit_code,
                 outputs,
                 collection_error,
+                observation.oom_killed,
             )
         )
         self._handles.pop(attempt.id, None)
@@ -1751,6 +1986,7 @@ class Supervisor:
         exit_code: int | None,
         outputs: CollectedOutputs,
         collection_error: str | None = None,
+        oom_killed: bool = False,
     ) -> None:
         with self._fenced() as uow:
             attempt = uow.attempts.get(attempt_id, for_update=True)
@@ -1761,13 +1997,41 @@ class Supervisor:
             attempt.ended_at = self._clock.now()
             timed_out = attempt.termination_reason == TERMINATION_TIMEOUT
             killed = attempt.termination_reason == TERMINATION_CANCEL
-            attempt.exit_class = classify_exit(
+            execution = uow.executions.get(attempt.execution_id)
+            assert execution is not None
+            # 07: a report file that is present but does not parse is a parse failure,
+            # recorded as one; only a missing file is "without report".
+            report_present = outputs.report_raw is not None or outputs.report is not None
+            exit_info = ExitInfo(
                 exit_code=exit_code,
-                report_present=outputs.report is not None,
+                report_present=report_present,
                 blocked_present=outputs.blocked_md is not None,
+                oom_killed=oom_killed,
                 timed_out=timed_out,
                 killed=killed,
             )
+            adapter = self._harnesses.get(execution.harness) if self._harnesses else None
+            if adapter is not None:
+                # 07 and S5: the adapter classifies from the code and both tails.
+                attempt.exit_class = adapter.classify_exit(
+                    exit_info, outputs.stdout_tail, outputs.stderr_tail
+                )
+            else:
+                attempt.exit_class = classify_exit(
+                    exit_code=exit_code,
+                    report_present=report_present,
+                    blocked_present=outputs.blocked_md is not None,
+                    timed_out=timed_out,
+                    killed=killed,
+                )
+                if oom_killed and not (timed_out or killed):
+                    attempt.exit_class = ExitClass.ENVIRONMENT
+            parsed: ParsedReport | None = None
+            if adapter is not None and attempt.workspace_path:
+                report_dir = Path(attempt.workspace_path) / "output" / "report"
+                if report_dir.is_dir():
+                    parsed = adapter.parse_report(report_dir, exit_info)
+            self._record_credential_sync(uow, attempt, execution, outputs)
             if collection_error is not None:
                 # Whatever the worker's own exit said, Crucible has no outputs from it.
                 attempt.exit_class = ExitClass.ENVIRONMENT
@@ -1791,10 +2055,9 @@ class Supervisor:
                     "exit_code": exit_code,
                     "exit_class": attempt.exit_class.value,
                     "termination_reason": attempt.termination_reason,
+                    "oom_killed": oom_killed,
                 },
             )
-            execution = uow.executions.get(attempt.execution_id)
-            assert execution is not None
             if execution.role is ExecutionRole.REVIEW:
                 self._finish_review_attempt(uow, attempt, outputs)
                 uow.leases.release_attempt_lease(attempt.id)
@@ -1802,6 +2065,27 @@ class Supervisor:
                 return
             claim_ok = False
             cancelled = attempt.termination_reason == TERMINATION_CANCEL
+            if outputs.report is None and outputs.report_raw is not None and not cancelled:
+                # The file exists and is not a YAML mapping (a bare colon in a value is
+                # the usual cause). The adapter's errors say so; nothing of it is stored.
+                record_event(
+                    uow,
+                    self._clock,
+                    EventKind.REPORT_PARSE_FAILED,
+                    principal=PRINCIPAL_CRUCIBLE,
+                    task_id=attempt.task_id,
+                    execution_id=attempt.execution_id,
+                    attempt_id=attempt.id,
+                    payload={
+                        "errors": (
+                            parsed.errors
+                            if parsed is not None and parsed.errors
+                            else [
+                                {"loc": [], "msg": "report.yaml is not a mapping", "type": "yaml"}
+                            ]
+                        )
+                    },
+                )
             if outputs.report is not None and not cancelled:
                 claim, errors = parse_claim(outputs.report)
                 claim_ok = claim is not None
@@ -1847,7 +2131,7 @@ class Supervisor:
                 AttemptState.COLLECTED,
                 EventKind.ATTEMPT_COLLECTED,
                 payload={
-                    "report_present": outputs.report is not None,
+                    "report_present": report_present,
                     "report_parsed": claim_ok,
                     "partial_report_kept_unparsed": cancelled and outputs.report is not None,
                     "blocked_present": outputs.blocked_md is not None,
@@ -1873,8 +2157,96 @@ class Supervisor:
                 task.updated_at = self._clock.now()
                 uow.tasks.save(task)
             self._record_wall_time(uow, attempt)
+            if parsed is not None:
+                self._record_harness_metrics(uow, attempt, parsed)
+                if parsed.progress:
+                    ingest_progress(
+                        uow,
+                        self._clock,
+                        attempt_id=attempt.id,
+                        task_id=attempt.task_id,
+                        execution_id=attempt.execution_id,
+                        progress=parsed.progress,
+                    )
             self._classify_and_finish(uow, attempt, blocked_text, claim_ok=claim_ok)
             uow.commit()
+
+    def _record_credential_sync(
+        self, uow: UnitOfWork, attempt: Attempt, execution: Execution, outputs: CollectedOutputs
+    ) -> None:
+        """12 and 25: what the sync-back did, as an event and on the harness row. Names,
+        booleans and reasons; never a value."""
+        now = self._clock.now()
+        auth_failure = attempt.exit_class is ExitClass.AUTH_FAILURE
+        record_launch_outcome(
+            uow,
+            self._clock,
+            name=execution.harness,
+            outcome=attempt.exit_class.value if attempt.exit_class else "unknown",
+            at=now,
+            auth_failure=auth_failure,
+        )
+        sync = outputs.credential_sync
+        if sync is None:
+            return
+        record_event(
+            uow,
+            self._clock,
+            EventKind.CREDENTIAL_SYNCED,
+            principal=PRINCIPAL_CRUCIBLE,
+            task_id=attempt.task_id,
+            execution_id=attempt.execution_id,
+            attempt_id=attempt.id,
+            payload=sync.as_dict(),
+        )
+        record_credential_observation(
+            uow,
+            self._clock,
+            name=execution.harness,
+            mount_mode=MountMode(sync.mount_mode),
+            changed=sync.changed,
+            at=now,
+        )
+
+    def _record_harness_metrics(
+        self, uow: UnitOfWork, attempt: Attempt, parsed: ParsedReport
+    ) -> None:
+        """05b: what the transcript said about tokens and cost, on the metrics row the
+        pools count. A harness that reports nothing leaves null, and the pool counts
+        attempts (routing.py)."""
+        metrics = uow.attempt_metrics.get(attempt.id)
+        if metrics is None:
+            return
+        reported = parsed.metrics
+        if reported.model is not None:
+            # The model that answered, beside the one the contract named: a harness that
+            # silently substituted one is visible to pool accounting and history (05b).
+            metrics.model_reported = reported.model
+        if reported.tokens_in is not None:
+            metrics.tokens_in = reported.tokens_in
+        if reported.tokens_out is not None:
+            metrics.tokens_out = reported.tokens_out
+        if reported.cost_usd is not None:
+            metrics.cost_units = reported.cost_usd
+        if reported.source != "none":
+            metrics.cost_source = reported.source
+        uow.attempt_metrics.put(metrics)
+        record_event(
+            uow,
+            self._clock,
+            EventKind.ATTEMPT_METRICS_RECORDED,
+            principal=PRINCIPAL_CRUCIBLE,
+            task_id=attempt.task_id,
+            execution_id=attempt.execution_id,
+            attempt_id=attempt.id,
+            payload={
+                **reported.as_dict(),
+                "model_requested": metrics.model,
+                "transcript_lines": parsed.transcript_lines,
+                "transcript": parsed.transcript_name,
+                "progress_lines": len(parsed.progress),
+            },
+        )
 
     def _record_wall_time(self, uow: UnitOfWork, attempt: Attempt) -> None:
         metrics = uow.attempt_metrics.get(attempt.id)
@@ -2042,6 +2414,9 @@ class Supervisor:
             ExitClass.LOST,
             ExitClass.AUTH_FAILURE,
         )
+        if attempt.termination_reason == TERMINATION_REFUSED:
+            # 07: a refused launch would be refused again; Foundry has the wake.
+            retryable = False
         if retryable and attempt.number < execution.max_attempts:
             nxt = self._create_attempt(uow, execution, number=attempt.number + 1)
             move_task(

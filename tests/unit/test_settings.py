@@ -49,3 +49,35 @@ def test_config_env_var_names_the_file(tmp_path: Path, monkeypatch: pytest.Monke
     monkeypatch.setenv("CRUCIBLE_CONFIG", str(cfg))
     monkeypatch.delenv("CRUCIBLE_SERVICE__BIND", raising=False)
     assert load_settings().service.port == 9090
+
+
+def test_credentials_and_harness_gates_from_toml_and_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """12 and 25: a credential is a path and a mount mode, a harness gate is a flag with
+    its reason; both come from the file and either can be overridden from the environment.
+    Nothing here is a value."""
+    cfg = tmp_path / "crucible.toml"
+    cfg.write_text(
+        "[credentials.codex]\n"
+        'path = "/var/lib/crucible/credentials/codex"\n'
+        'mount_mode = "rw-narrow"\n'
+        "[credentials.agy]\n"
+        'path = "/var/lib/crucible/credentials/agy"\n'
+        "[harnesses.codex]\n"
+        "enabled = false\n"
+        'reason = "unverified (S1b)"\n'
+    )
+    monkeypatch.setenv("CRUCIBLE_CREDENTIALS__AGY__MOUNT_MODE", "rw-narrow")
+    monkeypatch.setenv("CRUCIBLE_HARNESSES__AGY__ENABLED", "false")
+    monkeypatch.setenv("CRUCIBLE_HARNESSES__AGY__REASON", "probe pending")
+    settings = load_settings(str(cfg))
+    assert settings.credentials["codex"].path == "/var/lib/crucible/credentials/codex"
+    assert settings.credentials["codex"].mount_mode == "rw-narrow"
+    assert settings.credentials["agy"].mount_mode == "rw-narrow", "the environment overrides"
+    assert settings.harnesses["codex"].enabled is False
+    assert settings.harnesses["codex"].reason == "unverified (S1b)"
+    assert settings.harnesses["agy"].enabled is False
+    assert settings.harnesses["agy"].reason == "probe pending"
+    # A harness with no entry is not gated by configuration.
+    assert "claude_code" not in settings.harnesses

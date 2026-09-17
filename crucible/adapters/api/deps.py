@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Annotated
 
 from fastapi import Depends, Header, Request
@@ -11,10 +11,12 @@ from sqlalchemy import Engine
 
 from crucible.application.auth import authenticate
 from crucible.application.errors import ForbiddenError, UnauthorizedError
+from crucible.application.harnesses import HarnessRegistry
 from crucible.domain.entities import Principal, Role
 from crucible.ports.artifacts import ArtifactStore
 from crucible.ports.clock import Clock
 from crucible.ports.execution import ExecutionProvider
+from crucible.ports.harness import CredentialSource, HarnessGate
 from crucible.ports.repository import UnitOfWork, UnitOfWorkFactory
 
 
@@ -31,6 +33,11 @@ class AppContext:
     # reads, never a configuration value.
     github_webhook_enabled: bool = False
     github_webhook_secret_path: str | None = None
+    # 07 and 25: the adapters, the operator's configuration gates, and where each
+    # harness's credential directory is. Paths and flags only, never a value.
+    harnesses: HarnessRegistry | None = None
+    harness_gates: dict[str, HarnessGate] = field(default_factory=dict)
+    credential_sources: dict[str, CredentialSource] = field(default_factory=dict)
 
 
 def app_context(request: Request) -> AppContext:

@@ -4,11 +4,13 @@ record task_submitted. Does not launch (04)."""
 from __future__ import annotations
 
 import fnmatch
+from collections.abc import Mapping
 from typing import Any
 
 from pydantic import ValidationError
 
 from crucible.application.errors import ContractValidationError, DuplicateExternalIdError
+from crucible.application.harnesses import HarnessRegistry
 from crucible.application.registry import REGISTERED_HARNESSES, REGISTERED_PROVIDERS
 from crucible.application.routing import check_quota, check_selection, load_routing
 from crucible.application.transitions import record_event
@@ -20,6 +22,7 @@ from crucible.domain.exit_class import ExitClass
 from crucible.domain.ids import new_id
 from crucible.domain.lifecycle import TaskState
 from crucible.ports.clock import Clock
+from crucible.ports.harness import HarnessGate, HarnessUnavailableError
 from crucible.ports.repository import UnitOfWork
 
 Problem = dict[str, Any]
@@ -179,11 +182,24 @@ def validate_against_registry(
 
 
 def submit_task(
-    uow: UnitOfWork, clock: Clock, *, principal: Principal, body: object
+    uow: UnitOfWork,
+    clock: Clock,
+    *,
+    principal: Principal,
+    body: object,
+    harnesses: HarnessRegistry | None = None,
+    harness_gates: Mapping[str, HarnessGate] | None = None,
 ) -> tuple[Task, TaskContract]:
     contract = parse_contract(body)
     repository = uow.repositories.get_by_name(contract.repository.name)
     problems = validate_against_registry(uow, clock, contract)
+    if harnesses is not None:
+        # 25: a disabled harness is a contract problem now, not a refusal a task later.
+        name = contract.execution_request.harness.value
+        try:
+            harnesses.resolve(name, gates=harness_gates, state=uow.harnesses.get(name))
+        except HarnessUnavailableError as exc:
+            problems.append(_problem("execution_request.harness", exc.reason))
     if contract.correction is not None:
         problems.append(
             _problem("correction", "must be null on submit; corrections use /corrections")

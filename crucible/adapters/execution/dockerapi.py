@@ -11,6 +11,7 @@ even with `EXEC=0`, so the client not having the call is what keeps Crucible hon
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import json
 import socket
@@ -50,6 +51,40 @@ class _UnixConnection(HTTPConnection):
         sock.settimeout(self.timeout)
         sock.connect(self._unix_path)
         self.sock = sock
+
+
+# Go's os.FileMode bits the daemon puts in the archive stat header (mode is a Go
+# FileMode, not a POSIX mode): ModeDir and ModeSymlink.
+_GO_MODE_DIR = 1 << 31
+_GO_MODE_SYMLINK = 1 << 27
+
+
+@dataclass(frozen=True, slots=True)
+class ArchiveFile:
+    """What `GET /containers/{id}/archive` returned for one path: the tar bytes, what
+    the daemon said the path was, and whether the body exceeded the caller's limit."""
+
+    tar: bytes
+    stat: dict[str, Any]
+    truncated: bool = False
+
+    @property
+    def is_regular(self) -> bool:
+        mode = self.stat.get("mode")
+        if not isinstance(mode, int):
+            return False
+        return not (mode & _GO_MODE_SYMLINK) and not (mode & _GO_MODE_DIR)
+
+
+def _path_stat(header: str | None) -> dict[str, Any]:
+    """The base64 JSON stat header, or an empty mapping when the daemon sent none."""
+    if not header:
+        return {}
+    try:
+        decoded = json.loads(base64.b64decode(header).decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
 
 
 @dataclass(frozen=True, slots=True)
@@ -261,6 +296,70 @@ class DockerClient:
                 sock.shutdown(socket.SHUT_WR)
         finally:
             conn.close()
+
+    def put_archive(self, container_id: str, path: str, tar: bytes) -> None:
+        """Extract a tar into a container path (`docker cp -` by another name).
+
+        This is how the per-attempt credential copy is seeded (12): the container is
+        created, not started, its credential mount is in place, and the daemon extracts
+        the named auth files into it with the ownership the tar headers carry. The value
+        travels in the request body and nowhere else: not in `Env`, not in `Cmd`, not on
+        a command line, not through this process's argv."""
+        url = f"/{API_VERSION}/containers/{container_id}/archive?{urlencode({'path': path})}"
+        conn = self._connect()
+        try:
+            conn.request(
+                "PUT",
+                url,
+                body=tar,
+                headers={"Content-Type": "application/x-tar", "Host": "docker"},
+            )
+            response = conn.getresponse()
+            raw = response.read()
+            if response.status >= 400:
+                raise DockerApiError(
+                    response.status, _message(raw.decode("utf-8", "replace")), path=url
+                )
+        finally:
+            conn.close()
+
+    def get_archive(
+        self, container_id: str, path: str, *, limit: int = 1024 * 1024
+    ) -> ArchiveFile | None:
+        """A tar of one path inside a container, or None when it is not there.
+
+        Works on a stopped container: the daemon mounts its volumes and binds for the
+        copy. This is how the named auth files come back for the sync-back (12). The
+        body is read to `limit` bytes and no further: a worker owns its credential copy
+        and could leave anything at that path, so what comes back is bounded before it
+        is parsed. The daemon's stat header says what the path was; a symlink is
+        reported as such rather than followed into whatever it pointed at."""
+        try:
+            with self._request(
+                "GET", f"/containers/{container_id}/archive", params={"path": path}
+            ) as response:
+                stat = _path_stat(response.getheader("X-Docker-Container-Path-Stat"))
+                declared = response.getheader("Content-Length")
+                if declared is not None and declared.isdigit() and int(declared) > limit:
+                    return ArchiveFile(b"", stat, truncated=True)
+                body = response.read(limit + 1)
+        except DockerApiError as exc:
+            if exc.status == 404:
+                return None
+            raise
+        if len(body) > limit:
+            return ArchiveFile(b"", stat, truncated=True)
+        return ArchiveFile(body, stat, truncated=False)
+
+    def list_images(
+        self, filters: Mapping[str, Sequence[str]] | None = None
+    ) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {}
+        if filters:
+            params["filters"] = json.dumps({k: list(v) for k, v in filters.items()})
+        data = self._json("GET", "/images/json", params=params)
+        assert isinstance(data, list)
+        return [row for row in data if isinstance(row, dict)]
 
     def create_network(self, name: str, *, internal: bool) -> str:
         body = {"Name": name, "Driver": "bridge", "Internal": internal, "CheckDuplicate": True}

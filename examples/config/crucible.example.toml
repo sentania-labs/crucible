@@ -39,8 +39,11 @@ egress_allowlist = [
     "api.anthropic.com",
     "api.openai.com",
     "auth.openai.com",
+    "chatgpt.com",
     "daily-cloudcode-pa.googleapis.com",
     "oauth2.googleapis.com",
+    "www.googleapis.com",
+    "lh3.googleusercontent.com",
 ]
 no_proxy = "localhost,127.0.0.1"
 
@@ -54,6 +57,9 @@ report_size_cap_bytes = 10485760      # the collector refuses to copy a larger f
 use_reference_cache = true            # a bare mirror to clone from with --dissociate
 max_concurrency = 3                   # 05b concurrency.per_provider
 # extra_image_allowlist = ["crucible-worker:script-harness-*"]   # the e2e image (18)
+# Which tag a contract names for each harness is images/manifest.env, written by
+# images/build.sh: the declared pin. Reproducible images all carry the same creation
+# time, so no tool may pick one as "the newest" (13, C5).
 
 [supervisor]
 tick_seconds = 5
@@ -98,20 +104,43 @@ app_id = 0                            # public identifier, not a secret
 private_key_path = "/var/lib/crucible/credentials/github/app.pem"        # mounted read-only into crucible only
 webhook_secret_path = "/var/lib/crucible/credentials/github/webhook.secret"
 
+# Harness credentials (12, 25). Each entry names a directory Crucible reads and seeds a
+# per-attempt copy from; only the named auth files are copied, the copy is owned by the
+# worker's uid, and it is removed right after the run. `mount_mode` may raise the
+# adapter's declared minimum to `rw-narrow` and never lowers it (25 step 7). The values
+# in these directories are never configuration and never appear in any record.
 [credentials.claude_code]
 source = "directory"
-path = "/var/lib/crucible/credentials/claude_code"
+path = "/var/lib/crucible/credentials/claude_code"    # oauth-token (long-lived, S1b) and .claude.json
 mount_mode = "rw-narrow"
 
 [credentials.codex]
 source = "directory"
-path = "/var/lib/crucible/credentials/codex"
+path = "/var/lib/crucible/credentials/codex"          # auth.json; the CLI writes session state beside it (S1)
 mount_mode = "rw-narrow"
 
 [credentials.agy]
 source = "directory"
-path = "/var/lib/crucible/credentials/agy"
-mount_mode = "ro"
+path = "/var/lib/crucible/credentials/agy"            # .gemini/antigravity-cli/antigravity-oauth-token
+mount_mode = "rw-narrow"   # the CLI rotated its token on the first run past expiry (C5 live run)
+
+# Harness enablement (25, S1b). A launch needs this gate and the administrator's runtime
+# flag (`crucible-admin harnesses enable`, C5b; seeded the same way by migration 0008).
+# A harness ships disabled until its dedicated Crucible session has refreshed on the
+# Crucible side and the operator's own session was confirmed valid afterwards (S1b
+# steps 5 and 6). Claude Code's long-lived token has no refresh, so it is verified; AGY
+# completed both steps during C5; Codex's dedicated token has not refreshed yet.
+[harnesses.claude_code]
+enabled = true
+reason = "session_compatibility verified (S1b)"
+
+[harnesses.codex]
+enabled = false
+reason = "unverified: the dedicated session's Crucible-side refresh has not been observed (S1b step 5), so the operator's session cannot yet be confirmed after it (step 6)"
+
+[harnesses.agy]
+enabled = true
+reason = "session_compatibility verified: the dedicated session refreshed on the Crucible side at 00:50 CDT on 2026-09-17 (S1b step 5) and the operator's own session answered and refreshed normally afterwards at 06:32 CDT (step 6)"
 
 [wake.foundry]
 mode = "poll"          # or "webhook"

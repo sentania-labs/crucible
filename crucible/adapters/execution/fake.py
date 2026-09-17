@@ -8,6 +8,8 @@ optionally followed by `-<n>` observations before the scripted exit. Behaviors:
 - blocked            exit 75 with blocked.md
 - blocked-nofile     exit 75 without blocked.md (a plain failure)
 - crash              exit 1, no report
+- oom                exit 137 with the kernel's OOM kill flagged (environment, S5)
+- bad-report         exit 0 with a report.yaml that is not valid YAML (report_parse_failed)
 - environment        exit 70
 - hang               never exits; ignores drain, dies on kill
 - immortal           ignores drain and the first kill, dies on the second kill
@@ -39,6 +41,7 @@ from crucible.ports.execution import (
     CollectedArtifact,
     CollectedOutputs,
     Handle,
+    ImageInfo,
     IsolationLevel,
     LaunchSpec,
     LogChunk,
@@ -61,6 +64,8 @@ Behavior = Literal[
     "blocked",
     "blocked-nofile",
     "crash",
+    "oom",
+    "bad-report",
     "environment",
     "hang",
     "immortal",
@@ -82,6 +87,8 @@ BEHAVIORS: frozenset[str] = frozenset(
         "blocked",
         "blocked-nofile",
         "crash",
+        "oom",
+        "bad-report",
         "environment",
         "hang",
         "immortal",
@@ -217,6 +224,7 @@ class _Worker:
     drains: int = 0
     kills: int = 0
     logs: list[LogChunk] = field(default_factory=list)
+    oom_killed: bool = False
 
 
 def default_report(
@@ -272,6 +280,8 @@ class FakeProvider:
     name = PROVIDER_NAME
 
     def __init__(self) -> None:
+        # Attempts whose credential copy the supervisor asked to discard (12).
+        self.discarded: list[str] = []
         self._workers: dict[str, _Worker] = {}
         self._scripts: dict[str, tuple[str, int]] = {}
         self._reports: dict[str, dict[str, Any]] = {}
@@ -363,10 +373,14 @@ class FakeProvider:
             "blocked": 75,
             "blocked-nofile": 75,
             "crash": 1,
+            "oom": 137,
             "environment": 70,
         }.get(worker.behavior, 0)
         worker.logs.append(LogChunk("stdout", f"fake worker exit {worker.exit_code}\n".encode()))
-        return Observation(ObservationState.EXITED, exit_code=worker.exit_code)
+        worker.oom_killed = worker.behavior == "oom"
+        return Observation(
+            ObservationState.EXITED, exit_code=worker.exit_code, oom_killed=worker.oom_killed
+        )
 
     async def logs(self, h: Handle, since: LogOffset) -> list[LogChunk]:
         worker = self._workers.get(h.attempt_id)
@@ -381,6 +395,11 @@ class FakeProvider:
         spec = worker.spec
         behavior = worker.behavior
         head = synthetic_head_sha(spec.attempt_id)
+        if behavior == "bad-report" and worker.exit_code == 0:
+            # A file that exists and is not a YAML mapping: an unquoted colon in a value.
+            return CollectedOutputs(
+                report=None, report_raw="title: c5: live run\nsummary: x\n", blocked_md=None
+            )
         if behavior in REVIEW_BEHAVIORS and worker.exit_code == 0:
             verdict = "approve" if behavior == "review" else "request_changes"
             head = self._review_heads.get(spec.attempt_id, head)
@@ -464,6 +483,14 @@ class FakeProvider:
     ) -> None:
         self.cleaned.append(ws.attempt_id)
         self._workspaces.pop(ws.attempt_id, None)
+
+    async def list_images(self) -> list[ImageInfo]:
+        """The fake provider runs behaviours, not images (08): nothing to list."""
+        return []
+
+    async def discard(self, ws: Workspace, spec: LaunchSpec | None = None) -> None:
+        """Nothing secret was placed; the call is recorded so a test can assert it."""
+        self.discarded.append(ws.attempt_id)
 
     async def retention(self, keep: Sequence[str]) -> int:
         return 0

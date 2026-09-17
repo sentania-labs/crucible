@@ -374,6 +374,8 @@ class AttemptMetrics:
     tokens_out: int | None = None
     cost_units: float | None = None
     cost_source: str = "none"
+    # The model the harness's own transcript named, when it did (05b, C5).
+    model_reported: str | None = None
     exit_class: str | None = None
     gates_passed: int = 0
     gates_failed: int = 0
@@ -389,6 +391,44 @@ class RoutingPolicyRecord:
     document: dict[str, Any]
     created_at: datetime
     retired_at: datetime | None = None
+
+
+# ----- harness administration (07, 25) --------------------------------------
+
+
+@dataclass(slots=True)
+class HarnessState:
+    """The runtime record of one harness (25): the admin's enable flag with its reason,
+    the session-compatibility verdict, and what the last runs observed about the
+    credential. Never a value: booleans, enumerations, timestamps, and text reasons."""
+
+    name: str
+    enabled: bool
+    reason: str
+    session_compatibility: str
+    updated_at: datetime
+    updated_by: str
+    mount_mode_observed: str | None = None
+    refresh_requires_rw: bool | None = None
+    last_launch_at: datetime | None = None
+    last_launch_outcome: str | None = None
+    last_auth_failure_at: datetime | None = None
+    last_validated_at: datetime | None = None
+
+
+@dataclass(slots=True)
+class ImagePromotion:
+    """One worker image's promotion state (13): `candidate` until an explicit admin act
+    makes it `default`; the previous default becomes `retained`."""
+
+    digest: str
+    reference: str
+    harness: str
+    harness_version: str
+    state: str
+    updated_at: datetime
+    updated_by: str
+    reason: str = ""
 
 
 # ----- GitHub delivery (23) ---------------------------------------------

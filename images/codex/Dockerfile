@@ -18,13 +18,26 @@ ARG HARNESS_SHA256=f479424eca092484dc40d87ae28c44f4cc40234a60045d6131e493800d814
 ADD --checksum=sha256:${HARNESS_SHA256} --chmod=0644 \
     https://github.com/openai/codex/releases/download/rust-v${HARNESS_VERSION}/codex-x86_64-unknown-linux-musl.tar.gz \
     /fetch/codex.tar.gz
-# The extracted file keeps the tarball entry mtime; pin it to the epoch so a
+# The code-mode host: a companion binary the CLI spawns for the 5.6 model family
+# (Luna, Terra, Sol) and fails closed without (C5, found live 2026-09-17). It is an
+# asset of the same rust-v<version> release, static musl, with its own .sigstore
+# file, pinned here by the sha256 of the tarball as downloaded on 2026-09-17. The
+# CLI looks for it beside itself, as /usr/local/bin/codex-code-mode-host.
+ARG CODE_MODE_HOST_SHA256=f95830a869590957664bbfc67bccb08773806b693670baf15908176f89b4cd31
+ADD --checksum=sha256:${CODE_MODE_HOST_SHA256} --chmod=0644 \
+    https://github.com/openai/codex/releases/download/rust-v${HARNESS_VERSION}/codex-code-mode-host-x86_64-unknown-linux-musl.tar.gz \
+    /fetch/code-mode-host.tar.gz
+# The extracted files keep the tarball entry mtime; pin them to the epoch so a
 # repacked upstream tarball with the same bytes cannot change the layer.
 RUN set -eu; \
     tar -xzf /fetch/codex.tar.gz -C /fetch codex-x86_64-unknown-linux-musl; \
     mv /fetch/codex-x86_64-unknown-linux-musl /fetch/codex; \
     chmod 0755 /fetch/codex; \
-    touch -h -d "@${SOURCE_DATE_EPOCH}" /fetch/codex
+    touch -h -d "@${SOURCE_DATE_EPOCH}" /fetch/codex; \
+    tar -xzf /fetch/code-mode-host.tar.gz -C /fetch codex-code-mode-host-x86_64-unknown-linux-musl; \
+    mv /fetch/codex-code-mode-host-x86_64-unknown-linux-musl /fetch/codex-code-mode-host; \
+    chmod 0755 /fetch/codex-code-mode-host; \
+    touch -h -d "@${SOURCE_DATE_EPOCH}" /fetch/codex-code-mode-host
 
 FROM ${BASE_IMAGE}
 # Declared here so it reaches the RUN below: useradd stamps /etc/shadow with
@@ -72,6 +85,7 @@ RUN set -eu; \
 # (--cap-drop ALL, no-new-privileges) are then belt and braces, not the
 # only thing standing.
 COPY --from=fetch /fetch/codex /usr/local/bin/codex
+COPY --from=fetch /fetch/codex-code-mode-host /usr/local/bin/codex-code-mode-host
 
 # Codex has no environment variable for its update check. The documented
 # knob is the config key check_for_update_on_startup=false, which the adapter

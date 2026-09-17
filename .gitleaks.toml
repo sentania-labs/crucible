@@ -1,0 +1,78 @@
+# Extends gitleaks' default rules with every pattern crucible/domain/secrets.py knows,
+# so `make scan` and the CI scan job catch the harness token shapes the defaults miss
+# (12, C5). tests/unit/test_secrets.py holds this file and the scanner equal; edit the
+# scanner and regenerate rather than editing here.
+title = "crucible"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "crucible-github-installation-token"
+description = "Crucible scanner pattern github_installation_token"
+regex = '''\bghs_[A-Za-z0-9._-]{20,}'''
+
+[[rules]]
+id = "crucible-github-token"
+description = "Crucible scanner pattern github_token"
+regex = '''\b(?:ghp|gho|ghu|ghr)_[A-Za-z0-9]{36,}\b'''
+
+[[rules]]
+id = "crucible-github-fine-grained-token"
+description = "Crucible scanner pattern github_fine_grained_token"
+regex = '''\bgithub_pat_[A-Za-z0-9_]{22,}\b'''
+
+[[rules]]
+id = "crucible-private-key-header"
+description = "Crucible scanner pattern private_key_header"
+regex = '''-----BEGIN [A-Z ]*PRIVATE KEY-----'''
+
+[[rules]]
+id = "crucible-bearer-token"
+description = "Crucible scanner pattern bearer_token"
+regex = '''(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{20,}'''
+
+[[rules]]
+id = "crucible-aws-access-key"
+description = "Crucible scanner pattern aws_access_key"
+regex = '''\bAKIA[0-9A-Z]{16}\b'''
+
+[[rules]]
+id = "crucible-anthropic-oauth-token"
+description = "Crucible scanner pattern anthropic_oauth_token"
+regex = '''\bsk-ant-[A-Za-z0-9_-]{20,}'''
+
+[[rules]]
+id = "crucible-google-oauth-access-token"
+description = "Crucible scanner pattern google_oauth_access_token"
+regex = '''\bya29\.[A-Za-z0-9._-]{20,}'''
+
+[[rules]]
+id = "crucible-google-oauth-refresh-token"
+description = "Crucible scanner pattern google_oauth_refresh_token"
+regex = '''\b1//[A-Za-z0-9_-]{20,}'''
+
+[[rules]]
+id = "crucible-codex-refresh-token"
+description = "Crucible scanner pattern codex_refresh_token"
+regex = '''\b[A-Za-z0-9]{1,8}\.[A-Za-z0-9]{1,8}\.[A-Za-z0-9_-]{100,}'''
+
+[[rules]]
+id = "crucible-openai-style-key"
+description = "Crucible scanner pattern openai_style_key"
+regex = '''\bsk-[A-Za-z0-9_-]{20,}\b'''
+
+[[rules]]
+id = "crucible-slack-token"
+description = "Crucible scanner pattern slack_token"
+regex = '''\bxox[abprs]-[A-Za-z0-9-]{10,}\b'''
+
+[[rules]]
+id = "crucible-jwt"
+description = "Crucible scanner pattern jwt"
+regex = '''\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b'''
+
+[[rules]]
+id = "crucible-crucible-token"
+description = "Crucible scanner pattern crucible_token"
+regex = '''\bcru_[A-Za-z0-9]{26}\.[A-Za-z0-9_-]{30,}\b'''

@@ -7,7 +7,14 @@ from fastapi import FastAPI
 from crucible import __version__
 from crucible.adapters.api.deps import AppContext
 from crucible.adapters.api.problems import install_problem_handlers
-from crucible.adapters.api.routers import github, policies, records, supervision, tasks
+from crucible.adapters.api.routers import (
+    github,
+    harnesses,
+    policies,
+    records,
+    supervision,
+    tasks,
+)
 
 API_PREFIX = "/v1"
 
@@ -27,4 +34,5 @@ def create_app(ctx: AppContext) -> FastAPI:
     app.include_router(records.router, prefix=API_PREFIX)
     app.include_router(policies.router, prefix=API_PREFIX)
     app.include_router(github.router, prefix=API_PREFIX)
+    app.include_router(harnesses.router, prefix=API_PREFIX)
     return app
