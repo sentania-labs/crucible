@@ -25,8 +25,22 @@ export CRUCIBLE_DOCKER_SOCKET
 EGRESS_ALLOWLIST ?= github.com objects.githubusercontent.com pypi.org files.pythonhosted.org registry.npmjs.org api.anthropic.com api.openai.com auth.openai.com daily-cloudcode-pa.googleapis.com oauth2.googleapis.com
 WORKERS_SUBNET ?= 10.88.0.0/24
 
+# Where `make deploy-local` runs a published release: a directory the `crucible`
+# service user owns, because that user cannot read the operator's home (750) and so
+# cannot run the normal-mode stack from a working tree under it. DEPLOY_TAG is an exact
+# version, never `latest`: a deployment pins, and that is what makes a rollback one word.
+# It is a deployment pin, not the package version, which still comes from the git tag
+# (release.md). It does not follow a new release on its own: bump it, or pass DEPLOY_TAG.
+CRUCIBLE_SERVICE_USER ?= crucible
+CRUCIBLE_DEPLOY_DIR ?= /var/lib/crucible/deploy
+CRUCIBLE_CREDENTIAL_ROOT ?= /var/lib/crucible/credentials
+DEPLOY_TAG ?= 0.2.1
+CRUCIBLE_DEPLOY_IMAGE ?= ghcr.io/sentania-labs/crucible:$(DEPLOY_TAG)
+CRUCIBLE_DEPLOY_PORT ?= 8080
+
 .PHONY: up dev down reset lint scan scan-tree scan-history smoke test test-unit \
-	test-integration e2e e2e-image build proxy-config proxies preflight
+	test-integration e2e e2e-image build proxy-config proxies preflight \
+	deploy-local deploy-local-down
 
 up: preflight proxy-config ## normal mode: postgres, proxies, migrate, crucible
 	@test -f .env || cp .env.example .env
@@ -123,3 +137,18 @@ e2e: ## the Docker-provider end-to-end tier (18): real containers, no model
 
 build:
 	docker build -t crucible:dev .
+
+deploy-local: proxy-config ## run a pinned published release on the rootless daemon from /var/lib/crucible/deploy
+	CRUCIBLE_SERVICE_USER="$(CRUCIBLE_SERVICE_USER)" \
+	CRUCIBLE_DEPLOY_DIR="$(CRUCIBLE_DEPLOY_DIR)" \
+	CRUCIBLE_CREDENTIAL_ROOT="$(CRUCIBLE_CREDENTIAL_ROOT)" \
+	CRUCIBLE_DEPLOY_IMAGE="$(CRUCIBLE_DEPLOY_IMAGE)" \
+	CRUCIBLE_DEPLOY_PORT="$(CRUCIBLE_DEPLOY_PORT)" \
+	CRUCIBLE_EGRESS_ALLOWLIST_HOSTS="$(EGRESS_ALLOWLIST)" \
+	CRUCIBLE_WORKERS_SUBNET_CIDR="$(WORKERS_SUBNET)" \
+	tools/deploy/deploy_local.sh up
+
+deploy-local-down: ## stop the deployed stack; the postgres and artifact volumes are kept
+	CRUCIBLE_SERVICE_USER="$(CRUCIBLE_SERVICE_USER)" \
+	CRUCIBLE_DEPLOY_DIR="$(CRUCIBLE_DEPLOY_DIR)" \
+	tools/deploy/deploy_local.sh down

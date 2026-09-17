@@ -58,6 +58,7 @@ make test        # unit tier, then the integration tier against postgres:16 in a
 make smoke       # after `make up`: drive one task end to end; the same script CI and release run
 make e2e-image   # the script-harness worker image the e2e tier runs
 make e2e         # the Docker provider against real containers, no model
+make deploy-local # run a pinned published release from /var/lib/crucible/deploy
 make down
 make reset       # DESTRUCTIVE: down and delete the postgres and artifact volumes
 ```
@@ -107,6 +108,28 @@ is `fake` and whose image is `crucible-worker:fake-succeed` (or `docker` with a
 worker image the policy allowlist admits), `POST
 /v1/tasks/{id}/start`, and watch `GET /v1/tasks/{id}/events`. OpenAPI is at
 `/v1/openapi.json`.
+
+### Running the released image on the rootless daemon
+
+`make up` runs your working tree, which means the compose client must read it,
+which means it must run as the daemon's owner. On a workstation where the
+`crucible` service user cannot read the operator's home (mode 750, correctly),
+that cannot work. `make deploy-local` is the arrangement that does:
+
+```sh
+make deploy-local                    # the pin in DEPLOY_TAG
+make deploy-local DEPLOY_TAG=0.2.2   # or another published release
+make deploy-local-down               # containers down, volumes kept
+```
+
+It creates `/var/lib/crucible/deploy` owned by the service user, containing
+`compose.yaml`, an override that pins `ghcr.io/sentania-labs/crucible:<tag>` and
+drops the build section, a generated `.env` whose database password is created
+once and never printed, and the egress allowlist; creates the credential root
+layout under `/var/lib/crucible/credentials`; then brings the stack up as that
+user against its own daemon and prints `/v1/ready`. Nothing in the deployment
+directory references the operator's home, which is the point. Details:
+[docs/implementation-notes/deploy-local.md](docs/implementation-notes/deploy-local.md).
 
 ## The supervision half, end to end
 
