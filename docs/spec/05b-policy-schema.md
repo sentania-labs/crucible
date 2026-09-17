@@ -280,5 +280,7 @@ to `launching`; if the pool crossed its soft limit since submit, the
 attempt is refused with class `quota_exhausted` and Foundry is woken. Foundry
 records the tier and the chosen model with its rationale in the contract
 (05); Crucible records the outcome in AttemptMetrics (03, 14) and exposes
-`GET /routing/history?model=&project=` so the next selection is informed.
+`GET /routing/history?model=&project=`, which returns both the model the
+contract requested and the model the transcript named (14), so the next
+selection is informed.
 Selection itself stays a Foundry judgment; the policy bounds it.

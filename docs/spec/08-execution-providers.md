@@ -97,7 +97,9 @@ paths, emit N log lines. Every lifecycle and gate test runs against it.
 - `terminate`: `drain` sends SIGTERM and waits the policy grace; `kill`
   sends SIGKILL.
 - `cleanup`: only for attempts whose exit path recorded `logs_drained`;
-  remove container; keep or delete the workspace per policy; release the
+  remove container; keep or delete the workspace per policy, except the
+  per-attempt credential copy, which is removed under every policy (12);
+  release the
   lease; remove the per-attempt credential volume.
 - `reconcile`: list containers by label; anything with a label but no live
   attempt row is orphaned and removed; any live attempt with no container is
