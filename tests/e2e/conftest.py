@@ -59,7 +59,16 @@ RUN_ID = uuid.uuid4().hex[:8]
 NET_WORKERS = f"crucible-e2e-workers-{RUN_ID}"
 NET_CONTROL = f"crucible-e2e-control-{RUN_ID}"
 WORKERS_SUBNET = "10.89.0.0/24"
-EGRESS_ALLOWLIST = ("github.com",)
+# github.com for the script tier, plus every endpoint the real adapters declare (S6),
+# so the live tier's workers reach their model API through the same filtering proxy.
+EGRESS_ALLOWLIST = (
+    "github.com",
+    "api.anthropic.com",
+    "api.openai.com",
+    "auth.openai.com",
+    "daily-cloudcode-pa.googleapis.com",
+    "oauth2.googleapis.com",
+)
 
 TRUNCATE = (
     "TRUNCATE github_deliveries, ci_decisions, ci_certifications, reactions, "

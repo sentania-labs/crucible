@@ -39,6 +39,11 @@ SECRET_FIXTURES: list[tuple[str, str]] = [
         "jwt",
     ),
     (_join("cru_", "01ARZ3NDEKTSV4RRFFQ69G5FAV", ".", _repeat("s", 40)), "crucible_token"),
+    # The shapes the three harness CLIs keep in their auth files (12, S1, S1b): the
+    # Claude Code long-lived token, and Google's OAuth access and refresh tokens.
+    (_join("sk-ant-", "oat01-", _repeat("k", 40)), "anthropic_oauth_token"),
+    (_join("ya29.", "a0AfH6SM", _repeat("g", 40)), "google_oauth_access_token"),
+    (_join("1//", "0gABCDEF", _repeat("r", 40)), "google_oauth_refresh_token"),
 ]
 
 

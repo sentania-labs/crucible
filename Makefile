@@ -44,7 +44,7 @@ CRUCIBLE_DEPLOY_IMAGE ?= ghcr.io/sentania-labs/crucible:$(DEPLOY_TAG)
 CRUCIBLE_DEPLOY_PORT ?= 8080
 
 .PHONY: up dev down reset lint scan scan-tree scan-history smoke test test-unit \
-	test-integration e2e e2e-github e2e-image build proxy-config proxies preflight \
+	test-integration e2e e2e-github e2e-live e2e-image build proxy-config proxies preflight \
 	deploy-local deploy-local-down
 
 up: preflight proxy-config ## normal mode: postgres, proxies, migrate, crucible
@@ -180,6 +180,38 @@ e2e-github: ## the live GitHub tier: a real App against a throwaway repository
 	CRUCIBLE_GITHUB_APP_KEY="$(CRUCIBLE_GITHUB_APP_KEY)" \
 	CRUCIBLE_GITHUB_TARGET_REPO="$(CRUCIBLE_GITHUB_TARGET_REPO)" \
 	$(UV) run pytest tests/e2e -q -m e2e_github
+
+# The live harness tier (07, 12, 18). Local only, never in CI: it runs the real Claude
+# Code, Codex and AGY images with the dedicated Crucible credentials (never the
+# operator's daily-use directories) on the rootless daemon, one harness at a time, and
+# publishes a trivial change to the throwaway repository, then closes the pull request
+# and deletes the branch. Every variable names a directory, a file, a repository or a
+# harness; no key, token or secret is ever a value here.
+#
+#   make e2e-live HARNESS=claude_code \
+#     CRUCIBLE_LIVE_CREDENTIAL_ROOT=/path/to/dedicated/credentials \
+#     CRUCIBLE_GITHUB_APP_JSON=~/path/to/app.json \
+#     CRUCIBLE_GITHUB_APP_KEY=~/path/to/app.pem \
+#     CRUCIBLE_GITHUB_TARGET_REPO=owner/throwaway \
+#     DOCKER='<the rootless daemon wrapper above>'
+HARNESS ?= all
+e2e-live: ## the live harness tier: real harness images, the dedicated credentials, a throwaway repository
+	$(UV) sync --frozen --quiet
+	@test -n "$(CRUCIBLE_LIVE_CREDENTIAL_ROOT)" || { echo "set CRUCIBLE_LIVE_CREDENTIAL_ROOT"; exit 2; }
+	@test -n "$(CRUCIBLE_GITHUB_APP_JSON)" || { echo "set CRUCIBLE_GITHUB_APP_JSON"; exit 2; }
+	@test -n "$(CRUCIBLE_GITHUB_APP_KEY)" || { echo "set CRUCIBLE_GITHUB_APP_KEY"; exit 2; }
+	@test -n "$(CRUCIBLE_GITHUB_TARGET_REPO)" || { echo "set CRUCIBLE_GITHUB_TARGET_REPO"; exit 2; }
+	CRUCIBLE_E2E_DOCKER="$(DOCKER)" \
+	CRUCIBLE_E2E_DOCKER_SOCKET="$(CRUCIBLE_DOCKER_SOCKET)" \
+	CRUCIBLE_LIVE_CREDENTIAL_ROOT="$(CRUCIBLE_LIVE_CREDENTIAL_ROOT)" \
+	CRUCIBLE_LIVE_HARNESSES="$(HARNESS)" \
+	CRUCIBLE_LIVE_MODELS="$(CRUCIBLE_LIVE_MODELS)" \
+	CRUCIBLE_LIVE_AGY_MOUNT_MODE="$(CRUCIBLE_LIVE_AGY_MOUNT_MODE)" \
+	CRUCIBLE_LIVE_REPORT="$(CRUCIBLE_LIVE_REPORT)" \
+	CRUCIBLE_GITHUB_APP_JSON="$(CRUCIBLE_GITHUB_APP_JSON)" \
+	CRUCIBLE_GITHUB_APP_KEY="$(CRUCIBLE_GITHUB_APP_KEY)" \
+	CRUCIBLE_GITHUB_TARGET_REPO="$(CRUCIBLE_GITHUB_TARGET_REPO)" \
+	$(UV) run pytest tests/e2e -q -m e2e_live -s
 
 build:
 	docker build -t crucible:dev .
