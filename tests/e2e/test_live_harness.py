@@ -357,7 +357,7 @@ OBJECTIVE = """Make exactly this change and nothing else.
    creating the file if it does not exist. The line is:
    `{harness} completed a Crucible live run for task {external_id}.`
 2. Commit that one change on the current branch with `git add notes/c5-live.txt` and
-   `git commit -m "c5: live run for {external_id}" \
+   `git commit -m "c5 live run for {external_id}" \
    --trailer "Crucible-Attempt: $CRUCIBLE_ATTEMPT_ID"` (the environment variable
    CRUCIBLE_ATTEMPT_ID is set; the git author is already configured; never push).
 3. Run the four verification commands listed in section 6 of IDENTITY.md and write each
@@ -371,7 +371,7 @@ OBJECTIVE = """Make exactly this change and nothing else.
    refs.commits 1, one checks entry per verification command with its exit code and
    log file name, acceptance_mapping with id AC1 status met evidence run-evidence.md,
    run_evidence ["run-evidence.md"], proposed_pull_request with title
-   "c5: live run for {external_id}", an empty body, and closes []; empty lists for
+   "c5 live run for {external_id}", an empty body, and closes []; empty lists for
    limitations, risks, blockers and follow_ups.
 6. Exit 0. Do not open a pull request, do not push, do not touch any other file.
 """
@@ -379,7 +379,9 @@ OBJECTIVE = """Make exactly this change and nothing else.
 
 def _contract(harness: str, model: str, image: str, config: LiveConfig, external_id: str) -> Any:
     document = e2e_contract(external_id, config.repository, image)
-    document["title"] = f"c5: live run for {external_id}"
+    # No colon in the title: an unquoted colon inside a YAML value is the one thing a
+    # small model gets wrong most, and the tier proves the pipeline, not YAML quoting.
+    document["title"] = f"c5 live run for {external_id}"
     document["objective"] = OBJECTIVE.format(harness=harness, external_id=external_id)
     document["repository"]["work_branch"] = f"crucible/C5-{external_id}"
     document["scope"] = {

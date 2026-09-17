@@ -9,6 +9,7 @@ optionally followed by `-<n>` observations before the scripted exit. Behaviors:
 - blocked-nofile     exit 75 without blocked.md (a plain failure)
 - crash              exit 1, no report
 - oom                exit 137 with the kernel's OOM kill flagged (environment, S5)
+- bad-report         exit 0 with a report.yaml that is not valid YAML (report_parse_failed)
 - environment        exit 70
 - hang               never exits; ignores drain, dies on kill
 - immortal           ignores drain and the first kill, dies on the second kill
@@ -64,6 +65,7 @@ Behavior = Literal[
     "blocked-nofile",
     "crash",
     "oom",
+    "bad-report",
     "environment",
     "hang",
     "immortal",
@@ -86,6 +88,7 @@ BEHAVIORS: frozenset[str] = frozenset(
         "blocked-nofile",
         "crash",
         "oom",
+        "bad-report",
         "environment",
         "hang",
         "immortal",
@@ -392,6 +395,11 @@ class FakeProvider:
         spec = worker.spec
         behavior = worker.behavior
         head = synthetic_head_sha(spec.attempt_id)
+        if behavior == "bad-report" and worker.exit_code == 0:
+            # A file that exists and is not a YAML mapping: an unquoted colon in a value.
+            return CollectedOutputs(
+                report=None, report_raw="title: c5: live run\nsummary: x\n", blocked_md=None
+            )
         if behavior in REVIEW_BEHAVIORS and worker.exit_code == 0:
             verdict = "approve" if behavior == "review" else "request_changes"
             head = self._review_heads.get(spec.attempt_id, head)

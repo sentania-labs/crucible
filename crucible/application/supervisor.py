@@ -1999,9 +1999,12 @@ class Supervisor:
             killed = attempt.termination_reason == TERMINATION_CANCEL
             execution = uow.executions.get(attempt.execution_id)
             assert execution is not None
+            # 07: a report file that is present but does not parse is a parse failure,
+            # recorded as one; only a missing file is "without report".
+            report_present = outputs.report_raw is not None or outputs.report is not None
             exit_info = ExitInfo(
                 exit_code=exit_code,
-                report_present=outputs.report is not None,
+                report_present=report_present,
                 blocked_present=outputs.blocked_md is not None,
                 oom_killed=oom_killed,
                 timed_out=timed_out,
@@ -2016,7 +2019,7 @@ class Supervisor:
             else:
                 attempt.exit_class = classify_exit(
                     exit_code=exit_code,
-                    report_present=outputs.report is not None,
+                    report_present=report_present,
                     blocked_present=outputs.blocked_md is not None,
                     timed_out=timed_out,
                     killed=killed,
@@ -2062,6 +2065,27 @@ class Supervisor:
                 return
             claim_ok = False
             cancelled = attempt.termination_reason == TERMINATION_CANCEL
+            if outputs.report is None and outputs.report_raw is not None and not cancelled:
+                # The file exists and is not a YAML mapping (a bare colon in a value is
+                # the usual cause). The adapter's errors say so; nothing of it is stored.
+                record_event(
+                    uow,
+                    self._clock,
+                    EventKind.REPORT_PARSE_FAILED,
+                    principal=PRINCIPAL_CRUCIBLE,
+                    task_id=attempt.task_id,
+                    execution_id=attempt.execution_id,
+                    attempt_id=attempt.id,
+                    payload={
+                        "errors": (
+                            parsed.errors
+                            if parsed is not None and parsed.errors
+                            else [
+                                {"loc": [], "msg": "report.yaml is not a mapping", "type": "yaml"}
+                            ]
+                        )
+                    },
+                )
             if outputs.report is not None and not cancelled:
                 claim, errors = parse_claim(outputs.report)
                 claim_ok = claim is not None
@@ -2107,7 +2131,7 @@ class Supervisor:
                 AttemptState.COLLECTED,
                 EventKind.ATTEMPT_COLLECTED,
                 payload={
-                    "report_present": outputs.report is not None,
+                    "report_present": report_present,
                     "report_parsed": claim_ok,
                     "partial_report_kept_unparsed": cancelled and outputs.report is not None,
                     "blocked_present": outputs.blocked_md is not None,

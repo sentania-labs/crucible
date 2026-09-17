@@ -178,3 +178,20 @@ async def test_an_oom_killed_worker_is_environment_and_retries(
     events = client.get(f"/v1/tasks/{task_id}/events", params={"limit": 200}).json()["items"]
     exited = [e for e in events if e["kind"] == "attempt_exited"]
     assert exited and all(e["payload"]["oom_killed"] is True for e in exited)
+
+
+async def test_a_report_that_does_not_parse_is_a_parse_failure_not_no_report(
+    client: TestClient, supervisor: Supervisor
+) -> None:
+    """07 (found live): the file was there; the record says it did not parse, and only
+    a missing file reads as "without report"."""
+    task_id = submit_and_start(client, "crucible-worker:fake-bad-report")
+    assert await run_to_settled(supervisor, client, task_id) == "pre_pr_gates_failed"
+    events = client.get(f"/v1/tasks/{task_id}/events", params={"limit": 200}).json()["items"]
+    kinds = [e["kind"] for e in events]
+    assert "report_parse_failed" in kinds
+    collected = next(e for e in events if e["kind"] == "attempt_collected")
+    assert collected["payload"]["report_present"] is True
+    assert collected["payload"]["report_parsed"] is False
+    (attempt,) = _attempts(client, task_id)
+    assert attempt["exit_class"] == "completed_without_report"
