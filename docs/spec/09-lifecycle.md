@@ -53,12 +53,13 @@ ci_certification_failed --ci-decision reject--> rejected
 
 {awaiting_external_review, external_feedback_received, awaiting_ci_certification, ready_for_merge}
     --PR head changed out of band--> head_diverged --wake-->
-head_diverged --head-decision recollect--> reported     (new collected head from the remote; all gates, review, acceptance start over)
+head_diverged --head-decision recollect--> scheduled    (a `correct` execution against the remote work branch; the new head gets its own claim, then all gates, review, acceptance start over)
 head_diverged --head-decision reject--> rejected
 head_diverged --cancel--> cancelled
 
 ready_for_merge --PR merged (observed)--> merged --wake-->
-ready_for_merge --PR closed unmerged--> rejected
+{awaiting_external_review, external_feedback_received, awaiting_ci_certification,
+ ready_for_merge} --PR closed unmerged (observed)--> rejected
 merged --included in a release contract--> release_candidate
 release_candidate --release succeeded--> released
 release_candidate --release failed or cancelled--> merged
@@ -99,20 +100,24 @@ results, the review report, and the AcceptanceResult all name the SHA
 they were made for. A PR head that Crucible did not push invalidates all
 of them: the task moves to `head_diverged` and nothing about the new SHA
 is trusted, however green its CI. Foundry decides whether to `recollect`
-(Crucible fetches the new head into a fresh collector, and the task
-re-runs pre-PR gates, internal review when applicable, and acceptance
-before `publishing` re-verifies it) or to reject.
-
-**Until the publisher exists (C2, C3)**, an accepted `branch` or
-`pull_request` deliverable stays in `awaiting_acceptance` with a
-`publish_pending` flag and a wake of that reason; C4 replaces the flag with
-the `publishing` edge.
+(the task re-enters at `scheduled` with a `correct` execution against the
+remote `work_branch`, so the divergent head gets a completion claim of its
+own, and then re-runs pre-PR gates, internal review when applicable, and
+acceptance before `publishing` re-verifies it) or to reject. Re-entering at
+`reported` instead would put the new head in front of gates with no claim
+behind it, so `report_present` would fail and a correction would be the
+only way forward anyway.
 
 **Branch-only deliverables** (`branch`, allowed only under a policy with
 `deliverables.allow_branch_only: true`) pass through `publishing` like a
 PR deliverable: the bundle head is pushed and `branch_pushed_at_head`
 verified, then the task moves to `accepted`. Nothing is accepted
 unpublished.
+
+**A PR closed without merge rejects the task from wherever it is.** A
+person can close a PR at any point after it is opened, so the `rejected`
+edge is drawn from every observed state, not only from `ready_for_merge`
+(23). The closer is recorded where the provider exposes it.
 
 Cancelling a task after `publishing` never closes the PR; Crucible records
 the cancellation on the PR record and leaves the PR to the operator.

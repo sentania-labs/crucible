@@ -47,12 +47,12 @@ instead of a bearer token (below).
 | POST | `/tasks/{id}/accept` | Record an `AcceptanceResult` (accepted, rejected, needs_more_work) with reasoning for the current collected head. Orchestrator role only. |
 | POST | `/tasks/{id}/corrections` | Attach a correction: a new contract version whose `correction` section names the review comments or CI findings it addresses, plus an execution request. Creates a `correct` execution against the existing remote branch. Allowed in `pre_pr_gates_failed`, `external_feedback_received`, `ci_certification_failed`, and after `needs_more_work`. |
 | POST | `/tasks/{id}/dispositions` | Record `ReviewDisposition` rows for received external review comments. Orchestrator role. |
-| POST | `/tasks/{id}/head-decision` | In `head_diverged`: `recollect` (Crucible collects the new remote head and the task re-enters `reported`), `reject`, or `cancel`, with reasoning. |
+| POST | `/tasks/{id}/head-decision` | In `head_diverged`: `recollect` (the task re-enters `scheduled` with a `correct` execution against the remote work branch, so the new head gets a claim of its own before any gate reads it), `reject`, or `cancel`, with reasoning. |
 | POST | `/tasks/{id}/ci-decision` | In `ci_certification_failed`: record the cause Foundry determined (enum in 23) and the action: `rerun` (recorded; the operator re-runs on GitHub, 23), `correct` (followed by a correction), `reject`, or `cancel`. |
 | POST | `/tasks/{id}/decisions` | Record a `Decision` (verbatim text, who, what it resolves). |
 | POST | `/tasks/{id}/close` | Orchestrator closes an `accepted`, `merged`, or `released` task. |
 | GET | `/tasks/{id}/events` | Ordered events for the task and its children. |
-| GET | `/tasks/{id}/pull-request` | The PR record with head history, external reviews, dispositions, and CI certifications. |
+| GET | `/tasks/{id}/pull-request` | The PR record with head history, the external review cycles and their completed components, external reviews, comments, dispositions, the observed reactions, whether reactions are observable at all, and CI certifications. |
 | GET | `/events` | Global feed, `?cursor=&kind=&since=`. |
 
 ### Executions and attempts
