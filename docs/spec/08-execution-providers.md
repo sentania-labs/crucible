@@ -100,7 +100,7 @@ paths, emit N log lines. Every lifecycle and gate test runs against it.
   remove container; keep or delete the workspace per policy, except the
   per-attempt credential copy, which is removed under every policy (12);
   release the
-  lease; remove the per-attempt credential volume.
+  lease; remove the per-attempt credential copy.
 - `reconcile`: list containers by label; anything with a label but no live
   attempt row is orphaned and removed; any live attempt with no container is
   marked `lost`.

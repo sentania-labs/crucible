@@ -71,7 +71,7 @@ person. An open PR is never closed by Crucible on cancel.
 | `workspace_on_success` | delete, keep, keep_diff_only | keep_diff_only |
 | `workspace_on_failure` | delete, keep | keep |
 | `container_remove` | always, on_success, never | always, after `logs_drained` |
-| `credential_copy_remove` | immediately_after_validated_sync | immediately_after_validated_sync |
+| `credential_volume_remove` | immediately_after_validated_sync | immediately_after_validated_sync (the field keeps its name; the copy is a directory, 12) |
 
 The credential copy is not subject to `workspace_on_success` or
 `workspace_on_failure`: it is removed under every option, `keep` included,
