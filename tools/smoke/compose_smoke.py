@@ -244,6 +244,13 @@ def register_repository() -> None:
                 "example-service",
                 "--url",
                 "https://github.com/example-org/example-service",
+                # 23: the default policy requires an external review round, and GitHub
+                # exposes the reviewer's "review all pull requests" setting nowhere, so
+                # registration records the operator's attestation instead. The smoke
+                # stack is the operator's own, so the smoke attests.
+                "--attest-external-review-all-prs",
+                "--attested-by",
+                "compose-smoke",
             ]
         )
         log("repository registered")
