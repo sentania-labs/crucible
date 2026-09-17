@@ -47,7 +47,7 @@ network:
   harness_endpoints: "from-harness"    # each adapter contributes its model endpoints (S6)
 
 routing:                               # see RoutingPolicyV1 below; this names which one applies
-  policy: { name: "default-routing", version: 2 }
+  policy: { name: "default-routing", version: 1 }   # the shipped default-software v1 names v1; see below
 
 images:
   allowlist: ["crucible-worker:*", "ghcr.io/sentania-labs/crucible-worker:*"]
@@ -216,6 +216,11 @@ direction (2026-09-16): rotate work across providers by capability, cost,
 and speed; never spend frontier models on simple work; local models carry
 routine work once they exist.
 
+`default-routing` version 2, as seeded, is the document below. Version 1
+stays beside it because a policy version references it and a version is
+immutable; version 1's ids were placeholders, version 2's are the ones the
+CLIs themselves list.
+
 ```yaml
 schema_version: "1.0"
 name: "default-routing"
@@ -224,36 +229,39 @@ tiers:                                 # task tiers Foundry assigns in the contr
   trivial:   { allowed_capability: ["small", "mid"],  prefer: ["small"] }     # frontier is refused, not merely dispreferred
   standard:  { allowed_capability: ["mid", "small"],  prefer: ["mid"] }       # a task that truly needs frontier is marked complex
   complex:   { allowed_capability: ["frontier", "mid"], prefer: ["frontier"] }
-models:
-  - { id: "claude-fable-5-1",      harness: claude_code, endpoint: subscription, capability: frontier, cost: high,  speed: medium, pool: anthropic-sub, weight: 1, enabled: true }
-  - { id: "claude-sonnet-5",       harness: claude_code, endpoint: subscription, capability: mid,      cost: medium, speed: fast,  pool: anthropic-sub, weight: 2, enabled: true }
-  - { id: "claude-haiku-4-5",      harness: claude_code, endpoint: subscription, capability: small,    cost: low,    speed: fast,  pool: anthropic-sub, weight: 3, enabled: true }
-  - { id: "gpt-6-astra",           harness: codex,       endpoint: subscription, capability: frontier, cost: high,  speed: slow,  pool: openai-sub,    weight: 1, enabled: true }
-  - { id: "gpt-5.6-sol",           harness: codex,       endpoint: subscription, capability: frontier, cost: high,  speed: medium, pool: openai-sub,    weight: 1, enabled: true }
-  - { id: "gpt-5.6-terra",         harness: codex,       endpoint: subscription, capability: mid,      cost: medium, speed: medium, pool: openai-sub,    weight: 2, enabled: true }
-  - { id: "gpt-5.6-luna",          harness: codex,       endpoint: subscription, capability: small,    cost: low,    speed: fast,  pool: openai-sub,    weight: 3, enabled: true }
-  - { id: "gemini-3.1-pro-high",   harness: agy,         endpoint: subscription, capability: frontier, cost: high,  speed: slow,  pool: google-sub,    weight: 1, enabled: true }
-  - { id: "gemini-3.8-flash-high", harness: agy,         endpoint: subscription, capability: mid,      cost: medium, speed: medium, pool: google-sub,    weight: 2, enabled: true }
-  - { id: "gemini-3.8-flash-low",  harness: agy,         endpoint: subscription, capability: small,    cost: low,    speed: fast,  pool: google-sub,    weight: 3, enabled: true }
-  - { id: "local-spark-large",     harness: codex,       endpoint: local, endpoint_url: "http://spark.example.internal:8000/v1", capability: mid,   cost: none, speed: medium, pool: local-spark, weight: 3, enabled: false }   # DGX Spark, when present
-  - { id: "local-rtx-small",       harness: codex,       endpoint: local, endpoint_url: "http://rtx.example.internal:8000/v1",   capability: small, cost: none, speed: fast,   pool: local-rtx,   weight: 3, enabled: false }   # RTX 9060 16 GB
+models:                                # every entry weight 1: rotation is least-recent until the outcomes say otherwise
+  - { id: "claude-haiku-4-5",      harness: claude_code, endpoint: subscription, capability: small,    cost: low,    speed: fast,   pool: anthropic-sub, weight: 1, enabled: true }
+  - { id: "claude-sonnet-5",       harness: claude_code, endpoint: subscription, capability: mid,      cost: medium, speed: fast,   pool: anthropic-sub, weight: 1, enabled: true }
+  - { id: "claude-fable-5-1",      harness: claude_code, endpoint: subscription, capability: frontier, cost: high,   speed: medium, pool: anthropic-sub, weight: 1, enabled: true }
+  - { id: "gpt-5.6-luna",          harness: codex,       endpoint: subscription, capability: small,    cost: low,    speed: fast,   pool: openai-sub,    weight: 1, enabled: true }
+  - { id: "gpt-5.6-terra",         harness: codex,       endpoint: subscription, capability: mid,      cost: medium, speed: medium, pool: openai-sub,    weight: 1, enabled: true }
+  - { id: "gpt-5.6-sol",           harness: codex,       endpoint: subscription, capability: frontier, cost: high,   speed: medium, pool: openai-sub,    weight: 1, enabled: true }
+  - { id: "gpt-6-astra",           harness: codex,       endpoint: subscription, capability: frontier, cost: high,   speed: slow,   pool: openai-sub,    weight: 1, enabled: true }
+  - { id: "gemini-3.8-flash-low",  harness: agy,         endpoint: subscription, capability: small,    cost: low,    speed: fast,   pool: google-sub,    weight: 1, enabled: true }
+  - { id: "gemini-3.8-flash-high", harness: agy,         endpoint: subscription, capability: mid,      cost: medium, speed: medium, pool: google-sub,    weight: 1, enabled: true }
+  - { id: "gemini-3.1-pro-high",   harness: agy,         endpoint: subscription, capability: frontier, cost: high,   speed: slow,   pool: google-sub,    weight: 1, enabled: true }
 pools:                                 # budget_units is one of attempts | tokens_out | cost_units, all recorded in AttemptMetrics
   anthropic-sub: { window: "5h", budget_units: "tokens_out", soft_limit: 0 }   # 0 means observe only until measured
   openai-sub:    { window: "5h", budget_units: "tokens_out", soft_limit: 0 }
-  google-sub:    { window: "24h", budget_units: "tokens_out", soft_limit: 0 }
-  local-spark:   { window: "1h", budget_units: "attempts", soft_limit: 0 }
-  local-rtx:     { window: "1h", budget_units: "attempts", soft_limit: 0 }
+  google-sub:    { window: "5h", budget_units: "attempts", soft_limit: 0 }
 rotation:
   strategy: "weighted-least-recent"    # among models allowed for the tier, prefer the preferred capability, then the least recently used, weighted
   quality_feedback: true               # a model whose last N attempts on this project ended in gate failures or corrections drops one preference step
-  quality_window: 10
+  quality_window: 20
 ```
 
-Model ids are what the harness accepts. Version 1's ids were placeholders;
-a policy version already references it and a version is immutable, so
-version 2 is seeded beside it with ids read from the CLIs themselves and a
-deployment names version 2. The Codex pool is exactly the operator's roster
-decision: `gpt-5.6-luna` small, `gpt-5.6-terra` mid, `gpt-5.6-sol` and
+Version 2 carries subscription entries only. Local model entries, which
+carry `endpoint: local` and an `endpoint_url` on the DGX Spark and the RTX
+9060, join a later version with their own pools once S13 has run; the rules
+for them below already hold.
+
+Model ids are what the harness accepts. Which routing version a deployment
+uses is the policy's own choice, and today's shipped `default-software`
+version 1 names `default-routing` version 1. A `default-software` version 2
+naming `default-routing` version 2 is the pending step (C5b), once the
+operator settles the cost classes; until it is uploaded, version 2 is seeded
+and available but not in force. The Codex pool in version 2 is exactly the
+operator's roster decision: `gpt-5.6-luna` small, `gpt-5.6-terra` mid, `gpt-5.6-sol` and
 `gpt-6-astra` frontier. Nothing older and no mini; `gpt-5.5` is a recorded
 fallback outside the pool. The ids come from the CLI's own listing, the cost
 and speed classes are Foundry's tiering. AGY carries its effort inside the

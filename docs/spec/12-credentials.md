@@ -85,8 +85,9 @@ own session. No commercial API keys.
 
 `rw-narrow` means: a per-attempt copy holding **only the named auth files**
 of that harness (the adapter's `credential_spec` lists them), owned by the
-worker's uid and mode 600, mounted writable at the paths the harness
-expects. The requirement is the copy's properties, not its mechanism: only
+worker's uid, mounted writable at the paths the harness expects. The copy's
+directory is mode 0700 and each auth file inside it is mode 0600, so on the
+host the whole copy belongs to a subordinate uid no other user can read. The requirement is the copy's properties, not its mechanism: only
 the named files, readable by no other user, never shared between attempts,
 and removed as soon as the sync-back is done. The Docker provider makes it a
 per-attempt directory in the attempt's workspace rather than a named volume,

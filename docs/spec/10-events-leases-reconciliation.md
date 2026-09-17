@@ -4,7 +4,9 @@
 
 Append-only table `events` with a global monotonic `seq` (BIGSERIAL), `ts`,
 `kind`, `task_id`, `execution_id`, `attempt_id`, `principal` (who caused it:
-`crucible`, an API principal, `github`, or `worker:<attempt>`), `payload`
+`crucible`, an API principal, `github`, or the literal `worker`, whose
+attempt is the row's own `attempt_id` rather than part of the principal
+string), `payload`
 (JSONB, schema per kind), and `verified` (false for anything a worker
 asserted). `github` is the principal for **webhook ingress only**: the
 events recording that a delivery was received, that its event was outside
