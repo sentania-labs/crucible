@@ -29,9 +29,11 @@ from crucible.application.admin.context import (
     AdminContext,
     admin_event,
     guard_mutation,
+    record_refusal,
 )
 from crucible.application.admin.credentials import (
     RETIRED_MARK,
+    CredentialAdminError,
     check_shape,
     source_for,
     spec_for,
@@ -318,12 +320,17 @@ class LoginRegistry:
     def get(self, harness: str) -> LoginSession | None:
         return self._sessions.get(harness)
 
-    def start(self, ctx: AdminContext, harness: str, directory: str) -> LoginSession:
+    def resolve(self, ctx: AdminContext, harness: str) -> tuple[str, ...]:
+        """Every refusal `start` can raise, raised before anything on disk has moved.
+
+        The caller retires the credential that is at the configured path, so a refusal
+        that only surfaced inside `start` left the credential renamed aside with no login
+        running and the retention sweep free to shred it."""
         existing = self._sessions.get(harness)
         if existing is not None and existing.state not in ("finished", "failed"):
             raise ConflictError(f"a login for {harness} is already in progress")
         flow = FLOWS[harness]
-        argv = ctx.login_commands.get(harness) or flow.argv
+        argv = tuple(ctx.login_commands.get(harness) or flow.argv)
         if shutil.which(argv[0]) is None and not Path(argv[0]).exists():
             # The login drives the harness's own CLI, and only the worker images carry
             # the three; the Crucible service image carries none (13). Refusing here is
@@ -333,6 +340,11 @@ class LoginRegistry:
                 "run here; run `crucible-admin credentials login` in local mode on a host "
                 f"that has {argv[0]}"
             )
+        return argv
+
+    def start(self, ctx: AdminContext, harness: str, directory: str) -> LoginSession:
+        self.resolve(ctx, harness)
+        flow = FLOWS[harness]
         session = LoginSession(harness=harness, started_at=time.time())
         self._sessions[harness] = session
         thread = threading.Thread(
@@ -380,7 +392,14 @@ def start_login(
 
     A login writes into the configured directory, so an existing credential that still
     passes the shape check is not overwritten silently: `replace` retires it the way
-    rotate does (renamed aside, shredded by the retention sweep) before the CLI runs."""
+    rotate does (renamed aside, shredded by the retention sweep) before the CLI runs.
+
+    Nothing on disk moves until every precondition that can refuse has been checked, and
+    a start that fails after the retire puts the credential back at its configured path.
+    The harness CLI is absent from the service image (13), so the executable check alone
+    used to rename a valid credential aside and then refuse, leaving the harness with no
+    credential at its configured path and the retained copy eligible for the retention
+    sweep."""
     reason = guard_mutation(
         ctx, uow, reason, principal=principal, operation=f"credentials login {harness}"
     )
@@ -389,10 +408,35 @@ def start_login(
     spec = spec_for(ctx, harness)
     source = source_for(ctx, harness)
     flow = FLOWS[harness]
-    retired = _retire_existing(
-        ctx, uow, spec, source, principal=principal, harness=harness, reason=reason, replace=replace
+    # Every refusal first: the harness is known, the credential spec and directory are
+    # configured, the CLI exists, no login is already running, the directory can be
+    # written, and `replace` is set when a credential is there to be replaced.
+    registry.resolve(ctx, harness)
+    _check_writable(source, harness=harness)
+    replaceable = _check_replaceable(spec, source, harness=harness, replace=replace)
+    retired = (
+        _retire_existing(ctx, uow, source, principal=principal, harness=harness, reason=reason)
+        if replaceable
+        else None
     )
-    session = registry.start(ctx, harness, source.path)
+    try:
+        session = registry.start(ctx, harness, source.path)
+    except Exception as exc:
+        if retired is None:
+            raise
+        _restore_retired(
+            ctx,
+            source,
+            retired,
+            principal=principal,
+            harness=harness,
+            detail=f"{type(exc).__name__}: {exc}",
+        )
+        raise CredentialAdminError(
+            f"the {harness} login could not start ({type(exc).__name__}) after the "
+            "existing credential had been retired, so it was put back at its configured "
+            f"path: {exc}"
+        ) from exc
     admin_event(
         uow,
         ctx,
@@ -414,29 +458,58 @@ def start_login(
     }
 
 
-def _retire_existing(
-    ctx: AdminContext,
-    uow: UnitOfWork,
-    spec: Any,
-    source: Any,
-    *,
-    principal: str,
-    harness: str,
-    reason: str,
-    replace: bool,
-) -> str | None:
-    """Refuse to overwrite a credential that still passes the shape check; with
-    `replace`, move it aside under rotate's retained name so the retention sweep shreds
-    it on its own schedule. Nothing is shredded here and nothing is read."""
+def _check_writable(source: Any, *, harness: str) -> None:
+    """The login creates the directory and the retire renames it, both inside the
+    parent. A parent that cannot be written is a refusal, and it is one that has to be
+    raised before the retire rather than discovered by it."""
+    current = Path(source.path)
+    parent = current.parent
+    if not parent.is_dir():
+        raise CredentialAdminError(
+            f"the credential root {parent} for harness {harness!r} does not exist, so the "
+            f"login has nowhere to write (credentials.{harness}.path)"
+        )
+    if not os.access(parent, os.W_OK | os.X_OK):
+        raise CredentialAdminError(
+            f"the credential root {parent} for harness {harness!r} is not writable by the "
+            "Crucible service user, so the login cannot create or retire the directory"
+        )
+    if current.is_dir() and not os.access(current, os.W_OK | os.X_OK):
+        raise CredentialAdminError(
+            f"the {harness} credential directory {current} is not writable by the "
+            "Crucible service user, so the login cannot write into it"
+        )
+
+
+def _check_replaceable(spec: Any, source: Any, *, harness: str, replace: bool) -> bool:
+    """Whether a credential that still passes the shape check is at the configured path,
+    and therefore has to be retired before the login writes over it. Refuses when one is
+    there and `replace` was not given. Reads nothing and moves nothing."""
     current = Path(source.path)
     if not current.is_dir() or not check_shape(spec, source.path).ok:
-        return None
+        return False
     if not replace:
         raise ConflictError(
             f"the {harness} credential already passes the shape check; a login would "
             "overwrite it. Pass replace to retain and replace it, or use rotate to swap "
             "in a prepared directory"
         )
+    return True
+
+
+def _retire_existing(
+    ctx: AdminContext,
+    uow: UnitOfWork,
+    source: Any,
+    *,
+    principal: str,
+    harness: str,
+    reason: str,
+) -> str | None:
+    """Move the existing credential aside under rotate's retained name so the retention
+    sweep shreds it on its own schedule. Nothing is shredded here and nothing is read.
+    Every refusal has already been raised by the time this runs."""
+    current = Path(source.path)
     stamp = ctx.clock.now().strftime("%Y%m%dT%H%M%SZ")
     retired = current.with_name(current.name + RETIRED_MARK + stamp)
     os.rename(current, retired)
@@ -453,6 +526,50 @@ def _retire_existing(
         retention_hours=ctx.credential_retention_hours,
     )
     return retired.name
+
+
+def _restore_retired(
+    ctx: AdminContext,
+    source: Any,
+    retired_name: str,
+    *,
+    principal: str,
+    harness: str,
+    detail: str,
+) -> None:
+    """The start failed after the credential had been moved aside, so put it back at the
+    configured path: a credential is never left off its path because a later step failed.
+
+    The caller's transaction rolls back with the exception and takes the retire event with
+    it, but a rename does not roll back, so the undo is here and the failure is recorded
+    through a unit of work of its own, the way a failed rotate records its own."""
+    current = Path(source.path)
+    retired = current.with_name(retired_name)
+    restored = False
+    try:
+        if retired.is_dir():
+            if current.is_dir() and not any(current.iterdir()):
+                # Nothing has been written into it yet; the login never ran.
+                current.rmdir()
+            if not current.exists():
+                os.rename(retired, current)
+                restored = True
+    except OSError as exc:
+        detail = f"{detail}; the credential could not be put back: {type(exc).__name__}"
+    record_refusal(
+        ctx,
+        principal=principal,
+        operation=f"credentials login {harness}",
+        detail=(
+            f"the login failed to start after the credential was retired ({detail}); "
+            + (
+                f"{retired_name} was renamed back to the configured path"
+                if restored
+                else f"{retired_name} is still retired and the configured path is not "
+                "the credential"
+            )
+        ),
+    )
 
 
 def login_status(registry: LoginRegistry, harness: str) -> dict[str, Any]:
