@@ -167,11 +167,14 @@ Polling is the complete observation path; webhooks only shorten latency.
   to `head_diverged` (09). The previous head's acceptance, review report,
   and gate results are marked superseded and kept as history. Nothing
   about the new SHA is trusted: CI on it is observed and recorded but
-  cannot move the task. Foundry decides `recollect` (Crucible fetches the
-  new head into a fresh collector, produces a bundle, and the task
-  re-enters `reported` for the full pre-PR path, internal review as the
-  policy and Foundry decide, acceptance, and `publishing`, which verifies
-  the remote already matches) or `reject`.
+  cannot move the task. Foundry decides `recollect` (the task re-enters
+  `scheduled` with a `correct` execution against the remote `work_branch`,
+  which is where the divergent head is, so the new head produces a
+  completion claim and a bundle of its own; then the full pre-PR path,
+  internal review as the policy and Foundry decide, acceptance, and
+  `publishing`, which verifies the remote already matches) or `reject`.
+  Re-entering at `reported` would put the new head in front of gates with
+  no claim behind it (09).
 
 Foundry is not required to remain connected for any of this.
 
@@ -269,8 +272,11 @@ cycle opens on that head.
 
 ## External review (bounded input, not a loop)
 
-- A round is one completed cycle, opened by a signal from a login in
-  `external_review.reviewer_logins` whose kind is in
+- A round is one completed cycle. **A signal never opens a cycle**: the
+  cycle row is created at publication of a head, or when a retrigger is
+  recorded, with the components the policy expects. Signals complete the
+  components of a cycle that is already open. A signal counts only from a
+  login in `external_review.reviewer_logins` and only when its kind is in
   `external_review.accepted_signals`: by default a submitted review or a
   `+1` reaction on the PR (the configured reviewer's "no findings"
   signal), with a comment accepted only where a repository opts in (05b).
@@ -303,9 +309,12 @@ cycle opens on that head.
   default policy (one round, no retrigger after correction, no
   requirement on the final SHA) a correction never causes a second round.
   Other repositories may set `required_rounds`,
-  `retrigger_after_correction` (Crucible posts the provider's trigger
-  comment after each corrected head), and `require_review_on_final_sha`
-  (the last accepted signal must name the accepted head) differently.
+  `retrigger_after_correction` (on each corrected head Crucible opens a new
+  cycle and wakes the orchestrator with reason
+  `external_review_trigger_needed`; the orchestrator posts the trigger
+  under the operator's account, because Crucible never posts it), and
+  `require_review_on_final_sha` (the last accepted signal must name the
+  accepted head) differently.
 - Nothing received is overdue silently: `wait_timeout_hours` produces a
   repeat wake. **The clock starts when the task entered the state it is
   waiting in**, read from that transition's own event, not when the PR was
