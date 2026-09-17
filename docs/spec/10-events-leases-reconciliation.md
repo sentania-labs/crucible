@@ -21,8 +21,18 @@ unauthenticated caller chose is stored. Every outward-facing GitHub action
 is two events: `github_call_started` and `github_call_completed` or
 `github_call_failed`, with the endpoint, repository, and response class,
 never a token.
-Kinds are an enum; adding one is a migration. Events are never updated or
-deleted. Retention: forever in v0.x (volume is small); archival to object
+Kinds are an enum; adding one is a migration. The harness kinds are
+`harness_refused` (a launch refused for an unknown, disabled, unsupported
+or credential-less harness, which is terminal for the attempt and not
+retried), `harness_launch_deferred` (the per-harness cap held the launch
+back, which is a wait rather than a failure), `harness_enabled` and
+`harness_disabled` (the administrator's flag, from the admin surface, 25),
+`credential_synced` (an auth file written back to the source, or the reason
+it was not), `worker_progress` (a parsed progress line, principal `worker`
+and `verified` false, capped per 07), and `report_parse_failed` (a
+`report.yaml` that exists and does not parse, with the parser's errors and
+`report_present` true, which is distinct from no report at all). Events are
+never updated or deleted. Retention: forever in v0.x (volume is small); archival to object
 storage is a later policy.
 
 The API exposes events per task and a global feed with cursor. Log lines
