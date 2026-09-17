@@ -1,0 +1,14 @@
+# Developer mode (13): the proxies published on loopback so a Crucible process running
+# on the host can reach them. `make dev` applies this on top of compose.yaml.
+#
+# S9 records the exposure this creates and it is deliberate: while the socket proxy is
+# published, any local user who can reach 127.0.0.1:23750 can create containers on the
+# daemon it fronts. Normal mode publishes nothing.
+services:
+  docker-socket-proxy:
+    ports:
+      - "127.0.0.1:${CRUCIBLE_DOCKER_PROXY_PORT:-23750}:2375"
+
+  egress-proxy:
+    ports:
+      - "127.0.0.1:${CRUCIBLE_EGRESS_PROXY_PORT:-23128}:3128"

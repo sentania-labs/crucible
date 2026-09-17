@@ -59,6 +59,8 @@ from crucible.domain.entities import (
     EvidenceRecord,
     Execution,
     ExecutionRole,
+    LogChunkRecord,
+    RetentionAction,
     Task,
 )
 from crucible.domain.events import PRINCIPAL_CRUCIBLE, EventKind
@@ -77,10 +79,13 @@ from crucible.logs import log_context
 from crucible.ports.artifacts import ArtifactStore
 from crucible.ports.clock import Clock
 from crucible.ports.execution import (
+    CleanupPolicy,
     CollectedOutputs,
     ExecutionProvider,
     Handle,
     LaunchSpec,
+    LogChunk,
+    LogOffset,
     ObservationState,
     ProviderError,
     Workspace,
@@ -93,6 +98,12 @@ T = TypeVar("T")
 
 TERMINATION_TIMEOUT = "timeout"
 TERMINATION_CANCEL = "cancel"
+
+# 16 defaults, used when the policy names none.
+DEFAULT_LOG_RETENTION_DAYS = 90
+DEFAULT_WORKSPACE_RETENTION_DAYS = 14
+DEFAULT_WAKE_RETENTION_DAYS = 30
+RETENTION_BATCH = 200
 
 
 class LeaseLostError(Exception):
@@ -123,6 +134,7 @@ class _Pending:
     execution: Execution
     task: Task
     contract: dict[str, Any]
+    repository_url: str = ""
 
 
 class Supervisor:
@@ -137,6 +149,7 @@ class Supervisor:
         wake_deliverer: WakeDeliverer | None = None,
         lease_ttl_seconds: int = 30,
         attempt_lease_ttl_seconds: int = 60,
+        checkout_lease_ttl_seconds: int = 21600,
         grace_seconds: int = 60,
     ) -> None:
         self._uow_factory = uow_factory
@@ -147,6 +160,9 @@ class Supervisor:
         self.holder = holder
         self.lease_ttl_seconds = lease_ttl_seconds
         self.attempt_lease_ttl_seconds = attempt_lease_ttl_seconds
+        # Held for the life of the attempt (10); the TTL only bounds a lease whose
+        # attempt died without a supervisor to release it.
+        self.checkout_lease_ttl_seconds = checkout_lease_ttl_seconds
         self.grace_seconds = grace_seconds
         self.fenced_token: int | None = None
         self._handles: dict[str, Handle] = {}
@@ -221,6 +237,8 @@ class Supervisor:
                 checkout_path=f"{root}/repo",
                 identity_path=f"{root}/identity",
                 report_path=f"{root}/report",
+                output_path=f"{root}/output",
+                identity_sha256=attempt.identity_sha256,
             )
             self._workspaces[attempt.id] = ws
         return ws
@@ -308,6 +326,11 @@ class Supervisor:
             await self._sweep_cancellations()
             await self._db(self._materialize_evidence)
             await self._db(self._evaluate_pending_gates)
+            # After the gates, never before: 16 says nothing a gate consumed is deleted
+            # while the task still needs it, and cleanup only ever runs for an attempt
+            # that recorded logs_drained (08).
+            await self._cleanup_step()
+            await self._retention_step()
             await self._db(self._refresh_attempt_metrics)
             await self._db(self._repeat_stale_escalations)
             result.wakes_delivered = await self._deliver_wakes()
@@ -805,7 +828,16 @@ class Supervisor:
                     continue
                 stored = uow.contracts.get(task.id, execution.contract_version)
                 assert stored is not None
-                out.append(_Pending(attempt, execution, task, stored.document))
+                repository = uow.repositories.get(task.repository_id)
+                out.append(
+                    _Pending(
+                        attempt,
+                        execution,
+                        task,
+                        stored.document,
+                        repository.url if repository else "",
+                    )
+                )
         return out
 
     async def _launch_pending(self) -> int:
@@ -823,12 +855,18 @@ class Supervisor:
                     log.exception("launch step failed; continuing with the next attempt")
         return launched
 
-    async def _launch_one(self, item: _Pending) -> bool:
-        attempt, execution, task = item.attempt, item.execution, item.task
+    def _build_spec(
+        self,
+        attempt: Attempt,
+        execution: Execution,
+        task: Task,
+        contract: dict[str, Any],
+        repository_url: str = "",
+    ) -> LaunchSpec:
         env: dict[str, str] = {}
         if execution.role is ExecutionRole.REVIEW and task.head_sha:
             env["CRUCIBLE_REVIEW_HEAD_SHA"] = task.head_sha
-        spec = LaunchSpec(
+        return LaunchSpec(
             attempt_id=attempt.id,
             task_id=task.id,
             external_id=task.external_id,
@@ -837,11 +875,48 @@ class Supervisor:
             model=execution.model,
             image=execution.image,
             timeout_seconds=execution.timeout_seconds,
-            contract=item.contract,
+            contract=contract,
             env=env,
-            network=item.contract.get("constraints", {}).get("network", "policy"),
+            network=contract.get("constraints", {}).get("network", "policy"),
+            policy=execution.policy_snapshot or {},
+            owner=task.principal_id,
+            repository_url=repository_url,
         )
+
+    def _spec_for(self, attempt: Attempt) -> LaunchSpec | None:
+        """Rebuild the launch spec from the database, for a collect after a restart."""
+        with self._uow_factory() as uow:
+            execution = uow.executions.get(attempt.execution_id)
+            task = uow.tasks.get(attempt.task_id)
+            if execution is None or task is None:
+                return None
+            stored = uow.contracts.get(task.id, execution.contract_version)
+            if stored is None:
+                return None
+            repository = uow.repositories.get(task.repository_id)
+            return self._build_spec(
+                attempt, execution, task, stored.document, repository.url if repository else ""
+            )
+
+    @staticmethod
+    def checkout_key(contract: dict[str, Any], external_id: str, repository_url: str = "") -> str:
+        """One checkout lease per repository url and work branch (10)."""
+        repository = contract.get("repository", {})
+        url = repository_url or str(repository.get("url", "")) or str(repository.get("name", ""))
+        branch = str(repository.get("work_branch") or f"crucible/{external_id}")
+        return f"{url}#{branch}"
+
+    async def _launch_one(self, item: _Pending) -> bool:
+        attempt, execution, task = item.attempt, item.execution, item.task
+        spec = self._build_spec(attempt, execution, task, item.contract, item.repository_url)
         provider = self._provider(execution.provider)
+        key = self.checkout_key(item.contract, task.external_id, item.repository_url)
+        if execution.role is not ExecutionRole.REVIEW and not await self._db(
+            partial(self._take_checkout_lease, attempt.id, key)
+        ):
+            # A second attempt on the same repository and branch waits; it is not a
+            # failure, and nothing of the holder's checkout is disturbed (10).
+            return False
         if not await self._db(partial(self._mark_preparing, attempt.id)):
             return False
         try:
@@ -851,6 +926,7 @@ class Supervisor:
             await self._db(partial(self._environment_failure, attempt.id, "prepare", detail))
             return False
         self._workspaces[attempt.id] = ws
+        await self._db(partial(self._record_prepared, attempt.id, ws))
         if not await self._db(partial(self._mark_launching, attempt.id, ws)):
             return False
         try:
@@ -965,6 +1041,7 @@ class Supervisor:
                 payload={"pool": reservation.pool, "detail": reservation.detail},
             )
             attempt.workspace_path = ws.checkout_path.removesuffix("/repo")
+            attempt.identity_sha256 = ws.identity_sha256 or attempt.identity_sha256
             move_attempt(
                 uow,
                 self._clock,
@@ -1001,6 +1078,19 @@ class Supervisor:
             execution = uow.executions.get(attempt.execution_id)
             assert execution is not None
             now = self._clock.now()
+            if handle.image_digest and attempt.image_digest != handle.image_digest:
+                # 13: every attempt records the image digest it ran, resolved at launch.
+                attempt.image_digest = handle.image_digest
+                record_event(
+                    uow,
+                    self._clock,
+                    EventKind.IMAGE_RESOLVED,
+                    principal=PRINCIPAL_CRUCIBLE,
+                    task_id=attempt.task_id,
+                    execution_id=attempt.execution_id,
+                    attempt_id=attempt.id,
+                    payload={"image": execution.image, "digest": handle.image_digest},
+                )
             attempt.handle = handle.ref
             attempt.started_at = now
             attempt.timeout_at = now + timedelta(seconds=execution.timeout_seconds)
@@ -1057,6 +1147,332 @@ class Supervisor:
             parse_errors=[],
         )
         self._record_wall_time(uow, attempt)
+
+    # ----- checkout lease, workspace, logs, cleanup, retention -------------
+
+    def _take_checkout_lease(self, attempt_id: str, key: str) -> bool:
+        """One attempt at a time per repository and work branch (10). The holder is the
+        attempt, so a takeover by another supervisor does not hand the checkout over."""
+        with self._fenced() as uow:
+            attempt = uow.attempts.get(attempt_id)
+            assert attempt is not None and self.fenced_token is not None
+            lease = uow.leases.acquire_checkout_lease(
+                key,
+                attempt_id,
+                self.fenced_token,
+                self._clock.now(),
+                self.checkout_lease_ttl_seconds,
+            )
+            if lease is None:
+                held = uow.leases.get_checkout_lease(key)
+                existing = held.holder if held else "unknown"
+                last = uow.events.latest_for_task_kind(
+                    attempt.task_id, EventKind.CHECKOUT_LEASE_DENIED
+                )
+                if last is None or last.payload.get("attempt_id") != attempt_id:
+                    record_event(
+                        uow,
+                        self._clock,
+                        EventKind.CHECKOUT_LEASE_DENIED,
+                        principal=PRINCIPAL_CRUCIBLE,
+                        task_id=attempt.task_id,
+                        execution_id=attempt.execution_id,
+                        attempt_id=attempt_id,
+                        payload={"key": key, "held_by": existing, "attempt_id": attempt_id},
+                    )
+                uow.commit()
+                return False
+            record_event(
+                uow,
+                self._clock,
+                EventKind.CHECKOUT_LEASE_TAKEN,
+                principal=PRINCIPAL_CRUCIBLE,
+                task_id=attempt.task_id,
+                execution_id=attempt.execution_id,
+                attempt_id=attempt_id,
+                payload={"key": key},
+            )
+            uow.commit()
+            return True
+
+    def _release_checkout_leases(self, uow: UnitOfWork, attempt: Attempt) -> None:
+        for lease in uow.leases.list_checkout_leases():
+            if lease.holder != attempt.id:
+                continue
+            if uow.leases.release_checkout_lease(lease.key, attempt.id):
+                record_event(
+                    uow,
+                    self._clock,
+                    EventKind.CHECKOUT_LEASE_RELEASED,
+                    principal=PRINCIPAL_CRUCIBLE,
+                    task_id=attempt.task_id,
+                    execution_id=attempt.execution_id,
+                    attempt_id=attempt.id,
+                    payload={"key": lease.key},
+                )
+
+    def _record_prepared(self, attempt_id: str, ws: Workspace) -> None:
+        """08 wants it recorded as an event which branch the checkout started from."""
+        with self._fenced() as uow:
+            attempt = uow.attempts.get(attempt_id)
+            assert attempt is not None
+            record_event(
+                uow,
+                self._clock,
+                EventKind.WORKSPACE_PREPARED,
+                principal=PRINCIPAL_CRUCIBLE,
+                task_id=attempt.task_id,
+                execution_id=attempt.execution_id,
+                attempt_id=attempt_id,
+                payload={
+                    "work_branch": ws.work_branch,
+                    "started_from": ws.started_from,
+                    "identity_sha256": ws.identity_sha256,
+                },
+            )
+            uow.commit()
+
+    async def _pull_logs(
+        self, attempt: Attempt, provider: ExecutionProvider, handle: Handle
+    ) -> int:
+        """One log pull, appended and the resume position advanced (10)."""
+        offset = LogOffset(
+            timestamp=attempt.log_resume_ts.isoformat() if attempt.log_resume_ts else None,
+            line_sha256=attempt.log_resume_sha256,
+            occurrence=attempt.log_resume_occurrence,
+        )
+        try:
+            chunks = await provider.logs(handle, offset)
+        except ProviderError as exc:
+            log.warning("log pull failed (%s); the next tick tries again", exc)
+            return 0
+        if not chunks:
+            return 0
+        return int(await self._db(partial(self._store_logs, attempt.id, tuple(chunks))))
+
+    def _store_logs(self, attempt_id: str, chunks: tuple[LogChunk, ...]) -> int:
+        with self._fenced() as uow:
+            attempt = uow.attempts.get(attempt_id, for_update=True)
+            if attempt is None:
+                return 0
+            offset = uow.logs.last_offset(attempt_id)
+            stored = 0
+            for chunk in chunks:
+                if not chunk.content:
+                    continue
+                end = offset + len(chunk.content)
+                uow.logs.append(
+                    LogChunkRecord(
+                        id=None,
+                        attempt_id=attempt_id,
+                        stream=chunk.stream,
+                        offset_start=offset,
+                        offset_end=end,
+                        ts=chunk.ts or self._clock.now(),
+                        line_sha256=chunk.line_sha256 or "",
+                        occurrence=chunk.occurrence,
+                        content=chunk.content,
+                    )
+                )
+                offset = end
+                stored += 1
+                if chunk.ts is not None and chunk.line_sha256:
+                    attempt.log_resume_ts = chunk.ts
+                    attempt.log_resume_sha256 = chunk.line_sha256
+                    attempt.log_resume_occurrence = chunk.occurrence
+            if stored:
+                uow.attempts.save(attempt)
+            uow.commit()
+            return stored
+
+    def _mark_logs_drained(self, attempt_id: str) -> None:
+        """The final pull after exit. Cleanup never runs before this (08, 10)."""
+        with self._fenced() as uow:
+            attempt = uow.attempts.get(attempt_id, for_update=True)
+            if attempt is None or attempt.logs_drained_at is not None:
+                return
+            attempt.logs_drained_at = self._clock.now()
+            uow.attempts.save(attempt)
+            record_event(
+                uow,
+                self._clock,
+                EventKind.ATTEMPT_LOGS_DRAINED,
+                principal=PRINCIPAL_CRUCIBLE,
+                task_id=attempt.task_id,
+                execution_id=attempt.execution_id,
+                attempt_id=attempt_id,
+                payload={"chunks": len(uow.logs.list_for_attempt(attempt_id, limit=10_000))},
+            )
+            uow.commit()
+
+    def _list_cleanup_due(self) -> list[tuple[Attempt, str, str]]:
+        """Attempts whose logs are drained, that are done, and that are not cleaned."""
+        out: list[tuple[Attempt, str, str]] = []
+        with self._uow_factory() as uow:
+            states = [
+                AttemptState.COLLECTED,
+                AttemptState.SUCCEEDED,
+                AttemptState.BLOCKED,
+                AttemptState.FAILED,
+            ]
+            for attempt in uow.attempts.list_in_states(states):
+                if attempt.logs_drained_at is None or attempt.cleaned_up_at is not None:
+                    continue
+                execution = uow.executions.get(attempt.execution_id)
+                if execution is None:
+                    continue
+                cleanup = (execution.policy_snapshot or {}).get("cleanup", {})
+                succeeded = attempt.state is AttemptState.SUCCEEDED
+                choice = str(
+                    cleanup.get("workspace_on_success" if succeeded else "workspace_on_failure")
+                    or ("keep_diff_only" if succeeded else "keep")
+                )
+                out.append((attempt, execution.provider, choice))
+        return out
+
+    async def _cleanup_step(self) -> int:
+        """08: remove the container, keep or delete the workspace per policy, release
+        the checkout lease, and record it. Only ever after `logs_drained`."""
+        cleaned = 0
+        for attempt, provider_name, choice in await self._db(self._list_cleanup_due):
+            try:
+                provider = self._provider(provider_name)
+            except ProviderError:
+                continue
+            policy = {
+                "delete": CleanupPolicy.DELETE,
+                "keep": CleanupPolicy.KEEP,
+                "keep_diff_only": CleanupPolicy.KEEP_DIFF_ONLY,
+            }.get(choice, CleanupPolicy.KEEP)
+            try:
+                spec = await self._db(partial(self._spec_for, attempt))
+                await provider.cleanup(self._workspace_for(attempt), policy, spec)
+            except ProviderError:
+                log.exception("cleanup failed; the next tick tries again")
+                continue
+            await self._db(partial(self._mark_cleaned, attempt.id, choice))
+            self._workspaces.pop(attempt.id, None)
+            self._handles.pop(attempt.id, None)
+            cleaned += 1
+        return cleaned
+
+    def _mark_cleaned(self, attempt_id: str, choice: str) -> None:
+        with self._fenced() as uow:
+            attempt = uow.attempts.get(attempt_id, for_update=True)
+            if attempt is None or attempt.cleaned_up_at is not None:
+                return
+            attempt.cleaned_up_at = self._clock.now()
+            uow.attempts.save(attempt)
+            self._release_checkout_leases(uow, attempt)
+            record_event(
+                uow,
+                self._clock,
+                EventKind.ATTEMPT_CLEANED_UP,
+                principal=PRINCIPAL_CRUCIBLE,
+                task_id=attempt.task_id,
+                execution_id=attempt.execution_id,
+                attempt_id=attempt_id,
+                payload={"workspace": choice},
+            )
+            uow.commit()
+
+    async def _retention_step(self) -> int:
+        """16: deterministic, idempotent, and every deletion an event and a row."""
+        applied = await self._db(self._retention_sweep)
+        keep = await self._db(self._live_attempt_ids)
+        for provider in self._providers.values():
+            try:
+                applied += await provider.retention(keep)
+            except ProviderError:
+                log.warning("provider retention failed; the next tick tries again")
+        return applied
+
+    def _live_attempt_ids(self) -> list[str]:
+        with self._uow_factory() as uow:
+            return [
+                attempt.id
+                for attempt in uow.attempts.list_in_states(
+                    [
+                        AttemptState.PENDING,
+                        AttemptState.PREPARING,
+                        AttemptState.LAUNCHING,
+                        AttemptState.RUNNING,
+                        AttemptState.TERMINATING,
+                        AttemptState.EXITED,
+                        AttemptState.COLLECTED,
+                    ]
+                )
+            ]
+
+    def _retention_for(self, uow: UnitOfWork, task: Task | None) -> tuple[dict[str, Any], str, int]:
+        """The retention section of the policy that governs this task, and its version.
+
+        Every deletion names the policy version that authorized it (16), so the window
+        comes from the task's own policy, never from a global default."""
+        if task is None:
+            return {}, "unknown", 0
+        policy = uow.policies.get(task.policy_name, task.policy_version)
+        section = dict((policy.document if policy else {}).get("retention", {}))
+        return section, task.policy_name, task.policy_version
+
+    def _retention_sweep(self) -> int:
+        with self._fenced() as uow:
+            now = self._clock.now()
+            applied = 0
+
+            def act(
+                kind: str, subject: str, name: str, version: int, detail: dict[str, Any]
+            ) -> bool:
+                row = uow.retention.record(
+                    RetentionAction(
+                        id=new_id(),
+                        kind=kind,
+                        subject=subject,
+                        policy_name=name,
+                        policy_version=version,
+                        acted_at=now,
+                        detail=detail,
+                    )
+                )
+                if row is None:
+                    return False
+                record_event(
+                    uow,
+                    self._clock,
+                    EventKind.RETENTION_APPLIED,
+                    principal=PRINCIPAL_CRUCIBLE,
+                    payload={"kind": kind, "subject": subject, **detail},
+                )
+                return True
+
+            for attempt_id in uow.logs.attempts_with_logs_before(now, RETENTION_BATCH):
+                attempt = uow.attempts.get(attempt_id)
+                if attempt is None:
+                    continue
+                task = uow.tasks.get(attempt.task_id)
+                section, name, version = self._retention_for(uow, task)
+                days = int(section.get("logs_and_transcripts_days") or DEFAULT_LOG_RETENTION_DAYS)
+                newest = uow.logs.attempts_with_logs_before(
+                    now - timedelta(days=days), RETENTION_BATCH
+                )
+                if attempt_id not in newest:
+                    continue
+                removed = uow.logs.delete_for_attempts([attempt_id])
+                if act("logs", attempt_id, name, version, {"chunks": removed, "days": days}):
+                    applied += 1
+
+            floor = now - timedelta(days=1)
+            for wake in uow.wakes.list_acked_before(floor, RETENTION_BATCH):
+                task = uow.tasks.get(wake.task_id) if wake.task_id else None
+                section, name, version = self._retention_for(uow, task)
+                days = int(section.get("wakes_after_ack_days") or DEFAULT_WAKE_RETENTION_DAYS)
+                if wake.acked_at is None or wake.acked_at > now - timedelta(days=days):
+                    continue
+                uow.wakes.delete(wake.id)
+                if act("wake", wake.id, name, version, {"days": days}):
+                    applied += 1
+            uow.commit()
+            return applied
 
     # ----- step: observe ---------------------------------------------------
 
@@ -1119,13 +1535,39 @@ class Supervisor:
                 await provider.terminate(handle, "drain")
                 await self._db(partial(self._record_drain, attempt.id, TERMINATION_TIMEOUT))
                 return False
+            # Log bytes advancing is a heartbeat signal (10); the pull is also what
+            # keeps the stored stream current for a live tail.
+            await self._pull_logs(attempt, provider, handle)
             await self._db(partial(self._renew_attempt_lease, attempt.id))
             return False
         if observation.state is ObservationState.LOST:
+            # Nothing more can arrive from a worker the provider cannot see.
+            await self._db(partial(self._mark_logs_drained, attempt.id))
             await self._db(partial(self._finish_lost, attempt.id, observation.detail))
             return True
-        outputs = await provider.collect(handle, self._workspace_for(attempt))
-        await self._db(partial(self._finish_exited, attempt.id, observation.exit_code, outputs))
+        # The final drain before anything is collected or cleaned up (08, 10).
+        await self._pull_logs(attempt, provider, handle)
+        await self._db(partial(self._mark_logs_drained, attempt.id))
+        spec = await self._db(partial(self._spec_for, attempt))
+        collection_error: str | None = None
+        try:
+            outputs = await provider.collect(handle, self._workspace_for(attempt), spec)
+        except ProviderError as exc:
+            # 16: a provider that failed while producing the outputs is an environment
+            # failure. The attempt still finishes, with nothing collected, so the next
+            # tick does not try the same collection again forever.
+            collection_error = str(exc)
+            outputs = CollectedOutputs(report=None, report_raw=None, blocked_md=None)
+            log.warning("collection failed (%s); the attempt fails as environment", exc)
+        await self._db(
+            partial(
+                self._finish_exited,
+                attempt.id,
+                observation.exit_code,
+                outputs,
+                collection_error,
+            )
+        )
         self._handles.pop(attempt.id, None)
         self._workspaces.pop(attempt.id, None)
         return True
@@ -1281,7 +1723,11 @@ class Supervisor:
             uow.commit()
 
     def _finish_exited(
-        self, attempt_id: str, exit_code: int | None, outputs: CollectedOutputs
+        self,
+        attempt_id: str,
+        exit_code: int | None,
+        outputs: CollectedOutputs,
+        collection_error: str | None = None,
     ) -> None:
         with self._fenced() as uow:
             attempt = uow.attempts.get(attempt_id, for_update=True)
@@ -1299,6 +1745,19 @@ class Supervisor:
                 timed_out=timed_out,
                 killed=killed,
             )
+            if collection_error is not None:
+                # Whatever the worker's own exit said, Crucible has no outputs from it.
+                attempt.exit_class = ExitClass.ENVIRONMENT
+                record_event(
+                    uow,
+                    self._clock,
+                    EventKind.COLLECTION_FAILED,
+                    principal=PRINCIPAL_CRUCIBLE,
+                    task_id=attempt.task_id,
+                    execution_id=attempt.execution_id,
+                    attempt_id=attempt.id,
+                    payload={"detail": collection_error[:1000], "exit_code": exit_code},
+                )
             move_attempt(
                 uow,
                 self._clock,
@@ -1506,6 +1965,8 @@ class Supervisor:
             self._finish_failed_review(uow, attempt, execution, task)
             return
         exit_class = attempt.exit_class or ExitClass.UNKNOWN
+        # 10: the checkout lease is released on a terminal attempt state.
+        self._release_checkout_leases(uow, attempt)
         if exit_class is ExitClass.COMPLETED and claim_ok:
             move_attempt(
                 uow, self._clock, attempt, AttemptState.SUCCEEDED, EventKind.ATTEMPT_SUCCEEDED

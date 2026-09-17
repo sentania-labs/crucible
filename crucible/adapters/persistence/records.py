@@ -547,6 +547,23 @@ class Wakes:
     def __init__(self, session: Session) -> None:
         self._s = session
 
+    def list_acked_before(self, cutoff: datetime, limit: int) -> Sequence[Wake]:
+        rows = self._s.scalars(
+            select(WakeRow)
+            .where(WakeRow.acked_at.is_not(None), WakeRow.acked_at < cutoff)
+            .order_by(WakeRow.acked_at)
+            .limit(limit)
+        ).all()
+        return [self._to_entity(row) for row in rows]
+
+    def delete(self, wake_id: str) -> bool:
+        row = self._s.get(WakeRow, wake_id)
+        if row is None:
+            return False
+        self._s.delete(row)
+        self._s.flush()
+        return True
+
     @staticmethod
     def _to_entity(row: WakeRow) -> Wake:
         return Wake(

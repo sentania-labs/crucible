@@ -143,6 +143,44 @@ class AttemptRow(Base):
     drain_deadline: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
     killed_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
     termination_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    logs_drained_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
+    log_resume_ts: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
+    log_resume_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    log_resume_occurrence: Mapped[int] = mapped_column(Integer, default=0)
+    cleaned_up_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
+
+
+class LogChunkRow(Base):
+    __tablename__ = "log_chunks"
+    __table_args__ = (
+        Index("ix_log_chunks_attempt", "attempt_id", "id"),
+        UniqueConstraint("attempt_id", "offset_start", name="uq_log_chunks_attempt_offset"),
+    )
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    attempt_id: Mapped[str] = mapped_column(ID, ForeignKey("attempts.id"))
+    stream: Mapped[str] = mapped_column(String(8))
+    offset_start: Mapped[int] = mapped_column(BigInteger)
+    offset_end: Mapped[int] = mapped_column(BigInteger)
+    ts: Mapped[datetime] = mapped_column(TZ)
+    line_sha256: Mapped[str] = mapped_column(String(64))
+    occurrence: Mapped[int] = mapped_column(Integer)
+    content: Mapped[bytes] = mapped_column(LargeBinary)
+    gzipped: Mapped[bool] = mapped_column(Boolean)
+
+
+class RetentionActionRow(Base):
+    __tablename__ = "retention_actions"
+    __table_args__ = (
+        Index("ix_retention_actions_kind", "kind", "acted_at"),
+        UniqueConstraint("kind", "subject", name="uq_retention_actions_kind_subject"),
+    )
+    id: Mapped[str] = mapped_column(ID, primary_key=True)
+    kind: Mapped[str] = mapped_column(String(48))
+    subject: Mapped[str] = mapped_column(String(255))
+    policy_name: Mapped[str] = mapped_column(String(128))
+    policy_version: Mapped[int] = mapped_column(Integer)
+    acted_at: Mapped[datetime] = mapped_column(TZ)
+    detail: Mapped[dict[str, Any]] = mapped_column(JSONB)
 
 
 class EventRow(Base):

@@ -3,12 +3,13 @@ token with SET LOCAL at the start of every transaction, never per connection (14
 
 from __future__ import annotations
 
+import gzip
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from types import TracebackType
 from typing import Any
 
-from sqlalchemy import Engine, create_engine, select, text, update
+from sqlalchemy import Engine, create_engine, delete, func, select, text, update
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -19,8 +20,10 @@ from crucible.adapters.persistence.models import (
     ExecutionRow,
     IdempotencyKeyRow,
     LeaseRow,
+    LogChunkRow,
     PrincipalRow,
     RepositoryRow,
+    RetentionActionRow,
     SupervisorStatusRow,
     TaskContractRow,
     TaskRow,
@@ -46,8 +49,10 @@ from crucible.domain.entities import (
     Execution,
     ExecutionRole,
     Lease,
+    LogChunkRecord,
     Principal,
     Repository,
+    RetentionAction,
     Role,
     SupervisorStatus,
     Task,
@@ -76,9 +81,11 @@ from crucible.ports.repository import (
     IdempotencyKeyTakenError,
     IdempotencyRepository,
     LeaseRepository,
+    LogRepository,
     PolicyRepository,
     PrincipalRepository,
     RepositoryRegistry,
+    RetentionRepository,
     ReviewReportRepository,
     RoutingPolicyRepository,
     SupervisorStatusRepository,
@@ -90,6 +97,9 @@ from crucible.ports.repository import (
 SUPERVISOR_LEASE_KIND = "supervisor"
 SUPERVISOR_LEASE_KEY = "supervisor"
 ATTEMPT_LEASE_KIND = "attempt"
+CHECKOUT_LEASE_KIND = "checkout"
+# 10: gzip a chunk above this size; the column is bytea either way.
+GZIP_THRESHOLD_BYTES = 4096
 FENCED_TOKEN_SETTING = "crucible.fenced_token"
 FENCED_TOKEN_SQLSTATE = "CRU01"
 APPEND_ONLY_SQLSTATE = "CRU02"
@@ -474,6 +484,11 @@ class Attempts:
             drain_deadline=_dt(row.drain_deadline),
             killed_at=_dt(row.killed_at),
             termination_reason=row.termination_reason,
+            logs_drained_at=_dt(row.logs_drained_at),
+            log_resume_ts=_dt(row.log_resume_ts),
+            log_resume_sha256=row.log_resume_sha256,
+            log_resume_occurrence=row.log_resume_occurrence or 0,
+            cleaned_up_at=_dt(row.cleaned_up_at),
         )
 
     def add(self, attempt: Attempt) -> None:
@@ -497,6 +512,11 @@ class Attempts:
                 drain_deadline=attempt.drain_deadline,
                 killed_at=attempt.killed_at,
                 termination_reason=attempt.termination_reason,
+                logs_drained_at=attempt.logs_drained_at,
+                log_resume_ts=attempt.log_resume_ts,
+                log_resume_sha256=attempt.log_resume_sha256,
+                log_resume_occurrence=attempt.log_resume_occurrence,
+                cleaned_up_at=attempt.cleaned_up_at,
             )
         )
         self._s.flush()
@@ -526,6 +546,11 @@ class Attempts:
                 drain_deadline=attempt.drain_deadline,
                 killed_at=attempt.killed_at,
                 termination_reason=attempt.termination_reason,
+                logs_drained_at=attempt.logs_drained_at,
+                log_resume_ts=attempt.log_resume_ts,
+                log_resume_sha256=attempt.log_resume_sha256,
+                log_resume_occurrence=attempt.log_resume_occurrence,
+                cleaned_up_at=attempt.cleaned_up_at,
             )
         )
 
@@ -736,6 +761,180 @@ class Leases:
             self._s.delete(row)
             self._s.flush()
 
+    def acquire_checkout_lease(
+        self, key: str, holder: str, fenced_token: int, now: datetime, ttl_seconds: int
+    ) -> Lease | None:
+        """The checkout lease of 10: one attempt at a time per repository and branch."""
+        row = self._s.scalar(
+            select(LeaseRow)
+            .where(LeaseRow.kind == CHECKOUT_LEASE_KIND, LeaseRow.key == key)
+            .with_for_update()
+        )
+        expires = now + timedelta(seconds=ttl_seconds)
+        if row is None:
+            row = LeaseRow(
+                id=new_id(),
+                kind=CHECKOUT_LEASE_KIND,
+                key=key,
+                holder=holder,
+                fenced_token=fenced_token,
+                expires_at=expires,
+            )
+            self._s.add(row)
+            self._s.flush()
+            return self._to_entity(row)
+        if row.holder == holder or ensure_utc(row.expires_at) <= now:
+            row.holder = holder
+            row.fenced_token = fenced_token
+            row.expires_at = expires
+            self._s.flush()
+            return self._to_entity(row)
+        return None
+
+    def get_checkout_lease(self, key: str) -> Lease | None:
+        row = self._s.scalar(
+            select(LeaseRow).where(LeaseRow.kind == CHECKOUT_LEASE_KIND, LeaseRow.key == key)
+        )
+        return self._to_entity(row) if row else None
+
+    def release_checkout_lease(self, key: str, holder: str) -> bool:
+        row = self._s.scalar(
+            select(LeaseRow)
+            .where(LeaseRow.kind == CHECKOUT_LEASE_KIND, LeaseRow.key == key)
+            .with_for_update()
+        )
+        if row is None or row.holder != holder:
+            return False
+        self._s.delete(row)
+        self._s.flush()
+        return True
+
+    def list_checkout_leases(self) -> Sequence[Lease]:
+        rows = self._s.scalars(select(LeaseRow).where(LeaseRow.kind == CHECKOUT_LEASE_KIND)).all()
+        return [self._to_entity(row) for row in rows]
+
+
+class Logs:
+    """The log stream (10). Chunks are appended, never updated; retention deletes."""
+
+    def __init__(self, session: Session) -> None:
+        self._s = session
+
+    @staticmethod
+    def _to_entity(row: LogChunkRow) -> LogChunkRecord:
+        return LogChunkRecord(
+            id=row.id,
+            attempt_id=row.attempt_id,
+            stream=row.stream,
+            offset_start=row.offset_start,
+            offset_end=row.offset_end,
+            ts=ensure_utc(row.ts),
+            line_sha256=row.line_sha256,
+            occurrence=row.occurrence,
+            content=gzip.decompress(row.content) if row.gzipped else row.content,
+            gzipped=row.gzipped,
+        )
+
+    def append(self, chunk: LogChunkRecord) -> LogChunkRecord:
+        gzipped = len(chunk.content) > GZIP_THRESHOLD_BYTES
+        row = LogChunkRow(
+            attempt_id=chunk.attempt_id,
+            stream=chunk.stream,
+            offset_start=chunk.offset_start,
+            offset_end=chunk.offset_end,
+            ts=chunk.ts,
+            line_sha256=chunk.line_sha256,
+            occurrence=chunk.occurrence,
+            content=gzip.compress(chunk.content) if gzipped else chunk.content,
+            gzipped=gzipped,
+        )
+        self._s.add(row)
+        self._s.flush()
+        chunk.id = row.id
+        chunk.gzipped = gzipped
+        return chunk
+
+    def last_offset(self, attempt_id: str) -> int:
+        value = self._s.scalar(
+            select(func.max(LogChunkRow.offset_end)).where(LogChunkRow.attempt_id == attempt_id)
+        )
+        return int(value or 0)
+
+    def list_for_attempt(
+        self, attempt_id: str, *, after_id: int = 0, limit: int = 500
+    ) -> Sequence[LogChunkRecord]:
+        rows = self._s.scalars(
+            select(LogChunkRow)
+            .where(LogChunkRow.attempt_id == attempt_id, LogChunkRow.id > after_id)
+            .order_by(LogChunkRow.id)
+            .limit(limit)
+        ).all()
+        return [self._to_entity(row) for row in rows]
+
+    def delete_for_attempts(self, attempt_ids: Sequence[str]) -> int:
+        if not attempt_ids:
+            return 0
+        rows = self._s.scalars(
+            select(LogChunkRow.id).where(LogChunkRow.attempt_id.in_(list(attempt_ids)))
+        ).all()
+        self._s.execute(delete(LogChunkRow).where(LogChunkRow.attempt_id.in_(list(attempt_ids))))
+        self._s.flush()
+        return len(rows)
+
+    def attempts_with_logs_before(self, cutoff: datetime, limit: int) -> Sequence[str]:
+        rows = self._s.execute(
+            select(LogChunkRow.attempt_id)
+            .group_by(LogChunkRow.attempt_id)
+            .having(func.max(LogChunkRow.ts) < cutoff)
+            .limit(limit)
+        ).all()
+        return [str(row[0]) for row in rows]
+
+
+class Retentions:
+    def __init__(self, session: Session) -> None:
+        self._s = session
+
+    @staticmethod
+    def _to_entity(row: RetentionActionRow) -> RetentionAction:
+        return RetentionAction(
+            id=row.id,
+            kind=row.kind,
+            subject=row.subject,
+            policy_name=row.policy_name,
+            policy_version=row.policy_version,
+            acted_at=ensure_utc(row.acted_at),
+            detail=dict(row.detail),
+        )
+
+    def record(self, action: RetentionAction) -> RetentionAction | None:
+        existing = self._s.scalar(
+            select(RetentionActionRow).where(
+                RetentionActionRow.kind == action.kind,
+                RetentionActionRow.subject == action.subject,
+            )
+        )
+        if existing is not None:
+            return None
+        row = RetentionActionRow(
+            id=action.id,
+            kind=action.kind,
+            subject=action.subject,
+            policy_name=action.policy_name,
+            policy_version=action.policy_version,
+            acted_at=action.acted_at,
+            detail=dict(action.detail),
+        )
+        self._s.add(row)
+        self._s.flush()
+        return action
+
+    def list_recent(self, limit: int) -> Sequence[RetentionAction]:
+        rows = self._s.scalars(
+            select(RetentionActionRow).order_by(RetentionActionRow.acted_at.desc()).limit(limit)
+        ).all()
+        return [self._to_entity(row) for row in rows]
+
 
 class Claims:
     def __init__(self, session: Session) -> None:
@@ -855,6 +1054,8 @@ class SqlUnitOfWork:
     events: EventRepository
     leases: LeaseRepository
     claims: ClaimRepository
+    logs: LogRepository
+    retention: RetentionRepository
     supervisor_status: SupervisorStatusRepository
     idempotency: IdempotencyRepository
     routing_policies: RoutingPolicyRepository
@@ -892,6 +1093,8 @@ class SqlUnitOfWork:
         self.events = Events(s)
         self.leases = Leases(s)
         self.claims = Claims(s)
+        self.logs = Logs(s)
+        self.retention = Retentions(s)
         self.supervisor_status = SupervisorStatuses(s)
         self.idempotency = IdempotencyKeys(s)
         self.routing_policies = RoutingPolicies(s)

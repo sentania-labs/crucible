@@ -87,12 +87,18 @@ def test_submit_shape_errors_name_the_path(client: TestClient) -> None:
     assert any(e["path"] == "surprise" for e in r.json()["errors"])
 
 
-def test_docker_provider_not_registered_in_c1(client: TestClient) -> None:
+def test_only_registered_providers_are_accepted(client: TestClient) -> None:
+    """C3 registered the Docker provider (08, 20); Kubernetes is designed, not built."""
     doc = contract_document()
-    doc["execution_request"]["provider"] = "docker"
+    doc["execution_request"]["provider"] = "kubernetes"
     r = client.post("/v1/tasks", json=doc)
     assert r.status_code == 422
     assert any("not registered" in e["message"] for e in r.json()["errors"])
+
+    doc = contract_document(external_id="EX-DOCKER")
+    doc["repository"]["work_branch"] = "crucible/EX-DOCKER"
+    doc["execution_request"]["provider"] = "docker"
+    assert client.post("/v1/tasks", json=doc).status_code == 201
 
 
 def test_protected_branch_and_pattern(client: TestClient) -> None:

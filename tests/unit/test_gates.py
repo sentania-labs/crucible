@@ -9,7 +9,6 @@ import pytest
 
 from crucible.domain.gates import (
     COLLECTOR_MARKER,
-    DEFERRED_MARKER,
     DEFERRED_TO_C3,
     PRE_PR_EVALUATORS,
     PRE_PR_GATES,
@@ -84,6 +83,22 @@ def _passing_evidence() -> list[EvidenceItem]:
             ident=6,
         ),
         _ev(
+            "verification_run",
+            {"id": "V1", "command": "make lint", "exit_code": 0, "ran": True},
+            ident=8,
+        ),
+        _ev(
+            "verification_run",
+            {"id": "V2", "command": "make test", "exit_code": 0, "ran": True},
+            ident=9,
+        ),
+        _ev(
+            "verification_run",
+            {"id": "V3", "command": "make scan", "exit_code": 0, "ran": True},
+            ident=10,
+        ),
+        _ev("workspace_state", {"checked": True, "leftover": []}, ident=11),
+        _ev(
             "review_received",
             {
                 "reviewed_head_sha": HEAD,
@@ -115,20 +130,53 @@ def test_all_pass_on_a_clean_run() -> None:
     assert blocking(outcomes) == []
     assert not waiting_for_review(outcomes)
     for gate, outcome in outcomes.items():
-        if gate in DEFERRED_TO_C3:
-            assert outcome.result is GateResult.PENDING
-            assert DEFERRED_MARKER in outcome.detail
-        else:
-            assert outcome.result is GateResult.PASS, (gate, outcome.detail)
+        assert outcome.result is GateResult.PASS, (gate, outcome.detail)
 
 
-def test_deferred_gates_are_never_pass() -> None:
-    """verification_ran and workspace_clean need the verifier container (C3, 20)."""
-    for gate in DEFERRED_TO_C3:
-        for evidence in ([], _passing_evidence()):
-            outcome = evaluate_gate(gate, _gi(list(evidence)))
-            assert outcome.result is GateResult.PENDING
-            assert DEFERRED_MARKER in outcome.detail
+def test_no_pre_pr_gate_is_deferred_any_more() -> None:
+    """C3 shipped the verifier container, so `deferred` is gone for these two (11)."""
+    assert not DEFERRED_TO_C3
+    for gate in (GateName.VERIFICATION_RAN, GateName.WORKSPACE_CLEAN):
+        assert evaluate_gate(gate, _gi(_passing_evidence())).result is GateResult.PASS
+
+
+def test_verification_ran_reads_only_cruciblees_own_rerun() -> None:
+    """11: the worker's own check logs never satisfy this gate."""
+    evidence = [e for e in _passing_evidence() if e.kind != "verification_run"]
+    assert evaluate_gate(GateName.VERIFICATION_RAN, _gi(evidence)).result is GateResult.FAIL
+    worker_claimed = [
+        *evidence,
+        EvidenceItem(
+            id=20,
+            kind="verification_run",
+            source="worker",
+            verified=False,
+            payload={"id": "V1", "exit_code": 0, "ran": True},
+        ),
+    ]
+    assert evaluate_gate(GateName.VERIFICATION_RAN, _gi(worker_claimed)).result is GateResult.FAIL
+
+
+def test_verification_ran_fails_on_a_mismatched_exit() -> None:
+    evidence = [
+        e
+        for e in _passing_evidence()
+        if not (e.kind == "verification_run" and e.payload.get("id") == "V2")
+    ]
+    evidence.append(_ev("verification_run", {"id": "V2", "exit_code": 2, "ran": True}, ident=21))
+    outcome = evaluate_gate(GateName.VERIFICATION_RAN, _gi(evidence))
+    assert outcome.result is GateResult.FAIL
+    assert "V2 exited 2" in outcome.detail
+
+
+def test_workspace_clean_fails_when_a_container_is_left_behind() -> None:
+    evidence = [e for e in _passing_evidence() if e.kind != "workspace_state"]
+    evidence.append(
+        _ev("workspace_state", {"checked": True, "leftover": ["crucible-collector-x"]}, ident=22)
+    )
+    outcome = evaluate_gate(GateName.WORKSPACE_CLEAN, _gi(evidence))
+    assert outcome.result is GateResult.FAIL
+    assert "crucible-collector-x" in outcome.detail
 
 
 def test_worker_asserted_evidence_never_satisfies_a_gate() -> None:
@@ -153,7 +201,7 @@ def test_verified_flag_alone_does_not_admit_a_worker_row() -> None:
 
 def test_missing_evidence_fails_rather_than_waits() -> None:
     """09: a failed attempt still reaches `reported`, and its gates then fail."""
-    outcomes = evaluate_pre_pr(sorted(PRE_PR_GATES - DEFERRED_TO_C3), _gi([]))
+    outcomes = evaluate_pre_pr(sorted(PRE_PR_GATES), _gi([]))
     assert GateName.EXIT_CLEAN in blocking(outcomes)
     assert GateName.COMMITS_PRESENT in blocking(outcomes)
     assert outcomes[GateName.INTERNAL_REVIEW_RECORDED].result is GateResult.PENDING
@@ -419,6 +467,22 @@ def test_internal_review_gate_ignores_the_author_and_another_head() -> None:
     author = [
         *base,
         _ev(
+            "verification_run",
+            {"id": "V1", "command": "make lint", "exit_code": 0, "ran": True},
+            ident=8,
+        ),
+        _ev(
+            "verification_run",
+            {"id": "V2", "command": "make test", "exit_code": 0, "ran": True},
+            ident=9,
+        ),
+        _ev(
+            "verification_run",
+            {"id": "V3", "command": "make scan", "exit_code": 0, "ran": True},
+            ident=10,
+        ),
+        _ev("workspace_state", {"checked": True, "leftover": []}, ident=11),
+        _ev(
             "review_received",
             {"reviewed_head_sha": HEAD, "reviewer_is_author": True, "verdict": "approve"},
             ident=7,
@@ -429,6 +493,22 @@ def test_internal_review_gate_ignores_the_author_and_another_head() -> None:
     )
     other_head = [
         *base,
+        _ev(
+            "verification_run",
+            {"id": "V1", "command": "make lint", "exit_code": 0, "ran": True},
+            ident=8,
+        ),
+        _ev(
+            "verification_run",
+            {"id": "V2", "command": "make test", "exit_code": 0, "ran": True},
+            ident=9,
+        ),
+        _ev(
+            "verification_run",
+            {"id": "V3", "command": "make scan", "exit_code": 0, "ran": True},
+            ident=10,
+        ),
+        _ev("workspace_state", {"checked": True, "leftover": []}, ident=11),
         _ev(
             "review_received",
             {"reviewed_head_sha": "b" * 40, "reviewer_is_author": False, "verdict": "approve"},

@@ -22,9 +22,11 @@ from crucible.domain.entities import (
     ExecutionRole,
     GateResultRecord,
     Lease,
+    LogChunkRecord,
     Policy,
     Principal,
     Repository,
+    RetentionAction,
     ReviewDisposition,
     ReviewReportRecord,
     RoutingPolicyRecord,
@@ -175,6 +177,44 @@ class LeaseRepository(Protocol):
 
     def release_attempt_lease(self, attempt_id: str) -> None: ...
 
+    def acquire_checkout_lease(
+        self, key: str, holder: str, fenced_token: int, now: datetime, ttl_seconds: int
+    ) -> Lease | None:
+        """One attempt at a time per repository url and work branch (10). Returns None
+        when a different, unexpired holder has it."""
+        ...
+
+    def get_checkout_lease(self, key: str) -> Lease | None: ...
+
+    def release_checkout_lease(self, key: str, holder: str) -> bool: ...
+
+    def list_checkout_leases(self) -> Sequence[Lease]: ...
+
+
+class LogRepository(Protocol):
+    def append(self, chunk: LogChunkRecord) -> LogChunkRecord: ...
+
+    def last_offset(self, attempt_id: str) -> int: ...
+
+    def list_for_attempt(
+        self, attempt_id: str, *, after_id: int = 0, limit: int = 500
+    ) -> Sequence[LogChunkRecord]: ...
+
+    def delete_for_attempts(self, attempt_ids: Sequence[str]) -> int: ...
+
+    def attempts_with_logs_before(self, cutoff: datetime, limit: int) -> Sequence[str]:
+        """Attempts whose newest stored chunk is older than the cutoff (16)."""
+        ...
+
+
+class RetentionRepository(Protocol):
+    def record(self, action: RetentionAction) -> RetentionAction | None:
+        """Write the action, or return None when this subject was already acted on:
+        retention is idempotent and running it twice changes nothing (10)."""
+        ...
+
+    def list_recent(self, limit: int) -> Sequence[RetentionAction]: ...
+
 
 class ClaimRepository(Protocol):
     def put(self, record: CompletionClaimRecord) -> None: ...
@@ -263,6 +303,13 @@ class WakeRepository(Protocol):
 
     def count_unacked(self) -> int: ...
 
+    def list_acked_before(self, cutoff: datetime, limit: int) -> Sequence[Wake]:
+        """Wakes acked before the cutoff, oldest first. The caller applies each one's
+        own policy window and records a RetentionAction per deletion (16)."""
+        ...
+
+    def delete(self, wake_id: str) -> bool: ...
+
 
 class AttemptMetricsRepository(Protocol):
     def put(self, metrics: AttemptMetrics) -> None: ...
@@ -312,6 +359,8 @@ class UnitOfWork(Protocol):
     events: EventRepository
     leases: LeaseRepository
     claims: ClaimRepository
+    logs: LogRepository
+    retention: RetentionRepository
     supervisor_status: SupervisorStatusRepository
     idempotency: IdempotencyRepository
     routing_policies: RoutingPolicyRepository

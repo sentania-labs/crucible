@@ -13,6 +13,7 @@ from pydantic import Field, field_validator, model_validator
 
 from crucible.contracts.common import StrictModel, check_major_version
 from crucible.domain.exit_class import ExitClass
+from crucible.domain.refs import ref_problem
 from crucible.domain.secrets import find_secrets
 
 
@@ -20,6 +21,10 @@ class HarnessName(StrEnum):
     CLAUDE_CODE = "claude_code"
     CODEX = "codex"
     AGY = "agy"
+    # The e2e tier's harness (18): a script implementing the adapter's launch contract,
+    # with no model and no credential. It is a real harness name because a contract has
+    # to be able to name it, and the provider path it exercises is the real one.
+    SCRIPT_HARNESS = "script-harness"
 
 
 class TaskTier(StrEnum):
@@ -41,6 +46,17 @@ class RepositoryRef(StrictModel):
     name: str = Field(min_length=1)
     base_ref: str = Field(min_length=1)
     work_branch: str = Field(min_length=1)
+
+    @field_validator("base_ref", "work_branch")
+    @classmethod
+    def _usable_ref(cls, value: str) -> str:
+        """A ref reaches a command line in the preparer, the collector and the
+        publisher. It is quoted everywhere it is used, and it is also refused here if
+        it is not a plain ref: defence in depth, not either one alone."""
+        problem = ref_problem(value)
+        if problem is not None:
+            raise ValueError(problem)
+        return value
 
 
 class Scope(StrictModel):

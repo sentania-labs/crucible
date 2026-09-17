@@ -5,6 +5,7 @@ example in examples/config/."""
 from __future__ import annotations
 
 import os
+from typing import Literal
 
 from pydantic import BaseModel, Field
 from pydantic_settings import (
@@ -39,8 +40,42 @@ class SupervisorSettings(BaseModel):
     lease_ttl_seconds: int = 30
     reconcile_interval_seconds: int = 60
     attempt_lease_ttl_seconds: int = 60
+    checkout_lease_ttl_seconds: int = 21600
     grace_seconds: int = 60
     holder: str | None = None
+
+
+class DockerSettings(BaseModel):
+    """The Docker execution provider (08, 13).
+
+    `host` is the socket proxy, never the raw socket. Under the rootless arrangement
+    (S9) the Crucible service runs as uid 1000 and the artifact root is a named volume
+    it shares with every container it creates, so `mount_kind` stays `volume`;
+    developer mode uses `bind` with the daemon-visible path of the artifact root.
+    """
+
+    enabled: bool = False
+    host: str = "tcp://docker-socket-proxy:2375"
+    api_timeout_seconds: float = 30.0
+    mount_kind: Literal["volume", "bind"] = "volume"
+    artifact_volume: str = "crucible-artifacts"
+    artifact_host_root: str | None = None
+    credential_root: str | None = None
+    credential_host_root: str | None = None
+    workers_network: str = "crucible-workers"
+    egress_proxy: str | None = "http://egress-proxy:3128"
+    # What the egress proxy is configured to permit. An attempt whose allowlist is not
+    # a subset of this is refused at launch rather than quietly running with less
+    # network than the policy promised.
+    egress_allowlist: list[str] = Field(default_factory=list)
+    no_proxy: str = "localhost,127.0.0.1"
+    collector_timeout_seconds: int = 900
+    verifier_timeout_seconds: int = 3600
+    report_size_cap_bytes: int = 10 * 1024 * 1024
+    workspace_dir_mode: int = 0o755
+    use_reference_cache: bool = True
+    max_concurrency: int = 3
+    extra_image_allowlist: list[str] = Field(default_factory=list)
 
 
 class WakeSettings(BaseModel):
@@ -59,6 +94,7 @@ class Settings(BaseSettings):
     service: ServiceSettings = Field(default_factory=ServiceSettings)
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)
     supervisor: SupervisorSettings = Field(default_factory=SupervisorSettings)
+    docker: DockerSettings = Field(default_factory=DockerSettings)
     wake: WakeSettings = Field(default_factory=WakeSettings)
 
     @classmethod
