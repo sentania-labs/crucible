@@ -1032,3 +1032,85 @@ def test_the_probe_refuses_rather_than_falling_back_to_a_retired_model(
         uow.rollback()
     # The refusal happened before the provider was asked to run anything.
     assert len(provider.probe_requests) == probes_before
+
+
+def test_a_read_only_credential_directory_is_still_replaceable(
+    admin_client: TestClient,
+    live_supervisor: Supervisor,
+    credential_root: Path,
+) -> None:
+    """A replacement renames the directory aside and the CLI creates a fresh one, so only
+    the credential root has to be writable. Requiring the directory itself refused an
+    operator who deliberately holds a credential directory read-only, and it refused with
+    a reason that was not the real precondition.
+
+    The refusal each precondition gives is its own: an existing credential with no
+    `replace` is refused for being an existing credential, not for a mode."""
+    asyncio.run(live_supervisor.tick())
+    live = credential_root / "claude_code"
+    old_token = (live / "oauth-token").read_text(encoding="utf-8")
+    live.chmod(0o500)
+    try:
+        refused = admin_client.post(
+            "/v1/admin/credentials/claude_code/login", json={"reason": "onboarding"}
+        )
+        assert refused.status_code == 409, refused.text
+        detail = refused.json()["detail"]
+        assert "already passes the shape check" in detail
+        assert "not writable" not in detail
+
+        started = admin_client.post(
+            "/v1/admin/credentials/claude_code/login",
+            json={"reason": "onboarding", "replace": True},
+        )
+        assert started.status_code == 200, started.text
+        retained = started.json()["retained_as"]
+        assert retained.startswith("claude_code.retired-")
+        for _ in range(100):
+            state = admin_client.get("/v1/admin/credentials/claude_code/login").json()
+            if state["state"] == "waiting_for_code":
+                break
+            time.sleep(0.05)
+        admin_client.post(
+            "/v1/admin/credentials/claude_code/login/code", json={"code": "ABCD-EFGH"}
+        )
+        for _ in range(100):
+            state = admin_client.get("/v1/admin/credentials/claude_code/login").json()
+            if state["state"] in ("finished", "failed"):
+                break
+            time.sleep(0.05)
+        assert state["state"] == "finished", state
+        # The credential is at its configured path, and it is the new one.
+        new_token = (live / "oauth-token").read_text(encoding="utf-8")
+        assert new_token.strip() and new_token != old_token
+        assert (credential_root / retained / "oauth-token").read_text(encoding="utf-8") == old_token
+        assert admin_client.get("/v1/admin/credentials/claude_code").json()["state"] != "absent"
+    finally:
+        # The temporary tree has to be removable again whatever the test did.
+        for path in (live, *credential_root.glob("claude_code.retired-*")):
+            if path.is_dir():
+                path.chmod(0o700)
+
+
+def test_a_login_that_reuses_an_unwritable_directory_says_so(
+    admin_client: TestClient,
+    live_supervisor: Supervisor,
+    credential_root: Path,
+) -> None:
+    """The directory check still exists for the path that keeps it: nothing at the
+    configured path passes the shape check, so the login writes into the directory as it
+    stands, and an unwritable one is refused for exactly that."""
+    asyncio.run(live_supervisor.tick())
+    live = credential_root / "codex"
+    (live / "auth.json").unlink()
+    live.chmod(0o500)
+    try:
+        refused = admin_client.post(
+            "/v1/admin/credentials/codex/login", json={"reason": "onboarding"}
+        )
+        assert refused.status_code == 409, refused.text
+        detail = refused.json()["detail"]
+        assert "is not writable" in detail and str(live) in detail
+        assert "already passes the shape check" not in detail
+    finally:
+        live.chmod(0o700)

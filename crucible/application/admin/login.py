@@ -425,8 +425,12 @@ def start_login(
     # scanned here too rather than after the credential has moved.
     argv = registry.resolve(ctx, harness)
     refuse_secret_shaped(" ".join(argv), field="login command")
-    _check_writable(source, harness=harness)
+    # Whether the existing directory is being replaced decides what has to be writable,
+    # so it is decided first: a replacement renames the directory away and the CLI creates
+    # a fresh one, and only the parent is written. An operator who protects a credential
+    # directory read-only on purpose is entitled to replace it.
     replaceable = _check_replaceable(spec, source, harness=harness, replace=replace)
+    _check_writable(source, harness=harness, reuse=not replaceable)
     retired = (
         _retire_existing(ctx, uow, source, principal=principal, harness=harness, reason=reason)
         if replaceable
@@ -472,12 +476,18 @@ def start_login(
     }
 
 
-def _check_writable(source: Any, *, harness: str) -> None:
-    """The login creates the directory and the retire renames it, both inside the
-    parent. A parent that cannot be written is a refusal, and it is one that has to be
-    raised before the retire rather than discovered by it. `os.access` answers for the
-    real uid, so this is the clear message rather than a guarantee: the rename itself is
-    still the authority, which is why a failed start is restored."""
+def _check_writable(source: Any, *, harness: str, reuse: bool) -> None:
+    """What the login has to be able to write, and only that.
+
+    The parent is written in both paths: the retire renames the directory inside it and
+    the CLI creates the new directory there. The directory itself is only written when
+    the login will reuse it, which is when there is nothing at the configured path to
+    retire. A replacement renames it away and never writes into it, so a credential
+    directory an operator deliberately holds read-only is still replaceable.
+
+    `os.access` answers for the real uid, so this is the clear message rather than a
+    guarantee: the rename itself is still the authority, which is why a failed start is
+    restored."""
     current = Path(source.path)
     parent = current.parent
     if not parent.is_dir():
@@ -490,10 +500,12 @@ def _check_writable(source: Any, *, harness: str) -> None:
             f"the credential root {parent} for harness {harness!r} is not writable by the "
             "Crucible service user, so the login cannot create or retire the directory"
         )
-    if current.is_dir() and not os.access(current, os.W_OK | os.X_OK):
+    if reuse and current.is_dir() and not os.access(current, os.W_OK | os.X_OK):
         raise CredentialAdminError(
             f"the {harness} credential directory {current} is not writable by the "
-            "Crucible service user, so the login cannot write into it"
+            "Crucible service user, so the login cannot write into it; a login that "
+            "replaces an existing credential renames the directory aside instead and "
+            "does not need it writable"
         )
 
 
