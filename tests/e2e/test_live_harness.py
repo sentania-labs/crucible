@@ -33,6 +33,7 @@ import gzip
 import json
 import os
 import time
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -201,12 +202,10 @@ def live_provider(
     proxy allowlist the stack's squid was brought up with."""
     registry = default_registry()
     endpoints = {h for a in registry for h in a.capabilities().endpoints}
-    config = DockerConfig(
-        **{
-            **docker_config.__dict__,
-            "credentials": _sources(credential_root),
-            "proxy_allowlist": tuple(sorted(set(docker_config.proxy_allowlist) | endpoints)),
-        }
+    config = replace(
+        docker_config,
+        credentials=_sources(credential_root),
+        proxy_allowlist=tuple(sorted(set(docker_config.proxy_allowlist) | endpoints)),
     )
     return DockerProvider(config, harnesses=registry)
 
@@ -441,13 +440,13 @@ async def _drive(
 
 
 def _payload(client: TestClient, task_id: str, kind: str) -> dict[str, Any] | None:
-    events = client.get(f"/v1/tasks/{task_id}/events", params={"limit": 500}).json()["items"]
+    events = client.get(f"/v1/tasks/{task_id}/events", params={"limit": 200}).json()["items"]
     hits = [e["payload"] for e in events if e["kind"] == kind]
     return hits[-1] if hits else None
 
 
 def _haystack(client: TestClient, engine: Engine, artifact_root: Path, task_id: str) -> str:
-    parts: list[str] = [client.get(f"/v1/tasks/{task_id}/events", params={"limit": 500}).text]
+    parts: list[str] = [client.get(f"/v1/tasks/{task_id}/events", params={"limit": 200}).text]
     with engine.begin() as connection:
         for table, column in connection.execute(
             text(
@@ -544,6 +543,9 @@ async def test_a_trivial_task_reaches_ready_for_merge_live(
                 "auth_files": sync.get("files"),
                 "credential_copy_removed": sync.get("removed"),
                 "gate_summary": view.get("gate_summary", {}).get("results"),
+                "refusal": _payload(live_client, task_id, "harness_refused"),
+                "collected": _payload(live_client, task_id, "attempt_collected"),
+                "collection_failed": _payload(live_client, task_id, "collection_failed"),
             }
         )
         with engine.begin() as connection:

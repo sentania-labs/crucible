@@ -1523,10 +1523,10 @@ def _chunk(
 def _seed_tar(
     spec: CredentialSpec, source: CredentialSource
 ) -> tuple[bytes, dict[str, str | None]]:
-    """A tar of the named auth files, owned by the worker's uid, mode 600, plus an
-    empty mount point for each template. Built in memory; the bytes go to the daemon
-    and the hashes stay with the provider. A required file that is missing refuses the
-    launch rather than seeding a copy that cannot authenticate."""
+    """A tar of the named auth files, owned by the worker's uid, mode 600. Built in
+    memory; the bytes go to the daemon and the hashes stay with the provider. A required
+    file that is missing refuses the launch rather than seeding a copy that cannot
+    authenticate."""
     buffer = io.BytesIO()
     hashes: dict[str, str | None] = {}
     now = int(time.time())
@@ -1567,16 +1567,10 @@ def _seed_tar(
             info.mtime = now
             tar.addfile(info, io.BytesIO(data))
             hashes[auth.name] = hashlib.sha256(data).hexdigest()
-        for name in spec.templates:
-            # The read-only template mounts on top of this placeholder, so the mount
-            # point exists with the worker's ownership rather than the daemon's.
-            ensure_dirs(name)
-            info = tarfile.TarInfo(name)
-            info.size = 0
-            info.mode = 0o444
-            info.uid = info.gid = WORKER_UID
-            info.mtime = now
-            tar.addfile(info, io.BytesIO(b""))
+        # No placeholder for the templates: the daemon mounts every declared mount,
+        # the read-only template files included, before it extracts an archive, so a
+        # file at that path in the tar would collide with the mount point. The daemon
+        # creates the mount point itself (S1 observed the empty settings.json).
     return buffer.getvalue(), hashes
 
 

@@ -75,7 +75,11 @@ class CodexAdapter:
             model_flag=True,
             effort_flag=True,
             transcript_format=TranscriptFormat.JSON_EVENTS,
-            endpoints=("api.openai.com", "auth.openai.com"),
+            # S6 named api.openai.com and auth.openai.com, with chatgpt.com "only if the
+            # authenticated re-run shows the ChatGPT-plan backend needs it". The C5 live
+            # run showed exactly that: with `auth_mode = chatgpt` the CLI reconnects to
+            # chatgpt.com until it is permitted. ab.chatgpt.com stays denied.
+            endpoints=("api.openai.com", "auth.openai.com", "chatgpt.com"),
             shim="AGENTS.md",
         )
 

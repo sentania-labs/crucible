@@ -66,6 +66,7 @@ EGRESS_ALLOWLIST = (
     "api.anthropic.com",
     "api.openai.com",
     "auth.openai.com",
+    "chatgpt.com",
     "daily-cloudcode-pa.googleapis.com",
     "oauth2.googleapis.com",
 )

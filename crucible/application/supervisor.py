@@ -1027,22 +1027,33 @@ class Supervisor:
             return f"{running} of {limit} {execution.harness} worker(s) already running"
         return None
 
+    def _checkout_lease_free(self, attempt_id: str, key: str) -> bool:
+        with self._uow_factory() as uow:
+            held = uow.leases.get_checkout_lease(key)
+        return held is None or held.holder == attempt_id or held.expires_at <= self._clock.now()
+
     async def _launch_one(self, item: _Pending) -> bool:
         attempt, execution, task = item.attempt, item.execution, item.task
         refusal = await self._db(partial(self._harness_gate, execution))
         if refusal is not None:
-            await self._db(partial(self._refuse_launch, attempt.id, "registry", refusal))
-            return False
-        busy = await self._db(partial(self._harness_busy, execution))
-        if busy is not None:
-            await self._db(partial(self._defer_launch, attempt.id, busy))
+            # The same path an environment failure at prepare takes: the attempt and the
+            # execution become active first, so the refusal can end them.
+            if await self._db(partial(self._mark_preparing, attempt.id)):
+                await self._db(partial(self._refuse_launch, attempt.id, "registry", refusal))
             return False
         spec = self._build_spec(attempt, execution, task, item.contract, item.repository_url)
         provider = self._provider(execution.provider)
         key = self.checkout_key(item.contract, task.external_id, item.repository_url)
-        if execution.role is not ExecutionRole.REVIEW and not await self._db(
-            partial(self._take_checkout_lease, attempt.id, key)
-        ):
+        review = execution.role is ExecutionRole.REVIEW
+        # 10 first, then 05b: an attempt whose checkout another attempt holds waits on
+        # the lease and says so; only a launch that could take the checkout is held back
+        # by the per-harness cap.
+        if review or await self._db(partial(self._checkout_lease_free, attempt.id, key)):
+            busy = await self._db(partial(self._harness_busy, execution))
+            if busy is not None:
+                await self._db(partial(self._defer_launch, attempt.id, busy))
+                return False
+        if not review and not await self._db(partial(self._take_checkout_lease, attempt.id, key)):
             # A second attempt on the same repository and branch waits; it is not a
             # failure, and nothing of the holder's checkout is disturbed (10).
             return False

@@ -112,7 +112,11 @@ async def test_get_harnesses_reports_flags_ranges_and_a_sanitized_credential_sta
     assert codex["enabled"] is True
     assert codex["credential"]["last_launch_outcome"] == "completed"
     assert codex["credential"]["last_launch_at"] is not None
-    assert codex["capabilities"]["endpoints"] == ["api.openai.com", "auth.openai.com"]
+    assert codex["capabilities"]["endpoints"] == [
+        "api.openai.com",
+        "auth.openai.com",
+        "chatgpt.com",
+    ]
     # The fake provider lists no images (08); the endpoint still answers.
     assert client.get("/v1/images").json()["items"] == []
     # Nothing secret-shaped anywhere in the two documents.

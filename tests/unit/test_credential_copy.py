@@ -167,10 +167,9 @@ async def test_only_the_named_auth_files_are_seeded_as_uid_1000_mode_600(tmp_pat
     _, path, tar = client.archives[0]
     assert path == "/home/worker/.codex"
     seeded = members(tar)
-    assert set(seeded) == {"auth.json", "config.toml"}, "the template mount point and nothing else"
+    assert set(seeded) == {"auth.json"}, "the named auth file and nothing else"
     assert seeded["auth.json"].uid == 1000 and seeded["auth.json"].gid == 1000
     assert seeded["auth.json"].mode == 0o600
-    assert seeded["config.toml"].size == 0, "a placeholder for the read-only mount, not a copy"
 
 
 async def test_the_create_request_names_the_variable_and_the_path_never_the_value(
@@ -393,7 +392,7 @@ def test_agy_orders_by_the_token_expiry(tmp_path: Path) -> None:
 def test_the_seed_tar_holds_no_other_file_from_the_directory(tmp_path: Path) -> None:
     source = codex_source(tmp_path)
     tar, hashes = _seed_tar(CodexAdapter().credential_spec(), CredentialSource(str(source)))
-    assert set(members(tar)) == {"auth.json", "config.toml"}
+    assert set(members(tar)) == {"auth.json"}
     assert set(hashes) == {"auth.json"} and len(hashes["auth.json"] or "") == 64
 
 

@@ -22,7 +22,7 @@ export CRUCIBLE_DOCKER_SOCKET
 # and the adapters' declared model endpoints (13, S6). `proxy-config` writes the squid
 # configuration from this list and Crucible refuses to launch an attempt that needs a
 # host the running proxy does not permit.
-EGRESS_ALLOWLIST ?= github.com objects.githubusercontent.com pypi.org files.pythonhosted.org registry.npmjs.org api.anthropic.com api.openai.com auth.openai.com daily-cloudcode-pa.googleapis.com oauth2.googleapis.com
+EGRESS_ALLOWLIST ?= github.com objects.githubusercontent.com pypi.org files.pythonhosted.org registry.npmjs.org api.anthropic.com api.openai.com auth.openai.com chatgpt.com daily-cloudcode-pa.googleapis.com oauth2.googleapis.com
 WORKERS_SUBNET ?= 10.88.0.0/24
 
 # The publisher's own allowlist (23 step 3). It is deliberately not the workers' list:

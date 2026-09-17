@@ -39,6 +39,7 @@ egress_allowlist = [
     "api.anthropic.com",
     "api.openai.com",
     "auth.openai.com",
+    "chatgpt.com",
     "daily-cloudcode-pa.googleapis.com",
     "oauth2.googleapis.com",
 ]
@@ -98,20 +99,42 @@ app_id = 0                            # public identifier, not a secret
 private_key_path = "/var/lib/crucible/credentials/github/app.pem"        # mounted read-only into crucible only
 webhook_secret_path = "/var/lib/crucible/credentials/github/webhook.secret"
 
+# Harness credentials (12, 25). Each entry names a directory Crucible reads and seeds a
+# per-attempt copy from; only the named auth files are copied, the copy is owned by the
+# worker's uid, and it is removed right after the run. `mount_mode` may raise the
+# adapter's declared minimum to `rw-narrow` and never lowers it (25 step 7). The values
+# in these directories are never configuration and never appear in any record.
 [credentials.claude_code]
 source = "directory"
-path = "/var/lib/crucible/credentials/claude_code"
+path = "/var/lib/crucible/credentials/claude_code"    # oauth-token (long-lived, S1b) and .claude.json
 mount_mode = "rw-narrow"
 
 [credentials.codex]
 source = "directory"
-path = "/var/lib/crucible/credentials/codex"
+path = "/var/lib/crucible/credentials/codex"          # auth.json; the CLI writes session state beside it (S1)
 mount_mode = "rw-narrow"
 
 [credentials.agy]
 source = "directory"
-path = "/var/lib/crucible/credentials/agy"
-mount_mode = "ro"
+path = "/var/lib/crucible/credentials/agy"            # .gemini/antigravity-cli/antigravity-oauth-token
+mount_mode = "ro"      # the adapter's minimum; see c5.md for what the live run observed
+
+# Harness enablement (25, S1b). A launch needs this gate and the administrator's runtime
+# flag (`crucible-admin harnesses enable`, C5b; seeded the same way by migration 0008).
+# A harness ships disabled until its dedicated Crucible session has refreshed on the
+# Crucible side and the operator's own session was confirmed valid afterwards (S1b
+# steps 5 and 6). Claude Code's long-lived token has no refresh, so it is verified.
+[harnesses.claude_code]
+enabled = true
+reason = "session_compatibility verified (S1b)"
+
+[harnesses.codex]
+enabled = false
+reason = "unverified: the dedicated session's Crucible-side refresh has not been observed and the operator's session confirmed after it (S1b steps 5 and 6)"
+
+[harnesses.agy]
+enabled = false
+reason = "unverified: the dedicated session's Crucible-side refresh has not been observed and the operator's session confirmed after it (S1b steps 5 and 6)"
 
 [wake.foundry]
 mode = "poll"          # or "webhook"

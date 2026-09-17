@@ -10,10 +10,10 @@ It does not decide what to build. An orchestrator (Foundry, or a person)
 decides outcomes, scope, model, and acceptance. Crucible executes, persists,
 observes, and enforces.
 
-**Status: specification version 0.3; implementation phase C4 (GitHub delivery).**
+**Status: specification version 0.3; implementation phase C5 (harness adapters live).**
 The specification is under [`docs/spec/`](docs/spec/00-overview.md) and the
 decisions behind it under [`docs/adr/`](docs/adr/). Phase notes are under
-[`docs/implementation-notes/`](docs/implementation-notes/c4.md).
+[`docs/implementation-notes/`](docs/implementation-notes/c5.md).
 
 ## What it will do
 
@@ -58,6 +58,7 @@ make smoke       # after `make up`: drive one task end to end; the same script C
 make e2e-image   # the script-harness worker image the e2e tier runs
 make e2e         # the Docker provider against real containers, no model
 make e2e-github  # local only: the real GitHub App against a throwaway repository
+make e2e-live    # local only: the real harness images with the dedicated credentials
 make deploy-local # run a pinned published release from /var/lib/crucible/deploy
 make down
 make reset       # DESTRUCTIVE: down and delete the postgres and artifact volumes
@@ -87,6 +88,37 @@ and `make e2e` asserts each of those from inside a real worker.
 `make proxy-config` writes the egress proxy's allowlist from `EGRESS_ALLOWLIST`;
 Crucible refuses to launch an attempt that needs a hostname the running proxy
 does not permit, rather than letting it fail quietly on the network.
+
+### The harnesses
+
+Claude Code, Codex and AGY run behind one `HarnessAdapter` port (spec 07), with
+the e2e script harness as the fourth adapter. Each adapter declares the version
+range it was tested with; the image label carries the installed version, and a
+launch outside the range is refused with a wake. `GET /v1/harnesses` reports
+installed and supported versions, both enable flags with their reasons, and a
+sanitized credential state; `GET /v1/images` lists every labelled image with its
+promotion state.
+
+A harness credential is a directory Crucible reads (`[credentials.<harness>]`,
+paths only), never the operator's own `~/.claude`, `~/.codex` or `~/.gemini`.
+Per attempt, only the named auth files are seeded into a copy owned by the
+worker's uid, mounted read-only or narrow-writable at the path the CLI expects
+with Crucible-owned templates read-only on top; after the run the named files
+are read back, a valid file with a newer issued-at is written back, and the copy
+is removed. No credential value is in the create request, the environment,
+argv, an event, a log, an artifact, or the database.
+
+A harness ships disabled until its dedicated session and its daily-session
+compatibility are verified (S1b); `[harnesses.<name>]` is the operator's gate
+and migration 0008 seeds the administrator's flag the same way. `make e2e-live
+HARNESS=<name>` runs one harness live against the throwaway repository:
+
+```sh
+make e2e-live HARNESS=claude_code \
+  CRUCIBLE_LIVE_CREDENTIAL_ROOT=/path/to/dedicated/credentials \
+  CRUCIBLE_GITHUB_APP_JSON=... CRUCIBLE_GITHUB_APP_KEY=... \
+  CRUCIBLE_GITHUB_TARGET_REPO=owner/throwaway DOCKER='<the wrapper above>'
+```
 
 `/v1/ready` reports not ready with "schema drift" when the live schema does not
 match what the code expects (for example a database created by an earlier

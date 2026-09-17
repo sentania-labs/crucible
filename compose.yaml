@@ -129,7 +129,7 @@ services:
       # A JSON array: pydantic-settings decodes a complex field from the environment
       # as JSON, and the list here must be the one `make proxy-config` gave squid.
       CRUCIBLE_DOCKER__EGRESS_ALLOWLIST: >-
-        ${CRUCIBLE_EGRESS_ALLOWLIST:-["github.com","objects.githubusercontent.com","pypi.org","files.pythonhosted.org","registry.npmjs.org","api.anthropic.com","api.openai.com","auth.openai.com","daily-cloudcode-pa.googleapis.com","oauth2.googleapis.com"]}
+        ${CRUCIBLE_EGRESS_ALLOWLIST:-["github.com","objects.githubusercontent.com","pypi.org","files.pythonhosted.org","registry.npmjs.org","api.anthropic.com","api.openai.com","auth.openai.com","chatgpt.com","daily-cloudcode-pa.googleapis.com","oauth2.googleapis.com"]}
       # GitHub delivery (12, 23). Off until an App is configured. The App id is a public
       # identifier and the two secrets are *paths* to files in the credential directory
       # mounted below, which only this container ever sees: no worker, collector,
@@ -144,12 +144,33 @@ services:
       CRUCIBLE_GITHUB__WEBHOOK_ENABLED: "${CRUCIBLE_GITHUB_WEBHOOK_ENABLED:-false}"
       CRUCIBLE_GITHUB__PUBLISHER_NETWORK: crucible-publish
       CRUCIBLE_GITHUB__PUBLISHER_EGRESS_PROXY: http://publish-proxy:3128
+      # The harness credentials (12): one directory per harness under the root mounted
+      # below, referenced by path, never by value. The mount mode is the adapter's
+      # minimum unless raised here (25 step 7).
+      CRUCIBLE_CREDENTIALS__CLAUDE_CODE__PATH: /var/lib/crucible/credentials/claude_code
+      CRUCIBLE_CREDENTIALS__CODEX__PATH: /var/lib/crucible/credentials/codex
+      CRUCIBLE_CREDENTIALS__AGY__PATH: /var/lib/crucible/credentials/agy
+      # 25 and S1b: a harness ships disabled until its dedicated session and its
+      # daily-session compatibility are verified. Claude Code is verified; Codex and AGY
+      # wait on the Crucible-side refresh (S1b steps 5 and 6). Enable by configuration
+      # here and by `crucible-admin harnesses enable` (C5b) once verified.
+      CRUCIBLE_HARNESSES__CODEX__ENABLED: "${CRUCIBLE_HARNESS_CODEX_ENABLED:-false}"
+      CRUCIBLE_HARNESSES__CODEX__REASON: "unverified: Crucible-side refresh not yet observed (S1b)"
+      CRUCIBLE_HARNESSES__AGY__ENABLED: "${CRUCIBLE_HARNESS_AGY_ENABLED:-false}"
+      CRUCIBLE_HARNESSES__AGY__REASON: "unverified: Crucible-side refresh not yet observed (S1b)"
     volumes:
       - crucible-artifacts:/var/lib/crucible/artifacts
-      # The App private key and the webhook secret, read-only, on this container only
-      # (12). CRUCIBLE_CREDENTIAL_ROOT defaults to a directory that does not exist, so
-      # a stack with no App configured starts with nothing mounted there.
-      - ${CRUCIBLE_CREDENTIAL_ROOT:-./var/credentials}:/var/lib/crucible/credentials:ro
+      # The credential root (12, 25), on this container only; no worker, collector,
+      # verifier or publisher mounts it. The GitHub half (the App private key and the
+      # webhook secret) is read-only. The three harness directories are writable because
+      # Crucible syncs a refreshed auth file back into them after a run (12), and only
+      # ever the named auth files, chosen by the newer issued-at. CRUCIBLE_CREDENTIAL_ROOT
+      # defaults to a directory that does not exist, so a stack with nothing onboarded
+      # starts with empty mounts.
+      - ${CRUCIBLE_CREDENTIAL_ROOT:-./var/credentials}/github:/var/lib/crucible/credentials/github:ro
+      - ${CRUCIBLE_CREDENTIAL_ROOT:-./var/credentials}/claude_code:/var/lib/crucible/credentials/claude_code
+      - ${CRUCIBLE_CREDENTIAL_ROOT:-./var/credentials}/codex:/var/lib/crucible/credentials/codex
+      - ${CRUCIBLE_CREDENTIAL_ROOT:-./var/credentials}/agy:/var/lib/crucible/credentials/agy
     ports:
       - "127.0.0.1:${CRUCIBLE_PORT:-8080}:8080"
     healthcheck:
