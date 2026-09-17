@@ -64,7 +64,7 @@ resource.
 | onboard a credential | `POST /admin/credentials/{harness}/login` (starts) | `credentials login --harness` | interactive flow below, and a local-mode operation on a host that carries the harness CLI; the API form returns the device or browser URL and polls for completion where it can run at all |
 | rotate or replace a credential source | `POST /admin/credentials/{harness}/rotate` | `credentials rotate --harness` | the operator's prepared directory is shape-checked, copied in, and left exactly as it was found; the swap is two renames; the previous directory is retained for `credential_retention_hours` then shredded; a failed swap rolls back; every step an event |
 | remove a credential | `POST /admin/credentials/{harness}/remove` | `credentials remove --harness` | harness becomes `absent`; the directory is shredded at once rather than retained, because the operator said remove, and the harness is disabled with that reason |
-| list images and promote | `GET /admin/images`, `POST /admin/images/{digest}/promote` | `images list|promote` | 13 |
+| list images and promote | `GET /admin/images`, `POST /admin/images/{digest}/promote` | `images list|promote` | 13; one default per harness, and promoting a digest marks the previous default `retained`. The probe and the live tiers run the promoted image |
 | provider health | `GET /admin/providers` | `providers status` | |
 | GitHub health | `GET /admin/github`, `POST /admin/github/check` | `github status|check` | check mints a token per registered repository and discards it |
 | register a repository | `PUT /admin/repositories/{name}` | `repositories register` | 04; an administrative mutation like any other, guarded and audited here, with the previous registration as the before summary. 04's own `PUT /repositories/{name}` is a different, non-administrative surface |
@@ -251,6 +251,9 @@ collapses the authority boundary between them.
 
 Read `/v1/admin/status` parts that its role permits (orchestrator role
 gets `harnesses`, `providers`, `github` health, `workers`, `tasks`, `wakes`
-read-only through `GET /v1/capabilities`), and report to the operator that
+read-only through `GET /v1/capabilities`, reduced to harness and image
+enablement, provider and GitHub reachability, and counts of workers, tasks
+and wakes: no path, no fingerprint, no auth file name, no expiry time), and
+report to the operator that
 a harness is disabled, a credential is invalid or unverified, or a provider
 is unavailable. It never calls the mutation endpoints.
