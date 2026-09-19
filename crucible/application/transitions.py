@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from crucible.domain.entities import Attempt, Event, Execution, Task
+from crucible.application.errors import TransitionNotAllowedError
+from crucible.domain.entities import Attempt, Event, Execution, Task, TaskContract
 from crucible.domain.events import PRINCIPAL_CRUCIBLE, EventKind
 from crucible.domain.lifecycle import (
     AttemptState,
@@ -146,3 +147,18 @@ def record_rejected_transition(
             "to": error.target,
         },
     )
+
+
+def require_contract(uow: UnitOfWork, task: Task) -> TaskContract:
+    """The stored contract of the task's current version. A task imported from the
+    bootstrap ledger (15) is a record with `contract_version 0` and no contract, so
+    anything that would run, accept, reschedule or amend it is refused here with the
+    reason rather than failing on the missing document."""
+    stored = uow.contracts.get(task.id, task.contract_version)
+    if stored is None:
+        raise TransitionNotAllowedError(
+            f"task {task.id} ({task.external_id}) carries no contract (version "
+            f"{task.contract_version}): a task imported from the bootstrap ledger is a "
+            "record; submit a new task for the work, or cancel or close this one (15)"
+        )
+    return stored

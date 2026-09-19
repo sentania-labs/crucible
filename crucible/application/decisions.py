@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import timedelta
 
 from crucible.application.errors import ForbiddenError, NotFoundError, TransitionNotAllowedError
-from crucible.application.transitions import move_task, record_event
+from crucible.application.transitions import move_task, record_event, require_contract
 from crucible.application.wakes import create_wake
 from crucible.contracts.api import DecisionRequest, DispositionRequest
 from crucible.contracts.wake import WakeReason
@@ -166,8 +166,7 @@ def record_decision(
                 payload={"escalation_id": escalation.id, "decision_id": decision.id},
             )
     if request.reschedule:
-        stored = uow.contracts.get(task.id, task.contract_version)
-        assert stored is not None
+        stored = require_contract(uow, task)
         request_body = stored.document["execution_request"]
         move_task(
             uow,
