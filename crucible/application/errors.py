@@ -44,6 +44,15 @@ class ConflictError(ApplicationError):
     title = "Conflict"
 
 
+class BootstrapBundleError(ApplicationError):
+    """15 step 2: the bundle failed validation. `errors` is the full problem list, and
+    nothing was stored."""
+
+    slug = "bootstrap-bundle-invalid"
+    status = 422
+    title = "Bootstrap bundle failed validation"
+
+
 class DuplicateExternalIdError(ConflictError):
     slug = "external-id-exists"
     title = "external_id already exists for this principal"

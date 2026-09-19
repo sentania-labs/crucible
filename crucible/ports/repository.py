@@ -13,6 +13,7 @@ from crucible.domain.entities import (
     Artifact,
     Attempt,
     AttemptMetrics,
+    BootstrapImport,
     CICertification,
     CIDecision,
     CompletionClaimRecord,
@@ -153,7 +154,11 @@ class AttemptRepository(Protocol):
 
     def list_in_states(
         self, states: Sequence[AttemptState], *, for_update: bool = False
-    ) -> Sequence[Attempt]: ...
+    ) -> Sequence[Attempt]:
+        """The attempts the supervisor and the status views scan. An unsupervised attempt
+        (15: imported from the bootstrap ledger, no worker behind it) is never among
+        them; `list_for_task` and `list_for_execution` still return it."""
+        ...
 
 
 class EventRepository(Protocol):
@@ -463,6 +468,22 @@ class ImagePromotionRepository(Protocol):
     def put(self, promotion: ImagePromotion) -> ImagePromotion: ...
 
 
+class BootstrapImportRepository(Protocol):
+    """The imports of 15, newest first when listed."""
+
+    def add(self, record: BootstrapImport) -> None: ...
+
+    def get(self, import_id: str, *, for_update: bool = False) -> BootstrapImport | None: ...
+
+    def get_by_content(self, content_sha256: str) -> BootstrapImport | None: ...
+
+    def save(self, record: BootstrapImport) -> None: ...
+
+    def list_all(self) -> Sequence[BootstrapImport]: ...
+
+    def authoritative(self, *, for_update: bool = False) -> BootstrapImport | None: ...
+
+
 class IdempotencyKeyTakenError(Exception):
     """The (principal, key) row already exists; read it back in a fresh transaction."""
 
@@ -521,6 +542,7 @@ class UnitOfWork(Protocol):
     github_deliveries: GitHubDeliveryRepository
     harnesses: HarnessStateRepository
     image_promotions: ImagePromotionRepository
+    bootstrap_imports: BootstrapImportRepository
 
     def __enter__(self) -> UnitOfWork: ...
 

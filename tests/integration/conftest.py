@@ -40,7 +40,7 @@ TRUNCATE = (
     "review_comments, external_reviews, external_review_cycles, pull_request_heads, "
     "pull_requests, attempt_metrics, wakes, review_dispositions, decisions, escalations, "
     "acceptance_results, gate_results, review_reports, evidence, artifacts, "
-    "idempotency_keys, supervisor_status, completion_claims, leases, events, "
+    "bootstrap_imports, idempotency_keys, supervisor_status, completion_claims, leases, events, "
     "attempts, executions, task_contracts, tasks, repositories, principals RESTART IDENTITY CASCADE"
 )
 
@@ -70,6 +70,11 @@ def engine(migrated: str) -> Iterator[Engine]:
     with eng.begin() as conn:
         conn.execute(text(TRUNCATE))
     yield eng
+    # Truncated on the way out as well: a downgrade archives task-bound events and the
+    # upgrade puts them back by foreign key, so rows the last test left would break the
+    # migration tests that follow it in the run (C6).
+    with eng.begin() as conn:
+        conn.execute(text(TRUNCATE))
     eng.dispose()
 
 

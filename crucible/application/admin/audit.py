@@ -26,6 +26,8 @@ ADMIN_KINDS: frozenset[str] = frozenset(
         EventKind.REPOSITORY_ATTESTATION_RECORDED.value,
         EventKind.POLICY_UPLOADED.value,
         EventKind.ROUTING_POLICY_UPLOADED.value,
+        EventKind.BOOTSTRAP_IMPORT_VERIFIED.value,
+        EventKind.BOOTSTRAP_IMPORT_COMMITTED.value,
     }
 )
 

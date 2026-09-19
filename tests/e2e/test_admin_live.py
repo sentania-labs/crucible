@@ -598,3 +598,88 @@ def test_every_other_operation_through_api_and_cli_on_the_live_stack(
         view = orchestrator.get("/v1/capabilities").json()
         assert set(view) == {"harnesses", "providers", "github", "workers", "tasks", "wakes"}
         assert orchestrator.get("/v1/admin/status").status_code == 403
+
+
+def test_the_bootstrap_import_through_api_and_cli_on_the_live_stack(
+    scratch_ctx: AppContext,
+    stack: dict[str, Any],
+    artifact_root: Path,
+    migrated: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """15 on the live stack with a synthetic bundle (tests/fixtures.py): submit through
+    the API, show and list through the CLI, commit through the CLI, then the
+    orchestrator's start-of-session over the result. The operator's real ledger is never
+    read here; the real handoff is Foundry's act after this phase merges (c6.md)."""
+    from tests.fixtures import synthetic_bundle  # noqa: PLC0415
+
+    provider = scratch_ctx.providers[0]
+    assert isinstance(provider, DockerProvider)
+    asyncio.run(_supervisor(scratch_ctx, provider).tick())
+    tokens = _tokens(scratch_ctx)
+    assert scratch_ctx.admin is not None
+    config = _config_file(artifact_root, migrated, stack, scratch_ctx.admin.credential_sources)
+    _seed_policies(scratch_ctx, tokens["admin"])
+    owner = f"orchestrator-principal-{RUN_ID}"
+    started = datetime.now(UTC)
+    with _client(scratch_ctx, tokens["admin"]) as admin:
+        response = admin.post(
+            "/v1/import/bootstrap",
+            params={"reason": "e2e-admin: synthetic handoff", "owner": owner},
+            json=synthetic_bundle(),
+        )
+        assert response.status_code == 201, response.text
+        report = response.json()
+        assert report["state"] == "verified" and report["counts"]["tasks"] == 8
+        shown = _cli(config, "bootstrap", "show", report["import_id"], capsys=capsys)
+        assert shown == report
+        listed = _cli(config, "bootstrap", "list", capsys=capsys)["items"]
+        assert [i["import_id"] for i in listed] == [report["import_id"]]
+        committed = _cli(
+            config,
+            "--reason",
+            "e2e-admin: commit",
+            "bootstrap",
+            "commit",
+            report["import_id"],
+            capsys=capsys,
+        )
+        assert committed["state"] == "authoritative"
+        assert committed["counts"]["handoff_events"] == 8
+        assert (
+            admin.get("/v1/admin/status").json()["bootstrap"]["authoritative"]
+            == (report["import_id"])
+        )
+        assert scan_text(json.dumps(committed)) is None
+    with _client(scratch_ctx, tokens["orchestrator"]) as orchestrator:
+        live = {
+            item["external_id"]: item["state"]
+            for state in ("submitted", "running", "awaiting_acceptance", "accepted", "blocked")
+            for item in orchestrator.get("/v1/tasks", params={"state": state}).json()["items"]
+        }
+        assert live == {
+            "SYN-0001": "submitted",
+            "SYN-0002": "running",
+            "SYN-0003": "running",
+            "SYN-0004": "awaiting_acceptance",
+            "SYN-0005": "accepted",
+            "SYN-0006": "blocked",
+        }
+        assert orchestrator.get("/v1/wakes").json()["items"] == []
+    # A supervisor tick on the live daemon leaves the two unsupervised attempts alone.
+    asyncio.run(_supervisor(scratch_ctx, provider).tick())
+    with _client(scratch_ctx, tokens["admin"]) as admin:
+        status = admin.get("/v1/admin/status").json()
+        assert status["workers"] == []
+        assert status["tasks"]["counts"]["running"] == 2
+    _record(
+        {
+            "entry_point": "api submit, cli show/list/commit",
+            "started_local": _local(started),
+            "import_id": report["import_id"],
+            "state": committed["state"],
+            "counts": committed["counts"],
+            "state_map": committed["state_map"],
+            "duration_seconds": round((datetime.now(UTC) - started).total_seconds(), 1),
+        }
+    )

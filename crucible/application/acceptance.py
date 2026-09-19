@@ -11,7 +11,7 @@ from crucible.application.errors import (
     NotFoundError,
     TransitionNotAllowedError,
 )
-from crucible.application.transitions import move_task, record_event
+from crucible.application.transitions import move_task, record_event, require_contract
 from crucible.application.wakes import create_wake
 from crucible.contracts.api import AcceptRequest
 from crucible.contracts.wake import WakeReason
@@ -26,8 +26,7 @@ PUBLISHED_DELIVERABLES = frozenset({"pull_request", "branch"})
 
 
 def deliverable_kinds(uow: UnitOfWork, task: Task) -> list[str]:
-    stored = uow.contracts.get(task.id, task.contract_version)
-    assert stored is not None
+    stored = require_contract(uow, task)
     return [str(d.get("kind")) for d in stored.document.get("deliverables", [])]
 
 

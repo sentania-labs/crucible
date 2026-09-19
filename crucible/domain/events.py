@@ -166,6 +166,12 @@ class EventKind(StrEnum):
     IMAGE_PROMOTED = "image_promoted"
     GITHUB_CHECKED = "github_checked"
     ADMIN_REFUSED = "admin_refused"
+    # the bootstrap ledger handoff (15, C6)
+    BOOTSTRAP_IMPORT_VERIFIED = "bootstrap_import_verified"
+    BOOTSTRAP_IMPORT_COMMITTED = "bootstrap_import_committed"
+    BOOTSTRAP_TASK_IMPORTED = "bootstrap_task_imported"
+    BOOTSTRAP_EVENT_IMPORTED = "bootstrap_event_imported"
+    BOOTSTRAP_HANDOFF = "bootstrap_handoff"
     # principals and configuration
     PRINCIPAL_CREATED = "principal_created"
     REPOSITORY_REGISTERED = "repository_registered"

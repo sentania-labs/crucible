@@ -43,6 +43,7 @@ from crucible.adapters.persistence.records import (
     Acceptances,
     Artifacts,
     AttemptMetricsRepo,
+    BootstrapImports,
     Decisions,
     Dispositions,
     Escalations,
@@ -81,6 +82,7 @@ from crucible.ports.repository import (
     ArtifactRepository,
     AttemptMetricsRepository,
     AttemptRepository,
+    BootstrapImportRepository,
     CICertificationRepository,
     CIDecisionRepository,
     ClaimRepository,
@@ -520,6 +522,7 @@ class Attempts:
             log_resume_sha256=row.log_resume_sha256,
             log_resume_occurrence=row.log_resume_occurrence or 0,
             cleaned_up_at=_dt(row.cleaned_up_at),
+            unsupervised=bool(row.unsupervised),
         )
 
     def add(self, attempt: Attempt) -> None:
@@ -548,6 +551,7 @@ class Attempts:
                 log_resume_sha256=attempt.log_resume_sha256,
                 log_resume_occurrence=attempt.log_resume_occurrence,
                 cleaned_up_at=attempt.cleaned_up_at,
+                unsupervised=attempt.unsupervised,
             )
         )
         self._s.flush()
@@ -602,9 +606,14 @@ class Attempts:
     def list_in_states(
         self, states: Sequence[AttemptState], *, for_update: bool = False
     ) -> Sequence[Attempt]:
+        # An unsupervised attempt (15) has no worker behind it: nothing to observe,
+        # launch, count against a cap, or clean up, so no scan ever sees it.
         stmt = (
             select(AttemptRow)
-            .where(AttemptRow.state.in_([s.value for s in states]))
+            .where(
+                AttemptRow.state.in_([s.value for s in states]),
+                AttemptRow.unsupervised.is_(False),
+            )
             .order_by(AttemptRow.id)
         )
         if for_update:
@@ -1111,6 +1120,7 @@ class SqlUnitOfWork:
     github_deliveries: GitHubDeliveryRepository
     harnesses: HarnessStateRepository
     image_promotions: ImagePromotionRepository
+    bootstrap_imports: BootstrapImportRepository
 
     def __init__(self, session_factory: sessionmaker[Session]) -> None:
         self._factory = session_factory
@@ -1161,6 +1171,7 @@ class SqlUnitOfWork:
         self.github_deliveries = GitHubDeliveries(s)
         self.harnesses = HarnessStates(s)
         self.image_promotions = ImagePromotions(s)
+        self.bootstrap_imports = BootstrapImports(s)
         return self
 
     def __exit__(

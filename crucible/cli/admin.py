@@ -4,11 +4,12 @@ database and daemon; `--api-url` with a token runs the same operations against a
 running API. Results go to stdout as JSON; logs to stderr.
 
 Two gaps are deliberate and named here rather than implied. 25 lists four CLI-only
-operations; `migrate` and `token create` are below, and the bootstrap `import` and
-`export` of 15 and 14 are not implemented in this phase (c5.md C5b). And `credentials
-login` runs the harness's own CLI, so it works only where that CLI is installed: local
-mode on a host that has it. The Crucible service image carries none of the three, so the
-API form of login refuses there with that reason rather than hanging.
+operations; `migrate` and `token create` are below, the bootstrap import of 15 is the
+`bootstrap` group below (C6, with its API under `/v1/import/bootstrap`), and the
+portable `export` of 14 is not implemented yet. And `credentials login` runs the
+harness's own CLI, so it works only where that CLI is installed: local mode on a host
+that has it. The Crucible service image carries none of the three, so the API form of
+login refuses there with that reason rather than hanging.
 """
 
 from __future__ import annotations
@@ -20,11 +21,20 @@ import os
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any
 
 from crucible.adapters.persistence.migrate import head_revision, upgrade
-from crucible.application.admin import audit, credentials, github, harnesses, images, login
+from crucible.application.admin import (
+    audit,
+    bootstrap,
+    credentials,
+    github,
+    harnesses,
+    images,
+    login,
+)
 from crucible.application.admin import providers as providers_admin
 from crucible.application.admin import repositories as repositories_admin
 from crucible.application.admin import status as status_admin
@@ -127,7 +137,37 @@ def build_parser() -> argparse.ArgumentParser:
     tail = a_sub.add_parser("tail")
     tail.add_argument("--cursor", type=int, default=None)
     tail.add_argument("--limit", type=int, default=50)
+
+    b = sub.add_parser(
+        "bootstrap", help="the bootstrap ledger handoff (15): submit, show, list, commit"
+    )
+    b_sub = b.add_subparsers(dest="bootstrap_command", required=True)
+    submit = b_sub.add_parser(
+        "submit",
+        help="validate a BootstrapExportV1 bundle and write it as a verified import",
+    )
+    submit.add_argument("--file", required=True, help="the crucible.json foundry-ledger exported")
+    submit.add_argument(
+        "--owner",
+        default=None,
+        help="the principal the imported tasks belong to (default: this CLI's principal)",
+    )
+    show = b_sub.add_parser("show", help="the verification report of one import")
+    show.add_argument("import_id")
+    b_sub.add_parser("list")
+    commit = b_sub.add_parser("commit", help="make a verified import authoritative")
+    commit.add_argument("import_id")
     return parser
+
+
+def _read_bundle(path: str) -> Any:
+    """The bundle file, parsed and nothing else: validation is the service's."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError) as exc:
+        print(f"cannot read a bundle from {path}: {exc}", file=sys.stderr)
+        sys.exit(2)
 
 
 def _emit(document: Any) -> None:
@@ -211,6 +251,19 @@ def _remote(args: argparse.Namespace, remote: Remote) -> None:
     elif command == "audit":
         query = f"?limit={args.limit}" + (f"&cursor={args.cursor}" if args.cursor else "")
         _emit(remote.call("GET", "/v1/admin/audit" + query))
+    elif command == "bootstrap":
+        verb = args.bootstrap_command
+        if verb == "submit":
+            query = "?" + urllib.parse.urlencode(
+                {k: v for k, v in (("reason", args.reason), ("owner", args.owner)) if v}
+            )
+            _emit(remote.call("POST", "/v1/import/bootstrap" + query, _read_bundle(args.file)))
+        elif verb == "show":
+            _emit(remote.call("GET", f"/v1/import/bootstrap/{args.import_id}"))
+        elif verb == "list":
+            _emit(remote.call("GET", "/v1/import/bootstrap"))
+        else:
+            _emit(remote.call("POST", f"/v1/import/bootstrap/{args.import_id}/commit", reason))
     elif command in ("repository", "repositories"):
         _emit(
             remote.call(
@@ -393,6 +446,42 @@ def _local(args: argparse.Namespace, wiring: Wiring) -> None:
     elif command == "audit":
         with wiring.ctx.uow_factory() as uow:
             _emit(audit.tail(uow, cursor=args.cursor, limit=args.limit))
+    elif command == "bootstrap":
+        _local_bootstrap(args, wiring, admin, principal)
+
+
+def _local_bootstrap(
+    args: argparse.Namespace, wiring: Wiring, admin: AdminContext, principal: str
+) -> None:
+    """15 through the same services the API calls. The bundle file is read here and
+    handed over parsed; every rule of step 2 is the service's, on both entry points."""
+    verb = args.bootstrap_command
+    if verb == "submit":
+        bundle = _read_bundle(args.file)
+        with wiring.ctx.uow_factory() as uow:
+            report, _created = bootstrap.submit(
+                admin,
+                uow,
+                principal=principal,
+                bundle=bundle,
+                reason=args.reason,
+                owner=args.owner,
+            )
+            uow.commit()
+        _emit(report)
+        return
+    with wiring.ctx.uow_factory() as uow:
+        if verb == "show":
+            _emit(bootstrap.show(uow, args.import_id))
+        elif verb == "list":
+            _emit({"items": bootstrap.list_imports(uow)})
+        else:
+            _emit(
+                bootstrap.commit(
+                    admin, uow, principal=principal, import_id=args.import_id, reason=args.reason
+                )
+            )
+            uow.commit()
 
 
 def main(argv: list[str] | None = None) -> None:
