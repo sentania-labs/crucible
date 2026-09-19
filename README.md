@@ -264,6 +264,29 @@ GET  /v1/routing/history?model=&project=  # what each model actually did
 `examples/policies/default-software.yaml` is the seeded default (version 2), verbatim;
 version 1, the C1 seed, names the placeholder routing policy and stays for reference.
 
+## The bootstrap handoff
+
+Until Crucible is ready, Foundry keeps its own ledger (`foundry-ledger`, SQLite). The
+handoff is an import, not a copy:
+
+```sh
+POST /v1/import/bootstrap?reason=&owner=   # admin; the body is the exported bundle, verbatim
+GET  /v1/import/bootstrap/{id}             # the verification report
+POST /v1/import/bootstrap/{id}/commit      # makes the import authoritative
+crucible-admin bootstrap submit --file crucible.json --owner foundry   # the same, in process
+crucible-admin bootstrap show|list|commit
+```
+
+The bundle is validated in full (schema version, recomputed content hash, counts, id
+uniqueness, every state mappable, event order) and either every record is written in
+one transaction under an import in state `verified`, or nothing is and every problem
+comes back. External ids are kept, timestamps are normalized to UTC with the original
+kept in each event, and the report names every field the columns could not carry. The
+commit records the handoff on every imported task; only one import ever holds
+authority. Foundry then freezes its ledger and reads Crucible's state alone
+(`docs/spec/15-bootstrap-ledger-handoff.md`, `docs/implementation-notes/c6.md`). The
+readiness gate's evidence is `docs/readiness.md`.
+
 ## Releases
 
 A release is a tag push, not a merge: `git tag -a vX.Y.Z -m vX.Y.Z && git push
