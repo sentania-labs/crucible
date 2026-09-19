@@ -550,9 +550,11 @@ def test_providers_github_audit_status_and_capabilities(
         "tasks",
         "wakes",
         "retention",
+        "bootstrap",
         "audit",
     }
     assert document["supervisor"]["healthy"] is True
+    assert document["bootstrap"] == {"authoritative": None, "imports": []}
     assert {r["repository"] for r in document["github"]["repositories"]} >= {"second", "third"}
     local = run_cli(config_file, "status", capsys=capsys)
     assert set(local) == set(document)

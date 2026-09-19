@@ -258,3 +258,36 @@ def test_the_publish_pending_flag_becomes_the_publishing_state(database_url: str
     assert state == "publishing"
     assert events == 1
     engine.dispose()
+
+
+def test_0010_down_and_up(database_url: str) -> None:
+    """C6: the bootstrap_imports table and the attempts.unsupervised flag (15, 14)."""
+    engine = make_engine(database_url)
+    migrate.upgrade(database_url)
+    names = set(inspect(engine).get_table_names())
+    assert "bootstrap_imports" in names
+    assert "unsupervised" in {c["name"] for c in inspect(engine).get_columns("attempts")}
+    indexes = {i["name"] for i in inspect(engine).get_indexes("bootstrap_imports")}
+    assert {"ix_bootstrap_imports_content", "uq_bootstrap_imports_authoritative"} <= indexes
+    migrate.downgrade(database_url, "0009_administration")
+    names = set(inspect(engine).get_table_names())
+    assert "bootstrap_imports" not in names
+    assert "unsupervised" not in {c["name"] for c in inspect(engine).get_columns("attempts")}
+    with engine.begin() as conn, pytest.raises(Exception, match="ck_events_kind"):
+        conn.execute(
+            text(
+                "INSERT INTO events (ts, kind, principal, verified, payload) "
+                "VALUES (now(), 'bootstrap_handoff', 'tests', true, '{}')"
+            )
+        )
+    migrate.upgrade(database_url)
+    ok, detail = migrate.is_current(engine, database_url)
+    assert ok, detail
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO events (ts, kind, principal, verified, payload) "
+                "VALUES (now(), 'bootstrap_handoff', 'tests', true, '{}')"
+            )
+        )
+    engine.dispose()
