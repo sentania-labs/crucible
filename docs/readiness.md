@@ -42,9 +42,12 @@ The live harness tier (`make e2e-live`) and the live GitHub tier (`make e2e-gith
 were not run for this report. Their last recorded runs are C5's and C4's, named in
 rows 3 and 19.
 
-CI run for this branch: see the pull request's `ci` workflow run, linked from the pull
-request. The `ci` workflow runs `lint`, `scan`, `test` (unit and integration), `e2e`
-and `compose-smoke`; no workflow runs any live tier.
+CI run for this branch, all five required checks green:
+`https://github.com/sentania-labs/crucible/actions/runs/35422008877`, on commit
+`79f0ee9`, the head this report was first pushed at, 2026-09-18 11:42 PM local; the
+run for the current head is linked from pull request 32. `lint` 21 s, `scan` 7 s,
+`test` (unit and integration) 5 m 59 s, `e2e` 2 m 3 s, `compose-smoke` 1 m 1 s. No
+workflow runs any live tier.
 
 ## Table 1: the readiness gate
 
