@@ -2548,7 +2548,9 @@ class Supervisor:
     def _finish_cancelling(self, uow: UnitOfWork, task: Task) -> None:
         """Once no attempt is live, close open executions; a cancelling task becomes cancelled."""
         attempts = uow.attempts.list_for_task(task.id)
-        if any(a.state not in ATTEMPT_TERMINAL for a in attempts):
+        # An unsupervised attempt (15) has no worker to wait for; it stays as the record
+        # of a run Crucible never observed, and the cancellation settles around it.
+        if any(a.state not in ATTEMPT_TERMINAL and not a.unsupervised for a in attempts):
             return
         for e in uow.executions.list_for_task(task.id):
             if e.state in (ExecutionState.CREATED, ExecutionState.ACTIVE):
@@ -2567,7 +2569,11 @@ class Supervisor:
             for state in (TaskState.CANCELLING, TaskState.CANCELLED):
                 for task in uow.tasks.list_by_state(state):
                     attempts = uow.attempts.list_for_task(task.id)
-                    live = [a for a in attempts if a.state not in ATTEMPT_TERMINAL]
+                    live = [
+                        a
+                        for a in attempts
+                        if a.state not in ATTEMPT_TERMINAL and not a.unsupervised
+                    ]
                     out.extend(_CancelWork(task_id=task.id, attempt=a) for a in live)
                     open_exec = any(
                         e.state in (ExecutionState.CREATED, ExecutionState.ACTIVE)
