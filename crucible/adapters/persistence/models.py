@@ -150,6 +150,7 @@ class AttemptRow(Base):
     log_resume_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     log_resume_occurrence: Mapped[int] = mapped_column(Integer, default=0)
     cleaned_up_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
+    unsupervised: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 class LogChunkRow(Base):
@@ -630,6 +631,32 @@ class HarnessStateRow(Base):
     last_validated_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(TZ)
     updated_by: Mapped[str] = mapped_column(String(160))
+
+
+class BootstrapImportRow(Base):
+    __tablename__ = "bootstrap_imports"
+    __table_args__ = (
+        Index("ix_bootstrap_imports_content", "content_sha256"),
+        # ADR 0006: at most one import holds authority, enforced by the database.
+        Index(
+            "uq_bootstrap_imports_authoritative",
+            "state",
+            unique=True,
+            postgresql_where=text("state = 'authoritative'"),
+        ),
+    )
+    id: Mapped[str] = mapped_column(ID, primary_key=True)
+    state: Mapped[str] = mapped_column(String(16))
+    schema_version: Mapped[str] = mapped_column(String(16))
+    content_sha256: Mapped[str] = mapped_column(String(64))
+    source_sha256: Mapped[str] = mapped_column(String(64))
+    source: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    manifest: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    principal_id: Mapped[str] = mapped_column(ID, ForeignKey("principals.id"))
+    imported_by: Mapped[str] = mapped_column(String(160))
+    verified_at: Mapped[datetime] = mapped_column(TZ)
+    committed_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
+    committed_by: Mapped[str | None] = mapped_column(String(160), nullable=True)
 
 
 class ImagePromotionRow(Base):
