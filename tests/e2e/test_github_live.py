@@ -165,10 +165,11 @@ def live_policy() -> dict[str, Any]:
         "external_review_rounds",
         "feedback_dispositions_complete",
     ]
-    # The throwaway repository has no CI. An empty required set is pending, never green
-    # (23), so a tier that wants to reach `ready_for_merge` has to say so explicitly,
-    # which is an operator-recorded policy decision and is what this is.
-    document["ci_certification"]["allow_no_ci"] = True
+    # C6c gives the throwaway repository one stable required check. Ordinary tasks
+    # prove the green path, while the readiness failure task adds its marker to force
+    # this exact check red.
+    document["ci_certification"]["allow_no_ci"] = False
+    document["ci_certification"]["required_checks"] = ["crucible-readiness"]
     return document
 
 
@@ -316,7 +317,7 @@ async def test_a_task_reaches_a_real_pull_request_and_a_real_merge(
     certification = live_client.get(f"/v1/tasks/{task_id}/pull-request").json()[
         "ci_certifications"
     ][-1]
-    assert certification["state"] == "skipped", certification
+    assert certification["state"] == "green", certification
 
     status, payload = github_live.merge_with_app_token(
         github, live_config, record["number"], sha=view["head_sha"]
