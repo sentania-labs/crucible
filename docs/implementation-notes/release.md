@@ -162,6 +162,27 @@ When ADR 0010's publisher container starts cutting tags, it needs a GitHub App
 installation token or a PAT, or the tag will land and no release will happen.
 A tag pushed by a human from a workstation triggers the workflow normally.
 
+## Readiness uses CI from the tagged commit
+
+The release workflow does not rerun the repository test tiers. The release job
+builds, verifies, smokes, and publishes one tagged artifact. Repeating the CI
+test matrix there would create two independent definitions and recreate the
+drift that caused the v0.2.0 failure.
+
+For readiness row 14, "all tiers except live" means the five jobs in
+`.github/workflows/ci.yml`: `lint`, `scan`, `test`, `e2e`, and
+`compose-smoke`. The evidence is the green `ci` run attached to the release
+tag's commit, not the release workflow itself.
+
+The current release, v0.2.1, points to
+`a7a23679b85161982947abf49f5254cb6bf6d8eb`. Its green `ci` run is
+https://github.com/sentania-labs/crucible/actions/runs/35169303005. That commit
+predates the addition of the `e2e` job, so its historical run has four jobs.
+The current five-job shape is green on `main` at
+https://github.com/sentania-labs/crucible/actions/runs/35527704824. The next
+release tag based on the current workflow will have the complete five-job
+evidence without a second test execution in `release.yml`.
+
 ## Known gaps
 
 - No test asserts that `/v1/health` reports the derived version. The only guard
