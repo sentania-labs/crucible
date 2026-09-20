@@ -327,7 +327,9 @@ def live_client(
                     )
                 )
             uow.commit()
-    with TestClient(app, headers={"Authorization": f"Bearer {live_tokens['orchestrator']}"}) as c:
+    # The live contract pins the exact harness and model under test, which is an
+    # operator-only submission.
+    with TestClient(app, headers={"Authorization": f"Bearer {live_tokens['operator']}"}) as c:
         yield c
 
 
@@ -439,6 +441,7 @@ def _contract(harness: str, model: str, image: str, config: LiveConfig, external
         "tier": "trivial",
         "harness": harness,
         "model": model,
+        "pin_reason": "live acceptance verifies each configured harness and model",
         "effort": EFFORT[harness],
         "timeout_seconds": 900,
         "rationale": "trivial work goes to the cheapest model the harness offers (05b)",
