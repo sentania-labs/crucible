@@ -16,6 +16,7 @@ mounted read-only on top, so no hook, MCP server or plugin definition reaches a 
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,7 @@ from crucible.ports.harness import (
     LaunchContext,
     MountMode,
     ParsedReport,
+    ProviderQuotaEvent,
     ReportMetrics,
     TranscriptFormat,
     VersionRange,
@@ -70,10 +72,18 @@ QUOTA_PATTERNS += base.correlated(
     r"rate_limit_event.*\"status\"\s*:\s*\"rejected\"",
     r"rate_limit_event.*out_of_credits",
 )
-PROVIDER_QUOTA_SIGNALS = base.correlated(
-    r"rate_limit_event.*\"status\"\s*:\s*\"rejected\"",
-    r"rate_limit_event.*out_of_credits",
-)
+
+
+def _provider_quota_refusal(document: Mapping[str, Any]) -> bool:
+    if document.get("type") != "rate_limit_event":
+        return False
+    info = document.get("rate_limit_info")
+    if not isinstance(info, dict):
+        return False
+    return any(
+        info.get(key) in {"rejected", "out_of_credits"}
+        for key in ("status", "overageStatus", "overageDisabledReason")
+    )
 
 
 class ClaudeCodeAdapter:
@@ -83,10 +93,13 @@ class ClaudeCodeAdapter:
     def quota_reset_at(self, stdout_tail: str, stderr_tail: str) -> datetime | None:
         return base.quota_reset_at(stdout_tail, stderr_tail, quota=QUOTA_PATTERNS)
 
-    def provider_quota_exhausted(self, stdout_tail: str, stderr_tail: str) -> bool:
-        return base.provider_quota_exhausted(
-            stdout_tail, stderr_tail, signals=PROVIDER_QUOTA_SIGNALS
+    def provider_quota_event(self, stdout_tail: str, stderr_tail: str) -> ProviderQuotaEvent | None:
+        return base.provider_quota_event(
+            stdout_tail, stderr_tail, predicate=_provider_quota_refusal
         )
+
+    def provider_quota_exhausted(self, stdout_tail: str, stderr_tail: str) -> bool:
+        return self.provider_quota_event(stdout_tail, stderr_tail) is not None
 
     def capabilities(self) -> HarnessCapabilities:
         return HarnessCapabilities(

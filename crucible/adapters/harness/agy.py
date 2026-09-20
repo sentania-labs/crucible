@@ -16,6 +16,7 @@ rw-narrow and the file syncs back by that field.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,7 @@ from crucible.ports.harness import (
     LaunchContext,
     MountMode,
     ParsedReport,
+    ProviderQuotaEvent,
     ReportMetrics,
     TranscriptFormat,
     VersionRange,
@@ -56,9 +58,14 @@ QUOTA_PATTERNS = base.patterns(
     "rate limit exceeded",
     "Too Many Requests",
 )
-PROVIDER_QUOTA_SIGNALS = base.correlated(
-    r'"type"\s*:\s*"result".*"status"\s*:\s*"ERROR".*RESOURCE_EXHAUSTED',
-)
+
+
+def _provider_quota_refusal(document: Mapping[str, Any]) -> bool:
+    return (
+        document.get("type") == "result"
+        and document.get("status") == "ERROR"
+        and "RESOURCE_EXHAUSTED" in str(document.get("error", ""))
+    )
 
 
 class AgyAdapter:
@@ -68,10 +75,13 @@ class AgyAdapter:
     def quota_reset_at(self, stdout_tail: str, stderr_tail: str) -> datetime | None:
         return base.quota_reset_at(stdout_tail, stderr_tail, quota=QUOTA_PATTERNS)
 
-    def provider_quota_exhausted(self, stdout_tail: str, stderr_tail: str) -> bool:
-        return base.provider_quota_exhausted(
-            stdout_tail, stderr_tail, signals=PROVIDER_QUOTA_SIGNALS
+    def provider_quota_event(self, stdout_tail: str, stderr_tail: str) -> ProviderQuotaEvent | None:
+        return base.provider_quota_event(
+            stdout_tail, stderr_tail, predicate=_provider_quota_refusal
         )
+
+    def provider_quota_exhausted(self, stdout_tail: str, stderr_tail: str) -> bool:
+        return self.provider_quota_event(stdout_tail, stderr_tail) is not None
 
     def capabilities(self) -> HarnessCapabilities:
         return HarnessCapabilities(

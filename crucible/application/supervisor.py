@@ -2521,17 +2521,13 @@ class Supervisor:
                 )
                 if oom_killed and not (timed_out or killed):
                     attempt.exit_class = ExitClass.ENVIRONMENT
-            if (
-                attempt.exit_class is ExitClass.QUOTA_EXHAUSTED
-                and adapter is not None
-                and adapter.provider_quota_exhausted(outputs.stdout_tail, outputs.stderr_tail)
-            ):
-                reset_at = (
-                    adapter.quota_reset_at(outputs.stdout_tail, outputs.stderr_tail)
-                    if adapter is not None
-                    else None
-                )
-                self._mark_pool_exhausted(uow, attempt, execution, reset_at)
+            provider_quota = (
+                adapter.provider_quota_event(outputs.stdout_tail, outputs.stderr_tail)
+                if attempt.exit_class is ExitClass.QUOTA_EXHAUSTED and adapter is not None
+                else None
+            )
+            if provider_quota is not None:
+                self._mark_pool_exhausted(uow, attempt, execution, provider_quota.reset_at)
             parsed: ParsedReport | None = None
             if adapter is not None and attempt.workspace_path:
                 report_dir = Path(attempt.workspace_path) / "output" / "report"

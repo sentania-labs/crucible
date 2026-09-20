@@ -18,8 +18,10 @@ MCP servers and hook trust hashes never reach a worker.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from crucible.adapters.harness import base
 from crucible.domain.exit_class import ExitClass
@@ -32,6 +34,7 @@ from crucible.ports.harness import (
     LaunchContext,
     MountMode,
     ParsedReport,
+    ProviderQuotaEvent,
     ReportMetrics,
     TranscriptFormat,
     VersionRange,
@@ -64,9 +67,15 @@ QUOTA_PATTERNS = base.patterns(
     "Rate limit reached",
     "429 Too Many Requests",
 )
-PROVIDER_QUOTA_SIGNALS = base.correlated(
-    r'"type"\s*:\s*"turn\.failed".*"code"\s*:\s*"usage_limit_reached"',
-)
+
+
+def _provider_quota_refusal(document: Mapping[str, Any]) -> bool:
+    error = document.get("error")
+    return (
+        document.get("type") == "turn.failed"
+        and isinstance(error, dict)
+        and error.get("code") == "usage_limit_reached"
+    )
 
 
 class CodexAdapter:
@@ -76,10 +85,13 @@ class CodexAdapter:
     def quota_reset_at(self, stdout_tail: str, stderr_tail: str) -> datetime | None:
         return base.quota_reset_at(stdout_tail, stderr_tail, quota=QUOTA_PATTERNS)
 
-    def provider_quota_exhausted(self, stdout_tail: str, stderr_tail: str) -> bool:
-        return base.provider_quota_exhausted(
-            stdout_tail, stderr_tail, signals=PROVIDER_QUOTA_SIGNALS
+    def provider_quota_event(self, stdout_tail: str, stderr_tail: str) -> ProviderQuotaEvent | None:
+        return base.provider_quota_event(
+            stdout_tail, stderr_tail, predicate=_provider_quota_refusal
         )
+
+    def provider_quota_exhausted(self, stdout_tail: str, stderr_tail: str) -> bool:
+        return self.provider_quota_event(stdout_tail, stderr_tail) is not None
 
     def capabilities(self) -> HarnessCapabilities:
         return HarnessCapabilities(

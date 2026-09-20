@@ -306,3 +306,20 @@ def test_only_structured_harness_events_authorize_a_shared_quota_mark(
 ) -> None:
     assert adapter.provider_quota_exhausted(event, "") is True
     assert adapter.provider_quota_exhausted("agent says usage limit reached", "") is False
+
+
+def test_provider_reset_comes_only_from_the_authoritative_event() -> None:
+    adapter = ClaudeCodeAdapter()
+    assistant = (
+        '{"type":"assistant","rate_limit_event":{"status":"rejected",'
+        '"reason":"out_of_credits"},"metadata":{"reset_at":"2026-09-21T12:00:00Z"}}'
+    )
+    assert adapter.provider_quota_event(assistant, "") is None
+    refusal = (
+        '{"type":"rate_limit_event","rate_limit_info":{"status":"rejected",'
+        '"overageDisabledReason":"out_of_credits",'
+        '"reset_at":"2026-09-21T12:00:00Z"}}'
+    )
+    event = adapter.provider_quota_event(refusal, "")
+    assert event is not None
+    assert event.reset_at == datetime(2026, 9, 21, 12, tzinfo=UTC)

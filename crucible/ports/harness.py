@@ -34,6 +34,7 @@ __all__ = [
     "LaunchContext",
     "MountMode",
     "ParsedReport",
+    "ProviderQuotaEvent",
     "ReportMetrics",
     "SessionCompatibility",
     "TranscriptFormat",
@@ -62,6 +63,13 @@ class TranscriptFormat(StrEnum):
     STREAM_JSON = "stream-json"
     JSON_EVENTS = "json-events"
     NONE = "none"
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderQuotaEvent:
+    """One authoritative structured provider refusal emitted by a harness."""
+
+    reset_at: datetime | None = None
 
 
 def parse_version(value: str) -> tuple[int, int, int]:
@@ -301,6 +309,10 @@ class HarnessAdapter(Protocol):
     def classify_exit(self, exit: ExitInfo, stdout_tail: str, stderr_tail: str) -> ExitClass: ...
 
     def quota_reset_at(self, stdout_tail: str, stderr_tail: str) -> datetime | None: ...
+
+    def provider_quota_event(
+        self, stdout_tail: str, stderr_tail: str
+    ) -> ProviderQuotaEvent | None: ...
 
     def provider_quota_exhausted(self, stdout_tail: str, stderr_tail: str) -> bool:
         """True only for the harness's authoritative provider-refusal event."""
