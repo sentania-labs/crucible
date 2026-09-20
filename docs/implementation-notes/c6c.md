@@ -105,8 +105,8 @@ It reported three blockers:
    prevents a warning but cannot keep a worker alive forever. A progress
    heartbeat is now stored, and unit plus integration coverage records this
    behavior.
-2. Readiness contained the literal `<C6C-CI-RUN-URL>` placeholder. Accepted as
-   a delivery-sequencing blocker. The branch CI URL did not exist until this
+2. Readiness contained a temporary CI run URL placeholder. Accepted as a
+   delivery-sequencing blocker. The branch CI URL did not exist until this
    review was recorded and the pull request opened. The placeholder was
    replaced by the first green five-job run,
    https://github.com/sentania-labs/crucible/actions/runs/35532280495. The
