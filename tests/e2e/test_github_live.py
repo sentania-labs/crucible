@@ -322,6 +322,95 @@ async def test_a_task_reaches_a_real_pull_request_and_a_real_merge(
         assert kind in kinds, kind
 
 
+async def test_a_real_required_check_failure_escalates_without_retry(
+    ctx: AppContext,
+    live_client: TestClient,
+    live_supervisor: Supervisor,
+    live_config: LiveConfig,
+    mirror: str,
+    cleanup: github_live.Cleanup,
+    worker_image: str,
+    engine: Engine,
+) -> None:
+    """23: a real failing workflow is evidence, not an automatic correction."""
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE policies SET document = "
+                "jsonb_set(jsonb_set(document, '{ci_certification,allow_no_ci}', 'false'), "
+                "'{ci_certification,required_checks}', '[\"crucible-readiness\"]') "
+                "WHERE name='e2e-script' AND version=1"
+            )
+        )
+    register(ctx, live_config, mirror)
+    external_id = f"C6C-CI-{RUN_ID}"
+    branch = github_live.branch_for(external_id)
+    cleanup.add_branch(branch)
+    document = live_contract(external_id, live_config, worker_image)
+    document["scope"]["allowed_paths"] = [".crucible-force-ci-failure"]
+    task_id = submit_and_start(live_client, document)
+
+    state = await run_until(
+        live_supervisor,
+        live_client,
+        task_id,
+        {"awaiting_internal_review", "pre_pr_gates_failed"},
+        max_ticks=60,
+    )
+    assert state == "awaiting_internal_review"
+    upload_review(live_client, task_id)
+    assert (
+        await run_until(
+            live_supervisor, live_client, task_id, {"awaiting_acceptance"}, max_ticks=20
+        )
+        == "awaiting_acceptance"
+    )
+    view = live_client.get(f"/v1/tasks/{task_id}").json()
+    accepted = live_client.post(
+        f"/v1/tasks/{task_id}/accept",
+        json={
+            "verdict": "accepted",
+            "reasoning": "Exercise the required CI failure path.",
+            "head_sha": view["head_sha"],
+        },
+    )
+    assert accepted.status_code == 200, accepted.text
+    failed = await run_until(
+        live_supervisor,
+        live_client,
+        task_id,
+        {"ci_certification_failed", "publish_failed"},
+        max_ticks=120,
+        pause=2.0,
+    )
+    assert failed == "ci_certification_failed"
+    record = live_client.get(f"/v1/tasks/{task_id}/pull-request").json()
+    cleanup.add_pull_request(int(record["number"]))
+    await live_supervisor.tick()
+    record = live_client.get(f"/v1/tasks/{task_id}/pull-request").json()
+    certification = record["ci_certifications"][-1]
+    assert certification["state"] == "failed"
+    assert certification["required_checks"] == ["crucible-readiness"]
+    assert certification["failure"]["check"] == "crucible-readiness"
+    assert certification["failure"]["conclusion"] == "failure"
+    assert certification["failure"]["url"]
+    assert certification["failure"]["run_id"]
+
+    final = live_client.get(f"/v1/tasks/{task_id}").json()
+    assert len(final["executions"]) == 1
+    assert len(final["executions"][0]["attempts"]) == 1
+    assert final["contract_version"] == 1
+    for _ in range(2):
+        await live_supervisor.tick()
+    unchanged = live_client.get(f"/v1/tasks/{task_id}").json()
+    assert unchanged["state"] == "ci_certification_failed"
+    assert len(unchanged["executions"]) == 1
+    print(
+        "live CI failure: "
+        f"{record['url']} check {certification['failure']['url']} at {record['head_sha']}"
+    )
+
+
 @pytest.mark.skipif(
     github_live.review_wait_seconds() == 0,
     reason=(
