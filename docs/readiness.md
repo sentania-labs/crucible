@@ -76,9 +76,9 @@ dedicated live credential root, and `sentania-labs/crucible-spike-target`.
 
 | Tier | Command | Result |
 |---|---|---|
-| unit | `make test-unit` as part of `make test` | 578 passed, 6.35 s |
-| integration | `make test-integration` as part of `make test` | 301 passed, 454.00 s, real PostgreSQL 16 |
-| e2e (Docker) | `make e2e DOCKER='<rootless wrapper>'` | 16 passed, 10 deselected, 113.46 s |
+| unit | `make test-unit` as part of `make test` | 579 passed, 6.08 s |
+| integration | `make test-integration` as part of `make test` | 301 passed, 370.11 s, real PostgreSQL 16 |
+| e2e (Docker) | `make e2e DOCKER='<rootless wrapper>'` | 16 passed, 10 deselected, 100.43 s |
 | e2e GitHub | `make e2e-github` | 3 passed, 1 skipped, 92.06 s |
 | e2e live | `make e2e-live HARNESS=all` | 3 passed, 23 deselected, 282.85 s |
 | e2e admin | `make e2e-admin` | 3 passed, 23 deselected, 50.31 s |

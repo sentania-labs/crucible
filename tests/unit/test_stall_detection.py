@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
-from crucible.application.supervisor import worker_stall_action
+from crucible.application.supervisor import worker_stall_action, workspace_fingerprint
+from crucible.ports.execution import Workspace
 
 
 def test_stall_thresholds_warn_once_then_fail() -> None:
@@ -89,3 +91,19 @@ def test_unverified_progress_suppresses_warning_but_not_failure() -> None:
         )
         == "fail"
     )
+
+
+def test_workspace_fingerprint_changes_for_silent_file_edits(tmp_path: Path) -> None:
+    checkout = tmp_path / "repo"
+    report = tmp_path / "report"
+    checkout.mkdir()
+    report.mkdir()
+    workspace = Workspace(
+        attempt_id="attempt",
+        checkout_path=str(checkout),
+        identity_path=str(tmp_path / "identity"),
+        report_path=str(report),
+    )
+    before = workspace_fingerprint(workspace)
+    (checkout / "work.txt").write_text("quiet progress\n", encoding="utf-8")
+    assert workspace_fingerprint(workspace) != before

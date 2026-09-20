@@ -8,12 +8,13 @@ from collections.abc import AsyncIterator
 from datetime import datetime
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Query, Request, Response
+from fastapi import APIRouter, Header, Query, Request, Response
 from fastapi.responses import StreamingResponse
 
 from crucible.adapters.api.deps import Admin, Ctx, Orchestrator, Reader, UoW
 from crucible.application.artifacts import read_artifact, upload_artifact
-from crucible.application.errors import NotFoundError
+from crucible.application.auth import authenticate
+from crucible.application.errors import NotFoundError, UnauthorizedError
 from crucible.application.queries import (
     artifact_view,
     attempt_artifacts,
@@ -80,24 +81,34 @@ async def get_attempt_logs(
     attempt_id: str,
     request: Request,
     ctx: Ctx,
-    uow: UoW,
-    _principal: Reader,
+    authorization: Annotated[str | None, Header()] = None,
     stream: Literal["stdout", "stderr"] | None = None,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> Response:
     """Read stored bytes, or follow newly appended chunks with server-sent events (04)."""
-    attempt = uow.attempts.get(attempt_id)
-    if attempt is None:
-        raise NotFoundError(f"attempt {attempt_id} not found")
+    # Streaming responses finalize yield dependencies only when the stream closes.
+    # Authenticate and take the initial snapshot in a short local UoW so a live tail
+    # never holds a pool connection for its lifetime.
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise UnauthorizedError("a bearer token is required")
+    with ctx.uow_factory() as initial:
+        principal = authenticate(initial, authorization[7:].strip())
+        if principal is None:
+            raise UnauthorizedError("token not recognized")
+        request.state.principal = principal
+        attempt = initial.attempts.get(attempt_id)
+        if attempt is None:
+            raise NotFoundError(f"attempt {attempt_id} not found")
+        chunks = list(initial.logs.list_from_offset(attempt_id, offset=offset, stream=stream))
+        drained = attempt.logs_drained_at is not None
     if "text/event-stream" not in request.headers.get("accept", ""):
-        chunks = list(uow.logs.list_from_offset(attempt_id, offset=offset, stream=stream))
         body, next_offset = _log_body(chunks, offset)
         return Response(
             content=body,
             media_type="text/plain",
             headers={
                 "X-Crucible-Log-Offset": str(next_offset),
-                "X-Crucible-Logs-Drained": str(attempt.logs_drained_at is not None).lower(),
+                "X-Crucible-Logs-Drained": str(drained).lower(),
             },
         )
 

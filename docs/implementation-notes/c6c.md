@@ -72,10 +72,10 @@ Run on the reference workstation on 2026-09-20, America/Chicago.
 | Tier | Result |
 |---|---|
 | `make lint` | clean: Ruff format, Ruff checks, mypy on 225 files, and 3 import contracts |
-| `make test` | 578 unit tests and 301 integration tests passed |
+| `make test` | 579 unit tests and 301 integration tests passed |
 | `make scan` | tree and branch history clean, no leaks found |
 | `make e2e-image` | script harness built at digest `sha256:9b5b91e74522bf6e65d159d27fec2fd0815cc915f6b760f11ecc974c20fc6b73` |
-| `make e2e` | 16 passed, 10 deselected, 113.46 s on the dedicated rootless daemon |
+| `make e2e` | 16 passed, 10 deselected, 100.43 s on the dedicated rootless daemon |
 | `make up`, then `make smoke` | isolated host-daemon project healthy; full task, gates, review, and acceptance passed |
 | `make e2e-github` | 3 passed, 1 skipped, 92.06 s; target PRs cleaned up |
 | `make e2e-live HARNESS=all` | 3 passed, 23 deselected, 282.85 s; all three real harnesses reached `ready_for_merge` |
@@ -116,6 +116,25 @@ It reported three blockers:
 
 The reviewer reported no non-blocking findings. Per the contract, there is no
 second review round.
+
+The repository's GitHub settings automatically started another review when the
+pull request opened. It was not requested and is not a second contract review
+round. Its three findings were direct correctness defects in the new C6c paths,
+so they were fixed:
+
+1. SSE log tails held the request-scoped authentication UoW until the stream
+   ended. The route now authenticates and takes its initial snapshot in a short
+   local UoW, then opens only short-lived polling UoWs.
+2. Silent workers editing files could be killed because no live `fs_changed`
+   heartbeat was emitted. The supervisor now fingerprints the writable checkout
+   and report trees without following symlinks, and records substantive activity
+   when either changes.
+3. Cancellation could discard a parsed report when a provider supplied no raw
+   YAML. The parsed mapping is now serialized and stored as the unparsed partial
+   report artifact, with integration coverage.
+
+The complete lint, scan, unit, integration, Docker e2e, Compose smoke, and CI
+gates were rerun after these fixes. No additional review was initiated.
 
 ## Spec notes and follow-ups
 

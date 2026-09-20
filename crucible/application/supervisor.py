@@ -14,14 +14,18 @@ from __future__ import annotations
 import asyncio
 import copy
 import logging
+import stat
 import time
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from functools import partial
+from itertools import chain
 from pathlib import Path
 from typing import Any, ClassVar, TypeVar
+
+import yaml
 
 from crucible.application.decisions import (
     DEFAULT_ESCALATION_STALE_HOURS,
@@ -159,6 +163,27 @@ def worker_stall_action(
     return None
 
 
+def workspace_fingerprint(workspace: Workspace) -> tuple[int, int, int]:
+    """Cheap activity fingerprint for the writable checkout and report trees."""
+    newest_ns = files = total_bytes = 0
+    for root_name in (workspace.checkout_path, workspace.report_path):
+        root = Path(root_name)
+        try:
+            paths = chain((root,), root.rglob("*"))
+            for path in paths:
+                try:
+                    file_stat = path.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                newest_ns = max(newest_ns, file_stat.st_mtime_ns)
+                files += 1
+                if stat.S_ISREG(file_stat.st_mode):
+                    total_bytes += file_stat.st_size
+        except OSError:
+            continue
+    return newest_ns, files, total_bytes
+
+
 class LeaseLostError(Exception):
     """This supervisor no longer holds the lease; it must stop acting."""
 
@@ -238,6 +263,7 @@ class Supervisor:
         self.fenced_token: int | None = None
         self._handles: dict[str, Handle] = {}
         self._workspaces: dict[str, Workspace] = {}
+        self._workspace_fingerprints: dict[str, tuple[int, int, int]] = {}
         # The delivery half (23). With no GitHub client configured it is inert, which is
         # what every tier below the live one runs with.
         self.delivery = DeliveryCoordinator(
@@ -1364,10 +1390,12 @@ class Supervisor:
             await self._db(partial(self._environment_failure, attempt.id, "prepare", detail))
             return False
         self._workspaces[attempt.id] = ws
+        self._workspace_fingerprints[attempt.id] = workspace_fingerprint(ws)
         await self._db(partial(self._record_prepared, attempt.id, ws))
         if not await self._db(partial(self._mark_launching, attempt.id, ws)):
             await self._discard(provider, ws, spec)
             self._workspaces.pop(attempt.id, None)
+            self._workspace_fingerprints.pop(attempt.id, None)
             return False
         try:
             handle = await provider.launch(ws, spec)
@@ -1947,6 +1975,7 @@ class Supervisor:
                 continue
             await self._db(partial(self._mark_cleaned, attempt.id, choice))
             self._workspaces.pop(attempt.id, None)
+            self._workspace_fingerprints.pop(attempt.id, None)
             self._handles.pop(attempt.id, None)
             cleaned += 1
         return cleaned
@@ -2135,6 +2164,9 @@ class Supervisor:
             # Pull before checking for a stall so bytes arriving on this observation
             # count as activity. A merely running container is liveness, not progress.
             await self._pull_logs(attempt, provider, handle)
+            changed = await self._db(partial(self._workspace_changed, attempt))
+            if changed:
+                await self._db(partial(self._record_workspace_activity, attempt.id))
             stall = await self._db(partial(self._stall_action, attempt.id))
             if stall == "fail":
                 await provider.terminate(handle, "drain")
@@ -2184,6 +2216,7 @@ class Supervisor:
             await self._complete_quota_checkpoint(attempt.id)
         self._handles.pop(attempt.id, None)
         self._workspaces.pop(attempt.id, None)
+        self._workspace_fingerprints.pop(attempt.id, None)
         return True
 
     def _pending_quota_checkpoints(self) -> list[str]:
@@ -2528,6 +2561,28 @@ class Supervisor:
                 warned_at=warned_at,
             )
 
+    def _workspace_changed(self, attempt: Attempt) -> bool:
+        current = workspace_fingerprint(self._workspace_for(attempt))
+        previous = self._workspace_fingerprints.get(attempt.id)
+        self._workspace_fingerprints[attempt.id] = current
+        return previous is not None and current != previous
+
+    def _record_workspace_activity(self, attempt_id: str) -> None:
+        with self._fenced() as uow:
+            attempt = uow.attempts.get(attempt_id)
+            if attempt is None or attempt.state is not AttemptState.RUNNING:
+                return
+            uow.heartbeats.append(
+                Heartbeat(
+                    id=None,
+                    attempt_id=attempt.id,
+                    ts=self._clock.now(),
+                    signal="fs_changed",
+                    detail={},
+                )
+            )
+            uow.commit()
+
     def _record_stall_warning(self, attempt_id: str) -> None:
         with self._fenced() as uow:
             attempt = uow.attempts.get(attempt_id, for_update=True)
@@ -2726,8 +2781,10 @@ class Supervisor:
                 return
             claim_ok = False
             cancelled = attempt.termination_reason == TERMINATION_CANCEL
-            if cancelled and outputs.report_raw is not None:
-                partial_report = outputs.report_raw
+            if cancelled and (outputs.report_raw is not None or outputs.report is not None):
+                partial_report = outputs.report_raw or yaml.safe_dump(
+                    outputs.report, sort_keys=True, default_flow_style=False
+                )
                 if find_secrets(partial_report):
                     partial_report = redact(partial_report)
                 store_artifact(
