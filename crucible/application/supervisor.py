@@ -2001,11 +2001,76 @@ class Supervisor:
                 outputs,
                 collection_error,
                 observation.oom_killed,
+                defer_quota=True,
             )
         )
+        if await self._db(partial(self._quota_checkpoint_pending, attempt.id)):
+            repository_url = spec.repository_url if spec is not None else ""
+            required = provider_name == "docker" and not (
+                repository_url.startswith("/") or repository_url.startswith("file://")
+            )
+            pushed, detail = await self.delivery.push_quota_checkpoint(
+                attempt.id, required=required
+            )
+            await self._db(partial(self._finish_deferred_quota, attempt.id, pushed, detail))
         self._handles.pop(attempt.id, None)
         self._workspaces.pop(attempt.id, None)
         return True
+
+    def _quota_checkpoint_pending(self, attempt_id: str) -> bool:
+        with self._uow_factory() as uow:
+            attempt = uow.attempts.get(attempt_id)
+            if attempt is None or attempt.exit_class is not ExitClass.QUOTA_EXHAUSTED:
+                return False
+            execution = uow.executions.get(attempt.execution_id)
+            task = uow.tasks.get(attempt.task_id)
+            return bool(
+                execution is not None
+                and execution.state is ExecutionState.ACTIVE
+                and task is not None
+                and task.state is TaskState.RUNNING
+            )
+
+    def _finish_deferred_quota(self, attempt_id: str, pushed: bool, detail: str) -> None:
+        with self._fenced() as uow:
+            attempt = uow.attempts.get(attempt_id, for_update=True)
+            assert attempt is not None
+            execution = uow.executions.get(attempt.execution_id, for_update=True)
+            task = uow.tasks.get(attempt.task_id, for_update=True)
+            assert execution is not None and task is not None
+            if (
+                attempt.exit_class is not ExitClass.QUOTA_EXHAUSTED
+                or execution.state is not ExecutionState.ACTIVE
+                or task.state is not TaskState.RUNNING
+            ):
+                return
+            if pushed:
+                self._handle_quota_exit(uow, task, execution, attempt)
+            else:
+                record_event(
+                    uow,
+                    self._clock,
+                    EventKind.TASK_PUBLISH_FAILED,
+                    principal=PRINCIPAL_CRUCIBLE,
+                    task_id=task.id,
+                    execution_id=execution.id,
+                    attempt_id=attempt.id,
+                    payload={
+                        "step": "quota_checkpoint",
+                        "detail": detail[:1000],
+                        "head_sha": task.head_sha,
+                    },
+                )
+                move_execution(
+                    uow,
+                    self._clock,
+                    execution,
+                    ExecutionState.FAILED,
+                    EventKind.EXECUTION_FAILED,
+                    payload={"exit_class": "quota_exhausted", "checkpoint_push": "failed"},
+                )
+                self._task_reported(uow, task, attempt, ExitClass.QUOTA_EXHAUSTED, {})
+            uow.commit()
 
     async def _reconcile_stranded(self, attempt: Attempt) -> bool:
         """An attempt still in preparing or launching after the launch step ran was left
@@ -2164,6 +2229,8 @@ class Supervisor:
         outputs: CollectedOutputs,
         collection_error: str | None = None,
         oom_killed: bool = False,
+        *,
+        defer_quota: bool = False,
     ) -> None:
         with self._fenced() as uow:
             attempt = uow.attempts.get(attempt_id, for_update=True)
@@ -2352,7 +2419,9 @@ class Supervisor:
                         execution_id=attempt.execution_id,
                         progress=parsed.progress,
                     )
-            self._classify_and_finish(uow, attempt, blocked_text, claim_ok=claim_ok)
+            self._classify_and_finish(
+                uow, attempt, blocked_text, claim_ok=claim_ok, defer_quota=defer_quota
+            )
             uow.commit()
 
     def _record_credential_sync(
@@ -2858,6 +2927,7 @@ class Supervisor:
         blocked_text: str | None,
         *,
         claim_ok: bool = False,
+        defer_quota: bool = False,
     ) -> None:
         execution = uow.executions.get(attempt.execution_id, for_update=True)
         task = uow.tasks.get(attempt.task_id, for_update=True)
@@ -2932,6 +3002,8 @@ class Supervisor:
                     payload={"exit_class": exit_class.value, "phase": "reserve"},
                 )
                 self._task_reported(uow, task, attempt, exit_class, common)
+                return
+            if defer_quota:
                 return
             self._handle_quota_exit(uow, task, execution, attempt)
             return

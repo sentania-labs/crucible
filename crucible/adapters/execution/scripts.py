@@ -232,7 +232,9 @@ mkdir -p "$OUT"
 if [ -n "$QUOTA_ATTEMPT" ]; then
   {GIT} -C "$REPO" add -A
   if ! {GIT} -C "$REPO" diff --cached --quiet; then
-    {GIT} -C "$REPO" commit -q -m "wip(crucible): attempt $QUOTA_ATTEMPT"
+    {GIT} -C "$REPO" commit -q \
+      -m "wip(crucible): attempt $QUOTA_ATTEMPT" \
+      -m "Crucible-Attempt: $QUOTA_ATTEMPT"
   fi
   if [ -n "$QUOTA_PUSH_URL" ]; then
     {GIT} -C "$REPO" remote set-url origin "$QUOTA_PUSH_URL"
