@@ -51,9 +51,21 @@ step:
 
 A pinned task (05) skips step 3: it waits for its own pool's reset within
 the cap or ends `reported`. A quota refusal at launch-time reservation
-(the pool over Crucible's own soft limit) is not a reroute; it is the
-existing `quota_exhausted` refusal with a wake, because Crucible's count
-and the provider's word are different facts.
+(the pool over Crucible's own soft limit since selection) is a routing
+race, not a provider fact: it creates no exhaustion mark and no checkpoint,
+and it goes straight to step 3 with the refused pool excluded, recorded as
+a `reroute` event with source `reserve`. It counts toward `reroute_max`
+like any other reroute. (Amended 2026-09-20 after the C6b implementation:
+the original text sent this case to a wake, which with class-based
+selection is a round trip for a decision the rule already makes.)
+
+Timed resumes from `awaiting_quota` count toward `reroute_max` together
+with reroutes, per contract version. Attempts created by a reroute or a
+resume do not count toward `lifecycle.max_attempts`; retry eligibility
+compares the number of non-quota attempts. Once an execution has pushed
+any head (a checkpoint or a completed attempt's branch), every later
+attempt on that execution resumes from the remote work branch, whatever
+created it.
 
 ## Delivery-half failures (23)
 

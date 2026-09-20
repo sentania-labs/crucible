@@ -164,8 +164,11 @@ of the previous version's. `required_verification` may not shrink.
   select. The image is derived at launch from the selected harness through
   the image manifest, must match the provider's allowlist pattern, resolve
   to a known `WorkerImage` whose harness version is inside the adapter's
-  supported range, and not be `retired`; a tier whose every candidate has
-  no usable image is a 422 at submit.
+  supported range, and not be `retired`; a candidate whose derived image
+  fails any of these is excluded from selection with that reason and the
+  next candidate is considered; a tier whose every candidate has no usable
+  image is a 422 at submit. The `fake` execution provider alone may accept
+  a supplied `image`, as a test affordance; a real provider refuses one.
 - `deliverables[].closes` entries are issues in the same repository.
 - No credential reference or value anywhere: the contract has no auth
   fields by design; repository auth is Crucible configuration.

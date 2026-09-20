@@ -156,10 +156,12 @@ collected --classify--> succeeded | blocked | failed
 {preparing, launching} --error--> collected (exit_class environment)
 ```
 
-`launching` is where the model is selected (05b): the attempt row carries
-the selected harness, model, image, and the ordered candidate list from
-that moment on, and a reroute is simply the next attempt selecting again
-with the exhausted pool excluded.
+Selection (05b) happens once per attempt inside the fenced launch
+sequence, at its start, before the workspace is prepared: the attempt row
+carries the selected harness, model, image, and the ordered candidate list
+from that moment on, and the `launching` event repeats the decision. A
+reroute is simply the next attempt selecting again with the exhausted pool
+excluded.
 
 `collected` is the single point where outputs, logs, artifacts, evidence,
 the branch bundle, and the parsed report exist. For an attempt classified

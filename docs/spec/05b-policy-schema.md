@@ -221,16 +221,24 @@ whose harness is enabled and holds a credential (25), whose capability is
 in the tier's `allowed_capability`, whose pool is under its soft limit,
 and whose pool carries no live exhaustion mark. Order them by: position of
 their capability in the tier's `prefer` list (unlisted last); then quality
-demotion as `rotation.quality_feedback` states; then least recently
-launched on this project, weighted by `weight`; then id, as the final tie
-break. The first candidate is selected. The launch event records the
+demotion as `rotation.quality_feedback` states; then weighted least-recent:
+a candidate never launched on this project ranks first, otherwise rank by
+`(now - last_launched_at) * weight`, largest first; then id, as the final
+tie break. Recency is read directly from the latest AttemptMetrics per
+model on the project, never through a paged task listing. The first candidate is selected. The launch event records the
 selected entry, the derived image, and the ordered candidate list with
 each exclusion's reason.
 
 **Exhaustion marks.** A worker exit classified `quota_exhausted` (07, 16)
 marks the attempt's pool exhausted until `reset_at`: the reset the harness
 reported when the adapter can parse one, otherwise now plus the pool's
-`default_cooldown_seconds`. Marks are rows, survive a restart, expire on
+`default_cooldown_seconds`. A parsed reset is used as given, even when it
+lies beyond any task's wait cap; the cap ends the task, it does not shorten
+the pool's fact. Because a mark is shared by every task, it is written only
+when the harness's own provider-error event (07) says the provider refused
+for quota, never from quota-shaped text elsewhere in a transcript; text
+alone may still classify that one attempt `quota_exhausted` and reroute it,
+without a mark. Marks are rows, survive a restart, expire on
 their own, and can be cleared by the administrator with a reason (25). A
 launch-time reservation that finds the pool over its soft limit does not
 create a mark; the soft limit is Crucible's own count, the mark is the
