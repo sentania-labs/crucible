@@ -547,6 +547,7 @@ class Attempts:
             selected_image=row.selected_image,
             selected_pool=row.selected_pool,
             ordered_candidates=list(row.ordered_candidates or []),
+            routing_excluded_pools=list(row.routing_excluded_pools or []),
             resume_from_remote=bool(row.resume_from_remote),
         )
 
@@ -582,6 +583,7 @@ class Attempts:
                 selected_image=attempt.selected_image,
                 selected_pool=attempt.selected_pool,
                 ordered_candidates=list(attempt.ordered_candidates),
+                routing_excluded_pools=list(attempt.routing_excluded_pools),
                 resume_from_remote=attempt.resume_from_remote,
             )
         )
@@ -622,6 +624,7 @@ class Attempts:
                 selected_image=attempt.selected_image,
                 selected_pool=attempt.selected_pool,
                 ordered_candidates=list(attempt.ordered_candidates),
+                routing_excluded_pools=list(attempt.routing_excluded_pools),
                 resume_from_remote=attempt.resume_from_remote,
             )
         )

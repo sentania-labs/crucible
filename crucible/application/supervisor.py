@@ -567,7 +567,14 @@ class Supervisor:
             self._materialize_review_executions(uow)
             uow.commit()
 
-    def _create_attempt(self, uow: UnitOfWork, execution: Execution, *, number: int) -> Attempt:
+    def _create_attempt(
+        self,
+        uow: UnitOfWork,
+        execution: Execution,
+        *,
+        number: int,
+        excluded_pools: set[str] | None = None,
+    ) -> Attempt:
         attempt = Attempt(
             id=new_id(),
             execution_id=execution.id,
@@ -576,6 +583,7 @@ class Supervisor:
             state=AttemptState.PENDING,
             created_at=self._clock.now(),
             resume_from_remote=execution.resume_from_remote,
+            routing_excluded_pools=sorted(excluded_pools or set()),
         )
         uow.attempts.add(attempt)
         record_event(
@@ -1140,6 +1148,7 @@ class Supervisor:
             "harness disabled or has no credential",
             "capability ",
             "selected harness has no default image",
+            "derived image ",
         )
         for candidate in selection.candidates:
             reasons = [str(reason) for reason in candidate.get("excluded", [])]
@@ -1167,7 +1176,9 @@ class Supervisor:
             ):
                 return None
             current = replace(item, attempt=attempt, execution=execution, task=task)
-            selection = self._selection_for(uow, current)
+            selection = self._selection_for(
+                uow, current, excluded_pools=set(attempt.routing_excluded_pools)
+            )
             if selection is None or selection.selected is None or selection.image is None:
                 if self._selection_is_quota_blocked(selection):
                     self._enter_quota_wait(uow, task, attempt, execution, selection)
@@ -3130,7 +3141,12 @@ class Supervisor:
         item = _Pending(attempt, execution, task, stored.document)
         selection = self._selection_for(uow, item, excluded_pools={attempt.selected_pool})
         if selection is not None and selection.selected is not None and selection.image is not None:
-            nxt = self._create_attempt(uow, execution, number=attempt.number + 1)
+            nxt = self._create_attempt(
+                uow,
+                execution,
+                number=attempt.number + 1,
+                excluded_pools={attempt.selected_pool} if attempt.selected_pool else None,
+            )
             move_task(
                 uow,
                 self._clock,

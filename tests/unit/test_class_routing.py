@@ -267,6 +267,22 @@ def test_image_allowlist_excludes_one_candidate_and_selects_the_next() -> None:
     assert first["excluded"] == ["derived image is outside the policy allowlist"]
 
 
+def test_image_exclusions_are_ignored_when_deciding_if_usable_models_are_quota_blocked() -> None:
+    selection = SimpleNamespace(
+        candidates=(
+            {
+                "model": "image-disallowed",
+                "excluded": ["derived image is outside the policy allowlist"],
+            },
+            {
+                "model": "quota-blocked",
+                "excluded": [f"pool exhausted until {(NOW + timedelta(minutes=5)).isoformat()}"],
+            },
+        )
+    )
+    assert Supervisor._selection_is_quota_blocked(selection) is True
+
+
 def test_task_event_scan_has_no_one_thousand_event_cap() -> None:
     rows = [SimpleNamespace(seq=index) for index in range(1, 1502)]
 

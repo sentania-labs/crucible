@@ -15,6 +15,7 @@ from crucible.adapters.api.deps import AppContext
 from crucible.adapters.execution.fake import FakeProvider
 from crucible.adapters.persistence import migrate
 from crucible.adapters.persistence.unit_of_work import make_engine
+from crucible.application import routing as routing_module
 from crucible.application.admin.context import AdminContext
 from crucible.application.harnesses import set_harness_enabled
 from crucible.application.supervisor import Supervisor
@@ -526,6 +527,9 @@ async def test_downgrade_and_upgrade_preserve_an_active_quota_wait(
     task_id = _submit(client, "C6B-MIGRATION-WAIT", 87)
     await supervisor.tick()
     assert client.get(f"/v1/tasks/{task_id}").json()["state"] == "awaiting_quota"
+    with ctx.uow_factory() as uow:
+        execution = uow.executions.list_for_task(task_id)[0]
+        assert execution.resume_from_remote is True
     await supervisor.stop()
     ctx.engine.dispose()
 
@@ -551,6 +555,16 @@ async def test_downgrade_and_upgrade_preserve_an_active_quota_wait(
                 {"pool": "migration-wait-pool"},
             ).scalar_one()
             == 1
+        )
+        assert (
+            connection.execute(
+                text(
+                    "SELECT resume_from_remote FROM execution_routes_c6b_archive "
+                    "WHERE execution_id=(SELECT id FROM executions WHERE task_id=:task_id)"
+                ),
+                {"task_id": task_id},
+            ).scalar_one()
+            is True
         )
         archived_route = connection.execute(
             text(
@@ -590,7 +604,26 @@ async def test_downgrade_and_upgrade_preserve_an_active_quota_wait(
             "migration-wait-pool",
         )
         assert restored_route.ordered_candidates
+        assert (
+            connection.execute(
+                text("SELECT resume_from_remote FROM executions WHERE task_id=:task_id"),
+                {"task_id": task_id},
+            ).scalar_one()
+            is True
+        )
     check.dispose()
+
+    _promote(ctx, clock, "codex", "crucible-worker:fake-succeed")
+    clock.advance(31)
+    restarted = make_supervisor(ctx, provider, holder="sup-migration-resume")
+    await restarted.tick()
+    await restarted.tick()
+    resumed = client.get(f"/v1/tasks/{task_id}").json()
+    attempts = resumed["executions"][0]["attempts"]
+    assert len(attempts) == 2
+    assert attempts[1]["resume_from_remote"] is True
+    assert attempts[1]["state"] == "succeeded"
+    await restarted.stop()
 
 
 async def test_runtime_harness_loss_is_environment_not_quota(
@@ -785,11 +818,11 @@ async def test_quota_text_reroutes_only_the_task_without_marking_the_pool(
         clock,
         version=92,
         models=[
-            _model("a-quota-model", "codex", "text-pool-a"),
+            _model("a-quota-model", "claude_code", "text-pool-a"),
             _model("b-success-model", "agy", "text-pool-b"),
         ],
     )
-    _promote(ctx, clock, "codex", "crucible-worker:fake-quota")
+    _promote(ctx, clock, "claude_code", "crucible-worker:fake-quota")
     _promote(ctx, clock, "agy", "crucible-worker:fake-succeed")
     task_id = _submit(client, "C6B-TEXT-QUOTA", 92)
     original_collect = provider.collect
@@ -797,7 +830,14 @@ async def test_quota_text_reroutes_only_the_task_without_marking_the_pool(
     async def text_only_collect(*args: Any, **kwargs: Any) -> Any:
         outputs = await original_collect(*args, **kwargs)
         if outputs.stderr_tail:
-            return replace(outputs, stderr_tail="agent says usage_limit_reached")
+            return replace(
+                outputs,
+                stderr_tail=(
+                    '{"type":"assistant","rate_limit_event":{"status":"rejected",'
+                    '"reason":"out_of_credits"},"metadata":'
+                    '{"reset_at":"2026-09-21T12:00:00Z"}}'
+                ),
+            )
         return outputs
 
     provider.collect = text_only_collect  # type: ignore[method-assign]
@@ -807,6 +847,59 @@ async def test_quota_text_reroutes_only_the_task_without_marking_the_pool(
     assert view["state"] == "scheduled"
     with ctx.uow_factory() as uow:
         assert uow.pool_exhaustions.get("text-pool-a") is None
+        attempts = uow.attempts.list_for_task(task_id)
+        assert attempts[1].routing_excluded_pools == ["text-pool-a"]
+
+    await supervisor.tick()
+    final = client.get(f"/v1/tasks/{task_id}").json()
+    attempts = final["executions"][0]["attempts"]
+    assert [(item["model"], item["state"]) for item in attempts] == [
+        ("a-quota-model", "failed"),
+        ("b-success-model", "succeeded"),
+    ]
+    assert final["resume_at"] is None
+
+
+async def test_image_unusable_candidate_does_not_turn_quota_wait_into_environment(
+    client: TestClient,
+    ctx: AppContext,
+    clock: FakeClock,
+    supervisor: Supervisor,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_image_for_harness = routing_module.image_for_harness
+
+    def image_for_harness(uow: Any, harness: str, provider_name: str) -> str | None:
+        if harness == "claude_code":
+            return None
+        return real_image_for_harness(uow, harness, provider_name)
+
+    monkeypatch.setattr(routing_module, "image_for_harness", image_for_harness)
+    _install_policy(
+        ctx,
+        clock,
+        version=97,
+        models=[
+            _model("a-image-unusable", "claude_code", "image-pool-a"),
+            _model("b-quota-model", "codex", "image-pool-b"),
+        ],
+    )
+    _promote(ctx, clock, "codex", "crucible-worker:fake-quota")
+    task_id = _submit(client, "C6B-IMAGE-QUOTA-WAIT", 97)
+
+    await supervisor.tick()
+
+    view = client.get(f"/v1/tasks/{task_id}").json()
+    assert view["state"] == "awaiting_quota"
+    assert view["executions"][0]["attempts"][0]["model"] == "b-quota-model"
+    waiting = next(
+        event for event in _events(client, task_id) if event["kind"] == "task_awaiting_quota"
+    )
+    candidates = waiting["payload"]["ordered_candidates"]
+    first = next(item for item in candidates if item["model"] == "a-image-unusable")
+    second = next(item for item in candidates if item["model"] == "b-quota-model")
+    assert first["excluded"] == ["selected harness has no default image"]
+    assert any(reason.startswith("pool exhausted until ") for reason in second["excluded"])
 
 
 async def test_timed_resumes_share_the_reroute_cap(

@@ -156,6 +156,7 @@ class Attempt:
     selected_image: str | None = None
     selected_pool: str | None = None
     ordered_candidates: list[dict[str, Any]] = field(default_factory=list)
+    routing_excluded_pools: list[str] = field(default_factory=list)
     resume_from_remote: bool = False
 
 

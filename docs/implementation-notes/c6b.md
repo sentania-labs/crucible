@@ -44,29 +44,40 @@ the contract must also carry a reason and the pin never falls through to another
 8. A successful checkpoint push marks the execution as remote-backed. Every later
    attempt on that execution, including an ordinary environment retry after a reroute,
    starts from the remote work branch.
+9. The pool excluded by a task-local quota reroute is stored on the pending attempt.
+   The launch selection uses that exclusion once, so a preferred model cannot be
+   selected again before the eligible fallback model.
 
 During a quota checkpoint, the collector ignores system and global Git configuration,
 temporarily replaces `.git/config` with Crucible's minimal configuration, and runs:
 
 ```text
 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
-git -c diff.external= -c core.pager=cat -c safe.directory=* -C "$REPO" add -A
+GIT_DIR="$REPO/.git" GIT_COMMON_DIR="$REPO/.git" \
+git -c core.fsmonitor= -c core.hooksPath="$EMPTY_HOOKS" \
+    -c diff.external= -c core.pager=cat -c safe.directory=* -C "$REPO" add -A
 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
-git -c diff.external= -c core.pager=cat -c safe.directory=* -C "$REPO" commit ...
+GIT_DIR="$REPO/.git" GIT_COMMON_DIR="$REPO/.git" \
+git -c core.fsmonitor= -c core.hooksPath="$EMPTY_HOOKS" \
+    -c diff.external= -c core.pager=cat -c safe.directory=* -C "$REPO" commit ...
 ```
 
 The minimal local configuration sets `commit.gpgsign=false`, `tag.gpgsign=false`,
 `core.hooksPath` to a newly created empty directory, and `core.fsmonitor=false`. It
 contains no `filter.*` command, so a worker-authored `.gitattributes` filter is a
-no-op. The worker's local configuration is restored after collection.
+no-op. The worker's local configuration is restored after collection. Checkpointing
+is refused before Git runs unless `.git` is a real directory with no `commondir`
+redirect. The refusal follows the unsafe-checkpoint path and names the cause in the
+wake.
 
 ## Harness reset observations
 
-The adapter reads only an explicit machine timestamp from a JSON key named
+The adapter first parses the harness-specific structured provider-refusal event, then
+reads an explicit machine timestamp from that same event under a JSON key named
 `reset_at`, `resetAt`, `resets_at`, `resetsAt`, or `reset_time`. It accepts RFC 3339,
-Unix seconds, or Unix milliseconds. Human prose and bare numbers outside those keys
-are ignored. The actual observed quota failure samples do not provide a reset time, so
-the seeded policy supplies the fallback.
+Unix seconds, or Unix milliseconds. Human prose, assistant events, and timestamps on
+other lines are ignored. The actual observed quota failure samples do not provide a
+reset time, so the seeded policy supplies the fallback.
 
 | Harness | Authoritative mark signal | Reset supplied | Seeded fallback |
 |---|---|---:|---:|
@@ -84,12 +95,12 @@ rejected.
 ## Database and API shape
 
 Migration 0011 adds selected routing fields to attempts, `resume_from_remote`, the
-ordered candidates, an execution-level remote-backed flag, task wait timestamps, and
-`pool_exhaustions`. Before changing the schema, it validates the current contract of
-every non-terminal task and refuses with the incompatible task ids. Pre-C6b contracts
-on terminal tasks remain historical records and are never re-validated. Its downgrade
-archives C6b event kinds before tightening the event constraint, and the next upgrade
-restores those append-only events.
+ordered candidates, task-local reroute exclusions, an execution-level remote-backed
+flag, task wait timestamps, and `pool_exhaustions`. Before changing the schema, it
+validates the current contract of every non-terminal task and refuses with the
+incompatible task ids. Pre-C6b contracts on terminal tasks remain historical records
+and are never re-validated. Its downgrade archives C6b event kinds, attempt route
+state, and execution remote-backed state. The next upgrade restores them.
 
 Task views expose each attempt's selected model, harness, image, pool, ordered
 candidates, previous reroute source, and remote-resume flag. A waiting task exposes

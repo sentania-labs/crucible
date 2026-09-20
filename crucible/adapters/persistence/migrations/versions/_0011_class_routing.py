@@ -38,6 +38,7 @@ C6B_EVENT_KINDS = (
 EVENT_ARCHIVE = "events_c6b_archive"
 TASK_WAIT_ARCHIVE = "task_waits_c6b_archive"
 ATTEMPT_ROUTE_ARCHIVE = "attempt_routes_c6b_archive"
+EXECUTION_ROUTE_ARCHIVE = "execution_routes_c6b_archive"
 POOL_ARCHIVE = "pool_exhaustions_c6b_archive"
 POLICY_V3_DESCRIPTION = (
     "The default software delivery policy, version 3: class routing and reactive quota "
@@ -135,6 +136,15 @@ def upgrade() -> None:
     )
     op.add_column(
         "attempts",
+        sa.Column(
+            "routing_excluded_pools",
+            JSONB,
+            nullable=False,
+            server_default=sa.text("'[]'::jsonb"),
+        ),
+    )
+    op.add_column(
+        "attempts",
         sa.Column("resume_from_remote", sa.Boolean(), nullable=False, server_default=sa.false()),
     )
     op.create_table(
@@ -182,12 +192,21 @@ def upgrade() -> None:
             "WHERE t.id=a.task_id"
         )
         op.execute(f"DROP TABLE {TASK_WAIT_ARCHIVE}")
+    if _archive_exists(connection, EXECUTION_ROUTE_ARCHIVE):
+        op.execute("ALTER TABLE executions DISABLE TRIGGER trg_executions_fenced")
+        op.execute(
+            f"UPDATE executions x SET resume_from_remote=a.resume_from_remote "
+            f"FROM {EXECUTION_ROUTE_ARCHIVE} a WHERE x.id=a.execution_id"
+        )
+        op.execute("ALTER TABLE executions ENABLE TRIGGER trg_executions_fenced")
+        op.execute(f"DROP TABLE {EXECUTION_ROUTE_ARCHIVE}")
     if _archive_exists(connection, ATTEMPT_ROUTE_ARCHIVE):
         op.execute("ALTER TABLE attempts DISABLE TRIGGER trg_attempts_fenced")
         op.execute(
             f"UPDATE attempts x SET selected_model=a.selected_model, "
             "selected_harness=a.selected_harness, selected_image=a.selected_image, "
             "selected_pool=a.selected_pool, ordered_candidates=a.ordered_candidates, "
+            "routing_excluded_pools=a.routing_excluded_pools, "
             f"resume_from_remote=a.resume_from_remote FROM {ATTEMPT_ROUTE_ARCHIVE} a "
             "WHERE x.id=a.attempt_id"
         )
@@ -232,17 +251,27 @@ def downgrade() -> None:
     )
     op.execute("UPDATE tasks SET state='reported' WHERE state='awaiting_quota'")
     op.execute(
+        f"CREATE TABLE IF NOT EXISTS {EXECUTION_ROUTE_ARCHIVE} AS "
+        "SELECT id AS execution_id, resume_from_remote FROM executions WHERE false"
+    )
+    op.execute(
+        f"INSERT INTO {EXECUTION_ROUTE_ARCHIVE} "
+        "SELECT id, resume_from_remote FROM executions WHERE resume_from_remote"
+    )
+    op.execute(
         f"CREATE TABLE IF NOT EXISTS {ATTEMPT_ROUTE_ARCHIVE} AS "
         "SELECT id AS attempt_id, selected_model, selected_harness, selected_image, "
-        "selected_pool, ordered_candidates, resume_from_remote FROM attempts WHERE false"
+        "selected_pool, ordered_candidates, routing_excluded_pools, resume_from_remote "
+        "FROM attempts WHERE false"
     )
     op.execute(
         f"INSERT INTO {ATTEMPT_ROUTE_ARCHIVE} "
         "SELECT id, selected_model, selected_harness, selected_image, selected_pool, "
-        "ordered_candidates, resume_from_remote FROM attempts "
+        "ordered_candidates, routing_excluded_pools, resume_from_remote FROM attempts "
         "WHERE selected_model IS NOT NULL OR selected_harness IS NOT NULL "
         "OR selected_image IS NOT NULL OR selected_pool IS NOT NULL "
-        "OR ordered_candidates <> '[]'::jsonb OR resume_from_remote"
+        "OR ordered_candidates <> '[]'::jsonb OR routing_excluded_pools <> '[]'::jsonb "
+        "OR resume_from_remote"
     )
     op.execute(
         f"CREATE TABLE IF NOT EXISTS {POOL_ARCHIVE} AS SELECT * FROM pool_exhaustions WHERE false"
@@ -265,6 +294,7 @@ def downgrade() -> None:
     op.drop_table("pool_exhaustions")
     for column in (
         "resume_from_remote",
+        "routing_excluded_pools",
         "ordered_candidates",
         "selected_pool",
         "selected_image",
