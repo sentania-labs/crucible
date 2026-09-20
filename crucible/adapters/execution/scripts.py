@@ -46,7 +46,10 @@ GIT = (
     "git -c core.fsmonitor= -c diff.external= -c core.pager=cat "
     "-c core.hooksPath=/dev/null -c 'safe.directory=*'"
 )
-CHECKPOINT_GIT = "git -c diff.external= -c core.pager=cat -c 'safe.directory=*'"
+CHECKPOINT_GIT = (
+    "git -c core.fsmonitor= -c diff.external= -c core.pager=cat "
+    "-c core.hooksPath=\"$EMPTY_HOOKS\" -c 'safe.directory=*'"
+)
 GIT_ENV = (
     "export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 "
     "GIT_TERMINAL_PROMPT=0 GIT_ASKPASS= HOME=/home/worker LC_ALL=C"
@@ -230,6 +233,17 @@ mkdir -p "$OUT"
 : > "$OUT/copy-rejections.tsv"
 {_COPY_REPORT}
 if [ -n "$QUOTA_ATTEMPT" ]; then
+  refuse_checkpoint() {{
+    printf '%s\n' "$1" > "$OUT/checkpoint-refusal.txt"
+    printf '%s\n' "$1" >&2
+    exit 4
+  }}
+  if [ ! -d "$REPO/.git" ] || [ -L "$REPO/.git" ]; then
+    refuse_checkpoint "checkpoint refused: repository .git is not a real directory"
+  fi
+  if [ -e "$REPO/.git/commondir" ] || [ -L "$REPO/.git/commondir" ]; then
+    refuse_checkpoint "checkpoint refused: repository .git contains a commondir redirect"
+  fi
   # The worker can edit both .git/config and .gitattributes. Replace its local
   # configuration while Git stages and commits, then restore it before collection
   # continues. With no filter.* commands, a filter attribute is a no-op.
@@ -259,9 +273,12 @@ if [ -n "$QUOTA_ATTEMPT" ]; then
 [tag]
   gpgsign = false
 EOF
-  {CHECKPOINT_GIT} -C "$REPO" add -A
-  if ! {CHECKPOINT_GIT} -C "$REPO" diff --cached --quiet; then
-    {CHECKPOINT_GIT} -C "$REPO" commit -q \
+  GIT_DIR="$REPO/.git" GIT_COMMON_DIR="$REPO/.git" \
+    {CHECKPOINT_GIT} -C "$REPO" add -A
+  if ! GIT_DIR="$REPO/.git" GIT_COMMON_DIR="$REPO/.git" \
+    {CHECKPOINT_GIT} -C "$REPO" diff --cached --quiet; then
+    GIT_DIR="$REPO/.git" GIT_COMMON_DIR="$REPO/.git" \
+      {CHECKPOINT_GIT} -C "$REPO" commit -q \
       -m "wip(crucible): attempt $QUOTA_ATTEMPT" \
       -m "Crucible-Attempt: $QUOTA_ATTEMPT"
   fi

@@ -239,6 +239,9 @@ class CollectedOutputs:
     copy_rejections: tuple[dict[str, str], ...] = ()
     # What the sync-back of the per-attempt credential copy did, when there was one (12).
     credential_sync: CredentialSync | None = None
+    # A quota checkpoint collector can refuse worker-controlled Git metadata before it
+    # runs Git. This survives collection so the unsafe-checkpoint wake names the cause.
+    checkpoint_refusal: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -1021,6 +1021,7 @@ class DockerProvider:
             workspace_state=state,
             copy_rejections=outputs.copy_rejections,
             credential_sync=credential_sync,
+            checkpoint_refusal=outputs.checkpoint_refusal,
         )
 
     async def push_quota_checkpoint(
@@ -1499,6 +1500,7 @@ class _Outputs:
     artifacts: tuple[CollectedArtifact, ...]
     verifications: tuple[VerificationRun, ...]
     copy_rejections: tuple[dict[str, str], ...]
+    checkpoint_refusal: str | None
 
 
 def _text(path: Path, limit: int = 8 * 1024 * 1024) -> str:
@@ -1608,6 +1610,7 @@ def _read_outputs(
         artifacts=tuple(artifacts),
         verifications=verifications,
         copy_rejections=tuple(rejections),
+        checkpoint_refusal=_text(output / "checkpoint-refusal.txt").strip() or None,
     )
 
 

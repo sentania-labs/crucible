@@ -178,6 +178,71 @@ def test_quota_checkpoint_ignores_worker_filter_and_signing_programs(tmp_path: P
     )
 
 
+def test_quota_checkpoint_refuses_a_worker_commondir_redirect(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    common = tmp_path / "worker-common"
+    output = tmp_path / "output"
+    report = tmp_path / "report"
+    for path in (repo, common, output, report):
+        path.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=common, check=True)
+    (repo / "tracked.txt").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "base",
+        ],
+        cwd=repo,
+        check=True,
+    )
+    subprocess.run(["git", "checkout", "-q", "-b", "crucible/test"], cwd=repo, check=True)
+    filter_sentinel = tmp_path / "redirect-filter-ran"
+    hook_sentinel = tmp_path / "redirect-hook-ran"
+    hooks = common / ".git" / "hooks-redirected"
+    hooks.mkdir()
+    hook = hooks / "pre-commit"
+    hook.write_text(f"#!/bin/sh\ntouch {hook_sentinel}\n", encoding="utf-8")
+    hook.chmod(0o755)
+    subprocess.run(["git", "config", "core.hooksPath", str(hooks)], cwd=common, check=True)
+    subprocess.run(
+        [
+            "git",
+            "config",
+            "filter.evil.clean",
+            f"sh -c 'touch {filter_sentinel}; cat'",
+        ],
+        cwd=common,
+        check=True,
+    )
+    (repo / ".git" / "commondir").write_text(str(common / ".git") + "\n", encoding="utf-8")
+    (repo / ".gitattributes").write_text("*.txt filter=evil\n", encoding="utf-8")
+    (repo / "tracked.txt").write_text("checkpoint\n", encoding="utf-8")
+    generated = scripts.collector_script(
+        base_ref="main",
+        work_branch="crucible/test",
+        size_cap_bytes=1024,
+        quota_attempt_id="attempt-redirect",
+    )
+    generated = generated.replace(scripts.REPO_MOUNT, str(repo))
+    generated = generated.replace(OUTPUT_MOUNT, str(output))
+    generated = generated.replace(REPORT_MOUNT, str(report))
+    result = subprocess.run(["sh", "-c", generated], capture_output=True, text=True, check=False)
+    assert result.returncode == 4
+    assert "commondir redirect" in result.stderr
+    assert "commondir redirect" in (output / "checkpoint-refusal.txt").read_text()
+    assert not filter_sentinel.exists()
+    assert not hook_sentinel.exists()
+
+
 def test_a_verification_id_cannot_collide_with_another() -> None:
     """`a/b` and `a_b` are two ids, so they get two files and two exit codes."""
     assert scripts.encode_check_id("a/b") == "a%2Fb"

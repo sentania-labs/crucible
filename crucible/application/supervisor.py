@@ -2163,6 +2163,15 @@ class Supervisor:
             task = uow.tasks.get(attempt.task_id)
             execution = uow.executions.get(attempt.execution_id)
             assert task is not None and execution is not None
+            collection_failure = uow.events.latest_for_task_kind(
+                task.id, EventKind.COLLECTION_FAILED.value
+            )
+            if (
+                collection_failure is not None
+                and collection_failure.attempt_id == attempt.id
+                and collection_failure.payload.get("checkpoint_refusal") is True
+            ):
+                return False, str(collection_failure.payload.get("detail", "checkpoint refused"))
             inputs = gate_input(uow, task=task, attempt=attempt, execution=execution)
             outcomes = {
                 gate.value: evaluate_gate(gate.value, inputs)
@@ -2541,6 +2550,21 @@ class Supervisor:
                     execution_id=attempt.execution_id,
                     attempt_id=attempt.id,
                     payload={"detail": collection_error[:1000], "exit_code": exit_code},
+                )
+            elif outputs.checkpoint_refusal is not None:
+                record_event(
+                    uow,
+                    self._clock,
+                    EventKind.COLLECTION_FAILED,
+                    principal=PRINCIPAL_CRUCIBLE,
+                    task_id=attempt.task_id,
+                    execution_id=attempt.execution_id,
+                    attempt_id=attempt.id,
+                    payload={
+                        "detail": outputs.checkpoint_refusal[:1000],
+                        "exit_code": exit_code,
+                        "checkpoint_refusal": True,
+                    },
                 )
             move_attempt(
                 uow,
