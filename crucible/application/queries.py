@@ -364,6 +364,7 @@ def attempt_view(uow: UnitOfWork, attempt_id: str) -> AttemptView:
             "document": claim.document,
         }
     heartbeats = list(uow.heartbeats.list_for_attempt(a.id))
+    latest_signal = uow.heartbeats.latest_signal(a.id)
     latest_activity = uow.heartbeats.latest_activity(a.id)
     quiet = uow.events.latest_for_task_kind(a.task_id, "worker_quiet")
     if a.ended_at is not None:
@@ -371,7 +372,7 @@ def attempt_view(uow: UnitOfWork, attempt_id: str) -> AttemptView:
     elif (
         quiet is not None
         and quiet.attempt_id == a.id
-        and (latest_activity is None or quiet.ts >= latest_activity.ts)
+        and (latest_signal is None or quiet.ts >= latest_signal.ts)
     ):
         worker_state = "quiet"
     elif heartbeats:

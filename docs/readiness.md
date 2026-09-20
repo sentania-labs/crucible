@@ -76,15 +76,15 @@ dedicated live credential root, and `sentania-labs/crucible-spike-target`.
 
 | Tier | Command | Result |
 |---|---|---|
-| unit | `make test-unit` as part of `make test` | 577 passed, 6.16 s |
-| integration | `make test-integration` as part of `make test` | 301 passed, 399.04 s, real PostgreSQL 16 |
-| e2e (Docker) | `make e2e DOCKER='<rootless wrapper>'` | 16 passed, 10 deselected, 96.97 s |
+| unit | `make test-unit` as part of `make test` | 578 passed, 6.35 s |
+| integration | `make test-integration` as part of `make test` | 301 passed, 454.00 s, real PostgreSQL 16 |
+| e2e (Docker) | `make e2e DOCKER='<rootless wrapper>'` | 16 passed, 10 deselected, 113.46 s |
 | e2e GitHub | `make e2e-github` | 3 passed, 1 skipped, 92.06 s |
 | e2e live | `make e2e-live HARNESS=all` | 3 passed, 23 deselected, 282.85 s |
 | e2e admin | `make e2e-admin` | 3 passed, 23 deselected, 50.31 s |
 | compose smoke | `make up`, then `make smoke` | isolated stack healthy, task accepted, smoke passed |
 | lint | `make lint` | Ruff, mypy on 225 files, and 3 import contracts clean |
-| scan | `make scan` | no leaks in the tree or 8-commit history |
+| scan | `make scan` | no leaks in the tree or branch history |
 
 The C6c pull request CI run, including all five non-live jobs, is
 `<C6C-CI-RUN-URL>`. The live GitHub run URLs are recorded directly in rows 21

@@ -144,15 +144,17 @@ def worker_stall_action(
     *,
     now: datetime,
     last_activity: datetime,
+    last_signal: datetime | None = None,
     warn_seconds: int,
     fail_seconds: int,
     warned_at: datetime | None,
 ) -> str | None:
-    """Derive the next stall action from verified activity and policy limits."""
-    idle = (now - last_activity).total_seconds()
-    if idle >= fail_seconds:
+    """Derive warn from any signal and fail from substantive activity (10)."""
+    if (now - last_activity).total_seconds() >= fail_seconds:
         return "fail"
-    if idle >= warn_seconds and (warned_at is None or warned_at < last_activity):
+    quiet_baseline = last_signal or last_activity
+    quiet = (now - quiet_baseline).total_seconds()
+    if quiet >= warn_seconds and (warned_at is None or warned_at < quiet_baseline):
         return "warn"
     return None
 
@@ -2508,16 +2510,19 @@ class Supervisor:
             warn = int(limits.get("stall_warn_seconds", 300))
             fail = int(limits.get("stall_fail_seconds", 1800))
             activity = uow.heartbeats.latest_activity(attempt.id)
-            baseline = (
+            activity_baseline = (
                 activity.ts if activity is not None else attempt.started_at or attempt.created_at
             )
+            signal = uow.heartbeats.latest_signal(attempt.id)
+            signal_baseline = signal.ts if signal is not None else activity_baseline
             latest = uow.events.latest_for_task_kind(attempt.task_id, EventKind.WORKER_QUIET.value)
             warned_at = (
                 latest.ts if latest is not None and latest.attempt_id == attempt.id else None
             )
             return worker_stall_action(
                 now=self._clock.now(),
-                last_activity=baseline,
+                last_activity=activity_baseline,
+                last_signal=signal_baseline,
                 warn_seconds=warn,
                 fail_seconds=fail,
                 warned_at=warned_at,
@@ -2531,10 +2536,8 @@ class Supervisor:
             execution = uow.executions.get(attempt.execution_id)
             task = uow.tasks.get(attempt.task_id)
             assert execution is not None and task is not None
-            activity = uow.heartbeats.latest_activity(attempt.id)
-            baseline = (
-                activity.ts if activity is not None else attempt.started_at or attempt.created_at
-            )
+            signal = uow.heartbeats.latest_signal(attempt.id)
+            baseline = signal.ts if signal is not None else attempt.started_at or attempt.created_at
             latest = uow.events.latest_for_task_kind(task.id, EventKind.WORKER_QUIET.value)
             if latest is not None and latest.attempt_id == attempt.id and latest.ts >= baseline:
                 return
@@ -2832,13 +2835,22 @@ class Supervisor:
             if parsed is not None:
                 self._record_harness_metrics(uow, attempt, parsed)
                 if parsed.progress:
-                    ingest_progress(
+                    recorded = ingest_progress(
                         uow,
                         self._clock,
                         attempt_id=attempt.id,
                         task_id=attempt.task_id,
                         execution_id=attempt.execution_id,
                         progress=parsed.progress,
+                    )
+                    uow.heartbeats.append(
+                        Heartbeat(
+                            id=None,
+                            attempt_id=attempt.id,
+                            ts=self._clock.now(),
+                            signal="progress_line",
+                            detail={"lines": recorded},
+                        )
                     )
             self._classify_and_finish(
                 uow, attempt, blocked_text, claim_ok=claim_ok, defer_quota=defer_quota

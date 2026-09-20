@@ -69,10 +69,10 @@ Run on the reference workstation on 2026-09-20, America/Chicago.
 | Tier | Result |
 |---|---|
 | `make lint` | clean: Ruff format, Ruff checks, mypy on 225 files, and 3 import contracts |
-| `make test` | 577 unit tests and 301 integration tests passed |
-| `make scan` | tree and 8-commit history clean, no leaks found |
+| `make test` | 578 unit tests and 301 integration tests passed |
+| `make scan` | tree and branch history clean, no leaks found |
 | `make e2e-image` | script harness built at digest `sha256:9b5b91e74522bf6e65d159d27fec2fd0815cc915f6b760f11ecc974c20fc6b73` |
-| `make e2e` | 16 passed, 10 deselected, 96.97 s on the dedicated rootless daemon |
+| `make e2e` | 16 passed, 10 deselected, 113.46 s on the dedicated rootless daemon |
 | `make up`, then `make smoke` | isolated host-daemon project healthy; full task, gates, review, and acceptance passed |
 | `make e2e-github` | 3 passed, 1 skipped, 92.06 s; target PRs cleaned up |
 | `make e2e-live HARNESS=all` | 3 passed, 23 deselected, 282.85 s; all three real harnesses reached `ready_for_merge` |
@@ -86,8 +86,32 @@ after the successful smoke.
 
 ## Review
 
-The required non-author adversarial review is pending. Its findings and
-dispositions will be recorded here before the Crucible pull request opens.
+The required non-author adversarial review ran before the Crucible pull request
+opened. A fresh `codex exec` used model `gpt-5.6-terra`, reasoning effort none,
+and the contract plus `origin/main...HEAD` diff. Its first read-only process
+could not start because bubblewrap could not create a network namespace. That
+process inspected nothing. The fresh unsandboxed process was instructed not to
+modify files and completed the review.
+
+It reported three blockers:
+
+1. `container_running` and `progress_line` were excluded from the activity
+   query. Accepted with the distinction required by spec 10: any signal now
+   resets the quiet warning clock, while only substantive activity resets the
+   final stall clock. `container_running` is substantive. Unverified progress
+   prevents a warning but cannot keep a worker alive forever. A progress
+   heartbeat is now stored, and unit plus integration coverage records this
+   behavior.
+2. Readiness contained the literal `<C6C-CI-RUN-URL>` placeholder. Accepted as
+   a delivery-sequencing blocker. The branch CI URL does not exist until this
+   review is recorded and the pull request opens. The placeholder will be
+   replaced with that produced run URL immediately after the pull request
+   creates it, and the resulting head must pass all five jobs.
+3. This section still said the review was pending. Accepted and resolved by
+   this findings and dispositions record.
+
+The reviewer reported no non-blocking findings. Per the contract, there is no
+second review round.
 
 ## Spec notes and follow-ups
 

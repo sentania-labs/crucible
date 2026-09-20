@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
+from crucible.adapters.api.deps import AppContext
 from crucible.adapters.execution.fake import FakeProvider
 from crucible.application.supervisor import Supervisor
 from crucible.ports.execution import LogChunk
@@ -38,10 +39,16 @@ async def test_stall_warns_then_drains_and_kills_as_timeout(
     supervisor: Supervisor,
     provider: FakeProvider,
     clock: FakeClock,
+    ctx: AppContext,
 ) -> None:
     task_id = submit_and_start(client, "crucible-worker:fake-hang", external_id="STALL-1")
     await supervisor.tick()
     attempt_id = client.get(f"/v1/tasks/{task_id}").json()["latest_attempt"]["id"]
+    with ctx.uow_factory() as uow:
+        signals = [item.signal for item in uow.heartbeats.list_for_attempt(attempt_id)]
+        initial_activity = uow.heartbeats.latest_activity(attempt_id)
+    assert "container_running" in signals
+    assert initial_activity is not None and initial_activity.signal == "log_advanced"
 
     clock.advance(301)
     await supervisor.tick()

@@ -1054,7 +1054,9 @@ class Logs:
 class Heartbeats:
     """Append-only observed worker signals (10)."""
 
-    _ACTIVITY_SIGNALS = ("log_advanced", "fs_changed")
+    # Progress lines are unverified and may keep a worker out of the quiet state,
+    # but they do not prove useful work for the fail threshold (10).
+    _ACTIVITY_SIGNALS = ("container_running", "log_advanced", "fs_changed")
 
     def __init__(self, session: Session) -> None:
         self._s = session
@@ -1089,6 +1091,15 @@ class Heartbeats:
             .limit(limit)
         ).all()
         return [self._to_entity(row) for row in rows]
+
+    def latest_signal(self, attempt_id: str) -> Heartbeat | None:
+        row = self._s.scalar(
+            select(HeartbeatRow)
+            .where(HeartbeatRow.attempt_id == attempt_id)
+            .order_by(HeartbeatRow.ts.desc(), HeartbeatRow.id.desc())
+            .limit(1)
+        )
+        return self._to_entity(row) if row is not None else None
 
     def latest_activity(self, attempt_id: str) -> Heartbeat | None:
         row = self._s.scalar(
