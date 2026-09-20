@@ -1,6 +1,34 @@
 # ADR 0014: Subscription quota is observed through a pinned third-party reader, and is advisory only
 
-Status: proposed, 2026-09-17.
+Status: rejected, 2026-09-19. Proposed 2026-09-17.
+
+## Outcome
+
+Rejected by the operator on 2026-09-19 ("let's go reactive"), on the evidence
+of S14 and S15 together. The reader covers one provider of three, and the
+other two fail for reasons that do not share a fix:
+
+- Codex reads cleanly, in the service container, from a read-only mount, and
+  produced the only real `exhausted_now` this project has recorded.
+- Claude Code needs an oauth session credential that does not exist. The
+  dedicated worker credential is a `setup-token` standing token, which the
+  usage endpoint refuses with 403 (confirmed again 2026-09-19 against the
+  live dedicated token). Reading Claude would mean a second login and a
+  second rotating credential to carry.
+- AGY has no profile-only read path. The reader shells out to the vendor
+  CLI, which is absent from the service image and which, on the S15 host
+  run, upgraded itself in place and rotated the dedicated token. Adopting it
+  would put a self-updating vendor binary inside the Crucible container,
+  which is what ADR 0011 exists to prevent.
+
+The reactive path described under Context is retained as the mechanism:
+each adapter classifies `quota_exhausted` from the harness's own failure
+output, the supervisor records the event and raises a wake. What remains
+open is the resume half, backing off until the reported reset and retrying
+without a round trip through the orchestrator; that is Foundry task
+FDY-0035. S14 and S15 stay in the tree as the evidence for this decision,
+not as a design to build.
+
 
 ## Context
 
