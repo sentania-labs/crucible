@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import fnmatch
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from crucible.application.harnesses import HarnessRegistry
 from crucible.contracts.policy import RoutingModel, RoutingPolicyV1, window_seconds
 from crucible.domain.entities import AttemptMetrics
 from crucible.ports.repository import UnitOfWork
@@ -226,20 +228,12 @@ def image_for_harness(uow: UnitOfWork, harness: str, provider: str) -> str | Non
     return None
 
 
-def _project_metrics(uow: UnitOfWork, project: str) -> dict[str, list[AttemptMetrics]]:
-    task_ids = [
-        task.id
-        for task in uow.tasks.search(
-            state=None,
-            project=project,
-            repository_id=None,
-            external_id=None,
-            updated_since=None,
-            after_id=None,
-            limit=10000,
-        )
-    ]
-    rows = uow.attempt_metrics.list_since(since=None, model=None, task_ids=task_ids)
+def _project_metrics(
+    uow: UnitOfWork, project: str, models: list[str], quality_window: int
+) -> dict[str, list[AttemptMetrics]]:
+    rows = uow.attempt_metrics.recent_for_project(
+        project=project, models=models, limit_per_model=quality_window
+    )
     grouped: dict[str, list[AttemptMetrics]] = {}
     for row in rows:
         grouped.setdefault(row.model, []).append(row)
@@ -259,6 +253,9 @@ def select_model(
     provider: str,
     now: datetime,
     eligible_harnesses: set[str] | None = None,
+    harnesses: HarnessRegistry | None = None,
+    image_allowlist: list[str] | None = None,
+    excluded_pools: set[str] | None = None,
     pinned_model: str | None = None,
     pinned_harness: str | None = None,
 ) -> Selection:
@@ -266,7 +263,9 @@ def select_model(
     tier_rule = routing.tiers.get(tier)
     if tier_rule is None:
         return Selection(None, None, tuple())
-    metrics = _project_metrics(uow, project)
+    metrics = _project_metrics(
+        uow, project, [entry.id for entry in routing.models], routing.rotation.quality_window
+    )
     ranked: list[tuple[tuple[Any, ...], RoutingModel, str, list[str]]] = []
     for entry in routing.models:
         reasons: list[str] = []
@@ -285,10 +284,37 @@ def select_model(
             reasons.append("pool is at its soft limit")
         if usage.exhausted_until is not None:
             reasons.append(f"pool exhausted until {usage.exhausted_until.isoformat()}")
+        if excluded_pools and entry.pool in excluded_pools:
+            reasons.append("pool excluded for the current quota reroute")
         image = image_for_harness(uow, entry.harness, provider)
         if image is None:
             reasons.append("selected harness has no default image")
             image = ""
+        elif provider != "fake":
+            promotion = next(
+                (
+                    item
+                    for item in uow.image_promotions.list_all()
+                    if item.harness == entry.harness
+                    and item.reference == image
+                    and item.state == "default"
+                ),
+                None,
+            )
+            if promotion is None:
+                reasons.append("derived image is unknown or retired")
+            elif harnesses is not None:
+                adapter = harnesses.get(entry.harness)
+                if adapter is None:
+                    reasons.append("derived image names an unknown harness")
+                elif not adapter.supported_versions.supports(promotion.harness_version):
+                    reasons.append(
+                        "derived image harness version is outside the adapter supported range"
+                    )
+            if image_allowlist and not any(
+                fnmatch.fnmatchcase(image, pattern) for pattern in image_allowlist
+            ):
+                reasons.append("derived image is outside the policy allowlist")
         cap_rank = (
             tier_rule.prefer.index(entry.capability)
             if entry.capability in tier_rule.prefer
@@ -302,11 +328,11 @@ def select_model(
         )
         last = recent[-1].created_at if recent else None
         weight = max(entry.weight, 1)
-        weighted_use = len(recent) / weight
+        age_weight = (now - last).total_seconds() * weight if last is not None else 0.0
         rank = (
             cap_rank + demoted,
-            weighted_use,
-            last or datetime.min.replace(tzinfo=UTC),
+            0 if last is None else 1,
+            -age_weight,
             entry.id,
         )
         ranked.append((rank, entry, image, reasons))

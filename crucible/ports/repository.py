@@ -453,6 +453,12 @@ class AttemptMetricsRepository(Protocol):
         self, *, since: datetime | None, model: str | None, task_ids: Sequence[str] | None
     ) -> Sequence[AttemptMetrics]: ...
 
+    def recent_for_project(
+        self, *, project: str, models: Sequence[str], limit_per_model: int
+    ) -> Sequence[AttemptMetrics]:
+        """The newest metrics per model for one project, without paging through tasks."""
+        ...
+
 
 class SupervisorStatusRepository(Protocol):
     def get(self) -> SupervisorStatus: ...

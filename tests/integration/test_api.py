@@ -42,6 +42,24 @@ def test_observer_may_only_read(ctx: AppContext, tokens: dict[str, str]) -> None
     assert r.status_code == 403 and r.json()["type"] == "urn:crucible:problem:forbidden"
 
 
+def test_only_an_operator_may_submit_a_pinned_task(ctx: AppContext, tokens: dict[str, str]) -> None:
+    document = contract_document()
+    document["execution_request"].update(
+        {
+            "harness": "codex",
+            "model": "gpt-5.6-luna",
+            "pin_reason": "operator selected bootstrap route",
+        }
+    )
+    refused = _client(ctx, tokens["orchestrator"]).post("/v1/tasks", json=document)
+    assert refused.status_code == 403
+    assert "only an operator may" in refused.json()["detail"]
+    admin_refused = _client(ctx, tokens["admin"]).post("/v1/tasks", json=document)
+    assert admin_refused.status_code == 403
+    accepted = _client(ctx, tokens["operator"]).post("/v1/tasks", json=document)
+    assert accepted.status_code == 201, accepted.text
+
+
 def test_admin_only_repository_registration(ctx: AppContext, tokens: dict[str, str]) -> None:
     body = {
         "url": "https://github.com/example-org/other",
@@ -93,7 +111,7 @@ def test_submit_shape_errors_name_the_path(client: TestClient) -> None:
 
 
 def test_only_registered_providers_are_accepted(
-    client: TestClient, ctx: AppContext, clock: FakeClock
+    client: TestClient, ctx: AppContext, clock: FakeClock, tokens: dict[str, str]
 ) -> None:
     """C3 registered the Docker provider (08, 20); Kubernetes is designed, not built."""
     doc = contract_document()
@@ -107,6 +125,13 @@ def test_only_registered_providers_are_accepted(
     doc["repository"]["work_branch"] = "crucible/EX-DOCKER"
     doc["execution_request"]["provider"] = "docker"
     doc["execution_request"].pop("image")
+    doc["execution_request"].update(
+        {
+            "harness": "codex",
+            "model": "gpt-5.6-terra",
+            "pin_reason": "provider registry integration test",
+        }
+    )
     with ctx.uow_factory() as uow:
         uow.image_promotions.put(
             ImagePromotion(
@@ -121,7 +146,14 @@ def test_only_registered_providers_are_accepted(
             )
         )
         uow.commit()
-    assert client.post("/v1/tasks", json=doc).status_code == 201
+    assert (
+        client.post(
+            "/v1/tasks",
+            json=doc,
+            headers={"Authorization": f"Bearer {tokens['operator']}"},
+        ).status_code
+        == 201
+    )
 
 
 def test_protected_branch_and_pattern(client: TestClient) -> None:
@@ -189,8 +221,6 @@ def test_start_disagreeing_with_contract_is_422(client: TestClient) -> None:
 def test_start_twice_is_409(client: TestClient) -> None:
     task_id = client.post("/v1/tasks", json=contract_document()).json()["id"]
     body = {
-        "harness": "codex",
-        "model": "gpt-5.6-luna",
         "provider": "fake",
         "image": "crucible-worker:fake-succeed",
         "policy_version": 2,

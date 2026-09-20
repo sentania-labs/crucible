@@ -230,8 +230,6 @@ def submit_and_start(
     r = client.post(
         f"/v1/tasks/{task_id}/start",
         json={
-            "harness": req["harness"],
-            "model": req["model"],
             "provider": req["provider"],
             "image": req["image"],
             "policy_version": 2,

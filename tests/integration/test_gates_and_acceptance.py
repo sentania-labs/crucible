@@ -329,10 +329,10 @@ async def test_attempt_metrics_record_the_run(client: TestClient, supervisor: Su
     await review_and_settle(supervisor, client, task_id)
     client.post(f"/v1/tasks/{task_id}/accept", json={"verdict": "accepted", "reasoning": "good"})
     await supervisor.tick()
-    rows = client.get("/v1/routing/history", params={"model": "gpt-5.6-luna"}).json()["items"]
+    rows = client.get("/v1/routing/history", params={"model": "claude-sonnet-5"}).json()["items"]
     assert len(rows) == 1
     row = rows[0]
-    assert row["harness"] == "codex" and row["pool"] == "openai-sub"
+    assert row["harness"] == "claude_code" and row["pool"] == "anthropic-sub"
     assert row["exit_class"] == "completed" and row["wall_ms"] is not None
     assert row["gates_passed"] >= 9 and row["gates_failed"] == 0
     assert row["acceptance_verdict"] == "accepted"

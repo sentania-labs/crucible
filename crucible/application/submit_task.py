@@ -10,7 +10,11 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from crucible.application.errors import ContractValidationError, DuplicateExternalIdError
+from crucible.application.errors import (
+    ContractValidationError,
+    DuplicateExternalIdError,
+    ForbiddenError,
+)
 from crucible.application.harnesses import HarnessRegistry
 from crucible.application.registry import REGISTERED_HARNESSES, REGISTERED_PROVIDERS
 from crucible.application.routing import (
@@ -23,7 +27,7 @@ from crucible.application.routing import (
 from crucible.application.transitions import record_event
 from crucible.contracts.common import to_document
 from crucible.contracts.task_contract import TaskContractV1, contract_sha256
-from crucible.domain.entities import Event, Policy, Principal, Repository, Task, TaskContract
+from crucible.domain.entities import Event, Policy, Principal, Repository, Role, Task, TaskContract
 from crucible.domain.events import EventKind
 from crucible.domain.exit_class import ExitClass
 from crucible.domain.ids import new_id
@@ -51,12 +55,20 @@ def parse_contract(body: object) -> TaskContractV1:
         raise ContractValidationError("task contract failed validation", errors=problems) from None
 
 
+def require_operator_for_pin(principal: Principal, contract: TaskContractV1) -> None:
+    if contract.execution_request.pinned_model is not None and principal.role is not Role.OPERATOR:
+        raise ForbiddenError(
+            "only an operator may submit, amend, or correct an operator-pinned task"
+        )
+
+
 def _check_routing(
     uow: UnitOfWork,
     clock: Clock,
     contract: TaskContractV1,
     policy: Policy,
     eligible_harnesses: set[str] | None,
+    harnesses: HarnessRegistry | None,
 ) -> list[Problem]:
     """The class must have a candidate now; an operator pin is validated exactly."""
     routing = load_routing(uow, policy.document)
@@ -104,6 +116,10 @@ def _check_routing(
         provider=request.provider.value,
         now=clock.now(),
         eligible_harnesses=eligible_harnesses,
+        harnesses=harnesses,
+        image_allowlist=[
+            str(pattern) for pattern in policy.document.get("images", {}).get("allowlist", [])
+        ],
     )
     if selection.selected is None:
         return [
@@ -239,6 +255,7 @@ def validate_against_registry(
     contract: TaskContractV1,
     *,
     eligible_harnesses: set[str] | None = None,
+    harnesses: HarnessRegistry | None = None,
 ) -> list[Problem]:
     """Every submit-time rule of 05 that needs the registry: the repository, the policy
     and its caps, the image allowlist, the provider and harness, the routing entry, and
@@ -247,7 +264,9 @@ def validate_against_registry(
     policy = uow.policies.get(contract.policy.name, contract.policy.version)
     problems, checked_policy = _check_against_registry(contract, repository, policy)
     if checked_policy is not None:
-        problems.extend(_check_routing(uow, clock, contract, checked_policy, eligible_harnesses))
+        problems.extend(
+            _check_routing(uow, clock, contract, checked_policy, eligible_harnesses, harnesses)
+        )
     return problems
 
 
@@ -293,6 +312,7 @@ def submit_task(
     credential_sources: Mapping[str, CredentialSource] | None = None,
 ) -> tuple[Task, TaskContract]:
     contract = parse_contract(body)
+    require_operator_for_pin(principal, contract)
     repository = uow.repositories.get_by_name(contract.repository.name)
     eligible_harnesses = eligible_harness_names(
         uow,
@@ -302,7 +322,7 @@ def submit_task(
         credential_sources=credential_sources,
     )
     problems = validate_against_registry(
-        uow, clock, contract, eligible_harnesses=eligible_harnesses
+        uow, clock, contract, eligible_harnesses=eligible_harnesses, harnesses=harnesses
     )
     if harnesses is not None and contract.execution_request.pinned_harness is not None:
         # 25: a disabled harness is a contract problem now, not a refusal a task later.

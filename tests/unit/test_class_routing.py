@@ -12,11 +12,6 @@ from crucible.domain.entities import AttemptMetrics, PoolExhaustion
 NOW = datetime(2026, 9, 20, 12, 0, tzinfo=UTC)
 
 
-class _Tasks:
-    def search(self, **_kw: Any) -> list[Any]:
-        return [SimpleNamespace(id="task-1")]
-
-
 class _Metrics:
     def __init__(self, rows: list[AttemptMetrics]) -> None:
         self.rows = rows
@@ -31,6 +26,18 @@ class _Metrics:
             and (model is None or row.model == model)
         ]
 
+    def recent_for_project(self, **kw: Any) -> list[AttemptMetrics]:
+        models = set(kw["models"])
+        limit = int(kw["limit_per_model"])
+        found: list[AttemptMetrics] = []
+        for model in models:
+            rows = sorted(
+                (row for row in self.rows if row.model == model),
+                key=lambda row: (row.created_at or NOW, row.attempt_id),
+            )
+            found.extend(rows[-limit:])
+        return found
+
 
 class _Marks:
     def __init__(self, marks: list[PoolExhaustion]) -> None:
@@ -41,18 +48,22 @@ class _Marks:
 
 
 class _Images:
+    def __init__(self, rows: list[Any] | None = None) -> None:
+        self.rows = rows or []
+
     def list_all(self) -> list[Any]:
-        return []
+        return self.rows
 
 
 def _uow(
-    rows: list[AttemptMetrics] | None = None, marks: list[PoolExhaustion] | None = None
+    rows: list[AttemptMetrics] | None = None,
+    marks: list[PoolExhaustion] | None = None,
+    images: list[Any] | None = None,
 ) -> Any:
     return SimpleNamespace(
-        tasks=_Tasks(),
         attempt_metrics=_Metrics(rows or []),
         pool_exhaustions=_Marks(marks or []),
-        image_promotions=_Images(),
+        image_promotions=_Images(images),
     )
 
 
@@ -147,6 +158,32 @@ def test_selection_is_weighted_least_used() -> None:
     assert result.selected is not None and result.selected.id == "heavy"
 
 
+def test_weighted_least_recent_uses_age_times_weight_for_equal_history() -> None:
+    routing = _routing([_model("heavy", weight=2), _model("light", weight=1)])
+    launched = NOW - timedelta(minutes=5)
+    rows = [
+        _metric("a1", "heavy", at=launched),
+        _metric("a2", "light", at=launched),
+    ]
+    result = select_model(
+        _uow(rows), routing, tier="standard", project="p", provider="fake", now=NOW
+    )
+    assert result.selected is not None and result.selected.id == "heavy"
+
+
+def test_weighted_least_recent_tie_ends_at_model_id() -> None:
+    routing = _routing([_model("z-model"), _model("a-model")])
+    launched = NOW - timedelta(minutes=5)
+    rows = [
+        _metric("a1", "z-model", at=launched),
+        _metric("a2", "a-model", at=launched),
+    ]
+    result = select_model(
+        _uow(rows), routing, tier="standard", project="p", provider="fake", now=NOW
+    )
+    assert result.selected is not None and result.selected.id == "a-model"
+
+
 def test_quality_failure_demotes_one_preference_step() -> None:
     routing = _routing([_model("mid", capability="mid"), _model("small", capability="small")])
     result = select_model(
@@ -196,6 +233,40 @@ def test_operator_pin_is_exact_and_does_not_fall_through() -> None:
     assert "harness does not match the operator pin" in second["excluded"]
 
 
+def test_image_allowlist_excludes_one_candidate_and_selects_the_next() -> None:
+    routing = _routing([_model("first"), _model("second", harness="agy")])
+    images = [
+        SimpleNamespace(
+            harness="codex",
+            reference="workers/codex:1",
+            harness_version="0.153.4",
+            state="default",
+            updated_at=NOW,
+            digest="sha256:first",
+        ),
+        SimpleNamespace(
+            harness="agy",
+            reference="workers/agy:1",
+            harness_version="1.2.1",
+            state="default",
+            updated_at=NOW,
+            digest="sha256:second",
+        ),
+    ]
+    result = select_model(
+        _uow(images=images),
+        routing,
+        tier="standard",
+        project="p",
+        provider="docker",
+        now=NOW,
+        image_allowlist=["workers/agy:*"],
+    )
+    assert result.selected is not None and result.selected.id == "second"
+    first = next(candidate for candidate in result.candidates if candidate["model"] == "first")
+    assert first["excluded"] == ["derived image is outside the policy allowlist"]
+
+
 def test_task_event_scan_has_no_one_thousand_event_cap() -> None:
     rows = [SimpleNamespace(seq=index) for index in range(1, 1502)]
 
@@ -207,14 +278,13 @@ def test_task_event_scan_has_no_one_thousand_event_cap() -> None:
     assert len(found) == 1501
 
 
-def test_quota_reset_is_future_bounded() -> None:
+def test_quota_reset_keeps_any_future_provider_reset() -> None:
     default = NOW + timedelta(minutes=5)
-    for candidate in (NOW - timedelta(seconds=1), NOW + timedelta(days=2)):
-        reset, accepted = Supervisor._bounded_quota_reset(
-            NOW, candidate, max_seconds=3600, default_seconds=300
-        )
-        assert reset == default and accepted is None
-    candidate = NOW + timedelta(minutes=30)
+    reset, accepted = Supervisor._bounded_quota_reset(
+        NOW, NOW - timedelta(seconds=1), max_seconds=3600, default_seconds=300
+    )
+    assert reset == default and accepted is None
+    candidate = NOW + timedelta(days=2)
     reset, accepted = Supervisor._bounded_quota_reset(
         NOW, candidate, max_seconds=3600, default_seconds=300
     )

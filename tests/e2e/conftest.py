@@ -376,7 +376,9 @@ def client(
                 )
             )
             uow.commit()
-    with TestClient(app, headers={"Authorization": f"Bearer {tokens['orchestrator']}"}) as c:
+    # The live variants add an explicit model pin, which is an operator-only action.
+    # The ordinary tier remains class-routed even though it shares this client.
+    with TestClient(app, headers={"Authorization": f"Bearer {tokens['operator']}"}) as c:
         yield c
 
 
@@ -428,6 +430,9 @@ def register(ctx: AppContext, name: str, url: str) -> None:
 
 
 def e2e_contract(external_id: str, repository: str, image: str, **overrides: Any) -> dict[str, Any]:
+    # The ordinary e2e tier exercises class routing.  The image argument remains in
+    # this shared helper's interface for the live tiers, which add an operator pin.
+    del image
     doc = contract_document(external_id=external_id)
     doc["repository"] = {
         "name": repository,
@@ -450,9 +455,6 @@ def e2e_contract(external_id: str, repository: str, image: str, **overrides: Any
     doc["policy"] = {"name": "e2e-script", "version": 1}
     doc["execution_request"] = {
         **doc["execution_request"],
-        "harness": "script-harness",
-        "model": "none",
-        "pin_reason": "the e2e tier pins its sole script model",
         "provider": "docker",
         "timeout_seconds": 600,
     }

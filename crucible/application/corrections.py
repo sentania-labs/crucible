@@ -18,6 +18,7 @@ from crucible.application.harnesses import HarnessRegistry
 from crucible.application.submit_task import (
     eligible_harness_names,
     parse_contract,
+    require_operator_for_pin,
     validate_against_registry,
 )
 from crucible.application.transitions import move_task, record_event, require_contract
@@ -98,6 +99,7 @@ def attach_correction(
             f"task is {task.state.value}"
         )
     contract = parse_contract(body)
+    require_operator_for_pin(principal, contract)
     if contract.correction is None:
         raise ContractValidationError(
             "a correction version carries a correction section",
@@ -126,7 +128,7 @@ def attach_correction(
         credential_sources=credential_sources,
     )
     problems: list[dict[str, Any]] = validate_against_registry(
-        uow, clock, contract, eligible_harnesses=eligible
+        uow, clock, contract, eligible_harnesses=eligible, harnesses=harnesses
     )
     problems.extend(correction_narrows(previous, contract))
     if task.state is TaskState.AWAITING_ACCEPTANCE:
@@ -213,6 +215,7 @@ def amend_task(
             f"task is {task.state.value}"
         )
     contract = parse_contract(body)
+    require_operator_for_pin(principal, contract)
     if contract.correction is not None:
         raise ContractValidationError(
             "an amendment carries no correction section; use /corrections",
@@ -228,7 +231,7 @@ def amend_task(
         credential_sources=credential_sources,
     )
     problems: list[dict[str, Any]] = validate_against_registry(
-        uow, clock, contract, eligible_harnesses=eligible
+        uow, clock, contract, eligible_harnesses=eligible, harnesses=harnesses
     )
     if contract.external_identity_fields() != previous.external_identity_fields():
         problems.append(

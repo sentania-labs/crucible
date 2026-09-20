@@ -751,6 +751,36 @@ class AttemptMetricsRepo:
         rows = self._s.scalars(stmt.order_by(AttemptMetricsRow.created_at)).all()
         return [self._to_entity(r) for r in rows]
 
+    def recent_for_project(
+        self, *, project: str, models: Sequence[str], limit_per_model: int
+    ) -> Sequence[AttemptMetrics]:
+        if not models:
+            return []
+        ranked = (
+            select(
+                AttemptMetricsRow.attempt_id.label("attempt_id"),
+                func.row_number()
+                .over(
+                    partition_by=AttemptMetricsRow.model,
+                    order_by=(
+                        AttemptMetricsRow.created_at.desc(),
+                        AttemptMetricsRow.attempt_id.desc(),
+                    ),
+                )
+                .label("recency"),
+            )
+            .join(TaskRow, TaskRow.id == AttemptMetricsRow.task_id)
+            .where(TaskRow.project == project, AttemptMetricsRow.model.in_(list(models)))
+            .subquery()
+        )
+        rows = self._s.scalars(
+            select(AttemptMetricsRow)
+            .join(ranked, ranked.c.attempt_id == AttemptMetricsRow.attempt_id)
+            .where(ranked.c.recency <= limit_per_model)
+            .order_by(AttemptMetricsRow.model, AttemptMetricsRow.created_at)
+        ).all()
+        return [self._to_entity(row) for row in rows]
+
 
 # ----- C5: harness administration (07, 25) ---------------------------------
 

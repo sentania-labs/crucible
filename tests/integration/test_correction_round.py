@@ -61,6 +61,46 @@ def unblock(client: TestClient, task_id: str, **overrides: Any) -> Any:
     return client.post(f"/v1/tasks/{task_id}/decisions", json=body)
 
 
+async def test_orchestrator_cannot_add_a_pin_by_amendment_or_correction(
+    client: TestClient, supervisor: Supervisor
+) -> None:
+    amend_task_id = submit_and_start(
+        client, "crucible-worker:fake-succeed", external_id="C6B-PIN-AMEND", start=False
+    )
+    amendment = contract_of(client, amend_task_id)
+    amendment["execution_request"].update(
+        {
+            "harness": "codex",
+            "model": "gpt-5.6-luna",
+            "pin_reason": "orchestrator must not be allowed to pin",
+        }
+    )
+    refused = client.post(
+        f"/v1/tasks/{amend_task_id}/amend",
+        json={"contract": amendment, "reason": "try to pin"},
+    )
+    assert refused.status_code == 403
+    assert "only an operator may" in refused.json()["detail"]
+
+    correction_task_id = submit_and_start(
+        client, "crucible-worker:fake-no-report", external_id="C6B-PIN-CORRECTION"
+    )
+    assert await run_to_settled(supervisor, client, correction_task_id) == "pre_pr_gates_failed"
+    correction = correction_document(
+        client, correction_task_id, image="crucible-worker:fake-succeed"
+    )
+    correction["execution_request"].update(
+        {
+            "harness": "codex",
+            "model": "gpt-5.6-luna",
+            "pin_reason": "orchestrator must not be allowed to pin",
+        }
+    )
+    refused = client.post(f"/v1/tasks/{correction_task_id}/corrections", json=correction)
+    assert refused.status_code == 403
+    assert "only an operator may" in refused.json()["detail"]
+
+
 # ----- 1: a decision on a blocked task must create new work --------------------
 
 
@@ -171,7 +211,11 @@ async def test_a_review_execution_refused_by_the_quota_does_not_strand_the_task(
     # C6b seeds version 3, so the tightened copies become version 4.
     routing = client.get("/v1/routing/default-routing/2").json()["document"]
     routing["version"] = 4
-    routing["pools"]["openai-sub"] = {"window": "5h", "budget_units": "attempts", "soft_limit": 1}
+    routing["pools"]["anthropic-sub"] = {
+        "window": "5h",
+        "budget_units": "attempts",
+        "soft_limit": 1,
+    }
     admin = {"Authorization": f"Bearer {tokens['admin']}"}
     assert (
         client.put("/v1/routing/default-routing/4", json=routing, headers=admin).status_code == 200
@@ -189,7 +233,16 @@ async def test_a_review_execution_refused_by_the_quota_does_not_strand_the_task(
         conn.execute(text("UPDATE tasks SET policy_version = 4 WHERE id = :id"), {"id": task_id})
 
     assert (
-        client.post(f"/v1/tasks/{task_id}/review", json={"execution": REVIEW_EXECUTION}).status_code
+        client.post(
+            f"/v1/tasks/{task_id}/review",
+            json={
+                "execution": {
+                    **REVIEW_EXECUTION,
+                    "harness": "claude_code",
+                    "model": "claude-sonnet-5",
+                }
+            },
+        ).status_code
         == 200
     )
     for _ in range(5):
@@ -236,9 +289,14 @@ async def test_an_amendment_to_a_disabled_model_is_refused(
         **document["execution_request"],
         "model": "gemini-3.8-flash-low",
         "harness": "agy",
+        "pin_reason": "exercise disabled pinned model validation",
         "tier": "trivial",
     }
-    r = client.post(f"/v1/tasks/{task_id}/amend", json={"contract": document, "reason": "x"})
+    r = client.post(
+        f"/v1/tasks/{task_id}/amend",
+        json={"contract": document, "reason": "x"},
+        headers={"Authorization": f"Bearer {tokens['operator']}"},
+    )
     assert r.status_code == 422
     assert any("disabled" in e["message"] for e in r.json()["errors"])
 
