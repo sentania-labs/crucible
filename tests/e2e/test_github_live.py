@@ -12,6 +12,7 @@ all configured, so a partial run is never mistaken for a pass.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -30,6 +31,7 @@ from crucible.application.delivery_tick import DeliveryConfig
 from crucible.application.repositories import register_repository
 from crucible.application.supervisor import Supervisor
 from crucible.contracts.api import ExternalReviewAttestation, RepositoryRegistration
+from crucible.domain.entities import ImagePromotion
 from crucible.domain.secrets import scan_text
 from tests.e2e import github_live
 from tests.e2e.conftest import RUN_ID, e2e_contract, run_until, submit_and_start, upload_review
@@ -171,7 +173,12 @@ def live_policy() -> dict[str, Any]:
 
 
 @pytest.fixture
-def live_client(ctx: AppContext, tokens: dict[str, str]) -> Iterator[TestClient]:
+def live_client(
+    ctx: AppContext,
+    tokens: dict[str, str],
+    provider: DockerProvider,
+    worker_image: str,
+) -> Iterator[TestClient]:
     app = create_app(ctx)
     with TestClient(app, headers={"Authorization": f"Bearer {tokens['admin']}"}) as admin:
         routing = e2e_routing_document()
@@ -182,6 +189,23 @@ def live_client(ctx: AppContext, tokens: dict[str, str]) -> Iterator[TestClient]
         assert admin.put(
             f"/v1/policies/{document['name']}/{document['version']}", json=document
         ).status_code in (200, 201)
+        worker = next(
+            item for item in asyncio.run(provider.list_images()) if item.reference == worker_image
+        )
+        with ctx.uow_factory() as uow:
+            uow.image_promotions.put(
+                ImagePromotion(
+                    digest=worker.digest,
+                    reference=worker.reference,
+                    harness="script-harness",
+                    harness_version=worker.harness_version or "1.0.0",
+                    state="default",
+                    updated_at=ctx.clock.now(),
+                    updated_by="e2e-github",
+                    reason="live GitHub script harness image",
+                )
+            )
+            uow.commit()
     with TestClient(app, headers={"Authorization": f"Bearer {tokens['orchestrator']}"}) as c:
         yield c
 
