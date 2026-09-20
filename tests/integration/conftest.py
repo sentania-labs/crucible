@@ -228,7 +228,7 @@ def submit_and_start(
             "model": req["model"],
             "provider": req["provider"],
             "image": req["image"],
-            "policy_version": 1,
+            "policy_version": 2,
         },
     )
     assert r.status_code == 200, r.text

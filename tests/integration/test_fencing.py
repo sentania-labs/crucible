@@ -196,7 +196,7 @@ def test_attempt_metrics_require_a_fenced_token(ctx: AppContext) -> None:
             AttemptMetrics(
                 attempt_id="01ARZ3NDEKTSV4RRFFQ69G5FAW",
                 task_id="01ARZ3NDEKTSV4RRFFQ69G5FAV",
-                model="gpt-5-codex-mini",
+                model="gpt-5.6-luna",
                 harness="codex",
                 endpoint_kind="subscription",
                 pool="openai-sub",

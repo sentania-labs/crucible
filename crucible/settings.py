@@ -149,6 +149,20 @@ class WakeSettings(BaseModel):
     timeout_seconds: float = 5.0
 
 
+class AdminSettings(BaseModel):
+    """The administrative surface (25)."""
+
+    # How long a rotated-out credential directory is retained before it is shredded.
+    credential_retention_hours: int = 24
+    # The bounded auth probe's hard timeout (25: 120 s).
+    probe_timeout_seconds: int = 120
+    # How long an interactive login may wait for the operator in total.
+    login_timeout_seconds: int = 900
+    # The command each harness's login runs, overriding the adapter's own. Meant for the
+    # parity tests, which drive a fake CLI that mimics each flow; never a production knob.
+    login_commands: dict[str, list[str]] = Field(default_factory=dict)
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="CRUCIBLE_", env_nested_delimiter="__", extra="ignore", toml_file=None
@@ -162,6 +176,7 @@ class Settings(BaseSettings):
     wake: WakeSettings = Field(default_factory=WakeSettings)
     credentials: dict[str, CredentialSettings] = Field(default_factory=dict)
     harnesses: dict[str, HarnessSettings] = Field(default_factory=dict)
+    admin: AdminSettings = Field(default_factory=AdminSettings)
 
     @classmethod
     def settings_customise_sources(

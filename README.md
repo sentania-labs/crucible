@@ -59,6 +59,7 @@ make e2e-image   # the script-harness worker image the e2e tier runs
 make e2e         # the Docker provider against real containers, no model
 make e2e-github  # local only: the real GitHub App against a throwaway repository
 make e2e-live    # local only: the real harness images with the dedicated credentials
+make e2e-admin   # local only: the admin API and CLI on a live stack, probes with the dedicated credentials
 make deploy-local # run a pinned published release from /var/lib/crucible/deploy
 make down
 make reset       # DESTRUCTIVE: down and delete the postgres and artifact volumes
@@ -120,6 +121,40 @@ make e2e-live HARNESS=claude_code \
   CRUCIBLE_GITHUB_TARGET_REPO=owner/throwaway DOCKER='<the wrapper above>'
 ```
 
+Administration (25) is one set of operations behind two entry points: `/v1/admin`
+(admin role) and `crucible-admin`, which runs the same services in process by
+default or against a running API with `--api-url` and a token in
+`CRUCIBLE_ADMIN_TOKEN`. Every mutation takes `--reason`, needs a live supervisor,
+and leaves an event with the principal and a before/after summary, never a value:
+
+```sh
+crucible-admin status                                        # the sanitized status document
+crucible-admin harnesses list
+crucible-admin --reason "refresh unverified" harnesses disable codex
+crucible-admin credentials status --harness claude_code      # presence, permissions, expiry class
+crucible-admin credentials validate --harness claude_code    # shape and expiry, no network
+crucible-admin credentials probe --harness claude_code       # bounded run of the hardened image
+crucible-admin --reason "..." credentials login --harness codex   # prints the URL and the code; token file mode 600
+crucible-admin --reason "..." credentials rotate --harness agy --new-path /path/to/staged
+crucible-admin --reason "..." credentials remove --harness codex
+crucible-admin images list
+crucible-admin --reason "..." images promote <digest>
+crucible-admin providers status
+crucible-admin github status
+crucible-admin github check                                  # mints and discards a token per registered repository
+crucible-admin audit tail --limit 50
+```
+
+`credentials login` drives the harness's own CLI, so it runs where that CLI is
+installed: local mode on a host that has it. The Crucible service image carries none of
+the three (it is not a worker image), so the API form refuses there and says so. A
+login refuses to overwrite a credential that still passes the shape check unless
+`--replace` is given, which retires the old one first. `rotate` copies the directory you
+name and leaves it in place; disposing of it is yours to do.
+
+Orchestrators read `GET /v1/capabilities`: which harnesses and images are enabled,
+providers and GitHub reachable, and the worker, task and wake counts, nothing more.
+
 `/v1/ready` reports not ready with "schema drift" when the live schema does not
 match what the code expects (for example a database created by an earlier
 build of this branch). Before the first tagged release the answer is
@@ -130,8 +165,8 @@ build of this branch). Before the first tagged release the answer is
 
 ```sh
 docker compose exec crucible crucible-admin token create --principal foundry --role orchestrator
-docker compose exec crucible crucible-admin repository register --name example-service \
-  --url https://github.com/example-org/example-service \
+docker compose exec crucible crucible-admin --reason "onboarding" repository register \
+  --name example-service --url https://github.com/example-org/example-service \
   --installation-id 0 --attest-external-review-all-prs
 curl -s http://127.0.0.1:8080/v1/ready
 ```
@@ -219,14 +254,15 @@ event, or the database. Workers hold no GitHub credential at all.
 Policies and the routing policy they name are documents, not defaults in code:
 
 ```sh
-GET  /v1/policies/default-software/1    # every tunable the specification mentions
+GET  /v1/policies/default-software/2    # every tunable the specification mentions
 PUT  /v1/policies/{name}/{version}      # admin; a version a task references is immutable
-GET  /v1/routing/default-routing/1      # the models Foundry may name, per tier
+GET  /v1/routing/default-routing/2      # the models Foundry may name, per tier
 GET  /v1/routing/usage                  # per-pool usage in the current window
 GET  /v1/routing/history?model=&project=  # what each model actually did
 ```
 
-`examples/policies/default-software.yaml` is the seeded default, verbatim.
+`examples/policies/default-software.yaml` is the seeded default (version 2), verbatim;
+version 1, the C1 seed, names the placeholder routing policy and stays for reference.
 
 ## Releases
 

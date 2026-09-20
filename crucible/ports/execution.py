@@ -301,6 +301,49 @@ class ImageInfo:
     labels: dict[str, str] = field(default_factory=dict)
 
 
+@dataclass(frozen=True, slots=True)
+class ProbeRequest:
+    """The bounded auth probe (25): the hardened worker image, the credential mounted,
+    a one-line prompt, a hard timeout. The launch shape comes from the adapter; the
+    provider records only what 25 allows."""
+
+    harness: str
+    image: str
+    argv: tuple[str, ...]
+    env: dict[str, str] = field(default_factory=dict)
+    env_from_files: dict[str, str] = field(default_factory=dict)
+    stdin_files: tuple[str, ...] = ()
+    stdin_text: str = ""
+    identity_text: str = ""
+    timeout_seconds: int = 120
+    policy: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class ProbeResult:
+    """What the probe recorded: exit facts, the image, and whether the named auth files
+    changed. Tails stay with the caller for classification; nothing here is a value."""
+
+    exit_code: int | None
+    image_digest: str
+    harness_version: str | None
+    duration_seconds: float
+    timed_out: bool = False
+    oom_killed: bool = False
+    stdout_tail: str = ""
+    stderr_tail: str = ""
+    credential_sync: CredentialSync | None = None
+    detail: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderHealth:
+    """`ok`, `degraded` or `unavailable` with what was checked (25)."""
+
+    state: str
+    checks: dict[str, Any] = field(default_factory=dict)
+
+
 class CleanupPolicy(StrEnum):
     KEEP = "keep"
     DELETE = "delete"
@@ -355,4 +398,14 @@ class ExecutionProvider(Protocol):
         """Remove anything secret the provider placed for an attempt that will never be
         collected: a launch that failed after the credential was seeded, or a worker
         that was lost (12). Cleanup is separate and may never run for such an attempt."""
+        ...
+
+    async def probe_credential(self, request: ProbeRequest) -> ProbeResult:
+        """25: run the hardened image with the credential mounted for one prompt under a
+        hard timeout, sync the named auth files back, remove everything, and report
+        the exit facts and whether the files changed."""
+        ...
+
+    async def health(self) -> ProviderHealth:
+        """25: daemon reachable, network present, disk headroom, as one state."""
         ...

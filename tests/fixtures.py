@@ -61,11 +61,11 @@ def contract_document(**overrides: Any) -> dict[str, Any]:
             "conditions": ["a required verification command does not exist"],
             "action": "write report/blocked.md with the question and exit 75",
         },
-        "policy": {"name": "default-software", "version": 1},
+        "policy": {"name": "default-software", "version": 2},
         "execution_request": {
             "tier": "standard",
             "harness": "codex",
-            "model": "gpt-5-codex-mini",
+            "model": "gpt-5.6-luna",
             "effort": "high",
             "provider": "fake",
             "image": "crucible-worker:fake-succeed",

@@ -21,7 +21,7 @@ pytestmark = pytest.mark.integration
 
 REVIEW_EXECUTION = {
     "harness": "codex",
-    "model": "gpt-5-codex-mini",
+    "model": "gpt-5.6-luna",
     "provider": "fake",
     "image": "crucible-worker:fake-review",
     "timeout_seconds": 600,

@@ -155,6 +155,17 @@ class EventKind(StrEnum):
     HARNESS_DISABLED = "harness_disabled"
     CREDENTIAL_SYNCED = "credential_synced"
     WORKER_PROGRESS = "worker_progress"
+    # administration (25): every mutation, with principal, reason, before and after
+    CREDENTIAL_VALIDATED = "credential_validated"
+    CREDENTIAL_PROBED = "credential_probed"
+    CREDENTIAL_LOGIN_STARTED = "credential_login_started"
+    CREDENTIAL_LOGIN_FINISHED = "credential_login_finished"
+    CREDENTIAL_ROTATED = "credential_rotated"
+    CREDENTIAL_REMOVED = "credential_removed"
+    CREDENTIAL_RETIRED_SHREDDED = "credential_retired_shredded"
+    IMAGE_PROMOTED = "image_promoted"
+    GITHUB_CHECKED = "github_checked"
+    ADMIN_REFUSED = "admin_refused"
     # principals and configuration
     PRINCIPAL_CREATED = "principal_created"
     REPOSITORY_REGISTERED = "repository_registered"

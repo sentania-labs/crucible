@@ -33,7 +33,27 @@ back, which is a wait rather than a failure), `harness_enabled` and
 it was not), `worker_progress` (a parsed progress line, principal `worker`
 and `verified` false, capped per 07), and `report_parse_failed` (a
 `report.yaml` that exists and does not parse, with the parser's errors and
-`report_present` true, which is distinct from no report at all). Events are
+`report_present` true, which is distinct from no report at all). The
+administrative kinds, all written by the admin surface of 25 with the
+principal, the reason, and a before-and-after summary, are
+`credential_validated`, `credential_probed`, `credential_login_started`,
+`credential_login_finished`, `credential_rotated`, `credential_removed`,
+`credential_retired_shredded` (the retention sweep's shred of a retired
+directory, or the failure to finish one), `image_promoted`, `github_checked`,
+and `admin_refused`. `admin_refused` is the refusal of a mutation that
+carried no reason, carried a secret-shaped one, or arrived while no live
+supervisor held the lease; it is written outside the refused caller's
+transaction, since that transaction rolls back, and best effort, since a
+refusal is never made worse by a failure to record it. Harness enable and
+disable keep the `harness_enabled` and `harness_disabled` kinds above.
+
+`GET /admin/audit` is this stream filtered to the kinds an administrator
+caused, and there is no second administrative log. The filter is the ten
+kinds above plus `harness_enabled` and `harness_disabled`, `principal_created`,
+`repository_registered` and `repository_attestation_recorded`, and
+`policy_uploaded` and `routing_policy_uploaded`: administration is wider than
+the credential surface, and a client that assumed only the credential kinds
+would reject valid pages. Events are
 never updated or deleted. Retention: forever in v0.x (volume is small); archival to object
 storage is a later policy.
 

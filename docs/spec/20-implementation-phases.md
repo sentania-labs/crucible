@@ -93,7 +93,14 @@ credential seeded into a per-attempt copy owned by the worker's uid, to
 found in the create request, the events, any text column, the log chunks,
 the artifact store, or the pull request.
 
-**C5b in progress.**
+**C5b delivered 2026-09-17.** Live evidence: `make e2e-admin` runs the
+bounded probe for each of the three harnesses with its dedicated credential
+and then every other operation in 25's table through both entry points, the
+API and `crucible-admin`, against the rootless daemon, with rotate and remove
+acting on scratch copies and every probe conclusive and `completed` well
+inside the 120 s bound.
+
+**C5 is complete.**
 
 ## Phase C6: bootstrap import and readiness
 

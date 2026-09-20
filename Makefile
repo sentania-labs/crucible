@@ -44,7 +44,7 @@ CRUCIBLE_DEPLOY_IMAGE ?= ghcr.io/sentania-labs/crucible:$(DEPLOY_TAG)
 CRUCIBLE_DEPLOY_PORT ?= 8080
 
 .PHONY: up dev down reset lint scan scan-tree scan-history smoke test test-unit \
-	test-integration e2e e2e-github e2e-live e2e-image build proxy-config proxies preflight \
+	test-integration e2e e2e-github e2e-live e2e-admin e2e-image build proxy-config proxies preflight \
 	deploy-local deploy-local-down
 
 up: preflight proxy-config ## normal mode: postgres, proxies, migrate, crucible
@@ -213,6 +213,28 @@ e2e-live: ## the live harness tier: real harness images, the dedicated credentia
 	CRUCIBLE_GITHUB_APP_KEY="$(CRUCIBLE_GITHUB_APP_KEY)" \
 	CRUCIBLE_GITHUB_TARGET_REPO="$(CRUCIBLE_GITHUB_TARGET_REPO)" \
 	$(UV) run pytest tests/e2e -q -m e2e_live -s
+
+# The live administration tier (25, C5b): every row of the operations table through
+# `/v1/admin` and through `crucible-admin`, against a live stack on the daemon DOCKER
+# names, and `credentials probe` with the dedicated credentials for each harness. Rotate
+# and remove act on scratch copies inside the artifact root, never on the dedicated
+# root. The GitHub variables are optional; without them `github check` is recorded as
+# not configured. Again no key, token or secret is ever a value here.
+#
+#   make e2e-admin \
+#     CRUCIBLE_LIVE_CREDENTIAL_ROOT=/path/to/dedicated/credentials \
+#     DOCKER='<the rootless daemon wrapper above>'
+e2e-admin: ## the live administration tier: API and CLI parity on a live stack, probes with the dedicated credentials
+	$(UV) sync --frozen --quiet
+	@test -n "$(CRUCIBLE_LIVE_CREDENTIAL_ROOT)" || { echo "set CRUCIBLE_LIVE_CREDENTIAL_ROOT"; exit 2; }
+	CRUCIBLE_E2E_DOCKER="$(DOCKER)" \
+	CRUCIBLE_E2E_DOCKER_SOCKET="$(CRUCIBLE_DOCKER_SOCKET)" \
+	CRUCIBLE_LIVE_CREDENTIAL_ROOT="$(CRUCIBLE_LIVE_CREDENTIAL_ROOT)" \
+	CRUCIBLE_LIVE_REPORT="$(CRUCIBLE_LIVE_REPORT)" \
+	CRUCIBLE_GITHUB_APP_JSON="$(CRUCIBLE_GITHUB_APP_JSON)" \
+	CRUCIBLE_GITHUB_APP_KEY="$(CRUCIBLE_GITHUB_APP_KEY)" \
+	CRUCIBLE_GITHUB_TARGET_REPO="$(CRUCIBLE_GITHUB_TARGET_REPO)" \
+	$(UV) run pytest tests/e2e -q -m e2e_admin -s
 
 build:
 	docker build -t crucible:dev .

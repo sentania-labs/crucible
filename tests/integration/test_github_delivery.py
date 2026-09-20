@@ -976,7 +976,7 @@ async def test_two_required_rounds_return_the_task_to_awaiting_external_review(
                 "UPDATE policies SET document = jsonb_set(jsonb_set(document, "
                 "'{external_review,required_rounds}', '2'), "
                 "'{external_review,retrigger_after_correction}', 'true') "
-                "WHERE name = 'default-software' AND version = 1"
+                "WHERE name = 'default-software' AND version = 2"
             )
         )
     try:
@@ -998,7 +998,7 @@ async def test_two_required_rounds_return_the_task_to_awaiting_external_review(
                     "UPDATE policies SET document = jsonb_set(jsonb_set(document, "
                     "'{external_review,required_rounds}', '1'), "
                     "'{external_review,retrigger_after_correction}', 'false') "
-                    "WHERE name = 'default-software' AND version = 1"
+                    "WHERE name = 'default-software' AND version = 2"
                 )
             )
     _ = ctx

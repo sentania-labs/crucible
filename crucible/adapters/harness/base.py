@@ -35,6 +35,13 @@ def patterns(*texts: str) -> tuple[Pattern, ...]:
     return tuple((t, re.compile(re.escape(t), re.IGNORECASE)) for t in texts)
 
 
+def correlated(*sources: str) -> tuple[Pattern, ...]:
+    """Patterns whose text is a regular expression rather than a literal, for a signal
+    that is only a signal when two things appear together on one line. `.` never crosses
+    a newline here, which is what keeps the correlation to a single transcript event."""
+    return tuple((s, re.compile(s, re.IGNORECASE)) for s in sources)
+
+
 def first_match(tails: Sequence[str], candidates: Sequence[Pattern]) -> str | None:
     for tail in tails:
         for name, pattern in candidates:

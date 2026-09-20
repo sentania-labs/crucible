@@ -24,6 +24,39 @@ allowlist permits (23). `docker
 compose down` does not remove running workers by design; `crucible-admin
 drain` does.
 
+## The credential root is the operator's to create
+
+Compose binds the four credential directories (`github` and one per harness)
+into the `crucible` container from a configurable root. A bind mount whose
+source path does not exist is not an error: the Docker daemon creates it, as
+root, mode 0755. That is precisely what 12 says a credential directory must
+never be, and because the service runs unprivileged and has to write a
+refreshed auth file back into that directory after a run, a fresh deployment
+that let the daemon create them would look healthy and fail on the first
+sync-back.
+
+So the credential root and each per-harness directory under it are created
+before the stack starts, by the operator or by the deployment script, owned
+by the Crucible service user and mode 0700. `tools/deploy/deploy_local.sh`
+does exactly that and creates the layout and nothing else; a credential
+itself enters only through `crucible-admin credentials login` (25).
+
+Crucible refuses at startup when a configured credential directory is
+missing, is not owned by the service user, or is not mode 0700, and names the
+directory and what is wrong with it. That refusal is specified here and is
+the work item; it is not implemented yet, so today a wrongly created
+directory is caught by the deployment script's own layout step or not at all.
+
+**Login needs the harness CLI on the host.** The credential login flow of 25
+drives the harness's own CLI in a pty, and by the image rule above each CLI
+exists only in its worker image; the Crucible service image carries none of
+them. The API form of login therefore cannot work on a normal deployment and
+refuses with that reason, and login is a local-mode operation run where the
+harness CLI is. Making the API form work anywhere means running the flow
+inside the promoted harness image, the way the probe does, with the pty and
+the operator's pasted code relayed through the daemon's attach stream; that
+is a follow-up phase, not a fix.
+
 Compose owns lifecycle: `restart: unless-stopped` on all four. Closing any
 Foundry session touches none of them. Foundry detects Crucible down by
 `GET /ready` failing and runs the configured start command (`docker compose

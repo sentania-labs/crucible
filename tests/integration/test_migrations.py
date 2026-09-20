@@ -34,7 +34,8 @@ def test_up_down_up_from_empty(database_url: str) -> None:
     ok, detail = migrate.is_current(engine, database_url)
     assert ok, detail
     with engine.connect() as conn:
-        assert conn.execute(text("SELECT count(*) FROM policies")).scalar() == 1
+        # 0001 seeds version 1 and 0009 seeds version 2 of default-software.
+        assert conn.execute(text("SELECT count(*) FROM policies")).scalar() == 2
     migrate.downgrade(database_url, "base")
     assert "tasks" not in inspect(engine).get_table_names()
     migrate.upgrade(database_url)
@@ -120,8 +121,20 @@ def test_0004_creates_the_c2_tables_and_seeds_the_routing_policy(migrated: str) 
             .all()
         )
         assert versions == [1, 2]
+        # 0009 seeds default-software version 2 naming routing version 2; version 1
+        # stays and still names version 1 (policies are immutable, 05b).
+        policy_versions = conn.execute(
+            text(
+                "SELECT version, document -> 'routing' -> 'policy' ->> 'version' "
+                "FROM policies WHERE name = 'default-software' ORDER BY 1"
+            )
+        ).all()
+        assert [(v, int(r)) for v, r in policy_versions] == [(1, 1), (2, 2)]
         routing = conn.execute(
-            text("SELECT document -> 'routing' FROM policies WHERE name = 'default-software'")
+            text(
+                "SELECT document -> 'routing' FROM policies "
+                "WHERE name = 'default-software' AND version = 1"
+            )
         ).scalar()
     assert routing == {"policy": {"name": "default-routing", "version": 1}}
     engine.dispose()

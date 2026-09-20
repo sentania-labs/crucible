@@ -329,7 +329,7 @@ async def test_attempt_metrics_record_the_run(client: TestClient, supervisor: Su
     await review_and_settle(supervisor, client, task_id)
     client.post(f"/v1/tasks/{task_id}/accept", json={"verdict": "accepted", "reasoning": "good"})
     await supervisor.tick()
-    rows = client.get("/v1/routing/history", params={"model": "gpt-5-codex-mini"}).json()["items"]
+    rows = client.get("/v1/routing/history", params={"model": "gpt-5.6-luna"}).json()["items"]
     assert len(rows) == 1
     row = rows[0]
     assert row["harness"] == "codex" and row["pool"] == "openai-sub"
