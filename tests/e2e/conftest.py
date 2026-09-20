@@ -456,6 +456,7 @@ def e2e_contract(external_id: str, repository: str, image: str, **overrides: Any
         "provider": "docker",
         "timeout_seconds": 600,
     }
+    doc["execution_request"].pop("image", None)
     doc["project_instructions"] = []
     doc.update(overrides)
     return doc
