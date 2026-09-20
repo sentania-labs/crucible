@@ -24,10 +24,10 @@ def test_no_secret_bearing_column_names() -> None:
 
 def test_migration_event_kinds_match_enum() -> None:
     from crucible.adapters.persistence.migrations.versions import (  # noqa: PLC0415
-        _0011_class_routing as m,
+        _0012_heartbeats as m,
     )
 
-    # 0011 owns the current CHECK constraint; adding a kind is a new migration (10).
+    # 0012 owns the current CHECK constraint; adding a kind is a new migration (10).
     assert set(m._event_kinds()) == {k.value for k in EventKind}
 
 
@@ -52,6 +52,7 @@ def test_openapi_generates_from_the_pydantic_models() -> None:
         "/v1/tasks/{task_id}/accept",
         "/v1/tasks/{task_id}/corrections",
         "/v1/attempts/{attempt_id}/gates",
+        "/v1/attempts/{attempt_id}/logs",
         "/v1/wakes",
         "/v1/policies/{name}/{version}",
         "/v1/routing/usage",

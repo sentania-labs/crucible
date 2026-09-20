@@ -181,6 +181,16 @@ class LogChunkRow(Base):
     gzipped: Mapped[bool] = mapped_column(Boolean)
 
 
+class HeartbeatRow(Base):
+    __tablename__ = "heartbeats"
+    __table_args__ = (Index("ix_heartbeats_attempt_ts", "attempt_id", "ts"),)
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    attempt_id: Mapped[str] = mapped_column(ID, ForeignKey("attempts.id"))
+    ts: Mapped[datetime] = mapped_column(TZ)
+    signal: Mapped[str] = mapped_column(String(32))
+    detail: Mapped[dict[str, Any]] = mapped_column(JSONB)
+
+
 class RetentionActionRow(Base):
     __tablename__ = "retention_actions"
     __table_args__ = (

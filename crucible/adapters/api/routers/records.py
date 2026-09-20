@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
+from collections.abc import AsyncIterator
 from datetime import datetime
-from typing import Annotated
+from typing import Annotated, Literal
 
-from fastapi import APIRouter, Query, Request, Response
+from fastapi import APIRouter, Header, Query, Request, Response
+from fastapi.responses import StreamingResponse
 
 from crucible.adapters.api.deps import Admin, Ctx, Orchestrator, Reader, UoW
 from crucible.application.artifacts import read_artifact, upload_artifact
-from crucible.application.errors import NotFoundError
+from crucible.application.auth import authenticate
+from crucible.application.errors import NotFoundError, UnauthorizedError
 from crucible.application.queries import (
     artifact_view,
     attempt_artifacts,
@@ -33,7 +38,7 @@ from crucible.contracts.api import (
     RepositoryRegistration,
     RepositoryView,
 )
-from crucible.domain.entities import Repository
+from crucible.domain.entities import LogChunkRecord, Repository
 
 router = APIRouter()
 
@@ -58,6 +63,89 @@ def get_execution(execution_id: str, uow: UoW, _principal: Reader) -> ExecutionV
 @router.get("/attempts/{attempt_id}", response_model=AttemptView)
 def get_attempt(attempt_id: str, uow: UoW, _principal: Reader) -> AttemptView:
     return attempt_view(uow, attempt_id)
+
+
+def _log_body(chunks: list[LogChunkRecord], offset: int) -> tuple[bytes, int]:
+    body = bytearray()
+    next_offset = offset
+    for item in chunks:
+        chunk = item
+        start = max(offset, chunk.offset_start)
+        body.extend(chunk.content[start - chunk.offset_start :])
+        next_offset = max(next_offset, chunk.offset_end)
+    return bytes(body), next_offset
+
+
+@router.get("/attempts/{attempt_id}/logs")
+async def get_attempt_logs(
+    attempt_id: str,
+    request: Request,
+    ctx: Ctx,
+    authorization: Annotated[str | None, Header()] = None,
+    stream: Literal["stdout", "stderr"] | None = None,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> Response:
+    """Read stored bytes, or follow newly appended chunks with server-sent events (04)."""
+    # Streaming responses finalize yield dependencies only when the stream closes.
+    # Authenticate and take the initial snapshot in a short local UoW so a live tail
+    # never holds a pool connection for its lifetime.
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise UnauthorizedError("a bearer token is required")
+    with ctx.uow_factory() as initial:
+        principal = authenticate(initial, authorization[7:].strip())
+        if principal is None:
+            raise UnauthorizedError("token not recognized")
+        request.state.principal = principal
+        attempt = initial.attempts.get(attempt_id)
+        if attempt is None:
+            raise NotFoundError(f"attempt {attempt_id} not found")
+        chunks = list(initial.logs.list_from_offset(attempt_id, offset=offset, stream=stream))
+        drained = attempt.logs_drained_at is not None
+    if "text/event-stream" not in request.headers.get("accept", ""):
+        body, next_offset = _log_body(chunks, offset)
+        return Response(
+            content=body,
+            media_type="text/plain",
+            headers={
+                "X-Crucible-Log-Offset": str(next_offset),
+                "X-Crucible-Logs-Drained": str(drained).lower(),
+            },
+        )
+
+    async def events() -> AsyncIterator[str]:
+        cursor = offset
+        while True:
+            with ctx.uow_factory() as fresh:
+                current = fresh.attempts.get(attempt_id)
+                if current is None:
+                    return
+                chunks = list(fresh.logs.list_from_offset(attempt_id, offset=cursor, stream=stream))
+                drained = current.logs_drained_at is not None
+            for chunk in chunks:
+                start = max(cursor, chunk.offset_start)
+                content = chunk.content[start - chunk.offset_start :].decode("utf-8", "replace")
+                cursor = max(cursor, chunk.offset_end)
+                data = json.dumps(
+                    {
+                        "offset_start": start,
+                        "offset_end": chunk.offset_end,
+                        "content": content,
+                    },
+                    separators=(",", ":"),
+                )
+                yield f"id: {cursor}\nevent: {chunk.stream}\ndata: {data}\n\n"
+            if drained and not chunks:
+                yield f'id: {cursor}\nevent: end\ndata: {{"offset":{cursor}}}\n\n'
+                return
+            if await request.is_disconnected():
+                return
+            await asyncio.sleep(0.25)
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 def _repo_view(repo: Repository) -> RepositoryView:

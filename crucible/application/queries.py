@@ -363,6 +363,22 @@ def attempt_view(uow: UnitOfWork, attempt_id: str) -> AttemptView:
             "parse_errors": claim.parse_errors,
             "document": claim.document,
         }
+    heartbeats = list(uow.heartbeats.list_for_attempt(a.id))
+    latest_signal = uow.heartbeats.latest_signal(a.id)
+    latest_activity = uow.heartbeats.latest_activity(a.id)
+    quiet = uow.events.latest_for_task_kind(a.task_id, "worker_quiet")
+    if a.ended_at is not None:
+        worker_state = "stalled" if a.termination_reason == "stall" else "exited"
+    elif (
+        quiet is not None
+        and quiet.attempt_id == a.id
+        and (latest_signal is None or quiet.ts >= latest_signal.ts)
+    ):
+        worker_state = "quiet"
+    elif heartbeats:
+        worker_state = "alive"
+    else:
+        worker_state = "injected"
     return AttemptView(
         id=a.id,
         execution_id=a.execution_id,
@@ -388,7 +404,13 @@ def attempt_view(uow: UnitOfWork, attempt_id: str) -> AttemptView:
             if lease
             else None
         ),
-        heartbeat_summary={"signals": 0, "note": "heartbeats are C3"},
+        heartbeat_summary={
+            "state": worker_state,
+            "signals": len(heartbeats),
+            "last_signal": heartbeats[-1].signal if heartbeats else None,
+            "last_signal_at": heartbeats[-1].ts.isoformat() if heartbeats else None,
+            "last_activity_at": latest_activity.ts.isoformat() if latest_activity else None,
+        },
         report=report,
         model=a.selected_model,
         harness=a.selected_harness,

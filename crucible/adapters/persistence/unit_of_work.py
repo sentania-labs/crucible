@@ -29,6 +29,7 @@ from crucible.adapters.persistence.models import (
     CompletionClaimRow,
     EventRow,
     ExecutionRow,
+    HeartbeatRow,
     IdempotencyKeyRow,
     LeaseRow,
     LogChunkRow,
@@ -63,6 +64,7 @@ from crucible.domain.entities import (
     Event,
     Execution,
     ExecutionRole,
+    Heartbeat,
     Lease,
     LogChunkRecord,
     PoolExhaustion,
@@ -101,6 +103,7 @@ from crucible.ports.repository import (
     GateResultRepository,
     GitHubDeliveryRepository,
     HarnessStateRepository,
+    HeartbeatRepository,
     IdempotencyKeyTakenError,
     IdempotencyRepository,
     ImagePromotionRepository,
@@ -1000,6 +1003,12 @@ class Logs:
         )
         return int(value or 0)
 
+    def count_for_attempt(self, attempt_id: str) -> int:
+        value = self._s.scalar(
+            select(func.count(LogChunkRow.id)).where(LogChunkRow.attempt_id == attempt_id)
+        )
+        return int(value or 0)
+
     def list_for_attempt(
         self, attempt_id: str, *, after_id: int = 0, limit: int = 500
     ) -> Sequence[LogChunkRecord]:
@@ -1009,6 +1018,17 @@ class Logs:
             .order_by(LogChunkRow.id)
             .limit(limit)
         ).all()
+        return [self._to_entity(row) for row in rows]
+
+    def list_from_offset(
+        self, attempt_id: str, *, offset: int, stream: str | None = None, limit: int = 500
+    ) -> Sequence[LogChunkRecord]:
+        query = select(LogChunkRow).where(
+            LogChunkRow.attempt_id == attempt_id, LogChunkRow.offset_end > offset
+        )
+        if stream is not None:
+            query = query.where(LogChunkRow.stream == stream)
+        rows = self._s.scalars(query.order_by(LogChunkRow.id).limit(limit)).all()
         return [self._to_entity(row) for row in rows]
 
     def delete_for_attempts(self, attempt_ids: Sequence[str]) -> int:
@@ -1029,6 +1049,69 @@ class Logs:
             .limit(limit)
         ).all()
         return [str(row[0]) for row in rows]
+
+
+class Heartbeats:
+    """Append-only observed worker signals (10)."""
+
+    # Progress lines are unverified and may keep a worker out of the quiet state,
+    # but they do not prove useful work for the fail threshold (10).
+    _ACTIVITY_SIGNALS = ("container_running", "log_advanced", "fs_changed")
+
+    def __init__(self, session: Session) -> None:
+        self._s = session
+
+    @staticmethod
+    def _to_entity(row: HeartbeatRow) -> Heartbeat:
+        return Heartbeat(
+            id=row.id,
+            attempt_id=row.attempt_id,
+            ts=ensure_utc(row.ts),
+            signal=row.signal,
+            detail=row.detail,
+        )
+
+    def append(self, heartbeat: Heartbeat) -> Heartbeat:
+        row = HeartbeatRow(
+            attempt_id=heartbeat.attempt_id,
+            ts=heartbeat.ts,
+            signal=heartbeat.signal,
+            detail=heartbeat.detail,
+        )
+        self._s.add(row)
+        self._s.flush()
+        heartbeat.id = row.id
+        return heartbeat
+
+    def list_for_attempt(self, attempt_id: str, *, limit: int = 500) -> Sequence[Heartbeat]:
+        rows = self._s.scalars(
+            select(HeartbeatRow)
+            .where(HeartbeatRow.attempt_id == attempt_id)
+            .order_by(HeartbeatRow.ts, HeartbeatRow.id)
+            .limit(limit)
+        ).all()
+        return [self._to_entity(row) for row in rows]
+
+    def latest_signal(self, attempt_id: str) -> Heartbeat | None:
+        row = self._s.scalar(
+            select(HeartbeatRow)
+            .where(HeartbeatRow.attempt_id == attempt_id)
+            .order_by(HeartbeatRow.ts.desc(), HeartbeatRow.id.desc())
+            .limit(1)
+        )
+        return self._to_entity(row) if row is not None else None
+
+    def latest_activity(self, attempt_id: str) -> Heartbeat | None:
+        row = self._s.scalar(
+            select(HeartbeatRow)
+            .where(
+                HeartbeatRow.attempt_id == attempt_id,
+                HeartbeatRow.signal.in_(self._ACTIVITY_SIGNALS),
+            )
+            .order_by(HeartbeatRow.ts.desc(), HeartbeatRow.id.desc())
+            .limit(1)
+        )
+        return self._to_entity(row) if row is not None else None
 
 
 class Retentions:
@@ -1195,6 +1278,7 @@ class SqlUnitOfWork:
     leases: LeaseRepository
     claims: ClaimRepository
     logs: LogRepository
+    heartbeats: HeartbeatRepository
     retention: RetentionRepository
     supervisor_status: SupervisorStatusRepository
     idempotency: IdempotencyRepository
@@ -1247,6 +1331,7 @@ class SqlUnitOfWork:
         self.leases = Leases(s)
         self.claims = Claims(s)
         self.logs = Logs(s)
+        self.heartbeats = Heartbeats(s)
         self.retention = Retentions(s)
         self.supervisor_status = SupervisorStatuses(s)
         self.idempotency = IdempotencyKeys(s)

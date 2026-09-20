@@ -14,14 +14,18 @@ from __future__ import annotations
 import asyncio
 import copy
 import logging
+import stat
 import time
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
-from datetime import timedelta
+from datetime import datetime, timedelta
 from functools import partial
+from itertools import chain
 from pathlib import Path
 from typing import Any, ClassVar, TypeVar
+
+import yaml
 
 from crucible.application.decisions import (
     DEFAULT_ESCALATION_STALE_HOURS,
@@ -30,7 +34,7 @@ from crucible.application.decisions import (
 )
 from crucible.application.delivery_tick import DeliveryConfig, DeliveryCoordinator
 from crucible.application.errors import ApplicationError
-from crucible.application.evidence import record_collection_evidence
+from crucible.application.evidence import record_collection_evidence, store_artifact
 from crucible.application.gates import evaluate_and_advance, gate_input
 from crucible.application.harnesses import (
     HarnessRegistry,
@@ -70,6 +74,7 @@ from crucible.domain.entities import (
     EvidenceRecord,
     Execution,
     ExecutionRole,
+    Heartbeat,
     LogChunkRecord,
     PoolExhaustion,
     PullRequestState,
@@ -126,6 +131,7 @@ log = logging.getLogger("crucible.supervisor")
 T = TypeVar("T")
 
 TERMINATION_TIMEOUT = "timeout"
+TERMINATION_STALL = "stall"
 TERMINATION_CANCEL = "cancel"
 # A launch the registry or the provider refused (07): recorded so the retry rule knows
 # not to try the same refusal again.
@@ -136,6 +142,46 @@ DEFAULT_LOG_RETENTION_DAYS = 90
 DEFAULT_WORKSPACE_RETENTION_DAYS = 14
 DEFAULT_WAKE_RETENTION_DAYS = 30
 RETENTION_BATCH = 200
+
+
+def worker_stall_action(
+    *,
+    now: datetime,
+    last_activity: datetime,
+    last_signal: datetime | None = None,
+    warn_seconds: int,
+    fail_seconds: int,
+    warned_at: datetime | None,
+) -> str | None:
+    """Derive warn from any signal and fail from substantive activity (10)."""
+    if (now - last_activity).total_seconds() >= fail_seconds:
+        return "fail"
+    quiet_baseline = last_signal or last_activity
+    quiet = (now - quiet_baseline).total_seconds()
+    if quiet >= warn_seconds and (warned_at is None or warned_at < quiet_baseline):
+        return "warn"
+    return None
+
+
+def workspace_fingerprint(workspace: Workspace) -> tuple[int, int, int]:
+    """Cheap activity fingerprint for the writable checkout and report trees."""
+    newest_ns = files = total_bytes = 0
+    for root_name in (workspace.checkout_path, workspace.report_path):
+        root = Path(root_name)
+        try:
+            paths = chain((root,), root.rglob("*"))
+            for path in paths:
+                try:
+                    file_stat = path.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                newest_ns = max(newest_ns, file_stat.st_mtime_ns)
+                files += 1
+                if stat.S_ISREG(file_stat.st_mode):
+                    total_bytes += file_stat.st_size
+        except OSError:
+            continue
+    return newest_ns, files, total_bytes
 
 
 class LeaseLostError(Exception):
@@ -217,6 +263,7 @@ class Supervisor:
         self.fenced_token: int | None = None
         self._handles: dict[str, Handle] = {}
         self._workspaces: dict[str, Workspace] = {}
+        self._workspace_fingerprints: dict[str, tuple[int, int, int]] = {}
         # The delivery half (23). With no GitHub client configured it is inert, which is
         # what every tier below the live one runs with.
         self.delivery = DeliveryCoordinator(
@@ -1343,10 +1390,12 @@ class Supervisor:
             await self._db(partial(self._environment_failure, attempt.id, "prepare", detail))
             return False
         self._workspaces[attempt.id] = ws
+        self._workspace_fingerprints[attempt.id] = workspace_fingerprint(ws)
         await self._db(partial(self._record_prepared, attempt.id, ws))
         if not await self._db(partial(self._mark_launching, attempt.id, ws)):
             await self._discard(provider, ws, spec)
             self._workspaces.pop(attempt.id, None)
+            self._workspace_fingerprints.pop(attempt.id, None)
             return False
         try:
             handle = await provider.launch(ws, spec)
@@ -1571,6 +1620,15 @@ class Supervisor:
             uow.leases.upsert_attempt_lease(
                 attempt.id, self.holder, self.fenced_token, now, self.attempt_lease_ttl_seconds
             )
+            uow.heartbeats.append(
+                Heartbeat(
+                    id=None,
+                    attempt_id=attempt.id,
+                    ts=now,
+                    signal="container_running",
+                    detail={"handle": handle.ref},
+                )
+            )
             uow.commit()
 
     def _environment_failure(self, attempt_id: str, stage: str, detail: str) -> None:
@@ -1775,7 +1833,10 @@ class Supervisor:
         self, attempt: Attempt, provider: ExecutionProvider, handle: Handle
     ) -> int:
         """One log pull, appended and the resume position advanced (10)."""
+        with self._uow_factory() as uow:
+            index = uow.logs.count_for_attempt(attempt.id)
         offset = LogOffset(
+            index=index,
             timestamp=attempt.log_resume_ts.isoformat() if attempt.log_resume_ts else None,
             line_sha256=attempt.log_resume_sha256,
             occurrence=attempt.log_resume_occurrence,
@@ -1826,6 +1887,15 @@ class Supervisor:
                     attempt.log_resume_sha256 = chunk.line_sha256
                     attempt.log_resume_occurrence = chunk.occurrence
             if stored:
+                uow.heartbeats.append(
+                    Heartbeat(
+                        id=None,
+                        attempt_id=attempt_id,
+                        ts=self._clock.now(),
+                        signal="log_advanced",
+                        detail={"chunks": stored, "offset": offset},
+                    )
+                )
                 uow.attempts.save(attempt)
             uow.commit()
             return stored
@@ -1905,6 +1975,7 @@ class Supervisor:
                 continue
             await self._db(partial(self._mark_cleaned, attempt.id, choice))
             self._workspaces.pop(attempt.id, None)
+            self._workspace_fingerprints.pop(attempt.id, None)
             self._handles.pop(attempt.id, None)
             cleaned += 1
         return cleaned
@@ -2090,9 +2161,19 @@ class Supervisor:
                 await provider.terminate(handle, "drain")
                 await self._db(partial(self._record_drain, attempt.id, TERMINATION_TIMEOUT))
                 return False
-            # Log bytes advancing is a heartbeat signal (10); the pull is also what
-            # keeps the stored stream current for a live tail.
+            # Pull before checking for a stall so bytes arriving on this observation
+            # count as activity. A merely running container is liveness, not progress.
             await self._pull_logs(attempt, provider, handle)
+            changed = await self._db(partial(self._workspace_changed, attempt))
+            if changed:
+                await self._db(partial(self._record_workspace_activity, attempt.id))
+            stall = await self._db(partial(self._stall_action, attempt.id))
+            if stall == "fail":
+                await provider.terminate(handle, "drain")
+                await self._db(partial(self._record_drain, attempt.id, TERMINATION_STALL))
+                return False
+            if stall == "warn":
+                await self._db(partial(self._record_stall_warning, attempt.id))
             await self._db(partial(self._renew_attempt_lease, attempt.id))
             return False
         if observation.state is ObservationState.LOST:
@@ -2135,6 +2216,7 @@ class Supervisor:
             await self._complete_quota_checkpoint(attempt.id)
         self._handles.pop(attempt.id, None)
         self._workspaces.pop(attempt.id, None)
+        self._workspace_fingerprints.pop(attempt.id, None)
         return True
 
     def _pending_quota_checkpoints(self) -> list[str]:
@@ -2431,6 +2513,112 @@ class Supervisor:
                     "grace_seconds": self.grace_seconds,
                 },
             )
+            if reason == TERMINATION_STALL:
+                record_event(
+                    uow,
+                    self._clock,
+                    EventKind.WORKER_STALLED,
+                    principal=PRINCIPAL_CRUCIBLE,
+                    task_id=attempt.task_id,
+                    execution_id=attempt.execution_id,
+                    attempt_id=attempt.id,
+                    payload={"reason": "stall"},
+                )
+            uow.commit()
+
+    def _stall_action(self, attempt_id: str) -> str | None:
+        """Return the action due from verified activity, without changing state."""
+        with self._uow_factory() as uow:
+            attempt = uow.attempts.get(attempt_id)
+            if (
+                attempt is None
+                or attempt.state is not AttemptState.RUNNING
+                or attempt.drain_deadline is not None
+            ):
+                return None
+            execution = uow.executions.get(attempt.execution_id)
+            if execution is None:
+                return None
+            limits = (execution.policy_snapshot or {}).get("limits", {})
+            warn = int(limits.get("stall_warn_seconds", 300))
+            fail = int(limits.get("stall_fail_seconds", 1800))
+            activity = uow.heartbeats.latest_activity(attempt.id)
+            activity_baseline = (
+                activity.ts if activity is not None else attempt.started_at or attempt.created_at
+            )
+            signal = uow.heartbeats.latest_signal(attempt.id)
+            signal_baseline = signal.ts if signal is not None else activity_baseline
+            latest = uow.events.latest_for_task_kind(attempt.task_id, EventKind.WORKER_QUIET.value)
+            warned_at = (
+                latest.ts if latest is not None and latest.attempt_id == attempt.id else None
+            )
+            return worker_stall_action(
+                now=self._clock.now(),
+                last_activity=activity_baseline,
+                last_signal=signal_baseline,
+                warn_seconds=warn,
+                fail_seconds=fail,
+                warned_at=warned_at,
+            )
+
+    def _workspace_changed(self, attempt: Attempt) -> bool:
+        current = workspace_fingerprint(self._workspace_for(attempt))
+        previous = self._workspace_fingerprints.get(attempt.id)
+        self._workspace_fingerprints[attempt.id] = current
+        return previous is not None and current != previous
+
+    def _record_workspace_activity(self, attempt_id: str) -> None:
+        with self._fenced() as uow:
+            attempt = uow.attempts.get(attempt_id)
+            if attempt is None or attempt.state is not AttemptState.RUNNING:
+                return
+            uow.heartbeats.append(
+                Heartbeat(
+                    id=None,
+                    attempt_id=attempt.id,
+                    ts=self._clock.now(),
+                    signal="fs_changed",
+                    detail={},
+                )
+            )
+            uow.commit()
+
+    def _record_stall_warning(self, attempt_id: str) -> None:
+        with self._fenced() as uow:
+            attempt = uow.attempts.get(attempt_id, for_update=True)
+            if attempt is None or attempt.state is not AttemptState.RUNNING:
+                return
+            execution = uow.executions.get(attempt.execution_id)
+            task = uow.tasks.get(attempt.task_id)
+            assert execution is not None and task is not None
+            signal = uow.heartbeats.latest_signal(attempt.id)
+            baseline = signal.ts if signal is not None else attempt.started_at or attempt.created_at
+            latest = uow.events.latest_for_task_kind(task.id, EventKind.WORKER_QUIET.value)
+            if latest is not None and latest.attempt_id == attempt.id and latest.ts >= baseline:
+                return
+            idle_seconds = int((self._clock.now() - baseline).total_seconds())
+            record_event(
+                uow,
+                self._clock,
+                EventKind.WORKER_QUIET,
+                principal=PRINCIPAL_CRUCIBLE,
+                task_id=task.id,
+                execution_id=execution.id,
+                attempt_id=attempt.id,
+                payload={"idle_seconds": idle_seconds},
+            )
+            create_wake(
+                uow,
+                self._clock,
+                principal_id=task.principal_id,
+                reason=WakeReason.STALL_WARNING,
+                summary=(
+                    f"attempt {attempt.number} has made no verified progress for "
+                    f"{idle_seconds} seconds"
+                ),
+                task=task,
+                attempt_id=attempt.id,
+            )
             uow.commit()
 
     def _record_kill(self, attempt_id: str) -> None:
@@ -2501,7 +2689,7 @@ class Supervisor:
             assert task is not None
             attempt.exit_code = exit_code
             attempt.ended_at = self._clock.now()
-            timed_out = attempt.termination_reason == TERMINATION_TIMEOUT
+            timed_out = attempt.termination_reason in (TERMINATION_TIMEOUT, TERMINATION_STALL)
             killed = attempt.termination_reason == TERMINATION_CANCEL
             execution = uow.executions.get(attempt.execution_id)
             assert execution is not None
@@ -2593,6 +2781,22 @@ class Supervisor:
                 return
             claim_ok = False
             cancelled = attempt.termination_reason == TERMINATION_CANCEL
+            if cancelled and (outputs.report_raw is not None or outputs.report is not None):
+                partial_report = outputs.report_raw or yaml.safe_dump(
+                    outputs.report, sort_keys=True, default_flow_style=False
+                )
+                if find_secrets(partial_report):
+                    partial_report = redact(partial_report)
+                store_artifact(
+                    uow,
+                    self._clock,
+                    self._artifacts,
+                    attempt=attempt,
+                    name="report/report.yaml",
+                    artifact_type="partial_report",
+                    content=partial_report.encode("utf-8"),
+                    content_type="application/yaml",
+                )
             if outputs.report is None and outputs.report_raw is not None and not cancelled:
                 # The file exists and is not a YAML mapping (a bare colon in a value is
                 # the usual cause). The adapter's errors say so; nothing of it is stored.
@@ -2661,7 +2865,7 @@ class Supervisor:
                 payload={
                     "report_present": report_present,
                     "report_parsed": claim_ok,
-                    "partial_report_kept_unparsed": cancelled and outputs.report is not None,
+                    "partial_report_kept_unparsed": cancelled and report_present,
                     "blocked_present": outputs.blocked_md is not None,
                 },
             )
@@ -2688,13 +2892,22 @@ class Supervisor:
             if parsed is not None:
                 self._record_harness_metrics(uow, attempt, parsed)
                 if parsed.progress:
-                    ingest_progress(
+                    recorded = ingest_progress(
                         uow,
                         self._clock,
                         attempt_id=attempt.id,
                         task_id=attempt.task_id,
                         execution_id=attempt.execution_id,
                         progress=parsed.progress,
+                    )
+                    uow.heartbeats.append(
+                        Heartbeat(
+                            id=None,
+                            attempt_id=attempt.id,
+                            ts=self._clock.now(),
+                            signal="progress_line",
+                            detail={"lines": recorded},
+                        )
                     )
             self._classify_and_finish(
                 uow, attempt, blocked_text, claim_ok=claim_ok, defer_quota=defer_quota

@@ -136,6 +136,9 @@ async def test_cancel_with_partial_report_is_not_parsed(
     assert await run_until(supervisor, client, task_id, {"cancelled"}) == "cancelled"
     stored = client.get(f"/v1/attempts/{attempt['id']}").json()
     assert stored["report"] is None and stored["exit_class"] == "killed"
+    artifacts = client.get(f"/v1/attempts/{attempt['id']}/artifacts").json()["items"]
+    partial = [item for item in artifacts if item["type"] == "partial_report"]
+    assert len(partial) == 1 and partial[0]["filename"] == "report/report.yaml"
     events = client.get(f"/v1/tasks/{task_id}/events").json()["items"]
     collected = next(e for e in events if e["kind"] == "attempt_collected")
     assert collected["payload"]["partial_report_kept_unparsed"] is True
