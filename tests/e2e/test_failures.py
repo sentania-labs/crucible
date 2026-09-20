@@ -35,6 +35,18 @@ async def _attempt_id(client: TestClient, task_id: str) -> str:
     return str(view["latest_attempt"]["id"])
 
 
+async def _wait_running(
+    supervisor: Supervisor, client: TestClient, task_id: str, *, ticks: int = 40
+) -> dict[str, object]:
+    for _ in range(ticks):
+        await supervisor.tick()
+        attempt = client.get(f"/v1/tasks/{task_id}").json().get("latest_attempt")
+        if attempt and attempt["state"] == "running":
+            return dict(attempt)
+        await asyncio.sleep(0.25)
+    raise AssertionError("worker never reached running")
+
+
 async def test_a_timeout_drains_then_kills(
     ctx: AppContext,
     client: TestClient,
@@ -259,3 +271,122 @@ async def test_a_second_attempt_on_the_same_branch_waits_for_the_checkout_lease(
     assert attempt is None or attempt["state"] in ("pending", "preparing"), attempt
     assert "checkout_lease_denied" in event_kinds(client, second)
     assert "checkout_lease_taken" in event_kinds(client, first)
+
+
+async def test_live_log_tail_delivers_while_worker_is_running(
+    ctx: AppContext,
+    client: TestClient,
+    supervisor: Supervisor,
+    origin: OriginFactory,
+    worker_image: str,
+) -> None:
+    url = origin("live-tail", "hang")
+    register(ctx, "live-tail", url)
+    task_id = submit_and_start(client, e2e_contract("E2E-TAIL", "live-tail", worker_image))
+    attempt = await _wait_running(supervisor, client, task_id)
+    attempt_id = str(attempt["id"])
+
+    def read_tail() -> str:
+        with client.stream(
+            "GET",
+            f"/v1/attempts/{attempt_id}/logs",
+            headers={"Accept": "text/event-stream"},
+        ) as response:
+            assert response.status_code == 200
+            return "\n".join(response.iter_lines())
+
+    tail = asyncio.create_task(asyncio.to_thread(read_tail))
+    await asyncio.sleep(0.5)
+    cancelled = client.post(
+        f"/v1/tasks/{task_id}/cancel",
+        json={
+            "reason": "tail test complete",
+            "verbatim": "stop the tail test",
+            "decided_by": "tests",
+        },
+    )
+    assert cancelled.status_code == 200
+    await run_until(supervisor, client, task_id, {"cancelled"}, max_ticks=30, pause=0.5)
+    body = await asyncio.wait_for(tail, timeout=10)
+    assert "event: stdout" in body
+    assert "sleeping until Crucible drains me" in body
+    assert "event: end" in body
+
+
+async def test_cancel_kills_a_real_worker_and_keeps_its_partial_report_unparsed(
+    ctx: AppContext,
+    client: TestClient,
+    supervisor: Supervisor,
+    origin: OriginFactory,
+    worker_image: str,
+) -> None:
+    url = origin("partial-kill", "hang")
+    register(ctx, "partial-kill", url)
+    task_id = submit_and_start(client, e2e_contract("E2E-PARTIAL", "partial-kill", worker_image))
+    attempt = await _wait_running(supervisor, client, task_id)
+    attempt_id = str(attempt["id"])
+    container = daemon.container_ids(f"crucible.attempt={attempt_id}")[0]
+    daemon.run(
+        "exec",
+        container,
+        "sh",
+        "-c",
+        "printf '%s\\n' 'schema_version: 1.0' 'summary: interrupted' "
+        "> /crucible/report/report.yaml",
+    )
+    daemon.run("kill", "--signal", "STOP", container)
+    cancelled = client.post(
+        f"/v1/tasks/{task_id}/cancel",
+        json={
+            "reason": "forced partial report",
+            "verbatim": "kill this worker",
+            "decided_by": "tests",
+        },
+    )
+    assert cancelled.status_code == 200
+    await supervisor.tick()
+    await asyncio.sleep(6)
+    await supervisor.tick()
+    assert (
+        await run_until(supervisor, client, task_id, {"cancelled"}, max_ticks=20, pause=0.5)
+        == "cancelled"
+    )
+    stored = client.get(f"/v1/attempts/{attempt_id}").json()
+    assert stored["exit_class"] == "killed"
+    assert stored["report"] is None
+    artifacts = client.get(f"/v1/attempts/{attempt_id}/artifacts").json()["items"]
+    partial = [item for item in artifacts if item["type"] == "partial_report"]
+    assert len(partial) == 1 and partial[0]["filename"] == "report/report.yaml"
+    events = client.get(f"/v1/tasks/{task_id}/events").json()["items"]
+    collected = next(event for event in events if event["kind"] == "attempt_collected")
+    assert collected["payload"]["partial_report_kept_unparsed"] is True
+
+
+async def test_a_stalled_real_worker_warns_then_drains_and_kills(
+    ctx: AppContext,
+    client: TestClient,
+    supervisor: Supervisor,
+    origin: OriginFactory,
+    engine: Engine,
+    worker_image: str,
+) -> None:
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE policies SET document = jsonb_set(jsonb_set(document, "
+                "'{limits,stall_warn_seconds}', '2'), '{limits,stall_fail_seconds}', '4') "
+                "WHERE name='e2e-script' AND version=1"
+            )
+        )
+    url = origin("stall", "hang")
+    register(ctx, "stall", url)
+    task_id = submit_and_start(client, e2e_contract("E2E-STALL", "stall", worker_image))
+    attempt = await _wait_running(supervisor, client, task_id)
+    attempt_id = str(attempt["id"])
+    state = await run_until(supervisor, client, task_id, DONE, max_ticks=30, pause=1.0)
+    assert state in DONE
+    stored = client.get(f"/v1/attempts/{attempt_id}").json()
+    assert stored["exit_class"] == "timeout"
+    assert stored["termination_reason"] == "stall"
+    kinds = event_kinds(client, task_id)
+    assert "worker_quiet" in kinds and "worker_stalled" in kinds

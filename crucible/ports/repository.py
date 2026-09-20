@@ -28,6 +28,7 @@ from crucible.domain.entities import (
     GateResultRecord,
     GitHubDelivery,
     HarnessState,
+    Heartbeat,
     ImagePromotion,
     Lease,
     LogChunkRecord,
@@ -225,8 +226,14 @@ class LogRepository(Protocol):
 
     def last_offset(self, attempt_id: str) -> int: ...
 
+    def count_for_attempt(self, attempt_id: str) -> int: ...
+
     def list_for_attempt(
         self, attempt_id: str, *, after_id: int = 0, limit: int = 500
+    ) -> Sequence[LogChunkRecord]: ...
+
+    def list_from_offset(
+        self, attempt_id: str, *, offset: int, stream: str | None = None, limit: int = 500
     ) -> Sequence[LogChunkRecord]: ...
 
     def delete_for_attempts(self, attempt_ids: Sequence[str]) -> int: ...
@@ -234,6 +241,14 @@ class LogRepository(Protocol):
     def attempts_with_logs_before(self, cutoff: datetime, limit: int) -> Sequence[str]:
         """Attempts whose newest stored chunk is older than the cutoff (16)."""
         ...
+
+
+class HeartbeatRepository(Protocol):
+    def append(self, heartbeat: Heartbeat) -> Heartbeat: ...
+
+    def list_for_attempt(self, attempt_id: str, *, limit: int = 500) -> Sequence[Heartbeat]: ...
+
+    def latest_activity(self, attempt_id: str) -> Heartbeat | None: ...
 
 
 class RetentionRepository(Protocol):
@@ -533,6 +548,7 @@ class UnitOfWork(Protocol):
     leases: LeaseRepository
     claims: ClaimRepository
     logs: LogRepository
+    heartbeats: HeartbeatRepository
     retention: RetentionRepository
     supervisor_status: SupervisorStatusRepository
     idempotency: IdempotencyRepository
