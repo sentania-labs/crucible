@@ -85,7 +85,7 @@ def clamp_limit(limit: int | None) -> int:
     return max(1, min(limit, MAX_LIMIT))
 
 
-def _attempt_summary(a: Attempt) -> AttemptSummary:
+def _attempt_summary(a: Attempt, reroute_from_attempt_id: str | None = None) -> AttemptSummary:
     return AttemptSummary(
         id=a.id,
         execution_id=a.execution_id,
@@ -96,10 +96,18 @@ def _attempt_summary(a: Attempt) -> AttemptSummary:
         started_at=a.started_at,
         ended_at=a.ended_at,
         handle=a.handle,
+        model=a.selected_model,
+        harness=a.selected_harness,
+        image=a.selected_image,
+        pool=a.selected_pool,
+        reroute_from_attempt_id=reroute_from_attempt_id,
+        resume_from_remote=a.resume_from_remote,
     )
 
 
-def _execution_summary(e: Execution, attempts: list[Attempt]) -> ExecutionSummary:
+def _execution_summary(
+    e: Execution, attempts: list[Attempt], reroute_from: dict[str, str]
+) -> ExecutionSummary:
     return ExecutionSummary(
         id=e.id,
         role=e.role.value,
@@ -112,8 +120,19 @@ def _execution_summary(e: Execution, attempts: list[Attempt]) -> ExecutionSummar
         max_attempts=e.max_attempts,
         created_at=e.created_at,
         ended_at=e.ended_at,
-        attempts=[_attempt_summary(a) for a in attempts],
+        attempts=[_attempt_summary(a, reroute_from.get(a.id)) for a in attempts],
     )
+
+
+def _all_task_events(uow: UnitOfWork, task_id: str) -> list[Any]:
+    events: list[Any] = []
+    after_seq = 0
+    while True:
+        page = list(uow.events.list_for_task(task_id, after_seq=after_seq, limit=1000))
+        events.extend(page)
+        if len(page) < 1000:
+            return events
+        after_seq = int(page[-1].seq or after_seq)
 
 
 def task_view(uow: UnitOfWork, task_id: str) -> TaskView:
@@ -125,11 +144,25 @@ def task_view(uow: UnitOfWork, task_id: str) -> TaskView:
     versions = uow.contracts.list_for_task(task.id)
     current = next((v for v in versions if v.version == task.contract_version), None)
     executions = uow.executions.list_for_task(task.id)
+    task_events = _all_task_events(uow, task.id)
+    reroute_from = {
+        str(event.payload["to_attempt_id"]): str(event.payload["from_attempt_id"])
+        for event in task_events
+        if event.kind == "task_rerouted"
+        and event.payload.get("to_attempt_id")
+        and event.payload.get("from_attempt_id")
+    }
     summaries = [
-        _execution_summary(e, list(uow.attempts.list_for_execution(e.id))) for e in executions
+        _execution_summary(e, list(uow.attempts.list_for_execution(e.id)), reroute_from)
+        for e in executions
     ]
     all_attempts = [a for s in summaries for a in s.attempts]
     latest = max(all_attempts, key=lambda a: a.id) if all_attempts else None
+    reroutes = [
+        _event_view(event).model_dump(mode="json")
+        for event in task_events
+        if event.kind == "task_rerouted"
+    ]
     return TaskView(
         id=task.id,
         external_id=task.external_id,
@@ -175,6 +208,8 @@ def task_view(uow: UnitOfWork, task_id: str) -> TaskView:
                 task.principal_id, since=None, include_acked=False, limit=MAX_LIMIT
             )
         ),
+        resume_at=task.resume_at,
+        reroute_chain=reroutes,
     )
 
 
@@ -355,6 +390,12 @@ def attempt_view(uow: UnitOfWork, attempt_id: str) -> AttemptView:
         ),
         heartbeat_summary={"signals": 0, "note": "heartbeats are C3"},
         report=report,
+        model=a.selected_model,
+        harness=a.selected_harness,
+        image=a.selected_image,
+        pool=a.selected_pool,
+        ordered_candidates=a.ordered_candidates,
+        resume_from_remote=a.resume_from_remote,
     )
 
 

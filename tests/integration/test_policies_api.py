@@ -211,23 +211,44 @@ def test_upload_a_new_routing_policy_version(client: TestClient, tokens: dict[st
     ],
 )
 def test_a_contract_is_validated_against_the_routing_policy(
-    client: TestClient, patch: dict[str, str], path: str
+    client: TestClient, tokens: dict[str, str], patch: dict[str, str], path: str
 ) -> None:
     document = contract_document()
-    document["execution_request"] = {**document["execution_request"], **patch}
-    r = client.post("/v1/tasks", json=document)
+    document["execution_request"] = {
+        **document["execution_request"],
+        "harness": "codex",
+        "model": "gpt-5.6-luna",
+        "pin_reason": "routing policy validation test",
+        **patch,
+    }
+    r = client.post(
+        "/v1/tasks",
+        json=document,
+        headers={"Authorization": f"Bearer {tokens['operator']}"},
+    )
     assert r.status_code == 422, r.text
     assert any(e["path"] == path for e in r.json()["errors"])
 
 
-def test_a_complex_tier_may_name_a_frontier_model(client: TestClient) -> None:
+def test_a_complex_tier_may_name_a_frontier_model(
+    client: TestClient, tokens: dict[str, str]
+) -> None:
     document = contract_document()
     document["execution_request"] = {
         **document["execution_request"],
         "tier": "complex",
+        "harness": "codex",
         "model": "gpt-5.6-sol",
+        "pin_reason": "routing policy validation test",
     }
-    assert client.post("/v1/tasks", json=document).status_code == 201
+    assert (
+        client.post(
+            "/v1/tasks",
+            json=document,
+            headers={"Authorization": f"Bearer {tokens['operator']}"},
+        ).status_code
+        == 201
+    )
 
 
 def test_routing_usage_reports_every_pool(client: TestClient) -> None:
@@ -249,9 +270,9 @@ async def test_usage_counts_attempts_when_no_tokens_are_reported(
     await run_to_settled(supervisor, client, task_id)
     usage = client.get("/v1/routing/usage", params={"policy_version": 2}).json()
     pools = {p["pool"]: p for p in usage["pools"]}
-    openai = pools["openai-sub"]
-    assert openai["attempts"] == 1
-    assert openai["fallback_to_attempts"] is True and openai["counting"] == "attempts"
+    anthropic = pools["anthropic-sub"]
+    assert anthropic["attempts"] == 1
+    assert anthropic["fallback_to_attempts"] is True and anthropic["counting"] == "attempts"
 
 
 async def test_routing_history_filters_by_model_and_project(
@@ -261,7 +282,8 @@ async def test_routing_history_filters_by_model_and_project(
     await run_to_settled(supervisor, client, task_id)
     assert client.get("/v1/routing/history", params={"model": "gpt-5.6-sol"}).json()["items"] == []
     rows = client.get(
-        "/v1/routing/history", params={"model": "gpt-5.6-luna", "project": "example-service"}
+        "/v1/routing/history",
+        params={"model": "claude-sonnet-5", "project": "example-service"},
     ).json()["items"]
     assert len(rows) == 1 and rows[0]["task_id"] == task_id
     assert client.get("/v1/routing/history", params={"project": "nothing"}).json()["items"] == []

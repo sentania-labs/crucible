@@ -31,13 +31,14 @@ def start_task(
         problems.append(
             {"path": "overrides", "message": "overrides create an amendment, which is C2"}
         )
+    expected_harness = req.pinned_harness.value if req.pinned_harness else None
     for field, expected, given in (
-        ("harness", req.harness.value, request.harness.value),
-        ("model", req.model, request.model),
-        ("provider", req.provider.value, request.provider.value),
+        ("harness", expected_harness, request.harness.value if request.harness else None),
+        ("model", req.pinned_model, request.model),
+        ("provider", req.provider.value, request.provider.value if request.provider else None),
         ("image", req.image, request.image),
     ):
-        if expected != given:
+        if given is not None and expected != given:
             problems.append(
                 {
                     "path": field,
@@ -61,11 +62,18 @@ def start_task(
         EventKind.TASK_SCHEDULED,
         principal=principal.name,
         payload={
-            "harness": req.harness.value,
-            "model": req.model,
+            "tier": req.tier.value,
+            "pin": (
+                {
+                    "harness": expected_harness,
+                    "model": req.pinned_model,
+                    "reason": req.effective_pin_reason,
+                }
+                if req.pinned_model
+                else None
+            ),
             "effort": request.effort or req.effort,
             "provider": req.provider.value,
-            "image": req.image,
             "policy": {"name": contract.policy.name, "version": contract.policy.version},
             "contract_version": task.contract_version,
         },

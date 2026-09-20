@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +19,7 @@ import yaml
 from crucible.contracts.completion_claim import parse_claim
 from crucible.domain.exit_class import ExitClass, classify_exit
 from crucible.ports.execution import IDENTITY_MOUNT, REPORT_MOUNT
-from crucible.ports.harness import ExitInfo, ParsedReport, ReportMetrics
+from crucible.ports.harness import ExitInfo, ParsedReport, ProviderQuotaEvent, ReportMetrics
 
 # Argv carries only a short pointer; the identity bundle and the contract are files
 # (07, S3). The same sentence for every harness.
@@ -81,6 +82,73 @@ def classify_with_patterns(
     if first_match(tails, quota) is not None:
         return ExitClass.QUOTA_EXHAUSTED
     return base
+
+
+_RESET_KEYS = frozenset({"reset_at", "resetAt", "resets_at", "resetsAt", "reset_time"})
+
+
+def _reset_values(value: Any) -> Iterator[Any]:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key in _RESET_KEYS:
+                yield item
+            yield from _reset_values(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _reset_values(item)
+
+
+def _reset_from_document(document: Mapping[str, Any]) -> datetime | None:
+    for raw in _reset_values(document):
+        if isinstance(raw, (int, float)):
+            seconds = float(raw) / (1000 if raw > 10_000_000_000 else 1)
+            try:
+                return datetime.fromtimestamp(seconds, tz=UTC)
+            except (OverflowError, OSError, ValueError):
+                continue
+        if isinstance(raw, str):
+            try:
+                parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+    return None
+
+
+def quota_reset_at(*tails: str, quota: Sequence[Pattern]) -> datetime | None:
+    """Parse a machine timestamp only from a line that also proves quota exhaustion."""
+
+    for tail in tails:
+        for line in reversed(tail[-TAIL_LIMIT:].splitlines()):
+            if first_match((line,), quota) is None:
+                continue
+            try:
+                document = json.loads(line)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if isinstance(document, dict):
+                return _reset_from_document(document)
+    return None
+
+
+def provider_quota_event(
+    *tails: str, predicate: Callable[[Mapping[str, Any]], bool]
+) -> ProviderQuotaEvent | None:
+    """Return the refusal and reset from the same structured harness event."""
+    for tail in tails:
+        for line in reversed(tail[-TAIL_LIMIT:].splitlines()):
+            try:
+                document = json.loads(line)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if isinstance(document, dict) and predicate(document):
+                return ProviderQuotaEvent(reset_at=_reset_from_document(document))
+    return None
+
+
+def provider_quota_exhausted(*tails: str, signals: Sequence[Pattern]) -> bool:
+    """Shared pool state requires a structured signal emitted by the harness itself."""
+    return first_match(tuple(tail[-TAIL_LIMIT:] for tail in tails), signals) is not None
 
 
 def read_text(path: Path, limit: int = 8 * 1024 * 1024) -> str | None:

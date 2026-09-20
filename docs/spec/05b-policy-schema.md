@@ -205,10 +205,44 @@ contract cannot change them.
 
 ## Routing policy (RoutingPolicyV1)
 
-Uploaded and versioned like a policy. Foundry selects from it; Crucible
-never selects, but refuses a contract whose model is absent or disabled,
-whose harness does not match the entry, or whose quota pool is exhausted,
-and reports per-pool usage on `GET /routing/usage`. A harness that is
+Uploaded and versioned like a policy. Foundry names a tier; Crucible
+selects the model within it by the rule below, at every attempt launch,
+inside the fenced transaction that moves the attempt to `launching`. The
+rule is mechanical and total over database state: two supervisors given
+the same rows select the same entry. Crucible still refuses an operator pin
+whose model is absent or disabled, whose harness does not match the entry,
+or whose quota pool is exhausted, and reports per-pool usage and
+exhaustion marks on `GET /routing/usage`. (Decided 2026-09-20 on the
+operator's direction; before C6b the contract pinned a model and Crucible
+only refused.)
+
+**Selection rule.** Candidates are the policy's entries that are enabled,
+whose harness is enabled and holds a credential (25), whose capability is
+in the tier's `allowed_capability`, whose pool is under its soft limit,
+and whose pool carries no live exhaustion mark. Order them by: position of
+their capability in the tier's `prefer` list (unlisted last); then quality
+demotion as `rotation.quality_feedback` states; then weighted least-recent:
+a candidate never launched on this project ranks first, otherwise rank by
+`(now - last_launched_at) * weight`, largest first; then id, as the final
+tie break. Recency is read directly from the latest AttemptMetrics per
+model on the project, never through a paged task listing. The first candidate is selected. The launch event records the
+selected entry, the derived image, and the ordered candidate list with
+each exclusion's reason.
+
+**Exhaustion marks.** A worker exit classified `quota_exhausted` (07, 16)
+marks the attempt's pool exhausted until `reset_at`: the reset the harness
+reported when the adapter can parse one, otherwise now plus the pool's
+`default_cooldown_seconds`. A parsed reset is used as given, even when it
+lies beyond any task's wait cap; the cap ends the task, it does not shorten
+the pool's fact. Because a mark is shared by every task, it is written only
+when the harness's own provider-error event (07) says the provider refused
+for quota, never from quota-shaped text elsewhere in a transcript; text
+alone may still classify that one attempt `quota_exhausted` and reroute it,
+without a mark. Marks are rows, survive a restart, expire on
+their own, and can be cleared by the administrator with a reason (25). A
+launch-time reservation that finds the pool over its soft limit does not
+create a mark; the soft limit is Crucible's own count, the mark is the
+provider's word. A harness that is
 disabled, by configuration or by the administrator's flag (25), is likewise
 a contract problem at submit on `execution_request.harness`, answered 422
 with the reason, not a refusal the task discovers later. The operator's
@@ -216,15 +250,16 @@ direction (2026-09-16): rotate work across providers by capability, cost,
 and speed; never spend frontier models on simple work; local models carry
 routine work once they exist.
 
-`default-routing` version 2, as seeded, is the document below. Version 1
-stays beside it because a policy version references it and a version is
-immutable; version 1's ids were placeholders, version 2's are the ones the
-CLIs themselves list.
+`default-routing` version 3, seeded by C6b, is the document below: version 2's
+roster plus `default_cooldown_seconds` on every pool and the `reroute` block.
+Versions 1 and 2 stay beside it because policy versions reference them and a
+version is immutable; version 1's ids were placeholders, version 2's are the
+ones the CLIs themselves list.
 
 ```yaml
 schema_version: "1.0"
 name: "default-routing"
-version: 2
+version: 3
 tiers:                                 # task tiers Foundry assigns in the contract's execution_request.tier
   trivial:   { allowed_capability: ["small", "mid"],  prefer: ["small"] }     # frontier is refused, not merely dispreferred
   standard:  { allowed_capability: ["mid", "small"],  prefer: ["mid"] }       # a task that truly needs frontier is marked complex
@@ -241,16 +276,19 @@ models:                                # every entry weight 1: rotation is least
   - { id: "gemini-3.8-flash-high", harness: agy,         endpoint: subscription, capability: mid,      cost: medium, speed: medium, pool: google-sub,    weight: 1, enabled: true }
   - { id: "gemini-3.1-pro-high",   harness: agy,         endpoint: subscription, capability: frontier, cost: high,   speed: slow,   pool: google-sub,    weight: 1, enabled: true }
 pools:                                 # budget_units is one of attempts | tokens_out | cost_units, all recorded in AttemptMetrics
-  anthropic-sub: { window: "5h", budget_units: "tokens_out", soft_limit: 0 }   # 0 means observe only until measured
-  openai-sub:    { window: "5h", budget_units: "tokens_out", soft_limit: 0 }
-  google-sub:    { window: "5h", budget_units: "attempts", soft_limit: 0 }
+  anthropic-sub: { window: "5h", budget_units: "tokens_out", soft_limit: 0, default_cooldown_seconds: 18000 }   # 0 means observe only until measured; cooldown is the mark length when the harness reports no reset
+  openai-sub:    { window: "5h", budget_units: "tokens_out", soft_limit: 0, default_cooldown_seconds: 18000 }
+  google-sub:    { window: "5h", budget_units: "attempts",   soft_limit: 0, default_cooldown_seconds: 3600 }
 rotation:
   strategy: "weighted-least-recent"    # among models allowed for the tier, prefer the preferred capability, then the least recently used, weighted
   quality_feedback: true               # a model whose last N attempts on this project ended in gate failures or corrections drops one preference step
   quality_window: 20
+reroute:                               # C6b: what happens when a worker dies of quota (16)
+  reroute_max: 3                       # reroutes per task per contract version, counted apart from lifecycle.max_attempts
+  resume_max_wait_seconds: 86400       # longest a task waits in awaiting_quota before it ends reported with a wake
 ```
 
-Version 2 carries subscription entries only. Local model entries, which
+Version 3 carries subscription entries only. Local model entries, which
 carry `endpoint: local` and an `endpoint_url` on the DGX Spark and the RTX
 9060, join a later version with their own pools once S13 has run; the rules
 for them below already hold.
@@ -278,20 +316,11 @@ The quota check runs twice: advisory at submit (422 so Foundry can pick
 again) and authoritative at attempt launch, where the supervisor reserves
 the pool capacity in the same fenced transaction that moves the attempt
 to `launching`; if the pool crossed its soft limit since submit, the
-attempt is refused with class `quota_exhausted` and Foundry is woken. A `local`
-entry must carry `endpoint_url`; Crucible passes it to the adapter's
-launch context and adds its hostname to that attempt's egress allowlist.
-A pool's `budget_units` must be a unit AttemptMetrics records; when a
-harness reports no token counts, `tokens_out` is recorded as null and the
-pool falls back to counting attempts, which `GET /routing/usage` states.
-The quota check runs twice: advisory at submit (422 so Foundry can pick
-again) and authoritative at attempt launch, where the supervisor reserves
-the pool capacity in the same fenced transaction that moves the attempt
-to `launching`; if the pool crossed its soft limit since submit, the
 attempt is refused with class `quota_exhausted` and Foundry is woken. Foundry
-records the tier and the chosen model with its rationale in the contract
-(05); Crucible records the outcome in AttemptMetrics (03, 14) and exposes
-`GET /routing/history?model=&project=`, which returns both the model the
-contract requested and the model the transcript named (14), so the next
-selection is informed.
-Selection itself stays a Foundry judgment; the policy bounds it.
+records the tier with its rationale in the contract (05); Crucible records
+the selected model and the outcome in AttemptMetrics (03, 14) and exposes
+`GET /routing/history?model=&project=`, which returns both the model
+Crucible selected and the model the transcript named (14), which is what
+the least-recent and quality terms of the selection rule read.
+Foundry's judgment is the tier; the policy and the rule do the rest. The
+operator alone may pin (05).

@@ -6,6 +6,8 @@ sanitized state; per-harness concurrency defers the second launch.
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -13,6 +15,7 @@ from crucible.adapters.api.deps import AppContext
 from crucible.adapters.execution.fake import FakeProvider
 from crucible.application.harnesses import set_harness_enabled
 from crucible.application.supervisor import Supervisor
+from tests.fixtures import contract_document
 from tests.integration.conftest import (
     event_kinds,
     make_supervisor,
@@ -36,12 +39,43 @@ def _disable(ctx: AppContext, name: str, reason: str) -> None:
         uow.commit()
 
 
+def _pinned_document(external_id: str, image: str) -> dict[str, Any]:
+    document = contract_document(external_id=external_id)
+    document["repository"]["work_branch"] = f"crucible/{external_id}"
+    document["execution_request"].update(
+        {
+            "harness": "codex",
+            "model": "gpt-5.6-luna",
+            "pin_reason": "harness registry integration test",
+            "image": image,
+        }
+    )
+    return document
+
+
+def _submit_pinned(client: TestClient, tokens: dict[str, str], image: str, external_id: str) -> str:
+    headers = {"Authorization": f"Bearer {tokens['operator']}"}
+    response = client.post("/v1/tasks", json=_pinned_document(external_id, image), headers=headers)
+    assert response.status_code == 201, response.text
+    task_id = str(response.json()["id"])
+    response = client.post(
+        f"/v1/tasks/{task_id}/start",
+        json={"provider": "fake", "image": image, "policy_version": 2},
+        headers=headers,
+    )
+    assert response.status_code == 200, response.text
+    return task_id
+
+
 async def test_a_disabled_harness_is_refused_with_a_wake_and_no_retry(
-    ctx: AppContext, client: TestClient, supervisor: Supervisor
+    ctx: AppContext,
+    client: TestClient,
+    supervisor: Supervisor,
+    tokens: dict[str, str],
 ) -> None:
     # Disabled after submit: at submit the gate is a contract problem (review I8); a
     # harness disabled while a task is scheduled is what the launch-time refusal is for.
-    task_id = submit_and_start(client, "crucible-worker:fake-succeed")
+    task_id = _submit_pinned(client, tokens, "crucible-worker:fake-succeed", "EX-DISABLED-LAUNCH")
     _disable(ctx, "codex", "rotating the dedicated credential")
     assert await run_to_settled(supervisor, client, task_id) == "pre_pr_gates_failed"
     kinds = event_kinds(client, task_id)
@@ -58,7 +92,9 @@ async def test_a_disabled_harness_is_refused_with_a_wake_and_no_retry(
         "disabled by an administrator: rotating the dedicated credential"
         in refused["payload"]["detail"]
     )
-    wakes = client.get("/v1/wakes").json()["items"]
+    wakes = client.get(
+        "/v1/wakes", headers={"Authorization": f"Bearer {tokens['operator']}"}
+    ).json()["items"]
     unavailable = [w for w in wakes if w["reason"] == "harness_unavailable"]
     assert len(unavailable) == 1 and "codex" in unavailable[0]["summary"]
     view = client.get(f"/v1/tasks/{task_id}").json()
@@ -110,15 +146,11 @@ async def test_get_harnesses_reports_flags_ranges_and_a_sanitized_credential_sta
     # No credential path is configured in this tier: absent, and nothing else to say.
     assert agy["credential"]["state"] == "absent"
     assert agy["credential"]["source_fingerprint"] is None
-    codex = items["codex"]
-    assert codex["enabled"] is True
-    assert codex["credential"]["last_launch_outcome"] == "completed"
-    assert codex["credential"]["last_launch_at"] is not None
-    assert codex["capabilities"]["endpoints"] == [
-        "api.openai.com",
-        "auth.openai.com",
-        "chatgpt.com",
-    ]
+    claude = items["claude_code"]
+    assert claude["enabled"] is True
+    assert claude["credential"]["last_launch_outcome"] == "completed"
+    assert claude["credential"]["last_launch_at"] is not None
+    assert claude["capabilities"]["endpoints"] == ["api.anthropic.com"]
     # The fake provider lists no images (08); the endpoint still answers.
     assert client.get("/v1/images").json()["items"] == []
     # Nothing secret-shaped anywhere in the two documents.
@@ -127,12 +159,15 @@ async def test_get_harnesses_reports_flags_ranges_and_a_sanitized_credential_sta
 
 
 async def test_per_harness_concurrency_defers_the_second_launch(
-    ctx: AppContext, client: TestClient, provider: FakeProvider
+    ctx: AppContext,
+    client: TestClient,
+    provider: FakeProvider,
+    tokens: dict[str, str],
 ) -> None:
     """05b and 12: concurrency 1 for a harness whose credential is rw-narrow."""
     supervisor = make_supervisor(ctx, provider)
-    first = submit_and_start(client, "crucible-worker:fake-hang", external_id="EX-0001")
-    second = submit_and_start(client, "crucible-worker:fake-succeed", external_id="EX-0002")
+    first = _submit_pinned(client, tokens, "crucible-worker:fake-hang", "EX-0001")
+    second = _submit_pinned(client, tokens, "crucible-worker:fake-succeed", "EX-0002")
     await supervisor.tick()
     await supervisor.tick()
     states = {task: client.get(f"/v1/tasks/{task}").json()["state"] for task in (first, second)}
@@ -160,14 +195,16 @@ async def test_per_harness_concurrency_defers_the_second_launch(
 
 
 async def test_a_disabled_harness_is_a_contract_problem_at_submit(
-    ctx: AppContext, client: TestClient
+    ctx: AppContext, client: TestClient, tokens: dict[str, str]
 ) -> None:
     """25 (review I8): refused with the reason when the contract is submitted, not a
     task later at launch."""
     _disable(ctx, "codex", "rotating the dedicated credential")
-    from tests.fixtures import contract_document  # noqa: PLC0415
-
-    response = client.post("/v1/tasks", json=contract_document())
+    response = client.post(
+        "/v1/tasks",
+        json=_pinned_document("EX-DISABLED-SUBMIT", "crucible-worker:fake-succeed"),
+        headers={"Authorization": f"Bearer {tokens['operator']}"},
+    )
     assert response.status_code == 422, response.text
     problems = response.json()["errors"]
     assert any(

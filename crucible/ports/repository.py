@@ -32,6 +32,7 @@ from crucible.domain.entities import (
     Lease,
     LogChunkRecord,
     Policy,
+    PoolExhaustion,
     Principal,
     PullRequest,
     PullRequestHead,
@@ -93,6 +94,15 @@ class RoutingPolicyRepository(Protocol):
     def put(self, policy: RoutingPolicyRecord) -> RoutingPolicyRecord: ...
 
     def is_referenced(self, name: str, version: int) -> bool: ...
+
+
+class PoolExhaustionRepository(Protocol):
+    def get(self, pool: str, *, for_update: bool = False) -> PoolExhaustion | None: ...
+    def put(self, mark: PoolExhaustion) -> PoolExhaustion: ...
+    def list_all(self) -> Sequence[PoolExhaustion]: ...
+    def clear(
+        self, pool: str, *, at: datetime, principal: str, reason: str
+    ) -> PoolExhaustion | None: ...
 
 
 class TaskRepository(Protocol):
@@ -443,6 +453,12 @@ class AttemptMetricsRepository(Protocol):
         self, *, since: datetime | None, model: str | None, task_ids: Sequence[str] | None
     ) -> Sequence[AttemptMetrics]: ...
 
+    def recent_for_project(
+        self, *, project: str, models: Sequence[str], limit_per_model: int
+    ) -> Sequence[AttemptMetrics]:
+        """The newest metrics per model for one project, without paging through tasks."""
+        ...
+
 
 class SupervisorStatusRepository(Protocol):
     def get(self) -> SupervisorStatus: ...
@@ -521,6 +537,7 @@ class UnitOfWork(Protocol):
     supervisor_status: SupervisorStatusRepository
     idempotency: IdempotencyRepository
     routing_policies: RoutingPolicyRepository
+    pool_exhaustions: PoolExhaustionRepository
     artifacts: ArtifactRepository
     evidence: EvidenceRepository
     review_reports: ReviewReportRepository

@@ -7,7 +7,8 @@ from fastapi.testclient import TestClient
 
 from crucible.adapters.api.app import create_app
 from crucible.adapters.api.deps import AppContext
-from tests.fixtures import contract_document
+from crucible.domain.entities import ImagePromotion
+from tests.fixtures import FakeClock, contract_document
 
 pytestmark = pytest.mark.integration
 
@@ -39,6 +40,24 @@ def test_observer_may_only_read(ctx: AppContext, tokens: dict[str, str]) -> None
     assert c.get("/v1/tasks").status_code == 200
     r = c.post("/v1/tasks", json=contract_document())
     assert r.status_code == 403 and r.json()["type"] == "urn:crucible:problem:forbidden"
+
+
+def test_only_an_operator_may_submit_a_pinned_task(ctx: AppContext, tokens: dict[str, str]) -> None:
+    document = contract_document()
+    document["execution_request"].update(
+        {
+            "harness": "codex",
+            "model": "gpt-5.6-luna",
+            "pin_reason": "operator selected bootstrap route",
+        }
+    )
+    refused = _client(ctx, tokens["orchestrator"]).post("/v1/tasks", json=document)
+    assert refused.status_code == 403
+    assert "only an operator may" in refused.json()["detail"]
+    admin_refused = _client(ctx, tokens["admin"]).post("/v1/tasks", json=document)
+    assert admin_refused.status_code == 403
+    accepted = _client(ctx, tokens["operator"]).post("/v1/tasks", json=document)
+    assert accepted.status_code == 201, accepted.text
 
 
 def test_admin_only_repository_registration(ctx: AppContext, tokens: dict[str, str]) -> None:
@@ -91,10 +110,13 @@ def test_submit_shape_errors_name_the_path(client: TestClient) -> None:
     assert any(e["path"] == "surprise" for e in r.json()["errors"])
 
 
-def test_only_registered_providers_are_accepted(client: TestClient) -> None:
+def test_only_registered_providers_are_accepted(
+    client: TestClient, ctx: AppContext, clock: FakeClock, tokens: dict[str, str]
+) -> None:
     """C3 registered the Docker provider (08, 20); Kubernetes is designed, not built."""
     doc = contract_document()
     doc["execution_request"]["provider"] = "kubernetes"
+    doc["execution_request"].pop("image")
     r = client.post("/v1/tasks", json=doc)
     assert r.status_code == 422
     assert any("not registered" in e["message"] for e in r.json()["errors"])
@@ -102,7 +124,36 @@ def test_only_registered_providers_are_accepted(client: TestClient) -> None:
     doc = contract_document(external_id="EX-DOCKER")
     doc["repository"]["work_branch"] = "crucible/EX-DOCKER"
     doc["execution_request"]["provider"] = "docker"
-    assert client.post("/v1/tasks", json=doc).status_code == 201
+    doc["execution_request"].pop("image")
+    doc["execution_request"].update(
+        {
+            "harness": "codex",
+            "model": "gpt-5.6-terra",
+            "pin_reason": "provider registry integration test",
+        }
+    )
+    with ctx.uow_factory() as uow:
+        uow.image_promotions.put(
+            ImagePromotion(
+                digest="sha256:integration-codex",
+                reference="crucible-worker:codex-integration",
+                harness="codex",
+                harness_version="0.153.4",
+                state="default",
+                updated_at=clock.now(),
+                updated_by="tests",
+                reason="provider registry integration fixture",
+            )
+        )
+        uow.commit()
+    assert (
+        client.post(
+            "/v1/tasks",
+            json=doc,
+            headers={"Authorization": f"Bearer {tokens['operator']}"},
+        ).status_code
+        == 201
+    )
 
 
 def test_protected_branch_and_pattern(client: TestClient) -> None:
@@ -170,8 +221,6 @@ def test_start_disagreeing_with_contract_is_422(client: TestClient) -> None:
 def test_start_twice_is_409(client: TestClient) -> None:
     task_id = client.post("/v1/tasks", json=contract_document()).json()["id"]
     body = {
-        "harness": "codex",
-        "model": "gpt-5.6-luna",
         "provider": "fake",
         "image": "crucible-worker:fake-succeed",
         "policy_version": 2,

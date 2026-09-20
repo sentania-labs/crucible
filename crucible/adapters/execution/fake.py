@@ -20,6 +20,7 @@ optionally followed by `-<n>` observations before the scripted exit. Behaviors:
 - injected           exit 0 with a report, but the branch carries a `.crucible/` path
 - secret-leak        exit 0 with a report, but the scanner matches a credential shape
 - no-commits         exit 0 with a report, but the collected branch has no commit
+- quota              exit 1 with provider quota output and a synthetic WIP commit
 
 A test may also script a behavior per external_id with `script()`, which wins over
 the image tag. Handles survive as long as the provider instance does, which is how the
@@ -80,6 +81,7 @@ Behavior = Literal[
     "injected",
     "secret-leak",
     "no-commits",
+    "quota",
     "verification-fails",
     "dirty-workspace",
 ]
@@ -103,6 +105,7 @@ BEHAVIORS: frozenset[str] = frozenset(
         "injected",
         "secret-leak",
         "no-commits",
+        "quota",
         "verification-fails",
         "dirty-workspace",
     }
@@ -299,6 +302,7 @@ class FakeProvider:
         self._workspaces: dict[str, Workspace] = {}
         self._review_heads: dict[str, str] = {}
         self.cleaned: list[str] = []
+        self.cleanup_policies: dict[str, CleanupPolicy] = {}
 
     # test controls
     def script(self, external_id: str, behavior: str, *, after: int = 1) -> None:
@@ -386,6 +390,7 @@ class FakeProvider:
             "crash": 1,
             "oom": 137,
             "environment": 70,
+            "quota": 1,
         }.get(worker.behavior, 0)
         worker.logs.append(LogChunk("stdout", f"fake worker exit {worker.exit_code}\n".encode()))
         worker.oom_killed = worker.behavior == "oom"
@@ -406,6 +411,33 @@ class FakeProvider:
         spec = worker.spec
         behavior = worker.behavior
         head = synthetic_head_sha(spec.attempt_id)
+        if behavior == "quota":
+            worker.logs.append(
+                LogChunk(
+                    "stderr",
+                    b'{"type":"turn.failed","error":{"code":"usage_limit_reached"}}\n',
+                )
+            )
+            quota_paths = ("src/ledger/quota-wip.txt",)
+            bundle = BranchBundle(
+                head_sha=head,
+                base_ref=str(spec.contract.get("repository", {}).get("base_ref", "main")),
+                work_branch=str(spec.contract.get("repository", {}).get("work_branch", "")),
+                commits=1,
+                verified=True,
+                commit_paths=quota_paths,
+                commit_messages=(f"wip(crucible): attempt {spec.attempt_id}",),
+            )
+            return CollectedOutputs(
+                report=None,
+                report_raw=None,
+                blocked_md=None,
+                diff_paths=quota_paths,
+                diff_text=synthetic_diff(quota_paths, "succeed"),
+                bundle=bundle,
+                stdout_tail="",
+                stderr_tail=('{"type":"turn.failed","error":{"code":"usage_limit_reached"}}'),
+            )
         if behavior == "bad-report" and worker.exit_code == 0:
             # A file that exists and is not a YAML mapping: an unquoted colon in a value.
             return CollectedOutputs(
@@ -493,6 +525,7 @@ class FakeProvider:
         self, ws: Workspace, policy: CleanupPolicy, spec: LaunchSpec | None = None
     ) -> None:
         self.cleaned.append(ws.attempt_id)
+        self.cleanup_policies[ws.attempt_id] = policy
         self._workspaces.pop(ws.attempt_id, None)
 
     async def list_images(self) -> list[ImageInfo]:

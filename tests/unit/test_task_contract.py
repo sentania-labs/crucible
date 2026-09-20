@@ -15,6 +15,18 @@ def _errors(doc: dict[str, Any]) -> list[str]:
     return [".".join(str(p) for p in e["loc"]) + ": " + e["msg"] for e in exc.value.errors()]
 
 
+def _pinned_document() -> dict[str, Any]:
+    doc = contract_document()
+    doc["execution_request"].update(
+        {
+            "harness": "codex",
+            "model": "gpt-5.6-luna",
+            "pin_reason": "unit test operator pin",
+        }
+    )
+    return doc
+
+
 def test_example_validates() -> None:
     contract = TaskContractV1.model_validate(contract_document())
     assert contract.external_id == "EX-0001"
@@ -113,6 +125,54 @@ def test_unknown_harness_and_provider() -> None:
     doc = contract_document()
     doc["execution_request"]["provider"] = "lambda"
     assert any("execution_request.provider" in e for e in _errors(doc))
+
+
+def test_class_request_omits_model_harness_and_image() -> None:
+    doc = contract_document()
+    for field in ("model", "harness", "pin_reason", "image"):
+        doc["execution_request"].pop(field, None)
+    contract = TaskContractV1.model_validate(doc)
+    assert contract.execution_request.pinned_model is None
+    assert contract.execution_request.pinned_harness is None
+
+
+def test_harness_without_model_is_refused() -> None:
+    doc = _pinned_document()
+    doc["execution_request"].pop("model")
+    doc["execution_request"].pop("pin_reason")
+    assert any("harness without model" in error for error in _errors(doc))
+
+
+def test_model_without_harness_is_refused() -> None:
+    doc = _pinned_document()
+    doc["execution_request"].pop("harness")
+    assert any("pinned model must name its harness" in error for error in _errors(doc))
+
+
+def test_model_without_pin_reason_is_refused() -> None:
+    doc = _pinned_document()
+    doc["execution_request"].pop("pin_reason")
+    assert any("pinned model requires pin_reason" in error for error in _errors(doc))
+
+
+def test_real_provider_refuses_supplied_image() -> None:
+    doc = contract_document()
+    doc["execution_request"]["provider"] = "docker"
+    assert any("image is derived" in error for error in _errors(doc))
+
+
+def test_nested_operator_pin_is_supported_but_may_not_mix_with_flat_fields() -> None:
+    doc = _pinned_document()
+    request = doc["execution_request"]
+    request["pin"] = {
+        "harness": request.pop("harness"),
+        "model": request.pop("model"),
+        "pin_reason": request.pop("pin_reason"),
+    }
+    contract = TaskContractV1.model_validate(doc)
+    assert contract.execution_request.pinned_model == "gpt-5.6-luna"
+    request["model"] = "gpt-5.6-luna"
+    assert any("may not be combined" in error for error in _errors(doc))
 
 
 def test_sha256_is_canonical() -> None:

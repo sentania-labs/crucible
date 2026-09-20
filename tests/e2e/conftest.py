@@ -12,6 +12,7 @@ subscription, no credential, no model.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 import subprocess
@@ -29,6 +30,7 @@ from crucible.adapters.api.app import create_app
 from crucible.adapters.api.deps import AppContext
 from crucible.adapters.clock import SystemClock
 from crucible.adapters.execution.docker import DockerConfig, DockerProvider
+from crucible.adapters.harness.registry import default_registry
 from crucible.adapters.persistence import migrate
 from crucible.adapters.persistence.unit_of_work import SqlUnitOfWorkFactory, make_engine
 from crucible.adapters.storage.disk import DiskArtifactStore
@@ -36,7 +38,7 @@ from crucible.application.auth import mint_token
 from crucible.application.repositories import register_repository
 from crucible.application.supervisor import Supervisor
 from crucible.contracts.api import ExternalReviewAttestation, RepositoryRegistration
-from crucible.domain.entities import Role
+from crucible.domain.entities import ImagePromotion, Role
 from tests.e2e import daemon
 from tests.e2e.policy import e2e_policy_document, e2e_routing_document
 from tests.e2e.repo import make_origin
@@ -76,7 +78,7 @@ EGRESS_ALLOWLIST = (
 TRUNCATE = (
     "TRUNCATE github_deliveries, ci_decisions, ci_certifications, reactions, "
     "review_comments, external_reviews, external_review_cycles, pull_request_heads, "
-    "pull_requests, retention_actions, log_chunks, attempt_metrics, wakes, "
+    "pull_requests, retention_actions, log_chunks, attempt_metrics, pool_exhaustions, wakes, "
     "review_dispositions, "
     "decisions, escalations, acceptance_results, gate_results, review_reports, evidence, "
     "artifacts, bootstrap_imports, idempotency_keys, supervisor_status, completion_claims, "
@@ -324,6 +326,7 @@ def ctx(engine: Engine, migrated: str, artifact_root: Path, provider: DockerProv
         database_url=migrated,
         engine=engine,
         artifact_store=DiskArtifactStore(artifact_root / "store"),
+        harnesses=default_registry(),
     )
 
 
@@ -340,7 +343,12 @@ def tokens(ctx: AppContext, artifact_root: Path) -> dict[str, str]:
 
 
 @pytest.fixture
-def client(ctx: AppContext, tokens: dict[str, str]) -> Iterator[TestClient]:
+def client(
+    ctx: AppContext,
+    tokens: dict[str, str],
+    worker_image: str,
+    provider: DockerProvider,
+) -> Iterator[TestClient]:
     app = create_app(ctx)
     with TestClient(app, headers={"Authorization": f"Bearer {tokens['admin']}"}) as admin:
         routing = e2e_routing_document()
@@ -351,7 +359,26 @@ def client(ctx: AppContext, tokens: dict[str, str]) -> Iterator[TestClient]:
             f"/v1/policies/{document['name']}/{document['version']}", json=document
         )
         assert response.status_code in (200, 201), response.text
-    with TestClient(app, headers={"Authorization": f"Bearer {tokens['orchestrator']}"}) as c:
+        worker = next(
+            item for item in asyncio.run(provider.list_images()) if item.reference == worker_image
+        )
+        with ctx.uow_factory() as uow:
+            uow.image_promotions.put(
+                ImagePromotion(
+                    digest=worker.digest,
+                    reference=worker.reference,
+                    harness="script-harness",
+                    harness_version=worker.harness_version or "1.0.0",
+                    state="default",
+                    updated_at=ctx.clock.now(),
+                    updated_by="e2e",
+                    reason="e2e script harness image",
+                )
+            )
+            uow.commit()
+    # The live variants add an explicit model pin, which is an operator-only action.
+    # The ordinary tier remains class-routed even though it shares this client.
+    with TestClient(app, headers={"Authorization": f"Bearer {tokens['operator']}"}) as c:
         yield c
 
 
@@ -365,6 +392,7 @@ def supervisor(ctx: AppContext, provider: DockerProvider) -> Supervisor:
         artifact_store=ctx.artifact_store,
         lease_ttl_seconds=120,
         grace_seconds=5,
+        harnesses=ctx.harnesses,
     )
 
 
@@ -402,6 +430,9 @@ def register(ctx: AppContext, name: str, url: str) -> None:
 
 
 def e2e_contract(external_id: str, repository: str, image: str, **overrides: Any) -> dict[str, Any]:
+    # The ordinary e2e tier exercises class routing.  The image argument remains in
+    # this shared helper's interface for the live tiers, which add an operator pin.
+    del image
     doc = contract_document(external_id=external_id)
     doc["repository"] = {
         "name": repository,
@@ -424,12 +455,10 @@ def e2e_contract(external_id: str, repository: str, image: str, **overrides: Any
     doc["policy"] = {"name": "e2e-script", "version": 1}
     doc["execution_request"] = {
         **doc["execution_request"],
-        "harness": "script-harness",
-        "model": "none",
         "provider": "docker",
-        "image": image,
         "timeout_seconds": 600,
     }
+    doc["execution_request"].pop("image", None)
     doc["project_instructions"] = []
     doc.update(overrides)
     return doc
@@ -440,15 +469,16 @@ def submit_and_start(client: TestClient, document: dict[str, Any]) -> str:
     assert response.status_code == 201, response.text
     task_id: str = response.json()["id"]
     request = document["execution_request"]
+    start = {
+        "provider": request["provider"],
+        "policy_version": document["policy"]["version"],
+    }
+    for field in ("harness", "model", "image"):
+        if request.get(field) is not None:
+            start[field] = request[field]
     response = client.post(
         f"/v1/tasks/{task_id}/start",
-        json={
-            "harness": request["harness"],
-            "model": request["model"],
-            "provider": request["provider"],
-            "image": request["image"],
-            "policy_version": 1,
-        },
+        json=start,
     )
     assert response.status_code == 200, response.text
     return task_id

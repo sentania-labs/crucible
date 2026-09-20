@@ -9,7 +9,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Body, Query
 
 from crucible.adapters.api.deps import Admin, Ctx, Orchestrator, UoW
-from crucible.application.admin import audit, credentials, github, harnesses, images, login
+from crucible.application.admin import audit, credentials, github, harnesses, images, login, routing
 from crucible.application.admin import providers as providers_admin
 from crucible.application.admin import repositories as repositories_admin
 from crucible.application.admin import status as status_admin
@@ -33,6 +33,26 @@ def _reason(body: dict[str, Any] | None) -> str | None:
     if isinstance(value, str) and value.strip():
         return value
     return None
+
+
+@router.get("/admin/routing/exhaustion")
+def admin_routing_exhaustion(ctx: Ctx, uow: UoW, _principal: Admin) -> dict[str, Any]:
+    return routing.list_exhaustions(_admin(ctx), uow)
+
+
+@router.post("/admin/routing/exhaustion/{pool}/clear")
+def admin_clear_routing_exhaustion(
+    pool: str,
+    ctx: Ctx,
+    uow: UoW,
+    principal: Admin,
+    body: Annotated[dict[str, Any], Body()],
+) -> dict[str, Any]:
+    result = routing.clear_exhaustion(
+        _admin(ctx), uow, principal=principal.name, pool=pool, reason=_reason(body)
+    )
+    uow.commit()
+    return result
 
 
 @router.get("/admin/status")

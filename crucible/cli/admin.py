@@ -34,6 +34,7 @@ from crucible.application.admin import (
     harnesses,
     images,
     login,
+    routing,
 )
 from crucible.application.admin import providers as providers_admin
 from crucible.application.admin import repositories as repositories_admin
@@ -137,6 +138,12 @@ def build_parser() -> argparse.ArgumentParser:
     tail = a_sub.add_parser("tail")
     tail.add_argument("--cursor", type=int, default=None)
     tail.add_argument("--limit", type=int, default=50)
+
+    route = sub.add_parser("routing", help="read and clear reactive quota exhaustion")
+    route_sub = route.add_subparsers(dest="routing_command", required=True)
+    route_sub.add_parser("exhaustion")
+    clear = route_sub.add_parser("clear-exhaustion")
+    clear.add_argument("pool")
 
     b = sub.add_parser(
         "bootstrap", help="the bootstrap ledger handoff (15): submit, show, list, commit"
@@ -251,6 +258,11 @@ def _remote(args: argparse.Namespace, remote: Remote) -> None:
     elif command == "audit":
         query = f"?limit={args.limit}" + (f"&cursor={args.cursor}" if args.cursor else "")
         _emit(remote.call("GET", "/v1/admin/audit" + query))
+    elif command == "routing":
+        if args.routing_command == "exhaustion":
+            _emit(remote.call("GET", "/v1/admin/routing/exhaustion"))
+        else:
+            _emit(remote.call("POST", f"/v1/admin/routing/exhaustion/{args.pool}/clear", reason))
     elif command == "bootstrap":
         verb = args.bootstrap_command
         if verb == "submit":
@@ -446,6 +458,21 @@ def _local(args: argparse.Namespace, wiring: Wiring) -> None:
     elif command == "audit":
         with wiring.ctx.uow_factory() as uow:
             _emit(audit.tail(uow, cursor=args.cursor, limit=args.limit))
+    elif command == "routing":
+        with wiring.ctx.uow_factory() as uow:
+            if args.routing_command == "exhaustion":
+                _emit(routing.list_exhaustions(admin, uow))
+            else:
+                _emit(
+                    routing.clear_exhaustion(
+                        admin,
+                        uow,
+                        principal=principal,
+                        pool=args.pool,
+                        reason=args.reason,
+                    )
+                )
+                uow.commit()
     elif command == "bootstrap":
         _local_bootstrap(args, wiring, admin, principal)
 

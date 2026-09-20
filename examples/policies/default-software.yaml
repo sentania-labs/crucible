@@ -1,13 +1,11 @@
-# The operator's default policy, exactly as migration 0009 seeds version 2: the 05b
-# document of version 1 (migration 0001, with the routing section 0004 adds) naming the
-# routing policy with the verified model roster (default-routing version 2, C5).
-# Version 1, the seed of C1, stays for the tasks that reference it.
-# Upload with: PUT /v1/policies/default-software/2 (admin).
+# The operator's default policy, exactly as migration 0011 seeds version 3.
+# Older immutable versions remain for tasks that reference them.
+# Upload with: PUT /v1/policies/default-software/3 (admin).
 schema_version: '1.0'
 name: default-software
-version: 2
-description: 'The default software delivery policy, version 2: version 1 with the routing
-  policy that names the verified model roster (default-routing version 2, C5). Policies
+version: 3
+description: 'The default software delivery policy, version 3: class routing and reactive
+  quota reroute through default-routing version 3 (C6b). Policies
   are immutable once referenced, so this is a new version beside version 1.'
 limits:
   timeout_seconds:
@@ -158,4 +156,4 @@ retention:
 routing:
   policy:
     name: default-routing
-    version: 2
+    version: 3

@@ -44,6 +44,7 @@ from crucible.application.review import latest_work_attempt
 from crucible.application.transitions import record_event
 from crucible.domain.entities import PullRequestState, Task
 from crucible.domain.events import PRINCIPAL_CRUCIBLE, EventKind
+from crucible.domain.exit_class import ExitClass
 from crucible.domain.external_review import completed_rounds
 from crucible.domain.lifecycle import TaskState
 from crucible.domain.publication import body_sha256
@@ -133,6 +134,82 @@ class DeliveryCoordinator:
                 done += 1
         return done
 
+    async def push_quota_checkpoint(self, attempt_id: str, *, required: bool) -> tuple[bool, str]:
+        """Push a collected quota checkpoint without opening or updating a pull request."""
+        if self._github is None or self._publisher is None:
+            if required:
+                return False, "the GitHub publisher is not configured"
+            return True, "a publisher is not required for this repository"
+        plan = await self._host._db(lambda: self._checkpoint_plan(attempt_id))
+        if plan is None:
+            return True, "the attempt has no checkpoint to push"
+        if plan.installation_id is None:
+            return False, f"repository {plan.repository_name} has no installation id"
+        token: InstallationToken | None = None
+        try:
+            token = await asyncio.to_thread(
+                self._github.installation_token,
+                installation_id=plan.installation_id,
+                repository=plan.repository_name,
+            )
+            await self._host._db(lambda: self._record_minted(plan, token))
+            outcome = await self._publisher.push(self._publish_request(plan), token)
+            await self._host._db(lambda: self._record_publisher(plan, outcome))
+            if not outcome.pushed:
+                return False, outcome.detail or f"publisher exited {outcome.exit_code}"
+            remote = await asyncio.to_thread(
+                self._github.remote_head,
+                token,
+                repository=plan.repository_name,
+                ref=plan.work_branch,
+            )
+            if remote != plan.head_sha:
+                return False, f"remote branch is at {remote}, expected {plan.head_sha}"
+            await self._host._db(lambda: self._record_pushed(plan, remote))
+            return True, "checkpoint pushed"
+        except GitHubError as exc:
+            return False, redact(exc.message)
+        except Exception as exc:
+            return False, redact(f"{type(exc).__name__}: {exc}")
+        finally:
+            if token is not None:
+                token.discard()
+
+    def _checkpoint_plan(self, attempt_id: str) -> PublishPlan | None:
+        with self._host._fenced() as uow:
+            attempt = uow.attempts.get(attempt_id)
+            if attempt is None or attempt.exit_class is not ExitClass.QUOTA_EXHAUSTED:
+                return None
+            task = uow.tasks.get(attempt.task_id)
+            execution = uow.executions.get(attempt.execution_id)
+            if task is None or execution is None or not task.head_sha:
+                return None
+            return build_plan(uow, task, (attempt, execution))
+
+    def _publish_request(self, plan: PublishPlan) -> PublishRequest:
+        return PublishRequest(
+            attempt_id=plan.attempt_id,
+            task_id=plan.task_id,
+            owner=plan.external_id,
+            repository_url=plan.push_url,
+            work_branch=plan.work_branch,
+            base_ref=plan.base_ref,
+            expected_head=plan.head_sha,
+            bundle_path=plan.bundle_path,
+            image=self.config.publisher_image or plan.image,
+            policy=plan.policy,
+            author_name=str(plan.policy.get("git", {}).get("author_name", "crucible-worker")),
+            author_email=str(
+                plan.policy.get("git", {}).get(
+                    "author_email", "crucible-worker@users.noreply.github.com"
+                )
+            ),
+            commit_trailer=str(
+                plan.policy.get("git", {}).get("commit_trailer", "Crucible-Attempt")
+            ),
+            timeout_seconds=self.config.publisher_timeout_seconds,
+        )
+
     def _take_publishing(self) -> list[PublishPlan]:
         plans: list[PublishPlan] = []
         with self._host._fenced() as uow:
@@ -186,33 +263,7 @@ class DeliveryCoordinator:
                 repository=plan.repository_name,
             )
             await self._host._db(lambda: self._record_minted(plan, token))
-            outcome = await self._publisher.push(
-                PublishRequest(
-                    attempt_id=plan.attempt_id,
-                    task_id=plan.task_id,
-                    owner=plan.external_id,
-                    repository_url=plan.push_url,
-                    work_branch=plan.work_branch,
-                    base_ref=plan.base_ref,
-                    expected_head=plan.head_sha,
-                    bundle_path=plan.bundle_path,
-                    image=self.config.publisher_image or plan.image,
-                    policy=plan.policy,
-                    author_name=str(
-                        plan.policy.get("git", {}).get("author_name", "crucible-worker")
-                    ),
-                    author_email=str(
-                        plan.policy.get("git", {}).get(
-                            "author_email", "crucible-worker@users.noreply.github.com"
-                        )
-                    ),
-                    commit_trailer=str(
-                        plan.policy.get("git", {}).get("commit_trailer", "Crucible-Attempt")
-                    ),
-                    timeout_seconds=self.config.publisher_timeout_seconds,
-                ),
-                token,
-            )
+            outcome = await self._publisher.push(self._publish_request(plan), token)
             await self._host._db(lambda: self._record_publisher(plan, outcome))
             if not outcome.pushed:
                 await self._host._db(

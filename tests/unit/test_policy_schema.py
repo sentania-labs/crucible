@@ -20,6 +20,7 @@ from crucible.adapters.persistence.migrations.versions import (
 from crucible.adapters.persistence.migrations.versions import (
     _0009_administration as m9,
 )
+from crucible.adapters.persistence.migrations.versions import _0011_class_routing as m11
 from crucible.contracts.policy import (
     PolicyV1,
     RoutingPolicyV1,
@@ -54,6 +55,14 @@ def seeded_policy_v2() -> dict[str, Any]:
     return document
 
 
+def seeded_policy_v3() -> dict[str, Any]:
+    document = seeded_policy_v2()
+    document["version"] = 3
+    document["description"] = m11.POLICY_V3_DESCRIPTION
+    document["routing"] = {"policy": {"name": "default-routing", "version": 3}}
+    return document
+
+
 def test_the_seeded_policy_validates() -> None:
     policy = parse_policy(seeded_policy())
     assert policy.name == "default-software" and policy.version == 1
@@ -66,11 +75,11 @@ def test_the_seeded_policy_v2_validates() -> None:
 
 
 def test_the_example_policy_matches_the_seed() -> None:
-    """The shipped example is the current seed, version 2."""
+    """The shipped example is the current seed, version 3."""
     document = yaml.safe_load(EXAMPLE.read_text())
     parse_policy(document)
     assert json.loads(json.dumps(document, sort_keys=True)) == json.loads(
-        json.dumps(seeded_policy_v2(), sort_keys=True)
+        json.dumps(seeded_policy_v3(), sort_keys=True)
     )
 
 

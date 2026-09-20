@@ -35,6 +35,7 @@ __all__ = [
     "encode_check_id",
     "preparer_script",
     "publisher_script",
+    "quota_checkpoint_push_script",
     "verifier_script",
 ]
 
@@ -44,6 +45,10 @@ ORIGIN_MOUNT = "/crucible/origin"
 GIT = (
     "git -c core.fsmonitor= -c diff.external= -c core.pager=cat "
     "-c core.hooksPath=/dev/null -c 'safe.directory=*'"
+)
+CHECKPOINT_GIT = (
+    "git -c core.fsmonitor= -c diff.external= -c core.pager=cat "
+    "-c core.hooksPath=\"$EMPTY_HOOKS\" -c 'safe.directory=*'"
 )
 GIT_ENV = (
     "export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 "
@@ -207,7 +212,13 @@ printf '%s\n' "$STARTED" > "$OUT/started-from.txt"
 """
 
 
-def collector_script(*, base_ref: str, work_branch: str, size_cap_bytes: int) -> str:
+def collector_script(
+    *,
+    base_ref: str,
+    work_branch: str,
+    size_cap_bytes: int,
+    quota_attempt_id: str | None = None,
+) -> str:
     """Produce the full diff, the path list, the head, the log, the bundle, and a copy
     of the report directory (08). Never a push, never a network: `--network none`."""
     return f"""set -eu
@@ -217,9 +228,63 @@ REPO={REPO_MOUNT}
 WORK_BRANCH={_quote(work_branch)}
 BASE_REF={_quote(base_ref)}
 SIZE_CAP={_quote(str(size_cap_bytes))}
+QUOTA_ATTEMPT={_quote(quota_attempt_id or "")}
 mkdir -p "$OUT"
 : > "$OUT/copy-rejections.tsv"
 {_COPY_REPORT}
+if [ -n "$QUOTA_ATTEMPT" ]; then
+  refuse_checkpoint() {{
+    printf '%s\n' "$1" > "$OUT/checkpoint-refusal.txt"
+    printf '%s\n' "$1" >&2
+    exit 4
+  }}
+  if [ ! -d "$REPO/.git" ] || [ -L "$REPO/.git" ]; then
+    refuse_checkpoint "checkpoint refused: repository .git is not a real directory"
+  fi
+  if [ -e "$REPO/.git/commondir" ] || [ -L "$REPO/.git/commondir" ]; then
+    refuse_checkpoint "checkpoint refused: repository .git contains a commondir redirect"
+  fi
+  # The worker can edit both .git/config and .gitattributes. Replace its local
+  # configuration while Git stages and commits, then restore it before collection
+  # continues. With no filter.* commands, a filter attribute is a no-op.
+  ORIGINAL_CONFIG=/tmp/crucible-worker-git-config.$$
+  EMPTY_HOOKS=/tmp/crucible-empty-hooks.$$
+  cp "$REPO/.git/config" "$ORIGINAL_CONFIG"
+  restore_worker_git_config() {{
+    rm -f "$REPO/.git/config"
+    cp "$ORIGINAL_CONFIG" "$REPO/.git/config"
+    rm -rf "$ORIGINAL_CONFIG" "$EMPTY_HOOKS"
+  }}
+  trap restore_worker_git_config EXIT HUP INT TERM
+  rm -f "$REPO/.git/config"
+  mkdir -p "$EMPTY_HOOKS"
+  cat > "$REPO/.git/config" <<EOF
+[core]
+  repositoryformatversion = 0
+  bare = false
+  logallrefupdates = true
+  hooksPath = $EMPTY_HOOKS
+  fsmonitor = false
+[user]
+  name = crucible-worker
+  email = crucible-worker@users.noreply.github.com
+[commit]
+  gpgsign = false
+[tag]
+  gpgsign = false
+EOF
+  GIT_DIR="$REPO/.git" GIT_COMMON_DIR="$REPO/.git" \
+    {CHECKPOINT_GIT} -C "$REPO" add -A
+  if ! GIT_DIR="$REPO/.git" GIT_COMMON_DIR="$REPO/.git" \
+    {CHECKPOINT_GIT} -C "$REPO" diff --cached --quiet; then
+    GIT_DIR="$REPO/.git" GIT_COMMON_DIR="$REPO/.git" \
+      {CHECKPOINT_GIT} -C "$REPO" commit -q \
+      -m "wip(crucible): attempt $QUOTA_ATTEMPT" \
+      -m "Crucible-Attempt: $QUOTA_ATTEMPT"
+  fi
+  restore_worker_git_config
+  trap - EXIT HUP INT TERM
+fi
 BASE=$({GIT} -C "$REPO" rev-parse --verify --quiet "$BASE_REF" \
   || {GIT} -C "$REPO" rev-parse --verify --quiet "origin/$BASE_REF" \
   || echo "")
@@ -246,6 +311,24 @@ rm -rf "$OUT/tree"
 {GIT} clone --no-hardlinks --quiet "$REPO" "$OUT/tree" > "$OUT/clone.log" 2>&1 || true
 copy_report "{REPORT_MOUNT}" "$OUT/report" "$SIZE_CAP"
 echo done > "$OUT/collector.ok"
+"""
+
+
+def quota_checkpoint_push_script(work_branch: str) -> str:
+    """Push an already collected checkpoint after Crucible's safety gates pass."""
+    return f"""set -eu
+{GIT_ENV}
+REPO={REPO_MOUNT}
+ORIGIN={ORIGIN_MOUNT}
+WORK_BRANCH={_quote(work_branch)}
+HEAD=$({GIT} -C "$REPO" rev-parse HEAD)
+{GIT} -C "$REPO" remote set-url origin "$ORIGIN"
+{GIT} -C "$REPO" remote set-url --push origin "$ORIGIN"
+{GIT} -C "$REPO" \
+  -c 'remote.origin.receivepack=git -c safe.directory=* receive-pack' \
+  push origin "HEAD:refs/heads/$WORK_BRANCH"
+REMOTE=$({GIT} --git-dir "$ORIGIN" rev-parse "refs/heads/$WORK_BRANCH")
+test "$REMOTE" = "$HEAD"
 """
 
 

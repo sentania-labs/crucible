@@ -15,6 +15,7 @@ class TaskState(StrEnum):
     SUBMITTED = "submitted"
     SCHEDULED = "scheduled"
     RUNNING = "running"
+    AWAITING_QUOTA = "awaiting_quota"
     REPORTED = "reported"
     BLOCKED = "blocked"
     PRE_PR_GATES_FAILED = "pre_pr_gates_failed"
@@ -81,6 +82,7 @@ _CANCELLABLE_AT_ONCE: tuple[TaskState, ...] = (
     _S.SUBMITTED,
     _S.SCHEDULED,
     _S.BLOCKED,
+    _S.AWAITING_QUOTA,
     _S.AWAITING_INTERNAL_REVIEW,
     _S.AWAITING_ACCEPTANCE,
     _S.PRE_PR_GATES_FAILED,
@@ -99,9 +101,13 @@ TASK_TRANSITIONS: frozenset[tuple[TaskState, TaskState]] = frozenset(
     {
         (_S.SUBMITTED, _S.SCHEDULED),
         (_S.SCHEDULED, _S.RUNNING),
+        (_S.SCHEDULED, _S.AWAITING_QUOTA),
         (_S.RUNNING, _S.REPORTED),
         (_S.RUNNING, _S.BLOCKED),
         (_S.RUNNING, _S.SCHEDULED),
+        (_S.RUNNING, _S.AWAITING_QUOTA),
+        (_S.AWAITING_QUOTA, _S.SCHEDULED),
+        (_S.AWAITING_QUOTA, _S.REPORTED),
         (_S.BLOCKED, _S.SCHEDULED),
         (_S.REPORTED, _S.PRE_PR_GATES_FAILED),
         (_S.REPORTED, _S.AWAITING_INTERNAL_REVIEW),

@@ -41,6 +41,10 @@ from tests.integration.conftest import (
 )
 from tests.integration.fake_github import FakeGitHubServer, installation_token_value
 from tests.integration.fake_publisher import FakePublisher
+from tests.integration.test_class_routing import _install_policy as install_class_policy
+from tests.integration.test_class_routing import _model as class_model
+from tests.integration.test_class_routing import _promote as promote_class_image
+from tests.integration.test_class_routing import _submit as submit_class_task
 
 pytestmark = pytest.mark.integration
 
@@ -158,6 +162,36 @@ def gate(view: dict[str, Any], name: str) -> str:
 
 
 # ----- publication ------------------------------------------------------
+
+
+async def test_quota_checkpoint_is_pushed_before_the_reroute_is_scheduled(
+    client: TestClient,
+    ctx: AppContext,
+    clock: FakeClock,
+    publisher: FakePublisher,
+    delivery_supervisor: Supervisor,
+) -> None:
+    install_class_policy(
+        ctx,
+        clock,
+        version=90,
+        models=[
+            class_model("a-quota-model", "codex", "publisher-pool-a"),
+            class_model("b-success-model", "agy", "publisher-pool-b"),
+        ],
+    )
+    promote_class_image(ctx, clock, "codex", "crucible-worker:fake-quota")
+    promote_class_image(ctx, clock, "agy", "crucible-worker:fake-succeed")
+    task_id = submit_class_task(client, "C6B-PUBLISHER", 90)
+
+    await delivery_supervisor.tick()
+
+    view = client.get(f"/v1/tasks/{task_id}").json()
+    assert view["state"] == "scheduled"
+    assert publisher.pushes == [("crucible/C6B-PUBLISHER", view["head_sha"])]
+    events = client.get(f"/v1/tasks/{task_id}/events", params={"limit": 200}).json()["items"]
+    kinds = [event["kind"] for event in events]
+    assert kinds.index("branch_pushed") < kinds.index("task_rerouted")
 
 
 async def test_publication_pushes_the_head_and_opens_the_pull_request(

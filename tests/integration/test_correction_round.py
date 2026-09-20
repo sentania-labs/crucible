@@ -61,6 +61,46 @@ def unblock(client: TestClient, task_id: str, **overrides: Any) -> Any:
     return client.post(f"/v1/tasks/{task_id}/decisions", json=body)
 
 
+async def test_orchestrator_cannot_add_a_pin_by_amendment_or_correction(
+    client: TestClient, supervisor: Supervisor
+) -> None:
+    amend_task_id = submit_and_start(
+        client, "crucible-worker:fake-succeed", external_id="C6B-PIN-AMEND", start=False
+    )
+    amendment = contract_of(client, amend_task_id)
+    amendment["execution_request"].update(
+        {
+            "harness": "codex",
+            "model": "gpt-5.6-luna",
+            "pin_reason": "orchestrator must not be allowed to pin",
+        }
+    )
+    refused = client.post(
+        f"/v1/tasks/{amend_task_id}/amend",
+        json={"contract": amendment, "reason": "try to pin"},
+    )
+    assert refused.status_code == 403
+    assert "only an operator may" in refused.json()["detail"]
+
+    correction_task_id = submit_and_start(
+        client, "crucible-worker:fake-no-report", external_id="C6B-PIN-CORRECTION"
+    )
+    assert await run_to_settled(supervisor, client, correction_task_id) == "pre_pr_gates_failed"
+    correction = correction_document(
+        client, correction_task_id, image="crucible-worker:fake-succeed"
+    )
+    correction["execution_request"].update(
+        {
+            "harness": "codex",
+            "model": "gpt-5.6-luna",
+            "pin_reason": "orchestrator must not be allowed to pin",
+        }
+    )
+    refused = client.post(f"/v1/tasks/{correction_task_id}/corrections", json=correction)
+    assert refused.status_code == 403
+    assert "only an operator may" in refused.json()["detail"]
+
+
 # ----- 1: a decision on a blocked task must create new work --------------------
 
 
@@ -168,28 +208,41 @@ async def test_a_review_execution_refused_by_the_quota_does_not_strand_the_task(
     await run_to_settled(supervisor, client, task_id)
 
     # Tighten the pool the review model draws on, after the task was admitted.
-    # Versions 1 and 2 are seeded, so the tightened copies become version 3.
+    # C6b seeds version 3, so the tightened copies become version 4.
     routing = client.get("/v1/routing/default-routing/2").json()["document"]
-    routing["version"] = 3
-    routing["pools"]["openai-sub"] = {"window": "5h", "budget_units": "attempts", "soft_limit": 1}
+    routing["version"] = 4
+    routing["pools"]["anthropic-sub"] = {
+        "window": "5h",
+        "budget_units": "attempts",
+        "soft_limit": 1,
+    }
     admin = {"Authorization": f"Bearer {tokens['admin']}"}
     assert (
-        client.put("/v1/routing/default-routing/3", json=routing, headers=admin).status_code == 200
+        client.put("/v1/routing/default-routing/4", json=routing, headers=admin).status_code == 200
     )
     policy = client.get("/v1/policies/default-software/2").json()["document"]
-    policy["version"] = 3
-    policy["routing"]["policy"]["version"] = 3
+    policy["version"] = 4
+    policy["routing"]["policy"]["version"] = 4
     assert (
-        client.put("/v1/policies/default-software/3", json=policy, headers=admin).status_code == 200
+        client.put("/v1/policies/default-software/4", json=policy, headers=admin).status_code == 200
     )
 
     # The review execution snapshots the policy the task names, so point the task at the
     # version whose pool is now tight. `tasks` is the API role's table (14).
     with ctx.engine.begin() as conn:
-        conn.execute(text("UPDATE tasks SET policy_version = 3 WHERE id = :id"), {"id": task_id})
+        conn.execute(text("UPDATE tasks SET policy_version = 4 WHERE id = :id"), {"id": task_id})
 
     assert (
-        client.post(f"/v1/tasks/{task_id}/review", json={"execution": REVIEW_EXECUTION}).status_code
+        client.post(
+            f"/v1/tasks/{task_id}/review",
+            json={
+                "execution": {
+                    **REVIEW_EXECUTION,
+                    "harness": "claude_code",
+                    "model": "claude-sonnet-5",
+                }
+            },
+        ).status_code
         == 200
     )
     for _ in range(5):
@@ -209,36 +262,41 @@ async def test_an_amendment_to_a_disabled_model_is_refused(
     client: TestClient, supervisor: Supervisor, tokens: dict[str, str]
 ) -> None:
     # The seeded roster (routing version 2) has every model enabled, so this test
-    # uploads version 4 with one model disabled and a policy version 4 naming it
-    # (version 3 belongs to the quota test above; `policies` is not truncated).
+    # uploads version 5 with one model disabled and a policy version 5 naming it
+    # (versions 3 and 4 already exist; `policies` is not truncated).
     admin = {"Authorization": f"Bearer {tokens['admin']}"}
     routing = client.get("/v1/routing/default-routing/2").json()["document"]
-    routing["version"] = 4
+    routing["version"] = 5
     disabled = next(m for m in routing["models"] if m["id"] == "gemini-3.8-flash-low")
     disabled["enabled"] = False
     assert (
-        client.put("/v1/routing/default-routing/4", json=routing, headers=admin).status_code == 200
+        client.put("/v1/routing/default-routing/5", json=routing, headers=admin).status_code == 200
     )
     policy = client.get("/v1/policies/default-software/2").json()["document"]
-    policy["version"] = 4
-    policy["routing"]["policy"]["version"] = 4
+    policy["version"] = 5
+    policy["routing"]["policy"]["version"] = 5
     assert (
-        client.put("/v1/policies/default-software/4", json=policy, headers=admin).status_code == 200
+        client.put("/v1/policies/default-software/5", json=policy, headers=admin).status_code == 200
     )
     task_id = submit_and_start(
         client,
         "crucible-worker:fake-succeed",
         start=False,
-        policy={"name": "default-software", "version": 4},
+        policy={"name": "default-software", "version": 5},
     )
     document = contract_of(client, task_id)
     document["execution_request"] = {
         **document["execution_request"],
         "model": "gemini-3.8-flash-low",
         "harness": "agy",
+        "pin_reason": "exercise disabled pinned model validation",
         "tier": "trivial",
     }
-    r = client.post(f"/v1/tasks/{task_id}/amend", json={"contract": document, "reason": "x"})
+    r = client.post(
+        f"/v1/tasks/{task_id}/amend",
+        json={"contract": document, "reason": "x"},
+        headers={"Authorization": f"Bearer {tokens['operator']}"},
+    )
     assert r.status_code == 422
     assert any("disabled" in e["message"] for e in r.json()["errors"])
 

@@ -101,6 +101,13 @@ class EventKind(StrEnum):
     ROUTING_POLICY_UPLOADED = "routing_policy_uploaded"
     QUOTA_RESERVED = "quota_reserved"
     QUOTA_EXHAUSTED = "quota_exhausted"
+    POOL_EXHAUSTED = "pool_exhausted"
+    POOL_EXHAUSTION_CLEARED = "pool_exhaustion_cleared"
+    ATTEMPT_ROUTED = "attempt_routed"
+    TASK_REROUTED = "task_rerouted"
+    TASK_AWAITING_QUOTA = "task_awaiting_quota"
+    TASK_QUOTA_RESUMED = "task_quota_resumed"
+    QUOTA_WIP_COMMITTED = "quota_wip_committed"
     ATTEMPT_METRICS_RECORDED = "attempt_metrics_recorded"
     # supervisor
     SUPERVISOR_LEASE_ACQUIRED = "supervisor_lease_acquired"

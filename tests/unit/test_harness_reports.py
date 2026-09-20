@@ -6,6 +6,7 @@ account identifier, or hostname-bearing value in them.
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -274,3 +275,51 @@ def test_a_bare_number_in_a_crashed_agy_tail_is_not_quota() -> None:
         AgyAdapter().classify_exit(ExitInfo(exit_code=1), '{"error":"429 Too Many Requests"}', "")
         is ExitClass.QUOTA_EXHAUSTED
     )
+
+
+def test_reset_timestamp_must_be_on_the_quota_event_line() -> None:
+    adapter = CodexAdapter()
+    unrelated = '{"reset_at":"2026-09-21T12:00:00Z","type":"usage"}'
+    assert adapter.quota_reset_at(unrelated, "") is None
+    quota = '{"error":"usage_limit_reached","reset_at":"2026-09-21T12:00:00Z"}'
+    assert adapter.quota_reset_at(quota, "") == datetime(2026, 9, 21, 12, tzinfo=UTC)
+
+
+@pytest.mark.parametrize(
+    ("adapter", "event"),
+    [
+        (
+            ClaudeCodeAdapter(),
+            '{"type":"rate_limit_event","rate_limit_info":{"status":"rejected",'
+            '"overageDisabledReason":"out_of_credits"}}',
+        ),
+        (CodexAdapter(), '{"type":"turn.failed","error":{"code":"usage_limit_reached"}}'),
+        (
+            AgyAdapter(),
+            '{"type":"result","status":"ERROR","error":"RESOURCE_EXHAUSTED: quota"}',
+        ),
+        (ScriptHarnessAdapter(), '{"error":"scripted_quota_exhausted"}'),
+    ],
+)
+def test_only_structured_harness_events_authorize_a_shared_quota_mark(
+    adapter: HarnessAdapter, event: str
+) -> None:
+    assert adapter.provider_quota_exhausted(event, "") is True
+    assert adapter.provider_quota_exhausted("agent says usage limit reached", "") is False
+
+
+def test_provider_reset_comes_only_from_the_authoritative_event() -> None:
+    adapter = ClaudeCodeAdapter()
+    assistant = (
+        '{"type":"assistant","rate_limit_event":{"status":"rejected",'
+        '"reason":"out_of_credits"},"metadata":{"reset_at":"2026-09-21T12:00:00Z"}}'
+    )
+    assert adapter.provider_quota_event(assistant, "") is None
+    refusal = (
+        '{"type":"rate_limit_event","rate_limit_info":{"status":"rejected",'
+        '"overageDisabledReason":"out_of_credits",'
+        '"reset_at":"2026-09-21T12:00:00Z"}}'
+    )
+    event = adapter.provider_quota_event(refusal, "")
+    assert event is not None
+    assert event.reset_at == datetime(2026, 9, 21, 12, tzinfo=UTC)

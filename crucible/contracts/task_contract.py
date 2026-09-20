@@ -154,15 +154,55 @@ class PolicyRef(StrictModel):
     version: int = Field(ge=1)
 
 
-class ExecutionRequest(StrictModel):
-    tier: TaskTier
+class OperatorPin(StrictModel):
     harness: HarnessName
     model: str = Field(min_length=1)
+    pin_reason: str = Field(min_length=1)
+
+
+class ExecutionRequest(StrictModel):
+    tier: TaskTier
+    # C6b: Foundry normally supplies neither. The flat fields remain accepted for the
+    # operator bootstrap path described by the task contract; `pin` is the amended
+    # specification's equivalent shape. They may not be mixed.
+    harness: HarnessName | None = None
+    model: str | None = Field(default=None, min_length=1)
+    pin_reason: str | None = Field(default=None, min_length=1)
+    pin: OperatorPin | None = None
     effort: str | None = None
     provider: ProviderName
-    image: str = Field(min_length=1)
+    image: str | None = None
     timeout_seconds: int = Field(ge=1)
     rationale: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _selection_or_pin(self) -> ExecutionRequest:
+        if self.image is not None and self.provider is not ProviderName.FAKE:
+            raise ValueError("image is derived from the selected harness and must not be supplied")
+        flat = self.model is not None or self.harness is not None or self.pin_reason is not None
+        if self.pin is not None and flat:
+            raise ValueError("pin may not be combined with model, harness, or pin_reason")
+        if self.harness is not None and self.model is None:
+            raise ValueError("harness without model is not a valid operator pin")
+        if self.model is not None and self.harness is None:
+            raise ValueError("a pinned model must name its harness")
+        if self.model is not None and not self.pin_reason:
+            raise ValueError("a pinned model requires pin_reason")
+        if self.pin_reason is not None and self.model is None:
+            raise ValueError("pin_reason requires a pinned model")
+        return self
+
+    @property
+    def pinned_model(self) -> str | None:
+        return self.pin.model if self.pin is not None else self.model
+
+    @property
+    def pinned_harness(self) -> HarnessName | None:
+        return self.pin.harness if self.pin is not None else self.harness
+
+    @property
+    def effective_pin_reason(self) -> str | None:
+        return self.pin.pin_reason if self.pin is not None else self.pin_reason
 
 
 class Lifecycle(StrictModel):

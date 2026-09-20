@@ -32,6 +32,7 @@ from crucible.adapters.persistence.models import (
     IdempotencyKeyRow,
     LeaseRow,
     LogChunkRow,
+    PoolExhaustionRow,
     PrincipalRow,
     RepositoryRow,
     RetentionActionRow,
@@ -64,6 +65,7 @@ from crucible.domain.entities import (
     ExecutionRole,
     Lease,
     LogChunkRecord,
+    PoolExhaustion,
     Principal,
     Repository,
     RetentionAction,
@@ -105,6 +107,7 @@ from crucible.ports.repository import (
     LeaseRepository,
     LogRepository,
     PolicyRepository,
+    PoolExhaustionRepository,
     PrincipalRepository,
     PullRequestHeadRepository,
     PullRequestRepository,
@@ -280,6 +283,8 @@ class Tasks:
             updated_at=ensure_utc(row.updated_at),
             closed_at=_dt(row.closed_at),
             head_sha=row.head_sha,
+            resume_at=_dt(row.resume_at),
+            quota_wait_started_at=_dt(row.quota_wait_started_at),
         )
 
     def add(self, task: Task) -> None:
@@ -299,6 +304,8 @@ class Tasks:
                 updated_at=task.updated_at,
                 closed_at=task.closed_at,
                 head_sha=task.head_sha,
+                resume_at=task.resume_at,
+                quota_wait_started_at=task.quota_wait_started_at,
             )
         )
         self._s.flush()
@@ -328,6 +335,8 @@ class Tasks:
                 updated_at=task.updated_at,
                 closed_at=task.closed_at,
                 head_sha=task.head_sha,
+                resume_at=task.resume_at,
+                quota_wait_started_at=task.quota_wait_started_at,
             )
         )
 
@@ -432,6 +441,7 @@ class Executions:
             timeout_seconds=row.timeout_seconds,
             created_at=ensure_utc(row.created_at),
             ended_at=_dt(row.ended_at),
+            resume_from_remote=bool(row.resume_from_remote),
         )
 
     def add(self, execution: Execution) -> None:
@@ -453,6 +463,7 @@ class Executions:
                 timeout_seconds=execution.timeout_seconds,
                 created_at=execution.created_at,
                 ended_at=execution.ended_at,
+                resume_from_remote=execution.resume_from_remote,
             )
         )
         self._s.flush()
@@ -468,7 +479,15 @@ class Executions:
         self._s.execute(
             update(ExecutionRow)
             .where(ExecutionRow.id == execution.id)
-            .values(state=execution.state.value, ended_at=execution.ended_at)
+            .values(
+                state=execution.state.value,
+                ended_at=execution.ended_at,
+                harness=execution.harness,
+                model=execution.model,
+                effort=execution.effort,
+                image=execution.image,
+                resume_from_remote=execution.resume_from_remote,
+            )
         )
 
     def list_for_task(self, task_id: str) -> Sequence[Execution]:
@@ -523,6 +542,13 @@ class Attempts:
             log_resume_occurrence=row.log_resume_occurrence or 0,
             cleaned_up_at=_dt(row.cleaned_up_at),
             unsupervised=bool(row.unsupervised),
+            selected_model=row.selected_model,
+            selected_harness=row.selected_harness,
+            selected_image=row.selected_image,
+            selected_pool=row.selected_pool,
+            ordered_candidates=list(row.ordered_candidates or []),
+            routing_excluded_pools=list(row.routing_excluded_pools or []),
+            resume_from_remote=bool(row.resume_from_remote),
         )
 
     def add(self, attempt: Attempt) -> None:
@@ -552,6 +578,13 @@ class Attempts:
                 log_resume_occurrence=attempt.log_resume_occurrence,
                 cleaned_up_at=attempt.cleaned_up_at,
                 unsupervised=attempt.unsupervised,
+                selected_model=attempt.selected_model,
+                selected_harness=attempt.selected_harness,
+                selected_image=attempt.selected_image,
+                selected_pool=attempt.selected_pool,
+                ordered_candidates=list(attempt.ordered_candidates),
+                routing_excluded_pools=list(attempt.routing_excluded_pools),
+                resume_from_remote=attempt.resume_from_remote,
             )
         )
         self._s.flush()
@@ -586,6 +619,13 @@ class Attempts:
                 log_resume_sha256=attempt.log_resume_sha256,
                 log_resume_occurrence=attempt.log_resume_occurrence,
                 cleaned_up_at=attempt.cleaned_up_at,
+                selected_model=attempt.selected_model,
+                selected_harness=attempt.selected_harness,
+                selected_image=attempt.selected_image,
+                selected_pool=attempt.selected_pool,
+                ordered_candidates=list(attempt.ordered_candidates),
+                routing_excluded_pools=list(attempt.routing_excluded_pools),
+                resume_from_remote=attempt.resume_from_remote,
             )
         )
 
@@ -619,6 +659,66 @@ class Attempts:
         if for_update:
             stmt = stmt.with_for_update()
         return [self._to_entity(r) for r in self._s.scalars(stmt).all()]
+
+
+class PoolExhaustions:
+    def __init__(self, session: Session) -> None:
+        self._s = session
+
+    @staticmethod
+    def _to_entity(row: PoolExhaustionRow) -> PoolExhaustion:
+        return PoolExhaustion(
+            pool=row.pool,
+            exhausted_at=ensure_utc(row.exhausted_at),
+            reset_at=ensure_utc(row.reset_at),
+            task_id=row.task_id,
+            attempt_id=row.attempt_id,
+            reason=row.reason,
+            cleared_at=_dt(row.cleared_at),
+            cleared_by=row.cleared_by,
+            clear_reason=row.clear_reason,
+        )
+
+    def get(self, pool: str, *, for_update: bool = False) -> PoolExhaustion | None:
+        stmt = select(PoolExhaustionRow).where(PoolExhaustionRow.pool == pool)
+        if for_update:
+            stmt = stmt.with_for_update()
+        row = self._s.scalar(stmt)
+        return self._to_entity(row) if row else None
+
+    def put(self, mark: PoolExhaustion) -> PoolExhaustion:
+        row = self._s.get(PoolExhaustionRow, mark.pool)
+        if row is None:
+            row = PoolExhaustionRow(pool=mark.pool)
+            self._s.add(row)
+        elif row.cleared_at is None and ensure_utc(row.reset_at) > mark.reset_at:
+            mark.reset_at = ensure_utc(row.reset_at)
+        row.exhausted_at = mark.exhausted_at
+        row.reset_at = mark.reset_at
+        row.task_id = mark.task_id
+        row.attempt_id = mark.attempt_id
+        row.reason = mark.reason
+        row.cleared_at = mark.cleared_at
+        row.cleared_by = mark.cleared_by
+        row.clear_reason = mark.clear_reason
+        self._s.flush()
+        return self._to_entity(row)
+
+    def list_all(self) -> Sequence[PoolExhaustion]:
+        rows = self._s.scalars(select(PoolExhaustionRow).order_by(PoolExhaustionRow.pool)).all()
+        return [self._to_entity(row) for row in rows]
+
+    def clear(
+        self, pool: str, *, at: datetime, principal: str, reason: str
+    ) -> PoolExhaustion | None:
+        row = self._s.get(PoolExhaustionRow, pool)
+        if row is None:
+            return None
+        row.cleared_at = at
+        row.cleared_by = principal
+        row.clear_reason = reason
+        self._s.flush()
+        return self._to_entity(row)
 
 
 class Events:
@@ -1099,6 +1199,7 @@ class SqlUnitOfWork:
     supervisor_status: SupervisorStatusRepository
     idempotency: IdempotencyRepository
     routing_policies: RoutingPolicyRepository
+    pool_exhaustions: PoolExhaustionRepository
     artifacts: ArtifactRepository
     evidence: EvidenceRepository
     review_reports: ReviewReportRepository
@@ -1150,6 +1251,7 @@ class SqlUnitOfWork:
         self.supervisor_status = SupervisorStatuses(s)
         self.idempotency = IdempotencyKeys(s)
         self.routing_policies = RoutingPolicies(s)
+        self.pool_exhaustions = PoolExhaustions(s)
         self.artifacts = Artifacts(s)
         self.evidence = Evidences(s)
         self.review_reports = ReviewReports(s)

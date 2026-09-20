@@ -40,6 +40,12 @@ class AttemptSummary(Response):
     started_at: Rfc3339 | None
     ended_at: Rfc3339 | None
     handle: str | None
+    model: str | None = None
+    harness: str | None = None
+    image: str | None = None
+    pool: str | None = None
+    reroute_from_attempt_id: str | None = None
+    resume_from_remote: bool = False
 
 
 class ExecutionSummary(Response):
@@ -82,6 +88,8 @@ class TaskView(Response):
     acceptance_results: list[dict[str, Any]]
     decisions: list[dict[str, Any]]
     unacked_wakes: int
+    resume_at: Rfc3339 | None = None
+    reroute_chain: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class TaskListItem(Response):
@@ -111,10 +119,10 @@ class StartOverrides(StrictModel):
 
 
 class StartRequest(StrictModel):
-    harness: HarnessName
-    model: str = Field(min_length=1)
-    provider: ProviderName
-    image: str = Field(min_length=1)
+    harness: HarnessName | None = None
+    model: str | None = Field(default=None, min_length=1)
+    provider: ProviderName | None = None
+    image: str | None = Field(default=None, min_length=1)
     policy_version: int = Field(ge=1)
     effort: str | None = None
     overrides: StartOverrides | None = None
@@ -162,6 +170,12 @@ class AttemptView(Response):
     lease: dict[str, Any] | None
     heartbeat_summary: dict[str, Any]
     report: dict[str, Any] | None
+    model: str | None = None
+    harness: str | None = None
+    image: str | None = None
+    pool: str | None = None
+    ordered_candidates: list[dict[str, Any]] = Field(default_factory=list)
+    resume_from_remote: bool = False
 
 
 class ExecutionView(Response):
