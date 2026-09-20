@@ -42,6 +42,9 @@ https://github.com/sentania-labs/crucible/actions/runs/35527704824. A future
 release tag on a commit with the current workflow will carry all five jobs
 without duplicating them in `release.yml`.
 
+The C6c branch itself passed all five jobs at
+https://github.com/sentania-labs/crucible/actions/runs/35532280495.
+
 ## External target evidence
 
 The workflow was added to `sentania-labs/crucible-spike-target` through pull
@@ -103,10 +106,11 @@ It reported three blockers:
    heartbeat is now stored, and unit plus integration coverage records this
    behavior.
 2. Readiness contained the literal `<C6C-CI-RUN-URL>` placeholder. Accepted as
-   a delivery-sequencing blocker. The branch CI URL does not exist until this
-   review is recorded and the pull request opens. The placeholder will be
-   replaced with that produced run URL immediately after the pull request
-   creates it, and the resulting head must pass all five jobs.
+   a delivery-sequencing blocker. The branch CI URL did not exist until this
+   review was recorded and the pull request opened. The placeholder was
+   replaced by the first green five-job run,
+   https://github.com/sentania-labs/crucible/actions/runs/35532280495. The
+   evidence-only replacement commit must also pass all five jobs.
 3. This section still said the review was pending. Accepted and resolved by
    this findings and dispositions record.
 
