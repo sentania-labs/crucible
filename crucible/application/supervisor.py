@@ -507,10 +507,7 @@ class Supervisor:
                 if open_execution is not None:
                     attempts_so_far = uow.attempts.list_for_execution(open_execution.id)
                     number = max((a.number for a in attempts_so_far), default=0) + 1
-                    resumed_attempt = self._create_attempt(uow, open_execution, number=number)
-                    if task.quota_wait_started_at is not None:
-                        resumed_attempt.resume_from_remote = True
-                        uow.attempts.save(resumed_attempt)
+                    self._create_attempt(uow, open_execution, number=number)
                     record_event(
                         uow,
                         self._clock,
@@ -578,6 +575,7 @@ class Supervisor:
             number=number,
             state=AttemptState.PENDING,
             created_at=self._clock.now(),
+            resume_from_remote=execution.resume_from_remote,
         )
         uow.attempts.add(attempt)
         record_event(
@@ -1090,7 +1088,9 @@ class Supervisor:
                 eligible.add(name)
         return eligible
 
-    def _selection_for(self, uow: UnitOfWork, item: _Pending) -> Any:
+    def _selection_for(
+        self, uow: UnitOfWork, item: _Pending, *, excluded_pools: set[str | None] | None = None
+    ) -> Any:
         routing = load_routing(uow, item.execution.policy_snapshot or {})
         if routing is None:
             return None
@@ -1109,6 +1109,14 @@ class Supervisor:
             provider=request.provider.value,
             now=self._clock.now(),
             eligible_harnesses=eligible,
+            harnesses=self._harnesses,
+            image_allowlist=[
+                str(pattern)
+                for pattern in (item.execution.policy_snapshot or {})
+                .get("images", {})
+                .get("allowlist", [])
+            ],
+            excluded_pools={pool for pool in (excluded_pools or set()) if pool is not None},
             pinned_model=request.pinned_model,
             pinned_harness=request.pinned_harness.value if request.pinned_harness else None,
         )
@@ -1853,6 +1861,14 @@ class Supervisor:
                     cleanup.get("workspace_on_success" if succeeded else "workspace_on_failure")
                     or ("keep_diff_only" if succeeded else "keep")
                 )
+                checkpoint_push_failed = any(
+                    event.attempt_id == attempt.id
+                    and event.kind == EventKind.TASK_PUBLISH_FAILED.value
+                    and event.payload.get("step") == "quota_checkpoint"
+                    for event in self._all_task_events(uow, attempt.task_id)
+                )
+                if checkpoint_push_failed:
+                    choice = "keep"
                 out.append((attempt, execution.provider, choice))
         return out
 
@@ -2227,8 +2243,11 @@ class Supervisor:
             ):
                 return
             if pushed:
+                execution.resume_from_remote = True
+                uow.executions.save(execution)
                 self._handle_quota_exit(uow, task, execution, attempt)
             else:
+                bundle_path = f"{attempt.workspace_path}/output/work_branch.bundle"
                 record_event(
                     uow,
                     self._clock,
@@ -2241,8 +2260,39 @@ class Supervisor:
                         "step": "quota_checkpoint",
                         "detail": detail[:1000],
                         "head_sha": task.head_sha,
+                        "bundle_path": bundle_path,
                     },
                 )
+                retained = uow.retention.record(
+                    RetentionAction(
+                        id=new_id(),
+                        kind="quota_checkpoint_retained",
+                        subject=attempt.id,
+                        policy_name=task.policy_name,
+                        policy_version=task.policy_version,
+                        acted_at=self._clock.now(),
+                        detail={
+                            "workspace": attempt.workspace_path,
+                            "bundle_path": bundle_path,
+                            "reason": "checkpoint push failed",
+                        },
+                    )
+                )
+                if retained is not None:
+                    record_event(
+                        uow,
+                        self._clock,
+                        EventKind.RETENTION_APPLIED,
+                        principal=PRINCIPAL_CRUCIBLE,
+                        task_id=task.id,
+                        execution_id=execution.id,
+                        attempt_id=attempt.id,
+                        payload={
+                            "kind": "quota_checkpoint_retained",
+                            "subject": attempt.id,
+                            "bundle_path": bundle_path,
+                        },
+                    )
                 move_execution(
                     uow,
                     self._clock,
@@ -2251,7 +2301,17 @@ class Supervisor:
                     EventKind.EXECUTION_FAILED,
                     payload={"exit_class": "quota_exhausted", "checkpoint_push": "failed"},
                 )
-                self._task_reported(uow, task, attempt, ExitClass.QUOTA_EXHAUSTED, {})
+                self._task_reported(
+                    uow,
+                    task,
+                    attempt,
+                    ExitClass.QUOTA_EXHAUSTED,
+                    {},
+                    wake_summary=(
+                        f"checkpoint push failed; workspace retained and recovery bundle is "
+                        f"{bundle_path}"
+                    ),
+                )
             uow.commit()
 
     async def _reconcile_stranded(self, attempt: Attempt) -> bool:
@@ -2452,7 +2512,11 @@ class Supervisor:
                 )
                 if oom_killed and not (timed_out or killed):
                     attempt.exit_class = ExitClass.ENVIRONMENT
-            if attempt.exit_class is ExitClass.QUOTA_EXHAUSTED:
+            if (
+                attempt.exit_class is ExitClass.QUOTA_EXHAUSTED
+                and adapter is not None
+                and adapter.provider_quota_exhausted(outputs.stdout_tail, outputs.stderr_tail)
+            ):
                 reset_at = (
                     adapter.quota_reset_at(outputs.stdout_tail, outputs.stderr_tail)
                     if adapter is not None
@@ -2986,8 +3050,8 @@ class Supervisor:
     def _bounded_quota_reset(
         now: Any, candidate: Any, *, max_seconds: int, default_seconds: int
     ) -> tuple[Any, Any]:
-        latest = now + timedelta(seconds=max_seconds)
-        accepted = candidate if candidate is not None and now < candidate <= latest else None
+        del max_seconds
+        accepted = candidate if candidate is not None and now < candidate else None
         return accepted or now + timedelta(seconds=default_seconds), accepted
 
     def _handle_quota_exit(
@@ -3008,7 +3072,11 @@ class Supervisor:
             return
         routing, _contract = context
         reroutes = sum(
-            event.kind == EventKind.TASK_REROUTED.value
+            event.kind
+            in {
+                EventKind.TASK_REROUTED.value,
+                EventKind.TASK_QUOTA_RESUMED.value,
+            }
             and int(event.payload.get("contract_version", 0)) == execution.contract_version
             for event in self._all_task_events(uow, task.id)
         )
@@ -3040,11 +3108,9 @@ class Supervisor:
         stored = uow.contracts.get(task.id, execution.contract_version)
         assert stored is not None
         item = _Pending(attempt, execution, task, stored.document)
-        selection = self._selection_for(uow, item)
+        selection = self._selection_for(uow, item, excluded_pools={attempt.selected_pool})
         if selection is not None and selection.selected is not None and selection.image is not None:
             nxt = self._create_attempt(uow, execution, number=attempt.number + 1)
-            nxt.resume_from_remote = True
-            uow.attempts.save(nxt)
             move_task(
                 uow,
                 self._clock,
@@ -3104,16 +3170,29 @@ class Supervisor:
                 if context is None:
                     continue
                 routing, contract = context
+                quota_transitions = sum(
+                    event.kind
+                    in {
+                        EventKind.TASK_REROUTED.value,
+                        EventKind.TASK_QUOTA_RESUMED.value,
+                    }
+                    and int(event.payload.get("contract_version", 0)) == execution.contract_version
+                    for event in self._all_task_events(uow, task.id)
+                )
                 started = task.quota_wait_started_at or now
                 deadline = started + timedelta(seconds=routing.reroute.resume_max_wait_seconds)
-                if now >= deadline:
+                if now >= deadline or quota_transitions >= routing.reroute.reroute_max:
                     move_execution(
                         uow,
                         self._clock,
                         execution,
                         ExecutionState.FAILED,
                         EventKind.EXECUTION_FAILED,
-                        payload={"exit_class": "quota_exhausted", "wait_cap_exceeded": True},
+                        payload={
+                            "exit_class": "quota_exhausted",
+                            "wait_cap_exceeded": now >= deadline,
+                            "reroute_cap": quota_transitions,
+                        },
                     )
                     self._task_reported(uow, task, attempt, ExitClass.QUOTA_EXHAUSTED, {})
                     continue
@@ -3131,7 +3210,11 @@ class Supervisor:
                         EventKind.TASK_QUOTA_RESUMED,
                         execution_id=execution.id,
                         attempt_id=attempt.id,
-                        payload={"model": selection.selected.id, "pool": selection.selected.pool},
+                        payload={
+                            "contract_version": execution.contract_version,
+                            "model": selection.selected.id,
+                            "pool": selection.selected.pool,
+                        },
                     )
                     continue
                 resets = self._class_pool_resets(uow, routing, contract)
@@ -3246,7 +3329,12 @@ class Supervisor:
         if attempt.termination_reason == TERMINATION_REFUSED:
             # 07: a refused launch would be refused again; Foundry has the wake.
             retryable = False
-        if retryable and attempt.number < execution.max_attempts:
+        ordinary_attempts = sum(
+            prior.exit_class is not ExitClass.QUOTA_EXHAUSTED
+            for prior in uow.attempts.list_for_execution(execution.id)
+            if prior.state in ATTEMPT_TERMINAL
+        )
+        if retryable and ordinary_attempts < execution.max_attempts:
             nxt = self._create_attempt(uow, execution, number=attempt.number + 1)
             move_task(
                 uow,
@@ -3272,7 +3360,7 @@ class Supervisor:
             EventKind.EXECUTION_FAILED,
             payload={
                 "exit_class": exit_class.value,
-                "attempts_used": attempt.number,
+                "attempts_used": ordinary_attempts,
                 "max_attempts": execution.max_attempts,
                 "retry_eligible": retryable,
             },
@@ -3338,6 +3426,7 @@ class Supervisor:
         attempt: Attempt,
         exit_class: ExitClass,
         common: dict[str, str],
+        wake_summary: str | None = None,
     ) -> None:
         stored = uow.contracts.get(task.id, task.contract_version)
         tier = (
@@ -3366,8 +3455,11 @@ class Supervisor:
                 principal_id=task.principal_id,
                 reason=reason,
                 summary=(
-                    f"attempt {attempt.number} ended {exit_class.value} with no retry remaining; "
-                    "the pre-PR gates will say so"
+                    wake_summary
+                    or (
+                        f"attempt {attempt.number} ended {exit_class.value} with no retry "
+                        "remaining; the pre-PR gates will say so"
+                    )
                 ),
                 task=task,
                 attempt_id=attempt.id,

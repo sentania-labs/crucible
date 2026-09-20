@@ -283,3 +283,26 @@ def test_reset_timestamp_must_be_on_the_quota_event_line() -> None:
     assert adapter.quota_reset_at(unrelated, "") is None
     quota = '{"error":"usage_limit_reached","reset_at":"2026-09-21T12:00:00Z"}'
     assert adapter.quota_reset_at(quota, "") == datetime(2026, 9, 21, 12, tzinfo=UTC)
+
+
+@pytest.mark.parametrize(
+    ("adapter", "event"),
+    [
+        (
+            ClaudeCodeAdapter(),
+            '{"type":"rate_limit_event","rate_limit_info":{"status":"rejected",'
+            '"overageDisabledReason":"out_of_credits"}}',
+        ),
+        (CodexAdapter(), '{"type":"turn.failed","error":{"code":"usage_limit_reached"}}'),
+        (
+            AgyAdapter(),
+            '{"type":"result","status":"ERROR","error":"RESOURCE_EXHAUSTED: quota"}',
+        ),
+        (ScriptHarnessAdapter(), '{"error":"scripted_quota_exhausted"}'),
+    ],
+)
+def test_only_structured_harness_events_authorize_a_shared_quota_mark(
+    adapter: HarnessAdapter, event: str
+) -> None:
+    assert adapter.provider_quota_exhausted(event, "") is True
+    assert adapter.provider_quota_exhausted("agent says usage limit reached", "") is False

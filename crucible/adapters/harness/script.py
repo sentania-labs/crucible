@@ -28,6 +28,9 @@ from crucible.ports.harness import (
 
 NAME = "script-harness"
 QUOTA_PATTERNS = base.patterns("scripted_quota_exhausted")
+PROVIDER_QUOTA_SIGNALS = base.correlated(
+    r'"error"\s*:\s*"scripted_quota_exhausted"',
+)
 
 
 class ScriptHarnessAdapter:
@@ -36,6 +39,11 @@ class ScriptHarnessAdapter:
 
     def quota_reset_at(self, stdout_tail: str, stderr_tail: str) -> datetime | None:
         return base.quota_reset_at(stdout_tail, stderr_tail, quota=QUOTA_PATTERNS)
+
+    def provider_quota_exhausted(self, stdout_tail: str, stderr_tail: str) -> bool:
+        return base.provider_quota_exhausted(
+            stdout_tail, stderr_tail, signals=PROVIDER_QUOTA_SIGNALS
+        )
 
     def capabilities(self) -> HarnessCapabilities:
         return HarnessCapabilities(
@@ -56,6 +64,13 @@ class ScriptHarnessAdapter:
                 "mkdir -p src; printf 'quota checkpoint\\n' > src/quota-checkpoint.txt; "
                 "printf 'succeed\\n' > e2e-behavior; "
                 'printf \'{"error":"scripted_quota_exhausted"}\\n\' >&2; exit 1'
+            )
+            return AdapterLaunch(argv=("sh", "-c", script), workdir=ctx.repo_mount)
+        if ctx.model == "b-script-success":
+            script = (
+                "test -f src/quota-checkpoint.txt || { "
+                "printf 'rerouted checkout is missing quota checkpoint\\n' >&2; exit 1; }; "
+                "exec crucible-script-harness"
             )
             return AdapterLaunch(argv=("sh", "-c", script), workdir=ctx.repo_mount)
         return AdapterLaunch(argv=("crucible-script-harness",), workdir=ctx.repo_mount)

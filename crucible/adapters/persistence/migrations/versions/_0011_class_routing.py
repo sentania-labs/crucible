@@ -11,11 +11,13 @@ import json
 
 import sqlalchemy as sa
 from alembic import op
+from pydantic import ValidationError
 from sqlalchemy.dialects.postgresql import JSONB
 
 from crucible.adapters.persistence.migrations.versions._0010_bootstrap_import import (
     _event_kinds as c6_event_kinds,
 )
+from crucible.contracts.task_contract import TaskContractV1
 
 revision = "0011_class_routing"
 down_revision = "0010_bootstrap_import"
@@ -92,9 +94,35 @@ def _seed_v3(connection: sa.engine.Connection) -> None:
     )
 
 
+def _refuse_incompatible_active_contracts(connection: sa.engine.Connection) -> None:
+    rows = connection.execute(
+        sa.text(
+            "SELECT t.id, c.document FROM tasks t "
+            "JOIN task_contracts c ON c.task_id=t.id AND c.version=t.contract_version "
+            "WHERE t.state NOT IN ('cancelled', 'rejected', 'closed') ORDER BY t.id"
+        )
+    ).all()
+    incompatible: list[str] = []
+    for task_id, document in rows:
+        try:
+            TaskContractV1.model_validate(document)
+        except ValidationError:
+            incompatible.append(str(task_id))
+    if incompatible:
+        raise RuntimeError(
+            "0011_class_routing refuses incompatible contracts on non-terminal task ids: "
+            + ", ".join(incompatible)
+        )
+
+
 def upgrade() -> None:
+    _refuse_incompatible_active_contracts(op.get_bind())
     op.add_column("tasks", sa.Column("resume_at", TZ, nullable=True))
     op.add_column("tasks", sa.Column("quota_wait_started_at", TZ, nullable=True))
+    op.add_column(
+        "executions",
+        sa.Column("resume_from_remote", sa.Boolean(), nullable=False, server_default=sa.false()),
+    )
     op.add_column("attempts", sa.Column("selected_model", sa.String(128), nullable=True))
     op.add_column("attempts", sa.Column("selected_harness", sa.String(32), nullable=True))
     op.add_column("attempts", sa.Column("selected_image", sa.Text(), nullable=True))
@@ -246,3 +274,4 @@ def downgrade() -> None:
         op.drop_column("attempts", column)
     op.drop_column("tasks", "quota_wait_started_at")
     op.drop_column("tasks", "resume_at")
+    op.drop_column("executions", "resume_from_remote")

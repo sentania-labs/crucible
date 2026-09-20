@@ -302,6 +302,7 @@ class FakeProvider:
         self._workspaces: dict[str, Workspace] = {}
         self._review_heads: dict[str, str] = {}
         self.cleaned: list[str] = []
+        self.cleanup_policies: dict[str, CleanupPolicy] = {}
 
     # test controls
     def script(self, external_id: str, behavior: str, *, after: int = 1) -> None:
@@ -524,6 +525,7 @@ class FakeProvider:
         self, ws: Workspace, policy: CleanupPolicy, spec: LaunchSpec | None = None
     ) -> None:
         self.cleaned.append(ws.attempt_id)
+        self.cleanup_policies[ws.attempt_id] = policy
         self._workspaces.pop(ws.attempt_id, None)
 
     async def list_images(self) -> list[ImageInfo]:

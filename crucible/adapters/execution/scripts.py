@@ -46,6 +46,7 @@ GIT = (
     "git -c core.fsmonitor= -c diff.external= -c core.pager=cat "
     "-c core.hooksPath=/dev/null -c 'safe.directory=*'"
 )
+CHECKPOINT_GIT = "git -c diff.external= -c core.pager=cat -c 'safe.directory=*'"
 GIT_ENV = (
     "export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 "
     "GIT_TERMINAL_PROMPT=0 GIT_ASKPASS= HOME=/home/worker LC_ALL=C"
@@ -229,12 +230,43 @@ mkdir -p "$OUT"
 : > "$OUT/copy-rejections.tsv"
 {_COPY_REPORT}
 if [ -n "$QUOTA_ATTEMPT" ]; then
-  {GIT} -C "$REPO" add -A
-  if ! {GIT} -C "$REPO" diff --cached --quiet; then
-    {GIT} -C "$REPO" commit -q \
+  # The worker can edit both .git/config and .gitattributes. Replace its local
+  # configuration while Git stages and commits, then restore it before collection
+  # continues. With no filter.* commands, a filter attribute is a no-op.
+  ORIGINAL_CONFIG=/tmp/crucible-worker-git-config.$$
+  EMPTY_HOOKS=/tmp/crucible-empty-hooks.$$
+  cp "$REPO/.git/config" "$ORIGINAL_CONFIG"
+  restore_worker_git_config() {{
+    rm -f "$REPO/.git/config"
+    cp "$ORIGINAL_CONFIG" "$REPO/.git/config"
+    rm -rf "$ORIGINAL_CONFIG" "$EMPTY_HOOKS"
+  }}
+  trap restore_worker_git_config EXIT HUP INT TERM
+  rm -f "$REPO/.git/config"
+  mkdir -p "$EMPTY_HOOKS"
+  cat > "$REPO/.git/config" <<EOF
+[core]
+  repositoryformatversion = 0
+  bare = false
+  logallrefupdates = true
+  hooksPath = $EMPTY_HOOKS
+  fsmonitor = false
+[user]
+  name = crucible-worker
+  email = crucible-worker@users.noreply.github.com
+[commit]
+  gpgsign = false
+[tag]
+  gpgsign = false
+EOF
+  {CHECKPOINT_GIT} -C "$REPO" add -A
+  if ! {CHECKPOINT_GIT} -C "$REPO" diff --cached --quiet; then
+    {CHECKPOINT_GIT} -C "$REPO" commit -q \
       -m "wip(crucible): attempt $QUOTA_ATTEMPT" \
       -m "Crucible-Attempt: $QUOTA_ATTEMPT"
   fi
+  restore_worker_git_config
+  trap - EXIT HUP INT TERM
 fi
 BASE=$({GIT} -C "$REPO" rev-parse --verify --quiet "$BASE_REF" \
   || {GIT} -C "$REPO" rev-parse --verify --quiet "origin/$BASE_REF" \

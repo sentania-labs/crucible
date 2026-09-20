@@ -56,6 +56,9 @@ QUOTA_PATTERNS = base.patterns(
     "rate limit exceeded",
     "Too Many Requests",
 )
+PROVIDER_QUOTA_SIGNALS = base.correlated(
+    r'"type"\s*:\s*"result".*"status"\s*:\s*"ERROR".*RESOURCE_EXHAUSTED',
+)
 
 
 class AgyAdapter:
@@ -64,6 +67,11 @@ class AgyAdapter:
 
     def quota_reset_at(self, stdout_tail: str, stderr_tail: str) -> datetime | None:
         return base.quota_reset_at(stdout_tail, stderr_tail, quota=QUOTA_PATTERNS)
+
+    def provider_quota_exhausted(self, stdout_tail: str, stderr_tail: str) -> bool:
+        return base.provider_quota_exhausted(
+            stdout_tail, stderr_tail, signals=PROVIDER_QUOTA_SIGNALS
+        )
 
     def capabilities(self) -> HarnessCapabilities:
         return HarnessCapabilities(

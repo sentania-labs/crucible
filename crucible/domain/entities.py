@@ -114,6 +114,8 @@ class Execution:
     timeout_seconds: int
     created_at: datetime
     ended_at: datetime | None = None
+    # Once any head from this execution is pushed, every later attempt starts there.
+    resume_from_remote: bool = False
 
 
 @dataclass(slots=True)

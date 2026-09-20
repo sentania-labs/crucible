@@ -124,6 +124,11 @@ def quota_reset_at(*tails: str, quota: Sequence[Pattern]) -> datetime | None:
     return None
 
 
+def provider_quota_exhausted(*tails: str, signals: Sequence[Pattern]) -> bool:
+    """Shared pool state requires a structured signal emitted by the harness itself."""
+    return first_match(tuple(tail[-TAIL_LIMIT:] for tail in tails), signals) is not None
+
+
 def read_text(path: Path, limit: int = 8 * 1024 * 1024) -> str | None:
     try:
         with path.open("rb") as handle:

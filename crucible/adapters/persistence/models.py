@@ -120,6 +120,7 @@ class ExecutionRow(Base):
     timeout_seconds: Mapped[int] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(TZ)
     ended_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
+    resume_from_remote: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 class AttemptRow(Base):

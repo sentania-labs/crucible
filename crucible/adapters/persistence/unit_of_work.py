@@ -441,6 +441,7 @@ class Executions:
             timeout_seconds=row.timeout_seconds,
             created_at=ensure_utc(row.created_at),
             ended_at=_dt(row.ended_at),
+            resume_from_remote=bool(row.resume_from_remote),
         )
 
     def add(self, execution: Execution) -> None:
@@ -462,6 +463,7 @@ class Executions:
                 timeout_seconds=execution.timeout_seconds,
                 created_at=execution.created_at,
                 ended_at=execution.ended_at,
+                resume_from_remote=execution.resume_from_remote,
             )
         )
         self._s.flush()
@@ -484,6 +486,7 @@ class Executions:
                 model=execution.model,
                 effort=execution.effort,
                 image=execution.image,
+                resume_from_remote=execution.resume_from_remote,
             )
         )
 

@@ -70,6 +70,10 @@ QUOTA_PATTERNS += base.correlated(
     r"rate_limit_event.*\"status\"\s*:\s*\"rejected\"",
     r"rate_limit_event.*out_of_credits",
 )
+PROVIDER_QUOTA_SIGNALS = base.correlated(
+    r"rate_limit_event.*\"status\"\s*:\s*\"rejected\"",
+    r"rate_limit_event.*out_of_credits",
+)
 
 
 class ClaudeCodeAdapter:
@@ -78,6 +82,11 @@ class ClaudeCodeAdapter:
 
     def quota_reset_at(self, stdout_tail: str, stderr_tail: str) -> datetime | None:
         return base.quota_reset_at(stdout_tail, stderr_tail, quota=QUOTA_PATTERNS)
+
+    def provider_quota_exhausted(self, stdout_tail: str, stderr_tail: str) -> bool:
+        return base.provider_quota_exhausted(
+            stdout_tail, stderr_tail, signals=PROVIDER_QUOTA_SIGNALS
+        )
 
     def capabilities(self) -> HarnessCapabilities:
         return HarnessCapabilities(

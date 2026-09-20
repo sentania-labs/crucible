@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import subprocess
 
 import pytest
 from fastapi.testclient import TestClient
@@ -162,3 +163,13 @@ async def test_scripted_quota_reroutes_to_a_second_image_and_remote_branch(
     assert reroute["payload"]["wip_commit_sha"]
     prepared = [event for event in events if event["kind"] == "workspace_prepared"]
     assert prepared[-1]["payload"]["started_from"] == "origin/crucible/E2E-C6B"
+    # b-script-success refuses to run unless this file is in its checkout, so its
+    # succeeded state above proves reroute continuity. The pushed final branch proves
+    # the same checkpoint remains in the delivered history.
+    final_file = subprocess.run(
+        ["git", "--git-dir", url, "show", "crucible/E2E-C6B:src/quota-checkpoint.txt"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert final_file == "quota checkpoint\n"

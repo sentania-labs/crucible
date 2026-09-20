@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 from dataclasses import replace
 from datetime import datetime, timedelta
@@ -18,6 +19,7 @@ from crucible.application.admin.context import AdminContext
 from crucible.application.harnesses import set_harness_enabled
 from crucible.application.supervisor import Supervisor
 from crucible.domain.entities import ImagePromotion, Policy, PoolExhaustion, RoutingPolicyRecord
+from crucible.ports.execution import CleanupPolicy
 from tests.fixtures import FakeClock, contract_document
 from tests.integration.conftest import make_supervisor
 
@@ -47,6 +49,7 @@ def _install_policy(
     reroute_max: int = 3,
     wait_max: int = 60,
     cooldown: int = 30,
+    workspace_on_failure: str | None = None,
 ) -> None:
     with ctx.uow_factory() as uow:
         seeded = uow.policies.get("default-software", 3)
@@ -83,6 +86,8 @@ def _install_policy(
         policy = copy.deepcopy(seeded.document)
         policy["version"] = version
         policy["routing"] = {"policy": {"name": "class-routing-test", "version": version}}
+        if workspace_on_failure is not None:
+            policy["cleanup"]["workspace_on_failure"] = workspace_on_failure
         uow.routing_policies.put(
             RoutingPolicyRecord(
                 name="class-routing-test",
@@ -313,6 +318,51 @@ async def test_two_supervisors_cannot_double_launch_a_class_selected_attempt(
     view = client.get(f"/v1/tasks/{task_id}").json()
     assert len(view["executions"][0]["attempts"]) == 1
     await supervisor.stop()
+
+
+async def test_two_supervisors_interleaved_between_selection_and_reservation_launch_once(
+    client: TestClient,
+    ctx: AppContext,
+    clock: FakeClock,
+    provider: FakeProvider,
+    supervisor: Supervisor,
+) -> None:
+    _install_policy(
+        ctx,
+        clock,
+        version=97,
+        models=[_model("barrier-model", "codex", "barrier-pool")],
+    )
+    _promote(ctx, clock, "codex", "crucible-worker:fake-succeed")
+    task_id = _submit(client, "C6B-FENCE-BARRIER", 97)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_prepare = provider.prepare
+    prepare_calls = 0
+
+    async def pause_first_prepare(spec: Any) -> Any:
+        nonlocal prepare_calls
+        prepare_calls += 1
+        if prepare_calls == 1:
+            entered.set()
+            await release.wait()
+        return await original_prepare(spec)
+
+    provider.prepare = pause_first_prepare  # type: ignore[method-assign]
+    first_tick = asyncio.create_task(supervisor.tick())
+    await entered.wait()
+    clock.advance(31)
+    takeover = make_supervisor(ctx, provider, holder="sup-barrier-takeover")
+    second_result = await takeover.tick()
+    await takeover.tick()
+    release.set()
+    first_result = await first_tick
+    view = client.get(f"/v1/tasks/{task_id}").json()
+    attempts = view["executions"][0]["attempts"]
+    assert second_result.held is True and first_result.held is False
+    assert sum(attempt["started_at"] is not None for attempt in attempts) == 1
+    assert sum(attempt["state"] == "succeeded" for attempt in attempts) == 1
+    await takeover.stop()
 
 
 async def test_wait_cap_ends_the_task_through_reported_with_the_class_visible(
@@ -638,3 +688,320 @@ async def test_reservation_race_reroutes_and_discards_prepared_workspace(
     final = client.get(f"/v1/tasks/{task_id}").json()
     assert final["executions"][0]["attempts"][1]["model"] == "b-race-model"
     assert final["executions"][0]["attempts"][1]["state"] == "succeeded"
+
+
+async def test_environment_retry_after_reroute_keeps_remote_checkpoint_continuity(
+    client: TestClient,
+    ctx: AppContext,
+    clock: FakeClock,
+    supervisor: Supervisor,
+) -> None:
+    _install_policy(
+        ctx,
+        clock,
+        version=90,
+        models=[
+            _model("a-quota-model", "codex", "retry-pool-a"),
+            _model("b-environment-model", "agy", "retry-pool-b"),
+        ],
+    )
+    _promote(ctx, clock, "codex", "crucible-worker:fake-quota")
+    _promote(ctx, clock, "agy", "crucible-worker:fake-environment")
+    task_id = _submit(client, "C6B-REROUTE-RETRY", 90)
+
+    await supervisor.tick()
+    await supervisor.tick()
+    retried = client.get(f"/v1/tasks/{task_id}").json()
+    attempts = retried["executions"][0]["attempts"]
+    assert [attempt["exit_class"] for attempt in attempts[:2]] == [
+        "quota_exhausted",
+        "environment",
+    ]
+    assert attempts[2]["resume_from_remote"] is True
+
+    _promote(ctx, clock, "agy", "crucible-worker:fake-succeed")
+    await supervisor.tick()
+    final = client.get(f"/v1/tasks/{task_id}").json()
+    assert final["executions"][0]["attempts"][2]["state"] == "succeeded"
+
+
+async def test_checkpoint_push_failure_forces_workspace_and_bundle_retention(
+    client: TestClient,
+    ctx: AppContext,
+    clock: FakeClock,
+    provider: FakeProvider,
+    supervisor: Supervisor,
+) -> None:
+    _install_policy(
+        ctx,
+        clock,
+        version=91,
+        models=[_model("quota-model", "codex", "retention-pool")],
+        workspace_on_failure="delete",
+    )
+    _promote(ctx, clock, "codex", "crucible-worker:fake-quota")
+    task_id = _submit(client, "C6B-CHECKPOINT-RETAIN", 91)
+
+    async def fail_push(_attempt_id: str, *, required: bool) -> tuple[bool, str]:
+        assert required is False
+        return False, "synthetic checkpoint push failure"
+
+    supervisor.delivery.push_quota_checkpoint = fail_push  # type: ignore[assignment]
+    await supervisor.tick()
+    view = client.get(f"/v1/tasks/{task_id}").json()
+    attempt = view["executions"][0]["attempts"][0]
+    events = _events(client, task_id)
+    failure = next(event for event in events if event["kind"] == "task_publish_failed")
+    bundle_path = failure["payload"]["bundle_path"]
+    assert bundle_path.endswith("/output/work_branch.bundle")
+    wake = next(event for event in events if event["kind"] == "wake_created")
+    assert bundle_path in wake["payload"]["summary"]
+    assert any(
+        event["kind"] == "retention_applied"
+        and event["payload"].get("kind") == "quota_checkpoint_retained"
+        for event in events
+    )
+
+    await supervisor.tick()
+    assert provider.cleanup_policies[attempt["id"]] is CleanupPolicy.KEEP
+    with ctx.uow_factory() as uow:
+        retained = next(
+            action
+            for action in uow.retention.list_recent(50)
+            if action.kind == "quota_checkpoint_retained" and action.subject == attempt["id"]
+        )
+    assert retained.detail["bundle_path"] == bundle_path
+
+
+async def test_quota_text_reroutes_only_the_task_without_marking_the_pool(
+    client: TestClient,
+    ctx: AppContext,
+    clock: FakeClock,
+    provider: FakeProvider,
+    supervisor: Supervisor,
+) -> None:
+    _install_policy(
+        ctx,
+        clock,
+        version=92,
+        models=[
+            _model("a-quota-model", "codex", "text-pool-a"),
+            _model("b-success-model", "agy", "text-pool-b"),
+        ],
+    )
+    _promote(ctx, clock, "codex", "crucible-worker:fake-quota")
+    _promote(ctx, clock, "agy", "crucible-worker:fake-succeed")
+    task_id = _submit(client, "C6B-TEXT-QUOTA", 92)
+    original_collect = provider.collect
+
+    async def text_only_collect(*args: Any, **kwargs: Any) -> Any:
+        outputs = await original_collect(*args, **kwargs)
+        if outputs.stderr_tail:
+            return replace(outputs, stderr_tail="agent says usage_limit_reached")
+        return outputs
+
+    provider.collect = text_only_collect  # type: ignore[method-assign]
+    await supervisor.tick()
+    provider.collect = original_collect  # type: ignore[method-assign]
+    view = client.get(f"/v1/tasks/{task_id}").json()
+    assert view["state"] == "scheduled"
+    with ctx.uow_factory() as uow:
+        assert uow.pool_exhaustions.get("text-pool-a") is None
+
+
+async def test_timed_resumes_share_the_reroute_cap(
+    client: TestClient,
+    ctx: AppContext,
+    clock: FakeClock,
+    supervisor: Supervisor,
+) -> None:
+    _install_policy(
+        ctx,
+        clock,
+        version=93,
+        models=[_model("quota-model", "codex", "resume-cap-pool")],
+        reroute_max=1,
+        wait_max=120,
+        cooldown=10,
+    )
+    _promote(ctx, clock, "codex", "crucible-worker:fake-quota")
+    task_id = _submit(client, "C6B-RESUME-CAP", 93)
+    await supervisor.tick()
+    clock.advance(11)
+    await supervisor.tick()
+    await supervisor.tick()
+    assert len(client.get(f"/v1/tasks/{task_id}").json()["executions"][0]["attempts"]) == 2
+    clock.advance(11)
+    await supervisor.tick()
+    view = client.get(f"/v1/tasks/{task_id}").json()
+    assert view["state"] == "pre_pr_gates_failed"
+    events = _events(client, task_id)
+    assert sum(event["kind"] == "task_quota_resumed" for event in events) == 1
+    assert any(
+        event["kind"] == "execution_failed" and event["payload"].get("reroute_cap") == 1
+        for event in events
+    )
+
+
+async def test_pinned_task_waits_restarts_and_ends_at_its_wait_cap(
+    client: TestClient,
+    tokens: dict[str, str],
+    ctx: AppContext,
+    clock: FakeClock,
+    provider: FakeProvider,
+    supervisor: Supervisor,
+) -> None:
+    _install_policy(
+        ctx,
+        clock,
+        version=94,
+        models=[_model("pinned-quota", "codex", "pinned-pool")],
+        wait_max=10,
+        cooldown=30,
+    )
+    _promote(ctx, clock, "codex", "crucible-worker:fake-quota")
+    document = _class_contract("C6B-PINNED-WAIT", 94)
+    document["execution_request"].update(
+        {
+            "harness": "codex",
+            "model": "pinned-quota",
+            "pin_reason": "operator holds this model for bootstrap verification",
+        }
+    )
+    headers = {"Authorization": f"Bearer {tokens['operator']}"}
+    response = client.post("/v1/tasks", json=document, headers=headers)
+    assert response.status_code == 201, response.text
+    task_id = response.json()["id"]
+    response = client.post(
+        f"/v1/tasks/{task_id}/start",
+        json={"provider": "fake", "policy_version": 94},
+        headers=headers,
+    )
+    assert response.status_code == 200, response.text
+    await supervisor.tick()
+    assert client.get(f"/v1/tasks/{task_id}").json()["state"] == "awaiting_quota"
+    await supervisor.stop()
+    clock.advance(11)
+    restarted = make_supervisor(ctx, provider, holder="sup-pinned-wait")
+    await restarted.tick()
+    assert client.get(f"/v1/tasks/{task_id}").json()["state"] == "pre_pr_gates_failed"
+    await restarted.stop()
+
+
+async def test_provider_reset_is_not_shortened_by_the_task_wait_cap(
+    client: TestClient,
+    ctx: AppContext,
+    clock: FakeClock,
+    provider: FakeProvider,
+    supervisor: Supervisor,
+) -> None:
+    _install_policy(
+        ctx,
+        clock,
+        version=95,
+        models=[_model("quota-model", "codex", "long-reset-pool")],
+        wait_max=86400,
+        cooldown=30,
+    )
+    _promote(ctx, clock, "codex", "crucible-worker:fake-quota")
+    task_id = _submit(client, "C6B-LONG-RESET", 95)
+    reset_at = clock.now() + timedelta(days=2)
+    original_collect = provider.collect
+
+    async def collect_with_reset(*args: Any, **kwargs: Any) -> Any:
+        outputs = await original_collect(*args, **kwargs)
+        if outputs.stderr_tail:
+            return replace(
+                outputs,
+                stderr_tail=(
+                    '{"type":"turn.failed","error":{"code":"usage_limit_reached"},'
+                    f'"reset_at":"{reset_at.isoformat()}"}}'
+                ),
+            )
+        return outputs
+
+    provider.collect = collect_with_reset  # type: ignore[method-assign]
+    await supervisor.tick()
+    with ctx.uow_factory() as uow:
+        mark = uow.pool_exhaustions.get("long-reset-pool")
+        assert mark is not None and mark.reset_at == reset_at
+    view = client.get(f"/v1/tasks/{task_id}").json()
+    assert datetime.fromisoformat(view["resume_at"]) == clock.now() + timedelta(days=1)
+
+
+async def test_selection_history_is_not_limited_to_the_first_task_page(
+    client: TestClient,
+    ctx: AppContext,
+    clock: FakeClock,
+    supervisor: Supervisor,
+) -> None:
+    _install_policy(
+        ctx,
+        clock,
+        version=96,
+        models=[
+            _model("a-history-model", "codex", "history-pool-a"),
+            _model("b-history-model", "agy", "history-pool-b"),
+        ],
+    )
+    _promote(ctx, clock, "codex", "crucible-worker:fake-succeed")
+    _promote(ctx, clock, "agy", "crucible-worker:fake-succeed")
+    task_id = _submit(client, "C6B-HISTORY-PAGE", 96)
+    historical_task = "9" + str(10001).zfill(25)
+    historical_execution = "8" + str(10001).zfill(25)
+    historical_attempt = "7" + str(10001).zfill(25)
+    assert supervisor._lease_step() is True
+    assert supervisor.fenced_token is not None
+    with ctx.engine.begin() as connection:
+        connection.execute(
+            text("SELECT set_config('crucible.fenced_token', :token, true)"),
+            {"token": str(supervisor.fenced_token)},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO tasks "
+                "(id, external_id, principal_id, repository_id, project, title, state, "
+                "contract_version, policy_name, policy_version, created_at, updated_at) "
+                "SELECT '9' || lpad(gs::text, 25, '0'), 'HIST-' || gs, principal_id, "
+                "repository_id, project, 'history', 'closed', 1, policy_name, policy_version, "
+                "now(), now() FROM tasks, generate_series(1, 10001) gs WHERE id=:task_id"
+            ),
+            {"task_id": task_id},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO executions "
+                "(id, task_id, role, contract_version, harness, model, provider, image, "
+                "policy_snapshot, state, max_attempts, retry_on, timeout_seconds, created_at, "
+                "resume_from_remote) VALUES (:id, :task_id, 'implement', 1, 'codex', "
+                "'a-history-model', 'fake', 'crucible-worker:fake-succeed', '{}', "
+                "'succeeded', 1, '[]', 60, now(), false)"
+            ),
+            {"id": historical_execution, "task_id": historical_task},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO attempts (id, execution_id, task_id, number, state, created_at, "
+                "log_resume_occurrence, unsupervised, ordered_candidates, "
+                "resume_from_remote) VALUES "
+                "(:id, :execution_id, :task_id, 1, 'succeeded', now(), 0, false, '[]', false)"
+            ),
+            {
+                "id": historical_attempt,
+                "execution_id": historical_execution,
+                "task_id": historical_task,
+            },
+        )
+        connection.execute(
+            text(
+                "INSERT INTO attempt_metrics "
+                "(attempt_id, task_id, model, harness, endpoint_kind, pool, cost_source, "
+                "gates_passed, gates_failed, corrections_after, created_at) VALUES "
+                "(:attempt_id, :task_id, 'a-history-model', 'codex', 'subscription', "
+                "'history-pool-a', 'none', 0, 0, 0, now())"
+            ),
+            {"attempt_id": historical_attempt, "task_id": historical_task},
+        )
+    await supervisor.tick()
+    view = client.get(f"/v1/tasks/{task_id}").json()
+    assert view["executions"][0]["attempts"][0]["model"] == "b-history-model"

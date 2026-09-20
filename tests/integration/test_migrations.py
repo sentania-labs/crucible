@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 from sqlalchemy import inspect, text
 
 from crucible.adapters.persistence import migrate
 from crucible.adapters.persistence.unit_of_work import make_engine
+from tests.fixtures import contract_document
 
 pytestmark = pytest.mark.integration
 
@@ -319,4 +322,61 @@ def test_0011_down_and_up_preserves_class_routing_events(database_url: str) -> N
             conn.execute(text("SELECT to_regclass('public.events_c6b_archive')")).scalar() is None
         )
     assert restored == 1
+    engine.dispose()
+
+
+def test_0011_refuses_an_incompatible_contract_on_a_non_terminal_task(
+    database_url: str,
+) -> None:
+    engine = make_engine(database_url)
+    if migrate.current_revision(engine) is None:
+        migrate.upgrade(database_url, "0010_bootstrap_import")
+    else:
+        migrate.downgrade(database_url, "0010_bootstrap_import")
+    document = contract_document(external_id="MIG-C6B-GUARD")
+    document["execution_request"].update({"harness": "codex", "model": "gpt-5.6-luna"})
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO principals (id, name, role, token_salt, token_hash, created_at) "
+                "VALUES ('01MIGC6BP0000000000000001', 'c6b-migration-principal', "
+                "'orchestrator', '\\x00', '\\x00', now()) ON CONFLICT DO NOTHING"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO repositories (id, name, url, default_branch, policy_name, "
+                "registered_by, created_at, external_review_attested) VALUES "
+                "('01MIGC6BR0000000000000001', "
+                "'migration/c6b', 'https://example.invalid/migration/c6b', 'main', "
+                "'default-software', 'tests', now(), false) ON CONFLICT DO NOTHING"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO tasks (id, external_id, principal_id, repository_id, project, "
+                "title, state, contract_version, policy_name, policy_version, created_at, "
+                "updated_at, head_sha) VALUES ('01MIGC6BT0000000000000001', 'MIG-C6B-GUARD', "
+                "'01MIGC6BP0000000000000001', '01MIGC6BR0000000000000001', 'p', 't', "
+                "'submitted', 1, 'default-software', 1, now(), now(), NULL)"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO task_contracts "
+                "(id, task_id, version, document, sha256, submitted_at) VALUES "
+                "('01MIGC6BC0000000000000001', '01MIGC6BT0000000000000001', 1, "
+                "CAST(:document AS jsonb), 'invalid-contract-for-migration-guard', now())"
+            ),
+            {"document": json.dumps(document)},
+        )
+    with pytest.raises(RuntimeError, match="01MIGC6BT0000000000000001"):
+        migrate.upgrade(database_url)
+    with engine.begin() as conn:
+        conn.execute(
+            text("UPDATE tasks SET state='cancelled' WHERE id='01MIGC6BT0000000000000001'")
+        )
+    migrate.upgrade(database_url)
+    ok, detail = migrate.is_current(engine, database_url)
+    assert ok, detail
     engine.dispose()

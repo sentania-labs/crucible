@@ -64,6 +64,9 @@ QUOTA_PATTERNS = base.patterns(
     "Rate limit reached",
     "429 Too Many Requests",
 )
+PROVIDER_QUOTA_SIGNALS = base.correlated(
+    r'"type"\s*:\s*"turn\.failed".*"code"\s*:\s*"usage_limit_reached"',
+)
 
 
 class CodexAdapter:
@@ -72,6 +75,11 @@ class CodexAdapter:
 
     def quota_reset_at(self, stdout_tail: str, stderr_tail: str) -> datetime | None:
         return base.quota_reset_at(stdout_tail, stderr_tail, quota=QUOTA_PATTERNS)
+
+    def provider_quota_exhausted(self, stdout_tail: str, stderr_tail: str) -> bool:
+        return base.provider_quota_exhausted(
+            stdout_tail, stderr_tail, signals=PROVIDER_QUOTA_SIGNALS
+        )
 
     def capabilities(self) -> HarnessCapabilities:
         return HarnessCapabilities(
