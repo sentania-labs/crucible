@@ -91,3 +91,149 @@ class FakeClock:
     def advance(self, seconds: float) -> datetime:
         self._now = self._now + timedelta(seconds=seconds)
         return self._now
+
+
+# ----- the bootstrap ledger handoff (15) -------------------------------------------
+#
+# Synthetic bundles in the exact shape `foundry-ledger export --format crucible` writes:
+# the producer's nineteen task fields in its order, its six event fields, its local
+# timestamps, its counts and its content hash. Every value here is invented; no real
+# task text, no operator path, nothing secret-shaped.
+
+BOOTSTRAP_TASK_FIELDS = (
+    "id",
+    "title",
+    "parent",
+    "project",
+    "repository",
+    "scope",
+    "objective",
+    "contract",
+    "model",
+    "harness",
+    "execution",
+    "state",
+    "created",
+    "updated",
+    "refs",
+    "last_report",
+    "evidence",
+    "blockers",
+    "decisions_pending",
+)
+
+
+def bootstrap_content_sha256(tasks: list[Any], events: list[Any]) -> str:
+    """The producer's hash, restated here with only json and hashlib so a test never
+    proves the domain's implementation against itself."""
+    import hashlib  # noqa: PLC0415
+    import json  # noqa: PLC0415
+
+    canonical = json.dumps(
+        {"tasks": tasks, "events": events},
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def bootstrap_task(external_id: str, state: str, **overrides: Any) -> dict[str, Any]:
+    number = external_id.rsplit("-", 1)[-1]
+    record: dict[str, Any] = {
+        "id": external_id,
+        "title": f"Synthetic task {number}",
+        "parent": None,
+        "project": "example",
+        "repository": "example-service",
+        "scope": "src/example only",
+        "objective": f"An invented objective for synthetic task {number}.",
+        "contract": {"acceptance": ["the synthetic criterion holds"], "constraints": "none"},
+        "model": "example-model-1",
+        "harness": "example-harness",
+        "execution": f"example-harness session {number}",
+        "state": state,
+        "created": "2026-09-01 09:00 CDT",
+        "updated": "2026-09-02 10:30 CDT",
+        "refs": {"branch": f"crucible/{external_id}"},
+        "last_report": None,
+        "evidence": [],
+        "blockers": [],
+        "decisions_pending": [],
+    }
+    record.update(overrides)
+    return record
+
+
+def bootstrap_event(
+    seq: int,
+    task: str,
+    event: str,
+    *,
+    ts: str = "2026-09-01 09:00 CDT",
+    who: str = "operator",
+    detail: str | None = "",
+) -> dict[str, Any]:
+    return {"seq": seq, "ts": ts, "task": task, "event": event, "who": who, "detail": detail}
+
+
+def bootstrap_bundle(
+    tasks: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+    *,
+    migrated: str | None = None,
+    schema_version: str = "1.0",
+) -> dict[str, Any]:
+    return {
+        "schema_version": schema_version,
+        "source": {
+            "tool": "foundry-ledger 0.1.0",
+            "db_sha256": "0" * 64,
+            "exported_at": "2026-09-03 08:00 CDT",
+            "migrated": migrated,
+        },
+        "tasks": tasks,
+        "events": events,
+        "counts": {"tasks": len(tasks), "events": len(events)},
+        "content_sha256": bootstrap_content_sha256(tasks, events),
+    }
+
+
+# One task per mapped source state (15 step 2), in the producer's lifecycle order, with
+# a short event history each. `running` and `dispatched` are the two that become an
+# unsupervised attempt.
+SYNTHETIC_STATES = (
+    ("SYN-0001", "proposed"),
+    ("SYN-0002", "dispatched"),
+    ("SYN-0003", "running"),
+    ("SYN-0004", "reported"),
+    ("SYN-0005", "accepted"),
+    ("SYN-0006", "blocked"),
+    ("SYN-0007", "abandoned"),
+    ("SYN-0008", "done"),
+)
+
+
+def synthetic_bundle(**overrides: Any) -> dict[str, Any]:
+    """Eight synthetic tasks covering every mapped state, fifteen events."""
+    tasks = [bootstrap_task(external_id, state) for external_id, state in SYNTHETIC_STATES]
+    events: list[dict[str, Any]] = []
+    seq = 0
+    for external_id, state in SYNTHETIC_STATES:
+        seq += 1
+        events.append(bootstrap_event(seq, external_id, "proposed", detail="opened"))
+        if state != "proposed":
+            seq += 1
+            events.append(
+                bootstrap_event(
+                    seq,
+                    external_id,
+                    state,
+                    ts="2026-09-02 10:30 CDT",
+                    who="foundry",
+                    detail=f"moved to {state}",
+                )
+            )
+    bundle = bootstrap_bundle(tasks, events)
+    bundle.update(overrides)
+    return bundle

@@ -15,7 +15,7 @@ from crucible.application.errors import (
     TransitionNotAllowedError,
 )
 from crucible.application.submit_task import parse_contract, validate_against_registry
-from crucible.application.transitions import move_task, record_event
+from crucible.application.transitions import move_task, record_event, require_contract
 from crucible.contracts.common import to_document
 from crucible.contracts.task_contract import (
     TaskContractV1,
@@ -186,6 +186,7 @@ def amend_task(
             "an amendment carries no correction section; use /corrections",
             errors=[{"path": "correction", "message": "must be null on an amendment"}],
         )
+    require_contract(uow, task)
     previous = _previous(uow, task, task.contract_version)
     problems: list[dict[str, Any]] = validate_against_registry(uow, clock, contract)
     if contract.external_identity_fields() != previous.external_identity_fields():

@@ -14,6 +14,7 @@ from crucible.adapters.persistence.models import (
     AcceptanceResultRow,
     ArtifactRow,
     AttemptMetricsRow,
+    BootstrapImportRow,
     DecisionRow,
     EscalationRow,
     EvidenceRow,
@@ -32,6 +33,7 @@ from crucible.domain.entities import (
     AcceptanceVerdict,
     Artifact,
     AttemptMetrics,
+    BootstrapImport,
     Decision,
     DispositionKind,
     Escalation,
@@ -843,3 +845,88 @@ class ImagePromotions:
         row.updated_by = promotion.updated_by
         self._s.flush()
         return self._to_entity(row)
+
+
+class BootstrapImports:
+    """The bootstrap imports of 15: verified, then authoritative; at most one authoritative."""
+
+    def __init__(self, session: Session) -> None:
+        self._s = session
+
+    @staticmethod
+    def _to_entity(row: BootstrapImportRow) -> BootstrapImport:
+        return BootstrapImport(
+            id=row.id,
+            state=row.state,
+            schema_version=row.schema_version,
+            content_sha256=row.content_sha256,
+            source_sha256=row.source_sha256,
+            source=dict(row.source),
+            manifest=dict(row.manifest),
+            principal_id=row.principal_id,
+            imported_by=row.imported_by,
+            verified_at=ensure_utc(row.verified_at),
+            committed_at=_dt(row.committed_at),
+            committed_by=row.committed_by,
+        )
+
+    def add(self, record: BootstrapImport) -> None:
+        self._s.add(
+            BootstrapImportRow(
+                id=record.id,
+                state=record.state,
+                schema_version=record.schema_version,
+                content_sha256=record.content_sha256,
+                source_sha256=record.source_sha256,
+                source=dict(record.source),
+                manifest=dict(record.manifest),
+                principal_id=record.principal_id,
+                imported_by=record.imported_by,
+                verified_at=record.verified_at,
+                committed_at=record.committed_at,
+                committed_by=record.committed_by,
+            )
+        )
+        self._s.flush()
+
+    def get(self, import_id: str, *, for_update: bool = False) -> BootstrapImport | None:
+        stmt = select(BootstrapImportRow).where(BootstrapImportRow.id == import_id)
+        if for_update:
+            stmt = stmt.with_for_update()
+        row = self._s.scalar(stmt)
+        return self._to_entity(row) if row else None
+
+    def get_by_content(self, content_sha256: str) -> BootstrapImport | None:
+        row = self._s.scalars(
+            select(BootstrapImportRow)
+            .where(BootstrapImportRow.content_sha256 == content_sha256)
+            .order_by(BootstrapImportRow.id.desc())
+            .limit(1)
+        ).first()
+        return self._to_entity(row) if row else None
+
+    def save(self, record: BootstrapImport) -> None:
+        self._s.execute(
+            update(BootstrapImportRow)
+            .where(BootstrapImportRow.id == record.id)
+            .values(
+                state=record.state,
+                manifest=dict(record.manifest),
+                committed_at=record.committed_at,
+                committed_by=record.committed_by,
+            )
+        )
+        self._s.flush()
+
+    def list_all(self) -> Sequence[BootstrapImport]:
+        rows = self._s.scalars(
+            select(BootstrapImportRow).order_by(BootstrapImportRow.id.desc())
+        ).all()
+        return [self._to_entity(r) for r in rows]
+
+    def authoritative(self, *, for_update: bool = False) -> BootstrapImport | None:
+        stmt = select(BootstrapImportRow).where(BootstrapImportRow.state == "authoritative")
+        if for_update:
+            stmt = stmt.with_for_update()
+        row = self._s.scalars(stmt.order_by(BootstrapImportRow.id).limit(1)).first()
+        return self._to_entity(row) if row else None

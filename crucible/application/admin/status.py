@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from crucible.application.admin import audit, github
+from crucible.application.admin import audit, bootstrap, github
 from crucible.application.admin.context import AdminContext
 from crucible.application.admin.harnesses import list_harnesses, list_images
 from crucible.application.admin.providers import providers_status
@@ -113,6 +113,8 @@ async def status(ctx: AdminContext, uow: UnitOfWork) -> dict[str, Any]:
         "tasks": tasks(uow),
         "wakes": wakes(uow),
         "retention": retention(uow),
+        # 25: the bootstrap import is CLI-and-API in C6; its state is exposed here.
+        "bootstrap": bootstrap.status_part(uow),
         "audit": {"cursor": audit.tail(uow, cursor=None, limit=1)["next_cursor"]},
     }
 

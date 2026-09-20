@@ -1,0 +1,222 @@
+{
+  "schema_version": "1.0",
+  "source": {
+    "tool": "foundry-ledger 0.1.0",
+    "db_sha256": "692cb466b07994814859e044c17f7db8b5a5bef9ab31e79eda3aff5eced50e97",
+    "exported_at": "2026-09-18 23:14 CDT",
+    "migrated": null
+  },
+  "tasks": [
+    {
+      "id": "EX-0001",
+      "title": "Bootstrap the example project",
+      "parent": null,
+      "project": "example",
+      "repository": "/opt/example/widget",
+      "scope": "docs/, config/, root shims",
+      "objective": "Establish the example project's identity, ledger, and delivery policy so that later tasks can be delegated with confidence.",
+      "contract": {
+        "acceptance": [
+          "docs/identity.md exists and names the operator's duties",
+          "each task file has the full field set"
+        ],
+        "verification": "the operator reviews the repository and records the result",
+        "constraints": "no implementation code"
+      },
+      "model": "example-model-1",
+      "harness": "example-harness",
+      "execution": "example-harness session alpha",
+      "state": "done",
+      "created": "2026-03-01 09:00 CST",
+      "updated": "2026-03-10 08:05 CDT",
+      "refs": {
+        "branch": "main"
+      },
+      "last_report": "All bootstrap items complete; awaiting the operator's review of the repository",
+      "evidence": [
+        "docs/identity.md"
+      ],
+      "blockers": [],
+      "decisions_pending": [
+        "Whether to publish the example repository (outward-facing, so it waits for the operator's word)"
+      ]
+    },
+    {
+      "id": "EX-0002",
+      "title": "Verify the example resumes in each harness",
+      "parent": "EX-0001",
+      "project": "example",
+      "repository": "/opt/example/widget",
+      "scope": "docs/harness only, plus ledger updates",
+      "objective": "In each harness, start a session, confirm it loads the identity file, and report live tasks correctly.",
+      "contract": {
+        "acceptance": "docs/harness.md lists each harness with the output seen",
+        "verification": "the operator repeats the listed command and gets matching output",
+        "constraints": "read-only sessions"
+      },
+      "model": null,
+      "harness": "harness-a, harness-b",
+      "execution": "harness-a session beta; harness-b session gamma",
+      "state": "done",
+      "created": "2026-03-01 09:05 CST",
+      "updated": "2026-03-02 09:15 CST",
+      "refs": {},
+      "last_report": null,
+      "evidence": [
+        "docs/harness.md"
+      ],
+      "blockers": [],
+      "decisions_pending": []
+    },
+    {
+      "id": "EX-0003",
+      "title": "Publish the example project as a public repository",
+      "parent": null,
+      "project": "example",
+      "repository": "/opt/example/widget",
+      "scope": "public/private split of the example repository, new remote, first push, and a sanitized set of examples",
+      "objective": "The repository exists on the forge, public, with README, CONTRIBUTING, SECURITY; nothing private in the tree or the history",
+      "contract": {
+        "acceptance": [
+          "secret scan clean over the full history",
+          "every file in every commit read by a person"
+        ],
+        "verification": "the operator reviews the pushed repository",
+        "constraints": "Scan and read first, push second; the operator's go is recorded in events.jsonl"
+      },
+      "model": "example-model-1",
+      "harness": "example-harness",
+      "execution": "example-harness session delta",
+      "state": "proposed",
+      "created": "2026-03-10 08:00 CDT",
+      "updated": "2026-03-10 08:00 CDT",
+      "refs": {},
+      "last_report": null,
+      "evidence": [],
+      "blockers": [],
+      "decisions_pending": []
+    },
+    {
+      "id": "EX-0004",
+      "title": "Survey a prior-art tool for the example specification",
+      "parent": "EX-0003",
+      "project": "example",
+      "repository": null,
+      "scope": "read-only: the tool's public documentation",
+      "objective": "Classify the tool's containment concepts for the example specification",
+      "contract": {
+        "acceptance": "survey answers purpose, license, containment mechanism, reusable concepts",
+        "verification": [
+          "file and URL citations"
+        ],
+        "constraints": "the operator reads the report"
+      },
+      "model": "read-only",
+      "harness": "example-harness",
+      "execution": "example-harness (explore agent)",
+      "state": "proposed",
+      "created": "2026-03-10 08:05 CDT",
+      "updated": "2026-03-10 08:05 CDT",
+      "refs": {},
+      "last_report": null,
+      "evidence": [],
+      "blockers": [],
+      "decisions_pending": []
+    }
+  ],
+  "events": [
+    {
+      "seq": 1,
+      "ts": "2026-03-01 08:30 CST",
+      "task": "EX-0001",
+      "event": "bootstrap contract received",
+      "who": "operator",
+      "detail": "docs/contract.md"
+    },
+    {
+      "seq": 2,
+      "ts": "2026-03-01 09:05 CST",
+      "task": "EX-0002",
+      "event": "proposed",
+      "who": "operator",
+      "detail": ""
+    },
+    {
+      "seq": 3,
+      "ts": "2026-03-01 09:05 CST",
+      "task": "EX-0002",
+      "event": "dispatched",
+      "who": "operator",
+      "detail": "two explore agents, read-only"
+    },
+    {
+      "seq": 4,
+      "ts": "2026-03-01 09:05 CST",
+      "task": "EX-0001",
+      "event": "running",
+      "who": "operator",
+      "detail": "identity and ledger written; harness verification pending"
+    },
+    {
+      "seq": 5,
+      "ts": "2026-03-02 09:15 CST",
+      "task": "EX-0002",
+      "event": "done",
+      "who": "operator",
+      "detail": "both harnesses passed; evidence in docs/harness.md"
+    },
+    {
+      "seq": 6,
+      "ts": "2026-03-02 09:15 CST",
+      "task": "EX-0001",
+      "event": "unblocked",
+      "who": "operator",
+      "detail": "EX-0002 done"
+    },
+    {
+      "seq": 7,
+      "ts": "2026-03-02 17:30 CST",
+      "task": "EX-0001",
+      "event": "reported",
+      "who": "operator",
+      "detail": "bootstrap complete pending the operator's review"
+    },
+    {
+      "seq": 8,
+      "ts": "2026-03-10 08:00 CDT",
+      "task": "EX-0001",
+      "event": "accepted",
+      "who": "operator",
+      "detail": "Bootstrap looks good to me. Move on to EX-0003 when ready."
+    },
+    {
+      "seq": 9,
+      "ts": "2026-03-10 08:00 CDT",
+      "task": "EX-0003",
+      "event": "go",
+      "who": "operator",
+      "detail": "Set up the remote and publish. Read every file and every commit for private material first."
+    },
+    {
+      "seq": 10,
+      "ts": "2026-03-10 08:05 CDT",
+      "task": "EX-0003",
+      "event": "proposed",
+      "who": "operator",
+      "detail": "publication task opened after the go"
+    },
+    {
+      "seq": 11,
+      "ts": "2026-03-10 08:05 CDT",
+      "task": "EX-0001",
+      "event": "done",
+      "who": "operator",
+      "detail": "closed"
+    }
+  ],
+  "counts": {
+    "tasks": 4,
+    "events": 11
+  },
+  "content_sha256": "a565127c4092bcf68af34744f84d4c873c424c06d6a2cc4fa8aefb1238183b15"
+}

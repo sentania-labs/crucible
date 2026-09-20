@@ -144,6 +144,9 @@ class Attempt:
     # repeat inside one instant, so the hash alone does not identify the position.
     log_resume_occurrence: int = 0
     cleaned_up_at: datetime | None = None
+    # 15: an attempt imported from the bootstrap ledger stands for a worker Crucible never
+    # ran and cannot observe. The supervisor's scans skip it; the task view shows it.
+    unsupervised: bool = False
 
 
 @dataclass(slots=True)
@@ -414,6 +417,25 @@ class HarnessState:
     last_launch_outcome: str | None = None
     last_auth_failure_at: datetime | None = None
     last_validated_at: datetime | None = None
+
+
+@dataclass(slots=True)
+class BootstrapImport:
+    """One imported bootstrap bundle (15): `verified` once its records are written,
+    `authoritative` once committed. `manifest` is the verification report of step 4."""
+
+    id: str
+    state: str
+    schema_version: str
+    content_sha256: str
+    source_sha256: str
+    source: dict[str, Any]
+    manifest: dict[str, Any]
+    principal_id: str
+    imported_by: str
+    verified_at: datetime
+    committed_at: datetime | None = None
+    committed_by: str | None = None
 
 
 @dataclass(slots=True)

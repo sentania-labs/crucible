@@ -5,7 +5,7 @@ its next tick, because execution and attempt rows are fenced to the supervisor (
 from __future__ import annotations
 
 from crucible.application.errors import ContractValidationError, NotFoundError
-from crucible.application.transitions import move_task
+from crucible.application.transitions import move_task, require_contract
 from crucible.contracts.api import StartRequest
 from crucible.contracts.task_contract import TaskContractV1
 from crucible.domain.entities import Principal, Task
@@ -21,8 +21,7 @@ def start_task(
     task = uow.tasks.get(task_id, for_update=True)
     if task is None:
         raise NotFoundError(f"task {task_id} not found")
-    stored = uow.contracts.get(task.id, task.contract_version)
-    assert stored is not None
+    stored = require_contract(uow, task)
     contract = TaskContractV1.model_validate(stored.document)
     problems = []
     req = contract.execution_request
