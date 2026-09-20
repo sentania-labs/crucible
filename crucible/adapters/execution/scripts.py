@@ -35,6 +35,7 @@ __all__ = [
     "encode_check_id",
     "preparer_script",
     "publisher_script",
+    "quota_checkpoint_push_script",
     "verifier_script",
 ]
 
@@ -213,7 +214,6 @@ def collector_script(
     work_branch: str,
     size_cap_bytes: int,
     quota_attempt_id: str | None = None,
-    quota_push_url: str | None = None,
 ) -> str:
     """Produce the full diff, the path list, the head, the log, the bundle, and a copy
     of the report directory (08). Never a push, never a network: `--network none`."""
@@ -225,7 +225,6 @@ WORK_BRANCH={_quote(work_branch)}
 BASE_REF={_quote(base_ref)}
 SIZE_CAP={_quote(str(size_cap_bytes))}
 QUOTA_ATTEMPT={_quote(quota_attempt_id or "")}
-QUOTA_PUSH_URL={_quote(quota_push_url or "")}
 mkdir -p "$OUT"
 : > "$OUT/copy-rejections.tsv"
 {_COPY_REPORT}
@@ -235,13 +234,6 @@ if [ -n "$QUOTA_ATTEMPT" ]; then
     {GIT} -C "$REPO" commit -q \
       -m "wip(crucible): attempt $QUOTA_ATTEMPT" \
       -m "Crucible-Attempt: $QUOTA_ATTEMPT"
-  fi
-  if [ -n "$QUOTA_PUSH_URL" ]; then
-    {GIT} -C "$REPO" remote set-url origin "$QUOTA_PUSH_URL"
-    {GIT} -C "$REPO" remote set-url --push origin "$QUOTA_PUSH_URL"
-    {GIT} -C "$REPO" \
-      -c 'remote.origin.receivepack=git -c safe.directory=* receive-pack' \
-      push origin "HEAD:refs/heads/$WORK_BRANCH"
   fi
 fi
 BASE=$({GIT} -C "$REPO" rev-parse --verify --quiet "$BASE_REF" \
@@ -270,6 +262,24 @@ rm -rf "$OUT/tree"
 {GIT} clone --no-hardlinks --quiet "$REPO" "$OUT/tree" > "$OUT/clone.log" 2>&1 || true
 copy_report "{REPORT_MOUNT}" "$OUT/report" "$SIZE_CAP"
 echo done > "$OUT/collector.ok"
+"""
+
+
+def quota_checkpoint_push_script(work_branch: str) -> str:
+    """Push an already collected checkpoint after Crucible's safety gates pass."""
+    return f"""set -eu
+{GIT_ENV}
+REPO={REPO_MOUNT}
+ORIGIN={ORIGIN_MOUNT}
+WORK_BRANCH={_quote(work_branch)}
+HEAD=$({GIT} -C "$REPO" rev-parse HEAD)
+{GIT} -C "$REPO" remote set-url origin "$ORIGIN"
+{GIT} -C "$REPO" remote set-url --push origin "$ORIGIN"
+{GIT} -C "$REPO" \
+  -c 'remote.origin.receivepack=git -c safe.directory=* receive-pack' \
+  push origin "HEAD:refs/heads/$WORK_BRANCH"
+REMOTE=$({GIT} --git-dir "$ORIGIN" rev-parse "refs/heads/$WORK_BRANCH")
+test "$REMOTE" = "$HEAD"
 """
 
 

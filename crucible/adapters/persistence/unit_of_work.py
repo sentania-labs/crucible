@@ -685,6 +685,8 @@ class PoolExhaustions:
         if row is None:
             row = PoolExhaustionRow(pool=mark.pool)
             self._s.add(row)
+        elif row.cleared_at is None and ensure_utc(row.reset_at) > mark.reset_at:
+            mark.reset_at = ensure_utc(row.reset_at)
         row.exhausted_at = mark.exhausted_at
         row.reset_at = mark.reset_at
         row.task_id = mark.task_id

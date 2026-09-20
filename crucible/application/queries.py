@@ -124,6 +124,17 @@ def _execution_summary(
     )
 
 
+def _all_task_events(uow: UnitOfWork, task_id: str) -> list[Any]:
+    events: list[Any] = []
+    after_seq = 0
+    while True:
+        page = list(uow.events.list_for_task(task_id, after_seq=after_seq, limit=1000))
+        events.extend(page)
+        if len(page) < 1000:
+            return events
+        after_seq = int(page[-1].seq or after_seq)
+
+
 def task_view(uow: UnitOfWork, task_id: str) -> TaskView:
     task = uow.tasks.get(task_id)
     if task is None:
@@ -133,7 +144,7 @@ def task_view(uow: UnitOfWork, task_id: str) -> TaskView:
     versions = uow.contracts.list_for_task(task.id)
     current = next((v for v in versions if v.version == task.contract_version), None)
     executions = uow.executions.list_for_task(task.id)
-    task_events = uow.events.list_for_task(task.id, after_seq=0, limit=1000)
+    task_events = _all_task_events(uow, task.id)
     reroute_from = {
         str(event.payload["to_attempt_id"]): str(event.payload["from_attempt_id"])
         for event in task_events

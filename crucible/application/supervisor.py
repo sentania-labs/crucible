@@ -31,7 +31,7 @@ from crucible.application.decisions import (
 from crucible.application.delivery_tick import DeliveryConfig, DeliveryCoordinator
 from crucible.application.errors import ApplicationError
 from crucible.application.evidence import record_collection_evidence
-from crucible.application.gates import evaluate_and_advance
+from crucible.application.gates import evaluate_and_advance, gate_input
 from crucible.application.harnesses import (
     HarnessRegistry,
     effective_mount_mode,
@@ -78,6 +78,7 @@ from crucible.domain.entities import (
 )
 from crucible.domain.events import PRINCIPAL_CRUCIBLE, EventKind
 from crucible.domain.exit_class import ExitClass, classify_exit
+from crucible.domain.gates import GateName, GateResult, evaluate_gate
 from crucible.domain.ids import new_id
 from crucible.domain.lifecycle import (
     ATTEMPT_TERMINAL,
@@ -373,6 +374,7 @@ class Supervisor:
             return result
         try:
             result.orphans = await self._reconcile_provider_handles()
+            await self._resume_quota_checkpoints()
             await self._db(self._resume_quota_waits)
             await self._db(self._materialize_scheduled)
             result.launched = await self._launch_pending()
@@ -1023,6 +1025,10 @@ class Supervisor:
     def _harness_busy(self, execution: Execution) -> str | None:
         """05b: per-harness concurrency, which is 1 whenever the credential mounts
         rw-narrow (12). A launch over the limit waits; it is not a failure."""
+        with self._uow_factory() as uow:
+            return self._harness_busy_in_uow(uow, execution)
+
+    def _harness_busy_in_uow(self, uow: UnitOfWork, execution: Execution) -> str | None:
         policy = execution.policy_snapshot or {}
         limit = int(
             (policy.get("concurrency", {}).get("per_harness") or {}).get(execution.harness, 1)
@@ -1033,24 +1039,23 @@ class Supervisor:
             source = self._credential_sources.get(execution.harness)
             if effective_mount_mode(credential, source) is MountMode.RW_NARROW:
                 limit = 1
-        with self._uow_factory() as uow:
-            # An attempt holds its credential copy until collect has synced it back and
-            # removed it, which is after `exited`: a second seeding before that is the
-            # refresh race 12 gives as the reason for the cap.
-            live = uow.attempts.list_in_states(
-                [
-                    AttemptState.PREPARING,
-                    AttemptState.LAUNCHING,
-                    AttemptState.RUNNING,
-                    AttemptState.TERMINATING,
-                    AttemptState.EXITED,
-                ]
-            )
-            running = 0
-            for other in live:
-                other_execution = uow.executions.get(other.execution_id)
-                if other_execution is not None and other_execution.harness == execution.harness:
-                    running += 1
+        # An attempt holds its credential copy until collect has synced it back and
+        # removed it, which is after `exited`: a second seeding before that is the
+        # refresh race 12 gives as the reason for the cap.
+        live = uow.attempts.list_in_states(
+            [
+                AttemptState.PREPARING,
+                AttemptState.LAUNCHING,
+                AttemptState.RUNNING,
+                AttemptState.TERMINATING,
+                AttemptState.EXITED,
+            ]
+        )
+        running = 0
+        for other in live:
+            other_execution = uow.executions.get(other.execution_id)
+            if other_execution is not None and other_execution.harness == execution.harness:
+                running += 1
         if running >= limit:
             return f"{running} of {limit} {execution.harness} worker(s) already running"
         return None
@@ -1115,7 +1120,34 @@ class Supervisor:
         with self._uow_factory() as uow:
             return self._selection_for(uow, item)
 
-    def _mark_routed_launching(self, item: _Pending) -> bool:
+    @staticmethod
+    def _selection_is_quota_blocked(selection: Any) -> bool:
+        if selection is None:
+            return False
+        relevant: list[list[str]] = []
+        disqualifying = (
+            "not the operator pin",
+            "harness does not match the operator pin",
+            "model disabled",
+            "harness disabled or has no credential",
+            "capability ",
+            "selected harness has no default image",
+        )
+        for candidate in selection.candidates:
+            reasons = [str(reason) for reason in candidate.get("excluded", [])]
+            if any(reason.startswith(disqualifying) for reason in reasons):
+                continue
+            relevant.append(reasons)
+        return bool(relevant) and all(
+            reasons
+            and all(
+                reason.startswith("pool exhausted until ") or reason == "pool is at its soft limit"
+                for reason in reasons
+            )
+            for reasons in relevant
+        )
+
+    def _route_pending(self, item: _Pending) -> _Pending | None:
         with self._fenced() as uow:
             attempt = uow.attempts.get(item.attempt.id, for_update=True)
             task = uow.tasks.get(item.task.id, for_update=True)
@@ -1125,13 +1157,16 @@ class Supervisor:
                 TaskState.SCHEDULED,
                 TaskState.RUNNING,
             ):
-                return False
+                return None
             current = replace(item, attempt=attempt, execution=execution, task=task)
             selection = self._selection_for(uow, current)
             if selection is None or selection.selected is None or selection.image is None:
-                self._enter_quota_wait(uow, task, attempt, execution, selection)
+                if self._selection_is_quota_blocked(selection):
+                    self._enter_quota_wait(uow, task, attempt, execution, selection)
+                else:
+                    self._refuse_unroutable(uow, task, attempt, execution, selection)
                 uow.commit()
-                return False
+                return None
             chosen = selection.selected
             attempt.selected_model = chosen.id
             attempt.selected_harness = chosen.harness
@@ -1141,6 +1176,24 @@ class Supervisor:
             execution.model = chosen.id
             execution.harness = chosen.harness
             execution.image = selection.image
+            busy = self._harness_busy_in_uow(uow, execution)
+            if busy is not None:
+                latest = uow.events.latest_for_task_kind(
+                    attempt.task_id, EventKind.HARNESS_LAUNCH_DEFERRED.value
+                )
+                if latest is None or latest.payload.get("attempt_id") != attempt.id:
+                    record_event(
+                        uow,
+                        self._clock,
+                        EventKind.HARNESS_LAUNCH_DEFERRED,
+                        principal=PRINCIPAL_CRUCIBLE,
+                        task_id=attempt.task_id,
+                        execution_id=attempt.execution_id,
+                        attempt_id=attempt.id,
+                        payload={"attempt_id": attempt.id, "detail": busy},
+                    )
+                uow.commit()
+                return None
             uow.attempts.save(attempt)
             uow.executions.save(execution)
             move_attempt(
@@ -1179,7 +1232,38 @@ class Supervisor:
                 },
             )
             uow.commit()
-            return True
+            return replace(item, attempt=attempt, execution=execution, task=task)
+
+    def _refuse_unroutable(
+        self,
+        uow: UnitOfWork,
+        task: Task,
+        attempt: Attempt,
+        execution: Execution,
+        selection: Any,
+    ) -> None:
+        now = self._clock.now()
+        attempt.exit_class = ExitClass.ENVIRONMENT
+        attempt.ended_at = now
+        attempt.ordered_candidates = list(selection.candidates) if selection else []
+        uow.attempts.save(attempt)
+        move_attempt(uow, self._clock, attempt, AttemptState.COLLECTED, EventKind.ATTEMPT_COLLECTED)
+        move_attempt(uow, self._clock, attempt, AttemptState.FAILED, EventKind.ATTEMPT_FAILED)
+        if execution.state is ExecutionState.CREATED:
+            move_execution(
+                uow, self._clock, execution, ExecutionState.ACTIVE, EventKind.EXECUTION_ACTIVE
+            )
+        move_execution(
+            uow,
+            self._clock,
+            execution,
+            ExecutionState.FAILED,
+            EventKind.EXECUTION_FAILED,
+            payload={"reason": "no eligible routing candidate"},
+        )
+        if task.state is TaskState.SCHEDULED:
+            move_task(uow, self._clock, task, TaskState.RUNNING, EventKind.TASK_RUNNING)
+        self._task_reported(uow, task, attempt, ExitClass.ENVIRONMENT, {})
 
     async def _launch_one(self, item: _Pending) -> bool:
         attempt, execution, task = item.attempt, item.execution, item.task
@@ -1187,24 +1271,15 @@ class Supervisor:
         if not review:
             selection = await self._db(partial(self._preview_route, item))
             if selection is None or selection.selected is None or selection.image is None:
-                await self._db(partial(self._mark_routed_launching, item))
+                await self._db(partial(self._route_pending, item))
                 return False
-            attempt = replace(
-                attempt,
-                selected_model=selection.selected.id,
-                selected_harness=selection.selected.harness,
-                selected_image=selection.image,
-                selected_pool=selection.selected.pool,
-                ordered_candidates=list(selection.candidates),
-            )
             execution = replace(
                 execution,
                 model=selection.selected.id,
                 harness=selection.selected.harness,
                 image=selection.image,
             )
-            item = replace(item, attempt=attempt, execution=execution)
-        refusal = await self._db(partial(self._harness_gate, execution))
+        refusal = await self._db(partial(self._harness_gate, execution)) if review else None
         if refusal is not None:
             # The same path an environment failure at prepare takes: the attempt and the
             # execution become active first, so the refusal can end them.
@@ -1225,10 +1300,18 @@ class Supervisor:
             # A second attempt on the same repository and branch waits; it is not a
             # failure, and nothing of the holder's checkout is disturbed (10).
             return False
-        if review:
-            if not await self._db(partial(self._mark_preparing, attempt.id)):
+        if not review:
+            routed = await self._db(partial(self._route_pending, item))
+            if routed is None:
+                await self._db(partial(self._release_attempt_checkout, attempt.id))
                 return False
-        elif not await self._db(partial(self._mark_routed_launching, item)):
+            item = routed
+            attempt, execution, task = item.attempt, item.execution, item.task
+            refusal = await self._db(partial(self._harness_gate, execution))
+            if refusal is not None:
+                await self._db(partial(self._refuse_launch, attempt.id, "registry", refusal))
+                return False
+        elif not await self._db(partial(self._mark_preparing, attempt.id)):
             return False
         spec = self._build_spec(attempt, execution, task, item.contract, item.repository_url)
         try:
@@ -1243,6 +1326,8 @@ class Supervisor:
         self._workspaces[attempt.id] = ws
         await self._db(partial(self._record_prepared, attempt.id, ws))
         if not await self._db(partial(self._mark_launching, attempt.id, ws)):
+            await self._discard(provider, ws, spec)
+            self._workspaces.pop(attempt.id, None)
             return False
         try:
             handle = await provider.launch(ws, spec)
@@ -1310,6 +1395,13 @@ class Supervisor:
             uow.commit()
             return True
 
+    def _release_attempt_checkout(self, attempt_id: str) -> None:
+        with self._fenced() as uow:
+            attempt = uow.attempts.get(attempt_id)
+            if attempt is not None:
+                self._release_checkout_leases(uow, attempt)
+            uow.commit()
+
     def _mark_launching(self, attempt_id: str, ws: Workspace) -> bool:
         """Reserve the quota pool and move to launching in one fenced transaction (05b).
 
@@ -1342,15 +1434,6 @@ class Supervisor:
                     attempt_id=attempt.id,
                     payload={"pool": reservation.pool, "detail": reservation.detail},
                 )
-                create_wake(
-                    uow,
-                    self._clock,
-                    principal_id=task.principal_id,
-                    reason=WakeReason.QUOTA_EXHAUSTED,
-                    summary=reservation.detail,
-                    task=task,
-                    attempt_id=attempt.id,
-                )
                 move_attempt(
                     uow,
                     self._clock,
@@ -1359,7 +1442,21 @@ class Supervisor:
                     EventKind.ATTEMPT_COLLECTED,
                     payload={"exit_class": ExitClass.QUOTA_EXHAUSTED.value},
                 )
-                self._classify_and_finish(uow, attempt, None)
+                if execution.role is ExecutionRole.REVIEW:
+                    self._classify_and_finish(uow, attempt, None)
+                    uow.commit()
+                    return False
+                move_attempt(
+                    uow,
+                    self._clock,
+                    attempt,
+                    AttemptState.FAILED,
+                    EventKind.ATTEMPT_FAILED,
+                    payload={"exit_class": ExitClass.QUOTA_EXHAUSTED.value, "phase": "reserve"},
+                )
+                self._release_checkout_leases(uow, attempt)
+                self._record_bare_evidence(uow, attempt)
+                self._handle_quota_exit(uow, task, execution, attempt, source="reserve")
                 uow.commit()
                 return False
             self._ensure_metrics(uow, attempt, execution, reservation)
@@ -2008,17 +2105,98 @@ class Supervisor:
             )
         )
         if await self._db(partial(self._quota_checkpoint_pending, attempt.id)):
-            repository_url = spec.repository_url if spec is not None else ""
-            required = provider_name == "docker" and not (
-                repository_url.startswith("/") or repository_url.startswith("file://")
-            )
-            pushed, detail = await self.delivery.push_quota_checkpoint(
-                attempt.id, required=required
-            )
-            await self._db(partial(self._finish_deferred_quota, attempt.id, pushed, detail))
+            await self._complete_quota_checkpoint(attempt.id)
         self._handles.pop(attempt.id, None)
         self._workspaces.pop(attempt.id, None)
         return True
+
+    def _pending_quota_checkpoints(self) -> list[str]:
+        with self._uow_factory() as uow:
+            return [
+                attempt.id
+                for attempt in uow.attempts.list_in_states(
+                    [AttemptState.COLLECTED, AttemptState.FAILED]
+                )
+                if attempt.exit_class is ExitClass.QUOTA_EXHAUSTED
+                and (execution := uow.executions.get(attempt.execution_id)) is not None
+                and execution.state is ExecutionState.ACTIVE
+                and (task := uow.tasks.get(attempt.task_id)) is not None
+                and task.state is TaskState.RUNNING
+                and not self._quota_checkpoint_has_disposition(uow, attempt)
+            ]
+
+    def _quota_checkpoint_has_disposition(self, uow: UnitOfWork, attempt: Attempt) -> bool:
+        return any(
+            event.attempt_id == attempt.id
+            and event.kind
+            in {
+                EventKind.TASK_REROUTED.value,
+                EventKind.TASK_AWAITING_QUOTA.value,
+            }
+            for event in self._all_task_events(uow, attempt.task_id)
+        )
+
+    async def _resume_quota_checkpoints(self) -> None:
+        for attempt_id in await self._db(self._pending_quota_checkpoints):
+            await self._complete_quota_checkpoint(attempt_id)
+
+    def _quota_checkpoint_safety(self, attempt_id: str) -> tuple[bool, str]:
+        with self._uow_factory() as uow:
+            attempt = uow.attempts.get(attempt_id)
+            assert attempt is not None
+            task = uow.tasks.get(attempt.task_id)
+            execution = uow.executions.get(attempt.execution_id)
+            assert task is not None and execution is not None
+            inputs = gate_input(uow, task=task, attempt=attempt, execution=execution)
+            outcomes = {
+                gate.value: evaluate_gate(gate.value, inputs)
+                for gate in (
+                    GateName.SCOPE_CONTAINED,
+                    GateName.NO_INJECTED_FILES,
+                    GateName.NO_SECRETS,
+                )
+            }
+        failures = [
+            f"{gate}: {outcome.detail}"
+            for gate, outcome in outcomes.items()
+            if outcome.result is not GateResult.PASS
+        ]
+        return (not failures, "; ".join(failures) or "checkpoint safety gates passed")
+
+    async def _complete_quota_checkpoint(self, attempt_id: str) -> None:
+        safe, detail = await self._db(partial(self._quota_checkpoint_safety, attempt_id))
+        if not safe:
+            await self._db(partial(self._finish_deferred_quota, attempt_id, False, detail))
+            return
+        attempt = await self._db(lambda: self._attempt_by_id(attempt_id))
+        if attempt is None:
+            return
+        spec = await self._db(partial(self._spec_for, attempt))
+        if spec is None:
+            await self._db(
+                partial(
+                    self._finish_deferred_quota,
+                    attempt_id,
+                    False,
+                    "the checkpoint has no reconstructable launch specification",
+                )
+            )
+            return
+        provider_name = await self._db(partial(self._execution_provider_name, attempt))
+        provider = self._provider(provider_name)
+        local_push = getattr(provider, "push_quota_checkpoint", None)
+        outcome = await local_push(self._workspace_for(attempt), spec) if local_push else None
+        if outcome is None:
+            repository_url = spec.repository_url
+            required = provider_name == "docker" and not (
+                repository_url.startswith("/") or repository_url.startswith("file://")
+            )
+            outcome = await self.delivery.push_quota_checkpoint(attempt_id, required=required)
+        await self._db(partial(self._finish_deferred_quota, attempt_id, *outcome))
+
+    def _attempt_by_id(self, attempt_id: str) -> Attempt | None:
+        with self._uow_factory() as uow:
+            return uow.attempts.get(attempt_id)
 
     def _quota_checkpoint_pending(self, attempt_id: str) -> bool:
         with self._uow_factory() as uow:
@@ -2032,6 +2210,7 @@ class Supervisor:
                 and execution.state is ExecutionState.ACTIVE
                 and task is not None
                 and task.state is TaskState.RUNNING
+                and not self._quota_checkpoint_has_disposition(uow, attempt)
             )
 
     def _finish_deferred_quota(self, attempt_id: str, pushed: bool, detail: str) -> None:
@@ -2771,8 +2950,11 @@ class Supervisor:
             return
         routing, _ = context
         now = self._clock.now()
-        reset = reset_at or now + timedelta(
-            seconds=routing.pools[attempt.selected_pool].default_cooldown_seconds
+        reset, parsed_reset = self._bounded_quota_reset(
+            now,
+            reset_at,
+            max_seconds=routing.reroute.resume_max_wait_seconds,
+            default_seconds=routing.pools[attempt.selected_pool].default_cooldown_seconds,
         )
         mark = uow.pool_exhaustions.put(
             PoolExhaustion(
@@ -2784,6 +2966,7 @@ class Supervisor:
                 reason="harness reported quota_exhausted",
             )
         )
+
         record_event(
             uow,
             self._clock,
@@ -2795,12 +2978,26 @@ class Supervisor:
             payload={
                 "pool": mark.pool,
                 "reset_at": mark.reset_at.isoformat(),
-                "source": "harness" if reset_at else "policy_default_cooldown",
+                "source": "harness" if parsed_reset else "policy_default_cooldown",
             },
         )
 
+    @staticmethod
+    def _bounded_quota_reset(
+        now: Any, candidate: Any, *, max_seconds: int, default_seconds: int
+    ) -> tuple[Any, Any]:
+        latest = now + timedelta(seconds=max_seconds)
+        accepted = candidate if candidate is not None and now < candidate <= latest else None
+        return accepted or now + timedelta(seconds=default_seconds), accepted
+
     def _handle_quota_exit(
-        self, uow: UnitOfWork, task: Task, execution: Execution, attempt: Attempt
+        self,
+        uow: UnitOfWork,
+        task: Task,
+        execution: Execution,
+        attempt: Attempt,
+        *,
+        source: str = "worker",
     ) -> None:
         context = self._routing_context(uow, task, execution)
         if context is None:
@@ -2813,9 +3010,9 @@ class Supervisor:
         reroutes = sum(
             event.kind == EventKind.TASK_REROUTED.value
             and int(event.payload.get("contract_version", 0)) == execution.contract_version
-            for event in uow.events.list_for_task(task.id, after_seq=0, limit=1000)
+            for event in self._all_task_events(uow, task.id)
         )
-        if task.head_sha:
+        if task.head_sha and source == "worker":
             record_event(
                 uow,
                 self._clock,
@@ -2847,11 +3044,6 @@ class Supervisor:
         if selection is not None and selection.selected is not None and selection.image is not None:
             nxt = self._create_attempt(uow, execution, number=attempt.number + 1)
             nxt.resume_from_remote = True
-            nxt.selected_model = selection.selected.id
-            nxt.selected_harness = selection.selected.harness
-            nxt.selected_image = selection.image
-            nxt.selected_pool = selection.selected.pool
-            nxt.ordered_candidates = list(selection.candidates)
             uow.attempts.save(nxt)
             move_task(
                 uow,
@@ -2866,15 +3058,29 @@ class Supervisor:
                     "from_attempt_id": attempt.id,
                     "from_pool": attempt.selected_pool,
                     "to_attempt_id": nxt.id,
-                    "model": selection.selected.id,
-                    "harness": selection.selected.harness,
-                    "why": "previous pool reported quota exhaustion",
-                    "wip_commit_sha": task.head_sha,
+                    "why": (
+                        "previous pool reported quota exhaustion"
+                        if source == "worker"
+                        else "launch reservation found the selected pool unavailable"
+                    ),
+                    "source": source,
+                    **({"wip_commit_sha": task.head_sha} if source == "worker" else {}),
                     "ordered_candidates": list(selection.candidates),
                 },
             )
             return
         self._enter_quota_wait(uow, task, attempt, execution, selection)
+
+    @staticmethod
+    def _all_task_events(uow: UnitOfWork, task_id: str) -> list[Any]:
+        events: list[Any] = []
+        after_seq = 0
+        while True:
+            page = list(uow.events.list_for_task(task_id, after_seq=after_seq, limit=1000))
+            events.extend(page)
+            if len(page) < 1000:
+                return events
+            after_seq = int(page[-1].seq or after_seq)
 
     def _resume_quota_waits(self) -> None:
         with self._fenced() as uow:
@@ -2894,23 +3100,6 @@ class Supervisor:
                 attempt = attempts[-1]
                 stored = uow.contracts.get(task.id, execution.contract_version)
                 assert stored is not None
-                selection = self._selection_for(
-                    uow, _Pending(attempt, execution, task, stored.document)
-                )
-                if selection is not None and selection.selected is not None:
-                    task.resume_at = None
-                    uow.tasks.save(task)
-                    move_task(
-                        uow,
-                        self._clock,
-                        task,
-                        TaskState.SCHEDULED,
-                        EventKind.TASK_QUOTA_RESUMED,
-                        execution_id=execution.id,
-                        attempt_id=attempt.id,
-                        payload={"model": selection.selected.id, "pool": selection.selected.pool},
-                    )
-                    continue
                 context = self._routing_context(uow, task, execution)
                 if context is None:
                     continue
@@ -2927,6 +3116,23 @@ class Supervisor:
                         payload={"exit_class": "quota_exhausted", "wait_cap_exceeded": True},
                     )
                     self._task_reported(uow, task, attempt, ExitClass.QUOTA_EXHAUSTED, {})
+                    continue
+                selection = self._selection_for(
+                    uow, _Pending(attempt, execution, task, stored.document)
+                )
+                if selection is not None and selection.selected is not None:
+                    task.resume_at = None
+                    uow.tasks.save(task)
+                    move_task(
+                        uow,
+                        self._clock,
+                        task,
+                        TaskState.SCHEDULED,
+                        EventKind.TASK_QUOTA_RESUMED,
+                        execution_id=execution.id,
+                        attempt_id=attempt.id,
+                        payload={"model": selection.selected.id, "pool": selection.selected.pool},
+                    )
                     continue
                 resets = self._class_pool_resets(uow, routing, contract)
                 task.resume_at = min(resets[0], deadline) if resets else deadline

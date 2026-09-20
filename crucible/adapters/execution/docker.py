@@ -129,6 +129,7 @@ ROLE_CLEANER = "cleaner"
 ROLE_COLLECTOR = "collector"
 ROLE_BUNDLE = "bundle-verifier"
 ROLE_VERIFIER = "verifier"
+ROLE_QUOTA_CHECKPOINT = "quota-checkpoint"
 # The per-attempt credential copy, as a workspace leaf and the template subdirectory of
 # the identity bundle the read-only files on top of it come from (12).
 CREDENTIAL_LEAF = "credential"
@@ -946,14 +947,11 @@ class DockerProvider:
             )
             is ExitClass.QUOTA_EXHAUSTED
         )
-        local_origin = self._local_origin(spec.repository_url) if quota_checkpoint else None
         mounts = [
             self._daemon_mount(spec.attempt_id, "repo", REPO_MOUNT, read_only=not quota_checkpoint),
             self._daemon_mount(spec.attempt_id, "report", REPORT_MOUNT, read_only=True),
             self._daemon_mount(spec.attempt_id, "output", OUTPUT_MOUNT, read_only=False),
         ]
-        if local_origin is not None:
-            mounts.append(self._volume_mount(local_origin, scripts.ORIGIN_MOUNT, read_only=False))
         collector_exit = await self._run_throwaway(
             spec,
             role=ROLE_COLLECTOR,
@@ -962,7 +960,6 @@ class DockerProvider:
                 work_branch=work_branch,
                 size_cap_bytes=self.config.report_size_cap_bytes,
                 quota_attempt_id=spec.attempt_id if quota_checkpoint else None,
-                quota_push_url=scripts.ORIGIN_MOUNT if local_origin is not None else None,
             ),
             mounts=mounts,
             network="none",
@@ -1024,6 +1021,34 @@ class DockerProvider:
             workspace_state=state,
             copy_rejections=outputs.copy_rejections,
             credential_sync=credential_sync,
+        )
+
+    async def push_quota_checkpoint(
+        self, ws: Workspace, spec: LaunchSpec
+    ) -> tuple[bool, str] | None:
+        """Push a local-origin checkpoint only after the supervisor approves it."""
+        local_origin = self._local_origin(spec.repository_url)
+        if local_origin is None:
+            return None
+        repository = spec.contract.get("repository", {})
+        work_branch = ws.work_branch or str(
+            repository.get("work_branch") or f"crucible/{spec.external_id}"
+        )
+        code = await self._run_throwaway(
+            spec,
+            role=ROLE_QUOTA_CHECKPOINT,
+            script=scripts.quota_checkpoint_push_script(work_branch),
+            mounts=[
+                self._daemon_mount(spec.attempt_id, "repo", REPO_MOUNT, read_only=False),
+                self._volume_mount(local_origin, scripts.ORIGIN_MOUNT, read_only=False),
+            ],
+            network="none",
+            timeout=self.config.collector_timeout_seconds,
+        )
+        if code == 0:
+            return True, "checkpoint pushed to local origin"
+        return False, self.last_error.get(ROLE_QUOTA_CHECKPOINT) or (
+            f"quota checkpoint container exited {code}"
         )
 
     async def _run_verifier(self, spec: LaunchSpec) -> tuple[VerificationRun, ...]:

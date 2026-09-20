@@ -27,6 +27,7 @@ from crucible.ports.harness import (
 )
 
 NAME = "script-harness"
+QUOTA_PATTERNS = base.patterns("scripted_quota_exhausted")
 
 
 class ScriptHarnessAdapter:
@@ -34,7 +35,7 @@ class ScriptHarnessAdapter:
     supported_versions = VersionRange("1.0.0", "2.0.0")
 
     def quota_reset_at(self, stdout_tail: str, stderr_tail: str) -> datetime | None:
-        return base.quota_reset_at(stdout_tail, stderr_tail)
+        return base.quota_reset_at(stdout_tail, stderr_tail, quota=QUOTA_PATTERNS)
 
     def capabilities(self) -> HarnessCapabilities:
         return HarnessCapabilities(
@@ -68,5 +69,5 @@ class ScriptHarnessAdapter:
             stdout_tail,
             stderr_tail,
             auth=(),
-            quota=base.patterns("scripted_quota_exhausted"),
+            quota=QUOTA_PATTERNS,
         )

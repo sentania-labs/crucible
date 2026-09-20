@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from crucible.application.routing import select_model
+from crucible.application.supervisor import Supervisor
 from crucible.contracts.policy import RoutingPolicyV1
 from crucible.domain.entities import AttemptMetrics, PoolExhaustion
 
@@ -193,3 +194,28 @@ def test_operator_pin_is_exact_and_does_not_fall_through() -> None:
     assert result.selected is None
     second = next(item for item in result.candidates if item["model"] == "second")
     assert "harness does not match the operator pin" in second["excluded"]
+
+
+def test_task_event_scan_has_no_one_thousand_event_cap() -> None:
+    rows = [SimpleNamespace(seq=index) for index in range(1, 1502)]
+
+    class Events:
+        def list_for_task(self, _task_id: str, *, after_seq: int, limit: int) -> list[Any]:
+            return [row for row in rows if row.seq > after_seq][:limit]
+
+    found = Supervisor._all_task_events(SimpleNamespace(events=Events()), "task-1")
+    assert len(found) == 1501
+
+
+def test_quota_reset_is_future_bounded() -> None:
+    default = NOW + timedelta(minutes=5)
+    for candidate in (NOW - timedelta(seconds=1), NOW + timedelta(days=2)):
+        reset, accepted = Supervisor._bounded_quota_reset(
+            NOW, candidate, max_seconds=3600, default_seconds=300
+        )
+        assert reset == default and accepted is None
+    candidate = NOW + timedelta(minutes=30)
+    reset, accepted = Supervisor._bounded_quota_reset(
+        NOW, candidate, max_seconds=3600, default_seconds=300
+    )
+    assert reset == candidate and accepted == candidate

@@ -230,7 +230,14 @@ async def corrections(
 
     async def produce(uow: UnitOfWork) -> tuple[int, dict[str, Any]]:
         task = attach_correction(
-            uow, ctx.clock, principal=principal, task_id=task_id, body=document
+            uow,
+            ctx.clock,
+            principal=principal,
+            task_id=task_id,
+            body=document,
+            harnesses=ctx.harnesses,
+            harness_gates=ctx.harness_gates,
+            credential_sources=ctx.credential_sources,
         )
         return 200, task_view(uow, task.id).model_dump(mode="json")
 
@@ -264,6 +271,9 @@ async def amend(
             task_id=task_id,
             body=body.contract,
             reason=body.reason,
+            harnesses=ctx.harnesses,
+            harness_gates=ctx.harness_gates,
+            credential_sources=ctx.credential_sources,
         )
         return 200, task_view(uow, task.id).model_dump(mode="json")
 

@@ -87,8 +87,8 @@ def classify_with_patterns(
 _RESET_KEYS = frozenset({"reset_at", "resetAt", "resets_at", "resetsAt", "reset_time"})
 
 
-def quota_reset_at(*tails: str) -> datetime | None:
-    """Parse only explicit machine timestamps. Relative prose falls back to policy."""
+def quota_reset_at(*tails: str, quota: Sequence[Pattern]) -> datetime | None:
+    """Parse a machine timestamp only from a line that also proves quota exhaustion."""
 
     def walk(value: Any) -> Iterator[Any]:
         if isinstance(value, dict):
@@ -102,6 +102,8 @@ def quota_reset_at(*tails: str) -> datetime | None:
 
     for tail in tails:
         for line in reversed(tail[-TAIL_LIMIT:].splitlines()):
+            if first_match((line,), quota) is None:
+                continue
             try:
                 document = json.loads(line)
             except (json.JSONDecodeError, TypeError):

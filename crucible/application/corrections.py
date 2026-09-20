@@ -14,7 +14,12 @@ from crucible.application.errors import (
     NotFoundError,
     TransitionNotAllowedError,
 )
-from crucible.application.submit_task import parse_contract, validate_against_registry
+from crucible.application.harnesses import HarnessRegistry
+from crucible.application.submit_task import (
+    eligible_harness_names,
+    parse_contract,
+    validate_against_registry,
+)
 from crucible.application.transitions import move_task, record_event, require_contract
 from crucible.contracts.common import to_document
 from crucible.contracts.task_contract import (
@@ -27,6 +32,7 @@ from crucible.domain.events import EventKind
 from crucible.domain.ids import new_id
 from crucible.domain.lifecycle import TaskState
 from crucible.ports.clock import Clock
+from crucible.ports.harness import CredentialSource, HarnessGate
 from crucible.ports.repository import UnitOfWork
 
 CORRECTABLE_STATES = frozenset(
@@ -73,7 +79,15 @@ def _previous(uow: UnitOfWork, task: Task, of_version: int) -> TaskContractV1:
 
 
 def attach_correction(
-    uow: UnitOfWork, clock: Clock, *, principal: Principal, task_id: str, body: object
+    uow: UnitOfWork,
+    clock: Clock,
+    *,
+    principal: Principal,
+    task_id: str,
+    body: object,
+    harnesses: HarnessRegistry | None = None,
+    harness_gates: dict[str, HarnessGate] | None = None,
+    credential_sources: dict[str, CredentialSource] | None = None,
 ) -> Task:
     task = uow.tasks.get(task_id, for_update=True)
     if task is None:
@@ -104,7 +118,16 @@ def attach_correction(
         )
     previous = _previous(uow, task, contract.correction.of_version)
     # 3: a correction is a contract version, so it satisfies every submit-time rule.
-    problems: list[dict[str, Any]] = validate_against_registry(uow, clock, contract)
+    eligible = eligible_harness_names(
+        uow,
+        contract,
+        harnesses=harnesses,
+        harness_gates=harness_gates,
+        credential_sources=credential_sources,
+    )
+    problems: list[dict[str, Any]] = validate_against_registry(
+        uow, clock, contract, eligible_harnesses=eligible
+    )
     problems.extend(correction_narrows(previous, contract))
     if task.state is TaskState.AWAITING_ACCEPTANCE:
         # The current verdict only. A needs_more_work that a later accept superseded is
@@ -177,6 +200,9 @@ def amend_task(
     task_id: str,
     body: object,
     reason: str = "amendment",
+    harnesses: HarnessRegistry | None = None,
+    harness_gates: dict[str, HarnessGate] | None = None,
+    credential_sources: dict[str, CredentialSource] | None = None,
 ) -> Task:
     task = uow.tasks.get(task_id, for_update=True)
     if task is None:
@@ -194,7 +220,16 @@ def amend_task(
         )
     require_contract(uow, task)
     previous = _previous(uow, task, task.contract_version)
-    problems: list[dict[str, Any]] = validate_against_registry(uow, clock, contract)
+    eligible = eligible_harness_names(
+        uow,
+        contract,
+        harnesses=harnesses,
+        harness_gates=harness_gates,
+        credential_sources=credential_sources,
+    )
+    problems: list[dict[str, Any]] = validate_against_registry(
+        uow, clock, contract, eligible_harnesses=eligible
+    )
     if contract.external_identity_fields() != previous.external_identity_fields():
         problems.append(
             {

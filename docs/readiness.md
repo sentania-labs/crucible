@@ -57,11 +57,11 @@ run URL is added below once the branch is pushed.
 
 | Tier | Command | Result | Finished |
 |---|---|---|---|
-| unit | `make test-unit` as part of `make test` | 561 passed, 6.04 s | 9:44 AM |
-| integration | `make test-integration` as part of `make test` | 280 passed, 385.96 s, real PostgreSQL 16 | 9:50 AM |
-| e2e (Docker) | `make e2e DOCKER='<rootless wrapper>'` | 13 passed, 9 deselected, 80.34 s | 9:52 AM |
-| lint | `make lint` | ruff format, ruff check, mypy (222 files), lint-imports (3 contracts) all clean | 9:34 AM |
-| scan | `make scan` | gitleaks, no leaks, tree and 4-commit branch history | 9:34 AM |
+| unit | `make test-unit` as part of `make test` | 564 passed, 6.03 s | 11:03 AM |
+| integration | `make test-integration` as part of `make test` | 285 passed, 442.93 s, real PostgreSQL 16 | 11:09 AM |
+| e2e (Docker) | `make e2e DOCKER='<rootless wrapper>'` | 13 passed, 9 deselected, 104.39 s | 11:11 AM |
+| lint | `make lint` | ruff format, ruff check, mypy (222 files), lint-imports (3 contracts) all clean | 11:01 AM |
+| scan | `make scan` | gitleaks, no leaks, tree and 7-commit branch history | 10:58 AM |
 
 C6b-specific evidence is `tests/unit/test_class_routing.py`,
 `tests/unit/test_task_contract.py`, `tests/integration/test_class_routing.py`,

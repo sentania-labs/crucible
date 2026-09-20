@@ -77,7 +77,7 @@ class ClaudeCodeAdapter:
     supported_versions = VersionRange("2.1.0", "2.2.0")
 
     def quota_reset_at(self, stdout_tail: str, stderr_tail: str) -> datetime | None:
-        return base.quota_reset_at(stdout_tail, stderr_tail)
+        return base.quota_reset_at(stdout_tail, stderr_tail, quota=QUOTA_PATTERNS)
 
     def capabilities(self) -> HarnessCapabilities:
         return HarnessCapabilities(

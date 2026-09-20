@@ -6,6 +6,7 @@ account identifier, or hostname-bearing value in them.
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -274,3 +275,11 @@ def test_a_bare_number_in_a_crashed_agy_tail_is_not_quota() -> None:
         AgyAdapter().classify_exit(ExitInfo(exit_code=1), '{"error":"429 Too Many Requests"}', "")
         is ExitClass.QUOTA_EXHAUSTED
     )
+
+
+def test_reset_timestamp_must_be_on_the_quota_event_line() -> None:
+    adapter = CodexAdapter()
+    unrelated = '{"reset_at":"2026-09-21T12:00:00Z","type":"usage"}'
+    assert adapter.quota_reset_at(unrelated, "") is None
+    quota = '{"error":"usage_limit_reached","reset_at":"2026-09-21T12:00:00Z"}'
+    assert adapter.quota_reset_at(quota, "") == datetime(2026, 9, 21, 12, tzinfo=UTC)

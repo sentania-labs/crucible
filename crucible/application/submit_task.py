@@ -251,6 +251,37 @@ def validate_against_registry(
     return problems
 
 
+def eligible_harness_names(
+    uow: UnitOfWork,
+    contract: TaskContractV1,
+    *,
+    harnesses: HarnessRegistry | None,
+    harness_gates: Mapping[str, HarnessGate] | None,
+    credential_sources: Mapping[str, CredentialSource] | None,
+) -> set[str] | None:
+    if harnesses is None:
+        return None
+    eligible: set[str] = set()
+    needs_credential = contract.execution_request.provider.value != "fake"
+    for name in harnesses.names():
+        adapter = harnesses.get(name)
+        if adapter is None:
+            continue
+        source = (credential_sources or {}).get(name)
+        if (
+            needs_credential
+            and adapter.credential_spec() is not None
+            and (source is None or not Path(source.path).is_dir())
+        ):
+            continue
+        try:
+            harnesses.resolve(name, gates=harness_gates, state=uow.harnesses.get(name))
+        except HarnessUnavailableError:
+            continue
+        eligible.add(name)
+    return eligible
+
+
 def submit_task(
     uow: UnitOfWork,
     clock: Clock,
@@ -263,26 +294,13 @@ def submit_task(
 ) -> tuple[Task, TaskContract]:
     contract = parse_contract(body)
     repository = uow.repositories.get_by_name(contract.repository.name)
-    eligible_harnesses: set[str] | None = None
-    if harnesses is not None:
-        eligible_harnesses = set()
-        needs_credential = contract.execution_request.provider.value != "fake"
-        for name in harnesses.names():
-            adapter = harnesses.get(name)
-            if adapter is None:
-                continue
-            source = (credential_sources or {}).get(name)
-            if (
-                needs_credential
-                and adapter.credential_spec() is not None
-                and (source is None or not Path(source.path).is_dir())
-            ):
-                continue
-            try:
-                harnesses.resolve(name, gates=harness_gates, state=uow.harnesses.get(name))
-            except HarnessUnavailableError:
-                continue
-            eligible_harnesses.add(name)
+    eligible_harnesses = eligible_harness_names(
+        uow,
+        contract,
+        harnesses=harnesses,
+        harness_gates=harness_gates,
+        credential_sources=credential_sources,
+    )
     problems = validate_against_registry(
         uow, clock, contract, eligible_harnesses=eligible_harnesses
     )

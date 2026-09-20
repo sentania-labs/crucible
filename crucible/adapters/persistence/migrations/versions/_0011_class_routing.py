@@ -34,6 +34,9 @@ C6B_EVENT_KINDS = (
     "quota_wip_committed",
 )
 EVENT_ARCHIVE = "events_c6b_archive"
+TASK_WAIT_ARCHIVE = "task_waits_c6b_archive"
+ATTEMPT_ROUTE_ARCHIVE = "attempt_routes_c6b_archive"
+POOL_ARCHIVE = "pool_exhaustions_c6b_archive"
 POLICY_V3_DESCRIPTION = (
     "The default software delivery policy, version 3: class routing and reactive quota "
     "reroute through default-routing version 3 (C6b). Policies are immutable once "
@@ -45,11 +48,11 @@ def _event_kinds() -> list[str]:
     return [*c6_event_kinds(), *C6B_EVENT_KINDS]
 
 
-def _archive_exists(connection: sa.engine.Connection) -> bool:
+def _archive_exists(connection: sa.engine.Connection, name: str = EVENT_ARCHIVE) -> bool:
     return bool(
         connection.execute(
             sa.text("SELECT to_regclass(:name) IS NOT NULL"),
-            {"name": f"public.{EVENT_ARCHIVE}"},
+            {"name": f"public.{name}"},
         ).scalar()
     )
 
@@ -125,17 +128,55 @@ def upgrade() -> None:
     connection = op.get_bind()
     if _archive_exists(connection):
         op.execute("ALTER TABLE events DISABLE TRIGGER trg_events_append_only")
+        op.execute("ALTER TABLE events DISABLE TRIGGER trg_events_fenced")
         op.execute(
             f"INSERT INTO events (seq, ts, kind, task_id, execution_id, attempt_id, "
-            f"principal, verified, payload) SELECT seq, ts, kind, task_id, execution_id, "
-            f"attempt_id, principal, verified, payload FROM {EVENT_ARCHIVE}"
+            f"principal, verified, payload) SELECT e.seq, e.ts, e.kind, e.task_id, "
+            f"e.execution_id, e.attempt_id, e.principal, e.verified, e.payload "
+            f"FROM {EVENT_ARCHIVE} e WHERE "
+            "(e.task_id IS NULL OR EXISTS (SELECT 1 FROM tasks t WHERE t.id=e.task_id)) "
+            "AND (e.execution_id IS NULL OR EXISTS "
+            "(SELECT 1 FROM executions x WHERE x.id=e.execution_id)) "
+            "AND (e.attempt_id IS NULL OR EXISTS "
+            "(SELECT 1 FROM attempts a WHERE a.id=e.attempt_id))"
         )
         op.execute("ALTER TABLE events ENABLE TRIGGER trg_events_append_only")
+        op.execute("ALTER TABLE events ENABLE TRIGGER trg_events_fenced")
         op.execute(
             "SELECT setval('events_seq_seq', GREATEST("
             "(SELECT COALESCE(MAX(seq), 1) FROM events), 1))"
         )
         op.execute(f"DROP TABLE {EVENT_ARCHIVE}")
+    if _archive_exists(connection, TASK_WAIT_ARCHIVE):
+        op.execute(
+            f"UPDATE tasks t SET state=a.state, resume_at=a.resume_at, "
+            f"quota_wait_started_at=a.quota_wait_started_at FROM {TASK_WAIT_ARCHIVE} a "
+            "WHERE t.id=a.task_id"
+        )
+        op.execute(f"DROP TABLE {TASK_WAIT_ARCHIVE}")
+    if _archive_exists(connection, ATTEMPT_ROUTE_ARCHIVE):
+        op.execute("ALTER TABLE attempts DISABLE TRIGGER trg_attempts_fenced")
+        op.execute(
+            f"UPDATE attempts x SET selected_model=a.selected_model, "
+            "selected_harness=a.selected_harness, selected_image=a.selected_image, "
+            "selected_pool=a.selected_pool, ordered_candidates=a.ordered_candidates, "
+            f"resume_from_remote=a.resume_from_remote FROM {ATTEMPT_ROUTE_ARCHIVE} a "
+            "WHERE x.id=a.attempt_id"
+        )
+        op.execute("ALTER TABLE attempts ENABLE TRIGGER trg_attempts_fenced")
+        op.execute(f"DROP TABLE {ATTEMPT_ROUTE_ARCHIVE}")
+    if _archive_exists(connection, POOL_ARCHIVE):
+        op.execute(
+            f"INSERT INTO pool_exhaustions "
+            f"SELECT a.* FROM {POOL_ARCHIVE} a "
+            "JOIN tasks t ON t.id=a.task_id JOIN attempts x ON x.id=a.attempt_id "
+            "ON CONFLICT (pool) DO UPDATE SET "
+            "exhausted_at=EXCLUDED.exhausted_at, reset_at=EXCLUDED.reset_at, "
+            "task_id=EXCLUDED.task_id, attempt_id=EXCLUDED.attempt_id, reason=EXCLUDED.reason, "
+            "cleared_at=EXCLUDED.cleared_at, cleared_by=EXCLUDED.cleared_by, "
+            "clear_reason=EXCLUDED.clear_reason"
+        )
+        op.execute(f"DROP TABLE {POOL_ARCHIVE}")
     _seed_v3(op.get_bind())
 
 
@@ -143,13 +184,42 @@ def downgrade() -> None:
     gone = ", ".join(f"'{kind}'" for kind in C6B_EVENT_KINDS)
     op.execute(f"CREATE TABLE IF NOT EXISTS {EVENT_ARCHIVE} (LIKE events)")
     op.execute("ALTER TABLE events DISABLE TRIGGER trg_events_append_only")
+    op.execute("ALTER TABLE events DISABLE TRIGGER trg_events_fenced")
     op.execute(f"INSERT INTO {EVENT_ARCHIVE} SELECT * FROM events WHERE kind IN ({gone})")
     op.execute(f"DELETE FROM events WHERE kind IN ({gone})")
     op.execute("ALTER TABLE events ENABLE TRIGGER trg_events_append_only")
+    op.execute("ALTER TABLE events ENABLE TRIGGER trg_events_fenced")
     op.drop_constraint("ck_events_kind", "events", type_="check")
     allowed = ", ".join(f"'{kind}'" for kind in c6_event_kinds())
     op.execute(f"ALTER TABLE events ADD CONSTRAINT ck_events_kind CHECK (kind IN ({allowed}))")
     connection = op.get_bind()
+    op.execute(
+        f"CREATE TABLE IF NOT EXISTS {TASK_WAIT_ARCHIVE} AS "
+        "SELECT id AS task_id, state, resume_at, quota_wait_started_at FROM tasks WHERE false"
+    )
+    op.execute(
+        f"INSERT INTO {TASK_WAIT_ARCHIVE} "
+        "SELECT id, state, resume_at, quota_wait_started_at FROM tasks "
+        "WHERE state='awaiting_quota' OR resume_at IS NOT NULL OR quota_wait_started_at IS NOT NULL"
+    )
+    op.execute("UPDATE tasks SET state='reported' WHERE state='awaiting_quota'")
+    op.execute(
+        f"CREATE TABLE IF NOT EXISTS {ATTEMPT_ROUTE_ARCHIVE} AS "
+        "SELECT id AS attempt_id, selected_model, selected_harness, selected_image, "
+        "selected_pool, ordered_candidates, resume_from_remote FROM attempts WHERE false"
+    )
+    op.execute(
+        f"INSERT INTO {ATTEMPT_ROUTE_ARCHIVE} "
+        "SELECT id, selected_model, selected_harness, selected_image, selected_pool, "
+        "ordered_candidates, resume_from_remote FROM attempts "
+        "WHERE selected_model IS NOT NULL OR selected_harness IS NOT NULL "
+        "OR selected_image IS NOT NULL OR selected_pool IS NOT NULL "
+        "OR ordered_candidates <> '[]'::jsonb OR resume_from_remote"
+    )
+    op.execute(
+        f"CREATE TABLE IF NOT EXISTS {POOL_ARCHIVE} AS SELECT * FROM pool_exhaustions WHERE false"
+    )
+    op.execute(f"INSERT INTO {POOL_ARCHIVE} SELECT * FROM pool_exhaustions")
     connection.execute(
         sa.text(
             "DELETE FROM policies p WHERE p.name='default-software' AND p.version=3 "

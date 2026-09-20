@@ -127,6 +127,7 @@ async def test_scripted_quota_reroutes_to_a_second_image_and_remote_branch(
     _install_class_policy(ctx)
     document = e2e_contract("E2E-C6B", "class-routing", worker_image)
     document["policy"] = {"name": "e2e-script", "version": 2}
+    document["scope"]["allowed_paths"].append("e2e-behavior")
     for field in ("harness", "model", "pin_reason", "image"):
         document["execution_request"].pop(field, None)
     task_id = submit_and_start(client, document)

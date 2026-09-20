@@ -7,11 +7,11 @@ the contract must also carry a reason and the pin never falls through to another
 
 ## Decisions
 
-1. Selection is persisted before workspace preparation, then repeated under the
-   supervisor fence before the attempt leaves `preparing`. The `attempt_launching`
-   event carries the selected model, harness, image, pool, and ordered candidates.
-   Persisting the choice before preparation is necessary because the selected image
-   and harness define the workspace that must be prepared.
+1. The scheduler uses a routing preview only to decide whether work must wait. After
+   the checkout lease is held, the supervisor selects and persists the authoritative
+   route in the fenced transaction that moves the attempt to `preparing`. The
+   `attempt_launching` event repeats the selected model, harness, image, pool, and
+   ordered candidates after workspace preparation.
 2. Routing order is capability preference, quality demotion, weighted least-recent
    use, least-recent use, then model id. The last key makes equal database states
    deterministic across supervisors.
@@ -26,15 +26,16 @@ the contract must also carry a reason and the pin never falls through to another
    at `resume_at` selects again, including after a supervisor restart. The policy wait
    deadline ends through the ordinary reported path.
 6. The quota collector stages all worker changes and, when there are any, makes one
-   commit whose subject starts `wip(crucible): attempt`. The rerouted attempt asks the
-   preparer to start from the remote work branch. A daemon-mounted bare repository is
-   pushed by the isolated collector in the Docker proof arrangement. A GitHub remote
-   is pushed through the existing isolated publisher and short-lived installation
-   token. Crucible confirms the remote head before it records the reroute. The Docker
-   end-to-end test proves that the second attempt starts from that head, and the
-   GitHub integration test proves that `branch_pushed` precedes `task_rerouted`.
-7. Launch-time reserve refusal does not reroute. It has no worker worktree to preserve
-   and follows the existing quota refusal and wake path, as 16 specifies.
+   commit whose subject starts `wip(crucible): attempt`. It never pushes. After the
+   supervisor evaluates `scope_contained`, `no_injected_files`, and `no_secrets`, a
+   separate no-network checkpoint container pushes a local origin, or the existing
+   isolated publisher pushes GitHub with a short-lived installation token. Crucible
+   confirms the remote head before it records the reroute. The Docker end-to-end test
+   proves that the second attempt starts from that head, and the GitHub integration
+   test proves that `branch_pushed` precedes `task_rerouted`.
+7. A launch-time reserve race re-evaluates the capability class and reroutes or waits
+   without recording a WIP commit, because no worker ran. Review executions retain
+   the established refusal path instead of creating an implementation reroute.
 
 ## Harness reset observations
 
@@ -87,6 +88,10 @@ crucible-admin --reason '<reason>' routing clear-exhaustion <pool>
   the lifecycle has a required `preparing` state. The launching event repeats the full
   routing decision. The specification should say "the fenced launch sequence" rather
   than imply that selection first occurs in the state transition to `launching`.
+- The launch-time reserve path is treated as a routing race. An implementation attempt
+  may move to another eligible pool or wait, but it does not claim worker checkpoint
+  continuity. This is narrower than treating reserve refusal as a completed worker
+  quota exit.
 
 ## Limitations and risks
 

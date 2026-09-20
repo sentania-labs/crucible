@@ -1,18 +1,23 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import replace
 from datetime import datetime, timedelta
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import text
 
 from crucible.adapters.api.app import create_app
 from crucible.adapters.api.deps import AppContext
 from crucible.adapters.execution.fake import FakeProvider
+from crucible.adapters.persistence import migrate
+from crucible.adapters.persistence.unit_of_work import make_engine
 from crucible.application.admin.context import AdminContext
+from crucible.application.harnesses import set_harness_enabled
 from crucible.application.supervisor import Supervisor
-from crucible.domain.entities import ImagePromotion, Policy, RoutingPolicyRecord
+from crucible.domain.entities import ImagePromotion, Policy, PoolExhaustion, RoutingPolicyRecord
 from tests.fixtures import FakeClock, contract_document
 from tests.integration.conftest import make_supervisor
 
@@ -173,14 +178,15 @@ async def test_quota_exit_commits_wip_marks_pool_and_reroutes_to_another_pool(
     assert midway["state"] == "scheduled"
     assert [attempt["pool"] for attempt in midway["executions"][0]["attempts"]] == [
         "pool-a",
-        "pool-b",
+        None,
     ]
     assert midway["executions"][0]["attempts"][1]["resume_from_remote"] is True
 
     events = _events(client, task_id)
     reroute = next(event for event in events if event["kind"] == "task_rerouted")
     assert reroute["payload"]["from_pool"] == "pool-a"
-    assert reroute["payload"]["model"] == "b-success-model"
+    assert reroute["payload"]["to_attempt_id"] == midway["executions"][0]["attempts"][1]["id"]
+    assert "model" not in reroute["payload"]
     assert reroute["payload"]["wip_commit_sha"]
     assert any(event["kind"] == "quota_wip_committed" for event in events)
     usage = client.get("/v1/routing/usage", params={"policy_version": 80}).json()
@@ -215,6 +221,7 @@ async def test_quota_exit_commits_wip_marks_pool_and_reroutes_to_another_pool(
         ("a-quota-model", "codex"),
         ("b-success-model", "agy"),
     ]
+    assert [item["pool"] for item in attempts] == ["pool-a", "pool-b"]
     assert attempts[1]["state"] == "succeeded"
 
 
@@ -327,6 +334,12 @@ async def test_wait_cap_ends_the_task_through_reported_with_the_class_visible(
     await supervisor.tick()
     assert client.get(f"/v1/tasks/{task_id}").json()["state"] == "awaiting_quota"
 
+    with ctx.uow_factory() as uow:
+        uow.pool_exhaustions.clear(
+            "wait-pool", at=clock.now(), principal="tests", reason="candidate became eligible"
+        )
+        uow.commit()
+    _promote(ctx, clock, "codex", "crucible-worker:fake-succeed")
     clock.advance(11)
     await supervisor.tick()
     events = _events(client, task_id)
@@ -337,3 +350,291 @@ async def test_wait_cap_ends_the_task_through_reported_with_the_class_visible(
         event["kind"] == "execution_failed" and event["payload"].get("wait_cap_exceeded") is True
         for event in events
     )
+
+
+async def test_restart_recovers_a_collected_quota_checkpoint(
+    client: TestClient,
+    ctx: AppContext,
+    clock: FakeClock,
+    provider: FakeProvider,
+    supervisor: Supervisor,
+) -> None:
+    _install_policy(
+        ctx,
+        clock,
+        version=85,
+        models=[
+            _model("a-quota-model", "codex", "recovery-pool-a"),
+            _model("b-success-model", "agy", "recovery-pool-b"),
+        ],
+    )
+    _promote(ctx, clock, "codex", "crucible-worker:fake-quota")
+    _promote(ctx, clock, "agy", "crucible-worker:fake-succeed")
+    task_id = _submit(client, "C6B-CHECKPOINT-RECOVERY", 85)
+
+    original = supervisor._complete_quota_checkpoint
+
+    async def crash_once(_attempt_id: str) -> None:
+        raise RuntimeError("simulated supervisor crash after collection")
+
+    supervisor._complete_quota_checkpoint = crash_once  # type: ignore[assignment]
+    await supervisor.tick()
+    stranded = client.get(f"/v1/tasks/{task_id}").json()
+    assert stranded["state"] == "running"
+    assert stranded["executions"][0]["attempts"][0]["state"] == "failed"
+    supervisor._complete_quota_checkpoint = original  # type: ignore[method-assign]
+    await supervisor.stop()
+
+    restarted = make_supervisor(ctx, provider, holder="sup-checkpoint-recovery")
+    await restarted.tick()
+    recovered = client.get(f"/v1/tasks/{task_id}").json()
+    assert any(event["kind"] == "task_rerouted" for event in _events(client, task_id))
+    assert len(recovered["executions"][0]["attempts"]) == 2
+    await restarted.stop()
+
+
+async def test_unsafe_quota_checkpoint_is_not_rerouted(
+    client: TestClient,
+    ctx: AppContext,
+    clock: FakeClock,
+    provider: FakeProvider,
+    supervisor: Supervisor,
+) -> None:
+    _install_policy(
+        ctx,
+        clock,
+        version=86,
+        models=[
+            _model("a-quota-model", "codex", "unsafe-pool-a"),
+            _model("b-success-model", "agy", "unsafe-pool-b"),
+        ],
+    )
+    _promote(ctx, clock, "codex", "crucible-worker:fake-quota")
+    _promote(ctx, clock, "agy", "crucible-worker:fake-succeed")
+    task_id = _submit(client, "C6B-UNSAFE-CHECKPOINT", 86)
+    original_collect = provider.collect
+
+    async def unsafe_collect(*args: Any, **kwargs: Any) -> Any:
+        outputs = await original_collect(*args, **kwargs)
+        return replace(outputs, diff_paths=("outside/unsafe.txt",))
+
+    provider.collect = unsafe_collect  # type: ignore[method-assign]
+    await supervisor.tick()
+    view = client.get(f"/v1/tasks/{task_id}").json()
+    events = _events(client, task_id)
+    assert view["state"] == "pre_pr_gates_failed"
+    assert not any(event["kind"] == "task_rerouted" for event in events)
+    failure = next(event for event in events if event["kind"] == "task_publish_failed")
+    assert "scope_contained" in failure["payload"]["detail"]
+    later = clock.now() + timedelta(hours=2)
+    earlier = clock.now() + timedelta(minutes=10)
+    attempt_id = view["executions"][0]["attempts"][0]["id"]
+    with ctx.uow_factory() as uow:
+        uow.pool_exhaustions.put(
+            PoolExhaustion(
+                pool="unsafe-pool-a",
+                exhausted_at=clock.now(),
+                reset_at=later,
+                task_id=task_id,
+                attempt_id=attempt_id,
+                reason="long reset",
+            )
+        )
+        uow.pool_exhaustions.put(
+            PoolExhaustion(
+                pool="unsafe-pool-a",
+                exhausted_at=clock.now(),
+                reset_at=earlier,
+                task_id=task_id,
+                attempt_id=attempt_id,
+                reason="short reset",
+            )
+        )
+        uow.commit()
+    with ctx.uow_factory() as uow:
+        mark = uow.pool_exhaustions.get("unsafe-pool-a")
+        assert mark is not None and mark.reset_at == later
+
+
+async def test_downgrade_and_upgrade_preserve_an_active_quota_wait(
+    client: TestClient,
+    ctx: AppContext,
+    clock: FakeClock,
+    provider: FakeProvider,
+    supervisor: Supervisor,
+    database_url: str,
+) -> None:
+    _install_policy(
+        ctx,
+        clock,
+        version=87,
+        models=[_model("only-quota-model", "codex", "migration-wait-pool")],
+        wait_max=60,
+        cooldown=30,
+    )
+    _promote(ctx, clock, "codex", "crucible-worker:fake-quota")
+    task_id = _submit(client, "C6B-MIGRATION-WAIT", 87)
+    await supervisor.tick()
+    assert client.get(f"/v1/tasks/{task_id}").json()["state"] == "awaiting_quota"
+    await supervisor.stop()
+    ctx.engine.dispose()
+
+    migrate.downgrade(database_url, "0010_bootstrap_import")
+    check = make_engine(database_url)
+    with check.connect() as connection:
+        assert (
+            connection.execute(
+                text("SELECT state FROM tasks WHERE id=:task_id"), {"task_id": task_id}
+            ).scalar_one()
+            == "reported"
+        )
+        assert (
+            connection.execute(
+                text("SELECT count(*) FROM task_waits_c6b_archive WHERE task_id=:task_id"),
+                {"task_id": task_id},
+            ).scalar_one()
+            == 1
+        )
+        assert (
+            connection.execute(
+                text("SELECT count(*) FROM pool_exhaustions_c6b_archive WHERE pool=:pool"),
+                {"pool": "migration-wait-pool"},
+            ).scalar_one()
+            == 1
+        )
+        archived_route = connection.execute(
+            text(
+                "SELECT selected_model, selected_harness, selected_pool "
+                "FROM attempt_routes_c6b_archive"
+            )
+        ).one()
+        assert tuple(archived_route) == ("only-quota-model", "codex", "migration-wait-pool")
+    check.dispose()
+
+    migrate.upgrade(database_url)
+    check = make_engine(database_url)
+    with check.connect() as connection:
+        restored = connection.execute(
+            text("SELECT state, resume_at, quota_wait_started_at FROM tasks WHERE id=:task_id"),
+            {"task_id": task_id},
+        ).one()
+        assert restored.state == "awaiting_quota"
+        assert restored.resume_at is not None and restored.quota_wait_started_at is not None
+        assert (
+            connection.execute(
+                text("SELECT count(*) FROM pool_exhaustions WHERE pool=:pool"),
+                {"pool": "migration-wait-pool"},
+            ).scalar_one()
+            == 1
+        )
+        restored_route = connection.execute(
+            text(
+                "SELECT selected_model, selected_harness, selected_pool, ordered_candidates "
+                "FROM attempts WHERE task_id=:task_id"
+            ),
+            {"task_id": task_id},
+        ).one()
+        assert tuple(restored_route[:3]) == (
+            "only-quota-model",
+            "codex",
+            "migration-wait-pool",
+        )
+        assert restored_route.ordered_candidates
+    check.dispose()
+
+
+async def test_runtime_harness_loss_is_environment_not_quota(
+    client: TestClient,
+    ctx: AppContext,
+    clock: FakeClock,
+    supervisor: Supervisor,
+) -> None:
+    _install_policy(
+        ctx,
+        clock,
+        version=88,
+        models=[_model("runtime-model", "codex", "runtime-pool")],
+    )
+    _promote(ctx, clock, "codex", "crucible-worker:fake-succeed")
+    task_id = _submit(client, "C6B-RUNTIME-HARNESS-LOSS", 88)
+    with ctx.uow_factory() as uow:
+        set_harness_enabled(
+            uow,
+            clock,
+            principal_name="tests",
+            name="codex",
+            enabled=False,
+            reason="simulate runtime loss",
+        )
+        uow.commit()
+    await supervisor.tick()
+    view = client.get(f"/v1/tasks/{task_id}").json()
+    attempt = view["executions"][0]["attempts"][0]
+    assert attempt["exit_class"] == "environment"
+    assert view["state"] == "pre_pr_gates_failed"
+    assert not any(event["kind"] == "task_awaiting_quota" for event in _events(client, task_id))
+
+
+async def test_reservation_race_reroutes_and_discards_prepared_workspace(
+    client: TestClient,
+    ctx: AppContext,
+    clock: FakeClock,
+    provider: FakeProvider,
+    supervisor: Supervisor,
+) -> None:
+    _install_policy(
+        ctx,
+        clock,
+        version=89,
+        models=[
+            _model("a-race-model", "codex", "race-pool-a"),
+            _model("b-race-model", "agy", "race-pool-b"),
+        ],
+    )
+    _promote(ctx, clock, "codex", "crucible-worker:fake-succeed")
+    _promote(ctx, clock, "agy", "crucible-worker:fake-succeed")
+    task_id = _submit(client, "C6B-RESERVATION-RACE", 89)
+    with ctx.uow_factory() as uow:
+        task = uow.tasks.get(task_id)
+        assert task is not None
+        task.head_sha = "a" * 40
+        uow.tasks.save(task)
+        uow.commit()
+    original_prepare = provider.prepare
+
+    async def exhaust_after_prepare(spec: Any) -> Any:
+        workspace = await original_prepare(spec)
+        with ctx.uow_factory() as uow:
+            uow.pool_exhaustions.put(
+                PoolExhaustion(
+                    pool="race-pool-a",
+                    exhausted_at=clock.now(),
+                    reset_at=clock.now() + timedelta(minutes=5),
+                    task_id=spec.task_id,
+                    attempt_id=spec.attempt_id,
+                    reason="reservation race",
+                )
+            )
+            uow.commit()
+        provider.prepare = original_prepare  # type: ignore[method-assign]
+        return workspace
+
+    provider.prepare = exhaust_after_prepare  # type: ignore[method-assign]
+    await supervisor.tick()
+    midway = client.get(f"/v1/tasks/{task_id}").json()
+    attempts = midway["executions"][0]["attempts"]
+    assert midway["state"] == "scheduled"
+    assert attempts[0]["exit_class"] == "quota_exhausted"
+    assert attempts[0]["id"] in provider.discarded
+    assert attempts[1]["state"] == "pending"
+    assert not any(event["kind"] == "wake_created" for event in _events(client, task_id))
+    assert not any(event["kind"] == "quota_wip_committed" for event in _events(client, task_id))
+    reserve_reroute = next(
+        event for event in _events(client, task_id) if event["kind"] == "task_rerouted"
+    )
+    assert "wip_commit_sha" not in reserve_reroute["payload"]
+
+    await supervisor.tick()
+    final = client.get(f"/v1/tasks/{task_id}").json()
+    assert final["executions"][0]["attempts"][1]["model"] == "b-race-model"
+    assert final["executions"][0]["attempts"][1]["state"] == "succeeded"
