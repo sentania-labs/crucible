@@ -12,15 +12,20 @@ the contract must also carry a reason and the pin never falls through to another
    route in the fenced transaction that moves the attempt to `preparing`. The
    `attempt_launching` event repeats the selected model, harness, image, pool, and
    ordered candidates after workspace preparation.
-2. Routing order is capability preference, quality demotion, weighted least-recent
-   use, least-recent use, then model id. The last key makes equal database states
-   deterministic across supervisors.
-3. A worker quota exit creates a durable mark for the selected pool. Selection omits
-   active marks and `GET /v1/routing/usage` exposes the expiry and reason. A reasoned
-   admin clear records who cleared it and keeps the row as history.
+2. Routing order is capability preference, quality demotion, then weighted
+   least-recent. A model never launched on the project ranks first by id. Otherwise
+   the largest `(now - last_launched_at) * weight` ranks first, with model id as the
+   final tie break. The metrics query reads only the newest quality window per model
+   directly for the project, without a task-list page.
+3. A worker quota exit creates a durable mark for the selected pool only when the
+   harness emitted its authoritative provider-refusal event. Quota-shaped agent text
+   can reroute that task, but cannot write shared pool state. Selection omits active
+   marks and `GET /v1/routing/usage` exposes the expiry and reason. A reasoned admin
+   clear records who cleared it and keeps the row as history.
 4. A reroute is a new attempt on the same execution and contract version. It records
    the previous pool, the new model and harness, the candidate decision, and the WIP
-   head. `reroute_max` is independent of the execution's ordinary attempt cap.
+   head. Timed resumes and reroutes share `reroute_max`. Quota attempts do not consume
+   the ordinary `max_attempts` budget.
 5. When no eligible pool remains, the task releases its checkout lease and enters
    `awaiting_quota`. The first wait creates one informational wake. A supervisor tick
    at `resume_at` selects again, including after a supervisor restart. The policy wait
@@ -36,6 +41,24 @@ the contract must also carry a reason and the pin never falls through to another
 7. A launch-time reserve race re-evaluates the capability class and reroutes or waits
    without recording a WIP commit, because no worker ran. Review executions retain
    the established refusal path instead of creating an implementation reroute.
+8. A successful checkpoint push marks the execution as remote-backed. Every later
+   attempt on that execution, including an ordinary environment retry after a reroute,
+   starts from the remote work branch.
+
+During a quota checkpoint, the collector ignores system and global Git configuration,
+temporarily replaces `.git/config` with Crucible's minimal configuration, and runs:
+
+```text
+GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+git -c diff.external= -c core.pager=cat -c safe.directory=* -C "$REPO" add -A
+GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+git -c diff.external= -c core.pager=cat -c safe.directory=* -C "$REPO" commit ...
+```
+
+The minimal local configuration sets `commit.gpgsign=false`, `tag.gpgsign=false`,
+`core.hooksPath` to a newly created empty directory, and `core.fsmonitor=false`. It
+contains no `filter.*` command, so a worker-authored `.gitattributes` filter is a
+no-op. The worker's local configuration is restored after collection.
 
 ## Harness reset observations
 
@@ -45,11 +68,11 @@ Unix seconds, or Unix milliseconds. Human prose and bare numbers outside those k
 are ignored. The actual observed quota failure samples do not provide a reset time, so
 the seeded policy supplies the fallback.
 
-| Harness | Observed quota sample | Reset supplied | Seeded fallback |
+| Harness | Authoritative mark signal | Reset supplied | Seeded fallback |
 |---|---|---:|---:|
-| Claude Code | `{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour","overageStatus":"rejected","overageDisabledReason":"out_of_credits","isUsingOverage":false}}` | no | 18,000 seconds |
-| Codex | `{"type":"turn.failed","error":{"code":"usage_limit_reached"}}` | no | 18,000 seconds |
-| AGY | `{"type":"result","status":"ERROR","error":"RESOURCE_EXHAUSTED: quota"}` | no | 3,600 seconds |
+| Claude Code | `rate_limit_event` with `status: rejected` or `out_of_credits` | no | 18,000 seconds |
+| Codex | `turn.failed` with error code `usage_limit_reached` | no | 18,000 seconds |
+| AGY | `result` with `status: ERROR` and `RESOURCE_EXHAUSTED` | no | 3,600 seconds |
 
 The Claude Code line is the live exhaustion captured on September 17, 2026 at
 8:58 AM America/Chicago and already retained in the C5 evidence. The Codex and AGY
@@ -61,7 +84,10 @@ rejected.
 ## Database and API shape
 
 Migration 0011 adds selected routing fields to attempts, `resume_from_remote`, the
-ordered candidates, task wait timestamps, and `pool_exhaustions`. Its downgrade
+ordered candidates, an execution-level remote-backed flag, task wait timestamps, and
+`pool_exhaustions`. Before changing the schema, it validates the current contract of
+every non-terminal task and refuses with the incompatible task ids. Pre-C6b contracts
+on terminal tasks remain historical records and are never re-validated. Its downgrade
 archives C6b event kinds before tightening the event constraint, and the next upgrade
 restores those append-only events.
 
@@ -83,6 +109,8 @@ crucible-admin --reason '<reason>' routing clear-exhaustion <pool>
   refuses a supplied image and derives it from the promoted image manifest.
 - A pinned task waits only on its pinned model's pool and never reroutes to another
   model.
+- A pin in either supported contract shape is accepted only for an operator principal
+  at submit, amendment, and correction.
 - Candidate selection is persisted in the fenced transaction that starts preparation.
   The attempt moves to `launching` only after the selected workspace exists, because
   the lifecycle has a required `preparing` state. The launching event repeats the full
@@ -95,12 +123,23 @@ crucible-admin --reason '<reason>' routing clear-exhaustion <pool>
 
 ## Limitations and risks
 
-- A failed GitHub checkpoint push stops the reroute and reports the task with the
-  `quota_checkpoint` failure detail. The collected bundle remains subject to normal
-  retention, so the failure is recoverable, but Crucible does not launch from a stale
-  remote branch.
+- A failed checkpoint push stops the reroute and reports the task with the
+  `quota_checkpoint` failure detail. It overrides `workspace_on_failure` to keep the
+  attempt workspace and `output/work_branch.bundle`, records the retention action,
+  and puts the bundle path in the wake. Crucible does not launch from a stale remote
+  branch.
 - Reset extraction is deliberately conservative. If a future harness changes its
   quota event to include only relative prose, Crucible uses the pool cooldown until a
   stable machine field is observed and added.
 - Pool marks are keyed by policy pool name. Renaming a pool in a new policy version
   leaves the old row as history and does not transfer its exhaustion to the new name.
+
+## Verification
+
+| Tier | Command |
+|---|---|
+| lint | `make lint` |
+| unit and PostgreSQL integration | `make test` |
+| secret scan | `make scan` |
+| Docker end to end | `make e2e` |
+| Compose stack | `make smoke` |

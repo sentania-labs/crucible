@@ -58,7 +58,9 @@ dev: preflight proxy-config ## developer mode: postgres and the two proxies; run
 preflight: ## S9 follow-up 1: say what is wrong rather than letting compose be cryptic
 	@test -n "$(CRUCIBLE_UID)" \
 	  || echo "preflight: no 'crucible' service user, so this is ADR 0004's fallback: the host daemon behind the proxy. A compromise of Crucible is then a compromise of the host (13)."
-	@test -S "$(CRUCIBLE_DOCKER_SOCKET)" || { echo "preflight: no docker socket at $(CRUCIBLE_DOCKER_SOCKET)"; exit 2; }
+	@test -S "$(CRUCIBLE_DOCKER_SOCKET)" \
+	  || { command -v sudo >/dev/null && sudo -n test -S "$(CRUCIBLE_DOCKER_SOCKET)"; } \
+	  || { echo "preflight: no docker socket at $(CRUCIBLE_DOCKER_SOCKET)"; exit 2; }
 	@test -f /etc/apparmor.d/rootlesskit || echo "preflight: warning, /etc/apparmor.d/rootlesskit is missing; the rootless daemon will not start after a reboot on Ubuntu 24.04 (S9)"
 	@$(DOCKER) info --format '{{range .SecurityOptions}}{{.}} {{end}}' 2>/dev/null | grep -q rootless \
 	  || echo "preflight: warning, DOCKER is not pointed at a rootless daemon"
