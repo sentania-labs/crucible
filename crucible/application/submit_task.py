@@ -193,6 +193,22 @@ def _check_against_registry(
     if supported is None:
         problems.append(_problem("execution_request.provider", f"{provider!r} is not registered"))
     pinned = contract.execution_request.pinned_harness
+    supplied_image = contract.execution_request.image
+    allowlist = [str(pattern) for pattern in doc.get("images", {}).get("allowlist", [])]
+    if supplied_image is not None:
+        if provider != "fake":
+            problems.append(
+                _problem(
+                    "execution_request.image",
+                    "image is derived from the selected harness and must not be supplied",
+                )
+            )
+        elif allowlist and not any(
+            fnmatch.fnmatchcase(supplied_image, pattern) for pattern in allowlist
+        ):
+            problems.append(
+                _problem("execution_request.image", "does not match the policy image allowlist")
+            )
     if pinned is not None:
         harness = pinned.value
         if harness not in REGISTERED_HARNESSES:

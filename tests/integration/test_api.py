@@ -7,7 +7,8 @@ from fastapi.testclient import TestClient
 
 from crucible.adapters.api.app import create_app
 from crucible.adapters.api.deps import AppContext
-from tests.fixtures import contract_document
+from crucible.domain.entities import ImagePromotion
+from tests.fixtures import FakeClock, contract_document
 
 pytestmark = pytest.mark.integration
 
@@ -91,7 +92,9 @@ def test_submit_shape_errors_name_the_path(client: TestClient) -> None:
     assert any(e["path"] == "surprise" for e in r.json()["errors"])
 
 
-def test_only_registered_providers_are_accepted(client: TestClient) -> None:
+def test_only_registered_providers_are_accepted(
+    client: TestClient, ctx: AppContext, clock: FakeClock
+) -> None:
     """C3 registered the Docker provider (08, 20); Kubernetes is designed, not built."""
     doc = contract_document()
     doc["execution_request"]["provider"] = "kubernetes"
@@ -102,6 +105,21 @@ def test_only_registered_providers_are_accepted(client: TestClient) -> None:
     doc = contract_document(external_id="EX-DOCKER")
     doc["repository"]["work_branch"] = "crucible/EX-DOCKER"
     doc["execution_request"]["provider"] = "docker"
+    doc["execution_request"].pop("image")
+    with ctx.uow_factory() as uow:
+        uow.image_promotions.put(
+            ImagePromotion(
+                digest="sha256:integration-codex",
+                reference="crucible-worker:codex-integration",
+                harness="codex",
+                harness_version="0.153.4",
+                state="default",
+                updated_at=clock.now(),
+                updated_by="tests",
+                reason="provider registry integration fixture",
+            )
+        )
+        uow.commit()
     assert client.post("/v1/tasks", json=doc).status_code == 201
 
 

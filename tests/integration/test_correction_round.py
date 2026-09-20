@@ -168,25 +168,25 @@ async def test_a_review_execution_refused_by_the_quota_does_not_strand_the_task(
     await run_to_settled(supervisor, client, task_id)
 
     # Tighten the pool the review model draws on, after the task was admitted.
-    # Versions 1 and 2 are seeded, so the tightened copies become version 3.
+    # C6b seeds version 3, so the tightened copies become version 4.
     routing = client.get("/v1/routing/default-routing/2").json()["document"]
-    routing["version"] = 3
+    routing["version"] = 4
     routing["pools"]["openai-sub"] = {"window": "5h", "budget_units": "attempts", "soft_limit": 1}
     admin = {"Authorization": f"Bearer {tokens['admin']}"}
     assert (
-        client.put("/v1/routing/default-routing/3", json=routing, headers=admin).status_code == 200
+        client.put("/v1/routing/default-routing/4", json=routing, headers=admin).status_code == 200
     )
     policy = client.get("/v1/policies/default-software/2").json()["document"]
-    policy["version"] = 3
-    policy["routing"]["policy"]["version"] = 3
+    policy["version"] = 4
+    policy["routing"]["policy"]["version"] = 4
     assert (
-        client.put("/v1/policies/default-software/3", json=policy, headers=admin).status_code == 200
+        client.put("/v1/policies/default-software/4", json=policy, headers=admin).status_code == 200
     )
 
     # The review execution snapshots the policy the task names, so point the task at the
     # version whose pool is now tight. `tasks` is the API role's table (14).
     with ctx.engine.begin() as conn:
-        conn.execute(text("UPDATE tasks SET policy_version = 3 WHERE id = :id"), {"id": task_id})
+        conn.execute(text("UPDATE tasks SET policy_version = 4 WHERE id = :id"), {"id": task_id})
 
     assert (
         client.post(f"/v1/tasks/{task_id}/review", json={"execution": REVIEW_EXECUTION}).status_code
@@ -209,27 +209,27 @@ async def test_an_amendment_to_a_disabled_model_is_refused(
     client: TestClient, supervisor: Supervisor, tokens: dict[str, str]
 ) -> None:
     # The seeded roster (routing version 2) has every model enabled, so this test
-    # uploads version 4 with one model disabled and a policy version 4 naming it
-    # (version 3 belongs to the quota test above; `policies` is not truncated).
+    # uploads version 5 with one model disabled and a policy version 5 naming it
+    # (versions 3 and 4 already exist; `policies` is not truncated).
     admin = {"Authorization": f"Bearer {tokens['admin']}"}
     routing = client.get("/v1/routing/default-routing/2").json()["document"]
-    routing["version"] = 4
+    routing["version"] = 5
     disabled = next(m for m in routing["models"] if m["id"] == "gemini-3.8-flash-low")
     disabled["enabled"] = False
     assert (
-        client.put("/v1/routing/default-routing/4", json=routing, headers=admin).status_code == 200
+        client.put("/v1/routing/default-routing/5", json=routing, headers=admin).status_code == 200
     )
     policy = client.get("/v1/policies/default-software/2").json()["document"]
-    policy["version"] = 4
-    policy["routing"]["policy"]["version"] = 4
+    policy["version"] = 5
+    policy["routing"]["policy"]["version"] = 5
     assert (
-        client.put("/v1/policies/default-software/4", json=policy, headers=admin).status_code == 200
+        client.put("/v1/policies/default-software/5", json=policy, headers=admin).status_code == 200
     )
     task_id = submit_and_start(
         client,
         "crucible-worker:fake-succeed",
         start=False,
-        policy={"name": "default-software", "version": 4},
+        policy={"name": "default-software", "version": 5},
     )
     document = contract_of(client, task_id)
     document["execution_request"] = {

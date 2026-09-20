@@ -1091,6 +1091,11 @@ class Supervisor:
             return None
         contract = TaskContractV1.model_validate(item.contract)
         request = contract.execution_request
+        eligible = (
+            None
+            if request.pinned_model is not None
+            else self._eligible_harnesses(needs_credential=request.provider.value != "fake")
+        )
         selection = select_model(
             uow,
             routing,
@@ -1098,9 +1103,7 @@ class Supervisor:
             project=item.task.project,
             provider=request.provider.value,
             now=self._clock.now(),
-            eligible_harnesses=self._eligible_harnesses(
-                needs_credential=request.provider.value != "fake"
-            ),
+            eligible_harnesses=eligible,
             pinned_model=request.pinned_model,
             pinned_harness=request.pinned_harness.value if request.pinned_harness else None,
         )
@@ -2650,6 +2653,17 @@ class Supervisor:
             move_execution(
                 uow, self._clock, execution, ExecutionState.FAILED, EventKind.EXECUTION_FAILED
             )
+            if task.state is TaskState.SCHEDULED:
+                move_task(
+                    uow,
+                    self._clock,
+                    task,
+                    TaskState.RUNNING,
+                    EventKind.TASK_RUNNING,
+                    execution_id=execution.id,
+                    attempt_id=attempt.id,
+                    payload={"attempt_number": attempt.number},
+                )
             self._task_reported(uow, task, attempt, ExitClass.QUOTA_EXHAUSTED, {})
             return
         routing, contract = context
@@ -2671,6 +2685,17 @@ class Supervisor:
             move_execution(
                 uow, self._clock, execution, ExecutionState.FAILED, EventKind.EXECUTION_FAILED
             )
+            if task.state is TaskState.SCHEDULED:
+                move_task(
+                    uow,
+                    self._clock,
+                    task,
+                    TaskState.RUNNING,
+                    EventKind.TASK_RUNNING,
+                    execution_id=execution.id,
+                    attempt_id=attempt.id,
+                    payload={"attempt_number": attempt.number},
+                )
             self._task_reported(uow, task, attempt, ExitClass.QUOTA_EXHAUSTED, {})
             return
         if attempt.state not in ATTEMPT_TERMINAL:
