@@ -8,7 +8,7 @@
 | `blocked` | exit 75, `blocked.md` present | escalation, wake, task `blocked` |
 | `environment` | exit 70, the provider failed before the harness ran, the kernel killed the worker out of memory (exit 137 with the daemon's OOM flag), or the harness was refused | retry if attempts remain; else `failed`. A harness refusal (07, 25) is the exception: it is never retried, because the same refusal would come back |
 | `auth_failure` | harness reported auth problem (adapter classified) | retry per policy (`retry.auth_failure_max`, after `auth_retry_delay_seconds`); wake regardless |
-| `quota_exhausted` | harness reported rate or quota limit | not retry-eligible by default; task `reported` with the class visible; wake (Foundry may choose another harness) |
+| `quota_exhausted` | harness reported rate or quota limit | reroute (below): mark the pool, commit WIP, new attempt on the next candidate in the tier; if none, `awaiting_quota` until the earliest reset; caps exceeded or task pinned to the exhausted pool: task `reported` with the class visible, wake |
 | `timeout` | contract timeout or stall | no retry; gates run on what exists; wake |
 | `killed` | terminated by request | `cancelled` |
 | `crashed` | non-zero exit not otherwise classified | no retry by default; wake |
@@ -23,6 +23,37 @@ fresh workspace. A correction execution starts from the remote
 abandoned or force-pushed over; a plain retry of an unpublished attempt
 starts from `base_ref`, because nothing of the failed attempt was ever
 pushed.
+
+## Quota reroute and resume (C6b)
+
+A quota exit is not a failure of the worker's judgment, so it is handled
+apart from retry. It counts against `reroute.reroute_max` in the routing
+policy, never against `lifecycle.max_attempts`, and it never needs
+`retry_on` to name it. The sequence, all in one supervisor transaction per
+step:
+
+1. The collector runs. Uncommitted changes in the worktree are committed to
+   the work branch as one commit whose message begins `wip(crucible):` and
+   names the attempt, then pushed; the SHA goes in the event. Nothing is
+   discarded silently and nothing is left uncommitted. Squash on merge
+   removes the WIP commit from `main`.
+2. The attempt's pool is marked exhausted until `reset_at` (05b).
+3. Selection runs again for the tier with marked pools excluded. A
+   candidate: a new attempt on the same contract version, resumed from the
+   remote work branch as corrections are, and a `reroute` event naming the
+   pool left, the model chosen, and the ordered candidates. No wake.
+4. No candidate: the task moves to `awaiting_quota` with `resume_at` the
+   earliest `reset_at` among the tier's pools, and one informational wake
+   (17). The supervisor tick relaunches at `resume_at` through step 3. Past
+   `reroute.resume_max_wait_seconds`, or past `reroute_max`, the task ends
+   `reported` with the class visible and a wake, which is the pre-C6b
+   behaviour.
+
+A pinned task (05) skips step 3: it waits for its own pool's reset within
+the cap or ends `reported`. A quota refusal at launch-time reservation
+(the pool over Crucible's own soft limit) is not a reroute; it is the
+existing `quota_exhausted` refusal with a wake, because Crucible's count
+and the provider's word are different facts.
 
 ## Delivery-half failures (23)
 

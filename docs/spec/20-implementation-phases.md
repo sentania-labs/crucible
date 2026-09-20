@@ -110,6 +110,18 @@ report (19). Acceptance: the real Foundry ledger is imported and
 authoritative; readiness document complete; operator approval requested.
 **This is the worker-supervision readiness milestone.**
 
+## Phase C6b: class-based selection and quota reroute
+
+Contract carries a tier and no model; Crucible selects at launch by the
+05b rule; exhaustion marks; reroute to the next candidate with WIP
+committed to the branch; `awaiting_quota` with timed resume; caps;
+administrator read and clear of marks; `default-routing` version 3.
+Acceptance: an e2e run in which a scripted quota failure on one image
+reroutes to a second image and finishes, with the WIP commit and the
+reroute event in the record; a run with every pool marked waits and
+resumes on schedule across a supervisor restart. Replaces ADR 0014's
+predictive reads, which the operator rejected on 2026-09-19.
+
 ## Phase C7: release lifecycle (24)
 
 ReleaseContractV1, release gates, tag publisher, workflow observation.

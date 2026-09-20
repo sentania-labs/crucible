@@ -74,15 +74,13 @@ escalation:
 
 policy: { name: "default-software", version: 3 }
 
-execution_request:                 # Foundry's selection; Crucible does not choose
+execution_request:                 # the class of work; Crucible selects the model within it (05b, C6b)
   tier: "standard"                 # trivial | standard | complex, from the routing policy (05b)
-  harness: "codex"
-  model: "gpt-5-codex"             # passed through to the harness
-  effort: "high"
   provider: "docker"
-  image: "ghcr.io/sentania-labs/crucible-worker:codex-0.153.4"   # resolved to a digest at launch
   timeout_seconds: 5400
-  rationale: "Codex-first to preserve Claude quota; task is mechanical."
+  rationale: "mechanical change; standard tier"
+  effort: "high"                   # optional; passed through where the selected harness has an effort flag (07)
+  pin: null                        # operator pin only: { harness, model, pin_reason }; Foundry never sets it
 
 lifecycle:
   max_attempts: 2                  # must not exceed the policy's cap
@@ -147,24 +145,37 @@ of the previous version's. `required_verification` may not shrink.
   `repository.required_checks` lists (05b); missing ones are a 422 naming
   the check.
 - `policy` exists and is not retired; `lifecycle.max_attempts` within it.
-- `execution_request.model` is an enabled entry of the routing policy
-  whose `harness` matches, whose capability is allowed for `tier`, and
-  whose quota pool is not over its soft limit at submit (advisory; the
-  authoritative reservation happens at attempt launch, 05b); otherwise 422
-  naming the rule, so Foundry picks again.
-- `execution_request.harness` is registered; `provider` is registered
-  (only `fake` until C3) and supports the harness; `image` matches the provider's allowlist pattern,
-  resolves to a known `WorkerImage` whose harness version is inside the
-  adapter's supported range, and is not `retired`.
+- `execution_request` names no model, harness, or image. At submit the
+  advisory check is that the routing policy has at least one selectable
+  entry for `tier` (enabled, harness enabled with a credential, capability
+  allowed, pool under its soft limit and not marked exhausted); otherwise
+  422 naming the tier and why each candidate was excluded. Selection itself
+  happens at attempt launch (05b) and is recorded on the attempt, so the
+  contract stays valid across reroutes.
+- `execution_request.pin`, when present, is the operator's explicit choice
+  (bootstrap contract: an explicit model or harness selection from the
+  operator takes precedence). It carries `harness`, `model`, and a
+  non-empty `pin_reason`, and is validated as the old `model` field was:
+  an enabled entry whose harness matches, capability allowed for `tier`,
+  pool under its soft limit. A pinned task never reroutes; exhaustion on a
+  pinned pool waits for that pool's reset or ends `reported` at the cap
+  (16). A `pin` naming a harness without a model is refused.
+- `provider` is registered and supports every harness the tier could
+  select. The image is derived at launch from the selected harness through
+  the image manifest, must match the provider's allowlist pattern, resolve
+  to a known `WorkerImage` whose harness version is inside the adapter's
+  supported range, and not be `retired`; a tier whose every candidate has
+  no usable image is a 422 at submit.
 - `deliverables[].closes` entries are issues in the same repository.
 - No credential reference or value anywhere: the contract has no auth
   fields by design; repository auth is Crucible configuration.
 - `timeout_seconds` within policy bounds; `retry_on` a subset of both the
   `ExitClass` enum and the policy's `retry.eligible_classes`.
-- The contract is authoritative for harness, model, provider, image, and
-  policy. `POST /tasks/{id}/start` may carry an `overrides` object; applying
-  it creates a new contract version through the amendment path and records
-  an `amend` event.
+- The contract is authoritative for tier, provider, pin, and policy; the
+  attempt is authoritative for the harness, model, and image that actually
+  ran, and `GET /tasks/{id}` shows both. `POST /tasks/{id}/start` may carry
+  an `overrides` object; applying it creates a new contract version through
+  the amendment path and records an `amend` event.
 - No string field contains something that matches the secret-pattern
   scanner (bearer-like tokens, private key headers). Rejected with 422 and
   the offending path, not the value.

@@ -17,6 +17,12 @@ submitted --start--> scheduled --launch--> running
 running --attempt collected--> reported          (every exit class, see below)
 running --attempt blocked--> blocked
 running --attempt retry--> scheduled              (policy permitted a new attempt)
+running --attempt quota_exhausted, another candidate in the tier--> scheduled     (reroute, 16: WIP committed, pool marked, reroute count +1)
+running --attempt quota_exhausted, no candidate, wait within cap--> awaiting_quota --wake (informational)-->
+awaiting_quota --resume_at reached, a candidate exists--> scheduled
+awaiting_quota --resume_at reached, still no candidate, wait within cap--> awaiting_quota   (resume_at moves to the next reset; no new wake)
+awaiting_quota --wait cap exceeded, or reroute cap exceeded--> reported --wake-->
+awaiting_quota --cancel--> cancelled
 blocked --decision--> scheduled
 
 reported --mechanical pre-PR gates fail--> pre_pr_gates_failed --wake-->
@@ -150,8 +156,17 @@ collected --classify--> succeeded | blocked | failed
 {preparing, launching} --error--> collected (exit_class environment)
 ```
 
+`launching` is where the model is selected (05b): the attempt row carries
+the selected harness, model, image, and the ordered candidate list from
+that moment on, and a reroute is simply the next attempt selecting again
+with the exhausted pool excluded.
+
 `collected` is the single point where outputs, logs, artifacts, evidence,
-the branch bundle, and the parsed report exist. Classification:
+the branch bundle, and the parsed report exist. For an attempt classified
+`quota_exhausted` the collector also commits any uncommitted change in the
+worktree to the work branch as one `wip(crucible):` commit naming the
+attempt, and pushes it, so the next attempt resumes from the remote branch
+(16). Classification:
 `succeeded` requires exit 0 and a parsed report; `blocked` requires exit 75
 and `blocked.md`; everything else is `failed` with the recorded exit class.
 The task transition happens on classification: `succeeded` and `failed`
