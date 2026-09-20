@@ -444,6 +444,7 @@ async def _drive(
             if found is not None:
                 inspected["env"] = list(found.get("Config", {}).get("Env") or [])
                 inspected["cmd"] = list(found.get("Config", {}).get("Cmd") or [])
+                inspected["labels"] = dict(found.get("Config", {}).get("Labels") or {})
                 inspected["mounts"] = [
                     {k: m.get(k) for k in ("Type", "Source", "Destination", "RW")}
                     for m in found.get("Mounts", [])
@@ -543,6 +544,17 @@ async def test_a_trivial_task_reaches_ready_for_merge_live(
         )
         view = live_client.get(f"/v1/tasks/{task_id}").json()
         attempt = view["latest_attempt"]
+        running_version = inspected.get("labels", {}).get("crucible.harness_version")
+        harness_view = next(
+            item
+            for item in live_client.get("/v1/harnesses").json()["items"]
+            if item["name"] == harness
+        )
+        assert running_version, inspected
+        assert running_version in harness_view["installed_versions"], {
+            "running_label": running_version,
+            "harness_view": harness_view,
+        }
         sync = _payload(live_client, task_id, "credential_synced") or {}
         metrics = _payload(live_client, task_id, "attempt_metrics_recorded") or {}
         entry.update(
@@ -563,6 +575,8 @@ async def test_a_trivial_task_reaches_ready_for_merge_live(
                 "refusal": _payload(live_client, task_id, "harness_refused"),
                 "collected": _payload(live_client, task_id, "attempt_collected"),
                 "collection_failed": _payload(live_client, task_id, "collection_failed"),
+                "running_harness_version_label": running_version,
+                "api_installed_versions": harness_view["installed_versions"],
             }
         )
         with engine.begin() as connection:
