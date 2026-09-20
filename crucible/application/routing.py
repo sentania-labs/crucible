@@ -1,16 +1,9 @@
-"""Routing-policy enforcement, pool usage, and per-model history (05b, 03, 14).
-
-Crucible never selects a model. It refuses a contract whose model is absent, disabled,
-mismatched with the harness, outside the tier's allowed capability, or whose quota pool is
-over its soft limit; and it reports what happened so the next selection is informed.
-
-The quota check runs twice: advisory at submit, authoritative at attempt launch in the
-same fenced transaction that moves the attempt to `launching`."""
+"""Deterministic class routing, pool state, usage, and history (05b, C6b)."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from crucible.contracts.policy import RoutingModel, RoutingPolicyV1, window_seconds
@@ -30,6 +23,8 @@ class PoolUsage:
     attempts: int
     fallback_to_attempts: bool
     over_soft_limit: bool
+    exhausted_until: datetime | None = None
+    exhaustion_reason: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -42,6 +37,8 @@ class PoolUsage:
             "counting": "attempts" if self.fallback_to_attempts else self.budget_units,
             "fallback_to_attempts": self.fallback_to_attempts,
             "over_soft_limit": self.over_soft_limit,
+            "exhausted_until": self.exhausted_until.isoformat() if self.exhausted_until else None,
+            "exhaustion_reason": self.exhaustion_reason,
         }
 
 
@@ -119,6 +116,8 @@ def pool_usage(uow: UnitOfWork, routing: RoutingPolicyV1, pool: str, now: dateti
         if m.model in models
     ]
     attempts = len(rows)
+    mark = uow.pool_exhaustions.get(pool)
+    active = mark if mark and mark.cleared_at is None and mark.reset_at > now else None
     if spec.budget_units == "attempts":
         return PoolUsage(
             pool=pool,
@@ -129,6 +128,8 @@ def pool_usage(uow: UnitOfWork, routing: RoutingPolicyV1, pool: str, now: dateti
             attempts=attempts,
             fallback_to_attempts=False,
             over_soft_limit=spec.soft_limit > 0 and attempts >= spec.soft_limit,
+            exhausted_until=active.reset_at if active else None,
+            exhaustion_reason=active.reason if active else None,
         )
     values = [
         _budget_value(row, spec.budget_units)
@@ -148,6 +149,8 @@ def pool_usage(uow: UnitOfWork, routing: RoutingPolicyV1, pool: str, now: dateti
         attempts=attempts,
         fallback_to_attempts=fallback,
         over_soft_limit=spec.soft_limit > 0 and used >= spec.soft_limit,
+        exhausted_until=active.reset_at if active else None,
+        exhaustion_reason=active.reason if active else None,
     )
 
 
@@ -170,6 +173,12 @@ def check_quota(
     if entry is None:
         return None
     usage = pool_usage(uow, routing, entry.pool, now)
+    if usage.exhausted_until is not None:
+        exhausted_until = usage.exhausted_until.isoformat()
+        return {
+            "path": "execution_request.tier",
+            "message": f"quota pool {entry.pool} is exhausted until {exhausted_until}",
+        }
     if usage.over_soft_limit:
         return {
             "path": "execution_request.model",
@@ -192,6 +201,130 @@ class Reservation:
     pool: str
     ok: bool
     detail: str
+
+
+@dataclass(frozen=True, slots=True)
+class Selection:
+    selected: RoutingModel | None
+    image: str | None
+    candidates: tuple[dict[str, Any], ...]
+
+
+def image_for_harness(uow: UnitOfWork, harness: str, provider: str) -> str | None:
+    defaults = [
+        item
+        for item in uow.image_promotions.list_all()
+        if item.harness == harness and item.state == "default"
+    ]
+    if defaults:
+        return sorted(defaults, key=lambda item: (item.updated_at, item.digest), reverse=True)[
+            0
+        ].reference
+    # The fake provider is an in-process test double and has no image manifest.
+    if provider == "fake":
+        return "crucible-worker:fake-succeed"
+    return None
+
+
+def _project_metrics(uow: UnitOfWork, project: str) -> dict[str, list[AttemptMetrics]]:
+    task_ids = [
+        task.id
+        for task in uow.tasks.search(
+            state=None,
+            project=project,
+            repository_id=None,
+            external_id=None,
+            updated_since=None,
+            after_id=None,
+            limit=10000,
+        )
+    ]
+    rows = uow.attempt_metrics.list_since(since=None, model=None, task_ids=task_ids)
+    grouped: dict[str, list[AttemptMetrics]] = {}
+    for row in rows:
+        grouped.setdefault(row.model, []).append(row)
+    for values in grouped.values():
+        values.sort(
+            key=lambda item: (item.created_at or datetime.min.replace(tzinfo=UTC), item.attempt_id)
+        )
+    return grouped
+
+
+def select_model(
+    uow: UnitOfWork,
+    routing: RoutingPolicyV1,
+    *,
+    tier: str,
+    project: str,
+    provider: str,
+    now: datetime,
+    eligible_harnesses: set[str] | None = None,
+    pinned_model: str | None = None,
+    pinned_harness: str | None = None,
+) -> Selection:
+    """Return the same answer for the same rows, including a reason for every exclusion."""
+    tier_rule = routing.tiers.get(tier)
+    if tier_rule is None:
+        return Selection(None, None, tuple())
+    metrics = _project_metrics(uow, project)
+    ranked: list[tuple[tuple[Any, ...], RoutingModel, str, list[str]]] = []
+    for entry in routing.models:
+        reasons: list[str] = []
+        if pinned_model is not None and entry.id != pinned_model:
+            reasons.append("not the operator pin")
+        if pinned_harness is not None and entry.harness != pinned_harness:
+            reasons.append("harness does not match the operator pin")
+        if not entry.enabled:
+            reasons.append("model disabled")
+        if eligible_harnesses is not None and entry.harness not in eligible_harnesses:
+            reasons.append("harness disabled or has no credential")
+        if entry.capability not in tier_rule.allowed_capability:
+            reasons.append(f"capability {entry.capability} is not allowed for tier {tier}")
+        usage = pool_usage(uow, routing, entry.pool, now)
+        if usage.over_soft_limit:
+            reasons.append("pool is at its soft limit")
+        if usage.exhausted_until is not None:
+            reasons.append(f"pool exhausted until {usage.exhausted_until.isoformat()}")
+        image = image_for_harness(uow, entry.harness, provider)
+        if image is None:
+            reasons.append("selected harness has no default image")
+            image = ""
+        cap_rank = (
+            tier_rule.prefer.index(entry.capability)
+            if entry.capability in tier_rule.prefer
+            else len(tier_rule.prefer)
+        )
+        recent = metrics.get(entry.id, [])[-routing.rotation.quality_window :]
+        demoted = int(
+            routing.rotation.quality_feedback
+            and bool(recent)
+            and any(row.gates_failed > 0 or row.corrections_after > 0 for row in recent)
+        )
+        last = recent[-1].created_at if recent else None
+        weight = max(entry.weight, 1)
+        weighted_use = len(recent) / weight
+        rank = (
+            cap_rank + demoted,
+            weighted_use,
+            last or datetime.min.replace(tzinfo=UTC),
+            entry.id,
+        )
+        ranked.append((rank, entry, image, reasons))
+    ranked.sort(key=lambda item: item[0])
+    ordered = tuple(
+        {
+            "model": entry.id,
+            "harness": entry.harness,
+            "pool": entry.pool,
+            "capability": entry.capability,
+            "image": image or None,
+            "eligible": not reasons,
+            "excluded": reasons,
+        }
+        for _, entry, image, reasons in ranked
+    )
+    chosen = next(((entry, image) for _, entry, image, reasons in ranked if not reasons), None)
+    return Selection(chosen[0] if chosen else None, chosen[1] if chosen else None, ordered)
 
 
 def reserve(

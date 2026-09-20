@@ -153,10 +153,16 @@ def attach_correction(
         payload={
             "role": "correct",
             "contract_version": stored.version,
-            "harness": contract.execution_request.harness.value,
-            "model": contract.execution_request.model,
+            "tier": contract.execution_request.tier.value,
+            "pin": (
+                {
+                    "harness": contract.execution_request.pinned_harness.value,
+                    "model": contract.execution_request.pinned_model,
+                }
+                if contract.execution_request.pinned_harness
+                else None
+            ),
             "provider": contract.execution_request.provider.value,
-            "image": contract.execution_request.image,
             "policy": {"name": contract.policy.name, "version": contract.policy.version},
         },
     )

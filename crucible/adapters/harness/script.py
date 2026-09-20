@@ -9,6 +9,7 @@ port now so the registry has one shape for every harness (07).
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 
 from crucible.adapters.harness import base
@@ -31,6 +32,9 @@ NAME = "script-harness"
 class ScriptHarnessAdapter:
     name = NAME
     supported_versions = VersionRange("1.0.0", "2.0.0")
+
+    def quota_reset_at(self, stdout_tail: str, stderr_tail: str) -> datetime | None:
+        return base.quota_reset_at(stdout_tail, stderr_tail)
 
     def capabilities(self) -> HarnessCapabilities:
         return HarnessCapabilities(

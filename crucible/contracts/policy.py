@@ -334,12 +334,19 @@ class RoutingPool(StrictModel):
     window: str = Field(pattern=r"^[0-9]+[hm]$")
     budget_units: BudgetUnit
     soft_limit: int = Field(ge=0)
+    # Absent on immutable versions 1 and 2. Only version 3 uses reactive marks.
+    default_cooldown_seconds: int = Field(default=3600, ge=1)
 
 
 class Rotation(StrictModel):
     strategy: str = Field(min_length=1)
     quality_feedback: bool
     quality_window: int = Field(ge=1)
+
+
+class Reroute(StrictModel):
+    reroute_max: int = Field(default=3, ge=0)
+    resume_max_wait_seconds: int = Field(default=86400, ge=1)
 
 
 class RoutingPolicyV1(StrictModel):
@@ -350,6 +357,7 @@ class RoutingPolicyV1(StrictModel):
     models: list[RoutingModel] = Field(min_length=1)
     pools: dict[str, RoutingPool]
     rotation: Rotation
+    reroute: Reroute = Field(default_factory=Reroute)
 
     @field_validator("schema_version")
     @classmethod

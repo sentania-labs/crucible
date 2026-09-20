@@ -66,6 +66,7 @@ def contract_document(**overrides: Any) -> dict[str, Any]:
             "tier": "standard",
             "harness": "codex",
             "model": "gpt-5.6-luna",
+            "pin_reason": "synthetic fixture keeps deterministic legacy behavior",
             "effort": "high",
             "provider": "fake",
             "image": "crucible-worker:fake-succeed",

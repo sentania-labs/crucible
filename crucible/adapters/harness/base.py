@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Iterator, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -81,6 +82,44 @@ def classify_with_patterns(
     if first_match(tails, quota) is not None:
         return ExitClass.QUOTA_EXHAUSTED
     return base
+
+
+_RESET_KEYS = frozenset({"reset_at", "resetAt", "resets_at", "resetsAt", "reset_time"})
+
+
+def quota_reset_at(*tails: str) -> datetime | None:
+    """Parse only explicit machine timestamps. Relative prose falls back to policy."""
+
+    def walk(value: Any) -> Iterator[Any]:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key in _RESET_KEYS:
+                    yield item
+                yield from walk(item)
+        elif isinstance(value, list):
+            for item in value:
+                yield from walk(item)
+
+    for tail in tails:
+        for line in reversed(tail[-TAIL_LIMIT:].splitlines()):
+            try:
+                document = json.loads(line)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            for raw in walk(document):
+                if isinstance(raw, (int, float)):
+                    seconds = float(raw) / (1000 if raw > 10_000_000_000 else 1)
+                    try:
+                        return datetime.fromtimestamp(seconds, tz=UTC)
+                    except (OverflowError, OSError, ValueError):
+                        continue
+                if isinstance(raw, str):
+                    try:
+                        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                    except ValueError:
+                        continue
+                    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+    return None
 
 
 def read_text(path: Path, limit: int = 8 * 1024 * 1024) -> str | None:

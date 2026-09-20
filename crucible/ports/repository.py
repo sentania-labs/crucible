@@ -32,6 +32,7 @@ from crucible.domain.entities import (
     Lease,
     LogChunkRecord,
     Policy,
+    PoolExhaustion,
     Principal,
     PullRequest,
     PullRequestHead,
@@ -93,6 +94,15 @@ class RoutingPolicyRepository(Protocol):
     def put(self, policy: RoutingPolicyRecord) -> RoutingPolicyRecord: ...
 
     def is_referenced(self, name: str, version: int) -> bool: ...
+
+
+class PoolExhaustionRepository(Protocol):
+    def get(self, pool: str, *, for_update: bool = False) -> PoolExhaustion | None: ...
+    def put(self, mark: PoolExhaustion) -> PoolExhaustion: ...
+    def list_all(self) -> Sequence[PoolExhaustion]: ...
+    def clear(
+        self, pool: str, *, at: datetime, principal: str, reason: str
+    ) -> PoolExhaustion | None: ...
 
 
 class TaskRepository(Protocol):
@@ -521,6 +531,7 @@ class UnitOfWork(Protocol):
     supervisor_status: SupervisorStatusRepository
     idempotency: IdempotencyRepository
     routing_policies: RoutingPolicyRepository
+    pool_exhaustions: PoolExhaustionRepository
     artifacts: ArtifactRepository
     evidence: EvidenceRepository
     review_reports: ReviewReportRepository

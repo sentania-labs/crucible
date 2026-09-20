@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import fnmatch
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 from pydantic import ValidationError
@@ -12,7 +13,13 @@ from pydantic import ValidationError
 from crucible.application.errors import ContractValidationError, DuplicateExternalIdError
 from crucible.application.harnesses import HarnessRegistry
 from crucible.application.registry import REGISTERED_HARNESSES, REGISTERED_PROVIDERS
-from crucible.application.routing import check_quota, check_selection, load_routing
+from crucible.application.routing import (
+    check_quota,
+    check_selection,
+    image_for_harness,
+    load_routing,
+    select_model,
+)
 from crucible.application.transitions import record_event
 from crucible.contracts.common import to_document
 from crucible.contracts.task_contract import TaskContractV1, contract_sha256
@@ -22,7 +29,7 @@ from crucible.domain.exit_class import ExitClass
 from crucible.domain.ids import new_id
 from crucible.domain.lifecycle import TaskState
 from crucible.ports.clock import Clock
-from crucible.ports.harness import HarnessGate, HarnessUnavailableError
+from crucible.ports.harness import CredentialSource, HarnessGate, HarnessUnavailableError
 from crucible.ports.repository import UnitOfWork
 
 Problem = dict[str, Any]
@@ -45,11 +52,13 @@ def parse_contract(body: object) -> TaskContractV1:
 
 
 def _check_routing(
-    uow: UnitOfWork, clock: Clock, contract: TaskContractV1, policy: Policy
+    uow: UnitOfWork,
+    clock: Clock,
+    contract: TaskContractV1,
+    policy: Policy,
+    eligible_harnesses: set[str] | None,
 ) -> list[Problem]:
-    """05, 05b: the model must be an enabled routing entry the tier allows, and its quota
-    pool must not be over its soft limit. The submit check is advisory; the launch check
-    is authoritative."""
+    """The class must have a candidate now; an operator pin is validated exactly."""
     routing = load_routing(uow, policy.document)
     if routing is None:
         ref = policy.document.get("routing", {}).get("policy", {})
@@ -60,16 +69,62 @@ def _check_routing(
             )
         ]
     request = contract.execution_request
-    problems = check_selection(
+    pinned_model = request.pinned_model
+    pinned_harness = request.pinned_harness
+    if pinned_model is not None and pinned_harness is not None:
+        problems = check_selection(
+            routing,
+            tier=request.tier.value,
+            harness=pinned_harness.value,
+            model_id=pinned_model,
+        )
+        quota = check_quota(uow, routing, model_id=pinned_model, now=clock.now())
+        if quota is not None:
+            problems.append(quota)
+        image = image_for_harness(uow, pinned_harness.value, request.provider.value)
+        if image is None and request.provider.value != "fake":
+            problems.append(
+                _problem("execution_request.model", "pinned harness has no default image")
+            )
+        allowlist = [str(p) for p in policy.document.get("images", {}).get("allowlist", [])]
+        if (
+            image
+            and allowlist
+            and not any(fnmatch.fnmatchcase(image, pattern) for pattern in allowlist)
+        ):
+            problems.append(
+                _problem("execution_request.model", "derived image is outside the policy allowlist")
+            )
+        return problems
+    selection = select_model(
+        uow,
         routing,
         tier=request.tier.value,
-        harness=request.harness.value,
-        model_id=request.model,
+        project=contract.project,
+        provider=request.provider.value,
+        now=clock.now(),
+        eligible_harnesses=eligible_harnesses,
     )
-    quota = check_quota(uow, routing, model_id=request.model, now=clock.now())
-    if quota is not None:
-        problems.append(quota)
-    return problems
+    if selection.selected is None:
+        return [
+            _problem(
+                "execution_request.tier",
+                f"tier {request.tier.value!r} has no selectable model: "
+                f"{list(selection.candidates)!r}",
+            )
+        ]
+    allowlist = [str(p) for p in policy.document.get("images", {}).get("allowlist", [])]
+    if (
+        selection.image
+        and allowlist
+        and not any(fnmatch.fnmatchcase(selection.image, pattern) for pattern in allowlist)
+    ):
+        return [
+            _problem(
+                "execution_request.tier", "every candidate image is outside the policy allowlist"
+            )
+        ]
+    return []
 
 
 def _check_against_registry(
@@ -133,24 +188,19 @@ def _check_against_registry(
             problems.append(
                 _problem("required_verification", f"missing the policy-required check {check!r}")
             )
-    allowlist = [str(p) for p in doc.get("images", {}).get("allowlist", [])]
-    if allowlist and not any(
-        fnmatch.fnmatchcase(contract.execution_request.image, p) for p in allowlist
-    ):
-        problems.append(
-            _problem("execution_request.image", "does not match the policy image allowlist")
-        )
-    harness = contract.execution_request.harness.value
     provider = contract.execution_request.provider.value
-    if harness not in REGISTERED_HARNESSES:
-        problems.append(_problem("execution_request.harness", "is not registered"))
     supported = REGISTERED_PROVIDERS.get(provider)
     if supported is None:
         problems.append(_problem("execution_request.provider", f"{provider!r} is not registered"))
-    elif harness not in supported:
-        problems.append(
-            _problem("execution_request.provider", f"{provider!r} does not support {harness!r}")
-        )
+    pinned = contract.execution_request.pinned_harness
+    if pinned is not None:
+        harness = pinned.value
+        if harness not in REGISTERED_HARNESSES:
+            problems.append(_problem("execution_request.harness", "is not registered"))
+        elif supported is not None and harness not in supported:
+            problems.append(
+                _problem("execution_request.provider", f"{provider!r} does not support {harness!r}")
+            )
     if repository is not None:
         issue_prefix = repository.url.rstrip("/").removesuffix(".git") + "/issues/"
         for index, deliverable in enumerate(contract.deliverables):
@@ -168,7 +218,11 @@ def _check_against_registry(
 
 
 def validate_against_registry(
-    uow: UnitOfWork, clock: Clock, contract: TaskContractV1
+    uow: UnitOfWork,
+    clock: Clock,
+    contract: TaskContractV1,
+    *,
+    eligible_harnesses: set[str] | None = None,
 ) -> list[Problem]:
     """Every submit-time rule of 05 that needs the registry: the repository, the policy
     and its caps, the image allowlist, the provider and harness, the routing entry, and
@@ -177,7 +231,7 @@ def validate_against_registry(
     policy = uow.policies.get(contract.policy.name, contract.policy.version)
     problems, checked_policy = _check_against_registry(contract, repository, policy)
     if checked_policy is not None:
-        problems.extend(_check_routing(uow, clock, contract, checked_policy))
+        problems.extend(_check_routing(uow, clock, contract, checked_policy, eligible_harnesses))
     return problems
 
 
@@ -189,13 +243,33 @@ def submit_task(
     body: object,
     harnesses: HarnessRegistry | None = None,
     harness_gates: Mapping[str, HarnessGate] | None = None,
+    credential_sources: Mapping[str, CredentialSource] | None = None,
 ) -> tuple[Task, TaskContract]:
     contract = parse_contract(body)
     repository = uow.repositories.get_by_name(contract.repository.name)
-    problems = validate_against_registry(uow, clock, contract)
+    eligible_harnesses: set[str] | None = None
     if harnesses is not None:
+        eligible_harnesses = set()
+        for name in harnesses.names():
+            adapter = harnesses.get(name)
+            if adapter is None:
+                continue
+            source = (credential_sources or {}).get(name)
+            if adapter.credential_spec() is not None and (
+                source is None or not Path(source.path).is_dir()
+            ):
+                continue
+            try:
+                harnesses.resolve(name, gates=harness_gates, state=uow.harnesses.get(name))
+            except HarnessUnavailableError:
+                continue
+            eligible_harnesses.add(name)
+    problems = validate_against_registry(
+        uow, clock, contract, eligible_harnesses=eligible_harnesses
+    )
+    if harnesses is not None and contract.execution_request.pinned_harness is not None:
         # 25: a disabled harness is a contract problem now, not a refusal a task later.
-        name = contract.execution_request.harness.value
+        name = contract.execution_request.pinned_harness.value
         try:
             harnesses.resolve(name, gates=harness_gates, state=uow.harnesses.get(name))
         except HarnessUnavailableError as exc:

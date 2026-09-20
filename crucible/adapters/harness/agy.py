@@ -16,6 +16,7 @@ rw-narrow and the file syncs back by that field.
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -60,6 +61,9 @@ QUOTA_PATTERNS = base.patterns(
 class AgyAdapter:
     name = NAME
     supported_versions = VersionRange("1.2.0", "1.3.0")
+
+    def quota_reset_at(self, stdout_tail: str, stderr_tail: str) -> datetime | None:
+        return base.quota_reset_at(stdout_tail, stderr_tail)
 
     def capabilities(self) -> HarnessCapabilities:
         return HarnessCapabilities(

@@ -96,6 +96,10 @@ def _attempt_summary(a: Attempt) -> AttemptSummary:
         started_at=a.started_at,
         ended_at=a.ended_at,
         handle=a.handle,
+        model=a.selected_model,
+        harness=a.selected_harness,
+        image=a.selected_image,
+        pool=a.selected_pool,
     )
 
 
@@ -130,6 +134,11 @@ def task_view(uow: UnitOfWork, task_id: str) -> TaskView:
     ]
     all_attempts = [a for s in summaries for a in s.attempts]
     latest = max(all_attempts, key=lambda a: a.id) if all_attempts else None
+    reroutes = [
+        _event_view(event).model_dump(mode="json")
+        for event in uow.events.list_for_task(task.id, after_seq=0, limit=1000)
+        if event.kind == "task_rerouted"
+    ]
     return TaskView(
         id=task.id,
         external_id=task.external_id,
@@ -175,6 +184,8 @@ def task_view(uow: UnitOfWork, task_id: str) -> TaskView:
                 task.principal_id, since=None, include_acked=False, limit=MAX_LIMIT
             )
         ),
+        resume_at=task.resume_at,
+        reroute_chain=reroutes,
     )
 
 
@@ -355,6 +366,12 @@ def attempt_view(uow: UnitOfWork, attempt_id: str) -> AttemptView:
         ),
         heartbeat_summary={"signals": 0, "note": "heartbeats are C3"},
         report=report,
+        model=a.selected_model,
+        harness=a.selected_harness,
+        image=a.selected_image,
+        pool=a.selected_pool,
+        ordered_candidates=a.ordered_candidates,
+        resume_from_remote=a.resume_from_remote,
     )
 
 

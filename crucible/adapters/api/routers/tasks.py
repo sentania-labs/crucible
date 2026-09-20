@@ -62,6 +62,7 @@ async def submit(
             body=document,
             harnesses=ctx.harnesses,
             harness_gates=ctx.harness_gates,
+            credential_sources=ctx.credential_sources,
         )
         return 201, task_view(uow, task.id).model_dump(mode="json")
 

@@ -82,6 +82,8 @@ class Task:
     # The head SHA the collector produced for the latest implement or correct attempt.
     # Everything after `reported` is bound to it (09).
     head_sha: str | None = None
+    resume_at: datetime | None = None
+    quota_wait_started_at: datetime | None = None
 
 
 @dataclass(slots=True)
@@ -147,6 +149,12 @@ class Attempt:
     # 15: an attempt imported from the bootstrap ledger stands for a worker Crucible never
     # ran and cannot observe. The supervisor's scans skip it; the task view shows it.
     unsupervised: bool = False
+    selected_model: str | None = None
+    selected_harness: str | None = None
+    selected_image: str | None = None
+    selected_pool: str | None = None
+    ordered_candidates: list[dict[str, Any]] = field(default_factory=list)
+    resume_from_remote: bool = False
 
 
 @dataclass(slots=True)
@@ -394,6 +402,19 @@ class RoutingPolicyRecord:
     document: dict[str, Any]
     created_at: datetime
     retired_at: datetime | None = None
+
+
+@dataclass(slots=True)
+class PoolExhaustion:
+    pool: str
+    exhausted_at: datetime
+    reset_at: datetime
+    task_id: str
+    attempt_id: str
+    reason: str
+    cleared_at: datetime | None = None
+    cleared_by: str | None = None
+    clear_reason: str | None = None
 
 
 # ----- harness administration (07, 25) --------------------------------------

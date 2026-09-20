@@ -86,6 +86,8 @@ class TaskRow(Base):
     updated_at: Mapped[datetime] = mapped_column(TZ)
     closed_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
     head_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    resume_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
+    quota_wait_started_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
 
 
 class TaskContractRow(Base):
@@ -151,6 +153,12 @@ class AttemptRow(Base):
     log_resume_occurrence: Mapped[int] = mapped_column(Integer, default=0)
     cleaned_up_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
     unsupervised: Mapped[bool] = mapped_column(Boolean, default=False)
+    selected_model: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    selected_harness: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    selected_image: Mapped[str | None] = mapped_column(Text, nullable=True)
+    selected_pool: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    ordered_candidates: Mapped[list[Any]] = mapped_column(JSONB, default=list)
+    resume_from_remote: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 class LogChunkRow(Base):
@@ -253,6 +261,19 @@ class RoutingPolicyRow(Base):
     document: Mapped[dict[str, Any]] = mapped_column(JSONB)
     created_at: Mapped[datetime] = mapped_column(TZ)
     retired_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
+
+
+class PoolExhaustionRow(Base):
+    __tablename__ = "pool_exhaustions"
+    pool: Mapped[str] = mapped_column(String(128), primary_key=True)
+    exhausted_at: Mapped[datetime] = mapped_column(TZ)
+    reset_at: Mapped[datetime] = mapped_column(TZ, index=True)
+    task_id: Mapped[str] = mapped_column(ID, ForeignKey("tasks.id"))
+    attempt_id: Mapped[str] = mapped_column(ID, ForeignKey("attempts.id"))
+    reason: Mapped[str] = mapped_column(Text)
+    cleared_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
+    cleared_by: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    clear_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class ArtifactRow(Base):

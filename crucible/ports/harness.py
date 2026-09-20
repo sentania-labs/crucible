@@ -11,6 +11,7 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol
@@ -298,3 +299,5 @@ class HarnessAdapter(Protocol):
     def parse_report(self, report_dir: Path, exit: ExitInfo) -> ParsedReport: ...
 
     def classify_exit(self, exit: ExitInfo, stdout_tail: str, stderr_tail: str) -> ExitClass: ...
+
+    def quota_reset_at(self, stdout_tail: str, stderr_tail: str) -> datetime | None: ...

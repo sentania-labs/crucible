@@ -18,6 +18,7 @@ MCP servers and hook trust hashes never reach a worker.
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 
 from crucible.adapters.harness import base
@@ -68,6 +69,9 @@ QUOTA_PATTERNS = base.patterns(
 class CodexAdapter:
     name = NAME
     supported_versions = VersionRange("0.153.0", "0.154.0")
+
+    def quota_reset_at(self, stdout_tail: str, stderr_tail: str) -> datetime | None:
+        return base.quota_reset_at(stdout_tail, stderr_tail)
 
     def capabilities(self) -> HarnessCapabilities:
         return HarnessCapabilities(

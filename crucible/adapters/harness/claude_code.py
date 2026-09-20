@@ -16,6 +16,7 @@ mounted read-only on top, so no hook, MCP server or plugin definition reaches a 
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -74,6 +75,9 @@ QUOTA_PATTERNS += base.correlated(
 class ClaudeCodeAdapter:
     name = NAME
     supported_versions = VersionRange("2.1.0", "2.2.0")
+
+    def quota_reset_at(self, stdout_tail: str, stderr_tail: str) -> datetime | None:
+        return base.quota_reset_at(stdout_tail, stderr_tail)
 
     def capabilities(self) -> HarnessCapabilities:
         return HarnessCapabilities(
