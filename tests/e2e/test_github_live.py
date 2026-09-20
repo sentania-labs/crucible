@@ -12,6 +12,7 @@ all configured, so a partial run is never mistaken for a pass.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -30,6 +31,7 @@ from crucible.application.delivery_tick import DeliveryConfig
 from crucible.application.repositories import register_repository
 from crucible.application.supervisor import Supervisor
 from crucible.contracts.api import ExternalReviewAttestation, RepositoryRegistration
+from crucible.domain.entities import ImagePromotion
 from crucible.domain.secrets import scan_text
 from tests.e2e import github_live
 from tests.e2e.conftest import RUN_ID, e2e_contract, run_until, submit_and_start, upload_review
@@ -163,15 +165,21 @@ def live_policy() -> dict[str, Any]:
         "external_review_rounds",
         "feedback_dispositions_complete",
     ]
-    # The throwaway repository has no CI. An empty required set is pending, never green
-    # (23), so a tier that wants to reach `ready_for_merge` has to say so explicitly,
-    # which is an operator-recorded policy decision and is what this is.
-    document["ci_certification"]["allow_no_ci"] = True
+    # C6c gives the throwaway repository one stable required check. Ordinary tasks
+    # prove the green path, while the readiness failure task adds its marker to force
+    # this exact check red.
+    document["ci_certification"]["allow_no_ci"] = False
+    document["ci_certification"]["required_checks"] = ["crucible-readiness"]
     return document
 
 
 @pytest.fixture
-def live_client(ctx: AppContext, tokens: dict[str, str]) -> Iterator[TestClient]:
+def live_client(
+    ctx: AppContext,
+    tokens: dict[str, str],
+    provider: DockerProvider,
+    worker_image: str,
+) -> Iterator[TestClient]:
     app = create_app(ctx)
     with TestClient(app, headers={"Authorization": f"Bearer {tokens['admin']}"}) as admin:
         routing = e2e_routing_document()
@@ -182,6 +190,23 @@ def live_client(ctx: AppContext, tokens: dict[str, str]) -> Iterator[TestClient]
         assert admin.put(
             f"/v1/policies/{document['name']}/{document['version']}", json=document
         ).status_code in (200, 201)
+        worker = next(
+            item for item in asyncio.run(provider.list_images()) if item.reference == worker_image
+        )
+        with ctx.uow_factory() as uow:
+            uow.image_promotions.put(
+                ImagePromotion(
+                    digest=worker.digest,
+                    reference=worker.reference,
+                    harness="script-harness",
+                    harness_version=worker.harness_version or "1.0.0",
+                    state="default",
+                    updated_at=ctx.clock.now(),
+                    updated_by="e2e-github",
+                    reason="live GitHub script harness image",
+                )
+            )
+            uow.commit()
     with TestClient(app, headers={"Authorization": f"Bearer {tokens['orchestrator']}"}) as c:
         yield c
 
@@ -292,7 +317,7 @@ async def test_a_task_reaches_a_real_pull_request_and_a_real_merge(
     certification = live_client.get(f"/v1/tasks/{task_id}/pull-request").json()[
         "ci_certifications"
     ][-1]
-    assert certification["state"] == "skipped", certification
+    assert certification["state"] == "green", certification
 
     status, payload = github_live.merge_with_app_token(
         github, live_config, record["number"], sha=view["head_sha"]
@@ -320,6 +345,95 @@ async def test_a_task_reaches_a_real_pull_request_and_a_real_merge(
         "pull_request_polled",
     ):
         assert kind in kinds, kind
+
+
+async def test_a_real_required_check_failure_escalates_without_retry(
+    ctx: AppContext,
+    live_client: TestClient,
+    live_supervisor: Supervisor,
+    live_config: LiveConfig,
+    mirror: str,
+    cleanup: github_live.Cleanup,
+    worker_image: str,
+    engine: Engine,
+) -> None:
+    """23: a real failing workflow is evidence, not an automatic correction."""
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE policies SET document = "
+                "jsonb_set(jsonb_set(document, '{ci_certification,allow_no_ci}', 'false'), "
+                "'{ci_certification,required_checks}', '[\"crucible-readiness\"]') "
+                "WHERE name='e2e-script' AND version=1"
+            )
+        )
+    register(ctx, live_config, mirror)
+    external_id = f"C6C-CI-{RUN_ID}"
+    branch = github_live.branch_for(external_id)
+    cleanup.add_branch(branch)
+    document = live_contract(external_id, live_config, worker_image)
+    document["scope"]["allowed_paths"] = [".crucible-force-ci-failure"]
+    task_id = submit_and_start(live_client, document)
+
+    state = await run_until(
+        live_supervisor,
+        live_client,
+        task_id,
+        {"awaiting_internal_review", "pre_pr_gates_failed"},
+        max_ticks=60,
+    )
+    assert state == "awaiting_internal_review"
+    upload_review(live_client, task_id)
+    assert (
+        await run_until(
+            live_supervisor, live_client, task_id, {"awaiting_acceptance"}, max_ticks=20
+        )
+        == "awaiting_acceptance"
+    )
+    view = live_client.get(f"/v1/tasks/{task_id}").json()
+    accepted = live_client.post(
+        f"/v1/tasks/{task_id}/accept",
+        json={
+            "verdict": "accepted",
+            "reasoning": "Exercise the required CI failure path.",
+            "head_sha": view["head_sha"],
+        },
+    )
+    assert accepted.status_code == 200, accepted.text
+    failed = await run_until(
+        live_supervisor,
+        live_client,
+        task_id,
+        {"ci_certification_failed", "publish_failed"},
+        max_ticks=120,
+        pause=2.0,
+    )
+    assert failed == "ci_certification_failed"
+    record = live_client.get(f"/v1/tasks/{task_id}/pull-request").json()
+    cleanup.add_pull_request(int(record["number"]))
+    await live_supervisor.tick()
+    record = live_client.get(f"/v1/tasks/{task_id}/pull-request").json()
+    certification = record["ci_certifications"][-1]
+    assert certification["state"] == "failed"
+    assert certification["required_checks"] == ["crucible-readiness"]
+    assert certification["failure"]["check"] == "crucible-readiness"
+    assert certification["failure"]["conclusion"] == "failure"
+    assert certification["failure"]["url"]
+    assert certification["failure"]["run_id"]
+
+    final = live_client.get(f"/v1/tasks/{task_id}").json()
+    assert len(final["executions"]) == 1
+    assert len(final["executions"][0]["attempts"]) == 1
+    assert final["contract_version"] == 1
+    for _ in range(2):
+        await live_supervisor.tick()
+    unchanged = live_client.get(f"/v1/tasks/{task_id}").json()
+    assert unchanged["state"] == "ci_certification_failed"
+    assert len(unchanged["executions"]) == 1
+    print(
+        "live CI failure: "
+        f"{record['url']} check {certification['failure']['url']} at {record['head_sha']}"
+    )
 
 
 @pytest.mark.skipif(

@@ -33,6 +33,7 @@ def test_up_down_up_from_empty(database_url: str) -> None:
         "leases",
         "supervisor_status",
         "completion_claims",
+        "heartbeats",
     } <= names
     ok, detail = migrate.is_current(engine, database_url)
     assert ok, detail
@@ -321,6 +322,28 @@ def test_0011_down_and_up_preserves_class_routing_events(database_url: str) -> N
         assert (
             conn.execute(text("SELECT to_regclass('public.events_c6b_archive')")).scalar() is None
         )
+    assert restored == 1
+    engine.dispose()
+
+
+def test_0012_down_and_up_preserves_stall_events(database_url: str) -> None:
+    engine = make_engine(database_url)
+    migrate.upgrade(database_url)
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO events (ts, kind, principal, verified, payload) "
+                "VALUES (now(), 'worker_stalled', 'tests', true, "
+                '\'{"marker": "c6c-downgrade-test"}\')'
+            )
+        )
+    migrate.downgrade(database_url, "0011_class_routing")
+    assert "heartbeats" not in set(inspect(engine).get_table_names())
+    migrate.upgrade(database_url)
+    with engine.connect() as conn:
+        restored = conn.execute(
+            text("SELECT count(*) FROM events WHERE payload->>'marker' = 'c6c-downgrade-test'")
+        ).scalar_one()
     assert restored == 1
     engine.dispose()
 

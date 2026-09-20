@@ -21,6 +21,7 @@ class WakeReason(StrEnum):
     ATTEMPT_FAILED = "attempt_failed"
     TIMED_OUT = "timed_out"
     LOST = "lost"
+    STALL_WARNING = "stall_warning"
     QUOTA_EXHAUSTED = "quota_exhausted"
     AWAITING_QUOTA = "awaiting_quota"
     AUTH_FAILURE = "auth_failure"

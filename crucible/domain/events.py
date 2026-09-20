@@ -162,6 +162,8 @@ class EventKind(StrEnum):
     HARNESS_DISABLED = "harness_disabled"
     CREDENTIAL_SYNCED = "credential_synced"
     WORKER_PROGRESS = "worker_progress"
+    WORKER_QUIET = "worker_quiet"
+    WORKER_STALLED = "worker_stalled"
     # administration (25): every mutation, with principal, reason, before and after
     CREDENTIAL_VALIDATED = "credential_validated"
     CREDENTIAL_PROBED = "credential_probed"

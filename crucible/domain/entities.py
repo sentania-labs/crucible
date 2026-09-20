@@ -177,6 +177,17 @@ class LogChunkRecord:
 
 
 @dataclass(slots=True)
+class Heartbeat:
+    """One observed worker liveness or activity signal (10)."""
+
+    id: int | None
+    attempt_id: str
+    ts: datetime
+    signal: str
+    detail: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
 class RetentionAction:
     """One deletion retention performed, naming the policy version that authorized it
     (16). Deterministic, idempotent, and an event of its own."""

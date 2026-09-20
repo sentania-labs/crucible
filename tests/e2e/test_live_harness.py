@@ -32,6 +32,7 @@ Inputs, all paths, names or flags:
 
 from __future__ import annotations
 
+import asyncio
 import gzip
 import json
 import os
@@ -55,6 +56,7 @@ from crucible.adapters.harness.registry import default_registry
 from crucible.application.delivery_tick import DeliveryConfig
 from crucible.application.harnesses import set_harness_enabled
 from crucible.application.supervisor import Supervisor
+from crucible.domain.entities import ImagePromotion
 from crucible.domain.secrets import scan_text
 from crucible.ports.harness import CredentialSource, MountMode
 from tests.e2e import daemon, github_live
@@ -290,7 +292,11 @@ def _policy() -> dict[str, Any]:
 
 
 @pytest.fixture
-def live_client(live_ctx: AppContext, live_tokens: dict[str, str]) -> Any:
+def live_client(
+    live_ctx: AppContext,
+    live_tokens: dict[str, str],
+    live_provider: DockerProvider,
+) -> Any:
     app = create_app(live_ctx)
     models = _models()
     with TestClient(app, headers={"Authorization": f"Bearer {live_tokens['admin']}"}) as admin:
@@ -300,7 +306,30 @@ def live_client(live_ctx: AppContext, live_tokens: dict[str, str]) -> Any:
         policy = _policy()
         response = admin.put(f"/v1/policies/{policy['name']}/{policy['version']}", json=policy)
         assert response.status_code in (200, 201), response.text
-    with TestClient(app, headers={"Authorization": f"Bearer {live_tokens['orchestrator']}"}) as c:
+        available = {image.reference: image for image in asyncio.run(live_provider.list_images())}
+        overrides = _images()
+        with live_ctx.uow_factory() as uow:
+            for harness in _selected():
+                reference = overrides.get(harness) or daemon.image_tag(
+                    f"crucible-worker:{harness}-", harness=harness
+                )
+                image = available[reference]
+                uow.image_promotions.put(
+                    ImagePromotion(
+                        digest=image.digest,
+                        reference=image.reference,
+                        harness=harness,
+                        harness_version=image.harness_version or "",
+                        state="default",
+                        updated_at=live_ctx.clock.now(),
+                        updated_by="e2e-live",
+                        reason="live harness image selected for this test run",
+                    )
+                )
+            uow.commit()
+    # The live contract pins the exact harness and model under test, which is an
+    # operator-only submission.
+    with TestClient(app, headers={"Authorization": f"Bearer {live_tokens['operator']}"}) as c:
         yield c
 
 
@@ -412,11 +441,12 @@ def _contract(harness: str, model: str, image: str, config: LiveConfig, external
         "tier": "trivial",
         "harness": harness,
         "model": model,
+        "pin_reason": "live acceptance verifies each configured harness and model",
         "effort": EFFORT[harness],
-        "image": image,
         "timeout_seconds": 900,
         "rationale": "trivial work goes to the cheapest model the harness offers (05b)",
     }
+    del image
     document["lifecycle"] = {"max_attempts": 1, "retry_on": [], "cleanup": "policy"}
     return document
 
@@ -444,6 +474,7 @@ async def _drive(
             if found is not None:
                 inspected["env"] = list(found.get("Config", {}).get("Env") or [])
                 inspected["cmd"] = list(found.get("Config", {}).get("Cmd") or [])
+                inspected["labels"] = dict(found.get("Config", {}).get("Labels") or {})
                 inspected["mounts"] = [
                     {k: m.get(k) for k in ("Type", "Source", "Destination", "RW")}
                     for m in found.get("Mounts", [])
@@ -543,6 +574,17 @@ async def test_a_trivial_task_reaches_ready_for_merge_live(
         )
         view = live_client.get(f"/v1/tasks/{task_id}").json()
         attempt = view["latest_attempt"]
+        running_version = inspected.get("labels", {}).get("crucible.harness_version")
+        harness_view = next(
+            item
+            for item in live_client.get("/v1/harnesses").json()["items"]
+            if item["name"] == harness
+        )
+        assert running_version, inspected
+        assert running_version in harness_view["installed_versions"], {
+            "running_label": running_version,
+            "harness_view": harness_view,
+        }
         sync = _payload(live_client, task_id, "credential_synced") or {}
         metrics = _payload(live_client, task_id, "attempt_metrics_recorded") or {}
         entry.update(
@@ -563,6 +605,8 @@ async def test_a_trivial_task_reaches_ready_for_merge_live(
                 "refusal": _payload(live_client, task_id, "harness_refused"),
                 "collected": _payload(live_client, task_id, "attempt_collected"),
                 "collection_failed": _payload(live_client, task_id, "collection_failed"),
+                "running_harness_version_label": running_version,
+                "api_installed_versions": harness_view["installed_versions"],
             }
         )
         with engine.begin() as connection:
