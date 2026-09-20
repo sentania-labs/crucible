@@ -43,7 +43,8 @@ release tag on a commit with the current workflow will carry all five jobs
 without duplicating them in `release.yml`.
 
 The C6c branch itself passed all five jobs at
-https://github.com/sentania-labs/crucible/actions/runs/35532280495.
+https://github.com/sentania-labs/crucible/actions/runs/35533793026 after the
+post-PR correctness fixes.
 
 ## External target evidence
 
