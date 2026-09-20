@@ -177,6 +177,8 @@ class ExecutionRequest(StrictModel):
 
     @model_validator(mode="after")
     def _selection_or_pin(self) -> ExecutionRequest:
+        if self.image is not None and self.provider is not ProviderName.FAKE:
+            raise ValueError("image is derived from the selected harness and must not be supplied")
         flat = self.model is not None or self.harness is not None or self.pin_reason is not None
         if self.pin is not None and flat:
             raise ValueError("pin may not be combined with model, harness, or pin_reason")

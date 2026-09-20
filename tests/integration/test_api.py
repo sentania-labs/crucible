@@ -98,6 +98,7 @@ def test_only_registered_providers_are_accepted(
     """C3 registered the Docker provider (08, 20); Kubernetes is designed, not built."""
     doc = contract_document()
     doc["execution_request"]["provider"] = "kubernetes"
+    doc["execution_request"].pop("image")
     r = client.post("/v1/tasks", json=doc)
     assert r.status_code == 422
     assert any("not registered" in e["message"] for e in r.json()["errors"])
