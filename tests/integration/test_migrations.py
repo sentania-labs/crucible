@@ -34,8 +34,8 @@ def test_up_down_up_from_empty(database_url: str) -> None:
     ok, detail = migrate.is_current(engine, database_url)
     assert ok, detail
     with engine.connect() as conn:
-        # 0001 seeds version 1 and 0009 seeds version 2 of default-software.
-        assert conn.execute(text("SELECT count(*) FROM policies")).scalar() == 2
+        # 0001, 0009, and 0011 seed versions 1 through 3 of default-software.
+        assert conn.execute(text("SELECT count(*) FROM policies")).scalar() == 3
     migrate.downgrade(database_url, "base")
     assert "tasks" not in inspect(engine).get_table_names()
     migrate.upgrade(database_url)
@@ -110,7 +110,7 @@ def test_0004_creates_the_c2_tables_and_seeds_the_routing_policy(migrated: str) 
     } <= names
     with engine.connect() as conn:
         # 0004 seeds version 1; 0008 adds version 2 with the model ids the C5 live runs
-        # verified, so at head there are two and the policy still names version 1.
+        # verified; 0011 adds version 3 with class routing and quota controls.
         versions = (
             conn.execute(
                 text(
@@ -120,16 +120,16 @@ def test_0004_creates_the_c2_tables_and_seeds_the_routing_policy(migrated: str) 
             .scalars()
             .all()
         )
-        assert versions == [1, 2]
-        # 0009 seeds default-software version 2 naming routing version 2; version 1
-        # stays and still names version 1 (policies are immutable, 05b).
+        assert versions == [1, 2, 3]
+        # Later revisions add immutable policy versions that name their matching
+        # routing version (05b).
         policy_versions = conn.execute(
             text(
                 "SELECT version, document -> 'routing' -> 'policy' ->> 'version' "
                 "FROM policies WHERE name = 'default-software' ORDER BY 1"
             )
         ).all()
-        assert [(v, int(r)) for v, r in policy_versions] == [(1, 1), (2, 2)]
+        assert [(v, int(r)) for v, r in policy_versions] == [(1, 1), (2, 2), (3, 3)]
         routing = conn.execute(
             text(
                 "SELECT document -> 'routing' FROM policies "
@@ -290,4 +290,33 @@ def test_0010_down_and_up(database_url: str) -> None:
                 "VALUES (now(), 'bootstrap_handoff', 'tests', true, '{}')"
             )
         )
+    engine.dispose()
+
+
+def test_0011_down_and_up_preserves_class_routing_events(database_url: str) -> None:
+    engine = make_engine(database_url)
+    migrate.upgrade(database_url)
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO events (ts, kind, principal, verified, payload) "
+                "VALUES (now(), 'pool_exhausted', 'tests', true, "
+                '\'{"marker": "c6b-downgrade-test"}\')'
+            )
+        )
+    migrate.downgrade(database_url, "0010_bootstrap_import")
+    names = set(inspect(engine).get_table_names())
+    assert "pool_exhaustions" not in names
+    assert "resume_at" not in {c["name"] for c in inspect(engine).get_columns("tasks")}
+    with engine.connect() as conn:
+        assert conn.execute(text("SELECT to_regclass('public.events_c6b_archive')")).scalar()
+    migrate.upgrade(database_url)
+    with engine.connect() as conn:
+        restored = conn.execute(
+            text("SELECT count(*) FROM events WHERE payload->>'marker' = 'c6b-downgrade-test'")
+        ).scalar_one()
+        assert (
+            conn.execute(text("SELECT to_regclass('public.events_c6b_archive')")).scalar() is None
+        )
+    assert restored == 1
     engine.dispose()

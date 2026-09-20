@@ -45,6 +45,15 @@ def _event_kinds() -> list[str]:
     return [*c6_event_kinds(), *C6B_EVENT_KINDS]
 
 
+def _archive_exists(connection: sa.engine.Connection) -> bool:
+    return bool(
+        connection.execute(
+            sa.text("SELECT to_regclass(:name) IS NOT NULL"),
+            {"name": f"public.{EVENT_ARCHIVE}"},
+        ).scalar()
+    )
+
+
 def _seed_v3(connection: sa.engine.Connection) -> None:
     routing = connection.execute(
         sa.text("SELECT document FROM routing_policies WHERE name=:name AND version=2"),
@@ -113,6 +122,20 @@ def upgrade() -> None:
     op.drop_constraint("ck_events_kind", "events", type_="check")
     allowed = ", ".join(f"'{kind}'" for kind in _event_kinds())
     op.execute(f"ALTER TABLE events ADD CONSTRAINT ck_events_kind CHECK (kind IN ({allowed}))")
+    connection = op.get_bind()
+    if _archive_exists(connection):
+        op.execute("ALTER TABLE events DISABLE TRIGGER trg_events_append_only")
+        op.execute(
+            f"INSERT INTO events (seq, ts, kind, task_id, execution_id, attempt_id, "
+            f"principal, verified, payload) SELECT seq, ts, kind, task_id, execution_id, "
+            f"attempt_id, principal, verified, payload FROM {EVENT_ARCHIVE}"
+        )
+        op.execute("ALTER TABLE events ENABLE TRIGGER trg_events_append_only")
+        op.execute(
+            "SELECT setval('events_seq_seq', GREATEST("
+            "(SELECT COALESCE(MAX(seq), 1) FROM events), 1))"
+        )
+        op.execute(f"DROP TABLE {EVENT_ARCHIVE}")
     _seed_v3(op.get_bind())
 
 

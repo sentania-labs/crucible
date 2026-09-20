@@ -63,9 +63,9 @@ def make_origin(
     _git("add", "-A", cwd=work)
     _git("commit", "-q", "-m", "e2e: base commit", cwd=work)
     _git("clone", "-q", "--bare", str(work), str(bare), cwd=root)
-    # The preparer container reads this as container uid 1000, a different host uid
-    # under the rootless daemon (S9 Test E), so it has to be world readable.
+    # The preparer reads this as container uid 1000. The quota checkpoint collector
+    # also pushes its WIP commit back to this throwaway origin before rerouting.
     for path in bare.rglob("*"):
-        path.chmod(0o755 if path.is_dir() else 0o644)
-    bare.chmod(0o755)
+        path.chmod(0o777 if path.is_dir() else 0o666)
+    bare.chmod(0o777)
     return str(bare)

@@ -36,7 +36,7 @@ def start_task(
         ("harness", expected_harness, request.harness.value if request.harness else None),
         ("model", req.pinned_model, request.model),
         ("provider", req.provider.value, request.provider.value if request.provider else None),
-        ("image", None, request.image),
+        ("image", req.image, request.image),
     ):
         if given is not None and expected != given:
             problems.append(

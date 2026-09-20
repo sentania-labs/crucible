@@ -1060,7 +1060,7 @@ class Supervisor:
             held = uow.leases.get_checkout_lease(key)
         return held is None or held.holder == attempt_id or held.expires_at <= self._clock.now()
 
-    def _eligible_harnesses(self) -> set[str] | None:
+    def _eligible_harnesses(self, *, needs_credential: bool = True) -> set[str] | None:
         if self._harnesses is None:
             return None
         eligible: set[str] = set()
@@ -1070,8 +1070,10 @@ class Supervisor:
                 if adapter is None:
                     continue
                 source = self._credential_sources.get(name)
-                if adapter.credential_spec() is not None and (
-                    source is None or not Path(source.path).is_dir()
+                if (
+                    needs_credential
+                    and adapter.credential_spec() is not None
+                    and (source is None or not Path(source.path).is_dir())
                 ):
                     continue
                 try:
@@ -1096,7 +1098,9 @@ class Supervisor:
             project=item.task.project,
             provider=request.provider.value,
             now=self._clock.now(),
-            eligible_harnesses=self._eligible_harnesses(),
+            eligible_harnesses=self._eligible_harnesses(
+                needs_credential=request.provider.value != "fake"
+            ),
             pinned_model=request.pinned_model,
             pinned_harness=request.pinned_harness.value if request.pinned_harness else None,
         )
@@ -1171,19 +1175,6 @@ class Supervisor:
                     "ordered_candidates": list(selection.candidates),
                 },
             )
-            move_attempt(
-                uow,
-                self._clock,
-                attempt,
-                AttemptState.LAUNCHING,
-                EventKind.ATTEMPT_LAUNCHING,
-                payload={
-                    "model": chosen.id,
-                    "harness": chosen.harness,
-                    "image": selection.image,
-                    "ordered_candidates": list(selection.candidates),
-                },
-            )
             uow.commit()
             return True
 
@@ -1248,11 +1239,8 @@ class Supervisor:
             return False
         self._workspaces[attempt.id] = ws
         await self._db(partial(self._record_prepared, attempt.id, ws))
-        if review:
-            if not await self._db(partial(self._mark_launching, attempt.id, ws)):
-                return False
-        else:
-            await self._db(partial(self._record_launch_workspace, attempt.id, ws))
+        if not await self._db(partial(self._mark_launching, attempt.id, ws)):
+            return False
         try:
             handle = await provider.launch(ws, spec)
         except LaunchRefusedError as exc:
@@ -1390,7 +1378,14 @@ class Supervisor:
                 attempt,
                 AttemptState.LAUNCHING,
                 EventKind.ATTEMPT_LAUNCHING,
-                payload={"workspace": attempt.workspace_path},
+                payload={
+                    "workspace": attempt.workspace_path,
+                    "model": attempt.selected_model,
+                    "harness": attempt.selected_harness,
+                    "image": attempt.selected_image,
+                    "pool": attempt.selected_pool,
+                    "ordered_candidates": list(attempt.ordered_candidates),
+                },
             )
             uow.commit()
             return True
@@ -2544,10 +2539,13 @@ class Supervisor:
         self, uow: UnitOfWork, routing: Any, contract: TaskContractV1
     ) -> list[Any]:
         tier = routing.tiers[contract.execution_request.tier.value]
+        pinned = contract.execution_request.pinned_model
         pools = {
             model.pool
             for model in routing.models
-            if model.enabled and model.capability in tier.allowed_capability
+            if model.enabled
+            and model.capability in tier.allowed_capability
+            and (pinned is None or model.id == pinned)
         }
         now = self._clock.now()
         return sorted(
@@ -2921,6 +2919,20 @@ class Supervisor:
             )
             return
         if exit_class is ExitClass.QUOTA_EXHAUSTED:
+            # Reactive rerouting is only for a worker that actually ran. A reserve-time
+            # refusal has no worktree to checkpoint and follows the established
+            # quota-exhausted report path.
+            if attempt.started_at is None:
+                move_execution(
+                    uow,
+                    self._clock,
+                    execution,
+                    ExecutionState.FAILED,
+                    EventKind.EXECUTION_FAILED,
+                    payload={"exit_class": exit_class.value, "phase": "reserve"},
+                )
+                self._task_reported(uow, task, attempt, exit_class, common)
+                return
             self._handle_quota_exit(uow, task, execution, attempt)
             return
         retryable = exit_class.value in execution.retry_on and exit_class in (
@@ -3024,6 +3036,10 @@ class Supervisor:
         exit_class: ExitClass,
         common: dict[str, str],
     ) -> None:
+        stored = uow.contracts.get(task.id, task.contract_version)
+        tier = (
+            stored.document.get("execution_request", {}).get("tier") if stored is not None else None
+        )
         move_task(
             uow,
             self._clock,
@@ -3035,6 +3051,7 @@ class Supervisor:
                 "exit_class": exit_class.value,
                 "attempt_state": attempt.state.value,
                 "head_sha": task.head_sha,
+                "tier": tier,
             },
             **common,
         )

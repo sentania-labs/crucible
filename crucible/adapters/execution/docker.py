@@ -68,6 +68,7 @@ from crucible.application.harnesses import (
     egress_allowlist,
 )
 from crucible.contracts.completion_claim import CompletionClaimV1
+from crucible.domain.exit_class import ExitClass
 from crucible.domain.ids import new_id
 from crucible.domain.time import parse_rfc3339
 from crucible.ports.execution import (
@@ -105,6 +106,7 @@ from crucible.ports.harness import (
     AuthFile,
     CredentialSource,
     CredentialSpec,
+    ExitInfo,
     LaunchContext,
     MountMode,
 )
@@ -930,6 +932,28 @@ class DockerProvider:
         # 12: the credential copy is read back and removed before anything else runs.
         credential_sync = await self._sync_credential(h, ws, spec)
         stdout_tail, stderr_tail = await self._worker_tails(h.ref)
+        observation = (
+            await self.observe(h)
+            if hasattr(self.client, "inspect_container")
+            else Observation(ObservationState.EXITED, exit_code=1)
+        )
+        adapter = self.harnesses.get(spec.harness)
+        quota_checkpoint = bool(
+            adapter is not None
+            and observation.state is ObservationState.EXITED
+            and adapter.classify_exit(
+                ExitInfo(exit_code=observation.exit_code), stdout_tail, stderr_tail
+            )
+            is ExitClass.QUOTA_EXHAUSTED
+        )
+        local_origin = self._local_origin(spec.repository_url) if quota_checkpoint else None
+        mounts = [
+            self._daemon_mount(spec.attempt_id, "repo", REPO_MOUNT, read_only=not quota_checkpoint),
+            self._daemon_mount(spec.attempt_id, "report", REPORT_MOUNT, read_only=True),
+            self._daemon_mount(spec.attempt_id, "output", OUTPUT_MOUNT, read_only=False),
+        ]
+        if local_origin is not None:
+            mounts.append(self._volume_mount(local_origin, scripts.ORIGIN_MOUNT, read_only=False))
         collector_exit = await self._run_throwaway(
             spec,
             role=ROLE_COLLECTOR,
@@ -937,12 +961,10 @@ class DockerProvider:
                 base_ref=str(repository.get("base_ref", "main")),
                 work_branch=work_branch,
                 size_cap_bytes=self.config.report_size_cap_bytes,
+                quota_attempt_id=spec.attempt_id if quota_checkpoint else None,
+                quota_push_url=scripts.ORIGIN_MOUNT if local_origin is not None else None,
             ),
-            mounts=[
-                self._daemon_mount(spec.attempt_id, "repo", REPO_MOUNT, read_only=True),
-                self._daemon_mount(spec.attempt_id, "report", REPORT_MOUNT, read_only=True),
-                self._daemon_mount(spec.attempt_id, "output", OUTPUT_MOUNT, read_only=False),
-            ],
+            mounts=mounts,
             network="none",
             timeout=self.config.collector_timeout_seconds,
         )

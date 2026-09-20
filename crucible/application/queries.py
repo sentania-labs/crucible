@@ -85,7 +85,7 @@ def clamp_limit(limit: int | None) -> int:
     return max(1, min(limit, MAX_LIMIT))
 
 
-def _attempt_summary(a: Attempt) -> AttemptSummary:
+def _attempt_summary(a: Attempt, reroute_from_attempt_id: str | None = None) -> AttemptSummary:
     return AttemptSummary(
         id=a.id,
         execution_id=a.execution_id,
@@ -100,10 +100,14 @@ def _attempt_summary(a: Attempt) -> AttemptSummary:
         harness=a.selected_harness,
         image=a.selected_image,
         pool=a.selected_pool,
+        reroute_from_attempt_id=reroute_from_attempt_id,
+        resume_from_remote=a.resume_from_remote,
     )
 
 
-def _execution_summary(e: Execution, attempts: list[Attempt]) -> ExecutionSummary:
+def _execution_summary(
+    e: Execution, attempts: list[Attempt], reroute_from: dict[str, str]
+) -> ExecutionSummary:
     return ExecutionSummary(
         id=e.id,
         role=e.role.value,
@@ -116,7 +120,7 @@ def _execution_summary(e: Execution, attempts: list[Attempt]) -> ExecutionSummar
         max_attempts=e.max_attempts,
         created_at=e.created_at,
         ended_at=e.ended_at,
-        attempts=[_attempt_summary(a) for a in attempts],
+        attempts=[_attempt_summary(a, reroute_from.get(a.id)) for a in attempts],
     )
 
 
@@ -129,14 +133,23 @@ def task_view(uow: UnitOfWork, task_id: str) -> TaskView:
     versions = uow.contracts.list_for_task(task.id)
     current = next((v for v in versions if v.version == task.contract_version), None)
     executions = uow.executions.list_for_task(task.id)
+    task_events = uow.events.list_for_task(task.id, after_seq=0, limit=1000)
+    reroute_from = {
+        str(event.payload["to_attempt_id"]): str(event.payload["from_attempt_id"])
+        for event in task_events
+        if event.kind == "task_rerouted"
+        and event.payload.get("to_attempt_id")
+        and event.payload.get("from_attempt_id")
+    }
     summaries = [
-        _execution_summary(e, list(uow.attempts.list_for_execution(e.id))) for e in executions
+        _execution_summary(e, list(uow.attempts.list_for_execution(e.id)), reroute_from)
+        for e in executions
     ]
     all_attempts = [a for s in summaries for a in s.attempts]
     latest = max(all_attempts, key=lambda a: a.id) if all_attempts else None
     reroutes = [
         _event_view(event).model_dump(mode="json")
-        for event in uow.events.list_for_task(task.id, after_seq=0, limit=1000)
+        for event in task_events
         if event.kind == "task_rerouted"
     ]
     return TaskView(

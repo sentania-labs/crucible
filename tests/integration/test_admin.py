@@ -612,10 +612,24 @@ def test_the_cli_remote_mode_builds_the_same_calls(monkeypatch: pytest.MonkeyPat
         ]
     )
     cli.main(["--api-url", "http://127.0.0.1:1", "audit", "tail", "--cursor", "5", "--limit", "10"])
+    cli.main(["--api-url", "http://127.0.0.1:1", "routing", "exhaustion"])
+    cli.main(
+        [
+            "--api-url",
+            "http://127.0.0.1:1",
+            "--reason",
+            "r",
+            "routing",
+            "clear-exhaustion",
+            "pool-a",
+        ]
+    )
     assert calls == [
         ("POST", "/v1/admin/harnesses/agy/disable", {"reason": "r"}),
         ("POST", "/v1/admin/credentials/codex/probe", {"reason": "r"}),
         ("GET", "/v1/admin/audit?limit=10&cursor=5", None),
+        ("GET", "/v1/admin/routing/exhaustion", None),
+        ("POST", "/v1/admin/routing/exhaustion/pool-a/clear", {"reason": "r"}),
     ]
     assert Role.ADMIN.value == "admin"
 

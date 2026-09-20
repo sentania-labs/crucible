@@ -105,6 +105,7 @@ BEHAVIORS: frozenset[str] = frozenset(
         "injected",
         "secret-leak",
         "no-commits",
+        "quota",
         "verification-fails",
         "dirty-workspace",
     }

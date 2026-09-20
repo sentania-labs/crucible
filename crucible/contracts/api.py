@@ -45,6 +45,7 @@ class AttemptSummary(Response):
     image: str | None = None
     pool: str | None = None
     reroute_from_attempt_id: str | None = None
+    resume_from_remote: bool = False
 
 
 class ExecutionSummary(Response):

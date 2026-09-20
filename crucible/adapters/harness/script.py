@@ -50,10 +50,23 @@ class ScriptHarnessAdapter:
         return None
 
     def build_launch(self, ctx: LaunchContext) -> AdapterLaunch:
+        if ctx.model == "a-scripted-quota":
+            script = (
+                "mkdir -p src; printf 'quota checkpoint\\n' > src/quota-checkpoint.txt; "
+                "printf 'succeed\\n' > e2e-behavior; "
+                'printf \'{"error":"scripted_quota_exhausted"}\\n\' >&2; exit 1'
+            )
+            return AdapterLaunch(argv=("sh", "-c", script), workdir=ctx.repo_mount)
         return AdapterLaunch(argv=("crucible-script-harness",), workdir=ctx.repo_mount)
 
     def parse_report(self, report_dir: Path, exit: ExitInfo) -> ParsedReport:
         return base.parse_report_dir(report_dir, exit, metrics=ReportMetrics(), transcript_lines=0)
 
     def classify_exit(self, exit: ExitInfo, stdout_tail: str, stderr_tail: str) -> ExitClass:
-        return base.classify_with_patterns(exit, stdout_tail, stderr_tail, auth=(), quota=())
+        return base.classify_with_patterns(
+            exit,
+            stdout_tail,
+            stderr_tail,
+            auth=(),
+            quota=base.patterns("scripted_quota_exhausted"),
+        )

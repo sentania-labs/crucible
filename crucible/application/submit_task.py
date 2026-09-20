@@ -250,13 +250,16 @@ def submit_task(
     eligible_harnesses: set[str] | None = None
     if harnesses is not None:
         eligible_harnesses = set()
+        needs_credential = contract.execution_request.provider.value != "fake"
         for name in harnesses.names():
             adapter = harnesses.get(name)
             if adapter is None:
                 continue
             source = (credential_sources or {}).get(name)
-            if adapter.credential_spec() is not None and (
-                source is None or not Path(source.path).is_dir()
+            if (
+                needs_credential
+                and adapter.credential_spec() is not None
+                and (source is None or not Path(source.path).is_dir())
             ):
                 continue
             try:

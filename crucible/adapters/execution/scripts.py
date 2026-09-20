@@ -207,7 +207,14 @@ printf '%s\n' "$STARTED" > "$OUT/started-from.txt"
 """
 
 
-def collector_script(*, base_ref: str, work_branch: str, size_cap_bytes: int) -> str:
+def collector_script(
+    *,
+    base_ref: str,
+    work_branch: str,
+    size_cap_bytes: int,
+    quota_attempt_id: str | None = None,
+    quota_push_url: str | None = None,
+) -> str:
     """Produce the full diff, the path list, the head, the log, the bundle, and a copy
     of the report directory (08). Never a push, never a network: `--network none`."""
     return f"""set -eu
@@ -217,9 +224,24 @@ REPO={REPO_MOUNT}
 WORK_BRANCH={_quote(work_branch)}
 BASE_REF={_quote(base_ref)}
 SIZE_CAP={_quote(str(size_cap_bytes))}
+QUOTA_ATTEMPT={_quote(quota_attempt_id or "")}
+QUOTA_PUSH_URL={_quote(quota_push_url or "")}
 mkdir -p "$OUT"
 : > "$OUT/copy-rejections.tsv"
 {_COPY_REPORT}
+if [ -n "$QUOTA_ATTEMPT" ]; then
+  {GIT} -C "$REPO" add -A
+  if ! {GIT} -C "$REPO" diff --cached --quiet; then
+    {GIT} -C "$REPO" commit -q -m "wip(crucible): attempt $QUOTA_ATTEMPT"
+  fi
+  if [ -n "$QUOTA_PUSH_URL" ]; then
+    {GIT} -C "$REPO" remote set-url origin "$QUOTA_PUSH_URL"
+    {GIT} -C "$REPO" remote set-url --push origin "$QUOTA_PUSH_URL"
+    {GIT} -C "$REPO" \
+      -c 'remote.origin.receivepack=git -c safe.directory=* receive-pack' \
+      push origin "HEAD:refs/heads/$WORK_BRANCH"
+  fi
+fi
 BASE=$({GIT} -C "$REPO" rev-parse --verify --quiet "$BASE_REF" \
   || {GIT} -C "$REPO" rev-parse --verify --quiet "origin/$BASE_REF" \
   || echo "")

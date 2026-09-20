@@ -40,6 +40,7 @@ async def test_submit_start_run_to_reported(client: TestClient, supervisor: Supe
         "attempt_preparing",
         "execution_active",
         "task_running",
+        "attempt_routed",
         "workspace_prepared",
         "quota_reserved",
         "attempt_launching",
