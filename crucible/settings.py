@@ -7,13 +7,15 @@ from __future__ import annotations
 import os
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
     SettingsConfigDict,
     TomlConfigSettingsSource,
 )
+
+from crucible.ports.endpoints import validate_endpoint
 
 
 class ServiceSettings(BaseModel):
@@ -177,6 +179,14 @@ class Settings(BaseSettings):
     credentials: dict[str, CredentialSettings] = Field(default_factory=dict)
     harnesses: dict[str, HarnessSettings] = Field(default_factory=dict)
     admin: AdminSettings = Field(default_factory=AdminSettings)
+    spark_endpoint_url: str | None = None
+
+    @field_validator("spark_endpoint_url")
+    @classmethod
+    def _valid_spark_endpoint(cls, value: str | None) -> str | None:
+        if value:
+            validate_endpoint("local", value)
+        return value
 
     @classmethod
     def settings_customise_sources(

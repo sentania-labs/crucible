@@ -14,6 +14,7 @@ class ExitClass(StrEnum):
     BLOCKED = "blocked"
     ENVIRONMENT = "environment"
     AUTH_FAILURE = "auth_failure"
+    PROVIDER_ERROR = "provider_error"
     QUOTA_EXHAUSTED = "quota_exhausted"
     TIMEOUT = "timeout"
     KILLED = "killed"

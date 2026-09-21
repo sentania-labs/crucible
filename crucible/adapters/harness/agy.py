@@ -148,7 +148,9 @@ class AgyAdapter:
         metrics, lines = _metrics(report_dir / base.TRANSCRIPT_NAME)
         return base.parse_report_dir(report_dir, exit, metrics=metrics, transcript_lines=lines)
 
-    def classify_exit(self, exit: ExitInfo, stdout_tail: str, stderr_tail: str) -> ExitClass:
+    def classify_exit(
+        self, exit: ExitInfo, stdout_tail: str, stderr_tail: str, report_dir: Path | None = None
+    ) -> ExitClass:
         # S5: AGY exits 1 for an auth failure and still emits a well-formed `result`
         # line; the class comes from its text, not from the line's presence.
         return base.classify_with_patterns(

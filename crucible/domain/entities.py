@@ -395,6 +395,8 @@ class AttemptMetrics:
     endpoint_kind: str
     pool: str
     wall_ms: int | None = None
+    harness_duration_ms: int | None = None
+    tool_calls: int | None = None
     tokens_in: int | None = None
     tokens_out: int | None = None
     cost_units: float | None = None

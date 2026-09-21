@@ -100,6 +100,7 @@ services:
     command: ["crucible-admin", "migrate"]
     environment:
       CRUCIBLE_DATABASE__URL: postgresql+psycopg://crucible:${POSTGRES_PASSWORD}@postgres:5432/crucible
+      CRUCIBLE_SPARK_ENDPOINT_URL: "${CRUCIBLE_SPARK_ENDPOINT_URL:-}"
     depends_on:
       postgres:
         condition: service_healthy
@@ -130,6 +131,7 @@ services:
       # as JSON, and the list here must be the one `make proxy-config` gave squid.
       CRUCIBLE_DOCKER__EGRESS_ALLOWLIST: >-
         ${CRUCIBLE_EGRESS_ALLOWLIST:-["github.com","objects.githubusercontent.com","pypi.org","files.pythonhosted.org","registry.npmjs.org","api.anthropic.com","api.openai.com","auth.openai.com","chatgpt.com","daily-cloudcode-pa.googleapis.com","oauth2.googleapis.com","www.googleapis.com","lh3.googleusercontent.com"]}
+      CRUCIBLE_SPARK_ENDPOINT_URL: "${CRUCIBLE_SPARK_ENDPOINT_URL:-}"
       # GitHub delivery (12, 23). Off until an App is configured. The App id is a public
       # identifier and the two secrets are *paths* to files in the credential directory
       # mounted below, which only this container ever sees: no worker, collector,

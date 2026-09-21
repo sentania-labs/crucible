@@ -1,5 +1,5 @@
-"""The live harness tier (07, 12, 18): the real Claude Code, Codex and AGY images with
-the dedicated Crucible credentials, one harness at a time, local only, never in CI.
+"""The live harness tier (07, 12, 18): the real subscription and Hermes images,
+one harness at a time, local only, never in CI.
 
 Per harness, a trivial task (add one line to a file and report) runs in the hardened
 image with the credential seeded into a uid-1000 per-attempt copy, reaches a collected
@@ -76,6 +76,7 @@ HARNESSES_ENV = "CRUCIBLE_LIVE_HARNESSES"
 MODELS_ENV = "CRUCIBLE_LIVE_MODELS"
 AGY_MODE_ENV = "CRUCIBLE_LIVE_AGY_MOUNT_MODE"
 REPORT_ENV = "CRUCIBLE_LIVE_REPORT"
+SPARK_ENDPOINT_ENV = "CRUCIBLE_SPARK_ENDPOINT_URL"
 LOCAL_TZ = ZoneInfo("America/Chicago")
 
 # The cheapest model each harness offers that completes a trivial task: routing's rule
@@ -87,11 +88,12 @@ DEFAULT_MODELS = {
     "claude_code": "claude-haiku-4-5",
     "codex": "gpt-5.6-luna",
     "agy": "gemini-3.8-flash-low",
+    "hermes": "gpt-oss:120b",
 }
 IMAGES_ENV = "CRUCIBLE_LIVE_IMAGES"
 # AGY 1.2.4 refuses --effort for gemini-3.1-flash-lite (found live), so none is passed.
-EFFORT = {"claude_code": None, "codex": "low", "agy": None}
-ALL_HARNESSES = ("claude_code", "codex", "agy")
+EFFORT = {"claude_code": None, "codex": "low", "agy": None, "hermes": None}
+ALL_HARNESSES = ("claude_code", "codex", "agy", "hermes")
 
 
 def _selected() -> tuple[str, ...]:
@@ -103,13 +105,15 @@ def _selected() -> tuple[str, ...]:
 
 def _why_not_configured() -> str:
     root = os.environ.get(CREDENTIAL_ROOT_ENV, "")
-    if not root:
+    if any(harness != "hermes" for harness in _selected()) and not root:
         return f"set {CREDENTIAL_ROOT_ENV} to the dedicated Crucible credential root (12)"
-    if not Path(root).is_dir():
+    if root and not Path(root).is_dir():
         return f"{CREDENTIAL_ROOT_ENV} does not name a directory"
     unknown = sorted(set(_selected()) - set(ALL_HARNESSES))
     if unknown:
         return f"{HARNESSES_ENV} names unknown harnesses: {unknown}"
+    if "hermes" in _selected() and not os.environ.get(SPARK_ENDPOINT_ENV, "").strip():
+        return f"set {SPARK_ENDPOINT_ENV} to the DGX Spark OpenAI-compatible /v1 endpoint"
     return github_live.why_not_configured()
 
 
@@ -152,7 +156,8 @@ def _secret_values(root: Path, harness: str) -> list[str]:
     """The credential values, in memory only, for the absence proof. Never printed."""
     registry = default_registry()
     spec = registry.require(harness).credential_spec()
-    assert spec is not None
+    if spec is None:
+        return []
     values: list[str] = []
     for auth in spec.auth_files:
         path = spec.source_path(str(root / harness), auth.name)
@@ -187,7 +192,7 @@ def live_config() -> LiveConfig:
 
 @pytest.fixture(scope="session")
 def credential_root() -> Path:
-    return Path(os.environ[CREDENTIAL_ROOT_ENV])
+    return Path(os.environ.get(CREDENTIAL_ROOT_ENV, "/credential-not-required"))
 
 
 @pytest.fixture
@@ -263,19 +268,27 @@ def live_tokens(live_ctx: AppContext) -> dict[str, str]:
 def _routing(models: dict[str, str]) -> dict[str, Any]:
     document = e2e_routing_document()
     for harness, model in models.items():
+        local = harness == "hermes"
         document["models"].append(
             {
                 "id": model,
                 "harness": harness,
-                "endpoint": "subscription",
+                "endpoint": "local" if local else "subscription",
+                **({"endpoint_url": os.environ[SPARK_ENDPOINT_ENV]} if local else {}),
                 "capability": "small",
-                "cost": "low",
+                "cost": "none" if local else "low",
                 "speed": "fast",
-                "pool": "e2e",
+                "pool": "spark-local" if local else "e2e",
                 "weight": 1,
                 "enabled": True,
             }
         )
+    document["pools"]["spark-local"] = {
+        "window": "1h",
+        "budget_units": "attempts",
+        "soft_limit": 0,
+        "max_concurrency": 4,
+    }
     return document
 
 
@@ -300,7 +313,7 @@ def live_client(
     app = create_app(live_ctx)
     models = _models()
     with TestClient(app, headers={"Authorization": f"Bearer {live_tokens['admin']}"}) as admin:
-        routing = _routing(models)
+        routing = _routing({harness: models[harness] for harness in _selected()})
         response = admin.put(f"/v1/routing/{routing['name']}/{routing['version']}", json=routing)
         assert response.status_code in (200, 201), response.text
         policy = _policy()
@@ -405,13 +418,74 @@ OBJECTIVE = """Make exactly this change and nothing else.
 6. Exit 0. Do not open a pull request, do not push, do not touch any other file.
 """
 
+HERMES_OBJECTIVE = r"""Complete the task with one terminal tool call. Do not inspect
+other files and do not split this into multiple tool calls. Run this exact command:
+
+python3 - <<'PY'
+import os
+import subprocess
+from pathlib import Path
+import yaml
+
+external_id = "{external_id}"
+repo = Path("/crucible/repo")
+report = Path("/crucible/report")
+note = repo / "notes/c5-live.txt"
+note.parent.mkdir(parents=True, exist_ok=True)
+with note.open("a", encoding="utf-8") as handle:
+    handle.write("hermes completed a Crucible live run for task {external_id}.\n")
+subprocess.run(["git", "add", "notes/c5-live.txt"], cwd=repo, check=True)
+subprocess.run(
+    ["git", "commit", "-m", f"c5 live run for {{external_id}}", "--trailer",
+     f"Crucible-Attempt: {{os.environ['CRUCIBLE_ATTEMPT_ID']}}"],
+    cwd=repo,
+    check=True,
+)
+report.mkdir(parents=True, exist_ok=True)
+for check_id, text in (("V1", "lint ok"), ("V2", "test ok"), ("V3", "scan ok")):
+    (report / f"{{check_id}}.log").write_text(text + "\n", encoding="utf-8")
+head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+branch = subprocess.check_output(
+    ["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=repo, text=True
+).strip()
+(report / "run-evidence.md").write_text(head + "\nhermes\n", encoding="utf-8")
+claim = {{
+    "schema_version": "1.0",
+    "task_external_id": external_id,
+    "summary": "Hermes appended and committed the required live-run line.",
+    "changed_files": ["notes/c5-live.txt"],
+    "refs": {{"branch": branch, "head_sha": head, "commits": 1}},
+    "checks": [
+        {{"id": check_id, "command": f"echo {{text}}", "exit": 0,
+         "log": f"{{check_id}}.log"}}
+        for check_id, text in (("V1", "lint ok"), ("V2", "test ok"), ("V3", "scan ok"))
+    ],
+    "acceptance_mapping": [
+        {{"id": "AC1", "status": "met", "evidence": "run-evidence.md"}}
+    ],
+    "run_evidence": ["run-evidence.md"],
+    "proposed_pull_request": {{
+        "title": f"c5 live run for {{external_id}}", "body": "", "closes": []
+    }},
+    "limitations": [],
+    "risks": [],
+    "blockers": [],
+    "follow_ups": [],
+}}
+(report / "report.yaml").write_text(yaml.safe_dump(claim, sort_keys=False), encoding="utf-8")
+PY
+
+After that one command succeeds, exit without calling another tool.
+"""
+
 
 def _contract(harness: str, model: str, image: str, config: LiveConfig, external_id: str) -> Any:
     document = e2e_contract(external_id, config.repository, image)
     # No colon in the title: an unquoted colon inside a YAML value is the one thing a
     # small model gets wrong most, and the tier proves the pipeline, not YAML quoting.
     document["title"] = f"c5 live run for {external_id}"
-    document["objective"] = OBJECTIVE.format(harness=harness, external_id=external_id)
+    objective = HERMES_OBJECTIVE if harness == "hermes" else OBJECTIVE
+    document["objective"] = objective.format(harness=harness, external_id=external_id)
     document["repository"]["work_branch"] = f"crucible/C5-{external_id}"
     document["scope"] = {
         "allowed_paths": ["notes/**"],
@@ -544,7 +618,8 @@ async def test_a_trivial_task_reaches_ready_for_merge_live(
     )
     model = _models()[harness]
     secrets = _secret_values(credential_root, harness)
-    assert secrets, f"no credential files found for {harness} under the configured root"
+    if default_registry().require(harness).credential_spec() is not None:
+        assert secrets, f"no credential files found for {harness} under the configured root"
     register(live_ctx, live_config, mirror)
     _enable(live_ctx, harness)
     external_id = f"{harness.replace('_', '-')}-{RUN_ID}"
@@ -611,14 +686,20 @@ async def test_a_trivial_task_reaches_ready_for_merge_live(
         )
         with engine.begin() as connection:
             row = connection.execute(
-                text("SELECT wall_ms FROM attempt_metrics WHERE attempt_id = :id"),
+                text(
+                    "SELECT wall_ms, harness_duration_ms, tool_calls FROM attempt_metrics "
+                    "WHERE attempt_id = :id"
+                ),
                 {"id": attempt["id"]},
             ).one_or_none()
         if row is not None and row.wall_ms is not None:
             entry["duration_s"] = round(row.wall_ms / 1000, 1)
+            entry["harness_duration_ms"] = row.harness_duration_ms
+            entry["tool_calls"] = row.tool_calls
         assert state == "awaiting_internal_review", entry
-        assert sync, "no credential_synced event: the copy was never synced back"
-        assert sync.get("removed") is True, sync
+        if harness != "hermes":
+            assert sync, "no credential_synced event: the copy was never synced back"
+            assert sync.get("removed") is True, sync
 
         upload_review(live_client, task_id)
         await _drive(
@@ -680,3 +761,51 @@ async def test_a_trivial_task_reaches_ready_for_merge_live(
         }
     finally:
         _record(entry)
+
+
+async def test_hermes_spark_pool_runs_four_and_defers_the_fifth_live(
+    live_ctx: AppContext,
+    live_client: TestClient,
+    live_supervisor: Supervisor,
+    live_config: LiveConfig,
+    mirror: str,
+) -> None:
+    if "hermes" not in _selected():
+        pytest.skip("the live selection does not include Hermes")
+    register(live_ctx, live_config, mirror)
+    _enable(live_ctx, "hermes")
+    image = _images().get("hermes") or daemon.image_tag("crucible-worker:hermes-", harness="hermes")
+    task_ids: list[str] = []
+    for number in range(5):
+        external_id = f"hermes-pool-{number}-{RUN_ID}"
+        task_ids.append(
+            submit_and_start(
+                live_client,
+                _contract("hermes", "gpt-oss:120b", image, live_config, external_id),
+            )
+        )
+
+    for _ in range(3):
+        await live_supervisor.tick()
+        states = [live_client.get(f"/v1/tasks/{task_id}").json()["state"] for task_id in task_ids]
+        if states.count("running") == 4 and states.count("scheduled") == 1:
+            break
+    assert states.count("running") == 4, states
+    assert states.count("scheduled") == 1, states
+    deferred = live_client.get(f"/v1/tasks/{task_ids[-1]}/events").json()["items"]
+    assert any(
+        event["kind"] == "harness_launch_deferred"
+        and "spark-local pool" in event["payload"]["detail"]
+        for event in deferred
+    )
+
+    for task_id in task_ids:
+        response = live_client.post(
+            f"/v1/tasks/{task_id}/cancel",
+            json={
+                "reason": "the live pool-cap observation is complete",
+                "verbatim": "cancel the pool-cap test tasks",
+                "decided_by": "e2e-live",
+            },
+        )
+        assert response.status_code == 200, response.text

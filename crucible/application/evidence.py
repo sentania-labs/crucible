@@ -25,6 +25,7 @@ from crucible.domain.secrets import find_secrets, scan_text
 from crucible.ports.artifacts import ArtifactStore, SecretInArtifactError
 from crucible.ports.clock import Clock
 from crucible.ports.execution import CollectedOutputs
+from crucible.ports.harness import ParsedReport
 from crucible.ports.repository import UnitOfWork
 
 log = logging.getLogger("crucible.evidence")
@@ -165,6 +166,7 @@ def record_collection_evidence(
     claim: dict[str, Any] | None,
     claim_parsed_ok: bool,
     parse_errors: list[dict[str, Any]],
+    parsed_report: ParsedReport | None = None,
 ) -> str | None:
     """Write the artifacts and evidence a pre-PR gate consumes. Returns the collected head."""
     findings = _scanner_findings(outputs, claim)
@@ -238,6 +240,19 @@ def record_collection_evidence(
             kind=EvidenceKind.ARTIFACT_PRESENT,
             source=EvidenceSource.WORKER,
             payload={"role": ROLE_WORKER_CLAIM, "asserted": {} if findings else claim},
+        )
+    if parsed_report is not None and parsed_report.run_evidence_error is not None:
+        _add(
+            uow,
+            clock,
+            attempt=attempt,
+            kind=EvidenceKind.ARTIFACT_PRESENT,
+            source=EvidenceSource.CRUCIBLE,
+            payload={
+                "role": "harness_run_evidence",
+                "parsed_ok": False,
+                "error": parsed_report.run_evidence_error,
+            },
         )
     head_sha: str | None = None
     if outputs.bundle is not None:

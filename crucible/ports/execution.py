@@ -8,6 +8,8 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any, Literal, Protocol
 
+from crucible.ports.endpoints import validate_endpoint
+
 # Where the workspace appears inside every Crucible-created container (06, 08).
 REPO_MOUNT = "/crucible/repo"
 IDENTITY_MOUNT = "/crucible/identity"
@@ -81,6 +83,11 @@ class LaunchSpec:
     # Where the provider tees the harness's stdout, so the transcript is an artifact.
     transcript_path: str | None = None
     effort: str | None = None
+    endpoint: Literal["subscription", "local"] = "subscription"
+    endpoint_url: str | None = None
+
+    def __post_init__(self) -> None:
+        validate_endpoint(self.endpoint, self.endpoint_url)
 
 
 @dataclass(frozen=True, slots=True)

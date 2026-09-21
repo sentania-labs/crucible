@@ -137,7 +137,7 @@ async def test_get_harnesses_reports_flags_ranges_and_a_sanitized_credential_sta
     task_id = submit_and_start(client, "crucible-worker:fake-succeed")
     await run_to_settled(supervisor, client, task_id)
     items = {h["name"]: h for h in client.get("/v1/harnesses").json()["items"]}
-    assert set(items) == {"claude_code", "codex", "agy", "script-harness"}
+    assert set(items) == {"claude_code", "codex", "agy", "hermes", "script-harness"}
     agy = items["agy"]
     assert agy["enabled"] is False and agy["enabled_by_administrator"] is False
     assert agy["enabled_by_configuration"] is True
@@ -192,6 +192,73 @@ async def test_per_harness_concurrency_defers_the_second_launch(
     assert await run_to_settled(supervisor, client, second, max_ticks=40) == (
         "awaiting_internal_review"
     )
+
+
+async def test_local_pool_cap_is_independent_of_subscription_harness_caps(
+    ctx: AppContext,
+    client: TestClient,
+    provider: FakeProvider,
+    tokens: dict[str, str],
+) -> None:
+    supervisor = make_supervisor(ctx, provider)
+    admin = {"Authorization": f"Bearer {tokens['admin']}"}
+    routing = client.get("/v1/routing/default-routing/4").json()["document"]
+    routing["version"] = 41
+    hermes = next(model for model in routing["models"] if model["harness"] == "hermes")
+    hermes.update(
+        {
+            "endpoint_url": "http://192.0.2.41:11434/v1",
+            "enabled": True,
+            "disabled_reason": None,
+        }
+    )
+    assert (
+        client.put("/v1/routing/default-routing/41", json=routing, headers=admin).status_code == 200
+    )
+    policy = client.get("/v1/policies/default-software/4").json()["document"]
+    policy["version"] = 41
+    policy["routing"]["policy"]["version"] = 41
+    assert (
+        client.put("/v1/policies/default-software/41", json=policy, headers=admin).status_code
+        == 200
+    )
+
+    operator = {"Authorization": f"Bearer {tokens['operator']}"}
+    task_ids: list[str] = []
+    for number in range(5):
+        external_id = f"EX-LOCAL-{number}"
+        document = contract_document(external_id=external_id)
+        document["repository"]["work_branch"] = f"crucible/{external_id}"
+        document["policy"] = {"name": "default-software", "version": 41}
+        document["execution_request"].update(
+            {
+                "harness": "hermes",
+                "model": "gpt-oss:120b",
+                "pin_reason": "exercise the Spark pool cap",
+                "image": "crucible-worker:fake-hang",
+            }
+        )
+        response = client.post("/v1/tasks", json=document, headers=operator)
+        assert response.status_code == 201, response.text
+        task_id = response.json()["id"]
+        response = client.post(
+            f"/v1/tasks/{task_id}/start",
+            json={
+                "provider": "fake",
+                "image": "crucible-worker:fake-hang",
+                "policy_version": 41,
+            },
+            headers=operator,
+        )
+        assert response.status_code == 200, response.text
+        task_ids.append(task_id)
+
+    for _ in range(3):
+        await supervisor.tick()
+    states = [client.get(f"/v1/tasks/{task_id}").json()["state"] for task_id in task_ids]
+    assert states.count("running") == 4
+    assert states.count("scheduled") == 1
+    assert "harness_launch_deferred" in event_kinds(client, task_ids[-1])
 
 
 async def test_a_disabled_harness_is_a_contract_problem_at_submit(

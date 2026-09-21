@@ -666,6 +666,7 @@ class DockerProvider:
             spec.harness,
             [str(h) for h in (spec.policy.get("network", {}).get("egress_allowlist") or [])],
             [str(h) for h in (spec.contract.get("constraints", {}).get("egress_extra") or [])],
+            spec.endpoint_url,
         )
         configured = set(self.config.proxy_allowlist)
         if configured and not set(wanted) <= configured:
@@ -754,6 +755,8 @@ class DockerProvider:
             report_mount=REPORT_MOUNT,
             repo_mount=REPO_MOUNT,
             credential_mounted=self._credential_copy(spec) is not None,
+            endpoint=spec.endpoint,
+            endpoint_url=spec.endpoint_url,
         )
 
     def _credential_source(self, harness: str) -> CredentialSource | None:
@@ -772,7 +775,7 @@ class DockerProvider:
         at launch: it would only fail authentication after spending an attempt."""
         adapter = self.harnesses.get(spec.harness)
         credential = adapter.credential_spec() if adapter is not None else None
-        if credential is None:
+        if credential is None or spec.endpoint == "local":
             return None
         source = self._credential_source(spec.harness)
         if source is None:
@@ -943,7 +946,10 @@ class DockerProvider:
             adapter is not None
             and observation.state is ObservationState.EXITED
             and adapter.classify_exit(
-                ExitInfo(exit_code=observation.exit_code), stdout_tail, stderr_tail
+                ExitInfo(exit_code=observation.exit_code),
+                stdout_tail,
+                stderr_tail,
+                root / "report",
             )
             is ExitClass.QUOTA_EXHAUSTED
         )

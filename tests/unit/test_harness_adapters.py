@@ -12,6 +12,7 @@ import pytest
 from crucible.adapters.harness.agy import AgyAdapter
 from crucible.adapters.harness.claude_code import ClaudeCodeAdapter
 from crucible.adapters.harness.codex import CodexAdapter
+from crucible.adapters.harness.hermes import HermesAdapter
 from crucible.adapters.harness.registry import default_adapters, default_registry
 from crucible.adapters.harness.script import ScriptHarnessAdapter
 from crucible.application.harnesses import effective_mount_mode
@@ -114,7 +115,17 @@ def test_script_harness_is_a_plain_argv() -> None:
 @pytest.mark.parametrize("adapter", default_adapters(), ids=lambda a: a.name)
 def test_nothing_secret_shaped_in_any_launch(adapter: HarnessAdapter) -> None:
     """12: argv and env carry names, paths and flags; the scanner finds nothing."""
-    launch = adapter.build_launch(context())
+    ctx = (
+        context(
+            model="gpt-oss:120b",
+            credential_mounted=False,
+            endpoint="local",
+            endpoint_url="http://spark.example.internal:11434/v1",
+        )
+        if isinstance(adapter, HermesAdapter)
+        else context()
+    )
+    launch = adapter.build_launch(ctx)
     blob = "\n".join([*launch.argv, *launch.env.values(), *launch.env_from_files.values()])
     assert scan_text(blob) is None
     for value in launch.env_from_files.values():
@@ -171,12 +182,13 @@ def test_configuration_may_raise_the_mount_mode_and_never_lower_it() -> None:
 # ----- the registry (07, 25) ----------------------------------------------------
 
 
-def test_the_registry_knows_the_four_harnesses() -> None:
+def test_the_registry_knows_the_five_harnesses() -> None:
     registry = default_registry()
-    assert registry.names() == ("claude_code", "codex", "agy", "script-harness")
+    assert registry.names() == ("claude_code", "codex", "agy", "hermes", "script-harness")
     assert registry.require("codex").supported_versions.text == ">=0.153.0,<0.154.0"
     assert registry.require("claude_code").supported_versions.text == ">=2.1.0,<2.2.0"
     assert registry.require("agy").supported_versions.text == ">=1.2.0,<1.3.0"
+    assert registry.require("hermes").supported_versions.text == ">=0.19.0,<0.20.0"
 
 
 def test_an_unknown_name_is_refused() -> None:

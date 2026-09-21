@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from crucible.application.transitions import record_event
 from crucible.domain.entities import HarnessState
@@ -164,13 +165,22 @@ def check_image_version(
 
 
 def egress_allowlist(
-    registry: HarnessRegistry, harness: str, policy_hosts: list[str], extra: list[str]
+    registry: HarnessRegistry,
+    harness: str,
+    policy_hosts: list[str],
+    extra: list[str],
+    endpoint_url: str | None = None,
 ) -> tuple[str, ...]:
     """The union of the policy's allowlist and the adapter's declared endpoints (13)."""
     adapter = registry.get(harness)
     hosts = set(policy_hosts) | set(extra)
     if adapter is not None:
         hosts |= set(adapter.capabilities().endpoints)
+    if endpoint_url:
+        parsed = urlsplit(endpoint_url)
+        if parsed.hostname:
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+            hosts.add(f"{parsed.hostname}:{port}")
     return tuple(sorted(h for h in hosts if h))
 
 

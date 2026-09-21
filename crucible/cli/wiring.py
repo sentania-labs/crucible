@@ -6,6 +6,7 @@ import os
 import socket
 from dataclasses import dataclass
 from functools import partial
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI
 
@@ -107,6 +108,11 @@ def harness_gates(settings: Settings) -> dict[str, HarnessGate]:
 
 def docker_config(settings: Settings) -> DockerConfig:
     d = settings.docker
+    local_endpoints = []
+    if settings.spark_endpoint_url:
+        parsed = urlsplit(settings.spark_endpoint_url)
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        local_endpoints.append(f"{parsed.hostname}:{port}")
     return DockerConfig(
         endpoint=d.host,
         artifact_root=settings.service.artifact_root,
@@ -117,7 +123,7 @@ def docker_config(settings: Settings) -> DockerConfig:
         credential_host_root=d.credential_host_root,
         workers_network=d.workers_network,
         egress_proxy=d.egress_proxy,
-        proxy_allowlist=tuple(d.egress_allowlist),
+        proxy_allowlist=tuple([*d.egress_allowlist, *local_endpoints]),
         no_proxy=d.no_proxy,
         api_timeout_seconds=d.api_timeout_seconds,
         collector_timeout_seconds=d.collector_timeout_seconds,
