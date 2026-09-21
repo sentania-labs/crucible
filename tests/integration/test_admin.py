@@ -261,6 +261,8 @@ def test_ui_session_csrf_reader_access_and_page_walk(
             response = browser.get(path)
             assert response.status_code == 200, (path, response.text)
             assert "Crucible" in response.text
+            assert "<pre" not in response.text, path
+            assert re.search(r"\{\s*(?:&quot;|\")", response.text) is None, path
         forbidden = browser.post(
             "/ui/actions/harness",
             data={

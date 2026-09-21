@@ -5,11 +5,12 @@ from __future__ import annotations
 import hmac
 import json
 import os
+import re
 import tomllib
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, quote, urlsplit, urlunsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Request
@@ -38,7 +39,7 @@ from crucible.application.errors import ApplicationError, ConflictError, Forbidd
 from crucible.application.policies import put_policy, put_routing_policy
 from crucible.contracts.api import ExternalReviewAttestation, RepositoryRegistration
 from crucible.domain.entities import Principal, Role
-from crucible.domain.secrets import scan_text
+from crucible.domain.secrets import redact, scan_text
 from crucible.ports.repository import UnitOfWork
 
 ROOT = Path(__file__).parent
@@ -66,6 +67,216 @@ NAV = (
     ("/ui/bootstrap", "Bootstrap"),
     ("/ui/settings", "Settings"),
 )
+
+LABELS = {
+    "active": "Currently active",
+    "api_base": "API base",
+    "app_id": "App ID",
+    "attempt_id": "Attempt ID",
+    "authoritative": "Authoritative import",
+    "checked_at": "Last checked",
+    "clear_reason": "Clear reason",
+    "cleared_at": "Cleared at",
+    "cleared_by": "Cleared by",
+    "committed_at": "Committed at",
+    "configured": "App configured",
+    "content_sha256": "Content fingerprint",
+    "counts": "Tasks by state",
+    "enabled_by_administrator": "Runtime gate",
+    "enabled_by_configuration": "Configuration gate",
+    "exhausted_at": "Exhausted at",
+    "external_id": "External ID",
+    "health_detail": "Health detail",
+    "healthy": "Supervisor health",
+    "holder": "Lease holder",
+    "image_digest": "Image digest",
+    "installation_covers": "Installation coverage",
+    "installation_id": "Installation ID",
+    "key_fingerprint": "Public key fingerprint",
+    "key_present": "Private key",
+    "last_check": "Last connectivity check",
+    "last_error": "Last error",
+    "last_error_at": "Last error time",
+    "last_heartbeat": "Last heartbeat",
+    "last_run": "Last cleanup action",
+    "last_success_at": "Last successful tick",
+    "last_tick_at": "Last tick",
+    "lease": "Supervisor lease",
+    "lists": "Tasks needing attention",
+    "next_cursor": "Next cursor",
+    "oldest_pending": "Oldest pending wake",
+    "pending": "Deliveries pending by principal",
+    "recent_actions": "Recent actions",
+    "repositories": "Repositories",
+    "reset_at": "Automatic reset at",
+    "task_id": "Task ID",
+    "tick_ms": "Tick duration (ms)",
+    "unacked": "Deliveries pending",
+    "updated_at": "Last updated",
+    "verified_at": "Verified at",
+    "webhook_enabled": "Webhook",
+    "webhook_secret_present": "Webhook secret",
+}
+
+SECRET_PARTS = {
+    "access_token",
+    "authorization",
+    "code",
+    "credential_value",
+    "device_code",
+    "oauth_token",
+    "password",
+    "private_key",
+    "refresh_token",
+    "secret",
+    "token",
+}
+NON_SECRET_TOKEN_FIELDS = {
+    "error_code",
+    "exit_code",
+    "fenced_token",
+    "http_code",
+    "status_code",
+    "tokens_in",
+    "tokens_out",
+}
+
+
+def _operator_label(key: str) -> str:
+    """Turn an API key into an operator label while retaining the key separately."""
+    if key in LABELS:
+        return LABELS[key]
+    words = key.replace(".", " ").replace("_", " ").split()
+    expanded = [
+        word.upper() if word.lower() in {"api", "id", "sha256", "url"} else word for word in words
+    ]
+    label = " ".join(expanded)
+    return label[:1].upper() + label[1:]
+
+
+def _secret_field(key: str) -> bool:
+    separated = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", key).lower()
+    terminal = separated.rsplit(".", 1)[-1]
+    lowered = separated.replace(".", "_")
+    if lowered in NON_SECRET_TOKEN_FIELDS or terminal in NON_SECRET_TOKEN_FIELDS:
+        return False
+    if lowered.endswith("_present") or lowered.endswith("_fingerprint"):
+        return False
+    return any(
+        part == lowered
+        or lowered.startswith(f"{part}_")
+        or lowered.endswith(f"_{part}")
+        or f"_{part}_" in lowered
+        for part in SECRET_PARTS
+    )
+
+
+def _safe_value(key: str, value: Any) -> Any:
+    """Return readable scalar content without exposing secret-shaped values."""
+    lowered = key.lower()
+    if _secret_field(lowered):
+        return "not displayed"
+    if isinstance(value, str) and "://" in value:
+        try:
+            parsed = urlsplit(value)
+            url_parameters = unquote(f"{parsed.query}&{parsed.fragment}")
+            sensitive_parameters = any(
+                _secret_field(partition.partition("=")[0])
+                for partition in re.split(r"[&?;]", url_parameters)
+                if partition
+            )
+            if parsed.username is not None or parsed.password is not None or sensitive_parameters:
+                hostname = parsed.hostname or ""
+                if parsed.port is not None:
+                    hostname += f":{parsed.port}"
+                return urlunsplit((parsed.scheme, hostname, parsed.path, "", ""))
+        except ValueError:
+            return "invalid URL"
+    if isinstance(value, bool):
+        if lowered.endswith("healthy") or lowered == "healthy":
+            return "healthy" if value else "not healthy"
+        if lowered.endswith("present"):
+            return "present" if value else "absent"
+        if lowered.endswith("enabled") or lowered.startswith("enabled_"):
+            return "enabled" if value else "disabled"
+        if lowered in {"active", "configured", "installation_covers"}:
+            words = {
+                "active": ("active", "inactive"),
+                "configured": ("configured", "not configured"),
+                "installation_covers": ("covered", "not covered"),
+            }[lowered]
+            return words[0] if value else words[1]
+        if lowered == "ok":
+            return "successful" if value else "failed"
+        return "yes" if value else "no"
+    if value is None:
+        return "none"
+    if isinstance(value, str):
+        return redact(value)
+    return value
+
+
+def _flatten_table_row(value: dict[str, Any], prefix: str = "") -> dict[str, Any]:
+    if not value:
+        return {prefix or "value": _panel(value, key=prefix)}
+    row: dict[str, Any] = {}
+    for child_key, item in value.items():
+        path = f"{prefix}.{child_key}" if prefix else str(child_key)
+        if isinstance(item, dict):
+            row.update(_flatten_table_row(item, path))
+        elif isinstance(item, list):
+            row[path] = _panel(item, key=path)
+        else:
+            row[path] = _safe_value(path, item)
+    return row
+
+
+def _panel(value: Any, *, key: str = "") -> dict[str, Any]:
+    """Build the three readable panel kinds used by the administration template."""
+    if isinstance(value, dict):
+        items = []
+        for child_key, child in value.items():
+            item: dict[str, Any] = {
+                "label": _operator_label(str(child_key)),
+                "source": str(child_key),
+            }
+            if isinstance(child, (dict, list)):
+                item["panel"] = _panel(child, key=str(child_key))
+            else:
+                item["value"] = _safe_value(str(child_key), child)
+            items.append(item)
+        return {"kind": "fields", "items": items}
+    if isinstance(value, list):
+        if not value:
+            return {"kind": "empty"}
+        if all(isinstance(item, dict) for item in value):
+            flattened = [_flatten_table_row(item) for item in value]
+            column_keys = list(dict.fromkeys(path for row in flattened for path in row))
+            return {
+                "kind": "table",
+                "columns": [
+                    {"label": _operator_label(path), "source": path} for path in column_keys
+                ],
+                "rows": [[row.get(path, "none") for path in column_keys] for row in flattened],
+            }
+        rows = [
+            [_panel(item, key=key)] if isinstance(item, (dict, list)) else [_safe_value(key, item)]
+            for item in value
+        ]
+        return {
+            "kind": "table",
+            "columns": [{"label": "Value", "source": key}],
+            "rows": rows,
+        }
+    return {"kind": "value", "value": _safe_value(key, value)}
+
+
+def _document_section(title: str, document: Any) -> dict[str, Any]:
+    return {"title": title, "panel": _panel(document)}
+
+
+templates.env.globals["panel_from_cell"] = _panel
+templates.env.globals["safe_value"] = _safe_value
 
 
 def _serializer(ctx: Any) -> URLSafeTimedSerializer:
@@ -160,6 +371,23 @@ def _localize(value: Any, timezone: str) -> Any:
     if isinstance(value, tuple):
         return tuple(_localize(item, timezone) for item in value)
     moment: datetime | None = value if isinstance(value, datetime) else None
+    if isinstance(value, str) and "T" in value:
+        pattern = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})")
+
+        def replace(match: re.Match[str]) -> str:
+            try:
+                parsed = datetime.fromisoformat(match.group(0).replace("Z", "+00:00"))
+            except ValueError:
+                return match.group(0)
+            try:
+                local = parsed.astimezone(ZoneInfo(timezone))
+            except ZoneInfoNotFoundError:
+                local = parsed.astimezone(ZoneInfo("America/Chicago"))
+            return local.strftime("%Y-%m-%d %I:%M:%S %p %Z")
+
+        replaced = pattern.sub(replace, value)
+        if replaced != value:
+            return replaced
     if isinstance(value, str) and "T" in value and (value.endswith("Z") or "+" in value[10:]):
         try:
             moment = datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -345,10 +573,10 @@ async def dashboard(request: Request, ctx: Ctx, uow: UoW) -> Response:
         )
     sections.extend(
         [
-            {"title": "Supervisor", "json": document["supervisor"]},
-            {"title": "Providers", "json": document["providers"]},
-            {"title": "Task state", "json": document["tasks"]},
-            {"title": "Pending wakes", "json": document["wakes"]},
+            _document_section("Supervisor", document["supervisor"]),
+            _document_section("Providers", document["providers"]),
+            _document_section("Task state", document["tasks"]),
+            _document_section("Pending wakes", document["wakes"]),
         ]
     )
     ready = not gaps and document["supervisor"]["healthy"]
@@ -599,9 +827,9 @@ def routing_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
     assert ctx.admin is not None
     exhaustion = routing.list_exhaustions(ctx.admin, uow)
     sections: list[dict[str, Any]] = [
-        {"title": "Active policy", "json": policy.document if policy else {}},
-        {"title": "Routing policy", "json": routing_record.document if routing_record else {}},
-        {"title": "Pool exhaustion", "json": exhaustion},
+        _document_section("Active policy", policy.document if policy else {}),
+        _document_section("Routing policy", routing_record.document if routing_record else {}),
+        _document_section("Pool exhaustion", exhaustion),
     ]
     if principal.role is Role.ADMIN:
         sections.extend(
@@ -859,7 +1087,7 @@ def github_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
     principal, csrf = found
     assert ctx.admin is not None
     sections: list[dict[str, Any]] = [
-        {"title": "App and repository connectivity", "json": github.status(ctx.admin, uow)}
+        _document_section("App and repository connectivity", github.status(ctx.admin, uow))
     ]
     if principal.role is Role.ADMIN:
         sections.append(
@@ -958,7 +1186,7 @@ def worker_logs(request: Request, attempt_id: str, ctx: Ctx, uow: UoW) -> Respon
         active="/ui/workers",
         heading=f"Log tail: {attempt_id}",
         intro="Stored stdout and stderr tail. Refresh to follow an active attempt.",
-        sections=[{"title": "Tail", "json": {"text": text[-65536:]}}],
+        sections=[{"title": "Tail", "text": redact(text[-65536:])}],
     )
 
 
@@ -975,7 +1203,7 @@ def tasks_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
         active="/ui/tasks",
         heading="Failed and blocked tasks",
         intro="States that need operator attention, plus counts across the lifecycle.",
-        sections=[{"title": "Task state", "json": status.tasks(uow)}],
+        sections=[_document_section("Task state", status.tasks(uow))],
     )
 
 
@@ -994,7 +1222,7 @@ def wakes_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
         heading="Pending wakes",
         intro="Durable operator notifications for the signed-in principal.",
         sections=[
-            {"title": "Wakes", "json": status.wakes(uow)},
+            _document_section("Wakes", status.wakes(uow)),
             {
                 "title": "Your wake records",
                 "columns": ["ID", "Reason", "Created", "Acknowledged", "Payload"],
@@ -1028,7 +1256,7 @@ def retention_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
         heading="Retention and cleanup",
         intro="Recent cleanup actions and the last observed sweep.",
         sections=[
-            {"title": "Summary", "json": status.retention(uow)},
+            _document_section("Summary", status.retention(uow)),
             {
                 "title": "Recent actions",
                 "columns": ["Kind", "Subject", "Policy", "Time", "Detail"],
@@ -1071,7 +1299,7 @@ def audit_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                     for item in document["items"]
                 ],
             },
-            {"title": "Next cursor", "json": {"next_cursor": document["next_cursor"]}},
+            _document_section("Next cursor", {"next_cursor": document["next_cursor"]}),
         ],
     )
 
@@ -1084,7 +1312,7 @@ def bootstrap_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
     principal, csrf = found
     items = bootstrap.list_imports(uow)
     sections: list[dict[str, Any]] = [
-        {"title": "Imports", "json": items},
+        _document_section("Imports", items),
         {
             "title": "Show import",
             "form": {
@@ -1226,7 +1454,7 @@ async def action(request: Request, action: str, ctx: Ctx, uow: UoW) -> Response:
                 active="/ui/bootstrap",
                 heading="Bootstrap manifest",
                 intro=form.get("import_id", ""),
-                sections=[{"title": "Manifest", "json": document}],
+                sections=[_document_section("Manifest", document)],
             )
         _admin(principal)
         if ctx.admin is None:

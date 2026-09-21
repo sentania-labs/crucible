@@ -1,4 +1,27 @@
 {% extends "base.html" %}
+{% macro render_value(value) -%}
+  {% if value is sequence and value is not string %}
+    {% if value %}<ul class="admin-values">{% for item in value %}<li>{{ item }}</li>{% endfor %}</ul>{% else %}<span class="admin-empty">none</span>{% endif %}
+  {% else %}{{ value }}{% endif %}
+{%- endmacro %}
+{% macro render_panel(panel) -%}
+  {% if panel.kind == "fields" %}
+    {% if panel["items"] %}<dl class="admin-fields">
+      {% for item in panel["items"] %}
+      <div class="admin-field">
+        <dt title="{{ item.source }}">{{ item.label }}</dt>
+        <dd>{% if item.panel is defined %}{{ render_panel(item.panel) }}{% else %}{{ render_value(item.value) }}{% endif %}</dd>
+      </div>
+      {% endfor %}
+    </dl>{% else %}<p class="admin-empty">none</p>{% endif %}
+  {% elif panel.kind == "table" %}
+    <div class="admin-table-wrap lat-table-scroll"><table class="admin-table lat-table"><thead><tr>{% for column in panel.columns %}<th title="{{ column.source }}">{{ column.label }}</th>{% endfor %}</tr></thead><tbody>
+    {% for row in panel.rows %}<tr>{% for cell in row %}<td>{% if cell is mapping and cell.kind is defined %}{{ render_panel(cell) }}{% else %}{{ render_value(cell) }}{% endif %}</td>{% endfor %}</tr>{% endfor %}
+    </tbody></table></div>
+  {% elif panel.kind == "values" %}{{ render_value(panel["items"]) }}
+  {% elif panel.kind == "empty" %}<p class="admin-empty">none</p>
+  {% else %}{{ render_value(panel.value) }}{% endif %}
+{%- endmacro %}
 {% block content %}
 <div class="admin-title"><div><h1>{{ heading }}</h1><p>{{ intro }}</p></div>{% if badge %}<span class="lat-badge lat-badge--{{ badge_kind }}">{{ badge }}</span>{% endif %}</div>
 <div class="admin-stack">
@@ -7,11 +30,12 @@
     <h2>{{ section.title }}</h2>
     {% if section.note %}<p class="lat-hint">{{ section.note }}</p>{% endif %}
     {% if section.rows is defined %}
-      {% if section.rows %}<div class="admin-table-wrap"><table class="admin-table"><thead><tr>{% for column in section.columns %}<th>{{ column }}</th>{% endfor %}</tr></thead><tbody>
-      {% for row in section.rows %}<tr>{% for cell in row %}<td>{% if cell is string and cell.startswith('/ui') %}<a href="{{ cell }}">Open</a>{% elif cell is mapping or (cell is sequence and cell is not string) %}<code>{{ cell | tojson }}</code>{% else %}{{ cell if cell is not none else "" }}{% endif %}</td>{% endfor %}</tr>{% endfor %}
+      {% if section.rows %}<div class="admin-table-wrap lat-table-scroll"><table class="admin-table lat-table"><thead><tr>{% for column in section.columns %}<th>{{ column }}</th>{% endfor %}</tr></thead><tbody>
+      {% for row in section.rows %}<tr>{% for cell in row %}<td>{% if cell is string and cell.startswith('/ui') %}<a href="{{ cell }}">Open</a>{% elif cell is mapping or (cell is sequence and cell is not string) %}{{ render_panel(panel_from_cell(cell)) }}{% else %}{{ safe_value(section.columns[loop.index0], cell) }}{% endif %}</td>{% endfor %}</tr>{% endfor %}
       </tbody></table></div>{% else %}<p class="admin-empty">Nothing to show.</p>{% endif %}
     {% endif %}
-    {% if section.json is defined %}<pre class="lat-code admin-json">{{ section.json | tojson(indent=2) }}</pre>{% endif %}
+    {% if section.panel is defined %}{{ render_panel(section.panel) }}{% endif %}
+    {% if section.text is defined %}<pre class="lat-code admin-output">{{ section.text }}</pre>{% endif %}
     {% if section.form %}
     <form class="admin-form" method="post" action="{{ section.form.action }}">
       <input type="hidden" name="csrf" value="{{ csrf }}">
