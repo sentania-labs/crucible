@@ -266,9 +266,7 @@ def test_coded_urls_and_manual_table_cells_are_sanitized() -> None:
     assert "user:password" not in rendered
     assert marker not in rendered
     assert "[redacted:github_token]" in rendered
-    assert code not in _safe_value(
-        "device_url", f"https://example.invalid/device#user_code={code}"
-    )
+    assert code not in _safe_value("device_url", f"https://example.invalid/device#user_code={code}")
     assert code not in _safe_value(
         "device_url", f"https://example.invalid/device?user%5Fcode={code}"
     )
