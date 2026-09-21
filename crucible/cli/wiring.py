@@ -121,6 +121,7 @@ def docker_config(settings: Settings) -> DockerConfig:
         artifact_host_root=d.artifact_host_root,
         credential_root=d.credential_root,
         credential_host_root=d.credential_host_root,
+        credential_volume=d.credential_volume,
         workers_network=d.workers_network,
         egress_proxy=d.egress_proxy,
         proxy_allowlist=tuple([*d.egress_allowlist, *local_endpoints]),
@@ -206,6 +207,7 @@ def wire(settings: Settings) -> Wiring:
         harness_gates=harness_gates(settings),
         credential_sources=credential_sources(settings),
         admin=admin,
+        settings=settings,
     )
     publisher: Publisher | None = None
     if docker is not None and github is not None:

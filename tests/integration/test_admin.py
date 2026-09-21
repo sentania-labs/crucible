@@ -11,8 +11,10 @@ import asyncio
 import copy
 import json
 import os
+import re
 import time
 from collections.abc import Iterator
+from importlib import import_module
 from pathlib import Path
 from typing import Any
 
@@ -23,11 +25,13 @@ from crucible.adapters.api.app import create_app
 from crucible.adapters.api.deps import AppContext
 from crucible.adapters.clock import SystemClock
 from crucible.adapters.execution.fake import FakeProvider
+from crucible.adapters.persistence.unit_of_work import SqlUnitOfWorkFactory, make_engine
 from crucible.application.admin.context import AdminContext
+from crucible.application.auth import authenticate
 from crucible.application.errors import ApplicationError
 from crucible.application.supervisor import Supervisor
 from crucible.cli import admin as cli
-from crucible.domain.entities import Role
+from crucible.domain.entities import ImagePromotion, Role
 from crucible.ports.execution import ImageInfo
 from crucible.ports.harness import CredentialSource
 
@@ -194,7 +198,381 @@ def audit_kinds(client: TestClient) -> list[tuple[str, str]]:
     return [(e["kind"], e["principal"]) for e in items]
 
 
+def ui_sign_in(client: TestClient, token: str) -> str:
+    form = client.get("/ui/sign-in")
+    preauth = re.search(r'name="csrf" value="([a-f0-9]+)"', form.text)
+    assert form.status_code == 200 and preauth is not None
+    response = client.post(
+        "/ui/sign-in",
+        data={"csrf": preauth.group(1), "token": token, "next": "/ui"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    page = client.get("/ui")
+    assert page.status_code == 200
+    match = re.search(r'name="csrf" value="([a-f0-9]+)"', page.text)
+    assert match is not None
+    return match.group(1)
+
+
+def test_sign_in_rejects_cross_site_form_without_the_preauth_nonce(
+    ctx: AppContext, tokens: dict[str, str]
+) -> None:
+    with TestClient(create_app(ctx)) as browser:
+        refused = browser.post(
+            "/ui/sign-in",
+            data={"token": tokens["admin"], "next": "/ui"},
+            follow_redirects=False,
+        )
+        assert refused.status_code == 403
+        assert "CSRF token is invalid" in refused.text
+        assert "crucible_ui=" not in refused.headers.get("set-cookie", "")
+
+
 # ----- the guard --------------------------------------------------------------------
+
+
+def test_ui_session_csrf_reader_access_and_page_walk(
+    ctx: AppContext,
+    tokens: dict[str, str],
+    admin_ctx: AdminContext,
+) -> None:
+    with TestClient(create_app(ctx)) as browser:
+        assert browser.get("/ui", follow_redirects=False).status_code == 303
+        csrf = ui_sign_in(browser, tokens["observer"])
+        for path in (
+            "/ui",
+            "/ui/harnesses",
+            "/ui/credentials",
+            "/ui/credentials/hermes/login",
+            "/ui/images",
+            "/ui/routing",
+            "/ui/repositories",
+            "/ui/tokens",
+            "/ui/github",
+            "/ui/workers",
+            "/ui/tasks",
+            "/ui/wakes",
+            "/ui/retention",
+            "/ui/audit",
+            "/ui/bootstrap",
+            "/ui/settings",
+        ):
+            response = browser.get(path)
+            assert response.status_code == 200, (path, response.text)
+            assert "Crucible" in response.text
+        forbidden = browser.post(
+            "/ui/actions/harness",
+            data={
+                "csrf": csrf,
+                "harness": "agy",
+                "enabled": "false",
+                "reason": "reader must not mutate",
+                "return_to": "/ui/harnesses",
+            },
+            follow_redirects=False,
+        )
+        assert forbidden.status_code == 303
+        assert "admin%20role%20required" in forbidden.headers["location"]
+
+
+def test_ui_mutation_uses_the_same_harness_service_and_rejects_bad_csrf(
+    ctx: AppContext,
+    tokens: dict[str, str],
+    admin_ctx: AdminContext,
+    live_supervisor: Supervisor,
+) -> None:
+    asyncio.run(live_supervisor.tick())
+    with TestClient(create_app(ctx)) as browser:
+        csrf = ui_sign_in(browser, tokens["admin"])
+        refused = browser.post(
+            "/ui/actions/harness",
+            data={
+                "csrf": "wrong",
+                "harness": "agy",
+                "enabled": "false",
+                "reason": "bad csrf",
+                "return_to": "/ui/harnesses",
+            },
+            follow_redirects=False,
+        )
+        assert "CSRF" in refused.headers["location"]
+        changed = browser.post(
+            "/ui/actions/harness",
+            data={
+                "csrf": csrf,
+                "harness": "agy",
+                "enabled": "false",
+                "reason": "ui parity test",
+                "return_to": "/ui/harnesses",
+            },
+            follow_redirects=False,
+        )
+        assert changed.status_code == 303
+    with ctx.uow_factory() as uow:
+        state = uow.harnesses.get("agy")
+        assert state is not None
+        assert state.enabled is False and state.reason == "ui parity test"
+
+
+def test_migrate_creates_and_prints_the_first_admin_once(
+    migrated: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cli._ensure_first_admin(migrated)
+    first = capsys.readouterr().out
+    assert "CRUCIBLE FIRST-RUN ADMIN TOKEN, SHOWN ONCE" in first
+    shown = next(line for line in first.splitlines() if line.startswith("cru_"))
+    cli._ensure_first_admin(migrated)
+    assert capsys.readouterr().out == ""
+    engine = make_engine(migrated)
+    try:
+        with SqlUnitOfWorkFactory(engine)() as uow:
+            principal = authenticate(uow, shown)
+            assert principal is not None
+            assert principal.name == "first-run-admin" and principal.role is Role.ADMIN
+            uow.principals.disable(principal.id, SystemClock().now())
+            uow.commit()
+        cli._ensure_first_admin(migrated)
+        recovery = capsys.readouterr().out
+        recovered_token = next(line for line in recovery.splitlines() if line.startswith("cru_"))
+        with SqlUnitOfWorkFactory(engine)() as uow:
+            recovered = authenticate(uow, recovered_token)
+            assert recovered is not None
+            assert recovered.name.startswith("first-run-admin-")
+            assert recovered.role is Role.ADMIN and recovered.disabled_at is None
+    finally:
+        engine.dispose()
+
+
+def test_token_and_repository_mutations_have_ui_api_and_cli_parity(
+    ctx: AppContext,
+    tokens: dict[str, str],
+    admin_ctx: AdminContext,
+    admin_client: TestClient,
+    live_supervisor: Supervisor,
+    config_file: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    asyncio.run(live_supervisor.tick())
+    api_created = admin_client.post(
+        "/v1/admin/tokens",
+        json={"name": "api-reader", "role": "observer", "reason": "parity"},
+    )
+    assert api_created.status_code == 200
+    assert api_created.json()["token"].startswith("cru_")
+    cli_created = run_cli(
+        config_file,
+        "--reason",
+        "parity",
+        "token",
+        "create",
+        "--principal",
+        "cli-reader",
+        "--role",
+        "observer",
+        capsys=capsys,
+    )
+    assert set(cli_created) == {"principal", "role", "token"}
+    with TestClient(create_app(ctx)) as browser:
+        csrf = ui_sign_in(browser, tokens["admin"])
+        ui_created = browser.post(
+            "/ui/actions/token-create",
+            data={
+                "csrf": csrf,
+                "name": "ui-reader",
+                "role": "observer",
+                "reason": "parity",
+                "return_to": "/ui/tokens",
+            },
+        )
+        assert ui_created.status_code == 200
+        assert re.search(r"cru_[A-Z0-9]{26}\.[A-Za-z0-9_-]+", ui_created.text)
+
+        principals = admin_client.get("/v1/admin/tokens").json()["items"]
+        ids = {item["name"]: item["id"] for item in principals}
+        ui_revoked = browser.post(
+            "/ui/actions/token-revoke",
+            data={
+                "csrf": csrf,
+                "principal_id": ids["api-reader"],
+                "reason": "parity",
+                "return_to": "/ui/tokens",
+            },
+            follow_redirects=False,
+        )
+        assert ui_revoked.status_code == 303
+    api_revoked = admin_client.post(
+        f"/v1/admin/tokens/{ids['ui-reader']}/revoke", json={"reason": "parity"}
+    )
+    assert api_revoked.json()["revoked"] is True
+    cli_revoked = run_cli(
+        config_file,
+        "--reason",
+        "parity",
+        "token",
+        "revoke",
+        ids["cli-reader"],
+        capsys=capsys,
+    )
+    assert cli_revoked["revoked"] is True
+    assert {
+        item["name"] for item in run_cli(config_file, "token", "list", capsys=capsys)["items"]
+    } >= {
+        "api-reader",
+        "cli-reader",
+        "ui-reader",
+    }
+
+    for name in ("api-remove", "cli-remove", "ui-remove"):
+        response = admin_client.put(
+            f"/v1/admin/repositories/{name}",
+            json={
+                "url": f"https://github.com/example-org/{name}",
+                "attested_all_prs": True,
+                "reason": "parity",
+            },
+        )
+        assert response.status_code == 200
+    assert admin_client.request(
+        "DELETE", "/v1/admin/repositories/api-remove", json={"reason": "parity"}
+    ).json()["removed"]
+    assert run_cli(
+        config_file,
+        "--reason",
+        "parity",
+        "repositories",
+        "remove",
+        "cli-remove",
+        capsys=capsys,
+    )["removed"]
+    with TestClient(create_app(ctx)) as browser:
+        csrf = ui_sign_in(browser, tokens["admin"])
+        removed = browser.post(
+            "/ui/actions/repository-remove",
+            data={
+                "csrf": csrf,
+                "name": "ui-remove",
+                "reason": "parity",
+                "return_to": "/ui/repositories",
+            },
+            follow_redirects=False,
+        )
+    assert removed.status_code == 303
+    assert {
+        item["repository"] for item in admin_client.get("/v1/admin/repositories").json()["items"]
+    }.isdisjoint({"api-remove", "cli-remove", "ui-remove"})
+
+
+def test_every_remaining_ui_mutation_dispatches_to_the_shared_application_service(
+    ctx: AppContext,
+    tokens: dict[str, str],
+    admin_ctx: AdminContext,
+    live_supervisor: Supervisor,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """API and CLI parity tests above exercise the services themselves. This matrix
+    proves every other mutating UI form reaches those same service functions."""
+    ui = import_module("crucible.adapters.ui.router")
+    calls: list[str] = []
+
+    def stub(name: str) -> Any:
+        def called(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            calls.append(name)
+            return {"ok": True}
+
+        return called
+
+    def async_stub(name: str) -> Any:
+        async def called(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            calls.append(name)
+            return {"ok": True}
+
+        return called
+
+    for owner, name, replacement in (
+        (ui.credentials, "validate", async_stub("credential-validate")),
+        (ui.credentials, "probe", async_stub("credential-probe")),
+        (ui.credentials, "rotate", stub("credential-rotate")),
+        (ui.credentials, "remove", stub("credential-remove")),
+        (ui.login, "start_login", stub("login-start")),
+        (ui.login, "submit_code", stub("login-code")),
+        (ui.login, "cancel_login", stub("login-cancel")),
+        (ui.login, "finish_login", stub("login-finish")),
+        (ui.images, "promote", async_stub("image-promote")),
+        (ui.routing, "clear_exhaustion", stub("routing-clear")),
+        (ui.repositories, "register", stub("repository-register")),
+        (ui.repositories, "remove", stub("repository-remove")),
+        (ui.github, "check", stub("github-check")),
+        (ui.bootstrap, "commit", stub("bootstrap-commit")),
+    ):
+        monkeypatch.setattr(owner, name, replacement)
+    monkeypatch.setattr(ui, "put_routing_policy", stub("routing-upload"))
+    monkeypatch.setattr(ui, "put_policy", stub("policy-upload"))
+
+    asyncio.run(live_supervisor.tick())
+    common = {"reason": "UI dispatch parity", "return_to": "/ui"}
+    requests = [
+        ("credential", {"verb": "validate", "harness": "codex"}),
+        ("credential", {"verb": "probe", "harness": "codex"}),
+        (
+            "credential",
+            {"verb": "rotate", "harness": "codex", "new_path": "/prepared/codex"},
+        ),
+        ("credential", {"verb": "remove", "harness": "codex"}),
+        ("login-start", {"harness": "codex"}),
+        ("login-code", {"harness": "codex", "code": "fixture-code"}),
+        ("login-cancel", {"harness": "codex"}),
+        ("login-finish", {"harness": "codex"}),
+        ("image-promote", {"digest": "sha256:" + "a" * 64}),
+        ("routing-clear", {"pool": "primary"}),
+        (
+            "routing-upload",
+            {"name": "fixture-routing", "version": "1", "document": "{}"},
+        ),
+        (
+            "policy-upload",
+            {"name": "fixture-policy", "version": "1", "document": "{}"},
+        ),
+        (
+            "repository-register",
+            {
+                "name": "fixture-repository",
+                "url": "https://example.invalid/repository.git",
+                "default_branch": "main",
+                "policy_name": "default-software",
+            },
+        ),
+        ("repository-remove", {"name": "fixture-repository"}),
+        ("github-check", {}),
+        ("bootstrap-commit", {"import_id": "01TESTIMPORT00000000000000"}),
+    ]
+    with TestClient(create_app(ctx)) as browser:
+        csrf = ui_sign_in(browser, tokens["admin"])
+        for action, fields in requests:
+            response = browser.post(
+                f"/ui/actions/{action}",
+                data={"csrf": csrf, **common, **fields},
+                follow_redirects=False,
+            )
+            assert response.status_code == 303, (action, response.text)
+    assert calls == [
+        "credential-validate",
+        "credential-probe",
+        "credential-rotate",
+        "credential-remove",
+        "login-start",
+        "login-code",
+        "login-cancel",
+        "login-finish",
+        "image-promote",
+        "routing-clear",
+        "routing-upload",
+        "policy-upload",
+        "repository-register",
+        "repository-remove",
+        "github-check",
+        "bootstrap-commit",
+    ]
 
 
 def test_a_mutation_is_refused_without_a_live_supervisor(
@@ -402,7 +780,10 @@ def test_login_through_api_and_cli_against_the_fake_cli(
             break
         time.sleep(0.05)
     assert state["url"] == "https://example.invalid/device", state
-    admin_client.post("/v1/admin/credentials/claude_code/login/code", json={"code": "ABCD-EFGH"})
+    admin_client.post(
+        "/v1/admin/credentials/claude_code/login/code",
+        json={"code": "ABCD-EFGH", "reason": "complete onboarding"},
+    )
     for _ in range(100):
         state = admin_client.get("/v1/admin/credentials/claude_code/login").json()
         if state["state"] in ("finished", "failed"):
@@ -633,6 +1014,49 @@ def test_the_cli_remote_mode_builds_the_same_calls(monkeypatch: pytest.MonkeyPat
         ("POST", "/v1/admin/routing/exhaustion/pool-a/clear", {"reason": "r"}),
     ]
     assert Role.ADMIN.value == "admin"
+
+
+def test_remote_login_submits_the_reason_with_the_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, str, Any]] = []
+    states = iter(
+        [
+            {"state": "waiting_for_code", "output_tail": []},
+            {"state": "finished", "output_tail": []},
+        ]
+    )
+
+    def fake_call(self: Any, method: str, path: str, body: Any = None) -> Any:
+        calls.append((method, path, body))
+        if method == "GET":
+            return next(states)
+        if path.endswith("/login"):
+            return {"window": "login window"}
+        return {"state": "finished"}
+
+    monkeypatch.setattr(cli.Remote, "call", fake_call)
+    monkeypatch.setattr("crucible.cli.admin.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("builtins.input", lambda _prompt: "operator-code")
+    monkeypatch.setenv(cli.TOKEN_ENV, "cru_" + "0" * 26 + "." + "s" * 40)
+    cli.main(
+        [
+            "--api-url",
+            "http://127.0.0.1:1",
+            "--reason",
+            "operator approved login",
+            "credentials",
+            "login",
+            "--harness",
+            "claude_code",
+        ]
+    )
+
+    assert (
+        "POST",
+        "/v1/admin/credentials/claude_code/login/code",
+        {"reason": "operator approved login", "code": "operator-code"},
+    ) in calls
 
 
 # ----- the correction round ----------------------------------------------------------
@@ -971,6 +1395,102 @@ def test_a_start_that_fails_after_the_retire_puts_the_credential_back(
     ), refusals
 
 
+def test_container_login_checks_promotion_before_retiring_a_credential(
+    admin_ctx: AdminContext,
+    live_supervisor: Supervisor,
+    credential_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from crucible.application.admin.login import start_login  # noqa: PLC0415
+
+    live = credential_root / "codex" / "auth.json"
+    before = live.read_text(encoding="utf-8")
+    asyncio.run(live_supervisor.tick())
+
+    class ContainerRegistry:
+        def resolve(self, _ctx: AdminContext, _harness: str) -> tuple[str, ...]:
+            return ("codex", "login", "--device-auth")
+
+        def container_runner(self, _ctx: AdminContext) -> object:
+            return object()
+
+    with admin_ctx.uow_factory() as uow:
+        monkeypatch.setattr(uow.image_promotions, "list_all", lambda: [])
+        with pytest.raises(ApplicationError, match="no promoted worker image"):
+            start_login(
+                admin_ctx,
+                uow,
+                ContainerRegistry(),  # type: ignore[arg-type]
+                principal="admin-principal",
+                harness="codex",
+                reason="promotion precondition",
+                replace=True,
+            )
+        uow.rollback()
+    assert live.read_text(encoding="utf-8") == before
+    assert not list(credential_root.glob("codex.retired-*"))
+
+
+def test_container_login_restores_a_credential_when_replacement_mkdir_fails(
+    admin_ctx: AdminContext,
+    live_supervisor: Supervisor,
+    credential_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from crucible.application.admin.login import start_login  # noqa: PLC0415
+
+    live = credential_root / "codex" / "auth.json"
+    before = live.read_text(encoding="utf-8")
+    asyncio.run(live_supervisor.tick())
+
+    class ContainerRegistry:
+        def resolve(self, _ctx: AdminContext, _harness: str) -> tuple[str, ...]:
+            return ("codex", "login", "--device-auth")
+
+        def container_runner(self, _ctx: AdminContext) -> object:
+            return object()
+
+        def start(self, *args: Any, **kwargs: Any) -> None:
+            raise AssertionError("mkdir must fail before the login thread starts")
+
+    original_mkdir = Path.mkdir
+
+    def fail_replacement_mkdir(path: Path, *args: Any, **kwargs: Any) -> None:
+        if path == credential_root / "codex":
+            raise OSError("fixture mkdir failure")
+        original_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", fail_replacement_mkdir)
+    with admin_ctx.uow_factory() as uow:
+        uow.image_promotions.put(
+            ImagePromotion(
+                digest="sha256:" + "b" * 64,
+                reference="crucible-worker:codex-fixture",
+                harness="codex",
+                harness_version="fixture",
+                state="default",
+                updated_at=admin_ctx.clock.now(),
+                updated_by="tests",
+                reason="mkdir rollback test",
+            )
+        )
+        uow.commit()
+    with admin_ctx.uow_factory() as uow:
+        with pytest.raises(ApplicationError, match="put back at its configured path"):
+            start_login(
+                admin_ctx,
+                uow,
+                ContainerRegistry(),  # type: ignore[arg-type]
+                principal="admin-principal",
+                harness="codex",
+                reason="mkdir rollback",
+                replace=True,
+            )
+        uow.rollback()
+    assert live.read_text(encoding="utf-8") == before
+    assert not list(credential_root.glob("codex.retired-*"))
+
+
 def test_the_probe_uses_the_model_of_the_routing_policy_in_force(
     admin_client: TestClient,
     live_supervisor: Supervisor,
@@ -1089,7 +1609,8 @@ def test_a_read_only_credential_directory_is_still_replaceable(
                 break
             time.sleep(0.05)
         admin_client.post(
-            "/v1/admin/credentials/claude_code/login/code", json={"code": "ABCD-EFGH"}
+            "/v1/admin/credentials/claude_code/login/code",
+            json={"code": "ABCD-EFGH", "reason": "complete onboarding"},
         )
         for _ in range(100):
             state = admin_client.get("/v1/admin/credentials/claude_code/login").json()

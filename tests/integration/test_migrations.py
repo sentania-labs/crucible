@@ -402,6 +402,38 @@ def test_0012_down_and_up_preserves_stall_events(database_url: str) -> None:
     engine.dispose()
 
 
+def test_0015_down_and_up_preserves_admin_ui_events(database_url: str) -> None:
+    engine = make_engine(database_url)
+    migrate.upgrade(database_url)
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO events (ts, kind, principal, verified, payload) "
+                "VALUES (now(), 'principal_revoked', 'tests', true, "
+                '\'{"marker": "c7a-downgrade-test"}\')'
+            )
+        )
+    migrate.downgrade(database_url, "0014_enable_hermes_local")
+    with engine.connect() as conn:
+        archived = conn.execute(
+            text(
+                "SELECT count(*) FROM events_c7a_archive "
+                "WHERE payload->>'marker' = 'c7a-downgrade-test'"
+            )
+        ).scalar_one()
+    assert archived == 1
+    migrate.upgrade(database_url)
+    with engine.connect() as conn:
+        restored = conn.execute(
+            text("SELECT count(*) FROM events WHERE payload->>'marker' = 'c7a-downgrade-test'")
+        ).scalar_one()
+        assert (
+            conn.execute(text("SELECT to_regclass('public.events_c7a_archive')")).scalar() is None
+        )
+    assert restored == 1
+    engine.dispose()
+
+
 def test_0011_refuses_an_incompatible_contract_on_a_non_terminal_task(
     database_url: str,
 ) -> None:

@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="admin-title"><div><h1>{{ heading }}</h1><p>{{ intro }}</p></div>{% if badge %}<span class="lat-badge lat-badge--{{ badge_kind }}">{{ badge }}</span>{% endif %}</div>
+<div class="admin-stack">
+  {% for section in sections %}
+  <section class="lat-card">
+    <h2>{{ section.title }}</h2>
+    {% if section.note %}<p class="lat-hint">{{ section.note }}</p>{% endif %}
+    {% if section.rows is defined %}
+      {% if section.rows %}<div class="admin-table-wrap"><table class="admin-table"><thead><tr>{% for column in section.columns %}<th>{{ column }}</th>{% endfor %}</tr></thead><tbody>
+      {% for row in section.rows %}<tr>{% for cell in row %}<td>{% if cell is string and cell.startswith('/ui') %}<a href="{{ cell }}">Open</a>{% elif cell is mapping or (cell is sequence and cell is not string) %}<code>{{ cell | tojson }}</code>{% else %}{{ cell if cell is not none else "" }}{% endif %}</td>{% endfor %}</tr>{% endfor %}
+      </tbody></table></div>{% else %}<p class="admin-empty">Nothing to show.</p>{% endif %}
+    {% endif %}
+    {% if section.json is defined %}<pre class="lat-code admin-json">{{ section.json | tojson(indent=2) }}</pre>{% endif %}
+    {% if section.form %}
+    <form class="admin-form" method="post" action="{{ section.form.action }}">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <input type="hidden" name="return_to" value="{{ active }}">
+      <div class="admin-form-grid">{% for field in section.form.fields %}<label><span class="lat-label">{{ field.label }}</span>
+        {% if field.kind == "textarea" %}<textarea class="lat-textarea" rows="{{ field.rows or 5 }}" name="{{ field.name }}" {% if field.required %}required{% endif %}>{{ field.value or "" }}</textarea>
+        {% elif field.kind == "select" %}<select class="lat-select" name="{{ field.name }}">{% for value, label in field.options %}<option value="{{ value }}">{{ label }}</option>{% endfor %}</select>
+        {% elif field.kind == "checkbox" %}<input type="checkbox" name="{{ field.name }}" value="true" {% if field.value %}checked{% endif %}>
+        {% else %}<input class="lat-input" type="{{ field.kind or 'text' }}" name="{{ field.name }}" value="{{ field.value or '' }}" {% if field.required %}required{% endif %}>{% endif %}
+      </label>{% endfor %}</div>
+      <button class="lat-btn {% if section.form.danger %}lat-btn--danger{% else %}lat-btn--primary{% endif %}" type="submit">{{ section.form.label }}</button>
+    </form>{% endif %}
+  </section>
+  {% endfor %}
+</div>
+{% endblock %}

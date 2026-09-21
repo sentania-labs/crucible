@@ -133,6 +133,7 @@ class LoginSession:
     exit_code: int | None = None
     token_written: bool = False
     error: str | None = None
+    cancel_requested: bool = False
     _code_from_operator: str | None = None
     _wake: threading.Event = field(default_factory=threading.Event)
 
@@ -147,6 +148,7 @@ class LoginSession:
             "exit_code": self.exit_code,
             "token_written": self.token_written,
             "error": self.error,
+            "cancel_requested": self.cancel_requested,
         }
 
     def submit_code(self, code: str) -> None:
@@ -214,6 +216,10 @@ def run_login(
     session.state = "waiting_for_operator"
     try:
         while True:
+            if session.cancel_requested:
+                session.error = "login cancelled"
+                process.kill()
+                break
             if time.monotonic() > deadline:
                 session.error = "login timed out"
                 process.kill()
@@ -332,7 +338,8 @@ class LoginRegistry:
             raise ConflictError(f"a login for {harness} is already in progress")
         flow = FLOWS[harness]
         argv = tuple(ctx.login_commands.get(harness) or flow.argv)
-        if shutil.which(argv[0]) is None and not Path(argv[0]).exists():
+        runner = self.container_runner(ctx)
+        if runner is None and shutil.which(argv[0]) is None and not Path(argv[0]).exists():
             # The login drives the harness's own CLI, and only the worker images carry
             # the three; the Crucible service image carries none (13). Refusing here is
             # the difference between a clear message and a session that never finishes.
@@ -343,18 +350,49 @@ class LoginRegistry:
             )
         return argv
 
-    def start(self, ctx: AdminContext, harness: str, directory: str) -> LoginSession:
+    @staticmethod
+    def container_runner(ctx: AdminContext) -> Any | None:
+        return next(
+            (
+                provider
+                for provider in ctx.providers.values()
+                if callable(getattr(provider, "run_login_container", None))
+            ),
+            None,
+        )
+
+    def start(
+        self,
+        ctx: AdminContext,
+        harness: str,
+        directory: str,
+        *,
+        image: str | None = None,
+    ) -> LoginSession:
         argv = self.resolve(ctx, harness)
         flow = FLOWS[harness]
+        runner = self.container_runner(ctx)
+        if runner is not None and not image:
+            raise ConflictError(f"no promoted worker image is available for {harness}")
         session = LoginSession(harness=harness, started_at=time.time())
         self._sessions[harness] = session
-        thread = threading.Thread(
-            target=self._run,
-            args=(flow, directory, session, argv),
-            kwargs={"timeout": ctx.login_timeout_seconds},
-            daemon=True,
-            name=f"login-{harness}",
-        )
+        if runner is not None:
+            assert image is not None
+            thread = threading.Thread(
+                target=self._run_container,
+                args=(runner, flow, image, directory, session, argv),
+                kwargs={"timeout": ctx.login_timeout_seconds},
+                daemon=True,
+                name=f"login-{harness}",
+            )
+        else:
+            thread = threading.Thread(
+                target=self._run,
+                args=(flow, directory, session, argv),
+                kwargs={"timeout": ctx.login_timeout_seconds},
+                daemon=True,
+                name=f"login-{harness}",
+            )
         self._threads[harness] = thread
         try:
             thread.start()
@@ -366,6 +404,11 @@ class LoginRegistry:
             session.error = f"the login thread could not be started: {type(exc).__name__}"
             self._threads.pop(harness, None)
             raise
+        deadline = time.monotonic() + 5.0
+        while session.state == "starting" and thread.is_alive() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if session.state == "failed":
+            raise ConflictError(session.error or f"the {harness} login failed to start")
         return session
 
     @staticmethod
@@ -385,6 +428,34 @@ class LoginRegistry:
             session.state = "failed"
             if session.error is None:
                 session.error = f"the login driver failed: {type(exc).__name__}: {exc}"
+
+    @staticmethod
+    def _run_container(
+        runner: Any,
+        flow: LoginFlow,
+        image: str,
+        directory: str,
+        session: LoginSession,
+        argv: tuple[str, ...],
+        *,
+        timeout: int,
+    ) -> None:
+        try:
+            import asyncio  # noqa: PLC0415
+
+            asyncio.run(
+                runner.run_login_container(
+                    flow=flow,
+                    image=image,
+                    directory=directory,
+                    session=session,
+                    argv=argv,
+                    timeout=timeout,
+                )
+            )
+        except Exception as exc:
+            session.state = "failed"
+            session.error = f"the login container failed: {type(exc).__name__}: {exc}"
 
 
 def start_login(
@@ -431,13 +502,33 @@ def start_login(
     # directory read-only on purpose is entitled to replace it.
     replaceable = _check_replaceable(spec, source, harness=harness, replace=replace)
     _check_writable(source, harness=harness, reuse=not replaceable)
+    image = None
+    runner = getattr(registry, "container_runner", lambda _ctx: None)(ctx)
+    if runner is not None:
+        promoted = next(
+            (
+                item
+                for item in uow.image_promotions.list_all()
+                if item.harness == harness and item.state == "default"
+            ),
+            None,
+        )
+        if promoted is None:
+            raise ConflictError(
+                f"no promoted worker image is available for {harness}; promote one first"
+            )
+        image = promoted.reference
     retired = (
         _retire_existing(ctx, uow, source, principal=principal, harness=harness, reason=reason)
         if replaceable
         else None
     )
     try:
-        session = registry.start(ctx, harness, source.path)
+        if runner is not None:
+            Path(source.path).mkdir(parents=True, exist_ok=True, mode=0o700)
+            session = registry.start(ctx, harness, source.path, image=image)
+        else:
+            session = registry.start(ctx, harness, source.path)
     except Exception as exc:
         if retired is None:
             raise
@@ -466,6 +557,7 @@ def start_login(
         harness=harness,
         window=flow.window,
         command=list(argv),
+        image=image,
         retained_as=retired,
     )
     return {
@@ -587,7 +679,12 @@ def _restore_retired(
         if not retired.is_dir():
             problem = "the retired directory is not where it was left"
         elif current.exists():
-            problem = "something else is at the configured path already"
+            if current.is_dir() and not any(current.iterdir()):
+                current.rmdir()
+                os.rename(retired, current)
+                restored = True
+            else:
+                problem = "something else is at the configured path already"
         else:
             os.rename(retired, current)
             restored = True
@@ -617,11 +714,71 @@ def login_status(registry: LoginRegistry, harness: str) -> dict[str, Any]:
     return session.as_dict()
 
 
-def submit_code(registry: LoginRegistry, harness: str, code: str) -> dict[str, Any]:
+def submit_code(
+    registry: LoginRegistry,
+    harness: str,
+    code: str,
+    *,
+    ctx: AdminContext | None = None,
+    uow: UnitOfWork | None = None,
+    principal: str = "",
+    reason: str | None = None,
+) -> dict[str, Any]:
+    session = registry.get(harness)
+    if session is None or session.state != "waiting_for_code":
+        raise ConflictError(f"no login for {harness} is waiting for a code")
+    audited_reason: str | None = None
+    if ctx is not None and uow is not None:
+        audited_reason = guard_mutation(
+            ctx,
+            uow,
+            reason,
+            principal=principal,
+            operation=f"credentials login code {harness}",
+        )
+    session.submit_code(code)
+    if ctx is not None and uow is not None:
+        assert audited_reason is not None
+        admin_event(
+            uow,
+            ctx,
+            EventKind.CREDENTIAL_LOGIN_CODE_SUBMITTED,
+            principal=principal,
+            reason=audited_reason,
+            before=None,
+            after={"submitted": True},
+            harness=harness,
+        )
+    return session.as_dict()
+
+
+def cancel_login(
+    registry: LoginRegistry,
+    harness: str,
+    *,
+    ctx: AdminContext,
+    uow: UnitOfWork,
+    principal: str,
+    reason: str | None,
+) -> dict[str, Any]:
+    reason = guard_mutation(
+        ctx, uow, reason, principal=principal, operation=f"credentials login cancel {harness}"
+    )
     session = registry.get(harness)
     if session is None or session.state in ("finished", "failed"):
-        raise ConflictError(f"no login for {harness} is waiting for a code")
-    session.submit_code(code)
+        raise ConflictError(f"no login for {harness} is in progress")
+    session.cancel_requested = True
+    session._wake.set()
+    admin_event(
+        uow,
+        ctx,
+        EventKind.CREDENTIAL_LOGIN_CANCELLED,
+        principal=principal,
+        reason=reason,
+        before={"state": session.state},
+        after={"cancel_requested": True},
+        harness=harness,
+    )
     return session.as_dict()
 
 

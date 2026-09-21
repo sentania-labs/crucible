@@ -1,0 +1,302 @@
+/* Lattice component layer.
+   Derived from sentania-labs/vcf-cf-migrator: src/vcfcf_migrator/uipage.py
+   (light chrome) and src/vcfcf_migrator/preview.py (dark skin).
+   Every value here resolves through a token in tokens.css. No shadows,
+   no gradients, no motion. */
+
+*, *::before, *::after { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 14px/1.5 var(--font-sans);
+}
+
+a { color: var(--accent); }
+
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+
+/* --- Buttons ---------------------------------------------------------- */
+
+.lat-btn {
+  font: inherit;
+  font-size: 13px;
+  padding: 5px 11px;
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--ink);
+  cursor: pointer;
+}
+.lat-btn:hover { border-color: var(--ink-subtle); }
+
+.lat-btn--primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #ffffff;
+  font-weight: 600;
+}
+.lat-btn--primary:hover {
+  background: var(--accent-strong);
+  border-color: var(--accent-strong);
+}
+
+.lat-btn--ghost {
+  border-color: transparent;
+  background: none;
+  color: var(--ink-muted);
+  padding: 4px 7px;
+}
+.lat-btn--ghost:hover {
+  border-color: var(--line);
+  background: var(--surface);
+  color: var(--ink);
+}
+
+.lat-btn--danger {
+  background: var(--bad);
+  border-color: var(--bad);
+  color: #ffffff;
+  font-weight: 600;
+}
+
+.lat-btn[disabled] { opacity: 0.5; cursor: not-allowed; }
+
+/* --- Form controls ---------------------------------------------------- */
+
+.lat-label {
+  display: block;
+  font-size: 12px;
+  color: var(--ink-muted);
+  margin-bottom: 3px;
+}
+
+.lat-input, .lat-textarea, .lat-select {
+  font: inherit;
+  font-size: 13px;
+  padding: 6px 9px;
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  color: var(--ink);
+}
+.lat-textarea { font-family: var(--font-mono); font-size: 12px; }
+
+.lat-input:disabled, .lat-textarea:disabled {
+  background: var(--surface-sunken);
+  color: var(--ink-subtle);
+}
+
+.lat-hint { color: var(--ink-subtle); font-size: 11.5px; }
+.lat-hint--bad { color: var(--bad-ink); }
+
+/* --- Header and tabs -------------------------------------------------- */
+
+.lat-header {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  background: var(--surface);
+  border-bottom: 1px solid var(--line);
+  padding: 10px 18px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+.lat-header .lat-ver {
+  color: var(--ink-subtle);
+  font-size: 11.5px;
+  font-family: var(--font-mono);
+}
+
+.lat-tabs {
+  display: flex;
+  gap: 2px;
+  border-bottom: 1px solid var(--line);
+}
+.lat-tab {
+  background: none;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  padding: 8px 14px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--ink-muted);
+  cursor: pointer;
+  border-radius: 0;
+}
+.lat-tab:hover { color: var(--ink); }
+.lat-tab.is-on {
+  color: var(--ink);
+  border-bottom-color: var(--accent);
+  font-weight: 600;
+}
+
+/* --- Card ------------------------------------------------------------- */
+
+.lat-card {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-xl);
+  padding: 14px 16px;
+  min-width: 0;
+}
+.lat-card > h2, .lat-card-title {
+  font-size: 13px;
+  margin: 0 0 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--ink-subtle);
+  font-weight: 650;
+}
+.lat-card pre { max-width: 100%; }
+
+.lat-code {
+  background: var(--surface-sunken);
+  padding: 10px 12px;
+  border-radius: var(--radius-lg);
+  overflow-x: auto;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  margin: 0;
+  color: var(--ink);
+}
+
+/* --- Banners ---------------------------------------------------------- */
+
+.lat-banner {
+  padding: 9px 12px;
+  border-radius: var(--radius-lg);
+  font-size: 13px;
+  white-space: pre-wrap;
+  border-left: 3px solid var(--line);
+  background: var(--surface-sunken);
+  color: var(--ink-muted);
+}
+.lat-banner--ok   { background: var(--ok-soft);     border-left-color: var(--ok);     color: var(--ok-ink); }
+.lat-banner--warn { background: var(--warn-soft);   border-left-color: var(--warn);   color: var(--warn-ink); }
+.lat-banner--bad  { background: var(--bad-soft);    border-left-color: var(--bad);    color: var(--bad-ink); }
+.lat-banner--info { background: var(--accent-soft); border-left-color: var(--accent); color: var(--accent-ink); }
+
+/* --- Badges and pills ------------------------------------------------- */
+
+.lat-pill {
+  display: inline-block;
+  background: var(--surface-sunken);
+  border-radius: var(--radius-pill);
+  padding: 2px 10px;
+  font-size: 12px;
+  color: var(--ink-muted);
+}
+.lat-pill b {
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+.lat-pill.is-on { background: var(--accent-soft); color: var(--accent-ink); }
+
+.lat-badge {
+  display: inline-block;
+  border-radius: var(--radius-sm);
+  padding: 1px 6px;
+  font-size: 10.5px;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  background: var(--surface-sunken);
+  color: var(--ink-muted);
+}
+.lat-badge--ok     { background: var(--ok-soft);     color: var(--ok-ink); }
+.lat-badge--warn   { background: var(--warn-soft);   color: var(--warn-ink); }
+.lat-badge--bad    { background: var(--bad-soft);    color: var(--bad-ink); }
+.lat-badge--accent { background: var(--accent-soft); color: var(--accent-ink); }
+
+/* --- Table ------------------------------------------------------------ */
+
+.lat-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.lat-table th {
+  text-align: left;
+  color: var(--ink-subtle);
+  font-weight: 500;
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--line);
+  overflow-wrap: anywhere;
+}
+.lat-table td {
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--line-soft);
+  color: var(--ink-muted);
+  overflow-wrap: anywhere;
+}
+.lat-table td.lat-num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  font-family: var(--font-mono);
+  color: var(--ink);
+}
+.lat-table tbody tr:hover td { background: var(--surface-sunken); }
+.lat-table-scroll { overflow-x: auto; }
+
+/* --- Tree ------------------------------------------------------------- */
+
+.lat-tree, .lat-tree ul { list-style: none; margin: 0; padding: 0; }
+.lat-tree ul {
+  margin: 2px 0 4px;
+  padding-left: 14px;
+  border-left: 2px solid var(--line-soft);
+}
+.lat-tree li { padding: 1px 0; }
+
+.lat-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 7px;
+  padding: 3px 6px;
+  border-radius: var(--radius-lg);
+}
+.lat-row:hover { background: var(--surface-sunken); }
+.lat-row.is-sel { background: var(--accent-soft); }
+.lat-row .lat-why {
+  color: var(--ink-subtle);
+  font-size: 11.5px;
+  flex-basis: 100%;
+}
+
+.lat-group { border-top: 1px solid var(--line-soft); padding: 2px 0; }
+.lat-group-summary {
+  background: none;
+  border: 0;
+  width: 100%;
+  text-align: left;
+  font: inherit;
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--ink);
+  cursor: pointer;
+  padding: 6px 2px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  list-style: none;
+}
+.lat-group-summary::before { content: "\25B8"; color: var(--ink-subtle); font-size: 11px; }
+.lat-group.is-open > .lat-group-summary::before { content: "\25BE"; }
+.lat-group-summary .lat-n {
+  margin-left: auto;
+  color: var(--ink-subtle);
+  font-weight: 400;
+  font-size: 12px;
+}

@@ -297,6 +297,38 @@ class DockerClient:
         finally:
             conn.close()
 
+    def attach_interactive(
+        self, container_id: str
+    ) -> tuple[HTTPConnection, HTTPResponse, socket.socket]:
+        """Attach one TTY stream without persisting it in the daemon's log driver.
+
+        The caller owns both returned objects and closes the connection after the
+        interactive command exits. Bytes written to the socket are container stdin;
+        bytes read are its combined terminal output.
+        """
+        url = f"/{API_VERSION}/containers/{container_id}/attach?stream=1&stdin=1&stdout=1&stderr=1"
+        conn = self._connect()
+        conn.putrequest("POST", url, skip_host=True, skip_accept_encoding=True)
+        conn.putheader("Host", "docker")
+        conn.putheader("Content-Type", "application/vnd.docker.raw-stream")
+        conn.putheader("Connection", "Upgrade")
+        conn.putheader("Upgrade", "tcp")
+        conn.putheader("Content-Length", "0")
+        conn.endheaders()
+        response = conn.getresponse()
+        if response.status not in (101, 200):
+            raw = response.read().decode("utf-8", "replace")
+            conn.close()
+            raise DockerApiError(response.status, _message(raw), path=url)
+        sock = conn.sock
+        if sock is None:
+            conn.close()
+            raise DockerApiError(0, "the attach connection carried no socket", path=url)
+        # HTTPResponse owns the upgraded socket. The caller must retain it for the
+        # entire interactive session or its finalizer closes the stream as soon as
+        # this method returns.
+        return conn, response, sock
+
     def put_archive(self, container_id: str, path: str, tar: bytes) -> None:
         """Extract a tar into a container path (`docker cp -` by another name).
 

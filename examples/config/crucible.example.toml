@@ -54,6 +54,7 @@ no_proxy = "localhost,127.0.0.1"
 # The credential root. One directory per harness; a worker is given its own and never
 # another's (12), which the isolation test asserts.
 credential_root = "/var/lib/crucible/credentials"
+credential_volume = "crucible_crucible-credentials" # normal-mode named volume
 
 collector_timeout_seconds = 900
 verifier_timeout_seconds = 3600

@@ -11,9 +11,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from crucible.application.admin.context import AdminContext, guard_mutation
+from crucible.application.admin.context import AdminContext, admin_event, guard_mutation
+from crucible.application.errors import ConflictError
 from crucible.application.repositories import register_repository
 from crucible.contracts.api import RepositoryRegistration
+from crucible.domain.events import EventKind
 from crucible.ports.repository import UnitOfWork
 
 
@@ -29,6 +31,10 @@ def _view(uow: UnitOfWork, name: str) -> dict[str, Any] | None:
         "installation_id": existing.installation_id,
         "external_review_attested": existing.external_review_attested,
     }
+
+
+def list_all(uow: UnitOfWork) -> list[dict[str, Any]]:
+    return [view for item in uow.repositories.list_all() if (view := _view(uow, item.name))]
 
 
 def register(
@@ -64,3 +70,32 @@ def register(
         "installation_id": repo.installation_id,
         "external_review_attested": repo.external_review_attested,
     }
+
+
+def remove(
+    ctx: AdminContext,
+    uow: UnitOfWork,
+    *,
+    principal: str,
+    name: str,
+    reason: str | None,
+) -> dict[str, Any]:
+    reason = guard_mutation(
+        ctx, uow, reason, principal=principal, operation=f"repositories remove {name}"
+    )
+    before = _view(uow, name)
+    if before is None:
+        raise ConflictError(f"repository {name!r} is not registered")
+    if not uow.repositories.remove(name):
+        raise ConflictError(f"repository {name!r} is referenced by tasks and cannot be removed")
+    admin_event(
+        uow,
+        ctx,
+        EventKind.REPOSITORY_REMOVED,
+        principal=principal,
+        reason=reason,
+        before=before,
+        after=None,
+        repository=name,
+    )
+    return {"repository": name, "removed": True}

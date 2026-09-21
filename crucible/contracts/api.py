@@ -223,6 +223,7 @@ class SupervisorView(Response):
     last_error_at: Rfc3339 | None
     last_error: str | None
     healthy: bool
+    health_detail: str
     tick_ms: int | None
     counts: dict[str, int]
     providers: list[dict[str, Any]]

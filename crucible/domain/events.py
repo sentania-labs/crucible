@@ -168,6 +168,8 @@ class EventKind(StrEnum):
     CREDENTIAL_VALIDATED = "credential_validated"
     CREDENTIAL_PROBED = "credential_probed"
     CREDENTIAL_LOGIN_STARTED = "credential_login_started"
+    CREDENTIAL_LOGIN_CODE_SUBMITTED = "credential_login_code_submitted"
+    CREDENTIAL_LOGIN_CANCELLED = "credential_login_cancelled"
     CREDENTIAL_LOGIN_FINISHED = "credential_login_finished"
     CREDENTIAL_ROTATED = "credential_rotated"
     CREDENTIAL_REMOVED = "credential_removed"
@@ -183,5 +185,7 @@ class EventKind(StrEnum):
     BOOTSTRAP_HANDOFF = "bootstrap_handoff"
     # principals and configuration
     PRINCIPAL_CREATED = "principal_created"
+    PRINCIPAL_REVOKED = "principal_revoked"
     REPOSITORY_REGISTERED = "repository_registered"
+    REPOSITORY_REMOVED = "repository_removed"
     REPOSITORY_ATTESTATION_RECORDED = "repository_attestation_recorded"

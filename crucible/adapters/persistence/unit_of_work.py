@@ -210,6 +210,14 @@ class Principals:
         rows = self._s.scalars(select(PrincipalRow).order_by(PrincipalRow.name)).all()
         return [self._to_entity(r) for r in rows]
 
+    def disable(self, principal_id: str, at: datetime) -> bool:
+        row = self._s.get(PrincipalRow, principal_id)
+        if row is None or row.disabled_at is not None:
+            return False
+        row.disabled_at = at
+        self._s.flush()
+        return True
+
 
 class Repositories:
     def __init__(self, session: Session) -> None:
@@ -238,6 +246,19 @@ class Repositories:
     def list_all(self) -> Sequence[Repository]:
         rows = self._s.scalars(select(RepositoryRow).order_by(RepositoryRow.name)).all()
         return [self._to_entity(r) for r in rows]
+
+    def remove(self, name: str) -> bool:
+        row = self._s.scalar(select(RepositoryRow).where(RepositoryRow.name == name))
+        if row is None:
+            return False
+        referenced = self._s.scalar(
+            select(func.count(TaskRow.id)).where(TaskRow.repository_id == row.id)
+        )
+        if referenced:
+            return False
+        self._s.delete(row)
+        self._s.flush()
+        return True
 
     def get(self, repository_id: str) -> Repository | None:
         row = self._s.get(RepositoryRow, repository_id)

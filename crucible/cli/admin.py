@@ -25,7 +25,9 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
+from crucible.adapters.clock import SystemClock
 from crucible.adapters.persistence.migrate import head_revision, upgrade
+from crucible.adapters.persistence.unit_of_work import SqlUnitOfWorkFactory, make_engine
 from crucible.application.admin import (
     audit,
     bootstrap,
@@ -39,6 +41,9 @@ from crucible.application.admin import (
 from crucible.application.admin import providers as providers_admin
 from crucible.application.admin import repositories as repositories_admin
 from crucible.application.admin import status as status_admin
+from crucible.application.admin import (
+    tokens as tokens_admin,
+)
 from crucible.application.admin.context import AdminContext
 from crucible.application.admin.login import LoginRegistry
 from crucible.application.auth import mint_token
@@ -48,6 +53,7 @@ from crucible.cli.wiring import Wiring, wire
 from crucible.contracts.api import ExternalReviewAttestation, RepositoryRegistration
 from crucible.domain.entities import Role
 from crucible.domain.events import EventKind
+from crucible.domain.ids import new_id
 from crucible.logs import configure_logging
 from crucible.settings import load_settings
 
@@ -71,14 +77,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     token = sub.add_parser("token", help="token management")
     token_sub = token.add_subparsers(dest="token_command", required=True)
+    token_sub.add_parser("list", help="list principals without token values")
     create = token_sub.add_parser("create", help="create a principal and print its token once")
     create.add_argument("--principal", required=True)
     create.add_argument("--role", required=True, choices=[r.value for r in Role])
     create.add_argument("--rotate", action="store_true", help="replace an existing token")
+    revoke = token_sub.add_parser("revoke", help="disable a principal token")
+    revoke.add_argument("principal_id")
 
     for name in ("repository", "repositories"):
         repo = sub.add_parser(name, help="repository registry")
         repo_sub = repo.add_subparsers(dest="repo_command", required=True)
+        repo_sub.add_parser("list")
         register = repo_sub.add_parser("register")
         register.add_argument("--name", required=True)
         register.add_argument("--url", required=True)
@@ -87,6 +97,8 @@ def build_parser() -> argparse.ArgumentParser:
         register.add_argument("--installation-id", type=int, default=None)
         register.add_argument("--attest-external-review-all-prs", action="store_true")
         register.add_argument("--attested-by", default=None)
+        remove = repo_sub.add_parser("remove")
+        remove.add_argument("name")
 
     h = sub.add_parser("harnesses", help="list, enable, disable")
     h_sub = h.add_subparsers(dest="harness_command", required=True)
@@ -218,6 +230,22 @@ def _remote(args: argparse.Namespace, remote: Remote) -> None:
     command = args.command
     if command == "status":
         _emit(remote.call("GET", "/v1/admin/status"))
+    elif command == "token":
+        if args.token_command == "list":
+            _emit(remote.call("GET", "/v1/admin/tokens"))
+        elif args.token_command == "revoke":
+            _emit(remote.call("POST", f"/v1/admin/tokens/{args.principal_id}/revoke", reason))
+        else:
+            if args.rotate:
+                print("remote token rotation is not supported; revoke and create", file=sys.stderr)
+                sys.exit(2)
+            _emit(
+                remote.call(
+                    "POST",
+                    "/v1/admin/tokens",
+                    {**reason, "name": args.principal, "role": args.role},
+                )
+            )
     elif command == "harnesses":
         if args.harness_command == "list":
             _emit(remote.call("GET", "/v1/admin/harnesses"))
@@ -277,20 +305,26 @@ def _remote(args: argparse.Namespace, remote: Remote) -> None:
         else:
             _emit(remote.call("POST", f"/v1/import/bootstrap/{args.import_id}/commit", reason))
     elif command in ("repository", "repositories"):
-        _emit(
-            remote.call(
-                "PUT",
-                f"/v1/admin/repositories/{args.name}",
-                {
-                    "url": args.url,
-                    "default_branch": args.default_branch,
-                    "policy_name": args.policy,
-                    "installation_id": args.installation_id,
-                    "attested_all_prs": args.attest_external_review_all_prs,
-                    "attested_by": args.attested_by,
-                },
+        if args.repo_command == "list":
+            _emit(remote.call("GET", "/v1/admin/repositories"))
+        elif args.repo_command == "remove":
+            _emit(remote.call("DELETE", f"/v1/admin/repositories/{args.name}", reason))
+        else:
+            _emit(
+                remote.call(
+                    "PUT",
+                    f"/v1/admin/repositories/{args.name}",
+                    {
+                        **reason,
+                        "url": args.url,
+                        "default_branch": args.default_branch,
+                        "policy_name": args.policy,
+                        "installation_id": args.installation_id,
+                        "attested_all_prs": args.attest_external_review_all_prs,
+                        "attested_by": args.attested_by,
+                    },
+                )
             )
-        )
     else:
         print(f"{command} is CLI-only and runs in local mode", file=sys.stderr)
         sys.exit(2)
@@ -312,7 +346,11 @@ def _remote_login(args: argparse.Namespace, remote: Remote, reason: dict[str, st
                 print(line, file=sys.stderr)
         if state["state"] == "waiting_for_code":
             code = input("paste the code: ")
-            remote.call("POST", f"/v1/admin/credentials/{args.harness}/login/code", {"code": code})
+            remote.call(
+                "POST",
+                f"/v1/admin/credentials/{args.harness}/login/code",
+                {**reason, "code": code},
+            )
         elif state["state"] in ("finished", "failed"):
             break
         time.sleep(1)
@@ -525,6 +563,7 @@ def main(argv: list[str] | None = None) -> None:
     configure_logging(settings.service.log_level, stream=sys.stderr)
     if args.command == "migrate":
         upgrade(settings.database.url)
+        _ensure_first_admin(settings.database.url)
         _emit({"migrated_to": head_revision(settings.database.url)})
         return
     wiring = wire(settings)
@@ -547,24 +586,34 @@ def main(argv: list[str] | None = None) -> None:
 
 
 def _token(args: argparse.Namespace, wiring: Wiring) -> None:
+    if wiring.admin is None:
+        raise ApplicationError("the administrative surface is not configured")
     with wiring.ctx.uow_factory() as uow:
-        try:
-            minted = mint_token(
-                uow, wiring.ctx.clock, name=args.principal, role=Role(args.role), rotate=args.rotate
+        if args.token_command == "list":
+            _emit({"items": tokens_admin.list_principals(uow)})
+            return
+        if args.token_command == "revoke":
+            _emit(
+                tokens_admin.revoke(
+                    wiring.admin,
+                    uow,
+                    principal=CLI_PRINCIPAL,
+                    principal_id=args.principal_id,
+                    reason=args.reason,
+                )
             )
-        except ValueError as exc:
-            print(str(exc), file=sys.stderr)
-            sys.exit(1)
-        record_event(
+            uow.commit()
+            return
+        if args.rotate:
+            print("token rotation is replaced by revoke and create", file=sys.stderr)
+            sys.exit(2)
+        minted = tokens_admin.create(
+            wiring.admin,
             uow,
-            wiring.ctx.clock,
-            EventKind.PRINCIPAL_CREATED,
             principal=CLI_PRINCIPAL,
-            payload={
-                "principal": minted.principal.name,
-                "role": minted.principal.role.value,
-                "rotated": args.rotate,
-            },
+            name=args.principal,
+            role=args.role,
+            reason=args.reason,
         )
         uow.commit()
     # The token is printed exactly once and never stored in clear.
@@ -577,9 +626,70 @@ def _token(args: argparse.Namespace, wiring: Wiring) -> None:
     )
 
 
+def _ensure_first_admin(database_url: str) -> None:
+    """Create the first browser principal only when no administrator exists.
+
+    The value is printed by the migration process once and only its salted hash is
+    committed. A rerun sees the principal and emits nothing.
+    """
+    engine = make_engine(database_url)
+    try:
+        factory = SqlUnitOfWorkFactory(engine)
+        with factory() as uow:
+            if any(
+                item.role is Role.ADMIN and item.disabled_at is None
+                for item in uow.principals.list_all()
+            ):
+                return
+            name = "first-run-admin"
+            if uow.principals.get_by_name(name) is not None:
+                name = f"first-run-admin-{new_id()[-8:].lower()}"
+            minted = mint_token(
+                uow,
+                SystemClock(),
+                name=name,
+                role=Role.ADMIN,
+            )
+            record_event(
+                uow,
+                SystemClock(),
+                EventKind.PRINCIPAL_CREATED,
+                principal="crucible-migrate",
+                payload={
+                    "principal": minted.principal.name,
+                    "role": minted.principal.role.value,
+                    "first_run": True,
+                },
+            )
+            uow.commit()
+        border = "=" * 72
+        print(border)
+        print("CRUCIBLE FIRST-RUN ADMIN TOKEN, SHOWN ONCE")
+        print(minted.token)
+        print("Open /ui and sign in. Store this token before logs are rotated.")
+        print(border)
+    finally:
+        engine.dispose()
+
+
 def _register(args: argparse.Namespace, wiring: Wiring, admin: AdminContext) -> None:
     """The same guarded service the API route calls, returning the same document."""
     with wiring.ctx.uow_factory() as uow:
+        if args.repo_command == "list":
+            _emit({"items": repositories_admin.list_all(uow)})
+            return
+        if args.repo_command == "remove":
+            _emit(
+                repositories_admin.remove(
+                    admin,
+                    uow,
+                    principal=CLI_PRINCIPAL,
+                    name=args.name,
+                    reason=args.reason,
+                )
+            )
+            uow.commit()
+            return
         result = repositories_admin.register(
             admin,
             uow,

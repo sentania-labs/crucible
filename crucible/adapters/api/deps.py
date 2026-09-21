@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import secrets
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Annotated
@@ -43,6 +44,10 @@ class AppContext:
     # 25: the administrative services and the in-progress logins of this process.
     admin: AdminContext | None = None
     logins: LoginRegistry = field(default_factory=LoginRegistry)
+    # Browser sessions are process-local and intentionally expire on restart. The
+    # bearer token remains the source of identity and is never copied into state.
+    ui_signing_key: bytes = field(default_factory=lambda: secrets.token_bytes(32))
+    settings: object | None = None
 
 
 def app_context(request: Request) -> AppContext:

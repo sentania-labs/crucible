@@ -10,7 +10,7 @@ It does not decide what to build. An orchestrator (Foundry, or a person)
 decides outcomes, scope, model, and acceptance. Crucible executes, persists,
 observes, and enforces.
 
-**Status: specification version 0.3; implementation phase C5 (harness adapters live).**
+**Status: specification version 0.3; implementation phase C7a (administrative UI).**
 The specification is under [`docs/spec/`](docs/spec/00-overview.md) and the
 decisions behind it under [`docs/adr/`](docs/adr/). Phase notes are under
 [`docs/implementation-notes/`](docs/implementation-notes/c5.md).
@@ -121,11 +121,13 @@ make e2e-live HARNESS=claude_code \
   CRUCIBLE_GITHUB_TARGET_REPO=owner/throwaway DOCKER='<the wrapper above>'
 ```
 
-Administration (25) is one set of operations behind two entry points: `/v1/admin`
-(admin role) and `crucible-admin`, which runs the same services in process by
-default or against a running API with `--api-url` and a token in
-`CRUCIBLE_ADMIN_TOKEN`. Every mutation takes `--reason`, needs a live supervisor,
-and leaves an event with the principal and a before/after summary, never a value:
+Administration (25) is one set of operations behind three entry points: the
+server-rendered `/ui`, `/v1/admin`, and `crucible-admin`. They call the same
+services and own no separate state. On a fresh deployment, retrieve the
+one-time administrator token from `docker compose logs migrate`, then open
+`http://127.0.0.1:8080/ui`. Every mutation takes a reason, needs a live
+supervisor, and leaves an event with the principal and a before/after summary,
+never a value:
 
 ```sh
 crucible-admin status                                        # the sanitized status document
@@ -145,12 +147,12 @@ crucible-admin github check                                  # mints and discard
 crucible-admin audit tail --limit 50
 ```
 
-`credentials login` drives the harness's own CLI, so it runs where that CLI is
-installed: local mode on a host that has it. The Crucible service image carries none of
-the three (it is not a worker image), so the API form refuses there and says so. A
-login refuses to overwrite a credential that still passes the shape check unless
-`--replace` is given, which retires the old one first. `rotate` copies the directory you
-name and leaves it in place; disposing of it is yours to do.
+The UI and API run `credentials login` inside the promoted worker image with
+only that harness's credential subpath and the egress proxy. The CLI keeps its
+local-host mode. A login refuses to overwrite a credential that still passes
+the shape check unless `--replace` is given, which retires the old one first.
+`rotate` copies the directory you name and leaves it in place; disposing of it
+is yours to do.
 
 Orchestrators read `GET /v1/capabilities`: which harnesses and images are enabled,
 providers and GitHub reachable, and the worker, task and wake counts, nothing more.
@@ -164,7 +166,8 @@ build of this branch). Before the first tagged release the answer is
 `POSTGRES_PASSWORD` there. First use after `make up`:
 
 ```sh
-docker compose exec crucible crucible-admin token create --principal foundry --role orchestrator
+docker compose logs migrate     # copy the framed first-run administrator token
+# Open http://127.0.0.1:8080/ui and create any additional principals there.
 docker compose exec crucible crucible-admin --reason "onboarding" repository register \
   --name example-service --url https://github.com/example-org/example-service \
   --installation-id 0 --attest-external-review-all-prs
