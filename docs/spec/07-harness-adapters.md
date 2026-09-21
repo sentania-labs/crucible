@@ -8,7 +8,7 @@ run back into a parsed report. Adapters contain no lifecycle logic.
 
 ```python
 class HarnessAdapter(Protocol):
-    name: HarnessName                     # "claude_code" | "codex" | "agy" | "script-harness" (e2e only, 18)
+    name: HarnessName                     # "claude_code" | "codex" | "agy" | "hermes" | "script-harness" (e2e only, 18)
     supported_versions: VersionRange      # tested range; launch refused outside it
     def capabilities(self) -> HarnessCapabilities: ...
     def credential_spec(self) -> CredentialSpec: ...
@@ -24,7 +24,7 @@ dir, user, resource limits, network mode, expected exit semantics.
 
 `ExitClass` is the one enum used by contracts, policies, and 16:
 `completed`, `completed_without_report`, `blocked`, `environment`,
-`auth_failure`, `quota_exhausted`, `timeout`, `killed`, `crashed`, `lost`,
+`auth_failure`, `provider_error`, `quota_exhausted`, `timeout`, `killed`, `crashed`, `lost`,
 `unknown`. Which classes may retry is a policy decision (05b
 `retry.eligible_classes`), narrowed by the contract's `retry_on`; a retry
 happens only when the class is in both. Gate failures are never a class and
@@ -153,6 +153,30 @@ never retry.
   than `type` (`{"event": "result", "result": {...}}`); the adapter reads
   both keys.
 
+## Hermes
+
+- Hermes 0.19.0 fronts the DGX Spark OpenAI-compatible endpoint and accepts only
+  `gpt-oss:120b`. It has no credential spec. A local launch requires an
+  `endpoint_url` ending in `/v1`, mounts no credential, and sets
+  `OPENAI_BASE_URL` plus the literal non-secret placeholder `OPENAI_API_KEY` value
+  `local-no-auth`.
+- Launch is `crucible-hermes --ignore-user-config --ignore-rules --safe-mode
+  --yolo --provider openai-api --model gpt-oss:120b --toolsets terminal,file
+  --usage-file /crucible/report/hermes-usage.json -z <pointer>`. `--yolo` is
+  permitted only because the read-only worker container is the permission
+  boundary. `HERMES_HOME` is a per-attempt tmpfs, so rules, memory, plugins, MCP
+  configuration, and session `state.db` do not cross attempts.
+- Hermes's usage JSON is mandatory run evidence. Its input and output token counts
+  come from that file. The image wrapper enriches duration and tool-call count from
+  the same attempt's SQLite session row before exit. Missing or unparsable usage
+  fails `run_evidence_present`.
+- Classification checks Crucible termination facts first, then usage and provider
+  text, then report presence. `failed: true` overrides exit 0. Exit 75 is
+  `provider_error` unless explicit quota text makes it `quota_exhausted`; a local
+  5xx or connection refusal is always `provider_error` and never marks the pool.
+- Crucible's launch wrapper is the sole transcript writer. The Hermes image wrapper
+  inherits stdout and only enriches the usage record after the child exits.
+
 ## Report parsing (all harnesses)
 
 `/crucible/report/report.yaml` is parsed against `CompletionClaimV1` from
@@ -170,10 +194,12 @@ line redacted before it is stored (12).
 
 ## Local model endpoints
 
-Codex and AGY can be pointed at an OpenAI-compatible endpoint by
-configuration, which is how local models on the operator's DGX Spark and
-RTX 9060 enter the routing policy with cost class none. The adapter gains
-an `endpoint` in its launch context (`subscription` or a local URL on the
-egress allowlist); the identity, report, and gate contracts do not change.
-Which harness fronts each local server, what the model ids are, and how
-quality compares are answered by spike S13 before the entries are enabled.
+`LaunchContext` and `LaunchSpec` carry `endpoint` as `subscription` or `local`
+and a separate optional `endpoint_url`. Local requires the URL; subscription
+forbids it. The supervisor preserves both fields through launch reconstruction.
+The provider omits credentials and sets `credential_mounted=False` for every local
+attempt. The identity, report, and gate contracts do not change.
+
+Hermes is the verified DGX Spark front end. Other harness and local-server
+combinations remain disabled until their own compatibility and quality evidence
+exists.

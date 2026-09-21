@@ -12,6 +12,7 @@ import pytest
 from crucible.adapters.harness.agy import AgyAdapter
 from crucible.adapters.harness.claude_code import ClaudeCodeAdapter
 from crucible.adapters.harness.codex import CodexAdapter
+from crucible.adapters.harness.hermes import HermesAdapter
 from crucible.adapters.harness.registry import default_adapters, default_registry
 from crucible.adapters.harness.script import ScriptHarnessAdapter
 from crucible.application.harnesses import effective_mount_mode
@@ -104,6 +105,62 @@ def test_agy_launch_matches_07_and_stays_under_the_argv_ceiling() -> None:
     assert launch.env == {} and launch.env_from_files == {}
 
 
+def test_hermes_launch_matches_07_and_uses_no_credential() -> None:
+    adapter = HermesAdapter()
+    launch = adapter.build_launch(
+        context(
+            model="gpt-oss:120b",
+            credential_mounted=False,
+            endpoint="local",
+            endpoint_url="http://spark.example.internal:11434/v1",
+        )
+    )
+    assert launch.argv == (
+        "crucible-hermes",
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--safe-mode",
+        "--yolo",
+        "--provider",
+        "openai-api",
+        "--model",
+        "gpt-oss:120b",
+        "--toolsets",
+        "terminal,file",
+        "--usage-file",
+        "/crucible/report/hermes-usage.json",
+        "-z",
+        POINTER,
+    )
+    assert launch.env == {
+        "HERMES_HOME": "/home/worker/.hermes",
+        "OPENAI_BASE_URL": "http://spark.example.internal:11434/v1",
+        "OPENAI_API_KEY": "local-no-auth",
+        "CRUCIBLE_HERMES_USAGE": "/crucible/report/hermes-usage.json",
+    }
+    assert launch.env_from_files == {}
+    assert launch.stdin_files == () and launch.stdin_text == ""
+    assert launch.transcript_path == "/crucible/report/transcript.jsonl"
+    assert launch.workdir == "/crucible/repo"
+    assert adapter.credential_spec() is None
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"model": "gpt-oss:120b", "endpoint": "subscription", "endpoint_url": None},
+        {
+            "model": "another-model",
+            "endpoint": "local",
+            "endpoint_url": "http://spark.example.internal:11434/v1",
+        },
+    ],
+)
+def test_hermes_refuses_any_launch_outside_its_local_model(overrides: dict[str, Any]) -> None:
+    with pytest.raises(ValueError):
+        HermesAdapter().build_launch(context(credential_mounted=False, **overrides))
+
+
 def test_script_harness_is_a_plain_argv() -> None:
     launch = ScriptHarnessAdapter().build_launch(context(credential_mounted=False))
     assert launch.argv == ("crucible-script-harness",)
@@ -114,7 +171,17 @@ def test_script_harness_is_a_plain_argv() -> None:
 @pytest.mark.parametrize("adapter", default_adapters(), ids=lambda a: a.name)
 def test_nothing_secret_shaped_in_any_launch(adapter: HarnessAdapter) -> None:
     """12: argv and env carry names, paths and flags; the scanner finds nothing."""
-    launch = adapter.build_launch(context())
+    ctx = (
+        context(
+            model="gpt-oss:120b",
+            credential_mounted=False,
+            endpoint="local",
+            endpoint_url="http://spark.example.internal:11434/v1",
+        )
+        if isinstance(adapter, HermesAdapter)
+        else context()
+    )
+    launch = adapter.build_launch(ctx)
     blob = "\n".join([*launch.argv, *launch.env.values(), *launch.env_from_files.values()])
     assert scan_text(blob) is None
     for value in launch.env_from_files.values():
@@ -171,12 +238,13 @@ def test_configuration_may_raise_the_mount_mode_and_never_lower_it() -> None:
 # ----- the registry (07, 25) ----------------------------------------------------
 
 
-def test_the_registry_knows_the_four_harnesses() -> None:
+def test_the_registry_knows_the_five_harnesses() -> None:
     registry = default_registry()
-    assert registry.names() == ("claude_code", "codex", "agy", "script-harness")
+    assert registry.names() == ("claude_code", "codex", "agy", "hermes", "script-harness")
     assert registry.require("codex").supported_versions.text == ">=0.153.0,<0.154.0"
     assert registry.require("claude_code").supported_versions.text == ">=2.1.0,<2.2.0"
     assert registry.require("agy").supported_versions.text == ">=1.2.0,<1.3.0"
+    assert registry.require("hermes").supported_versions.text == ">=0.19.0,<0.20.0"
 
 
 def test_an_unknown_name_is_refused() -> None:

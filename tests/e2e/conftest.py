@@ -21,6 +21,7 @@ import uuid
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, Protocol
+from urllib.parse import urlsplit
 
 import pytest
 from fastapi.testclient import TestClient
@@ -35,6 +36,7 @@ from crucible.adapters.persistence import migrate
 from crucible.adapters.persistence.unit_of_work import SqlUnitOfWorkFactory, make_engine
 from crucible.adapters.storage.disk import DiskArtifactStore
 from crucible.application.auth import mint_token
+from crucible.application.proxy_config import worker_proxy_config
 from crucible.application.repositories import register_repository
 from crucible.application.supervisor import Supervisor
 from crucible.contracts.api import ExternalReviewAttestation, RepositoryRegistration
@@ -91,24 +93,23 @@ TRUNCATE = (
 
 def _squid_conf(directory: Path) -> Path:
     """The same configuration `make proxy-config` writes, for the test's allowlist."""
-    lines = [
-        f"acl workers src {WORKERS_SUBNET}",
-        "acl SSL_ports port 443",
-        "acl Safe_ports port 443",
-        "acl CONNECT method CONNECT",
-        *[f"acl allowed dstdomain {host}" for host in EGRESS_ALLOWLIST],
-        "http_access deny !Safe_ports",
-        "http_access deny CONNECT !SSL_ports",
-        "http_access allow workers CONNECT allowed",
-        "http_access deny all",
-        "http_port 3128",
-        "cache deny all",
-        "access_log /var/log/squid/access.log",
-        "pid_filename none",
-        "shutdown_lifetime 1 second",
-    ]
+    endpoint = os.environ.get("CRUCIBLE_SPARK_ENDPOINT_URL", "").strip()
+    routing = {
+        "models": [
+            {
+                "endpoint": "local",
+                "endpoint_url": endpoint,
+                "enabled": True,
+            }
+        ]
+        if endpoint
+        else []
+    }
     path = directory / "squid.conf"
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    path.write_text(
+        worker_proxy_config(WORKERS_SUBNET, list(EGRESS_ALLOWLIST), [routing]),
+        encoding="utf-8",
+    )
     path.chmod(0o644)
     return path
 
@@ -293,6 +294,11 @@ def engine(migrated: str) -> Iterator[Engine]:
 
 @pytest.fixture
 def docker_config(stack: dict[str, Any], artifact_root: Path) -> DockerConfig:
+    allowlist = list(EGRESS_ALLOWLIST)
+    endpoint = os.environ.get("CRUCIBLE_SPARK_ENDPOINT_URL", "").strip()
+    if endpoint:
+        parsed = urlsplit(endpoint)
+        allowlist.append(f"{parsed.hostname}:{parsed.port or 80}")
     return DockerConfig(
         endpoint=str(stack["docker_host"]),
         artifact_root=str(artifact_root),
@@ -302,7 +308,7 @@ def docker_config(stack: dict[str, Any], artifact_root: Path) -> DockerConfig:
         artifact_volume="",
         workers_network=NET_WORKERS,
         egress_proxy=str(stack["egress_proxy"]),
-        proxy_allowlist=EGRESS_ALLOWLIST,
+        proxy_allowlist=tuple(allowlist),
         collector_timeout_seconds=300,
         verifier_timeout_seconds=300,
         workspace_dir_mode=0o777,

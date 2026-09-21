@@ -14,8 +14,9 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
+from crucible.domain.endpoints import validate_endpoint
 from crucible.domain.exit_class import ExitClass
 
 _VERSION = re.compile(r"^(\d+)\.(\d+)\.(\d+)")
@@ -214,6 +215,11 @@ class LaunchContext:
     report_mount: str
     repo_mount: str
     credential_mounted: bool = False
+    endpoint: Literal["subscription", "local"] = "subscription"
+    endpoint_url: str | None = None
+
+    def __post_init__(self) -> None:
+        validate_endpoint(self.endpoint, self.endpoint_url)
 
 
 @dataclass(frozen=True, slots=True)
@@ -258,6 +264,8 @@ class ReportMetrics:
     tokens_out: int | None = None
     cost_usd: float | None = None
     source: str = "none"
+    duration_ms: int | None = None
+    tool_calls: int | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -265,6 +273,8 @@ class ReportMetrics:
             "tokens_in": self.tokens_in,
             "tokens_out": self.tokens_out,
             "cost_usd": self.cost_usd,
+            "duration_ms": self.duration_ms,
+            "tool_calls": self.tool_calls,
             "source": self.source,
         }
 
@@ -283,6 +293,7 @@ class ParsedReport:
     metrics: ReportMetrics = field(default_factory=ReportMetrics)
     transcript_lines: int = 0
     transcript_name: str | None = None
+    run_evidence_error: str | None = None
 
 
 class HarnessUnavailableError(Exception):
@@ -306,7 +317,13 @@ class HarnessAdapter(Protocol):
 
     def parse_report(self, report_dir: Path, exit: ExitInfo) -> ParsedReport: ...
 
-    def classify_exit(self, exit: ExitInfo, stdout_tail: str, stderr_tail: str) -> ExitClass: ...
+    def classify_exit(
+        self,
+        exit: ExitInfo,
+        stdout_tail: str,
+        stderr_tail: str,
+        report_dir: Path | None = None,
+    ) -> ExitClass: ...
 
     def quota_reset_at(self, stdout_tail: str, stderr_tail: str) -> datetime | None: ...
 

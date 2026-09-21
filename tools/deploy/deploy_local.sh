@@ -29,6 +29,7 @@ DEPLOY_DIR="${CRUCIBLE_DEPLOY_DIR:-/var/lib/crucible/deploy}"
 CREDENTIAL_ROOT="${CRUCIBLE_CREDENTIAL_ROOT:-/var/lib/crucible/credentials}"
 DEPLOY_IMAGE="${CRUCIBLE_DEPLOY_IMAGE:-}"
 DEPLOY_PORT="${CRUCIBLE_DEPLOY_PORT:-8080}"
+SPARK_ENDPOINT_URL="${CRUCIBLE_SPARK_ENDPOINT_URL:-}"
 # The harness directories spec 12 names, plus the GitHub App's own directory (12, 25).
 CREDENTIAL_DIRS="${CRUCIBLE_CREDENTIAL_DIRS:-claude_code codex agy github}"
 # What the egress proxy is configured to permit and which subnet its source ACL names.
@@ -203,6 +204,7 @@ sudo -n env \
   SERVICE_GROUP="$service_group" \
   DEPLOY_IMAGE="$DEPLOY_IMAGE" \
   DEPLOY_PORT="$DEPLOY_PORT" \
+  SPARK_ENDPOINT_URL="$SPARK_ENDPOINT_URL" \
   SOCKET="$socket" \
   EGRESS_JSON="$egress_json" \
   WORKERS_SUBNET="$WORKERS_SUBNET" \
@@ -260,6 +262,8 @@ trap 'rm -f "$tmp"' EXIT INT TERM
   printf '%s\n' "CRUCIBLE_DOCKER_SOCKET=${SOCKET}"
   echo "# The pinned release, agreeing with compose.deploy.yaml."
   printf '%s\n' "CRUCIBLE_IMAGE=${DEPLOY_IMAGE}"
+  echo "# The configured local model endpoint. Its presence enables the Spark route."
+  [ -z "$SPARK_ENDPOINT_URL" ] || printf '%s\n' "CRUCIBLE_SPARK_ENDPOINT_URL=${SPARK_ENDPOINT_URL}"
   echo "# What the deployed squid.conf permits, so the application's declared allowlist"
   echo "# and the proxy's rules cannot drift apart in this directory (13, S6)."
   [ "$EGRESS_JSON" = "[]" ] || printf '%s\n' "CRUCIBLE_EGRESS_ALLOWLIST=${EGRESS_JSON}"

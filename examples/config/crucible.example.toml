@@ -1,4 +1,8 @@
 # Example Crucible configuration. All paths are illustrative.
+# Optional DGX Spark OpenAI-compatible endpoint. It must end in /v1. The migration
+# records a disabled local route with its reason when this is absent.
+spark_endpoint_url = "http://spark.internal.example:11434/v1"
+
 [service]
 bind = "0.0.0.0:8080"
 render_timezone = "UTC"            # operators set their own zone in private configuration

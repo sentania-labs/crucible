@@ -23,7 +23,7 @@ from datetime import datetime, timedelta
 from functools import partial
 from itertools import chain
 from pathlib import Path
-from typing import Any, ClassVar, TypeVar
+from typing import Any, ClassVar, Literal, TypeVar
 
 import yaml
 
@@ -995,6 +995,14 @@ class Supervisor:
         effective_contract = copy.deepcopy(contract)
         if attempt.resume_from_remote:
             effective_contract.setdefault("repository", {})["resume_from_work_branch"] = True
+        endpoint: Literal["subscription", "local"] = "subscription"
+        endpoint_url = None
+        with self._uow_factory() as route_uow:
+            routing = load_routing(route_uow, execution.policy_snapshot or {})
+            route = routing.model(selected_model) if routing is not None else None
+            if route is not None:
+                endpoint = route.endpoint
+                endpoint_url = route.endpoint_url
         spec = LaunchSpec(
             attempt_id=attempt.id,
             task_id=task.id,
@@ -1011,6 +1019,8 @@ class Supervisor:
             owner=task.principal_id,
             repository_url=repository_url,
             effort=execution.effort,
+            endpoint=endpoint,
+            endpoint_url=endpoint_url,
         )
         adapter = self._harnesses.get(selected_harness) if self._harnesses else None
         if adapter is None:
@@ -1026,7 +1036,9 @@ class Supervisor:
                 identity_mount=IDENTITY_MOUNT,
                 report_mount=REPORT_MOUNT,
                 repo_mount=REPO_MOUNT,
-                credential_mounted=adapter.credential_spec() is not None,
+                credential_mounted=(endpoint != "local" and adapter.credential_spec() is not None),
+                endpoint=endpoint,
+                endpoint_url=endpoint_url,
             )
         )
         return replace(
@@ -1083,6 +1095,8 @@ class Supervisor:
 
     def _harness_busy_in_uow(self, uow: UnitOfWork, execution: Execution) -> str | None:
         policy = execution.policy_snapshot or {}
+        routing = load_routing(uow, policy)
+        selected = routing.model(execution.model) if routing is not None else None
         limit = int(
             (policy.get("concurrency", {}).get("per_harness") or {}).get(execution.harness, 1)
         )
@@ -1109,8 +1123,20 @@ class Supervisor:
             other_execution = uow.executions.get(other.execution_id)
             if other_execution is not None and other_execution.harness == execution.harness:
                 running += 1
-        if running >= limit:
+        # Subscription harnesses retain their credential and policy cap. Local workers
+        # share no credential, so their independent pool cap is the isolation boundary.
+        if (selected is None or selected.endpoint == "subscription") and running >= limit:
             return f"{running} of {limit} {execution.harness} worker(s) already running"
+        if selected is not None:
+            assert routing is not None
+            pool_limit = routing.pools[selected.pool].max_concurrency
+            if pool_limit is not None:
+                pool_running = sum(1 for other in live if other.selected_pool == selected.pool)
+                if pool_running >= pool_limit:
+                    return (
+                        f"{pool_running} of {pool_limit} {selected.pool} pool worker(s) "
+                        "already running"
+                    )
         return None
 
     def _checkout_lease_free(self, attempt_id: str, key: str) -> bool:
@@ -2705,10 +2731,15 @@ class Supervisor:
                 killed=killed,
             )
             adapter = self._harnesses.get(execution.harness) if self._harnesses else None
+            report_dir = (
+                Path(attempt.workspace_path) / "output" / "report"
+                if attempt.workspace_path
+                else None
+            )
             if adapter is not None:
                 # 07 and S5: the adapter classifies from the code and both tails.
                 attempt.exit_class = adapter.classify_exit(
-                    exit_info, outputs.stdout_tail, outputs.stderr_tail
+                    exit_info, outputs.stdout_tail, outputs.stderr_tail, report_dir
                 )
             else:
                 attempt.exit_class = classify_exit(
@@ -2728,10 +2759,8 @@ class Supervisor:
             if provider_quota is not None:
                 self._mark_pool_exhausted(uow, attempt, execution, provider_quota.reset_at)
             parsed: ParsedReport | None = None
-            if adapter is not None and attempt.workspace_path:
-                report_dir = Path(attempt.workspace_path) / "output" / "report"
-                if report_dir.is_dir():
-                    parsed = adapter.parse_report(report_dir, exit_info)
+            if adapter is not None and report_dir is not None and report_dir.is_dir():
+                parsed = adapter.parse_report(report_dir, exit_info)
             self._record_credential_sync(uow, attempt, execution, outputs)
             if collection_error is not None:
                 # Whatever the worker's own exit said, Crucible has no outputs from it.
@@ -2883,6 +2912,7 @@ class Supervisor:
                 claim=claim_document,
                 claim_parsed_ok=claim_ok,
                 parse_errors=errors,
+                parsed_report=parsed,
             )
             if head:
                 task.head_sha = head
@@ -2969,6 +2999,10 @@ class Supervisor:
             metrics.tokens_in = reported.tokens_in
         if reported.tokens_out is not None:
             metrics.tokens_out = reported.tokens_out
+        if reported.duration_ms is not None:
+            metrics.harness_duration_ms = reported.duration_ms
+        if reported.tool_calls is not None:
+            metrics.tool_calls = reported.tool_calls
         if reported.cost_usd is not None:
             metrics.cost_units = reported.cost_usd
         if reported.source != "none":

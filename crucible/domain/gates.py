@@ -353,6 +353,13 @@ def no_secrets(gi: GateInput) -> GateOutcome:
 
 
 def run_evidence_present(gi: GateInput) -> GateOutcome:
+    harness_evidence = gi.one("artifact_present", role="harness_run_evidence")
+    if harness_evidence is not None and not harness_evidence.payload.get("parsed_ok", False):
+        return GateOutcome(
+            GateResult.FAIL,
+            f"harness run evidence is invalid: {harness_evidence.payload.get('error')}",
+            (harness_evidence.id,),
+        )
     required = [
         v
         for v in gi.contract.get("required_verification", [])

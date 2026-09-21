@@ -695,6 +695,8 @@ class AttemptMetricsRepo:
             endpoint_kind=row.endpoint_kind,
             pool=row.pool,
             wall_ms=row.wall_ms,
+            harness_duration_ms=row.harness_duration_ms,
+            tool_calls=row.tool_calls,
             tokens_in=row.tokens_in,
             tokens_out=row.tokens_out,
             cost_units=row.cost_units,
@@ -722,6 +724,8 @@ class AttemptMetricsRepo:
         row.endpoint_kind = metrics.endpoint_kind
         row.pool = metrics.pool
         row.wall_ms = metrics.wall_ms
+        row.harness_duration_ms = metrics.harness_duration_ms
+        row.tool_calls = metrics.tool_calls
         row.tokens_in = metrics.tokens_in
         row.tokens_out = metrics.tokens_out
         row.cost_units = metrics.cost_units

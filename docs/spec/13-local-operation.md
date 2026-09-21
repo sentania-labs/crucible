@@ -223,7 +223,18 @@ was configured with, and a per-attempt proxy is a later hardening. Worker
 `/tmp` is mounted without `noexec` in v0.x because no evidence exists yet
 that the real harnesses never execute from it. C5a did not test it; the
 test against each real harness is carried forward and this section is
-updated with the result. From S6, as each list stood after an authenticated task completed through
+updated with the result.
+
+`make proxy-config` accepts routing policy JSON through
+`ROUTING_POLICY_FILES`. Generation reads only entries whose `enabled` value is
+true and whose `endpoint` is `local`; a configured but disabled local URL is not
+authorized. Each enabled plain-HTTP URL becomes an exact destination ACL and an
+exact port ACL. The port is added to `Safe_ports`, never `SSL_ports`, and the allow
+line follows both unsafe-port denies and precedes the final deny. After an operator
+uploads or selects a different routing policy, the proxy configuration is regenerated
+from that policy and the proxy is reloaded before an attempt can use the route.
+
+From S6, as each list stood after an authenticated task completed through
 the filter (so none of them is provisional any more): Claude Code
 `api.anthropic.com` (plus `mcp-proxy.anthropic.com` only if account MCP
 connectors are wanted; telemetry to Datadog denied); Codex

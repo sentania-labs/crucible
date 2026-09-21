@@ -85,7 +85,9 @@ class ScriptHarnessAdapter:
     def parse_report(self, report_dir: Path, exit: ExitInfo) -> ParsedReport:
         return base.parse_report_dir(report_dir, exit, metrics=ReportMetrics(), transcript_lines=0)
 
-    def classify_exit(self, exit: ExitInfo, stdout_tail: str, stderr_tail: str) -> ExitClass:
+    def classify_exit(
+        self, exit: ExitInfo, stdout_tail: str, stderr_tail: str, report_dir: Path | None = None
+    ) -> ExitClass:
         return base.classify_with_patterns(
             exit,
             stdout_tail,

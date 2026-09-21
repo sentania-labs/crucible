@@ -449,6 +449,8 @@ class AttemptMetricsRow(Base):
     endpoint_kind: Mapped[str] = mapped_column(String(16))
     pool: Mapped[str] = mapped_column(String(64))
     wall_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    harness_duration_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    tool_calls: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     tokens_in: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     tokens_out: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     cost_units: Mapped[float | None] = mapped_column(Float, nullable=True)

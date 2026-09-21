@@ -234,6 +234,7 @@ def test_harnesses_list_enable_disable_through_api_and_cli(
         "claude_code": "configured",
         "codex": "configured",
         "agy": "configured",
+        "hermes": "not_required",
         "script-harness": "not_required",
     }
     disabled = admin_client.post(

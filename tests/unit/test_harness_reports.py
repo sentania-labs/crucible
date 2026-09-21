@@ -14,6 +14,7 @@ import pytest
 from crucible.adapters.harness.agy import AgyAdapter
 from crucible.adapters.harness.claude_code import ClaudeCodeAdapter
 from crucible.adapters.harness.codex import CodexAdapter
+from crucible.adapters.harness.hermes import HermesAdapter
 from crucible.adapters.harness.registry import default_adapters
 from crucible.adapters.harness.script import ScriptHarnessAdapter
 from crucible.domain.exit_class import ExitClass
@@ -163,6 +164,38 @@ def test_a_harness_that_reports_nothing_leaves_null(tmp_path: Path) -> None:
     assert ScriptHarnessAdapter().parse_report(tmp_path, exit_ok()).metrics.source == "none"
 
 
+def test_hermes_usage_is_run_evidence_and_supplies_metrics(tmp_path: Path) -> None:
+    (tmp_path / "hermes-usage.json").write_text(
+        json.dumps(
+            {
+                "completed": True,
+                "failed": False,
+                "model": "gpt-oss:120b",
+                "input_tokens": 120,
+                "output_tokens": 30,
+                "api_calls": 2,
+                "duration_ms": 456,
+                "tool_calls": 3,
+            }
+        ),
+        encoding="utf-8",
+    )
+    parsed = HermesAdapter().parse_report(tmp_path, ExitInfo(exit_code=0))
+    assert parsed.run_evidence_error is None
+    assert (parsed.metrics.tokens_in, parsed.metrics.tokens_out) == (120, 30)
+    assert (parsed.metrics.duration_ms, parsed.metrics.tool_calls) == (456, 3)
+
+
+@pytest.mark.parametrize("content", [None, "not json", "[]", '{"completed": true}'])
+def test_hermes_missing_or_bad_usage_is_an_evidence_anomaly(
+    tmp_path: Path, content: str | None
+) -> None:
+    if content is not None:
+        (tmp_path / "hermes-usage.json").write_text(content, encoding="utf-8")
+    parsed = HermesAdapter().parse_report(tmp_path, ExitInfo(exit_code=0))
+    assert parsed.run_evidence_error is not None
+
+
 # ----- exit classification (S5 table) ----------------------------------------
 
 # The recorded shapes, sanitized: the text each CLI printed for a missing or expired
@@ -264,6 +297,82 @@ def test_the_deterministic_table_holds_before_any_pattern() -> None:
     assert adapter.classify_exit(ExitInfo(exit_code=137, oom_killed=True), "", "") is (
         ExitClass.ENVIRONMENT
     )
+
+
+def test_hermes_usage_and_provider_failures_precede_report_classification(tmp_path: Path) -> None:
+    adapter = HermesAdapter()
+    usage = tmp_path / "hermes-usage.json"
+    usage.write_text('{"completed":false,"failed":true}', encoding="utf-8")
+    assert adapter.classify_exit(ExitInfo(exit_code=0, report_present=True), "", "", tmp_path) is (
+        ExitClass.CRASHED
+    )
+    assert (
+        adapter.classify_exit(
+            ExitInfo(exit_code=0, report_present=True), "", "connection refused", tmp_path
+        )
+        is ExitClass.PROVIDER_ERROR
+    )
+    usage.write_text('{"completed":true,"failed":false}', encoding="utf-8")
+    assert adapter.classify_exit(
+        ExitInfo(exit_code=75, blocked_present=True), "", "", tmp_path
+    ) is (ExitClass.PROVIDER_ERROR)
+    assert (
+        adapter.classify_exit(
+            ExitInfo(exit_code=75, blocked_present=True), "", "quota exceeded", tmp_path
+        )
+        is ExitClass.QUOTA_EXHAUSTED
+    )
+    assert adapter.provider_quota_event("quota exceeded", "") is None
+
+
+def test_hermes_termination_facts_precede_usage_and_provider_text(tmp_path: Path) -> None:
+    (tmp_path / "hermes-usage.json").write_text(
+        '{"completed":true,"failed":false}', encoding="utf-8"
+    )
+    adapter = HermesAdapter()
+    assert adapter.classify_exit(ExitInfo(exit_code=None, lost=True), "", "", tmp_path) is (
+        ExitClass.LOST
+    )
+    assert adapter.classify_exit(
+        ExitInfo(exit_code=137, timed_out=True), "", "quota exceeded", tmp_path
+    ) is (ExitClass.TIMEOUT)
+    assert adapter.classify_exit(
+        ExitInfo(exit_code=137, killed=True), "", "HTTP 503", tmp_path
+    ) is (ExitClass.KILLED)
+    assert adapter.classify_exit(
+        ExitInfo(exit_code=137, oom_killed=True), "", "connection refused", tmp_path
+    ) is (ExitClass.ENVIRONMENT)
+
+
+def test_hermes_completed_usage_then_report_and_missing_usage_order(tmp_path: Path) -> None:
+    usage = tmp_path / "hermes-usage.json"
+    usage.write_text('{"completed":true,"failed":false}', encoding="utf-8")
+    adapter = HermesAdapter()
+    assert adapter.classify_exit(ExitInfo(exit_code=0, report_present=True), "", "", tmp_path) is (
+        ExitClass.COMPLETED
+    )
+    assert adapter.classify_exit(ExitInfo(exit_code=0), "", "", tmp_path) is (
+        ExitClass.COMPLETED_WITHOUT_REPORT
+    )
+    usage.unlink()
+    assert adapter.classify_exit(ExitInfo(exit_code=0, report_present=True), "", "", tmp_path) is (
+        ExitClass.COMPLETED
+    )
+    parsed = adapter.parse_report(tmp_path, ExitInfo(exit_code=0, report_present=True))
+    assert parsed.run_evidence_error == "missing hermes-usage.json"
+
+
+@pytest.mark.parametrize("stderr", ["HTTP 500", "bad gateway", "connection refused"])
+def test_hermes_local_provider_failures_never_mark_quota(tmp_path: Path, stderr: str) -> None:
+    (tmp_path / "hermes-usage.json").write_text(
+        '{"completed":false,"failed":true}', encoding="utf-8"
+    )
+    adapter = HermesAdapter()
+    assert adapter.classify_exit(ExitInfo(exit_code=75), "", stderr, tmp_path) is (
+        ExitClass.PROVIDER_ERROR
+    )
+    assert adapter.provider_quota_event("", stderr) is None
+    assert not adapter.provider_quota_exhausted("", stderr)
 
 
 def test_a_bare_number_in_a_crashed_agy_tail_is_not_quota() -> None:

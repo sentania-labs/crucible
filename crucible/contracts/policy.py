@@ -12,6 +12,7 @@ from typing import Any, Literal
 from pydantic import Field, field_validator, model_validator
 
 from crucible.contracts.common import StrictModel, check_major_version
+from crucible.domain.endpoints import validate_endpoint
 from crucible.domain.exit_class import ExitClass
 from crucible.domain.gates import (
     ALL_GATES,
@@ -317,13 +318,22 @@ class RoutingModel(StrictModel):
     pool: str = Field(min_length=1)
     weight: int = Field(ge=0)
     enabled: bool
+    disabled_reason: str | None = None
 
     @model_validator(mode="after")
     def _local_needs_endpoint(self) -> RoutingModel:
-        if self.endpoint == "local" and not self.endpoint_url:
+        if self.endpoint == "local" and not self.endpoint_url and self.enabled:
             raise ValueError(f"local model {self.id!r} must carry endpoint_url")
+        if self.endpoint == "local" and not self.endpoint_url and not self.disabled_reason:
+            raise ValueError(
+                f"disabled local model {self.id!r} without endpoint_url must record why"
+            )
+        if self.endpoint == "local" and self.endpoint_url:
+            validate_endpoint("local", self.endpoint_url)
         if self.endpoint == "subscription" and self.endpoint_url:
             raise ValueError(f"subscription model {self.id!r} must not carry endpoint_url")
+        if self.enabled and self.disabled_reason:
+            raise ValueError(f"enabled model {self.id!r} must not carry disabled_reason")
         return self
 
 
@@ -336,6 +346,7 @@ class RoutingPool(StrictModel):
     soft_limit: int = Field(ge=0)
     # Absent on immutable versions 1 and 2. Only version 3 uses reactive marks.
     default_cooldown_seconds: int = Field(default=3600, ge=1)
+    max_concurrency: int | None = Field(default=None, ge=1)
 
 
 class Rotation(StrictModel):

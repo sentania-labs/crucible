@@ -60,6 +60,11 @@ LOCAL_TZ = ZoneInfo("America/Chicago")
 # is two orders of magnitude clear of the observed cost; raising it would need evidence
 # that a probe legitimately needs longer, and there is none.
 PROBE_TIMEOUT_SECONDS = 120
+CREDENTIAL_HARNESSES = tuple(
+    harness
+    for harness in ALL_HARNESSES
+    if default_registry().require(harness).credential_spec() is not None
+)
 
 
 def _why_not() -> str:
@@ -100,7 +105,7 @@ def scratch_root(artifact_root: Path, dedicated_root: Path) -> Iterator[Path]:
     rotate and remove act on. Shredded at the end whatever the test did."""
     root = artifact_root / f"scratch-credentials-{RUN_ID}"
     root.mkdir(mode=0o700)
-    for harness in ALL_HARNESSES:
+    for harness in CREDENTIAL_HARNESSES:
         # symlinks=True, and not by taste: the Codex directory carries symlinks into the
         # operator's daily-use `~/.codex` release tree, and dereferencing them would read
         # and copy exactly what 12 says is never read, as well as making this copy's size
@@ -339,7 +344,7 @@ def test_the_probe_runs_live_for_each_harness_through_api_and_cli(
     _promote_pins(probe_ctx, provider, tokens["admin"])
     entries: list[dict[str, Any]] = []
     with _client(probe_ctx, tokens["admin"]) as admin:
-        for index, harness in enumerate(ALL_HARNESSES):
+        for index, harness in enumerate(CREDENTIAL_HARNESSES):
             secrets = _secret_values(dedicated_root, harness)
             started = datetime.now(UTC)
             if index % 2 == 0:
@@ -425,7 +430,7 @@ def test_the_probe_runs_live_for_each_harness_through_api_and_cli(
                 ).scalars()
                 haystack.extend(str(v) for v in values if v is not None)
         blob = "\n".join(haystack)
-        for harness in ALL_HARNESSES:
+        for harness in CREDENTIAL_HARNESSES:
             for value in _secret_values(dedicated_root, harness):
                 assert value not in blob, "a credential value reached a Crucible record"
         assert scan_text(blob) is None
@@ -439,7 +444,7 @@ def test_the_probe_runs_live_for_each_harness_through_api_and_cli(
         status = admin.get("/v1/admin/status").json()
         assert all(
             status["credentials"][h]["last_launch_outcome"] == "probe:completed"
-            for h in ALL_HARNESSES
+            for h in CREDENTIAL_HARNESSES
         ), status["credentials"]
 
 

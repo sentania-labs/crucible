@@ -156,7 +156,9 @@ class ClaudeCodeAdapter:
         metrics, lines = _metrics(report_dir / base.TRANSCRIPT_NAME)
         return base.parse_report_dir(report_dir, exit, metrics=metrics, transcript_lines=lines)
 
-    def classify_exit(self, exit: ExitInfo, stdout_tail: str, stderr_tail: str) -> ExitClass:
+    def classify_exit(
+        self, exit: ExitInfo, stdout_tail: str, stderr_tail: str, report_dir: Path | None = None
+    ) -> ExitClass:
         return base.classify_with_patterns(
             exit, stdout_tail, stderr_tail, auth=AUTH_PATTERNS, quota=QUOTA_PATTERNS
         )

@@ -288,10 +288,15 @@ reroute:                               # C6b: what happens when a worker dies of
   resume_max_wait_seconds: 86400       # longest a task waits in awaiting_quota before it ends reported with a wake
 ```
 
-Version 3 carries subscription entries only. Local model entries, which
-carry `endpoint: local` and an `endpoint_url` on the DGX Spark and the RTX
-9060, join a later version with their own pools once S13 has run; the rules
-for them below already hold.
+Version 3 carries subscription entries only. Version 4 is immutable version 3
+plus a `spark-local` pool with `max_concurrency: 4` and one disabled model entry:
+`gpt-oss:120b`, harness `hermes`, endpoint `local`, capability `mid`, cost
+`none`, and the configured Spark `/v1` URL. Without that configuration the URL
+is null and `disabled_reason` records that it is not configured. With the URL,
+the entry remains disabled with the reason that the enablement gate has not
+passed. Version 5 differs only by enabling that entry and removing the reason,
+after the single-task and four-way live gates pass. No Qwen model is in either
+version.
 
 Model ids are what the harness accepts. Which routing version a deployment
 uses is the policy's own choice. `default-software` version 2, seeded by
@@ -324,3 +329,9 @@ Crucible selected and the model the transcript named (14), which is what
 the least-recent and quality terms of the selection rule read.
 Foundry's judgment is the tier; the policy and the rule do the rest. The
 operator alone may pin (05).
+
+`max_concurrency` is a pool-wide count of launching and running attempts. It is
+enforced independently of `concurrency.per_harness`; the local Hermes pool may use
+all four Spark slots, while subscription routes retain their credential-derived
+per-harness caps. A fifth Spark task stays scheduled and records
+`harness_launch_deferred` until capacity is released.

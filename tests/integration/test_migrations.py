@@ -7,6 +7,7 @@ from sqlalchemy import inspect, text
 
 from crucible.adapters.persistence import migrate
 from crucible.adapters.persistence.unit_of_work import make_engine
+from crucible.contracts.policy import RoutingPolicyV1
 from tests.fixtures import contract_document
 
 pytestmark = pytest.mark.integration
@@ -38,8 +39,8 @@ def test_up_down_up_from_empty(database_url: str) -> None:
     ok, detail = migrate.is_current(engine, database_url)
     assert ok, detail
     with engine.connect() as conn:
-        # 0001, 0009, and 0011 seed versions 1 through 3 of default-software.
-        assert conn.execute(text("SELECT count(*) FROM policies")).scalar() == 3
+        # The migrations seed versions 1 through 4 of default-software.
+        assert conn.execute(text("SELECT count(*) FROM policies")).scalar() == 4
     migrate.downgrade(database_url, "base")
     assert "tasks" not in inspect(engine).get_table_names()
     migrate.upgrade(database_url)
@@ -114,7 +115,7 @@ def test_0004_creates_the_c2_tables_and_seeds_the_routing_policy(migrated: str) 
     } <= names
     with engine.connect() as conn:
         # 0004 seeds version 1; 0008 adds version 2 with the model ids the C5 live runs
-        # verified; 0011 adds version 3 with class routing and quota controls.
+        # verified; 0011 adds version 3 and 0013 adds the disabled Hermes route in 4.
         versions = (
             conn.execute(
                 text(
@@ -124,7 +125,7 @@ def test_0004_creates_the_c2_tables_and_seeds_the_routing_policy(migrated: str) 
             .scalars()
             .all()
         )
-        assert versions == [1, 2, 3]
+        assert versions == [1, 2, 3, 4]
         # Later revisions add immutable policy versions that name their matching
         # routing version (05b).
         policy_versions = conn.execute(
@@ -133,7 +134,12 @@ def test_0004_creates_the_c2_tables_and_seeds_the_routing_policy(migrated: str) 
                 "FROM policies WHERE name = 'default-software' ORDER BY 1"
             )
         ).all()
-        assert [(v, int(r)) for v, r in policy_versions] == [(1, 1), (2, 2), (3, 3)]
+        assert [(v, int(r)) for v, r in policy_versions] == [
+            (1, 1),
+            (2, 2),
+            (3, 3),
+            (4, 4),
+        ]
         routing = conn.execute(
             text(
                 "SELECT document -> 'routing' FROM policies "
@@ -141,6 +147,54 @@ def test_0004_creates_the_c2_tables_and_seeds_the_routing_policy(migrated: str) 
             )
         ).scalar()
     assert routing == {"policy": {"name": "default-routing", "version": 1}}
+    engine.dispose()
+
+
+def test_0013_records_an_unconfigured_spark_route_with_a_reason(migrated: str) -> None:
+    engine = make_engine(migrated)
+    with engine.connect() as conn:
+        document = conn.execute(
+            text("SELECT document FROM routing_policies WHERE name='default-routing' AND version=4")
+        ).scalar_one()
+        assert (
+            conn.execute(text("SELECT count(*) FROM harnesses WHERE name='hermes'")).scalar() == 1
+        )
+    routing = RoutingPolicyV1.model_validate(document)
+    hermes = routing.model("gpt-oss:120b")
+    assert hermes is not None and not hermes.enabled and hermes.endpoint_url is None
+    assert hermes.disabled_reason == "CRUCIBLE_SPARK_ENDPOINT_URL is not configured"
+    assert routing.pools["spark-local"].max_concurrency == 4
+    engine.dispose()
+
+
+def test_0013_materializes_the_configured_spark_url(
+    database_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    migrate.downgrade(database_url, "0012_heartbeats")
+    monkeypatch.setenv("CRUCIBLE_SPARK_ENDPOINT_URL", "http://192.0.2.41:11434/v1")
+    migrate.upgrade(database_url)
+    engine = make_engine(database_url)
+    with engine.connect() as conn:
+        document = conn.execute(
+            text("SELECT document FROM routing_policies WHERE name='default-routing' AND version=4")
+        ).scalar_one()
+    hermes = RoutingPolicyV1.model_validate(document).model("gpt-oss:120b")
+    assert hermes is not None and hermes.endpoint_url == "http://192.0.2.41:11434/v1"
+    assert hermes.disabled_reason == "enablement gate has not passed"
+    with engine.connect() as conn:
+        enabled_document = conn.execute(
+            text("SELECT document FROM routing_policies WHERE name='default-routing' AND version=5")
+        ).scalar_one()
+        policy_ref = conn.execute(
+            text(
+                "SELECT document -> 'routing' -> 'policy' ->> 'version' FROM policies "
+                "WHERE name='default-software' AND version=5"
+            )
+        ).scalar_one()
+    enabled = RoutingPolicyV1.model_validate(enabled_document).model("gpt-oss:120b")
+    assert enabled is not None and enabled.enabled and enabled.disabled_reason is None
+    assert enabled.endpoint_url == "http://192.0.2.41:11434/v1"
+    assert int(policy_ref) == 5
     engine.dispose()
 
 
