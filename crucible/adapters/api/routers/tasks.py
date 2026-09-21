@@ -21,6 +21,7 @@ from crucible.application.queries import (
     task_list,
     task_view,
 )
+from crucible.application.republish import republish_task
 from crucible.application.review import request_review
 from crucible.application.start_task import start_task
 from crucible.application.submit_task import submit_task
@@ -34,6 +35,7 @@ from crucible.contracts.api import (
     DispositionRequest,
     EventList,
     HeadDecisionRequest,
+    PublishRetryRequest,
     PullRequestView,
     ReviewRequest,
     StartRequest,
@@ -208,6 +210,32 @@ async def accept(
 
     async def produce(uow: UnitOfWork) -> tuple[int, dict[str, Any]]:
         task = record_acceptance(uow, ctx.clock, principal=principal, task_id=task_id, request=body)
+        return 200, task_view(uow, task.id).model_dump(mode="json")
+
+    return await with_idempotency(
+        uow_factory=ctx.uow_factory,
+        clock=ctx.clock,
+        principal=principal,
+        key=idempotency_key,
+        body=raw,
+        scope=str(request.url.path),
+        produce=produce,
+    )
+
+
+@router.post("/{task_id}/republish", response_model=TaskView)
+async def republish(
+    task_id: str,
+    body: PublishRetryRequest,
+    request: Request,
+    ctx: Ctx,
+    principal: Orchestrator,
+    idempotency_key: IdemKey = None,
+) -> JSONResponse:
+    raw = await request.body()
+
+    async def produce(uow: UnitOfWork) -> tuple[int, dict[str, Any]]:
+        task = republish_task(uow, ctx.clock, principal=principal, task_id=task_id, request=body)
         return 200, task_view(uow, task.id).model_dump(mode="json")
 
     return await with_idempotency(

@@ -94,6 +94,9 @@ class PublishPlan:
     existing_pr_number: int | None = None
     timeout_seconds: int = 600
     problem: str = ""
+    resume_step: str = ""
+    retry_number: int = 0
+    publish_retry_max: int = 3
 
 
 def repository_slug(repository: Repository) -> str:
@@ -255,6 +258,8 @@ def build_plan(uow: UnitOfWork, task: Task, work: tuple[Attempt, Execution]) -> 
     )
     existing = uow.pull_requests.get_for_task(task.id)
     git_policy = policy.get("git", {})
+    publishing = uow.events.latest_for_task_kind(task.id, EventKind.TASK_PUBLISHING.value)
+    publishing_payload = publishing.payload if publishing else {}
     return PublishPlan(
         task_id=task.id,
         external_id=task.external_id,
@@ -277,6 +282,12 @@ def build_plan(uow: UnitOfWork, task: Task, work: tuple[Attempt, Execution]) -> 
         existing_pr_number=existing.number if existing else None,
         timeout_seconds=int(git_policy.get("publish_timeout_seconds", 600)),
         problem=problem,
+        resume_step=str(publishing_payload.get("resume_step") or ""),
+        retry_number=int(publishing_payload.get("retry_number", 0)),
+        publish_retry_max=int(
+            publishing_payload.get("publish_retry_max")
+            or policy.get("limits", {}).get("publish_retry_max", 3)
+        ),
     )
 
 
@@ -296,6 +307,9 @@ def record_publish_started(uow: UnitOfWork, clock: Clock, plan: PublishPlan) -> 
             "base_ref": plan.base_ref,
             "deliverable": plan.deliverable_kind,
             "body_sha256": body_sha256(plan.body),
+            "resume_step": plan.resume_step,
+            "retry_number": plan.retry_number,
+            "publish_retry_max": plan.publish_retry_max,
         },
     )
 
@@ -366,15 +380,32 @@ def fail_publish(
             attempt_id=attempt_id,
             payload=payload,
         )
+    publishing = uow.events.latest_for_task_kind(task.id, EventKind.TASK_PUBLISHING.value)
+    retry_number = int((publishing.payload if publishing else {}).get("retry_number", 0))
+    stored_policy = uow.policies.get(task.policy_name, task.policy_version)
+    retry_max = int(
+        (publishing.payload if publishing else {}).get("publish_retry_max")
+        or (stored_policy.document if stored_policy else {})
+        .get("limits", {})
+        .get("publish_retry_max", 3)
+    )
+    retries_remaining = max(retry_max - retry_number, 0)
+    links = {"events": f"/v1/tasks/{task.id}/events"}
+    if retries_remaining:
+        links["republish"] = f"/v1/tasks/{task.id}/republish"
     create_wake(
         uow,
         clock,
         principal_id=task.principal_id,
         reason=WakeReason.PUBLISH_FAILED,
-        summary=f"publication failed at {step} on {task.head_sha}: {detail}"[:500],
+        summary=(
+            f"publication failed at {step} on {task.head_sha}: {detail}; "
+            f"manual publication retries used {retry_number} of {retry_max}, "
+            f"{retries_remaining} remaining"
+        )[:500],
         task=task,
         attempt_id=attempt_id,
-        extra_links={"events": f"/v1/tasks/{task.id}/events"},
+        extra_links=links,
     )
 
 

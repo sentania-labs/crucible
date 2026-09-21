@@ -61,6 +61,7 @@ class Limits(StrictModel):
     auth_retry_delay_seconds: int = Field(ge=0)
     escalation_stale_hours: int = Field(ge=1)
     wake_retry_hours: int = Field(ge=1)
+    publish_retry_max: int = Field(default=3, ge=0)
 
     @model_validator(mode="after")
     def _stall_order(self) -> Limits:

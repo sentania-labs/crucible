@@ -263,22 +263,23 @@ class DeliveryCoordinator:
                 repository=plan.repository_name,
             )
             await self._host._db(lambda: self._record_minted(plan, token))
-            outcome = await self._publisher.push(self._publish_request(plan), token)
-            await self._host._db(lambda: self._record_publisher(plan, outcome))
-            if not outcome.pushed:
-                await self._host._db(
-                    lambda: self._fail(
-                        plan,
-                        step=outcome.step,
-                        detail=outcome.detail or f"the publisher exited {outcome.exit_code}",
-                        extra={
-                            "remote_head_before": outcome.remote_head_before,
-                            "author_problems": list(outcome.author_problems),
-                            "trailer_problems": list(outcome.trailer_problems),
-                        },
+            if plan.resume_step not in ("branch_pushed_at_head", "github"):
+                outcome = await self._publisher.push(self._publish_request(plan), token)
+                await self._host._db(lambda: self._record_publisher(plan, outcome))
+                if not outcome.pushed:
+                    await self._host._db(
+                        lambda: self._fail(
+                            plan,
+                            step=outcome.step,
+                            detail=outcome.detail or f"the publisher exited {outcome.exit_code}",
+                            extra={
+                                "remote_head_before": outcome.remote_head_before,
+                                "author_problems": list(outcome.author_problems),
+                                "trailer_problems": list(outcome.trailer_problems),
+                            },
+                        )
                     )
-                )
-                return False
+                    return False
             remote = await asyncio.to_thread(
                 self._github.remote_head,
                 token,

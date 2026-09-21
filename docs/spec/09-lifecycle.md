@@ -46,6 +46,7 @@ publish_failed --retry publish (decision)--> publishing
 publish_failed --cancel--> cancelled
 
 awaiting_external_review --review signal from allowlisted login--> external_feedback_received --wake-->
+awaiting_ci_certification --review signal from allowlisted login--> external_feedback_received --wake-->
 awaiting_external_review --wait_timeout_hours elapsed--> (repeat wake, reason external_review_overdue; no state change)
 external_feedback_received --every comment dispositioned, none is fix, rounds satisfied--> awaiting_ci_certification
 external_feedback_received --every comment dispositioned, none is fix, rounds outstanding--> awaiting_external_review
@@ -53,6 +54,8 @@ external_feedback_received --correction attached--> scheduled
 
 awaiting_ci_certification --required checks green on the accepted head--> ready_for_merge --wake-->
 awaiting_ci_certification --a required check failed on the accepted head--> ci_certification_failed --wake-->
+ready_for_merge --a required check on the accepted head turns red--> ci_certification_failed --wake-->
+ready_for_merge --new review signal from allowlisted login--> external_feedback_received --wake-->
 ci_certification_failed --ci-decision rerun--> awaiting_ci_certification
 ci_certification_failed --ci-decision correct, correction attached--> scheduled
 ci_certification_failed --ci-decision reject--> rejected
@@ -226,6 +229,7 @@ change.
 | task `awaiting_internal_review` | wake (reason `internal_review_needed`); if policy `executor` is `crucible` and the contract names a reviewer execution request, a `review` execution is created |
 | task `gates_passed` / `pre_pr_gates_failed` | wake created for the submitting principal |
 | task `publishing` | publisher job enqueued: mint installation token, push bundle head, open or update PR, render body; events before and after each GitHub call |
+| task `publish_failed` to `publishing` | an orchestrator or operator supplies a reason through `republish`; the same accepted head and sealed bundle resume at the failed step, subject to `limits.publish_retry_max`; no tick retries automatically |
 | task `awaiting_external_review` | PR observation registered (polling and webhook routing) |
 | task `external_feedback_received` | ExternalReview and comment rows written; wake |
 | task `ci_certification_failed` | CICertification row with captured check, workflow, job, log pointers, head SHA; wake; no retry, no correction |

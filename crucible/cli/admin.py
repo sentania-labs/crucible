@@ -48,10 +48,16 @@ from crucible.application.admin.context import AdminContext
 from crucible.application.admin.login import LoginRegistry
 from crucible.application.auth import mint_token
 from crucible.application.errors import ApplicationError
+from crucible.application.queries import task_view
+from crucible.application.republish import republish_task
 from crucible.application.transitions import record_event
 from crucible.cli.wiring import Wiring, wire
-from crucible.contracts.api import ExternalReviewAttestation, RepositoryRegistration
-from crucible.domain.entities import Role
+from crucible.contracts.api import (
+    ExternalReviewAttestation,
+    PublishRetryRequest,
+    RepositoryRegistration,
+)
+from crucible.domain.entities import Principal, Role
 from crucible.domain.events import EventKind
 from crucible.domain.ids import new_id
 from crucible.logs import configure_logging
@@ -74,6 +80,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("migrate", help="apply migrations to head")
     sub.add_parser("status", help="the status document (25)")
+
+    task = sub.add_parser("task", help="task recovery operations")
+    task_sub = task.add_subparsers(dest="task_command", required=True)
+    republish = task_sub.add_parser("republish", help="retry a failed publication")
+    republish.add_argument("task_id")
+    republish.add_argument("--reason", required=True)
 
     token = sub.add_parser("token", help="token management")
     token_sub = token.add_subparsers(dest="token_command", required=True)
@@ -230,6 +242,14 @@ def _remote(args: argparse.Namespace, remote: Remote) -> None:
     command = args.command
     if command == "status":
         _emit(remote.call("GET", "/v1/admin/status"))
+    elif command == "task":
+        _emit(
+            remote.call(
+                "POST",
+                f"/v1/tasks/{args.task_id}/republish",
+                {"reason": args.reason},
+            )
+        )
     elif command == "token":
         if args.token_command == "list":
             _emit(remote.call("GET", "/v1/admin/tokens"))
@@ -404,6 +424,22 @@ def _local(args: argparse.Namespace, wiring: Wiring) -> None:
     if command == "status":
         with wiring.ctx.uow_factory() as uow:
             _emit(asyncio.run(status_admin.status(admin, uow)))
+    elif command == "task":
+        with wiring.ctx.uow_factory() as uow:
+            task = republish_task(
+                uow,
+                wiring.ctx.clock,
+                principal=Principal(
+                    id=CLI_PRINCIPAL,
+                    name=CLI_PRINCIPAL,
+                    role=Role.ADMIN,
+                    created_at=wiring.ctx.clock.now(),
+                ),
+                task_id=args.task_id,
+                request=PublishRetryRequest(reason=args.reason),
+            )
+            uow.commit()
+            _emit(task_view(uow, task.id).model_dump(mode="json"))
     elif command == "harnesses":
         with wiring.ctx.uow_factory() as uow:
             if args.harness_command == "list":

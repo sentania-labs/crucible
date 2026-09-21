@@ -50,6 +50,7 @@ def test_openapi_generates_from_the_pydantic_models() -> None:
     assert {
         "/v1/tasks/{task_id}/review",
         "/v1/tasks/{task_id}/accept",
+        "/v1/tasks/{task_id}/republish",
         "/v1/tasks/{task_id}/corrections",
         "/v1/attempts/{attempt_id}/gates",
         "/v1/attempts/{attempt_id}/logs",
