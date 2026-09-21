@@ -447,7 +447,7 @@ def supervisor_view(
 ) -> SupervisorView:
     lease = uow.leases.get_supervisor()
     status = uow.supervisor_status.get()
-    healthy, _ = supervisor_health(uow, now, lease_ttl_seconds)
+    healthy, health_detail = supervisor_health(uow, now, lease_ttl_seconds)
     return SupervisorView(
         lease=(
             {
@@ -463,6 +463,7 @@ def supervisor_view(
         last_error_at=status.last_error_at,
         last_error=status.last_error,
         healthy=healthy,
+        health_detail=health_detail,
         tick_ms=status.tick_ms,
         counts={**status.counts, "wakes_unacked": uow.wakes.count_unacked()},
         providers=[{"name": p.name, **p.capabilities().as_dict()} for p in providers],

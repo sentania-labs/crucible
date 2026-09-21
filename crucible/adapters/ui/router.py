@@ -200,6 +200,43 @@ def _redirect(form: dict[str, str], message: str, *, kind: str = "ok") -> Redire
     )
 
 
+def _readiness_gaps(document: dict[str, Any], *, repository_registered: bool) -> list[list[str]]:
+    """Plain operator actions derived only from fields in the status document."""
+    gaps: list[list[str]] = []
+    supervisor = document["supervisor"]
+    if not supervisor["healthy"]:
+        gaps.append([f"The supervisor is not ready: {supervisor['health_detail']}.", "/ui"])
+    for item in document["harnesses"]:
+        if item["enabled_by_configuration"] and not item["enabled"]:
+            gaps.append(
+                [f"{item['name']} is disabled. Open Harnesses to enable it.", "/ui/harnesses"]
+            )
+        if item["credential"]["state"] in ("absent", "invalid"):
+            gaps.append(
+                [
+                    f"{item['name']} needs a credential. Open Credentials to log in.",
+                    "/ui/credentials",
+                ]
+            )
+        if item["enabled"] and not any(
+            image["promotion_state"] == "default" for image in item["images"]
+        ):
+            gaps.append(
+                [
+                    f"{item['name']} has no promoted worker image. Open Images to choose one.",
+                    "/ui/images",
+                ]
+            )
+    if not repository_registered:
+        gaps.append(
+            [
+                "No repository is registered. Open Repositories before submitting work.",
+                "/ui/repositories",
+            ]
+        )
+    return gaps
+
+
 @router.get("/sign-in", response_class=HTMLResponse)
 def sign_in_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
     if _session(request, ctx, uow) is not None:
@@ -296,38 +333,7 @@ async def dashboard(request: Request, ctx: Ctx, uow: UoW) -> Response:
     if ctx.admin is None:
         raise ConflictError("the administrative surface is not configured")
     document = await status.status(ctx.admin, uow)
-    gaps: list[list[str]] = []
-    if not document["supervisor"].get("ready"):
-        gaps.append(["The supervisor is not ready. Check its lease and last error.", "/ui"])
-    for item in document["harnesses"]:
-        if item["enabled_by_configuration"] and not item["enabled"]:
-            gaps.append(
-                [f"{item['name']} is disabled. Open Harnesses to enable it.", "/ui/harnesses"]
-            )
-        credential = item.get("credential", {})
-        if credential.get("state") in ("absent", "invalid"):
-            gaps.append(
-                [
-                    f"{item['name']} needs a credential. Open Credentials to log in.",
-                    "/ui/credentials",
-                ]
-            )
-        if item["enabled"] and not any(
-            image.get("promotion_state") == "default" for image in item.get("images", [])
-        ):
-            gaps.append(
-                [
-                    f"{item['name']} has no promoted worker image. Open Images to choose one.",
-                    "/ui/images",
-                ]
-            )
-    if not uow.repositories.list_all():
-        gaps.append(
-            [
-                "No repository is registered. Open Repositories before submitting work.",
-                "/ui/repositories",
-            ]
-        )
+    gaps = _readiness_gaps(document, repository_registered=bool(uow.repositories.list_all()))
     sections = []
     if gaps:
         sections.append(
@@ -345,7 +351,7 @@ async def dashboard(request: Request, ctx: Ctx, uow: UoW) -> Response:
             {"title": "Pending wakes", "json": document["wakes"]},
         ]
     )
-    ready = not gaps and bool(document["supervisor"].get("ready"))
+    ready = not gaps and document["supervisor"]["healthy"]
     return _page(
         request,
         principal,

@@ -215,3 +215,20 @@ test covering the complete request sequence. Revision 0015 now archives its
 new event kinds while downgraded, disables both event triggers only for that
 move, and restores the audit rows on upgrade. A real PostgreSQL down-up test
 proves the event survives.
+
+## Acceptance correction
+
+Checked 2026-09-21 at 1:35 AM CDT. The status page now reads supervisor
+`healthy` and `health_detail`, both produced by the same `supervisor_health`
+rule used by `GET /v1/ready`. A healthy supervisor contributes no gap. Missing
+leases, stale successful ticks, and last-tick errors each contribute one gap
+whose text carries the canonical readiness detail.
+
+Every other readiness row was checked against its source. The harness gate
+uses `enabled_by_configuration` and `enabled`; the credential row uses
+`credential.state`; and the image row uses `enabled`, `images`, and each
+image's `promotion_state`. Those fields are all emitted by
+`admin.status.status` through `list_harnesses`. The repository row does not
+inspect the status document; it uses the repository collection directly. A
+strict unit test runs the gap logic against an actual `status.status` result
+and fails on optional or indexed access to any undefined field.
