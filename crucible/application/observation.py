@@ -111,6 +111,7 @@ class ObservationResult:
     diverged: bool = False
     accepted_signals: int = 0
     new_comments: int = 0
+    edited_feedback: int = 0
     completed_cycles: int = 0
     certification: str = ""
     state: str = ""
@@ -427,6 +428,30 @@ def record_comments(
         digest = _sha(comment.body)
         if existing is not None:
             if existing.body_sha256 != digest or existing.updated_at < comment.updated_at:
+                body_changed = existing.body_sha256 != digest
+                disposition_invalidated = False
+                if body_changed and comment.login in allowlist:
+                    result.edited_feedback += 1
+                    if comment.kind == "review_comment":
+                        result.new_comments += 1
+                        old_disposition = uow.dispositions.get_by_comment(
+                            existing.id, existing.body_sha256
+                        )
+                        if old_disposition is not None:
+                            disposition_invalidated = True
+                            record_event(
+                                uow,
+                                clock,
+                                EventKind.DISPOSITION_INVALIDATED,
+                                principal=PRINCIPAL_CRUCIBLE,
+                                task_id=task.id,
+                                payload={
+                                    "disposition_id": old_disposition.id,
+                                    "review_comment_id": existing.id,
+                                    "old_body_sha256": existing.body_sha256,
+                                    "new_body_sha256": digest,
+                                },
+                            )
                 existing.body = comment.body
                 existing.body_sha256 = digest
                 existing.updated_at = comment.updated_at
@@ -445,6 +470,8 @@ def record_comments(
                         "github_id": comment.github_id,
                         "login": comment.login,
                         "edited": True,
+                        "allowlisted": comment.login in allowlist,
+                        "disposition_invalidated": disposition_invalidated,
                         "body_sha256": digest,
                         "note": "edited in place; an edit never counts as a round (23)",
                     },
@@ -872,7 +899,11 @@ def evaluate_delivery_gates(
     )
     allowlist = reviewer_logins(policy)
     needing = [c for c in comments if c.login in allowlist and c.kind == "review_comment"]
-    recorded = list(uow.dispositions.list_for_comments([c.id for c in needing]))
+    recorded = list(
+        uow.dispositions.list_for_comments(
+            [c.id for c in needing], {c.id: c.body_sha256 for c in needing}
+        )
+    )
     dispositioned = {d.review_comment_id for d in recorded}
     # 09: advancement needs every comment dispositioned *and none of them fix*. A `fix`
     # is Foundry saying the work is not done; what follows it is a correction contract,
@@ -992,7 +1023,9 @@ def advance_delivery(
         GateResult.SKIPPED.value,
     ) or "feedback_dispositions_complete" in policy.get("gates", {}).get("skipped", [])
     feedback_from = task.state
-    feedback_activity = bool(result.accepted_signals or result.new_comments)
+    feedback_activity = bool(
+        result.accepted_signals or result.new_comments or result.edited_feedback
+    )
     if feedback_activity and task.state in (
         TaskState.AWAITING_EXTERNAL_REVIEW,
         TaskState.AWAITING_CI_CERTIFICATION,
@@ -1011,6 +1044,7 @@ def advance_delivery(
                 "pull_request": pull_request.number,
                 "accepted_signals": result.accepted_signals,
                 "new_comments": result.new_comments,
+                "edited_feedback": result.edited_feedback,
                 "completed_rounds": gates.get("completed_rounds"),
                 "feedback_from": feedback_from.value,
             },
@@ -1018,7 +1052,8 @@ def advance_delivery(
         summary = (
             f"{result.accepted_signals} external review signal(s) on "
             f"#{pull_request.number} at {pull_request.head_sha}: "
-            f"{result.new_comments} comment(s), 0 dispositions recorded"
+            f"{result.new_comments} comment(s), {result.edited_feedback} edited, "
+            "0 dispositions recorded"
         )
         feedback_needs_wake = True
         if (
@@ -1107,6 +1142,7 @@ def advance_delivery(
                         "pull_request": pull_request.number,
                         "accepted_signals": result.accepted_signals,
                         "new_comments": result.new_comments,
+                        "edited_feedback": result.edited_feedback,
                         "completed_rounds": gates.get("completed_rounds"),
                         "reason": "feedback dispositions are incomplete",
                     },
@@ -1261,7 +1297,9 @@ def ready_summary(
 ) -> str:
     """23's ready-for-merge report: Crucible produces the facts, Foundry the sentence."""
     comments = list(uow.review_comments.list_for_pull_request(pull_request.id))
-    dispositions = uow.dispositions.list_for_comments([c.id for c in comments])
+    dispositions = uow.dispositions.list_for_comments(
+        [c.id for c in comments], {c.id: c.body_sha256 for c in comments}
+    )
     checks = ", ".join(str(name) for name in certification.required_checks) or "none required"
     return (
         f"{pull_request.url} is ready for merge at {pull_request.head_sha}. "

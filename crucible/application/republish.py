@@ -6,11 +6,11 @@ import hashlib
 from pathlib import Path
 
 from crucible.application.errors import ForbiddenError, NotFoundError, TransitionNotAllowedError
+from crucible.application.publish import collected_bundle_sha256
 from crucible.application.review import latest_work_attempt
 from crucible.application.task_access import require_task_principal
 from crucible.application.transitions import move_task
 from crucible.contracts.api import PublishRetryRequest
-from crucible.contracts.evidence import EvidenceKind
 from crucible.domain.entities import AcceptanceVerdict, Principal, Role, Task
 from crucible.domain.events import EventKind
 from crucible.domain.lifecycle import TaskState
@@ -70,17 +70,7 @@ def republish_task(
         raise TransitionNotAllowedError(
             "republish requires the same sealed bundle and implementing attempt"
         )
-    bundle_evidence = next(
-        (
-            row
-            for row in reversed(uow.evidence.list_for_attempt(attempt.id))
-            if row.kind == EvidenceKind.BUNDLE_HEAD.value and row.verified
-        ),
-        None,
-    )
-    sealed_sha256 = str(
-        (bundle_evidence.payload if bundle_evidence else {}).get("bundle_sha256") or ""
-    )
+    sealed_sha256 = collected_bundle_sha256(uow, attempt) or recorded_bundle_sha256
     bundle_file = Path(expected_bundle)
     if bundle_file.is_file():
         current_sha256 = hashlib.sha256(bundle_file.read_bytes()).hexdigest()

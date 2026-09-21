@@ -709,7 +709,9 @@ def _pr_summary(uow: UnitOfWork, task_id: str) -> dict[str, Any] | None:
         return None
     cycles = uow.review_cycles.list_for_pull_request(pull_request.id)
     comments = uow.review_comments.list_for_pull_request(pull_request.id)
-    dispositions = uow.dispositions.list_for_comments([c.id for c in comments])
+    dispositions = uow.dispositions.list_for_comments(
+        [c.id for c in comments], {c.id: c.body_sha256 for c in comments}
+    )
     certifications = uow.ci_certifications.list_for_task(task_id)
     return {
         "number": pull_request.number,
@@ -740,7 +742,10 @@ def pull_request_view(uow: UnitOfWork, task_id: str) -> PullRequestView:
     cycles = list(uow.review_cycles.list_for_pull_request(pull_request.id))
     comments = list(uow.review_comments.list_for_pull_request(pull_request.id))
     dispositions = {
-        d.review_comment_id: d for d in uow.dispositions.list_for_comments([c.id for c in comments])
+        d.review_comment_id: d
+        for d in uow.dispositions.list_for_comments(
+            [c.id for c in comments], {c.id: c.body_sha256 for c in comments}
+        )
     }
     certifications = list(uow.ci_certifications.list_for_task(task_id))
     decisions = list(uow.ci_decisions.list_for_task(task_id))

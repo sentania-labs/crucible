@@ -3,7 +3,7 @@ the transaction. Every state change and its event commit together."""
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 from types import TracebackType
 from typing import Any, Protocol
@@ -340,9 +340,15 @@ class EscalationRepository(Protocol):
 class DispositionRepository(Protocol):
     def add(self, disposition: ReviewDisposition) -> None: ...
 
-    def get_by_comment(self, review_comment_id: str) -> ReviewDisposition | None: ...
+    def get_by_comment(
+        self, review_comment_id: str, comment_body_sha256: str | None = None
+    ) -> ReviewDisposition | None: ...
 
-    def list_for_comments(self, comment_ids: Sequence[str]) -> Sequence[ReviewDisposition]: ...
+    def list_for_comments(
+        self,
+        comment_ids: Sequence[str],
+        comment_body_sha256_by_comment: Mapping[str, str] | None = None,
+    ) -> Sequence[ReviewDisposition]: ...
 
 
 # ----- C4: GitHub delivery (14, 23) --------------------------------------

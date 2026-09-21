@@ -19,9 +19,11 @@ class. The token is never in the record, the event, or the log; only its expiry 
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from crucible.application.transitions import move_task, record_event
@@ -205,6 +207,29 @@ def review_reference(uow: UnitOfWork, task: Task) -> dict[str, str] | None:
     return reference
 
 
+def collected_bundle_sha256(uow: UnitOfWork, attempt: Attempt) -> str:
+    """Return the recorded seal, or seal a retained pre-upgrade bundle in place.
+
+    C7d added the digest to bundle evidence. Attempts collected before that deployment
+    have verified bundle evidence but no digest, so publication derives the seal from
+    Crucible's retained workspace before the first publisher receives it. The resulting
+    `publish_started` event makes that derived seal durable for any manual retry.
+    """
+    bundle_evidence = next(
+        (
+            row
+            for row in reversed(uow.evidence.list_for_attempt(attempt.id))
+            if row.kind == EvidenceKind.BUNDLE_HEAD.value and row.verified
+        ),
+        None,
+    )
+    recorded = str((bundle_evidence.payload if bundle_evidence else {}).get("bundle_sha256") or "")
+    if recorded:
+        return recorded
+    bundle_path = Path(f"{attempt.workspace_path}/output/work_branch.bundle")
+    return hashlib.sha256(bundle_path.read_bytes()).hexdigest() if bundle_path.is_file() else ""
+
+
 def build_plan(uow: UnitOfWork, task: Task, work: tuple[Attempt, Execution]) -> PublishPlan:
     """Read everything the publication needs and render the body. Pure of I/O beyond
     the database: the GitHub calls and the container come later."""
@@ -261,17 +286,7 @@ def build_plan(uow: UnitOfWork, task: Task, work: tuple[Attempt, Execution]) -> 
     git_policy = policy.get("git", {})
     publishing = uow.events.latest_for_task_kind(task.id, EventKind.TASK_PUBLISHING.value)
     publishing_payload = publishing.payload if publishing else {}
-    bundle_evidence = next(
-        (
-            row
-            for row in reversed(uow.evidence.list_for_attempt(attempt.id))
-            if row.kind == EvidenceKind.BUNDLE_HEAD.value and row.verified
-        ),
-        None,
-    )
-    bundle_sha256 = str(
-        (bundle_evidence.payload if bundle_evidence else {}).get("bundle_sha256", "")
-    )
+    bundle_sha256 = collected_bundle_sha256(uow, attempt)
     retry_limit = publishing_payload.get("publish_retry_max")
     if retry_limit is None:
         retry_limit = policy.get("limits", {}).get("publish_retry_max", 3)
@@ -407,7 +422,8 @@ def fail_publish(
     retry_max = int(retry_limit)
     retries_remaining = max(retry_max - retry_number, 0)
     links = {"events": f"/v1/tasks/{task.id}/events"}
-    if retries_remaining:
+    started = uow.events.latest_for_task_kind(task.id, EventKind.PUBLISH_STARTED.value)
+    if retries_remaining and started is not None:
         links["republish"] = f"/v1/tasks/{task.id}/republish"
     create_wake(
         uow,

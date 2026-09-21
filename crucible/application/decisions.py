@@ -204,11 +204,6 @@ def record_disposition(
     require_task_principal(principal, task)
     if principal.role not in (Role.ORCHESTRATOR, Role.OPERATOR):
         raise ForbiddenError("only an orchestrator or operator principal records dispositions")
-    existing = uow.dispositions.get_by_comment(request.review_comment_id)
-    if existing is not None:
-        raise TransitionNotAllowedError(
-            f"review comment {request.review_comment_id} already has a disposition"
-        )
     comment = uow.review_comments.get(request.review_comment_id)
     if comment is None:
         raise NotFoundError(f"review comment {request.review_comment_id!r} is unknown")
@@ -217,10 +212,22 @@ def record_disposition(
         raise NotFoundError(
             f"review comment {request.review_comment_id!r} is not on this task's pull request"
         )
+    existing = uow.dispositions.get_by_comment(request.review_comment_id, comment.body_sha256)
+    if existing is not None:
+        raise TransitionNotAllowedError(
+            f"review comment {request.review_comment_id} already has a disposition"
+        )
     # A `fix` disposition is Foundry's finding, not an instruction to a worker: Crucible
     # never forwards feedback (ADR 0008). The correction contract that follows is
     # Foundry's own act through POST /tasks/{id}/corrections.
-    return store_disposition(uow, clock, principal=principal, task_id=task_id, request=request)
+    return store_disposition(
+        uow,
+        clock,
+        principal=principal,
+        task_id=task_id,
+        request=request,
+        comment_body_sha256=comment.body_sha256,
+    )
 
 
 def store_disposition(
@@ -230,11 +237,13 @@ def store_disposition(
     principal: Principal,
     task_id: str,
     request: DispositionRequest,
+    comment_body_sha256: str,
 ) -> ReviewDisposition:
     """The row-writing half, kept separate so C4 can call it once comments exist."""
     disposition = ReviewDisposition(
         id=new_id(),
         review_comment_id=request.review_comment_id,
+        comment_body_sha256=comment_body_sha256,
         principal_id=principal.id,
         disposition=request.disposition,
         reasoning=request.reasoning,

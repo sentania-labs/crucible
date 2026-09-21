@@ -39,7 +39,7 @@ from tests.integration.conftest import (
     run_to_settled,
     submit_and_start,
 )
-from tests.integration.fake_github import FakeGitHubServer, installation_token_value
+from tests.integration.fake_github import FakeGitHubServer, installation_token_value, now_iso
 from tests.integration.fake_publisher import FakePublisher
 from tests.integration.test_class_routing import _install_policy as install_class_policy
 from tests.integration.test_class_routing import _model as class_model
@@ -285,6 +285,100 @@ async def test_token_mint_failure_republishes_from_before_push(
 
     assert client.get(f"/v1/tasks/{task_id}").json()["state"] == "awaiting_external_review"
     assert len(publisher.pushes) == 1
+
+
+async def test_pre_start_installation_failure_can_be_republished(
+    client: TestClient,
+    ctx: AppContext,
+    delivery_supervisor: Supervisor,
+    publisher: FakePublisher,
+) -> None:
+    task_id = submit_and_start(client, "crucible-worker:fake-succeed")
+    await run_to_settled(delivery_supervisor, client, task_id)
+    await review_and_settle(delivery_supervisor, client, task_id)
+    with ctx.uow_factory() as uow:
+        task = uow.tasks.get(task_id)
+        assert task is not None
+        repository = uow.repositories.get(task.repository_id)
+        assert repository is not None
+        repository.installation_id = None
+        uow.repositories.upsert(repository)
+        uow.commit()
+
+    accepted = client.post(
+        f"/v1/tasks/{task_id}/accept",
+        json={"verdict": "accepted", "reasoning": "The evidence is sufficient."},
+    )
+    assert accepted.status_code == 200, accepted.text
+    await delivery_supervisor.tick()
+    assert client.get(f"/v1/tasks/{task_id}").json()["state"] == "publish_failed"
+    assert "publish_started" in event_kinds(client, task_id)
+    assert publisher.pushes == []
+
+    with ctx.uow_factory() as uow:
+        task = uow.tasks.get(task_id)
+        assert task is not None
+        repository = uow.repositories.get(task.repository_id)
+        assert repository is not None
+        repository.installation_id = 1
+        uow.repositories.upsert(repository)
+        uow.commit()
+    response = client.post(
+        f"/v1/tasks/{task_id}/republish",
+        json={"reason": "The repository installation ID is now registered."},
+    )
+    assert response.status_code == 200, response.text
+    await delivery_supervisor.tick()
+
+    assert client.get(f"/v1/tasks/{task_id}").json()["state"] == "awaiting_external_review"
+    assert len(publisher.pushes) == 1
+
+
+async def test_pre_upgrade_bundle_is_sealed_before_publication(
+    client: TestClient,
+    engine: Engine,
+    delivery_supervisor: Supervisor,
+    publisher: FakePublisher,
+    tmp_path: Path,
+) -> None:
+    task_id = submit_and_start(client, "crucible-worker:fake-succeed")
+    await run_to_settled(delivery_supervisor, client, task_id)
+    await review_and_settle(delivery_supervisor, client, task_id)
+    output = tmp_path / "output"
+    output.mkdir()
+    bundle = output / "work_branch.bundle"
+    bundle.write_bytes(b"bundle collected before the digest field existed")
+    expected_sha256 = hashlib.sha256(bundle.read_bytes()).hexdigest()
+    assert delivery_supervisor.fenced_token is not None
+    with engine.begin() as connection:
+        connection.execute(
+            text("SELECT set_config('crucible.fenced_token', :token, true)"),
+            {"token": str(delivery_supervisor.fenced_token)},
+        )
+        connection.execute(
+            text("UPDATE attempts SET workspace_path = :workspace WHERE task_id = :task_id"),
+            {"workspace": str(tmp_path), "task_id": task_id},
+        )
+        connection.execute(
+            text(
+                "UPDATE evidence SET payload = payload - 'bundle_sha256' "
+                "WHERE task_id = :task_id AND kind = 'bundle_head'"
+            ),
+            {"task_id": task_id},
+        )
+
+    accepted = client.post(
+        f"/v1/tasks/{task_id}/accept",
+        json={"verdict": "accepted", "reasoning": "Publish the retained bundle."},
+    )
+    assert accepted.status_code == 200, accepted.text
+    await delivery_supervisor.tick()
+
+    assert client.get(f"/v1/tasks/{task_id}").json()["state"] == "awaiting_external_review"
+    assert publisher.bundle_sha256s == [expected_sha256]
+    events = client.get(f"/v1/tasks/{task_id}/events", params={"limit": 200}).json()["items"]
+    started = [event for event in events if event["kind"] == "publish_started"]
+    assert started[-1]["payload"]["bundle_sha256"] == expected_sha256
 
 
 async def test_republish_refuses_changed_bundle_content(
@@ -763,6 +857,52 @@ async def test_new_inline_comment_on_recorded_review_revokes_ready(
 
     assert client.get(f"/v1/tasks/{task_id}").json()["state"] == "external_feedback_received"
     assert gate(pr(client, task_id), "feedback_dispositions_complete") == "pending"
+
+
+async def test_edited_inline_comment_invalidates_its_old_disposition(
+    client: TestClient, delivery_supervisor: Supervisor, github: FakeGitHubServer
+) -> None:
+    task_id, view = await publish(client, delivery_supervisor)
+    github.state.add_review(
+        REPOSITORY,
+        1,
+        login=REVIEWER,
+        body="Codex Review",
+        comments=[{"body": "P2 original finding", "path": "src/app.txt", "line": 5}],
+    )
+    await delivery_supervisor.tick()
+    comment_id = pr(client, task_id)["comments"][0]["id"]
+    response = client.post(
+        f"/v1/tasks/{task_id}/dispositions",
+        json={
+            "review_comment_id": comment_id,
+            "disposition": "decline",
+            "reasoning": "The original text does not apply.",
+        },
+    )
+    assert response.status_code == 200, response.text
+    await delivery_supervisor.tick()
+    github.state.repositories[REPOSITORY].required_checks = ["build"]
+    github.state.set_check(REPOSITORY, view["head_sha"], name="build", conclusion="success")
+    await delivery_supervisor.tick()
+    assert client.get(f"/v1/tasks/{task_id}").json()["state"] == "ready_for_merge"
+
+    comment = github.state.repositories[REPOSITORY].pulls[1].review_comments[0]
+    comment["body"] = "P1 edited text introduces a different finding"
+    comment["updated_at"] = now_iso(1)
+    await delivery_supervisor.tick()
+
+    assert client.get(f"/v1/tasks/{task_id}").json()["state"] == "external_feedback_received"
+    assert gate(pr(client, task_id), "feedback_dispositions_complete") == "pending"
+    response = client.post(
+        f"/v1/tasks/{task_id}/dispositions",
+        json={
+            "review_comment_id": comment_id,
+            "disposition": "decline",
+            "reasoning": "The edited text was evaluated separately.",
+        },
+    )
+    assert response.status_code == 200, response.text
 
 
 async def test_a_required_failure_lands_in_ci_certification_failed_with_evidence(

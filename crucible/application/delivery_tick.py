@@ -226,6 +226,7 @@ class DeliveryCoordinator:
                     )
                     continue
                 plan = build_plan(uow, task, work)
+                record_publish_started(uow, self._clock, plan)
                 if plan.problem:
                     fail_publish(
                         uow,
@@ -249,7 +250,6 @@ class DeliveryCoordinator:
                         attempt_id=plan.attempt_id,
                     )
                     continue
-                record_publish_started(uow, self._clock, plan)
                 plans.append(plan)
             uow.commit()
         return plans

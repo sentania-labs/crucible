@@ -380,6 +380,7 @@ class Wake:
 class ReviewDisposition:
     id: str
     review_comment_id: str
+    comment_body_sha256: str
     principal_id: str
     disposition: DispositionKind
     reasoning: str
