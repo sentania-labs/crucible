@@ -990,11 +990,16 @@ def advance_delivery(
     dispositions_ok = results.get("feedback_dispositions_complete") in (
         GateResult.PASS.value,
         GateResult.SKIPPED.value,
-    )
-    if task.state is TaskState.AWAITING_EXTERNAL_REVIEW and result.accepted_signals:
-        # 09: a signal moves the task to `external_feedback_received` whatever the round
-        # count says. Whether it then advances, and to where, is the dispositions gate's
-        # answer and `advance_from_feedback`'s branch, never this condition.
+    ) or "feedback_dispositions_complete" in policy.get("gates", {}).get("skipped", [])
+    feedback_from = task.state
+    if result.accepted_signals and task.state in (
+        TaskState.AWAITING_EXTERNAL_REVIEW,
+        TaskState.AWAITING_CI_CERTIFICATION,
+        TaskState.READY_FOR_MERGE,
+    ):
+        # An accepted signal wins the race with CI. It is recorded before any green or
+        # failed certification can advance the task, and ready_for_merge steps back for
+        # a new signal on the same head.
         move_task(
             uow,
             clock,
@@ -1006,6 +1011,7 @@ def advance_delivery(
                 "accepted_signals": result.accepted_signals,
                 "new_comments": result.new_comments,
                 "completed_rounds": gates.get("completed_rounds"),
+                "feedback_from": feedback_from.value,
             },
         )
         summary = (
@@ -1013,33 +1019,51 @@ def advance_delivery(
             f"#{pull_request.number} at {pull_request.head_sha}: "
             f"{result.new_comments} comment(s), 0 dispositions recorded"
         )
-        if result.new_comments == 0 and dispositions_ok:
+        feedback_needs_wake = True
+        if (
+            result.new_comments == 0
+            and dispositions_ok
+            and feedback_from is not TaskState.READY_FOR_MERGE
+        ):
             # 23: a round with no findings has nothing to disposition. Crucible records
             # it and advances without a wake for judgment; with rounds still outstanding
             # `advance_from_feedback` sends it back to wait for the next one.
             advance_from_feedback(
                 uow, clock, task=task, pull_request=pull_request, gates=gates, policy=policy
             )
+            if feedback_from is TaskState.AWAITING_EXTERNAL_REVIEW:
+                return
+            feedback_needs_wake = False
+            # A clean signal received during CI returns to certification and may use the
+            # certification from this same observation. A signal after ready_for_merge
+            # always leaves the task stepped back for a later reconciliation.
+        if feedback_needs_wake:
+            create_wake(
+                uow,
+                clock,
+                principal_id=task.principal_id,
+                reason=WakeReason.EXTERNAL_FEEDBACK_RECEIVED,
+                summary=summary,
+                task=task,
+                extra_links={
+                    "pull_request": f"/v1/tasks/{task.id}/pull-request",
+                    "dispositions": f"/v1/tasks/{task.id}/dispositions",
+                },
+            )
             return
-        create_wake(
-            uow,
-            clock,
-            principal_id=task.principal_id,
-            reason=WakeReason.EXTERNAL_FEEDBACK_RECEIVED,
-            summary=summary,
-            task=task,
-            extra_links={
-                "pull_request": f"/v1/tasks/{task.id}/pull-request",
-                "dispositions": f"/v1/tasks/{task.id}/dispositions",
-            },
-        )
-        return
     if task.state is TaskState.EXTERNAL_FEEDBACK_RECEIVED and dispositions_ok:
         advance_from_feedback(
             uow, clock, task=task, pull_request=pull_request, gates=gates, policy=policy
         )
         return
-    if task.state is TaskState.AWAITING_CI_CERTIFICATION and certification is not None:
+    if (
+        task.state
+        in (
+            TaskState.AWAITING_CI_CERTIFICATION,
+            TaskState.READY_FOR_MERGE,
+        )
+        and certification is not None
+    ):
         if certification.state == CertificationState.FAILED.value:
             move_task(
                 uow,
@@ -1067,10 +1091,41 @@ def advance_delivery(
                 extra_links={"ci_decision": f"/v1/tasks/{task.id}/ci-decision"},
             )
             return
-        if certification.state in (
+        if task.state is TaskState.AWAITING_CI_CERTIFICATION and certification.state in (
             CertificationState.GREEN.value,
             CertificationState.SKIPPED.value,
         ):
+            if not dispositions_ok:
+                move_task(
+                    uow,
+                    clock,
+                    task,
+                    TaskState.EXTERNAL_FEEDBACK_RECEIVED,
+                    EventKind.TASK_EXTERNAL_FEEDBACK_RECEIVED,
+                    payload={
+                        "pull_request": pull_request.number,
+                        "accepted_signals": result.accepted_signals,
+                        "new_comments": result.new_comments,
+                        "completed_rounds": gates.get("completed_rounds"),
+                        "reason": "feedback dispositions are incomplete",
+                    },
+                )
+                create_wake(
+                    uow,
+                    clock,
+                    principal_id=task.principal_id,
+                    reason=WakeReason.EXTERNAL_FEEDBACK_RECEIVED,
+                    summary=(
+                        f"CI is {certification.state} on {certification.head_sha}, but "
+                        "review feedback still needs disposition"
+                    ),
+                    task=task,
+                    extra_links={
+                        "pull_request": f"/v1/tasks/{task.id}/pull-request",
+                        "dispositions": f"/v1/tasks/{task.id}/dispositions",
+                    },
+                )
+                return
             move_task(
                 uow,
                 clock,

@@ -309,10 +309,29 @@ async def test_a_task_reaches_a_real_pull_request_and_a_real_merge(
         live_supervisor,
         live_client,
         task_id,
-        {"ready_for_merge", "rejected"},
+        {"ready_for_merge", "external_feedback_received", "rejected"},
         max_ticks=20,
         pause=2.0,
     )
+    if ready == "external_feedback_received":
+        # A clean accepted signal can arrive after green CI first made the task ready.
+        # CRU-04 deliberately steps it back. Never auto-disposition a real finding in
+        # this tier: only a clean signal may reconcile forward without judgment.
+        feedback = live_client.get(f"/v1/tasks/{task_id}/pull-request").json()
+        undispositioned = [
+            comment
+            for comment in feedback["comments"]
+            if comment["kind"] == "review_comment" and comment["disposition"] is None
+        ]
+        assert undispositioned == [], undispositioned
+        ready = await run_until(
+            live_supervisor,
+            live_client,
+            task_id,
+            {"ready_for_merge", "rejected"},
+            max_ticks=5,
+            pause=2.0,
+        )
     assert ready == "ready_for_merge"
     certification = live_client.get(f"/v1/tasks/{task_id}/pull-request").json()[
         "ci_certifications"
