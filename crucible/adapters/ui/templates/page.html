@@ -16,7 +16,7 @@
     </dl>{% else %}<p class="admin-empty">none</p>{% endif %}
   {% elif panel.kind == "table" %}
     <div class="admin-table-wrap lat-table-scroll"><table class="admin-table lat-table"><thead><tr>{% for column in panel.columns %}<th title="{{ column.source }}">{{ column.label }}</th>{% endfor %}</tr></thead><tbody>
-    {% for row in panel.rows %}<tr>{% for cell in row %}<td>{{ render_value(cell) }}</td>{% endfor %}</tr>{% endfor %}
+    {% for row in panel.rows %}<tr>{% for cell in row %}<td>{% if cell is mapping and cell.kind is defined %}{{ render_panel(cell) }}{% else %}{{ render_value(cell) }}{% endif %}</td>{% endfor %}</tr>{% endfor %}
     </tbody></table></div>
   {% elif panel.kind == "values" %}{{ render_value(panel["items"]) }}
   {% elif panel.kind == "empty" %}<p class="admin-empty">none</p>
@@ -31,7 +31,7 @@
     {% if section.note %}<p class="lat-hint">{{ section.note }}</p>{% endif %}
     {% if section.rows is defined %}
       {% if section.rows %}<div class="admin-table-wrap lat-table-scroll"><table class="admin-table lat-table"><thead><tr>{% for column in section.columns %}<th>{{ column }}</th>{% endfor %}</tr></thead><tbody>
-      {% for row in section.rows %}<tr>{% for cell in row %}<td>{% if cell is string and cell.startswith('/ui') %}<a href="{{ cell }}">Open</a>{% elif cell is mapping or (cell is sequence and cell is not string) %}{{ render_panel(panel_from_cell(cell)) }}{% else %}{{ cell if cell is not none else "none" }}{% endif %}</td>{% endfor %}</tr>{% endfor %}
+      {% for row in section.rows %}<tr>{% for cell in row %}<td>{% if cell is string and cell.startswith('/ui') %}<a href="{{ cell }}">Open</a>{% elif cell is mapping or (cell is sequence and cell is not string) %}{{ render_panel(panel_from_cell(cell)) }}{% else %}{{ safe_value(section.columns[loop.index0], cell) }}{% endif %}</td>{% endfor %}</tr>{% endfor %}
       </tbody></table></div>{% else %}<p class="admin-empty">Nothing to show.</p>{% endif %}
     {% endif %}
     {% if section.panel is defined %}{{ render_panel(section.panel) }}{% endif %}

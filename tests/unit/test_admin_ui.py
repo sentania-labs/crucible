@@ -19,11 +19,13 @@ from crucible.adapters.persistence.migrations.versions._0001_walking_skeleton im
 from crucible.adapters.persistence.migrations.versions._0008_harness_adapters import (
     VERIFIED_ROUTING,
 )
+from crucible.adapters.ui import router as ui_router
 from crucible.adapters.ui.router import (
     _document_section,
     _localize,
     _panel,
     _readiness_gaps,
+    _safe_value,
     templates,
 )
 from crucible.application.admin import audit as audit_service
@@ -142,7 +144,16 @@ def _panel_leaves(panel: dict[str, Any]) -> list[Any]:
             leaves.extend(_panel_leaves(item["panel"]) if "panel" in item else [item["value"]])
         return leaves
     if panel["kind"] == "table":
-        return [leaf for row in panel["rows"] for cell in row for leaf in _document_leaves(cell)]
+        return [
+            leaf
+            for row in panel["rows"]
+            for cell in row
+            for leaf in (
+                _panel_leaves(cell)
+                if isinstance(cell, dict) and "kind" in cell
+                else _document_leaves(cell)
+            )
+        ]
     if panel["kind"] == "values":
         return [leaf for item in panel["items"] for leaf in _document_leaves(item)]
     if panel["kind"] == "empty":
@@ -214,6 +225,55 @@ def test_all_document_sections_suppress_secret_shaped_values() -> None:
     assert "present" in rendered and "absent" in rendered
 
 
+def test_nested_lists_stay_readable_and_suppress_secrets_at_any_depth() -> None:
+    marker = "ghp_" + "q" * 40
+    document = {
+        "entries": [
+            {
+                "description": f"provider returned {marker}",
+                "details": [{"access_token": "LEAK-MARKER", "state": "ready"}],
+                "checks": {},
+                "lease": {"fenced_token": 27},
+            }
+        ]
+    }
+
+    rendered = _render_documents([_document_section("Nested", document)])
+
+    assert marker not in rendered
+    assert "LEAK-MARKER" not in rendered
+    assert "[redacted:github_token]" in rendered
+    assert "not displayed" in rendered
+    assert "ready" in rendered
+    assert "Checks" in rendered and ">none<" in rendered
+    assert "27" in rendered
+    assert "{'" not in rendered and '{"' not in rendered
+
+
+def test_coded_urls_and_manual_table_cells_are_sanitized() -> None:
+    code = "ABCD-EFGH"
+    marker = "ghp_" + "q" * 40
+    sections = [
+        {
+            "title": "Repositories",
+            "columns": ["URL", "Description"],
+            "rows": [["https://user:password@example.invalid/repo", f"failure {marker}"]],
+        }
+    ]
+
+    rendered = _render_documents(sections)
+
+    assert "user:password" not in rendered
+    assert marker not in rendered
+    assert "[redacted:github_token]" in rendered
+    assert code not in _safe_value(
+        "device_url", f"https://example.invalid/device#user_code={code}"
+    )
+    assert code not in _safe_value(
+        "device_url", f"https://example.invalid/device?user%5Fcode={code}"
+    )
+
+
 def test_document_pages_have_no_generic_dump_markup() -> None:
     rendered = _render_documents(
         [
@@ -238,6 +298,35 @@ def test_live_log_tail_is_the_only_page_template_preformatted_text() -> None:
 
     assert rendered.count("<pre") == 1
     assert "worker output" in rendered
+
+
+def test_live_log_tail_redacts_secret_shaped_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    marker = "ghp_" + "q" * 40
+    logs = SimpleNamespace(
+        last_offset=lambda _attempt_id: len(marker),
+        list_from_offset=lambda _attempt_id, **_kwargs: [
+            SimpleNamespace(content=f"before {marker} after".encode())
+        ],
+    )
+    principal = SimpleNamespace(name="reader", role=SimpleNamespace(value="observer"))
+    rendered: dict[str, Any] = {}
+    monkeypatch.setattr(ui_router, "_require", lambda *_args: (principal, "fixture-csrf"))
+    monkeypatch.setattr(
+        ui_router,
+        "_page",
+        lambda *_args, sections, **_kwargs: rendered.update(sections=sections),
+    )
+
+    ui_router.worker_logs(
+        request("/ui/workers/attempt-1/logs"),
+        "attempt-1",
+        cast(Any, SimpleNamespace()),
+        cast(Any, SimpleNamespace(logs=logs)),
+    )
+    text = rendered["sections"][0]["text"]
+
+    assert marker not in text
+    assert "[redacted:github_token]" in text
 
 
 NOW = datetime(2026, 9, 21, 6, 30, tzinfo=UTC)

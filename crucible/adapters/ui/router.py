@@ -10,7 +10,7 @@ import tomllib
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, quote, urlsplit, urlunsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Request
@@ -39,7 +39,7 @@ from crucible.application.errors import ApplicationError, ConflictError, Forbidd
 from crucible.application.policies import put_policy, put_routing_policy
 from crucible.contracts.api import ExternalReviewAttestation, RepositoryRegistration
 from crucible.domain.entities import Principal, Role
-from crucible.domain.secrets import scan_text
+from crucible.domain.secrets import redact, scan_text
 from crucible.ports.repository import UnitOfWork
 
 ROOT = Path(__file__).parent
@@ -147,8 +147,10 @@ def _operator_label(key: str) -> str:
 
 
 def _secret_field(key: str) -> bool:
-    lowered = key.lower().replace(".", "_")
-    if lowered in NON_SECRET_TOKEN_FIELDS:
+    separated = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", key).lower()
+    terminal = separated.rsplit(".", 1)[-1]
+    lowered = separated.replace(".", "_")
+    if lowered in NON_SECRET_TOKEN_FIELDS or terminal in NON_SECRET_TOKEN_FIELDS:
         return False
     if lowered.endswith("_present") or lowered.endswith("_fingerprint"):
         return False
@@ -168,12 +170,13 @@ def _safe_value(key: str, value: Any) -> Any:
         return "not displayed"
     if isinstance(value, str) and "://" in value:
         parsed = urlsplit(value)
-        sensitive_query = any(
+        url_parameters = unquote(f"{parsed.query}&{parsed.fragment}")
+        sensitive_parameters = any(
             _secret_field(partition.partition("=")[0])
-            for partition in parsed.query.split("&")
+            for partition in re.split(r"[&?;]", url_parameters)
             if partition
         )
-        if parsed.username is not None or parsed.password is not None or sensitive_query:
+        if parsed.username is not None or parsed.password is not None or sensitive_parameters:
             hostname = parsed.hostname or ""
             if parsed.port is not None:
                 hostname += f":{parsed.port}"
@@ -197,15 +200,21 @@ def _safe_value(key: str, value: Any) -> Any:
         return "yes" if value else "no"
     if value is None:
         return "none"
+    if isinstance(value, str):
+        return redact(value)
     return value
 
 
 def _flatten_table_row(value: dict[str, Any], prefix: str = "") -> dict[str, Any]:
+    if not value:
+        return {prefix or "value": _panel(value, key=prefix)}
     row: dict[str, Any] = {}
     for child_key, item in value.items():
         path = f"{prefix}.{child_key}" if prefix else str(child_key)
         if isinstance(item, dict):
             row.update(_flatten_table_row(item, path))
+        elif isinstance(item, list):
+            row[path] = _panel(item, key=path)
         else:
             row[path] = _safe_value(path, item)
     return row
@@ -239,10 +248,14 @@ def _panel(value: Any, *, key: str = "") -> dict[str, Any]:
                 ],
                 "rows": [[row.get(path, "none") for path in column_keys] for row in flattened],
             }
+        rows = [
+            [_panel(item, key=key)] if isinstance(item, (dict, list)) else [_safe_value(key, item)]
+            for item in value
+        ]
         return {
             "kind": "table",
             "columns": [{"label": "Value", "source": key}],
-            "rows": [[_safe_value(key, item)] for item in value],
+            "rows": rows,
         }
     return {"kind": "value", "value": _safe_value(key, value)}
 
@@ -252,6 +265,7 @@ def _document_section(title: str, document: Any) -> dict[str, Any]:
 
 
 templates.env.globals["panel_from_cell"] = _panel
+templates.env.globals["safe_value"] = _safe_value
 
 
 def _serializer(ctx: Any) -> URLSafeTimedSerializer:
@@ -1158,7 +1172,7 @@ def worker_logs(request: Request, attempt_id: str, ctx: Ctx, uow: UoW) -> Respon
         active="/ui/workers",
         heading=f"Log tail: {attempt_id}",
         intro="Stored stdout and stderr tail. Refresh to follow an active attempt.",
-        sections=[{"title": "Tail", "text": text[-65536:]}],
+        sections=[{"title": "Tail", "text": redact(text[-65536:])}],
     )
 
 
