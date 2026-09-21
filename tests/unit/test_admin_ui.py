@@ -2,17 +2,47 @@
 
 from __future__ import annotations
 
+import asyncio
+import html
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
 from starlette.requests import Request
 
-from crucible.adapters.ui.router import _readiness_gaps, templates
+from crucible.adapters.execution.fake import FakeProvider
+from crucible.adapters.persistence.migrations.versions._0001_walking_skeleton import (
+    DEFAULT_POLICY,
+)
+from crucible.adapters.persistence.migrations.versions._0008_harness_adapters import (
+    VERIFIED_ROUTING,
+)
+from crucible.adapters.ui.router import (
+    _document_section,
+    _localize,
+    _panel,
+    _readiness_gaps,
+    templates,
+)
+from crucible.application.admin import audit as audit_service
+from crucible.application.admin import bootstrap as bootstrap_service
+from crucible.application.admin import github as github_service
+from crucible.application.admin import providers as providers_service
+from crucible.application.admin import routing as routing_service
 from crucible.application.admin import status as status_service
 from crucible.application.queries import supervisor_view
-from crucible.domain.entities import Lease, SupervisorStatus
+from crucible.domain.entities import (
+    BootstrapImport,
+    Event,
+    Lease,
+    PoolExhaustion,
+    RetentionAction,
+    SupervisorStatus,
+)
+from crucible.domain.events import EventKind
+from crucible.domain.lifecycle import TaskState
 
 
 def request(path: str) -> Request:
@@ -93,6 +123,119 @@ def test_reader_login_page_has_state_but_no_operator_controls() -> None:
     assert "sensitive operator output" not in rendered
     assert "/ui/actions/login-" not in rendered
     assert "<script>" not in rendered
+
+
+def _render_documents(sections: list[dict[str, Any]]) -> str:
+    return templates.get_template("page.html").render(
+        **base_context("/ui"),
+        heading="Readable panels",
+        intro="Fixture",
+        sections=_localize(sections, "America/Chicago"),
+        badge=None,
+    )
+
+
+def _panel_leaves(panel: dict[str, Any]) -> list[Any]:
+    if panel["kind"] == "fields":
+        leaves: list[Any] = []
+        for item in panel["items"]:
+            leaves.extend(_panel_leaves(item["panel"]) if "panel" in item else [item["value"]])
+        return leaves
+    if panel["kind"] == "table":
+        return [leaf for row in panel["rows"] for cell in row for leaf in _document_leaves(cell)]
+    if panel["kind"] == "values":
+        return [leaf for item in panel["items"] for leaf in _document_leaves(item)]
+    if panel["kind"] == "empty":
+        return []
+    return [panel["value"]]
+
+
+def _document_leaves(value: Any) -> list[Any]:
+    if isinstance(value, dict):
+        return [leaf for item in value.values() for leaf in _document_leaves(item)]
+    if isinstance(value, list):
+        return [leaf for item in value for leaf in _document_leaves(item)]
+    return [value]
+
+
+def test_readable_panel_preserves_every_supervisor_service_leaf() -> None:
+    document = _supervisor_document(_lease(), _status())
+    panel = _panel(document)
+    rendered = _render_documents([_document_section("Supervisor", document)])
+
+    assert len(_panel_leaves(panel)) == len(_document_leaves(document))
+    assert "Lease holder" in rendered
+    assert "Last successful tick" in rendered
+    assert "healthy" in rendered
+    assert "2026-09-21 01:30:00 AM CDT" in rendered
+    assert "2026-09-21T06:30:00" not in rendered
+    assert "<pre" not in rendered
+    assert "{&#34;" not in rendered and '{"' not in rendered
+
+
+def test_all_document_sections_suppress_secret_shaped_values() -> None:
+    marker = "LEAK-MARKER-7f394b"
+    document = {
+        "token": marker,
+        "access_token": marker,
+        "refresh_token": marker,
+        "device_code": marker,
+        "password": marker,
+        "webhook_secret": marker,
+        "private_key": marker,
+        "credential_value": marker,
+        "authorization": marker,
+        "device_url": f"https://example.invalid/device?user_code={marker}",
+        "key_present": True,
+        "webhook_secret_present": False,
+    }
+    titles = (
+        "Supervisor",
+        "Providers",
+        "Status task state",
+        "Pending wakes",
+        "Active policy",
+        "Routing policy",
+        "Pool exhaustion",
+        "App and repository connectivity",
+        "Task state",
+        "Wakes",
+        "Summary",
+        "Next cursor",
+        "Imports",
+        "Manifest",
+    )
+    rendered = _render_documents([_document_section(title, document) for title in titles])
+
+    assert marker not in rendered
+    assert "not displayed" in rendered
+    assert "present" in rendered and "absent" in rendered
+
+
+def test_document_pages_have_no_generic_dump_markup() -> None:
+    rendered = _render_documents(
+        [
+            _document_section("Fields", {"lease_holder": "supervisor-a", "healthy": True}),
+            _document_section("Table", [{"attempt_id": "attempt-1", "active": False}]),
+            _document_section("Empty", []),
+        ]
+    )
+
+    filename = templates.get_template("page.html").filename
+    assert filename is not None
+    source = Path(filename).read_text(encoding="utf-8")
+    assert "<pre" not in rendered
+    assert "tojson" not in source
+    assert "section.json" not in source
+    assert "supervisor-a" in rendered and "attempt-1" in rendered
+    assert "inactive" in rendered and ">none<" in rendered
+
+
+def test_live_log_tail_is_the_only_page_template_preformatted_text() -> None:
+    rendered = _render_documents([{"title": "Tail", "text": "worker output"}])
+
+    assert rendered.count("<pre") == 1
+    assert "worker output" in rendered
 
 
 NOW = datetime(2026, 9, 21, 6, 30, tzinfo=UTC)
@@ -254,3 +397,168 @@ async def test_gap_logic_reads_only_keys_from_real_status_document(
     gaps = _readiness_gaps(_strict_status(document), repository_registered=False)
 
     assert len(gaps) == 5
+
+
+def test_all_fifteen_sections_preserve_real_service_output_shapes() -> None:
+    blocked_task = SimpleNamespace(
+        id="01BLOCKEDTASK00000000000000",
+        external_id="FDY-READABLE",
+        updated_at=NOW,
+    )
+    tasks_uow = SimpleNamespace(
+        tasks=SimpleNamespace(
+            list_by_state=lambda state: [blocked_task] if state is TaskState.BLOCKED else []
+        )
+    )
+    wake = SimpleNamespace(created_at=NOW)
+    wakes_uow = SimpleNamespace(
+        principals=SimpleNamespace(
+            list_all=lambda: [SimpleNamespace(id="principal-1", name="operator")]
+        ),
+        wakes=SimpleNamespace(
+            list_for_principal=lambda *_args, **_kwargs: [wake],
+            count_unacked=lambda: 1,
+        ),
+    )
+    retention_action = RetentionAction(
+        id="01RETENTION000000000000000",
+        kind="logs_removed",
+        subject="attempt-1",
+        policy_name="default-software",
+        policy_version=1,
+        acted_at=NOW,
+        detail={"bytes": 4096},
+    )
+    retention_uow = SimpleNamespace(
+        retention=SimpleNamespace(list_recent=lambda _limit: [retention_action])
+    )
+    exhaustion = PoolExhaustion(
+        pool="openai-sub",
+        exhausted_at=NOW,
+        reset_at=NOW + timedelta(hours=5),
+        task_id="01BLOCKEDTASK00000000000000",
+        attempt_id="01ATTEMPT0000000000000000",
+        reason="soft limit reached",
+    )
+    routing_document = routing_service.list_exhaustions(
+        cast(Any, SimpleNamespace(clock=SimpleNamespace(now=lambda: NOW))),
+        cast(
+            Any,
+            SimpleNamespace(pool_exhaustions=SimpleNamespace(list_all=lambda: [exhaustion])),
+        ),
+    )
+    provider_document = asyncio.run(
+        providers_service.providers_status(
+            cast(Any, SimpleNamespace(providers={"fake": FakeProvider()}))
+        )
+    )
+    github_document = github_service.status(
+        cast(
+            Any,
+            SimpleNamespace(
+                github=object(),
+                github_app=SimpleNamespace(
+                    app_id=1234,
+                    api_base="https://api.github.com",
+                    private_key_path=None,
+                    webhook_secret_path=None,
+                    webhook_enabled=True,
+                ),
+            ),
+        ),
+        cast(
+            Any,
+            SimpleNamespace(
+                repositories=SimpleNamespace(
+                    list_all=lambda: [
+                        SimpleNamespace(name="sentania-labs/crucible", installation_id=55)
+                    ]
+                ),
+                events=SimpleNamespace(list_global=lambda **_kwargs: []),
+            ),
+        ),
+    )
+    manifest = {
+        "import_id": "01IMPORT000000000000000000",
+        "state": "verified",
+        "counts": {"tasks": 2, "events": 3},
+        "principal": "operator",
+        "verified_at": NOW.isoformat(),
+        "committed_at": None,
+        "tasks": [{"external_id": "FDY-1", "state": "closed"}],
+    }
+    import_record = BootstrapImport(
+        id=str(manifest["import_id"]),
+        state="verified",
+        schema_version="1.0",
+        content_sha256="a" * 64,
+        source_sha256="b" * 64,
+        source={"kind": "foundry-ledger"},
+        manifest=manifest,
+        principal_id="principal-1",
+        imported_by="admin",
+        verified_at=NOW,
+    )
+    bootstrap_uow = cast(
+        Any,
+        SimpleNamespace(
+            bootstrap_imports=SimpleNamespace(
+                list_all=lambda: [import_record],
+                get=lambda import_id: import_record if import_id == import_record.id else None,
+            )
+        ),
+    )
+    imports_document = bootstrap_service.list_imports(bootstrap_uow)
+    manifest_document = bootstrap_service.show(bootstrap_uow, import_record.id)
+    audit_event = Event(
+        seq=27,
+        ts=NOW,
+        kind=EventKind.HARNESS_ENABLED.value,
+        principal="admin",
+        verified=True,
+        payload={"harness": "codex", "reason": "operator enabled"},
+    )
+
+    def audit_rows(*, after_seq: int, **_kwargs: Any) -> list[Event]:
+        return [audit_event] if after_seq < (audit_event.seq or 0) else []
+
+    audit_document = audit_service.tail(
+        cast(Any, SimpleNamespace(events=SimpleNamespace(list_global=audit_rows))),
+        cursor=0,
+        limit=100,
+    )
+    task_document = status_service.tasks(cast(Any, tasks_uow))
+    wake_document = status_service.wakes(cast(Any, wakes_uow))
+    retention_document = status_service.retention(cast(Any, retention_uow))
+    documents: list[tuple[str, Any | None]] = [
+        ("Supervisor", _supervisor_document(_lease(), _status())),
+        ("Providers", provider_document),
+        ("Status task state", task_document),
+        ("Pending wakes", wake_document),
+        ("Active policy", DEFAULT_POLICY),
+        ("Routing policy", VERIFIED_ROUTING),
+        ("Pool exhaustion", routing_document),
+        ("App and repository connectivity", github_document),
+        ("Task state", task_document),
+        ("Wakes", wake_document),
+        ("Summary", retention_document),
+        ("Next cursor", {"next_cursor": audit_document["next_cursor"]}),
+        ("Imports", imports_document),
+        ("Tail", None),
+        ("Manifest", manifest_document),
+    ]
+
+    assert len(documents) == 15
+    for title, document in documents:
+        if document is None:
+            rendered = _render_documents([{"title": title, "text": "worker output"}])
+            assert "worker output" in rendered
+            continue
+        section = _document_section(title, document)
+        panel = cast(dict[str, Any], _localize(section["panel"], "America/Chicago"))
+        rendered = html.unescape(_render_documents([section]))
+        assert len(_panel_leaves(panel)) == len(_document_leaves(document)), title
+        for leaf in _panel_leaves(panel):
+            values = leaf if isinstance(leaf, list) else [leaf]
+            for value in values:
+                assert str(value) in rendered, (title, value)
