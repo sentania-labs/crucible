@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build the Crucible worker base images reproducibly (spec 13, ADR 0011).
 #
-#   images/build.sh [claude_code|codex|agy ...]     default: all three
+#   images/build.sh [claude_code|codex|agy|hermes ...]     default: all four
 #
 # Environment:
 #   OUT=<dir>       where the OCI and docker tarballs go (default images/out)
@@ -22,7 +22,7 @@ here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 out=${OUT:-$here/out}
 builder=${BUILDER:-crucible-images}
 harnesses=("$@")
-[ ${#harnesses[@]} -gt 0 ] || harnesses=(claude_code codex agy)
+[ ${#harnesses[@]} -gt 0 ] || harnesses=(claude_code codex agy hermes)
 for harness in "${harnesses[@]}"; do
     [ -f "$here/$harness/Dockerfile" ] || { echo "build.sh: no Dockerfile for harness '$harness'" >&2; exit 2; }
 done
@@ -80,7 +80,15 @@ for harness in "${harnesses[@]}"; do
     version=$(sed -n 's/^ARG HARNESS_VERSION=//p' "$dockerfile" | head -n1)
     [ -n "$version" ] || { echo "build.sh: $dockerfile has no ARG HARNESS_VERSION" >&2; exit 2; }
 
-    inputs=$(cat "$here/pins.env" "$dockerfile" "$here/build.sh" | sha256sum | cut -c1-64)
+    inputs=$(
+        {
+            cat "$here/pins.env" "$here/build.sh"
+            find "$dir" -maxdepth 1 -type f -print0 | sort -z | while IFS= read -r -d '' input; do
+                printf '%s\0' "${input#"$here/"}"
+                cat "$input"
+            done
+        } | sha256sum | cut -c1-64
+    )
     build=${inputs:0:12}
     tag="crucible-worker:$harness-$version-$build"
     stem="$out/crucible-worker-$harness-$version-$build"
@@ -94,6 +102,8 @@ for harness in "${harnesses[@]}"; do
         --build-arg "CURL_VERSION=$CURL_VERSION" \
         --build-arg "JQ_VERSION=$JQ_VERSION" \
         --build-arg "CA_CERTIFICATES_VERSION=$CA_CERTIFICATES_VERSION" \
+        --build-arg "PYTHON3_VERSION=$PYTHON3_VERSION" \
+        --build-arg "PYTHON3_VENV_VERSION=$PYTHON3_VENV_VERSION" \
         --label "org.opencontainers.image.version=$harness-$version-$build" \
         --label "org.opencontainers.image.created=$created" \
         --label "crucible.harness=$harness" \
