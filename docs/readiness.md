@@ -98,8 +98,8 @@ Docker daemon, and an isolated host-daemon Compose project.
 
 | Tier | Command | Result |
 |---|---|---|
-| unit | `make test-unit` as part of `make test` | 609 passed, 6.87 s |
-| integration | `make test-integration` as part of `make test` | 312 passed, 822.48 s, real PostgreSQL 16 |
+| unit | `make test-unit` as part of `make test` | 609 passed, 6.63 s |
+| integration | `make test-integration` as part of `make test` | 314 passed, 305.68 s, real PostgreSQL 16 |
 | e2e (Docker) | `make e2e DOCKER='<rootless wrapper>'` | 17 passed, 12 deselected, 105.12 s |
 | e2e admin | `make e2e-admin` | 1 passed and 2 failed because the dedicated AGY `oauth-token` file is absent; the second failure is the dependent probe |
 | compose smoke | fresh isolated `make up`, then `make smoke` | signed first-run UI walk passed, task `01M3193VMG9NJ8J5Y2VWRQJ7V0` accepted, smoke passed |

@@ -346,7 +346,11 @@ def _remote_login(args: argparse.Namespace, remote: Remote, reason: dict[str, st
                 print(line, file=sys.stderr)
         if state["state"] == "waiting_for_code":
             code = input("paste the code: ")
-            remote.call("POST", f"/v1/admin/credentials/{args.harness}/login/code", {"code": code})
+            remote.call(
+                "POST",
+                f"/v1/admin/credentials/{args.harness}/login/code",
+                {**reason, "code": code},
+            )
         elif state["state"] in ("finished", "failed"):
             break
         time.sleep(1)

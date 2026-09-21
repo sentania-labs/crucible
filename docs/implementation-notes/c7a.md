@@ -208,3 +208,10 @@ addressed before the pull request, and the contract forbids a second round.
 | medium | The sign-in POST had no pre-authentication CSRF nonce. | The GET now sets a signed, HttpOnly, SameSite=Strict, ten-minute pre-authentication cookie and matching hidden nonce. Missing or mismatched values return 403 before token authentication. |
 | medium | UI mutation parity coverage did not enumerate every dispatch. | The integration matrix now drives every remaining UI mutation and proves it reaches the same application-service entry point used by API and CLI coverage. Incorrect readiness test names were corrected. |
 | low | Reader principals could see login operation forms. | Reader rendering now shows only the login state and an administrator-required notice, with no URL, code, output, form, or polling script. |
+
+The automatic pull request review found two more defects. Remote CLI login
+code submission now carries the operator's required reason, with a regression
+test covering the complete request sequence. Revision 0015 now archives its
+new event kinds while downgraded, disables both event triggers only for that
+move, and restores the audit rows on upgrade. A real PostgreSQL down-up test
+proves the event survives.

@@ -1016,6 +1016,49 @@ def test_the_cli_remote_mode_builds_the_same_calls(monkeypatch: pytest.MonkeyPat
     assert Role.ADMIN.value == "admin"
 
 
+def test_remote_login_submits_the_reason_with_the_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, str, Any]] = []
+    states = iter(
+        [
+            {"state": "waiting_for_code", "output_tail": []},
+            {"state": "finished", "output_tail": []},
+        ]
+    )
+
+    def fake_call(self: Any, method: str, path: str, body: Any = None) -> Any:
+        calls.append((method, path, body))
+        if method == "GET":
+            return next(states)
+        if path.endswith("/login"):
+            return {"window": "login window"}
+        return {"state": "finished"}
+
+    monkeypatch.setattr(cli.Remote, "call", fake_call)
+    monkeypatch.setattr("crucible.cli.admin.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("builtins.input", lambda _prompt: "operator-code")
+    monkeypatch.setenv(cli.TOKEN_ENV, "cru_" + "0" * 26 + "." + "s" * 40)
+    cli.main(
+        [
+            "--api-url",
+            "http://127.0.0.1:1",
+            "--reason",
+            "operator approved login",
+            "credentials",
+            "login",
+            "--harness",
+            "claude_code",
+        ]
+    )
+
+    assert (
+        "POST",
+        "/v1/admin/credentials/claude_code/login/code",
+        {"reason": "operator approved login", "code": "operator-code"},
+    ) in calls
+
+
 # ----- the correction round ----------------------------------------------------------
 
 
