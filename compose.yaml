@@ -105,6 +105,17 @@ services:
       postgres:
         condition: service_healthy
 
+  credential-init:
+    # Docker creates a fresh named volume as root. Give only the volume root to the
+    # service uid so the first browser-driven login can create its harness directory.
+    # Existing credential files are not traversed or changed on later starts.
+    image: ${CRUCIBLE_IMAGE:-ghcr.io/sentania-labs/crucible:latest}
+    profiles: ["full"]
+    user: "0:0"
+    command: ["chown", "1000:1000", "/var/lib/crucible/credentials"]
+    volumes:
+      - crucible-credentials:/var/lib/crucible/credentials
+
   crucible:
     # Tracks `latest`; deployments pin an exact tag (see migrate above).
     image: ${CRUCIBLE_IMAGE:-ghcr.io/sentania-labs/crucible:latest}
@@ -115,7 +126,7 @@ services:
     environment:
       CRUCIBLE_DATABASE__URL: postgresql+psycopg://crucible:${POSTGRES_PASSWORD}@postgres:5432/crucible
       CRUCIBLE_SERVICE__BIND: 0.0.0.0:8080
-      CRUCIBLE_SERVICE__RENDER_TIMEZONE: UTC
+      CRUCIBLE_SERVICE__RENDER_TIMEZONE: America/Chicago
       CRUCIBLE_SUPERVISOR__HOLDER: crucible-compose
       # The Docker provider (08, 13). S9 Test E: the service runs as uid 1000 and the
       # artifact root is a named volume it shares with every container it creates, so
@@ -182,6 +193,8 @@ services:
       postgres:
         condition: service_healthy
       migrate:
+        condition: service_completed_successfully
+      credential-init:
         condition: service_completed_successfully
       docker-socket-proxy:
         condition: service_started

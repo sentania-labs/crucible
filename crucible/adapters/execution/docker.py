@@ -132,6 +132,7 @@ ROLE_COLLECTOR = "collector"
 ROLE_BUNDLE = "bundle-verifier"
 ROLE_VERIFIER = "verifier"
 ROLE_QUOTA_CHECKPOINT = "quota-checkpoint"
+ROLE_LOGIN = "login"
 # The per-attempt credential copy, as a workspace leaf and the template subdirectory of
 # the identity bundle the read-only files on top of it come from (12).
 CREDENTIAL_LEAF = "credential"
@@ -1318,6 +1319,10 @@ class DockerProvider:
             return 0
         for row in rows:
             labels = {str(k): str(v) for k, v in (row.get("Labels") or {}).items()}
+            if labels.get(LABEL_ROLE) == ROLE_LOGIN:
+                # Login containers are process-local administrative sessions, not task
+                # attempts. Their driver reaps them on finish, cancel, or timeout.
+                continue
             attempt_id = labels.get(LABEL_ATTEMPT, "")
             if attempt_id and attempt_id not in live:
                 await self._call(self.client.remove_container, str(row["Id"]), force=True)
@@ -1517,7 +1522,7 @@ class DockerProvider:
             policy={
                 "images": {"allowlist": [image]},
                 "network": {"mode": "egress-proxy", "egress_allowlist": []},
-                "resources": {"memory": "1GiB", "cpus": 1, "pids": 256},
+                "resources": {"memory": "4GiB", "cpus": 2, "pids": 512},
             },
             owner="crucible-admin",
         )
@@ -1573,11 +1578,15 @@ class DockerProvider:
         host_config["LogConfig"] = {"Type": "none", "Config": {}}
         body: dict[str, Any] = {
             "Image": resolved,
-            "Cmd": list(argv),
+            # A worker image's normal entrypoint may require the task identity bundle.
+            # Login is an administrative flow with no workspace or task identity, so
+            # invoke the adapter's declared executable directly.
+            "Entrypoint": [argv[0]],
+            "Cmd": list(argv[1:]),
             "User": "1000:1000",
             "WorkingDir": "/tmp",
             "Env": [f"{key}={value}" for key, value in sorted(env.items())],
-            "Labels": self._labels(spec, "login"),
+            "Labels": self._labels(spec, ROLE_LOGIN),
             "Tty": True,
             "OpenStdin": True,
             "AttachStdin": True,
@@ -1588,6 +1597,7 @@ class DockerProvider:
         check_create(body, self._create_policy(spec, resolved=resolved))
         container_id = ""
         connection = None
+        response = None
         sock = None
         buffer = ""
         token_re = re.compile(flow.token_pattern) if flow.captures_token else None
@@ -1596,7 +1606,9 @@ class DockerProvider:
             container_id = await self._call(
                 self.client.create_container, f"crucible-login-{flow.harness}-{login_id}", body
             )
-            connection, sock = await self._call(self.client.attach_interactive, container_id)
+            connection, response, sock = await self._call(
+                self.client.attach_interactive, container_id
+            )
             await self._call(self.client.start_container, container_id)
             session.state = "waiting_for_operator"
             while True:
@@ -1641,6 +1653,8 @@ class DockerProvider:
             session.state = "failed"
             session.error = f"the login container failed: {type(exc).__name__}: {exc}"
         finally:
+            if response is not None:
+                response.close()
             if connection is not None:
                 connection.close()
             if container_id:

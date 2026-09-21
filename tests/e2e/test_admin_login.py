@@ -70,7 +70,7 @@ def test_stub_device_login_uses_one_credential_mount_and_reaps_container(
         )
     )
 
-    assert session.state == "finished", session.as_dict()
+    assert session.state == "finished", f"{session.error}: {session.lines}"
     assert session.url == "https://example.invalid/device"
     assert session.code == "C7AA-TEST"
     assert (selected / "session.json").read_text(encoding="utf-8") == ('{"authenticated":true}\n')

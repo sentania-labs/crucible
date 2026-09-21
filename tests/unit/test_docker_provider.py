@@ -45,6 +45,7 @@ class StubClient:
         self.created: list[dict[str, Any]] = []
         self.killed: list[str] = []
         self.removed: list[str] = []
+        self.containers: list[dict[str, Any]] = []
         self._peers: list[socket.socket] = []
 
     def inspect_image(self, reference: str) -> dict[str, Any]:
@@ -68,7 +69,7 @@ class StubClient:
     def inspect_container(self, container_id: str) -> dict[str, Any]:
         return {"State": {"Running": False, "ExitCode": 0}}
 
-    def attach_interactive(self, container_id: str) -> tuple[Any, socket.socket]:
+    def attach_interactive(self, container_id: str) -> tuple[Any, Any, socket.socket]:
         attached, peer = socket.socketpair()
         peer.sendall(b"Visit https://auth.openai.com/codex/device and enter ABCD-EFGH\n")
         peer.shutdown(socket.SHUT_WR)
@@ -78,7 +79,11 @@ class StubClient:
             def close(self) -> None:
                 attached.close()
 
-        return Connection(), attached
+        class Response:
+            def close(self) -> None:
+                return None
+
+        return Connection(), Response(), attached
 
     def wait_container(self, container_id: str, *, timeout: float) -> int:
         if isinstance(self.wait, Exception):
@@ -95,7 +100,7 @@ class StubClient:
         return [LogFrame("stderr", b"2026-09-16T16:49:48.000000000Z it went wrong\n")]
 
     def list_containers(self, **kw: Any) -> list[dict[str, Any]]:
-        return []
+        return self.containers
 
 
 def config(tmp_path: Path) -> DockerConfig:
@@ -268,6 +273,8 @@ async def test_login_container_has_one_narrow_credential_mount_and_no_workspace(
         timeout=10,
     )
     body = client.created[0]["body"]
+    assert body["Entrypoint"] == ["codex"]
+    assert body["Cmd"] == ["login", "--device-auth"]
     mounts = body["HostConfig"]["Mounts"]
     assert mounts == [
         {
@@ -284,3 +291,25 @@ async def test_login_container_has_one_narrow_credential_mount_and_no_workspace(
     assert not any("workspace" in str(value) for value in mounts)
     assert session.state == "finished" and session.code == "ABCD-EFGH"
     assert client.removed == ["container-1"]
+
+
+async def test_task_retention_does_not_kill_an_interactive_login(tmp_path: Path) -> None:
+    client = StubClient()
+    client.containers = [
+        {
+            "Id": "login-container",
+            "Labels": {
+                "crucible.attempt": "login-not-a-task-attempt",
+                "crucible.role": "login",
+            },
+        },
+        {
+            "Id": "orphan-worker",
+            "Labels": {"crucible.attempt": "gone", "crucible.role": "worker"},
+        },
+    ]
+
+    removed = await provider(tmp_path, client).retention([])
+
+    assert removed == 1
+    assert client.removed == ["orphan-worker"]

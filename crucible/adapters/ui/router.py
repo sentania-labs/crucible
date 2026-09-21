@@ -6,9 +6,11 @@ import hmac
 import json
 import os
 import tomllib
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, urlsplit, urlunsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
@@ -127,6 +129,11 @@ def _page(
     badge: str | None = None,
     badge_kind: str = "accent",
 ) -> HTMLResponse:
+    timezone = "America/Chicago"
+    settings = getattr(request.app.state.ctx, "settings", None)
+    if settings is not None:
+        timezone = settings.service.render_timezone
+    sections = _localize(sections, timezone)
     context = _base(request, principal, csrf, title=heading, active=active)
     context.update(
         heading=heading,
@@ -136,6 +143,29 @@ def _page(
         badge_kind=badge_kind,
     )
     return templates.TemplateResponse(request=request, name="page.html", context=context)
+
+
+def _localize(value: Any, timezone: str) -> Any:
+    """Render stored UTC instants in the operator's configured local zone."""
+    if isinstance(value, dict):
+        return {key: _localize(item, timezone) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_localize(item, timezone) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_localize(item, timezone) for item in value)
+    moment: datetime | None = value if isinstance(value, datetime) else None
+    if isinstance(value, str) and "T" in value and (value.endswith("Z") or "+" in value[10:]):
+        try:
+            moment = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            moment = None
+    if moment is None or moment.tzinfo is None:
+        return value
+    try:
+        local = moment.astimezone(ZoneInfo(timezone))
+    except ZoneInfoNotFoundError:
+        local = moment.astimezone(ZoneInfo("America/Chicago"))
+    return local.strftime("%Y-%m-%d %I:%M:%S %p %Z")
 
 
 async def _form(request: Request) -> dict[str, str]:

@@ -297,7 +297,9 @@ class DockerClient:
         finally:
             conn.close()
 
-    def attach_interactive(self, container_id: str) -> tuple[HTTPConnection, socket.socket]:
+    def attach_interactive(
+        self, container_id: str
+    ) -> tuple[HTTPConnection, HTTPResponse, socket.socket]:
         """Attach one TTY stream without persisting it in the daemon's log driver.
 
         The caller owns both returned objects and closes the connection after the
@@ -322,7 +324,10 @@ class DockerClient:
         if sock is None:
             conn.close()
             raise DockerApiError(0, "the attach connection carried no socket", path=url)
-        return conn, sock
+        # HTTPResponse owns the upgraded socket. The caller must retain it for the
+        # entire interactive session or its finalizer closes the stream as soon as
+        # this method returns.
+        return conn, response, sock
 
     def put_archive(self, container_id: str, path: str, tar: bytes) -> None:
         """Extract a tar into a container path (`docker cp -` by another name).
