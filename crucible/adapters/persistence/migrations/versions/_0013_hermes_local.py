@@ -150,7 +150,6 @@ def upgrade() -> None:
         ).bindparams(reason="local Hermes 0.19.0 worker uses no subscription credential")
     )
     _seed_v4(op.get_bind())
-    _seed_v5(op.get_bind())
 
 
 def downgrade() -> None:
