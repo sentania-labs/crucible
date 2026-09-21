@@ -196,6 +196,7 @@ class DeliveryCoordinator:
             base_ref=plan.base_ref,
             expected_head=plan.head_sha,
             bundle_path=plan.bundle_path,
+            bundle_sha256=plan.bundle_sha256,
             image=self.config.publisher_image or plan.image,
             policy=plan.policy,
             author_name=str(plan.policy.get("git", {}).get("author_name", "crucible-worker")),
@@ -256,6 +257,7 @@ class DeliveryCoordinator:
     async def _publish_one(self, plan: PublishPlan) -> bool:
         assert self._github is not None and self._publisher is not None
         token: InstallationToken | None = None
+        github_step = "installation_token"
         try:
             token = await asyncio.to_thread(
                 self._github.installation_token,
@@ -263,6 +265,7 @@ class DeliveryCoordinator:
                 repository=plan.repository_name,
             )
             await self._host._db(lambda: self._record_minted(plan, token))
+            github_step = "branch_pushed_at_head"
             if plan.resume_step not in ("branch_pushed_at_head", "github"):
                 outcome = await self._publisher.push(self._publish_request(plan), token)
                 await self._host._db(lambda: self._record_publisher(plan, outcome))
@@ -302,6 +305,7 @@ class DeliveryCoordinator:
             if plan.deliverable_kind == "branch":
                 await self._host._db(lambda: self._finish(plan, ref=None))
                 return True
+            github_step = "github"
             ref = await asyncio.to_thread(
                 self._github.find_pull_request,
                 token,
@@ -361,7 +365,7 @@ class DeliveryCoordinator:
             await self._host._db(
                 lambda: self._fail(
                     plan,
-                    step="github",
+                    step=github_step,
                     detail=failure.message,
                     response_class=failure.response_class,
                 )

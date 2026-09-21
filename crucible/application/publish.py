@@ -88,6 +88,7 @@ class PublishPlan:
     draft: bool
     image: str
     bundle_path: str
+    bundle_sha256: str
     policy: dict[str, Any] = field(default_factory=dict)
     title: str = DEFAULT_TITLE
     body: str = ""
@@ -260,6 +261,20 @@ def build_plan(uow: UnitOfWork, task: Task, work: tuple[Attempt, Execution]) -> 
     git_policy = policy.get("git", {})
     publishing = uow.events.latest_for_task_kind(task.id, EventKind.TASK_PUBLISHING.value)
     publishing_payload = publishing.payload if publishing else {}
+    bundle_evidence = next(
+        (
+            row
+            for row in reversed(uow.evidence.list_for_attempt(attempt.id))
+            if row.kind == EvidenceKind.BUNDLE_HEAD.value and row.verified
+        ),
+        None,
+    )
+    bundle_sha256 = str(
+        (bundle_evidence.payload if bundle_evidence else {}).get("bundle_sha256", "")
+    )
+    retry_limit = publishing_payload.get("publish_retry_max")
+    if retry_limit is None:
+        retry_limit = policy.get("limits", {}).get("publish_retry_max", 3)
     return PublishPlan(
         task_id=task.id,
         external_id=task.external_id,
@@ -276,6 +291,7 @@ def build_plan(uow: UnitOfWork, task: Task, work: tuple[Attempt, Execution]) -> 
         draft=bool(deliverable.get("draft", False)),
         image=attempt.image_digest or execution.image,
         bundle_path=f"{attempt.workspace_path}/output/work_branch.bundle",
+        bundle_sha256=bundle_sha256,
         policy=policy,
         title=title,
         body=body,
@@ -284,10 +300,7 @@ def build_plan(uow: UnitOfWork, task: Task, work: tuple[Attempt, Execution]) -> 
         problem=problem,
         resume_step=str(publishing_payload.get("resume_step") or ""),
         retry_number=int(publishing_payload.get("retry_number", 0)),
-        publish_retry_max=int(
-            publishing_payload.get("publish_retry_max")
-            or policy.get("limits", {}).get("publish_retry_max", 3)
-        ),
+        publish_retry_max=int(retry_limit),
     )
 
 
@@ -302,6 +315,7 @@ def record_publish_started(uow: UnitOfWork, clock: Clock, plan: PublishPlan) -> 
         payload={
             "head_sha": plan.head_sha,
             "bundle": plan.bundle_path,
+            "bundle_sha256": plan.bundle_sha256,
             "repository": plan.repository_name,
             "work_branch": plan.work_branch,
             "base_ref": plan.base_ref,
@@ -383,12 +397,14 @@ def fail_publish(
     publishing = uow.events.latest_for_task_kind(task.id, EventKind.TASK_PUBLISHING.value)
     retry_number = int((publishing.payload if publishing else {}).get("retry_number", 0))
     stored_policy = uow.policies.get(task.policy_name, task.policy_version)
-    retry_max = int(
-        (publishing.payload if publishing else {}).get("publish_retry_max")
-        or (stored_policy.document if stored_policy else {})
-        .get("limits", {})
-        .get("publish_retry_max", 3)
-    )
+    retry_limit = (publishing.payload if publishing else {}).get("publish_retry_max")
+    if retry_limit is None:
+        retry_limit = (
+            (stored_policy.document if stored_policy else {})
+            .get("limits", {})
+            .get("publish_retry_max", 3)
+        )
+    retry_max = int(retry_limit)
     retries_remaining = max(retry_max - retry_number, 0)
     links = {"events": f"/v1/tasks/{task.id}/events"}
     if retries_remaining:

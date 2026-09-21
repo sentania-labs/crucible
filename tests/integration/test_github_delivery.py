@@ -257,6 +257,87 @@ async def test_publish_failure_can_be_republished(
     assert "3 remaining" in wakes[0]["summary"]
 
 
+async def test_token_mint_failure_republishes_from_before_push(
+    client: TestClient,
+    delivery_supervisor: Supervisor,
+    github: FakeGitHubServer,
+    publisher: FakePublisher,
+) -> None:
+    github.state.mint_failure_once = True
+    task_id, failed = await publish(client, delivery_supervisor)
+    assert failed["state"] == "publish_failed"
+    assert publisher.bundle_paths == []
+    failed_events = [
+        event
+        for event in client.get(f"/v1/tasks/{task_id}/events", params={"limit": 200}).json()[
+            "items"
+        ]
+        if event["kind"] == "task_publish_failed"
+    ]
+    assert failed_events[-1]["payload"]["step"] == "installation_token"
+
+    response = client.post(
+        f"/v1/tasks/{task_id}/republish",
+        json={"reason": "The installation-token service recovered."},
+    )
+    assert response.status_code == 200, response.text
+    await delivery_supervisor.tick()
+
+    assert client.get(f"/v1/tasks/{task_id}").json()["state"] == "awaiting_external_review"
+    assert len(publisher.pushes) == 1
+
+
+async def test_republish_refuses_changed_bundle_content(
+    client: TestClient,
+    engine: Engine,
+    delivery_supervisor: Supervisor,
+    publisher: FakePublisher,
+    tmp_path: Path,
+) -> None:
+    task_id = submit_and_start(client, "crucible-worker:fake-succeed")
+    await run_to_settled(delivery_supervisor, client, task_id)
+    await review_and_settle(delivery_supervisor, client, task_id)
+    output = tmp_path / "output"
+    output.mkdir()
+    bundle = output / "work_branch.bundle"
+    bundle.write_bytes(b"sealed branch bundle")
+    sealed_sha256 = hashlib.sha256(bundle.read_bytes()).hexdigest()
+    assert delivery_supervisor.fenced_token is not None
+    with engine.begin() as connection:
+        connection.execute(
+            text("SELECT set_config('crucible.fenced_token', :token, true)"),
+            {"token": str(delivery_supervisor.fenced_token)},
+        )
+        connection.execute(
+            text("UPDATE attempts SET workspace_path = :workspace WHERE task_id = :task_id"),
+            {"workspace": str(tmp_path), "task_id": task_id},
+        )
+        connection.execute(
+            text(
+                "UPDATE evidence SET payload = jsonb_set(payload, '{bundle_sha256}', "
+                "to_jsonb(CAST(:digest AS text)), true) "
+                "WHERE task_id = :task_id AND kind = 'bundle_head'"
+            ),
+            {"digest": sealed_sha256, "task_id": task_id},
+        )
+    publisher.refuse_push = "HTTP 503 Service Unavailable"
+    accepted = client.post(
+        f"/v1/tasks/{task_id}/accept",
+        json={"verdict": "accepted", "reasoning": "The evidence is sufficient."},
+    )
+    assert accepted.status_code == 200, accepted.text
+    await delivery_supervisor.tick()
+    assert client.get(f"/v1/tasks/{task_id}").json()["state"] == "publish_failed"
+
+    bundle.write_bytes(b"changed branch bundle")
+    response = client.post(
+        f"/v1/tasks/{task_id}/republish",
+        json={"reason": "retry a bundle that changed on disk"},
+    )
+    assert response.status_code == 409
+    assert "unchanged sealed bundle" in response.json()["detail"]
+
+
 async def test_republish_refuses_a_changed_head(
     client: TestClient,
     ctx: AppContext,
@@ -305,6 +386,13 @@ async def test_republish_enforces_the_policy_cap(
     )
     assert response.status_code == 409
     assert "retry cap reached" in response.json()["detail"]
+    wakes = [
+        w
+        for w in client.get("/v1/wakes").json()["items"]
+        if w["task_id"] == task_id and w["reason"] == "publish_failed"
+    ]
+    assert wakes and "0 remaining" in wakes[0]["summary"]
+    assert "republish" not in wakes[0]["payload"]["links"]
 
 
 async def test_the_body_is_rendered_from_verified_evidence_only(
@@ -644,6 +732,37 @@ async def test_ready_for_merge_invalidation(
     kinds = event_kinds(client, task_id)
     assert kinds.count("task_external_feedback_received") >= 1
     assert "task_ci_certification_failed" in kinds
+
+
+async def test_new_inline_comment_on_recorded_review_revokes_ready(
+    client: TestClient, delivery_supervisor: Supervisor, github: FakeGitHubServer
+) -> None:
+    task_id, view = await publish(client, delivery_supervisor)
+    review_id = github.state.add_review(
+        REPOSITORY,
+        1,
+        login=REVIEWER,
+        body="Codex Review. No findings.",
+    )
+    await delivery_supervisor.tick()
+    github.state.repositories[REPOSITORY].required_checks = ["build"]
+    github.state.set_check(REPOSITORY, view["head_sha"], name="build", conclusion="success")
+    await delivery_supervisor.tick()
+    assert client.get(f"/v1/tasks/{task_id}").json()["state"] == "ready_for_merge"
+
+    github.state.add_review_comment(
+        REPOSITORY,
+        1,
+        review_id=review_id,
+        login=REVIEWER,
+        body="P1 this late inline finding still needs disposition",
+        path="src/app.txt",
+        line=9,
+    )
+    await delivery_supervisor.tick()
+
+    assert client.get(f"/v1/tasks/{task_id}").json()["state"] == "external_feedback_received"
+    assert gate(pr(client, task_id), "feedback_dispositions_complete") == "pending"
 
 
 async def test_a_required_failure_lands_in_ci_certification_failed_with_evidence(

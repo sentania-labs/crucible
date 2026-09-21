@@ -85,6 +85,7 @@ class FakeGitHub:
         # reactions endpoint is the one call that needs it. Both paths are tested.
         self.issues_read = True
         self.rate_limit_once = False
+        self.mint_failure_once = False
         self.mint_calls = 0
         self.workflow_log = b"fake workflow log: the required check failed\n"
         self.lock = threading.Lock()
@@ -160,6 +161,36 @@ class FakeGitHub:
             }
         )
         return reaction_id
+
+    def add_review_comment(
+        self,
+        full_name: str,
+        number: int,
+        *,
+        review_id: str,
+        login: str,
+        body: str,
+        path: str,
+        line: int,
+    ) -> str:
+        repo = self.repositories[full_name]
+        pull = repo.pulls[number]
+        comment_id = str(repo.next_object_id)
+        repo.next_object_id += 1
+        pull.review_comments.append(
+            {
+                "id": comment_id,
+                "user": {"login": login, "type": "Bot"},
+                "body": body,
+                "path": path,
+                "line": line,
+                "commit_id": pull.head_sha,
+                "pull_request_review_id": review_id,
+                "created_at": now_iso(),
+                "updated_at": now_iso(),
+            }
+        )
+        return comment_id
 
     def remove_reaction(self, full_name: str, number: int, reaction_id: str) -> None:
         pull = self.repositories[full_name].pulls[number]
@@ -325,6 +356,10 @@ class _Handler(BaseHTTPRequestHandler):
         state = self.state
         if parts[:2] == ["app", "installations"] and parts[-1] == "access_tokens":
             state.mint_calls += 1
+            if state.mint_failure_once:
+                state.mint_failure_once = False
+                self._send(503, {"message": "Service Unavailable"})
+                return
             token = installation_token_value()
             state.tokens.add(token)
             body = self._body() or {}

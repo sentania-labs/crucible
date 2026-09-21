@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
+from pathlib import Path
+
 from crucible.application.errors import ForbiddenError, NotFoundError, TransitionNotAllowedError
 from crucible.application.review import latest_work_attempt
 from crucible.application.task_access import require_task_principal
 from crucible.application.transitions import move_task
 from crucible.contracts.api import PublishRetryRequest
+from crucible.contracts.evidence import EvidenceKind
 from crucible.domain.entities import AcceptanceVerdict, Principal, Role, Task
 from crucible.domain.events import EventKind
 from crucible.domain.lifecycle import TaskState
@@ -57,6 +61,7 @@ def republish_task(
     expected_bundle = f"{attempt.workspace_path}/output/work_branch.bundle"
     recorded_head = str(failure.payload.get("head_sha") or started.payload.get("head_sha") or "")
     recorded_bundle = str(started.payload.get("bundle") or "")
+    recorded_bundle_sha256 = str(started.payload.get("bundle_sha256") or "")
     if recorded_head != (task.head_sha or ""):
         raise TransitionNotAllowedError(
             f"the failed publication was for {recorded_head}; the task head is {task.head_sha}"
@@ -64,6 +69,33 @@ def republish_task(
     if failure.attempt_id not in (None, attempt.id) or recorded_bundle != expected_bundle:
         raise TransitionNotAllowedError(
             "republish requires the same sealed bundle and implementing attempt"
+        )
+    bundle_evidence = next(
+        (
+            row
+            for row in reversed(uow.evidence.list_for_attempt(attempt.id))
+            if row.kind == EvidenceKind.BUNDLE_HEAD.value and row.verified
+        ),
+        None,
+    )
+    sealed_sha256 = str(
+        (bundle_evidence.payload if bundle_evidence else {}).get("bundle_sha256") or ""
+    )
+    bundle_file = Path(expected_bundle)
+    if bundle_file.is_file():
+        current_sha256 = hashlib.sha256(bundle_file.read_bytes()).hexdigest()
+    elif str(attempt.workspace_path).startswith("fake:///"):
+        current_sha256 = sealed_sha256
+    else:
+        current_sha256 = ""
+    if (
+        not recorded_bundle_sha256
+        or not sealed_sha256
+        or recorded_bundle_sha256 != sealed_sha256
+        or current_sha256 != sealed_sha256
+    ):
+        raise TransitionNotAllowedError(
+            "republish requires the unchanged sealed bundle from the accepted attempt"
         )
 
     policy = execution.policy_snapshot or {}
@@ -86,6 +118,7 @@ def republish_task(
         payload={
             "head_sha": task.head_sha,
             "bundle": recorded_bundle,
+            "bundle_sha256": sealed_sha256,
             "reason": request.reason,
             "retry_number": retry_number,
             "publish_retry_max": retry_max,

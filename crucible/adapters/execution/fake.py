@@ -425,6 +425,7 @@ class FakeProvider:
                 work_branch=str(spec.contract.get("repository", {}).get("work_branch", "")),
                 commits=1,
                 verified=True,
+                sha256=hashlib.sha256(f"fake-bundle:{head}".encode()).hexdigest(),
                 commit_paths=quota_paths,
                 commit_messages=(f"wip(crucible): attempt {spec.attempt_id}",),
             )
@@ -460,6 +461,7 @@ class FakeProvider:
                 work_branch=str(spec.contract.get("repository", {}).get("work_branch", "")),
                 commits=commits,
                 verified=True,
+                sha256=hashlib.sha256(f"fake-bundle:{head}".encode()).hexdigest(),
                 commit_paths=paths,
                 commit_messages=(f"Fake commit for {spec.external_id}",) if commits else (),
             )

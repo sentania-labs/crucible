@@ -992,7 +992,8 @@ def advance_delivery(
         GateResult.SKIPPED.value,
     ) or "feedback_dispositions_complete" in policy.get("gates", {}).get("skipped", [])
     feedback_from = task.state
-    if result.accepted_signals and task.state in (
+    feedback_activity = bool(result.accepted_signals or result.new_comments)
+    if feedback_activity and task.state in (
         TaskState.AWAITING_EXTERNAL_REVIEW,
         TaskState.AWAITING_CI_CERTIFICATION,
         TaskState.READY_FOR_MERGE,

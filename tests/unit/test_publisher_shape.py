@@ -8,6 +8,7 @@ script text it runs, not against a description of them.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -37,6 +38,7 @@ def _request(**kw: Any) -> PublishRequest:
         "base_ref": "main",
         "expected_head": HEAD,
         "bundle_path": "/var/lib/crucible/artifacts/workspaces/01ATTEMPT/output/work_branch.bundle",
+        "bundle_sha256": "b" * 64,
         "image": "crucible-worker:script-harness-1.0.0",
         "policy": {"resources": {"cpus": 1, "memory": "512m", "pids": 128}},
     }
@@ -89,6 +91,18 @@ def test_the_create_body_carries_no_token_anywhere_the_daemon_records(
     # the container runs as.
     tmpfs = body["HostConfig"]["Tmpfs"][scripts.TOKEN_MOUNT]
     assert "noexec" in tmpfs and "mode=0700" in tmpfs and "uid=1000" in tmpfs
+
+
+def test_the_publisher_refuses_a_bundle_changed_after_collection(
+    publisher: DockerPublisher, tmp_path: Path
+) -> None:
+    bundle = tmp_path / "work_branch.bundle"
+    bundle.write_bytes(b"sealed branch bundle")
+    sealed_sha256 = hashlib.sha256(bundle.read_bytes()).hexdigest()
+    bundle.write_bytes(b"changed branch bundle")
+
+    with pytest.raises(ValueError, match="sealed sha256"):
+        publisher._stage(tmp_path / "publish", str(bundle), sealed_sha256)
 
 
 def test_the_publisher_script_can_never_force_push(publisher: DockerPublisher) -> None:

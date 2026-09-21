@@ -187,6 +187,7 @@ class BranchBundle:
     work_branch: str
     commits: int
     verified: bool
+    sha256: str = ""
     commit_paths: tuple[str, ...] = ()
     commit_messages: tuple[str, ...] = ()
 
