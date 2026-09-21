@@ -406,8 +406,16 @@ class DecisionRow(Base):
 
 class ReviewDispositionRow(Base):
     __tablename__ = "review_dispositions"
+    __table_args__ = (
+        UniqueConstraint(
+            "review_comment_id",
+            "comment_body_sha256",
+            name="uq_review_dispositions_comment_body",
+        ),
+    )
     id: Mapped[str] = mapped_column(ID, primary_key=True)
-    review_comment_id: Mapped[str] = mapped_column(String(64), unique=True)
+    review_comment_id: Mapped[str] = mapped_column(String(64))
+    comment_body_sha256: Mapped[str] = mapped_column(String(64))
     principal_id: Mapped[str] = mapped_column(ID, ForeignKey("principals.id"))
     disposition: Mapped[str] = mapped_column(String(24))
     reasoning: Mapped[str] = mapped_column(Text)

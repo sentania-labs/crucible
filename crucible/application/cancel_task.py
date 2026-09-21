@@ -4,6 +4,7 @@ runs (the supervisor terminates it), cancelled at once otherwise."""
 from __future__ import annotations
 
 from crucible.application.errors import NotFoundError
+from crucible.application.task_access import require_task_principal
 from crucible.application.transitions import move_task, record_event
 from crucible.contracts.api import CancelRequest
 from crucible.domain.entities import Principal, Task
@@ -19,6 +20,7 @@ def cancel_task(
     task = uow.tasks.get(task_id, for_update=True)
     if task is None:
         raise NotFoundError(f"task {task_id} not found")
+    require_task_principal(principal, task)
     payload = {
         "reason": request.reason,
         "verbatim": request.verbatim,

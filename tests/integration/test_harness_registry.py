@@ -181,6 +181,7 @@ async def test_per_harness_concurrency_defers_the_second_launch(
     cancel = client.post(
         f"/v1/tasks/{first}/cancel",
         json={"reason": "free the harness", "verbatim": "cancel it", "decided_by": "tests"},
+        headers={"Authorization": f"Bearer {tokens['operator']}"},
     )
     assert cancel.status_code == 200, cancel.text
     # The hang ignores the drain; past the grace it is killed, exits, and is collected,

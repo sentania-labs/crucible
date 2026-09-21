@@ -87,6 +87,7 @@ class EventKind(StrEnum):
     TASK_CLOSED = "task_closed"
     DECISION_RECORDED = "decision_recorded"
     DISPOSITION_RECORDED = "disposition_recorded"
+    DISPOSITION_INVALIDATED = "disposition_invalidated"
     ESCALATION_OPENED = "escalation_opened"
     ESCALATION_ANSWERED = "escalation_answered"
     ESCALATION_CLOSED = "escalation_closed"

@@ -196,6 +196,7 @@ class DeliveryCoordinator:
             base_ref=plan.base_ref,
             expected_head=plan.head_sha,
             bundle_path=plan.bundle_path,
+            bundle_sha256=plan.bundle_sha256,
             image=self.config.publisher_image or plan.image,
             policy=plan.policy,
             author_name=str(plan.policy.get("git", {}).get("author_name", "crucible-worker")),
@@ -225,6 +226,7 @@ class DeliveryCoordinator:
                     )
                     continue
                 plan = build_plan(uow, task, work)
+                record_publish_started(uow, self._clock, plan)
                 if plan.problem:
                     fail_publish(
                         uow,
@@ -248,7 +250,6 @@ class DeliveryCoordinator:
                         attempt_id=plan.attempt_id,
                     )
                     continue
-                record_publish_started(uow, self._clock, plan)
                 plans.append(plan)
             uow.commit()
         return plans
@@ -256,6 +257,7 @@ class DeliveryCoordinator:
     async def _publish_one(self, plan: PublishPlan) -> bool:
         assert self._github is not None and self._publisher is not None
         token: InstallationToken | None = None
+        github_step = "installation_token"
         try:
             token = await asyncio.to_thread(
                 self._github.installation_token,
@@ -263,22 +265,24 @@ class DeliveryCoordinator:
                 repository=plan.repository_name,
             )
             await self._host._db(lambda: self._record_minted(plan, token))
-            outcome = await self._publisher.push(self._publish_request(plan), token)
-            await self._host._db(lambda: self._record_publisher(plan, outcome))
-            if not outcome.pushed:
-                await self._host._db(
-                    lambda: self._fail(
-                        plan,
-                        step=outcome.step,
-                        detail=outcome.detail or f"the publisher exited {outcome.exit_code}",
-                        extra={
-                            "remote_head_before": outcome.remote_head_before,
-                            "author_problems": list(outcome.author_problems),
-                            "trailer_problems": list(outcome.trailer_problems),
-                        },
+            github_step = "branch_pushed_at_head"
+            if plan.resume_step not in ("branch_pushed_at_head", "github"):
+                outcome = await self._publisher.push(self._publish_request(plan), token)
+                await self._host._db(lambda: self._record_publisher(plan, outcome))
+                if not outcome.pushed:
+                    await self._host._db(
+                        lambda: self._fail(
+                            plan,
+                            step=outcome.step,
+                            detail=outcome.detail or f"the publisher exited {outcome.exit_code}",
+                            extra={
+                                "remote_head_before": outcome.remote_head_before,
+                                "author_problems": list(outcome.author_problems),
+                                "trailer_problems": list(outcome.trailer_problems),
+                            },
+                        )
                     )
-                )
-                return False
+                    return False
             remote = await asyncio.to_thread(
                 self._github.remote_head,
                 token,
@@ -301,6 +305,7 @@ class DeliveryCoordinator:
             if plan.deliverable_kind == "branch":
                 await self._host._db(lambda: self._finish(plan, ref=None))
                 return True
+            github_step = "github"
             ref = await asyncio.to_thread(
                 self._github.find_pull_request,
                 token,
@@ -360,7 +365,7 @@ class DeliveryCoordinator:
             await self._host._db(
                 lambda: self._fail(
                     plan,
-                    step="github",
+                    step=github_step,
                     detail=failure.message,
                     response_class=failure.response_class,
                 )

@@ -51,6 +51,7 @@ also carries a signed-session CSRF value. Sign-out clears the cookie.
 | POST | `/tasks/{id}/amend` | Attach a new contract version; allowed only in `submitted`, `blocked`, or `awaiting_acceptance`. |
 | POST | `/tasks/{id}/review` | Request the internal non-author review of the current collected head. Body either names an execution request for a Crucible `review` execution, or carries an uploaded `ReviewReportV1` produced by the orchestrator through its own harness. Allowed in `awaiting_internal_review`. The API records the request; the supervisor creates the review execution, or turns the uploaded report into evidence and resolves the gate, on its next tick, so clients poll the task rather than read the outcome from the response. The reviewer identity recorded is the authenticated caller's (or the review attempt's), never the one the document names. |
 | POST | `/tasks/{id}/accept` | Record an `AcceptanceResult` (accepted, rejected, needs_more_work) with reasoning for the current collected head. Orchestrator role only. |
+| POST | `/tasks/{id}/republish` | In `publish_failed`, manually retry publication with a reason. The same accepted head and sealed bundle resume at the failed step. Policy `limits.publish_retry_max` caps retries and the wake reports the cap. Orchestrator or operator role. |
 | POST | `/tasks/{id}/corrections` | Attach a correction: a new contract version whose `correction` section names the review comments or CI findings it addresses, plus an execution request. Creates a `correct` execution against the existing remote branch. Allowed in `pre_pr_gates_failed`, `external_feedback_received`, `ci_certification_failed`, and after `needs_more_work`. |
 | POST | `/tasks/{id}/dispositions` | Record `ReviewDisposition` rows for received external review comments. Orchestrator role. |
 | POST | `/tasks/{id}/head-decision` | In `head_diverged`: `recollect` (the task re-enters `scheduled` with a `correct` execution against the remote work branch, so the new head gets a claim of its own before any gate reads it), `reject`, or `cancel`, with reasoning. |
@@ -60,6 +61,12 @@ also carries a signed-session CSRF value. Sign-out clears the cookie.
 | GET | `/tasks/{id}/events` | Ordered events for the task and its children. |
 | GET | `/tasks/{id}/pull-request` | The PR record with head history, the external review cycles and their completed components, external reviews, comments, dispositions, the observed reactions, whether reactions are observable at all, and CI certifications. |
 | GET | `/events` | Global feed, `?cursor=&kind=&since=`. |
+
+The task mutations `cancel`, `accept`, `review`, `dispositions`, `corrections`,
+`ci-decision`, `head-decision`, `decisions`, `amend`, and `close` return 403
+when an orchestrator principal does not own the task. Operator and admin
+principals are exempt from the ownership comparison, without changing each
+endpoint's existing role requirements.
 
 ### Executions and attempts
 

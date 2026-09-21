@@ -35,6 +35,7 @@ class PublishRequest:
     base_ref: str
     expected_head: str
     bundle_path: str
+    bundle_sha256: str
     image: str
     policy: Mapping[str, object] = field(default_factory=dict)
     author_name: str = "crucible-worker"

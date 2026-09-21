@@ -132,6 +132,7 @@ TASK_TRANSITIONS: frozenset[tuple[TaskState, TaskState]] = frozenset(
         (_S.EXTERNAL_FEEDBACK_RECEIVED, _S.SCHEDULED),
         (_S.AWAITING_CI_CERTIFICATION, _S.READY_FOR_MERGE),
         (_S.AWAITING_CI_CERTIFICATION, _S.CI_CERTIFICATION_FAILED),
+        (_S.AWAITING_CI_CERTIFICATION, _S.EXTERNAL_FEEDBACK_RECEIVED),
         (_S.CI_CERTIFICATION_FAILED, _S.AWAITING_CI_CERTIFICATION),
         (_S.CI_CERTIFICATION_FAILED, _S.SCHEDULED),
         (_S.CI_CERTIFICATION_FAILED, _S.REJECTED),
@@ -139,6 +140,8 @@ TASK_TRANSITIONS: frozenset[tuple[TaskState, TaskState]] = frozenset(
         (_S.EXTERNAL_FEEDBACK_RECEIVED, _S.HEAD_DIVERGED),
         (_S.AWAITING_CI_CERTIFICATION, _S.HEAD_DIVERGED),
         (_S.READY_FOR_MERGE, _S.HEAD_DIVERGED),
+        (_S.READY_FOR_MERGE, _S.CI_CERTIFICATION_FAILED),
+        (_S.READY_FOR_MERGE, _S.EXTERNAL_FEEDBACK_RECEIVED),
         (_S.HEAD_DIVERGED, _S.REPORTED),
         # A `recollect` decision puts the task back into supervision against the remote
         # work branch, which is where the divergent head is. 09 draws this edge to

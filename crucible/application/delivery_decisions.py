@@ -16,6 +16,7 @@ from crucible.application.errors import (
     TransitionNotAllowedError,
 )
 from crucible.application.observation import supersede_for_head
+from crucible.application.task_access import require_task_principal
 from crucible.application.transitions import move_task, record_event
 from crucible.application.wakes import create_wake
 from crucible.contracts.api import CIDecisionRequest, HeadDecisionRequest
@@ -53,6 +54,7 @@ def record_ci_decision(
     task = uow.tasks.get(task_id, for_update=True)
     if task is None:
         raise NotFoundError(f"task {task_id} not found")
+    require_task_principal(principal, task)
     if task.state is not TaskState.CI_CERTIFICATION_FAILED:
         raise TransitionNotAllowedError(
             f"a CI decision is recorded in ci_certification_failed; task is {task.state.value}"
@@ -158,6 +160,7 @@ def record_head_decision(
     task = uow.tasks.get(task_id, for_update=True)
     if task is None:
         raise NotFoundError(f"task {task_id} not found")
+    require_task_principal(principal, task)
     if task.state is not TaskState.HEAD_DIVERGED:
         raise TransitionNotAllowedError(
             f"a head decision is recorded in head_diverged; task is {task.state.value}"

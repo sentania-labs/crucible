@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import logging
 import shutil
 from collections.abc import Sequence
@@ -103,7 +104,7 @@ class DockerPublisher:
         await self._ensure_network()
         root = self._root(request.attempt_id)
         await asyncio.to_thread(shutil.rmtree, root, True)
-        await asyncio.to_thread(self._stage, root, request.bundle_path)
+        await asyncio.to_thread(self._stage, root, request.bundle_path, request.bundle_sha256)
         script = scripts.publisher_script(
             clone_url=request.repository_url,
             work_branch=request.work_branch,
@@ -188,7 +189,7 @@ class DockerPublisher:
                     await asyncio.to_thread(self._client.remove_container, container_id, force=True)
         return await asyncio.to_thread(self._read_outcome, root / "out", exit_code)
 
-    def _stage(self, root: Path, bundle_path: str) -> None:
+    def _stage(self, root: Path, bundle_path: str, expected_sha256: str) -> None:
         """Copy the branch bundle into a directory of its own and make the output dir.
 
         The publisher gets the bundle and nothing else of the collector's output: the
@@ -197,6 +198,9 @@ class DockerPublisher:
         source = Path(bundle_path)
         if not source.is_file():
             raise FileNotFoundError(f"no branch bundle at {bundle_path}")
+        actual_sha256 = hashlib.sha256(source.read_bytes()).hexdigest()
+        if not expected_sha256 or actual_sha256 != expected_sha256:
+            raise ValueError("the branch bundle no longer matches its sealed sha256")
         for leaf in ("bundle", "out"):
             directory = root / leaf
             directory.mkdir(parents=True, exist_ok=True)

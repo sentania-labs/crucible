@@ -263,6 +263,7 @@ def test_review_dispositions_are_append_only(ctx: AppContext) -> None:
         disposition = ReviewDisposition(
             id=new_id(),
             review_comment_id="2101",
+            comment_body_sha256="0" * 64,
             principal_id=principal.id,
             disposition=DispositionKind.FIX,
             reasoning="The reviewer is right.",

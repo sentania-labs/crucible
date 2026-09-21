@@ -271,6 +271,7 @@ def record_collection_evidence(
                 "work_branch": bundle.work_branch,
                 "commits": bundle.commits,
                 "bundle_verified": bundle.verified,
+                "bundle_sha256": bundle.sha256,
                 "commit_paths": list(bundle.commit_paths),
                 "commit_messages": list(bundle.commit_messages),
                 "claimed_head_sha": claimed,

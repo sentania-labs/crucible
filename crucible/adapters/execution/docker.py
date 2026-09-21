@@ -1763,6 +1763,7 @@ def _read_outputs(
     head = _text(output / "head.txt").strip()
     commits_text = _text(output / "commits.txt").strip() or "0"
     repository = spec.contract.get("repository", {})
+    bundle_path = output / "work_branch.bundle"
     bundle = None
     if head and collector_exit == 0:
         bundle = BranchBundle(
@@ -1772,6 +1773,11 @@ def _read_outputs(
             or str(repository.get("work_branch", "")),
             commits=int(commits_text) if commits_text.isdigit() else 0,
             verified=bundle_verified,
+            sha256=(
+                hashlib.sha256(bundle_path.read_bytes()).hexdigest()
+                if bundle_path.is_file()
+                else ""
+            ),
             commit_paths=commit_paths,
             commit_messages=tuple(messages),
         )

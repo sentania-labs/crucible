@@ -31,11 +31,13 @@ class FakePublisher:
     pushes: list[tuple[str, str]] = field(default_factory=list)
     tokens_seen: list[str] = field(default_factory=list)
     bundle_paths: list[str] = field(default_factory=list)
+    bundle_sha256s: list[str] = field(default_factory=list)
 
     async def push(self, request: PublishRequest, token: InstallationToken) -> PublishOutcome:
         value = token.reveal()
         self.tokens_seen.append(value)
         self.bundle_paths.append(request.bundle_path)
+        self.bundle_sha256s.append(request.bundle_sha256)
         if value not in self.github.tokens:
             return PublishOutcome(
                 pushed=False,

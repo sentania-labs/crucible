@@ -4,7 +4,7 @@ dispositions, wakes, and attempt metrics."""
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 
 from sqlalchemy import func, select, update
@@ -527,6 +527,7 @@ class Dispositions:
         return ReviewDisposition(
             id=row.id,
             review_comment_id=row.review_comment_id,
+            comment_body_sha256=row.comment_body_sha256,
             principal_id=row.principal_id,
             disposition=DispositionKind(row.disposition),
             reasoning=row.reasoning,
@@ -538,6 +539,7 @@ class Dispositions:
             ReviewDispositionRow(
                 id=disposition.id,
                 review_comment_id=disposition.review_comment_id,
+                comment_body_sha256=disposition.comment_body_sha256,
                 principal_id=disposition.principal_id,
                 disposition=disposition.disposition.value,
                 reasoning=disposition.reasoning,
@@ -546,7 +548,11 @@ class Dispositions:
         )
         self._s.flush()
 
-    def list_for_comments(self, comment_ids: Sequence[str]) -> Sequence[ReviewDisposition]:
+    def list_for_comments(
+        self,
+        comment_ids: Sequence[str],
+        comment_body_sha256_by_comment: Mapping[str, str] | None = None,
+    ) -> Sequence[ReviewDisposition]:
         if not comment_ids:
             return []
         rows = self._s.scalars(
@@ -554,13 +560,26 @@ class Dispositions:
                 ReviewDispositionRow.review_comment_id.in_(list(comment_ids))
             )
         ).all()
-        return [self._to_entity(r) for r in rows]
+        dispositions = [self._to_entity(r) for r in rows]
+        if comment_body_sha256_by_comment is None:
+            return dispositions
+        return [
+            disposition
+            for disposition in dispositions
+            if comment_body_sha256_by_comment.get(disposition.review_comment_id)
+            == disposition.comment_body_sha256
+        ]
 
-    def get_by_comment(self, review_comment_id: str) -> ReviewDisposition | None:
+    def get_by_comment(
+        self, review_comment_id: str, comment_body_sha256: str | None = None
+    ) -> ReviewDisposition | None:
+        conditions = [ReviewDispositionRow.review_comment_id == review_comment_id]
+        if comment_body_sha256 is not None:
+            conditions.append(ReviewDispositionRow.comment_body_sha256 == comment_body_sha256)
         row = self._s.scalar(
-            select(ReviewDispositionRow).where(
-                ReviewDispositionRow.review_comment_id == review_comment_id
-            )
+            select(ReviewDispositionRow)
+            .where(*conditions)
+            .order_by(ReviewDispositionRow.created_at.desc(), ReviewDispositionRow.id.desc())
         )
         return self._to_entity(row) if row else None
 
