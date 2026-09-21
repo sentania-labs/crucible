@@ -46,7 +46,7 @@ CRUCIBLE_DEPLOY_PORT ?= 8080
 
 .PHONY: up dev down reset lint check-image-manifest scan scan-tree scan-history smoke test test-unit \
 	test-integration e2e e2e-github e2e-live e2e-admin e2e-image build proxy-config proxies preflight \
-	deploy-local deploy-local-down
+	release-images-classify release-images-pull release-images-verify deploy-local deploy-local-down
 
 up: preflight proxy-config ## normal mode: postgres, proxies, migrate, crucible
 	@test -f .env || cp .env.example .env
@@ -108,9 +108,9 @@ reset: ## DESTRUCTIVE: down plus postgres, artifact, and credential volumes
 
 lint: check-image-manifest
 	$(UV) sync --frozen --quiet
-	$(UV) run ruff format --check crucible tests tools/smoke
-	$(UV) run ruff check crucible tests tools/smoke
-	$(UV) run mypy crucible tests tools/smoke
+	$(UV) run ruff format --check crucible tests tools/release tools/smoke
+	$(UV) run ruff check crucible tests tools/release tools/smoke
+	$(UV) run mypy crucible tests tools/release tools/smoke
 	$(UV) run lint-imports
 
 check-image-manifest: ## fail when a declared worker-image tag is stale
@@ -129,6 +129,19 @@ smoke: ## drive one task end to end through a running stack; `make up` first
 	@test -f .env || cp .env.example .env
 	COMPOSE="$(COMPOSE)" $(if $(CRUCIBLE_IMAGE),CRUCIBLE_IMAGE="$(CRUCIBLE_IMAGE)") \
 	  python3 tools/smoke/compose_smoke.py
+
+release-images-classify: ## classify release candidate and supporting images without pulling
+	@CRUCIBLE_IMAGE="$${CRUCIBLE_IMAGE:-ghcr.io/sentania-labs/crucible:classification-test}" \
+	  POSTGRES_PASSWORD="$${POSTGRES_PASSWORD:-classification-only}" COMPOSE="$(COMPOSE)" \
+	  DOCKER="$(DOCKER)" python3 tools/release/compose_images.py classify
+
+release-images-pull: ## pull only images that do not resolve to CRUCIBLE_IMAGE
+	@test -n "$(CRUCIBLE_IMAGE)" || { echo "set CRUCIBLE_IMAGE"; exit 2; }
+	@COMPOSE="$(COMPOSE)" DOCKER="$(DOCKER)" python3 tools/release/compose_images.py pull-supporting
+
+release-images-verify: ## prove every CRUCIBLE_IMAGE service container uses the local candidate
+	@test -n "$(CRUCIBLE_IMAGE)" || { echo "set CRUCIBLE_IMAGE"; exit 2; }
+	@COMPOSE="$(COMPOSE)" DOCKER="$(DOCKER)" python3 tools/release/compose_images.py verify-candidate
 
 test: test-unit test-integration
 

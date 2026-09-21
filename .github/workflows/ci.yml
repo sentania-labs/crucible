@@ -77,6 +77,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: classify release candidate and supporting images
+        run: make release-images-classify
       - name: make up from a clean clone
         run: make up
       # tools/smoke/compose_smoke.py is the only definition of this smoke; the
