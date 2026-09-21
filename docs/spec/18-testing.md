@@ -1,7 +1,9 @@
 # 18. Testing strategy
 
-Same definitions locally and in CI: `make lint` (ruff, mypy --strict,
-import-linter), `make test` (unit + integration), `make e2e`. CI runs on
+Same definitions locally and in CI: `make lint` (image-manifest drift, ruff,
+mypy --strict, import-linter), `make test` (unit + integration), `make e2e`.
+The e2e target checks the declared script-harness pin before contacting the
+daemon and requires an explicit `make e2e-image` to repair drift. CI runs on
 GitHub-hosted runners because the integration and end-to-end tiers need a
 Docker daemon.
 

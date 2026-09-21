@@ -112,8 +112,10 @@ Rules:
   a live run picked a stale tag exactly that way. `images/build.sh` writes
   `images/manifest.env` with the tag and OCI manifest digest per harness,
   and the e2e and live tiers read it. Recording is not a build input, so
-  writing the manifest never changes a tag. A launch is refused when more
-  than one tag matches a harness and the manifest pins none.
+  writing the manifest never changes a tag. `make lint` and `make e2e`
+  execute `images/check-manifest.sh`, which runs the tag calculation in
+  `build.sh` without building and refuses a stale declared pin. A launch is
+  refused when more than one tag matches a harness and the manifest pins none.
 - An image is launched with a harness's credential only when it carries a
   `crucible.harness` label equal to the requested harness (07). No label,
   or a different one, is a refusal before anything is seeded.
@@ -124,23 +126,24 @@ Rules:
   installed versions (from image labels of allowlisted images) and the
   supported range; a launch with an unsupported combination is refused
   with a wake, never a warning.
-- Images are built locally in C3 and C5. Versioned, digest-pinned images
+- Images are built locally. Versioned, digest-pinned images
   publish to `ghcr.io/sentania-labs/crucible-worker` once the live harness
-  phase and the release workflow exist. The four images the C5a rebuild
-  produced on the rootless daemon, with `images/manifest.env` as the
-  authoritative record:
+  phase and the release workflow exist. The current images on the rootless
+  daemon, with `images/manifest.env` as the authoritative record:
 
   | Harness | Tag |
   |---|---|
-  | `claude_code` | `crucible-worker:claude_code-2.1.273-8b75176f203e` |
-  | `codex` | `crucible-worker:codex-0.153.4-ce72fc1b2e20` |
-  | `agy` | `crucible-worker:agy-1.2.4-26838f92302b` |
-  | `script-harness` | `crucible-worker:script-harness-1.0.0-34cf5b56ca5a` |
+  | `claude_code` | `crucible-worker:claude_code-2.1.273-1d43260eec11` |
+  | `codex` | `crucible-worker:codex-0.153.4-8cc315ca7aab` |
+  | `agy` | `crucible-worker:agy-1.2.4-975aff4033e0` |
+  | `hermes` | `crucible-worker:hermes-0.19.0-ced6620edef7` |
+  | `script-harness` | `crucible-worker:script-harness-1.0.0-88cd22bf214a` |
 
   `build.sh` is itself a hashed build input, so editing it retags every
   image; the previous tags stay on the daemon as the rollback. CI builds
   the script image from the same inputs and so gets the same tag, which is
-  how its e2e job and the pin agree without a push.
+  how its e2e job and the pin agree without a push. The CI lint job calls the
+  same `make lint` definition as a local run, so drift is rejected in both.
 
 Image promotion (a Crucible repository process, C8):
 
