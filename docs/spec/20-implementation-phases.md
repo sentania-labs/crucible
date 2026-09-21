@@ -130,9 +130,8 @@ routing entries; `spark-local` pool concurrency of four; routing version 4 disab
 before the gate and version 5 only after it. Acceptance: one real Hermes task
 passes report, scope, verification, transcript-integrity, routing-history, and metrics
 checks; four concurrent tasks complete without shared state while a fifth waits; all
-standard and live tiers pass. The 2026-09-20 single-task gate passed, but the
-four-way gate timed out three concurrent attempts, so version 4 remains disabled and
-version 5 is deferred.
+standard and live tiers pass. Delivered 2026-09-20 after the single-task and four-way
+gates passed; immutable routing version 5 enables the verified entry.
 
 ## Phase C7: release lifecycle (24)
 

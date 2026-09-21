@@ -182,15 +182,19 @@ def test_0013_materializes_the_configured_spark_url(
     assert hermes is not None and hermes.endpoint_url == "http://192.0.2.41:11434/v1"
     assert hermes.disabled_reason == "enablement gate has not passed"
     with engine.connect() as conn:
-        assert (
-            conn.execute(
-                text(
-                    "SELECT count(*) FROM routing_policies "
-                    "WHERE name='default-routing' AND version=5"
-                )
-            ).scalar_one()
-            == 0
-        )
+        enabled_document = conn.execute(
+            text("SELECT document FROM routing_policies WHERE name='default-routing' AND version=5")
+        ).scalar_one()
+        policy_ref = conn.execute(
+            text(
+                "SELECT document -> 'routing' -> 'policy' ->> 'version' FROM policies "
+                "WHERE name='default-software' AND version=5"
+            )
+        ).scalar_one()
+    enabled = RoutingPolicyV1.model_validate(enabled_document).model("gpt-oss:120b")
+    assert enabled is not None and enabled.enabled and enabled.disabled_reason is None
+    assert enabled.endpoint_url == "http://192.0.2.41:11434/v1"
+    assert int(policy_ref) == 5
     engine.dispose()
 
 
