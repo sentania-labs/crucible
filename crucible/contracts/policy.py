@@ -12,6 +12,7 @@ from typing import Any, Literal
 from pydantic import Field, field_validator, model_validator
 
 from crucible.contracts.common import StrictModel, check_major_version
+from crucible.domain.endpoints import validate_endpoint
 from crucible.domain.exit_class import ExitClass
 from crucible.domain.gates import (
     ALL_GATES,
@@ -327,6 +328,8 @@ class RoutingModel(StrictModel):
             raise ValueError(
                 f"disabled local model {self.id!r} without endpoint_url must record why"
             )
+        if self.endpoint == "local" and self.endpoint_url:
+            validate_endpoint("local", self.endpoint_url)
         if self.endpoint == "subscription" and self.endpoint_url:
             raise ValueError(f"subscription model {self.id!r} must not carry endpoint_url")
         if self.enabled and self.disabled_reason:

@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import subprocess
+from pathlib import Path
+
 import pytest
 
 from crucible.application.proxy_config import enabled_local_endpoints, worker_proxy_config
 from crucible.ports.execution import LaunchSpec
 from crucible.ports.harness import LaunchContext
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_launch_contracts_require_a_local_url_and_forbid_a_subscription_url() -> None:
@@ -81,3 +86,27 @@ def test_proxy_rejects_https_local_destinations() -> None:
                 }
             ],
         )
+
+
+def test_make_proxy_config_passes_the_configured_spark_endpoint() -> None:
+    endpoint = "http://192.0.2.41:11434/v1"
+    result = subprocess.run(
+        ["make", "--dry-run", "proxy-config", f"CRUCIBLE_SPARK_ENDPOINT_URL={endpoint}"],
+        cwd=REPO_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert f'--configured-local-endpoint "{endpoint}"' in result.stdout
+
+
+def test_make_deploy_local_forwards_the_configured_spark_endpoint() -> None:
+    endpoint = "http://192.0.2.41:11434/v1"
+    result = subprocess.run(
+        ["make", "--dry-run", "deploy-local", f"CRUCIBLE_SPARK_ENDPOINT_URL={endpoint}"],
+        cwd=REPO_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert f'CRUCIBLE_SPARK_ENDPOINT_URL="{endpoint}"' in result.stdout

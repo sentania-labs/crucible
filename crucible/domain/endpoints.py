@@ -1,4 +1,4 @@
-"""Validation shared by the launch contracts for subscription and local endpoints."""
+"""Validation shared by policy and launch contracts for model endpoints."""
 
 from __future__ import annotations
 

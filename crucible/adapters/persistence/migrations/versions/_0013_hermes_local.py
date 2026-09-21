@@ -13,7 +13,7 @@ import os
 import sqlalchemy as sa
 from alembic import op
 
-from crucible.ports.endpoints import validate_endpoint
+from crucible.domain.endpoints import validate_endpoint
 
 revision = "0013_hermes_local"
 down_revision = "0012_heartbeats"

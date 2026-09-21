@@ -15,7 +15,7 @@ from pydantic_settings import (
     TomlConfigSettingsSource,
 )
 
-from crucible.ports.endpoints import validate_endpoint
+from crucible.domain.endpoints import validate_endpoint
 
 
 class ServiceSettings(BaseModel):

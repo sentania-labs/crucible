@@ -56,3 +56,14 @@ The reviewer also noted stale specs and two transcript writers. The named spec s
 now describe C6d, `provider_error`, version 4 and 5, the pool cap, and the local proxy
 rules. Hermes now inherits stdout so Crucible's launch wrapper is the sole transcript
 writer. No review finding remains open.
+
+The automatic pull request review found three deployment-path defects after PR 43
+opened. `deploy-local` did not persist the configured Spark endpoint into its service
+user-owned environment, `make up` did not derive a proxy ACL from that configured
+endpoint unless a separate routing policy file was supplied, and routing policy upload
+accepted malformed local URLs until attempt preparation. The deployment now forwards
+and persists the endpoint, proxy generation represents the configured endpoint as the
+same enabled local route migration 0014 creates, and policy parsing applies the shared
+endpoint validator before storage. Focused tests cover normal `make up`, deploy-local
+forwarding, malformed URLs, and the resulting ordered Squid rules. All three findings
+are closed in the same PR without initiating another review round.

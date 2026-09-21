@@ -16,8 +16,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
+from crucible.domain.endpoints import validate_endpoint
 from crucible.domain.exit_class import ExitClass
-from crucible.ports.endpoints import validate_endpoint
 
 _VERSION = re.compile(r"^(\d+)\.(\d+)\.(\d+)")
 

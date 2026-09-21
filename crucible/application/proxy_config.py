@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from crucible.ports.endpoints import validate_endpoint
+from crucible.domain.endpoints import validate_endpoint
 
 
 def enabled_local_endpoints(routing_policies: Sequence[Mapping[str, Any]]) -> list[str]:
@@ -86,6 +86,7 @@ def main() -> None:
     parser.add_argument("--subnet", required=True)
     parser.add_argument("--host", action="append", default=[])
     parser.add_argument("--routing-policy", action="append", type=Path, default=[])
+    parser.add_argument("--configured-local-endpoint", action="append", default=[])
     args = parser.parse_args()
     routing_policies: list[Mapping[str, Any]] = []
     for path in args.routing_policy:
@@ -96,6 +97,22 @@ def main() -> None:
         if not isinstance(document, dict):
             raise ValueError(f"routing policy {path} has no object document")
         routing_policies.append(document)
+    # A configured Spark endpoint is also the input that makes migration 0014 create
+    # an enabled local route. Represent that deployment-time route in the same shape as
+    # uploaded policy documents so one filtering and validation path generates Squid.
+    if args.configured_local_endpoint:
+        routing_policies.append(
+            {
+                "models": [
+                    {
+                        "endpoint": "local",
+                        "endpoint_url": endpoint,
+                        "enabled": True,
+                    }
+                    for endpoint in args.configured_local_endpoint
+                ]
+            }
+        )
     args.output.write_text(
         worker_proxy_config(args.subnet, args.host, routing_policies), encoding="utf-8"
     )

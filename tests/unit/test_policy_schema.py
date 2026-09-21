@@ -202,6 +202,16 @@ def test_local_model_must_carry_an_endpoint_url() -> None:
     assert any("endpoint_url" in e for e in _routing_errors(document))
 
 
+@pytest.mark.parametrize(
+    "endpoint_url",
+    ["file:///v1", "http://example.invalid/not-v1", "http://user@example.invalid/v1"],
+)
+def test_local_model_endpoint_url_must_be_a_valid_http_base(endpoint_url: str) -> None:
+    document = routing_document()
+    document["models"][5]["endpoint_url"] = endpoint_url
+    assert any("http(s) base URL ending in /v1" in e for e in _routing_errors(document))
+
+
 def test_subscription_model_must_not_carry_an_endpoint_url() -> None:
     document = routing_document()
     document["models"][0]["endpoint_url"] = "http://example.invalid/v1"
