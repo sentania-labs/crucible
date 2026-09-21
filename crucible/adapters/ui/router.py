@@ -46,7 +46,9 @@ templates = Jinja2Templates(directory=str(ROOT / "templates"))
 router = APIRouter(prefix="/ui", include_in_schema=False)
 static = StaticFiles(directory=str(ROOT / "static"))
 COOKIE = "crucible_ui"
+PREAUTH_COOKIE = "crucible_ui_preauth"
 SESSION_MAX_AGE = 12 * 60 * 60
+PREAUTH_MAX_AGE = 10 * 60
 NAV = (
     ("/ui", "Status"),
     ("/ui/harnesses", "Harnesses"),
@@ -68,6 +70,10 @@ NAV = (
 
 def _serializer(ctx: Any) -> URLSafeTimedSerializer:
     return URLSafeTimedSerializer(ctx.ui_signing_key, salt="crucible-ui-session-v1")
+
+
+def _preauth_serializer(ctx: Any) -> URLSafeTimedSerializer:
+    return URLSafeTimedSerializer(ctx.ui_signing_key, salt="crucible-ui-preauth-v1")
 
 
 def _session(request: Request, ctx: Any, uow: UnitOfWork) -> tuple[Principal, str] | None:
@@ -198,25 +204,59 @@ def _redirect(form: dict[str, str], message: str, *, kind: str = "ok") -> Redire
 def sign_in_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
     if _session(request, ctx, uow) is not None:
         return RedirectResponse("/ui", status_code=303)
+    return _sign_in_form(request, ctx, next_path=request.query_params.get("next", "/ui"))
+
+
+def _sign_in_form(
+    request: Request,
+    ctx: Any,
+    *,
+    next_path: str,
+    message: str | None = None,
+    status_code: int = 200,
+) -> Response:
+    csrf = os.urandom(24).hex()
     context = _base(request, None, title="Sign in", active="")
-    context["next"] = request.query_params.get("next", "/ui")
-    return templates.TemplateResponse(request=request, name="signin.html", context=context)
+    context.update(next=next_path, csrf=csrf, message=message, message_kind="bad")
+    response = templates.TemplateResponse(
+        request=request, name="signin.html", context=context, status_code=status_code
+    )
+    response.set_cookie(
+        PREAUTH_COOKIE,
+        _preauth_serializer(ctx).dumps({"csrf": csrf}),
+        max_age=PREAUTH_MAX_AGE,
+        httponly=True,
+        samesite="strict",
+        path="/ui/sign-in",
+    )
+    return response
 
 
 @router.post("/sign-in")
 async def sign_in(request: Request, ctx: Ctx, uow: UoW) -> Response:
     form = await _form(request)
+    raw_preauth = request.cookies.get(PREAUTH_COOKIE, "")
+    try:
+        preauth = _preauth_serializer(ctx).loads(raw_preauth, max_age=PREAUTH_MAX_AGE)
+        expected = preauth.get("csrf", "") if isinstance(preauth, dict) else ""
+        _csrf(form, expected)
+    except (BadSignature, SignatureExpired, ForbiddenError):
+        return _sign_in_form(
+            request,
+            ctx,
+            next_path=form.get("next", "/ui"),
+            message="The sign-in form expired or its CSRF token is invalid.",
+            status_code=403,
+        )
     token = form.get("token", "")
     principal = authenticate(uow, token)
     if principal is None:
-        context = _base(request, None, title="Sign in", active="")
-        context.update(
-            next=form.get("next", "/ui"),
+        return _sign_in_form(
+            request,
+            ctx,
+            next_path=form.get("next", "/ui"),
             message="Token not recognized.",
-            message_kind="bad",
-        )
-        return templates.TemplateResponse(
-            request=request, name="signin.html", context=context, status_code=401
+            status_code=401,
         )
     csrf = os.urandom(24).hex()
     value = _serializer(ctx).dumps({"token": token, "csrf": csrf})
@@ -232,6 +272,7 @@ async def sign_in(request: Request, ctx: Ctx, uow: UoW) -> Response:
         samesite="strict",
         path="/ui",
     )
+    response.delete_cookie(PREAUTH_COOKIE, path="/ui/sign-in", httponly=True, samesite="strict")
     return response
 
 

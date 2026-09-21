@@ -293,13 +293,22 @@ async def test_login_container_has_one_narrow_credential_mount_and_no_workspace(
     assert client.removed == ["container-1"]
 
 
-async def test_task_retention_does_not_kill_an_interactive_login(tmp_path: Path) -> None:
+async def test_retention_reaps_stale_login_but_keeps_one_owned_by_this_process(
+    tmp_path: Path,
+) -> None:
     client = StubClient()
     client.containers = [
         {
-            "Id": "login-container",
+            "Id": "stale-login",
             "Labels": {
-                "crucible.attempt": "login-not-a-task-attempt",
+                "crucible.attempt": "stale-login-id",
+                "crucible.role": "login",
+            },
+        },
+        {
+            "Id": "active-login",
+            "Labels": {
+                "crucible.attempt": "active-login-id",
                 "crucible.role": "login",
             },
         },
@@ -308,8 +317,10 @@ async def test_task_retention_does_not_kill_an_interactive_login(tmp_path: Path)
             "Labels": {"crucible.attempt": "gone", "crucible.role": "worker"},
         },
     ]
+    docker = provider(tmp_path, client)
+    docker._active_login_ids.add("active-login-id")
 
-    removed = await provider(tmp_path, client).retention([])
+    removed = await docker.retention([])
 
-    assert removed == 1
-    assert client.removed == ["orphan-worker"]
+    assert removed == 2
+    assert client.removed == ["stale-login", "orphan-worker"]

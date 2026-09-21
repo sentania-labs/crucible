@@ -298,6 +298,9 @@ class DockerProvider:
         # say what went wrong rather than only that something did.
         self.last_error: dict[str, str] = {}
         self._network_ready = False
+        # Login sessions are process-local. Retention preserves only sessions driven
+        # by this provider instance and reaps labels left by a crashed predecessor.
+        self._active_login_ids: set[str] = set()
 
     # ----- helpers -----------------------------------------------------
 
@@ -1319,11 +1322,11 @@ class DockerProvider:
             return 0
         for row in rows:
             labels = {str(k): str(v) for k, v in (row.get("Labels") or {}).items()}
-            if labels.get(LABEL_ROLE) == ROLE_LOGIN:
-                # Login containers are process-local administrative sessions, not task
-                # attempts. Their driver reaps them on finish, cancel, or timeout.
-                continue
             attempt_id = labels.get(LABEL_ATTEMPT, "")
+            if labels.get(LABEL_ROLE) == ROLE_LOGIN and attempt_id in self._active_login_ids:
+                # A live process owns this administrative session. A restarted provider
+                # has an empty set, so its first retention sweep reaps stale logins.
+                continue
             if attempt_id and attempt_id not in live:
                 await self._call(self.client.remove_container, str(row["Id"]), force=True)
                 removed += 1
@@ -1602,6 +1605,7 @@ class DockerProvider:
         buffer = ""
         token_re = re.compile(flow.token_pattern) if flow.captures_token else None
         deadline = time.monotonic() + timeout
+        self._active_login_ids.add(login_id)
         try:
             container_id = await self._call(
                 self.client.create_container, f"crucible-login-{flow.harness}-{login_id}", body
@@ -1653,6 +1657,7 @@ class DockerProvider:
             session.state = "failed"
             session.error = f"the login container failed: {type(exc).__name__}: {exc}"
         finally:
+            self._active_login_ids.discard(login_id)
             if response is not None:
                 response.close()
             if connection is not None:

@@ -49,8 +49,10 @@ def test_page_template_uses_lattice_in_order_and_carries_csrf() -> None:
 
 
 def test_login_template_has_refresh_fallback_and_only_polling_script() -> None:
+    context = base_context("/ui/credentials/codex/login")
+    context["principal"] = SimpleNamespace(name="admin", role=SimpleNamespace(value="admin"))
     rendered = templates.get_template("login.html").render(
-        **base_context("/ui/credentials/codex/login"),
+        **context,
         harness="codex",
         login={
             "state": "starting",
@@ -64,3 +66,24 @@ def test_login_template_has_refresh_fallback_and_only_polling_script() -> None:
     assert "Refresh status" in rendered
     assert rendered.count("<script>") == 1
     assert "setTimeout" in rendered
+
+
+def test_reader_login_page_has_state_but_no_operator_controls() -> None:
+    rendered = templates.get_template("login.html").render(
+        **base_context("/ui/credentials/codex/login"),
+        harness="codex",
+        login={
+            "state": "waiting_for_operator",
+            "window": "Device flow",
+            "url": "https://example.invalid/device",
+            "code": "ABCD-EFGH",
+            "output_tail": ["sensitive operator output"],
+            "error": None,
+        },
+    )
+    assert "Administrator access is required" in rendered
+    assert "waiting_for_operator" in rendered
+    assert "ABCD-EFGH" not in rendered
+    assert "sensitive operator output" not in rendered
+    assert "/ui/actions/login-" not in rendered
+    assert "<script>" not in rendered

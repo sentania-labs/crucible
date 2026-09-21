@@ -502,11 +502,6 @@ def start_login(
     # directory read-only on purpose is entitled to replace it.
     replaceable = _check_replaceable(spec, source, harness=harness, replace=replace)
     _check_writable(source, harness=harness, reuse=not replaceable)
-    retired = (
-        _retire_existing(ctx, uow, source, principal=principal, harness=harness, reason=reason)
-        if replaceable
-        else None
-    )
     image = None
     runner = getattr(registry, "container_runner", lambda _ctx: None)(ctx)
     if runner is not None:
@@ -523,9 +518,14 @@ def start_login(
                 f"no promoted worker image is available for {harness}; promote one first"
             )
         image = promoted.reference
-        Path(source.path).mkdir(parents=True, exist_ok=True, mode=0o700)
+    retired = (
+        _retire_existing(ctx, uow, source, principal=principal, harness=harness, reason=reason)
+        if replaceable
+        else None
+    )
     try:
         if runner is not None:
+            Path(source.path).mkdir(parents=True, exist_ok=True, mode=0o700)
             session = registry.start(ctx, harness, source.path, image=image)
         else:
             session = registry.start(ctx, harness, source.path)

@@ -53,6 +53,7 @@ from crucible.cli.wiring import Wiring, wire
 from crucible.contracts.api import ExternalReviewAttestation, RepositoryRegistration
 from crucible.domain.entities import Role
 from crucible.domain.events import EventKind
+from crucible.domain.ids import new_id
 from crucible.logs import configure_logging
 from crucible.settings import load_settings
 
@@ -636,10 +637,13 @@ def _ensure_first_admin(database_url: str) -> None:
                 for item in uow.principals.list_all()
             ):
                 return
+            name = "first-run-admin"
+            if uow.principals.get_by_name(name) is not None:
+                name = f"first-run-admin-{new_id()[-8:].lower()}"
             minted = mint_token(
                 uow,
                 SystemClock(),
-                name="first-run-admin",
+                name=name,
                 role=Role.ADMIN,
             )
             record_event(
