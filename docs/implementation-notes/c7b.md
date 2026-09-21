@@ -84,8 +84,8 @@ screenshots exercised the final image directly.
 | Tier | Result |
 |---|---|
 | `make lint` | Passed: formatting, Ruff, mypy across 237 files, and all three import contracts. |
-| `make test` | Passed: 619 unit tests and 314 integration tests, with three warnings. |
-| `make scan` | Passed: no secret patterns in tracked content or branch commits. |
+| `make test` | Passed: 622 unit tests in 5.69 seconds and 314 integration tests in 368.28 seconds, with three dependency deprecation warnings. |
+| `make scan` | Passed: no secret patterns in 3.70 MB of tracked content or the branch commits. |
 | `make e2e` | Limited by the local rootless container tier. First run: 8 passed, 9 failed, 12 deselected. Clean rerun: 12 passed, 5 failed, 12 deselected. The remaining failures were an identity entrypoint exit 70 without its identity bundle, expected timeout or stalled states observed as lost after worker exit, a cancellation case with no worker container to inspect, and absent V9 verifier evidence. None exercised the administration renderer. |
 | `make up` | Passed after assigning unused isolated subnets. Application, migration, proxy, and PostgreSQL containers became healthy or completed successfully. |
 | `make smoke` | Passed on the isolated port after the initial default-port invocation failed to connect. |
