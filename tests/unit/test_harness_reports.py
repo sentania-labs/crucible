@@ -325,6 +325,56 @@ def test_hermes_usage_and_provider_failures_precede_report_classification(tmp_pa
     assert adapter.provider_quota_event("quota exceeded", "") is None
 
 
+def test_hermes_termination_facts_precede_usage_and_provider_text(tmp_path: Path) -> None:
+    (tmp_path / "hermes-usage.json").write_text(
+        '{"completed":true,"failed":false}', encoding="utf-8"
+    )
+    adapter = HermesAdapter()
+    assert adapter.classify_exit(ExitInfo(exit_code=None, lost=True), "", "", tmp_path) is (
+        ExitClass.LOST
+    )
+    assert adapter.classify_exit(
+        ExitInfo(exit_code=137, timed_out=True), "", "quota exceeded", tmp_path
+    ) is (ExitClass.TIMEOUT)
+    assert adapter.classify_exit(
+        ExitInfo(exit_code=137, killed=True), "", "HTTP 503", tmp_path
+    ) is (ExitClass.KILLED)
+    assert adapter.classify_exit(
+        ExitInfo(exit_code=137, oom_killed=True), "", "connection refused", tmp_path
+    ) is (ExitClass.ENVIRONMENT)
+
+
+def test_hermes_completed_usage_then_report_and_missing_usage_order(tmp_path: Path) -> None:
+    usage = tmp_path / "hermes-usage.json"
+    usage.write_text('{"completed":true,"failed":false}', encoding="utf-8")
+    adapter = HermesAdapter()
+    assert adapter.classify_exit(ExitInfo(exit_code=0, report_present=True), "", "", tmp_path) is (
+        ExitClass.COMPLETED
+    )
+    assert adapter.classify_exit(ExitInfo(exit_code=0), "", "", tmp_path) is (
+        ExitClass.COMPLETED_WITHOUT_REPORT
+    )
+    usage.unlink()
+    assert adapter.classify_exit(ExitInfo(exit_code=0, report_present=True), "", "", tmp_path) is (
+        ExitClass.COMPLETED
+    )
+    parsed = adapter.parse_report(tmp_path, ExitInfo(exit_code=0, report_present=True))
+    assert parsed.run_evidence_error == "missing hermes-usage.json"
+
+
+@pytest.mark.parametrize("stderr", ["HTTP 500", "bad gateway", "connection refused"])
+def test_hermes_local_provider_failures_never_mark_quota(tmp_path: Path, stderr: str) -> None:
+    (tmp_path / "hermes-usage.json").write_text(
+        '{"completed":false,"failed":true}', encoding="utf-8"
+    )
+    adapter = HermesAdapter()
+    assert adapter.classify_exit(ExitInfo(exit_code=75), "", stderr, tmp_path) is (
+        ExitClass.PROVIDER_ERROR
+    )
+    assert adapter.provider_quota_event("", stderr) is None
+    assert not adapter.provider_quota_exhausted("", stderr)
+
+
 def test_a_bare_number_in_a_crashed_agy_tail_is_not_quota() -> None:
     """A line number or a token count is three digits too; the quota class needs the
     provider's own words."""

@@ -56,26 +56,14 @@ def _enrich_usage(usage_path: Path, home: Path) -> None:
 def main() -> int:
     usage_path = Path(os.environ["CRUCIBLE_HERMES_USAGE"])
     home = Path(os.environ["HERMES_HOME"])
-    transcript_path = usage_path.parent / "transcript.jsonl"
-    child = subprocess.Popen(
-        ["/opt/hermes/bin/hermes", *sys.argv[1:]],
-        stdout=subprocess.PIPE,
-        text=True,
-        bufsize=1,
-    )
+    # Stdout stays inherited. Crucible's launch wrapper is the sole transcript writer.
+    child = subprocess.Popen(["/opt/hermes/bin/hermes", *sys.argv[1:]])
 
     def forward(signum: int, _frame: object) -> None:
         child.send_signal(signum)
 
     signal.signal(signal.SIGTERM, forward)
     signal.signal(signal.SIGINT, forward)
-    assert child.stdout is not None
-    with transcript_path.open("w", encoding="utf-8") as transcript:
-        for line in child.stdout:
-            sys.stdout.write(line)
-            sys.stdout.flush()
-            transcript.write(line)
-            transcript.flush()
     code = child.wait()
     _enrich_usage(usage_path, home)
     return code if code >= 0 else 128 - code

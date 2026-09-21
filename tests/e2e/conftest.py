@@ -94,9 +94,20 @@ TRUNCATE = (
 def _squid_conf(directory: Path) -> Path:
     """The same configuration `make proxy-config` writes, for the test's allowlist."""
     endpoint = os.environ.get("CRUCIBLE_SPARK_ENDPOINT_URL", "").strip()
+    routing = {
+        "models": [
+            {
+                "endpoint": "local",
+                "endpoint_url": endpoint,
+                "enabled": True,
+            }
+        ]
+        if endpoint
+        else []
+    }
     path = directory / "squid.conf"
     path.write_text(
-        worker_proxy_config(WORKERS_SUBNET, list(EGRESS_ALLOWLIST), [endpoint] if endpoint else []),
+        worker_proxy_config(WORKERS_SUBNET, list(EGRESS_ALLOWLIST), [routing]),
         encoding="utf-8",
     )
     path.chmod(0o644)

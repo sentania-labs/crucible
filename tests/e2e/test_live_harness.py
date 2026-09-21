@@ -418,11 +418,7 @@ OBJECTIVE = """Make exactly this change and nothing else.
 6. Exit 0. Do not open a pull request, do not push, do not touch any other file.
 """
 
-HERMES_OBJECTIVE = r"""Complete the task with one terminal tool call. Do not inspect
-other files and do not split this into multiple tool calls. Run this exact command:
-
-python3 - <<'PY'
-import os
+HERMES_SCRIPT = r"""import os
 import subprocess
 from pathlib import Path
 import yaml
@@ -473,7 +469,16 @@ claim = {{
     "follow_ups": [],
 }}
 (report / "report.yaml").write_text(yaml.safe_dump(claim, sort_keys=False), encoding="utf-8")
-PY
+"""
+
+
+def _hermes_objective(external_id: str) -> str:
+    script = HERMES_SCRIPT.format(external_id=external_id)
+    return f"""Complete the task with one terminal tool call. Do not use the file tool,
+inspect other files, or split this into multiple calls. Run this exact command:
+
+python3 - <<'PY'
+{script}PY
 
 After that one command succeeds, exit without calling another tool.
 """
@@ -484,8 +489,11 @@ def _contract(harness: str, model: str, image: str, config: LiveConfig, external
     # No colon in the title: an unquoted colon inside a YAML value is the one thing a
     # small model gets wrong most, and the tier proves the pipeline, not YAML quoting.
     document["title"] = f"c5 live run for {external_id}"
-    objective = HERMES_OBJECTIVE if harness == "hermes" else OBJECTIVE
-    document["objective"] = objective.format(harness=harness, external_id=external_id)
+    document["objective"] = (
+        _hermes_objective(external_id)
+        if harness == "hermes"
+        else OBJECTIVE.format(harness=harness, external_id=external_id)
+    )
     document["repository"]["work_branch"] = f"crucible/C5-{external_id}"
     document["scope"] = {
         "allowed_paths": ["notes/**"],
@@ -661,7 +669,8 @@ async def test_a_trivial_task_reaches_ready_for_merge_live(
             "harness_view": harness_view,
         }
         sync = _payload(live_client, task_id, "credential_synced") or {}
-        metrics = _payload(live_client, task_id, "attempt_metrics_recorded") or {}
+        metrics = _payload(live_client, task_id, "attempt_metrics_recorded")
+        assert metrics is not None, "the completed live attempt has no metrics event"
         entry.update(
             {
                 "state_after_run": state,
@@ -692,10 +701,19 @@ async def test_a_trivial_task_reaches_ready_for_merge_live(
                 ),
                 {"id": attempt["id"]},
             ).one_or_none()
-        if row is not None and row.wall_ms is not None:
-            entry["duration_s"] = round(row.wall_ms / 1000, 1)
-            entry["harness_duration_ms"] = row.harness_duration_ms
-            entry["tool_calls"] = row.tool_calls
+        assert row is not None and row.wall_ms is not None, "AttemptMetrics was not recorded"
+        entry["duration_s"] = round(row.wall_ms / 1000, 1)
+        entry["harness_duration_ms"] = row.harness_duration_ms
+        entry["tool_calls"] = row.tool_calls
+        history = live_client.get(
+            "/v1/routing/history",
+            params={"model": model, "project": view["project"]},
+        ).json()["items"]
+        routing_row = next((item for item in history if item["attempt_id"] == attempt["id"]), None)
+        assert routing_row is not None, "the live attempt is absent from routing history"
+        assert routing_row["pool"] == ("spark-local" if harness == "hermes" else "e2e")
+        assert routing_row["wall_ms"] == row.wall_ms
+        entry["routing_history_recorded"] = True
         assert state == "awaiting_internal_review", entry
         if harness != "hermes":
             assert sync, "no credential_synced event: the copy was never synced back"
@@ -769,6 +787,7 @@ async def test_hermes_spark_pool_runs_four_and_defers_the_fifth_live(
     live_supervisor: Supervisor,
     live_config: LiveConfig,
     mirror: str,
+    engine: Engine,
 ) -> None:
     if "hermes" not in _selected():
         pytest.skip("the live selection does not include Hermes")
@@ -776,14 +795,15 @@ async def test_hermes_spark_pool_runs_four_and_defers_the_fifth_live(
     _enable(live_ctx, "hermes")
     image = _images().get("hermes") or daemon.image_tag("crucible-worker:hermes-", harness="hermes")
     task_ids: list[str] = []
+    started: dict[str, datetime] = {}
     for number in range(5):
         external_id = f"hermes-pool-{number}-{RUN_ID}"
-        task_ids.append(
-            submit_and_start(
-                live_client,
-                _contract("hermes", "gpt-oss:120b", image, live_config, external_id),
-            )
+        task_id = submit_and_start(
+            live_client,
+            _contract("hermes", "gpt-oss:120b", image, live_config, external_id),
         )
+        task_ids.append(task_id)
+        started[task_id] = datetime.now(UTC)
 
     for _ in range(3):
         await live_supervisor.tick()
@@ -798,14 +818,104 @@ async def test_hermes_spark_pool_runs_four_and_defers_the_fifth_live(
         and "spark-local pool" in event["payload"]["detail"]
         for event in deferred
     )
+    waiting = live_client.get(f"/v1/tasks/{task_ids[-1]}").json()
+    waiting_attempt = waiting["latest_attempt"]["id"]
+    response = live_client.post(
+        f"/v1/tasks/{task_ids[-1]}/cancel",
+        json={
+            "reason": "the fifth task proved the four-slot pool cap",
+            "verbatim": "cancel the deferred fifth pool-cap task",
+            "decided_by": "e2e-live",
+        },
+    )
+    assert response.status_code == 200, response.text
 
-    for task_id in task_ids:
+    completed = task_ids[:4]
+    final_states: dict[str, str] = {}
+    views: dict[str, dict[str, Any]] = {}
+    terminal = {"awaiting_internal_review", "pre_pr_gates_failed", "blocked", "cancelled"}
+    for _ in range(240):
+        await live_supervisor.tick()
+        views = {task_id: live_client.get(f"/v1/tasks/{task_id}").json() for task_id in completed}
+        final_states = {task_id: str(view["state"]) for task_id, view in views.items()}
+        if all(state in terminal for state in final_states.values()):
+            break
+        await asyncio.sleep(5.0)
+    assert all(state in terminal for state in final_states.values()), final_states
+
+    runs: list[dict[str, Any]] = []
+    attempt_ids: set[str] = set()
+    work_branches: set[str] = set()
+    for task_id in completed:
+        view = views[task_id]
+        attempt = view["latest_attempt"]
+        assert attempt["id"] not in attempt_ids
+        work_branch = view["contract"]["repository"]["work_branch"]
+        assert work_branch not in work_branches
+        attempt_ids.add(attempt["id"])
+        work_branches.add(work_branch)
+        gates = view["gate_summary"]["results"]
+        gates_passed = all(
+            result == "pass" for name, result in gates.items() if name != "internal_review_recorded"
+        )
+        with engine.begin() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT wall_ms, harness_duration_ms, tokens_in, tokens_out, tool_calls "
+                    "FROM attempt_metrics WHERE attempt_id = :id"
+                ),
+                {"id": attempt["id"]},
+            ).one_or_none()
+        assert row is not None and row.wall_ms is not None
+        runs.append(
+            {
+                "task_id": task_id,
+                "attempt_id": attempt["id"],
+                "started_local": _local(started[task_id]),
+                "wall_seconds": round(row.wall_ms / 1000, 1),
+                "harness_duration_ms": row.harness_duration_ms,
+                "tokens_in": row.tokens_in,
+                "tokens_out": row.tokens_out,
+                "tool_calls": row.tool_calls,
+                "state": view["state"],
+                "exit_class": attempt["exit_class"],
+                "exit_code": attempt["exit_code"],
+                "pre_pr_gates_passed": gates_passed,
+            }
+        )
+    all_completed = all(
+        run["state"] == "awaiting_internal_review"
+        and run["exit_class"] == "completed"
+        and run["exit_code"] == 0
+        and run["pre_pr_gates_passed"]
+        for run in runs
+    )
+    _record(
+        {
+            "kind": "hermes-pool-run",
+            "pool": "spark-local",
+            "max_concurrency": 4,
+            "all_completed": all_completed,
+            "runs": runs,
+            "deferred_fifth": {
+                "task_id": task_ids[-1],
+                "attempt_id": waiting_attempt,
+                "state_when_observed": "scheduled",
+                "durable_defer_event": True,
+            },
+        }
+    )
+
+    for task_id in completed:
+        if final_states[task_id] != "awaiting_internal_review":
+            continue
         response = live_client.post(
             f"/v1/tasks/{task_id}/cancel",
             json={
-                "reason": "the live pool-cap observation is complete",
-                "verbatim": "cancel the pool-cap test tasks",
+                "reason": "the completed four-way gate evidence is recorded",
+                "verbatim": "cancel the completed pool-gate task before review",
                 "decided_by": "e2e-live",
             },
         )
         assert response.status_code == 200, response.text
+    assert all_completed, runs

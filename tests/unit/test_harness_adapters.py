@@ -105,6 +105,62 @@ def test_agy_launch_matches_07_and_stays_under_the_argv_ceiling() -> None:
     assert launch.env == {} and launch.env_from_files == {}
 
 
+def test_hermes_launch_matches_07_and_uses_no_credential() -> None:
+    adapter = HermesAdapter()
+    launch = adapter.build_launch(
+        context(
+            model="gpt-oss:120b",
+            credential_mounted=False,
+            endpoint="local",
+            endpoint_url="http://spark.example.internal:11434/v1",
+        )
+    )
+    assert launch.argv == (
+        "crucible-hermes",
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--safe-mode",
+        "--yolo",
+        "--provider",
+        "openai-api",
+        "--model",
+        "gpt-oss:120b",
+        "--toolsets",
+        "terminal,file",
+        "--usage-file",
+        "/crucible/report/hermes-usage.json",
+        "-z",
+        POINTER,
+    )
+    assert launch.env == {
+        "HERMES_HOME": "/home/worker/.hermes",
+        "OPENAI_BASE_URL": "http://spark.example.internal:11434/v1",
+        "OPENAI_API_KEY": "local-no-auth",
+        "CRUCIBLE_HERMES_USAGE": "/crucible/report/hermes-usage.json",
+    }
+    assert launch.env_from_files == {}
+    assert launch.stdin_files == () and launch.stdin_text == ""
+    assert launch.transcript_path == "/crucible/report/transcript.jsonl"
+    assert launch.workdir == "/crucible/repo"
+    assert adapter.credential_spec() is None
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"model": "gpt-oss:120b", "endpoint": "subscription", "endpoint_url": None},
+        {
+            "model": "another-model",
+            "endpoint": "local",
+            "endpoint_url": "http://spark.example.internal:11434/v1",
+        },
+    ],
+)
+def test_hermes_refuses_any_launch_outside_its_local_model(overrides: dict[str, Any]) -> None:
+    with pytest.raises(ValueError):
+        HermesAdapter().build_launch(context(credential_mounted=False, **overrides))
+
+
 def test_script_harness_is_a_plain_argv() -> None:
     launch = ScriptHarnessAdapter().build_launch(context(credential_mounted=False))
     assert launch.argv == ("crucible-script-harness",)

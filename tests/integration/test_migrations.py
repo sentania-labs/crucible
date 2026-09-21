@@ -185,7 +185,8 @@ def test_0013_materializes_the_configured_spark_url(
         assert (
             conn.execute(
                 text(
-                    "SELECT count(*) FROM routing_policies WHERE name='default-routing' AND version=5"
+                    "SELECT count(*) FROM routing_policies "
+                    "WHERE name='default-routing' AND version=5"
                 )
             ).scalar_one()
             == 0

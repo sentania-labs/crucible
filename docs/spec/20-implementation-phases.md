@@ -122,6 +122,18 @@ reroute event in the record; a run with every pool marked waits and
 resumes on schedule across a supervisor restart. Replaces ADR 0014's
 predictive reads, which the operator rejected on 2026-09-19.
 
+## Phase C6d: Hermes on the DGX Spark local pool
+
+Hermes 0.19.0 worker image; credential-free local endpoint plumbing; mandatory
+usage evidence and AttemptMetrics; exact plain-HTTP proxy ACLs derived from enabled
+routing entries; `spark-local` pool concurrency of four; routing version 4 disabled
+before the gate and version 5 only after it. Acceptance: one real Hermes task
+passes report, scope, verification, transcript-integrity, routing-history, and metrics
+checks; four concurrent tasks complete without shared state while a fifth waits; all
+standard and live tiers pass. The 2026-09-20 single-task gate passed, but the
+four-way gate timed out three concurrent attempts, so version 4 remains disabled and
+version 5 is deferred.
+
 ## Phase C7: release lifecycle (24)
 
 ReleaseContractV1, release gates, tag publisher, workflow observation.
