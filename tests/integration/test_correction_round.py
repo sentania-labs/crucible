@@ -276,7 +276,8 @@ async def test_an_amendment_to_a_disabled_model_is_refused(
     policy["version"] = 50
     policy["routing"]["policy"]["version"] = 50
     assert (
-        client.put("/v1/policies/default-software/50", json=policy, headers=admin).status_code == 200
+        client.put("/v1/policies/default-software/50", json=policy, headers=admin).status_code
+        == 200
     )
     task_id = submit_and_start(
         client,
