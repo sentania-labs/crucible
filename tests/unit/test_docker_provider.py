@@ -7,6 +7,7 @@ tier's job.
 
 from __future__ import annotations
 
+import socket
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,7 @@ from crucible.adapters.execution.docker import (
     DockerProvider,
 )
 from crucible.adapters.execution.dockerapi import DockerApiError, LogFrame
+from crucible.application.admin.login import FLOWS, LoginSession
 from crucible.ports.execution import Handle, LaunchSpec, ProviderError, Workspace
 from tests.fixtures import contract_document
 
@@ -43,6 +45,7 @@ class StubClient:
         self.created: list[dict[str, Any]] = []
         self.killed: list[str] = []
         self.removed: list[str] = []
+        self._peers: list[socket.socket] = []
 
     def inspect_image(self, reference: str) -> dict[str, Any]:
         self.inspections += 1
@@ -61,6 +64,21 @@ class StubClient:
 
     def start_container(self, container_id: str) -> None:
         return None
+
+    def inspect_container(self, container_id: str) -> dict[str, Any]:
+        return {"State": {"Running": False, "ExitCode": 0}}
+
+    def attach_interactive(self, container_id: str) -> tuple[Any, socket.socket]:
+        attached, peer = socket.socketpair()
+        peer.sendall(b"Visit https://auth.openai.com/codex/device and enter ABCD-EFGH\n")
+        peer.shutdown(socket.SHUT_WR)
+        self._peers.append(peer)
+
+        class Connection:
+            def close(self) -> None:
+                attached.close()
+
+        return Connection(), attached
 
     def wait_container(self, container_id: str, *, timeout: float) -> int:
         if isinstance(self.wait, Exception):
@@ -218,3 +236,51 @@ async def test_a_hung_verifier_fails_verification_ran_with_the_reason(tmp_path: 
 async def test_the_sentinels_are_outside_any_real_exit_code() -> None:
     assert THROWAWAY_TIMED_OUT < 0 and THROWAWAY_API_ERROR < 0
     assert THROWAWAY_TIMED_OUT != THROWAWAY_API_ERROR
+
+
+async def test_login_container_has_one_narrow_credential_mount_and_no_workspace(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "credentials"
+    directory = root / "codex"
+    directory.mkdir(parents=True)
+    client = StubClient(labels={"crucible.harness": "codex", "crucible.harness_version": "0.153.0"})
+    docker = DockerProvider(
+        DockerConfig(
+            endpoint="tcp://127.0.0.1:1",
+            artifact_root=str(tmp_path / "artifacts"),
+            artifact_volume="artifacts",
+            credential_root=str(root),
+            credential_volume="credentials",
+            workers_network="workers",
+            egress_proxy="http://proxy:3128",
+            proxy_allowlist=("api.openai.com", "auth.openai.com", "chatgpt.com"),
+        ),
+        client=client,  # type: ignore[arg-type]
+    )
+    session = LoginSession(harness="codex", started_at=0)
+    await docker.run_login_container(
+        flow=FLOWS["codex"],
+        image="crucible-worker:codex-test",
+        directory=str(directory),
+        session=session,
+        argv=("codex", "login", "--device-auth"),
+        timeout=10,
+    )
+    body = client.created[0]["body"]
+    mounts = body["HostConfig"]["Mounts"]
+    assert mounts == [
+        {
+            "Type": "volume",
+            "Source": "credentials",
+            "Target": "/home/worker/.codex",
+            "ReadOnly": False,
+            "VolumeOptions": {"Subpath": "codex"},
+        }
+    ]
+    assert body["HostConfig"]["NetworkMode"] == "workers"
+    assert body["HostConfig"]["LogConfig"] == {"Type": "none", "Config": {}}
+    assert body["Tty"] and body["OpenStdin"] and body["AttachStdin"]
+    assert not any("workspace" in str(value) for value in mounts)
+    assert session.state == "finished" and session.code == "ABCD-EFGH"
+    assert client.removed == ["container-1"]

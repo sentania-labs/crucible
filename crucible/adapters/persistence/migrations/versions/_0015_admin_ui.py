@@ -9,7 +9,7 @@ from __future__ import annotations
 from alembic import op
 
 from crucible.adapters.persistence.migrations.versions._0012_heartbeats import (
-    _event_kinds as previous_event_kinds,
+    _event_kinds,
 )
 
 revision = "0015_admin_ui"
@@ -23,6 +23,10 @@ EVENT_KINDS = [
     "principal_revoked",
     "repository_removed",
 ]
+
+
+def previous_event_kinds() -> list[str]:
+    return _event_kinds()
 
 
 def _replace_kinds(kinds: list[str]) -> None:

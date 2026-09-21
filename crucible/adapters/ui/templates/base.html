@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ title }} | Crucible</title>
+  <link rel="stylesheet" href="/ui/static/tokens.css">
+  <link rel="stylesheet" href="/ui/static/lattice.css">
+  <link rel="stylesheet" href="/ui/static/admin.css">
+</head>
+<body>
+<div class="admin-shell">
+  <header class="lat-header">
+    <a class="admin-brand" href="/ui">Crucible</a>
+    <span class="lat-ver">administration</span>
+    <span class="admin-spacer"></span>
+    {% if principal %}<span class="lat-pill"><b>{{ principal.name }}</b> {{ principal.role.value }}</span>
+    <form method="post" action="/ui/sign-out"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="lat-btn lat-btn--ghost">Sign out</button></form>{% endif %}
+  </header>
+  {% if principal %}<nav class="admin-nav" aria-label="Administration">
+    {% for href, label in nav %}<a href="{{ href }}" {% if active == href %}aria-current="page"{% endif %}>{{ label }}</a>{% endfor %}
+  </nav>{% endif %}
+  <main class="admin-main">
+    {% if message %}<div class="lat-banner lat-banner--{{ message_kind }} admin-flash">{{ message }}</div>{% endif %}
+    {% block content %}{% endblock %}
+  </main>
+</div>
+</body>
+</html>

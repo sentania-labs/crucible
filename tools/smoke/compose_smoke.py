@@ -19,12 +19,15 @@ says nothing about what the server refused.
 from __future__ import annotations
 
 import argparse
+import http.cookiejar
 import json
 import os
+import re
 import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any
 
@@ -205,6 +208,8 @@ def mint_token(principal: str) -> str:
             "-T",
             "crucible",
             "crucible-admin",
+            "--reason",
+            "compose smoke principal",
             "token",
             "create",
             "--principal",
@@ -223,6 +228,55 @@ def mint_token(principal: str) -> str:
             "`crucible-admin token create` did not return a JSON object with a "
             f"`token` field ({exc}). Its output is withheld because it carries a token."
         ) from None
+
+
+def walk_first_run_ui(base_url: str) -> None:
+    """On a fresh compose database, sign in with the migration's one-time token.
+
+    Existing stacks may have replaced the migration container after the first run, so
+    absence of the framed token means this fresh-database assertion is not applicable.
+    The token is never printed by this process.
+    """
+    logs = compose(["logs", "--no-color", "migrate"], redact=True)
+    match = re.search(r"\bcru_[A-Z0-9]{26}\.[A-Za-z0-9_-]+\b", logs)
+    if match is None:
+        log("first-run UI walk skipped: migration log has no one-time token")
+        return
+    jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+    body = urllib.parse.urlencode({"token": match.group(0), "next": "/ui"}).encode()
+    request_object = urllib.request.Request(
+        f"{base_url}/ui/sign-in",
+        data=body,
+        method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    try:
+        with opener.open(request_object, timeout=DEFAULT_TIMEOUT) as response:
+            if response.status != 200 or b"System status" not in response.read():
+                raise SmokeError("first-run administrator sign-in did not render System status")
+        for path in (
+            "/ui/harnesses",
+            "/ui/credentials",
+            "/ui/images",
+            "/ui/routing",
+            "/ui/repositories",
+            "/ui/tokens",
+            "/ui/github",
+            "/ui/workers",
+            "/ui/tasks",
+            "/ui/wakes",
+            "/ui/retention",
+            "/ui/audit",
+            "/ui/bootstrap",
+            "/ui/settings",
+        ):
+            with opener.open(f"{base_url}{path}", timeout=DEFAULT_TIMEOUT) as response:
+                if response.status != 200 or b"Crucible" not in response.read():
+                    raise SmokeError(f"the first-run UI page {path} did not render")
+    except urllib.error.URLError as exc:
+        raise SmokeError(f"the first-run UI walk failed: {exc}") from None
+    log("first-run administrator sign-in and every UI page passed")
 
 
 def register_repository() -> None:
@@ -328,6 +382,7 @@ def smoke(
         log(f"reported version matches {expect_version}")
     request("GET", f"{base_url}/v1/ready")
     log("ready")
+    walk_first_run_ui(base_url)
 
     if token is None:
         token = mint_token(principal)

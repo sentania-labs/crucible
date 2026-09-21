@@ -1,0 +1,5 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="admin-title"><div><h1>Token created</h1><p>This is the only time Crucible will show this value.</p></div><span class="lat-badge lat-badge--warn">shown once</span></div>
+<section class="lat-card"><h2>{{ token_name }} ({{ token_role }})</h2><pre class="lat-code admin-secret">{{ token }}</pre><p class="lat-banner lat-banner--warn">Copy it now. Reloading or leaving this page loses it.</p><a class="lat-btn" href="/ui/tokens">Return to tokens</a></section>
+{% endblock %}

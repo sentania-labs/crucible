@@ -51,6 +51,9 @@ fallback-version = "0.0.0.dev0"
 [tool.hatch.build.targets.wheel]
 packages = ["crucible"]
 
+[tool.hatch.build]
+artifacts = ["crucible/adapters/ui/templates/*.html"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py312"

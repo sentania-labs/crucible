@@ -11,6 +11,17 @@
 # would have to carry.
 set -u
 
+# C7a exercises the interactive-login container path with the same real image and
+# daemon as the e2e worker tier. This mode emits harmless device-flow markers and
+# writes a non-secret result only into the selected credential mount.
+if [ "${1:-}" = "login-stub" ]; then
+  printf 'Open https://example.invalid/device\n'
+  printf 'Device code C7AA-TEST\n'
+  printf '{"authenticated":true}\n' > "${CRUCIBLE_LOGIN_DIR:?}/session.json"
+  sleep 1
+  exit 0
+fi
+
 ID=${CRUCIBLE_IDENTITY_DIR:-/crucible/identity}
 REPORT=${CRUCIBLE_REPORT_DIR:-/crucible/report}
 REPO=${CRUCIBLE_REPO_DIR:-/crucible/repo}

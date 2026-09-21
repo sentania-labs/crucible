@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="lat-card admin-signin">
+  <h1 class="page-title">Sign in to Crucible</h1>
+  <p>Use an existing Crucible token. On a fresh deployment, the one-time administrator token is framed in <code>docker compose logs migrate</code>.</p>
+  <form class="admin-form" method="post" action="/ui/sign-in">
+    <label><span class="lat-label">Administrator or reader token</span><input class="lat-input" type="password" name="token" autocomplete="current-password" required autofocus></label>
+    <input type="hidden" name="next" value="{{ next }}">
+    <button class="lat-btn lat-btn--primary" type="submit">Sign in</button>
+  </form>
+</section>
+{% endblock %}
