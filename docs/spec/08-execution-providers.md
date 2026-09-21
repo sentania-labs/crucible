@@ -105,19 +105,21 @@ paths, emit N log lines. Every lifecycle and gate test runs against it.
   attempt row is orphaned and removed; any live attempt with no container is
   marked `lost`.
 
-## Kubernetes provider (designed for v1.x)
+## Kubernetes provider (C8, specified in 26)
 
-Same contract. `launch` creates a Job in the worker namespace with a
-per-attempt PVC or emptyDir plus init container that performs the checkout,
-identity as a ConfigMap (or projected volume from an object store when
-bundles exceed ConfigMap limits), harness credentials as a Secret projected
-read-only (or a per-attempt writable volume seeded from it for `rw-narrow`),
-the GitHub App key as a projected or external Secret on the `crucible` pods
-only,
-`securityContext` mirroring the Docker flags, NetworkPolicy per policy.
-`observe` watches Job status. No Docker socket anywhere. Crucible's
-ServiceAccount is limited to Jobs, Pods, ConfigMaps, and Secrets in that one
-namespace. Local Kubernetes testing uses kind, later than Compose.
+Same contract. One Job per role per attempt in a worker namespace (preparer,
+worker, collector, bundle verifier, verifier, publisher, and the admin login
+flow), a per-attempt PersistentVolumeClaim as the workspace, identity as a
+ConfigMap or projected volume, the harness credential as a per-attempt
+Secret seeded from the harness's dedicated Secret, the GitHub App key on
+the `crucible` pods only, a pod security context mirroring the Docker
+flags and enforced again by Pod Security admission, and a per-attempt
+NetworkPolicy in place of the egress proxy. `observe` watches the Job and
+Pod. No Docker socket anywhere; the supervisor's ServiceAccount is limited
+to that one namespace. The operator decided on 2026-09-21 that this
+version runs on the node's standard container runtime; a runtime class
+(gVisor or Kata) is a later step. Mechanics, cluster prerequisites, and the
+kind test tier are in 26.
 
 ## Host-process provider (designed, not implemented)
 

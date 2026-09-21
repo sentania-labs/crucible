@@ -81,6 +81,14 @@ requested code). Proves the real provider path without a subscription:
   and a wake is waiting on poll.
 - No injected files in the resulting branch; shims excluded.
 
+## End-to-end on Kubernetes (`make e2e-kind`, C8)
+
+The end-to-end suite against the Kubernetes provider on a throwaway kind
+cluster with an egress-enforcing CNI, plus the NetworkPolicy denials, loss by
+eviction, SIGTERM-ignoring workers, per-attempt Secret removal, supervisor
+re-attach, and the namespace readiness refusal. Cases and evidence rules in
+26; runs in CI beside the Docker tier.
+
 ## Live harness tests (subscription required, not in CI by default)
 
 `make e2e-live HARNESS=<name>` runs a trivial task through the real harness
