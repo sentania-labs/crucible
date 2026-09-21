@@ -21,6 +21,7 @@ from crucible.application.submit_task import (
     require_operator_for_pin,
     validate_against_registry,
 )
+from crucible.application.task_access import require_task_principal
 from crucible.application.transitions import move_task, record_event, require_contract
 from crucible.contracts.common import to_document
 from crucible.contracts.task_contract import (
@@ -93,6 +94,7 @@ def attach_correction(
     task = uow.tasks.get(task_id, for_update=True)
     if task is None:
         raise NotFoundError(f"task {task_id} not found")
+    require_task_principal(principal, task)
     if task.state not in CORRECTABLE_STATES:
         raise TransitionNotAllowedError(
             f"a correction is accepted in {sorted(s.value for s in CORRECTABLE_STATES)}; "
@@ -209,6 +211,7 @@ def amend_task(
     task = uow.tasks.get(task_id, for_update=True)
     if task is None:
         raise NotFoundError(f"task {task_id} not found")
+    require_task_principal(principal, task)
     if task.state not in AMENDABLE_STATES:
         raise TransitionNotAllowedError(
             f"an amendment is accepted in {sorted(s.value for s in AMENDABLE_STATES)}; "

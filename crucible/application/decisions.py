@@ -10,6 +10,7 @@ from __future__ import annotations
 from datetime import timedelta
 
 from crucible.application.errors import ForbiddenError, NotFoundError, TransitionNotAllowedError
+from crucible.application.task_access import require_task_principal
 from crucible.application.transitions import move_task, record_event, require_contract
 from crucible.application.wakes import create_wake
 from crucible.contracts.api import DecisionRequest, DispositionRequest
@@ -105,6 +106,7 @@ def record_decision(
     task = uow.tasks.get(task_id, for_update=True)
     if task is None:
         raise NotFoundError(f"task {task_id} not found")
+    require_task_principal(principal, task)
     if request.kind in OPERATOR_ONLY_DECISION_KINDS and principal.role not in (
         Role.OPERATOR,
         Role.ADMIN,
@@ -199,6 +201,7 @@ def record_disposition(
     task = uow.tasks.get(task_id)
     if task is None:
         raise NotFoundError(f"task {task_id} not found")
+    require_task_principal(principal, task)
     if principal.role not in (Role.ORCHESTRATOR, Role.OPERATOR):
         raise ForbiddenError("only an orchestrator or operator principal records dispositions")
     existing = uow.dispositions.get_by_comment(request.review_comment_id)

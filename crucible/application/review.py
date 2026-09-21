@@ -16,6 +16,7 @@ from crucible.application.errors import (
     NotFoundError,
     TransitionNotAllowedError,
 )
+from crucible.application.task_access import require_task_principal
 from crucible.application.transitions import record_event
 from crucible.contracts.api import ReviewRequest
 from crucible.contracts.review_report import parse_review_report
@@ -221,6 +222,7 @@ def request_review(
     task = uow.tasks.get(task_id, for_update=True)
     if task is None:
         raise NotFoundError(f"task {task_id} not found")
+    require_task_principal(principal, task)
     if task.state is not TaskState.AWAITING_INTERNAL_REVIEW:
         raise TransitionNotAllowedError(
             f"a review is accepted only in awaiting_internal_review; task is {task.state.value}"

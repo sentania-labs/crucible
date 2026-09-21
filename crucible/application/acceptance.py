@@ -11,6 +11,7 @@ from crucible.application.errors import (
     NotFoundError,
     TransitionNotAllowedError,
 )
+from crucible.application.task_access import require_task_principal
 from crucible.application.transitions import move_task, record_event, require_contract
 from crucible.application.wakes import create_wake
 from crucible.contracts.api import AcceptRequest
@@ -38,6 +39,7 @@ def record_acceptance(
     task = uow.tasks.get(task_id, for_update=True)
     if task is None:
         raise NotFoundError(f"task {task_id} not found")
+    require_task_principal(principal, task)
     if task.state is not TaskState.AWAITING_ACCEPTANCE:
         raise TransitionNotAllowedError(
             f"acceptance is recorded only in awaiting_acceptance; task is {task.state.value}"
@@ -134,6 +136,7 @@ def close_task(
     task = uow.tasks.get(task_id, for_update=True)
     if task is None:
         raise NotFoundError(f"task {task_id} not found")
+    require_task_principal(principal, task)
     move_task(
         uow,
         clock,

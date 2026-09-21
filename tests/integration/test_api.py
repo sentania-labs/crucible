@@ -7,7 +7,8 @@ from fastapi.testclient import TestClient
 
 from crucible.adapters.api.app import create_app
 from crucible.adapters.api.deps import AppContext
-from crucible.domain.entities import ImagePromotion
+from crucible.application.auth import mint_token
+from crucible.domain.entities import ImagePromotion, Role
 from tests.fixtures import FakeClock, contract_document
 
 pytestmark = pytest.mark.integration
@@ -40,6 +41,82 @@ def test_observer_may_only_read(ctx: AppContext, tokens: dict[str, str]) -> None
     assert c.get("/v1/tasks").status_code == 200
     r = c.post("/v1/tasks", json=contract_document())
     assert r.status_code == 403 and r.json()["type"] == "urn:crucible:problem:forbidden"
+
+
+def _other_orchestrator(ctx: AppContext) -> str:
+    with ctx.uow_factory() as uow:
+        token = mint_token(
+            uow,
+            ctx.clock,
+            name="other-orchestrator-principal",
+            role=Role.ORCHESTRATOR,
+        ).token
+        uow.commit()
+    return token
+
+
+def test_principal_isolation_cancel_and_accept(client: TestClient, ctx: AppContext) -> None:
+    task_id = client.post("/v1/tasks", json=contract_document()).json()["id"]
+    other = _client(ctx, _other_orchestrator(ctx))
+    cancel = other.post(
+        f"/v1/tasks/{task_id}/cancel",
+        json={"reason": "test", "verbatim": "cancel it", "decided_by": "test"},
+    )
+    accept = other.post(
+        f"/v1/tasks/{task_id}/accept",
+        json={"verdict": "accepted", "reasoning": "test"},
+    )
+    assert cancel.status_code == 403
+    assert accept.status_code == 403
+    assert client.get(f"/v1/tasks/{task_id}").json()["state"] == "submitted"
+
+
+@pytest.mark.parametrize(
+    ("suffix", "body"),
+    [
+        ("review", {"report": {}}),
+        (
+            "dispositions",
+            {
+                "review_comment_id": "comment-1",
+                "disposition": "decline",
+                "reasoning": "test",
+            },
+        ),
+        ("corrections", {}),
+        ("ci-decision", {"cause": "other", "action": "reject", "reasoning": "test"}),
+        ("head-decision", {"action": "reject", "reasoning": "test"}),
+        (
+            "decisions",
+            {"kind": "scope", "verbatim": "keep scope", "resolves": "scope question"},
+        ),
+        ("amend", {"contract": contract_document(), "reason": "test"}),
+        ("close", {"note": "test"}),
+    ],
+)
+def test_principal_isolation_remaining_routes(
+    client: TestClient,
+    ctx: AppContext,
+    suffix: str,
+    body: dict[str, object],
+) -> None:
+    task_id = client.post("/v1/tasks", json=contract_document()).json()["id"]
+    response = _client(ctx, _other_orchestrator(ctx)).post(
+        f"/v1/tasks/{task_id}/{suffix}", json=body
+    )
+    assert response.status_code == 403, response.text
+
+
+@pytest.mark.parametrize("role", ["operator", "admin"])
+def test_operator_and_admin_are_exempt_from_task_ownership(
+    client: TestClient, ctx: AppContext, tokens: dict[str, str], role: str
+) -> None:
+    task_id = client.post("/v1/tasks", json=contract_document()).json()["id"]
+    response = _client(ctx, tokens[role]).post(
+        f"/v1/tasks/{task_id}/cancel",
+        json={"reason": "test", "verbatim": "cancel it", "decided_by": "test"},
+    )
+    assert response.status_code == 200, response.text
 
 
 def test_only_an_operator_may_submit_a_pinned_task(ctx: AppContext, tokens: dict[str, str]) -> None:
