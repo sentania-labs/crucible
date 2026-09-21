@@ -67,3 +67,31 @@ compose smoke passed
 The required normal compose path also passed in the same isolated project:
 `make up` reached healthy and `make smoke` drove task
 `01M32MPRW0C9MK84MAXT8CZS1W` to `accepted`.
+
+## Verification
+
+- `make lint`: passed, including Ruff formatting and checks, mypy on 244
+  files, the image manifest check, and all three import contracts.
+- `make test`: 635 unit tests and 336 integration tests passed. The integration
+  run reported three existing dependency deprecation warnings.
+- `make scan`: the tracked tree and all three branch commits contained no
+  detected secrets.
+- `make up`, then `make smoke`: passed on the isolated host-daemon project.
+- Release-path proof: the supporting images were the only pull targets,
+  `docker compose up --pull never` reached healthy, all three candidate
+  containers matched the locally built image ID, and the versioned smoke
+  reached `accepted`.
+
+## Review
+
+The required single non-author adversarial review found no blockers. It
+confirmed that only the classifier's supporting set can reach `compose pull`
+and that the identity check fails on a missing candidate container or an image
+ID mismatch while including exited containers.
+
+The reviewer reported one non-blocking test gap: unit coverage exercised
+classification and missing-image failure, but not the pull and verification
+modes. Commit `f575806` addresses it with command-level tests that assert only
+the supporting service is pulled and every candidate service is queried with
+`compose ps --all` and inspected. Per the task contract, no second review round
+was started.
