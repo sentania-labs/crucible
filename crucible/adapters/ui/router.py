@@ -131,6 +131,7 @@ SECRET_PARTS = {
     "secret",
     "token",
 }
+NON_SECRET_TOKEN_FIELDS = {"fenced_token", "tokens_in", "tokens_out"}
 
 
 def _operator_label(key: str) -> str:
@@ -147,6 +148,8 @@ def _operator_label(key: str) -> str:
 
 def _secret_field(key: str) -> bool:
     lowered = key.lower().replace(".", "_")
+    if lowered in NON_SECRET_TOKEN_FIELDS:
+        return False
     if lowered.endswith("_present") or lowered.endswith("_fingerprint"):
         return False
     return any(

@@ -166,6 +166,8 @@ def test_readable_panel_preserves_every_supervisor_service_leaf() -> None:
     assert len(_panel_leaves(panel)) == len(_document_leaves(document))
     assert "Lease holder" in rendered
     assert "Last successful tick" in rendered
+    assert "Fenced token" in rendered
+    assert "not displayed" not in rendered
     assert "healthy" in rendered
     assert "2026-09-21 01:30:00 AM CDT" in rendered
     assert "2026-09-21T06:30:00" not in rendered
