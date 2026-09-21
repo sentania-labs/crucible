@@ -37,6 +37,8 @@ import io
 import json
 import logging
 import os
+import re
+import select
 import shutil
 import tarfile
 import time
@@ -192,6 +194,7 @@ class DockerConfig:
     artifact_host_root: str | None = None
     credential_root: str | None = None
     credential_host_root: str | None = None
+    credential_volume: str = "crucible-credentials"
     workers_network: str = "crucible-workers"
     egress_proxy: str | None = None
     # What the egress proxy is actually configured to permit. An attempt whose
@@ -355,7 +358,11 @@ class DockerProvider:
             image_allowlist=tuple(allowlist),
             artifact_root=host_root,
             credential_root=self.config.credential_host_root or self.config.credential_root,
-            allowed_volumes=(self.config.artifact_volume,) if self.config.artifact_volume else (),
+            allowed_volumes=tuple(
+                value
+                for value in (self.config.artifact_volume, self.config.credential_volume)
+                if value
+            ),
         )
 
     def _labels(self, spec: LaunchSpec, role: str) -> dict[str, str]:
@@ -1465,6 +1472,180 @@ class DockerProvider:
             credential_sync=sync,
             detail=detail,
         )
+
+    async def run_login_container(
+        self,
+        *,
+        flow: Any,
+        image: str,
+        directory: str,
+        session: Any,
+        argv: tuple[str, ...],
+        timeout: int,
+    ) -> None:
+        """Run one harness login with only its credential directory and proxy network.
+
+        The TTY is attached directly and the daemon log driver is disabled. This keeps
+        a one-time provider token in process memory long enough to capture it without
+        placing it in Docker logs. The container is always reaped.
+        """
+        from crucible.application.admin.login import _consume  # noqa: PLC0415
+
+        login_id = f"login{new_id()}"[:26]
+        adapter = self.harnesses.require(flow.harness)
+        credential = adapter.credential_spec()
+        if credential is None:
+            raise ProviderError(f"harness {flow.harness!r} has no credential")
+        source = Path(directory)
+        configured_root = self.config.credential_host_root or self.config.credential_root
+        if configured_root is None or source.parent != Path(configured_root):
+            raise ProviderError(
+                f"the {flow.harness} login credential path is not directly under the "
+                "configured dedicated credential root"
+            )
+        source.mkdir(parents=True, exist_ok=True, mode=0o700)
+        spec = LaunchSpec(
+            attempt_id=login_id,
+            task_id=login_id,
+            external_id="login",
+            role="login",
+            harness=flow.harness,
+            model="login",
+            image=image,
+            timeout_seconds=timeout,
+            contract={"repository": {}},
+            policy={
+                "images": {"allowlist": [image]},
+                "network": {"mode": "egress-proxy", "egress_allowlist": []},
+                "resources": {"memory": "1GiB", "cpus": 1, "pids": 256},
+            },
+            owner="crucible-admin",
+        )
+        await self._ensure_network()
+        resolved = await self._resolve_image(spec)
+        wanted = egress_allowlist(self.harnesses, flow.harness, [], [], None)
+        configured = set(self.config.proxy_allowlist)
+        if configured and not set(wanted) <= configured:
+            raise ProviderError(
+                f"the egress proxy does not permit the {flow.harness} login endpoints"
+            )
+        env = {
+            "HOME": "/home/worker",
+            "TERM": "xterm",
+            flow.directory_env: (
+                "/home/worker" if flow.harness == "agy" else credential.mount_target
+            ),
+            "CRUCIBLE_EGRESS_ALLOWLIST": ",".join(wanted),
+        }
+        if self.config.egress_proxy:
+            env.update(
+                {
+                    "HTTPS_PROXY": self.config.egress_proxy,
+                    "HTTP_PROXY": self.config.egress_proxy,
+                    "https_proxy": self.config.egress_proxy,
+                    "http_proxy": self.config.egress_proxy,
+                    "NO_PROXY": self.config.no_proxy,
+                    "no_proxy": self.config.no_proxy,
+                }
+            )
+        target = "/home/worker" if flow.harness == "agy" else credential.mount_target
+        if self.config.credential_volume:
+            mount = {
+                "Type": "volume",
+                "Source": self.config.credential_volume,
+                "Target": target,
+                "ReadOnly": False,
+                "VolumeOptions": {"Subpath": source.name},
+            }
+        else:
+            root = self.config.credential_host_root or self.config.credential_root
+            if not root:
+                raise ProviderError("the Docker credential root is not configured")
+            mount = {
+                "Type": "bind",
+                "Source": str(Path(root) / source.name),
+                "Target": target,
+                "ReadOnly": False,
+                "BindOptions": {"Propagation": "rprivate"},
+            }
+        host_config = self._hardened(spec, network=self.config.workers_network, tmpfs_mb=128)
+        host_config["Mounts"] = [mount]
+        host_config["LogConfig"] = {"Type": "none", "Config": {}}
+        body: dict[str, Any] = {
+            "Image": resolved,
+            "Cmd": list(argv),
+            "User": "1000:1000",
+            "WorkingDir": "/tmp",
+            "Env": [f"{key}={value}" for key, value in sorted(env.items())],
+            "Labels": self._labels(spec, "login"),
+            "Tty": True,
+            "OpenStdin": True,
+            "AttachStdin": True,
+            "AttachStdout": True,
+            "AttachStderr": True,
+            "HostConfig": host_config,
+        }
+        check_create(body, self._create_policy(spec, resolved=resolved))
+        container_id = ""
+        connection = None
+        sock = None
+        buffer = ""
+        token_re = re.compile(flow.token_pattern) if flow.captures_token else None
+        deadline = time.monotonic() + timeout
+        try:
+            container_id = await self._call(
+                self.client.create_container, f"crucible-login-{flow.harness}-{login_id}", body
+            )
+            connection, sock = await self._call(self.client.attach_interactive, container_id)
+            await self._call(self.client.start_container, container_id)
+            session.state = "waiting_for_operator"
+            while True:
+                if session.cancel_requested:
+                    session.error = "login cancelled"
+                    await self._call(self.client.kill_container, container_id)
+                    break
+                if time.monotonic() >= deadline:
+                    session.error = "login timed out"
+                    await self._call(self.client.kill_container, container_id)
+                    break
+                assert sock is not None
+                ready, _, _ = await asyncio.to_thread(select.select, [sock], [], [], 0.25)
+                if ready:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    buffer += chunk.decode("utf-8", "replace")
+                    buffer = _consume(buffer, flow, token_re, source, session, None)
+                if session.state == "waiting_for_code":
+                    code = session.wait_for_code(0)
+                    if code is not None:
+                        sock.sendall((code.strip() + "\n").encode("utf-8"))
+                        session.state = "waiting_for_operator"
+                state = await self._call(self.client.inspect_container, container_id)
+                if not bool((state.get("State") or {}).get("Running", False)):
+                    break
+            if buffer:
+                _consume(buffer + "\n", flow, token_re, source, session, None)
+            state = await self._call(self.client.inspect_container, container_id)
+            exit_code = (state.get("State") or {}).get("ExitCode")
+            session.exit_code = int(exit_code) if exit_code is not None else None
+            if session.cancel_requested:
+                session.state = "failed"
+            else:
+                session.state = (
+                    "finished" if session.exit_code == 0 and not session.error else "failed"
+                )
+            if session.state == "failed" and session.error is None:
+                session.error = f"the login command exited {session.exit_code}"
+        except Exception as exc:
+            session.state = "failed"
+            session.error = f"the login container failed: {type(exc).__name__}: {exc}"
+        finally:
+            if connection is not None:
+                connection.close()
+            if container_id:
+                with contextlib.suppress(Exception):
+                    await self._call(self.client.remove_container, container_id, force=True)
 
     async def list_images(self) -> list[ImageInfo]:
         """Every image on the daemon that carries the `crucible.harness` label (13)."""

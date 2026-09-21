@@ -103,7 +103,7 @@ proxies: preflight proxy-config ## bring up only the socket proxy and the egress
 down:
 	$(COMPOSE) --profile "*" down
 
-reset: ## DESTRUCTIVE: down plus the postgres and artifact volumes; the only cure for schema drift
+reset: ## DESTRUCTIVE: down plus postgres, artifact, and credential volumes
 	$(COMPOSE) --profile "*" down --volumes
 
 lint:

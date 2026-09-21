@@ -125,6 +125,8 @@ services:
       CRUCIBLE_DOCKER__HOST: tcp://docker-socket-proxy:2375
       CRUCIBLE_DOCKER__MOUNT_KIND: volume
       CRUCIBLE_DOCKER__ARTIFACT_VOLUME: crucible_crucible-artifacts
+      CRUCIBLE_DOCKER__CREDENTIAL_VOLUME: crucible_crucible-credentials
+      CRUCIBLE_DOCKER__CREDENTIAL_ROOT: /var/lib/crucible/credentials
       CRUCIBLE_DOCKER__WORKERS_NETWORK: crucible-workers
       CRUCIBLE_DOCKER__EGRESS_PROXY: http://egress-proxy:3128
       # A JSON array: pydantic-settings decodes a complex field from the environment
@@ -162,17 +164,12 @@ services:
       CRUCIBLE_HARNESSES__AGY__REASON: "session_compatibility verified (S1b steps 5 and 6, 2026-09-17)"
     volumes:
       - crucible-artifacts:/var/lib/crucible/artifacts
-      # The credential root (12, 25), on this container only; no worker, collector,
-      # verifier or publisher mounts it. The GitHub half (the App private key and the
-      # webhook secret) is read-only. The three harness directories are writable because
-      # Crucible syncs a refreshed auth file back into them after a run (12), and only
-      # ever the named auth files, chosen by the newer issued-at. CRUCIBLE_CREDENTIAL_ROOT
-      # defaults to a directory that does not exist, so a stack with nothing onboarded
-      # starts with empty mounts.
+      # The credential root (12, 25), on this container only. Ordinary workers receive
+      # per-attempt copies. A login container receives one named-volume subpath and no
+      # workspace. The GitHub App files remain a separate read-only host mount. The
+      # harness volume starts empty, so a fresh deployment needs no host directories.
       - ${CRUCIBLE_CREDENTIAL_ROOT:-./var/credentials}/github:/var/lib/crucible/credentials/github:ro
-      - ${CRUCIBLE_CREDENTIAL_ROOT:-./var/credentials}/claude_code:/var/lib/crucible/credentials/claude_code
-      - ${CRUCIBLE_CREDENTIAL_ROOT:-./var/credentials}/codex:/var/lib/crucible/credentials/codex
-      - ${CRUCIBLE_CREDENTIAL_ROOT:-./var/credentials}/agy:/var/lib/crucible/credentials/agy
+      - crucible-credentials:/var/lib/crucible/credentials
     ports:
       - "127.0.0.1:${CRUCIBLE_PORT:-8080}:8080"
     healthcheck:
@@ -215,3 +212,4 @@ networks:
 volumes:
   crucible-pg:
   crucible-artifacts:
+  crucible-credentials:

@@ -30,10 +30,12 @@ without Foundry.
   row, or artifact ever carries a credential value, a token, a key, or a
   file's contents. Validation results are booleans, enumerations,
   timestamps, hashes of non-secret metadata, and version strings.
-- **No web admin UI before the worker-supervision readiness milestone.** A
-  later interface calls the admin API; it owns no state. Section
-  "Designed for a later interface" lists what the API must expose so that
-  portal needs nothing else.
+- **Web administration under `/ui`.** The worker-supervision readiness
+  milestone is met. The server-rendered interface calls the same application
+  services as the API and CLI and owns no state. Reader principals see the
+  same operational pages without controls; administrator principals can use
+  every mutation. Its signed, HttpOnly, SameSite=Strict cookie carries the
+  same bearer token, and every form mutation also requires a CSRF token.
 
 ## Status model
 
@@ -61,7 +63,7 @@ resource.
 | disable or enable a harness | `POST /admin/harnesses/{name}/disable` and `/enable` | `harnesses disable|enable` | flips the administrator's flag only; configuration retained; running attempts finish; new launches refused with a wake |
 | validate a credential | `POST /admin/credentials/{harness}/validate` | `credentials validate --harness` | shape check of the named auth files, then the bounded probe (below); returns state, timestamps, and the probe's `conclusive` and `cause`, never a verdict the run did not support |
 | bounded auth probe | `POST /admin/credentials/{harness}/probe` | `credentials probe --harness` | launches the promoted worker image with the credential mounted, runs a one-line prompt with a 120 s timeout, records exit class, conclusiveness and cause, harness version, image digest, whether auth files changed (by hash), mount mode and duration, removes everything; never shows output beyond the exit class |
-| onboard a credential | `POST /admin/credentials/{harness}/login` (starts) | `credentials login --harness` | interactive flow below, and a local-mode operation on a host that carries the harness CLI; the API form returns the device or browser URL and polls for completion where it can run at all |
+| onboard a credential | `POST /admin/credentials/{harness}/login` (starts) | `credentials login --harness` | interactive flow below; the service runs the login in the promoted worker image and the CLI retains its local-host mode |
 | rotate or replace a credential source | `POST /admin/credentials/{harness}/rotate` | `credentials rotate --harness` | the operator's prepared directory is shape-checked, copied in, and left exactly as it was found; the swap is two renames; the previous directory is retained for `credential_retention_hours` then shredded; a failed swap rolls back; every step an event |
 | remove a credential | `POST /admin/credentials/{harness}/remove` | `credentials remove --harness` | harness becomes `absent`; the directory is shredded at once rather than retained, because the operator said remove, and the harness is disabled with that reason |
 | list images and promote | `GET /admin/images`, `POST /admin/images/{digest}/promote` | `images list|promote` | 13; one default per harness, and promoting a digest marks the previous default `retained`. The probe and the live tiers run the promoted image |
@@ -153,17 +155,14 @@ disabled at the time a contract is submitted is a contract problem then
 
 `crucible-admin credentials login --harness <claude_code|codex|agy>`:
 
-0. **Where it runs.** The flow drives the harness's own CLI in a pty on the
-   host the flow runs on. By 13 each harness CLI lives only in its worker
-   image and the Crucible service image carries none of them, so on a normal
-   deployment the API form cannot work: it resolves the executable first and
-   refuses with that reason, leaving no session behind so a later attempt is
-   accepted. Login is therefore a local-mode operation on a host that has the
-   harness CLI, and the subcommand help, the route's description, and the
-   module say so. Running the flow inside the promoted harness image, the way
-   the probe runs, would need the pty and the operator's pasted code relayed
-   through the daemon's attach stream; that is a phase of its own and is the
-   named follow-up that would make the API form work anywhere.
+0. **Where it runs.** The API and UI run the harness CLI in that harness's
+   promoted worker image. The container has a TTY attached directly to the
+   service, uses the worker egress proxy, mounts only that harness's subpath of
+   the Crucible credential volume read-write, mounts no workspace, disables
+   Docker's log driver, and is removed on completion, cancellation, or timeout.
+   This keeps a one-time token out of Docker logs while allowing the service to
+   capture it to the named credential file. The CLI keeps local-host mode for
+   an operator workstation that already carries the executable.
 1. Create or select the dedicated Crucible credential directory for the
    harness under the configured credential root (`credentials.<harness>.path`,
    mode 0700, owned by the Crucible service user; 13 for who creates it). A
@@ -235,9 +234,9 @@ because the operator asked for the credential to be gone, and the harness is
 disabled with `credential removed: <reason>`. Running attempts finish, as for
 any disable. Shredding is complete or it says so (12).
 
-## Designed for a later interface
+## Administrative interface
 
-The admin API must expose, without any other data source: harness status;
+The `/ui` interface consumes, without any other data source: harness status;
 credential onboarding and validation status (including an in-progress
 login's device URL); worker-image versions and promotion state; provider
 health; GitHub App and repository connectivity; active workers; failed or
@@ -245,7 +244,16 @@ blocked tasks; pending Foundry wakes; retention and cleanup status; audit
 events with cursors. A portal that combines Foundry chat, task and Kanban
 views, Crucible execution views, and this administrative surface is a
 client of the two services and owns none of their state; it never
-collapses the authority boundary between them.
+collapses the authority boundary between them. Process settings are shown
+read-only with their effective source because they bind ports, sockets,
+storage, startup timing, and secret-bearing paths at process start. Runtime
+policy and state remain editable through the application services.
+
+A fresh migrated database with no administrator receives one
+`first-run-admin` principal. The migration process prints its token once in a
+clearly framed block. Only the salted token hash is stored. The sign-in page
+directs the operator to `docker compose logs migrate`; a later migration run
+finds the principal and prints no token.
 
 ## What Foundry may do
 

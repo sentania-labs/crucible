@@ -64,6 +64,7 @@ class DockerSettings(BaseModel):
     artifact_host_root: str | None = None
     credential_root: str | None = None
     credential_host_root: str | None = None
+    credential_volume: str = "crucible-credentials"
     workers_network: str = "crucible-workers"
     egress_proxy: str | None = "http://egress-proxy:3128"
     # What the egress proxy is configured to permit. An attempt whose allowlist is not

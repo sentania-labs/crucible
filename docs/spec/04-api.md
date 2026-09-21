@@ -20,6 +20,12 @@ Every mutating request records `principal` on the resulting event. Workers
 never hold a token. The GitHub webhook endpoint uses HMAC verification
 instead of a bearer token (below).
 
+The administrative HTML interface at `/ui` authenticates the same principals.
+Its sign-in form exchanges the bearer token for a signed, HttpOnly,
+SameSite=Strict session cookie, not a second identity. Reader roles receive
+read-only pages and the `admin` role receives controls. Every mutating form
+also carries a signed-session CSRF value. Sign-out clears the cookie.
+
 ## Conventions
 
 - IDs are ULIDs. Orchestrator-stable IDs travel in `external_id`.

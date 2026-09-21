@@ -17,6 +17,8 @@ from crucible.adapters.api.routers import (
     supervision,
     tasks,
 )
+from crucible.adapters.ui.router import router as ui_router
+from crucible.adapters.ui.router import static as ui_static
 
 API_PREFIX = "/v1"
 
@@ -31,6 +33,8 @@ def create_app(ctx: AppContext) -> FastAPI:
     )
     app.state.ctx = ctx
     install_problem_handlers(app)
+    app.mount("/ui/static", ui_static, name="ui-static")
+    app.include_router(ui_router)
     app.include_router(supervision.router, prefix=API_PREFIX)
     app.include_router(tasks.router, prefix=API_PREFIX)
     app.include_router(records.router, prefix=API_PREFIX)

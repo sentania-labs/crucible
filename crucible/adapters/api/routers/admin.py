@@ -9,7 +9,16 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Body, Query
 
 from crucible.adapters.api.deps import Admin, Ctx, Orchestrator, UoW
-from crucible.application.admin import audit, credentials, github, harnesses, images, login, routing
+from crucible.application.admin import (
+    audit,
+    credentials,
+    github,
+    harnesses,
+    images,
+    login,
+    routing,
+    tokens,
+)
 from crucible.application.admin import providers as providers_admin
 from crucible.application.admin import repositories as repositories_admin
 from crucible.application.admin import status as status_admin
@@ -143,9 +152,8 @@ def admin_login(
     and finish with /login/finish once the CLI has exited. `replace` is required when a
     credential that still passes the shape check is in place, and retains it first.
 
-    The login runs the harness's own CLI, which lives in the worker images and not in the
-    Crucible service image, so on a normal deployment this refuses with that reason and
-    the operator runs `crucible-admin credentials login` where the CLI is (c5.md)."""
+    The login runs the harness's own CLI in the promoted worker image. The container gets
+    only the selected harness credential directory and the worker egress-proxy network."""
     result = login.start_login(
         _admin(ctx),
         uow,
@@ -166,9 +174,35 @@ def admin_login_status(harness: str, ctx: Ctx, _principal: Admin) -> dict[str, A
 
 @router.post("/admin/credentials/{harness}/login/code")
 def admin_login_code(
-    harness: str, ctx: Ctx, _principal: Admin, body: Annotated[dict[str, Any], Body()]
+    harness: str, ctx: Ctx, uow: UoW, principal: Admin, body: Annotated[dict[str, Any], Body()]
 ) -> dict[str, Any]:
-    return login.submit_code(ctx.logins, harness, str(body.get("code", "")))
+    result = login.submit_code(
+        ctx.logins,
+        harness,
+        str(body.get("code", "")),
+        ctx=_admin(ctx),
+        uow=uow,
+        principal=principal.name,
+        reason=_reason(body),
+    )
+    uow.commit()
+    return result
+
+
+@router.post("/admin/credentials/{harness}/login/cancel")
+def admin_login_cancel(
+    harness: str, ctx: Ctx, uow: UoW, principal: Admin, body: Annotated[dict[str, Any], Body()]
+) -> dict[str, Any]:
+    result = login.cancel_login(
+        ctx.logins,
+        harness,
+        ctx=_admin(ctx),
+        uow=uow,
+        principal=principal.name,
+        reason=_reason(body),
+    )
+    uow.commit()
+    return result
 
 
 @router.post("/admin/credentials/{harness}/login/finish")
@@ -275,6 +309,66 @@ def admin_register_repository(
         principal=principal.name,
         name=name,
         registration=registration,
+        reason=_reason(body),
+    )
+    uow.commit()
+    return result
+
+
+@router.get("/admin/repositories")
+def admin_repositories(uow: UoW, _principal: Admin) -> dict[str, Any]:
+    return {"items": repositories_admin.list_all(uow)}
+
+
+@router.delete("/admin/repositories/{name}")
+def admin_remove_repository(
+    name: str, ctx: Ctx, uow: UoW, principal: Admin, body: Annotated[dict[str, Any], Body()]
+) -> dict[str, Any]:
+    result = repositories_admin.remove(
+        _admin(ctx), uow, principal=principal.name, name=name, reason=_reason(body)
+    )
+    uow.commit()
+    return result
+
+
+@router.get("/admin/tokens")
+def admin_tokens(uow: UoW, _principal: Admin) -> dict[str, Any]:
+    return {"items": tokens.list_principals(uow)}
+
+
+@router.post("/admin/tokens")
+def admin_create_token(
+    ctx: Ctx, uow: UoW, principal: Admin, body: Annotated[dict[str, Any], Body()]
+) -> dict[str, Any]:
+    minted = tokens.create(
+        _admin(ctx),
+        uow,
+        principal=principal.name,
+        name=str(body.get("name", "")),
+        role=str(body.get("role", "observer")),
+        reason=_reason(body),
+    )
+    uow.commit()
+    return {
+        "principal": minted.principal.name,
+        "role": minted.principal.role.value,
+        "token": minted.token,
+    }
+
+
+@router.post("/admin/tokens/{principal_id}/revoke")
+def admin_revoke_token(
+    principal_id: str,
+    ctx: Ctx,
+    uow: UoW,
+    principal: Admin,
+    body: Annotated[dict[str, Any], Body()],
+) -> dict[str, Any]:
+    result = tokens.revoke(
+        _admin(ctx),
+        uow,
+        principal=principal.name,
+        principal_id=principal_id,
         reason=_reason(body),
     )
     uow.commit()

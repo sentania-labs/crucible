@@ -79,6 +79,7 @@ def put_policy(
     name: str,
     version: int,
     document: object,
+    reason: str | None = None,
 ) -> Policy:
     policy = validate_policy(document, name=name, version=version)
     existing = uow.policies.get(name, version)
@@ -125,6 +126,15 @@ def put_policy(
             "policy": {"name": name, "version": version},
             "replaced": existing is not None,
             "operator_only_settings": operator_only,
+            **(
+                {
+                    "reason": reason,
+                    "before": {"present": existing is not None},
+                    "after": {"present": True, "version": version},
+                }
+                if reason is not None
+                else {}
+            ),
         },
     )
     for field in operator_only:
@@ -175,6 +185,7 @@ def put_routing_policy(
     name: str,
     version: int,
     document: object,
+    reason: str | None = None,
 ) -> RoutingPolicyRecord:
     routing = validate_routing_policy(document, name=name, version=version)
     existing = uow.routing_policies.get(name, version)
@@ -200,6 +211,15 @@ def put_routing_policy(
             "routing_policy": {"name": name, "version": version},
             "models": len(routing.models),
             "replaced": existing is not None,
+            **(
+                {
+                    "reason": reason,
+                    "before": {"present": existing is not None},
+                    "after": {"present": True, "version": version},
+                }
+                if reason is not None
+                else {}
+            ),
         },
     )
     return stored
