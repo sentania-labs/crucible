@@ -23,8 +23,10 @@ signs everyone out without changing or copying any bearer token.
 The migration command checks for any enabled administrator after applying the
 schema. If none exists, it creates `first-run-admin`, stores only the salted
 token hash, and prints the token once inside a framed migration log block. A
-later migration run prints nothing. This was chosen over a one-time file
-because Compose already gives the migration process an isolated, finite log,
+later migration run prints nothing while an enabled administrator remains. If
+all administrators are later revoked, migration creates a uniquely named
+recovery administrator and prints that new token once. This was chosen over a
+one-time file because Compose already gives the migration process an isolated, finite log,
 `docker compose logs migrate` works without a host mount or file ownership
 step, and no plaintext credential remains in a volume after the operator has
 stored it. The sign-in page names that exact retrieval command.
@@ -139,6 +141,11 @@ was also viewed while a separate fake worker was running so the active row and
 local-time timestamps were visible. A final rebuild and smoke run on the same
 stack accepted task `01M316622MKWNA2K5JQ04QEBFZ`.
 
+After the adversarial-review fixes, a second fresh project,
+`crucible-c7a-final`, started on a new database. Its smoke walk fetched the
+signed pre-authentication nonce, signed in with the one-time migration token,
+walked every page, and accepted task `01M3193VMG9NJ8J5Y2VWRQJ7V0`.
+
 A real Codex login was started from the page with the promoted pinned worker
 image. The page reached `WAITING_FOR_OPERATOR` and displayed the provider URL
 and one-time code. The committed screenshot replaces both with explanatory
@@ -149,7 +156,8 @@ root, the upgraded HTTP response was not retained for the attached TTY's
 lifetime, and task retention treated the administrative login label as an
 orphan task attempt. The Compose initializer changes only the credential
 volume root, the attach owner retains the response, and retention now excludes
-the login role that its own lifecycle always reaps. The container also invokes
+login ids owned by the running provider while reaping stale login labels after
+a restart. The container also invokes
 the adapter's declared login executable directly, without inheriting a worker
 entrypoint that may require a task identity bundle.
 
@@ -189,7 +197,14 @@ code is stored in the file.
 
 ## Review findings
 
-This section is completed after the single required non-author adversarial
-review. The reviewer receives the contract and branch diff and specifically
-checks session and CSRF behavior, first-run token exposure, and login-container
-isolation.
+The single required non-author adversarial review found six issues. All were
+addressed before the pull request, and the contract forbids a second round.
+
+| Severity | Finding | Disposition |
+|---|---|---|
+| high | Replacement could retire a valid credential before a missing image or replacement-directory failure. | Image selection now precedes retirement; every fallible post-retirement step is inside the restore boundary. Integration tests cover missing promotion and `mkdir` failure. |
+| high | A service crash could leave a login container that task retention skipped forever. | The provider tracks login ids owned by the current process. Retention preserves those and reaps login labels left by a prior process. A unit test models restart recovery. |
+| high | Revoking the fixed first-run administrator prevented later migration recovery. | Migration keeps the stable first name on a fresh database and creates a unique recovery administrator if that name already exists but no enabled administrator remains. The integration test authenticates the recovery token. |
+| medium | The sign-in POST had no pre-authentication CSRF nonce. | The GET now sets a signed, HttpOnly, SameSite=Strict, ten-minute pre-authentication cookie and matching hidden nonce. Missing or mismatched values return 403 before token authentication. |
+| medium | UI mutation parity coverage did not enumerate every dispatch. | The integration matrix now drives every remaining UI mutation and proves it reaches the same application-service entry point used by API and CLI coverage. Incorrect readiness test names were corrected. |
+| low | Reader principals could see login operation forms. | Reader rendering now shows only the login state and an administrator-required notice, with no URL, code, output, form, or polling script. |

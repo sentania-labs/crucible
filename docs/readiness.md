@@ -98,19 +98,19 @@ Docker daemon, and an isolated host-daemon Compose project.
 
 | Tier | Command | Result |
 |---|---|---|
-| unit | `make test-unit` as part of `make test` | 608 passed, 8.51 s |
-| integration | `make test-integration` as part of `make test` | 308 passed, 412.60 s, real PostgreSQL 16 |
-| e2e (Docker) | `make e2e DOCKER='<rootless wrapper>'` | 17 passed, 12 deselected, 106.85 s |
+| unit | `make test-unit` as part of `make test` | 609 passed, 6.87 s |
+| integration | `make test-integration` as part of `make test` | 312 passed, 822.48 s, real PostgreSQL 16 |
+| e2e (Docker) | `make e2e DOCKER='<rootless wrapper>'` | 17 passed, 12 deselected, 105.12 s |
 | e2e admin | `make e2e-admin` | 1 passed and 2 failed because the dedicated AGY `oauth-token` file is absent; the second failure is the dependent probe |
-| compose smoke | isolated `make up`, then `make smoke` | first-run UI walk passed, task `01M313XZ02ST8CK0PKQMK2YVFD` accepted, smoke passed |
+| compose smoke | fresh isolated `make up`, then `make smoke` | signed first-run UI walk passed, task `01M3193VMG9NJ8J5Y2VWRQJ7V0` accepted, smoke passed |
 | lint | `make lint` | Ruff, mypy on 237 files, and 3 import contracts clean |
 | scan | `make scan` | final result recorded in the C7a report |
 
-C7a-specific evidence is `tests/unit/test_ui_templates.py`,
+C7a-specific evidence is `tests/unit/test_admin_ui.py`,
 `tests/unit/test_docker_provider.py`,
 `tests/integration/test_admin.py::test_ui_session_csrf_reader_access_and_page_walk`,
-`tests/integration/test_admin.py::test_first_migration_creates_one_admin_and_never_reprints_the_token`,
-`tests/integration/test_admin.py::test_ui_api_and_cli_mutations_share_the_application_services`,
+`tests/integration/test_admin.py::test_migrate_creates_and_prints_the_first_admin_once`,
+`tests/integration/test_admin.py::test_every_remaining_ui_mutation_dispatches_to_the_shared_application_service`,
 and `tests/e2e/test_admin_ui.py`. Browser evidence for every page is indexed in
 `docs/implementation-notes/c7a.md`.
 

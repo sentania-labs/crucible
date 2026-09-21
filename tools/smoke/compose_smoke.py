@@ -244,7 +244,14 @@ def walk_first_run_ui(base_url: str) -> None:
         return
     jar = http.cookiejar.CookieJar()
     opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
-    body = urllib.parse.urlencode({"token": match.group(0), "next": "/ui"}).encode()
+    with opener.open(f"{base_url}/ui/sign-in", timeout=DEFAULT_TIMEOUT) as response:
+        sign_in = response.read().decode("utf-8", "replace")
+    csrf = re.search(r'name="csrf" value="([a-f0-9]+)"', sign_in)
+    if csrf is None:
+        raise SmokeError("the first-run sign-in page has no pre-authentication CSRF nonce")
+    body = urllib.parse.urlencode(
+        {"csrf": csrf.group(1), "token": match.group(0), "next": "/ui"}
+    ).encode()
     request_object = urllib.request.Request(
         f"{base_url}/ui/sign-in",
         data=body,
