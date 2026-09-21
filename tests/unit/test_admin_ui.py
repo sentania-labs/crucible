@@ -233,7 +233,7 @@ def test_nested_lists_stay_readable_and_suppress_secrets_at_any_depth() -> None:
                 "description": f"provider returned {marker}",
                 "details": [{"access_token": "LEAK-MARKER", "state": "ready"}],
                 "checks": {},
-                "lease": {"fenced_token": 27},
+                "lease": {"fenced_token": 27, "exit_code": 70},
             }
         ]
     }
@@ -246,7 +246,7 @@ def test_nested_lists_stay_readable_and_suppress_secrets_at_any_depth() -> None:
     assert "not displayed" in rendered
     assert "ready" in rendered
     assert "Checks" in rendered and ">none<" in rendered
-    assert "27" in rendered
+    assert "27" in rendered and "70" in rendered
     assert "{'" not in rendered and '{"' not in rendered
 
 
@@ -270,6 +270,13 @@ def test_coded_urls_and_manual_table_cells_are_sanitized() -> None:
     assert code not in _safe_value(
         "device_url", f"https://example.invalid/device?user%5Fcode={code}"
     )
+    assert _safe_value("repository_url", "https://[") == "invalid URL"
+
+
+def test_invalid_timestamp_shaped_text_does_not_break_localization() -> None:
+    detail = "provider failed near 2026-99-99T99:99:99Z"
+
+    assert _localize(detail, "America/Chicago") == detail
 
 
 def test_document_pages_have_no_generic_dump_markup() -> None:

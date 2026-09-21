@@ -131,7 +131,15 @@ SECRET_PARTS = {
     "secret",
     "token",
 }
-NON_SECRET_TOKEN_FIELDS = {"fenced_token", "tokens_in", "tokens_out"}
+NON_SECRET_TOKEN_FIELDS = {
+    "error_code",
+    "exit_code",
+    "fenced_token",
+    "http_code",
+    "status_code",
+    "tokens_in",
+    "tokens_out",
+}
 
 
 def _operator_label(key: str) -> str:
@@ -169,18 +177,21 @@ def _safe_value(key: str, value: Any) -> Any:
     if _secret_field(lowered):
         return "not displayed"
     if isinstance(value, str) and "://" in value:
-        parsed = urlsplit(value)
-        url_parameters = unquote(f"{parsed.query}&{parsed.fragment}")
-        sensitive_parameters = any(
-            _secret_field(partition.partition("=")[0])
-            for partition in re.split(r"[&?;]", url_parameters)
-            if partition
-        )
-        if parsed.username is not None or parsed.password is not None or sensitive_parameters:
-            hostname = parsed.hostname or ""
-            if parsed.port is not None:
-                hostname += f":{parsed.port}"
-            return urlunsplit((parsed.scheme, hostname, parsed.path, "", ""))
+        try:
+            parsed = urlsplit(value)
+            url_parameters = unquote(f"{parsed.query}&{parsed.fragment}")
+            sensitive_parameters = any(
+                _secret_field(partition.partition("=")[0])
+                for partition in re.split(r"[&?;]", url_parameters)
+                if partition
+            )
+            if parsed.username is not None or parsed.password is not None or sensitive_parameters:
+                hostname = parsed.hostname or ""
+                if parsed.port is not None:
+                    hostname += f":{parsed.port}"
+                return urlunsplit((parsed.scheme, hostname, parsed.path, "", ""))
+        except ValueError:
+            return "invalid URL"
     if isinstance(value, bool):
         if lowered.endswith("healthy") or lowered == "healthy":
             return "healthy" if value else "not healthy"
@@ -364,7 +375,10 @@ def _localize(value: Any, timezone: str) -> Any:
         pattern = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})")
 
         def replace(match: re.Match[str]) -> str:
-            parsed = datetime.fromisoformat(match.group(0).replace("Z", "+00:00"))
+            try:
+                parsed = datetime.fromisoformat(match.group(0).replace("Z", "+00:00"))
+            except ValueError:
+                return match.group(0)
             try:
                 local = parsed.astimezone(ZoneInfo(timezone))
             except ZoneInfoNotFoundError:

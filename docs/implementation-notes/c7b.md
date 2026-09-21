@@ -84,7 +84,7 @@ screenshots exercised the final image directly.
 | Tier | Result |
 |---|---|
 | `make lint` | Passed: formatting, Ruff, mypy across 237 files, and all three import contracts. |
-| `make test` | Passed: 622 unit tests in 5.69 seconds and 314 integration tests in 368.28 seconds, with three dependency deprecation warnings. |
+| `make test` | Passed before the PR: 622 unit tests in 5.69 seconds and 314 integration tests in 368.28 seconds, with three dependency deprecation warnings. After the automatic-review fixes, the final unit tier passed 623 tests in 5.63 seconds and the focused administration unit and integration slice passed 47 tests. |
 | `make scan` | Passed: no secret patterns in 3.70 MB of tracked content or the branch commits. |
 | `make e2e` | Limited by the local rootless container tier. First run: 8 passed, 9 failed, 12 deselected. Clean rerun: 12 passed, 5 failed, 12 deselected. The remaining failures were an identity entrypoint exit 70 without its identity bundle, expected timeout or stalled states observed as lost after worker exit, a cancellation case with no worker container to inspect, and absent V9 verifier evidence. None exercised the administration renderer. |
 | `make up` | Passed after assigning unused isolated subnets. Application, migration, proxy, and PostgreSQL containers became healthy or completed successfully. |
@@ -121,6 +121,16 @@ passed 46 tests after the dispositions.
 | high | Scalar cells in existing hand-built tables bypassed the document renderer's sanitization, including stored repository URLs with user information. | Every ordinary table scalar now uses the shared safe-value function with column context. Tests cover URL user information and a credential-shaped description. |
 | medium | Empty dictionaries nested in list rows disappeared during flattening. | Empty maps now remain explicit empty panels that render `none`; the nested-list test covers the provider-check shape. |
 | medium | A dotted table path caused the permitted operational `fenced_token` counter to be treated as a secret. | Secret-name matching now applies the operational exception to the final path component. The nested-list test retains the counter. |
+
+The repository's single automatic PR review found three medium-priority
+defects. All were corrected on the same PR without asking for another review
+round.
+
+| Finding | Disposition |
+|---|---|
+| The broad `code` secret-name rule also suppressed operational `exit_code` values. | Exit, error, HTTP, and status codes are explicit non-secret operational fields. Nested rendering now proves exit code 70 remains visible while authentication codes stay suppressed. |
+| A malformed stored value containing `://` could raise during URL parsing and return a 500 page. | URL parsing is guarded and renders `invalid URL` without echoing the rejected value. |
+| An invalid timestamp-shaped substring could raise inside embedded-time replacement. | The replacement leaves invalid timestamp-shaped text unchanged, and a regression proves the page renderer does not fail. |
 
 ## Follow-ups, limitations, and risks
 
