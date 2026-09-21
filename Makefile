@@ -44,7 +44,7 @@ DEPLOY_TAG ?= 0.2.1
 CRUCIBLE_DEPLOY_IMAGE ?= ghcr.io/sentania-labs/crucible:$(DEPLOY_TAG)
 CRUCIBLE_DEPLOY_PORT ?= 8080
 
-.PHONY: up dev down reset lint scan scan-tree scan-history smoke test test-unit \
+.PHONY: up dev down reset lint check-image-manifest scan scan-tree scan-history smoke test test-unit \
 	test-integration e2e e2e-github e2e-live e2e-admin e2e-image build proxy-config proxies preflight \
 	deploy-local deploy-local-down
 
@@ -106,12 +106,15 @@ down:
 reset: ## DESTRUCTIVE: down plus postgres, artifact, and credential volumes
 	$(COMPOSE) --profile "*" down --volumes
 
-lint:
+lint: check-image-manifest
 	$(UV) sync --frozen --quiet
 	$(UV) run ruff format --check crucible tests tools/smoke
 	$(UV) run ruff check crucible tests tools/smoke
 	$(UV) run mypy crucible tests tools/smoke
 	$(UV) run lint-imports
+
+check-image-manifest: ## fail when a declared worker-image tag is stale
+	images/check-manifest.sh
 
 scan: scan-tree scan-history ## secret scan; needs gitleaks on PATH
 
@@ -140,7 +143,7 @@ test-integration: ## needs Docker for postgres:16 (testcontainers) or CRUCIBLE_T
 e2e-image: ## build the e2e worker image (18) on whichever daemon DOCKER names
 	DOCKER_HOST=$${DOCKER_HOST:-} images/build.sh script-harness
 
-e2e: ## the Docker-provider end-to-end tier (18): real containers, no model
+e2e: check-image-manifest ## the Docker-provider end-to-end tier (18): real containers, no model
 	$(UV) sync --frozen --quiet
 	CRUCIBLE_E2E_DOCKER="$(DOCKER)" \
 	CRUCIBLE_E2E_DOCKER_SOCKET="$(CRUCIBLE_DOCKER_SOCKET)" \
