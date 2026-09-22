@@ -1,0 +1,187 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: crucible-workers
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: crucible-kind-peer
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: crucible-supervisor
+  namespace: crucible-workers
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: crucible-worker
+  namespace: crucible-workers
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: crucible-supervisor
+  namespace: crucible-workers
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "pods/exec", "configmaps", "secrets", "persistentvolumeclaims", "events", "resourcequotas"]
+    verbs: ["create", "get", "list", "watch", "patch", "delete"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: crucible-supervisor
+  namespace: crucible-workers
+subjects:
+  - kind: ServiceAccount
+    name: crucible-supervisor
+    namespace: crucible-workers
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: crucible-supervisor
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: crucible-workers
+  namespace: crucible-workers
+spec:
+  hard:
+    count/jobs.batch: "12"
+    persistentvolumeclaims: "12"
+    requests.cpu: "6"
+    requests.memory: 8Gi
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: crucible-workers
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+  ingress: []
+  egress: []
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: crucible-kind-reference-cache
+spec:
+  capacity:
+    storage: 1Gi
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: crucible-kind-cache
+  hostPath:
+    path: /crucible-kind-cache
+    type: Directory
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: crucible-reference-cache
+  namespace: crucible-workers
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: crucible-kind-cache
+  volumeName: crucible-kind-reference-cache
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: peer-http
+  namespace: crucible-kind-peer
+  labels:
+    app: peer-http
+spec:
+  automountServiceAccountToken: false
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: peer
+      image: busybox@sha256:9db7b59979c38555a39def84a31fb98b5296952f9e3afd4f6f11f05b07adfab0
+      command: ["sh", "-c", "mkdir -p /tmp/www; echo peer > /tmp/www/index.html; exec httpd -f -p 8080 -h /tmp/www"]
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: [ALL]
+      volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+  volumes:
+    - name: tmp
+      emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: peer-http
+  namespace: crucible-kind-peer
+spec:
+  selector:
+    app: peer-http
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: range-http
+  namespace: kube-system
+  labels:
+    app: range-http
+spec:
+  hostNetwork: true
+  automountServiceAccountToken: false
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: range-http
+      image: busybox@sha256:9db7b59979c38555a39def84a31fb98b5296952f9e3afd4f6f11f05b07adfab0
+      command: ["sh", "-c", "mkdir -p /www; echo range-control > /www/index.html; exec httpd -f -p 18080 -h /www"]
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: [ALL]
+      volumeMounts:
+        - name: www
+          mountPath: /www
+  volumes:
+    - name: www
+      emptyDir: {}

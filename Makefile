@@ -49,7 +49,7 @@ CRUCIBLE_DEPLOY_PORT ?= 8080
 
 .PHONY: up dev down reset lint check-image-manifest scan scan-tree scan-history smoke test test-unit \
 	test-integration e2e e2e-github e2e-live e2e-admin e2e-image build proxy-config proxies preflight \
-	release-images-classify release-images-pull release-images-verify deploy-local deploy-local-down
+	e2e-kind release-images-classify release-images-pull release-images-verify deploy-local deploy-local-down
 
 up: preflight proxy-config ## normal mode: postgres, proxies, migrate, crucible
 	@test -f .env || cp .env.example .env
@@ -164,6 +164,9 @@ e2e: check-image-manifest ## the Docker-provider end-to-end tier (18): real cont
 	CRUCIBLE_E2E_DOCKER="$(DOCKER)" \
 	CRUCIBLE_E2E_DOCKER_SOCKET="$(CRUCIBLE_DOCKER_SOCKET)" \
 	$(UV) run pytest tests/e2e -q -m e2e
+
+e2e-kind: check-image-manifest ## Kubernetes-provider e2e on a disposable kind cluster (18, 26)
+	tools/kind/e2e-kind.sh
 
 # The live GitHub tier (23). Local only, never in CI: it mints a real installation token
 # from the mounted App key and opens a real pull request on one throwaway repository,
