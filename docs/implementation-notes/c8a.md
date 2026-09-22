@@ -145,8 +145,8 @@ $ make lint
 ruff format --check, ruff check, mypy, lint-imports: 3 contracts kept, 0 broken
 
 $ make test
-tests/unit          740 passed in 10.58s
-tests/integration   349 passed in 375.83s (0:06:15)
+tests/unit          753 passed in 9.18s
+tests/integration   349 passed in 502.87s (0:08:22)
 
 $ make scan
 gitleaks: no leaks found, tree (4.05 MB) and history (8 commits)
