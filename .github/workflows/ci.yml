@@ -73,6 +73,30 @@ jobs:
           docker ps -a --filter label=crucible.attempt
           docker network ls
 
+  # A real API server, kubelet, enforcing CNI and PVC on the runner's Docker daemon.
+  # This belongs beside the Docker tier on GitHub-hosted infrastructure: it needs a
+  # daemon but no lab access (github-ci skill).
+  e2e-kind:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: astral-sh/setup-uv@eb1897b8dc4b5d5bfe39a428a8f2304605e0983c # v7.0.0
+        with:
+          enable-cache: true
+      - name: install kind
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 4 -o "$RUNNER_TEMP/kind" \
+            https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64
+          echo 'aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d  '"$RUNNER_TEMP/kind" | sha256sum -c -
+          chmod 0755 "$RUNNER_TEMP/kind"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      - name: build the script-harness worker image
+        run: make e2e-image
+      - name: run the kind tier
+        run: make e2e-kind
+
   compose-smoke:
     runs-on: ubuntu-24.04
     steps:

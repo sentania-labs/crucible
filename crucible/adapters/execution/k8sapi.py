@@ -435,6 +435,10 @@ def _exec_over_websocket(
     parsed = urlsplit(server)
     request_headers = {
         **headers,
+        # The ordinary API calls ask for JSON. An exec upgrade has no JSON
+        # representation, and a real API server answers 406 when that Accept header
+        # leaks into the WebSocket handshake.
+        "Accept": "*/*",
         "Host": parsed.netloc,
         "Connection": "Upgrade",
         "Upgrade": "websocket",

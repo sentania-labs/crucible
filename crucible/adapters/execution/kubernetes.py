@@ -327,6 +327,7 @@ class KubernetesProvider:
         self._images: dict[str, ImageInfo] = {}
         self.last_error: dict[str, str] = {}
         self.probe: NamespaceProbe | None = None
+        self._probe_lock = asyncio.Lock()
         self._quota_concurrency: int | None = None
         self._pull_auths_loaded = False
         self._resolved: dict[str, tuple[float, tuple[str, ...]]] = {}
@@ -404,8 +405,11 @@ class KubernetesProvider:
         the next call: lab-admin fixing the CNI must not need a Crucible restart."""
         if self.probe is not None and self.probe.passed:
             return self.probe
-        self.probe = await self._run_probe()
-        return self.probe
+        async with self._probe_lock:
+            if self.probe is not None and self.probe.passed:
+                return self.probe
+            self.probe = await self._run_probe()
+            return self.probe
 
     async def _run_probe(self) -> NamespaceProbe:
         image = self._probe_image()
@@ -445,11 +449,21 @@ class KubernetesProvider:
                 return NamespaceProbe(
                     False, False, None, "the canary Pod never reached a terminal phase", False
                 )
-            body = await self._call(self.client.pod_log, name, container=k8sspec.CONTAINER_NAME)
+            # The probe parser consumes `crucible-canary.*` keys at column one. Normal
+            # worker log pulls need timestamps for resume, but the one-shot canary does
+            # not, and a real API server prefixes every line when timestamps are left
+            # enabled.
+            body = await self._call(
+                self.client.pod_log,
+                name,
+                container=k8sspec.CONTAINER_NAME,
+                timestamps=False,
+            )
             output = b"".join(frame.payload for frame in body).decode("utf-8", "replace")
         finally:
             with contextlib.suppress(KubernetesApiError):
                 await self._call(self.client.delete, "pods", name, grace_period_seconds=0)
+            await self._await_pod_gone(name)
         return _read_probe(output)
 
     def _probe_image(self) -> str:
@@ -839,7 +853,10 @@ class KubernetesProvider:
         spec = spec or (launched.spec if launched else None)
         if spec is None:
             raise ProviderError("collect needs the launch spec and the provider has none")
-        limits = launched.limits if launched else self._limits(spec)
+        # The stored launch spec is authoritative after a supervisor restart. An
+        # adopted provider only has the live Pod shape until the supervisor supplies
+        # this spec again for collection.
+        limits = self._limits(spec)
         repository = spec.contract.get("repository", {})
         work_branch = ws.work_branch or str(
             repository.get("work_branch") or f"crucible/{spec.external_id}"
@@ -949,7 +966,7 @@ class KubernetesProvider:
             "job": launched.job_name if launched else "",
             "pod": (launched.pod_name if launched else "") or "",
             "node": (launched.node if launched else "") or "",
-            "limits": (launched.limits if launched else self._limits(spec)).as_dict(),
+            "limits": self._limits(spec).as_dict(),
             "pod_pid_limit": probe.pid_limit if probe else None,
             "runtime_class": "standard",
             "network_policy": (launched.network_policy if launched else None),
@@ -1094,14 +1111,30 @@ class KubernetesProvider:
                 # from now, so a Pod that has already been Pending too long is caught on
                 # the first observation rather than being given the window again.
                 created = _age_seconds(str(metadata.get("creationTimestamp", "")))
+                pod_spec = pod.get("spec") or {}
+                containers = pod_spec.get("containers") or []
+                image = str((containers[0] if containers else {}).get("image", ""))
+                limits = replace(
+                    k8sspec.limits_from_policy({}),
+                    grace_seconds=int(pod_spec.get("terminationGracePeriodSeconds") or 60),
+                )
                 self._launched[attempt_id] = _Launched(
                     job_name=name,
                     spec=_ADOPTED_SPEC,
-                    image_digest="",
-                    limits=k8sspec.limits_from_policy({}),
+                    image_digest=image,
+                    limits=limits,
                     launched_at=time.monotonic() - created,
                 )
-            handles.append(Handle(provider=self.name, ref=name, attempt_id=attempt_id, name=name))
+            launched = self._launched[attempt_id]
+            handles.append(
+                Handle(
+                    provider=self.name,
+                    ref=name,
+                    attempt_id=attempt_id,
+                    image_digest=launched.image_digest,
+                    name=name,
+                )
+            )
         return handles
 
     async def retention(self, keep: Sequence[str]) -> int:
@@ -1807,9 +1840,12 @@ class KubernetesProvider:
         finally:
             with contextlib.suppress(KubernetesApiError):
                 await self._call(self.client.delete, "jobs", name)
-            if policy_name:
-                with contextlib.suppress(KubernetesApiError):
-                    await self._call(self.client.delete, "networkpolicies", policy_name)
+            try:
+                await self._await_job_pods_gone(name)
+            finally:
+                if policy_name:
+                    with contextlib.suppress(KubernetesApiError):
+                        await self._call(self.client.delete, "networkpolicies", policy_name)
 
     async def _run_verifier(
         self, spec: LaunchSpec, limits: Limits
@@ -1880,6 +1916,7 @@ class KubernetesProvider:
         finally:
             with contextlib.suppress(KubernetesApiError):
                 await self._call(self.client.delete, "pods", name, grace_period_seconds=0)
+            await self._await_pod_gone(name)
 
     async def _read_files(
         self,
@@ -2057,6 +2094,33 @@ class KubernetesProvider:
             self.client.list_objects, "pods", label_selector=f"job-name={job_name}"
         )
         return rows[0] if rows else None
+
+    async def _await_pod_gone(self, name: str, *, timeout: float = 15) -> None:
+        """Wait for an asynchronous Pod deletion before recording workspace state."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                await self._call(self.client.get, "pods", name)
+            except KubernetesApiError as exc:
+                if exc.status == 404:
+                    return
+                raise
+            await asyncio.sleep(self.config.poll_interval_seconds)
+        raise ProviderError(f"Pod {name!r} was still present after {timeout:g} seconds")
+
+    async def _await_job_pods_gone(self, job_name: str, *, timeout: float = 15) -> None:
+        """Wait for background Job propagation to remove its Pod."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            rows = await self._call(
+                self.client.list_objects, "pods", label_selector=f"job-name={job_name}"
+            )
+            if not rows:
+                return
+            await asyncio.sleep(self.config.poll_interval_seconds)
+        raise ProviderError(
+            f"Pods for Job {job_name!r} were still present after {timeout:g} seconds"
+        )
 
     async def _job_tail(self, job_name: str, limit: int = 4000) -> str:
         try:

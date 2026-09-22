@@ -175,7 +175,7 @@ shown on the admin status page (25).
 ## Provider mechanics (08's interface)
 
 - `prepare`: create the PVC, ConfigMap, and per-attempt Secret; run the
-  preparer Job with the reference cache mounted read-only from a
+  preparer Job with the reference cache mounted read-write from a
   cluster-side cache volume that Crucible refreshes with a short-lived
   installation token (the token never enters the workspace); the Job
   performs exactly what 08's Docker `prepare` performs. `prepare` returns
@@ -228,8 +228,10 @@ container copies the named files off the Secret's read-only projection into the
 `credential` leaf of the attempt's own claim, mode 0700 on the directory and
 0600 on each file, which is the same shape, the same properties and the same
 place the Docker provider puts it (12). The provider reads the rotated file
-back from there through the reader Pod and writes it into the harness Secret on
-a successful exit, exactly as the Docker provider syncs a rotated token today.
+back from there through the reader Pod and writes it into the harness Secret
+whenever the attempt reaches collection, whether the worker exited successfully
+or not. This matches the Docker provider: a valid newer refresh is durable state
+even when the task itself fails.
 (Made concrete 2026-09-21 during C8a.)
 The per-attempt Secret is deleted under every cleanup policy. The admin
 login flow (25) runs the harness's login in a login Job with the harness

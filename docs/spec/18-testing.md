@@ -87,7 +87,12 @@ The end-to-end suite against the Kubernetes provider on a throwaway kind
 cluster with an egress-enforcing CNI, plus the NetworkPolicy denials, loss by
 eviction, SIGTERM-ignoring workers, per-attempt Secret removal, supervisor
 re-attach, and the namespace readiness refusal. Cases and evidence rules in
-26; runs in CI beside the Docker tier.
+26; runs in CI beside the Docker tier. The tier also runs a full
+API-and-Supervisor lifecycle for gates, timeout, cancellation, stall,
+disconnected completion, verification hardening, restart, and orphan cleanup;
+two concurrent claims; real registry digest and harness-label resolution; and
+every cleanup policy. Every denied NetworkPolicy endpoint has a reachable
+control before the selected policy proves it blocked.
 
 ## Live harness tests (subscription required, not in CI by default)
 
