@@ -544,6 +544,9 @@ class KubernetesProvider:
         identity_sha: str,
     ) -> Workspace:
         repository = spec.contract.get("repository", {})
+        # The shim rule is the adapter's (06): Claude Code reads AGENTS.md only where the
+        # project has no CLAUDE.md of its own, and the preparer needs to be told which.
+        adapter = self.harnesses.require(spec.harness)
         cache_mounts: list[Mount] = []
         cache_volumes: list[dict[str, Any]] = []
         cache_name: str | None = None
@@ -573,6 +576,7 @@ class KubernetesProvider:
                     git_policy.get("author_email", "crucible-worker@users.noreply.github.com")
                 ),
                 origin_placeholder=workspace.ORIGIN_PLACEHOLDER,
+                claude_md_wins=adapter.capabilities().claude_md_wins,
                 shims=workspace.SHIM_NAMES,
                 exclude_entries=workspace.EXCLUDE_ENTRIES,
                 identity_mount=IDENTITY_MOUNT,
