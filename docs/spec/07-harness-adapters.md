@@ -91,11 +91,12 @@ never retry.
   account MCP connectors are wanted). Confirmed by a task completed
   through the filtering proxy, so the list is no longer provisional.
 - Shim: one-line untracked `AGENTS.md` pointing at the identity file when the
-  checkout has neither `AGENTS.md` nor `CLAUDE.md`. If the checkout has its
-  own `CLAUDE.md`, Claude Code reads that file because it wins under the
-  default `instructionFiles` setting, so Crucible writes no shim and records
-  that the project's `CLAUDE.md` is in force. A committed `CLAUDE.md` and a
-  committed `AGENTS.md` remain project files and no generated shim is written.
+  checkout has no `AGENTS.md`. Claude Code alone suppresses that shim when the
+  checkout has its own `CLAUDE.md`, because it reads that file when it wins
+  under the default `instructionFiles` setting, and records that the project's
+  `CLAUDE.md` is in force. Codex and AGY do not read `CLAUDE.md`, so it does not
+  suppress their shim. A committed `CLAUDE.md` and a committed `AGENTS.md`
+  remain project files and no generated shim is written.
 - Stream-json lines are parsed into progress events (tool use, text) at low
   fidelity; the full stream is stored as the transcript artifact.
 - Known: nested invocation from inside another Claude session works, but

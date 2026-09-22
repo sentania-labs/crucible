@@ -96,6 +96,7 @@ def preparer_script(
     author_name: str,
     author_email: str,
     origin_placeholder: str,
+    claude_md_wins: bool,
     shims: tuple[str, ...],
     exclude_entries: tuple[str, ...],
     identity_mount: str,
@@ -134,6 +135,7 @@ fi
             f"AUTHOR_NAME={_quote(author_name)}",
             f"AUTHOR_EMAIL={_quote(author_email)}",
             f"IDENTITY_MOUNT={_quote(identity_mount)}",
+            f"CLAUDE_MD_WINS={_quote('1' if claude_md_wins else '0')}",
         )
     )
     shim_list = " ".join(_quote(name) for name in shims)
@@ -194,8 +196,10 @@ mkdir -p "$REPO/.git/info"
 SHIM_TEXT="Read $IDENTITY_MOUNT/IDENTITY.md first; it is the task contract for this run."
 for shim in {shim_list}; do
   # Claude Code uses AGENTS.md only when the project has no own CLAUDE.md.
-  # CLAUDE.md wins under its default instructionFiles setting.
-  if [ "$shim" = "AGENTS.md" ] && [ -e "$REPO/CLAUDE.md" ]; then
+  # CLAUDE.md wins under its default instructionFiles setting. Other harnesses
+  # do not read CLAUDE.md, so it does not suppress their shim.
+  if [ "$CLAUDE_MD_WINS" = "1" ] && [ "$shim" = "AGENTS.md" ] \
+    && {{ [ -e "$REPO/CLAUDE.md" ] || [ -L "$REPO/CLAUDE.md" ]; }}; then
     continue
   fi
   if [ ! -e "$REPO/$shim" ]; then

@@ -439,6 +439,7 @@ class DockerProvider:
         await asyncio.to_thread(shutil.rmtree, root, True)
         paths = await asyncio.to_thread(self._make_dirs, root)
         resolved = await self._resolve_image(spec)
+        adapter = self.harnesses.require(spec.harness)
 
         local = self._local_origin(url)
         # The preparer gets the workspace itself, so git creates the checkout directory
@@ -477,6 +478,7 @@ class DockerProvider:
                     git_policy.get("author_email", "crucible-worker@users.noreply.github.com")
                 ),
                 origin_placeholder=workspace.ORIGIN_PLACEHOLDER,
+                claude_md_wins=adapter.capabilities().claude_md_wins,
                 shims=workspace.SHIM_NAMES,
                 exclude_entries=workspace.EXCLUDE_ENTRIES,
                 identity_mount=IDENTITY_MOUNT,

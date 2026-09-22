@@ -109,6 +109,7 @@ class ClaudeCodeAdapter:
             transcript_format=TranscriptFormat.STREAM_JSON,
             endpoints=("api.anthropic.com",),
             shim="AGENTS.md",
+            claude_md_wins=True,
         )
 
     def credential_spec(self) -> CredentialSpec:
