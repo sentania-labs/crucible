@@ -86,8 +86,8 @@ FROM ${BASE_IMAGE} AS fetch-hermes
 ARG HARNESS_HERMES_VERSION=0.19.0
 ARG HARNESS_HERMES_SHA256=bd0bac012aee38a60894781f4597dc29ee7bedb3448540249921f10d3bef327f
 ADD --checksum=sha256:${HARNESS_HERMES_SHA256} --chmod=0644 \
-    https://files.pythonhosted.org/packages/e5/30/c85be8290e9565dc3c7a9720e93f3e59e09b1b163487be4946c3aa848f80/hermes_agent-0.19.0-py3-none-any.whl \
-    /fetch/hermes_agent-0.19.0-py3-none-any.whl
+    https://files.pythonhosted.org/packages/e5/30/c85be8290e9565dc3c7a9720e93f3e59e09b1b163487be4946c3aa848f80/hermes_agent-${HARNESS_HERMES_VERSION}-py3-none-any.whl \
+    /fetch/hermes_agent-${HARNESS_HERMES_VERSION}-py3-none-any.whl
 
 FROM ${BASE_IMAGE}
 # Declared here so it reaches the RUN below: useradd stamps /etc/shadow with
@@ -146,10 +146,10 @@ RUN set -eu; \
     echo "${LAB_CA_SHA256}  /usr/local/share/ca-certificates/sentania-lab-root.crt" | sha256sum -c -; \
     update-ca-certificates
 COPY worker/requirements.lock /tmp/requirements.lock
-COPY --from=fetch-hermes /fetch/hermes_agent-0.19.0-py3-none-any.whl /fetch/hermes_agent-0.19.0-py3-none-any.whl
+COPY --from=fetch-hermes /fetch/hermes_agent-${HARNESS_HERMES_VERSION}-py3-none-any.whl /fetch/hermes_agent-${HARNESS_HERMES_VERSION}-py3-none-any.whl
 RUN set -eu; \
     /opt/hermes/bin/pip install --no-cache-dir --require-hashes -r /tmp/requirements.lock; \
-    /opt/hermes/bin/pip install --no-cache-dir --no-deps --force-reinstall /fetch/hermes_agent-0.19.0-py3-none-any.whl; \
+    /opt/hermes/bin/pip install --no-cache-dir --no-deps --force-reinstall /fetch/hermes_agent-${HARNESS_HERMES_VERSION}-py3-none-any.whl; \
     test "$(/opt/hermes/bin/python -c 'import importlib.metadata; print(importlib.metadata.version("hermes-agent"))')" = "${HARNESS_HERMES_VERSION}"; \
     rm -rf /root/.cache /tmp/requirements.lock /fetch
 COPY --chmod=0755 worker/crucible-hermes.py /usr/local/bin/crucible-hermes
