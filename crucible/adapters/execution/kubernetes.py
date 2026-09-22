@@ -947,8 +947,13 @@ class KubernetesProvider:
             name = str(metadata.get("name", ""))
             if not attempt_id or not name:
                 continue
-            status = row.get("status") or {}
-            if not int(status.get("active") or 0):
+            pod = await self._pod_of(name)
+            # A Job's `status.active` lags its Pod, so the Pod is what says whether a
+            # worker is alive: 08 adopts only what is actually running.
+            if pod is None:
+                continue
+            phase = str((pod.get("status") or {}).get("phase", ""))
+            if phase not in ("Pending", "Running"):
                 continue
             handles.append(Handle(provider=self.name, ref=name, attempt_id=attempt_id, name=name))
         return handles
@@ -1144,6 +1149,24 @@ class KubernetesProvider:
         through the reader Pod and the copy is removed under every cleanup policy."""
         target = copy.spec.mount_target
         templates = sorted(copy.spec.templates)
+        # A Secret key may not hold a path separator and an auth file's name may (AGY's
+        # token sits under `antigravity-cli/`), so the volume projects each key back to
+        # the relative path the adapter declared.
+        items = [
+            {"key": _secret_key(auth.name), "path": auth.name, "mode": 0o400}
+            for auth in copy.spec.auth_files
+        ]
+        source_volume = {
+            "name": "cred-source" if copy.writable else "cred",
+            "secret": {
+                "secretName": k8sspec.object_name("cred", spec.attempt_id),
+                "defaultMode": 0o400,
+                "items": items,
+                # A harness whose optional auth file was absent still starts; a required
+                # one refused the launch before this Pod was rendered (12).
+                "optional": False,
+            },
+        }
         mounts: list[Mount] = []
         volumes: list[dict[str, Any]] = []
         init: list[dict[str, Any]] = []
@@ -1153,7 +1176,7 @@ class KubernetesProvider:
                 {
                     "name": k8sspec.CREDENTIAL_INIT_CONTAINER,
                     "image": image,
-                    "command": ["sh", "-c", _SEED_SCRIPT],
+                    "command": ["sh", "-c", _seed_script(copy.spec)],
                     "securityContext": {
                         "allowPrivilegeEscalation": False,
                         "readOnlyRootFilesystem": True,
@@ -1182,26 +1205,10 @@ class KubernetesProvider:
                     ],
                 }
             )
-            volumes.append(
-                {
-                    "name": "cred-source",
-                    "secret": {
-                        "secretName": k8sspec.object_name("cred", spec.attempt_id),
-                        "defaultMode": 0o400,
-                    },
-                }
-            )
+            volumes.append(source_volume)
         else:
             mounts.append(Mount("cred", target, read_only=True))
-            volumes.append(
-                {
-                    "name": "cred",
-                    "secret": {
-                        "secretName": k8sspec.object_name("cred", spec.attempt_id),
-                        "defaultMode": 0o400,
-                    },
-                }
-            )
+            volumes.append(source_volume)
         for name in templates:
             # 12, 13: the Crucible-owned templates, read-only, each at its own path
             # inside the credential directory, so a worker cannot plant a hook or a
@@ -2077,22 +2084,30 @@ esac
 echo "crucible-canary.done=1"
 """
 
-# The init container that makes a `rw-narrow` copy (12). It reads the per-attempt
-# Secret's read-only projection and writes the same named files into the attempt's own
-# claim, mode 0700 on the directory and 0600 on each file, owned by the worker's uid.
-_SEED_SCRIPT = f"""set -eu
+
+def _seed_script(spec: CredentialSpec) -> str:
+    """The init container that makes a `rw-narrow` copy (12).
+
+    It reads the per-attempt Secret's read-only projection and writes the same named
+    files into the attempt's own claim, mode 0700 on the directory and 0600 on each
+    file, owned by the worker's uid. The file list is written out rather than globbed:
+    an auth file can sit in a subdirectory, and nothing but the adapter's declared files
+    is ever copied."""
+    names = " ".join("'" + a.name.replace("'", "'\"'\"'") + "'" for a in spec.auth_files)
+    return f"""set -eu
 umask 077
 src={k8sspec.CREDENTIAL_SOURCE_MOUNT}
 dst=/crucible/credential
 mkdir -p "$dst"
 chmod 0700 "$dst"
-for f in "$src"/*; do
-  [ -f "$f" ] || continue
-  name=$(basename "$f")
-  cat < "$f" > "$dst/$name"
-  chmod 0600 "$dst/$name"
+for rel in {names}; do
+  [ -f "$src/$rel" ] || continue
+  mkdir -p "$dst/$(dirname "$rel")"
+  cat < "$src/$rel" > "$dst/$rel"
+  chmod 0600 "$dst/$rel"
 done
 """
+
 
 __all__ = [
     "PROVIDER_NAME",

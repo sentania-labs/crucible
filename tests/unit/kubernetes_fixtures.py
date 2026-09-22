@@ -65,6 +65,7 @@ def spec(
     network: str = "policy",
     endpoint: str = "subscription",
     endpoint_url: str | None = None,
+    model: str = "none",
     policy: dict[str, Any] | None = None,
     **overrides: Any,
 ) -> LaunchSpec:
@@ -76,7 +77,7 @@ def spec(
         external_id="EX-0001",
         role="implement",
         harness=harness,
-        model="none",
+        model=model,
         image=image,
         timeout_seconds=600,
         contract=document,
