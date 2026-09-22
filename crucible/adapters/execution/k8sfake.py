@@ -115,6 +115,15 @@ class _Worker:
     kills: int = 0
 
 
+@dataclass(frozen=True)
+class _SpecStub:
+    """What `fake.py`'s report builders read off a launch spec."""
+
+    attempt_id: str
+    external_id: str
+    contract: dict[str, Any]
+
+
 @dataclass
 class _Object:
     kind: str
@@ -142,8 +151,11 @@ class FakeKubernetesApi:
     claims: dict[str, dict[str, bytes]] = field(default_factory=dict)
     logs: dict[str, list[str]] = field(default_factory=dict)
     workers: dict[str, _Worker] = field(default_factory=dict)
-    specs: dict[str, Any] = field(default_factory=dict)
     scripts: dict[str, tuple[str, int]] = field(default_factory=dict)
+    # What an attempt's roles act out when its image tag names no behaviour. The
+    # integration tier sets it per case, because the image a routed task runs is the
+    # promoted one and carries no behaviour in its tag.
+    default_behavior: tuple[str, int] | None = None
     # A test flips this to make the next create fail, or to make a Pod unschedulable.
     refuse_create: set[str] = field(default_factory=set)
     pending_forever: set[str] = field(default_factory=set)
@@ -156,6 +168,11 @@ class FakeKubernetesApi:
         if behavior not in BEHAVIORS:
             raise ValueError(f"unknown fake behavior {behavior!r}")
         self.scripts[attempt_id] = (behavior, after)
+
+    def script_all(self, behavior: str, *, after: int = 1) -> None:
+        if behavior not in BEHAVIORS:
+            raise ValueError(f"unknown fake behavior {behavior!r}")
+        self.default_behavior = (behavior, after)
 
     def remove_pod_out_of_band(self, attempt_id: str) -> None:
         """An operator, an eviction, or a node that went away (26)."""
@@ -393,12 +410,9 @@ class FakeKubernetesApi:
         for container in (obj.body.get("spec") or {}).get("containers") or []:
             image = str(container.get("image", "")).split("@", 1)[0]
         match = _TAG.match(image)
-        if match is None:
-            return "succeed", 1
-        behavior = match.group("behavior")
-        if behavior not in BEHAVIORS:
-            return "succeed", 1
-        return behavior, int(match.group("n") or 1)
+        if match is None or match.group("behavior") not in BEHAVIORS:
+            return self.default_behavior or ("succeed", 1)
+        return match.group("behavior"), int(match.group("n") or 1)
 
     def _finish(self, obj: _Object, code: int, *, reason: str = "Completed") -> None:
         obj.body["status"] = {
@@ -433,10 +447,26 @@ class FakeKubernetesApi:
         claim["repo/.git/HEAD"] = b"ref: refs/heads/crucible\n"
         self._finish(obj, 0)
 
+    def _spec_of(self, attempt_id: str) -> _SpecStub | None:
+        """What the attempt's roles know about the contract: the identity ConfigMap the
+        provider created, which is exactly what the worker itself was given (06)."""
+        obj = self.objects.get(("configmaps", f"identity-{attempt_id.lower()}"))
+        if obj is None:
+            return None
+        raw = (obj.body.get("data") or {}).get("contract.json")
+        if not raw:
+            return None
+        contract = json.loads(str(raw))
+        return _SpecStub(
+            attempt_id=attempt_id,
+            external_id=str(contract.get("external_id", "")),
+            contract=contract,
+        )
+
     def _act_collector(self, obj: _Object, attempt_id: str) -> None:
         behavior, _ = self._behavior(attempt_id, obj)
         claim = self._claim_of(obj)
-        spec = self.specs.get(attempt_id)
+        spec = self._spec_of(attempt_id)
         head = synthetic_head_sha(attempt_id)
         contract = dict(getattr(spec, "contract", {}) or {})
         repository = contract.get("repository", {})
@@ -485,7 +515,7 @@ class FakeKubernetesApi:
 
         behavior, _ = self._behavior(attempt_id, obj)
         claim = self._claim_of(obj)
-        spec = self.specs.get(attempt_id)
+        spec = self._spec_of(attempt_id)
         checks = [
             check
             for check in (getattr(spec, "contract", {}) or {}).get("required_verification", [])

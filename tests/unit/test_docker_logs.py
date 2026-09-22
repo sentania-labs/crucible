@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import hashlib
 
-from crucible.adapters.execution.docker import _chunks, _since_param
+from crucible.adapters.execution.docker import _since_param
 from crucible.adapters.execution.dockerapi import LogFrame, demultiplex
+from crucible.adapters.execution.logstream import chunks as _chunks
 from crucible.ports.execution import LogOffset
 
 

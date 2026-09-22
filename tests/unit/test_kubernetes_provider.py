@@ -30,7 +30,7 @@ from crucible.ports.execution import (
 from crucible.ports.execution import (
     CleanupPolicy as Cleanup,
 )
-from tests.unit.kubernetes_fixtures import ATTEMPT, IMAGE, build, spec
+from tests.unit.kubernetes_fixtures import IMAGE, build, spec
 
 CODEX_IMAGE = "crucible-worker:codex-fake-succeed-2"
 
@@ -51,7 +51,6 @@ async def run_to_exit(provider: KubernetesProvider, handle: Handle) -> Any:
 async def prepared(**kwargs: Any) -> Any:
     api, registry, provider = build(**kwargs.pop("build", {}))
     launch = spec(**kwargs)
-    api.specs[launch.attempt_id] = launch
     workspace = await provider.prepare(launch)
     return api, registry, provider, launch, workspace
 
@@ -87,8 +86,7 @@ async def test_max_concurrency_comes_from_the_namespace_resource_quota() -> None
 
 
 async def test_the_probe_passes_when_the_canary_cannot_reach_the_api_server() -> None:
-    api, _registry, provider = build()
-    api.specs[ATTEMPT] = spec()
+    _api, _registry, provider = build()
     await provider.prepare(spec())
     probe = await provider.ensure_ready()
     assert probe == NamespaceProbe(True, True, 4096, "namespace ready")
@@ -121,25 +119,22 @@ async def test_a_node_with_no_pod_pid_limit_refuses_every_launch() -> None:
 
 
 async def test_an_image_outside_the_policy_allowlist_is_refused() -> None:
-    api, _registry, provider = build()
+    _api, _registry, provider = build()
     launch = spec(policy={"images": {"allowlist": ["ghcr.io/someone-else/worker:*"]}})
-    api.specs[launch.attempt_id] = launch
     with pytest.raises(ProviderError, match="outside the policy allowlist"):
         await provider.prepare(launch)
 
 
 async def test_an_image_whose_harness_label_differs_is_refused() -> None:
-    api, _registry, provider = build(harness="codex")
+    _api, _registry, provider = build(harness="codex")
     launch = spec()
-    api.specs[launch.attempt_id] = launch
     with pytest.raises(LaunchRefusedError, match="declares harness"):
         await provider.prepare(launch)
 
 
 async def test_an_image_outside_the_tested_range_is_refused() -> None:
-    api, _registry, provider = build(version="9.9.9")
+    _api, _registry, provider = build(version="9.9.9")
     launch = spec()
-    api.specs[launch.attempt_id] = launch
     with pytest.raises(LaunchRefusedError, match="outside the tested range"):
         await provider.prepare(launch)
 
@@ -279,7 +274,6 @@ async def codex_attempt(**build_kwargs: Any) -> Any:
     registry.register(CODEX_IMAGE, harness="codex", version="0.153.4")
     api.put_harness_secret("crucible-harness-codex", {"auth.json": _auth("2026-09-20T00:00:00Z")})
     launch = spec(harness="codex", image=CODEX_IMAGE)
-    api.specs[launch.attempt_id] = launch
     workspace = await provider.prepare(launch)
     return api, provider, launch, workspace
 
@@ -296,16 +290,14 @@ async def test_a_missing_required_auth_file_refuses_the_launch() -> None:
     registry.register(CODEX_IMAGE, harness="codex", version="0.153.4")
     api.put_harness_secret("crucible-harness-codex", {})
     launch = spec(harness="codex", image=CODEX_IMAGE)
-    api.specs[launch.attempt_id] = launch
     with pytest.raises(LaunchRefusedError, match="missing its auth file"):
         await provider.prepare(launch)
 
 
 async def test_a_harness_with_no_secret_at_all_refuses_the_launch() -> None:
-    api, registry, provider = build(harness="codex")
+    _api, registry, provider = build(harness="codex")
     registry.register(CODEX_IMAGE, harness="codex", version="0.153.4")
     launch = spec(harness="codex", image=CODEX_IMAGE)
-    api.specs[launch.attempt_id] = launch
     with pytest.raises(LaunchRefusedError, match="not readable"):
         await provider.prepare(launch)
 
@@ -321,7 +313,6 @@ async def test_hermes_needs_no_credential() -> None:
         endpoint_url="http://10.10.0.42:8000/v1",
         model="gpt-oss:120b",
     )
-    api.specs[launch.attempt_id] = launch
     workspace = await provider.prepare(launch)
     await provider.launch(workspace, launch)
     assert not api.secret_exists("cred-01attempt0000000000000000a")

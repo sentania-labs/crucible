@@ -65,7 +65,6 @@ async def policies(**kwargs: Any) -> dict[str, dict[str, Any]]:
     """Every NetworkPolicy one whole attempt creates, by the role it selects."""
     api, _registry, provider = build()
     launch = spec(**kwargs)
-    api.specs[launch.attempt_id] = launch
     workspace = await provider.prepare(launch)
     handle = await provider.launch(workspace, launch)
     while (await provider.observe(handle)).state.value == "running":
@@ -158,9 +157,8 @@ async def test_the_provider_never_adds_github_to_a_worker() -> None:
 async def test_a_host_that_does_not_resolve_refuses_the_launch() -> None:
     """13's rule for the same situation: an attempt whose allowlist the egress path
     cannot actually permit is refused, never run with less network than promised."""
-    api, _registry, provider = build(resolver=lambda host: [])
+    _api, _registry, provider = build(resolver=lambda host: [])
     launch = spec()
-    api.specs[launch.attempt_id] = launch
     with pytest.raises(ProviderError, match="do not resolve"):
         await provider.prepare(launch)
 
@@ -205,9 +203,8 @@ async def test_a_local_route_is_an_exact_address_and_port_inside_a_denied_range(
 
 async def test_a_hostname_local_route_is_refused_rather_than_widened() -> None:
     """A name in an ipBlock would silently become "the whole internet on that port"."""
-    api, _registry, provider = build()
+    _api, _registry, provider = build()
     launch = spec(endpoint="local", endpoint_url="http://spark.int.example:8000/v1")
-    api.specs[launch.attempt_id] = launch
     workspace = await provider.prepare(launch)
     with pytest.raises((ProviderError, SpecError), match="must be an IP address"):
         await provider.launch(workspace, launch)

@@ -42,7 +42,6 @@ async def ran() -> Any:
     """One whole attempt against the fake API, so every role's Pod has been rendered."""
     api, _registry, provider = build()
     launch = spec()
-    api.specs[launch.attempt_id] = launch
     workspace = await provider.prepare(launch)
     handle = await provider.launch(workspace, launch)
     while (await provider.observe(handle)).state.value == "running":
@@ -217,7 +216,6 @@ async def test_the_image_pull_secret_is_on_every_pod_when_one_is_configured(ran:
 async def test_the_workspace_claim_is_read_write_once_with_the_configured_class() -> None:
     api, _registry, provider = build()
     launch = spec()
-    api.specs[launch.attempt_id] = launch
     await provider.prepare(launch)
     claim = next(row["body"] for row in api.created if row["kind"] == "persistentvolumeclaims")
     assert claim["spec"]["accessModes"] == ["ReadWriteOnce"]
@@ -228,9 +226,8 @@ async def test_the_workspace_claim_is_read_write_once_with_the_configured_class(
 async def test_a_bundle_above_the_configmap_cap_is_refused_rather_than_truncated() -> None:
     """08, 26: a ConfigMap has a size cap and the projected-volume form above it is not
     implemented. A truncated identity bundle is a worker given the wrong contract."""
-    api, _registry, provider = build(config=KubernetesConfig(poll_interval_seconds=0))
+    _api, _registry, provider = build(config=KubernetesConfig(poll_interval_seconds=0))
     launch = spec()
     launch.contract["objective"] = "x" * (1024 * 1024 + 1)
-    api.specs[launch.attempt_id] = launch
     with pytest.raises(Exception, match="above the ConfigMap cap"):
         await provider.prepare(launch)
