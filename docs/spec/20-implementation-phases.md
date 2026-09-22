@@ -140,7 +140,32 @@ Acceptance: a release of the throwaway repository tagged by Crucible from
 an operator-authorized contract; a contract with a stale target SHA is
 refused with nothing pushed.
 
-## Phase C8: image promotion and GHCR publication
+## Phase C8: Kubernetes execution provider (26)
+
+The provider adapter (prepare, launch, observe, logs, collect, terminate,
+cleanup, reconcile as Jobs and Pods), per-attempt NetworkPolicy generated
+from the same policy that generates the proxy allowlist, per-attempt
+credential Secrets with `rw-narrow` sync-back, the namespace readiness
+probe, provider capabilities and status-page fields, and the `make e2e-kind`
+tier in CI. Acceptance: the Docker end-to-end cases plus the Kubernetes
+cases in 26 pass on kind in CI; readiness rows 5, 7, 11, 12, and 23 are
+re-proven on that tier and cited in 19. Standard container runtime;
+no runtime class.
+
+## Phase C9: cluster deployment
+
+Deployment manifests for the `crucible` and `crucible-workers` namespaces
+(api and supervisor Deployments, PostgreSQL for the lab or an external
+connection, RBAC, Pod Security admission labels, default-deny
+NetworkPolicy, ResourceQuota, storage class reference, SealedSecret or
+ExternalSecret shapes for the App key and harness credentials), pinned to
+an exact image tag, consumed by an Argo Application in the deployment
+repository. Acceptance: the release image comes up on the lab cluster, the
+status page shows the namespace probe green, the operator logs the
+harnesses in from the admin UI, and one trivial task runs end to end there.
+Lab-side prerequisites are the checklist in 26 and are lab-admin work.
+
+## Phase C10: image promotion and GHCR publication
 
 Renovate configuration, candidate image build in CI, canary procedure,
 promotion endpoint, GHCR publication from the release workflow.
@@ -148,5 +173,7 @@ promotion endpoint, GHCR publication from the release workflow.
 ## Later (not scheduled)
 
 Kubernetes provider with kind tests; deployment manifests; object storage
-for artifacts; credential broker; observer UI; microVM isolation; Foundry
+for artifacts; credential broker; observer UI; a runtime class for worker
+pods (gVisor or Kata, the microVM step the operator deferred on 2026-09-21);
+Foundry
 as a persistent service.

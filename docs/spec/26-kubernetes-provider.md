@@ -1,0 +1,267 @@
+# 26. Kubernetes execution provider
+
+Status: draft for review, 2026-09-21. Decided by the operator the same day:
+"let's move forward with the weaker container only sandboxing on k8s ...
+and we will target the microvm once it's working." So this version of the
+provider runs worker pods on the node's standard container runtime with the
+full pod security context, and a stronger runtime class (gVisor or Kata) is a
+later, separate step that changes one field of the pod spec and nothing
+else.
+
+Everything above the provider is unchanged: task, worker, execution, event,
+artifact, gate, evidence, review, publication, administration, and the API
+(03, 04, 09, 10, 11, 16, 23, 25). Spec 08 defines the provider interface
+every provider implements; this document is the Kubernetes provider's
+mechanics, in the same order as 08's Docker section, plus what the cluster
+must guarantee before a worker runs there.
+
+## Why a second provider, and why now
+
+The operator cannot use Crucible for real work until workers are sandboxed
+on the lab Kubernetes cluster; the Docker provider (08, 13) is for
+development, testing, and the readiness evidence gathered so far. The
+bootstrap contract names deployment on that cluster through Argo as a
+design requirement. The readiness rows that prove isolation, termination,
+log capture, and failure detection (19) are re-proven on this provider
+before the gate counts for real-project use.
+
+## Topology (from 01, made concrete)
+
+One namespace for Crucible itself (`crucible`), one for workers
+(`crucible-workers`). In `crucible`: the `api` Deployment, the `supervisor`
+Deployment (one replica, lease-guarded exactly as today, fenced tokens in
+PostgreSQL), and PostgreSQL (operator-managed or external; the manifests
+carry a single-instance StatefulSet for the lab and a connection-string
+option for an external server). No Docker socket anywhere. The GitHub App
+key and webhook secret are a Secret mounted on the `crucible` pods only
+(12). Everything a worker needs lives in `crucible-workers` and is created
+per attempt by the supervisor through the Kubernetes API.
+
+The supervisor's ServiceAccount is bound to a Role in `crucible-workers`
+that permits create, get, list, watch, and delete on Jobs, Pods,
+ConfigMaps, Secrets, and PersistentVolumeClaims, plus `pods/log` and
+`pods/exec` for log tail and the login flow, and nothing in any other
+namespace. It has no cluster-scoped permissions. Admission (the cluster's
+Pod Security admission at the `restricted` level on `crucible-workers`)
+enforces the pod shape below independently of Crucible's own code, which
+is the surviving half of 13's create-request policy.
+
+## The attempt as Kubernetes objects
+
+Per attempt the provider creates, in `crucible-workers`, all labelled
+`crucible.attempt`, `crucible.task`, `crucible.owner`, `crucible.role`:
+
+| Object | Role | Lifetime |
+|---|---|---|
+| PersistentVolumeClaim `ws-<attempt>` | the workspace: `repo/`, `report/`, `output/` | attempt, then per cleanup policy |
+| ConfigMap `identity-<attempt>` (or a projected volume from an object store above the ConfigMap size cap, 08) | the identity bundle, read-only | attempt |
+| Secret `cred-<attempt>` | the per-attempt copy of one harness credential directory, seeded from the harness's dedicated Secret in `crucible-workers`, `rw-narrow` where the adapter declares it (12) | attempt, deleted under every cleanup policy |
+| Job `prepare-<attempt>` | the preparer: clone into the PVC from the reference cache, branch, shims, author identity, `origin` placeholder (08) | until complete, then deleted |
+| Job `worker-<attempt>` | the worker, one Pod, `backoffLimit: 0`, `restartPolicy: Never` | until terminal, then deleted after `logs_drained` |
+| Job `collect-<attempt>` | the collector, no network, repo and report read-only, output read-write (08) | until complete |
+| Job `verify-bundle-<attempt>` | `git bundle verify`, no network | until complete |
+| Job `verifier-<attempt>` | re-runs `required_verification` on an independent clone from the bundle (10, 11) | until complete |
+| Job `publish-<attempt>` | pushes the sealed bundle with a token on an in-memory volume (23) | until complete |
+| Job `login-<harness>-<n>` (admin flow, 25) | the harness's own login in its worker image, credential Secret writable, no workspace | until finished, cancelled, or timed out |
+
+A Job per role keeps the same separation the Docker provider has (worker,
+collector, verifier, publisher are distinct processes with distinct
+mounts), and lets Kubernetes own restarts, deadlines, and garbage
+collection. `activeDeadlineSeconds` on each Job is the policy's timeout for
+that role; Crucible still drains before the deadline and classifies the
+exit itself (16).
+
+## Pod shape (every role)
+
+Mirrors 13's Docker flags, enforced twice: by the provider's spec and by
+Pod Security admission on the namespace.
+
+```yaml
+securityContext:            # pod
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  seccompProfile: {type: RuntimeDefault}
+containers:
+- securityContext:          # container
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities: {drop: ["ALL"]}
+  resources:                # from policy limits
+    limits: {cpu: ..., memory: ..., ephemeral-storage: ...}
+    requests: {cpu: ..., memory: ...}
+  volumeMounts:
+  - {name: tmp, mountPath: /tmp}           # emptyDir, medium Memory, sizeLimit
+  - {name: home, mountPath: /home/worker}  # emptyDir, medium Memory, sizeLimit
+  - {name: ws, mountPath: /crucible/workspace}      # PVC, rw for the worker
+  - {name: identity, mountPath: /crucible/identity, readOnly: true}
+  - {name: cred, mountPath: <adapter mount target>, readOnly: <not rw-narrow>}
+  - {name: report, mountPath: /crucible/report}     # subPath of ws
+automountServiceAccountToken: false
+serviceAccountName: crucible-worker      # a no-permission account
+enableServiceLinks: false
+hostNetwork: false
+hostPID: false
+hostIPC: false
+terminationGracePeriodSeconds: <policy grace>
+```
+
+`--init` has no Kubernetes equivalent; the worker image's entrypoint
+already reaps and forwards signals (S5), and `terminationGracePeriodSeconds`
+plus a SIGTERM from Crucible's `drain` gives the harness the same window.
+`--pids-limit` becomes the node's pod PID limit (a kubelet setting lab-admin
+sets; the provider records the effective limit in the launch evidence and
+refuses to launch if none is configured). A runtime class is not set in this
+version; the field is reserved and documented as the microVM step.
+
+## Networking: NetworkPolicy replaces the egress proxy
+
+There is no Squid on the cluster. The workers namespace carries a default
+deny for ingress and egress, and the provider creates one NetworkPolicy per
+attempt for the roles that need egress, selecting that attempt's pods by
+label. The allowed destinations come from the same policy document that
+generates the proxy allowlist locally (05b routing pools, the adapter's
+declared endpoints, 13), resolved to CIDRs or FQDN rules where the CNI
+supports them:
+
+- worker: the model provider endpoints of the routed harness, the package
+  registries the project policy names, and, for a local route, the Spark
+  (`endpoint_url` host and port, plain HTTP, 05b, S16). GitHub is not
+  reachable from a worker; the preparer and the publisher do the git
+  traffic.
+- preparer and publisher: `github.com` and `api.github.com` only.
+- collector, bundle verifier, verifier: no egress at all (the verifier
+  gets the registries only when `required_verification` needs them and the
+  policy says so).
+- login Job: the harness's login endpoints only.
+
+Two destinations are denied explicitly, because a naive policy lets them
+through: cluster DNS is allowed on port 53 UDP and TCP to the cluster's DNS
+service and nothing else on that address, and the Kubernetes API service,
+the node network, the pod network of other namespaces, link-local
+`169.254.0.0/16`, and the lab's private ranges are denied. The e2e tier
+proves each denial from inside a worker pod (18). If the cluster's CNI does
+not enforce egress NetworkPolicy, the provider refuses to launch: readiness
+of the namespace is probed once at supervisor start by creating a canary
+pod that must fail to reach the API server, and the result is recorded and
+shown on the admin status page (25).
+
+## Provider mechanics (08's interface)
+
+- `prepare`: create the PVC, ConfigMap, and per-attempt Secret; run the
+  preparer Job with the reference cache mounted read-only from a
+  cluster-side cache volume that Crucible refreshes with a short-lived
+  installation token (the token never enters the workspace); the Job
+  performs exactly what 08's Docker `prepare` performs. `prepare` returns
+  when the Job completes; a failed Job is a prepare failure with the Job's
+  log excerpt as detail.
+- `launch`: resolve the worker image to a digest through the image registry
+  (11, 25) and record it; refuse an unsupported harness version; create the
+  NetworkPolicy and the worker Job; return the Job name as the handle.
+- `observe`: read the Job and its Pod; `running` while the Pod is Pending
+  or Running, `exited(code)` from the terminated container status, `lost`
+  when the Job or Pod no longer exists or the Pod was evicted or its node is
+  gone. Pending longer than the policy's launch timeout (image pull, no
+  schedulable node, PVC unbound) is a launch failure with the Pod's
+  conditions as detail, not a stall.
+- `logs`: `pods/log` with timestamps, `sinceTime` from the stored offset,
+  resumed strict-after by the (timestamp, line hash) pair (10). A restarted
+  supervisor re-attaches by Job name.
+- `collect`: the collector Job with the workspace mounted read-only and an
+  output subpath read-write; then the bundle verifier Job; outputs are read
+  by the supervisor from the PVC through a short-lived reader Pod, never by
+  mounting the PVC into the Crucible pods.
+- `terminate`: `drain` deletes the Pod with the policy grace period
+  (SIGTERM, then SIGKILL by the kubelet); `kill` deletes with grace zero.
+- `cleanup`: only after `logs_drained`; delete Jobs and NetworkPolicy;
+  delete the per-attempt Secret under every policy; keep or delete the PVC
+  per policy (retained PVCs carry a retention label the sweep honours);
+  release the lease.
+- `reconcile`: list Jobs by label; a Job with no live attempt row is
+  orphaned and deleted; a live attempt with no Job is `lost`.
+
+Heartbeats and stall detection (10, C6c) are unchanged: log progress and
+the filesystem fingerprint come from the PVC through the reader Pod, and
+`container_running` is the Pod phase.
+
+## Credentials on the cluster (12, made concrete)
+
+Each harness's dedicated credential directory becomes one Secret in
+`crucible-workers` that only the supervisor's ServiceAccount can read,
+delivered through the GitOps repository as a SealedSecret or ExternalSecret.
+Per attempt, the provider copies it into `cred-<attempt>`; a harness whose
+adapter declares `rw-narrow` gets that copy mounted writable and the
+provider reads the rotated file back into the harness Secret on a
+successful exit, exactly as the Docker provider syncs a rotated token today.
+The per-attempt Secret is deleted under every cleanup policy. The admin
+login flow (25) runs the harness's login in a login Job with the harness
+Secret writable and the device URL captured from the Pod log. Local
+Hermes needs no credential; its Secret is absent and its launch spec says
+so.
+
+## Observability and administration
+
+`GET /providers` reports the Kubernetes provider with `isolation: pod`,
+`network_control: true`, `resource_limits: true`, `shared_disk: false`, the
+harnesses whose images are promoted, and `max_concurrency` from the
+namespace's ResourceQuota. The admin status page (25) shows the namespace
+readiness probe, the CNI egress enforcement result, the pod PID limit, and
+the runtime class in use ("standard" in this version). Attempt evidence
+records the image digest, the Job and Pod names, the node, the effective
+limits, and the NetworkPolicy applied.
+
+## What the cluster must guarantee first (lab-admin)
+
+Recorded here so the prerequisite is a checklist, not folklore; each item
+is verified by the namespace readiness probe or the e2e tier and shown on
+the status page.
+
+1. The two namespaces exist; `crucible-workers` has Pod Security admission
+   at `restricted` and a default-deny NetworkPolicy.
+2. The CNI enforces egress NetworkPolicy (the canary must fail to reach the
+   API server).
+3. A storage class for the workspace PVCs with `ReadWriteOnce` and a size
+   the policy's workspace cap fits.
+4. Nodes have a pod PID limit configured.
+5. The cluster can pull the Crucible and worker images from the registry
+   the release publishes to (24); a pull secret if the packages are private.
+6. Egress from `crucible-workers` to the model providers, the package
+   registries, GitHub, and the Spark is possible at the network edge (the
+   NetworkPolicy narrows it; the lab's edge must not block it).
+7. An Argo Application pointing at the deployment manifests; the manifests
+   are the deployment repository's record, and pin an exact image tag (24).
+8. Public DNS is the operator's alone (operator rule 10): the API's ingress
+   route is provisioned and reported; no record is created by Crucible or by
+   any manifest.
+
+A runtime class for worker pods (gVisor or Kata) is not a prerequisite for
+this version.
+
+## Testing (18, extended)
+
+A fourth tier, `make e2e-kind`: the end-to-end suite run against the
+Kubernetes provider on a throwaway kind cluster with a unique name, deleted
+on exit even on failure (the `sdlc` skill's kind pattern). It loads the
+script-harness image with `kind load docker-image`, installs a CNI that
+enforces NetworkPolicy (kind's default does not), applies the namespace
+manifests, and runs the same cases as the Docker tier plus:
+
+- every NetworkPolicy denial from inside a worker pod: API server, cluster
+  DNS on any port but 53, another namespace, link-local, the lab ranges;
+- a Pod evicted or deleted out of band is `lost`;
+- a worker that ignores SIGTERM is killed at the grace period;
+- the per-attempt Secret is gone after cleanup under every policy;
+- supervisor restart re-attaches to a running Job and logs resume;
+- the readiness probe refuses launches when egress enforcement is absent
+  (run once with the enforcing CNI removed).
+
+It runs in CI on the same runner class as the Docker tier. The readiness
+rows 5, 7, 11, 12, and 23 are re-proven on this tier and cited in 19 with
+their kind run before the gate counts for real-project use.
+
+## Out of scope for this version
+
+Runtime class (microVM or gVisor), multi-cluster, object storage for
+artifacts (the PVC and the reader Pod are enough for the lab), a Kubernetes
+operator, and autoscaling. Each is a later phase in 20.

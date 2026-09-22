@@ -119,12 +119,12 @@ provider. Workers still run as containers.
 
 Detail in 13-local-operation.md.
 
-## Kubernetes topology (designed, not built in v0.x)
+## Kubernetes topology (built in C8; detail in 26)
 
 `api` Deployment, `supervisor` Deployment (replicas 1, lease-guarded),
 PostgreSQL (operator-managed or external), workers as Jobs created through
 the Kubernetes API with a ServiceAccount scoped to one namespace. No Docker
-socket anywhere. Detail in 08-execution-providers.md.
+socket anywhere. Detail in 26-kubernetes-provider.md.
 
 ## Cross-cutting
 

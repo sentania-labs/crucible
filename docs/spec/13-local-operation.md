@@ -204,9 +204,10 @@ In both arrangements:
   Unit-tested. Protects against Crucible bugs, not a hostile Crucible.
 - **Workers, collectors, verifiers, and publishers never receive the socket
   or the proxy endpoint.** Verified by the isolation integration test (18).
-- **Not carried to Kubernetes.** The Kubernetes provider uses the API
+- **Not carried to Kubernetes.** The Kubernetes provider (26) uses the API
   server with a namespaced ServiceAccount. Only the create-request policy
-  survives, as a Pod spec policy enforced by admission on the cluster.
+  survives, as a Pod spec policy enforced by Pod Security admission on the
+  workers namespace; egress control becomes a per-attempt NetworkPolicy.
 
 ## Networking
 

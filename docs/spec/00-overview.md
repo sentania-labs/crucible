@@ -65,7 +65,7 @@ Crucible only records.
 - Any user interface. Boards, chat, and Kanban consume the API later.
 - Model selection, prompt authoring, or planning.
 - Interactive worker sessions. Crucible runs harnesses in print or exec mode.
-- Kubernetes execution provider (designed for, not built, in v0.x).
+- Kubernetes execution provider (26; built in phase C8, standard runtime first, runtime class later).
 - Multi-tenant authorization. One trust domain, one operator.
 - Secret storage. Credentials are mounted from outside; never persisted.
 - Deployment of the products workers build. The tag is a one-way handoff
