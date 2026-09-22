@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import Engine, text
 
 from crucible.adapters.api.deps import AppContext
 from crucible.adapters.execution.fake import FakeProvider
@@ -270,6 +271,7 @@ async def test_an_empty_hermes_credential_directory_keeps_the_no_key_fallback(
     provider: FakeProvider,
     tokens: dict[str, str],
     tmp_path: Path,
+    engine: Engine,
 ) -> None:
     """Compose's credential-init creates the Hermes directory empty and the service
     registers it. Until `api-key` exists the launch must use the no-key fallback, not
@@ -330,13 +332,24 @@ async def test_an_empty_hermes_credential_directory_keeps_the_no_key_fallback(
         spec = provider._workers[attempt_id].spec
         return dict(spec.env), dict(spec.env_from_files)
 
-    env, from_files = await launch_env("EX-HERMES-EMPTY")
-    assert env["OPENAI_API_KEY"] == "local-no-auth"
-    assert from_files == {}
+    try:
+        env, from_files = await launch_env("EX-HERMES-EMPTY")
+        assert env["OPENAI_API_KEY"] == "local-no-auth"
+        assert from_files == {}
 
-    (credential_dir / "api-key").write_text("placeholder-for-the-test\n", encoding="utf-8")
-    _, from_files = await launch_env("EX-HERMES-KEYED")
-    assert from_files == {"OPENAI_API_KEY": "/home/worker/.hermes-auth/api-key"}
+        (credential_dir / "api-key").write_text("placeholder-for-the-test\n", encoding="utf-8")
+        _, from_files = await launch_env("EX-HERMES-KEYED")
+        assert from_files == {"OPENAI_API_KEY": "/home/worker/.hermes-auth/api-key"}
+    finally:
+        # Policies outlive the per-test truncate; a version 42 left in force would hand
+        # later tests an endpoint they did not configure.
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "UPDATE policies SET retired_at = now() "
+                    "WHERE name='default-software' AND version=42"
+                )
+            )
 
 
 async def test_a_disabled_harness_is_a_contract_problem_at_submit(
