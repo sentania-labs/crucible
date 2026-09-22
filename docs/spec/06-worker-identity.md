@@ -64,11 +64,12 @@ are reproducible.
 ## Harness-specific delivery
 
 The bundle is the same for every harness. How the harness is pointed at it
-differs (07): Claude Code gets it as an appended system prompt file plus a
-generated, untracked `CLAUDE.md` shim in the checkout if the project has
-none; Codex gets `IDENTITY.md` on stdin ahead of the prompt plus an untracked
-`AGENTS.md` shim when needed; AGY gets `--add-dir /crucible/identity` and a
-short argv prompt that says to read `IDENTITY.md` first.
+differs (07): all harnesses use the single generated, untracked `AGENTS.md`
+shim when the checkout has no applicable project instruction file. Claude Code
+uses the existing project `CLAUDE.md` when one is present, so Crucible writes
+no `AGENTS.md` shim in that case. Codex gets `IDENTITY.md` on stdin ahead of
+the prompt; AGY gets `--add-dir /crucible/identity` and a short argv prompt
+that says to read `IDENTITY.md` first.
 
 Shims are written by Crucible after checkout, listed in
 `.git/info/exclude`, and their absence from the diff is a gate (11).

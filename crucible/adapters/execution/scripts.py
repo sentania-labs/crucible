@@ -193,6 +193,11 @@ fi
 mkdir -p "$REPO/.git/info"
 SHIM_TEXT="Read $IDENTITY_MOUNT/IDENTITY.md first; it is the task contract for this run."
 for shim in {shim_list}; do
+  # Claude Code uses AGENTS.md only when the project has no own CLAUDE.md.
+  # CLAUDE.md wins under its default instructionFiles setting.
+  if [ "$shim" = "AGENTS.md" ] && [ -e "$REPO/CLAUDE.md" ]; then
+    continue
+  fi
   if [ ! -e "$REPO/$shim" ]; then
     printf '%s\\n' "$SHIM_TEXT" > "$REPO/$shim"
   fi

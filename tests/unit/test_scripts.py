@@ -44,6 +44,17 @@ def preparer(work_branch: str, base_ref: str = "main") -> str:
     )
 
 
+def test_only_agents_md_is_a_generated_shim() -> None:
+    script = preparer("crucible/test")
+    assert "for shim in 'AGENTS.md'" in script
+    assert "for shim in 'CLAUDE.md'" not in script
+
+
+def test_a_project_claude_md_suppresses_the_agents_md_shim() -> None:
+    script = preparer("crucible/test")
+    assert 'if [ "$shim" = "AGENTS.md" ] && [ -e "$REPO/CLAUDE.md" ]' in script
+
+
 def parses(script: str) -> None:
     """`sh -n` on the generated text: a quoting mistake is a syntax error or worse."""
     with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as handle:

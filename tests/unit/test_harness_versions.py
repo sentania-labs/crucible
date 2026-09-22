@@ -25,6 +25,17 @@ def test_a_version_inside_the_range_is_accepted() -> None:
     assert check.supported == ">=0.153.0,<0.154.0"
 
 
+def test_claude_code_version_that_predates_agents_md_is_refused() -> None:
+    check = check_image_version("claude_code", labels("claude_code", "2.1.273"))
+    assert not check.ok
+    assert check.supported == ">=2.1.277,<2.2.0"
+
+
+def test_claude_code_agents_md_floor_is_accepted() -> None:
+    check = check_image_version("claude_code", labels("claude_code", "2.1.277"))
+    assert check.ok
+
+
 @pytest.mark.parametrize("version", ["0.152.9", "0.154.0", "1.0.0"])
 def test_a_version_outside_the_range_is_refused(version: str) -> None:
     check = check_image_version("codex", labels("codex", version))

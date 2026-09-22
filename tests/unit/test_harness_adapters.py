@@ -242,7 +242,7 @@ def test_the_registry_knows_the_five_harnesses() -> None:
     registry = default_registry()
     assert registry.names() == ("claude_code", "codex", "agy", "hermes", "script-harness")
     assert registry.require("codex").supported_versions.text == ">=0.153.0,<0.154.0"
-    assert registry.require("claude_code").supported_versions.text == ">=2.1.0,<2.2.0"
+    assert registry.require("claude_code").supported_versions.text == ">=2.1.277,<2.2.0"
     assert registry.require("agy").supported_versions.text == ">=1.2.0,<1.3.0"
     assert registry.require("hermes").supported_versions.text == ">=0.19.0,<0.20.0"
 
