@@ -132,7 +132,19 @@ class KubernetesSettings(BaseModel):
         ]
     )
     # The worker image repositories `GET /admin/images` reports the promoted tags of.
+    # Bare repositories: the provider appends each tag the registry lists.
     image_repositories: list[str] = Field(default_factory=list)
+    # One exact, pullable worker image reference for 26's namespace readiness canary.
+    #
+    # The canary runs the first image the provider knows of, and until an attempt has
+    # resolved one that is the first entry of `image_repositories`, which is a bare
+    # repository and therefore means `:latest` to a kubelet. A cluster whose registry has
+    # no `latest` then has a canary stuck in ImagePullBackOff until the launch timeout,
+    # and a status page that reports the namespace as not ready for a reason that is not
+    # about the namespace. Naming the promoted worker image here is what a deployment
+    # does about that. It is its own field on the provider and never an entry of
+    # `image_repositories`, so the images listing does not take it for a repository.
+    probe_image: str = ""
     # The harness credential Secret in the workers namespace, per harness (12, 26).
     credential_secrets: dict[str, str] = Field(default_factory=dict)
     extra_image_allowlist: list[str] = Field(default_factory=list)

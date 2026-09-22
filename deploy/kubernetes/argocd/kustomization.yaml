@@ -1,0 +1,7 @@
+# Built and validated on its own: an Application object belongs to lab-admin's GitOps
+# repository, not to the deployment this repository describes, so it is deliberately not
+# a resource of any overlay here.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - application.yaml

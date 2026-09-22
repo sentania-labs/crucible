@@ -1,0 +1,31 @@
+# REPLACE: crucible.REPLACE_ME_LAB_DOMAIN   the API and /ui host
+# REPLACE: REPLACE_ME_INGRESS_CLASS         the cluster's ingress class
+# REPLACE: crucible-tls                     the TLS Secret the cluster's issuer fills
+#
+# Operator rule 10 and 26 item 8: the public DNS record for this host is the operator's
+# alone. Crucible provisions the route and reports the record that would be needed; it
+# never creates one, and no manifest here does either.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: crucible-api
+  namespace: crucible
+  annotations:
+    REPLACE_ME_CERT_ISSUER_ANNOTATION: REPLACE_ME_CERT_ISSUER_NAME
+spec:
+  ingressClassName: REPLACE_ME_INGRESS_CLASS
+  tls:
+    - hosts:
+        - crucible.REPLACE_ME_LAB_DOMAIN
+      secretName: crucible-tls
+  rules:
+    - host: crucible.REPLACE_ME_LAB_DOMAIN
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: crucible-api
+                port:
+                  name: http

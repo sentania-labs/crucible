@@ -180,6 +180,7 @@ def kubernetes_config(settings: Settings) -> KubernetesConfig:
             if entry.mount_mode
         },
         image_repositories=tuple(k.image_repositories),
+        probe_image=k.probe_image,
         use_reference_cache=k.use_reference_cache,
     )
 

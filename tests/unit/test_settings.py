@@ -4,7 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from crucible.settings import load_settings
+from crucible.cli.wiring import kubernetes_config
+from crucible.settings import Settings, load_settings
 
 
 def test_defaults_without_file(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -81,3 +82,27 @@ def test_credentials_and_harness_gates_from_toml_and_environment(
     assert settings.harnesses["agy"].reason == "probe pending"
     # A harness with no entry is not gated by configuration.
     assert "claude_code" not in settings.harnesses
+
+
+def test_the_probe_image_is_its_own_field_and_not_a_repository() -> None:
+    """26's readiness canary runs an exact reference a deployment names, and a bare
+    repository means `:latest` to a kubelet. Keeping it out of `image_repositories` is
+    what stops `list_images` taking it for a repository and paying a suppressed registry
+    round trip per tag on every admin images read."""
+    settings = Settings(
+        kubernetes={
+            "enabled": True,
+            "image_repositories": ["registry.example/crucible-worker"],
+            "probe_image": "registry.example/crucible-worker:script-harness-1.0.0",
+        }
+    )
+    config = kubernetes_config(settings)
+    assert config.image_repositories == ("registry.example/crucible-worker",)
+    assert config.probe_image == "registry.example/crucible-worker:script-harness-1.0.0"
+
+
+def test_without_a_probe_image_the_field_is_empty() -> None:
+    settings = Settings(kubernetes={"image_repositories": ["registry.example/w"]})
+    config = kubernetes_config(settings)
+    assert config.image_repositories == ("registry.example/w",)
+    assert config.probe_image == ""

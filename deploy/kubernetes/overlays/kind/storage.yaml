@@ -1,0 +1,43 @@
+# kind's built-in local-path provisioner is single-node and ReadWriteOnce. The lab's
+# artifact claim is ReadWriteMany because the api and the supervisor are separate
+# Deployments; here they land on the one node, so ReadWriteOnce is what the cluster can
+# actually bind. This is the boundary of what kind proves (github-ci skill): the
+# manifests and the images, never the lab's storage.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: crucible-artifacts
+  namespace: crucible
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: standard
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: crucible-reference-cache
+  namespace: crucible-workers
+spec:
+  storageClassName: standard
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: crucible-postgres
+  namespace: crucible
+spec:
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: standard
+        resources:
+          requests:
+            storage: 2Gi

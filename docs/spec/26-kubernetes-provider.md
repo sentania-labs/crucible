@@ -41,7 +41,40 @@ The supervisor's ServiceAccount is bound to a Role in `crucible-workers`
 that permits create, get, list, watch, and delete on Jobs, Pods,
 ConfigMaps, Secrets, and PersistentVolumeClaims, plus `pods/log` and
 `pods/exec` for log tail and the login flow, and nothing in any other
-namespace. It has no cluster-scoped permissions. Admission (the cluster's
+namespace. It has no cluster-scoped permissions.
+
+The exact verb set, which is what `deploy/kubernetes/base/workers/role.yaml`
+carries and what a unit test holds it to (C9):
+
+| Resource | Verbs |
+|---|---|
+| `pods`, `configmaps` | create, get, list, watch, delete |
+| `secrets`, `persistentvolumeclaims` | create, get, list, watch, **patch**, delete |
+| `pods/log` | get |
+| `pods/exec` | create, get |
+| `resourcequotas` | get, list |
+| `batch/jobs` | create, get, list, watch, delete |
+| `networking.k8s.io/networkpolicies` | create, get, list, watch, delete |
+
+The three additions to the sentence above are the ones the implemented
+provider needs: `patch` on PersistentVolumeClaims writes the retention label
+`cleanup` leaves behind, `patch` on Secrets is the `rw-narrow` credential
+sync-back (12), and reading the ResourceQuota is where `max_concurrency` on
+`GET /providers` comes from. `pods/exec` needs `create` as well as `get`
+because the API server authorizes an exec against `create` even when the
+client opens it as a GET WebSocket upgrade, which is how the reader Pod's tar
+stream is opened; a Role with only `get` is refused at the upgrade with a 403
+(found on a real cluster in C9).
+
+The account itself lives in the `crucible` namespace, not in
+`crucible-workers`: a Pod can only use a ServiceAccount from its own
+namespace, and the supervisor Pod runs beside the api. A RoleBinding may name
+a subject in another namespace, so the permission stays namespaced to
+`crucible-workers` exactly as above. The api Deployment uses the same account,
+because the admin status page (25) reports provider health and the Kubernetes
+provider answers that by running the namespace readiness canary: the api
+process makes real API calls to `crucible-workers` on every status read.
+(Made concrete 2026-09-22 during C9.) Admission (the cluster's
 Pod Security admission at the `restricted` level on `crucible-workers`)
 enforces the pod shape below independently of Crucible's own code, which
 is the surviving half of 13's create-request policy.
@@ -172,6 +205,16 @@ of the namespace is probed once at supervisor start by creating a canary
 pod that must fail to reach the API server, and the result is recorded and
 shown on the admin status page (25).
 
+The canary runs the first worker image reference the provider knows of, which
+before any attempt has resolved one is the first entry of
+`kubernetes.image_repositories`. Those are bare repositories, and a bare
+repository means `:latest` to a kubelet, so a registry with no `latest` leaves
+the canary in `ImagePullBackOff` until the launch timeout and the status page
+reporting the namespace as not ready for a reason that has nothing to do with
+the namespace. A deployment therefore names one exact, pullable reference in
+`kubernetes.probe_image`, and the wiring puts it first.
+(Added 2026-09-22 during C9, after exactly that happened on kind.)
+
 ## Provider mechanics (08's interface)
 
 - `prepare`: create the PVC, ConfigMap, and per-attempt Secret; run the
@@ -268,7 +311,11 @@ the status page.
 2. The CNI enforces egress NetworkPolicy (the canary must fail to reach the
    API server).
 3. A storage class for the workspace PVCs with `ReadWriteOnce` and a size
-   the policy's workspace cap fits.
+   the policy's workspace cap fits, and one with `ReadWriteMany` for the
+   artifact root: the api serves what the supervisor wrote and they are
+   separate Deployments on this topology. Object storage for artifacts would
+   remove the second requirement and is a later phase.
+   (Added 2026-09-22 during C9.)
 4. Nodes have a pod PID limit configured.
 5. The cluster can pull the Crucible and worker images from the registry
    the release publishes to (24); a pull secret if the packages are private.
@@ -283,6 +330,11 @@ the status page.
 
 A runtime class for worker pods (gVisor or Kata) is not a prerequisite for
 this version.
+
+The manifests that satisfy the Crucible half of this list are
+`deploy/kubernetes`, and the operator-facing runbook, including every
+placeholder lab-admin fills in and the public DNS record the operator creates
+alone, is `docs/deployment.md` (C9).
 
 ## Testing (18, extended)
 

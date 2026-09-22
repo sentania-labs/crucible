@@ -1,0 +1,16 @@
+# The deployable shape of Crucible (20 phase C9, 26). Two namespaces: `crucible` for the
+# control plane and `crucible-workers` for everything an attempt becomes.
+#
+# The image tag is pinned here and in exactly one place. It is never `latest`: a
+# deployment pins, and the pin is what makes a redeploy reproducible and a rollback one
+# word (sdlc skill, docs/implementation-notes/release.md). The Deployments and the
+# migration Job name the repository with no tag at all so that this is the only line
+# that can carry a version.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - crucible
+  - workers
+images:
+  - name: ghcr.io/sentania-labs/crucible
+    newTag: 0.4.0

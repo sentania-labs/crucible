@@ -1,0 +1,43 @@
+# REPLACE: REPLACE_ME_STORAGE_CLASS_RWO   ReadWriteOnce, for PostgreSQL and the cache
+# REPLACE: REPLACE_ME_STORAGE_CLASS_RWX   ReadWriteMany, for the artifact root
+#
+# 26 checklist item 3. The artifact claim is ReadWriteMany because the api serves what
+# the supervisor wrote and they are separate Deployments; the other two are
+# ReadWriteOnce. A cluster with only one class that does both may name it twice.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: crucible-artifacts
+  namespace: crucible
+spec:
+  storageClassName: REPLACE_ME_STORAGE_CLASS_RWX
+  resources:
+    requests:
+      storage: 100Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: crucible-reference-cache
+  namespace: crucible-workers
+spec:
+  storageClassName: REPLACE_ME_STORAGE_CLASS_RWO
+  resources:
+    requests:
+      storage: 50Gi
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: crucible-postgres
+  namespace: crucible
+spec:
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: REPLACE_ME_STORAGE_CLASS_RWO
+        resources:
+          requests:
+            storage: 50Gi

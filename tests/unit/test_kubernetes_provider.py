@@ -86,6 +86,16 @@ async def test_max_concurrency_comes_from_the_namespace_resource_quota() -> None
     assert provider.capabilities().max_concurrency == 7
 
 
+async def test_a_job_quota_reports_attempt_capacity_not_raw_jobs() -> None:
+    api, _registry, provider = build()
+    api.create(
+        "resourcequotas",
+        {"metadata": {"name": "workers"}, "spec": {"hard": {"count/jobs.batch": "15"}}},
+    )
+    await provider.health()
+    assert provider.capabilities().max_concurrency == 3
+
+
 # ----- the namespace readiness probe (26) ----------------------------------
 
 
@@ -886,3 +896,22 @@ async def test_an_adopted_pending_job_still_times_out() -> None:
     observation = await provider.observe(adopted[0])
     assert observation.state is ObservationState.EXITED and observation.exit_code == 70
     assert "Unschedulable" in (observation.detail or "")
+
+
+def test_the_readiness_canary_runs_the_configured_probe_image() -> None:
+    """26: the canary needs one exact, pullable reference. A bare repository is what
+    `image_repositories` holds, and a kubelet reads one as `:latest` (C9)."""
+    _, _, provider = build(
+        config=KubernetesConfig(
+            image_repositories=("registry.example/crucible-worker",),
+            probe_image="registry.example/crucible-worker:script-harness-1.0.0",
+        )
+    )
+    assert provider._probe_image() == "registry.example/crucible-worker:script-harness-1.0.0"
+
+
+def test_without_a_probe_image_the_canary_falls_back_to_the_first_repository() -> None:
+    _, _, provider = build(
+        config=KubernetesConfig(image_repositories=("registry.example/crucible-worker",))
+    )
+    assert provider._probe_image() == "registry.example/crucible-worker"

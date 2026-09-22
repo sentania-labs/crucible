@@ -1,0 +1,50 @@
+# One Secret per harness in `crucible-workers`, readable only by the supervisor's
+# account (12, 26). The provider copies the declared auth files into `cred-<attempt>`
+# per attempt and writes a newer refreshed token back here when the attempt reaches
+# collection. The keys are the adapter's declared auth file names with any path
+# separator replaced by an underscore (C8a).
+#
+# A harness with no credential at all (local Hermes) has no Secret and its launch spec
+# says so; it is deliberately absent from this file.
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: crucible-harness-claude-code
+  namespace: crucible-workers
+spec:
+  encryptedData:
+    oauth-token: REPLACE_WITH_SEALED_CLAUDE_CODE_OAUTH_TOKEN
+    .claude.json: REPLACE_WITH_SEALED_CLAUDE_CODE_CLAUDE_JSON
+  template:
+    metadata:
+      name: crucible-harness-claude-code
+      namespace: crucible-workers
+    type: Opaque
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: crucible-harness-codex
+  namespace: crucible-workers
+spec:
+  encryptedData:
+    auth.json: REPLACE_WITH_SEALED_CODEX_AUTH
+  template:
+    metadata:
+      name: crucible-harness-codex
+      namespace: crucible-workers
+    type: Opaque
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: crucible-harness-agy
+  namespace: crucible-workers
+spec:
+  encryptedData:
+    antigravity-cli_antigravity-oauth-token: REPLACE_WITH_SEALED_AGY_OAUTH_TOKEN
+  template:
+    metadata:
+      name: crucible-harness-agy
+      namespace: crucible-workers
+    type: Opaque

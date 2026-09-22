@@ -3,6 +3,8 @@
 set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+# shellcheck source=tools/kind/cluster.sh
+. "$root/tools/kind/cluster.sh"
 run_id=${CRUCIBLE_KIND_RUN_ID:-$(date +%s)-$$}
 cluster="crucible-e2e-${run_id}"
 registry="${cluster}-registry"
@@ -57,27 +59,7 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
-# Put a shim ahead of PATH so both this script and kind use the daemon selected
-# by the same possibly wrapped Docker command as the other end-to-end tiers.
-read -r -a docker_command <<< "${CRUCIBLE_E2E_DOCKER:-docker}"
-if [ "${#docker_command[@]}" -eq 0 ]; then
-  echo "e2e-kind: CRUCIBLE_E2E_DOCKER must name a Docker command" >&2
-  exit 2
-fi
-host_docker=$(command -v docker)
-for index in "${!docker_command[@]}"; do
-  if [ "${docker_command[$index]}" = docker ]; then
-    docker_command[index]=$host_docker
-  fi
-done
-mkdir -p "$scratch/bin"
-{
-  printf '#!/usr/bin/env bash\nset -euo pipefail\nexec'
-  printf ' %q' "${docker_command[@]}"
-  printf ' "$@"\n'
-} > "$scratch/bin/docker"
-chmod 0755 "$scratch/bin/docker"
-export PATH="$scratch/bin:$PATH"
+crucible_kind_docker_shim "$scratch"
 
 mkdir -p "$cache"
 chmod 0777 "$cache"
@@ -91,20 +73,11 @@ if ! docker image inspect "$worker_image" >/dev/null 2>&1; then
   exit 2
 fi
 
-registry_image='registry@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373'
-docker network inspect kind >/dev/null 2>&1 || docker network create kind >/dev/null
 registry_started=1
-docker run -d --restart=no --network kind --name "$registry" \
-  -p 127.0.0.1::5000 "$registry_image" >/dev/null
-registry_port=$(docker port "$registry" 5000/tcp | awk -F: 'NR == 1 {print $NF}')
+crucible_kind_start_registry "$registry"
+registry_port=$CRUCIBLE_KIND_REGISTRY_PORT
 registry_ref="localhost:${registry_port}/crucible-worker:${run_id}"
-for _ in $(seq 1 40); do
-  if curl -fsS "http://127.0.0.1:${registry_port}/v2/" >/dev/null; then
-    break
-  fi
-  sleep 0.25
-done
-curl -fsS "http://127.0.0.1:${registry_port}/v2/" >/dev/null
+crucible_kind_await_registry "http://127.0.0.1:${registry_port}"
 tag_created=1
 docker tag "$worker_image" "$registry_ref"
 docker push "$registry_ref" >/dev/null
@@ -139,17 +112,28 @@ for address in 10.0.0.1 172.16.0.1 192.168.0.1 100.64.0.1 169.254.169.254; do
   docker exec "$node" ip address add "$address/32" dev lo
 done
 
-calico="$scratch/calico.yaml"
-curl -fsSL --retry 4 \
-  https://raw.githubusercontent.com/projectcalico/calico/v3.32.2/manifests/calico.yaml \
-  -o "$calico"
-echo 'a8c828a06a87c629a282ebbc424895b77f3a030251993e41ea400a743675bb02  '"$calico" | sha256sum -c -
-sed -i 's#192\.168\.0\.0/16#10.244.0.0/16#g' "$calico"
-KUBECONFIG="$kubeconfig" kubectl apply -f "$calico" >/dev/null
-KUBECONFIG="$kubeconfig" kubectl -n kube-system rollout status daemonset/calico-node --timeout=180s
-KUBECONFIG="$kubeconfig" kubectl wait --for=condition=Ready nodes --all --timeout=180s
+crucible_kind_install_calico "$scratch" "$kubeconfig"
 
+KUBECONFIG="$kubeconfig" kubectl create namespace crucible >/dev/null
+KUBECONFIG="$kubeconfig" kubectl -n crucible create serviceaccount crucible-supervisor >/dev/null
 KUBECONFIG="$kubeconfig" kubectl apply -f "$root/deploy/kind/workers.yaml" >/dev/null
+# The tier consumes the deployed RBAC files directly. A provider change needing another
+# verb therefore exercises the same Role and RoleBinding that the deployment uses.
+KUBECONFIG="$kubeconfig" kubectl apply -f "$root/deploy/kubernetes/base/workers/role.yaml" >/dev/null
+KUBECONFIG="$kubeconfig" kubectl apply -f "$root/deploy/kubernetes/base/workers/rolebinding.yaml" >/dev/null
+supervisor_kubeconfig="$scratch/supervisor-kubeconfig"
+api_server=$(KUBECONFIG="$kubeconfig" kubectl config view --raw --minify -o jsonpath='{.clusters[0].cluster.server}')
+ca_data=$(KUBECONFIG="$kubeconfig" kubectl config view --raw --minify -o jsonpath='{.clusters[0].cluster.certificate-authority-data}')
+supervisor_token=$(KUBECONFIG="$kubeconfig" kubectl -n crucible create token crucible-supervisor)
+ca_file="$scratch/cluster-ca.crt"
+printf '%s' "$ca_data" | base64 -d > "$ca_file"
+KUBECONFIG="$supervisor_kubeconfig" kubectl config set-cluster kind \
+  --server="$api_server" --certificate-authority="$ca_file" --embed-certs=true >/dev/null
+KUBECONFIG="$supervisor_kubeconfig" kubectl config set-credentials crucible-supervisor \
+  --token="$supervisor_token" >/dev/null
+KUBECONFIG="$supervisor_kubeconfig" kubectl config set-context crucible-supervisor \
+  --cluster=kind --user=crucible-supervisor --namespace=crucible-workers >/dev/null
+KUBECONFIG="$supervisor_kubeconfig" kubectl config use-context crucible-supervisor >/dev/null
 KUBECONFIG="$kubeconfig" kubectl -n kube-system patch deployment coredns --type=json -p='[
   {"op":"add","path":"/spec/template/spec/volumes/-","value":{"name":"wrong-port-www","emptyDir":{}}},
   {"op":"add","path":"/spec/template/spec/containers/-","value":{"name":"wrong-port-http","image":"busybox@sha256:9db7b59979c38555a39def84a31fb98b5296952f9e3afd4f6f11f05b07adfab0","command":["sh","-c","mkdir -p /www; echo dns-wrong-port > /www/index.html; exec httpd -f -p 18080 -h /www"],"securityContext":{"allowPrivilegeEscalation":false,"readOnlyRootFilesystem":true,"runAsNonRoot":true,"runAsUser":1000,"capabilities":{"drop":["ALL"]}},"volumeMounts":[{"name":"wrong-port-www","mountPath":"/www"}]}}
@@ -176,7 +160,7 @@ export CRUCIBLE_E2E_KIND_DNS_IP="$dns_ip"
 export CRUCIBLE_E2E_KIND_PEER_IP="$peer_ip"
 export CRUCIBLE_E2E_KIND_API_IP="$api_ip"
 export CRUCIBLE_E2E_KIND_REGISTRY="$registry_ref"
-export CRUCIBLE_E2E_KIND_KUBECONFIG="$kubeconfig"
+export CRUCIBLE_E2E_KIND_KUBECONFIG="$supervisor_kubeconfig"
 export CRUCIBLE_E2E_KIND_CANARY_LOG="$scratch/canary.log"
 export CRUCIBLE_E2E_DOCKER_SOCKET="${CRUCIBLE_E2E_DOCKER_SOCKET:-/var/run/docker.sock}"
 export KUBECONFIG="$kubeconfig"

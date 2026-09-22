@@ -1,0 +1,29 @@
+# The kind overlay: what `make deploy-kind` applies to a disposable single-node cluster
+# to prove the base manifests actually run (sdlc skill step 3).
+#
+# It is never applied anywhere else. What it changes is exactly the set of things a kind
+# cluster cannot have: plain Secrets instead of sealed ones, kind's `standard` storage
+# class, ReadWriteOnce for the artifact claim because kind's local-path provisioner is
+# single-node, and no ingress TLS because there is no issuer and no DNS.
+#
+# `make deploy-kind` layers one generated overlay on top of this one to set the image
+# under test and the disposable registry the worker image is pushed to. Those are per-run
+# values and are never committed.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+patches:
+  - path: storage.yaml
+  - path: settings.yaml
+generatorOptions:
+  # The Deployments name these Secrets, so their names have to be stable.
+  disableNameSuffixHash: true
+secretGenerator:
+  # Throwaway values for a cluster that is deleted at the end of the run. There is no
+  # plain-Secret path for the lab: see ../../secret-shapes/README.md.
+  - name: crucible-database
+    namespace: crucible
+    literals:
+      - password=kind-disposable-cluster
+      - url=postgresql+psycopg://crucible:kind-disposable-cluster@crucible-postgres:5432/crucible

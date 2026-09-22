@@ -1,0 +1,21 @@
+# The lab overlay: every value that is a property of a cluster rather than of Crucible.
+#
+# Each one is a named placeholder, and every placeholder in this directory is listed in
+# docs/deployment.md with what lab-admin should put there. Nothing in this repository is
+# a lab hostname, a lab address, a storage class name that only exists in the lab, or a
+# secret. `kubectl kustomize deploy/kubernetes/overlays/lab` renders exactly what Argo
+# will apply once the placeholders are replaced.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+  # The Secret objects, as SealedSecret placeholders. Replace with ../../secret-shapes/external
+  # on a cluster running external-secrets. Either way the real values are sealed or
+  # sourced in lab-admin's own GitOps repository, never here.
+  - ../../secret-shapes/sealed
+patches:
+  - path: ingress.yaml
+  - path: storage.yaml
+  - path: settings.yaml
+  - path: resources.yaml
+  - path: pull-secret.yaml

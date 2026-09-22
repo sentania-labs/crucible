@@ -1,0 +1,17 @@
+# The GitHub App private key and the webhook secret (12, 23). Mounted as files on the
+# `crucible` pods only, mode 0400, and never on any worker, collector, verifier or
+# publisher. Rotation is a new App key, a new sealed manifest, and a revoke of the old.
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: crucible-github-app
+  namespace: crucible
+spec:
+  encryptedData:
+    app.pem: REPLACE_WITH_SEALED_GITHUB_APP_PRIVATE_KEY
+    webhook.secret: REPLACE_WITH_SEALED_GITHUB_WEBHOOK_SECRET
+  template:
+    metadata:
+      name: crucible-github-app
+      namespace: crucible
+    type: Opaque

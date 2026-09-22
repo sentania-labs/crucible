@@ -1,0 +1,25 @@
+# The namespace's resource ceiling, and the bound on what one runaway attempt can leave
+# behind: an attempt is one claim and a Job per role, so a namespace that is full refuses
+# a launch rather than wedging. The lab overlay sets the sizes; these fit three
+# concurrent attempts.
+#
+# `count/jobs.batch` is five Jobs per attempt: preparer, worker, collector,
+# bundle-verifier and verifier. The provider divides this count by five when it reports
+# attempt capacity, so this limit of 15 reports three attempts rather than 15.
+# The claim count is the structural cap, one claim per attempt. No Pod count is used,
+# because a Pod count also cannot distinguish attempts from their supporting Pods.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: crucible-workers
+  namespace: crucible-workers
+  labels:
+    app.kubernetes.io/name: crucible
+spec:
+  hard:
+    count/jobs.batch: "15"
+    persistentvolumeclaims: "12"
+    requests.cpu: "6"
+    requests.memory: 12Gi
+    limits.cpu: "6"
+    limits.memory: 12Gi
