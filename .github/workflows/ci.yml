@@ -81,11 +81,13 @@ jobs:
   # needs a Docker daemon and buildx (github-ci skill).
   #
   # Pull requests import the BuildKit layer cache the last push to main exported, so
-  # the job takes minutes. A cached layer is content-addressed on its instruction and
-  # inputs, so it can only be the layer a from-scratch build of those inputs produced;
-  # and every push to main builds from scratch (NO_CACHE=1, nothing restored) before it
-  # exports the cache, so the proof on a fresh machine is re-made on every merge. The
-  # release builds from scratch again before it publishes anything.
+  # the job takes minutes. The digest is always computed from what the build output,
+  # but a network step (apt, pip, ADD <url>) is cached on its instruction text, not on
+  # the bytes it would fetch today, so a pull request's pass is not on its own proof
+  # that upstream still serves those bytes. That proof is every push to main, which
+  # builds from scratch (NO_CACHE=1, nothing restored) before exporting the cache, and
+  # the release, which builds from scratch again and publishes nothing unless the
+  # digests match.
   images:
     runs-on: ubuntu-24.04
     timeout-minutes: 60

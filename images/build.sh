@@ -152,6 +152,7 @@ for image in "${images[@]}"; do
         --build-arg "PYTHON3_VENV_VERSION=$PYTHON3_VENV_VERSION" \
         --label "org.opencontainers.image.version=$version-$build" \
         --label "org.opencontainers.image.created=$created" \
+        --label "org.opencontainers.image.source=https://github.com/sentania-labs/crucible" \
         "${labels[@]}" \
         --label "crucible.build_inputs=sha256:$inputs" \
         ${cache[@]+"${cache[@]}"} \
@@ -161,8 +162,16 @@ for image in "${images[@]}"; do
         -f "$dockerfile" -t "$tag" "$here"
 
     digest=$(tar -xOf "$stem.oci.tar" index.json | jq -r '.manifests[0].digest')
+    config=$(tar -xOf "$stem.oci.tar" "blobs/sha256/${digest#sha256:}" | jq -r '.config.digest')
     "${docker_cmd[@]}" load -q -i "$stem.docker.tar" >/dev/null
     id=$("${docker_cmd[@]}" image inspect -f '{{.Id}}' "$tag")
+    # The image the daemon now holds under the tag must be the one the OCI archive
+    # describes: its ID is the config digest (the manifest digest on a containerd
+    # image store), never something else loaded under the same name.
+    if [ "$id" != "$config" ] && [ "$id" != "$digest" ]; then
+        echo "build.sh: $tag loaded as $id, but the OCI archive describes $digest (config $config)" >&2
+        exit 1
+    fi
     size=$("${docker_cmd[@]}" image inspect -f '{{.Size}}' "$tag")
     printf '%s digest=%s id=%s size=%s\n' "$tag" "$digest" "$id" "$size"
     if [ -n "${CACHE_DIR:-}" ]; then

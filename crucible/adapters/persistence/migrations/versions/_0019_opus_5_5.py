@@ -3,8 +3,9 @@
 The operator asked for it on 2026-09-22 ("opus-5.5 should be added to our list"). The
 id is the one Claude Code 2.1.280's own model catalog lists for Opus 5.5 (c11.md),
 not typed from memory. It joins the anthropic-sub pool at the frontier tier beside
-claude-fable-5-1, and it is disabled: the operator enables it by uploading a routing
-version from the admin UI's Routing page.
+claude-fable-5-1, and it is disabled: the operator enables it from the admin UI's
+Routing page by uploading a routing version with the entry enabled and then a
+delivery policy version that names that routing version.
 
 The admin UI and API mint new routing and delivery policy versions on every save
 (max + 1), so this does not assume a version number. It copies the routing policy the
@@ -61,13 +62,17 @@ def upgrade() -> None:
     policy = copy.deepcopy(active.document)
     reference = (policy.get("routing") or {}).get("policy") or {}
     routing_name = str(reference.get("name", ""))
-    source = connection.execute(
-        sa.text("SELECT document FROM routing_policies WHERE name=:name AND version=:version"),
+    found = connection.execute(
+        sa.text(
+            "SELECT document, retired_at FROM routing_policies "
+            "WHERE name=:name AND version=:version"
+        ),
         {"name": routing_name, "version": int(reference.get("version", 0))},
-    ).scalar()
-    if source is None:
+    ).first()
+    # A retired routing version is not copied back into force.
+    if found is None or found.retired_at is not None:
         return
-    routing = copy.deepcopy(source)
+    routing = copy.deepcopy(found.document)
     models = list(routing.get("models") or [])
     if any(model.get("id") == MODEL_ID for model in models):
         return
@@ -116,11 +121,13 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # Only the version this migration wrote: the lowest one carrying the marker. A copy
+    # the operator uploaded later keeps the description verbatim and is left alone.
     connection = op.get_bind()
     rows = connection.execute(
         sa.text(
             "SELECT version, document FROM policies WHERE name='default-software' "
-            "AND document ->> 'description' LIKE :marker"
+            "AND document ->> 'description' LIKE :marker ORDER BY version LIMIT 1"
         ),
         {"marker": f"%{MARKER}"},
     ).all()

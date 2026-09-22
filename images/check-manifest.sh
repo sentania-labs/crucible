@@ -48,9 +48,14 @@ case "${1:-}:${2:-}" in
         }
         scratch=$(mktemp -d)
         trap 'rm -rf "$scratch"' EXIT
-        printf '%s\n' '{"manifests":[{"digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"}]}' \
-            > "$scratch/index.json"
-        tar -cf "$oci_dest" -C "$scratch" index.json
+        # A manifest naming the all-zero config, which is the ID `image inspect` reports
+        # below, so build.sh's loaded-image check passes.
+        mkdir -p "$scratch/blobs/sha256"
+        manifest='{"config":{"digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"}}'
+        manifest_hex=$(printf '%s' "$manifest" | sha256sum | cut -c1-64)
+        printf '%s' "$manifest" > "$scratch/blobs/sha256/$manifest_hex"
+        printf '{"manifests":[{"digest":"sha256:%s"}]}\n' "$manifest_hex" > "$scratch/index.json"
+        tar -cf "$oci_dest" -C "$scratch" index.json blobs
         ;;
     load:-q)
         exit 0

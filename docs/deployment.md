@@ -154,6 +154,9 @@ Once the api is reachable, sign in at `/ui` with that token and, for each harnes
 **Rolling the worker image back** is promoting the previous digest from the same page.
 Because one image carries all four harnesses, that rolls all four back together; there is
 no way to roll back one harness alone, which is the trade the one-image decision made.
+Promotion checks every harness the image carries against the running release's tested
+ranges, so once a release raises a range's lower bound past an older image's pin, that
+older image can no longer be promoted; roll the Crucible release back with it.
 
 For Hermes, use **Routing** to set the HTTPS `/v1` gateway URL, model `coder`, thinking
 preference, enabled state, and pool concurrency. Saving creates immutable policy

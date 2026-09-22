@@ -217,7 +217,7 @@ async def test_the_image_listing_reads_both_label_shapes(tmp_path: Path) -> None
         ],
     }
     client = StubClient()
-    client.list_images = lambda filters: rows[filters["label"][0]]  # type: ignore[method-assign]
+    client.list_images = lambda filters: rows[filters["label"][0]]  # type: ignore[attr-defined]
     images = await provider(tmp_path, client).list_images()
     assert [(i.reference, dict(i.harnesses)) for i in images] == [
         ("crucible-worker:20260916-a", {"agy": "1.2.8", "codex": "0.156.0"}),

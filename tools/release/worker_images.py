@@ -169,7 +169,14 @@ class Registry:
         self.opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=context))
 
     def _url(self, path: str) -> str:
-        return path if path.startswith("https://") else f"https://{self.host}{path}"
+        if "://" not in path:
+            return f"https://{self.host}{path}"
+        # An absolute Location from the registry must stay on the registry: the request
+        # carries its credential.
+        parsed = urllib.parse.urlsplit(path)
+        if parsed.scheme != "https" or parsed.netloc != self.host:
+            raise PublishError(f"{self.host} sent the upload elsewhere: {parsed.netloc}")
+        return path
 
     def _basic(self) -> str | None:
         if not self.username:
@@ -199,7 +206,7 @@ class Registry:
             query["service"] = fields["service"]
         request = urllib.request.Request(f"{realm}?{urllib.parse.urlencode(query)}")
         if (basic := self._basic()) is not None:
-            request.add_header("Authorization", basic)
+            request.add_unredirected_header("Authorization", basic)
         try:
             with self.opener.open(request, timeout=TIMEOUT) as response:
                 document = json.loads(response.read())
@@ -225,10 +232,11 @@ class Registry:
             request = urllib.request.Request(self._url(path), data=body, method=method)
             for key, value in (headers or {}).items():
                 request.add_header(key, value)
+            # Unredirected: a redirect to another host never carries the credential.
             if self.token:
-                request.add_header("Authorization", f"Bearer {self.token}")
+                request.add_unredirected_header("Authorization", f"Bearer {self.token}")
             elif self.basic_challenged and (basic := self._basic()) is not None:
-                request.add_header("Authorization", basic)
+                request.add_unredirected_header("Authorization", basic)
             try:
                 with self.opener.open(request, timeout=TIMEOUT) as response:
                     status, answer = response.status, response.read()

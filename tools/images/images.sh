@@ -34,12 +34,14 @@ source_dir="$repo_root/images"
 stage=$(mktemp -d "${IMAGES_STAGE_ROOT:-${TMPDIR:-/tmp}}/crucible-images.XXXXXX")
 trap 'rm -rf "$stage"' EXIT
 # The build inputs are public, so the staged tree is world-readable; only `out`, where
-# the daemon user's CLI writes the archives, is writable by it. Previous archives in
-# images/out are never staged.
+# the daemon user's CLI writes the archives, is writable by it, and it is sticky so no
+# other local user can replace an archive once written. build.sh then checks the
+# image it loads against the OCI archive. Previous archives in images/out are never
+# staged.
 tar -C "$source_dir" --exclude=./out -cf - . | tar -C "$stage" -xf -
 mkdir "$stage/out"
 chmod -R a+rX "$stage"
-chmod 0777 "$stage/out"
+chmod 1777 "$stage/out"
 
 # Every image is built, so the manifest is written fresh: an entry for an image
 # directory that no longer exists cannot survive a build.

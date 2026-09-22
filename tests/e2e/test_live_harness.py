@@ -58,6 +58,7 @@ from crucible.application.harnesses import set_harness_enabled
 from crucible.application.supervisor import Supervisor
 from crucible.domain.entities import ImagePromotion
 from crucible.domain.secrets import scan_text
+from crucible.ports.execution import image_harnesses
 from crucible.ports.harness import CredentialSource, MountMode
 from tests.e2e import daemon, github_live
 from tests.e2e.conftest import (
@@ -653,7 +654,7 @@ async def test_a_trivial_task_reaches_ready_for_merge_live(
         )
         view = live_client.get(f"/v1/tasks/{task_id}").json()
         attempt = view["latest_attempt"]
-        running_version = inspected.get("labels", {}).get("crucible.harness_version")
+        running_version = image_harnesses(inspected.get("labels", {})).get(harness)
         harness_view = next(
             item
             for item in live_client.get("/v1/harnesses").json()["items"]

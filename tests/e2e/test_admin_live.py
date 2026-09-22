@@ -540,7 +540,7 @@ def test_every_other_operation_through_api_and_cli_on_the_live_stack(
         assert not any(p.is_file() for p in (scratch_root / "agy").rglob("*"))
         # images: list and promote the pinned codex image
         images = admin.get("/v1/admin/images").json()["items"]
-        codex_images = [i for i in images if i["harness"] == "codex"]
+        codex_images = [i for i in images if "codex" in i["harnesses"]]
         assert codex_images
         from tests.e2e import daemon  # noqa: PLC0415
 
