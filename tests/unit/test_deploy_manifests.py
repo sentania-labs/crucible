@@ -420,6 +420,7 @@ LAB_STARTUP_PLACEHOLDER_KEYS = frozenset(
         "CRUCIBLE_KUBERNETES__STORAGE_CLASS",
         "CRUCIBLE_KUBERNETES__IMAGE_PULL_SECRET",
         "CRUCIBLE_SERVICE__RENDER_TIMEZONE",
+        "CRUCIBLE_KUBERNETES__LOCAL_ENDPOINT_CIDRS",
     }
 )
 
@@ -432,6 +433,15 @@ def test_the_lab_config_has_no_unresolved_probe_image(
     assert settings["CRUCIBLE_KUBERNETES__PROBE_IMAGE"] == ""
     unresolved = {key: value for key, value in settings.items() if "REPLACE_ME_" in str(value)}
     assert set(unresolved) <= LAB_STARTUP_PLACEHOLDER_KEYS
+
+
+def test_the_base_config_carries_no_lab_local_endpoint_address(
+    rendered: dict[str, list[dict[str, Any]]],
+) -> None:
+    """The lab gateway's address is a cluster fact; the base is inherited by kind too."""
+    for target in ("base", "overlays/kind"):
+        settings = _named(rendered[target], "ConfigMap", "crucible-settings")["data"]
+        assert settings["CRUCIBLE_KUBERNETES__LOCAL_ENDPOINT_CIDRS"] == "[]", target
 
 
 def test_the_kubernetes_provider_is_on_and_docker_is_off(

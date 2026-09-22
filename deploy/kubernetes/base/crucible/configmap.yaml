@@ -63,8 +63,9 @@ data:
   CRUCIBLE_KUBERNETES__CREDENTIAL_SECRETS: >-
     {"claude_code":"crucible-harness-claude-code","codex":"crucible-harness-codex","agy":"crucible-harness-agy","hermes":"crucible-harness-hermes"}
   # A named endpoint may enter only this private range. Service and Pod ranges remain
-  # denied even when DNS returns one of their addresses.
-  CRUCIBLE_KUBERNETES__LOCAL_ENDPOINT_CIDRS: '["172.16.6.20/32"]'
+  # denied even when DNS returns one of their addresses. Empty here on purpose: the
+  # local endpoint host's address is a cluster fact, and the overlay sets it.
+  CRUCIBLE_KUBERNETES__LOCAL_ENDPOINT_CIDRS: "[]"
 
   # 12: all three subscription harnesses refresh their own token in place, so the mount
   # mode is `rw-narrow` and the provider's init container copies the named auth files off

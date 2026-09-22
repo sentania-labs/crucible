@@ -64,6 +64,7 @@ Spec 26's checklist, made concrete. Each row is either a placeholder in
 | `REPLACE_ME_CLUSTER_DNS_IP` | `overlays/lab/settings.yaml` | `kubectl -n kube-system get service kube-dns -o jsonpath='{.spec.clusterIP}'` |
 | `REPLACE_ME_RENDER_TIMEZONE` | `overlays/lab/settings.yaml` | the operator's IANA zone. Stored time is UTC; this is only how it is rendered (01) |
 | `REPLACE_ME_IMAGE_PULL_SECRET` | `overlays/lab/settings.yaml`, `overlays/lab/pull-secret.yaml` | the pull secret's name, in both namespaces. Delete the `pull-secret.yaml` patch and blank the setting when the packages are public |
+| `REPLACE_ME_LOCAL_ENDPOINT_CIDRS` | `overlays/lab/settings.yaml` | the resolved address of the local endpoint host, as a `/32`. Reviewed when the gateway moves |
 | `REPLACE_ME_PROBE_IMAGE` | `overlays/lab/settings.yaml` comment | one exact, pullable worker image reference. 26's readiness canary runs it, and a bare repository would mean `:latest` to a kubelet. The committed default is blank, so set it only when an exact reference is available. |
 | `REPLACE_ME_ARGOCD_PROJECT`, `REPLACE_ME_MANIFEST_REPO_URL`, `REPLACE_ME_MANIFEST_REVISION` | `argocd/application.yaml` | the Argo project, the repository holding these manifests, and an exact tag or commit. Never a branch: this field plus the pinned image tag are the deployment's record of what is running |
 | `REPLACE_ME_SECRET_STORE_NAME`, `REPLACE_ME_REMOTE_PATH` | `secret-shapes/external/database.yaml` | only on a cluster using external-secrets instead of sealed ones |
