@@ -57,6 +57,19 @@ class SmokeError(Exception):
     """A failure with a message an operator can act on without reading a traceback."""
 
 
+def minted_token(document: Any) -> str:
+    """The token `crucible admin token create` printed: `data.token` of its envelope.
+
+    A KeyError or TypeError here is the caller's cue that the output had no token; the
+    output itself is never echoed, because it carries one.
+    """
+    if isinstance(document, dict) and "envelope" in document:
+        if not document.get("ok"):
+            raise KeyError("the envelope reports a failure")
+        document = document["data"]
+    return str(document["token"])
+
+
 def log(message: str) -> None:
     print(message, flush=True)
 
@@ -135,7 +148,10 @@ def compose(args: list[str], *, redact: bool = False) -> str:
         if redact:
             detail = "Its output is withheld because it can carry a token."
         else:
-            detail = (completed.stderr or completed.stdout or "").strip() or "(no output)"
+            # Both streams: `crucible admin` prints its envelope, error included, on stdout
+            # and its logs on stderr, and the caller matches on the error's code.
+            parts = (completed.stderr, completed.stdout)
+            detail = "\n".join(p.strip() for p in parts if p.strip()) or "(no output)"
         raise SmokeError(f"`{' '.join(command)}` exited {completed.returncode}.\n{detail}")
     return completed.stdout
 
@@ -207,7 +223,8 @@ def mint_token(principal: str) -> str:
             "exec",
             "-T",
             "crucible",
-            "crucible-admin",
+            "crucible",
+            "admin",
             "--reason",
             "compose smoke principal",
             "token",
@@ -220,12 +237,12 @@ def mint_token(principal: str) -> str:
         redact=True,
     )
     try:
-        return str(json.loads(raw)["token"])
-    except (json.JSONDecodeError, KeyError) as exc:
+        return minted_token(json.loads(raw))
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
         # The output is never echoed: it carries a live bearer token, and a
         # smoke failure is a public CI log.
         raise SmokeError(
-            "`crucible-admin token create` did not return a JSON object with a "
+            "`crucible admin token create` did not return a JSON object with a "
             f"`token` field ({exc}). Its output is withheld because it carries a token."
         ) from None
 
@@ -315,7 +332,8 @@ def _register_once() -> None:
                 "exec",
                 "-T",
                 "crucible",
-                "crucible-admin",
+                "crucible",
+                "admin",
                 # Registration under the administrative surface is a mutation like any
                 # other (25): a reason, and a live supervisor lease.
                 "--reason",
@@ -497,7 +515,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--token",
         default=os.environ.get("CRUCIBLE_SMOKE_TOKEN") or None,
-        help="orchestrator token; minted with crucible-admin in the container when omitted",
+        help="orchestrator token; minted with `crucible admin` in the container when omitted",
     )
     # Unique per run by default: an external id and a principal are both
     # unique in the database, so fixed values make a second `make smoke` against

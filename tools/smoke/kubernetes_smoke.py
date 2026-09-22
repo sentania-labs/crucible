@@ -72,6 +72,19 @@ class SmokeError(Exception):
     """A failure with a message an operator can act on without reading a traceback."""
 
 
+def minted_token(document: Any) -> str:
+    """The token `crucible admin token create` printed: `data.token` of its envelope.
+
+    A KeyError or TypeError here is the caller's cue that the output had no token; the
+    output itself is never echoed, because it carries one.
+    """
+    if isinstance(document, dict) and "envelope" in document:
+        if not document.get("ok"):
+            raise KeyError("the envelope reports a failure")
+        document = document["data"]
+    return str(document["token"])
+
+
 def log(message: str) -> None:
     print(message, flush=True)
 
@@ -153,7 +166,8 @@ def kubectl(args: list[str], *, redact: bool = False, check: bool = True) -> str
         detail = (
             "Its output is withheld because it can carry a token."
             if redact
-            else (completed.stderr or completed.stdout or "").strip() or "(no output)"
+            else "\n".join(p.strip() for p in (completed.stderr, completed.stdout) if p.strip())
+            or "(no output)"
         )
         raise SmokeError(f"`{' '.join(command)}` exited {completed.returncode}.\n{detail}")
     return completed.stdout
@@ -231,7 +245,8 @@ def mint_token(principal: str, role: str) -> str:
             "exec",
             "deployment/crucible-api",
             "--",
-            "crucible-admin",
+            "crucible",
+            "admin",
             "--reason",
             "kubernetes deploy smoke principal",
             "token",
@@ -244,10 +259,10 @@ def mint_token(principal: str, role: str) -> str:
         redact=True,
     )
     try:
-        return str(json.loads(raw)["token"])
-    except (json.JSONDecodeError, KeyError) as exc:
+        return minted_token(json.loads(raw))
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
         raise SmokeError(
-            "`crucible-admin token create` did not return a JSON object with a `token` "
+            "`crucible admin token create` did not return a JSON object with a `token` "
             f"field ({exc}). Its output is withheld because it carries a token."
         ) from None
 
