@@ -151,10 +151,10 @@ jobs:
           # CRUCIBLE_IMAGE pins compose to this run's versioned local tag and
           # --pull never forbids reaching the registry for the candidate, so a
           # v0.2.0 run can never end up smoking the published v0.1.0. --pull
-          # never does not stop compose building when an image is absent,
-          # because the service has a build section, so the image ID is checked
-          # below rather than trusted.
-          docker compose up -d --wait --pull never
+          # never alone would permit Compose to build services that have a
+          # build section. --no-build makes an absent candidate fail instead.
+          # The image ID is still checked below rather than trusted.
+          make up COMPOSE_UP_FLAGS="--pull never --no-build"
           # Prove every service that resolves to the candidate image uses the
           # freshly built image ID. This includes exited one-shot containers.
           make release-images-verify
