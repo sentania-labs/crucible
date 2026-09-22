@@ -118,7 +118,8 @@ $ make e2e-kind
 10 passed, 2 warnings in 384.15s (0:06:24)
 ```
 
-The green CI run URL is added after the pre-PR review and CI run.
+The initial pull request workflow passed all six jobs, including `e2e-kind`:
+[CI run 35692723709](https://github.com/sentania-labs/crucible/actions/runs/35692723709).
 
 ## Limitations and risks
 
