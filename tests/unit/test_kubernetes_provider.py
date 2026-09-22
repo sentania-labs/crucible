@@ -13,7 +13,10 @@ from typing import Any
 import pytest
 
 from crucible.adapters.execution import k8sspec
+from crucible.adapters.execution import kubernetes as kubernetes_module
+from crucible.adapters.execution.k8sapi import KubernetesApiError
 from crucible.adapters.execution.kubernetes import (
+    CollectionFailedError,
     KubernetesConfig,
     KubernetesProvider,
     NamespaceProbe,
@@ -479,3 +482,122 @@ async def test_the_attempt_records_26s_observability_fields() -> None:
     assert "pypi.org" in document["egress"]
     # Nothing in the record is a value (12).
     assert "auth" not in evidence.content.decode().lower()
+
+
+# ----- what the adversarial review of C8a attacked --------------------------
+
+
+async def test_a_canary_that_cannot_tell_does_not_pass_the_probe() -> None:
+    """26's one un-fakeable gate must fail closed.
+
+    An earlier canary tested the API server with bash's `/dev/tcp` redirect, which is
+    not a feature of `sh`: under dash or busybox the redirect fails to open and the
+    script would have reported `unreachable` on a namespace with no egress enforcement
+    at all. An answer that is not a definite refusal to connect is `inconclusive`, and
+    an inconclusive probe refuses every launch."""
+    _api, _registry, provider, launch, workspace = await prepared(
+        build={"canary_answer": "inconclusive"}
+    )
+    probe = await provider.ensure_ready()
+    assert probe.passed is False and probe.checked is False
+    assert "could not tell" in probe.detail
+    with pytest.raises(LaunchRefusedError, match="not ready"):
+        await provider.launch(workspace, launch)
+    assert (await provider.health()).state == "degraded"
+
+
+async def test_a_canary_whose_output_never_finished_is_not_a_result() -> None:
+    _api, _registry, provider = build(canary_done=False)
+    await provider.prepare(spec())
+    probe = await provider.ensure_ready()
+    assert probe.passed is False and probe.checked is False
+
+
+async def test_a_transient_api_error_is_not_a_lost_worker() -> None:
+    """16: `lost` is terminal. A 503 from the API server, or one reset connection, while
+    a healthy worker runs must not fail the attempt and retry it while the original Pod
+    keeps going. Nothing is decided from a look that failed."""
+    api, _registry, provider, launch, workspace = await prepared()
+    handle = await provider.launch(workspace, launch)
+
+    real = api.list_objects
+
+    def flaky(kind: str, **kwargs: Any) -> Any:
+        if kind == "pods":
+            raise KubernetesApiError(503, "the api server is restarting")
+        return real(kind, **kwargs)
+
+    api.list_objects = flaky
+    with pytest.raises(ProviderError, match="could not read the Pod"):
+        await provider.observe(handle)
+    api.list_objects = real
+    assert (await provider.observe(handle)).state is ObservationState.RUNNING
+
+
+async def test_a_completed_job_whose_pod_was_reaped_is_not_lost() -> None:
+    """A successful attempt whose Pod a node drain or a TTL controller removed, read by
+    a supervisor that has no memory of the launch."""
+    api, _registry, provider, launch, workspace = await prepared()
+    handle = await provider.launch(workspace, launch)
+    await run_to_exit(provider, handle)
+    api.objects[("jobs", handle.ref)].body["status"] = {
+        "succeeded": 1,
+        "conditions": [{"type": "Complete", "status": "True"}],
+    }
+    api.remove_pod_out_of_band(launch.attempt_id)
+    provider._launched.clear()
+    observation = await provider.observe(handle)
+    assert observation.state is ObservationState.EXITED and observation.exit_code == 0
+
+
+@pytest.mark.parametrize(
+    "break_it",
+    ["preparer-fails", "no-head"],
+)
+async def test_a_prepare_that_fails_after_seeding_leaves_no_secret(break_it: str) -> None:
+    """12: the copy is removed on every path, not only the clean one. `prepare` seeds
+    the per-attempt Secret before the preparer runs, and a supervisor never calls
+    `cleanup` or `discard` for an attempt whose `prepare` raised."""
+    api, registry, provider = build(harness="codex")
+    registry.register(CODEX_IMAGE, harness="codex", version="0.153.4")
+    api.put_harness_secret("crucible-harness-codex", {"auth.json": _auth("2026-09-20T00:00:00Z")})
+    launch = spec(harness="codex", image=CODEX_IMAGE)
+    if break_it == "preparer-fails":
+        api.script(launch.attempt_id, "prepare-fails")
+    else:
+        api.claims_suppress_head = True
+    with pytest.raises(ProviderError):
+        await provider.prepare(launch)
+    assert not api.secret_exists("cred-01attempt0000000000000000a")
+    assert "credential/auth.json" not in api.claims.get("ws-01attempt0000000000000000a", {})
+
+
+async def test_retention_removes_a_claim_for_an_attempt_crucible_forgot() -> None:
+    """A failed prepare leaves a workspace claim behind; nothing else would remove it."""
+    api, _registry, provider = build()
+    launch = spec()
+    await provider.prepare(launch)
+    assert api.object_names("persistentvolumeclaims")
+    assert await provider.retention(keep=[]) > 0
+    assert api.object_names("persistentvolumeclaims") == []
+
+
+async def test_retention_keeps_a_claim_a_cleanup_policy_kept() -> None:
+    api, _registry, provider, launch, workspace = await prepared()
+    handle = await provider.launch(workspace, launch)
+    await run_to_exit(provider, handle)
+    await provider.cleanup(workspace, CleanupPolicy.KEEP, launch)
+    await provider.retention(keep=[])
+    assert api.object_names("persistentvolumeclaims") == ["ws-01attempt0000000000000000a"]
+
+
+async def test_a_truncated_collected_output_fails_the_attempt(monkeypatch: Any) -> None:
+    """16: outputs Crucible could not read whole are an environment failure. A partial
+    extraction would give the gates a diff and a report quietly missing files."""
+    api, _registry, provider, launch, workspace = await prepared()
+    handle = await provider.launch(workspace, launch)
+    await run_to_exit(provider, handle)
+    monkeypatch.setattr(kubernetes_module, "OUTPUT_READ_LIMIT", 8)
+    with pytest.raises(CollectionFailedError, match="truncated"):
+        await provider.collect(handle, workspace, launch)
+    assert api.object_names("secrets") == []

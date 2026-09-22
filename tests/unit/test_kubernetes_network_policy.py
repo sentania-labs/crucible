@@ -224,4 +224,90 @@ async def test_the_login_role_gets_the_harness_login_endpoints() -> None:
 async def test_the_verifier_gets_the_policys_registries_and_not_the_model_endpoints() -> None:
     _api, _registry, provider = build()
     plan = provider._egress_plan(spec(), k8sspec.ROLE_VERIFIER)
-    assert set(plan.hosts) == {"github.com", "pypi.org"}
+    assert set(plan.hosts) == {"pypi.org"}
+
+
+# ----- the denials are real for a resolved allowlist -----------------------
+
+
+async def test_a_host_that_resolves_into_a_denied_range_refuses_the_launch() -> None:
+    """26: the denials are the `except` of every allow, so a name that resolves into a
+    denied range cannot open one.
+
+    An allowed destination is a `/32`, so asking whether a denied `/8` sits inside it is
+    always false; the check that matters is the other direction. Without it, a vendor
+    host whose record points at the API server's ClusterIP, at cloud metadata, or into
+    the lab's own ranges becomes an allow rule for exactly that address."""
+    for address in ("169.254.169.254/32", "10.43.0.1/32", "192.168.40.10/32"):
+        _api, _registry, provider = build(resolver=lambda _host, a=address: [a])
+        launch = spec()
+        with pytest.raises(ProviderError, match="denies"):
+            await provider.prepare(launch)
+
+
+async def test_the_rendered_rules_never_name_a_denied_address() -> None:
+    """The property the parametrised denial test above states, asserted against the
+    rendered object rather than against a fixture that could not produce one."""
+    rendered = await policies()
+    for policy in rendered.values():
+        for rule in rules(policy):
+            for destination in rule.get("to") or []:
+                block = destination["ipBlock"]
+                if block["cidr"] == "0.0.0.0/0":
+                    continue
+                network = ipaddress.ip_network(block["cidr"])
+                for denied in k8sspec.DEFAULT_DENIED_CIDRS:
+                    if k8sspec.denied_by(block["cidr"], [denied]) is not None:
+                        # Cluster DNS is the one address 26 allows inside a denied
+                        # range, on port 53 and nothing else.
+                        assert network.version == 4
+                        assert block["cidr"] == "10.96.0.10/32", block
+                        assert rule["ports"] == [
+                            {"protocol": "UDP", "port": 53},
+                            {"protocol": "TCP", "port": 53},
+                        ]
+
+
+async def test_a_worker_never_reaches_the_git_remote_whatever_the_policy_names() -> None:
+    """26 is unconditional: GitHub is not reachable from a worker; the preparer and the
+    publisher do the git traffic. The seeded default policy names `github.com` in its
+    `egress_allowlist` for the roles that need it, so the worker role subtracts it
+    rather than trusting the list."""
+    rendered = await policies(
+        policy={
+            "images": {"allowlist": ["crucible-worker:*"]},
+            "network": {
+                "mode": "egress-proxy",
+                "egress_allowlist": ["github.com", "api.github.com", "pypi.org"],
+            },
+            "resources": {"cpus": 2, "memory": "4GiB"},
+            "limits": {"grace_seconds": 30},
+        }
+    )
+    worker = rendered[k8sspec.ROLE_WORKER]
+    assert not allows(worker, "140.82.121.4", 443)
+    assert not allows(worker, "140.82.121.6", 443)
+    assert allows(worker, "151.101.0.223", 443)
+    # What was granted is what the annotation records.
+    assert "github.com" not in worker["metadata"]["annotations"][k8sspec.ANNOTATION_EGRESS]
+    # The preparer still does the git traffic.
+    assert allows(rendered[k8sspec.ROLE_PREPARER], "140.82.121.4", 443)
+
+
+async def test_the_verifier_does_not_get_the_git_remote_either() -> None:
+    _api, _registry, provider = build()
+    plan = provider._egress_plan(
+        spec(
+            policy={
+                "images": {"allowlist": ["crucible-worker:*"]},
+                "network": {
+                    "mode": "egress-proxy",
+                    "egress_allowlist": ["github.com", "pypi.org"],
+                },
+                "resources": {"cpus": 2, "memory": "4GiB"},
+                "limits": {"grace_seconds": 30},
+            }
+        ),
+        k8sspec.ROLE_VERIFIER,
+    )
+    assert set(plan.hosts) == {"pypi.org"}

@@ -453,16 +453,21 @@ def _endpoint_rule(endpoint: str) -> dict[str, Any]:
     }
 
 
-def _covered(cidr: str, denied: Sequence[str]) -> list[str]:
-    """Which denied ranges fall inside an allowed one. A hostname that resolves into a
-    lab range must not become a hole in the denials the same policy just made."""
+def denied_by(cidr: str, denied: Sequence[str]) -> str | None:
+    """The denied range an allowed destination falls inside, if any.
+
+    This is the check that makes the denials of 26 real for a resolved allowlist. An
+    allowed address is a `/32`, so asking whether a denied range sits inside it is
+    always false and always was; what matters is the other direction, because a name
+    that resolves to the API server's ClusterIP, to link-local, or into the lab's own
+    ranges would otherwise become an allow rule for exactly the destination the policy
+    denies. The caller refuses the launch rather than emitting the rule."""
     network = ipaddress.ip_network(cidr)
-    out: list[str] = []
     for entry in denied:
         candidate = ipaddress.ip_network(entry)
-        if isinstance(candidate, type(network)) and candidate.subnet_of(network):  # type: ignore[arg-type]
-            out.append(entry)
-    return out
+        if isinstance(network, type(candidate)) and network.subnet_of(candidate):  # type: ignore[arg-type]
+            return entry
+    return None
 
 
 def egress_policy(
@@ -500,17 +505,14 @@ def egress_policy(
             }
         )
     if plan.hosts:
-        # The resolved addresses of the allowlist, each excepted against 26's denials so
-        # a name that resolves into the lab's own range cannot smuggle one back in.
+        # The resolved addresses of the allowlist. Every one of them has already been
+        # checked against `denied_cidrs` by the caller and refused if it fell inside
+        # one, so nothing here can name a denied destination; the broad form keeps the
+        # denials as its `except`.
         destinations: list[dict[str, Any]] = (
             [{"ipBlock": {"cidr": "0.0.0.0/0", "except": list(denied_cidrs)}}]
             if plan.broad
-            else [
-                {"ipBlock": {"cidr": cidr, "except": _covered(cidr, denied_cidrs)}}
-                if _covered(cidr, denied_cidrs)
-                else {"ipBlock": {"cidr": cidr}}
-                for cidr in plan.cidrs
-            ]
+            else [{"ipBlock": {"cidr": cidr}} for cidr in plan.cidrs]
         )
         if destinations:
             rules.append(
@@ -577,6 +579,7 @@ __all__ = [
     "base_mounts",
     "base_volumes",
     "config_map",
+    "denied_by",
     "egress_policy",
     "job",
     "labels",

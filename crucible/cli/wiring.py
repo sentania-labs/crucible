@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import socket
 from dataclasses import dataclass
@@ -16,6 +17,7 @@ from crucible.adapters.clock import SystemClock
 from crucible.adapters.execution.docker import DockerConfig, DockerProvider
 from crucible.adapters.execution.fake import FakeProvider
 from crucible.adapters.execution.k8sapi import (
+    KubernetesApiError,
     KubernetesClient,
     in_cluster_access,
     kubeconfig_access,
@@ -43,6 +45,8 @@ from crucible.ports.harness import CredentialSource, HarnessGate, MountMode
 from crucible.ports.notification import WakeDeliverer
 from crucible.ports.publish import Publisher
 from crucible.settings import Settings
+
+log = logging.getLogger("crucible.wiring")
 
 
 @dataclass(slots=True)
@@ -224,8 +228,14 @@ def wire(settings: Settings) -> Wiring:
     if settings.kubernetes.enabled:
         # 26: the Kubernetes provider is reported by `GET /v1/capabilities` and
         # `GET /v1/admin/providers` exactly when it is wired, with its namespace probe
-        # in its health checks.
-        providers["kubernetes"] = kubernetes_provider(settings, registry)
+        # in its health checks. A deployment that turned it on with no kubeconfig and
+        # no in-cluster ServiceAccount gets the provider left out and a log line, not a
+        # service that will not start: the Docker provider and the API are still the
+        # operator's way of finding out what is wrong (25).
+        try:
+            providers["kubernetes"] = kubernetes_provider(settings, registry)
+        except KubernetesApiError as exc:
+            log.error("the kubernetes provider is enabled but unreachable: %s", exc)
     artifact_store = DiskArtifactStore(settings.service.artifact_root)
     wake_deliverer = WebhookWakeDeliverer(
         settings.wake.webhook_url,

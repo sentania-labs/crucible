@@ -144,6 +144,13 @@ OBJECT_PREFIX: dict[str, str] = {
     k8sspec.ROLE_READER: "reader",
 }
 
+# 26 is unconditional: "GitHub is not reachable from a worker; the preparer and the
+# publisher do the git traffic." A policy document may still name these in its
+# `egress_allowlist` for the roles that do need them (05b's default does), so the worker
+# role subtracts them rather than trusting the list. The removal is recorded in the
+# policy's annotation, so what was asked for and what was granted are both readable.
+WORKER_DENIED_HOSTS: frozenset[str] = frozenset({"github.com", "api.github.com"})
+
 DEFAULT_IMAGE_ALLOWLIST: tuple[str, ...] = (
     "crucible-worker:*",
     "ghcr.io/sentania-labs/crucible-worker:*",
@@ -277,6 +284,21 @@ class _Launched:
     # deleted it is never reported as lost (16).
     terminated: str | None = None
     exit_code: int | None = None
+
+
+# What an adopted attempt's `_Launched` carries before the supervisor hands the real
+# launch spec back on the next collect. It names nothing and runs nothing.
+_ADOPTED_SPEC = LaunchSpec(
+    attempt_id="",
+    task_id="",
+    external_id="",
+    role="adopted",
+    harness="",
+    model="",
+    image="",
+    timeout_seconds=0,
+    contract={},
+)
 
 
 class KubernetesProvider:
@@ -487,7 +509,39 @@ class KubernetesProvider:
         copy = self._credential_copy(spec)
         if copy is not None:
             await self._seed_credential(spec, copy)
+        try:
+            return await self._prepare_checkout(
+                spec,
+                url=url,
+                base_ref=base_ref,
+                work_branch=work_branch,
+                resolved=resolved,
+                limits=limits,
+                identity_sha=identity_sha,
+            )
+        except BaseException:
+            # 12: the copy is removed on *every* path, not only the clean one. Every
+            # failure past this point (a preparer Job that failed, a HEAD it never
+            # produced, a reader Pod that never became ready) leaves an attempt the
+            # supervisor will never collect or clean up, so the seeded Secret and the
+            # writable copy go now rather than waiting for a retention sweep.
+            if copy is not None:
+                with contextlib.suppress(Exception):
+                    await self._remove_credential(spec, copy)
+            raise
 
+    async def _prepare_checkout(
+        self,
+        spec: LaunchSpec,
+        *,
+        url: str,
+        base_ref: str,
+        work_branch: str,
+        resolved: str,
+        limits: Limits,
+        identity_sha: str,
+    ) -> Workspace:
+        repository = spec.contract.get("repository", {})
         cache_mounts: list[Mount] = []
         cache_volumes: list[dict[str, Any]] = []
         cache_name: str | None = None
@@ -621,7 +675,13 @@ class KubernetesProvider:
             if exc.status != 404:
                 raise ProviderError(f"reading the Job failed: {exc}") from exc
             job = {}
-        pod = await self._pod_of(h.ref)
+        try:
+            pod = await self._pod_of(h.ref)
+        except KubernetesApiError as exc:
+            # Nothing is decided from a failed look. The supervisor logs this and asks
+            # again on the next tick, which is what an attempt whose state could not be
+            # read deserves.
+            raise ProviderError(f"could not read the Pod of {h.ref}: {exc}") from exc
         if pod is None:
             return self._observation_without_pod(h, launched, job)
         status = pod.get("status") or {}
@@ -670,6 +730,11 @@ class KubernetesProvider:
         for condition in (job.get("status") or {}).get("conditions") or []:
             if not isinstance(condition, dict) or str(condition.get("status")) != "True":
                 continue
+            if str(condition.get("type")) == "Complete":
+                # The Job finished and its Pod was garbage collected afterwards (a node
+                # drain, an operator, a TTL controller someone adds). A successful
+                # attempt whose Pod was reaped is not a loss.
+                return Observation(ObservationState.EXITED, exit_code=0, detail="the Job completed")
             if str(condition.get("reason")) == "DeadlineExceeded":
                 # The Job's own deadline fired. Crucible drains before it (26), so this
                 # is the cluster killing a worker Crucible had not classified yet.
@@ -716,7 +781,10 @@ class KubernetesProvider:
         )
 
     async def logs(self, h: Handle, since: LogOffset) -> list[LogChunk]:
-        pod = await self._pod_of(h.ref)
+        try:
+            pod = await self._pod_of(h.ref)
+        except KubernetesApiError:
+            return []
         if pod is None:
             return []
         name = str((pod.get("metadata") or {}).get("name") or "")
@@ -875,7 +943,10 @@ class KubernetesProvider:
         remembered, so a Pod that is gone because Crucible deleted it is reported as an
         exit and never as a loss (16)."""
         launched = self._launched.get(h.attempt_id)
-        pod = await self._pod_of(h.ref)
+        try:
+            pod = await self._pod_of(h.ref)
+        except KubernetesApiError as exc:
+            raise ProviderError(f"terminate could not read the Pod of {h.ref}: {exc}") from exc
         grace = launched.limits.grace_seconds if launched else 60
         if launched is not None:
             launched.terminated = mode
@@ -925,16 +996,29 @@ class KubernetesProvider:
                 ("persistentvolumeclaims", "configmaps"), attempt_id=ws.attempt_id
             )
         else:
-            if policy is CleanupPolicy.KEEP_DIFF_ONLY and spec is not None:
+            leaves = (
+                ["repo", "output/tree", k8sspec.CREDENTIAL_LEAF]
+                if policy is CleanupPolicy.KEEP_DIFF_ONLY
                 # The checkout, the verifier's tree and any credential copy go; the
                 # collected evidence stays on the claim (08).
-                with contextlib.suppress(Exception):
-                    await self._remove_from_claim(
-                        spec, ["repo", "output/tree", k8sspec.CREDENTIAL_LEAF]
+                else [k8sspec.CREDENTIAL_LEAF]
+            )
+            if spec is None:
+                log.warning(
+                    "a retained claim keeps its credential leaf: no launch spec to remove it with",
+                    extra={"attempt_id": ws.attempt_id},
+                )
+            else:
+                try:
+                    await self._remove_from_claim(spec, leaves)
+                except Exception as exc:
+                    # 12: a rotated token left on a retained claim is the thing this
+                    # call exists to stop. A cleanup that could not do it says so
+                    # rather than reporting success.
+                    log.warning(
+                        "a retained claim may still hold the credential copy",
+                        extra={"attempt_id": ws.attempt_id, "error": str(exc)},
                     )
-            elif spec is not None:
-                with contextlib.suppress(Exception):
-                    await self._remove_from_claim(spec, [k8sspec.CREDENTIAL_LEAF])
             with contextlib.suppress(KubernetesApiError):
                 await self._call(
                     self.client.patch,
@@ -961,7 +1045,10 @@ class KubernetesProvider:
             name = str(metadata.get("name", ""))
             if not attempt_id or not name:
                 continue
-            pod = await self._pod_of(name)
+            try:
+                pod = await self._pod_of(name)
+            except KubernetesApiError:
+                continue
             # A Job's `status.active` lags its Pod, so the Pod is what says whether a
             # worker is alive: 08 adopts only what is actually running.
             if pod is None:
@@ -976,7 +1063,14 @@ class KubernetesProvider:
         """Remove what is labelled for attempts Crucible no longer tracks (16)."""
         live = set(keep)
         removed = 0
-        for kind in ("jobs", "pods", "networkpolicies", "secrets", "configmaps"):
+        for kind in (
+            "jobs",
+            "pods",
+            "networkpolicies",
+            "secrets",
+            "configmaps",
+            "persistentvolumeclaims",
+        ):
             try:
                 rows = await self._call(
                     self.client.list_objects, kind, label_selector=k8sspec.LABEL_ATTEMPT
@@ -985,7 +1079,13 @@ class KubernetesProvider:
                 continue
             for row in rows:
                 metadata = row.get("metadata") or {}
-                attempt_id = str((metadata.get("labels") or {}).get(k8sspec.LABEL_ATTEMPT, ""))
+                labels = metadata.get("labels") or {}
+                attempt_id = str(labels.get(k8sspec.LABEL_ATTEMPT, ""))
+                if kind == "persistentvolumeclaims" and labels.get(k8sspec.LABEL_RETAIN):
+                    # A claim a cleanup policy deliberately kept carries the retention
+                    # label; the sweep honours it (26) and the workspace retention
+                    # window of 16 is what removes it later.
+                    continue
                 if attempt_id and attempt_id not in live:
                     with contextlib.suppress(KubernetesApiError):
                         await self._call(self.client.delete, kind, str(metadata.get("name", "")))
@@ -1292,8 +1392,12 @@ class KubernetesProvider:
         policy_hosts = [str(h) for h in (network.get("egress_allowlist") or [])]
         extra = [str(h) for h in (spec.contract.get("constraints", {}).get("egress_extra") or [])]
         if role == k8sspec.ROLE_WORKER:
-            wanted = egress_allowlist(
-                self.harnesses, spec.harness, policy_hosts, extra, spec.endpoint_url
+            wanted = tuple(
+                host
+                for host in egress_allowlist(
+                    self.harnesses, spec.harness, policy_hosts, extra, spec.endpoint_url
+                )
+                if host not in WORKER_DENIED_HOSTS
             )
         elif role in (k8sspec.ROLE_PREPARER, k8sspec.ROLE_PUBLISHER):
             # 26: the preparer and the publisher do the git traffic, and nothing else.
@@ -1306,8 +1410,9 @@ class KubernetesProvider:
             # 26: the verifier gets the registries only when the policy says so. The
             # policy's own allowlist is that statement; the harness endpoints are not
             # part of it, because the verifier runs the repository's commands and never
-            # a model.
-            wanted = tuple(sorted(set(policy_hosts)))
+            # a model, and the git remote is not part of it either, for the same reason
+            # a worker does not get it.
+            wanted = tuple(sorted(set(policy_hosts) - WORKER_DENIED_HOSTS))
         else:
             # Collector, bundle verifier, reader, cleaner: no egress at all.
             return EgressPlan()
@@ -1352,6 +1457,7 @@ class KubernetesProvider:
             return replace(plan, broad=self.config.broad_egress)
         cidrs: list[str] = []
         unresolved: list[str] = []
+        forbidden: list[str] = []
         now = time.monotonic()
         for host in plan.hosts:
             cached = self._resolved.get(host)
@@ -1362,11 +1468,25 @@ class KubernetesProvider:
                 self._resolved[host] = (now, addresses)
             if not addresses:
                 unresolved.append(host)
+            for address in addresses:
+                # 26: the API server, the node network, other namespaces, link-local and
+                # the lab's private ranges are denied. A name that resolves into one of
+                # them would otherwise become an allow rule for exactly the destination
+                # the policy denies, whether by a vendor's split-horizon record, a CNAME
+                # change, or a poisoned resolver. It refuses the launch.
+                denied = k8sspec.denied_by(address, self.config.denied_cidrs)
+                if denied is not None:
+                    forbidden.append(f"{host} -> {address} inside {denied}")
             cidrs.extend(addresses)
         if unresolved:
             raise ProviderError(
                 "the egress allowlist names hosts that do not resolve to an address, so "
                 f"no NetworkPolicy can permit them: {sorted(unresolved)}"
+            )
+        if forbidden:
+            raise ProviderError(
+                "the egress allowlist resolves into ranges this namespace denies, so no "
+                f"NetworkPolicy may permit it: {sorted(forbidden)}"
             )
         return replace(plan, cidrs=tuple(dict.fromkeys(cidrs)))
 
@@ -1734,6 +1854,19 @@ class KubernetesProvider:
                 container=k8sspec.CONTAINER_NAME,
                 limit=OUTPUT_READ_LIMIT,
             )
+        if result.exit_code not in (0, None) or result.stderr:
+            raise CollectionFailedError(
+                "the reader Pod could not hand the collected output back "
+                f"(exit {result.exit_code}): "
+                f"{result.stderr.decode('utf-8', 'replace')[:400]}"
+            )
+        if len(result.stdout) >= OUTPUT_READ_LIMIT:
+            # 16: outputs Crucible could not read whole are an environment failure. A
+            # partial extraction would give the gates a diff and a report quietly
+            # missing files, which is worse than failing the attempt.
+            raise CollectionFailedError(
+                f"the collected output exceeded {OUTPUT_READ_LIMIT} bytes and was truncated"
+            )
         if not result.stdout:
             return
         await asyncio.to_thread(_extract, result.stdout, into)
@@ -1765,7 +1898,12 @@ class KubernetesProvider:
         """Wait for a Job's Pod to terminate and return the container's exit code."""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            pod = await self._pod_of(name)
+            try:
+                pod = await self._pod_of(name)
+            except KubernetesApiError:
+                # A failed look is not an answer; ask again on the next poll.
+                await asyncio.sleep(self.config.poll_interval_seconds)
+                continue
             if pod is not None:
                 terminated = _terminated_state(pod.get("status") or {})
                 if terminated is not None:
@@ -1818,16 +1956,23 @@ class KubernetesProvider:
                 raise
 
     async def _pod_of(self, job_name: str) -> dict[str, Any] | None:
-        try:
-            rows = await self._call(
-                self.client.list_objects, "pods", label_selector=f"job-name={job_name}"
-            )
-        except KubernetesApiError:
-            return None
+        """The Pod of a Job, or None when the namespace genuinely has none.
+
+        It does not swallow a transport failure. A 503 from the API server, a reset
+        connection or a timed-out list is "Crucible could not look", and answering None
+        would make `observe` read that as "the Pod is gone", which is `lost` and
+        terminal (16): a healthy worker would be failed and retried while the original
+        Pod kept running. The caller decides; the ones that do not care suppress."""
+        rows = await self._call(
+            self.client.list_objects, "pods", label_selector=f"job-name={job_name}"
+        )
         return rows[0] if rows else None
 
     async def _job_tail(self, job_name: str, limit: int = 4000) -> str:
-        pod = await self._pod_of(job_name)
+        try:
+            pod = await self._pod_of(job_name)
+        except KubernetesApiError:
+            return ""
         if pod is None:
             return ""
         name = str((pod.get("metadata") or {}).get("name") or "")
@@ -2031,20 +2176,29 @@ def _extract(raw: bytes, into: Path) -> None:
 
 
 def _read_probe(output: str) -> NamespaceProbe:
-    """Parse the canary's three lines. Anything else is a probe that did not run."""
+    """Parse the canary's answers. Anything but a definite refusal fails the probe.
+
+    `done=1` is what says the script ran to the end; without it the output is a
+    truncated log and nothing in it is a result."""
     fields: dict[str, str] = {}
     for line in output.splitlines():
         key, _, value = line.partition("=")
         if key.startswith("crucible-canary."):
             fields[key[len("crucible-canary.") :].strip()] = value.strip()
-    if "api" not in fields:
+    if "api" not in fields or fields.get("done") != "1":
         return NamespaceProbe(False, False, None, "the canary produced no result", checked=False)
-    enforced = fields["api"] == "unreachable"
+    answer = fields["api"]
+    enforced = answer == "unreachable"
     raw = fields.get("pids", "")
     pid_limit = int(raw) if raw.isdigit() else None
     problems = []
-    if not enforced:
+    if answer == "reachable":
         problems.append("the canary reached the API server, so the CNI is not enforcing egress")
+    elif not enforced:
+        problems.append(
+            "the canary could not tell whether it reached the API server "
+            f"(tool {fields.get('tool', 'unknown')}, curl exit {fields.get('curl_exit', 'none')})"
+        )
     if pid_limit is None:
         problems.append("the node has no pod PID limit configured")
     return NamespaceProbe(
@@ -2052,6 +2206,9 @@ def _read_probe(output: str) -> NamespaceProbe:
         egress_enforced=enforced,
         pid_limit=pid_limit,
         detail="; ".join(problems) or "namespace ready",
+        # An inconclusive answer is not a probe that ran: the status page should say so
+        # rather than showing a namespace that merely failed.
+        checked=answer != "inconclusive",
     )
 
 
@@ -2082,13 +2239,32 @@ exec tar cf - --exclude=output/tree "$@"
 
 # The canary of 26: it must fail to reach the API server, and it reports the node's pod
 # PID limit. Both answers go to its own log, which holds nothing secret.
+#
+# The reachability test fails *closed*. An earlier form used bash's `/dev/tcp` redirect,
+# which is not a feature of `sh`: under dash or busybox the redirect simply fails, and
+# the probe would have reported "unreachable" on a namespace with no egress enforcement
+# at all, which is the one answer this gate exists to refuse to invent. So the test is
+# curl, whose exit code says which happened, and anything that is not a definite refusal
+# to connect is `inconclusive`, which does not pass the probe.
 _CANARY_SCRIPT = """
 host=${KUBERNETES_SERVICE_HOST:-kubernetes.default.svc}
 port=${KUBERNETES_SERVICE_PORT:-443}
-if timeout 5 sh -c "</dev/tcp/$host/$port" 2>/dev/null; then
-  echo "crucible-canary.api=reachable"
+if ! command -v curl >/dev/null 2>&1; then
+  echo "crucible-canary.api=inconclusive"
+  echo "crucible-canary.tool=none"
 else
-  echo "crucible-canary.api=unreachable"
+  echo "crucible-canary.tool=curl"
+  curl -sS -k -o /dev/null --max-time 5 "https://$host:$port/version" 2>/dev/null
+  rc=$?
+  case "$rc" in
+    # Connected: 0 is a response, and 22/35/52/56/60 are TLS or HTTP outcomes that all
+    # required a completed TCP connection to the API server.
+    0|22|35|52|56|60) echo "crucible-canary.api=reachable" ;;
+    # 7 is "failed to connect", 28 is "timed out": the CNI refused the packet.
+    7|28) echo "crucible-canary.api=unreachable" ;;
+    *) echo "crucible-canary.api=inconclusive" ;;
+  esac
+  echo "crucible-canary.curl_exit=$rc"
 fi
 limit=$(cat /sys/fs/cgroup/pids.max 2>/dev/null || cat /sys/fs/cgroup/pids/pids.max 2>/dev/null)
 case "$limit" in

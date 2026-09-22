@@ -149,6 +149,15 @@ class FakeKubernetesApi:
     # A canary that cannot reach the API server and a node with a pod PID limit: the
     # namespace 26 asks lab-admin for. A test flips either to prove the refusal.
     egress_enforced: bool = True
+    # What the canary reports: `unreachable`, `reachable`, or the `inconclusive` a
+    # cluster whose image carries no curl produces.
+    canary_answer: str = ""
+    # A preparer that runs and writes no HEAD, which is the second way `prepare` can
+    # raise after the per-attempt Secret has been seeded.
+    claims_suppress_head: bool = False
+    # A canary whose output stops before the final line, which is a truncated log and
+    # not a result.
+    canary_done: bool = True
     pod_pid_limit: int | None = 4096
     node_name: str = "lab-node-1"
     quota_jobs: int | None = None
@@ -172,6 +181,10 @@ class FakeKubernetesApi:
     deleted: list[tuple[str, str]] = field(default_factory=list)
 
     # ----- test controls ------------------------------------------------
+
+    def __post_init__(self) -> None:
+        if not self.canary_answer:
+            self.canary_answer = "unreachable" if self.egress_enforced else "reachable"
 
     def script(self, attempt_id: str, behavior: str, *, after: int = 1) -> None:
         if behavior not in BEHAVIORS:
@@ -438,9 +451,11 @@ class FakeKubernetesApi:
         name = obj.name
         pid = "none" if self.pod_pid_limit is None else str(self.pod_pid_limit)
         self.logs[name] = [
-            f"crucible-canary.api={'unreachable' if self.egress_enforced else 'reachable'}",
+            "crucible-canary.tool=curl",
+            f"crucible-canary.api={self.canary_answer}",
+            f"crucible-canary.curl_exit={'7' if self.egress_enforced else '0'}",
             f"crucible-canary.pids={pid}",
-            "crucible-canary.done=1",
+            *(["crucible-canary.done=1"] if self.canary_done else []),
         ]
         self._finish(obj, 0)
 
@@ -451,7 +466,8 @@ class FakeKubernetesApi:
             self.logs[obj.name] = ["the fake preparer could not clone"]
             self._finish(obj, 3, reason="Error")
             return
-        claim["output/prepared-head.txt"] = (synthetic_head_sha(attempt_id) + "\n").encode()
+        if not self.claims_suppress_head:
+            claim["output/prepared-head.txt"] = (synthetic_head_sha(attempt_id) + "\n").encode()
         claim["output/started-from.txt"] = b"main\n"
         claim["repo/.git/HEAD"] = b"ref: refs/heads/crucible\n"
         self._finish(obj, 0)

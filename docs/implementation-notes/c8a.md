@@ -162,6 +162,66 @@ integration tier was running on the same machine: that test gives the verifier
 container a 5 second deadline, and under the contention the container exited on
 its own before the deadline could fire. Run alone, the tier is green.
 
+## The review round, and what it changed
+
+A non-author adversarial pass ran against the diff and the stated scope before the
+PR opened (the `sdlc` skill's step 4). It returned five blockers, all real, all fixed
+here:
+
+1. **The NetworkPolicy's denials were never emitted.** The `except` check asked whether
+   a denied range sat *inside* an allowed one. An allowed destination is a `/32`, so
+   that is always false and the `except` key never appeared. The check now runs the
+   other way and a resolved address that falls inside a denied range refuses the launch,
+   naming the host and the address. Without this, an allowlisted name whose record
+   pointed at the API server's ClusterIP, at cloud metadata, or into the lab's own
+   ranges became an allow rule for exactly that address.
+2. **The readiness canary could only report "unreachable".** It tested the API server
+   with bash's `/dev/tcp` redirect, which is not a feature of `sh`: under dash or
+   busybox the redirect fails to open and the else branch fires. The one gate that is
+   supposed to be un-fakeable passed on a namespace with no egress enforcement at all.
+   Confirmed on this workstation: `dash` reports "unreachable" for a host that answers.
+   The test is now curl, whose exit code says which happened, and anything that is not a
+   definite refusal to connect is `inconclusive`, which does not pass the probe and
+   therefore refuses every launch.
+3. **A worker reached GitHub under the shipped default policy.** 26 is unconditional,
+   and the seeded `default-software` policy names `github.com` in its `egress_allowlist`
+   for the roles that do need it. The worker and verifier roles now subtract the git
+   remote rather than trusting the list, and the annotation records what was granted.
+4. **A transient API error reported a running worker as `lost`.** `_pod_of` swallowed
+   every `KubernetesApiError`, so one 503 during a rolling restart read as "the Pod is
+   gone", which is terminal under 16: the attempt would be failed and retried while the
+   original Pod kept running. Nothing is decided from a look that failed; `observe`
+   raises and the supervisor asks again next tick.
+5. **The per-attempt Secret survived every `prepare` failure.** The Secret is seeded
+   before the preparer Job, and the supervisor calls neither `discard` nor `cleanup` for
+   an attempt whose `prepare` raised, so a live harness credential sat in the namespace
+   until a retention sweep happened to notice. `prepare` now removes it on every path
+   out.
+
+Non-blockers fixed in the same pass: retention never removed workspace claims (a failed
+prepare left a 20Gi PVC forever); a completed Job whose Pod was garbage collected read
+as `lost` after a restart; an adopted attempt could never time out of `Pending` because
+the launch clock was in-memory only; a cleanup that could not remove a retained
+credential copy reported success silently; a truncated or failed read of the collected
+output produced a quietly short report instead of an environment failure; and
+`kubernetes.enabled` outside a cluster stopped the service from starting.
+
+Non-blockers carried forward rather than fixed, with the reasoning:
+
+- **`drain` records 143 for a worker that exited cleanly inside the grace window.**
+  Deleting a Pod is the only signal Kubernetes offers and the exit code goes with the
+  Pod object. Recovering the real code needs a watch rather than a poll, which is a
+  design change, not a fix.
+- **The pod PID limit is read from the canary's node.** That is 26's design (it is a
+  kubelet setting, not a pod field); on a multi-node cluster the canary can land
+  somewhere other than the workers. The kind tier is where this becomes measurable.
+- **`pod_log` has no `limitBytes`.** Every poll reads the whole pod log into memory.
+  Worth a bound before a long-running worker on a real cluster.
+- **A read-only harness with declared templates.** Mounting a template inside a Secret
+  volume mount may fail at container creation, because a Secret volume is a read-only
+  tmpfs. All three subscription harnesses are `rw-narrow` today, so the path is latent;
+  the kind tier should cover it before any harness declares read-only with templates.
+
 ## What C8b needs from here
 
 - `k8sfake.FakeKubernetesApi` and `FakeRegistry` stay the unit and integration
