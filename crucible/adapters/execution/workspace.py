@@ -14,10 +14,9 @@ from __future__ import annotations
 
 # The origin URL a worker sees. It resolves nowhere, so a push cannot even start (S4).
 ORIGIN_PLACEHOLDER = "crucible-no-remote://this-checkout-cannot-push"
-SHIM_NAMES: tuple[str, ...] = ("CLAUDE.md", "AGENTS.md")
+SHIM_NAMES: tuple[str, ...] = ("AGENTS.md",)
 EXCLUDE_ENTRIES: tuple[str, ...] = (
     "# Written by Crucible at prepare; these are shims, not work (06, 11).",
-    "/CLAUDE.md",
     "/AGENTS.md",
     "/.crucible/",
 )

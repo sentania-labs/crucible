@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 import pytest
 
 from crucible.adapters.harness.registry import default_registry
@@ -9,6 +12,10 @@ from crucible.application.harnesses import check_image_version as _check
 from crucible.application.harnesses import egress_allowlist
 
 REGISTRY = default_registry()
+MANIFEST = Path(__file__).parents[2] / "images" / "manifest.env"
+IMAGE_TAG = re.compile(
+    r"^crucible-worker:(?P<harness>[a-z0-9_-]+)-(?P<version>\d+\.\d+\.\d+)-[0-9a-f]{12}$"
+)
 
 
 def check_image_version(harness: str, labels: dict[str, str]):  # type: ignore[no-untyped-def]
@@ -19,10 +26,39 @@ def labels(harness: str, version: str) -> dict[str, str]:
     return {"crucible.harness": harness, "crucible.harness_version": version}
 
 
+def test_every_manifest_harness_version_is_supported_by_its_adapter() -> None:
+    """The declared image pins and the adapters' tested ranges move together (13)."""
+    tags = {
+        key: value
+        for line in MANIFEST.read_text(encoding="utf-8").splitlines()
+        if "=" in line
+        for key, value in [line.split("=", maxsplit=1)]
+        if not key.endswith("_DIGEST")
+    }
+    assert set(tags) == {adapter.name.upper().replace("-", "_") for adapter in REGISTRY}
+    for key, tag in tags.items():
+        match = IMAGE_TAG.fullmatch(tag)
+        assert match is not None, f"{key} has malformed worker image tag: {tag!r}"
+        harness = match["harness"]
+        assert key == harness.upper().replace("-", "_"), tag
+        assert REGISTRY.require(harness).supported_versions.supports(match["version"]), tag
+
+
 def test_a_version_inside_the_range_is_accepted() -> None:
     check = check_image_version("codex", labels("codex", "0.153.4"))
     assert check.ok and check.installed == "0.153.4"
     assert check.supported == ">=0.153.0,<0.154.0"
+
+
+def test_claude_code_version_that_predates_agents_md_is_refused() -> None:
+    check = check_image_version("claude_code", labels("claude_code", "2.1.273"))
+    assert not check.ok
+    assert check.supported == ">=2.1.277,<2.2.0"
+
+
+def test_claude_code_agents_md_floor_is_accepted() -> None:
+    check = check_image_version("claude_code", labels("claude_code", "2.1.277"))
+    assert check.ok
 
 
 @pytest.mark.parametrize("version", ["0.152.9", "0.154.0", "1.0.0"])

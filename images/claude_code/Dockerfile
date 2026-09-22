@@ -8,8 +8,8 @@ ARG BASE_IMAGE=docker.io/library/debian:bookworm-slim@sha256:5ae3c39ebd15e229dce
 # in the final image.
 FROM ${BASE_IMAGE} AS fetch
 ARG SOURCE_DATE_EPOCH
-ARG HARNESS_VERSION=2.1.273
-ARG HARNESS_SHA256=6c752e2cc7c110c9df15f26d8d134d438c5ae95dbd610efc1a308bf7f9c5f6c1
+ARG HARNESS_VERSION=2.1.278
+ARG HARNESS_SHA256=5c4735937844e84f8a93306e841a5b0e12252909b07870f789b190468da147ab
 ADD --checksum=sha256:${HARNESS_SHA256} --chmod=0755 \
     https://downloads.claude.ai/claude-code-releases/${HARNESS_VERSION}/linux-x64/claude \
     /fetch/claude
