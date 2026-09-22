@@ -40,18 +40,35 @@ def _replace_event_kinds(kinds: list[str]) -> None:
 
 
 def _seed_local_route(connection: sa.engine.Connection) -> None:
-    source_version = connection.execute(
+    # Clone what is in force, not the highest version: a routing draft nothing references
+    # would otherwise become the new default. In force is what admin/routing.py reads, the
+    # latest non-retired default-software and the routing version it names. The maxima
+    # only number the new rows.
+    policy_row = connection.execute(
+        sa.text(
+            "SELECT document FROM policies WHERE name='default-software' "
+            "AND retired_at IS NULL ORDER BY version DESC LIMIT 1"
+        )
+    ).scalar_one_or_none()
+    if policy_row is None:
+        raise RuntimeError("no default-software policy is in force; 0017 has nothing to extend")
+    policy = copy.deepcopy(policy_row)
+    ref = (policy.get("routing") or {}).get("policy") or {}
+    if ref.get("name") != "default-routing" or ref.get("version") is None:
+        raise RuntimeError(f"the default-software policy in force names no default-routing: {ref}")
+    routing_row = connection.execute(
+        sa.text(
+            "SELECT document FROM routing_policies "
+            "WHERE name='default-routing' AND version=:version AND retired_at IS NULL"
+        ),
+        {"version": int(ref["version"])},
+    ).scalar_one_or_none()
+    if routing_row is None:
+        raise RuntimeError(f"default-routing/{ref['version']} is missing or retired")
+    routing = copy.deepcopy(routing_row)
+    routing_max = connection.execute(
         sa.text("SELECT max(version) FROM routing_policies WHERE name='default-routing'")
     ).scalar_one()
-    routing = copy.deepcopy(
-        connection.execute(
-            sa.text(
-                "SELECT document FROM routing_policies "
-                "WHERE name='default-routing' AND version=:version"
-            ),
-            {"version": source_version},
-        ).scalar_one()
-    )
     endpoint_url = (
         os.environ.get("CRUCIBLE_LOCAL_ENDPOINT_URL")
         or os.environ.get("CRUCIBLE_SPARK_ENDPOINT_URL")
@@ -64,7 +81,7 @@ def _seed_local_route(connection: sa.engine.Connection) -> None:
         )
     else:
         disabled_reason = "the local endpoint environment seed is not configured (0017_lab_local)"
-    routing_version = int(source_version) + 1
+    routing_version = int(routing_max) + 1
     routing["version"] = routing_version
     routing["models"] = [model for model in routing["models"] if model.get("harness") != "hermes"]
     routing["models"].append(
@@ -99,18 +116,10 @@ def _seed_local_route(connection: sa.engine.Connection) -> None:
         {"version": routing_version, "document": json.dumps(routing)},
     )
 
-    policy_source = connection.execute(
+    policy_max = connection.execute(
         sa.text("SELECT max(version) FROM policies WHERE name='default-software'")
     ).scalar_one()
-    policy = copy.deepcopy(
-        connection.execute(
-            sa.text(
-                "SELECT document FROM policies WHERE name='default-software' AND version=:version"
-            ),
-            {"version": policy_source},
-        ).scalar_one()
-    )
-    policy_version = int(policy_source) + 1
+    policy_version = int(policy_max) + 1
     policy["version"] = policy_version
     policy["description"] = POLICY_MARKER
     policy["routing"] = {"policy": {"name": "default-routing", "version": routing_version}}
