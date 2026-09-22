@@ -145,14 +145,14 @@ $ make lint
 ruff format --check, ruff check, mypy, lint-imports: 3 contracts kept, 0 broken
 
 $ make test
-tests/unit          760 passed in 9.86s
-tests/integration   349 passed in 328.65s (0:05:28)
+tests/unit          785 passed in 9.96s
+tests/integration   349 passed in 317.32s (0:05:17)
 
 $ make scan
 gitleaks: no leaks found, tree (4.05 MB) and history (8 commits)
 
 $ make e2e DOCKER='<the rootless daemon wrapper>'
-17 passed, 12 deselected in 89.76s (0:01:29)
+17 passed, 12 deselected in 92.11s (0:01:32)
 ```
 
 The Docker tier ran on the rootless daemon of the `crucible` service user
@@ -263,6 +263,21 @@ Each has a test. Findings 2 and 6 are worth noting together: both were cases whe
 provider's answer to "what is this worker doing" was "running" when the honest answer
 was "it is never going to run", which is the failure mode 16 is least able to recover
 from on its own.
+
+## The one red CI run, and the gap it exposed
+
+CI's `lint` failed once on a branch whose local `make lint` was clean. The cause was
+not a divergence between the two definitions: `main` gained the AGENTS.md shim rule
+(#51) while this branch was in review, which added a named argument to
+`preparer_script`. CI type-checks the merge of the branch with `main`; the branch alone
+type-checks against the older signature. Local was a perfect predictor of local, and
+that was the gap.
+
+What closes it is not a new check but an ordering rule: fetch and merge `main` before
+running the local tiers for a PR, not only before opening one. A long-lived branch that
+touches a shared helper (`scripts.py` here, which both providers call) is exactly the
+case where `main` moving underneath it changes the answer. The merge is recorded as its
+own commit so what came from where stays readable.
 
 ## What C8b needs from here
 
