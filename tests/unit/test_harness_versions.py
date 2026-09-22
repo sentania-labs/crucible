@@ -32,15 +32,6 @@ def legacy_labels(harness: str, version: str) -> dict[str, str]:
     return {"crucible.harness": harness, "crucible.harness_version": version}
 
 
-WORKER_LABELS = {
-    "crucible.harnesses": "agy,claude_code,codex,hermes",
-    "crucible.harness.agy.version": "1.2.8",
-    "crucible.harness.claude_code.version": "2.1.280",
-    "crucible.harness.codex.version": "0.156.0",
-    "crucible.harness.hermes.version": "0.19.0",
-}
-
-
 def _manifest() -> dict[str, str]:
     return {
         key: value
@@ -48,6 +39,20 @@ def _manifest() -> dict[str, str]:
         if "=" in line and not line.startswith("#")
         for key, value in [line.split("=", maxsplit=1)]
     }
+
+
+def _worker_labels() -> dict[str, str]:
+    """The labels images/build.sh writes for the worker image, read from the manifest
+    so this stays in step with the harness versions it pins, not a copy that goes
+    stale on the next pin bump."""
+    pairs = dict(pair.split(":", 1) for pair in _manifest()["WORKER_HARNESSES"].split(","))
+    return {
+        "crucible.harnesses": ",".join(pairs),
+        **{f"crucible.harness.{harness}.version": version for harness, version in pairs.items()},
+    }
+
+
+WORKER_LABELS = _worker_labels()
 
 
 def test_every_manifest_harness_version_is_supported_by_its_adapter() -> None:
@@ -73,10 +78,7 @@ def test_every_manifest_harness_version_is_supported_by_its_adapter() -> None:
 def test_the_worker_image_labels_are_checked_per_harness() -> None:
     """13, C11: the launch checks the version the image pins for the harness launched."""
     for harness, version in (
-        ("agy", "1.2.8"),
-        ("claude_code", "2.1.280"),
-        ("codex", "0.156.0"),
-        ("hermes", "0.19.0"),
+        pair.split(":", 1) for pair in _manifest()["WORKER_HARNESSES"].split(",")
     ):
         check = check_image_version(harness, WORKER_LABELS)
         assert check.ok, check.detail
