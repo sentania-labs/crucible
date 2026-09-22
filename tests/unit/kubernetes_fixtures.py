@@ -40,7 +40,7 @@ def build(
     **api_kwargs: Any,
 ) -> tuple[FakeKubernetesApi, FakeRegistry, KubernetesProvider]:
     api = FakeKubernetesApi(**api_kwargs)
-    registry = FakeRegistry()
+    registry = FakeRegistry(api)
     registry.register(IMAGE, harness=harness, version=version)
     provider = KubernetesProvider(
         config

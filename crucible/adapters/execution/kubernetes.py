@@ -130,6 +130,20 @@ JOB_TIMED_OUT = -2
 DRAIN_EXIT_CODE = 143
 KILL_EXIT_CODE = 137
 
+# 26's object table names the Jobs; `crucible.role` keeps the Docker provider's role
+# names, so one label means the same thing on both providers. The two differ for three
+# roles and that is the whole mapping.
+OBJECT_PREFIX: dict[str, str] = {
+    k8sspec.ROLE_PREPARER: "prepare",
+    k8sspec.ROLE_WORKER: "worker",
+    k8sspec.ROLE_COLLECTOR: "collect",
+    k8sspec.ROLE_BUNDLE: "verify-bundle",
+    k8sspec.ROLE_VERIFIER: "verifier",
+    k8sspec.ROLE_PUBLISHER: "publish",
+    k8sspec.ROLE_CLEANER: "cleaner",
+    k8sspec.ROLE_READER: "reader",
+}
+
 DEFAULT_IMAGE_ALLOWLIST: tuple[str, ...] = (
     "crucible-worker:*",
     "ghcr.io/sentania-labs/crucible-worker:*",
@@ -1558,7 +1572,7 @@ class KubernetesProvider:
         env: Mapping[str, str] | None = None,
     ) -> int:
         """Run one single-purpose Job to completion and delete it."""
-        name = k8sspec.object_name(role, spec.attempt_id)
+        name = k8sspec.object_name(OBJECT_PREFIX.get(role, role), spec.attempt_id)
         policy_name: str | None = None
         with contextlib.suppress(KubernetesApiError):
             await self._call(self.client.delete, "jobs", name)

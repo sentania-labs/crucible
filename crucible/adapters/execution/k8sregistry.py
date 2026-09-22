@@ -64,12 +64,11 @@ class ImageReference:
     def pinned(self, digest: str) -> str:
         """The immutable form of this reference, which is what an attempt records.
 
-        The tag is kept beside the digest (`repo:tag@sha256:...`, which a kubelet pulls
-        by digest) so the recorded image still says which tag resolved to it. The
-        policy allowlist is matched against the tag half, as 13 specifies."""
+        `repo@sha256:...`, the same shape the Docker provider records from the daemon's
+        `RepoDigests`, and the shape the attempt's `image_digest` column is sized for.
+        Which tag resolved to it stays on the execution row beside it (13)."""
         host = "" if self.registry == DOCKER_HUB else f"{self.registry}/"
-        tag = f":{self.tag}" if self.tag else ""
-        return f"{host}{self.repository}{tag}@{digest}"
+        return f"{host}{self.repository}@{digest}"
 
 
 def parse_reference(reference: str) -> ImageReference:

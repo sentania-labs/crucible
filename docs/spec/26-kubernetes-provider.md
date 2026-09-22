@@ -94,10 +94,10 @@ containers:
   volumeMounts:
   - {name: tmp, mountPath: /tmp}           # emptyDir, medium Memory, sizeLimit
   - {name: home, mountPath: /home/worker}  # emptyDir, medium Memory, sizeLimit
-  - {name: ws, mountPath: /crucible/workspace}      # PVC, rw for the worker
+  - {name: ws, mountPath: /crucible/repo, subPath: repo}    # PVC, rw for the worker
+  - {name: ws, mountPath: /crucible/report, subPath: report}
   - {name: identity, mountPath: /crucible/identity, readOnly: true}
   - {name: cred, mountPath: <adapter mount target>, readOnly: <not rw-narrow>}
-  - {name: report, mountPath: /crucible/report}     # subPath of ws
 automountServiceAccountToken: false
 serviceAccountName: crucible-worker      # a no-permission account
 enableServiceLinks: false
@@ -106,6 +106,18 @@ hostPID: false
 hostIPC: false
 terminationGracePeriodSeconds: <policy grace>
 ```
+
+The mount paths are the ones `crucible/ports/execution.py` defines and the
+identity bundle names (06): a worker is told its checkout is at
+`/crucible/repo` and its report directory at `/crucible/report`, so those are
+where they are mounted. Only the preparer gets the whole claim, at
+`/crucible/work`, the way the Docker preparer gets the whole workspace (08).
+(Corrected 2026-09-21 during C8a; the draft named one `/crucible/workspace`
+mount, which would have contradicted the bundle every worker reads.)
+
+A Secret volume is read-only in Kubernetes whatever the mount asks for, so the
+`readOnly: <not rw-narrow>` line above is the read-only case only. The
+`rw-narrow` case is below, under credentials.
 
 `--init` has no Kubernetes equivalent; the worker image's entrypoint
 already reaps and forwards signals (S5), and `terminationGracePeriodSeconds`
@@ -119,8 +131,12 @@ version; the field is reserved and documented as the microVM step.
 
 There is no Squid on the cluster. The workers namespace carries a default
 deny for ingress and egress, and the provider creates one NetworkPolicy per
-attempt for the roles that need egress, selecting that attempt's pods by
-label. The allowed destinations come from the same policy document that
+attempt **per role that needs egress**, selecting that attempt's pods of that
+role by label. A NetworkPolicy has one `podSelector`, so a single object per
+attempt would have to carry the union of every role's destinations, which
+would hand the worker GitHub and the collector the model endpoints; a role
+with no egress gets no object at all, because the namespace's default deny is
+already the answer for it. (Clarified 2026-09-21 during C8a.) The allowed destinations come from the same policy document that
 generates the proxy allowlist locally (05b routing pools, the adapter's
 declared endpoints, 13), resolved to CIDRs or FQDN rules where the CNI
 supports them:
@@ -135,6 +151,15 @@ supports them:
   gets the registries only when `required_verification` needs them and the
   policy says so).
 - login Job: the harness's login endpoints only.
+
+A `networking.k8s.io/v1` policy has no deny verb and no FQDN rule, so the
+allowlist's names are resolved to addresses when the policy is written and the
+names themselves are recorded in the object's `crucible.io/egress-hosts`
+annotation. A name that does not resolve refuses the launch rather than being
+dropped or widened, which is 13's rule for an attempt the egress path cannot
+actually permit. The denials below are the `except` of every allow, so a name
+that resolves into a denied range cannot open one. IPv6 never appears in a
+rule and is therefore denied entirely. (Made concrete 2026-09-21 during C8a.)
 
 Two destinations are denied explicitly, because a naive policy lets them
 through: cluster DNS is allowed on port 53 UDP and TCP to the cluster's DNS
@@ -190,10 +215,22 @@ the filesystem fingerprint come from the PVC through the reader Pod, and
 Each harness's dedicated credential directory becomes one Secret in
 `crucible-workers` that only the supervisor's ServiceAccount can read,
 delivered through the GitOps repository as a SealedSecret or ExternalSecret.
-Per attempt, the provider copies it into `cred-<attempt>`; a harness whose
-adapter declares `rw-narrow` gets that copy mounted writable and the
-provider reads the rotated file back into the harness Secret on a
-successful exit, exactly as the Docker provider syncs a rotated token today.
+Per attempt, the provider copies it into `cred-<attempt>`, taking only the
+auth files the adapter declares. A Secret key cannot hold a path separator, so
+a harness whose auth file sits in a subdirectory (AGY's token) is keyed with
+the separator replaced and the volume projects it back to its declared path.
+
+A read-only harness mounts `cred-<attempt>` directly, which is a tmpfs nothing
+writes and nothing stores. A harness whose adapter declares `rw-narrow` cannot:
+a Kubernetes Secret volume is read-only however it is mounted, and the three
+subscription harnesses refresh their own token in place (S1). So an init
+container copies the named files off the Secret's read-only projection into the
+`credential` leaf of the attempt's own claim, mode 0700 on the directory and
+0600 on each file, which is the same shape, the same properties and the same
+place the Docker provider puts it (12). The provider reads the rotated file
+back from there through the reader Pod and writes it into the harness Secret on
+a successful exit, exactly as the Docker provider syncs a rotated token today.
+(Made concrete 2026-09-21 during C8a.)
 The per-attempt Secret is deleted under every cleanup policy. The admin
 login flow (25) runs the harness's login in a login Job with the harness
 Secret writable and the device URL captured from the Pod log. Local
@@ -201,6 +238,13 @@ Hermes needs no credential; its Secret is absent and its launch spec says
 so.
 
 ## Observability and administration
+
+Attempt evidence that has no field of its own on the provider port (the Job and
+Pod names, the node, the effective limits, the pod PID limit and the
+NetworkPolicy applied) is stored as one `report/kubernetes-launch.json`
+artifact of the attempt, which carries an `artifact_present` evidence row like
+any other per-attempt fact Crucible observed (11). The image digest stays on
+the attempt row. (Made concrete 2026-09-21 during C8a.)
 
 `GET /providers` reports the Kubernetes provider with `isolation: pod`,
 `network_control: true`, `resource_limits: true`, `shared_disk: false`, the

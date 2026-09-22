@@ -60,7 +60,11 @@ class FakeRegistry:
     """The registry half: a reference resolves to a digest and the two labels a launch
     is refused on (07, 13)."""
 
-    def __init__(self) -> None:
+    def __init__(self, api: FakeKubernetesApi | None = None) -> None:
+        # A real registry answers a tag with a digest and the tag is gone from the
+        # reference the Pod runs. The fake records the mapping back so a role can still
+        # read the behaviour a test spelled in the tag.
+        self._api = api
         self.auths: dict[str, Any] = {}
         self._images: dict[str, ImageInfo] = {}
         self._tags: dict[str, list[str]] = {}
@@ -79,13 +83,15 @@ class FakeRegistry:
         if labels is not None:
             resolved = dict(labels)
         info = ImageInfo(
-            reference=f"{reference}@{digest}",
+            reference=f"{reference.split(':', maxsplit=1)[0]}@{digest}",
             digest=digest,
             harness=resolved.get("crucible.harness"),
             harness_version=resolved.get("crucible.harness_version"),
             labels=resolved,
         )
         self._images[reference] = info
+        if self._api is not None:
+            self._api.image_tags[info.reference] = reference
         repository = reference.rsplit(":", 1)[0]
         self._tags.setdefault(repository, []).append(reference.rsplit(":", 1)[-1])
         return info
@@ -152,6 +158,9 @@ class FakeKubernetesApi:
     logs: dict[str, list[str]] = field(default_factory=dict)
     workers: dict[str, _Worker] = field(default_factory=dict)
     scripts: dict[str, tuple[str, int]] = field(default_factory=dict)
+    # Which tag each resolved digest came from, so a role can read the behaviour a test
+    # spelled in the tag (a registry answers with a digest and the tag is gone).
+    image_tags: dict[str, str] = field(default_factory=dict)
     # What an attempt's roles act out when its image tag names no behaviour. The
     # integration tier sets it per case, because the image a routed task runs is the
     # promoted one and carries no behaviour in its tag.
@@ -408,8 +417,8 @@ class FakeKubernetesApi:
             return scripted
         image = ""
         for container in (obj.body.get("spec") or {}).get("containers") or []:
-            image = str(container.get("image", "")).split("@", 1)[0]
-        match = _TAG.match(image)
+            image = str(container.get("image", ""))
+        match = _TAG.match(self.image_tags.get(image, image).split("@", 1)[0])
         if match is None or match.group("behavior") not in BEHAVIORS:
             return self.default_behavior or ("succeed", 1)
         return match.group("behavior"), int(match.group("n") or 1)

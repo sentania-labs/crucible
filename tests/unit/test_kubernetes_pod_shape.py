@@ -27,10 +27,10 @@ from tests.unit.kubernetes_fixtures import build, pod_of, spec
 
 # Every object an attempt's roles produce, by the prefix its name carries.
 ROLE_PREFIXES = (
-    "preparer-",
+    "prepare-",
     "worker-",
-    "collector-",
-    "bundle-verifier-",
+    "collect-",
+    "verify-bundle-",
     "verifier-",
     "reader-",
     "cleaner-",
@@ -155,16 +155,16 @@ async def test_the_preparer_gets_the_whole_claim_and_the_collector_gets_it_read_
     def mounts(prefix: str) -> dict[str, Any]:
         return {m["mountPath"]: m for m in pod_of(api, prefix)["containers"][0]["volumeMounts"]}
 
-    preparer = mounts("preparer-")
+    preparer = mounts("prepare-")
     assert preparer[WORK_MOUNT]["readOnly"] is False and "subPath" not in preparer[WORK_MOUNT]
 
-    collector = mounts("collector-")
+    collector = mounts("collect-")
     # 08: the checkout and the report directory read-only, an output directory writable.
     assert collector[REPO_MOUNT]["readOnly"] is True
     assert collector[REPORT_MOUNT]["readOnly"] is True
     assert collector[OUTPUT_MOUNT]["readOnly"] is False
 
-    bundle = mounts("bundle-")
+    bundle = mounts("verify-bundle-")
     assert bundle[OUTPUT_MOUNT]["readOnly"] is True
 
     verifier = mounts("verifier-")
