@@ -52,14 +52,27 @@ real Docker daemon. Each step gates the next:
    pulling or rebuilding over the candidate before it then runs `make smoke`,
    which is
    `tools/smoke/compose_smoke.py`, the same file CI runs on every pull request.
-5. **Publish.** Whether the version already exists is decided by the registry
+5. **Prove and publish the worker images** (C11). `make images-publish` builds
+   the worker image (all four harness CLIs) and the script-harness image from
+   scratch on the fresh runner with the same `tools/images/images.sh` that
+   `make images` and CI's `images` job run, and refuses to push anything unless
+   every tag, harness version and OCI digest equals `images/manifest.env`. Each
+   OCI archive is then pushed to `ghcr.io/sentania-labs/crucible-worker:<tag>`
+   byte for byte (`tools/release/worker_images.py`), so the registry stores the
+   declared digest rather than a re-encoding of it. The never-overwrite rule is
+   the service image's: only an explicit 404 is absent; the declared digest
+   already there is a re-run and is skipped; any other digest stops the
+   release. Every published digest is read back at the end. This runs before
+   the version tag is pushed, so a release whose worker images cannot be proven
+   publishes nothing.
+6. **Publish.** Whether the version already exists is decided by the registry
    API, where only an explicit HTTP 404 means absent: a blip, a rate limit or an
    auth failure stops the job rather than being read as "not published". An
    existing version from this same commit is a re-run and the push is skipped;
    an existing version from a different commit means the tag was moved, which
    fails the job. Push `:latest` only when this version is the highest already
    published, so re-tagging an old fix does not move `latest` backwards.
-6. **Create the GitHub release** with generated notes, last, so a release never
+7. **Create the GitHub release** with generated notes, last, so a release never
    points at a version that is not consumable from the registry.
 
 The workflow uses the job's `GITHUB_TOKEN` with `packages: write` and

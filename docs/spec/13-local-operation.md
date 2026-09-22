@@ -53,7 +53,7 @@ exists only in its worker image; the Crucible service image carries none of
 them. The API form of login therefore cannot work on a normal deployment and
 refuses with that reason, and login is a local-mode operation run where the
 harness CLI is. Making the API form work anywhere means running the flow
-inside the promoted harness image, the way the probe does, with the pty and
+inside the promoted worker image, the way the probe does, with the pty and
 the operator's pasted code relayed through the daemon's attach stream; that
 is a follow-up phase, not a fix.
 
@@ -84,17 +84,36 @@ requirement.
 
 ## Worker images and harness version management
 
-One base image per harness version, built from `images/<harness>/Dockerfile`:
-Debian slim, non-root `worker` (uid 1000), git, curl, jq, the harness CLI
-at a pinned version, and nothing else. No `gh`: workers have no GitHub
+**One worker image carries every harness.** The operator decided on
+2026-09-22 at 3:09 PM (C11): "let's go with one image, it'll make the tests
+cheaper and easier in the long run." Before C11 there was one image per
+harness; now `images/worker/Dockerfile` builds a single image with Claude
+Code, Codex, AGY and Hermes, each CLI at its own pinned version and each
+downloaded by URL and verified against a sha256 computed when the pin was
+taken. It is Debian slim, non-root `worker` (uid 1000), git, curl, jq, the
+lab root CA, the Python runtime and hash-locked virtual environment Hermes
+needs, the four CLIs, and nothing else. No `gh`: workers have no GitHub
 credential to use it with. Where a CLI needs a companion binary to work at
-all, as Codex does for the 5.6 model family, the companion ships in the same
-image from the same pinned release, fetched by URL and verified against a
-recorded sha256 of the tarball, with its mtime set to the epoch (07, S11). Labels: `org.opencontainers.image.version`,
-`crucible.harness`, `crucible.harness_version`, `crucible.build_inputs`
-(hash). Reproducible: pinned base digest, pinned package versions,
+all, as Codex does for the 5.6 model family, the companion ships from the
+same pinned release, fetched and verified the same way, with its mtime set
+to the epoch (07, S11). Each adapter launches its CLI by absolute path
+inside the shared image, and Hermes's virtual environment is on PATH for
+the Hermes process only. The e2e image, `images/script-harness`, stays
+separate: it exists for CI.
+
+Tag: `crucible-worker:<YYYYMMDD>-<build>` for the worker image, where the
+date is the UTC day of `SOURCE_DATE_EPOCH` (the pinned inputs' instant) and
+`<build>` is the first twelve hex digits of the build-input hash, so any
+changed pin is a new tag; `crucible-worker:script-harness-<version>-<build>`
+for the e2e image. Labels: `org.opencontainers.image.version`,
+`crucible.harnesses` (the comma-separated list of harnesses the image
+carries), `crucible.harness.<name>.version` for each of them (read by
+`images/build.sh` from the Dockerfile's `ARG HARNESS_<NAME>_VERSION` lines),
+and `crucible.build_inputs` (hash). An image built before C11 carries
+`crucible.harness` and `crucible.harness_version` instead and is still read.
+Reproducible: pinned base digest, pinned package versions,
 `SOURCE_DATE_EPOCH`. Project-specific toolchains come from a per-project
-image the task contract names, built `FROM` the harness base; the
+image the task contract names, built `FROM` the worker image; the
 provider's image allowlist controls what may run.
 
 Rules:
@@ -106,19 +125,25 @@ Rules:
   honors `AGY_CLI_DISABLE_AUTO_UPDATE=1`; Codex has no environment
   variable, only the config key `check_for_update_on_startup=false`, which
   the Codex adapter passes at launch. S11 re-confirms on each promotion.
-- Every harness's image is a **declared pin**, never "the newest". Every
+- Every image is a **declared pin**, never "the newest". Every
   reproducible image carries the same `SOURCE_DATE_EPOCH` creation time, so
-  two tags of one harness tie and a choice by creation time is arbitrary;
+  two tags of one image tie and a choice by creation time is arbitrary;
   a live run picked a stale tag exactly that way. `images/build.sh` writes
-  `images/manifest.env` with the tag and OCI manifest digest per harness,
-  and the e2e and live tiers read it. Recording is not a build input, so
+  `images/manifest.env` with, per image, the tag, the OCI manifest digest
+  and the harness versions it carries (`WORKER`, `WORKER_DIGEST`,
+  `WORKER_HARNESSES`, and the same three for `SCRIPT_HARNESS`); the e2e and
+  live tiers and the release read it. Recording is not a build input, so
   writing the manifest never changes a tag. `make lint` and `make e2e`
-  execute `images/check-manifest.sh`, which runs the tag calculation in
-  `build.sh` without building and refuses a stale declared pin. A launch is
-  refused when more than one tag matches a harness and the manifest pins none.
-- An image is launched with a harness's credential only when it carries a
-  `crucible.harness` label equal to the requested harness (07). No label,
-  or a different one, is a refusal before anything is seeded.
+  execute `images/check-manifest.sh`, which runs the tag and label
+  calculation in `build.sh` without building and refuses a stale tag or
+  harness list, and the unit tier holds every recorded harness version
+  inside its adapter's tested range. A launch is refused when more than one
+  tag matches and the manifest pins none.
+- An image is launched with a harness's credential only when its
+  `crucible.harnesses` label lists the requested harness and its
+  `crucible.harness.<name>.version` label is inside the adapter's tested
+  range (07). No list, a list without the harness, or no version label for
+  it is a refusal before anything is seeded.
 - Every attempt records the image digest it ran, resolved at launch.
   Retries and corrections of a task keep that digest unless Foundry
   explicitly authorizes a different image in the correction contract.
@@ -126,24 +151,28 @@ Rules:
   installed versions (from image labels of allowlisted images) and the
   supported range; a launch with an unsupported combination is refused
   with a wake, never a warning.
-- Images are built locally. Versioned, digest-pinned images
-  publish to `ghcr.io/sentania-labs/crucible-worker` once the live harness
-  phase and the release workflow exist. The current images on the rootless
-  daemon, with `images/manifest.env` as the authoritative record:
-
-  | Harness | Tag |
-  |---|---|
-  | `claude_code` | `crucible-worker:claude_code-2.1.273-1d43260eec11` |
-  | `codex` | `crucible-worker:codex-0.153.4-8cc315ca7aab` |
-  | `agy` | `crucible-worker:agy-1.2.4-975aff4033e0` |
-  | `hermes` | `crucible-worker:hermes-0.19.0-ced6620edef7` |
-  | `script-harness` | `crucible-worker:script-harness-1.0.0-88cd22bf214a` |
-
-  `build.sh` is itself a hashed build input, so editing it retags every
-  image; the previous tags stay on the daemon as the rollback. CI builds
-  the script image from the same inputs and so gets the same tag, which is
-  how its e2e job and the pin agree without a push. The CI lint job calls the
-  same `make lint` definition as a local run, so drift is rejected in both.
+- `make images` builds both images (C11, FDY-0072). The rootless daemon's
+  service user cannot read a checkout under the operator's home, so the
+  target copies `images/` to a scratch directory it can read, runs
+  `build.sh` there, and writes `images/manifest.env` back. `images/manifest.env`
+  is the authoritative record of the current tags; this document does not
+  copy them.
+- CI's `images` job runs the same script as `make images-check`: it builds
+  both images from the pinned inputs on a fresh runner and fails if any tag,
+  harness version or OCI digest differs from `images/manifest.env`. Pull
+  requests import a BuildKit layer cache; every push to main builds from
+  scratch before exporting it.
+- The release publishes both to `ghcr.io/sentania-labs/crucible-worker`
+  (`make images-publish`, 24): it builds from scratch, refuses to push
+  unless the build reproduces the manifest, pushes each OCI archive as
+  built so the registry holds the declared digest, never over a tag that
+  already carries another digest, and reads every published digest back.
+  A cluster resolves the worker image there (`kubernetes.image_repositories`,
+  26); a compose deployment uses the local daemon's `crucible-worker` images.
+- `build.sh` is itself a hashed build input, so editing it retags every
+  image; the previous tags stay on the daemon and in the registry as the
+  rollback. The CI lint job calls the same `make lint` definition as a
+  local run, so drift is rejected in both.
 
 Image promotion (a Crucible repository process, C8):
 
@@ -158,8 +187,14 @@ Image promotion (a Crucible repository process, C8):
 6. The supported-version declaration is updated in the same PR.
 7. Merge and tag publish the image to GHCR with its digest.
 8. `POST /images/{digest}/promote` to `default` is an explicit admin act,
-   recorded as a decision. The previous default becomes `retained`.
-9. At least one known-good prior version stays `retained` for rollback.
+   recorded as a decision. The worker image carries all four harnesses, so
+   one promotion switches all four; every harness it carries must be inside
+   its adapter's range or the promotion is refused whole. A previous default
+   the new image fully covers becomes `retained`.
+9. At least one known-good prior digest stays `retained` for rollback.
+   **Rollback is promoting the previous digest, and it rolls all four
+   harnesses back together** (C11): with one image there is no rolling back
+   one harness alone.
 
 ## Docker authority, stated honestly
 

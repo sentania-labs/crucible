@@ -47,7 +47,7 @@ Spec 26's checklist, made concrete. Each row is either a placeholder in
 | 3 | A `ReadWriteOnce` storage class for PostgreSQL, the reference cache and the attempt workspaces | `REPLACE_ME_STORAGE_CLASS_RWO` |
 | 3b | A `ReadWriteMany` storage class for the artifact root | `REPLACE_ME_STORAGE_CLASS_RWX` |
 | 4 | A pod PID limit configured on the nodes (a kubelet setting) | reported on the status page; the provider refuses to launch without one |
-| 5 | The cluster can pull `ghcr.io/sentania-labs/crucible` and the worker images; a pull secret if the packages are private | `REPLACE_ME_IMAGE_PULL_SECRET` |
+| 5 | The cluster can pull `ghcr.io/sentania-labs/crucible` and `ghcr.io/sentania-labs/crucible-worker` (the release publishes both); a pull secret if the packages are private | `REPLACE_ME_IMAGE_PULL_SECRET` |
 | 6 | Egress from `crucible-workers` to the model providers, the package registries, GitHub and the Spark is possible at the network edge | the per-attempt NetworkPolicy narrows it; the edge must not block it |
 | 7 | The Argo Application | `argocd/application.yaml`, with `REPLACE_ME_ARGOCD_PROJECT`, `REPLACE_ME_MANIFEST_REPO_URL`, `REPLACE_ME_MANIFEST_REVISION` |
 | 8 | Nothing: public DNS is the operator's alone (below) | - |
@@ -65,7 +65,7 @@ Spec 26's checklist, made concrete. Each row is either a placeholder in
 | `REPLACE_ME_RENDER_TIMEZONE` | `overlays/lab/settings.yaml` | the operator's IANA zone. Stored time is UTC; this is only how it is rendered (01) |
 | `REPLACE_ME_IMAGE_PULL_SECRET` | `overlays/lab/settings.yaml`, `overlays/lab/pull-secret.yaml` | the pull secret's name, in both namespaces. Delete the `pull-secret.yaml` patch and blank the setting when the packages are public |
 | `REPLACE_ME_LOCAL_ENDPOINT_CIDRS` | `overlays/lab/settings.yaml` | the resolved address of the local endpoint host, as a `/32`. Reviewed when the gateway moves |
-| `REPLACE_ME_PROBE_IMAGE` | `overlays/lab/settings.yaml` comment | one exact, pullable worker image reference. 26's readiness canary runs it, and a bare repository would mean `:latest` to a kubelet. The committed default is blank, so set it only when an exact reference is available. |
+| `REPLACE_ME_PROBE_IMAGE` | `overlays/lab/settings.yaml` comment | the one worker image reference, exact: `ghcr.io/sentania-labs/crucible-worker:<tag>` with the `WORKER=` tag of `images/manifest.env` at the release being deployed. 26's readiness canary runs it, and a bare repository would mean `:latest` to a kubelet. The committed default is blank, so set it only when that release's worker image is published. |
 | `REPLACE_ME_ARGOCD_PROJECT`, `REPLACE_ME_MANIFEST_REPO_URL`, `REPLACE_ME_MANIFEST_REVISION` | `argocd/application.yaml` | the Argo project, the repository holding these manifests, and an exact tag or commit. Never a branch: this field plus the pinned image tag are the deployment's record of what is running |
 | `REPLACE_ME_SECRET_STORE_NAME`, `REPLACE_ME_REMOTE_PATH` | `secret-shapes/external/database.yaml` | only on a cluster using external-secrets instead of sealed ones |
 
@@ -130,8 +130,8 @@ drift nor prunes them.
 Once the api is reachable, sign in at `/ui` with that token and, for each harness
 (25, step by step in that document):
 
-1. **Credentials**: start the login. The service runs the harness's own CLI inside that
-   harness's promoted worker image, with the credential Secret writable and no
+1. **Credentials**: start the login. The service runs the harness's own CLI inside the
+   promoted worker image, with the credential Secret writable and no
    workspace, and captures the device or browser URL from the Pod log. Finish the
    authorization with the provider; the code has a window (Codex fifteen minutes, AGY
    sixty seconds, Claude Code's pasted token).
@@ -143,8 +143,17 @@ Once the api is reachable, sign in at `/ui` with that token and, for each harnes
 4. **Harnesses**: flip the administrator's runtime gate. Both gates have to say yes: the
    configuration gate is the `CRUCIBLE_HARNESSES__*` entries in the settings ConfigMap
    and changing one is an edit and a restart; the runtime gate is this page.
-5. **Images**: promote one worker image digest per harness to `default`. A launch is
-   refused without one.
+5. **Images**: promote the worker image to `default`. There is one worker image and it
+   carries all four harnesses (the operator's decision of 2026-09-22), so this is one
+   promotion, and the Images page lists the version of each harness it carries. A
+   launch is refused without it. The registry the page lists is
+   `CRUCIBLE_KUBERNETES__IMAGE_REPOSITORIES`, which the base settings already set to
+   `["ghcr.io/sentania-labs/crucible-worker"]`; compose deployments list the local
+   daemon's `crucible-worker` images instead and need no setting.
+
+**Rolling the worker image back** is promoting the previous digest from the same page.
+Because one image carries all four harnesses, that rolls all four back together; there is
+no way to roll back one harness alone, which is the trade the one-image decision made.
 
 For Hermes, use **Routing** to set the HTTPS `/v1` gateway URL, model `coder`, thinking
 preference, enabled state, and pool concurrency. Saving creates immutable policy
