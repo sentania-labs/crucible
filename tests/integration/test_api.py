@@ -190,9 +190,10 @@ def test_submit_shape_errors_name_the_path(client: TestClient) -> None:
 def test_only_registered_providers_are_accepted(
     client: TestClient, ctx: AppContext, clock: FakeClock, tokens: dict[str, str]
 ) -> None:
-    """C3 registered the Docker provider (08, 20); Kubernetes is designed, not built."""
+    """C3 registered the Docker provider and C8a the Kubernetes one (08, 20, 26); the
+    host-process provider stays designed and not built."""
     doc = contract_document()
-    doc["execution_request"]["provider"] = "kubernetes"
+    doc["execution_request"]["provider"] = "hostprocess"
     doc["execution_request"].pop("image")
     r = client.post("/v1/tasks", json=doc)
     assert r.status_code == 422
