@@ -31,10 +31,11 @@ import json
 import logging
 import os
 import shutil
+import socket
 import tarfile
 import tempfile
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from io import BytesIO
 from pathlib import Path
@@ -106,6 +107,9 @@ from crucible.ports.harness import AuthFile, CredentialSpec, ExitInfo, LaunchCon
 log = logging.getLogger("crucible.provider.kubernetes")
 
 PROVIDER_NAME = "kubernetes"
+
+# A name to the addresses a NetworkPolicy may name.
+Resolver = Callable[[str], list[str]]
 
 # Where `prepare` records which ConfigMap key is which bundle file, so `launch` projects
 # every file back to the relative path the bundle hash covers.
@@ -180,6 +184,15 @@ class KubernetesConfig:
     # else on it; every other destination inside the cluster stays denied.
     cluster_dns_ip: str = "10.96.0.10"
     denied_cidrs: tuple[str, ...] = k8sspec.DEFAULT_DENIED_CIDRS
+    # 26: the allowlist is "resolved to CIDRs or FQDN rules where the CNI supports
+    # them". A plain `networking.k8s.io/v1` CNI has no FQDN rule, so the names are
+    # resolved here and the policy carries their addresses. Turning this off gives the
+    # broad rule instead ("the public internet on 443, minus every denied range"), which
+    # a deployment may want when its CNI enforces names some other way; it is off by
+    # default because that rule would let a worker reach GitHub, and 26 says it cannot.
+    broad_egress: bool = False
+    # How long a resolved address stays in a policy before it is looked up again.
+    resolve_ttl_seconds: float = 300.0
     extra_image_allowlist: tuple[str, ...] = ()
     # The harness credential Secrets in the workers namespace, by harness name (12, 26).
     credential_secrets: Mapping[str, str] = field(default_factory=dict)
@@ -263,8 +276,12 @@ class KubernetesProvider:
         client: KubernetesClient,
         registry: RegistryClient,
         harnesses: HarnessRegistry | None = None,
+        resolver: Resolver | None = None,
     ) -> None:
         self.config = config
+        # Injected so the unit tier resolves without a network and the e2e tier can
+        # point at the cluster's own DNS.
+        self.resolve = resolver or _resolve_host
         self.client = client
         self.registry = registry
         self.harnesses = harnesses or default_registry()
@@ -274,6 +291,7 @@ class KubernetesProvider:
         self.probe: NamespaceProbe | None = None
         self._quota_concurrency: int | None = None
         self._pull_auths_loaded = False
+        self._resolved: dict[str, tuple[float, tuple[str, ...]]] = {}
 
     # ----- helpers -----------------------------------------------------
 
@@ -1287,6 +1305,7 @@ class KubernetesProvider:
         policy at all: the namespace's default deny is already the answer for it."""
         if plan.empty:
             return None
+        plan = await self._resolve_plan(plan)
         name = k8sspec.object_name(f"np-{role}", spec.attempt_id)
         body = k8sspec.egress_policy(
             name=name,
@@ -1300,6 +1319,35 @@ class KubernetesProvider:
         )
         await self._create("networkpolicies", body)
         return name
+
+    async def _resolve_plan(self, plan: EgressPlan) -> EgressPlan:
+        """Turn the allowlist's names into the addresses a CIDR-only CNI can enforce.
+
+        A name that does not resolve refuses the launch rather than being dropped or
+        widened, which is the Docker provider's rule for the same situation: an attempt
+        whose allowlist the egress path cannot actually permit is refused, never run
+        with less network than the policy promised (13)."""
+        if self.config.broad_egress or not plan.hosts:
+            return replace(plan, broad=self.config.broad_egress)
+        cidrs: list[str] = []
+        unresolved: list[str] = []
+        now = time.monotonic()
+        for host in plan.hosts:
+            cached = self._resolved.get(host)
+            if cached is not None and now - cached[0] < self.config.resolve_ttl_seconds:
+                addresses = cached[1]
+            else:
+                addresses = tuple(await self._call(self.resolve, host))
+                self._resolved[host] = (now, addresses)
+            if not addresses:
+                unresolved.append(host)
+            cidrs.extend(addresses)
+        if unresolved:
+            raise ProviderError(
+                "the egress allowlist names hosts that do not resolve to an address, so "
+                f"no NetworkPolicy can permit them: {sorted(unresolved)}"
+            )
+        return replace(plan, cidrs=tuple(dict.fromkeys(cidrs)))
 
     # ----- credentials (12) ---------------------------------------------
 
@@ -1833,6 +1881,18 @@ class KubernetesProvider:
 
 
 # ----- pure helpers -------------------------------------------------------
+
+
+def _resolve_host(host: str) -> list[str]:
+    """Every IPv4 address a name resolves to, as /32 CIDRs. IPv6 is never emitted: no
+    rule of this provider's policies carries a v6 block, so a v6 destination is denied
+    by never appearing (26)."""
+    try:
+        infos = socket.getaddrinfo(host, None, family=socket.AF_INET, type=socket.SOCK_STREAM)
+    except OSError:
+        return []
+    return sorted({f"{info[4][0]}/32" for info in infos})
+
 
 # Returned by `_read_files` for a path that was larger than the read limit. A distinct
 # object so "the file was too big" is never confused with "the file held these bytes".

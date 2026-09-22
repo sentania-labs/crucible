@@ -409,20 +409,24 @@ def secret(
 
 @dataclass(frozen=True, slots=True)
 class EgressPlan:
-    """What one role may reach. `hosts` are names the allowlist carries and `endpoints`
-    are exact `address:port` destinations (a local model route, 05b, S16).
+    """What one role may reach.
 
-    A `networking.k8s.io/v1` CNI cannot express a hostname, so `hosts` becomes "the
-    public internet on 443, minus every range 26 denies" and the names themselves are
-    recorded in the policy's annotation. That is weaker than the Squid allowlist the
-    Docker provider gets and the difference is deliberate and written down: the
-    denials 26 lists by name (the API server, the node network, other namespaces, the
-    link-local range, the lab's private ranges) are all enforced, and narrowing the
-    public half further needs a CNI with FQDN rules."""
+    `hosts` are the names the allowlist carries, which is the record of what the policy
+    authorized; `cidrs` are those names resolved to addresses, which is what a
+    `networking.k8s.io/v1` CNI can actually enforce (26: "resolved to CIDRs or FQDN
+    rules where the CNI supports them"); `endpoints` are exact `address:port`
+    destinations for a local model route (05b, S16).
+
+    `broad` is the opt-out: a deployment whose CNI enforces FQDN rules some other way
+    can ask for "the public internet on 443, minus every range 26 denies" instead of a
+    resolved set. It is off by default, because that rule would let a worker reach
+    GitHub, and 26 says a worker cannot."""
 
     hosts: tuple[str, ...] = ()
+    cidrs: tuple[str, ...] = ()
     endpoints: tuple[str, ...] = ()
     https_port: int = 443
+    broad: bool = False
 
     @property
     def empty(self) -> bool:
@@ -448,6 +452,18 @@ def _endpoint_rule(endpoint: str) -> dict[str, Any]:
         "to": [{"ipBlock": {"cidr": f"{parsed}/32"}}],
         "ports": [{"protocol": "TCP", "port": int(port)}],
     }
+
+
+def _covered(cidr: str, denied: Sequence[str]) -> list[str]:
+    """Which denied ranges fall inside an allowed one. A hostname that resolves into a
+    lab range must not become a hole in the denials the same policy just made."""
+    network = ipaddress.ip_network(cidr)
+    out: list[str] = []
+    for entry in denied:
+        candidate = ipaddress.ip_network(entry)
+        if isinstance(candidate, type(network)) and candidate.subnet_of(network):  # type: ignore[arg-type]
+            out.append(entry)
+    return out
 
 
 def egress_policy(
@@ -485,12 +501,25 @@ def egress_policy(
             }
         )
     if plan.hosts:
-        rules.append(
-            {
-                "to": [{"ipBlock": {"cidr": "0.0.0.0/0", "except": list(denied_cidrs)}}],
-                "ports": [{"protocol": "TCP", "port": plan.https_port}],
-            }
+        # The resolved addresses of the allowlist, each excepted against 26's denials so
+        # a name that resolves into the lab's own range cannot smuggle one back in.
+        destinations: list[dict[str, Any]] = (
+            [{"ipBlock": {"cidr": "0.0.0.0/0", "except": list(denied_cidrs)}}]
+            if plan.broad
+            else [
+                {"ipBlock": {"cidr": cidr, "except": _covered(cidr, denied_cidrs)}}
+                if _covered(cidr, denied_cidrs)
+                else {"ipBlock": {"cidr": cidr}}
+                for cidr in plan.cidrs
+            ]
         )
+        if destinations:
+            rules.append(
+                {
+                    "to": destinations,
+                    "ports": [{"protocol": "TCP", "port": plan.https_port}],
+                }
+            )
     rules.extend(_endpoint_rule(endpoint) for endpoint in plan.endpoints)
     return {
         "apiVersion": "networking.k8s.io/v1",

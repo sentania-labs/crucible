@@ -62,9 +62,14 @@ class ImageReference:
         return self.digest or self.tag or "latest"
 
     def pinned(self, digest: str) -> str:
-        """The immutable form of this reference, which is what an attempt records."""
+        """The immutable form of this reference, which is what an attempt records.
+
+        The tag is kept beside the digest (`repo:tag@sha256:...`, which a kubelet pulls
+        by digest) so the recorded image still says which tag resolved to it. The
+        policy allowlist is matched against the tag half, as 13 specifies."""
         host = "" if self.registry == DOCKER_HUB else f"{self.registry}/"
-        return f"{host}{self.repository}@{digest}"
+        tag = f":{self.tag}" if self.tag else ""
+        return f"{host}{self.repository}{tag}@{digest}"
 
 
 def parse_reference(reference: str) -> ImageReference:

@@ -79,7 +79,7 @@ class FakeRegistry:
         if labels is not None:
             resolved = dict(labels)
         info = ImageInfo(
-            reference=f"{reference.split(':', maxsplit=1)[0]}@{digest}",
+            reference=f"{reference}@{digest}",
             digest=digest,
             harness=resolved.get("crucible.harness"),
             harness_version=resolved.get("crucible.harness_version"),
@@ -391,7 +391,7 @@ class FakeKubernetesApi:
             return scripted
         image = ""
         for container in (obj.body.get("spec") or {}).get("containers") or []:
-            image = str(container.get("image", ""))
+            image = str(container.get("image", "")).split("@", 1)[0]
         match = _TAG.match(image)
         if match is None:
             return "succeed", 1
