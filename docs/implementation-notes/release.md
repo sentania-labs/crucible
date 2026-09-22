@@ -41,10 +41,12 @@ real Docker daemon. Each step gates the next:
    not the published one.
    `CRUCIBLE_IMAGE` pins compose to this run's versioned local tag and
    `--pull never` forbids the registry, so a v0.2.0 run cannot boot the
-   published v0.1.0. Compose will still build when an image is absent, because
-   the services carry a `build:` section, so the step compares the running
-   containers' image IDs against the freshly built one rather than trusting the
-   pull policy. It then runs `make smoke`, which is
+   published v0.1.0. `tools/release/compose_images.py` resolves the Compose
+   model as JSON with every profile active. It identifies candidate services by
+   comparing each resolved image with `CRUCIBLE_IMAGE`, pulls only the other
+   services, and checks every candidate service container against the freshly
+   built image ID. The container lookup includes exited one-shot services. It
+   then runs `make smoke`, which is
    `tools/smoke/compose_smoke.py`, the same file CI runs on every pull request.
 5. **Publish.** Whether the version already exists is decided by the registry
    API, where only an explicit HTTP 404 means absent: a blip, a rate limit or an
@@ -94,10 +96,11 @@ The gates behaved correctly: the smoke failed, the publish and release steps
 were skipped, nothing reached GHCR and no GitHub release was created. The cost
 was a burnt tag, not a bad artifact.
 
-The fix pulls every service except the candidate by name before the smoke, so a
-service added later is covered without anyone remembering to update a list, and
-leaves `--pull never` in place so the candidate itself can still never be
-fetched from the registry.
+The initial fix pulled every service except a hand-written candidate service
+list before the smoke and left `--pull never` in place. That repaired the fresh
+runner failure, but the service-name exclusion later drifted when another
+service began using the candidate image. The third live run below replaces the
+name list with resolved-image classification.
 
 Reproduced locally before fixing. The workstation's copy of the pinned postgres
 image could not be removed, because containers belonging to other projects were
@@ -154,6 +157,25 @@ acceptance, rather than stopping at the report.
 The release workflow keeps the guards that are genuinely release-only: the
 supporting-image pre-pull, `--pull never`, the running-container image ID
 assertion, and the fail-closed GHCR manifest check.
+
+## Third live run: a candidate service looked like supporting infrastructure
+
+The v0.3.0 run (`35638978974`) failed before Compose booted. C7a added the
+one-shot `credential-init` service on `${CRUCIBLE_IMAGE}`, but the release
+workflow's candidate exclusions still named only `crucible` and `migrate`.
+The supporting-image loop therefore asked GHCR for the unpublished `0.3.0`
+candidate and received `manifest unknown`. Nothing was published.
+
+The fix has one classifier in `tools/release/compose_images.py`. Both the pull
+operation and the post-boot identity check consume its resolved Compose image
+classification. The release workflow calls it through Make targets, and the CI
+compose-smoke job runs its classify-only mode before boot. A unit test fixes the
+current candidate set at `credential-init`, `crucible`, and `migrate`, and also
+requires a service without an image to fail with its service name.
+
+This closes the local and CI divergence: release alone had a service-name pull
+list, while local and CI only exercised normal Compose boot; all three now use
+the shared resolved-image classifier before a tag can publish.
 
 ## Who pushes the tag
 
