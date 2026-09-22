@@ -152,7 +152,7 @@ $ make scan
 gitleaks: no leaks found, tree (4.05 MB) and history (8 commits)
 
 $ make e2e DOCKER='<the rootless daemon wrapper>'
-17 passed, 12 deselected in 99.26s (0:01:39)
+17 passed, 12 deselected in 108.22s (0:01:48)
 ```
 
 The Docker tier ran on the rootless daemon of the `crucible` service user
