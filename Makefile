@@ -9,6 +9,15 @@
 #     XDG_RUNTIME_DIR=/run/user/999 DOCKER_HOST=unix:///run/user/999/docker.sock docker'
 #
 # CI has an ordinary rootful daemon and needs none of that: DOCKER stays `docker`.
+#
+# That service user cannot read a checkout under the operator's home (mode 750), so a
+# build on its daemon cannot use images/ in place. `make images` (FDY-0072) copies
+# images/ to a scratch directory it can read, builds the worker image and the
+# script-harness image there with images/build.sh, and writes images/manifest.env
+# back. CI and the release run the same script through `images-check` and
+# `images-publish`; on their rootful daemon the staging is merely harmless:
+#
+#   make images DOCKER='<the rootless daemon wrapper above>'
 DOCKER ?= docker
 COMPOSE ?= $(DOCKER) compose
 # Normal local and CI boots build from the working tree. Release passes
@@ -50,7 +59,7 @@ CRUCIBLE_DEPLOY_PORT ?= 8080
 .PHONY: up dev down reset lint check-image-manifest scan scan-tree scan-history smoke test test-unit \
 	test-integration e2e e2e-github e2e-live e2e-admin e2e-image build proxy-config proxies preflight \
 	e2e-kind manifests deploy-kind release-images-classify release-images-pull release-images-verify \
-	deploy-local deploy-local-down
+	deploy-local deploy-local-down images images-check images-publish
 
 up: preflight proxy-config ## normal mode: postgres, proxies, migrate, crucible
 	@test -f .env || cp .env.example .env
@@ -118,6 +127,27 @@ lint: check-image-manifest
 
 check-image-manifest: ## fail when a declared worker-image tag is stale
 	images/check-manifest.sh
+
+# The worker images (13, C11). One worker image carries Claude Code, Codex, AGY and
+# Hermes; the script-harness image is the e2e tier's. All three targets build both from
+# a staged copy of images/ (see the header) with images/build.sh.
+#
+# CACHE_DIR is a BuildKit layer cache directory that CI keeps between runs; it never
+# changes a digest. NO_CACHE=1 builds from scratch. WORKER_REGISTRY is where the
+# release publishes; nothing else pushes, and no credential is ever a value here (the
+# release passes REGISTRY_USERNAME and REGISTRY_PASSWORD in the environment).
+WORKER_REGISTRY ?= ghcr.io/sentania-labs/crucible-worker
+CACHE_DIR ?=
+NO_CACHE ?=
+images: ## FDY-0072: build both images from a staged copy the daemon's user can read; writes images/manifest.env
+	DOCKER="$(DOCKER)" CACHE_DIR="$(CACHE_DIR)" NO_CACHE="$(NO_CACHE)" tools/images/images.sh build
+
+images-check: ## build both images and fail if any tag, harness version or OCI digest differs from images/manifest.env
+	DOCKER="$(DOCKER)" CACHE_DIR="$(CACHE_DIR)" NO_CACHE="$(NO_CACHE)" tools/images/images.sh check
+
+images-publish: ## release only: images-check, then push each OCI archive to WORKER_REGISTRY, never over another digest
+	DOCKER="$(DOCKER)" CACHE_DIR="$(CACHE_DIR)" NO_CACHE="$(NO_CACHE)" \
+	  WORKER_REGISTRY="$(WORKER_REGISTRY)" tools/images/images.sh publish
 
 scan: scan-tree scan-history ## secret scan; needs gitleaks on PATH
 
