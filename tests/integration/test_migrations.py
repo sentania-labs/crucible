@@ -335,11 +335,14 @@ def test_0017_seeds_from_the_routing_in_force_not_an_unreferenced_draft(
             ),
             {"version": in_force},
         ).scalar_one()
-        draft_version = int(
-            conn.execute(
-                text("SELECT max(version) FROM routing_policies WHERE name='default-routing'")
-            ).scalar_one()
-        ) + 1
+        draft_version = (
+            int(
+                conn.execute(
+                    text("SELECT max(version) FROM routing_policies WHERE name='default-routing'")
+                ).scalar_one()
+            )
+            + 1
+        )
         draft = json.loads(json.dumps(routing))
         draft["version"] = draft_version
         experiment = {
