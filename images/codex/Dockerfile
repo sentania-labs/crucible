@@ -48,6 +48,7 @@ ARG GIT_VERSION=1:2.39.5-0+deb12u3
 ARG CURL_VERSION=7.88.1-10+deb12u15
 ARG JQ_VERSION=1.6-2.1+deb12u2
 ARG CA_CERTIFICATES_VERSION=20250419~deb12u1
+ARG LAB_CA_SHA256=567f110bb80bb2179b44995c78c7a49a4149085a59f6acb73cf37c6503a0481a
 RUN set -eu; \
     printf '%s\n' \
         'Types: deb' \
@@ -75,6 +76,10 @@ RUN set -eu; \
     groupadd --gid 1000 worker; \
     useradd --uid 1000 --gid 1000 --create-home --home-dir /home/worker --shell /bin/bash worker; \
     find / -xdev -type f -perm /6000 -exec chmod a-s {} +
+COPY ca/sentania-lab-root.crt /usr/local/share/ca-certificates/sentania-lab-root.crt
+RUN set -eu; \
+    echo "${LAB_CA_SHA256}  /usr/local/share/ca-certificates/sentania-lab-root.crt" | sha256sum -c -; \
+    update-ca-certificates
 # The snapshot sources stay in place on purpose: a per-project image built
 # FROM this one that runs a plain apt-get update gets the same frozen
 # package set. Check-Valid-Until: no lives in the stanzas, not on the
@@ -92,6 +97,9 @@ COPY --from=fetch /fetch/codex-code-mode-host /usr/local/bin/codex-code-mode-hos
 # passes at launch (codex -c check_for_update_on_startup=false) because the
 # config directory is the credential mount, not part of this image. The
 # read-only root makes "codex update" fail regardless (S7, S11).
-ENV HOME=/home/worker
+ENV HOME=/home/worker \
+    NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt \
+    SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+    REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
 USER 1000:1000
 WORKDIR /home/worker

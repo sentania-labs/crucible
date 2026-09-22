@@ -15,6 +15,7 @@ ARG GIT_VERSION=1:2.39.5-0+deb12u3
 ARG CURL_VERSION=7.88.1-10+deb12u15
 ARG JQ_VERSION=1.6-2.1+deb12u2
 ARG CA_CERTIFICATES_VERSION=20250419~deb12u1
+ARG LAB_CA_SHA256=567f110bb80bb2179b44995c78c7a49a4149085a59f6acb73cf37c6503a0481a
 ARG PYTHON3_VERSION=3.11.2-1+b1
 ARG PYTHON3_VENV_VERSION=3.11.2-1+b1
 RUN set -eu; \
@@ -47,17 +48,24 @@ RUN set -eu; \
     useradd --uid 1000 --gid 1000 --create-home --home-dir /home/worker --shell /bin/bash worker; \
     python3 -m venv /opt/hermes; \
     find / -xdev -type f -perm /6000 -exec chmod a-s {} +
-COPY requirements.lock /tmp/requirements.lock
+COPY ca/sentania-lab-root.crt /usr/local/share/ca-certificates/sentania-lab-root.crt
+RUN set -eu; \
+    echo "${LAB_CA_SHA256}  /usr/local/share/ca-certificates/sentania-lab-root.crt" | sha256sum -c -; \
+    update-ca-certificates
+COPY hermes/requirements.lock /tmp/requirements.lock
 COPY --from=fetch /fetch/hermes_agent-0.19.0-py3-none-any.whl /fetch/hermes_agent-0.19.0-py3-none-any.whl
 RUN set -eu; \
     /opt/hermes/bin/pip install --no-cache-dir --require-hashes -r /tmp/requirements.lock; \
     /opt/hermes/bin/pip install --no-cache-dir --no-deps --force-reinstall /fetch/hermes_agent-0.19.0-py3-none-any.whl; \
     test "$(/opt/hermes/bin/python -c 'import importlib.metadata; print(importlib.metadata.version("hermes-agent"))')" = "0.19.0"; \
     rm -rf /root/.cache /tmp/requirements.lock /fetch
-COPY --chmod=0755 crucible-hermes.py /usr/local/bin/crucible-hermes
+COPY --chmod=0755 hermes/crucible-hermes.py /usr/local/bin/crucible-hermes
 # Hermes 0.19.0 has no automatic update facility or opt-out setting. The exact wheel
 # is pinned above and the provider launches the image with a read-only root filesystem.
 ENV HOME=/home/worker \
-    PATH=/opt/hermes/bin:/usr/local/bin:/usr/bin:/bin
+    PATH=/opt/hermes/bin:/usr/local/bin:/usr/bin:/bin \
+    NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt \
+    SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+    REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
 USER 1000:1000
 WORKDIR /home/worker

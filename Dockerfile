@@ -30,7 +30,14 @@ LABEL org.opencontainers.image.title="crucible" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${REVISION}"
-ENV PYTHONUNBUFFERED=1 PATH=/app/.venv/bin:$PATH
+COPY images/ca/sentania-lab-root.crt /usr/local/share/ca-certificates/sentania-lab-root.crt
+RUN echo "567f110bb80bb2179b44995c78c7a49a4149085a59f6acb73cf37c6503a0481a  /usr/local/share/ca-certificates/sentania-lab-root.crt" \
+      | sha256sum -c - \
+    && update-ca-certificates
+ENV PYTHONUNBUFFERED=1 PATH=/app/.venv/bin:$PATH \
+    NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt \
+    SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+    REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
 RUN groupadd --gid 1000 crucible && useradd --uid 1000 --gid 1000 --create-home crucible \
     && mkdir -p /var/lib/crucible/artifacts && chown -R crucible:crucible /var/lib/crucible
 WORKDIR /app
