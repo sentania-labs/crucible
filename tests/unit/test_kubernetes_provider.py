@@ -7,6 +7,7 @@ the credential paths are exercised deterministically. The real cluster is C8b's
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -98,6 +99,39 @@ async def test_the_probe_passes_when_the_canary_cannot_reach_the_api_server() ->
     assert health.checks["egress_enforced"] is True
     assert health.checks["pod_pid_limit"] == 4096
     assert health.checks["runtime_class"] == "standard"
+
+
+async def test_the_probe_requests_log_lines_without_timestamp_prefixes() -> None:
+    api, _registry, provider = build()
+    await provider.prepare(spec())
+    real = api.pod_log
+    requested: list[bool] = []
+
+    def pod_log(*args: Any, **kwargs: Any) -> Any:
+        requested.append(bool(kwargs.get("timestamps", True)))
+        return real(*args, **kwargs)
+
+    api.pod_log = pod_log  # type: ignore[method-assign]
+    assert (await provider.ensure_ready()).passed
+    assert requested == [False]
+
+
+async def test_concurrent_readiness_checks_share_one_canary() -> None:
+    _api, _registry, provider = build()
+    await provider.prepare(spec())
+    real = provider._run_probe
+    calls = 0
+
+    async def delayed_probe() -> NamespaceProbe:
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(0.01)
+        return await real()
+
+    provider._run_probe = delayed_probe  # type: ignore[method-assign]
+    first, second = await asyncio.gather(provider.ensure_ready(), provider.ensure_ready())
+    assert first.passed and second.passed
+    assert calls == 1
 
 
 async def test_a_namespace_whose_cni_does_not_enforce_egress_refuses_every_launch() -> None:
@@ -253,6 +287,64 @@ async def test_reconcile_adopts_a_live_worker_job_by_label() -> None:
     handle = await provider.launch(workspace, launch)
     adopted = await provider.reconcile()
     assert [(h.attempt_id, h.ref) for h in adopted] == [(launch.attempt_id, handle.ref)]
+    assert adopted[0].image_digest == handle.image_digest
+
+
+async def test_reconcile_recovers_the_image_after_provider_restart() -> None:
+    api, _registry, provider, launch, workspace = await prepared()
+    api.script(launch.attempt_id, "hang")
+    handle = await provider.launch(workspace, launch)
+    provider._launched.clear()
+    adopted = await provider.reconcile()
+    assert adopted[0].image_digest == handle.image_digest
+    assert provider._launched[launch.attempt_id].image_digest == handle.image_digest
+
+
+async def test_collection_waits_for_the_reader_pod_to_finish_deleting() -> None:
+    api, _registry, provider, launch, workspace = await prepared()
+    handle = await provider.launch(workspace, launch)
+    await run_to_exit(provider, handle)
+    real_delete = api.delete
+    real_get = api.get
+    delayed: set[str] = set()
+
+    def delayed_delete(kind: str, name: str, **kwargs: Any) -> Any:
+        if kind == "pods" and name.startswith("reader-"):
+            delayed.add(name)
+            return {}
+        return real_delete(kind, name, **kwargs)
+
+    def delayed_get(kind: str, name: str) -> Any:
+        body = real_get(kind, name)
+        if kind == "pods" and name in delayed:
+            delayed.remove(name)
+            real_delete(kind, name)
+        return body
+
+    api.delete = delayed_delete
+    api.get = delayed_get
+    outputs = await provider.collect(handle, workspace, launch)
+    assert outputs.workspace_state.checked
+    assert outputs.workspace_state.leftover == ()
+
+
+async def test_job_cleanup_waits_for_background_pod_deletion() -> None:
+    api, _registry, provider, launch, workspace = await prepared()
+    handle = await provider.launch(workspace, launch)
+    real_list = api.list_objects
+    polls = 0
+
+    def delayed_list(kind: str, **kwargs: Any) -> Any:
+        nonlocal polls
+        rows = real_list(kind, **kwargs)
+        if kind == "pods" and kwargs.get("label_selector") == f"job-name={handle.ref}" and rows:
+            polls += 1
+            api.delete("pods", str(rows[0]["metadata"]["name"]))
+        return rows
+
+    api.list_objects = delayed_list
+    await provider._await_job_pods_gone(handle.ref, timeout=1)
+    assert polls == 1
 
 
 async def test_reconcile_does_not_adopt_a_job_whose_pod_is_finished() -> None:
