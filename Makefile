@@ -49,7 +49,8 @@ CRUCIBLE_DEPLOY_PORT ?= 8080
 
 .PHONY: up dev down reset lint check-image-manifest scan scan-tree scan-history smoke test test-unit \
 	test-integration e2e e2e-github e2e-live e2e-admin e2e-image build proxy-config proxies preflight \
-	e2e-kind release-images-classify release-images-pull release-images-verify deploy-local deploy-local-down
+	e2e-kind manifests deploy-kind release-images-classify release-images-pull release-images-verify \
+	deploy-local deploy-local-down
 
 up: preflight proxy-config ## normal mode: postgres, proxies, migrate, crucible
 	@test -f .env || cp .env.example .env
@@ -169,6 +170,23 @@ e2e-kind: check-image-manifest ## Kubernetes-provider e2e on a disposable kind c
 	CRUCIBLE_E2E_DOCKER="$(DOCKER)" \
 	CRUCIBLE_E2E_DOCKER_SOCKET="$(CRUCIBLE_DOCKER_SOCKET)" \
 	tools/kind/e2e-kind.sh
+
+manifests: ## render deploy/kubernetes and validate every object; needs kubectl and kubeconform
+	UV="$(UV)" tools/manifests/validate.sh
+
+# Bring the deployment manifests up on a disposable kind cluster and run one task through
+# the deployed API on the Kubernetes provider (C9, sdlc skill step 3). This is the
+# author's half of "done means seen working": it proves the manifests and the image, and
+# it deliberately proves nothing cluster-specific (github-ci skill).
+#
+# DEPLOY_KIND_IMAGE is the Crucible image under test. It defaults to a locally built one
+# because the published 0.3.3 predates the Kubernetes provider (docs/implementation-notes/c9.md);
+# pass a published tag once one carries the provider.
+DEPLOY_KIND_IMAGE ?=
+deploy-kind: check-image-manifest ## deploy the manifests on a disposable kind cluster and run one task
+	CRUCIBLE_E2E_DOCKER="$(DOCKER)" \
+	CRUCIBLE_DEPLOY_KIND_IMAGE="$(DEPLOY_KIND_IMAGE)" \
+	UV="$(UV)" tools/kind/deploy-kind.sh
 
 # The live GitHub tier (23). Local only, never in CI: it mints a real installation token
 # from the mounted App key and opens a real pull request on one throwaway repository,
