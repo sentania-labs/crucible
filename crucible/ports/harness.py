@@ -114,6 +114,8 @@ class HarnessCapabilities:
     # The instruction file the harness reads from the checkout; the preparer writes an
     # untracked one only when the checkout has none (06, 07).
     shim: str | None = None
+    # Whether a project CLAUDE.md takes precedence over the generated AGENTS.md shim.
+    claude_md_wins: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -123,6 +125,7 @@ class HarnessCapabilities:
             "transcript_format": self.transcript_format.value,
             "endpoints": list(self.endpoints),
             "shim": self.shim,
+            "claude_md_wins": self.claude_md_wins,
         }
 
 

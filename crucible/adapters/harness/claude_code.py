@@ -88,7 +88,7 @@ def _provider_quota_refusal(document: Mapping[str, Any]) -> bool:
 
 class ClaudeCodeAdapter:
     name = NAME
-    supported_versions = VersionRange("2.1.0", "2.2.0")
+    supported_versions = VersionRange("2.1.277", "2.2.0")
 
     def quota_reset_at(self, stdout_tail: str, stderr_tail: str) -> datetime | None:
         return base.quota_reset_at(stdout_tail, stderr_tail, quota=QUOTA_PATTERNS)
@@ -108,7 +108,8 @@ class ClaudeCodeAdapter:
             effort_flag=False,
             transcript_format=TranscriptFormat.STREAM_JSON,
             endpoints=("api.anthropic.com",),
-            shim="CLAUDE.md",
+            shim="AGENTS.md",
+            claude_md_wins=True,
         )
 
     def credential_spec(self) -> CredentialSpec:

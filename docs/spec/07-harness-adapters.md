@@ -65,6 +65,10 @@ never retry.
 
 ## Claude Code
 
+- Version floor: `>=2.1.277,<2.2.0`. Claude Code 2.1.277 is the first release
+  whose changelog says it reads `AGENTS.md` under the default
+  `instructionFiles` setting. Older worker images are refused at launch.
+
 - Launch: `claude -p --permission-mode bypassPermissions
   --append-system-prompt-file /crucible/identity/IDENTITY.md
   --output-format stream-json --verbose --model <model>` with the prompt on
@@ -86,8 +90,13 @@ never retry.
 - Endpoints: `api.anthropic.com` (plus `mcp-proxy.anthropic.com` only if
   account MCP connectors are wanted). Confirmed by a task completed
   through the filtering proxy, so the list is no longer provisional.
-- Shim: none if the checkout has a `CLAUDE.md`; otherwise a one-line
-  untracked `CLAUDE.md` pointing at the identity file.
+- Shim: one-line untracked `AGENTS.md` pointing at the identity file when the
+  checkout has no `AGENTS.md`. Claude Code alone suppresses that shim when the
+  checkout has its own `CLAUDE.md`, because it reads that file when it wins
+  under the default `instructionFiles` setting, and records that the project's
+  `CLAUDE.md` is in force. Codex and AGY do not read `CLAUDE.md`, so it does not
+  suppress their shim. A committed `CLAUDE.md` and a committed `AGENTS.md`
+  remain project files and no generated shim is written.
 - Stream-json lines are parsed into progress events (tool use, text) at low
   fidelity; the full stream is stored as the transcript artifact.
 - Known: nested invocation from inside another Claude session works, but

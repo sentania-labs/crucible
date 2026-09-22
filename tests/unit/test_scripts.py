@@ -28,7 +28,7 @@ HOSTILE_REFS = [
 ]
 
 
-def preparer(work_branch: str, base_ref: str = "main") -> str:
+def preparer(work_branch: str, base_ref: str = "main", claude_md_wins: bool = True) -> str:
     return scripts.preparer_script(
         url="/crucible/origin",
         base_ref=base_ref,
@@ -38,10 +38,117 @@ def preparer(work_branch: str, base_ref: str = "main") -> str:
         author_name="crucible-worker",
         author_email="crucible-worker@users.noreply.github.com",
         origin_placeholder=workspace.ORIGIN_PLACEHOLDER,
+        claude_md_wins=claude_md_wins,
         shims=workspace.SHIM_NAMES,
         exclude_entries=workspace.EXCLUDE_ENTRIES,
         identity_mount=IDENTITY_MOUNT,
     )
+
+
+def test_only_agents_md_is_a_generated_shim() -> None:
+    script = preparer("crucible/test")
+    assert "for shim in 'AGENTS.md'" in script
+    assert "for shim in 'CLAUDE.md'" not in script
+
+
+def test_a_project_claude_md_suppresses_the_agents_md_shim() -> None:
+    script = preparer("crucible/test")
+    assert 'if [ "$CLAUDE_MD_WINS" = "1" ] && [ "$shim" = "AGENTS.md" ]' in script
+
+
+@pytest.mark.parametrize(
+    ("harness", "claude_md_wins"),
+    [("claude_code", True), ("codex", False), ("agy", False), ("future_claude", True)],
+)
+@pytest.mark.parametrize("project_file", ["neither", "claude", "agents"])
+def test_shim_policy_runs_the_rendered_prepare_script(
+    harness: str, claude_md_wins: bool, project_file: str, tmp_path: Path
+) -> None:
+    """The rendered script applies the harness-specific policy to a real checkout."""
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=origin, check=True)
+    (origin / "README").write_text("base\n", encoding="utf-8")
+    if project_file == "claude":
+        (origin / "CLAUDE.md").write_text("project instructions\n", encoding="utf-8")
+    elif project_file == "agents":
+        (origin / "AGENTS.md").write_text("project instructions\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=origin, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "base",
+        ],
+        cwd=origin,
+        check=True,
+    )
+    work = tmp_path / "work"
+    script = preparer("crucible/test", claude_md_wins=claude_md_wins)
+    script = script.replace("/crucible/origin", str(origin))
+    script = script.replace("/crucible/work", str(work))
+    result = subprocess.run(["sh", "-c", script], capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stderr
+    checkout = work / "repo"
+    shim = checkout / "AGENTS.md"
+    if project_file == "agents":
+        assert shim.read_text(encoding="utf-8") == "project instructions\n"
+    elif project_file == "claude" and claude_md_wins:
+        assert not shim.exists()
+    else:
+        assert shim.is_file()
+        assert shim.read_text(encoding="utf-8") == (
+            "Read /crucible/identity/IDENTITY.md first; it is the task contract for this run.\n"
+        )
+
+
+@pytest.mark.parametrize("harness", ["claude_code", "codex", "agy"])
+@pytest.mark.parametrize("claude_kind", ["directory", "symlink"])
+def test_claude_code_policy_handles_non_regular_claude_path(
+    harness: str, claude_kind: str, tmp_path: Path
+) -> None:
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=origin, check=True)
+    if claude_kind == "directory":
+        (origin / "CLAUDE.md").mkdir()
+        (origin / "CLAUDE.md" / "README").write_text("project instructions\n", encoding="utf-8")
+    else:
+        (origin / "instructions").write_text("project instructions\n", encoding="utf-8")
+        (origin / "CLAUDE.md").symlink_to("instructions")
+    subprocess.run(["git", "add", "."], cwd=origin, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "base",
+        ],
+        cwd=origin,
+        check=True,
+    )
+    work = tmp_path / "work"
+    script = preparer("crucible/test", claude_md_wins=harness == "claude_code")
+    script = script.replace("/crucible/origin", str(origin))
+    script = script.replace("/crucible/work", str(work))
+    result = subprocess.run(["sh", "-c", script], capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stderr
+    shim = work / "repo" / "AGENTS.md"
+    if harness == "claude_code":
+        assert not shim.exists()
+    else:
+        assert shim.is_file()
 
 
 def parses(script: str) -> None:

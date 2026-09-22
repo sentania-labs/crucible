@@ -93,7 +93,7 @@ it cannot check stays with Foundry or the user.
 | `exit_clean` | exit code 0 | attempt exit info |
 | `commits_present` | the collected `work_branch` has at least one commit beyond `base_ref`, the bundle verifies, and the bundle head equals the reported `head_sha` | branch bundle from `collect` |
 | `scope_contained` | every changed path matches `allowed_paths` and none matches `prohibited_paths` | diff path list from `collect` |
-| `no_injected_files` | shims, `.crucible/`, identity paths absent from diff and from any commit on `work_branch` | diff, `git log --stat` |
+| `no_injected_files` | `AGENTS.md`, `CLAUDE.md`, other shims, `.crucible/`, and identity paths absent from diff and from any commit on `work_branch` | diff, `git log --stat` |
 | `no_secrets` | secret scanner over the diff, every commit message, and the report finds nothing | scanner output artifact |
 | `verification_ran` | for each `required_verification` command: Crucible itself re-ran the command after exit, in a fresh verifier container from the collected tree (same image, `network` per policy), and its exit matches `expect_exit`. The worker's own check logs are stored as a claim and shown to Foundry, never consumed by the gate | verifier exit and log (verified) |
 | `run_evidence_present` | each `kind: artifact` verification path exists and is non-empty | artifacts |

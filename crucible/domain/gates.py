@@ -92,7 +92,14 @@ WORKER_SOURCE = "worker"
 # Shims and identity paths a worker must never leave behind (11).
 INJECTED_PREFIXES: tuple[str, ...] = (".crucible/", "crucible/identity/", ".crucible-shims/")
 INJECTED_NAMES: frozenset[str] = frozenset(
-    {".crucible", "crucible-identity.md", "crucible-shim", ".crucible-identity"}
+    {
+        ".crucible",
+        "crucible-identity.md",
+        "crucible-shim",
+        ".crucible-identity",
+        "AGENTS.md",
+        "CLAUDE.md",
+    }
 )
 CI_PATH_PREFIXES: tuple[str, ...] = (".github/workflows/", ".github/actions/", ".gitlab-ci")
 DEPENDENCY_FILES: frozenset[str] = frozenset(

@@ -181,7 +181,7 @@ async def test_the_create_request_names_the_variable_and_the_path_never_the_valu
     token = _token("sk-ant-oat01-")
     (source / "oauth-token").write_text(token + "\n", encoding="utf-8")
     (source / ".claude.json").write_text('{"hasCompletedOnboarding": true}\n', encoding="utf-8")
-    client = StubClient("claude_code", "2.1.273")
+    client = StubClient("claude_code", "2.1.277")
     provider = DockerProvider(
         config(tmp_path, claude_code=CredentialSource(str(source))),
         client=client,  # type: ignore[arg-type]
@@ -190,7 +190,7 @@ async def test_the_create_request_names_the_variable_and_the_path_never_the_valu
     launch_shape = adapter.build_launch(provider._launch_context(spec("claude_code")))
     launch = spec(
         "claude_code",
-        image="crucible-worker:claude_code-2.1.273-abc",
+        image="crucible-worker:claude_code-2.1.277-abc",
         command=launch_shape.argv,
         env=dict(launch_shape.env),
         env_from_files=dict(launch_shape.env_from_files),
