@@ -142,16 +142,25 @@ the Docker provider's.
 
 ```text
 $ make lint
-ruff format --check / ruff check / mypy / lint-imports: all clean
+ruff format --check, ruff check, mypy, lint-imports: 3 contracts kept, 0 broken
+
 $ make test
-tests/unit: 740 passed
-tests/integration: 233 passed
+tests/unit          740 passed in 10.58s
+tests/integration   349 passed in 375.83s (0:06:15)
+
 $ make scan
-gitleaks: no leaks found (tree and history)
-$ make e2e     # the Docker tier, unchanged, on the rootless daemon
+gitleaks: no leaks found, tree (4.05 MB) and history (8 commits)
+
+$ make e2e DOCKER='<the rootless daemon wrapper>'
+17 passed, 12 deselected in 99.26s (0:01:39)
 ```
 
-The exact output is in the task report.
+The Docker tier ran on the rootless daemon of the `crucible` service user
+(13, ADR 0004, S9) and is unchanged by this branch. One earlier run of it
+failed `test_a_verifier_that_never_finishes_fails_the_gate` while the
+integration tier was running on the same machine: that test gives the verifier
+container a 5 second deadline, and under the contention the container exited on
+its own before the deadline could fire. Run alone, the tier is green.
 
 ## What C8b needs from here
 
