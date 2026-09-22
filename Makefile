@@ -166,6 +166,8 @@ e2e: check-image-manifest ## the Docker-provider end-to-end tier (18): real cont
 	$(UV) run pytest tests/e2e -q -m e2e
 
 e2e-kind: check-image-manifest ## Kubernetes-provider e2e on a disposable kind cluster (18, 26)
+	CRUCIBLE_E2E_DOCKER="$(DOCKER)" \
+	CRUCIBLE_E2E_DOCKER_SOCKET="$(CRUCIBLE_DOCKER_SOCKET)" \
 	tools/kind/e2e-kind.sh
 
 # The live GitHub tier (23). Local only, never in CI: it mints a real installation token

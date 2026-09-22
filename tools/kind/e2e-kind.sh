@@ -57,6 +57,28 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
+# Put a shim ahead of PATH so both this script and kind use the daemon selected
+# by the same possibly wrapped Docker command as the other end-to-end tiers.
+read -r -a docker_command <<< "${CRUCIBLE_E2E_DOCKER:-docker}"
+if [ "${#docker_command[@]}" -eq 0 ]; then
+  echo "e2e-kind: CRUCIBLE_E2E_DOCKER must name a Docker command" >&2
+  exit 2
+fi
+host_docker=$(command -v docker)
+for index in "${!docker_command[@]}"; do
+  if [ "${docker_command[$index]}" = docker ]; then
+    docker_command[index]=$host_docker
+  fi
+done
+mkdir -p "$scratch/bin"
+{
+  printf '#!/usr/bin/env bash\nset -euo pipefail\nexec'
+  printf ' %q' "${docker_command[@]}"
+  printf ' "$@"\n'
+} > "$scratch/bin/docker"
+chmod 0755 "$scratch/bin/docker"
+export PATH="$scratch/bin:$PATH"
+
 mkdir -p "$cache"
 chmod 0777 "$cache"
 
@@ -156,6 +178,7 @@ export CRUCIBLE_E2E_KIND_API_IP="$api_ip"
 export CRUCIBLE_E2E_KIND_REGISTRY="$registry_ref"
 export CRUCIBLE_E2E_KIND_KUBECONFIG="$kubeconfig"
 export CRUCIBLE_E2E_KIND_CANARY_LOG="$scratch/canary.log"
+export CRUCIBLE_E2E_DOCKER_SOCKET="${CRUCIBLE_E2E_DOCKER_SOCKET:-/var/run/docker.sock}"
 export KUBECONFIG="$kubeconfig"
 
 cd "$root"
