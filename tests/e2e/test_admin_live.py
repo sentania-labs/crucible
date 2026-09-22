@@ -44,6 +44,7 @@ from crucible.cli import admin as cli
 from crucible.domain.entities import Role
 from crucible.domain.secrets import scan_text
 from crucible.ports.harness import CredentialSource, MountMode
+from tests.admin_cli import admin_main, envelope_data
 from tests.e2e import github_live
 from tests.e2e.conftest import EGRESS_ALLOWLIST, NET_WORKERS, RUN_ID
 from tests.e2e.test_live_harness import (
@@ -267,9 +268,8 @@ def _config_file(
 
 
 def _cli(config: Path, *argv: str, capsys: pytest.CaptureFixture[str]) -> Any:
-    cli.main(["--config", str(config), *argv])
-    out = capsys.readouterr().out.strip().splitlines()
-    return json.loads(out[-1])
+    admin_main(["--config", str(config), *argv])
+    return envelope_data(capsys)
 
 
 @pytest.fixture(autouse=True)

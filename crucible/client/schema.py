@@ -259,6 +259,11 @@ def kind_schemas() -> dict[str, dict[str, Any]]:
             _obj("a mark", {"pool": STR, "active": BOOL}),
         ),
         "exhaustion_cleared": _obj("the cleared mark", {}),
+        "local_endpoint": _obj(
+            "the local model endpoint panel: its URL, model entries, and pool",
+            {"endpoint_url": NSTR, "models": {"type": "array"}, "pool": ANY_OBJ},
+            {"policy": ANY_OBJ, "routing_policy": ANY_OBJ},
+        ),
         "bootstrap_import": bootstrap,
         "bootstrap_import_list": _items("bootstrap imports", ANY_OBJ),
         # this command

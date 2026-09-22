@@ -362,6 +362,7 @@ CREDENTIAL_ACTIONS: dict[str, tuple[str, ...]] = {
     "validated": ("probe", "rotate", "remove", "login"),
 }
 CREDENTIAL_WORDS = {
+    "set": "read an API key from stdin or a hidden prompt; never placed in argv",
     "validate": "check the auth files' shape, then run the bounded probe",
     "probe": "run the bounded probe of the hardened image",
     "rotate": "copy a prepared credential directory in",
@@ -369,15 +370,23 @@ CREDENTIAL_WORDS = {
     "login": "run the harness's own login (needs its CLI on this host)",
 }
 
+# `set` is the LiteLLM virtual key path; only hermes takes one (`--harness` is
+# restricted to it on the parser), so it is offered only for that harness.
+SET_KEY_HARNESSES = frozenset({"hermes"})
+
 
 def credential_actions(
     harness: str, state: str | None, prefix: Sequence[str], *, local: bool
 ) -> list[dict[str, Any]]:
     """By the credential's state (25). `login` runs the harness's own CLI, which the
     service image does not carry, so it is offered only in local mode; with a credential
-    already present it needs `--replace`."""
+    already present it needs `--replace`. `set` is offered only for the harnesses that
+    take an API key rather than a login."""
     out: list[dict[str, Any]] = []
-    for verb in CREDENTIAL_ACTIONS.get(state or "", ()):
+    verbs = CREDENTIAL_ACTIONS.get(state or "", ())
+    if harness in SET_KEY_HARNESSES and state in ("absent", "invalid"):
+        verbs = ("set", *verbs)
+    for verb in verbs:
         if verb == "login" and not local:
             continue
         command = [*prefix, "--reason", "{reason}", "credentials", verb, "--harness", harness]
@@ -389,6 +398,42 @@ def credential_actions(
             command.append("--replace")
         out.append(action(verb, CREDENTIAL_WORDS[verb], command, needs=needs, roles=(ADMIN,)))
     return out
+
+
+def local_endpoint_actions(document: Any, prefix: Sequence[str]) -> list[dict[str, Any]]:
+    """The panel always offers an update; the current values are advisory context,
+    not defaults the client should assume for the caller."""
+    if not isinstance(document, dict):
+        return []
+    return [
+        action(
+            "set-local-endpoint",
+            "update the local model endpoint, its models, and concurrency",
+            [
+                *prefix,
+                "--reason",
+                "{reason}",
+                "routing",
+                "set-local-endpoint",
+                "--endpoint-url",
+                "{endpoint_url}",
+                "--model",
+                "{model}",
+                "--enable",
+            ],
+            needs={
+                "endpoint_url": "the local endpoint's base URL",
+                "model": "a model id from data.models",
+                **REASON,
+            },
+            optional=[
+                {"flag": "--disable", "description": "disable the model instead of enabling it"},
+                {"flag": "--enable-thinking", "description": "turn on the model's thinking mode"},
+                {"flag": "--max-concurrency", "description": "the pool's concurrency (default 4)"},
+            ],
+            roles=(ADMIN,),
+        )
+    ]
 
 
 def harness_actions(items: Iterable[Any], prefix: Sequence[str]) -> list[dict[str, Any]]:
