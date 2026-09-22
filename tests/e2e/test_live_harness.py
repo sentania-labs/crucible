@@ -782,7 +782,7 @@ async def test_a_trivial_task_reaches_ready_for_merge_live(
         _record(entry)
 
 
-async def test_hermes_spark_pool_runs_four_and_defers_the_fifth_live(
+async def test_hermes_lab_local_pool_runs_four_and_defers_the_fifth_live(
     live_ctx: AppContext,
     live_client: TestClient,
     live_supervisor: Supervisor,

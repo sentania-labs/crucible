@@ -155,7 +155,9 @@ def test_hermes_launch_matches_07_and_uses_the_optional_api_key() -> None:
         {"model": "gpt-oss:120b", "endpoint": "subscription", "endpoint_url": None},
     ],
 )
-def test_hermes_refuses_any_launch_outside_its_local_model(overrides: dict[str, Any]) -> None:
+def test_hermes_refuses_a_subscription_launch_with_no_endpoint_url(
+    overrides: dict[str, Any],
+) -> None:
     with pytest.raises(ValueError):
         HermesAdapter().build_launch(context(credential_mounted=False, **overrides))
 
