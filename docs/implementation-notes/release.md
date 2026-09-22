@@ -45,8 +45,12 @@ real Docker daemon. Each step gates the next:
    model as JSON with every profile active. It identifies candidate services by
    comparing each resolved image with `CRUCIBLE_IMAGE`, pulls only the other
    services, and checks every candidate service container against the freshly
-   built image ID. The container lookup includes exited one-shot services. It
-   then runs `make smoke`, which is
+   built image ID. The container lookup includes exited one-shot services.
+   Release boots with
+   `make up COMPOSE_UP_FLAGS="--pull never --no-build"`, so it runs the same
+   `preflight` and generated proxy-config path as local work and CI without
+   pulling or rebuilding over the candidate before it then runs `make smoke`,
+   which is
    `tools/smoke/compose_smoke.py`, the same file CI runs on every pull request.
 5. **Publish.** Whether the version already exists is decided by the registry
    API, where only an explicit HTTP 404 means absent: a blip, a rate limit or an
