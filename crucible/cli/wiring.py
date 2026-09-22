@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import socket
+from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -40,7 +41,11 @@ from crucible.application.admin.routing import local_endpoint_view
 from crucible.application.delivery_tick import DeliveryConfig
 from crucible.application.errors import NotFoundError
 from crucible.application.harnesses import HarnessRegistry
-from crucible.application.proxy_config import install_worker_proxy_config, worker_proxy_config
+from crucible.application.proxy_config import (
+    enabled_local_endpoints,
+    install_worker_proxy_config,
+    worker_proxy_config,
+)
 from crucible.application.supervisor import Supervisor
 from crucible.domain.ids import new_id
 from crucible.ports.artifacts import ArtifactStore
@@ -227,6 +232,19 @@ def github_client(settings: Settings) -> GitHubClient | None:
     return RestGitHubClient(authenticator, transport, allow_issue_comments=g.allow_issue_comments)
 
 
+def enabled_database_endpoint(routing_document: Mapping[str, object] | None) -> str | None:
+    """The one endpoint an enabled local model authorizes, or None.
+
+    A disabled model gets no Squid rule (`proxy_config.enabled_local_endpoints`); the
+    Docker provider's own allowlist, wired from this at startup, has to agree, or a
+    restart after disabling every local model puts the destination back.
+    """
+    if routing_document is None:
+        return None
+    endpoints = enabled_local_endpoints([routing_document])
+    return endpoints[0] if len(endpoints) == 1 else None
+
+
 def wire(settings: Settings) -> Wiring:
     engine = make_engine(settings.database.url)
     factory = SqlUnitOfWorkFactory(engine)
@@ -237,10 +255,10 @@ def wire(settings: Settings) -> Wiring:
         with factory() as uow:
             local = local_endpoint_view(uow)
             database_value = True
-            database_endpoint = local.get("endpoint_url")
             reference = local["routing_policy"]
             record = uow.routing_policies.get(reference["name"], reference["version"])
             routing_document = record.document if record is not None else None
+            database_endpoint = enabled_database_endpoint(routing_document)
     except (SQLAlchemyError, NotFoundError):
         # `migrate` and first-run commands can wire before the policy tables exist.
         database_value = False

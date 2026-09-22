@@ -24,6 +24,7 @@ from fastapi.testclient import TestClient
 from crucible.adapters.api.app import create_app
 from crucible.adapters.api.deps import AppContext
 from crucible.adapters.clock import SystemClock
+from crucible.adapters.execution.docker import DockerConfig
 from crucible.adapters.execution.fake import FakeProvider
 from crucible.adapters.persistence.unit_of_work import SqlUnitOfWorkFactory, make_engine
 from crucible.application.admin.context import AdminContext
@@ -840,6 +841,37 @@ def test_local_endpoint_and_hermes_key_are_saved_without_exposing_the_key(
         ui_view = admin_client.get("/v1/admin/routing/local-endpoint").json()
         assert ui_view["models"][0]["chat_template_kwargs"] == {"enable_thinking": True}
         assert ui_view["pool"]["max_concurrency"] == 2
+
+
+def test_a_save_with_every_local_model_disabled_leaves_the_docker_allowlist_unchanged(
+    admin_client: TestClient,
+    admin_ctx: AdminContext,
+    live_supervisor: Supervisor,
+) -> None:
+    """A disabled model gets no rendered Squid rule (proxy_config.enabled_local_endpoints);
+    the in-process allowlist the Docker provider checks launches against must follow the
+    same rule, or a disabled destination would still be reachable from that provider."""
+
+    class _DockerStub:
+        def __init__(self, config: DockerConfig) -> None:
+            self.config = config
+
+    asyncio.run(live_supervisor.tick())
+    stub = _DockerStub(
+        DockerConfig(endpoint="tcp://127.0.0.1:1", artifact_root="/tmp/does-not-matter")
+    )
+    admin_ctx.providers["docker"] = stub  # type: ignore[assignment]
+    updated = admin_client.post(
+        "/v1/admin/routing/local-endpoint",
+        json={
+            "reason": "leave every local model disabled",
+            "endpoint_url": "https://llm.apps.int.sentania.net/v1",
+            "models": [{"id": "coder", "enabled": False, "enable_thinking": False}],
+            "max_concurrency": 3,
+        },
+    )
+    assert updated.status_code == 200, updated.text
+    assert stub.config.proxy_allowlist == ()
 
 
 def test_credentials_rotate_and_remove_through_api_and_cli(

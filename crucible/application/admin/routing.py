@@ -11,7 +11,11 @@ from urllib.parse import urlsplit
 from crucible.application.admin.context import AdminContext, admin_event, guard_mutation
 from crucible.application.errors import NotFoundError
 from crucible.application.policies import put_policy, put_routing_policy
-from crucible.application.proxy_config import install_worker_proxy_config, worker_proxy_config
+from crucible.application.proxy_config import (
+    enabled_local_endpoints,
+    install_worker_proxy_config,
+    worker_proxy_config,
+)
 from crucible.domain.endpoints import validate_endpoint
 from crucible.domain.entities import Principal
 from crucible.domain.events import EventKind
@@ -151,18 +155,19 @@ def save_local_endpoint(
             rendered,
             reload_timeout_seconds=ctx.proxy_reload_timeout_seconds,
         )
-    parsed = urlsplit(endpoint_url)
-    local_destination = (
-        f"{parsed.hostname}:{parsed.port or (443 if parsed.scheme == 'https' else 80)}"
-    )
     docker = ctx.providers.get("docker")
     if docker is not None and hasattr(docker, "config"):
         base_hosts = tuple(
             host for host in getattr(docker.config, "proxy_allowlist", ()) if ":" not in host
         )
+        enabled_destinations = []
+        for endpoint in enabled_local_endpoints([routing_document]):
+            parsed = urlsplit(endpoint)
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+            enabled_destinations.append(f"{parsed.hostname}:{port}")
         docker.config = replace(
             docker.config,
-            proxy_allowlist=tuple(dict.fromkeys([*base_hosts, local_destination])),
+            proxy_allowlist=tuple(dict.fromkeys([*base_hosts, *enabled_destinations])),
         )
     after = {
         "policy": {"name": policy.name, "version": next_policy_version},

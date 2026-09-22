@@ -12,6 +12,7 @@ from crucible.application.proxy_config import (
     install_worker_proxy_config,
     worker_proxy_config,
 )
+from crucible.cli.wiring import enabled_database_endpoint
 from crucible.ports.execution import LaunchSpec
 from crucible.ports.harness import LaunchContext
 
@@ -111,6 +112,7 @@ def test_proxy_allows_https_local_destinations_by_exact_name_and_port() -> None:
     assert "acl local_port_0 port 443" in config
     assert "acl SSL_ports port 443" in config
     assert "http_access allow workers local_destination_0 local_port_0" in config
+    assert config.count("acl Safe_ports port 443") == 1
 
 
 def test_make_proxy_config_does_not_authorize_the_environment_seed() -> None:
@@ -124,6 +126,24 @@ def test_make_proxy_config_does_not_authorize_the_environment_seed() -> None:
     )
     assert "--configured-local-endpoint" not in result.stdout
     assert endpoint not in result.stdout
+
+
+def test_enabled_database_endpoint_is_none_with_every_local_model_disabled() -> None:
+    """A restart must not put a disabled destination back on the Docker allowlist
+    (crucible.cli.wiring.wire reads this to seed proxy_allowlist)."""
+    routing_document = {
+        "models": [
+            {
+                "endpoint": "local",
+                "endpoint_url": "https://llm.apps.int.sentania.net/v1",
+                "enabled": False,
+            }
+        ]
+    }
+    assert enabled_database_endpoint(routing_document) is None
+    assert enabled_database_endpoint(None) is None
+    routing_document["models"][0]["enabled"] = True
+    assert enabled_database_endpoint(routing_document) == "https://llm.apps.int.sentania.net/v1"
 
 
 def test_make_deploy_local_maps_the_compatibility_seed_to_the_local_endpoint() -> None:
