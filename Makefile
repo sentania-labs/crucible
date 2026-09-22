@@ -11,6 +11,9 @@
 # CI has an ordinary rootful daemon and needs none of that: DOCKER stays `docker`.
 DOCKER ?= docker
 COMPOSE ?= $(DOCKER) compose
+# Normal local and CI boots build from the working tree. Release passes
+# `--pull never` here after it has built and classified the candidate image.
+COMPOSE_UP_FLAGS ?= --build
 UV ?= uv
 
 # The rootless daemon's socket, derived, never hardcoded: the uid differs per host (S9).
@@ -50,7 +53,7 @@ CRUCIBLE_DEPLOY_PORT ?= 8080
 
 up: preflight proxy-config ## normal mode: postgres, proxies, migrate, crucible
 	@test -f .env || cp .env.example .env
-	$(COMPOSE) up -d --build --wait
+	$(COMPOSE) up -d $(COMPOSE_UP_FLAGS) --wait
 
 dev: preflight proxy-config ## developer mode: postgres and the two proxies; run `uv run crucible serve --all` on the host
 	@test -f .env || cp .env.example .env
