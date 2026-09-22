@@ -398,6 +398,85 @@ def test_0017_seeds_from_the_routing_in_force_not_an_unreferenced_draft(
     migrate.upgrade(database_url)
 
 
+def test_0017_extends_a_routing_policy_the_operator_named_differently(
+    database_url: str,
+) -> None:
+    """The policy in force may name a routing policy uploaded under another name. The
+    migration extends that one, under its own name, and its downgrade removes it."""
+    migrate.downgrade(database_url, "base")
+    migrate.upgrade(database_url, "0016_disposition_versions")
+    engine = make_engine(database_url)
+    with engine.begin() as conn:
+        policy = conn.execute(
+            text(
+                "SELECT document FROM policies WHERE name='default-software' "
+                "ORDER BY version DESC LIMIT 1"
+            )
+        ).scalar_one()
+        routing = conn.execute(
+            text(
+                "SELECT document FROM routing_policies "
+                "WHERE name='default-routing' AND version=:version"
+            ),
+            {"version": int(policy["routing"]["policy"]["version"])},
+        ).scalar_one()
+        routing["version"] = 1
+        conn.execute(
+            text(
+                "INSERT INTO routing_policies(name, version, document, created_at) "
+                "VALUES ('lab-routing', 1, CAST(:document AS jsonb), now())"
+            ),
+            {"document": json.dumps(routing)},
+        )
+        policy["version"] = int(policy["version"]) + 1
+        policy["routing"] = {"policy": {"name": "lab-routing", "version": 1}}
+        conn.execute(
+            text(
+                "INSERT INTO policies(name, version, document, created_at) "
+                "VALUES ('default-software', :version, CAST(:document AS jsonb), now())"
+            ),
+            {"version": policy["version"], "document": json.dumps(policy)},
+        )
+        default_routing_rows = conn.execute(
+            text("SELECT count(*) FROM routing_policies WHERE name='default-routing'")
+        ).scalar_one()
+    engine.dispose()
+
+    migrate.upgrade(database_url)
+    engine = make_engine(database_url)
+    with engine.connect() as conn:
+        seeded_policy = conn.execute(
+            text(
+                "SELECT document FROM policies WHERE name='default-software' "
+                "ORDER BY version DESC LIMIT 1"
+            )
+        ).scalar_one()
+        seeded = conn.execute(
+            text("SELECT document FROM routing_policies WHERE name='lab-routing' AND version=2")
+        ).scalar_one()
+        assert (
+            conn.execute(
+                text("SELECT count(*) FROM routing_policies WHERE name='default-routing'")
+            ).scalar_one()
+            == default_routing_rows
+        )
+    engine.dispose()
+    assert seeded_policy["routing"] == {"policy": {"name": "lab-routing", "version": 2}}
+    assert [model["id"] for model in seeded["models"] if model["harness"] == "hermes"] == ["coder"]
+
+    migrate.downgrade(database_url, "0016_disposition_versions")
+    engine = make_engine(database_url)
+    with engine.connect() as conn:
+        assert (
+            conn.execute(
+                text("SELECT max(version) FROM routing_policies WHERE name='lab-routing'")
+            ).scalar_one()
+            == 1
+        )
+    engine.dispose()
+    migrate.upgrade(database_url)
+
+
 def test_0004_down_and_up(database_url: str) -> None:
     """Down migrations are required for every revision in v0.x (14)."""
     engine = make_engine(database_url)

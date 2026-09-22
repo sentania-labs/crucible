@@ -42,8 +42,8 @@ def _replace_event_kinds(kinds: list[str]) -> None:
 def _seed_local_route(connection: sa.engine.Connection) -> None:
     # Clone what is in force, not the highest version: a routing draft nothing references
     # would otherwise become the new default. In force is what admin/routing.py reads, the
-    # latest non-retired default-software and the routing version it names. The maxima
-    # only number the new rows.
+    # latest non-retired default-software and the routing policy it names, under whatever
+    # name the operator gave it. The maxima only number the new rows.
     policy_row = connection.execute(
         sa.text(
             "SELECT document FROM policies WHERE name='default-software' "
@@ -54,20 +54,22 @@ def _seed_local_route(connection: sa.engine.Connection) -> None:
         raise RuntimeError("no default-software policy is in force; 0017 has nothing to extend")
     policy = copy.deepcopy(policy_row)
     ref = (policy.get("routing") or {}).get("policy") or {}
-    if ref.get("name") != "default-routing" or ref.get("version") is None:
-        raise RuntimeError(f"the default-software policy in force names no default-routing: {ref}")
+    if not ref.get("name") or ref.get("version") is None:
+        raise RuntimeError(f"the default-software policy in force names no routing policy: {ref}")
+    routing_name = str(ref["name"])
     routing_row = connection.execute(
         sa.text(
             "SELECT document FROM routing_policies "
-            "WHERE name='default-routing' AND version=:version AND retired_at IS NULL"
+            "WHERE name=:name AND version=:version AND retired_at IS NULL"
         ),
-        {"version": int(ref["version"])},
+        {"name": routing_name, "version": int(ref["version"])},
     ).scalar_one_or_none()
     if routing_row is None:
-        raise RuntimeError(f"default-routing/{ref['version']} is missing or retired")
+        raise RuntimeError(f"{routing_name}/{ref['version']} is missing or retired")
     routing = copy.deepcopy(routing_row)
     routing_max = connection.execute(
-        sa.text("SELECT max(version) FROM routing_policies WHERE name='default-routing'")
+        sa.text("SELECT max(version) FROM routing_policies WHERE name=:name"),
+        {"name": routing_name},
     ).scalar_one()
     endpoint_url = (
         os.environ.get("CRUCIBLE_LOCAL_ENDPOINT_URL")
@@ -111,9 +113,9 @@ def _seed_local_route(connection: sa.engine.Connection) -> None:
     connection.execute(
         sa.text(
             "INSERT INTO routing_policies(name, version, document, created_at) "
-            "VALUES ('default-routing', :version, CAST(:document AS jsonb), now())"
+            "VALUES (:name, :version, CAST(:document AS jsonb), now())"
         ),
-        {"version": routing_version, "document": json.dumps(routing)},
+        {"name": routing_name, "version": routing_version, "document": json.dumps(routing)},
     )
 
     policy_max = connection.execute(
@@ -122,7 +124,7 @@ def _seed_local_route(connection: sa.engine.Connection) -> None:
     policy_version = int(policy_max) + 1
     policy["version"] = policy_version
     policy["description"] = POLICY_MARKER
-    policy["routing"] = {"policy": {"name": "default-routing", "version": routing_version}}
+    policy["routing"] = {"policy": {"name": routing_name, "version": routing_version}}
     connection.execute(
         sa.text(
             "INSERT INTO policies(name, version, document, created_at) "
@@ -163,7 +165,7 @@ def downgrade() -> None:
         f"AND document ->> 'description' = '{POLICY_MARKER}'"
     )
     op.execute(
-        "DELETE FROM routing_policies WHERE name='default-routing' "
-        "AND EXISTS (SELECT 1 FROM jsonb_array_elements(document -> 'models') AS model "
+        "DELETE FROM routing_policies "
+        "WHERE EXISTS (SELECT 1 FROM jsonb_array_elements(document -> 'models') AS model "
         f"WHERE model ->> 'disabled_reason' LIKE '%{ROUTING_MARKER}%')"
     )
