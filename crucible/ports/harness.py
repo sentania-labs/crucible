@@ -189,6 +189,15 @@ class CredentialSpec:
             base = base / self.source_subdir
         return base / name
 
+    def held_by(self, root: str) -> bool:
+        """Whether a configured source counts as mounted. A required credential is
+        mounted once configured, and its seeding refuses a missing file. An optional one
+        is mounted only when its required auth files exist: Compose creates its directory
+        empty, and an empty directory must keep the unauthenticated fallback."""
+        if self.required_for_launch:
+            return True
+        return all(self.source_path(root, a.name).is_file() for a in self.auth_files if a.required)
+
 
 @dataclass(frozen=True, slots=True)
 class HarnessGate:

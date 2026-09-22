@@ -6,6 +6,7 @@ sanitized state; per-harness concurrency defers the second launch.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -15,6 +16,7 @@ from crucible.adapters.api.deps import AppContext
 from crucible.adapters.execution.fake import FakeProvider
 from crucible.application.harnesses import set_harness_enabled
 from crucible.application.supervisor import Supervisor
+from crucible.ports.harness import CredentialSource
 from tests.fixtures import contract_document
 from tests.integration.conftest import (
     event_kinds,
@@ -260,6 +262,81 @@ async def test_local_pool_cap_is_independent_of_subscription_harness_caps(
     assert states.count("running") == 4
     assert states.count("scheduled") == 1
     assert "harness_launch_deferred" in event_kinds(client, task_ids[-1])
+
+
+async def test_an_empty_hermes_credential_directory_keeps_the_no_key_fallback(
+    ctx: AppContext,
+    client: TestClient,
+    provider: FakeProvider,
+    tokens: dict[str, str],
+    tmp_path: Path,
+) -> None:
+    """Compose's credential-init creates the Hermes directory empty and the service
+    registers it. Until `api-key` exists the launch must use the no-key fallback, not
+    point OPENAI_API_KEY at a file that is not there."""
+    credential_dir = tmp_path / "credentials" / "hermes"
+    credential_dir.mkdir(parents=True)
+    supervisor = make_supervisor(
+        ctx, provider, credential_sources={"hermes": CredentialSource(str(credential_dir))}
+    )
+    admin = {"Authorization": f"Bearer {tokens['admin']}"}
+    routing = client.get("/v1/routing/default-routing/4").json()["document"]
+    routing["version"] = 42
+    hermes = next(model for model in routing["models"] if model["harness"] == "hermes")
+    hermes.update(
+        {"endpoint_url": "http://192.0.2.41:11434/v1", "enabled": True, "disabled_reason": None}
+    )
+    assert (
+        client.put("/v1/routing/default-routing/42", json=routing, headers=admin).status_code == 200
+    )
+    policy = client.get("/v1/policies/default-software/4").json()["document"]
+    policy["version"] = 42
+    policy["routing"]["policy"]["version"] = 42
+    assert (
+        client.put("/v1/policies/default-software/42", json=policy, headers=admin).status_code
+        == 200
+    )
+    operator = {"Authorization": f"Bearer {tokens['operator']}"}
+
+    async def launch_env(external_id: str) -> tuple[dict[str, str], dict[str, str]]:
+        document = contract_document(external_id=external_id)
+        document["repository"]["work_branch"] = f"crucible/{external_id}"
+        document["policy"] = {"name": "default-software", "version": 42}
+        document["execution_request"].update(
+            {
+                "harness": "hermes",
+                "model": hermes["id"],
+                "pin_reason": "exercise the Hermes credential fallback",
+                "image": "crucible-worker:fake-hang",
+            }
+        )
+        response = client.post("/v1/tasks", json=document, headers=operator)
+        assert response.status_code == 201, response.text
+        task_id = response.json()["id"]
+        response = client.post(
+            f"/v1/tasks/{task_id}/start",
+            json={
+                "provider": "fake",
+                "image": "crucible-worker:fake-hang",
+                "policy_version": 42,
+            },
+            headers=operator,
+        )
+        assert response.status_code == 200, response.text
+        before = set(provider._workers)
+        for _ in range(3):
+            await supervisor.tick()
+        (attempt_id,) = set(provider._workers) - before
+        spec = provider._workers[attempt_id].spec
+        return dict(spec.env), dict(spec.env_from_files)
+
+    env, from_files = await launch_env("EX-HERMES-EMPTY")
+    assert env["OPENAI_API_KEY"] == "local-no-auth"
+    assert from_files == {}
+
+    (credential_dir / "api-key").write_text("placeholder-for-the-test\n", encoding="utf-8")
+    _, from_files = await launch_env("EX-HERMES-KEYED")
+    assert from_files == {"OPENAI_API_KEY": "/home/worker/.hermes-auth/api-key"}
 
 
 async def test_a_disabled_harness_is_a_contract_problem_at_submit(

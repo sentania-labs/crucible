@@ -1025,6 +1025,8 @@ class Supervisor:
         adapter = self._harnesses.get(selected_harness) if self._harnesses else None
         if adapter is None:
             return spec
+        credential = adapter.credential_spec()
+        source = self._credential_sources.get(selected_harness)
         # 07: the adapter's launch shape. Argv carries the pointer; the identity and
         # the contract are files; a credential value is never in any of it.
         launch = adapter.build_launch(
@@ -1037,9 +1039,9 @@ class Supervisor:
                 report_mount=REPORT_MOUNT,
                 repo_mount=REPO_MOUNT,
                 credential_mounted=(
-                    adapter.credential_spec() is not None
+                    credential is not None
                     and (
-                        selected_harness in self._credential_sources
+                        (source is not None and credential.held_by(source.path))
                         or self._providers[execution.provider].credential_available(
                             selected_harness
                         )

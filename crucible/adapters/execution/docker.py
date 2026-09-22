@@ -432,7 +432,10 @@ class DockerProvider:
         )
 
     def credential_available(self, harness: str) -> bool:
-        return self._credential_source(harness) is not None
+        source = self._credential_source(harness)
+        adapter = self.harnesses.get(harness)
+        credential = adapter.credential_spec() if adapter is not None else None
+        return source is not None and (credential is None or credential.held_by(source.path))
 
     async def prepare(self, spec: LaunchSpec) -> Workspace:
         repository = spec.contract.get("repository", {})
@@ -797,6 +800,8 @@ class DockerProvider:
         if credential is None:
             return None
         source = self._credential_source(spec.harness)
+        if source is not None and not credential.held_by(source.path):
+            source = None
         if source is None:
             if not credential.required_for_launch:
                 return None
