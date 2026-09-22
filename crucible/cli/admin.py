@@ -178,9 +178,7 @@ def build_parser() -> argparse.ArgumentParser:
     state = local_set.add_mutually_exclusive_group(required=True)
     state.add_argument("--enable", action="store_true")
     state.add_argument("--disable", action="store_true")
-    thinking = local_set.add_mutually_exclusive_group()
-    thinking.add_argument("--enable-thinking", action="store_true")
-    thinking.add_argument("--disable-thinking", action="store_true")
+    local_set.add_argument("--enable-thinking", action="store_true")
     local_set.add_argument("--max-concurrency", type=int, default=4)
 
     b = sub.add_parser(

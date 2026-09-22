@@ -59,9 +59,10 @@ def worker_proxy_config(
             [
                 f"acl local_destination_{index} {acl_kind} {destination}",
                 f"acl local_port_{index} port {port}",
-                f"acl Safe_ports port {port}",
             ]
         )
+        if port != 443:
+            lines.append(f"acl Safe_ports port {port}")
         if parsed.scheme == "https" and port != 443:
             lines.append(f"acl SSL_ports port {port}")
         local_rules.append((f"local_destination_{index}", port, f"local_port_{index}"))

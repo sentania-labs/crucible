@@ -262,7 +262,7 @@ trap 'rm -f "$tmp"' EXIT INT TERM
   printf '%s\n' "CRUCIBLE_DOCKER_SOCKET=${SOCKET}"
   echo "# The pinned release, agreeing with compose.deploy.yaml."
   printf '%s\n' "CRUCIBLE_IMAGE=${DEPLOY_IMAGE}"
-  echo "# The configured local model endpoint. Its presence enables the Spark route."
+  echo "# The configured local model endpoint. Its presence enables the local route."
   [ -z "$LOCAL_ENDPOINT_URL" ] || printf '%s\n' "CRUCIBLE_LOCAL_ENDPOINT_URL=${LOCAL_ENDPOINT_URL}"
   echo "# What the deployed squid.conf permits, so the application's declared allowlist"
   echo "# and the proxy's rules cannot drift apart in this directory (13, S6)."
