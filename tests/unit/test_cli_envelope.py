@@ -65,7 +65,8 @@ def test_every_offered_action_is_complete_and_admitted(state: str, role: str | N
         assert actions == []
     for entry in actions:
         assert role in entry["requires"]["roles"]
-        assert entry["requires"]["owner"] == "foundry"
+        if entry["action"] != "start":
+            assert entry["requires"]["owner"] == "foundry"
         tokens = {m for arg in entry["command"] for m in re.findall(r"\{(\w+)\}", arg)}
         assert tokens <= set(entry["needs"]), (entry["action"], tokens)
         assert entry["command"][0] == "crucible"

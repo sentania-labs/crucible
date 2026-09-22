@@ -360,7 +360,7 @@ def test_token_is_redacted_even_from_success_response(
 def test_json_escaped_token_is_redacted_from_error_response(
     fake: FakeCrucible, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    token = 'abc"def\\ghi\t'
+    token = 'abc"def\\ghi'
     monkeypatch.setenv("CRUCIBLE_TOKEN", token)
     fake.status = 400
     fake.response = {"type": "refused", "detail": f"echo {token}"}
@@ -369,6 +369,36 @@ def test_json_escaped_token_is_redacted_from_error_response(
     assert token not in output
     assert json.dumps(token)[1:-1] not in output
     assert "[REDACTED]" in output
+
+
+@pytest.mark.parametrize("token", ["SECRETTOKENVALUE123456\nsecondline", "tab\tseparated-token"])
+def test_a_token_that_cannot_be_a_header_is_refused_unshown(
+    fake: FakeCrucible,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    token: str,
+) -> None:
+    """A token file with a second line made the HTTP library quote the whole header."""
+    token_file = tmp_path / "token"
+    token_file.write_text(token, encoding="utf-8")
+    config = tmp_path / "client.toml"
+    config.write_text(f'token_file = "{token_file}"\n', encoding="utf-8")
+    monkeypatch.setenv("CRUCIBLE_CLIENT_CONFIG", str(config))
+    monkeypatch.delenv("CRUCIBLE_TOKEN")
+    assert run(["health"]) == 2
+    captured = capsys.readouterr()
+    for part in token.split():
+        assert part not in captured.out + captured.err
+    assert json.loads(captured.out)["error"]["code"] == "config"
+    assert not fake.requests
+
+
+def test_a_reason_outside_ascii_is_carried(fake: FakeCrucible) -> None:
+    assert run(["close", "T1", "--reason", "it\u2019s done\nsecond line"]) == 0
+    request = fake.requests[0]
+    assert request["body"] == {"note": "it\u2019s done\nsecond line"}
+    assert request["headers"]["X-Foundry-Reason"] == "it%E2%80%99s done%0Asecond line"
 
 
 def test_problem_document_with_success_status_is_refused(

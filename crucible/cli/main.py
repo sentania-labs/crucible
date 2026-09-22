@@ -28,12 +28,14 @@ from crucible.client.config import (
 )
 from crucible.client.envelope import (
     EXIT_OK,
+    IN_USE,
     ClientError,
     Result,
     UsageError,
     dumps,
     failure,
     redact,
+    redact_text,
     success,
 )
 from crucible.client.http import Api
@@ -102,7 +104,7 @@ def _reason(parser: argparse.ArgumentParser, text: str = "why this is being done
     parser.add_argument(
         "--reason",
         required=True,
-        help=f"{text}; sent as X-Foundry-Reason and in the body's reason field",
+        help=f"{text} (required; also sent as the X-Foundry-Reason header)",
     )
 
 
@@ -147,7 +149,7 @@ def _add_orchestrator_verbs(sub: Any) -> None:
     wakes_sub = wakes.add_subparsers(dest="wakes_command")
     ack = wakes_sub.add_parser("ack", help="acknowledge a wake")
     ack.add_argument("id", help="the wake id")
-    _reason(ack, "what was done about the wake; sent as the ack note")
+    _reason(ack, "what was done about the wake; the body's note")
 
     submit = verb("submit")
     _file(submit, "a TaskContractV1 JSON document")
@@ -168,7 +170,7 @@ def _add_orchestrator_verbs(sub: Any) -> None:
         "--verdict", required=True, choices=("accepted", "rejected", "needs_more_work")
     )
     accept.add_argument("--head-sha", help="the head the verdict is for")
-    _reason(accept, "the reasoning for the verdict")
+    _reason(accept, "the reasoning for the verdict; the body's reasoning")
 
     review = verb("review")
     review.add_argument("id", help="the task id")
@@ -188,12 +190,12 @@ def _add_orchestrator_verbs(sub: Any) -> None:
     ci.add_argument("id", help="the task id")
     ci.add_argument("--cause", required=True, help="the CI failure cause (see `next`)")
     ci.add_argument("--action", required=True, help="rerun, correct, reject, or cancel")
-    _reason(ci, "the reasoning for the decision")
+    _reason(ci, "the reasoning for the decision; the body's reasoning")
 
     head = verb("head-decision")
     head.add_argument("id", help="the task id")
     head.add_argument("--action", required=True, help="recollect, reject, or cancel")
-    _reason(head, "the reasoning for the decision")
+    _reason(head, "the reasoning for the decision; the body's reasoning")
 
     decisions = verb("decisions")
     decisions.add_argument("id", help="the task id")
@@ -210,15 +212,15 @@ def _add_orchestrator_verbs(sub: Any) -> None:
     cancel.add_argument("id", help="the task id")
     cancel.add_argument("--verbatim", required=True, help="the deciding person's words")
     cancel.add_argument("--decided-by", default="foundry", help="who decided (foundry)")
-    _reason(cancel)
+    _reason(cancel, "why the task is cancelled; the body's reason")
 
     close = verb("close")
     close.add_argument("id", help="the task id")
-    _reason(close, "the closing note")
+    _reason(close, "the closing note; the body's note")
 
     republish = verb("republish")
     republish.add_argument("id", help="the task id")
-    _reason(republish)
+    _reason(republish, "why the retry is safe now; the body's reason")
 
     verb("health")
 
@@ -234,7 +236,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="group", required=True)
     sub.add_parser(
         "serve",
-        help="run the api and/or the supervisor (prints logs, not an envelope)",
+        help="run the api and/or the supervisor; first on the line (prints logs, not an "
+        "envelope; `crucible serve --help` for its options)",
         add_help=False,
     )
     admin.build_parser(sub.add_parser("admin", help="the operator's console (25)"))
@@ -269,10 +272,12 @@ def _execute(args: argparse.Namespace) -> Result:
 
 
 def _secrets() -> list[str]:
-    """The bearer tokens in the environment, redacted from any envelope. A value too short
-    to be a token would redact ordinary text, so it is not treated as one."""
-    values = (os.environ.get(name, "").strip() for name in (TOKEN_ENV, ADMIN_TOKEN_ENV))
-    return [value for value in values if len(value) >= 16]
+    """The bearer tokens in the environment and every token this process sent (a token
+    file's included), redacted from anything printed. A value too short to be a token
+    would redact ordinary text, so it is not treated as one; the transport redacts the
+    token it holds whatever its length."""
+    values = [os.environ.get(name, "").strip() for name in (TOKEN_ENV, ADMIN_TOKEN_ENV)]
+    return [value for value in [*values, *IN_USE] if len(value) >= 16]
 
 
 def _zone(timezone: str | None) -> ZoneInfo:
@@ -303,7 +308,7 @@ def run(argv: Sequence[str] | None = None) -> int:
         envelope = failure(ClientError("interrupted", "interrupted", hint="run it again"))
         code = 1
     except Exception as exc:  # the envelope, never a bare traceback on stdout
-        traceback.print_exc(file=sys.stderr)
+        print(redact_text(traceback.format_exc(), _secrets()), file=sys.stderr, end="")
         envelope = failure(
             ClientError(
                 "internal",

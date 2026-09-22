@@ -1036,7 +1036,7 @@ def test_login_through_api_and_cli_against_the_fake_cli(
     assert finished["shape"]["ok"]
     assert "sk-ant-" not in json.dumps(finished) + json.dumps(state)
 
-    monkeypatch.setattr("builtins.input", lambda prompt="": "ABCD-EFGH")
+    monkeypatch.setattr("crucible.cli.admin._read_code", lambda: "ABCD-EFGH")
     result = run_cli(
         config_file,
         "--reason",
@@ -1286,7 +1286,7 @@ def test_remote_login_submits_the_reason_with_the_code(
 
     monkeypatch.setattr(Api, "call", fake_call)
     monkeypatch.setattr("crucible.cli.admin.time.sleep", lambda _seconds: None)
-    monkeypatch.setattr("builtins.input", lambda _prompt: "operator-code")
+    monkeypatch.setattr("crucible.cli.admin._read_code", lambda: "operator-code")
     monkeypatch.setenv(ADMIN_TOKEN_ENV, "cru_" + "0" * 26 + "." + "s" * 40)
     admin_main(
         [

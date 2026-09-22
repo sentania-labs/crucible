@@ -96,15 +96,18 @@ Each entry is one action:
 - `requires.roles` are the roles the API accepts the action from. It is
   always a set the role in use belongs to; it is there so a caller that holds
   several tokens can tell which one to use.
-- `requires.owner` is the task's principal. An orchestrator may act only on
-  its own tasks; the API refuses another orchestrator's attempt.
+- `requires.owner`, where the API checks one, is the task's principal. An
+  orchestrator may act only on its own tasks; the API refuses another
+  orchestrator's attempt. The client cannot learn its own principal's name
+  (there is no endpoint for it), so it names the owner rather than guessing.
 
 What `next` offers follows the API's own checks: the lifecycle table (09) and
 each endpoint's state guard (an acceptance only in `awaiting_acceptance`, a
 correction only in the four correctable states, and so on), filtered by the
 role the route admits. What a state cannot show is still the API's to decide:
 a live supervisor lease for an admin mutation, a review comment that exists,
-a prepared directory for a rotation. If the API refuses, the refusal comes
+a prepared directory for a rotation, an import already authoritative when
+another verified one is committed. If the API refuses, the refusal comes
 back in `error`; read the record again and follow its new `next`.
 
 List kinds offer a read of each item (`crucible task {task_id}`); a wake list
@@ -222,10 +225,23 @@ their arguments.
 and runs `crucible admin ARGS`. Foundry's `foundry-crucible ARGS` becomes
 `crucible ARGS`, verb for verb; the shim in `docs/integration/foundry-crucible-shim/`
 keeps the old name. Arguments, API calls, and bodies are unchanged, and a
-test holds both old command trees to the new one. Three things did change:
-output is the envelope (the old record is its `data`), errors are envelopes
-on stdout rather than text on stderr, and an unreachable server exits 1
-rather than 3.
+test holds both old command trees to the new one. What did change:
+
+- output is the envelope, and the old record is its `data`;
+- errors are envelopes on stdout rather than text on stderr, and a refusal
+  exits 1 (the old admin client exited 2), an unreachable server 1 (Foundry's
+  client exited 3);
+- the admin client's remote mode refuses redirects, as Foundry's did, so an
+  `--api-url` that redirects (http to https, say) must name the final URL;
+- the admin client's remote mode takes `CRUCIBLE_TOKEN` or `token_file` when
+  `CRUCIBLE_ADMIN_TOKEN` is not set, where it used to stop;
+- `crucible admin migrate` prints the first-run administrator token on stderr,
+  where it used to share stdout with the result;
+- a login's "paste the code" prompt is on stderr, and the code is read from
+  stdin;
+- a `--reason` outside printable ASCII is percent-encoded in the
+  `X-Foundry-Reason` header (the body carries it unchanged), where Foundry's
+  client failed before sending.
 
 ## Later: MCP
 

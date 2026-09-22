@@ -130,7 +130,7 @@ def task_actions(task: Any, role: str | None, prefix: Sequence[str]) -> list[dic
                     for name in ("harness", "model", "provider", "image", "effort")
                 ],
                 roles=MUTATOR_ROUTE,
-                owner=owner,
+                # start_task checks no owner: any principal that may mutate may start.
             ),
         )
     if state == "awaiting_internal_review":

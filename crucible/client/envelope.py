@@ -155,6 +155,16 @@ def _forms(secret: str) -> list[str]:
     return sorted((form for form in forms if form), key=len, reverse=True)
 
 
+# Every bearer token this process has sent, however it was read (the environment or a
+# token file). The CLI redacts all of them from whatever it prints, including a traceback.
+IN_USE: set[str] = set()
+
+
+def remember_secret(value: str) -> None:
+    if value:
+        IN_USE.add(value)
+
+
 def redact_text(text: str, secrets: Iterable[str]) -> str:
     for secret in secrets:
         if not secret:

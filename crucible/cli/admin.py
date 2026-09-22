@@ -239,6 +239,13 @@ def build_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     return parser
 
 
+def _read_code() -> str:
+    """The login code a person pastes. The prompt goes to stderr and the code is read
+    from stdin, so stdout carries the envelope alone even when stdin is not a terminal."""
+    print("paste the code: ", end="", file=sys.stderr, flush=True)
+    return sys.stdin.readline().rstrip("\r\n")
+
+
 def _read_bundle(path: str) -> Any:
     """The bundle file, parsed and nothing else: validation is the service's."""
     try:
@@ -406,7 +413,7 @@ def _remote_login(args: argparse.Namespace, remote: Api, reason: dict[str, str])
                 shown.add(line)
                 print(line, file=sys.stderr)
         if state["state"] == "waiting_for_code":
-            code = input("paste the code: ")
+            code = _read_code()
             remote.call(
                 "POST",
                 f"/v1/admin/credentials/{args.harness}/login/code",
@@ -443,7 +450,7 @@ def _local_login(args: argparse.Namespace, wiring: Wiring, admin: AdminContext) 
             print(line, file=sys.stderr)
         shown = len(session.lines)
         if session.state == "waiting_for_code":
-            session.submit_code(input("paste the code: "))
+            session.submit_code(_read_code())
         time.sleep(0.5)
     for line in session.lines[shown:]:
         print(line, file=sys.stderr)

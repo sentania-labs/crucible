@@ -9,17 +9,39 @@ the token in use is redacted from every message before it leaves this module.
 from __future__ import annotations
 
 import json
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any
 
-from crucible.client.envelope import ClientError, UsageError, redact, redact_text, refusal
+from crucible.client.envelope import (
+    ClientError,
+    UsageError,
+    redact,
+    redact_text,
+    refusal,
+    remember_secret,
+)
 
 # Foundry's client used 30 seconds; the admin client 300, because a credential probe
 # runs a bounded container and a login waits on a person.
 ORCHESTRATOR_TIMEOUT_SECONDS = 30.0
 ADMIN_TIMEOUT_SECONDS = 300.0
+
+
+_HEADER_SAFE = re.compile(r"[\x21-\x7e]+")
+_PRINTABLE_ASCII = "".join(chr(c) for c in range(0x20, 0x7F) if chr(c) != "%")
+
+
+def header_value(text: str) -> str:
+    """`X-Foundry-Reason` as sent: unchanged when it is printable ASCII, else
+    percent-encoded, so a reason with a curly quote or a newline is carried rather than
+    refused by the HTTP library. The server does not read the header; the reason it
+    records travels in the body."""
+    if all(ch in _PRINTABLE_ASCII for ch in text):
+        return text
+    return urllib.parse.quote(text, safe=_PRINTABLE_ASCII)
 
 
 def validate_base_url(value: str, *, source: str) -> str:
@@ -55,6 +77,14 @@ class Api:
     """`/v1` over HTTP with a bearer token."""
 
     def __init__(self, base_url: str, token: str) -> None:
+        remember_secret(token)
+        if not _HEADER_SAFE.fullmatch(token):
+            # The HTTP library would refuse it with the whole header in its message.
+            raise UsageError(
+                "the token has whitespace, control, or non-ASCII characters; check the "
+                "variable or token_file it came from (the value is not shown)",
+                code="config",
+            )
         self.base_url = base_url.rstrip("/")
         self.token = token
         self._opener = urllib.request.build_opener(_NoRedirect())
@@ -80,7 +110,7 @@ class Api:
             data = json.dumps(body, separators=(",", ":")).encode("utf-8")
             headers["Content-Type"] = "application/json"
         if reason is not None:
-            headers["X-Foundry-Reason"] = reason
+            headers["X-Foundry-Reason"] = header_value(reason)
         request = urllib.request.Request(
             self.base_url + path, data=data, headers=headers, method=method
         )
@@ -97,6 +127,12 @@ class Api:
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             raise ClientError(
                 "unreachable", self._redact(f"cannot reach {self.base_url}: {exc}")
+            ) from None
+        except (ValueError, UnicodeError) as exc:
+            # The HTTP library refusing a request it was given; its message can quote a
+            # header, so it is redacted like everything else.
+            raise ClientError(
+                "usage", self._redact(f"the request was refused locally: {exc}")
             ) from None
         if not raw:
             if versioned:
