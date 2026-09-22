@@ -210,7 +210,9 @@ and a separate optional `endpoint_url`. Local requires the URL; subscription
 forbids it. The supervisor preserves both fields through launch reconstruction.
 Local routing does not imply credential absence. The provider mounts the selected
 harness's declared credential when one is configured. Hermes therefore receives its
-read-only `api-key` copy, while an unconfigured deployment gets the explicit fallback.
+read-only `api-key` copy, while a deployment without that file gets the explicit
+fallback. For an optional credential, a configured directory that does not hold its
+required auth files (the empty directory Compose creates) counts as not mounted.
 The identity, report, and gate contracts do not change.
 
 Hermes is the local gateway front end. Other harness and local-server
