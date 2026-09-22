@@ -42,6 +42,7 @@ from crucible.application.admin.credentials import (
 from crucible.application.errors import ConflictError
 from crucible.domain.events import EventKind
 from crucible.domain.secrets import redact
+from crucible.ports.harness import AGY_BINARY, CLAUDE_CODE_BINARY, CODEX_BINARY
 from crucible.ports.repository import UnitOfWork
 
 URL_RE = re.compile(r"https?://[^\s'\"<>]+")
@@ -79,7 +80,7 @@ class LoginFlow:
 FLOWS: dict[str, LoginFlow] = {
     "claude_code": LoginFlow(
         harness="claude_code",
-        argv=("claude", "setup-token"),
+        argv=(CLAUDE_CODE_BINARY, "setup-token"),
         directory_env="CLAUDE_CONFIG_DIR",
         directory_subdir="",
         pastes_code=True,
@@ -93,7 +94,7 @@ FLOWS: dict[str, LoginFlow] = {
     ),
     "codex": LoginFlow(
         harness="codex",
-        argv=("codex", "login", "--device-auth"),
+        argv=(CODEX_BINARY, "login", "--device-auth"),
         directory_env="CODEX_HOME",
         directory_subdir="",
         pastes_code=False,
@@ -104,7 +105,7 @@ FLOWS: dict[str, LoginFlow] = {
     ),
     "agy": LoginFlow(
         harness="agy",
-        argv=("agy", "-p", "Reply with exactly the word OK and nothing else."),
+        argv=(AGY_BINARY, "-p", "Reply with exactly the word OK and nothing else."),
         directory_env="HOME",
         directory_subdir="",
         pastes_code=True,
@@ -505,11 +506,19 @@ def start_login(
     image = None
     runner = getattr(registry, "container_runner", lambda _ctx: None)(ctx)
     if runner is not None:
+        # The promoted worker image carries every harness (C11); the most recent
+        # default that carries this one is what a launch would use too.
         promoted = next(
-            (
-                item
-                for item in uow.image_promotions.list_all()
-                if item.harness == harness and item.state == "default"
+            iter(
+                sorted(
+                    (
+                        item
+                        for item in uow.image_promotions.list_all()
+                        if item.carries(harness) and item.state == "default"
+                    ),
+                    key=lambda item: (item.updated_at, item.digest),
+                    reverse=True,
+                )
             ),
             None,
         )

@@ -324,16 +324,13 @@ def live_client(
         overrides = _images()
         with live_ctx.uow_factory() as uow:
             for harness in _selected():
-                reference = overrides.get(harness) or daemon.image_tag(
-                    f"crucible-worker:{harness}-", harness=harness
-                )
+                reference = overrides.get(harness) or daemon.worker_image()
                 image = available[reference]
                 uow.image_promotions.put(
                     ImagePromotion(
                         digest=image.digest,
                         reference=image.reference,
-                        harness=harness,
-                        harness_version=image.harness_version or "",
+                        harnesses=dict(image.harnesses),
                         state="default",
                         updated_at=live_ctx.clock.now(),
                         updated_by="e2e-live",
@@ -622,9 +619,7 @@ async def test_a_trivial_task_reaches_ready_for_merge_live(
     engine: Engine,
     artifact_root: Path,
 ) -> None:
-    image = _images().get(harness) or daemon.image_tag(
-        f"crucible-worker:{harness}-", harness=harness
-    )
+    image = _images().get(harness) or daemon.worker_image()
     model = _models()[harness]
     secrets = _secret_values(credential_root, harness)
     if default_registry().require(harness).credential_spec() is not None:
@@ -794,7 +789,7 @@ async def test_hermes_lab_local_pool_runs_four_and_defers_the_fifth_live(
         pytest.skip("the live selection does not include Hermes")
     register(live_ctx, live_config, mirror)
     _enable(live_ctx, "hermes")
-    image = _images().get("hermes") or daemon.image_tag("crucible-worker:hermes-", harness="hermes")
+    image = _images().get("hermes") or daemon.worker_image()
     task_ids: list[str] = []
     started: dict[str, datetime] = {}
     for number in range(5):

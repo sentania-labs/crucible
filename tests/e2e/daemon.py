@@ -76,22 +76,29 @@ MANIFEST = Path(__file__).resolve().parents[2] / "images" / "manifest.env"
 
 
 def manifest_pins() -> dict[str, str]:
-    """The declared image per harness from images/manifest.env, written by build.sh (13).
+    """The declared tag per image from images/manifest.env, written by build.sh (13):
+    `worker`, the one image carrying all four real harnesses (C11), and
+    `script-harness`, the e2e tier's.
 
     Every reproducible image carries the same SOURCE_DATE_EPOCH creation time, so no
-    tier picks an image by "newest": two tags of one harness tie, and the choice would
+    tier picks an image by "newest": two tags of one image tie, and the choice would
     be arbitrary (found by Foundry on 2026-09-17 at 07:26 CDT)."""
     pins: dict[str, str] = {}
     if not MANIFEST.is_file():
         return pins
     for line in MANIFEST.read_text(encoding="utf-8").splitlines():
-        if not line or line.startswith("#") or "=" not in line or line.endswith("_DIGEST"):
+        if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
-        if key.endswith("_DIGEST"):
+        if key.endswith(("_DIGEST", "_HARNESSES")):
             continue
-        pins[key.lower().replace("_", "-") if key == "SCRIPT_HARNESS" else key.lower()] = value
+        pins[key.lower().replace("_", "-")] = value
     return pins
+
+
+def worker_image() -> str:
+    """The worker image the manifest pins; it carries Claude Code, Codex, AGY and Hermes."""
+    return image_tag("crucible-worker:2", harness="worker")
 
 
 def image_tag(prefix: str, *, harness: str | None = None) -> str:

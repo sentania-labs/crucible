@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
@@ -300,16 +300,53 @@ class CredentialSync:
         }
 
 
+HARNESSES_LABEL = "crucible.harnesses"
+LEGACY_HARNESS_LABEL = "crucible.harness"
+LEGACY_VERSION_LABEL = "crucible.harness_version"
+
+
+def harness_version_label(harness: str) -> str:
+    return f"crucible.harness.{harness}.version"
+
+
+def image_harnesses(labels: Mapping[str, str]) -> dict[str, str]:
+    """The harnesses an image declares, by name, with the version each is pinned at (13).
+
+    Since C11 one worker image carries every harness: `crucible.harnesses` lists them
+    and `crucible.harness.<name>.version` pins each. An image built before C11 carries
+    one, as `crucible.harness` and `crucible.harness_version`, and is still read. A
+    harness the list names without a version maps to "", so the version check refuses
+    it by name rather than taking it for a harness the image does not carry."""
+    listed = labels.get(HARNESSES_LABEL)
+    if listed is not None:
+        names = sorted({name.strip() for name in listed.split(",") if name.strip()})
+        return {name: labels.get(harness_version_label(name), "") for name in names}
+    single = labels.get(LEGACY_HARNESS_LABEL)
+    if single:
+        return {single: labels.get(LEGACY_VERSION_LABEL, "")}
+    return {}
+
+
 @dataclass(frozen=True, slots=True)
 class ImageInfo:
     """A worker image the provider can see (13): its reference, its digest, and the
-    harness and version its labels declare."""
+    harnesses its labels declare, name to version. The worker image carries all four
+    real harnesses (C11); the e2e image carries the script harness."""
 
     reference: str
     digest: str
-    harness: str | None
-    harness_version: str | None
+    harnesses: Mapping[str, str] = field(default_factory=dict)
     labels: dict[str, str] = field(default_factory=dict)
+
+    @classmethod
+    def from_labels(cls, reference: str, digest: str, labels: Mapping[str, str]) -> ImageInfo:
+        return cls(reference, digest, image_harnesses(labels), dict(labels))
+
+    def carries(self, harness: str) -> bool:
+        return harness in self.harnesses
+
+    def version_of(self, harness: str) -> str | None:
+        return self.harnesses.get(harness) or None
 
 
 @dataclass(frozen=True, slots=True)

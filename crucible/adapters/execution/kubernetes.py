@@ -1225,7 +1225,7 @@ class KubernetesProvider:
                     info = await self._call(self.registry.resolve, f"{repository}:{tag}")
                 except RegistryError:
                     continue
-                if info.harness:
+                if info.harnesses:
                     images.append(replace(info, reference=f"{repository}:{tag}"))
         return sorted(images, key=lambda i: i.reference)
 

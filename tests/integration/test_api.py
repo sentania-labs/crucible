@@ -215,8 +215,7 @@ def test_only_registered_providers_are_accepted(
             ImagePromotion(
                 digest="sha256:integration-codex",
                 reference="crucible-worker:codex-integration",
-                harness="codex",
-                harness_version="0.153.4",
+                harnesses={"codex": "0.156.0"},
                 state="default",
                 updated_at=clock.now(),
                 updated_by="tests",

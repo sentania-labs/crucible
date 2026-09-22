@@ -111,15 +111,14 @@ def _install_policy(
 def _promote(ctx: AppContext, clock: FakeClock, harness: str, image: str) -> None:
     with ctx.uow_factory() as uow:
         for existing in uow.image_promotions.list_all():
-            if existing.harness == harness and existing.state == "default":
+            if existing.carries(harness) and existing.state == "default":
                 existing.state = "retained"
                 uow.image_promotions.put(existing)
         uow.image_promotions.put(
             ImagePromotion(
                 digest=f"sha256:{harness}-{image}",
                 reference=image,
-                harness=harness,
-                harness_version="1.0.0",
+                harnesses={harness: "1.0.0"},
                 state="default",
                 updated_at=clock.now(),
                 updated_by="tests",

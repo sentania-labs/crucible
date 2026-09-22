@@ -399,17 +399,20 @@ def _probe_provider(ctx: AdminContext) -> ExecutionProvider:
 async def probe_image(
     ctx: AdminContext, uow: UnitOfWork, provider: ExecutionProvider, harness: str
 ) -> str:
-    """The image the probe runs: the promoted default for the harness, else the one
-    labelled image the provider has for it, else a refusal naming the ambiguity (13)."""
-    promoted = [
-        p for p in uow.image_promotions.list_all() if p.harness == harness and p.state == "default"
-    ]
+    """The image the probe runs: the promoted default that carries the harness (the one
+    worker image, C11), else the one labelled image the provider has for it, else a
+    refusal naming the ambiguity (13)."""
+    promoted = sorted(
+        (p for p in uow.image_promotions.list_all() if p.carries(harness) and p.state == "default"),
+        key=lambda p: (p.updated_at, p.digest),
+        reverse=True,
+    )
     if promoted:
         return promoted[0].reference
     if provider.name == "fake":
         # The fake provider runs behaviours, not images (08).
         return "crucible-worker:fake-probe"
-    images = [i for i in await provider.list_images() if i.harness == harness]
+    images = [i for i in await provider.list_images() if i.carries(harness)]
     references = sorted({i.reference for i in images})
     if len(references) == 1:
         return references[0]

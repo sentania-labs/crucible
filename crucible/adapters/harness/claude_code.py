@@ -24,6 +24,7 @@ from typing import Any
 from crucible.adapters.harness import base
 from crucible.domain.exit_class import ExitClass
 from crucible.ports.harness import (
+    CLAUDE_CODE_BINARY,
     AdapterLaunch,
     AuthFile,
     CredentialSpec,
@@ -131,7 +132,7 @@ class ClaudeCodeAdapter:
 
     def build_launch(self, ctx: LaunchContext) -> AdapterLaunch:
         argv = (
-            "claude",
+            CLAUDE_CODE_BINARY,
             "-p",
             "--permission-mode",
             "bypassPermissions",

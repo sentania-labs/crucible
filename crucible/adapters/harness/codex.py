@@ -26,6 +26,7 @@ from typing import Any
 from crucible.adapters.harness import base
 from crucible.domain.exit_class import ExitClass
 from crucible.ports.harness import (
+    CODEX_BINARY,
     AdapterLaunch,
     AuthFile,
     CredentialSpec,
@@ -80,7 +81,7 @@ def _provider_quota_refusal(document: Mapping[str, Any]) -> bool:
 
 class CodexAdapter:
     name = NAME
-    supported_versions = VersionRange("0.153.0", "0.154.0")
+    supported_versions = VersionRange("0.153.0", "0.157.0")
 
     def quota_reset_at(self, stdout_tail: str, stderr_tail: str) -> datetime | None:
         return base.quota_reset_at(stdout_tail, stderr_tail, quota=QUOTA_PATTERNS)
@@ -126,7 +127,7 @@ class CodexAdapter:
 
     def build_launch(self, ctx: LaunchContext) -> AdapterLaunch:
         argv: list[str] = [
-            "codex",
+            CODEX_BINARY,
             "exec",
             "--dangerously-bypass-approvals-and-sandbox",
             "--skip-git-repo-check",

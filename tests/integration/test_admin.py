@@ -38,6 +38,14 @@ from crucible.ports.harness import CredentialSource
 
 pytestmark = pytest.mark.integration
 
+# What the C11 worker image declares: every real harness, each inside its adapter's range.
+WORKER_HARNESSES = {
+    "agy": "1.2.8",
+    "claude_code": "2.1.280",
+    "codex": "0.156.0",
+    "hermes": "0.19.0",
+}
+
 
 @pytest.fixture(autouse=True)
 def _quiet_cli_logging(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1053,22 +1061,25 @@ def test_images_list_and_promote_through_api_and_cli(
     # The fake provider lists what a test hands it (08); the CLI's own provider lists
     # nothing, so the promotion is exercised through the API and its refusal through
     # both.
+    # One worker image carries all four harnesses (C11): the listing shows each version
+    # and promoting it switches all four.
     image = ImageInfo(
-        reference="crucible-worker:codex-0.153.4-test",
+        reference="crucible-worker:20260916-aaaaaaaaaaaa",
         digest="sha256:" + "d" * 64,
-        harness="codex",
-        harness_version="0.153.4",
+        harnesses=WORKER_HARNESSES,
     )
     provider.images = [image]
     listed = admin_client.get("/v1/admin/images").json()["items"]
     assert listed[0]["promotion_state"] == "candidate" and listed[0]["supported"] is True
+    assert listed[0]["harnesses"] == WORKER_HARNESSES
     promoted = admin_client.post(
         f"/v1/admin/images/{image.digest}/promote", json={"reason": "canary passed"}
     ).json()
     assert promoted["promotion_state"] == "default"
+    assert promoted["harnesses"] == WORKER_HARNESSES
     provider.images = [
         image,
-        ImageInfo("crucible-worker:codex-0.153.4-next", "sha256:" + "e" * 64, "codex", "0.153.4"),
+        ImageInfo("crucible-worker:20260917-bbbbbbbbbbbb", "sha256:" + "e" * 64, WORKER_HARNESSES),
     ]
     again = admin_client.post(
         "/v1/admin/images/sha256:" + "e" * 64 + "/promote", json={"reason": "next canary"}
@@ -1079,6 +1090,11 @@ def test_images_list_and_promote_through_api_and_cli(
         for i in admin_client.get("/v1/admin/images").json()["items"]
     }
     assert states[image.digest] == "retained" and states["sha256:" + "e" * 64] == "default"
+    # Rollback is promoting the previous digest, and it rolls back all four together.
+    back = admin_client.post(
+        f"/v1/admin/images/{image.digest}/promote", json={"reason": "roll back"}
+    ).json()
+    assert back["promotion_state"] == "default" and back["retained"] == ["sha256:" + "e" * 64]
     assert run_cli(config_file, "images", "list", capsys=capsys)["items"] == []
     with pytest.raises(SystemExit):
         cli.main(
@@ -1693,8 +1709,7 @@ def test_container_login_restores_a_credential_when_replacement_mkdir_fails(
             ImagePromotion(
                 digest="sha256:" + "b" * 64,
                 reference="crucible-worker:codex-fixture",
-                harness="codex",
-                harness_version="fixture",
+                harnesses={"codex": "fixture"},
                 state="default",
                 updated_at=admin_ctx.clock.now(),
                 updated_by="tests",

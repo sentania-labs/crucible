@@ -21,7 +21,23 @@ from crucible.domain.exit_class import ExitClass
 
 _VERSION = re.compile(r"^(\d+)\.(\d+)\.(\d+)")
 
+# Where each harness's CLI lives inside the worker image (images/worker/Dockerfile).
+# One image carries all four since C11, so a launch names its binary by path rather
+# than by whatever a PATH lookup inside a shared image would find.
+CLAUDE_CODE_BINARY = "/usr/local/bin/claude"
+CODEX_BINARY = "/usr/local/bin/codex"
+AGY_BINARY = "/usr/local/bin/agy"
+HERMES_BINARY = "/usr/local/bin/crucible-hermes"
+# The Hermes virtual environment. Only the Hermes launch puts it on PATH; the image's
+# own PATH leaves it off, so no other harness's `python3` resolves into it.
+HERMES_PATH = "/opt/hermes/bin:/usr/local/bin:/usr/bin:/bin"
+
 __all__ = [
+    "AGY_BINARY",
+    "CLAUDE_CODE_BINARY",
+    "CODEX_BINARY",
+    "HERMES_BINARY",
+    "HERMES_PATH",
     "AdapterLaunch",
     "AuthFile",
     "CredentialSource",

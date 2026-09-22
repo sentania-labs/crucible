@@ -82,12 +82,8 @@ class FakeRegistry:
         resolved = {"crucible.harness": harness, "crucible.harness_version": version}
         if labels is not None:
             resolved = dict(labels)
-        info = ImageInfo(
-            reference=f"{reference.split(':', maxsplit=1)[0]}@{digest}",
-            digest=digest,
-            harness=resolved.get("crucible.harness"),
-            harness_version=resolved.get("crucible.harness_version"),
-            labels=resolved,
+        info = ImageInfo.from_labels(
+            f"{reference.split(':', maxsplit=1)[0]}@{digest}", digest, resolved
         )
         self._images[reference] = info
         if self._api is not None:

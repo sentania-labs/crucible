@@ -393,8 +393,7 @@ async def test_rows_5_7_11_23_supervisor_restart_and_full_gate_lifecycle(
                 ImagePromotion(
                     digest=resolved.digest,
                     reference=resolved.reference,
-                    harness="script-harness",
-                    harness_version=resolved.harness_version or "1.0.0",
+                    harnesses=dict(resolved.harnesses) or {"script-harness": "1.0.0"},
                     state="default",
                     updated_at=clock.now(),
                     updated_by="e2e-kind",

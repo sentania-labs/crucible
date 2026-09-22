@@ -7,7 +7,7 @@ from typing import Any
 from crucible.application.routing import select_model
 from crucible.application.supervisor import Supervisor
 from crucible.contracts.policy import RoutingPolicyV1
-from crucible.domain.entities import AttemptMetrics, PoolExhaustion
+from crucible.domain.entities import AttemptMetrics, ImagePromotion, PoolExhaustion
 
 NOW = datetime(2026, 9, 20, 12, 0, tzinfo=UTC)
 
@@ -236,21 +236,21 @@ def test_operator_pin_is_exact_and_does_not_fall_through() -> None:
 def test_image_allowlist_excludes_one_candidate_and_selects_the_next() -> None:
     routing = _routing([_model("first"), _model("second", harness="agy")])
     images = [
-        SimpleNamespace(
-            harness="codex",
-            reference="workers/codex:1",
-            harness_version="0.153.4",
-            state="default",
-            updated_at=NOW,
+        ImagePromotion(
             digest="sha256:first",
-        ),
-        SimpleNamespace(
-            harness="agy",
-            reference="workers/agy:1",
-            harness_version="1.2.1",
+            reference="workers/codex:1",
+            harnesses={"codex": "0.156.0"},
             state="default",
             updated_at=NOW,
+            updated_by="tests",
+        ),
+        ImagePromotion(
             digest="sha256:second",
+            reference="workers/agy:1",
+            harnesses={"agy": "1.2.1"},
+            state="default",
+            updated_at=NOW,
+            updated_by="tests",
         ),
     ]
     result = select_model(
