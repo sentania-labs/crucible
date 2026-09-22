@@ -1,4 +1,4 @@
-"""Hermes 0.19 worker adapter for credential-free local OpenAI endpoints."""
+"""Hermes 0.19 worker adapter for local OpenAI-compatible endpoints."""
 
 from __future__ import annotations
 
@@ -12,10 +12,12 @@ from crucible.adapters.harness import base
 from crucible.domain.exit_class import ExitClass, classify_exit
 from crucible.ports.harness import (
     AdapterLaunch,
+    AuthFile,
     CredentialSpec,
     ExitInfo,
     HarnessCapabilities,
     LaunchContext,
+    MountMode,
     ParsedReport,
     ProviderQuotaEvent,
     ReportMetrics,
@@ -25,6 +27,7 @@ from crucible.ports.harness import (
 
 NAME = "hermes"
 HERMES_HOME = "/home/worker/.hermes"
+AUTH_DIR = "/home/worker/.hermes-auth"
 USAGE_NAME = "hermes-usage.json"
 
 PROVIDER_PATTERNS = base.patterns(
@@ -115,14 +118,21 @@ class HermesAdapter:
         )
 
     def credential_spec(self) -> CredentialSpec | None:
-        return None
+        return CredentialSpec(
+            harness=NAME,
+            mount_target=AUTH_DIR,
+            auth_files=(AuthFile("api-key", env_var="OPENAI_API_KEY", sync_back=False),),
+            minimum_mode=MountMode.RO,
+            required_for_launch=False,
+            login_hint="Paste the LiteLLM virtual key in the Crucible admin credential panel",
+        )
 
     def build_launch(self, ctx: LaunchContext) -> AdapterLaunch:
         if ctx.endpoint != "local" or ctx.endpoint_url is None:
             raise ValueError("Hermes is supported only with a configured local endpoint")
-        if ctx.model != "gpt-oss:120b":
-            raise ValueError("Hermes local launches are restricted to gpt-oss:120b")
         usage_path = f"{ctx.report_mount}/{USAGE_NAME}"
+        spec = self.credential_spec()
+        assert spec is not None
         return AdapterLaunch(
             argv=(
                 "crucible-hermes",
@@ -152,6 +162,7 @@ class HermesAdapter:
                 "OPENAI_API_KEY": "local-no-auth",
                 "CRUCIBLE_HERMES_USAGE": usage_path,
             },
+            env_from_files=spec.env_from_files() if ctx.credential_mounted else {},
             transcript_path=f"{ctx.report_mount}/{base.TRANSCRIPT_NAME}",
             workdir=ctx.repo_mount,
         )

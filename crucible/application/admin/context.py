@@ -49,6 +49,9 @@ class AdminContext:
     credential_retention_hours: int = 24
     probe_timeout_seconds: int = 120
     login_timeout_seconds: int = 900
+    proxy_config_path: str | None = None
+    proxy_subnet: str = "10.88.0.0/24"
+    proxy_hosts: tuple[str, ...] = ()
     # The command each harness's login runs, overridable for the fake-CLI tests.
     login_commands: dict[str, tuple[str, ...]] = field(default_factory=dict)
 

@@ -1,4 +1,4 @@
-"""Generate the worker Squid policy, including exact plain-HTTP local endpoints."""
+"""Generate the worker Squid policy, including exact local endpoint destinations."""
 
 from __future__ import annotations
 
@@ -42,10 +42,10 @@ def worker_proxy_config(
     local_rules: list[tuple[str, int, str]] = []
     for index, endpoint in enumerate(enabled_local_endpoints(routing_policies)):
         parsed = urlsplit(endpoint)
-        if parsed.scheme != "http":
-            raise ValueError("local model proxy destinations must use plain HTTP")
+        if parsed.scheme not in ("http", "https"):
+            raise ValueError("local model proxy destinations must use HTTP or HTTPS")
         assert parsed.hostname is not None
-        port = parsed.port or 80
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
         try:
             address = ipaddress.ip_address(parsed.hostname)
             destination = f"{address}/{32 if address.version == 4 else 128}"
@@ -60,6 +60,8 @@ def worker_proxy_config(
                 f"acl Safe_ports port {port}",
             ]
         )
+        if parsed.scheme == "https" and port != 443:
+            lines.append(f"acl SSL_ports port {port}")
         local_rules.append((f"local_destination_{index}", port, f"local_port_{index}"))
     lines.append("acl CONNECT method CONNECT")
     lines.extend(f"acl allowed dstdomain {host}" for host in hosts)

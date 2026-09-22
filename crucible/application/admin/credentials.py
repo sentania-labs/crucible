@@ -9,15 +9,19 @@ shreds. Every step is an event with the principal and the reason.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import os
 import shutil
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from crucible.application.admin.context import (
     AdminContext,
@@ -25,6 +29,7 @@ from crucible.application.admin.context import (
     guard_mutation,
     record_refusal,
 )
+from crucible.application.admin.routing import local_endpoint_view
 from crucible.application.errors import ConflictError, ContractValidationError, NotFoundError
 from crucible.application.harnesses import (
     credential_state,
@@ -58,6 +63,7 @@ PROBE_PROMPT = "Reply with exactly the word OK and nothing else. Do not read or 
 RETIRED_MARK = ".retired-"
 INCOMING_MARK = ".incoming-"
 SHRED_CHUNK = 1024 * 1024
+HERMES = "hermes"
 
 
 class CredentialAdminError(ConflictError):
@@ -233,8 +239,76 @@ def check_shape(spec: CredentialSpec, path: str) -> ShapeCheck:
     return ShapeCheck(ok=not problems, files=tuple(files), problems=tuple(problems))
 
 
+async def set_api_key(
+    ctx: AdminContext,
+    uow: UnitOfWork,
+    *,
+    principal: str,
+    harness: str,
+    api_key: str,
+    reason: str | None,
+) -> CredentialReport:
+    """Write one opaque API key without ever returning, logging, or auditing its value."""
+    reason = guard_mutation(
+        ctx, uow, reason, principal=principal, operation=f"credentials set {harness}"
+    )
+    if harness != HERMES:
+        raise CredentialAdminError("the paste credential flow is available only for Hermes")
+    value = api_key.strip()
+    if not value:
+        raise ContractValidationError(
+            "an API key is required", errors=[{"path": "api_key", "message": "must not be empty"}]
+        )
+    spec = spec_for(ctx, harness)
+    source = source_for(ctx, harness)
+    directory = Path(source.path)
+    try:
+        directory_stat = directory.stat()
+    except OSError as exc:
+        raise CredentialAdminError("the configured Hermes credential directory is absent") from exc
+    if not directory.is_dir() or directory_stat.st_mode & 0o077:
+        raise CredentialAdminError("the configured Hermes credential directory must be mode 0700")
+    target = spec.source_path(source.path, "api-key")
+    temporary = target.with_name(f".{target.name}.incoming")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(value.encode("utf-8"))
+            stream.write(b"\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, target)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            temporary.unlink()
+    admin_event(
+        uow,
+        ctx,
+        EventKind.CREDENTIAL_SET,
+        principal=principal,
+        reason=reason,
+        before={"harness": harness},
+        after={"harness": harness, "state": "credential set"},
+    )
+    return await validate(
+        ctx,
+        uow,
+        principal=principal,
+        harness=harness,
+        reason=reason,
+        audit_events=False,
+    )
+
+
 async def validate(
-    ctx: AdminContext, uow: UnitOfWork, *, principal: str, harness: str, reason: str | None
+    ctx: AdminContext,
+    uow: UnitOfWork,
+    *,
+    principal: str,
+    harness: str,
+    reason: str | None,
+    audit_events: bool = True,
 ) -> CredentialReport:
     """25: shape check of the named auth files, then the bounded probe; returns state
     and timestamps only. The shape check alone marks `invalid`; the probe decides
@@ -248,7 +322,14 @@ async def validate(
     shape = check_shape(spec, source.path)
     probe: ProbeRecord | None = None
     if shape.ok:
-        probe = await _probe_async(ctx, uow, harness=harness, principal=principal, reason=reason)
+        probe = await _probe_async(
+            ctx,
+            uow,
+            harness=harness,
+            principal=principal,
+            reason=reason,
+            audit_event=audit_events,
+        )
     now = ctx.clock.now()
     state = uow.harnesses.get(harness)
     validated = (
@@ -279,20 +360,21 @@ async def validate(
         state.updated_at = now
         uow.harnesses.put(state)
     after = state_view(ctx, uow, harness)
-    admin_event(
-        uow,
-        ctx,
-        EventKind.CREDENTIAL_VALIDATED,
-        principal=principal,
-        reason=reason,
-        before=before,
-        after=after,
-        harness=harness,
-        shape=shape.as_dict(),
-        validated=validated,
-        conclusive=not inconclusive,
-        cause=cause,
-    )
+    if audit_events:
+        admin_event(
+            uow,
+            ctx,
+            EventKind.CREDENTIAL_VALIDATED,
+            principal=principal,
+            reason=reason,
+            before=before,
+            after=after,
+            harness=harness,
+            shape=shape.as_dict(),
+            validated=validated,
+            conclusive=not inconclusive,
+            cause=cause,
+        )
     return CredentialReport(
         harness,
         after,
@@ -382,8 +464,23 @@ def _record_inconclusive(
 
 
 async def _probe_async(
-    ctx: AdminContext, uow: UnitOfWork, *, harness: str, principal: str, reason: str
+    ctx: AdminContext,
+    uow: UnitOfWork,
+    *,
+    harness: str,
+    principal: str,
+    reason: str,
+    audit_event: bool = True,
 ) -> ProbeRecord:
+    if harness == HERMES:
+        return await _hermes_probe_async(
+            ctx,
+            uow,
+            harness=harness,
+            principal=principal,
+            reason=reason,
+            audit_event=audit_event,
+        )
     adapter = adapter_for(ctx, harness)
     spec = spec_for(ctx, harness)
     source = source_for(ctx, harness)
@@ -484,6 +581,104 @@ async def _probe_async(
         uow, ctx.clock, name=harness, mount_mode=MountMode(mode.value), changed=changed, at=now
     )
     record_event_probe(uow, ctx, principal, record, reason)
+    return record
+
+
+def _http_status(url: str, *, bearer: str | None, timeout: float) -> int:
+    headers = {"Authorization": f"Bearer {bearer}"} if bearer is not None else {}
+    request = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return int(response.status)
+    except urllib.error.HTTPError as exc:
+        return int(exc.code)
+
+
+async def _hermes_probe_async(
+    ctx: AdminContext,
+    uow: UnitOfWork,
+    *,
+    harness: str,
+    principal: str,
+    reason: str,
+    audit_event: bool = True,
+) -> ProbeRecord:
+    """Probe LiteLLM without running a model or exposing its bearer in process output."""
+    source = source_for(ctx, harness)
+    key_path = spec_for(ctx, harness).source_path(source.path, "api-key")
+    bearer = key_path.read_text(encoding="utf-8").strip()
+    endpoint = local_endpoint_view(uow).get("endpoint_url")
+    if not isinstance(endpoint, str) or not endpoint:
+        raise CredentialAdminError("the Hermes probe needs a configured local endpoint URL")
+    parsed = urlsplit(endpoint)
+    readiness = urlunsplit((parsed.scheme, parsed.netloc, "/health/readiness", "", ""))
+    models = endpoint.rstrip("/") + "/models"
+    started = time.monotonic()
+    try:
+        readiness_status = await asyncio.to_thread(
+            _http_status, readiness, bearer=None, timeout=float(ctx.probe_timeout_seconds)
+        )
+        if readiness_status != 200:
+            exit_class = ExitClass.ENVIRONMENT
+            conclusive = False
+            cause = f"readiness_http_{readiness_status}"
+            models_status = None
+        else:
+            models_status = await asyncio.to_thread(
+                _http_status,
+                models,
+                bearer=bearer,
+                timeout=float(ctx.probe_timeout_seconds),
+            )
+            exit_class = (
+                ExitClass.COMPLETED
+                if models_status == 200
+                else ExitClass.AUTH_FAILURE
+                if models_status == 401
+                else ExitClass.ENVIRONMENT
+            )
+            conclusive = models_status in (200, 401)
+            cause = "" if conclusive else f"models_http_{models_status}"
+    except (OSError, urllib.error.URLError, UnicodeError) as exc:
+        exit_class = ExitClass.ENVIRONMENT
+        conclusive = False
+        cause = "endpoint_unreachable"
+        models_status = None
+        detail = type(exc).__name__
+    else:
+        detail = (
+            f"readiness HTTP {readiness_status}; models HTTP {models_status}"
+            if models_status is not None
+            else f"readiness HTTP {readiness_status}"
+        )
+    record = ProbeRecord(
+        harness=harness,
+        exit_class=exit_class.value,
+        exit_code=0 if exit_class is ExitClass.COMPLETED else 1,
+        harness_version=None,
+        image="direct-http",
+        image_digest="",
+        auth_files_changed=False,
+        mount_mode=MountMode.RO.value,
+        duration_seconds=round(time.monotonic() - started, 1),
+        detail=detail,
+        conclusive=conclusive,
+        cause=cause,
+    )
+    now = ctx.clock.now()
+    record_launch_outcome(
+        uow,
+        ctx.clock,
+        name=harness,
+        outcome=(f"probe:{exit_class.value}" if conclusive else f"probe:inconclusive:{cause}"),
+        at=now,
+        auth_failure=exit_class is ExitClass.AUTH_FAILURE,
+    )
+    record_credential_observation(
+        uow, ctx.clock, name=harness, mount_mode=MountMode.RO, changed=False, at=now
+    )
+    if audit_event:
+        record_event_probe(uow, ctx, principal, record, reason)
     return record
 
 

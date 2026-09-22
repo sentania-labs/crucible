@@ -13,6 +13,7 @@ ADMIN_KINDS: frozenset[str] = frozenset(
         EventKind.HARNESS_DISABLED.value,
         EventKind.CREDENTIAL_VALIDATED.value,
         EventKind.CREDENTIAL_PROBED.value,
+        EventKind.CREDENTIAL_SET.value,
         EventKind.CREDENTIAL_LOGIN_STARTED.value,
         EventKind.CREDENTIAL_LOGIN_CODE_SUBMITTED.value,
         EventKind.CREDENTIAL_LOGIN_CANCELLED.value,
@@ -33,6 +34,7 @@ ADMIN_KINDS: frozenset[str] = frozenset(
         EventKind.BOOTSTRAP_IMPORT_VERIFIED.value,
         EventKind.BOOTSTRAP_IMPORT_COMMITTED.value,
         EventKind.POOL_EXHAUSTION_CLEARED.value,
+        EventKind.LOCAL_ENDPOINT_UPDATED.value,
     }
 )
 

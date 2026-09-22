@@ -27,6 +27,7 @@ import asyncio
 import base64
 import contextlib
 import hashlib
+import ipaddress
 import json
 import logging
 import os
@@ -1564,6 +1565,40 @@ class KubernetesProvider:
         widened, which is the Docker provider's rule for the same situation: an attempt
         whose allowlist the egress path cannot actually permit is refused, never run
         with less network than the policy promised (13)."""
+        resolved_endpoints: list[str] = []
+        endpoint_unresolved: list[str] = []
+        endpoint_forbidden: list[str] = []
+        for endpoint in plan.endpoints:
+            host, separator, port = endpoint.rpartition(":")
+            if not separator or not host or not port.isdigit():
+                raise k8sspec.SpecError(f"{endpoint!r} is not an address:port destination")
+            try:
+                parsed_address = ipaddress.ip_address(host)
+            except ValueError:
+                addresses = tuple(await self._call(self.resolve, host))
+                if not addresses:
+                    endpoint_unresolved.append(host)
+                    continue
+                for cidr in addresses:
+                    address_text = str(ipaddress.ip_network(cidr).network_address)
+                    resolved_endpoints.append(f"{address_text}:{port}")
+            else:
+                cidr = f"{parsed_address}/{32 if parsed_address.version == 4 else 128}"
+                denied = k8sspec.denied_by(cidr, self.config.denied_cidrs)
+                if denied is not None:
+                    endpoint_forbidden.append(f"{host} inside {denied}")
+                resolved_endpoints.append(endpoint)
+        if endpoint_unresolved:
+            raise ProviderError(
+                "the configured local endpoint does not resolve to an address, so no "
+                f"NetworkPolicy can permit it: {sorted(endpoint_unresolved)}"
+            )
+        if endpoint_forbidden:
+            raise ProviderError(
+                "the configured local endpoint directly names an address this namespace "
+                f"denies: {sorted(endpoint_forbidden)}"
+            )
+        plan = replace(plan, endpoints=tuple(dict.fromkeys(resolved_endpoints)))
         if self.config.broad_egress or not plan.hosts:
             return replace(plan, broad=self.config.broad_egress)
         cidrs: list[str] = []
@@ -1606,7 +1641,12 @@ class KubernetesProvider:
     def _credential_copy(self, spec: LaunchSpec) -> _CredentialCopy | None:
         adapter = self.harnesses.get(spec.harness)
         credential = adapter.credential_spec() if adapter is not None else None
-        if credential is None or spec.endpoint == "local":
+        if credential is None:
+            return None
+        if (
+            not credential.required_for_launch
+            and spec.harness not in self.config.credential_secrets
+        ):
             return None
         secret_name = self.config.credential_secret_name(spec.harness)
         mode = credential.minimum_mode

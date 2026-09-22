@@ -7,9 +7,11 @@ import os
 import socket
 from dataclasses import dataclass
 from functools import partial
+from pathlib import Path
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI
+from sqlalchemy.exc import SQLAlchemyError
 
 from crucible.adapters.api.app import create_app
 from crucible.adapters.api.deps import AppContext
@@ -34,8 +36,11 @@ from crucible.adapters.persistence.unit_of_work import SqlUnitOfWorkFactory, mak
 from crucible.adapters.storage.disk import DiskArtifactStore
 from crucible.application.admin.context import AdminContext, GitHubAppInfo
 from crucible.application.admin.credentials import sweep_retired
+from crucible.application.admin.routing import local_endpoint_view
 from crucible.application.delivery_tick import DeliveryConfig
+from crucible.application.errors import NotFoundError
 from crucible.application.harnesses import HarnessRegistry
+from crucible.application.proxy_config import worker_proxy_config
 from crucible.application.supervisor import Supervisor
 from crucible.domain.ids import new_id
 from crucible.ports.artifacts import ArtifactStore
@@ -117,11 +122,14 @@ def harness_gates(settings: Settings) -> dict[str, HarnessGate]:
     }
 
 
-def docker_config(settings: Settings) -> DockerConfig:
+def docker_config(
+    settings: Settings, *, local_endpoint_url: str | None = None, database_value: bool = False
+) -> DockerConfig:
     d = settings.docker
     local_endpoints = []
-    if settings.spark_endpoint_url:
-        parsed = urlsplit(settings.spark_endpoint_url)
+    endpoint = local_endpoint_url if database_value else settings.endpoint_seed
+    if endpoint:
+        parsed = urlsplit(endpoint)
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
         local_endpoints.append(f"{parsed.hostname}:{port}")
     return DockerConfig(
@@ -220,11 +228,44 @@ def github_client(settings: Settings) -> GitHubClient | None:
 
 def wire(settings: Settings) -> Wiring:
     engine = make_engine(settings.database.url)
+    factory = SqlUnitOfWorkFactory(engine)
+    database_endpoint: str | None = None
+    routing_document: dict[str, object] | None = None
+    database_value = False
+    try:
+        with factory() as uow:
+            local = local_endpoint_view(uow)
+            database_value = True
+            database_endpoint = local.get("endpoint_url")
+            reference = local["routing_policy"]
+            record = uow.routing_policies.get(reference["name"], reference["version"])
+            routing_document = record.document if record is not None else None
+    except (SQLAlchemyError, NotFoundError):
+        # `migrate` and first-run commands can wire before the policy tables exist.
+        database_value = False
+    if settings.admin.proxy_config_path and routing_document is not None:
+        path = Path(settings.admin.proxy_config_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            worker_proxy_config(
+                settings.admin.proxy_subnet,
+                list(settings.docker.egress_allowlist),
+                [routing_document],
+            ),
+            encoding="utf-8",
+        )
     registry = default_registry()
     providers: dict[str, ExecutionProvider] = {"fake": FakeProvider()}
     docker: DockerProvider | None = None
     if settings.docker.enabled:
-        docker = DockerProvider(docker_config(settings), harnesses=registry)
+        docker = DockerProvider(
+            docker_config(
+                settings,
+                local_endpoint_url=database_endpoint,
+                database_value=database_value,
+            ),
+            harnesses=registry,
+        )
         providers["docker"] = docker
     if settings.kubernetes.enabled:
         # 26: the Kubernetes provider is reported by `GET /v1/capabilities` and
@@ -245,7 +286,7 @@ def wire(settings: Settings) -> Wiring:
     )
     github = github_client(settings)
     admin = AdminContext(
-        uow_factory=SqlUnitOfWorkFactory(engine),
+        uow_factory=factory,
         clock=SystemClock(),
         providers=providers,
         harnesses=registry,
@@ -265,9 +306,12 @@ def wire(settings: Settings) -> Wiring:
         probe_timeout_seconds=settings.admin.probe_timeout_seconds,
         login_timeout_seconds=settings.admin.login_timeout_seconds,
         login_commands={k: tuple(v) for k, v in settings.admin.login_commands.items()},
+        proxy_config_path=settings.admin.proxy_config_path,
+        proxy_subnet=settings.admin.proxy_subnet,
+        proxy_hosts=tuple(settings.docker.egress_allowlist),
     )
     ctx = AppContext(
-        uow_factory=SqlUnitOfWorkFactory(engine),
+        uow_factory=factory,
         clock=SystemClock(),
         providers=list(providers.values()),
         database_url=settings.database.url,

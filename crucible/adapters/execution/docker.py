@@ -791,10 +791,12 @@ class DockerProvider:
         at launch: it would only fail authentication after spending an attempt."""
         adapter = self.harnesses.get(spec.harness)
         credential = adapter.credential_spec() if adapter is not None else None
-        if credential is None or spec.endpoint == "local":
+        if credential is None:
             return None
         source = self._credential_source(spec.harness)
         if source is None:
+            if not credential.required_for_launch:
+                return None
             raise HarnessRefusedError(
                 f"refusing to launch: no credential directory is configured for "
                 f"harness {spec.harness!r} (credentials.{spec.harness}.path)"

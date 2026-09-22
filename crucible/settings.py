@@ -234,6 +234,10 @@ class AdminSettings(BaseModel):
     # The command each harness's login runs, overriding the adapter's own. Meant for the
     # parity tests, which drive a fake CLI that mimics each flow; never a production knob.
     login_commands: dict[str, list[str]] = Field(default_factory=dict)
+    # Shared with the egress proxy in Docker deployments. A UI save rewrites this file
+    # from the same renderer as `make proxy-config`.
+    proxy_config_path: str | None = None
+    proxy_subnet: str = "10.88.0.0/24"
 
 
 class Settings(BaseSettings):
@@ -251,14 +255,21 @@ class Settings(BaseSettings):
     credentials: dict[str, CredentialSettings] = Field(default_factory=dict)
     harnesses: dict[str, HarnessSettings] = Field(default_factory=dict)
     admin: AdminSettings = Field(default_factory=AdminSettings)
+    local_endpoint_url: str | None = None
+    # Compatibility seed for deployments created before C10. Database routing state
+    # wins after the migration has created a local entry.
     spark_endpoint_url: str | None = None
 
-    @field_validator("spark_endpoint_url")
+    @field_validator("local_endpoint_url", "spark_endpoint_url")
     @classmethod
     def _valid_spark_endpoint(cls, value: str | None) -> str | None:
         if value:
             validate_endpoint("local", value)
         return value
+
+    @property
+    def endpoint_seed(self) -> str | None:
+        return self.local_endpoint_url or self.spark_endpoint_url
 
     @classmethod
     def settings_customise_sources(

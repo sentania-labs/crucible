@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import getpass
 import json
 import os
 import sys
@@ -119,7 +120,7 @@ def build_parser() -> argparse.ArgumentParser:
         p = h_sub.add_parser(verb)
         p.add_argument("name")
 
-    c = sub.add_parser("credentials", help="validate, probe, login, rotate, remove")
+    c = sub.add_parser("credentials", help="set, validate, probe, login, rotate, remove")
     c_sub = c.add_subparsers(dest="credential_command", required=True)
     for verb in ("status", "validate", "probe", "remove"):
         p = c_sub.add_parser(verb)
@@ -141,6 +142,8 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="a prepared directory to copy in; it is left untouched and is yours to dispose of",
     )
+    set_key = c_sub.add_parser("set", help="read an API key without placing it in argv")
+    set_key.add_argument("--harness", default="hermes", choices=("hermes",))
 
     i = sub.add_parser("images", help="list and promote")
     i_sub = i.add_subparsers(dest="image_command", required=True)
@@ -163,11 +166,22 @@ def build_parser() -> argparse.ArgumentParser:
     tail.add_argument("--cursor", type=int, default=None)
     tail.add_argument("--limit", type=int, default=50)
 
-    route = sub.add_parser("routing", help="read and clear reactive quota exhaustion")
+    route = sub.add_parser("routing", help="local endpoint and reactive quota exhaustion")
     route_sub = route.add_subparsers(dest="routing_command", required=True)
     route_sub.add_parser("exhaustion")
     clear = route_sub.add_parser("clear-exhaustion")
     clear.add_argument("pool")
+    route_sub.add_parser("local-endpoint")
+    local_set = route_sub.add_parser("set-local-endpoint")
+    local_set.add_argument("--endpoint-url", required=True)
+    local_set.add_argument("--model", default="coder")
+    state = local_set.add_mutually_exclusive_group(required=True)
+    state.add_argument("--enable", action="store_true")
+    state.add_argument("--disable", action="store_true")
+    thinking = local_set.add_mutually_exclusive_group()
+    thinking.add_argument("--enable-thinking", action="store_true")
+    thinking.add_argument("--disable-thinking", action="store_true")
+    local_set.add_argument("--max-concurrency", type=int, default=4)
 
     b = sub.add_parser(
         "bootstrap", help="the bootstrap ledger handoff (15): submit, show, list, commit"
@@ -203,6 +217,15 @@ def _read_bundle(path: str) -> Any:
 
 def _emit(document: Any) -> None:
     print(json.dumps(document, sort_keys=True, default=str))
+
+
+def _read_api_key() -> str:
+    """Read a key from a hidden terminal prompt or stdin, never from argv."""
+    return (
+        getpass.getpass("LiteLLM virtual key: ")
+        if sys.stdin.isatty()
+        else sys.stdin.readline().rstrip("\r\n")
+    )
 
 
 # ----- remote mode -------------------------------------------------------------
@@ -279,6 +302,14 @@ def _remote(args: argparse.Namespace, remote: Remote) -> None:
         verb = args.credential_command
         if verb == "status":
             _emit(remote.call("GET", f"/v1/admin/credentials/{args.harness}"))
+        elif verb == "set":
+            _emit(
+                remote.call(
+                    "POST",
+                    f"/v1/admin/credentials/{args.harness}/set",
+                    {**reason, "api_key": _read_api_key()},
+                )
+            )
         elif verb == "rotate":
             _emit(
                 remote.call(
@@ -309,8 +340,29 @@ def _remote(args: argparse.Namespace, remote: Remote) -> None:
     elif command == "routing":
         if args.routing_command == "exhaustion":
             _emit(remote.call("GET", "/v1/admin/routing/exhaustion"))
-        else:
+        elif args.routing_command == "clear-exhaustion":
             _emit(remote.call("POST", f"/v1/admin/routing/exhaustion/{args.pool}/clear", reason))
+        elif args.routing_command == "local-endpoint":
+            _emit(remote.call("GET", "/v1/admin/routing/local-endpoint"))
+        else:
+            _emit(
+                remote.call(
+                    "POST",
+                    "/v1/admin/routing/local-endpoint",
+                    {
+                        **reason,
+                        "endpoint_url": args.endpoint_url,
+                        "models": [
+                            {
+                                "id": args.model,
+                                "enabled": args.enable,
+                                "enable_thinking": args.enable_thinking,
+                            }
+                        ],
+                        "max_concurrency": args.max_concurrency,
+                    },
+                )
+            )
     elif command == "bootstrap":
         verb = args.bootstrap_command
         if verb == "submit":
@@ -465,6 +517,19 @@ def _local(args: argparse.Namespace, wiring: Wiring) -> None:
         with wiring.ctx.uow_factory() as uow:
             if verb == "status":
                 _emit(credentials.state_view(admin, uow, args.harness))
+            elif verb == "set":
+                _emit(
+                    asyncio.run(
+                        credentials.set_api_key(
+                            admin,
+                            uow,
+                            principal=principal,
+                            harness=args.harness,
+                            api_key=_read_api_key(),
+                            reason=args.reason,
+                        )
+                    ).as_dict()
+                )
             elif verb == "validate":
                 _emit(
                     asyncio.run(
@@ -536,13 +601,39 @@ def _local(args: argparse.Namespace, wiring: Wiring) -> None:
         with wiring.ctx.uow_factory() as uow:
             if args.routing_command == "exhaustion":
                 _emit(routing.list_exhaustions(admin, uow))
-            else:
+            elif args.routing_command == "clear-exhaustion":
                 _emit(
                     routing.clear_exhaustion(
                         admin,
                         uow,
                         principal=principal,
                         pool=args.pool,
+                        reason=args.reason,
+                    )
+                )
+                uow.commit()
+            elif args.routing_command == "local-endpoint":
+                _emit(routing.local_endpoint_view(uow))
+            else:
+                _emit(
+                    routing.save_local_endpoint(
+                        admin,
+                        uow,
+                        principal=Principal(
+                            id=CLI_PRINCIPAL,
+                            name=CLI_PRINCIPAL,
+                            role=Role.ADMIN,
+                            created_at=wiring.ctx.clock.now(),
+                        ),
+                        endpoint_url=args.endpoint_url,
+                        models=[
+                            {
+                                "id": args.model,
+                                "enabled": args.enable,
+                                "enable_thinking": args.enable_thinking,
+                            }
+                        ],
+                        max_concurrency=args.max_concurrency,
                         reason=args.reason,
                     )
                 )

@@ -676,20 +676,15 @@ async def credentials_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
     names = list(ctx.admin.harnesses.names())
     rows: list[list[Any]] = []
     for name in names:
-        if name == "hermes":
-            rows.append(
-                [name, "not required", "Local endpoint harness", f"/ui/credentials/{name}/login"]
-            )
-        else:
-            view = credentials.state_view(ctx.admin, uow, name)
-            rows.append(
-                [
-                    name,
-                    view.get("state"),
-                    view.get("session_compatibility"),
-                    f"/ui/credentials/{name}/login",
-                ]
-            )
+        view = credentials.state_view(ctx.admin, uow, name)
+        rows.append(
+            [
+                name,
+                view.get("state"),
+                view.get("session_compatibility"),
+                f"/ui/credentials/{name}/login",
+            ]
+        )
     sections: list[dict[str, Any]] = [
         {
             "title": "Credential state",
@@ -698,7 +693,29 @@ async def credentials_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
         }
     ]
     if principal.role is Role.ADMIN:
-        options = [(name, name) for name in names if name != "hermes"]
+        options = [(name, name) for name in names]
+        sections.append(
+            {
+                "title": "Set Hermes API key",
+                "note": (
+                    "The value is written mode 0600, then discarded from the request. "
+                    "It is never displayed or included in audit details."
+                ),
+                "form": {
+                    "action": "/ui/actions/credential-set",
+                    "label": "Set and probe",
+                    "fields": [
+                        {
+                            "name": "api_key",
+                            "label": "LiteLLM virtual key",
+                            "kind": "password",
+                            "required": True,
+                        },
+                        {"name": "reason", "label": "Reason", "required": True},
+                    ],
+                },
+            }
+        )
         sections.append(
             {
                 "title": "Validate, probe, or remove",
@@ -826,12 +843,65 @@ def routing_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
     )
     assert ctx.admin is not None
     exhaustion = routing.list_exhaustions(ctx.admin, uow)
+    local = routing.local_endpoint_view(uow)
     sections: list[dict[str, Any]] = [
+        _document_section("Local endpoint", local),
         _document_section("Active policy", policy.document if policy else {}),
         _document_section("Routing policy", routing_record.document if routing_record else {}),
         _document_section("Pool exhaustion", exhaustion),
     ]
     if principal.role is Role.ADMIN:
+        for model in local["models"]:
+            sections.append(
+                {
+                    "title": f"Edit local model {model['id']}",
+                    "note": (
+                        "Saving creates new immutable routing and delivery policy versions "
+                        "and regenerates the worker proxy allowlist."
+                    ),
+                    "form": {
+                        "action": "/ui/actions/routing-local",
+                        "label": "Save local endpoint",
+                        "fields": [
+                            {
+                                "name": "endpoint_url",
+                                "label": "Endpoint URL",
+                                "kind": "url",
+                                "value": local.get("endpoint_url") or "",
+                                "required": True,
+                            },
+                            {
+                                "name": "model_id",
+                                "label": "Model",
+                                "value": model["id"],
+                                "required": True,
+                            },
+                            {
+                                "name": "enabled",
+                                "label": "Enabled",
+                                "kind": "checkbox",
+                                "value": model.get("enabled", False),
+                            },
+                            {
+                                "name": "enable_thinking",
+                                "label": "Thinking by default",
+                                "kind": "checkbox",
+                                "value": (model.get("chat_template_kwargs") or {}).get(
+                                    "enable_thinking", False
+                                ),
+                            },
+                            {
+                                "name": "max_concurrency",
+                                "label": "Pool max concurrency",
+                                "kind": "number",
+                                "value": local["pool"].get("max_concurrency", 1),
+                                "required": True,
+                            },
+                            {"name": "reason", "label": "Reason", "required": True},
+                        ],
+                    },
+                }
+            )
         sections.extend(
             [
                 {
@@ -1506,6 +1576,15 @@ async def action(request: Request, action: str, ctx: Ctx, uow: UoW) -> Response:
                 )
             else:
                 raise ConflictError("unknown credential action")
+        elif action == "credential-set":
+            await credentials.set_api_key(
+                ctx.admin,
+                uow,
+                principal=principal.name,
+                harness="hermes",
+                api_key=form.get("api_key", ""),
+                reason=reason,
+            )
         elif action == "login-start":
             login.start_login(
                 ctx.admin,
@@ -1555,6 +1634,22 @@ async def action(request: Request, action: str, ctx: Ctx, uow: UoW) -> Response:
         elif action == "routing-clear":
             routing.clear_exhaustion(
                 ctx.admin, uow, principal=principal.name, pool=form.get("pool", ""), reason=reason
+            )
+        elif action == "routing-local":
+            routing.save_local_endpoint(
+                ctx.admin,
+                uow,
+                principal=principal,
+                endpoint_url=form.get("endpoint_url", ""),
+                models=[
+                    {
+                        "id": form.get("model_id", ""),
+                        "enabled": form.get("enabled") == "true",
+                        "enable_thinking": form.get("enable_thinking") == "true",
+                    }
+                ],
+                max_concurrency=int(form.get("max_concurrency", "0")),
+                reason=reason,
             )
         elif action in ("routing-upload", "policy-upload"):
             raw = form.get("document", "")

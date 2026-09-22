@@ -168,6 +168,7 @@ class EventKind(StrEnum):
     # administration (25): every mutation, with principal, reason, before and after
     CREDENTIAL_VALIDATED = "credential_validated"
     CREDENTIAL_PROBED = "credential_probed"
+    CREDENTIAL_SET = "credential_set"
     CREDENTIAL_LOGIN_STARTED = "credential_login_started"
     CREDENTIAL_LOGIN_CODE_SUBMITTED = "credential_login_code_submitted"
     CREDENTIAL_LOGIN_CANCELLED = "credential_login_cancelled"
@@ -178,6 +179,7 @@ class EventKind(StrEnum):
     IMAGE_PROMOTED = "image_promoted"
     GITHUB_CHECKED = "github_checked"
     ADMIN_REFUSED = "admin_refused"
+    LOCAL_ENDPOINT_UPDATED = "local_endpoint_updated"
     # the bootstrap ledger handoff (15, C6)
     BOOTSTRAP_IMPORT_VERIFIED = "bootstrap_import_verified"
     BOOTSTRAP_IMPORT_COMMITTED = "bootstrap_import_committed"

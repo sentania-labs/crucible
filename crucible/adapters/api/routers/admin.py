@@ -64,6 +64,35 @@ def admin_clear_routing_exhaustion(
     return result
 
 
+@router.get("/admin/routing/local-endpoint")
+def admin_local_endpoint(ctx: Ctx, uow: UoW, _principal: Admin) -> dict[str, Any]:
+    _admin(ctx)
+    return routing.local_endpoint_view(uow)
+
+
+@router.post("/admin/routing/local-endpoint")
+def admin_save_local_endpoint(
+    ctx: Ctx,
+    uow: UoW,
+    principal: Admin,
+    body: Annotated[dict[str, Any], Body()],
+) -> dict[str, Any]:
+    models = body.get("models")
+    if not isinstance(models, list) or not all(isinstance(item, dict) for item in models):
+        raise ConflictError("models must be a list of local model settings")
+    result = routing.save_local_endpoint(
+        _admin(ctx),
+        uow,
+        principal=principal,
+        endpoint_url=str(body.get("endpoint_url", "")),
+        models=models,
+        max_concurrency=int(body.get("max_concurrency", 0)),
+        reason=_reason(body),
+    )
+    uow.commit()
+    return result
+
+
 @router.get("/admin/status")
 async def admin_status(ctx: Ctx, uow: UoW, _principal: Admin) -> dict[str, Any]:
     return await status_admin.status(_admin(ctx), uow)
@@ -138,6 +167,29 @@ async def admin_probe(
 ) -> dict[str, Any]:
     report = await credentials.probe(
         _admin(ctx), uow, principal=principal.name, harness=harness, reason=_reason(body)
+    )
+    uow.commit()
+    return report.as_dict()
+
+
+@router.post("/admin/credentials/{harness}/set")
+async def admin_set_credential(
+    harness: str,
+    ctx: Ctx,
+    uow: UoW,
+    principal: Admin,
+    body: Annotated[dict[str, Any], Body()],
+) -> dict[str, Any]:
+    value = body.get("api_key")
+    if not isinstance(value, str):
+        raise ConflictError("api_key must be a string")
+    report = await credentials.set_api_key(
+        _admin(ctx),
+        uow,
+        principal=principal.name,
+        harness=harness,
+        api_key=value,
+        reason=_reason(body),
     )
     uow.commit()
     return report.as_dict()
