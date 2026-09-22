@@ -12,4 +12,7 @@ REGISTERED_PROVIDERS: dict[str, frozenset[str]] = {
     # The Docker provider arrived in C3. The three real harnesses go live in C5; what
     # C3 runs on it is the script harness of 18, which needs no model and no credential.
     ProviderName.DOCKER.value: REGISTERED_HARNESSES,
+    # The Kubernetes provider arrived in C8a (26). It runs the same harness images the
+    # Docker provider runs; what differs is the sandbox, not the harness.
+    ProviderName.KUBERNETES.value: REGISTERED_HARNESSES,
 }

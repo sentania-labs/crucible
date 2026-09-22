@@ -49,10 +49,14 @@ from http.client import HTTPException
 from pathlib import Path
 from typing import Any, Literal
 
-import yaml
-
 from crucible.adapters.execution import identity as identity_bundle
 from crucible.adapters.execution import scripts, workspace
+from crucible.adapters.execution.collected import (
+    read_outputs as _read_outputs,
+)
+from crucible.adapters.execution.collected import (
+    read_verifications as _read_verifications,
+)
 from crucible.adapters.execution.create_policy import (
     CreatePolicy,
     CreateRequestRefusedError,
@@ -62,6 +66,7 @@ from crucible.adapters.execution.create_policy import (
     check as check_create,
 )
 from crucible.adapters.execution.dockerapi import DockerApiError, DockerClient, LogFrame
+from crucible.adapters.execution.logstream import chunks as _chunks
 from crucible.adapters.harness.registry import default_registry
 from crucible.application.harnesses import (
     HarnessRegistry,
@@ -80,9 +85,7 @@ from crucible.ports.execution import (
     REPORT_MOUNT,
     VERIFY_MOUNT,
     WORK_MOUNT,
-    BranchBundle,
     CleanupPolicy,
-    CollectedArtifact,
     CollectedOutputs,
     CredentialFileSync,
     CredentialSync,
@@ -1692,180 +1695,6 @@ class DockerProvider:
         return sorted(images, key=lambda i: i.reference)
 
 
-# ----- reading what the collector wrote ---------------------------------
-
-
-@dataclass(frozen=True, slots=True)
-class _Outputs:
-    report: dict[str, Any] | None
-    report_raw: str | None
-    blocked_md: str | None
-    stdout_tail: str
-    stderr_tail: str
-    diff_paths: tuple[str, ...]
-    diff_text: str | None
-    bundle: BranchBundle | None
-    artifacts: tuple[CollectedArtifact, ...]
-    verifications: tuple[VerificationRun, ...]
-    copy_rejections: tuple[dict[str, str], ...]
-    checkpoint_refusal: str | None
-
-
-def _text(path: Path, limit: int = 8 * 1024 * 1024) -> str:
-    try:
-        with path.open("rb") as handle:
-            return handle.read(limit).decode("utf-8", "replace")
-    except OSError:
-        return ""
-
-
-def _tail(path: Path, limit: int) -> str:
-    try:
-        size = path.stat().st_size
-        with path.open("rb") as handle:
-            if size > limit:
-                handle.seek(size - limit)
-            return handle.read().decode("utf-8", "replace")
-    except OSError:
-        return ""
-
-
-def _read_outputs(
-    output: Path,
-    verify: Path,
-    *,
-    spec: LaunchSpec,
-    bundle_verified: bool,
-    collector_exit: int,
-    verifications: tuple[VerificationRun, ...],
-    tail_bytes: int,
-) -> _Outputs:
-    report_dir = output / "report"
-    report: dict[str, Any] | None = None
-    report_raw: str | None = None
-    report_file = report_dir / "report.yaml"
-    if report_file.is_file():
-        report_raw = _text(report_file)
-        try:
-            parsed = yaml.safe_load(report_raw)
-            report = parsed if isinstance(parsed, dict) else None
-        except yaml.YAMLError:
-            report = None
-    blocked = report_dir / "blocked.md"
-    blocked_md = _text(blocked) if blocked.is_file() else None
-
-    changed = tuple(p for p in _text(output / "changed.txt").splitlines() if p.strip())
-    diff_text = _text(output / "diff.patch") if (output / "diff.patch").is_file() else None
-    commit_paths = tuple(p for p in _text(output / "commit-paths.txt").splitlines() if p.strip())
-    messages: list[str] = []
-    for record in _text(output / "log.txt").split("\x1e"):
-        parts = record.strip("\n").split("\x1f")
-        if len(parts) >= 2 and parts[0]:
-            messages.append(parts[1])
-    head = _text(output / "head.txt").strip()
-    commits_text = _text(output / "commits.txt").strip() or "0"
-    repository = spec.contract.get("repository", {})
-    bundle_path = output / "work_branch.bundle"
-    bundle = None
-    if head and collector_exit == 0:
-        bundle = BranchBundle(
-            head_sha=head,
-            base_ref=str(repository.get("base_ref", "main")),
-            work_branch=_text(output / "branch.txt").strip()
-            or str(repository.get("work_branch", "")),
-            commits=int(commits_text) if commits_text.isdigit() else 0,
-            verified=bundle_verified,
-            sha256=(
-                hashlib.sha256(bundle_path.read_bytes()).hexdigest()
-                if bundle_path.is_file()
-                else ""
-            ),
-            commit_paths=commit_paths,
-            commit_messages=tuple(messages),
-        )
-
-    artifacts: list[CollectedArtifact] = []
-    if report_dir.is_dir():
-        for path in sorted(p for p in report_dir.rglob("*") if p.is_file()):
-            name = f"report/{path.relative_to(report_dir)}"
-            if path.name in ("report.yaml", "blocked.md"):
-                continue
-            artifacts.append(
-                CollectedArtifact(
-                    name=name,
-                    type="run_evidence",
-                    content=path.read_bytes()[: 4 * 1024 * 1024],
-                    content_type="text/plain",
-                )
-            )
-    for run in verifications:
-        artifacts.append(
-            CollectedArtifact(
-                name=f"verify/{run.id}.log",
-                type="verification_log",
-                content=run.log_tail.encode("utf-8"),
-                content_type="text/plain",
-            )
-        )
-    rejections: list[dict[str, str]] = []
-    for line in _text(output / "copy-rejections.tsv").splitlines():
-        if "\t" in line:
-            reason, path_text = line.split("\t", 1)
-            rejections.append({"reason": reason, "path": path_text})
-    return _Outputs(
-        report=report,
-        report_raw=report_raw,
-        blocked_md=blocked_md,
-        stdout_tail=_tail(output / "collector.ok", tail_bytes),
-        stderr_tail=_tail(output / "bundle.log", tail_bytes),
-        diff_paths=changed,
-        diff_text=diff_text,
-        bundle=bundle,
-        artifacts=tuple(artifacts),
-        verifications=verifications,
-        copy_rejections=tuple(rejections),
-        checkpoint_refusal=_text(output / "checkpoint-refusal.txt").strip() or None,
-    )
-
-
-def _read_verifications(
-    verify: Path, spec: LaunchSpec, checks: list[tuple[str, str]]
-) -> tuple[VerificationRun, ...]:
-    expected = {
-        str(v.get("id")): int(v.get("expect_exit", 0))
-        for v in spec.contract.get("required_verification", [])
-    }
-    runs: list[VerificationRun] = []
-    for check_id, command in checks:
-        safe = scripts.encode_check_id(check_id)
-        exit_file = verify / f"{safe}.exit"
-        log_file = verify / f"{safe}.log"
-        if not exit_file.is_file():
-            runs.append(
-                VerificationRun(
-                    id=check_id,
-                    command=command,
-                    expect_exit=expected.get(check_id, 0),
-                    exit_code=-1,
-                    log_tail=_tail(log_file, 32 * 1024),
-                    ran=False,
-                    detail="the verifier container recorded no exit for this command",
-                )
-            )
-            continue
-        raw = _text(exit_file).strip()
-        runs.append(
-            VerificationRun(
-                id=check_id,
-                command=command,
-                expect_exit=expected.get(check_id, 0),
-                exit_code=int(raw) if raw.lstrip("-").isdigit() else -1,
-                log_tail=_tail(log_file, 32 * 1024),
-            )
-        )
-    return tuple(runs)
-
-
 # ----- log resume --------------------------------------------------------
 
 
@@ -1882,101 +1711,6 @@ def _since_param(timestamp: str | None) -> str | None:
     except ValueError:
         return None
     return f"{int(moment.timestamp())}.{moment.microsecond * 1000:09d}"
-
-
-def _split(frame_stream: str, payload: bytes) -> list[tuple[str, datetime | None, str, bytes]]:
-    out: list[tuple[str, datetime | None, str, bytes]] = []
-    for raw in payload.split(b"\n"):
-        if not raw:
-            continue
-        line = raw.decode("utf-8", "replace")
-        ts: datetime | None = None
-        stamp, _, rest = line.partition(" ")
-        try:
-            ts = parse_rfc3339(stamp)
-        except ValueError:
-            rest = line
-            stamp = ""
-        out.append((frame_stream, ts, stamp, rest.encode("utf-8")))
-    return out
-
-
-def _chunks(frames: Sequence[Any], since: LogOffset) -> list[LogChunk]:
-    """Demultiplexed frames into chunks, resuming strict-after the stored position.
-
-    `--since` is inclusive (S8), so the batch always reopens at the boundary instant.
-    The stored position is (timestamp, occurrence, sha256): the occurrence is which
-    line at that instant was last stored, counting from 0, and it is what separates
-    two identical lines logged in the same instant. Matching the last hash in the batch
-    instead would silently swallow every repeat between the two.
-
-    If the line at the stored position is not the stored hash, the stream is not the
-    one the offset came from (rotated, truncated, a different container), and the pull
-    falls back to strictly after the timestamp rather than guessing."""
-    lines: list[tuple[str, datetime | None, str, bytes]] = []
-    for frame in frames:
-        lines.extend(_split(frame.stream, frame.payload))
-    boundary: datetime | None = None
-    if since.timestamp is not None:
-        try:
-            boundary = parse_rfc3339(since.timestamp)
-        except ValueError:
-            boundary = None
-    carried = 0
-    if boundary is not None:
-        at_boundary = [index for index, entry in enumerate(lines) if entry[1] == boundary]
-        position = since.occurrence
-        matched = (
-            position < len(at_boundary)
-            and hashlib.sha256(lines[at_boundary[position]][3]).hexdigest() == since.line_sha256
-        )
-        if matched:
-            lines = lines[at_boundary[position] + 1 :]
-            carried = position + 1
-        else:
-            lines = [e for e in lines if e[1] is not None and e[1] > boundary]
-    # Which line at its instant each kept line is. The boundary instant continues the
-    # count from the offset rather than restarting it, because the lines before the
-    # boundary were stored on an earlier pull.
-    seen: dict[datetime | None, int] = {}
-    if boundary is not None:
-        seen[boundary] = carried
-    occurrences: list[int] = []
-    for entry in lines:
-        position = seen.get(entry[1], 0)
-        occurrences.append(position)
-        seen[entry[1]] = position + 1
-
-    chunks: list[LogChunk] = []
-    buffer: list[bytes] = []
-    stream = ""
-    last: tuple[datetime | None, str, int] = (None, "", 0)
-    count = 0
-    for (line_stream, ts, _stamp, text), occurrence in zip(lines, occurrences, strict=True):
-        if stream and line_stream != stream:
-            chunks.append(_chunk(stream, buffer, last, count))
-            buffer, count = [], 0
-        stream = line_stream
-        buffer.append(text)
-        count += 1
-        last = (ts, hashlib.sha256(text).hexdigest(), occurrence)
-    if buffer:
-        chunks.append(_chunk(stream, buffer, last, count))
-    return chunks
-
-
-def _chunk(
-    stream: str, buffer: list[bytes], last: tuple[datetime | None, str, int], count: int
-) -> LogChunk:
-    content = b"\n".join(buffer) + b"\n"
-    return LogChunk(
-        stream="stderr" if stream == "stderr" else "stdout",
-        content=content,
-        ts=last[0],
-        line_sha256=last[1],
-        occurrence=last[2],
-        lines=count,
-    )
 
 
 # ----- the credential copy (12) --------------------------------------------
