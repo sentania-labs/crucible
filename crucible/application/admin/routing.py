@@ -107,10 +107,11 @@ def save_local_endpoint(
         update = updates.get(str(model.get("id")))
         if update is None:
             continue
-        enabled = bool(update.get("enabled", False))
+        # Only a real True turns a flag on; the API rejects non-booleans before this.
+        enabled = update.get("enabled") is True
         model["enabled"] = enabled
         model["chat_template_kwargs"] = {
-            "enable_thinking": bool(update.get("enable_thinking", False))
+            "enable_thinking": update.get("enable_thinking") is True
         }
         if enabled:
             model["disabled_reason"] = None

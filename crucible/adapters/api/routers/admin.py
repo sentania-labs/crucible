@@ -7,6 +7,7 @@ from __future__ import annotations
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Body, Query
+from fastapi.exceptions import RequestValidationError
 
 from crucible.adapters.api.deps import Admin, Ctx, Orchestrator, UoW
 from crucible.application.admin import (
@@ -70,6 +71,23 @@ def admin_local_endpoint(ctx: Ctx, uow: UoW, _principal: Admin) -> dict[str, Any
     return routing.local_endpoint_view(uow)
 
 
+def _require_boolean_flags(models: list[dict[str, Any]]) -> None:
+    """The flags must be JSON booleans. Truthiness would read the string "false" as on,
+    enabling the model and opening its proxy destination."""
+    errors = [
+        {
+            "loc": ("body", "models", index, flag),
+            "msg": f"{flag} must be a JSON boolean",
+            "type": "bool_type",
+        }
+        for index, item in enumerate(models)
+        for flag in ("enabled", "enable_thinking")
+        if flag in item and not isinstance(item[flag], bool)
+    ]
+    if errors:
+        raise RequestValidationError(errors)
+
+
 @router.post("/admin/routing/local-endpoint")
 def admin_save_local_endpoint(
     ctx: Ctx,
@@ -80,6 +98,7 @@ def admin_save_local_endpoint(
     models = body.get("models")
     if not isinstance(models, list) or not all(isinstance(item, dict) for item in models):
         raise ConflictError("models must be a list of local model settings")
+    _require_boolean_flags(models)
     result = routing.save_local_endpoint(
         _admin(ctx),
         uow,

@@ -874,6 +874,42 @@ def test_a_save_with_every_local_model_disabled_leaves_the_docker_allowlist_unch
     assert stub.config.proxy_allowlist == ()
 
 
+@pytest.mark.parametrize("flag", ["enabled", "enable_thinking"])
+@pytest.mark.parametrize("value", ["false", "true", 0, 1, None])
+def test_a_non_boolean_local_model_flag_is_rejected_and_changes_nothing(
+    admin_client: TestClient,
+    admin_ctx: AdminContext,
+    live_supervisor: Supervisor,
+    tmp_path: Path,
+    flag: str,
+    value: object,
+) -> None:
+    """bool("false") is True, so a string flag would enable the model and open its proxy
+    destination. The API takes JSON booleans only and writes nothing otherwise."""
+    asyncio.run(live_supervisor.tick())
+    proxy_path = tmp_path / "egress" / "squid.conf"
+    admin_ctx.proxy_config_path = str(proxy_path)
+    admin_ctx.proxy_hosts = ("github.com",)
+    before = admin_client.get("/v1/admin/routing/local-endpoint").json()
+    settings: dict[str, object] = {"id": "coder", "enabled": False, "enable_thinking": False}
+    settings[flag] = value
+    response = admin_client.post(
+        "/v1/admin/routing/local-endpoint",
+        json={
+            "reason": "string flag from a direct caller",
+            "endpoint_url": "https://llm.apps.int.sentania.net/v1",
+            "models": [settings],
+            "max_concurrency": 3,
+        },
+    )
+    assert response.status_code == 422, response.text
+    assert response.json()["errors"] == [
+        {"path": f"body.models.0.{flag}", "message": f"{flag} must be a JSON boolean"}
+    ]
+    assert admin_client.get("/v1/admin/routing/local-endpoint").json() == before
+    assert not proxy_path.exists()
+
+
 def test_credentials_rotate_and_remove_through_api_and_cli(
     admin_client: TestClient,
     admin_ctx: AdminContext,
