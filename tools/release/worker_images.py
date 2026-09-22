@@ -13,6 +13,16 @@ images/manifest.env declares; nothing is re-encoded or recompressed on the way, 
 `docker push` of a loaded image would do. Before anything is sent, the archive's own
 manifest digest must equal the declared one.
 
+Each blob (the worker image's layers run about 1.23 GB combined) is streamed from the
+archive in bounded CHUNK_SIZE reads and uploaded with the registry's POST, PATCH, PUT
+chunked-upload sequence, so the publisher never holds a whole blob in memory. The
+archive's own tampered-blob check (a blob's bytes must hash to the name the manifest
+gave it, FDY-0074) runs incrementally over the same reads: a mismatch is only knowable
+after the last chunk, so it is raised before the final PUT commits the upload, not
+before the first PATCH sends it. An upload that a mismatch aborts is left unfinalized
+on the registry, never referenced by a manifest, and is the registry's own garbage to
+collect.
+
 A published tag is never overwritten (the rule the service image has, ADR 0010):
 absent means push; present with the declared digest means a re-run of the same
 release, and the push is skipped; present with any other digest stops the release.
@@ -42,6 +52,7 @@ import tarfile
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -52,6 +63,10 @@ MANIFEST_TYPES = (
     "application/vnd.docker.distribution.manifest.list.v2+json",
 )
 TIMEOUT = 120.0
+# Bounded so a blob is never held whole in memory; each PATCH body is at most this many
+# bytes (FDY-0074). 8 MiB is well inside every registry's chunk-size limits, including
+# GHCR's.
+CHUNK_SIZE = 8 * 1024 * 1024
 
 
 class PublishError(Exception):
@@ -147,6 +162,27 @@ class OciArchive:
     def blob(self, digest: str) -> bytes:
         with tarfile.open(self.path) as archive:
             return self._blob(archive, digest)
+
+    def blob_chunks(self, digest: str, chunk_size: int = CHUNK_SIZE) -> Iterator[bytes]:
+        """The blob's bytes, read in bounded chunks straight off the tar member: never
+        the whole blob in memory. The digest is checked incrementally against the same
+        reads; a mismatch can only be known after the last chunk, so it is raised once
+        the generator is exhausted, after every chunk already produced has been handed
+        to the caller."""
+        algorithm, _, hex_digest = digest.partition(":")
+        if algorithm != "sha256" or len(hex_digest) != 64:
+            raise PublishError(f"{self.path.name} names a blob {digest!r} that is not sha256")
+        with tarfile.open(self.path) as archive:
+            member = archive.extractfile(f"blobs/sha256/{hex_digest}")
+            if member is None:
+                raise PublishError(f"{self.path.name!r} has no blobs/sha256/{hex_digest}")
+            hasher = hashlib.sha256()
+            while chunk := member.read(chunk_size):
+                hasher.update(chunk)
+                yield chunk
+            computed = "sha256:" + hasher.hexdigest()
+            if computed != digest:
+                raise PublishError(f"{self.path.name}: blob {digest} does not hash to its name")
 
 
 class Registry:
@@ -271,20 +307,39 @@ class Registry:
             raise PublishError(f"{self.host} reports {header} for {tag} but served {digest}")
         return digest
 
-    def push_blob(self, digest: str, data: bytes) -> None:
+    def push_blob(self, digest: str, chunks: Iterator[bytes]) -> None:
+        """Streams `chunks` (bounded reads, never the whole blob) through the registry's
+        POST, PATCH, PUT chunked-upload sequence. When the blob is already present, the
+        chunks are still drained and hashed (never sent) so a tampered archive is caught
+        the same way whether or not the registry needs the bytes again."""
         status, _, _ = self.request("HEAD", f"/v2/{self.name}/blobs/{digest}", ok=(200, 404))
         if status == 200:
+            for _ in chunks:
+                pass
             return
         _, reply, _ = self.request("POST", f"/v2/{self.name}/blobs/uploads/", body=b"", ok=(202,))
         location = reply.get("location", "")
         if not location:
             raise PublishError(f"{self.host} opened an upload with no location")
+        offset = 0
+        for chunk in chunks:
+            _, reply, _ = self.request(
+                "PATCH",
+                location,
+                body=chunk,
+                headers={
+                    "Content-Type": "application/octet-stream",
+                    "Content-Range": f"{offset}-{offset + len(chunk) - 1}",
+                },
+                ok=(202,),
+            )
+            location = reply.get("location", location)
+            offset += len(chunk)
         separator = "&" if "?" in location else "?"
         self.request(
             "PUT",
             f"{location}{separator}digest={urllib.parse.quote(digest)}",
-            body=data,
-            headers={"Content-Type": "application/octet-stream"},
+            body=b"",
             ok=(201,),
         )
 
@@ -322,7 +377,7 @@ def publish(manifest: Path, archives: Path, repository: str) -> None:
                 "inputs so the image gets a new tag."
             )
         for digest in archive.blobs:
-            registry.push_blob(digest, archive.blob(digest))
+            registry.push_blob(digest, archive.blob_chunks(digest))
         registry.push_manifest(image.tag, archive.media_type, archive.manifest_bytes)
         print(f"{reference} published with {image.digest}")
 
