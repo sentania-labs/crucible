@@ -12,7 +12,7 @@ metadata:
 spec:
   refreshInterval: 1h
   secretStoreRef:
-    name: REPLACE_WITH_SECRET_STORE_NAME
+    name: REPLACE_ME_SECRET_STORE_NAME
     kind: ClusterSecretStore
   target:
     name: crucible-database
@@ -20,9 +20,9 @@ spec:
   data:
     - secretKey: password
       remoteRef:
-        key: REPLACE_WITH_REMOTE_PATH
+        key: REPLACE_ME_REMOTE_PATH
         property: password
     - secretKey: url
       remoteRef:
-        key: REPLACE_WITH_REMOTE_PATH
+        key: REPLACE_ME_REMOTE_PATH
         property: url

@@ -46,13 +46,17 @@ data:
   # (13, 25). A JSON array: pydantic-settings decodes a complex field from the
   # environment as JSON.
   CRUCIBLE_KUBERNETES__IMAGE_REPOSITORIES: '["ghcr.io/sentania-labs/crucible-worker"]'
-  # One exact worker image for 26's readiness canary. The canary runs the first image the
-  # provider knows of, and a bare repository means `:latest` to a kubelet, so a registry
-  # with no `latest` would leave the canary in ImagePullBackOff and the status page
-  # reporting the namespace as not ready for a reason that is not about the namespace.
-  # The overlay names the promoted image; `crucible-worker:latest` is only a default that
-  # happens to be right when the registry publishes one.
-  CRUCIBLE_KUBERNETES__PROBE_IMAGE: ghcr.io/sentania-labs/crucible-worker:latest
+  # One exact worker image for 26's readiness canary, set by the overlay. The canary runs
+  # the first image the provider knows of, and a bare repository means `:latest` to a
+  # kubelet, so a registry with no `latest` leaves the canary in ImagePullBackOff and the
+  # status page reporting the namespace as not ready for a reason that is not about the
+  # namespace.
+  #
+  # Empty here on purpose, and not a `:latest` default: a deployment pins, and the one
+  # thing this setting exists to prevent is a `:latest` a kubelet resolves. Empty means
+  # the setting contributes nothing at all, so a deployment that leaves it empty behaves
+  # exactly as it did before the setting existed.
+  CRUCIBLE_KUBERNETES__PROBE_IMAGE: ""
   # The harness credential Secret in `crucible-workers`, per harness (12, 26). The
   # default for a harness that is absent here is `crucible-harness-<harness>`; it is
   # written out so the runbook and the cluster name the same objects.

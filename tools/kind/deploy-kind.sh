@@ -89,7 +89,7 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
-for tool in kind kubectl openssl curl; do
+for tool in docker kind kubectl openssl curl; do
   command -v "$tool" >/dev/null || { echo "deploy-kind: $tool is not on PATH" >&2; exit 2; }
 done
 
@@ -109,7 +109,12 @@ fi
 # provider (docs/implementation-notes/c9.md).
 crucible_image="${CRUCIBLE_DEPLOY_KIND_IMAGE:-}"
 if [ -n "$crucible_image" ]; then
-  docker image inspect "$crucible_image" >/dev/null 2>&1 || docker pull "$crucible_image"
+  if ! docker image inspect "$crucible_image" >/dev/null 2>&1; then
+    docker pull "$crucible_image"
+    # Pulled by this run, so removed by this run. One that was already on the daemon is
+    # the operator's and is left exactly as it was found.
+    built_image="$crucible_image"
+  fi
   echo "deploy-kind: proving the image $crucible_image"
 else
   crucible_image="crucible:deploy-kind-${run_id}"
@@ -144,6 +149,9 @@ extendedKeyUsage=serverAuth
 EOF
 openssl x509 -req -in "$certs/registry.csr" -CA "$certs/ca.crt" -CAkey "$certs/ca.key" \
   -CAcreateserial -out "$certs/registry.crt" -days 1 -extfile "$certs/registry.ext" 2>/dev/null
+# The registry container runs unprivileged and has to read its own key. The mode is
+# only reachable through this scratch directory, which `mktemp -d` made 0700, and the
+# key is a one-day certificate for a registry that is deleted with the cluster.
 chmod 0644 "$certs/registry.key"
 
 registry_started=1
@@ -281,6 +289,10 @@ EOF
 done
 
 echo "deploy-kind: applying deploy/kubernetes/overlays/kind"
+# A Job's pod template is immutable, so a second apply against a live cluster would be
+# refused. Argo re-creates it through the hook annotations the Job carries; a plain
+# apply needs this. The cluster is new on the first run, so `--ignore-not-found`.
+kubectl -n crucible delete job crucible-migrate --ignore-not-found --wait=true
 kubectl apply -k "$overlay"
 
 kubectl -n crucible wait --for=condition=Complete job/crucible-migrate --timeout=300s

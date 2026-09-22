@@ -28,7 +28,7 @@ from typing import Any
 import pytest
 import yaml
 
-from crucible.settings import Settings
+from crucible.settings import CredentialSettings, HarnessSettings, Settings
 
 ROOT = Path(__file__).resolve().parents[2]
 DEPLOY = ROOT / "deploy" / "kubernetes"
@@ -182,18 +182,19 @@ def test_the_only_rolebinding_names_the_control_plane_account(
 ) -> None:
     """A second subject, or a Group subject, is how the supervisor's Role would reach
     something other than Crucible."""
-    bindings = _of_kind(rendered["base"], "RoleBinding")
-    assert len(bindings) == 1
-    binding = bindings[0]
-    assert binding["metadata"]["namespace"] == "crucible-workers"
-    assert binding["roleRef"] == {
-        "apiGroup": "rbac.authorization.k8s.io",
-        "kind": "Role",
-        "name": "crucible-supervisor",
-    }
-    assert binding["subjects"] == [
-        {"kind": "ServiceAccount", "name": "crucible-supervisor", "namespace": "crucible"}
-    ]
+    for target in ("base", "overlays/lab", "overlays/kind"):
+        bindings = _of_kind(rendered[target], "RoleBinding")
+        assert len(bindings) == 1, f"{target}: {len(bindings)} RoleBinding objects"
+        binding = bindings[0]
+        assert binding["metadata"]["namespace"] == "crucible-workers"
+        assert binding["roleRef"] == {
+            "apiGroup": "rbac.authorization.k8s.io",
+            "kind": "Role",
+            "name": "crucible-supervisor",
+        }
+        assert binding["subjects"] == [
+            {"kind": "ServiceAccount", "name": "crucible-supervisor", "namespace": "crucible"}
+        ], target
 
 
 def test_the_worker_account_is_bound_to_nothing(
@@ -248,6 +249,19 @@ def test_no_pod_is_privileged_or_shares_a_host_namespace(
                 assert not security.get("capabilities", {}).get("add"), where
 
 
+def _pinned(image: str) -> bool:
+    """A reference carrying an explicit tag or digest.
+
+    The tag separator is a colon in the last path segment. A registry host may carry a
+    port, so a bare `host:5000/repo` has a colon and no tag at all, which is exactly the
+    shape this has to refuse.
+    """
+    if "@sha256:" in image:
+        return True
+    last = image.rsplit("/", 1)[-1]
+    return ":" in last
+
+
 def test_every_image_is_pinned_and_none_is_latest(
     rendered: dict[str, list[dict[str, Any]]],
 ) -> None:
@@ -257,7 +271,19 @@ def test_every_image_is_pinned_and_none_is_latest(
             for container in _containers(spec):
                 image = container["image"]
                 assert not image.endswith(":latest"), f"{target}: {where} runs {image}"
-                assert ":" in image or "@" in image, f"{target}: {where} runs {image} untagged"
+                assert _pinned(image), f"{target}: {where} runs {image} untagged"
+
+
+def test_no_setting_names_a_latest_image(
+    rendered: dict[str, list[dict[str, Any]]],
+) -> None:
+    """26's readiness canary runs an image named in configuration, not in a pod spec, so
+    the container walk above cannot see it. A `:latest` there is the same defect and the
+    whole reason `kubernetes.probe_image` exists."""
+    for target in ("base", "overlays/lab", "overlays/kind"):
+        for config in _of_kind(rendered[target], "ConfigMap"):
+            for key, value in (config.get("data") or {}).items():
+                assert not str(value).rstrip().endswith(":latest"), f"{target}: {key}"
 
 
 def test_the_crucible_image_tag_is_pinned_in_exactly_one_place() -> None:
@@ -367,26 +393,67 @@ def test_the_kubernetes_provider_is_on_and_docker_is_off(
         assert settings["CRUCIBLE_KUBERNETES__SERVICE_ACCOUNT"] == "crucible-worker"
 
 
-def test_every_configmap_setting_is_one_the_application_reads() -> None:
-    """A setting that pydantic-settings does not know is dropped in silence (`extra`
-    is `ignore`), so a typo in the ConfigMap is a deployment that quietly runs on the
-    default. This walks the rendered keys against the real Settings model."""
+# Keys an overlay may add that are not Crucible settings at all. `SSL_CERT_FILE` is
+# Python's own, and only the generated kind overlay sets it.
+NON_SETTING_KEYS = frozenset({"SSL_CERT_FILE"})
 
-    objects = _render("base")
-    data = _named(objects, "ConfigMap", "crucible-settings")["data"]
-    for key in data:
-        assert key.startswith("CRUCIBLE_"), key
-        parts = key.removeprefix("CRUCIBLE_").lower().split("__")
-        model: Any = Settings
-        for index, part in enumerate(parts):
-            fields = getattr(model, "model_fields", None)
-            if fields is None:
-                break
-            if part in fields:
-                model = fields[part].annotation
-                continue
-            # `credentials` and `harnesses` are dicts keyed by harness name, so the next
-            # segment is a key and the one after it is the field.
-            if index and isinstance(model, type) and issubclass(model, dict):
-                break
+
+def _resolve_setting(key: str) -> None:
+    """Walk one environment key through the real Settings model, or raise.
+
+    A setting pydantic-settings does not know is dropped in silence (`extra` is
+    `ignore`), so a typo in a ConfigMap is a deployment that quietly runs on the default.
+    """
+    # `credentials` and `harnesses` are dicts keyed by harness name, so the segment after
+    # one of them is a key of the operator's choosing and the one after that is a field
+    # of the dict's value type.
+    keyed = {"credentials": CredentialSettings, "harnesses": HarnessSettings}
+    parts = key.removeprefix("CRUCIBLE_").lower().split("__")
+    model: Any = Settings
+    previous = ""
+    for part in parts:
+        if previous in keyed:
+            model = keyed[previous]
+            previous = part
+            continue
+        fields = getattr(model, "model_fields", None)
+        if fields is None or part not in fields:
             raise AssertionError(f"{key} names no setting: {part!r} is not a field")
+        model = fields[part].annotation
+        previous = part
+    if previous in keyed:
+        raise AssertionError(f"{key} names a section and no field inside it")
+
+
+@pytest.mark.parametrize("target", ("base", "overlays/lab", "overlays/kind"))
+def test_every_configmap_setting_is_one_the_application_reads(
+    rendered: dict[str, list[dict[str, Any]]], target: str
+) -> None:
+    """The overlays are where the typo risk lives, so all three are walked."""
+    data = _named(rendered[target], "ConfigMap", "crucible-settings")["data"]
+    for key in data:
+        if key in NON_SETTING_KEYS:
+            continue
+        assert key.startswith("CRUCIBLE_"), key
+        _resolve_setting(key)
+
+
+def test_the_setting_walk_rejects_a_key_the_model_does_not_carry() -> None:
+    """The walk is only worth having if it fails; a `break` on an unknown segment would
+    make every key past the first one pass."""
+    for key in (
+        "CRUCIBLE_SERVICE__NONSENSE",
+        "CRUCIBLE_SERVICE__BIND__NONSENSE",
+        "CRUCIBLE_KUBERNETES__PROBE_IMAGE__NONSENSE",
+        "CRUCIBLE_HARNESSES__CODEX__NONSENSE",
+    ):
+        with pytest.raises(AssertionError):
+            _resolve_setting(key)
+    # And the real shapes still resolve, including the two dict-keyed sections.
+    for key in (
+        "CRUCIBLE_SERVICE__BIND",
+        "CRUCIBLE_KUBERNETES__PROBE_IMAGE",
+        "CRUCIBLE_HARNESSES__CODEX__ENABLED",
+        "CRUCIBLE_CREDENTIALS__CLAUDE_CODE__MOUNT_MODE",
+    ):
+        _resolve_setting(key)

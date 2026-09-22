@@ -5,9 +5,9 @@
 # that builds here builds there. It needs `kubectl` (for its built-in kustomize) and
 # `kubeconform` on PATH; CI installs both at pinned versions.
 #
-# SealedSecret and ExternalSecret are skipped by name rather than by
-# `-ignore-missing-schemas`: those two are the only custom resources this repository
-# emits, and naming them means a third one added by accident fails instead of passing
+# SealedSecret, ExternalSecret and Argo's Application are skipped by name rather than by
+# `-ignore-missing-schemas`: those three are the only custom resources this repository
+# emits, and naming them means a fourth one added by accident fails instead of passing
 # quietly.
 set -euo pipefail
 
