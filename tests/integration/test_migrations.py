@@ -138,7 +138,9 @@ def test_0004_creates_the_c2_tables_and_seeds_the_routing_policy(migrated: str) 
                 "WHERE model ->> 'disabled_reason' LIKE '%0017_lab_local%')"
             )
         ).scalar_one()
-        assert seeded == 1
+        # Every later migration that copies the routing document forward without
+        # touching this model keeps the marker, so this only checks it was seeded.
+        assert seeded >= 1
         # Later revisions add immutable policy versions that name their matching
         # routing version (05b).
         policy_versions = conn.execute(
