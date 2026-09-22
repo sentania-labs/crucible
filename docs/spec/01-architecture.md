@@ -30,7 +30,7 @@ crucible/
                   delivery parsing, publisher job
   scheduler/      the supervision loop: leases, heartbeats, timeouts,
                   reconciliation ticks
-  cli/            crucible-admin: migrate, import, reconcile, tokens, drain, export
+  cli/            crucible: serve, admin (migrate, import, tokens, ...), orchestrator verbs
 ```
 
 Dependency direction is inward only: adapters import application and

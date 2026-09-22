@@ -90,7 +90,7 @@ if [ "$action" = "down" ]; then
   # No --volumes: the database and the artifact root outlive a restart by design (13).
   # Workers are not compose services, so one that is still running keeps the
   # `crucible-workers` network alive and compose exits non-zero on the network removal.
-  # That is the container being left alone, as 13 intends; `crucible-admin drain` is what
+  # That is the container being left alone, as 13 intends; `crucible admin drain` is what
   # removes a worker.
   compose --profile "*" down
   echo "deploy-local: containers down, volumes kept (crucible-pg, crucible-artifacts)"
@@ -134,7 +134,7 @@ sudo -n install -d -o "$SERVICE_USER" -g "$service_group" -m 750 "$DEPLOY_DIR/va
 
 # 2. The credential root spec 12 and 25 expect: one empty directory per harness, mode
 #    700, owned by the service user. This target creates the layout and nothing else;
-#    a credential enters only through `crucible-admin credentials login` (25), which
+#    a credential enters only through `crucible admin credentials login` (25), which
 #    points the harness's own interactive login at its directory here. The operator's
 #    own harness directories are never read, copied or referenced (12).
 sudo -n install -d -o "$SERVICE_USER" -g "$service_group" -m 700 "$CREDENTIAL_ROOT"
@@ -317,5 +317,5 @@ echo "deploy-local: running from $DEPLOY_DIR on the rootless daemon of '$SERVICE
 echo "  first use:   sudo -u $SERVICE_USER env HOME=$service_home XDG_RUNTIME_DIR=$runtime_dir \\"
 echo "                 DOCKER_HOST=unix://$socket docker compose --project-directory $DEPLOY_DIR \\"
 echo "                 -f $DEPLOY_DIR/compose.yaml -f $DEPLOY_DIR/compose.deploy.yaml \\"
-echo "                 exec crucible crucible-admin token create --principal foundry --role orchestrator"
+echo "                 exec crucible crucible admin token create --principal foundry --role orchestrator"
 echo "  stop:        make deploy-local-down"

@@ -3,7 +3,7 @@ validated in full and written in one transaction under a `bootstrap_imports` row
 state `verified`; show and list imports; commit one, which makes it authoritative and
 records the handoff on every imported task.
 
-Both entry points (the API under `/v1/import/bootstrap` and `crucible-admin bootstrap`)
+Both entry points (the API under `/v1/import/bootstrap` and `crucible admin bootstrap`)
 call these functions. Submit and commit are administrative mutations (25): a reason and
 a live supervisor lease, one event each with the principal and a before-and-after
 summary. A bundle that fails validation returns every problem and stores nothing.

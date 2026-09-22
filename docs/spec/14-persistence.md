@@ -96,7 +96,7 @@ supervisor.
   implicit lazy loading in the application layer (repositories return
   domain objects).
 - Alembic migrations, one file per change, hand-reviewed (autogenerate as
-  a draft only). `crucible-admin migrate` applies; the container entrypoint
+  a draft only). `crucible admin migrate` applies; the container entrypoint
   refuses to serve if the head revision is not applied, and `/ready` reports
   it.
 - Down migrations required for every revision in v0.x.
@@ -129,7 +129,7 @@ supervisor.
   versions inside documents, table versions by Alembic. A document schema
   bump that changes stored shape ships with a data migration.
 - Backups are the operator's concern (volume snapshot locally; operator
-  tooling on the cluster). `crucible-admin export` produces a portable JSON
+  tooling on the cluster). `crucible admin export` produces a portable JSON
   bundle for the same reason the bootstrap import exists; it and the
   bootstrap `import` arrive with the ledger handoff (15) in C6, and until
   then neither command exists (25).

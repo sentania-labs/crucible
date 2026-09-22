@@ -4,7 +4,7 @@ The registry resolves a harness name to an adapter and refuses an unknown or dis
 name with a reason the supervisor turns into a wake. A harness is launchable only when
 the operator's configuration gate and the admin's runtime flag both say so: the gate
 ships closed for a harness whose dedicated session is unverified (S1b), and the flag is
-what `crucible-admin harnesses disable` flips without touching configuration.
+what `crucible admin harnesses disable` flips without touching configuration.
 
 Also here: the image-version check every launch runs (a combination outside the tested
 range is a refusal, never a warning), the egress allowlist a worker gets (the union of

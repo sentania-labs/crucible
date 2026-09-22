@@ -134,7 +134,7 @@ source = "directory"
 path = "/var/lib/crucible/credentials/hermes"        # api-key, written mode 600 by the admin surface
 mount_mode = "ro"
 
-# Administration (25, C5b): the same operations behind `/v1/admin` and `crucible-admin`.
+# Administration (25, C5b): the same operations behind `/v1/admin` and `crucible admin`.
 # A rotated credential's previous directory is kept for `credential_retention_hours`
 # beside the live one, then shredded on the supervisor's retention tick; remove shreds
 # at once. The probe runs the harness's hardened image with the dedicated credential
@@ -151,7 +151,7 @@ proxy_config_path = "/var/lib/crucible/egress/squid.conf"
 proxy_subnet = "10.88.0.0/24"
 
 # Harness enablement (25, S1b). A launch needs this gate and the administrator's runtime
-# flag (`crucible-admin harnesses enable`, C5b; seeded the same way by migration 0008).
+# flag (`crucible admin harnesses enable`, C5b; seeded the same way by migration 0008).
 # A harness ships disabled until its dedicated Crucible session has refreshed on the
 # Crucible side and the operator's own session was confirmed valid afterwards (S1b
 # steps 5 and 6). Claude Code's long-lived token has no refresh, so it is verified; AGY

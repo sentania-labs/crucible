@@ -1,4 +1,4 @@
-# 25. Crucible administration: admin API, crucible-admin CLI, credential onboarding
+# 25. Crucible administration: admin API, `crucible admin` CLI, credential onboarding
 
 Harness credentials, harness availability, worker-image versions, execution
 providers, GitHub App configuration, and operational health are Crucible
@@ -12,12 +12,17 @@ without Foundry.
 - **Versioned admin API** under `/v1/admin`, admin role only, generated
   into the same OpenAPI document. Every mutation is an event with the
   principal, before-and-after summary (never a value), and reason.
-- **`crucible-admin` CLI** calls the same application services as the API
+- **`crucible admin` CLI** (the `admin` group of the one `crucible`
+  command; `crucible-admin` remains as a shim that prints one deprecation
+  line on stderr and runs `crucible admin` with the same arguments) calls
+  the same application services as the API
   (`crucible/application/admin/*`), not a private path; the CLI is a
   client of the service layer running in-process (local mode) or against
-  the API (remote mode). Every operation in the table below exists on
-  both, with the same audit event, and parity tests drive both entry
-  points. Four operations are CLI-only by design because they need the
+  the API (remote mode, `--api-url URL` or `--remote`). Every operation in
+  the table below exists on both, with the same audit event, and parity
+  tests drive both entry points; a further test holds `crucible admin` to
+  every verb and argument `crucible-admin` had (the command tree captured
+  at 0cf0075), and to the same API call per verb in remote mode. Four operations are CLI-only by design because they need the
   database or filesystem directly and run before or beside the service:
   `migrate`, `import` (bootstrap, which also has its verify and commit API
   in 15), `export`, and `token create`; they are audited the same way and
@@ -26,6 +31,22 @@ without Foundry.
   `token create` exist today; `import` and `export` are named here and in 14
   but arrive with the bootstrap ledger (15) in C6, and the CLI's own help
   states the gap rather than asserting commands that are not there.
+- **One envelope.** Every `crucible admin` verb prints one JSON object on
+  stdout (docs/client.md): `ok`, `kind`, `state` where the record has a
+  lifecycle (a credential's `state`, a harness's enabled or disabled, a
+  bootstrap import's state), `data` exactly as the service or the API
+  returned it, `next`, `warnings`, and on failure `error` with the
+  service's problem detail in the API's RFC 9457 shape, in local mode as
+  in remote. Exit 0 on `ok`, 1 on a refused or failed operation, 2 on
+  usage. `next` lists the admin verbs valid from the record's state: for a
+  credential, what 25's operations accept from its state (`login` only in
+  local mode, because only there can the harness's own CLI run); for a
+  harness, the enable flag's other value; for an image, `promote` while it
+  is a supported candidate; for a pool, `clear-exhaustion` while its mark
+  is active; for a verified import, `commit`. Each names its argv,
+  including the `--api-url` or `--config` the command ran with, and what
+  the caller must supply. Logs, and the interactive parts of a login, go to
+  stderr.
 - **Sanitized status** only. No response, log line, event payload, table
   row, or artifact ever carries a credential value, a token, a key, or a
   file's contents. Validation results are booleans, enumerations,
@@ -161,7 +182,7 @@ disabled at the time a contract is submitted is a contract problem then
 
 ## Credential onboarding workflow
 
-`crucible-admin credentials login --harness <claude_code|codex|agy>`:
+`crucible admin credentials login --harness <claude_code|codex|agy>`:
 
 0. **Where it runs.** The API and UI run the harness CLI in that harness's
    promoted worker image. The container has a TTY attached directly to the
@@ -265,7 +286,8 @@ policy and state remain editable through the application services.
 
 A fresh migrated database with no administrator receives one
 `first-run-admin` principal. The migration process prints its token once in a
-clearly framed block. Only the salted token hash is stored. The sign-in page
+clearly framed block on stderr (stdout carries the envelope alone, so a caller
+parsing it never holds the token). Only the salted token hash is stored. The sign-in page
 directs the operator to `docker compose logs migrate`; a later migration run
 finds the principal and prints no token.
 

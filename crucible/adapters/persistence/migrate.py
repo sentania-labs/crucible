@@ -1,4 +1,4 @@
-"""Programmatic Alembic: `crucible-admin migrate` applies; serve refuses if not at head (14)."""
+"""Programmatic Alembic: `crucible admin migrate` applies; serve refuses if not at head (14)."""
 
 from __future__ import annotations
 
