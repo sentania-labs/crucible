@@ -20,13 +20,14 @@ registry_host="crucible-registry-${run_id}"
 scratch=$(mktemp -d -t crucible-deploy-kind.XXXXXX)
 kubeconfig="$scratch/kubeconfig"
 certs="$scratch/certs"
-# kustomize refuses an absolute path in `resources` and refuses to leave its own root,
-# so the generated overlay has to sit inside the repository. `var/` is gitignored and is
+# kustomize refuses an absolute path in resources and refuses to leave its own root,
+# so the generated overlay has to sit inside the repository. var/ is gitignored and is
 # where the other generated deployment artefacts already go.
 overlay="$root/var/deploy-kind/$run_id"
 worker_ref=""
 push_ref=""
 built_image=""
+release_image=""
 cluster_created=0
 registry_started=0
 
@@ -104,34 +105,25 @@ if ! docker image inspect "$worker_image" >/dev/null 2>&1; then
   exit 2
 fi
 
-# The Crucible image under test. The manifests pin the published tag; this run may point
-# at a different one, and says which, because the published 0.3.3 predates the Kubernetes
-# provider (docs/implementation-notes/c9.md).
-crucible_image="${CRUCIBLE_DEPLOY_KIND_IMAGE:-}"
-if [ -n "$crucible_image" ]; then
-  if ! docker image inspect "$crucible_image" >/dev/null 2>&1; then
-    docker pull "$crucible_image"
-    # Pulled by this run, so removed by this run. One that was already on the daemon is
-    # the operator's and is left exactly as it was found.
-    built_image="$crucible_image"
-  fi
-  echo "deploy-kind: proving the image $crucible_image"
-else
-  crucible_image="crucible:deploy-kind-${run_id}"
-  built_image="$crucible_image"
-  revision=$(git -C "$root" rev-parse HEAD 2>/dev/null || echo unknown)
-  echo "deploy-kind: building $crucible_image from the working tree (no published image"
-  echo "deploy-kind: carries the Kubernetes provider yet; see docs/implementation-notes/c9.md)"
-  # No VERSION build argument: `git describe` on a branch past a tag is not a PEP 440
-  # version and hatch-vcs refuses it, so the image takes the Dockerfile's 0.0.0.dev0
-  # default. A version an operator could mistake for a release is the wrong thing for a
-  # working-tree build to carry anyway.
-  docker build -t "$crucible_image" --build-arg "REVISION=$revision" "$root" >/dev/null
+# The only release reference comes from the manifest source. The working-tree image gets
+# a disposable host tag, then kind retags it to this exact reference after loading. That
+# avoids replacing a release image the operator already has on the host.
+release_image=$(awk '
+  $2 == "name:" { name = $3 }
+  $1 == "newTag:" && name { print name ":" $2; exit }
+' "$root/deploy/kubernetes/base/kustomization.yaml")
+if [ -z "$release_image" ]; then
+  echo "deploy-kind: base kustomization names no release image" >&2
+  exit 2
 fi
-crucible_image_name=${crucible_image%:*}
-crucible_image_tag=${crucible_image##*:}
+built_image="ghcr.io/sentania-labs/crucible:deploy-kind-${run_id}"
+revision=$(git -C "$root" rev-parse HEAD 2>/dev/null || echo unknown)
+echo "deploy-kind: building and proving $release_image from the working tree"
+echo "deploy-kind: kind loads this local image and never pulls it, so the rendered release"
+echo "deploy-kind: reference and the image under test are both $release_image"
+docker build -t "$built_image" --build-arg "REVISION=$revision" "$root" >/dev/null
 
-# A registry the deployed provider can reach over HTTPS. `k8sregistry.py` speaks HTTPS
+# A registry the deployed provider can reach over HTTPS. k8sregistry.py speaks HTTPS
 # only and it is right to: resolving a tag to a digest is how the harness version refusal
 # happens before a kubelet pulls (07, 26), so it must not be a plaintext hop. The CA is
 # generated per run, lives only in this scratch directory, and is trusted by exactly two
@@ -150,7 +142,7 @@ EOF
 openssl x509 -req -in "$certs/registry.csr" -CA "$certs/ca.crt" -CAkey "$certs/ca.key" \
   -CAcreateserial -out "$certs/registry.crt" -days 1 -extfile "$certs/registry.ext" 2>/dev/null
 # The registry container runs unprivileged and has to read its own key. The mode is
-# only reachable through this scratch directory, which `mktemp -d` made 0700, and the
+# only reachable through this scratch directory, which mktemp -d made 0700, and the
 # key is a one-day certificate for a registry that is deleted with the cluster.
 chmod 0644 "$certs/registry.key"
 
@@ -190,7 +182,7 @@ kubeadmConfigPatches:
     kind: KubeletConfiguration
     podPidsLimit: 512
 containerdConfigPatches:
-  # containerd 2.x ignores `registry.configs`, so the CA goes in a certs.d host file
+  # containerd 2.x ignores registry.configs, so the CA goes in a certs.d host file
   # written below. Setting config_path here, before containerd first starts, is what
   # makes that directory be read at all and saves restarting the daemon.
   - |-
@@ -213,9 +205,16 @@ EOF
 
 crucible_kind_install_calico "$scratch" "$kubeconfig"
 
-# The image under test goes in by `kind load`, not by the registry: the manifests pin a
-# published tag and this run replaces that pin with the image being proved.
-kind load docker-image "$crucible_image" --name "$cluster"
+# The locally built image goes in by kind load, never a registry pull. Retag it inside
+# the node at the exact reference kustomize rendered, leaving any host release tag alone.
+kind load docker-image "$built_image" --name "$cluster"
+loaded_image=$(docker exec "$node" ctr -n k8s.io images list -q | \
+  awk -v tag="deploy-kind-${run_id}" '$0 ~ (":" tag "$") { print; exit }')
+if [ -z "$loaded_image" ]; then
+  echo "deploy-kind: kind did not load $built_image" >&2
+  exit 2
+fi
+docker exec "$node" ctr -n k8s.io images tag "$loaded_image" "$release_image"
 
 # The generated overlay: the per-run values, layered on the committed kind overlay. They
 # are generated rather than committed because an image under test, a disposable
@@ -228,10 +227,6 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
   - ../../../deploy/kubernetes/overlays/kind
-images:
-  - name: ghcr.io/sentania-labs/crucible
-    newName: $crucible_image_name
-    newTag: $crucible_image_tag
 generatorOptions:
   disableNameSuffixHash: true
 configMapGenerator:
@@ -288,10 +283,10 @@ spec:
 EOF
 done
 
-echo "deploy-kind: applying deploy/kubernetes/overlays/kind"
+echo "deploy-kind: applying deploy/kubernetes/overlays/kind at $release_image"
 # A Job's pod template is immutable, so a second apply against a live cluster would be
 # refused. Argo re-creates it through the hook annotations the Job carries; a plain
-# apply needs this. The cluster is new on the first run, so `--ignore-not-found`.
+# apply needs this. The cluster is new on the first run, so --ignore-not-found is enough.
 kubectl -n crucible delete job crucible-migrate --ignore-not-found --wait=true
 kubectl apply -k "$overlay"
 

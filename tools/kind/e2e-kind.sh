@@ -114,7 +114,26 @@ done
 
 crucible_kind_install_calico "$scratch" "$kubeconfig"
 
+KUBECONFIG="$kubeconfig" kubectl create namespace crucible >/dev/null
+KUBECONFIG="$kubeconfig" kubectl -n crucible create serviceaccount crucible-supervisor >/dev/null
 KUBECONFIG="$kubeconfig" kubectl apply -f "$root/deploy/kind/workers.yaml" >/dev/null
+# The tier consumes the deployed RBAC files directly. A provider change needing another
+# verb therefore exercises the same Role and RoleBinding that the deployment uses.
+KUBECONFIG="$kubeconfig" kubectl apply -f "$root/deploy/kubernetes/base/workers/role.yaml" >/dev/null
+KUBECONFIG="$kubeconfig" kubectl apply -f "$root/deploy/kubernetes/base/workers/rolebinding.yaml" >/dev/null
+supervisor_kubeconfig="$scratch/supervisor-kubeconfig"
+api_server=$(KUBECONFIG="$kubeconfig" kubectl config view --raw --minify -o jsonpath='{.clusters[0].cluster.server}')
+ca_data=$(KUBECONFIG="$kubeconfig" kubectl config view --raw --minify -o jsonpath='{.clusters[0].cluster.certificate-authority-data}')
+supervisor_token=$(KUBECONFIG="$kubeconfig" kubectl -n crucible create token crucible-supervisor)
+ca_file="$scratch/cluster-ca.crt"
+printf '%s' "$ca_data" | base64 -d > "$ca_file"
+KUBECONFIG="$supervisor_kubeconfig" kubectl config set-cluster kind \
+  --server="$api_server" --certificate-authority="$ca_file" --embed-certs=true >/dev/null
+KUBECONFIG="$supervisor_kubeconfig" kubectl config set-credentials crucible-supervisor \
+  --token="$supervisor_token" >/dev/null
+KUBECONFIG="$supervisor_kubeconfig" kubectl config set-context crucible-supervisor \
+  --cluster=kind --user=crucible-supervisor --namespace=crucible-workers >/dev/null
+KUBECONFIG="$supervisor_kubeconfig" kubectl config use-context crucible-supervisor >/dev/null
 KUBECONFIG="$kubeconfig" kubectl -n kube-system patch deployment coredns --type=json -p='[
   {"op":"add","path":"/spec/template/spec/volumes/-","value":{"name":"wrong-port-www","emptyDir":{}}},
   {"op":"add","path":"/spec/template/spec/containers/-","value":{"name":"wrong-port-http","image":"busybox@sha256:9db7b59979c38555a39def84a31fb98b5296952f9e3afd4f6f11f05b07adfab0","command":["sh","-c","mkdir -p /www; echo dns-wrong-port > /www/index.html; exec httpd -f -p 18080 -h /www"],"securityContext":{"allowPrivilegeEscalation":false,"readOnlyRootFilesystem":true,"runAsNonRoot":true,"runAsUser":1000,"capabilities":{"drop":["ALL"]}},"volumeMounts":[{"name":"wrong-port-www","mountPath":"/www"}]}}
@@ -141,7 +160,7 @@ export CRUCIBLE_E2E_KIND_DNS_IP="$dns_ip"
 export CRUCIBLE_E2E_KIND_PEER_IP="$peer_ip"
 export CRUCIBLE_E2E_KIND_API_IP="$api_ip"
 export CRUCIBLE_E2E_KIND_REGISTRY="$registry_ref"
-export CRUCIBLE_E2E_KIND_KUBECONFIG="$kubeconfig"
+export CRUCIBLE_E2E_KIND_KUBECONFIG="$supervisor_kubeconfig"
 export CRUCIBLE_E2E_KIND_CANARY_LOG="$scratch/canary.log"
 export CRUCIBLE_E2E_DOCKER_SOCKET="${CRUCIBLE_E2E_DOCKER_SOCKET:-/var/run/docker.sock}"
 export KUBECONFIG="$kubeconfig"

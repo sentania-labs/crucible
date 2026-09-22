@@ -124,6 +124,11 @@ ANNOTATION_IDENTITY_PATHS = "crucible.io/identity-paths"
 JOB_API_ERROR = -1
 JOB_TIMED_OUT = -2
 
+# One attempt may create a preparer, worker, collector, bundle-verifier and verifier Job.
+# A ResourceQuota's Job count therefore needs this conversion before it can truthfully be
+# shown as attempt capacity.
+JOBS_PER_ATTEMPT = 5
+
 # Deleting a Pod is the only way to signal one. Kubernetes sends SIGTERM, waits the
 # grace period and then SIGKILLs, and the Pod object is gone either way, so the exit
 # code the container produced is gone with it. These are the codes the Docker provider
@@ -2206,14 +2211,16 @@ class KubernetesProvider:
         )
 
     async def _read_quota(self) -> int | None:
-        """26: `max_concurrency` from the namespace's ResourceQuota."""
+        """26: attempt capacity from the namespace's ResourceQuota."""
         rows = await self._call(self.client.list_objects, "resourcequotas")
         for row in rows:
             hard = (row.get("spec") or {}).get("hard") or {}
-            for key in ("count/jobs.batch", "pods"):
-                if key in hard:
-                    with contextlib.suppress(ValueError):
-                        return int(str(hard[key]))
+            if "count/jobs.batch" in hard:
+                with contextlib.suppress(ValueError):
+                    return int(str(hard["count/jobs.batch"])) // JOBS_PER_ATTEMPT
+            if "pods" in hard:
+                with contextlib.suppress(ValueError):
+                    return int(str(hard["pods"]))
         return None
 
 

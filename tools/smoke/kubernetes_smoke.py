@@ -588,8 +588,10 @@ def walk_status_ui(base_url: str) -> None:
     logs = kubectl(["-n", NAMESPACE, "logs", "job/crucible-migrate"], redact=True, check=False)
     match = re.search(r"\bcru_[A-Z0-9]{26}\.[A-Za-z0-9_-]+\b", logs)
     if match is None:
-        log("first-run UI walk skipped: the migration log has no one-time token")
-        return
+        raise SmokeError(
+            "the migration log has no one-time token, so the required first-run UI walk "
+            "cannot authenticate"
+        )
     jar = http.cookiejar.CookieJar()
     opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
     with opener.open(f"{base_url}/ui/sign-in", timeout=DEFAULT_TIMEOUT) as response:

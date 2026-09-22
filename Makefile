@@ -179,14 +179,9 @@ manifests: ## render deploy/kubernetes and validate every object; needs kubectl 
 # author's half of "done means seen working": it proves the manifests and the image, and
 # it deliberately proves nothing cluster-specific (github-ci skill).
 #
-# DEPLOY_KIND_IMAGE is the Crucible image under test. It defaults to a locally built one
-# because the published 0.3.3 predates the Kubernetes provider (docs/implementation-notes/c9.md);
-# pass a published tag once one carries the provider.
-DEPLOY_KIND_IMAGE ?=
 deploy-kind: check-image-manifest ## deploy the manifests on a disposable kind cluster and run one task
 	CRUCIBLE_E2E_DOCKER="$(DOCKER)" \
-	CRUCIBLE_DEPLOY_KIND_IMAGE="$(DEPLOY_KIND_IMAGE)" \
-	UV="$(UV)" tools/kind/deploy-kind.sh
+	  UV="$(UV)" tools/kind/deploy-kind.sh
 
 # The live GitHub tier (23). Local only, never in CI: it mints a real installation token
 # from the mounted App key and opens a real pull request on one throwaway repository,

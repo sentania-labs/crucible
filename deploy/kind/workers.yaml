@@ -19,46 +19,9 @@ metadata:
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: crucible-supervisor
-  namespace: crucible-workers
-automountServiceAccountToken: false
----
-apiVersion: v1
-kind: ServiceAccount
-metadata:
   name: crucible-worker
   namespace: crucible-workers
 automountServiceAccountToken: false
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: crucible-supervisor
-  namespace: crucible-workers
-rules:
-  - apiGroups: [""]
-    resources: ["pods", "pods/log", "pods/exec", "configmaps", "secrets", "persistentvolumeclaims", "events", "resourcequotas"]
-    verbs: ["create", "get", "list", "watch", "patch", "delete"]
-  - apiGroups: ["batch"]
-    resources: ["jobs"]
-    verbs: ["create", "get", "list", "watch", "delete"]
-  - apiGroups: ["networking.k8s.io"]
-    resources: ["networkpolicies"]
-    verbs: ["create", "get", "list", "watch", "delete"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: crucible-supervisor
-  namespace: crucible-workers
-subjects:
-  - kind: ServiceAccount
-    name: crucible-supervisor
-    namespace: crucible-workers
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: crucible-supervisor
 ---
 apiVersion: v1
 kind: ResourceQuota
@@ -67,7 +30,7 @@ metadata:
   namespace: crucible-workers
 spec:
   hard:
-    count/jobs.batch: "12"
+    count/jobs.batch: "15"
     persistentvolumeclaims: "12"
     requests.cpu: "6"
     requests.memory: 8Gi

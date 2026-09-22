@@ -32,14 +32,8 @@ deploy/kubernetes/
 The Crucible image tag is pinned in exactly one place, `base/kustomization.yaml`, and is
 never `latest`. Changing the deployed version is that one line and a sync.
 
-> **The pinned tag today is `0.3.3`, and that release has no Kubernetes provider.**
-> `v0.3.3` is commit `8d2f32b`, which is before C8a added
-> `crucible/adapters/execution/kubernetes.py`. An 0.3.3 deployment starts, serves and
-> reports no `kubernetes` provider at all, so the status-page check and the task in
-> **Verifying** below cannot pass on it. Pin the first release cut after C9 merges
-> before deploying for real. Until then these manifests are complete and proven
-> (`make deploy-kind`, against a locally built image) but the version they name is not
-> one that can run a worker on a cluster.
+> `0.4.0` is the first release carrying the Kubernetes provider, and its tag is cut after
+> this change merges.
 
 ## What lab-admin provides
 
@@ -70,7 +64,7 @@ Spec 26's checklist, made concrete. Each row is either a placeholder in
 | `REPLACE_ME_CLUSTER_DNS_IP` | `overlays/lab/settings.yaml` | `kubectl -n kube-system get service kube-dns -o jsonpath='{.spec.clusterIP}'` |
 | `REPLACE_ME_RENDER_TIMEZONE` | `overlays/lab/settings.yaml` | the operator's IANA zone. Stored time is UTC; this is only how it is rendered (01) |
 | `REPLACE_ME_IMAGE_PULL_SECRET` | `overlays/lab/settings.yaml`, `overlays/lab/pull-secret.yaml` | the pull secret's name, in both namespaces. Delete the `pull-secret.yaml` patch and blank the setting when the packages are public |
-| `REPLACE_ME_PROBE_IMAGE` | `overlays/lab/settings.yaml` | one exact, pullable worker image reference. 26's readiness canary runs it, and a bare repository would mean `:latest` to a kubelet. **Fill it or blank it**: left as the placeholder it is also a repository `GET /v1/admin/images` tries to list, and the error names a registry rather than the placeholder |
+| `REPLACE_ME_PROBE_IMAGE` | `overlays/lab/settings.yaml` comment | one exact, pullable worker image reference. 26's readiness canary runs it, and a bare repository would mean `:latest` to a kubelet. The committed default is blank, so set it only when an exact reference is available. |
 | `REPLACE_ME_ARGOCD_PROJECT`, `REPLACE_ME_MANIFEST_REPO_URL`, `REPLACE_ME_MANIFEST_REVISION` | `argocd/application.yaml` | the Argo project, the repository holding these manifests, and an exact tag or commit. Never a branch: this field plus the pinned image tag are the deployment's record of what is running |
 | `REPLACE_ME_SECRET_STORE_NAME`, `REPLACE_ME_REMOTE_PATH` | `secret-shapes/external/database.yaml` | only on a cluster using external-secrets instead of sealed ones |
 

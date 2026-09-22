@@ -35,7 +35,7 @@ DEPLOY = ROOT / "deploy" / "kubernetes"
 TARGETS = ("base", "overlays/lab", "overlays/kind", "argocd")
 
 # The image the manifests pin, in the one place they pin it (base/kustomization.yaml).
-PINNED_IMAGE = "ghcr.io/sentania-labs/crucible:0.3.3"
+PINNED_IMAGE = "ghcr.io/sentania-labs/crucible:0.4.0"
 
 # 26, as the implemented provider needs it. Each entry is (apiGroup, resource) -> verbs.
 SUPERVISOR_ROLE_RULES = {
@@ -197,6 +197,17 @@ def test_the_only_rolebinding_names_the_control_plane_account(
         ], target
 
 
+def test_the_kind_tier_applies_the_deployed_rbac_files() -> None:
+    """The e2e support manifest carries no RBAC copy that can drift from deployment."""
+    support = [
+        doc for doc in yaml.safe_load_all((ROOT / "deploy/kind/workers.yaml").read_text()) if doc
+    ]
+    assert {doc["kind"] for doc in support}.isdisjoint({"Role", "RoleBinding"})
+    tier = (ROOT / "tools/kind/e2e-kind.sh").read_text(encoding="utf-8")
+    for path in ("role.yaml", "rolebinding.yaml"):
+        assert f"deploy/kubernetes/base/workers/{path}" in tier
+
+
 def test_the_worker_account_is_bound_to_nothing(
     rendered: dict[str, list[dict[str, Any]]],
 ) -> None:
@@ -299,8 +310,15 @@ def test_the_crucible_image_tag_is_pinned_in_exactly_one_place() -> None:
                 )
     kustomization = yaml.safe_load((DEPLOY / "base" / "kustomization.yaml").read_text())
     assert kustomization["images"] == [
-        {"name": "ghcr.io/sentania-labs/crucible", "newTag": "0.3.3"}
+        {"name": "ghcr.io/sentania-labs/crucible", "newTag": "0.4.0"}
     ]
+
+
+def test_deploy_kind_derives_its_release_reference_from_the_base_pin() -> None:
+    script = (ROOT / "tools/kind/deploy-kind.sh").read_text(encoding="utf-8")
+    assert "deploy/kubernetes/base/kustomization.yaml" in script
+    assert "release_image=$(awk" in script
+    assert "ghcr.io/sentania-labs/crucible:0.4.0" not in script
 
 
 def test_the_rendered_crucible_containers_run_the_pinned_image(
@@ -382,20 +400,38 @@ def test_the_supervisor_runs_exactly_one_replica(
         assert supervisor["spec"]["strategy"]["type"] == "Recreate"
 
 
-def test_the_quota_carries_no_key_the_provider_reads_as_concurrency(
+def test_the_quota_reports_attempt_capacity_from_its_job_count(
     rendered: dict[str, list[dict[str, Any]]],
 ) -> None:
-    """26 has the provider report `max_concurrency` from the namespace's ResourceQuota,
-    and it reads `count/jobs.batch` then `pods`. Neither counts attempts: one attempt is
-    several live Jobs. A quota carrying either makes the status page advertise capacity
-    the namespace does not have, so neither is here and the configured value stands."""
-    for target in ("base", "overlays/lab", "overlays/kind"):
+    """An attempt uses five Jobs, so the raw quota must be converted before display."""
+    expected = {"base": "15", "overlays/lab": "30", "overlays/kind": "15"}
+    for target, jobs in expected.items():
         quota = _named(rendered[target], "ResourceQuota", "crucible-workers")
         hard = quota["spec"]["hard"]
-        assert "count/jobs.batch" not in hard, target
+        assert hard["count/jobs.batch"] == jobs, target
         assert "pods" not in hard, target
         # The claim count is the structural attempt cap, one claim per attempt.
         assert "persistentvolumeclaims" in hard, target
+
+
+LAB_STARTUP_PLACEHOLDER_KEYS = frozenset(
+    {
+        "CRUCIBLE_KUBERNETES__CLUSTER_DNS_IP",
+        "CRUCIBLE_KUBERNETES__STORAGE_CLASS",
+        "CRUCIBLE_KUBERNETES__IMAGE_PULL_SECRET",
+        "CRUCIBLE_SERVICE__RENDER_TIMEZONE",
+    }
+)
+
+
+def test_the_lab_config_has_no_unresolved_probe_image(
+    rendered: dict[str, list[dict[str, Any]]],
+) -> None:
+    """Only cluster facts may remain unresolved in a setting wiring reads at startup."""
+    settings = _named(rendered["overlays/lab"], "ConfigMap", "crucible-settings")["data"]
+    assert settings["CRUCIBLE_KUBERNETES__PROBE_IMAGE"] == ""
+    unresolved = {key: value for key, value in settings.items() if "REPLACE_ME_" in str(value)}
+    assert set(unresolved) <= LAB_STARTUP_PLACEHOLDER_KEYS
 
 
 def test_the_kubernetes_provider_is_on_and_docker_is_off(

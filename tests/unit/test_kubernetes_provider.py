@@ -86,6 +86,16 @@ async def test_max_concurrency_comes_from_the_namespace_resource_quota() -> None
     assert provider.capabilities().max_concurrency == 7
 
 
+async def test_a_job_quota_reports_attempt_capacity_not_raw_jobs() -> None:
+    api, _registry, provider = build()
+    api.create(
+        "resourcequotas",
+        {"metadata": {"name": "workers"}, "spec": {"hard": {"count/jobs.batch": "15"}}},
+    )
+    await provider.health()
+    assert provider.capabilities().max_concurrency == 3
+
+
 # ----- the namespace readiness probe (26) ----------------------------------
 
 
