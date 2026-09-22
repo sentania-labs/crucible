@@ -222,8 +222,15 @@ class KubernetesConfig:
     # The operator's declared mount mode per harness, as the Docker configuration
     # carries it. It may raise the adapter's minimum and never lowers it (25 step 7).
     credential_modes: Mapping[str, MountMode] = field(default_factory=dict)
-    # Worker image repositories `list_images` reports the promoted tags of (25).
+    # Worker image repositories `list_images` reports the promoted tags of (25). Bare
+    # repositories: the listing appends each tag the registry returns.
     image_repositories: tuple[str, ...] = ()
+    # One exact, pullable worker image for the readiness canary (26). It is deliberately
+    # not an entry of `image_repositories`: the listing would take it for a repository,
+    # list the same tags a second time, and then build `<repo>:<probe tag>:<tag>` for
+    # each of them, which is a reference that does not parse and one suppressed registry
+    # round trip per tag on every `GET /admin/images`.
+    probe_image: str = ""
     use_reference_cache: bool = True
 
     def credential_secret_name(self, harness: str) -> str:
@@ -467,8 +474,18 @@ class KubernetesProvider:
         return _read_probe(output)
 
     def _probe_image(self) -> str:
+        """What the readiness canary runs: an image an attempt already resolved, else the
+        one the deployment named, else the first configured repository.
+
+        The last of those is a bare repository, which a kubelet reads as `:latest`, so a
+        registry without that tag leaves the canary in ImagePullBackOff until the launch
+        timeout and the status page reporting the namespace as not ready for a reason
+        that is not about the namespace. `probe_image` is what a deployment says instead
+        (C9)."""
         for image in self._images.values():
             return image.reference
+        if self.config.probe_image:
+            return self.config.probe_image
         for repository in self.config.image_repositories:
             return repository
         return ""

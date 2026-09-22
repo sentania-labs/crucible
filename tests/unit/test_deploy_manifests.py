@@ -382,6 +382,22 @@ def test_the_supervisor_runs_exactly_one_replica(
         assert supervisor["spec"]["strategy"]["type"] == "Recreate"
 
 
+def test_the_quota_carries_no_key_the_provider_reads_as_concurrency(
+    rendered: dict[str, list[dict[str, Any]]],
+) -> None:
+    """26 has the provider report `max_concurrency` from the namespace's ResourceQuota,
+    and it reads `count/jobs.batch` then `pods`. Neither counts attempts: one attempt is
+    several live Jobs. A quota carrying either makes the status page advertise capacity
+    the namespace does not have, so neither is here and the configured value stands."""
+    for target in ("base", "overlays/lab", "overlays/kind"):
+        quota = _named(rendered[target], "ResourceQuota", "crucible-workers")
+        hard = quota["spec"]["hard"]
+        assert "count/jobs.batch" not in hard, target
+        assert "pods" not in hard, target
+        # The claim count is the structural attempt cap, one claim per attempt.
+        assert "persistentvolumeclaims" in hard, target
+
+
 def test_the_kubernetes_provider_is_on_and_docker_is_off(
     rendered: dict[str, list[dict[str, Any]]],
 ) -> None:

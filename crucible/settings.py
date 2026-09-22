@@ -142,7 +142,8 @@ class KubernetesSettings(BaseModel):
     # no `latest` then has a canary stuck in ImagePullBackOff until the launch timeout,
     # and a status page that reports the namespace as not ready for a reason that is not
     # about the namespace. Naming the promoted worker image here is what a deployment
-    # does about that; `crucible/cli/wiring.py` puts it first.
+    # does about that. It is its own field on the provider and never an entry of
+    # `image_repositories`, so the images listing does not take it for a repository.
     probe_image: str = ""
     # The harness credential Secret in the workers namespace, per harness (12, 26).
     credential_secrets: dict[str, str] = Field(default_factory=dict)

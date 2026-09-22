@@ -179,19 +179,8 @@ def kubernetes_config(settings: Settings) -> KubernetesConfig:
             for name, entry in settings.credentials.items()
             if entry.mount_mode
         },
-        # 26's readiness canary runs the first reference in this tuple, so a configured
-        # `probe_image` goes in front of the repositories it lists tags from.
-        #
-        # `list_images` walks the same tuple. It takes the repository part of each entry
-        # to list tags, so the entry with a tag lists the same tags as the bare
-        # repository beside it, and then builds `<entry>:<tag>` to resolve each one,
-        # which for a tagged entry is a reference that does not parse and is skipped.
-        # The listing is therefore correct and pays one extra tag listing per admin
-        # images read. That is the price of not reaching into the provider, which C9 is
-        # not scoped to change; a provider field of its own is the eventual answer.
-        image_repositories=tuple(
-            ([k.probe_image] if k.probe_image else []) + list(k.image_repositories)
-        ),
+        image_repositories=tuple(k.image_repositories),
+        probe_image=k.probe_image,
         use_reference_cache=k.use_reference_cache,
     )
 

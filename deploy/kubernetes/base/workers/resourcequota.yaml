@@ -1,8 +1,18 @@
-# 26: `GET /providers` reports `max_concurrency` from this quota. The counts bound what
-# one attempt may leave behind as much as they bound concurrency: an attempt is a Job per
-# role and one claim, so a namespace that is full refuses a launch rather than wedging.
-# The lab overlay sets the sizes; these are the smallest that fit three concurrent
-# attempts with their preparer, collector and verifier Jobs.
+# The namespace's resource ceiling, and the bound on what one runaway attempt can leave
+# behind: an attempt is one claim and a Job per role, so a namespace that is full refuses
+# a launch rather than wedging. The lab overlay sets the sizes; these fit three
+# concurrent attempts.
+#
+# Deliberately no `count/jobs.batch` and no `pods`. 26 has `GET /providers` report
+# `max_concurrency` from this quota, and the provider reads exactly those two keys, in
+# that order. Neither counts attempts: one attempt is a preparer, a worker, a collector,
+# a bundle verifier and a verifier Job, several of them live at once, so a Job count
+# sized to let one attempt finish reports about four times the attempts the namespace
+# can actually carry, and a Job count sized to report the right number would wedge a
+# single attempt partway through. Leaving both out makes the provider fall back to
+# `kubernetes.max_concurrency`, which is the number the operator set and means what it
+# says. The claim count is the structural cap that still bounds attempts, because there
+# is exactly one claim per attempt.
 apiVersion: v1
 kind: ResourceQuota
 metadata:
@@ -12,7 +22,6 @@ metadata:
     app.kubernetes.io/name: crucible
 spec:
   hard:
-    count/jobs.batch: "12"
     persistentvolumeclaims: "12"
     requests.cpu: "6"
     requests.memory: 12Gi
