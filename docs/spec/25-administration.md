@@ -62,6 +62,7 @@ resource.
 | list harnesses | `GET /admin/harnesses` | `harnesses list` | |
 | disable or enable a harness | `POST /admin/harnesses/{name}/disable` and `/enable` | `harnesses disable|enable` | flips the administrator's flag only; configuration retained; running attempts finish; new launches refused with a wake |
 | validate a credential | `POST /admin/credentials/{harness}/validate` | `credentials validate --harness` | shape check of the named auth files, then the bounded probe (below); returns state, timestamps, and the probe's `conclusive` and `cause`, never a verdict the run did not support |
+| set the Hermes API key | `POST /admin/credentials/hermes/set` | `credentials set --harness hermes` | reads the value from a password field or stdin, atomically writes `api-key` mode 0600, returns no value, and audits only `credential set`; immediately probes readiness without auth and models with auth |
 | bounded auth probe | `POST /admin/credentials/{harness}/probe` | `credentials probe --harness` | launches the promoted worker image with the credential mounted, runs a one-line prompt with a 120 s timeout, records exit class, conclusiveness and cause, harness version, image digest, whether auth files changed (by hash), mount mode and duration, removes everything; never shows output beyond the exit class |
 | onboard a credential | `POST /admin/credentials/{harness}/login` (starts) | `credentials login --harness` | interactive flow below; the service runs the login in the promoted worker image and the CLI retains its local-host mode |
 | rotate or replace a credential source | `POST /admin/credentials/{harness}/rotate` | `credentials rotate --harness` | the operator's prepared directory is shape-checked, copied in, and left exactly as it was found; the swap is two renames; the previous directory is retained for `credential_retention_hours` then shredded; a failed swap rolls back; every step an event |
@@ -71,6 +72,7 @@ resource.
 | GitHub health | `GET /admin/github`, `POST /admin/github/check` | `github status|check` | check mints a token per registered repository and discards it |
 | register a repository | `PUT /admin/repositories/{name}` | `repositories register` | 04; an administrative mutation like any other, guarded and audited here, with the previous registration as the before summary. 04's own `PUT /repositories/{name}` is a different, non-administrative surface |
 | audit | `GET /admin/audit?cursor=` | `audit tail` | admin events only; the cursor is the scan position and always moves forward, so a long stretch of non-administrative events cannot strand the pages behind it |
+| show or update the local gateway | `GET`, `POST /admin/routing/local-endpoint` | `routing local-endpoint`, `routing set-local-endpoint` | edits endpoint URL, local model enablement, thinking preference, and pool concurrency by creating new immutable routing and delivery policy versions; regenerates the proxy configuration |
 
 Every mutation requires a non-empty `reason` string, records the principal,
 and is refused when the supervisor lease is not held by a live instance (so
@@ -129,6 +131,12 @@ probe means `invalid`, a loaded daemon or a slow model response would condemn
 a working credential and take that harness out of service on latency, and the
 operator reading `invalid` would go looking for a revoked token that does not
 exist. The 120 s bound stands; conclusiveness is what makes it safe.
+
+Hermes uses the same result model with a bounded HTTP probe rather than a model turn.
+It first calls `/health/readiness` without a bearer so endpoint reachability is distinct
+from authentication, then calls the configured `/v1/models` with the saved bearer. No
+response, log line, or event includes the bearer. The key-paste transaction emits only
+the `credential_set` event even though it also updates the sanitized credential state.
 
 ## Harness enablement: two gates
 
@@ -209,6 +217,12 @@ code lasts fifteen minutes, AGY's sixty seconds, and Claude Code's
 `setup-token` takes the pasted code and prints the long-lived token, which
 the driver captures into the credential file mode 0600 and never displays.
 The CLI's own output is not echoed.
+
+The local gateway panel is the runtime authority after migration. An environment value
+may seed version 6 on first migration, but later restarts read the active database
+policy and do not overwrite it. Each save creates a new routing-policy version and a
+new delivery-policy version that references it, writes the Squid configuration from the
+same document, and updates the running Docker provider's exact host-and-port allowlist.
 
 ## Rotation and removal
 

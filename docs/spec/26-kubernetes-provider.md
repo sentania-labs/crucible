@@ -175,8 +175,8 @@ declared endpoints, 13), resolved to CIDRs or FQDN rules where the CNI
 supports them:
 
 - worker: the model provider endpoints of the routed harness, the package
-  registries the project policy names, and, for a local route, the Spark
-  (`endpoint_url` host and port, plain HTTP, 05b, S16). GitHub is not
+  registries the project policy names, and, for a local route, the configured
+  `endpoint_url` hostname and port over HTTP or HTTPS. GitHub is not
   reachable from a worker; the preparer and the publisher do the git
   traffic.
 - preparer and publisher: `github.com` and `api.github.com` only.
@@ -189,10 +189,12 @@ A `networking.k8s.io/v1` policy has no deny verb and no FQDN rule, so the
 allowlist's names are resolved to addresses when the policy is written and the
 names themselves are recorded in the object's `crucible.io/egress-hosts`
 annotation. A name that does not resolve refuses the launch rather than being
-dropped or widened, which is 13's rule for an attempt the egress path cannot
-actually permit. The denials below are the `except` of every allow, so a name
-that resolves into a denied range cannot open one. IPv6 never appears in a
-rule and is therefore denied entirely. (Made concrete 2026-09-21 during C8a.)
+dropped or widened. For a configured local endpoint, the hostname is the trust
+anchor: the provider resolves it and permits only the resulting addresses on the
+configured port, including a private gateway address. A URL that directly names the
+Kubernetes API ClusterIP, a namespace address, or another denied CIDR is refused.
+General allowlist hostnames that resolve into a denied range remain refused. IPv6 never
+appears in a rule and is therefore denied entirely.
 
 Two destinations are denied explicitly, because a naive policy lets them
 through: cluster DNS is allowed on port 53 UDP and TCP to the cluster's DNS
@@ -278,9 +280,11 @@ even when the task itself fails.
 (Made concrete 2026-09-21 during C8a.)
 The per-attempt Secret is deleted under every cleanup policy. The admin
 login flow (25) runs the harness's login in a login Job with the harness
-Secret writable and the device URL captured from the Pod log. Local
-Hermes needs no credential; its Secret is absent and its launch spec says
-so.
+Secret writable and the device URL captured from the Pod log. Hermes declares optional
+read-only credential file `api-key`. When `crucible-harness-hermes` is configured, the
+provider copies that file into the per-attempt credential Secret and never syncs it
+back. When the Secret mapping is absent, the launch uses the adapter's explicit
+unauthenticated placeholder.
 
 ## Observability and administration
 

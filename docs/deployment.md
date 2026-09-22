@@ -79,12 +79,17 @@ Spec 26's checklist, made concrete. Each row is either a placeholder in
 | `crucible-harness-claude-code` | `crucible-workers` | `oauth-token`, `.claude.json` |
 | `crucible-harness-codex` | `crucible-workers` | `auth.json` |
 | `crucible-harness-agy` | `crucible-workers` | `antigravity-cli_antigravity-oauth-token` |
+| `crucible-harness-hermes` | `crucible-workers` | `api-key` |
 
 A Secret key cannot hold a path separator, so AGY's auth file is keyed with the
 separator replaced by an underscore and the volume projects it back (C8a). **The harness
 Secrets must use the flattened key**, or the provider will not find the file.
 
 The harness Secrets may be left absent at first. The login flow below fills them.
+Hermes is different: place its LiteLLM virtual key in the one-file Secret through the
+same sealed or external-secret path as the other harnesses. It is projected read-only
+and never synced back. The browser paste flow is for the directory-backed Docker
+deployment; it does not bypass cluster GitOps authority.
 
 The placeholders in `secret-shapes/sealed/` are deliberately not valid ciphertext: the
 sealed-secrets controller refuses them, so nothing starts with a wrong value. Seal the
@@ -139,6 +144,12 @@ Once the api is reachable, sign in at `/ui` with that token and, for each harnes
    and changing one is an edit and a restart; the runtime gate is this page.
 5. **Images**: promote one worker image digest per harness to `default`. A launch is
    refused without one.
+
+For Hermes, use **Routing** to set the HTTPS `/v1` gateway URL, model `coder`, thinking
+preference, enabled state, and pool concurrency. Saving creates immutable policy
+versions. Confirm unauthenticated `/health/readiness` returns 200, then validate the
+Hermes Secret by checking authenticated `/v1/models`. The committed lab CA is already
+installed in the worker image trust store.
 
 The operator's own daily-use harness directories are never read, copied or referenced
 (12). These are dedicated Crucible logins.

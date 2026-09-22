@@ -298,6 +298,17 @@ passed. Version 5 differs only by enabling that entry and removing the reason,
 after the single-task and four-way live gates pass. No Qwen model is in either
 version.
 
+Version 6 replaces every Hermes entry from those Spark-specific versions with one
+disabled `coder` entry in pool `lab-local`. The endpoint comes from
+`CRUCIBLE_LOCAL_ENDPOINT_URL` on first migration, with the older Spark variable accepted
+only as a compatibility seed. The entry stores
+`chat_template_kwargs.enable_thinking`, false by default, and the pool starts with
+`max_concurrency: 4`. Hermes 0.19 has no safe non-interactive flag that can pass this
+request option, so C10 retains the operator's choice in immutable routing state but does
+not claim it reached the server. Runtime edits create later immutable versions through
+the admin surface. The database value is authoritative over the environment after the
+migration.
+
 Model ids are what the harness accepts. Which routing version a deployment
 uses is the policy's own choice. `default-software` version 2, seeded by
 migration 0009 (C5b), is version 1's document naming `default-routing`
@@ -331,7 +342,7 @@ Foundry's judgment is the tier; the policy and the rule do the rest. The
 operator alone may pin (05).
 
 `max_concurrency` is a pool-wide count of launching and running attempts. It is
-enforced independently of `concurrency.per_harness`; the local Hermes pool may use
-all four Spark slots, while subscription routes retain their credential-derived
-per-harness caps. A fifth Spark task stays scheduled and records
+enforced independently of `concurrency.per_harness`; the local Hermes pool uses its
+configured pool limit because its credential is read-only, while subscription routes
+retain their writable-credential caps. An attempt beyond the local pool limit stays scheduled and records
 `harness_launch_deferred` until capacity is released.

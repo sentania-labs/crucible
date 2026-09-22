@@ -102,6 +102,30 @@ deployment's database is not a development scratch database. Workers are not
 compose services, so a running worker is left alone (13); `crucible-admin drain`
 is what removes those.
 
+## Authenticated local gateway
+
+`CRUCIBLE_LOCAL_ENDPOINT_URL` is a first-migration seed, not the continuing source of
+truth. After startup, sign in to `/ui`, open **Routing**, and save the gateway `/v1`
+URL, model enablement, thinking preference, and pool concurrency. The save writes new
+immutable routing and delivery policy versions and regenerates `var/egress/squid.conf`.
+The database value wins on later restarts.
+
+Open **Credentials**, paste the Hermes LiteLLM virtual key, and give the mutation a
+reason. Crucible writes only `/var/lib/crucible/credentials/hermes/api-key`, mode 0600,
+then probes `/health/readiness` without a bearer and `/v1/models` with the bearer. The
+key is not returned, logged, or included in audit. The equivalent non-interactive path
+is:
+
+```sh
+printf '%s\n' "$LITELLM_VIRTUAL_KEY" \
+  | crucible-admin --reason "install lab gateway key" credentials set --harness hermes
+```
+
+The key remains in the shell variable and stdin. It is never an argument. Restart the
+egress proxy after a routing save so Squid loads the regenerated file. Recovery is to
+disable `coder` in **Routing** or select the preceding immutable policy version, then
+restart the proxy. No environment edit is needed for either action.
+
 ## Choosing the version
 
 ```sh
@@ -143,10 +167,9 @@ next `make deploy-local` because `migrate` runs before `crucible` starts.
   password will not match the one in the volume and `migrate` fails to
   authenticate. The cure is the old password or a new database; there is no
   third answer. Keep the deployment directory and the volume together.
-- The deployed stack has no credential mounts yet. `compose.yaml` mounts the
-  artifact volume and nothing under the credential root, so the directories this
-  target creates are the layout 12 and 25 expect and not a working credential
-  path. Wiring the mount belongs with the onboarding workflow in C5.
+- Harness credentials live in the private named credential volume. The GitHub App
+  remains a separate read-only host bind. The Hermes directory is created mode 0700 by
+  `credential-init`; the admin paste flow owns only its `api-key` file.
 - The target assumes one deployment per host: the compose project name comes
   from `compose.yaml` (`crucible`) and the published ports are fixed on
   loopback. A second deployment collides on both, and so does the development

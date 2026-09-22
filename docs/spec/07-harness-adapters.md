@@ -164,13 +164,15 @@ never retry.
 
 ## Hermes
 
-- Hermes 0.19.0 fronts the DGX Spark OpenAI-compatible endpoint and accepts only
-  `gpt-oss:120b`. It has no credential spec. A local launch requires an
-  `endpoint_url` ending in `/v1`, mounts no credential, and sets
-  `OPENAI_BASE_URL` plus the literal non-secret placeholder `OPENAI_API_KEY` value
-  `local-no-auth`.
+- Hermes 0.19.0 fronts an OpenAI-compatible local gateway. The routing model id is
+  supplied by policy, with `coder` as the C10 migration entry. The adapter does not
+  pin a model id. A local launch requires an `endpoint_url` ending in `/v1`.
+- Its credential spec names only `api-key`, maps it to `OPENAI_API_KEY`, mounts the
+  per-attempt copy read-only, and never syncs it back. When no credential source is
+  configured the launch uses the literal non-secret placeholder `local-no-auth`, so an
+  unauthenticated compatible endpoint remains possible.
 - Launch is `crucible-hermes --ignore-user-config --ignore-rules --safe-mode
-  --yolo --provider openai-api --model gpt-oss:120b --toolsets terminal,file
+  --yolo --provider openai-api --model <routing-model> --toolsets terminal,file
   --usage-file /crucible/report/hermes-usage.json -z <pointer>`. `--yolo` is
   permitted only because the read-only worker container is the permission
   boundary. `HERMES_HOME` is a per-attempt tmpfs, so rules, memory, plugins, MCP
@@ -206,9 +208,11 @@ line redacted before it is stored (12).
 `LaunchContext` and `LaunchSpec` carry `endpoint` as `subscription` or `local`
 and a separate optional `endpoint_url`. Local requires the URL; subscription
 forbids it. The supervisor preserves both fields through launch reconstruction.
-The provider omits credentials and sets `credential_mounted=False` for every local
-attempt. The identity, report, and gate contracts do not change.
+Local routing does not imply credential absence. The provider mounts the selected
+harness's declared credential when one is configured. Hermes therefore receives its
+read-only `api-key` copy, while an unconfigured deployment gets the explicit fallback.
+The identity, report, and gate contracts do not change.
 
-Hermes is the verified DGX Spark front end. Other harness and local-server
+Hermes is the local gateway front end. Other harness and local-server
 combinations remain disabled until their own compatibility and quality evidence
 exists.
