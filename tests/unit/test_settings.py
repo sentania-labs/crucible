@@ -4,7 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from crucible.settings import load_settings
+from crucible.cli.wiring import kubernetes_config
+from crucible.settings import Settings, load_settings
 
 
 def test_defaults_without_file(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -81,3 +82,26 @@ def test_credentials_and_harness_gates_from_toml_and_environment(
     assert settings.harnesses["agy"].reason == "probe pending"
     # A harness with no entry is not gated by configuration.
     assert "claude_code" not in settings.harnesses
+
+
+def test_probe_image_leads_the_image_repositories_the_provider_is_given() -> None:
+    """26's readiness canary runs the first reference the provider knows of, and a bare
+    repository means `:latest` to a kubelet. `probe_image` is how a deployment names an
+    exact one, and the wiring is what puts it first."""
+    settings = Settings(
+        kubernetes={
+            "enabled": True,
+            "image_repositories": ["registry.example/crucible-worker"],
+            "probe_image": "registry.example/crucible-worker:script-harness-1.0.0",
+        }
+    )
+    config = kubernetes_config(settings)
+    assert config.image_repositories == (
+        "registry.example/crucible-worker:script-harness-1.0.0",
+        "registry.example/crucible-worker",
+    )
+
+
+def test_without_a_probe_image_the_repositories_are_passed_through() -> None:
+    settings = Settings(kubernetes={"image_repositories": ["registry.example/w"]})
+    assert kubernetes_config(settings).image_repositories == ("registry.example/w",)

@@ -179,7 +179,13 @@ def kubernetes_config(settings: Settings) -> KubernetesConfig:
             for name, entry in settings.credentials.items()
             if entry.mount_mode
         },
-        image_repositories=tuple(k.image_repositories),
+        # 26's readiness canary runs the first reference in this tuple, so a configured
+        # `probe_image` goes in front of the repositories it lists tags from. It is the
+        # same list to `list_images`, which takes the repository part of each entry, so
+        # an exact reference here costs that listing nothing.
+        image_repositories=tuple(
+            ([k.probe_image] if k.probe_image else []) + list(k.image_repositories)
+        ),
         use_reference_cache=k.use_reference_cache,
     )
 
