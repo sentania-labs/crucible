@@ -45,7 +45,6 @@ ROLE_LOGIN = "login"
 ROLE_READER = "reader"
 ROLE_CLEANER = "cleaner"
 ROLE_CANARY = "canary"
-ROLE_PROBE = "probe"
 
 WORKER_UID = 1000
 CACHE_MOUNT = "/crucible/cache"
@@ -561,7 +560,6 @@ __all__ = [
     "ROLE_COLLECTOR",
     "ROLE_LOGIN",
     "ROLE_PREPARER",
-    "ROLE_PROBE",
     "ROLE_PUBLISHER",
     "ROLE_READER",
     "ROLE_VERIFIER",
