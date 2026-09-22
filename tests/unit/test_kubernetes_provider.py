@@ -347,6 +347,54 @@ async def test_job_cleanup_waits_for_background_pod_deletion() -> None:
     assert polls == 1
 
 
+async def test_waits_fail_when_a_deleted_pod_survives_the_timeout() -> None:
+    api, _registry, provider = build()
+    api.create("pods", {"metadata": {"name": "surviving-pod"}})
+
+    with pytest.raises(ProviderError, match=r"surviving-pod.*still present"):
+        await provider._await_pod_gone("surviving-pod", timeout=0)
+
+
+async def test_waits_fail_when_a_deleted_job_pod_survives_the_timeout() -> None:
+    api, _registry, provider = build()
+    api.create(
+        "pods",
+        {"metadata": {"name": "surviving-job-pod", "labels": {"job-name": "surviving-job"}}},
+    )
+
+    with pytest.raises(ProviderError, match=r"surviving-job.*still present"):
+        await provider._await_job_pods_gone("surviving-job", timeout=0)
+
+
+async def test_role_policy_is_removed_when_the_pod_deletion_wait_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api, _registry, provider = build()
+    launch = spec()
+
+    async def pod_wait_fails(_job_name: str, *, timeout: float = 15) -> None:
+        del timeout
+        raise ProviderError("Pod was still present")
+
+    monkeypatch.setattr(provider, "_await_job_pods_gone", pod_wait_fails)
+
+    with pytest.raises(ProviderError, match="still present"):
+        await provider._run_role_job(
+            launch,
+            role=k8sspec.ROLE_READER,
+            image=IMAGE,
+            script="true",
+            mounts=(),
+            volumes=(),
+            limits=provider._limits(launch),
+            timeout=1,
+            plan=k8sspec.EgressPlan(hosts=("github.com",)),
+        )
+
+    policy_name = k8sspec.object_name(f"np-{k8sspec.ROLE_READER}", launch.attempt_id)
+    assert ("networkpolicies", policy_name) in api.deleted
+
+
 async def test_reconcile_does_not_adopt_a_job_whose_pod_is_finished() -> None:
     _api, _registry, provider, launch, workspace = await prepared()
     handle = await provider.launch(workspace, launch)

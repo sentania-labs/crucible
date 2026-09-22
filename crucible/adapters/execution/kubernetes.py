@@ -1840,10 +1840,12 @@ class KubernetesProvider:
         finally:
             with contextlib.suppress(KubernetesApiError):
                 await self._call(self.client.delete, "jobs", name)
-            await self._await_job_pods_gone(name)
-            if policy_name:
-                with contextlib.suppress(KubernetesApiError):
-                    await self._call(self.client.delete, "networkpolicies", policy_name)
+            try:
+                await self._await_job_pods_gone(name)
+            finally:
+                if policy_name:
+                    with contextlib.suppress(KubernetesApiError):
+                        await self._call(self.client.delete, "networkpolicies", policy_name)
 
     async def _run_verifier(
         self, spec: LaunchSpec, limits: Limits
@@ -2104,6 +2106,7 @@ class KubernetesProvider:
                     return
                 raise
             await asyncio.sleep(self.config.poll_interval_seconds)
+        raise ProviderError(f"Pod {name!r} was still present after {timeout:g} seconds")
 
     async def _await_job_pods_gone(self, job_name: str, *, timeout: float = 15) -> None:
         """Wait for background Job propagation to remove its Pod."""
@@ -2115,6 +2118,9 @@ class KubernetesProvider:
             if not rows:
                 return
             await asyncio.sleep(self.config.poll_interval_seconds)
+        raise ProviderError(
+            f"Pods for Job {job_name!r} were still present after {timeout:g} seconds"
+        )
 
     async def _job_tail(self, job_name: str, limit: int = 4000) -> str:
         try:

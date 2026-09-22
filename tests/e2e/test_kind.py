@@ -250,23 +250,24 @@ def _network_destinations() -> dict[str, str]:
     return {
         "api-server": f"https://{os.environ['CRUCIBLE_E2E_KIND_API_IP']}:443/version",
         "cluster-dns-wrong-port": f"http://{os.environ['CRUCIBLE_E2E_KIND_DNS_IP']}:443/",
-        "another-namespace": f"http://{os.environ['CRUCIBLE_E2E_KIND_PEER_IP']}:8080/",
-        "link-local": "http://169.254.169.254:18080/",
-        "lab-10": "http://10.0.0.1:18080/",
-        "lab-172": "http://172.16.0.1:18080/",
-        "lab-192": "http://192.168.0.1:18080/",
-        "lab-carrier": "http://100.64.0.1:18080/",
+        "another-namespace": f"http://{os.environ['CRUCIBLE_E2E_KIND_PEER_IP']}:443/",
+        "link-local": "http://169.254.169.254:443/",
+        "lab-10": "http://10.0.0.1:443/",
+        "lab-172": "http://172.16.0.1:443/",
+        "lab-192": "http://192.168.0.1:443/",
+        "lab-carrier": "http://100.64.0.1:443/",
     }
 
 
 def _network_script(destinations: dict[str, str], *, attempts: int) -> str:
-    return "\n".join(
-        f"reached=0; for i in $(seq 1 {attempts}); do "
+    probes = "\n".join(
+        f"( reached=0; for i in $(seq 1 {attempts}); do "
         f"if curl -k -sS -o /dev/null --connect-timeout 1 --max-time 1 '{url}'; "
         f"then reached=1; break; fi; sleep 0.25; done; "
-        f"if [ $reached -eq 1 ]; then echo '{name}=reached'; else echo '{name}=denied'; fi"
+        f"if [ $reached -eq 1 ]; then echo '{name}=reached'; else echo '{name}=denied'; fi ) &"
         for name, url in destinations.items()
     )
+    return f"{probes}\nwait"
 
 
 async def _unrestricted_network_control(api: KubernetesClient, destinations: dict[str, str]) -> str:
@@ -676,7 +677,7 @@ async def test_network_policy_denies_every_kubernetes_destination_from_the_worke
     spec = _spec(
         2,
         _origin("network-denials"),
-        command=("sh", "-c", _network_script(destinations, attempts=1)),
+        command=("sh", "-c", _network_script(destinations, attempts=20)),
         network_hosts=("example.com",),
     )
     workspace = await provider.prepare(spec)

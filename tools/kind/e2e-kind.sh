@@ -115,7 +115,7 @@ apiVersion: kind.x-k8s.io/v1alpha4
 name: $cluster
 networking:
   disableDefaultCNI: true
-  podSubnet: 198.18.0.0/16
+  podSubnet: 10.244.0.0/16
 nodes:
   - role: control-plane
     extraMounts:
@@ -144,7 +144,7 @@ curl -fsSL --retry 4 \
   https://raw.githubusercontent.com/projectcalico/calico/v3.32.2/manifests/calico.yaml \
   -o "$calico"
 echo 'a8c828a06a87c629a282ebbc424895b77f3a030251993e41ea400a743675bb02  '"$calico" | sha256sum -c -
-sed -i 's#192\.168\.0\.0/16#198.18.0.0/16#g' "$calico"
+sed -i 's#192\.168\.0\.0/16#10.244.0.0/16#g' "$calico"
 KUBECONFIG="$kubeconfig" kubectl apply -f "$calico" >/dev/null
 KUBECONFIG="$kubeconfig" kubectl -n kube-system rollout status daemonset/calico-node --timeout=180s
 KUBECONFIG="$kubeconfig" kubectl wait --for=condition=Ready nodes --all --timeout=180s

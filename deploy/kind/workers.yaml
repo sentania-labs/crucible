@@ -128,12 +128,13 @@ spec:
   containers:
     - name: peer
       image: busybox@sha256:9db7b59979c38555a39def84a31fb98b5296952f9e3afd4f6f11f05b07adfab0
-      command: ["sh", "-c", "mkdir -p /tmp/www; echo peer > /tmp/www/index.html; exec httpd -f -p 8080 -h /tmp/www"]
+      command: ["sh", "-c", "mkdir -p /tmp/www; echo peer > /tmp/www/index.html; exec httpd -f -p 443 -h /tmp/www"]
       securityContext:
         allowPrivilegeEscalation: false
         readOnlyRootFilesystem: true
         capabilities:
           drop: [ALL]
+          add: [NET_BIND_SERVICE]
       volumeMounts:
         - name: tmp
           mountPath: /tmp
@@ -151,8 +152,8 @@ spec:
     app: peer-http
   ports:
     - name: http
-      port: 8080
-      targetPort: 8080
+      port: 443
+      targetPort: 443
 ---
 apiVersion: v1
 kind: Pod
@@ -173,12 +174,13 @@ spec:
   containers:
     - name: range-http
       image: busybox@sha256:9db7b59979c38555a39def84a31fb98b5296952f9e3afd4f6f11f05b07adfab0
-      command: ["sh", "-c", "mkdir -p /www; echo range-control > /www/index.html; exec httpd -f -p 18080 -h /www"]
+      command: ["sh", "-c", "mkdir -p /www; echo range-control > /www/index.html; exec httpd -f -p 443 -h /www"]
       securityContext:
         allowPrivilegeEscalation: false
         readOnlyRootFilesystem: true
         capabilities:
           drop: [ALL]
+          add: [NET_BIND_SERVICE]
       volumeMounts:
         - name: www
           mountPath: /www
