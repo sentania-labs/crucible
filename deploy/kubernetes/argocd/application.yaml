@@ -1,0 +1,46 @@
+# The Argo Application that consumes the lab overlay (26 checklist item 7, 20 phase C9).
+#
+# Automated sync is off on purpose. The first sync creates two namespaces, a database,
+# RBAC and the Secret objects, and the SealedSecret placeholders in the overlay are not
+# real ciphertext until lab-admin seals them. A person looking at the diff before the
+# first apply is the control that catches a placeholder that was missed; turning
+# automation on afterwards is lab-admin's call and their record, not this repository's.
+#
+# `repoURL` and `targetRevision` are placeholders because this manifest is a template for
+# lab-admin's own GitOps repository, which is where an Application object actually lives.
+# Crucible's repository is the source of the manifests, not the source of the deployment.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: crucible
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: crucible
+spec:
+  project: REPLACE_ME_ARGOCD_PROJECT
+  source:
+    repoURL: REPLACE_ME_MANIFEST_REPO_URL
+    # An exact tag or commit, never a branch: the deployment's record of what is running
+    # is this field plus the image tag the overlay pins (24, sdlc skill).
+    targetRevision: REPLACE_ME_MANIFEST_REVISION
+    path: deploy/kubernetes/overlays/lab
+  destination:
+    server: https://kubernetes.default.svc
+  syncPolicy:
+    # No `automated:` block: sync is manual until lab-admin decides otherwise.
+    syncOptions:
+      # The two namespaces are resources of the base, with their Pod Security admission
+      # labels and their default deny. Argo must not create a bare one ahead of them.
+      - CreateNamespace=false
+      - PrunePropagationPolicy=foreground
+    retry:
+      limit: 3
+      backoff:
+        duration: 30s
+        factor: 2
+        maxDuration: 5m
+# An attempt's Jobs, Pods, ConfigMaps, Secrets, NetworkPolicies and claims are created by
+# Crucible at runtime in `crucible-workers`. Argo tracks only what it applied, so those
+# objects are invisible to it and a prune cannot reach a running attempt. That is worth
+# re-checking before automated sync is ever turned on, because it is the one assumption
+# standing between a sync and a deleted worker.

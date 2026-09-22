@@ -1,0 +1,20 @@
+# 26: `GET /providers` reports `max_concurrency` from this quota. The counts bound what
+# one attempt may leave behind as much as they bound concurrency: an attempt is a Job per
+# role and one claim, so a namespace that is full refuses a launch rather than wedging.
+# The lab overlay sets the sizes; these are the smallest that fit three concurrent
+# attempts with their preparer, collector and verifier Jobs.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: crucible-workers
+  namespace: crucible-workers
+  labels:
+    app.kubernetes.io/name: crucible
+spec:
+  hard:
+    count/jobs.batch: "12"
+    persistentvolumeclaims: "12"
+    requests.cpu: "6"
+    requests.memory: 12Gi
+    limits.cpu: "6"
+    limits.memory: 12Gi

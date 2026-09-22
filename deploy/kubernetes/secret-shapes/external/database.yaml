@@ -1,0 +1,28 @@
+# The same object as ../sealed/database.yaml, sourced from a secret store instead of a
+# sealed ciphertext. One worked example rather than a full set: the remaining objects
+# differ only in name, namespace and key list, all of which are in ../README.md.
+#
+# Crucible reads a mounted file or an environment variable and does not care which
+# controller produced the Secret (12).
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: crucible-database
+  namespace: crucible
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: REPLACE_WITH_SECRET_STORE_NAME
+    kind: ClusterSecretStore
+  target:
+    name: crucible-database
+    creationPolicy: Owner
+  data:
+    - secretKey: password
+      remoteRef:
+        key: REPLACE_WITH_REMOTE_PATH
+        property: password
+    - secretKey: url
+      remoteRef:
+        key: REPLACE_WITH_REMOTE_PATH
+        property: url

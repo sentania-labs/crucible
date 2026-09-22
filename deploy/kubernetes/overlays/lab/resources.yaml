@@ -1,0 +1,18 @@
+# REPLACE: the four numbers below, if the lab's sizing differs.
+#
+# The quota is what `GET /v1/providers` reports as `max_concurrency` (26), so raising it
+# raises how many attempts may run at once. Each attempt is one worker Pod plus, in turn,
+# a preparer, a collector, a bundle verifier and a verifier, and one claim.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: crucible-workers
+  namespace: crucible-workers
+spec:
+  hard:
+    count/jobs.batch: "24"
+    persistentvolumeclaims: "24"
+    requests.cpu: "12"
+    requests.memory: 24Gi
+    limits.cpu: "12"
+    limits.memory: 24Gi

@@ -1,0 +1,87 @@
+# Every non-secret setting the cluster deployment carries (crucible/settings.py). Nothing
+# here is a credential value: the database DSN, the App key and the webhook secret are
+# Secrets, and the harness credentials are Secrets in `crucible-workers` that only the
+# supervisor's account can read (12, 26).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: crucible-settings
+  namespace: crucible
+  labels:
+    app.kubernetes.io/name: crucible
+data:
+  CRUCIBLE_SERVICE__BIND: "0.0.0.0:8080"
+  CRUCIBLE_SERVICE__ARTIFACT_ROOT: /var/lib/crucible/artifacts
+  CRUCIBLE_SERVICE__LOG_LEVEL: INFO
+  # 01: stored UTC, rendered in the operator's zone. The repository carries UTC and the
+  # overlay sets the deployment's own zone; a zone name is a lab-specific value.
+  CRUCIBLE_SERVICE__RENDER_TIMEZONE: UTC
+
+  # 01: exactly one active supervisor, enforced by the database lease. The holder names
+  # the deployment, not the Pod, so a restarted Pod re-takes its own lease.
+  CRUCIBLE_SUPERVISOR__HOLDER: crucible-kubernetes
+
+  # 13: the Docker provider is the development provider and there is no Docker socket
+  # anywhere on the cluster (26).
+  CRUCIBLE_DOCKER__ENABLED: "false"
+
+  # The Kubernetes execution provider (26).
+  CRUCIBLE_KUBERNETES__ENABLED: "true"
+  CRUCIBLE_KUBERNETES__NAMESPACE: crucible
+  CRUCIBLE_KUBERNETES__WORKERS_NAMESPACE: crucible-workers
+  CRUCIBLE_KUBERNETES__SERVICE_ACCOUNT: crucible-worker
+  CRUCIBLE_KUBERNETES__CACHE_CLAIM: crucible-reference-cache
+  CRUCIBLE_KUBERNETES__USE_REFERENCE_CACHE: "true"
+  CRUCIBLE_KUBERNETES__WORKSPACE_SIZE: 20Gi
+  CRUCIBLE_KUBERNETES__MAX_CONCURRENCY: "3"
+  CRUCIBLE_KUBERNETES__LAUNCH_TIMEOUT_SECONDS: "300"
+  CRUCIBLE_KUBERNETES__PREPARE_TIMEOUT_SECONDS: "900"
+  CRUCIBLE_KUBERNETES__COLLECTOR_TIMEOUT_SECONDS: "900"
+  CRUCIBLE_KUBERNETES__VERIFIER_TIMEOUT_SECONDS: "3600"
+  # The cluster's DNS service address. 26 allows port 53 there and denies everything else
+  # inside the cluster, so a wrong value here is a worker with no name resolution, not a
+  # worker with more reach. The overlay sets the cluster's own value.
+  CRUCIBLE_KUBERNETES__CLUSTER_DNS_IP: 10.96.0.10
+  # The worker image repositories `GET /v1/admin/images` reports the promoted tags of
+  # (13, 25). A JSON array: pydantic-settings decodes a complex field from the
+  # environment as JSON.
+  CRUCIBLE_KUBERNETES__IMAGE_REPOSITORIES: '["ghcr.io/sentania-labs/crucible-worker"]'
+  # One exact worker image for 26's readiness canary. The canary runs the first image the
+  # provider knows of, and a bare repository means `:latest` to a kubelet, so a registry
+  # with no `latest` would leave the canary in ImagePullBackOff and the status page
+  # reporting the namespace as not ready for a reason that is not about the namespace.
+  # The overlay names the promoted image; `crucible-worker:latest` is only a default that
+  # happens to be right when the registry publishes one.
+  CRUCIBLE_KUBERNETES__PROBE_IMAGE: ghcr.io/sentania-labs/crucible-worker:latest
+  # The harness credential Secret in `crucible-workers`, per harness (12, 26). The
+  # default for a harness that is absent here is `crucible-harness-<harness>`; it is
+  # written out so the runbook and the cluster name the same objects.
+  CRUCIBLE_KUBERNETES__CREDENTIAL_SECRETS: >-
+    {"claude_code":"crucible-harness-claude-code","codex":"crucible-harness-codex","agy":"crucible-harness-agy"}
+
+  # 12: all three subscription harnesses refresh their own token in place, so the mount
+  # mode is `rw-narrow` and the provider's init container copies the named auth files off
+  # the Secret's read-only projection into the attempt's own claim (C8a). No `path` here:
+  # on the cluster a harness credential is a Secret, not a directory.
+  CRUCIBLE_CREDENTIALS__CLAUDE_CODE__MOUNT_MODE: rw-narrow
+  CRUCIBLE_CREDENTIALS__CODEX__MOUNT_MODE: rw-narrow
+  CRUCIBLE_CREDENTIALS__AGY__MOUNT_MODE: rw-narrow
+
+  # 25 and S1b: a harness ships disabled until its dedicated session and its daily-session
+  # compatibility are verified. These are the same gates compose.yaml carries.
+  CRUCIBLE_HARNESSES__CLAUDE_CODE__ENABLED: "true"
+  CRUCIBLE_HARNESSES__CLAUDE_CODE__REASON: "session_compatibility verified (S1b)"
+  CRUCIBLE_HARNESSES__CODEX__ENABLED: "false"
+  CRUCIBLE_HARNESSES__CODEX__REASON: "unverified: Crucible-side refresh not yet observed (S1b step 5)"
+  CRUCIBLE_HARNESSES__AGY__ENABLED: "true"
+  CRUCIBLE_HARNESSES__AGY__REASON: "session_compatibility verified (S1b steps 5 and 6, 2026-09-17)"
+
+  # GitHub delivery (12, 23). Off until the App Secret is in place; the two values below
+  # are paths to files projected from that Secret, never key or secret values. The
+  # webhook is the optional accelerator and needs the Ingress route below plus the
+  # operator's own public DNS record (operator rule 10), so it stays off in the base.
+  CRUCIBLE_GITHUB__ENABLED: "false"
+  CRUCIBLE_GITHUB__APP__APP_ID: "0"
+  CRUCIBLE_GITHUB__APP__PRIVATE_KEY_PATH: /var/lib/crucible/credentials/github/app.pem
+  CRUCIBLE_GITHUB__APP__WEBHOOK_SECRET_PATH: /var/lib/crucible/credentials/github/webhook.secret
+  CRUCIBLE_GITHUB__WEBHOOK_ENABLED: "false"
