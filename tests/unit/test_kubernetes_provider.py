@@ -455,16 +455,19 @@ async def test_a_harness_with_no_secret_at_all_refuses_the_launch() -> None:
         await provider.prepare(launch)
 
 
-async def test_hermes_needs_no_credential() -> None:
-    api, registry, provider = build(harness="hermes")
+async def test_hermes_uses_no_secret_when_its_optional_credential_is_unconfigured() -> None:
+    def resolver(host: str) -> list[str]:
+        return ["10.10.0.42/32"] if host == "llm.apps.int.sentania.net" else ["151.101.0.223/32"]
+
+    api, registry, provider = build(harness="hermes", resolver=resolver)
     image = "crucible-worker:hermes-fake-succeed-1"
     registry.register(image, harness="hermes", version="0.19.0")
     launch = spec(
         harness="hermes",
         image=image,
         endpoint="local",
-        endpoint_url="http://10.10.0.42:8000/v1",
-        model="gpt-oss:120b",
+        endpoint_url="https://llm.apps.int.sentania.net/v1",
+        model="coder",
     )
     workspace = await provider.prepare(launch)
     await provider.launch(workspace, launch)

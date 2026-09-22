@@ -39,8 +39,8 @@ def test_up_down_up_from_empty(database_url: str) -> None:
     ok, detail = migrate.is_current(engine, database_url)
     assert ok, detail
     with engine.connect() as conn:
-        # The migrations seed versions 1 through 4 of default-software.
-        assert conn.execute(text("SELECT count(*) FROM policies")).scalar() == 4
+        # C10 adds immutable version 6 and intentionally does not rewrite older rows.
+        assert conn.execute(text("SELECT count(*) FROM policies")).scalar() == 5
     migrate.downgrade(database_url, "base")
     assert "tasks" not in inspect(engine).get_table_names()
     migrate.upgrade(database_url)
@@ -114,8 +114,8 @@ def test_0004_creates_the_c2_tables_and_seeds_the_routing_policy(migrated: str) 
         "attempt_metrics",
     } <= names
     with engine.connect() as conn:
-        # 0004 seeds version 1; 0008 adds version 2 with the model ids the C5 live runs
-        # verified; 0011 adds version 3 and 0013 adds the disabled Hermes route in 4.
+        # Older migrations seed 1 through 4. C10 adds version 6 with the lab gateway
+        # model and leaves every previous document intact.
         versions = (
             conn.execute(
                 text(
@@ -125,7 +125,7 @@ def test_0004_creates_the_c2_tables_and_seeds_the_routing_policy(migrated: str) 
             .scalars()
             .all()
         )
-        assert versions == [1, 2, 3, 4]
+        assert versions == [1, 2, 3, 4, 6]
         # Later revisions add immutable policy versions that name their matching
         # routing version (05b).
         policy_versions = conn.execute(
@@ -139,6 +139,7 @@ def test_0004_creates_the_c2_tables_and_seeds_the_routing_policy(migrated: str) 
             (2, 2),
             (3, 3),
             (4, 4),
+            (6, 6),
         ]
         routing = conn.execute(
             text(
@@ -195,6 +196,29 @@ def test_0013_materializes_the_configured_spark_url(
     assert enabled is not None and enabled.enabled and enabled.disabled_reason is None
     assert enabled.endpoint_url == "http://192.0.2.41:11434/v1"
     assert int(policy_ref) == 5
+    engine.dispose()
+
+
+def test_0017_replaces_the_spark_pin_with_the_disabled_coder_route(migrated: str) -> None:
+    engine = make_engine(migrated)
+    with engine.connect() as conn:
+        document = conn.execute(
+            text("SELECT document FROM routing_policies WHERE name='default-routing' AND version=6")
+        ).scalar_one()
+        policy_ref = conn.execute(
+            text(
+                "SELECT document -> 'routing' -> 'policy' ->> 'version' FROM policies "
+                "WHERE name='default-software' AND version=6"
+            )
+        ).scalar_one()
+    routing = RoutingPolicyV1.model_validate(document)
+    local = [model for model in routing.models if model.harness == "hermes"]
+    assert [model.id for model in local] == ["coder"]
+    assert not local[0].enabled
+    assert local[0].chat_template_kwargs.enable_thinking is False
+    assert routing.pools["lab-local"].max_concurrency == 4
+    assert "spark-local" not in routing.pools
+    assert int(policy_ref) == 6
     engine.dispose()
 
 

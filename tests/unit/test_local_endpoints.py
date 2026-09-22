@@ -69,23 +69,26 @@ def test_proxy_allows_only_the_exact_local_destination_and_plain_http_port() -> 
     assert unsafe < connect < local < final
 
 
-def test_proxy_rejects_https_local_destinations() -> None:
-    with pytest.raises(ValueError, match="plain HTTP"):
-        worker_proxy_config(
-            "10.88.0.0/24",
-            [],
-            [
-                {
-                    "models": [
-                        {
-                            "endpoint": "local",
-                            "endpoint_url": "https://spark.example.invalid/v1",
-                            "enabled": True,
-                        }
-                    ]
-                }
-            ],
-        )
+def test_proxy_allows_https_local_destinations_by_exact_name_and_port() -> None:
+    config = worker_proxy_config(
+        "10.88.0.0/24",
+        [],
+        [
+            {
+                "models": [
+                    {
+                        "endpoint": "local",
+                        "endpoint_url": "https://spark.example.invalid/v1",
+                        "enabled": True,
+                    }
+                ]
+            }
+        ],
+    )
+    assert "acl local_destination_0 dstdomain spark.example.invalid" in config
+    assert "acl local_port_0 port 443" in config
+    assert "acl SSL_ports port 443" in config
+    assert "http_access allow workers local_destination_0 local_port_0" in config
 
 
 def test_make_proxy_config_passes_the_configured_spark_endpoint() -> None:
@@ -100,7 +103,7 @@ def test_make_proxy_config_passes_the_configured_spark_endpoint() -> None:
     assert f'--configured-local-endpoint "{endpoint}"' in result.stdout
 
 
-def test_make_deploy_local_forwards_the_configured_spark_endpoint() -> None:
+def test_make_deploy_local_maps_the_compatibility_seed_to_the_local_endpoint() -> None:
     endpoint = "http://192.0.2.41:11434/v1"
     result = subprocess.run(
         ["make", "--dry-run", "deploy-local", f"CRUCIBLE_SPARK_ENDPOINT_URL={endpoint}"],
@@ -109,4 +112,4 @@ def test_make_deploy_local_forwards_the_configured_spark_endpoint() -> None:
         capture_output=True,
         text=True,
     )
-    assert f'CRUCIBLE_SPARK_ENDPOINT_URL="{endpoint}"' in result.stdout
+    assert f'CRUCIBLE_LOCAL_ENDPOINT_URL="{endpoint}"' in result.stdout

@@ -93,7 +93,10 @@ TRUNCATE = (
 
 def _squid_conf(directory: Path) -> Path:
     """The same configuration `make proxy-config` writes, for the test's allowlist."""
-    endpoint = os.environ.get("CRUCIBLE_SPARK_ENDPOINT_URL", "").strip()
+    endpoint = (
+        os.environ.get("CRUCIBLE_LOCAL_ENDPOINT_URL")
+        or os.environ.get("CRUCIBLE_SPARK_ENDPOINT_URL", "")
+    ).strip()
     routing = {
         "models": [
             {
@@ -295,10 +298,15 @@ def engine(migrated: str) -> Iterator[Engine]:
 @pytest.fixture
 def docker_config(stack: dict[str, Any], artifact_root: Path) -> DockerConfig:
     allowlist = list(EGRESS_ALLOWLIST)
-    endpoint = os.environ.get("CRUCIBLE_SPARK_ENDPOINT_URL", "").strip()
+    endpoint = (
+        os.environ.get("CRUCIBLE_LOCAL_ENDPOINT_URL")
+        or os.environ.get("CRUCIBLE_SPARK_ENDPOINT_URL", "")
+    ).strip()
     if endpoint:
         parsed = urlsplit(endpoint)
-        allowlist.append(f"{parsed.hostname}:{parsed.port or 80}")
+        allowlist.append(
+            f"{parsed.hostname}:{parsed.port or (443 if parsed.scheme == 'https' else 80)}"
+        )
     return DockerConfig(
         endpoint=str(stack["docker_host"]),
         artifact_root=str(artifact_root),
