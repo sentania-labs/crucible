@@ -15,6 +15,13 @@ from crucible.adapters.api.deps import AppContext
 from crucible.adapters.clock import SystemClock
 from crucible.adapters.execution.docker import DockerConfig, DockerProvider
 from crucible.adapters.execution.fake import FakeProvider
+from crucible.adapters.execution.k8sapi import (
+    KubernetesClient,
+    in_cluster_access,
+    kubeconfig_access,
+)
+from crucible.adapters.execution.k8sregistry import HttpRegistryClient
+from crucible.adapters.execution.kubernetes import KubernetesConfig, KubernetesProvider
 from crucible.adapters.execution.publisher import DockerPublisher, PublisherConfig
 from crucible.adapters.github.appauth import AppAuthenticator, AppConfig
 from crucible.adapters.github.client import RestGitHubClient
@@ -138,6 +145,56 @@ def docker_config(settings: Settings) -> DockerConfig:
     )
 
 
+def kubernetes_config(settings: Settings) -> KubernetesConfig:
+    k = settings.kubernetes
+    return KubernetesConfig(
+        namespace=k.workers_namespace,
+        service_account=k.service_account,
+        storage_class=k.storage_class,
+        workspace_size=k.workspace_size,
+        image_pull_secret=k.image_pull_secret,
+        cache_claim=k.cache_claim,
+        launch_timeout_seconds=k.launch_timeout_seconds,
+        prepare_timeout_seconds=k.prepare_timeout_seconds,
+        collector_timeout_seconds=k.collector_timeout_seconds,
+        verifier_timeout_seconds=k.verifier_timeout_seconds,
+        report_size_cap_bytes=k.report_size_cap_bytes,
+        max_concurrency=k.max_concurrency,
+        poll_interval_seconds=k.poll_interval_seconds,
+        api_timeout_seconds=k.api_timeout_seconds,
+        cluster_dns_ip=k.cluster_dns_ip,
+        denied_cidrs=tuple(k.denied_cidrs),
+        extra_image_allowlist=tuple(k.extra_image_allowlist),
+        credential_secrets=dict(k.credential_secrets),
+        # 25 step 7: a configured mount mode may raise the adapter's declared minimum
+        # to rw-narrow and never lowers it. The Kubernetes provider reads the same
+        # `[credentials.<harness>]` block the Docker provider does; only the source
+        # differs, a Secret in the workers namespace rather than a directory (12, 26).
+        credential_modes={
+            name: MountMode(entry.mount_mode)
+            for name, entry in settings.credentials.items()
+            if entry.mount_mode
+        },
+        image_repositories=tuple(k.image_repositories),
+        use_reference_cache=k.use_reference_cache,
+    )
+
+
+def kubernetes_provider(settings: Settings, registry: HarnessRegistry) -> KubernetesProvider:
+    """The provider of 26. The access is either a kubeconfig path or the in-cluster
+    ServiceAccount; neither is a credential value in configuration (12)."""
+    k = settings.kubernetes
+    access = (
+        kubeconfig_access(k.kubeconfig, k.kubeconfig_context)
+        if k.kubeconfig
+        else in_cluster_access()
+    )
+    client = KubernetesClient(access, k.workers_namespace, timeout=k.api_timeout_seconds)
+    return KubernetesProvider(
+        kubernetes_config(settings), client, HttpRegistryClient(), harnesses=registry
+    )
+
+
 def github_client(settings: Settings) -> GitHubClient | None:
     """The GitHub adapter, when the App is configured. The key is a path Crucible reads
     to sign a JWT in memory; nothing about it is a configuration value (12)."""
@@ -164,6 +221,11 @@ def wire(settings: Settings) -> Wiring:
     if settings.docker.enabled:
         docker = DockerProvider(docker_config(settings), harnesses=registry)
         providers["docker"] = docker
+    if settings.kubernetes.enabled:
+        # 26: the Kubernetes provider is reported by `GET /v1/capabilities` and
+        # `GET /v1/admin/providers` exactly when it is wired, with its namespace probe
+        # in its health checks.
+        providers["kubernetes"] = kubernetes_provider(settings, registry)
     artifact_store = DiskArtifactStore(settings.service.artifact_root)
     wake_deliverer = WebhookWakeDeliverer(
         settings.wake.webhook_url,

@@ -308,6 +308,26 @@ class KubernetesClient:
             if exc.status != 404:
                 raise
 
+    def patch(self, kind: str, name: str, body: Mapping[str, Any]) -> dict[str, Any]:
+        """A JSON merge patch on one object. The only mutation this client makes to an
+        object it did not create, and the only thing it patches is the harness
+        credential Secret's data on a validated sync-back (12)."""
+        url = f"{self._base(kind)}/{quote(name, safe='')}"
+        headers = {**self._headers(), "Content-Type": "application/merge-patch+json"}
+        conn = self._connect()
+        try:
+            conn.request("PATCH", url, body=json.dumps(body).encode("utf-8"), headers=headers)
+            response = conn.getresponse()
+            raw = response.read()
+            if response.status >= 400:
+                raise KubernetesApiError(
+                    response.status, _message(raw.decode("utf-8", "replace")), path=url
+                )
+        finally:
+            conn.close()
+        data = json.loads(raw.decode("utf-8")) if raw else {}
+        return data if isinstance(data, dict) else {}
+
     def pod_log(
         self,
         name: str,

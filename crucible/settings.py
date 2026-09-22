@@ -81,6 +81,64 @@ class DockerSettings(BaseModel):
     extra_image_allowlist: list[str] = Field(default_factory=list)
 
 
+class KubernetesSettings(BaseModel):
+    """The Kubernetes execution provider (08, 26).
+
+    Off by default: a deployment that has not had the namespaces, the default-deny
+    NetworkPolicy, the storage class and the pod PID limit prepared for it (26's
+    checklist) would only fail at the readiness probe, and Docker stays the development
+    provider either way.
+
+    `kubeconfig` is a path or None for the in-cluster ServiceAccount. Nothing here is
+    ever a credential value: the ServiceAccount token is a file the kubelet rotates and
+    the registry credential is the cluster's own image pull Secret (12).
+    """
+
+    enabled: bool = False
+    namespace: str = "crucible"
+    workers_namespace: str = "crucible-workers"
+    kubeconfig: str | None = None
+    kubeconfig_context: str | None = None
+    api_timeout_seconds: float = 30.0
+    service_account: str = "crucible-worker"
+    storage_class: str = ""
+    workspace_size: str = "20Gi"
+    image_pull_secret: str | None = None
+    # The cluster-side PersistentVolumeClaim holding the git reference cache the
+    # preparer clones from. Without one the preparer clones from the remote.
+    cache_claim: str | None = None
+    # 26: a Pod Pending longer than this is a launch failure with the Pod's conditions
+    # as the detail, never a stall.
+    launch_timeout_seconds: int = 300
+    prepare_timeout_seconds: int = 900
+    collector_timeout_seconds: int = 900
+    verifier_timeout_seconds: int = 3600
+    report_size_cap_bytes: int = 10 * 1024 * 1024
+    poll_interval_seconds: float = 2.0
+    max_concurrency: int = 3
+    # The cluster DNS service address. 26 allows port 53 on this address and nothing
+    # else on it, and denies everything else inside the cluster.
+    cluster_dns_ip: str = "10.96.0.10"
+    # What a worker's egress rule excludes: the API server, the node network, other
+    # namespaces' pod network, link-local, and the lab's private ranges (26).
+    denied_cidrs: list[str] = Field(
+        default_factory=lambda: [
+            "10.0.0.0/8",
+            "172.16.0.0/12",
+            "192.168.0.0/16",
+            "169.254.0.0/16",
+            "100.64.0.0/10",
+            "127.0.0.0/8",
+        ]
+    )
+    # The worker image repositories `GET /admin/images` reports the promoted tags of.
+    image_repositories: list[str] = Field(default_factory=list)
+    # The harness credential Secret in the workers namespace, per harness (12, 26).
+    credential_secrets: dict[str, str] = Field(default_factory=dict)
+    extra_image_allowlist: list[str] = Field(default_factory=list)
+    use_reference_cache: bool = True
+
+
 class CredentialSettings(BaseModel):
     """One harness's credential directory (12). `path` is a directory Crucible reads and
     seeds per-attempt copies from; no value is ever configuration. `mount_mode` may raise
@@ -175,6 +233,7 @@ class Settings(BaseSettings):
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)
     supervisor: SupervisorSettings = Field(default_factory=SupervisorSettings)
     docker: DockerSettings = Field(default_factory=DockerSettings)
+    kubernetes: KubernetesSettings = Field(default_factory=KubernetesSettings)
     github: GitHubSettings = Field(default_factory=GitHubSettings)
     wake: WakeSettings = Field(default_factory=WakeSettings)
     credentials: dict[str, CredentialSettings] = Field(default_factory=dict)

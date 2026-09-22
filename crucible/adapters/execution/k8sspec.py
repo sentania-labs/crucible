@@ -360,12 +360,22 @@ def workspace_claim(
 
 
 def config_map(
-    *, name: str, namespace: str, object_labels: Mapping[str, str], data: Mapping[str, str]
+    *,
+    name: str,
+    namespace: str,
+    object_labels: Mapping[str, str],
+    data: Mapping[str, str],
+    annotations: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     return {
         "apiVersion": "v1",
         "kind": "ConfigMap",
-        "metadata": {"name": name, "namespace": namespace, "labels": dict(object_labels)},
+        "metadata": {
+            "name": name,
+            "namespace": namespace,
+            "labels": dict(object_labels),
+            **({"annotations": dict(annotations)} if annotations else {}),
+        },
         "data": dict(data),
     }
 
