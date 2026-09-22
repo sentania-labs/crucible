@@ -30,9 +30,9 @@ needs and nothing the operator's home provides:
   compose.yaml                     640  copy of the repository's, unmodified
   compose.deploy.yaml              640  the override that pins the image
   .env                             600  from .env.example, generated password
-  var/egress/squid.conf            640  copy of what `make proxy-config` wrote
+  var/egress/squid.conf            640  seed copied into the managed proxy volume
 /var/lib/crucible/credentials/     700 crucible:crucible
-  claude_code/ codex/ agy/ github/ 700  empty, for 12 and 25
+  claude_code/ codex/ agy/ hermes/ github/ 700  empty, for 12 and 25
 ```
 
 `make deploy-local` creates or refreshes that directory and brings the stack up;
@@ -121,10 +121,11 @@ printf '%s\n' "$LITELLM_VIRTUAL_KEY" \
   | crucible-admin --reason "install lab gateway key" credentials set --harness hermes
 ```
 
-The key remains in the shell variable and stdin. It is never an argument. Restart the
-egress proxy after a routing save so Squid loads the regenerated file. Recovery is to
-disable `coder` in **Routing** or select the preceding immutable policy version, then
-restart the proxy. No environment edit is needed for either action.
+The key remains in the shell variable and stdin. It is never an argument. A routing
+save atomically rewrites the live file in the managed `crucible-egress` volume and
+signals Squid to validate and reload it. Recovery is to disable `coder` in **Routing**
+or select the preceding immutable policy version. No environment edit or manual proxy
+restart is needed.
 
 ## Choosing the version
 

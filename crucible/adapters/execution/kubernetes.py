@@ -109,6 +109,18 @@ from crucible.ports.harness import AuthFile, CredentialSpec, ExitInfo, LaunchCon
 
 log = logging.getLogger("crucible.provider.kubernetes")
 
+
+def _inside_declared_network(
+    network: ipaddress.IPv4Network | ipaddress.IPv6Network, declared: str
+) -> bool:
+    candidate = ipaddress.ip_network(declared)
+    return (
+        network.version == candidate.version
+        and int(network.network_address) >= int(candidate.network_address)
+        and int(network.broadcast_address) <= int(candidate.broadcast_address)
+    )
+
+
 PROVIDER_NAME = "kubernetes"
 
 # A name to the addresses a NetworkPolicy may name.
@@ -213,6 +225,7 @@ class KubernetesConfig:
     # else on it; every other destination inside the cluster stays denied.
     cluster_dns_ip: str = "10.96.0.10"
     denied_cidrs: tuple[str, ...] = k8sspec.DEFAULT_DENIED_CIDRS
+    local_endpoint_cidrs: tuple[str, ...] = ()
     # 26: the allowlist is "resolved to CIDRs or FQDN rules where the CNI supports
     # them". A plain `networking.k8s.io/v1` CNI has no FQDN rule, so the names are
     # resolved here and the policy carries their addresses. Turning this off gives the
@@ -509,6 +522,9 @@ class KubernetesProvider:
             supports_harnesses=frozenset(self.harnesses.names()),
             max_concurrency=self._quota_concurrency or self.config.max_concurrency,
         )
+
+    def credential_available(self, harness: str) -> bool:
+        return harness in self.config.credential_secrets
 
     async def prepare(self, spec: LaunchSpec) -> Workspace:
         repository = spec.contract.get("repository", {})
@@ -1580,7 +1596,17 @@ class KubernetesProvider:
                     endpoint_unresolved.append(host)
                     continue
                 for cidr in addresses:
-                    address_text = str(ipaddress.ip_network(cidr).network_address)
+                    network = ipaddress.ip_network(cidr)
+                    address_text = str(network.network_address)
+                    denied = k8sspec.denied_by(str(network), self.config.denied_cidrs)
+                    explicitly_local = any(
+                        _inside_declared_network(network, value)
+                        for value in self.config.local_endpoint_cidrs
+                    )
+                    if denied is not None and not explicitly_local:
+                        endpoint_forbidden.append(
+                            f"{host} resolved to {address_text} inside {denied}"
+                        )
                     resolved_endpoints.append(f"{address_text}:{port}")
             else:
                 cidr = f"{parsed_address}/{32 if parsed_address.version == 4 else 128}"
@@ -1595,7 +1621,7 @@ class KubernetesProvider:
             )
         if endpoint_forbidden:
             raise ProviderError(
-                "the configured local endpoint directly names an address this namespace "
+                "the configured local endpoint names or resolves to an address this namespace "
                 f"denies: {sorted(endpoint_forbidden)}"
             )
         plan = replace(plan, endpoints=tuple(dict.fromkeys(resolved_endpoints)))

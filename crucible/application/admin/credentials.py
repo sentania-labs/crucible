@@ -585,10 +585,22 @@ async def _probe_async(
 
 
 def _http_status(url: str, *, bearer: str | None, timeout: float) -> int:
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(
+            self,
+            req: urllib.request.Request,
+            fp: Any,
+            code: int,
+            msg: str,
+            headers: Any,
+            newurl: str,
+        ) -> None:
+            return None
+
     headers = {"Authorization": f"Bearer {bearer}"} if bearer is not None else {}
     request = urllib.request.Request(url, headers=headers, method="GET")
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with urllib.request.build_opener(_NoRedirect()).open(request, timeout=timeout) as response:
             return int(response.status)
     except urllib.error.HTTPError as exc:
         return int(exc.code)
@@ -608,49 +620,55 @@ async def _hermes_probe_async(
     key_path = spec_for(ctx, harness).source_path(source.path, "api-key")
     bearer = key_path.read_text(encoding="utf-8").strip()
     endpoint = local_endpoint_view(uow).get("endpoint_url")
-    if not isinstance(endpoint, str) or not endpoint:
-        raise CredentialAdminError("the Hermes probe needs a configured local endpoint URL")
-    parsed = urlsplit(endpoint)
-    readiness = urlunsplit((parsed.scheme, parsed.netloc, "/health/readiness", "", ""))
-    models = endpoint.rstrip("/") + "/models"
     started = time.monotonic()
-    try:
-        readiness_status = await asyncio.to_thread(
-            _http_status, readiness, bearer=None, timeout=float(ctx.probe_timeout_seconds)
-        )
-        if readiness_status != 200:
-            exit_class = ExitClass.ENVIRONMENT
-            conclusive = False
-            cause = f"readiness_http_{readiness_status}"
-            models_status = None
-        else:
-            models_status = await asyncio.to_thread(
-                _http_status,
-                models,
-                bearer=bearer,
-                timeout=float(ctx.probe_timeout_seconds),
-            )
-            exit_class = (
-                ExitClass.COMPLETED
-                if models_status == 200
-                else ExitClass.AUTH_FAILURE
-                if models_status == 401
-                else ExitClass.ENVIRONMENT
-            )
-            conclusive = models_status in (200, 401)
-            cause = "" if conclusive else f"models_http_{models_status}"
-    except (OSError, urllib.error.URLError, UnicodeError) as exc:
+    if not isinstance(endpoint, str) or not endpoint:
+        readiness_status = None
+        models_status = None
         exit_class = ExitClass.ENVIRONMENT
         conclusive = False
-        cause = "endpoint_unreachable"
-        models_status = None
-        detail = type(exc).__name__
+        cause = "endpoint_not_configured"
+        detail = "the local endpoint is not configured"
     else:
-        detail = (
-            f"readiness HTTP {readiness_status}; models HTTP {models_status}"
-            if models_status is not None
-            else f"readiness HTTP {readiness_status}"
-        )
+        parsed = urlsplit(endpoint)
+        readiness = urlunsplit((parsed.scheme, parsed.netloc, "/health/readiness", "", ""))
+        models = endpoint.rstrip("/") + "/models"
+        try:
+            readiness_status = await asyncio.to_thread(
+                _http_status, readiness, bearer=None, timeout=float(ctx.probe_timeout_seconds)
+            )
+            if readiness_status != 200:
+                exit_class = ExitClass.ENVIRONMENT
+                conclusive = False
+                cause = f"readiness_http_{readiness_status}"
+                models_status = None
+            else:
+                models_status = await asyncio.to_thread(
+                    _http_status,
+                    models,
+                    bearer=bearer,
+                    timeout=float(ctx.probe_timeout_seconds),
+                )
+                exit_class = (
+                    ExitClass.COMPLETED
+                    if models_status == 200
+                    else ExitClass.AUTH_FAILURE
+                    if models_status == 401
+                    else ExitClass.ENVIRONMENT
+                )
+                conclusive = models_status in (200, 401)
+                cause = "" if conclusive else f"models_http_{models_status}"
+        except (OSError, urllib.error.URLError, UnicodeError) as exc:
+            exit_class = ExitClass.ENVIRONMENT
+            conclusive = False
+            cause = "endpoint_unreachable"
+            models_status = None
+            detail = type(exc).__name__
+        else:
+            detail = (
+                f"readiness HTTP {readiness_status}; models HTTP {models_status}"
+                if models_status is not None
+                else f"readiness HTTP {readiness_status}"
+            )
     record = ProbeRecord(
         harness=harness,
         exit_class=exit_class.value,

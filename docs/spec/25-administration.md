@@ -72,7 +72,7 @@ resource.
 | GitHub health | `GET /admin/github`, `POST /admin/github/check` | `github status|check` | check mints a token per registered repository and discards it |
 | register a repository | `PUT /admin/repositories/{name}` | `repositories register` | 04; an administrative mutation like any other, guarded and audited here, with the previous registration as the before summary. 04's own `PUT /repositories/{name}` is a different, non-administrative surface |
 | audit | `GET /admin/audit?cursor=` | `audit tail` | admin events only; the cursor is the scan position and always moves forward, so a long stretch of non-administrative events cannot strand the pages behind it |
-| show or update the local gateway | `GET`, `POST /admin/routing/local-endpoint` | `routing local-endpoint`, `routing set-local-endpoint` | edits endpoint URL, local model enablement, thinking preference, and pool concurrency by creating new immutable routing and delivery policy versions; regenerates the proxy configuration |
+| show or update the local gateway | `GET`, `POST /admin/routing/local-endpoint` | `routing local-endpoint`, `routing set-local-endpoint` | edits endpoint URL, local model enablement, thinking preference, and pool concurrency by creating new immutable routing and delivery policy versions; atomically regenerates and reloads the proxy configuration |
 
 Every mutation requires a non-empty `reason` string, records the principal,
 and is refused when the supervisor lease is not held by a live instance (so

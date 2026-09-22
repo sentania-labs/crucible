@@ -11,7 +11,7 @@ from urllib.parse import urlsplit
 from crucible.application.admin.context import AdminContext, admin_event, guard_mutation
 from crucible.application.errors import NotFoundError
 from crucible.application.policies import put_policy, put_routing_policy
-from crucible.application.proxy_config import worker_proxy_config
+from crucible.application.proxy_config import install_worker_proxy_config, worker_proxy_config
 from crucible.domain.endpoints import validate_endpoint
 from crucible.domain.entities import Principal
 from crucible.domain.events import EventKind
@@ -146,9 +146,11 @@ def save_local_endpoint(
     )
     if ctx.proxy_config_path:
         rendered = worker_proxy_config(ctx.proxy_subnet, list(ctx.proxy_hosts), [routing_document])
-        path = Path(ctx.proxy_config_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(rendered, encoding="utf-8")
+        install_worker_proxy_config(
+            Path(ctx.proxy_config_path),
+            rendered,
+            reload_timeout_seconds=ctx.proxy_reload_timeout_seconds,
+        )
     parsed = urlsplit(endpoint_url)
     local_destination = (
         f"{parsed.hostname}:{parsed.port or (443 if parsed.scheme == 'https' else 80)}"

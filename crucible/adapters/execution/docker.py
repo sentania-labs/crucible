@@ -431,6 +431,9 @@ class DockerProvider:
             max_concurrency=self.config.max_concurrency,
         )
 
+    def credential_available(self, harness: str) -> bool:
+        return self._credential_source(harness) is not None
+
     async def prepare(self, spec: LaunchSpec) -> Workspace:
         repository = spec.contract.get("repository", {})
         url = spec.repository_url or str(repository.get("url", ""))

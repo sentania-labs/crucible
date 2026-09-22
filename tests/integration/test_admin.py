@@ -689,6 +689,28 @@ def test_credentials_validate_and_probe_through_api_and_cli(
     assert status["state"] == "validated" and status["last_validated_at"]
 
 
+def test_hermes_key_before_endpoint_is_saved_and_audited_as_inconclusive(
+    admin_client: TestClient,
+    live_supervisor: Supervisor,
+    credential_root: Path,
+) -> None:
+    asyncio.run(live_supervisor.tick())
+    api_key = "vk_" + "n" * 40
+    response = admin_client.post(
+        "/v1/admin/credentials/hermes/set",
+        json={"reason": "stage key before route", "api_key": api_key},
+    )
+    assert response.status_code == 200, response.text
+    document = response.json()
+    assert document["validated"] is False
+    assert document["conclusive"] is False
+    assert document["cause"] == "endpoint_not_configured"
+    assert api_key not in response.text
+    assert (credential_root / "hermes" / "api-key").is_file()
+    audit = admin_client.get("/v1/admin/audit", params={"limit": 200}).text
+    assert "credential_set" in audit and api_key not in audit
+
+
 def test_local_endpoint_and_hermes_key_are_saved_without_exposing_the_key(
     ctx: AppContext,
     tokens: dict[str, str],
@@ -726,6 +748,7 @@ def test_local_endpoint_and_hermes_key_are_saved_without_exposing_the_key(
     assert view["models"][0]["chat_template_kwargs"] == {"enable_thinking": False}
     assert view["pool"]["max_concurrency"] == 3
     assert "llm.apps.int.sentania.net" in proxy_path.read_text(encoding="utf-8")
+    assert (proxy_path.parent / "reload").is_file()
     assert admin_client.get("/v1/admin/routing/local-endpoint").json() == view
 
     observed: list[tuple[str, str | None]] = []

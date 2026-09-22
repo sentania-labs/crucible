@@ -131,6 +131,9 @@ class KubernetesSettings(BaseModel):
             "127.0.0.0/8",
         ]
     )
+    # Private ranges a named local endpoint may resolve into. Literal IP endpoint URLs
+    # are still refused. Keep this narrower than the cluster service and pod ranges.
+    local_endpoint_cidrs: list[str] = Field(default_factory=list)
     # The worker image repositories `GET /admin/images` reports the promoted tags of.
     # Bare repositories: the provider appends each tag the registry lists.
     image_repositories: list[str] = Field(default_factory=list)
@@ -238,6 +241,7 @@ class AdminSettings(BaseModel):
     # from the same renderer as `make proxy-config`.
     proxy_config_path: str | None = None
     proxy_subnet: str = "10.88.0.0/24"
+    proxy_reload_timeout_seconds: float = 0
 
 
 class Settings(BaseSettings):

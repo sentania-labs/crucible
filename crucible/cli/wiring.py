@@ -40,7 +40,7 @@ from crucible.application.admin.routing import local_endpoint_view
 from crucible.application.delivery_tick import DeliveryConfig
 from crucible.application.errors import NotFoundError
 from crucible.application.harnesses import HarnessRegistry
-from crucible.application.proxy_config import worker_proxy_config
+from crucible.application.proxy_config import install_worker_proxy_config, worker_proxy_config
 from crucible.application.supervisor import Supervisor
 from crucible.domain.ids import new_id
 from crucible.ports.artifacts import ArtifactStore
@@ -176,6 +176,7 @@ def kubernetes_config(settings: Settings) -> KubernetesConfig:
         api_timeout_seconds=k.api_timeout_seconds,
         cluster_dns_ip=k.cluster_dns_ip,
         denied_cidrs=tuple(k.denied_cidrs),
+        local_endpoint_cidrs=tuple(k.local_endpoint_cidrs),
         extra_image_allowlist=tuple(k.extra_image_allowlist),
         credential_secrets=dict(k.credential_secrets),
         # 25 step 7: a configured mount mode may raise the adapter's declared minimum
@@ -245,14 +246,13 @@ def wire(settings: Settings) -> Wiring:
         database_value = False
     if settings.admin.proxy_config_path and routing_document is not None:
         path = Path(settings.admin.proxy_config_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
+        install_worker_proxy_config(
+            path,
             worker_proxy_config(
                 settings.admin.proxy_subnet,
                 list(settings.docker.egress_allowlist),
                 [routing_document],
             ),
-            encoding="utf-8",
         )
     registry = default_registry()
     providers: dict[str, ExecutionProvider] = {"fake": FakeProvider()}
@@ -309,6 +309,7 @@ def wire(settings: Settings) -> Wiring:
         proxy_config_path=settings.admin.proxy_config_path,
         proxy_subnet=settings.admin.proxy_subnet,
         proxy_hosts=tuple(settings.docker.egress_allowlist),
+        proxy_reload_timeout_seconds=settings.admin.proxy_reload_timeout_seconds,
     )
     ctx = AppContext(
         uow_factory=factory,

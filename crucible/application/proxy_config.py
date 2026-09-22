@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import json
+import os
+import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -75,11 +77,46 @@ def worker_proxy_config(
             "http_port 3128",
             "cache deny all",
             "access_log /var/log/squid/access.log",
-            "pid_filename none",
+            "pid_filename /run/squid.pid",
             "shutdown_lifetime 1 second",
         ]
     )
     return "\n".join(lines) + "\n"
+
+
+def install_worker_proxy_config(
+    path: Path, rendered: str, *, reload_timeout_seconds: float = 0
+) -> None:
+    """Atomically replace worker proxy rules, then request a live reload."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.incoming")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(rendered)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, 0o644)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    marker = path.parent / "reload"
+    marker_temporary = marker.with_name(".reload.incoming")
+    token = f"{time.time_ns()}-{os.getpid()}"
+    marker_temporary.write_text(f"{token}\n", encoding="ascii")
+    os.replace(marker_temporary, marker)
+    if reload_timeout_seconds <= 0:
+        return
+    deadline = time.monotonic() + reload_timeout_seconds
+    acknowledged = path.parent / "reloaded"
+    while time.monotonic() < deadline:
+        try:
+            if acknowledged.read_text(encoding="ascii").strip() == token:
+                return
+        except OSError:
+            pass
+        time.sleep(0.05)
+    raise TimeoutError("the egress proxy did not acknowledge the new configuration")
 
 
 def main() -> None:
@@ -88,7 +125,6 @@ def main() -> None:
     parser.add_argument("--subnet", required=True)
     parser.add_argument("--host", action="append", default=[])
     parser.add_argument("--routing-policy", action="append", type=Path, default=[])
-    parser.add_argument("--configured-local-endpoint", action="append", default=[])
     args = parser.parse_args()
     routing_policies: list[Mapping[str, Any]] = []
     for path in args.routing_policy:
@@ -99,24 +135,8 @@ def main() -> None:
         if not isinstance(document, dict):
             raise ValueError(f"routing policy {path} has no object document")
         routing_policies.append(document)
-    # A configured Spark endpoint is also the input that makes migration 0014 create
-    # an enabled local route. Represent that deployment-time route in the same shape as
-    # uploaded policy documents so one filtering and validation path generates Squid.
-    if args.configured_local_endpoint:
-        routing_policies.append(
-            {
-                "models": [
-                    {
-                        "endpoint": "local",
-                        "endpoint_url": endpoint,
-                        "enabled": True,
-                    }
-                    for endpoint in args.configured_local_endpoint
-                ]
-            }
-        )
-    args.output.write_text(
-        worker_proxy_config(args.subnet, args.host, routing_policies), encoding="utf-8"
+    install_worker_proxy_config(
+        args.output, worker_proxy_config(args.subnet, args.host, routing_policies)
     )
 
 

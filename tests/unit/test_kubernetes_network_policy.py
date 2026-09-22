@@ -18,6 +18,7 @@ import pytest
 
 from crucible.adapters.execution import k8sspec
 from crucible.adapters.execution.k8sspec import SpecError
+from crucible.adapters.execution.kubernetes import KubernetesConfig
 from crucible.ports.execution import CleanupPolicy, ProviderError
 from tests.unit.kubernetes_fixtures import build, spec
 
@@ -198,7 +199,14 @@ async def test_a_hostname_local_route_resolves_to_exact_addresses_and_port() -> 
     def resolver(host: str) -> list[str]:
         return ["10.10.0.42/32"] if host == "llm.apps.int.sentania.net" else ["151.101.0.223/32"]
 
-    api, _registry, provider = build(resolver=resolver)
+    api, _registry, provider = build(
+        resolver=resolver,
+        config=KubernetesConfig(
+            poll_interval_seconds=0,
+            launch_timeout_seconds=5,
+            local_endpoint_cidrs=("10.10.0.0/24",),
+        ),
+    )
     launch = spec(endpoint="local", endpoint_url="https://llm.apps.int.sentania.net:8443/v1")
     workspace = await provider.prepare(launch)
     handle = await provider.launch(workspace, launch)
@@ -220,7 +228,32 @@ async def test_a_direct_private_local_address_is_refused() -> None:
     _api, _registry, provider = build()
     launch = spec(endpoint="local", endpoint_url="http://10.10.0.42:8000/v1")
     workspace = await provider.prepare(launch)
-    with pytest.raises((ProviderError, SpecError), match="directly names an address"):
+    with pytest.raises((ProviderError, SpecError), match="names or resolves to an address"):
+        await provider.launch(workspace, launch)
+
+
+@pytest.mark.parametrize(
+    ("host", "address"),
+    [
+        ("kubernetes.default.svc", "10.96.0.1/32"),
+        ("service.other-namespace.svc", "10.244.3.7/32"),
+    ],
+)
+async def test_a_named_local_route_into_cluster_ranges_is_refused(host: str, address: str) -> None:
+    def resolver(candidate: str) -> list[str]:
+        return [address] if candidate == host else ["151.101.0.223/32"]
+
+    _api, _registry, provider = build(
+        resolver=resolver,
+        config=KubernetesConfig(
+            poll_interval_seconds=0,
+            launch_timeout_seconds=5,
+            local_endpoint_cidrs=("172.16.6.20/32",),
+        ),
+    )
+    launch = spec(endpoint="local", endpoint_url=f"https://{host}:443/v1")
+    workspace = await provider.prepare(launch)
+    with pytest.raises(ProviderError, match="resolves to an address"):
         await provider.launch(workspace, launch)
 
 

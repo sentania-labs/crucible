@@ -232,11 +232,12 @@ updated with the result.
 `make proxy-config` accepts routing policy JSON through
 `ROUTING_POLICY_FILES`. Generation reads only entries whose `enabled` value is
 true and whose `endpoint` is `local`; a configured but disabled local URL is not
-authorized. Each enabled plain-HTTP URL becomes an exact destination ACL and an
-exact port ACL. The port is added to `Safe_ports`, never `SSL_ports`, and the allow
-line follows both unsafe-port denies and precedes the final deny. After an operator
-uploads or selects a different routing policy, the proxy configuration is regenerated
-from that policy and the proxy is reloaded before an attempt can use the route.
+authorized. Each enabled HTTP or HTTPS URL becomes an exact destination ACL and an
+exact port ACL. The port is added to `Safe_ports`; an HTTPS port is also added to
+`SSL_ports`. The allow line follows both unsafe-port denies and precedes the final deny.
+After an operator uploads or selects a different routing policy, the proxy configuration
+is atomically regenerated from that policy and the proxy is reloaded before an attempt
+can use the route.
 
 From S6, as each list stood after an authenticated task completed through
 the filter (so none of them is provisional any more): Claude Code

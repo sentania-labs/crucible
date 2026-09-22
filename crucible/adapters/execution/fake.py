@@ -339,6 +339,9 @@ class FakeProvider:
             max_concurrency=16,
         )
 
+    def credential_available(self, harness: str) -> bool:
+        return False
+
     async def prepare(self, spec: LaunchSpec) -> Workspace:
         behavior, _ = self._behavior_for(spec)
         if behavior == "prepare-fails":

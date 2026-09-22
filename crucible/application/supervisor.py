@@ -1038,7 +1038,12 @@ class Supervisor:
                 repo_mount=REPO_MOUNT,
                 credential_mounted=(
                     adapter.credential_spec() is not None
-                    and selected_harness in self._credential_sources
+                    and (
+                        selected_harness in self._credential_sources
+                        or self._providers[execution.provider].credential_available(
+                            selected_harness
+                        )
+                    )
                 ),
                 endpoint=endpoint,
                 endpoint_url=endpoint_url,

@@ -191,9 +191,11 @@ names themselves are recorded in the object's `crucible.io/egress-hosts`
 annotation. A name that does not resolve refuses the launch rather than being
 dropped or widened. For a configured local endpoint, the hostname is the trust
 anchor: the provider resolves it and permits only the resulting addresses on the
-configured port, including a private gateway address. A URL that directly names the
-Kubernetes API ClusterIP, a namespace address, or another denied CIDR is refused.
-General allowlist hostnames that resolve into a denied range remain refused. IPv6 never
+configured port. A private result must also be inside the operator's explicit
+`kubernetes.local_endpoint_cidrs` declaration. A URL that directly names a denied
+address, or a name resolving to the Kubernetes API ClusterIP, another namespace, or
+any denied range outside that declaration, is refused. General allowlist hostnames that
+resolve into a denied range remain refused. IPv6 never
 appears in a rule and is therefore denied entirely.
 
 Two destinations are denied explicitly, because a naive policy lets them

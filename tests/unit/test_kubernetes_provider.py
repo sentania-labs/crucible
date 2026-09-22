@@ -459,7 +459,15 @@ async def test_hermes_uses_no_secret_when_its_optional_credential_is_unconfigure
     def resolver(host: str) -> list[str]:
         return ["10.10.0.42/32"] if host == "llm.apps.int.sentania.net" else ["151.101.0.223/32"]
 
-    api, registry, provider = build(harness="hermes", resolver=resolver)
+    api, registry, provider = build(
+        harness="hermes",
+        resolver=resolver,
+        config=KubernetesConfig(
+            poll_interval_seconds=0,
+            launch_timeout_seconds=5,
+            local_endpoint_cidrs=("10.10.0.0/24",),
+        ),
+    )
     image = "crucible-worker:hermes-fake-succeed-1"
     registry.register(image, harness="hermes", version="0.19.0")
     launch = spec(
@@ -472,6 +480,14 @@ async def test_hermes_uses_no_secret_when_its_optional_credential_is_unconfigure
     workspace = await provider.prepare(launch)
     await provider.launch(workspace, launch)
     assert not api.secret_exists("cred-01attempt0000000000000000a")
+
+
+def test_kubernetes_reports_a_configured_hermes_secret_as_available() -> None:
+    _api, _registry, provider = build(
+        harness="hermes",
+        config=KubernetesConfig(credential_secrets={"hermes": "crucible-harness-hermes"}),
+    )
+    assert provider.credential_available("hermes")
 
 
 async def test_a_rotated_auth_file_is_written_back_and_the_copy_removed() -> None:

@@ -25,6 +25,8 @@ depends_on = None
 
 EVENT_KINDS = ("credential_set", "local_endpoint_updated")
 EVENT_ARCHIVE = "events_c10_archive"
+ROUTING_MARKER = "0017_lab_local"
+POLICY_MARKER = "Authenticated Hermes lab-local route seeded by 0017_lab_local."
 
 
 def _event_kinds() -> list[str]:
@@ -39,10 +41,7 @@ def _replace_event_kinds(kinds: list[str]) -> None:
 
 def _seed_local_route(connection: sa.engine.Connection) -> None:
     source_version = connection.execute(
-        sa.text(
-            "SELECT max(version) FROM routing_policies "
-            "WHERE name='default-routing' AND version IN (4, 5)"
-        )
+        sa.text("SELECT max(version) FROM routing_policies WHERE name='default-routing'")
     ).scalar_one()
     routing = copy.deepcopy(
         connection.execute(
@@ -60,10 +59,13 @@ def _seed_local_route(connection: sa.engine.Connection) -> None:
     )
     if endpoint_url:
         validate_endpoint("local", endpoint_url)
-        disabled_reason = "operator enablement is required after the key is validated"
+        disabled_reason = (
+            "operator enablement is required after the key is validated (0017_lab_local)"
+        )
     else:
-        disabled_reason = "the local endpoint environment seed is not configured"
-    routing["version"] = 6
+        disabled_reason = "the local endpoint environment seed is not configured (0017_lab_local)"
+    routing_version = int(source_version) + 1
+    routing["version"] = routing_version
     routing["models"] = [model for model in routing["models"] if model.get("harness") != "hermes"]
     routing["models"].append(
         {
@@ -92,16 +94,13 @@ def _seed_local_route(connection: sa.engine.Connection) -> None:
     connection.execute(
         sa.text(
             "INSERT INTO routing_policies(name, version, document, created_at) "
-            "VALUES ('default-routing', 6, CAST(:document AS jsonb), now()) "
-            "ON CONFLICT DO NOTHING"
+            "VALUES ('default-routing', :version, CAST(:document AS jsonb), now())"
         ),
-        {"document": json.dumps(routing)},
+        {"version": routing_version, "document": json.dumps(routing)},
     )
 
     policy_source = connection.execute(
-        sa.text(
-            "SELECT max(version) FROM policies WHERE name='default-software' AND version IN (4, 5)"
-        )
+        sa.text("SELECT max(version) FROM policies WHERE name='default-software'")
     ).scalar_one()
     policy = copy.deepcopy(
         connection.execute(
@@ -111,19 +110,16 @@ def _seed_local_route(connection: sa.engine.Connection) -> None:
             {"version": policy_source},
         ).scalar_one()
     )
-    policy["version"] = 6
-    policy["description"] = (
-        "The default software delivery policy, version 6: authenticated Hermes on the "
-        "disabled lab-local coder route."
-    )
-    policy["routing"] = {"policy": {"name": "default-routing", "version": 6}}
+    policy_version = int(policy_source) + 1
+    policy["version"] = policy_version
+    policy["description"] = POLICY_MARKER
+    policy["routing"] = {"policy": {"name": "default-routing", "version": routing_version}}
     connection.execute(
         sa.text(
             "INSERT INTO policies(name, version, document, created_at) "
-            "VALUES ('default-software', 6, CAST(:document AS jsonb), now()) "
-            "ON CONFLICT DO NOTHING"
+            "VALUES ('default-software', :version, CAST(:document AS jsonb), now())"
         ),
-        {"document": json.dumps(policy)},
+        {"version": policy_version, "document": json.dumps(policy)},
     )
 
 
@@ -153,5 +149,12 @@ def downgrade() -> None:
     op.execute("ALTER TABLE events ENABLE TRIGGER trg_events_append_only")
     op.execute("ALTER TABLE events ENABLE TRIGGER trg_events_fenced")
     _replace_event_kinds(_previous_event_kinds())
-    op.execute("DELETE FROM policies WHERE name='default-software' AND version=6")
-    op.execute("DELETE FROM routing_policies WHERE name='default-routing' AND version=6")
+    op.execute(
+        "DELETE FROM policies WHERE name='default-software' "
+        f"AND document ->> 'description' = '{POLICY_MARKER}'"
+    )
+    op.execute(
+        "DELETE FROM routing_policies WHERE name='default-routing' "
+        "AND EXISTS (SELECT 1 FROM jsonb_array_elements(document -> 'models') AS model "
+        f"WHERE model ->> 'disabled_reason' LIKE '%{ROUTING_MARKER}%')"
+    )
