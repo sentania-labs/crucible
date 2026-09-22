@@ -145,14 +145,14 @@ $ make lint
 ruff format --check, ruff check, mypy, lint-imports: 3 contracts kept, 0 broken
 
 $ make test
-tests/unit          753 passed in 9.18s
-tests/integration   349 passed in 502.87s (0:08:22)
+tests/unit          760 passed in 9.86s
+tests/integration   349 passed in 328.65s (0:05:28)
 
 $ make scan
 gitleaks: no leaks found, tree (4.05 MB) and history (8 commits)
 
 $ make e2e DOCKER='<the rootless daemon wrapper>'
-17 passed, 12 deselected in 108.22s (0:01:48)
+17 passed, 12 deselected in 89.76s (0:01:29)
 ```
 
 The Docker tier ran on the rootless daemon of the `crucible` service user
@@ -221,6 +221,48 @@ Non-blockers carried forward rather than fixed, with the reasoning:
   volume mount may fail at container creation, because a Secret volume is a read-only
   tmpfs. All three subscription harnesses are `rw-narrow` today, so the path is latent;
   the kind tier should cover it before any harness declares read-only with templates.
+
+## The repository's automatic reviewer
+
+The external round on the PR returned six findings, five P1 and one P2. All six were
+real and all six are fixed:
+
+1. **An absent optional auth file broke the Pod.** `_seed_credential` omits an optional
+   file the harness Secret does not carry, but the volume projected every declared file
+   with `optional: false`, and a Secret projection naming a key that is not there is a
+   Pod the kubelet refuses to start. Claude Code declares `.claude.json` optional, so a
+   harness Secret with only `oauth-token` is an ordinary deployment. The projection is
+   now built from the keys the per-attempt Secret actually holds, read back rather than
+   assumed so a restart between `prepare` and `launch` still projects the truth.
+2. **A Pod whose init container failed reported `running` forever.** Kubernetes reports
+   the Pod `Failed` with only the init status terminated, `_terminated_state` found
+   nothing, and the fallback said running. The credential-seed init container makes this
+   reachable, and the attempt would have hung with nothing to classify, collect or clean
+   up. A `Failed` phase is now terminal, with the init container's own exit in the
+   detail.
+3. **An exec stream that ended early was accepted as success.** `exit_code` is None when
+   the API server never sent the error channel. For the output tar that let a partial
+   archive through `_extract`, which suppresses tar errors, so a report or a diff
+   quietly missing files would have produced a wrong gate result; for a credential read
+   it would have been recorded as "absent after the run". Both now require an explicit
+   zero, and the credential case records "read failed", which is not the same fact.
+4. **A cleaner Job that failed was reported as a successful removal.** `_remove_from_claim`
+   discarded the Job's exit, so a retained claim could keep its credential leaf while
+   `cleanup` said it had gone. It raises now, and the caller records `removed: False`.
+5. **Embedded kubeconfig certificates were not read.** kind writes
+   `certificate-authority-data` and friends inline; the parser read only the path forms,
+   so the developer and kind path could not connect at all. The inline material is
+   decoded to a private temporary file, which is what `ssl` needs. C8b depends on this.
+6. **An adopted Pending Job never timed out.** 26's Pending timeout is measured from a
+   launch time held in memory, so after a restart an adopted Pod that would never
+   schedule was reported running until the much longer Job deadline. The clock now comes
+   from the Job's own `creationTimestamp`, so a Pod already past the window is caught on
+   the first observation rather than being given it again.
+
+Each has a test. Findings 2 and 6 are worth noting together: both were cases where the
+provider's answer to "what is this worker doing" was "running" when the honest answer
+was "it is never going to run", which is the failure mode 16 is least able to recover
+from on its own.
 
 ## What C8b needs from here
 

@@ -14,7 +14,7 @@ import pytest
 
 from crucible.adapters.execution import k8sspec
 from crucible.adapters.execution import kubernetes as kubernetes_module
-from crucible.adapters.execution.k8sapi import KubernetesApiError
+from crucible.adapters.execution.k8sapi import ExecResult, KubernetesApiError
 from crucible.adapters.execution.kubernetes import (
     CollectionFailedError,
     KubernetesConfig,
@@ -601,3 +601,148 @@ async def test_a_truncated_collected_output_fails_the_attempt(monkeypatch: Any) 
     with pytest.raises(CollectionFailedError, match="truncated"):
         await provider.collect(handle, workspace, launch)
     assert api.object_names("secrets") == []
+
+
+# ----- what the repository's automatic reviewer found on the PR --------------
+
+
+async def test_an_absent_optional_auth_file_is_not_projected() -> None:
+    """A Secret projection naming a key the Secret does not carry is a Pod the kubelet
+    refuses to start. Claude Code declares `.claude.json` optional, so a harness Secret
+    with only the required file is an ordinary deployment, not a broken one."""
+    api, registry, provider = build(harness="claude_code")
+    image = "crucible-worker:claude-fake-succeed-2"
+    registry.register(image, harness="claude_code", version="2.1.273")
+    api.put_harness_secret("crucible-harness-claude_code", {"oauth-token": b"not-a-real-value"})
+    launch = spec(harness="claude_code", image=image)
+    workspace = await provider.prepare(launch)
+    await provider.launch(workspace, launch)
+    pod = next(
+        row["body"]["spec"]["template"]["spec"]
+        for row in api.created
+        if row["kind"] == "jobs" and str(row["name"]).startswith("worker-")
+    )
+    volume = next(v for v in pod["volumes"] if v["name"] == "cred-source")
+    assert [item["key"] for item in volume["secret"]["items"]] == ["oauth-token"]
+
+
+async def test_an_init_container_failure_is_terminal_not_running_forever() -> None:
+    """A Pod whose init container failed reports `Failed` with only the init status
+    terminated. Reporting `running` would hang the attempt with nothing to classify,
+    collect or clean up, and the credential-seed init container makes this reachable."""
+    api, _registry, provider, launch, workspace = await prepared()
+    api.script(launch.attempt_id, "hang")
+    handle = await provider.launch(workspace, launch)
+    pod = next(
+        obj for (kind, _), obj in api.objects.items() if kind == "pods" and "worker-" in obj.name
+    )
+    pod.body["status"] = {
+        "phase": "Failed",
+        "message": "init container failed",
+        "initContainerStatuses": [
+            {
+                "name": "credential-seed",
+                "state": {"terminated": {"exitCode": 1, "reason": "Error"}},
+            }
+        ],
+    }
+    observation = await provider.observe(handle)
+    assert observation.state is ObservationState.EXITED
+    assert observation.exit_code == 70
+    assert "credential-seed" in (observation.detail or "")
+
+
+async def test_a_failed_pod_with_no_terminated_container_is_still_terminal() -> None:
+    api, _registry, provider, launch, workspace = await prepared()
+    api.script(launch.attempt_id, "hang")
+    handle = await provider.launch(workspace, launch)
+    pod = next(
+        obj for (kind, _), obj in api.objects.items() if kind == "pods" and "worker-" in obj.name
+    )
+    pod.body["status"] = {"phase": "Failed", "reason": "CreateContainerConfigError"}
+    observation = await provider.observe(handle)
+    assert observation.state is ObservationState.EXITED and observation.exit_code == 70
+
+
+async def test_an_exec_stream_that_ended_early_fails_the_collection() -> None:
+    """`exit_code` is None when the API server never sent the error channel, which means
+    the stream ended before the command reported. Accepting it would let a partial tar
+    through and produce a report quietly missing files."""
+    api, _registry, provider, launch, workspace = await prepared()
+    handle = await provider.launch(workspace, launch)
+    await run_to_exit(provider, handle)
+    real = api.pod_exec
+
+    def truncated(name: str, command: Any, **kwargs: Any) -> Any:
+        result = real(name, command, **kwargs)
+        return ExecResult(result.stdout, b"", None)
+
+    api.pod_exec = truncated
+    with pytest.raises(CollectionFailedError, match="stream ended early"):
+        await provider.collect(handle, workspace, launch)
+    api.pod_exec = real
+
+
+async def test_an_exec_stream_that_ended_early_is_not_an_absent_credential() -> None:
+    """12: a read that failed is a recorded outcome, and it is not 'the file was gone'."""
+    api, provider, launch, workspace = await codex_attempt()
+    handle = await provider.launch(workspace, launch)
+    api.claims["ws-01attempt0000000000000000a"]["credential/auth.json"] = _auth(
+        "2026-09-21T00:00:00Z"
+    )
+    await run_to_exit(provider, handle)
+    real = api.pod_exec
+
+    def truncated(name: str, command: Any, **kwargs: Any) -> Any:
+        result = real(name, command, **kwargs)
+        if "tar cf -" in command[-1]:
+            return result
+        return ExecResult(result.stdout, b"", None)
+
+    api.pod_exec = truncated
+    outputs = await provider.collect(handle, workspace, launch)
+    api.pod_exec = real
+    sync = outputs.credential_sync
+    assert sync is not None
+    assert sync.files[0].present is False
+    assert "read failed" in sync.files[0].reason
+    # The source is untouched and the per-attempt Secret is still gone.
+    assert api.harness_secret("crucible-harness-codex")["auth.json"] == _auth(
+        "2026-09-20T00:00:00Z"
+    )
+    assert not api.secret_exists("cred-01attempt0000000000000000a")
+
+
+async def test_a_cleaner_job_that_failed_is_not_a_successful_removal() -> None:
+    """12: a credential leaf still on the claim has not been removed, whatever the
+    caller would otherwise have recorded."""
+    api, provider, launch, workspace = await codex_attempt()
+    handle = await provider.launch(workspace, launch)
+    api.claims["ws-01attempt0000000000000000a"]["credential/auth.json"] = _auth(
+        "2026-09-21T00:00:00Z"
+    )
+    await run_to_exit(provider, handle)
+    api.refuse_roles.add("cleaner")
+    outputs = await provider.collect(handle, workspace, launch)
+    api.refuse_roles.discard("cleaner")
+    assert outputs.credential_sync is not None
+    assert outputs.credential_sync.removed is False
+
+
+async def test_an_adopted_pending_job_still_times_out() -> None:
+    """26's Pending timeout has to survive a supervisor restart. The clock comes from
+    the Job's creation timestamp, so a Pod already past the window is caught on the
+    first observation rather than being given it again."""
+    api, _registry, provider, launch, workspace = await prepared()
+    assert (await provider.ensure_ready()).passed
+    api.pending_forever.add(launch.attempt_id)
+    handle = await provider.launch(workspace, launch)
+    # A restarted supervisor: no memory of the launch, and the Job was created an hour
+    # ago as far as the API server is concerned.
+    provider._launched.clear()
+    api.objects[("jobs", handle.ref)].body["metadata"]["creationTimestamp"] = "2020-01-01T00:00:00Z"
+    adopted = await provider.reconcile()
+    assert len(adopted) == 1
+    observation = await provider.observe(adopted[0])
+    assert observation.state is ObservationState.EXITED and observation.exit_code == 70
+    assert "Unschedulable" in (observation.detail or "")

@@ -24,6 +24,7 @@ import json
 import os
 import secrets
 import ssl
+import tempfile
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -140,18 +141,48 @@ def kubeconfig_access(path: str, context: str | None = None) -> ClusterAccess:
             f"kubeconfig user for context {wanted!r} needs a credential plugin; "
             "Crucible authenticates with a token or a client certificate only",
         )
+    # A kubeconfig holds its certificates either as a path or inline as base64 under the
+    # `-data` twin. kind writes the inline form, so a parser that reads only paths gets
+    # the system CA and no client certificate, and cannot connect at all.
     return ClusterAccess(
         server=server,
         token=str(user["token"]) if user.get("token") else None,
-        ca_cert_path=str(cluster["certificate-authority"])
-        if cluster.get("certificate-authority")
-        else None,
-        client_cert_path=str(user["client-certificate"])
-        if user.get("client-certificate")
-        else None,
-        client_key_path=str(user["client-key"]) if user.get("client-key") else None,
+        ca_cert_path=_material(cluster, "certificate-authority", "crucible-ca"),
+        client_cert_path=_material(user, "client-certificate", "crucible-cert"),
+        client_key_path=_material(user, "client-key", "crucible-key"),
         verify=not bool(cluster.get("insecure-skip-tls-verify")),
     )
+
+
+def _material(entry: Mapping[str, Any], key: str, prefix: str) -> str | None:
+    """A certificate as a path, taking the inline `<key>-data` form when that is what
+    the kubeconfig carries.
+
+    Inline material is written to a private temporary file, because `ssl` loads a chain
+    from a path and nothing else. The file is mode 0600 and lives for the process."""
+    path = entry.get(key)
+    if path:
+        return str(path)
+    raw = entry.get(f"{key}-data")
+    if not raw:
+        return None
+    try:
+        decoded = base64.b64decode(str(raw))
+    except ValueError as exc:
+        raise KubernetesApiError(0, f"kubeconfig {key}-data is not base64") from exc
+    handle, name = tempfile.mkstemp(prefix=f"{prefix}-", suffix=".pem")
+    try:
+        os.fchmod(handle, 0o600)
+        os.write(handle, decoded)
+    finally:
+        os.close(handle)
+    _MATERIAL_FILES.append(name)
+    return name
+
+
+# What `_material` wrote, so a caller can remove it and so the files are not collected
+# while a connection still needs them.
+_MATERIAL_FILES: list[str] = []
 
 
 def _named(entries: Any, name: str, kind: str) -> dict[str, Any]:

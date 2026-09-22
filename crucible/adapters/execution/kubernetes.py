@@ -37,6 +37,7 @@ import tempfile
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Literal
@@ -72,6 +73,7 @@ from crucible.application.harnesses import (
 from crucible.contracts.completion_claim import CompletionClaimV1
 from crucible.domain.exit_class import ExitClass
 from crucible.domain.ids import new_id
+from crucible.domain.time import parse_rfc3339
 from crucible.ports.execution import (
     IDENTITY_MOUNT,
     OUTPUT_MOUNT,
@@ -621,6 +623,7 @@ class KubernetesProvider:
         plan = self._egress_plan(spec, k8sspec.ROLE_WORKER)
         policy_name: str | None = None
         identity_paths = await self._identity_paths(spec.attempt_id)
+        credential_keys = await self._credential_keys(spec.attempt_id) if copy else []
         job_name = k8sspec.object_name("worker", spec.attempt_id)
         try:
             policy_name = await self._apply_policy(spec, k8sspec.ROLE_WORKER, plan)
@@ -635,6 +638,7 @@ class KubernetesProvider:
                     limits=limits,
                     copy=copy,
                     identity_paths=identity_paths,
+                    credential_keys=credential_keys,
                 ),
                 active_deadline_seconds=max(60, spec.timeout_seconds + limits.grace_seconds),
             )
@@ -705,6 +709,29 @@ class KubernetesProvider:
         if phase == "Failed" and str(status.get("reason", "")) in _LOST_REASONS:
             # 26: an evicted Pod, or one whose node is gone, is `lost`, not an exit.
             return Observation(ObservationState.LOST, detail=f"the Pod was {status.get('reason')}")
+        if phase == "Failed":
+            # The Pod failed without the worker's own container producing an exit. The
+            # init container that seeds a `rw-narrow` credential copy is the way this
+            # happens in practice: it fails, the main container never starts, and only
+            # the init status carries a terminated state. Reporting `running` here would
+            # hang the attempt forever with nothing to classify, collect or clean up.
+            init = _terminated_init(status)
+            detail = str(status.get("message") or status.get("reason") or "")
+            if init is not None:
+                return Observation(
+                    ObservationState.EXITED,
+                    exit_code=70,
+                    detail=(
+                        f"the {init.get('containerName', 'init')} container failed before "
+                        f"the worker started (exit {init.get('exitCode')}, "
+                        f"{init.get('reason', '')}) {detail}".strip()
+                    ),
+                )
+            return Observation(
+                ObservationState.EXITED,
+                exit_code=70,
+                detail=f"the Pod failed before the worker started: {detail or phase}",
+            )
         if phase in _PENDING_PHASES and self._pending_too_long(launched):
             return self._pending_failure(pod)
         return Observation(ObservationState.RUNNING, detail=phase or "Pending")
@@ -1056,6 +1083,20 @@ class KubernetesProvider:
             phase = str((pod.get("status") or {}).get("phase", ""))
             if phase not in ("Pending", "Running"):
                 continue
+            if attempt_id not in self._launched:
+                # A restarted supervisor has no memory of the launch, so the Pending
+                # timeout of 26 would never fire for an adopted Pod that will never
+                # schedule. The clock comes from the Job's own creation timestamp, not
+                # from now, so a Pod that has already been Pending too long is caught on
+                # the first observation rather than being given the window again.
+                created = _age_seconds(str(metadata.get("creationTimestamp", "")))
+                self._launched[attempt_id] = _Launched(
+                    job_name=name,
+                    spec=_ADOPTED_SPEC,
+                    image_digest="",
+                    limits=k8sspec.limits_from_policy({}),
+                    launched_at=time.monotonic() - created,
+                )
             handles.append(Handle(provider=self.name, ref=name, attempt_id=attempt_id, name=name))
         return handles
 
@@ -1193,6 +1234,7 @@ class KubernetesProvider:
         limits: Limits,
         copy: _CredentialCopy | None,
         identity_paths: Mapping[str, str],
+        credential_keys: Sequence[str],
     ) -> dict[str, Any]:
         command, launch_env = self._command(spec)
         env = {
@@ -1225,7 +1267,7 @@ class KubernetesProvider:
         init_containers: list[dict[str, Any]] = []
         if copy is not None:
             credential_mounts, credential_volumes, init_containers = self._credential_mounts(
-                spec, copy, resolved, limits
+                spec, copy, resolved, limits, credential_keys
             )
             mounts.extend(credential_mounts)
             volumes.extend(credential_volumes)
@@ -1247,7 +1289,12 @@ class KubernetesProvider:
         )
 
     def _credential_mounts(
-        self, spec: LaunchSpec, copy: _CredentialCopy, image: str, limits: Limits
+        self,
+        spec: LaunchSpec,
+        copy: _CredentialCopy,
+        image: str,
+        limits: Limits,
+        present: Sequence[str],
     ) -> tuple[list[Mount], list[dict[str, Any]], list[dict[str, Any]]]:
         """The per-attempt credential, mounted per the adapter's declaration (12, 26).
 
@@ -1266,9 +1313,14 @@ class KubernetesProvider:
         # A Secret key may not hold a path separator and an auth file's name may (AGY's
         # token sits under `antigravity-cli/`), so the volume projects each key back to
         # the relative path the adapter declared.
+        # Only the keys the Secret actually carries. An adapter may declare an optional
+        # auth file (Claude Code's `.claude.json`) that the harness Secret does not
+        # have, and a projection naming a key that is not there is a Pod the kubelet
+        # refuses to start: the worker would sit Pending with nothing to classify.
         items = [
             {"key": _secret_key(auth.name), "path": auth.name, "mode": 0o400}
             for auth in copy.spec.auth_files
+            if _secret_key(auth.name) in set(present)
         ]
         source_volume = {
             "name": "cred-source" if copy.writable else "cred",
@@ -1503,6 +1555,17 @@ class KubernetesProvider:
             mode = MountMode.RW_NARROW
         return _CredentialCopy(spec=credential, source_secret=secret_name, mode=mode)
 
+    async def _credential_keys(self, attempt_id: str) -> list[str]:
+        """Which auth files the per-attempt Secret actually holds, read back rather than
+        assumed, so a restart between `prepare` and `launch` still projects the truth."""
+        try:
+            body = await self._call(
+                self.client.get, "secrets", k8sspec.object_name("cred", attempt_id)
+            )
+        except KubernetesApiError:
+            return []
+        return [str(key) for key in (body.get("data") or {})]
+
     async def _seed_credential(self, spec: LaunchSpec, copy: _CredentialCopy) -> None:
         """26: per attempt, copy the harness Secret into `cred-<attempt>`.
 
@@ -1591,9 +1654,15 @@ class KubernetesProvider:
     ) -> CredentialFileSync:
         if data is None:
             return CredentialFileSync(auth.name, False, False, False, False, "absent after the run")
-        if data is _TRUNCATED:  # pragma: no cover - sentinel identity, see _read_files
+        if data is _TRUNCATED:
             return CredentialFileSync(
                 auth.name, True, True, False, False, "changed; larger than the read limit"
+            )
+        if data is _UNREADABLE:
+            # 12: the sync is a recorded outcome, never an exception past the removal,
+            # and "the read failed" is not "the file was absent".
+            return CredentialFileSync(
+                auth.name, False, False, False, False, "read failed: the exec stream ended early"
             )
         seeded = copy.seeded.get(auth.name)
         changed = seeded is None or hashlib.sha256(data).hexdigest() != seeded
@@ -1832,6 +1901,11 @@ class KubernetesProvider:
                     container=k8sspec.CONTAINER_NAME,
                     limit=limit * 2,
                 )
+                if result.exit_code != 0:
+                    # The stream ended before the command reported a status. "Could not
+                    # read" is not "the file was absent", and 12 records the difference.
+                    out[path] = _UNREADABLE
+                    continue
                 status, _, payload = result.stdout.partition(b"\n")
                 token = status.decode("ascii", "replace").strip()
                 if token == "ok":
@@ -1854,10 +1928,14 @@ class KubernetesProvider:
                 container=k8sspec.CONTAINER_NAME,
                 limit=OUTPUT_READ_LIMIT,
             )
-        if result.exit_code not in (0, None) or result.stderr:
+        if result.exit_code != 0 or result.stderr:
+            # A `None` exit is the API server never sending the error channel, which
+            # means the stream ended early. Accepting it would let a partial tar through
+            # `_extract`, which suppresses tar errors, and a report or a diff quietly
+            # missing files is a wrong gate result rather than a visible failure.
             raise CollectionFailedError(
                 "the reader Pod could not hand the collected output back "
-                f"(exit {result.exit_code}): "
+                f"(exit {result.exit_code}, None means the stream ended early): "
                 f"{result.stderr.decode('utf-8', 'replace')[:400]}"
             )
         if len(result.stdout) >= OUTPUT_READ_LIMIT:
@@ -1877,7 +1955,7 @@ class KubernetesProvider:
         What a Pod made, a Pod removes: the claim belongs to the worker's uid and the
         Crucible process never mounts it (26)."""
         targets = " ".join(f'"{WORK_MOUNT}/{leaf}"' for leaf in leaves)
-        await self._run_role_job(
+        code = await self._run_role_job(
             spec,
             role=k8sspec.ROLE_CLEANER,
             image=(
@@ -1891,6 +1969,14 @@ class KubernetesProvider:
             timeout=120,
             plan=EgressPlan(),
         )
+        if code != 0:
+            # 12: a credential leaf that is still on the claim has not been removed,
+            # whatever the caller would otherwise have recorded. The caller turns this
+            # into `removed: False` and a log line rather than a silent success.
+            raise ProviderError(
+                f"the cleaner Job for {spec.attempt_id} exited {code}: "
+                f"{self.last_error.get(k8sspec.ROLE_CLEANER, '')}"
+            )
 
     # ----- waiting -------------------------------------------------------
 
@@ -2049,6 +2135,16 @@ class KubernetesProvider:
 # ----- pure helpers -------------------------------------------------------
 
 
+def _age_seconds(timestamp: str) -> float:
+    """How long ago an object was created, from its RFC 3339 `creationTimestamp`."""
+    if not timestamp:
+        return 0.0
+    try:
+        return max(0.0, (datetime.now(UTC) - parse_rfc3339(timestamp)).total_seconds())
+    except ValueError:
+        return 0.0
+
+
 def _resolve_host(host: str) -> list[str]:
     """Every IPv4 address a name resolves to, as /32 CIDRs. IPv6 is never emitted: no
     rule of this provider's policies carries a v6 block, so a v6 destination is denied
@@ -2063,6 +2159,10 @@ def _resolve_host(host: str) -> list[str]:
 # Returned by `_read_files` for a path that was larger than the read limit. A distinct
 # object so "the file was too big" is never confused with "the file held these bytes".
 _TRUNCATED = b"\x00__crucible_truncated__"
+# Returned for a path the reader Pod could not be asked about at all, because the exec
+# stream ended before the command reported its status. Distinct from "absent", which is
+# an answer, and from "truncated", which is a file that was there.
+_UNREADABLE = b"\x00__crucible_unreadable__"
 
 
 def _secret_key(name: str) -> str:
@@ -2128,6 +2228,17 @@ def _render_identity(
         return data, paths, identity_sha
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
+
+
+def _terminated_init(status: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """The first init container that terminated non-zero, with its name attached."""
+    for entry in status.get("initContainerStatuses") or []:
+        if not isinstance(entry, dict):
+            continue
+        terminated = (entry.get("state") or {}).get("terminated")
+        if isinstance(terminated, dict) and int(terminated.get("exitCode", 0)) != 0:
+            return {**terminated, "containerName": entry.get("name")}
+    return None
 
 
 def _terminated_state(status: Mapping[str, Any]) -> Mapping[str, Any] | None:
@@ -2284,6 +2395,8 @@ def _seed_script(spec: CredentialSpec) -> str:
     an auth file can sit in a subdirectory, and nothing but the adapter's declared files
     is ever copied."""
     names = " ".join("'" + a.name.replace("'", "'\"'\"'") + "'" for a in spec.auth_files)
+    # An optional file the Secret did not carry is simply not projected, and the `-f`
+    # test below skips it; nothing but the adapter's declared files is ever copied.
     return f"""set -eu
 umask 077
 src={k8sspec.CREDENTIAL_SOURCE_MOUNT}

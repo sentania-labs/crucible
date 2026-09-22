@@ -176,6 +176,9 @@ class FakeKubernetesApi:
     default_behavior: tuple[str, int] | None = None
     # A test flips this to make the next create fail, or to make a Pod unschedulable.
     refuse_create: set[str] = field(default_factory=set)
+    # Roles whose Job creation fails, so a test can break one role without breaking the
+    # rest of the attempt.
+    refuse_roles: set[str] = field(default_factory=set)
     pending_forever: set[str] = field(default_factory=set)
     created: list[dict[str, Any]] = field(default_factory=list)
     deleted: list[tuple[str, str]] = field(default_factory=list)
@@ -241,6 +244,9 @@ class FakeKubernetesApi:
         name = str(metadata.get("name", ""))
         if kind in self.refuse_create:
             raise KubernetesApiError(500, f"the fake refuses to create a {kind}")
+        role = str((metadata.get("labels") or {}).get(LABEL_ROLE, ""))
+        if role and role in self.refuse_roles:
+            raise KubernetesApiError(500, f"the fake refuses to create the {role} {kind}")
         if (kind, name) in self.objects:
             raise KubernetesApiError(409, f"{kind}/{name} already exists")
         stored: dict[str, Any] = json.loads(json.dumps(dict(body)))
