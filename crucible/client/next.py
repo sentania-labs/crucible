@@ -468,7 +468,7 @@ def image_actions(items: Iterable[Any], prefix: Sequence[str]) -> list[dict[str,
         for item in items
         if isinstance(item, dict)
         and item.get("digest")
-        and item.get("harness")
+        and item.get("harnesses")
         and item.get("supported") is True
         and item.get("promotion_state") == "candidate"
     ]

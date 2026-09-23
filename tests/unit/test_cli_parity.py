@@ -51,7 +51,7 @@ def test_every_old_command_maps_to_a_new_one_with_the_same_arguments(
 
 
 def test_the_trees_were_captured_from_the_sources_the_contract_names() -> None:
-    assert TREES["crucible-admin"]["ref"] == "6198913"
+    assert TREES["crucible-admin"]["ref"] == "c7cd915"
     assert len(TREES["crucible-admin"]["tree"]) == 49
     assert len(TREES["foundry-crucible"]["tree"]) == 18
 
