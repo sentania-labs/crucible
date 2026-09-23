@@ -146,7 +146,8 @@ def downgrade() -> None:
         connection.execute(
             sa.text(
                 "UPDATE policies p SET retired_at = now() "
-                "WHERE p.name='default-software' AND p.version=:version AND EXISTS (SELECT 1 FROM tasks t "
+                "WHERE p.name='default-software' AND p.version=:version "
+                "AND EXISTS (SELECT 1 FROM tasks t "
                 "WHERE t.policy_name=p.name AND t.policy_version=p.version)"
             ),
             {"version": row.version},
