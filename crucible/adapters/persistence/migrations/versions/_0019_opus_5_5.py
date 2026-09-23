@@ -121,23 +121,50 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    # Only the version this migration wrote: the lowest one carrying the marker. A copy
-    # the operator uploaded later keeps the description verbatim and is left alone.
+    # Only the version this migration wrote: the lowest one carrying the marker that is
+    # not retired (an earlier downgrade may have retired one). A copy the operator
+    # uploaded later keeps the description verbatim and is left alone.
+    # A version a task was submitted against is retired, not deleted, as 0011 keeps
+    # the rows tasks reference: the task still resolves its policy and routing, and the
+    # version before it is back in force. The routing version is kept, unchanged, while
+    # any policy, retired or not, still names it.
     connection = op.get_bind()
     rows = connection.execute(
         sa.text(
             "SELECT version, document FROM policies WHERE name='default-software' "
-            "AND document ->> 'description' LIKE :marker ORDER BY version LIMIT 1"
+            "AND retired_at IS NULL AND document ->> 'description' LIKE :marker "
+            "ORDER BY version LIMIT 1"
         ),
         {"marker": f"%{MARKER}"},
     ).all()
     for row in rows:
         reference = (row.document.get("routing") or {}).get("policy") or {}
+        routing = {
+            "name": str(reference.get("name", "")),
+            "version": int(reference.get("version", 0)),
+        }
         connection.execute(
-            sa.text("DELETE FROM routing_policies WHERE name=:name AND version=:version"),
-            {"name": str(reference.get("name", "")), "version": int(reference.get("version", 0))},
+            sa.text(
+                "UPDATE policies p SET retired_at = now() "
+                "WHERE p.name='default-software' AND p.version=:version AND EXISTS (SELECT 1 FROM tasks t "
+                "WHERE t.policy_name=p.name AND t.policy_version=p.version)"
+            ),
+            {"version": row.version},
         )
         connection.execute(
-            sa.text("DELETE FROM policies WHERE name='default-software' AND version=:version"),
+            sa.text(
+                "DELETE FROM policies p WHERE p.name='default-software' AND p.version=:version "
+                "AND NOT EXISTS (SELECT 1 FROM tasks t "
+                "WHERE t.policy_name=p.name AND t.policy_version=p.version)"
+            ),
             {"version": row.version},
+        )
+        connection.execute(
+            sa.text(
+                "DELETE FROM routing_policies r WHERE r.name=:name AND r.version=:version "
+                "AND NOT EXISTS (SELECT 1 FROM policies p "
+                "WHERE p.document->'routing'->'policy'->>'name'=r.name "
+                "AND (p.document->'routing'->'policy'->>'version')::int=r.version)"
+            ),
+            routing,
         )

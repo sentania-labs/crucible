@@ -4,12 +4,15 @@ import json
 from typing import Any
 
 import pytest
+from fastapi.testclient import TestClient
 from sqlalchemy import Connection, inspect, text
 
 from crucible.adapters.persistence import migrate
-from crucible.adapters.persistence.unit_of_work import make_engine
+from crucible.adapters.persistence.unit_of_work import SqlUnitOfWorkFactory, make_engine
+from crucible.application.routing import load_routing
 from crucible.contracts.policy import RoutingPolicyV1
 from tests.fixtures import contract_document
+from tests.integration.conftest import submit_and_start
 
 pytestmark = pytest.mark.integration
 
@@ -563,6 +566,64 @@ def test_0019_adds_opus_5_5_disabled_beside_the_frontier_entry(database_url: str
         assert _active(conn)[0] == before_policy and _active(conn)[2] == before_routing
     migrate.upgrade(database_url)
     engine.dispose()
+
+
+def test_0019_downgrade_keeps_the_version_a_task_was_submitted_against(
+    client: TestClient, migrated: str
+) -> None:
+    """A rollback after a submission must not strand the task: the policy version 0019
+    wrote is retired, not deleted, and its routing version stays, so the task still
+    resolves both, while the version before 0019 is back in force. A second round
+    removes only the version the re-upgrade wrote."""
+    engine = make_engine(migrated)
+    with engine.connect() as conn:
+        version, _, routing_version, _ = _active(conn)
+    task_id = submit_and_start(
+        client,
+        "crucible-worker:fake-succeed",
+        "MIG-0019",
+        start=False,
+        policy={"name": "default-software", "version": version},
+    )
+    try:
+        migrate.downgrade(migrated, "0018_combined_worker_image")
+        with engine.connect() as conn:
+            assert _active(conn)[0] < version
+            retired = conn.execute(
+                text(
+                    "SELECT retired_at FROM policies "
+                    "WHERE name='default-software' AND version=:version"
+                ),
+                {"version": version},
+            ).scalar_one()
+            assert retired is not None
+        with SqlUnitOfWorkFactory(engine)() as uow:
+            task = uow.tasks.get(task_id)
+            assert task is not None and task.policy_version == version
+            policy = uow.policies.get(task.policy_name, task.policy_version)
+            assert policy is not None
+            routing = load_routing(uow, policy.document)
+            assert routing is not None and routing.version == routing_version
+            assert routing.model("claude-opus-5-5") is not None
+        assert client.get(f"/v1/tasks/{task_id}").status_code == 200
+        migrate.upgrade(migrated)
+        with engine.connect() as conn:
+            again = _active(conn)[0]
+        assert again > version
+        migrate.downgrade(migrated, "0018_combined_worker_image")
+        with engine.connect() as conn:
+            assert _active(conn)[0] < version
+            versions = {
+                row.version: row.retired_at
+                for row in conn.execute(
+                    text("SELECT version, retired_at FROM policies WHERE name='default-software'")
+                )
+            }
+        assert again not in versions
+        assert versions[version] is not None
+    finally:
+        migrate.upgrade(migrated)
+        engine.dispose()
 
 
 def test_0018_keeps_a_promotion_across_down_and_up(database_url: str) -> None:
