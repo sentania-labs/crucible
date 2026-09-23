@@ -328,7 +328,9 @@ the status page.
    container runtime must make visible for the probe to confirm it; on a
    runtime that isolates the pod's cgroup from the container (the default on
    current containerd and runc), the probe reports the limit as unconfirmed
-   rather than guess, and lab-admin verifies it another way (95).
+   rather than guess, and lab-admin attests to it with
+   `kubernetes.pod_pid_limit_override` instead, once, after checking the
+   node's kubelet configuration directly (95).
 5. The cluster can pull the Crucible and worker images from the registry
    the release publishes to (24); a pull secret if the packages are private.
 6. Egress from `crucible-workers` to the model providers, the package

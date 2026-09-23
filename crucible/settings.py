@@ -148,6 +148,16 @@ class KubernetesSettings(BaseModel):
     # does about that. It is its own field on the provider and never an entry of
     # `image_repositories`, so the images listing does not take it for a repository.
     probe_image: str = ""
+    # An explicit, operator-declared pod-level PID limit (95), for a cluster whose
+    # container runtime hides the pod's own cgroup from inside the container (a private
+    # cgroup namespace, the default on current containerd and runc): the canary cannot
+    # read the kubelet's podPidsLimit there at all, confirmed or not, so lab-admin
+    # verifies it out of band (`kubectl debug` on a node, or the kubelet's own config)
+    # and states the number here. Never used to override a limit the canary positively
+    # read as absent; only fills a gap the canary could not see into. Unset by default,
+    # so a cluster the canary cannot read still refuses to launch until lab-admin
+    # attests to it.
+    pod_pid_limit_override: int | None = None
     # The harness credential Secret in the workers namespace, per harness (12, 26).
     credential_secrets: dict[str, str] = Field(default_factory=dict)
     extra_image_allowlist: list[str] = Field(default_factory=list)

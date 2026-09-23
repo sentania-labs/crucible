@@ -182,6 +182,50 @@ async def test_a_private_cgroup_namespace_reports_inconclusive_not_a_pass() -> N
         await provider.launch(workspace, launch)
 
 
+async def test_an_operator_declared_limit_covers_a_private_cgroup_namespace() -> None:
+    """95's follow-up: a cluster whose runtime hides the pod cgroup (the common case)
+    would otherwise never launch anything. lab-admin's explicit, out-of-band
+    attestation is the one way past that, and it is clearly not the same thing as the
+    canary confirming the number itself."""
+    config = KubernetesConfig(
+        poll_interval_seconds=0,
+        launch_timeout_seconds=5,
+        storage_class="lab-ssd",
+        image_pull_secret="ghcr-pull",
+        pod_pid_limit_override=512,
+    )
+    _api, _registry, provider, launch, workspace = await prepared(
+        build={"config": config, "pod_pid_limit_source": "cgroupns-private"}
+    )
+    probe = await provider.ensure_ready()
+    assert probe.passed is True
+    assert probe.pid_limit == 512
+    assert probe.pid_limit_source == "operator-declared"
+    await provider.launch(workspace, launch)
+
+
+async def test_an_operator_declared_limit_never_overrides_a_confirmed_absence() -> None:
+    """The override fills a gap the canary could not see into; it never contradicts an
+    answer the canary actually read, since that answer is more current than a
+    declaration lab-admin made once at deploy time."""
+    config = KubernetesConfig(
+        poll_interval_seconds=0,
+        launch_timeout_seconds=5,
+        storage_class="lab-ssd",
+        image_pull_secret="ghcr-pull",
+        pod_pid_limit_override=512,
+    )
+    _api, _registry, provider, launch, workspace = await prepared(
+        build={"config": config, "pod_pid_limit": None}
+    )
+    probe = await provider.ensure_ready()
+    assert probe.passed is False
+    assert probe.pid_limit is None
+    assert probe.pid_limit_source == "cgroup-v2-parent"
+    with pytest.raises(LaunchRefusedError, match="not ready"):
+        await provider.launch(workspace, launch)
+
+
 async def test_cgroup_v1_pod_pid_limit_is_unsupported_not_a_pass() -> None:
     _api, _registry, provider, launch, workspace = await prepared(
         build={"pod_pid_limit_source": "cgroup-v1"}
