@@ -376,19 +376,19 @@ SET_KEY_HARNESSES = frozenset({"hermes"})
 
 
 def credential_actions(
-    harness: str, state: str | None, prefix: Sequence[str], *, local: bool
+    harness: str, state: str | None, prefix: Sequence[str]
 ) -> list[dict[str, Any]]:
-    """By the credential's state (25). `login` runs the harness's own CLI, which the
-    service image does not carry, so it is offered only in local mode; with a credential
-    already present it needs `--replace`. `set` is offered only for the harnesses that
-    take an API key rather than a login."""
+    """By the credential's state (25). `login` runs the harness's own CLI: locally,
+    directly on this host; remotely, in the promoted worker image
+    (crucible/adapters/api/routers/admin.py `admin_login`), so it is offered in both
+    modes on the state alone, and a live promoted image or an installed CLI is still
+    the API's to refuse. With a credential already present it needs `--replace`. `set`
+    is offered only for the harnesses that take an API key rather than a login."""
     out: list[dict[str, Any]] = []
     verbs = CREDENTIAL_ACTIONS.get(state or "", ())
     if harness in SET_KEY_HARNESSES and state in ("absent", "invalid"):
         verbs = ("set", *verbs)
     for verb in verbs:
-        if verb == "login" and not local:
-            continue
         command = [*prefix, "--reason", "{reason}", "credentials", verb, "--harness", harness]
         needs: dict[str, Any] = dict(REASON)
         if verb == "rotate":

@@ -857,7 +857,7 @@ def result_for(
     elif kind in ("credential_state", "credential_report"):
         credential = document.get("credential", document) if isinstance(document, dict) else {}
         state = credential.get("state") if isinstance(credential, dict) else None
-        actions = nx.credential_actions(args.harness, state, prefix, local=local)
+        actions = nx.credential_actions(args.harness, state, prefix)
     elif kind == "harness_list":
         actions = nx.harness_actions(_items(document), prefix)
     elif kind == "harness" and isinstance(document, dict):

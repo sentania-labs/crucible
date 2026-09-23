@@ -184,9 +184,10 @@ def test_the_admin_group_in_remote_mode(cli: Cli, api_url: str) -> None:
     assert status["principal_role"] == "admin"
     report = cli("admin", *base, "credentials", "status", "--harness", "codex")
     # The harness rows outlive the tier's truncation, so an earlier test's recorded auth
-    # failure can leave codex `invalid`; either way remote mode offers no login.
+    # failure can leave codex `invalid`; remote mode offers login either way, since the
+    # remote admin API runs it in a promoted worker image.
     assert report["kind"] == "credential_state" and report["state"] in ("configured", "invalid")
-    expected = set(nx.CREDENTIAL_ACTIONS[report["state"]]) - {"login"}
+    expected = set(nx.CREDENTIAL_ACTIONS[report["state"]])
     assert {e["action"] for e in report["next"]} == expected
     assert all(e["command"][:4] == ["crucible", *base] for e in report["next"])
     refused = cli("orchestrator", *base, "status", code=1)

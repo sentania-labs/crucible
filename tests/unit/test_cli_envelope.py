@@ -240,14 +240,20 @@ def test_help_is_prose_and_complete(capsys: pytest.CaptureFixture[str]) -> None:
 # ----- the admin group's next ---------------------------------------------------------
 
 
-def test_login_is_offered_only_where_it_can_run() -> None:
-    local = nx.credential_actions("codex", "validated", ["crucible", "admin"], local=True)
-    remote = nx.credential_actions("codex", "validated", ["crucible", "admin"], local=False)
-    assert "login" in {e["action"] for e in local}
-    assert "login" not in {e["action"] for e in remote}
-    login = next(e for e in local if e["action"] == "login")
-    assert "--replace" in login["command"]
-    assert nx.credential_actions("hermes", "not_required", [], local=True) == []
+@pytest.mark.parametrize("state", ["absent", "configured"])
+def test_login_is_offered_remotely_too(state: str) -> None:
+    """The remote admin API runs login in a promoted worker image
+    (crucible/adapters/api/routers/admin.py `admin_login`), so `next` offers it on the
+    credential's state alone, the same as local mode."""
+    actions = nx.credential_actions("codex", state, ["crucible", "admin", "--api-url", "https://x"])
+    login = next(e for e in actions if e["action"] == "login")
+    assert ("--replace" in login["command"]) == (state != "absent")
+    fill = {name: "x" for name in login["needs"]}
+    argv = [re.sub(r"\{(\w+)\}", lambda m: fill[m.group(1)], arg) for arg in login["command"][1:]]
+    parsed = build_parser().parse_args(argv)
+    assert parsed.group == "admin"
+
+    assert nx.credential_actions("hermes", "not_required", []) == []
 
 
 def test_a_remote_admin_command_names_its_url_in_next(
@@ -263,7 +269,13 @@ def test_a_remote_admin_command_names_its_url_in_next(
     document = _out(capsys)
     assert document["kind"] == "credential_report" and document["state"] == "configured"
     assert document["principal_role"] == "admin"
-    assert {e["action"] for e in document["next"]} == {"validate", "probe", "rotate", "remove"}
+    assert {e["action"] for e in document["next"]} == {
+        "validate",
+        "probe",
+        "rotate",
+        "remove",
+        "login",
+    }
     for entry in document["next"]:
         assert entry["command"][:4] == ["crucible", "admin", "--api-url", "http://127.0.0.1:1"]
 
