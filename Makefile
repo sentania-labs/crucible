@@ -136,7 +136,10 @@ check-image-manifest: ## fail when a declared worker-image tag is stale
 # changes a digest. NO_CACHE=1 builds from scratch. WORKER_REGISTRY is where the
 # release publishes; nothing else pushes, and no credential is ever a value here (the
 # release passes REGISTRY_USERNAME and REGISTRY_PASSWORD in the environment).
+# WORKER_TAG_PREFIX is empty for the release; CI's ghcr-publish job sets ci-<sha>- to
+# prove the same publish against the real registry under throwaway tags (FDY-0090).
 WORKER_REGISTRY ?= ghcr.io/sentania-labs/crucible-worker
+WORKER_TAG_PREFIX ?=
 CACHE_DIR ?=
 NO_CACHE ?=
 images: ## FDY-0072: build both images from a staged copy the daemon's user can read; writes images/manifest.env
@@ -145,9 +148,10 @@ images: ## FDY-0072: build both images from a staged copy the daemon's user can 
 images-check: ## build both images and fail if any tag, harness version or OCI digest differs from images/manifest.env
 	DOCKER="$(DOCKER)" CACHE_DIR="$(CACHE_DIR)" NO_CACHE="$(NO_CACHE)" tools/images/images.sh check
 
-images-publish: ## release only: images-check, then push each OCI archive to WORKER_REGISTRY, never over another digest
+images-publish: ## release and CI's ghcr-publish: images-check, then push each OCI archive to WORKER_REGISTRY, never over another digest
 	DOCKER="$(DOCKER)" CACHE_DIR="$(CACHE_DIR)" NO_CACHE="$(NO_CACHE)" \
-	  WORKER_REGISTRY="$(WORKER_REGISTRY)" tools/images/images.sh publish
+	  WORKER_REGISTRY="$(WORKER_REGISTRY)" WORKER_TAG_PREFIX="$(WORKER_TAG_PREFIX)" \
+	  tools/images/images.sh publish
 
 # Needs REGISTRY_USERNAME and REGISTRY_PASSWORD in the environment, the same as
 # images-publish: reading a manifest back is still an authenticated registry call.
