@@ -186,18 +186,22 @@ jobs:
       # Claude Code, Codex, AGY and Hermes, and the script-harness image. A build from
       # scratch on this fresh runner has to reproduce every tag, harness version and OCI
       # digest images/manifest.env declares before anything is pushed. Then each OCI
-      # archive goes to ghcr.io/sentania-labs/crucible-worker:<tag> exactly as built, so
-      # the registry holds the declared digest; a tag already there with that digest is
-      # a re-run and is left alone, and one there with any other digest stops the
-      # release (the never-overwrite rule the service image has). Every published digest
-      # is then read back. It is the same script `make images` and the CI images job
-      # run, not a copy (the c7c, c7e and c7f lesson). It comes before the version tag
-      # is pushed, so a release whose worker images cannot be proven publishes nothing.
+      # archive goes to ghcr.io/sentania-labs/crucible-worker:<version>, exactly as
+      # built, under this release's own VERSION (13, 24, the operator's decision of
+      # 2026-09-23), never its input fingerprint; the registry holds the declared
+      # digest, a version tag already there with that digest is a re-run and is left
+      # alone, and one there with any other digest stops the release (the
+      # never-overwrite rule the service image has). :latest moves only when VERSION
+      # is the highest version published, the same rule the "move latest" step below
+      # applies to the service image. Every published digest is then read back. It is
+      # the same script `make images` and the CI images job run, not a copy (the c7c,
+      # c7e and c7f lesson). It comes before the service image's version tag is
+      # pushed, so a release whose worker images cannot be proven publishes nothing.
       - name: build, prove and publish the worker images
         env:
           REGISTRY_USERNAME: ${{ github.actor }}
           REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
-        run: make images-publish NO_CACHE=1
+        run: make images-publish NO_CACHE=1 WORKER_RELEASE_VERSION="${VERSION}"
 
       # Gate 4. Publish. An existing version tag is never overwritten: a re-run
       # after a transient failure skips the push instead of failing on it.
@@ -214,6 +218,9 @@ jobs:
       # push, so re-tagging an old fix does not move it backwards. A tag list
       # that cannot be read is fatal: treating a failed lookup as "no versions
       # published" would move `latest` in exactly the direction this prevents.
+      # The comparison itself (which tags are versions, which of them is highest)
+      # is tools/release/version.py, the same rule images-publish applies to the
+      # worker images' own latest tags, so there is only ever one such rule.
       - name: move latest only if this is the highest published version
         env:
           GHCR_USER: ${{ github.actor }}
@@ -247,8 +254,7 @@ jobs:
               *) URL="$NEXT" ;;
             esac
           done
-          HIGHEST=$(printf '%s\n%s\n' "$TAGS" "${VERSION}" \
-            | tr -d '[:blank:]' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)
+          HIGHEST=$(printf '%s\n' "$TAGS" | python3 tools/release/version.py "${VERSION}")
           echo "highest published version: $HIGHEST"
           if [ "$HIGHEST" = "${VERSION}" ]; then
             docker push "${IMAGE}:latest"

@@ -4,7 +4,8 @@
 # REPLACE: REPLACE_ME_RENDER_TIMEZONE       the operator's zone, an IANA name (01)
 # REPLACE: REPLACE_ME_LOCAL_ENDPOINT_CIDRS  the resolved address of the local endpoint
 #                                            host, as a /32, reviewed when the gateway moves
-# OPTIONAL: REPLACE_ME_PROBE_IMAGE          ghcr.io/sentania-labs/crucible-worker:<WORKER tag> (26)
+# OPTIONAL: REPLACE_ME_PROBE_IMAGE          example: ghcr.io/sentania-labs/crucible-worker:latest (26)
+#                                            the deployer pins <version>@<digest> from the release body
 #
 # 26 checklist item 2 and the DNS denial: the provider allows port 53 on this one address
 # and denies everything else inside the cluster. A wrong address is a worker with no name
