@@ -63,7 +63,7 @@ async def test_the_canary_runs_under_its_own_policy_and_removes_it() -> None:
         if row["kind"] == "pods" and row["name"].startswith("crucible-canary-")
     )
     # The policy selects the canary Pod and nothing else.
-    assert canary["metadata"]["labels"][k8sspec.LABEL_ATTEMPT] == selector[k8sspec.LABEL_ATTEMPT]
+    assert canary["metadata"]["labels"][k8sspec.LABEL_CANARY] == selector[k8sspec.LABEL_CANARY]
     assert selector[k8sspec.LABEL_ROLE] == k8sspec.ROLE_CANARY
     # Cluster DNS and nothing else: no endpoint is configured.
     [rule] = policy["spec"]["egress"]
@@ -220,3 +220,35 @@ async def test_the_provider_reads_its_settings_back_from_the_source() -> None:
     provider.reload_settings()
     await provider.ensure_ready()
     assert len(reads) == 2
+
+
+async def test_the_retention_sweep_never_takes_a_canary_mid_run() -> None:
+    """The supervisor's retention sweep deletes whatever carries an attempt id Crucible
+    does not track. A canary is never an attempt, so it carries its own label and the
+    sweep's listing does not see it or its policy (found on `make deploy-kind`, where
+    the supervisor's sweep deleted the API process's canary and the probe failed)."""
+    api, _registry, provider = build()
+    await provider.prepare(spec())
+    real_log = api.pod_log
+    swept: list[str] = []
+    in_flight: list[str] = []
+
+    def pod_log(name: str, **kwargs: Any) -> Any:
+        # The canary has finished and is about to be read and removed: what the sweep
+        # would list right now, for every kind it sweeps.
+        for kind in ("pods", "networkpolicies"):
+            in_flight.extend(
+                str(row["metadata"]["name"])
+                for row in api.list_objects(kind)
+                if "canary" in str(row["metadata"]["name"])
+            )
+            swept.extend(
+                str(row["metadata"]["name"])
+                for row in api.list_objects(kind, label_selector=k8sspec.LABEL_ATTEMPT)
+            )
+        return real_log(name, **kwargs)
+
+    api.pod_log = pod_log  # type: ignore[method-assign]
+    assert (await provider.ensure_ready()).passed
+    assert len(in_flight) == 2
+    assert not [name for name in swept if "canary" in name]

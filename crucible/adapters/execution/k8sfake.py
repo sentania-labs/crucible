@@ -41,6 +41,7 @@ from crucible.adapters.execution.k8sregistry import RegistryError
 from crucible.adapters.execution.k8sspec import (
     CONTAINER_NAME,
     LABEL_ATTEMPT,
+    LABEL_CANARY,
     LABEL_ROLE,
     ROLE_BUNDLE,
     ROLE_CANARY,
@@ -464,12 +465,12 @@ class FakeKubernetesApi:
             ],
         }
 
-    def _canary_policy(self, attempt_id: str) -> dict[str, Any] | None:
+    def _canary_policy(self, canary_id: str) -> dict[str, Any] | None:
         for (kind, _name), candidate in self.objects.items():
             if kind != "networkpolicies" or candidate.deleted:
                 continue
             selector = (candidate.body.get("spec") or {}).get("podSelector") or {}
-            if (selector.get("matchLabels") or {}).get(LABEL_ATTEMPT) == attempt_id:
+            if canary_id and (selector.get("matchLabels") or {}).get(LABEL_CANARY) == canary_id:
                 return candidate.body
         return None
 
@@ -477,7 +478,7 @@ class FakeKubernetesApi:
         name = obj.name
         pid = "none" if self.pod_pid_limit is None else str(self.pod_pid_limit)
         labels = (obj.body.get("metadata") or {}).get("labels") or {}
-        policy = self._canary_policy(str(labels.get(LABEL_ATTEMPT, "")))
+        policy = self._canary_policy(str(labels.get(LABEL_CANARY, "")))
         dns_open = policy is not None and any(
             int(port.get("port", 0)) == 53
             for rule in (policy.get("spec") or {}).get("egress") or []

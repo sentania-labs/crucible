@@ -39,6 +39,9 @@ LABEL_TASK = "crucible.task"
 LABEL_OWNER = "crucible.owner"
 LABEL_ROLE = "crucible.role"
 LABEL_RETAIN = "crucible.retain"
+# The readiness canary's own id. Never `crucible.attempt`: the retention sweep deletes
+# whatever carries an attempt id Crucible does not track, which a canary always is.
+LABEL_CANARY = "crucible.canary"
 ANNOTATION_EGRESS = "crucible.io/egress-hosts"
 
 ROLE_WORKER = "worker"
@@ -557,6 +560,7 @@ def egress_policy(
     dns_server: str,
     denied_cidrs: Sequence[str] = DEFAULT_DENIED_CIDRS,
     dns_selector: PeerSelector | None = None,
+    pod_selector: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """One attempt's one role's egress, as the only thing that opens the default deny.
 
@@ -630,7 +634,11 @@ def egress_policy(
             "annotations": {ANNOTATION_EGRESS: ",".join(plan.hosts)},
         },
         "spec": {
-            "podSelector": {"matchLabels": {LABEL_ATTEMPT: attempt_id, LABEL_ROLE: role}},
+            "podSelector": {
+                "matchLabels": dict(pod_selector)
+                if pod_selector is not None
+                else {LABEL_ATTEMPT: attempt_id, LABEL_ROLE: role}
+            },
             "policyTypes": ["Egress"],
             "egress": rules,
         },
@@ -649,6 +657,7 @@ __all__ = [
     "DEFAULT_DNS_POD_LABELS",
     "IDENTITY_MOUNT",
     "LABEL_ATTEMPT",
+    "LABEL_CANARY",
     "LABEL_OWNER",
     "LABEL_RETAIN",
     "LABEL_ROLE",

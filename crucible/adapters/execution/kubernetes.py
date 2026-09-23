@@ -527,7 +527,7 @@ class KubernetesProvider:
         object_labels = {
             k8sspec.LABEL_ROLE: k8sspec.ROLE_CANARY,
             k8sspec.LABEL_OWNER: "crucible",
-            k8sspec.LABEL_ATTEMPT: canary_id,
+            k8sspec.LABEL_CANARY: canary_id,
         }
         # The canary runs under the rules a worker gets (crucible#91): cluster DNS and
         # the local endpoint, and nothing else. What it proves is then what a worker
@@ -545,7 +545,14 @@ class KubernetesProvider:
                 local_endpoint_reachable=False,
             )
         policy_name = k8sspec.object_name("np-canary", canary_id)
-        policy = self._policy_body(policy_name, object_labels, canary_id, k8sspec.ROLE_CANARY, plan)
+        policy = self._policy_body(
+            policy_name,
+            object_labels,
+            canary_id,
+            k8sspec.ROLE_CANARY,
+            plan,
+            pod_selector={k8sspec.LABEL_CANARY: canary_id, k8sspec.LABEL_ROLE: k8sspec.ROLE_CANARY},
+        )
         limits = k8sspec.limits_from_policy({})
         pod = k8sspec.bare_pod(
             name=name,
@@ -1698,6 +1705,7 @@ class KubernetesProvider:
         attempt_id: str,
         role: str,
         plan: EgressPlan,
+        pod_selector: Mapping[str, str] | None = None,
     ) -> dict[str, Any]:
         egress = self.config.egress
         protected = self._protected()
@@ -1722,6 +1730,7 @@ class KubernetesProvider:
             dns_server=self.config.cluster_dns_ip,
             denied_cidrs=self.config.denied_cidrs,
             dns_selector=dns_selector,
+            pod_selector=pod_selector,
         )
 
     async def _apply_policy(self, spec: LaunchSpec, role: str, plan: EgressPlan) -> str | None:
