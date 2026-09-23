@@ -22,6 +22,7 @@ from crucible.adapters.persistence.models import (
     HarnessStateRow,
     ImagePromotionRow,
     PolicyRow,
+    ProviderSettingRow,
     ReviewDispositionRow,
     ReviewReportRow,
     RoutingPolicyRow,
@@ -43,6 +44,7 @@ from crucible.domain.entities import (
     HarnessState,
     ImagePromotion,
     Policy,
+    ProviderSetting,
     ReviewDisposition,
     ReviewReportRecord,
     RoutingPolicyRecord,
@@ -902,6 +904,39 @@ class ImagePromotions:
         row.updated_by = promotion.updated_by
         self._s.flush()
         return self._to_entity(row)
+
+
+class ProviderSettings:
+    """Runtime provider settings (25, crucible#91): one document per name."""
+
+    def __init__(self, session: Session) -> None:
+        self._s = session
+
+    def get(self, name: str) -> ProviderSetting | None:
+        row = self._s.get(ProviderSettingRow, name)
+        if row is None:
+            return None
+        return ProviderSetting(
+            name=row.name,
+            document=dict(row.document or {}),
+            updated_at=ensure_utc(row.updated_at),
+            updated_by=row.updated_by,
+            reason=row.reason,
+        )
+
+    def put(self, setting: ProviderSetting) -> ProviderSetting:
+        row = self._s.get(ProviderSettingRow, setting.name, with_for_update=True)
+        if row is None:
+            row = ProviderSettingRow(name=setting.name)
+            self._s.add(row)
+        row.document = dict(setting.document)
+        row.reason = setting.reason
+        row.updated_at = setting.updated_at
+        row.updated_by = setting.updated_by
+        self._s.flush()
+        stored = self.get(setting.name)
+        assert stored is not None
+        return stored
 
 
 class BootstrapImports:

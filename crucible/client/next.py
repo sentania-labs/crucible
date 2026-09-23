@@ -400,6 +400,44 @@ def credential_actions(
     return out
 
 
+def _labels_text(labels: Any) -> str:
+    if not isinstance(labels, dict):
+        return ""
+    return ",".join(f"{k}={v}" for k, v in sorted(labels.items()))
+
+
+def kubernetes_egress_actions(document: Any, prefix: Sequence[str]) -> list[dict[str, Any]]:
+    """One action: replace the setting, prefilled with what is in force now, so the
+    command as offered changes nothing until a value in it is edited."""
+    if not isinstance(document, dict) or not isinstance(document.get("document"), dict):
+        return []
+    current = document["document"]
+    dns = current.get("dns") if isinstance(current.get("dns"), dict) else {}
+    endpoint = (
+        current.get("local_endpoint") if isinstance(current.get("local_endpoint"), dict) else {}
+    )
+    return [
+        action(
+            "set-egress",
+            "replace the resolver's and the in-cluster local endpoint's selectors",
+            [
+                *prefix,
+                "--reason",
+                "{reason}",
+                "kubernetes",
+                "set-egress",
+                f"--dns-namespace={dns.get('namespace', '')}",
+                f"--dns-labels={_labels_text(dns.get('pod_labels'))}",
+                f"--endpoint-namespace={endpoint.get('namespace', '')}",
+                f"--endpoint-labels={_labels_text(endpoint.get('pod_labels'))}",
+                f"--endpoint-port={endpoint.get('port', 0)}",
+            ],
+            needs=REASON,
+            roles=(ADMIN,),
+        )
+    ]
+
+
 def local_endpoint_actions(document: Any, prefix: Sequence[str]) -> list[dict[str, Any]]:
     """One action per model in data.models, already set to flip its current state:
     `enable` for a disabled model, `disable` for an enabled one. The parser's

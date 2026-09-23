@@ -17,6 +17,7 @@ from collections.abc import Iterator
 from importlib import import_module
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 import pytest
 from fastapi.testclient import TestClient
@@ -1900,3 +1901,159 @@ def test_a_login_that_reuses_an_unwritable_directory_says_so(
         assert "already passes the shape check" not in detail
     finally:
         live.chmod(0o700)
+
+
+class _EgressProbe(FakeProvider):
+    """Stands in for the Kubernetes provider: counts the reloads a save asks for."""
+
+    reloads = 0
+
+    def reload_settings(self) -> None:
+        self.reloads += 1
+
+
+def test_kubernetes_egress_through_api_cli_and_ui(
+    ctx: AppContext,
+    tokens: dict[str, str],
+    admin_client: TestClient,
+    admin_ctx: AdminContext,
+    live_supervisor: Supervisor,
+    config_file: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """crucible#91: the resolver's and an in-cluster local endpoint's selectors are a
+    runtime setting with API, CLI and UI parity, one audit trail, and the provider told
+    to read them back. Until a save the settings file's values are shown."""
+    asyncio.run(live_supervisor.tick())
+    probe = _EgressProbe()
+    admin_ctx.providers["kubernetes"] = probe
+    admin_ctx.kubernetes_protected_namespaces = ("crucible-workers", "crucible")
+    first = admin_client.get("/v1/admin/kubernetes/egress").json()
+    assert first["source"] == "settings"
+    assert first["document"]["dns"] == {
+        "namespace": "kube-system",
+        "pod_labels": {"k8s-app": "kube-dns"},
+    }
+
+    saved = admin_client.post(
+        "/v1/admin/kubernetes/egress",
+        json={
+            "reason": "api: litellm runs in the cluster",
+            "dns": {"namespace": "kube-system", "pod_labels": {"k8s-app": "kube-dns"}},
+            "local_endpoint": {
+                "namespace": "litellm",
+                "pod_labels": {"app.kubernetes.io/name": "litellm"},
+                "port": 4000,
+            },
+        },
+    )
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["source"] == "database"
+    assert saved.json()["document"]["local_endpoint"]["port"] == 4000
+    assert probe.reloads == 1
+
+    refused = admin_client.post(
+        "/v1/admin/kubernetes/egress",
+        json={
+            "reason": "api: into the workers namespace",
+            "local_endpoint": {"namespace": "crucible-workers", "pod_labels": {"a": "b"}},
+        },
+    )
+    assert refused.status_code == 422
+    assert "may never reach" in refused.text
+    no_reason = admin_client.post("/v1/admin/kubernetes/egress", json={"dns": {"namespace": ""}})
+    assert no_reason.status_code == 422
+    assert (
+        admin_client.get("/v1/admin/kubernetes/egress").json()["document"]
+        == (saved.json()["document"])
+    )
+
+    cli_view = run_cli(config_file, "kubernetes", "egress", capsys=capsys)
+    assert cli_view["document"] == saved.json()["document"]
+    cli_saved = run_cli(
+        config_file,
+        "--reason",
+        "cli: gateway moved port",
+        "kubernetes",
+        "set-egress",
+        "--endpoint-namespace=litellm",
+        "--endpoint-labels=app.kubernetes.io/name=litellm",
+        "--endpoint-port=8080",
+        capsys=capsys,
+    )
+    assert cli_saved["document"]["local_endpoint"]["port"] == 8080
+    assert cli_saved["updated_by"] == "crucible-admin"
+
+    with TestClient(create_app(ctx)) as browser:
+        csrf = ui_sign_in(browser, tokens["admin"])
+        page = browser.get("/ui/routing")
+        assert page.status_code == 200
+        assert 'action="/ui/actions/kubernetes-egress"' in page.text
+        assert 'value="app.kubernetes.io/name=litellm"' in page.text
+        ui_saved = browser.post(
+            "/ui/actions/kubernetes-egress",
+            data={
+                "csrf": csrf,
+                "dns_namespace": "kube-system",
+                "dns_labels": "k8s-app=kube-dns",
+                "endpoint_namespace": "",
+                "endpoint_labels": "",
+                "endpoint_port": "0",
+                "reason": "ui: gateway moved out of the cluster",
+                "return_to": "/ui/routing",
+            },
+            follow_redirects=False,
+        )
+        assert ui_saved.status_code == 303
+        assert "Completed" in unquote(ui_saved.headers.get("location", ""))
+    final = admin_client.get("/v1/admin/kubernetes/egress").json()
+    assert final["document"]["local_endpoint"] == {"namespace": "", "pod_labels": {}, "port": 0}
+    assert final["reason"] == "ui: gateway moved out of the cluster"
+    # The API and the UI share this process's provider; the CLI in local mode wires its
+    # own, and a running supervisor follows its save by reading the row back.
+    assert probe.reloads == 2
+    kinds = audit_kinds(admin_client)
+    assert ("kubernetes_egress_updated", "admin-principal") in kinds
+    assert ("kubernetes_egress_updated", "crucible-admin") in kinds
+    assert len([k for k in kinds if k[0] == "kubernetes_egress_updated"]) == 3
+
+
+def test_the_cli_remote_mode_sends_the_egress_document(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[str, str, Any]] = []
+
+    def fake_call(self: Any, method: str, path: str, body: Any = None, **_: Any) -> Any:
+        calls.append((method, path, body))
+        return {"setting": "kubernetes.egress", "source": "database", "document": {}}
+
+    monkeypatch.setattr(Api, "call", fake_call)
+    monkeypatch.setenv(ADMIN_TOKEN_ENV, "cru_" + "0" * 26 + "." + "s" * 40)
+    admin_main(["--api-url", "http://127.0.0.1:1", "kubernetes", "egress"])
+    admin_main(
+        [
+            "--api-url",
+            "http://127.0.0.1:1",
+            "--reason",
+            "r",
+            "kubernetes",
+            "set-egress",
+            "--endpoint-namespace=litellm",
+            "--endpoint-labels=app=litellm",
+            "--endpoint-port=4000",
+        ]
+    )
+    assert calls == [
+        ("GET", "/v1/admin/kubernetes/egress", None),
+        (
+            "POST",
+            "/v1/admin/kubernetes/egress",
+            {
+                "reason": "r",
+                "dns": {"namespace": "kube-system", "pod_labels": {"k8s-app": "kube-dns"}},
+                "local_endpoint": {
+                    "namespace": "litellm",
+                    "pod_labels": {"app": "litellm"},
+                    "port": 4000,
+                },
+            },
+        ),
+    ]

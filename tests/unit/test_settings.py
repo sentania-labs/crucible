@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from crucible.cli.wiring import kubernetes_config
+from crucible.domain.cluster_egress import ClusterEgress
 from crucible.settings import Settings, load_settings
 
 
@@ -106,3 +107,35 @@ def test_without_a_probe_image_the_field_is_empty() -> None:
     config = kubernetes_config(settings)
     assert config.image_repositories == ("registry.example/w",)
     assert config.probe_image == ""
+
+
+def test_the_egress_selectors_default_to_coredns_and_no_in_cluster_endpoint() -> None:
+    config = kubernetes_config(Settings())
+    assert config.egress == ClusterEgress()
+    assert config.control_namespace == "crucible"
+
+
+def test_the_egress_selectors_seed_from_the_settings_file() -> None:
+    settings = Settings(
+        kubernetes={
+            "local_endpoint_namespace": "litellm",
+            "local_endpoint_pod_labels": {"app.kubernetes.io/name": "litellm"},
+            "local_endpoint_port": 4000,
+        }
+    )
+    config = kubernetes_config(settings, local_endpoint_url="http://litellm.litellm.svc:4000")
+    assert config.egress.endpoint_namespace == "litellm"
+    assert config.egress.endpoint_pod_labels == (("app.kubernetes.io/name", "litellm"),)
+    assert config.egress.endpoint_port == 4000
+    assert config.local_endpoint_url == "http://litellm.litellm.svc:4000"
+
+
+def test_a_seed_into_the_workers_namespace_stops_the_service_at_start() -> None:
+    settings = Settings(
+        kubernetes={
+            "local_endpoint_namespace": "crucible-workers",
+            "local_endpoint_pod_labels": {"a": "b"},
+        }
+    )
+    with pytest.raises(ValueError, match="may never reach"):
+        kubernetes_config(settings)

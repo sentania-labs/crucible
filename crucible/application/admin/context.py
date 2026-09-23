@@ -55,6 +55,10 @@ class AdminContext:
     proxy_reload_timeout_seconds: float = 0
     # The command each harness's login runs, overridable for the fake-CLI tests.
     login_commands: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    # The settings file's `kubernetes.egress` values, shown until a save replaces them,
+    # and the namespaces no selector may name (crucible#91).
+    kubernetes_egress_seed: dict[str, Any] = field(default_factory=dict)
+    kubernetes_protected_namespaces: tuple[str, ...] = ()
 
 
 def record_refusal(ctx: AdminContext, *, principal: str, operation: str, detail: str) -> None:

@@ -477,6 +477,21 @@ class BootstrapImport:
 
 
 @dataclass(slots=True)
+class ProviderSetting:
+    """One provider setting an administrator edits at runtime, as a document (25).
+
+    The settings file seeds it; a saved row wins over the file from then on, in every
+    process, because each provider reads it back rather than holding its own copy.
+    `kubernetes.egress` is the one such setting (crucible#91)."""
+
+    name: str
+    document: dict[str, Any]
+    updated_at: datetime
+    updated_by: str
+    reason: str = ""
+
+
+@dataclass(slots=True)
 class ImagePromotion:
     """One worker image's promotion state (13): `candidate` until an explicit admin act
     makes it `default`; a previous default it fully supersedes becomes `retained`.

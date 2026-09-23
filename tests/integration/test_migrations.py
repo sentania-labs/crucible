@@ -1030,3 +1030,48 @@ def test_0011_refuses_an_incompatible_contract_on_a_non_terminal_task(
     ok, detail = migrate.is_current(engine, database_url)
     assert ok, detail
     engine.dispose()
+
+
+def test_0020_provider_settings_down_and_up_keeps_the_audit_trail(database_url: str) -> None:
+    """crucible#91: the setting table goes with a rollback, but the audit events of an
+    edit are archived and come back on the next upgrade."""
+    migrate.upgrade(database_url)
+    engine = make_engine(database_url)
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO provider_settings (name, document, reason, updated_at, updated_by) "
+                "VALUES ('kubernetes.egress', CAST(:doc AS jsonb), 'r', now(), 'tests')"
+            ),
+            {"doc": json.dumps({"dns": {"namespace": "kube-system"}})},
+        )
+        conn.execute(
+            text(
+                # An explicit seq: an earlier migration test's archive round trip
+                # re-inserts events by seq and leaves the sequence behind them.
+                "INSERT INTO events (seq, ts, kind, principal, verified, payload) "
+                "SELECT coalesce(max(seq), 0) + 1, now(), 'kubernetes_egress_updated', "
+                "'tests', true, '{}'::jsonb FROM events"
+            )
+        )
+    migrate.downgrade(database_url, "0019_opus_5_5")
+    assert "provider_settings" not in inspect(engine).get_table_names()
+    with engine.connect() as conn:
+        assert (
+            conn.execute(
+                text("SELECT count(*) FROM events WHERE kind='kubernetes_egress_updated'")
+            ).scalar()
+            == 0
+        )
+    migrate.upgrade(database_url)
+    assert "provider_settings" in inspect(engine).get_table_names()
+    with engine.begin() as conn:
+        assert (
+            conn.execute(
+                text("SELECT count(*) FROM events WHERE kind='kubernetes_egress_updated'")
+            ).scalar()
+            == 1
+        )
+    ok, detail = migrate.is_current(engine, database_url)
+    assert ok, detail
+    engine.dispose()
