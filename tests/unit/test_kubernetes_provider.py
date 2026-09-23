@@ -103,7 +103,7 @@ async def test_the_probe_passes_when_the_canary_cannot_reach_the_api_server() ->
     _api, _registry, provider = build()
     await provider.prepare(spec())
     probe = await provider.ensure_ready()
-    assert probe == NamespaceProbe(True, True, 4096, "namespace ready")
+    assert probe == NamespaceProbe(True, True, 4096, "namespace ready", dns_resolves=True)
     health = await provider.health()
     assert health.state == "ok"
     assert health.checks["egress_enforced"] is True

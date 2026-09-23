@@ -42,6 +42,7 @@ from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 from crucible.adapters.execution import identity as identity_bundle
 from crucible.adapters.execution import k8sspec, scripts, workspace
@@ -61,6 +62,7 @@ from crucible.adapters.execution.k8sspec import (
     EgressPlan,
     Limits,
     Mount,
+    PeerSelector,
     PodRequest,
     SpecError,
 )
@@ -72,6 +74,7 @@ from crucible.application.harnesses import (
     egress_allowlist,
 )
 from crucible.contracts.completion_claim import CompletionClaimV1
+from crucible.domain.cluster_egress import ClusterEgress, parse_cluster_egress
 from crucible.domain.exit_class import ExitClass
 from crucible.domain.ids import new_id
 from crucible.domain.time import parse_rfc3339
@@ -125,6 +128,14 @@ PROVIDER_NAME = "kubernetes"
 
 # A name to the addresses a NetworkPolicy may name.
 Resolver = Callable[[str], list[str]]
+
+# What the canary resolves to prove cluster DNS works: a name every cluster serves, looked
+# up through the pod's search path so the cluster domain need not be known here.
+CANARY_DNS_NAME = "kubernetes.default.svc"
+
+# The runtime settings source: the `kubernetes.egress` document (None when it was never
+# saved) and the enabled local endpoint URL (None when no local model is enabled).
+SettingsSource = Callable[[], tuple[Mapping[str, Any] | None, str | None]]
 
 # Where `prepare` records which ConfigMap key is which bundle file, so `launch` projects
 # every file back to the relative path the bundle hash covers.
@@ -224,6 +235,19 @@ class KubernetesConfig:
     # The cluster's DNS service address. 26 allows port 53 on this address and nothing
     # else on it; every other destination inside the cluster stays denied.
     cluster_dns_ip: str = "10.96.0.10"
+    # The cluster resolver and an in-cluster local endpoint as namespace and pod
+    # selectors (crucible#91), which a CNI that translates a service address before it
+    # evaluates policy still matches. Seeded from the settings file and replaced at
+    # runtime by the `kubernetes.egress` admin setting.
+    egress: ClusterEgress = field(default_factory=ClusterEgress)
+    # Crucible's own namespace. No selector may name it or the workers namespace.
+    control_namespace: str = "crucible"
+    # The enabled local model endpoint the readiness canary proves a connection to,
+    # from the routing policy in force. Empty when no local model is enabled.
+    local_endpoint_url: str = ""
+    # How often the runtime settings above are read back from the database, so the
+    # supervisor follows an edit made through the API process without a restart.
+    settings_refresh_seconds: float = 15.0
     denied_cidrs: tuple[str, ...] = k8sspec.DEFAULT_DENIED_CIDRS
     local_endpoint_cidrs: tuple[str, ...] = ()
     # 26: the allowlist is "resolved to CIDRs or FQDN rules where the CNI supports
@@ -271,11 +295,18 @@ class NamespaceProbe:
     pid_limit: int | None
     detail: str = ""
     checked: bool = True
+    # What the canary found under the same egress rules a worker gets (crucible#91):
+    # whether a cluster name resolved, and whether the configured local endpoint took a
+    # TCP connection. None is "not checked" (no local endpoint) or "could not tell".
+    dns_resolves: bool | None = None
+    local_endpoint_reachable: bool | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "namespace_ready": self.passed,
             "egress_enforced": self.egress_enforced,
+            "dns_resolves": self.dns_resolves,
+            "local_endpoint_reachable": self.local_endpoint_reachable,
             "pod_pid_limit": self.pid_limit,
             "runtime_class": "standard",
             "detail": self.detail,
@@ -341,8 +372,14 @@ class KubernetesProvider:
         registry: RegistryClient,
         harnesses: HarnessRegistry | None = None,
         resolver: Resolver | None = None,
+        settings_source: SettingsSource | None = None,
     ) -> None:
         self.config = config
+        # The runtime settings (the `kubernetes.egress` admin setting and the enabled
+        # local endpoint), read back from the database; None in the unit tier.
+        self._settings_source = settings_source
+        self._settings_read_at: float | None = None
+        self._file_egress = config.egress
         # Injected so the unit tier resolves without a network and the e2e tier can
         # point at the cluster's own DNS.
         self.resolve = resolver or _resolve_host
@@ -426,9 +463,51 @@ class KubernetesProvider:
 
     # ----- the readiness probe (26) ------------------------------------
 
+    def reload_settings(self) -> None:
+        """Read the runtime settings back on the next launch or status call. The admin
+        services call this after an edit; the transaction commits before either runs."""
+        self._settings_read_at = None
+
+    def apply_settings(self, document: Mapping[str, Any] | None, endpoint_url: str | None) -> None:
+        """Take the `kubernetes.egress` document (None: the settings file's) and the
+        enabled local endpoint. A change forgets the readiness probe, because what the
+        canary proved was proved under the old rules."""
+        egress = self._file_egress
+        if document is not None:
+            try:
+                egress = parse_cluster_egress(document, protected_namespaces=self._protected())
+            except ValueError as exc:
+                log.error("the kubernetes.egress setting is refused: %s", exc)
+                return
+        updated = replace(self.config, egress=egress, local_endpoint_url=endpoint_url or "")
+        if updated != self.config:
+            self.config = updated
+            self.probe = None
+
+    def _protected(self) -> tuple[str, ...]:
+        return tuple(n for n in (self.config.namespace, self.config.control_namespace) if n)
+
+    async def _refresh_settings(self) -> None:
+        if self._settings_source is None:
+            return
+        now = time.monotonic()
+        if (
+            self._settings_read_at is not None
+            and now - self._settings_read_at < self.config.settings_refresh_seconds
+        ):
+            return
+        self._settings_read_at = now
+        try:
+            document, endpoint_url = await self._call(self._settings_source)
+        except Exception as exc:  # the settings file's values stay in force
+            log.warning("the kubernetes runtime settings are unreadable: %s", exc)
+            return
+        self.apply_settings(document, endpoint_url)
+
     async def ensure_ready(self) -> NamespaceProbe:
         """Probe the namespace once, and keep the answer. A failed probe is re-run on
         the next call: lab-admin fixing the CNI must not need a Crucible restart."""
+        await self._refresh_settings()
         if self.probe is not None and self.probe.passed:
             return self.probe
         async with self._probe_lock:
@@ -443,21 +522,45 @@ class KubernetesProvider:
             return NamespaceProbe(
                 False, False, None, "no image is configured to run the canary with", checked=False
             )
-        name = f"crucible-canary-{new_id().lower()}"[:60]
+        canary_id = new_id()
+        name = f"crucible-canary-{canary_id.lower()}"[:60]
+        object_labels = {
+            k8sspec.LABEL_ROLE: k8sspec.ROLE_CANARY,
+            k8sspec.LABEL_OWNER: "crucible",
+            k8sspec.LABEL_ATTEMPT: canary_id,
+        }
+        # The canary runs under the rules a worker gets (crucible#91): cluster DNS and
+        # the local endpoint, and nothing else. What it proves is then what a worker
+        # will meet, and on a CNI where those rules do not match it says so.
+        endpoint_url = self.config.local_endpoint_url
+        try:
+            plan = await self._resolve_plan(self._local_endpoint_plan(EgressPlan(), endpoint_url))
+        except (ProviderError, SpecError) as exc:
+            return NamespaceProbe(
+                False,
+                False,
+                None,
+                f"local endpoint check failed: no rule can permit it ({exc})",
+                checked=False,
+                local_endpoint_reachable=False,
+            )
+        policy_name = k8sspec.object_name("np-canary", canary_id)
+        policy = self._policy_body(policy_name, object_labels, canary_id, k8sspec.ROLE_CANARY, plan)
         limits = k8sspec.limits_from_policy({})
         pod = k8sspec.bare_pod(
             name=name,
             namespace=self.config.namespace,
-            object_labels={
-                k8sspec.LABEL_ROLE: k8sspec.ROLE_CANARY,
-                k8sspec.LABEL_OWNER: "crucible",
-            },
+            object_labels=object_labels,
             pod=k8sspec.pod_spec(
                 PodRequest(
                     role=k8sspec.ROLE_CANARY,
                     image=image,
                     command=["sh", "-c", _CANARY_SCRIPT],
                     limits=limits,
+                    env={
+                        "CRUCIBLE_CANARY_DNS_NAME": CANARY_DNS_NAME,
+                        **({"CRUCIBLE_CANARY_ENDPOINT_URL": endpoint_url} if endpoint_url else {}),
+                    },
                     mounts=k8sspec.base_mounts(),
                     volumes=k8sspec.base_volumes(limits),
                     service_account=self.config.service_account,
@@ -466,8 +569,16 @@ class KubernetesProvider:
             ),
         )
         try:
+            await self._call(self.client.create, "networkpolicies", policy)
+        except KubernetesApiError as exc:
+            return NamespaceProbe(
+                False, False, None, f"the canary NetworkPolicy was refused: {exc}", False
+            )
+        try:
             await self._call(self.client.create, "pods", pod)
         except KubernetesApiError as exc:
+            with contextlib.suppress(KubernetesApiError):
+                await self._call(self.client.delete, "networkpolicies", policy_name)
             return NamespaceProbe(False, False, None, f"the canary Pod was refused: {exc}", False)
         try:
             phase = await self._await_pod(name, timeout=self.config.launch_timeout_seconds)
@@ -490,6 +601,8 @@ class KubernetesProvider:
             with contextlib.suppress(KubernetesApiError):
                 await self._call(self.client.delete, "pods", name, grace_period_seconds=0)
             await self._await_pod_gone(name)
+            with contextlib.suppress(KubernetesApiError):
+                await self._call(self.client.delete, "networkpolicies", policy_name)
         return _read_probe(output)
 
     def _probe_image(self) -> str:
@@ -1546,7 +1659,70 @@ class KubernetesProvider:
             return EgressPlan()
         hosts = tuple(h for h in wanted if ":" not in h)
         endpoints = tuple(h for h in wanted if ":" in h)
-        return EgressPlan(hosts=hosts, endpoints=endpoints)
+        plan = EgressPlan(hosts=hosts, endpoints=endpoints)
+        if role == k8sspec.ROLE_WORKER:
+            plan = self._local_endpoint_plan(plan, spec.endpoint_url)
+        return plan
+
+    def _local_endpoint_plan(self, plan: EgressPlan, endpoint_url: str | None) -> EgressPlan:
+        """Add the local model endpoint to a plan, in the form this cluster matches.
+
+        Out of the cluster it is the URL's `host:port`, which `_resolve_plan` turns into
+        exact addresses. In the cluster (the `kubernetes.egress` setting names its
+        namespace) it is a selector on the gateway's pods and their port instead, and
+        the `host:port` is taken out: it would resolve to a service address, which is
+        inside a denied range and which a translating CNI never matches (crucible#91)."""
+        if not endpoint_url:
+            return plan
+        parsed = urlsplit(endpoint_url)
+        if not parsed.hostname:
+            return plan
+        url_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        destination = f"{parsed.hostname}:{url_port}"
+        egress = self.config.egress
+        if not egress.endpoint_in_cluster:
+            if destination in plan.endpoints:
+                return plan
+            return replace(plan, endpoints=(*plan.endpoints, destination))
+        return replace(
+            plan,
+            endpoints=tuple(e for e in plan.endpoints if e != destination),
+            endpoint_selector=PeerSelector(egress.endpoint_namespace, egress.endpoint_pod_labels),
+            endpoint_ports=(egress.endpoint_port or url_port,),
+        )
+
+    def _policy_body(
+        self,
+        name: str,
+        object_labels: Mapping[str, str],
+        attempt_id: str,
+        role: str,
+        plan: EgressPlan,
+    ) -> dict[str, Any]:
+        egress = self.config.egress
+        protected = self._protected()
+        dns_selector = None
+        if egress.dns_namespace:
+            dns_selector = k8sspec.check_selector(
+                PeerSelector(egress.dns_namespace, egress.dns_pod_labels),
+                what="cluster DNS",
+                protected_namespaces=protected,
+            )
+        if plan.endpoint_selector is not None:
+            k8sspec.check_selector(
+                plan.endpoint_selector, what="local endpoint", protected_namespaces=protected
+            )
+        return k8sspec.egress_policy(
+            name=name,
+            namespace=self.config.namespace,
+            object_labels=object_labels,
+            attempt_id=attempt_id,
+            role=role,
+            plan=plan,
+            dns_server=self.config.cluster_dns_ip,
+            denied_cidrs=self.config.denied_cidrs,
+            dns_selector=dns_selector,
+        )
 
     async def _apply_policy(self, spec: LaunchSpec, role: str, plan: EgressPlan) -> str | None:
         """One NetworkPolicy per attempt per role that needs egress.
@@ -1561,16 +1737,7 @@ class KubernetesProvider:
             return None
         plan = await self._resolve_plan(plan)
         name = k8sspec.object_name(f"np-{role}", spec.attempt_id)
-        body = k8sspec.egress_policy(
-            name=name,
-            namespace=self.config.namespace,
-            object_labels=self._labels(spec, role),
-            attempt_id=spec.attempt_id,
-            role=role,
-            plan=plan,
-            dns_server=self.config.cluster_dns_ip,
-            denied_cidrs=self.config.denied_cidrs,
-        )
+        body = self._policy_body(name, self._labels(spec, role), spec.attempt_id, role, plan)
         await self._create("networkpolicies", body)
         return name
 
@@ -2460,6 +2627,9 @@ def _read_probe(output: str) -> NamespaceProbe:
     enforced = answer == "unreachable"
     raw = fields.get("pids", "")
     pid_limit = int(raw) if raw.isdigit() else None
+    # A canary that did not say is a canary that could not tell, never a pass.
+    dns = fields.get("dns", "inconclusive")
+    endpoint = fields.get("endpoint", "inconclusive")
     problems = []
     if answer == "reachable":
         problems.append("the canary reached the API server, so the CNI is not enforcing egress")
@@ -2467,6 +2637,30 @@ def _read_probe(output: str) -> NamespaceProbe:
         problems.append(
             "the canary could not tell whether it reached the API server "
             f"(tool {fields.get('tool', 'unknown')}, curl exit {fields.get('curl_exit', 'none')})"
+        )
+    if dns == "failed":
+        problems.append(
+            "DNS check failed: the canary could not resolve a cluster name under the "
+            "worker egress rules, so a worker would have no DNS (check kubernetes.egress dns)"
+        )
+    elif dns != "resolved":
+        problems.append(
+            "DNS check inconclusive: the canary image has no getent or nslookup "
+            f"(tool {fields.get('dns_tool', 'unknown')})"
+        )
+    if endpoint in ("unreachable", "unresolved"):
+        problems.append(
+            "local endpoint check failed: the canary could not "
+            + ("resolve" if endpoint == "unresolved" else "connect to")
+            + " the configured local endpoint under the worker egress rules "
+            f"(curl exit {fields.get('endpoint_curl_exit', 'none')}; check "
+            "kubernetes.egress local_endpoint)"
+        )
+    elif endpoint not in ("reachable", "none"):
+        problems.append(
+            "local endpoint check inconclusive: the canary could not tell whether it "
+            f"connected (tool {fields.get('tool', 'unknown')}, curl exit "
+            f"{fields.get('endpoint_curl_exit', 'none')})"
         )
     if pid_limit is None:
         problems.append("the node has no pod PID limit configured")
@@ -2477,7 +2671,15 @@ def _read_probe(output: str) -> NamespaceProbe:
         detail="; ".join(problems) or "namespace ready",
         # An inconclusive answer is not a probe that ran: the status page should say so
         # rather than showing a namespace that merely failed.
-        checked=answer != "inconclusive",
+        checked=answer != "inconclusive"
+        and dns in ("resolved", "failed")
+        and endpoint in ("reachable", "unreachable", "unresolved", "none"),
+        dns_resolves={"resolved": True, "failed": False}.get(dns),
+        local_endpoint_reachable={
+            "reachable": True,
+            "unreachable": False,
+            "unresolved": False,
+        }.get(endpoint),
     )
 
 
@@ -2509,6 +2711,11 @@ exec tar cf - --exclude=output/tree "$@"
 # The canary of 26: it must fail to reach the API server, and it reports the node's pod
 # PID limit. Both answers go to its own log, which holds nothing secret.
 #
+# It also runs under the egress rules a worker gets and proves the two things a worker
+# needs from them (crucible#91): a cluster name resolves, and the configured local
+# endpoint takes a connection. A missing tool is `inconclusive` for the same reason as
+# below, and so is anything curl says that is not a definite outcome.
+#
 # The reachability test fails *closed*. An earlier form used bash's `/dev/tcp` redirect,
 # which is not a feature of `sh`: under dash or busybox the redirect simply fails, and
 # the probe would have reported "unreachable" on a namespace with no egress enforcement
@@ -2534,6 +2741,43 @@ else
     *) echo "crucible-canary.api=inconclusive" ;;
   esac
   echo "crucible-canary.curl_exit=$rc"
+fi
+name=${CRUCIBLE_CANARY_DNS_NAME:-kubernetes.default.svc}
+bounded=""
+command -v timeout >/dev/null 2>&1 && bounded="timeout 30"
+if command -v getent >/dev/null 2>&1; then
+  echo "crucible-canary.dns_tool=getent"
+  if $bounded getent hosts "$name" >/dev/null 2>&1; then
+    echo "crucible-canary.dns=resolved"
+  else
+    echo "crucible-canary.dns=failed"
+  fi
+elif command -v nslookup >/dev/null 2>&1; then
+  echo "crucible-canary.dns_tool=nslookup"
+  if $bounded nslookup "$name" >/dev/null 2>&1; then
+    echo "crucible-canary.dns=resolved"
+  else
+    echo "crucible-canary.dns=failed"
+  fi
+else
+  echo "crucible-canary.dns_tool=none"
+  echo "crucible-canary.dns=inconclusive"
+fi
+url=${CRUCIBLE_CANARY_ENDPOINT_URL:-}
+if [ -z "$url" ]; then
+  echo "crucible-canary.endpoint=none"
+elif ! command -v curl >/dev/null 2>&1; then
+  echo "crucible-canary.endpoint=inconclusive"
+else
+  curl -sS -k -o /dev/null --max-time 10 "$url" 2>/dev/null
+  rc=$?
+  case "$rc" in
+    0|22|35|52|56|60) echo "crucible-canary.endpoint=reachable" ;;
+    6) echo "crucible-canary.endpoint=unresolved" ;;
+    7|28) echo "crucible-canary.endpoint=unreachable" ;;
+    *) echo "crucible-canary.endpoint=inconclusive" ;;
+  esac
+  echo "crucible-canary.endpoint_curl_exit=$rc"
 fi
 limit=$(cat /sys/fs/cgroup/pids.max 2>/dev/null || cat /sys/fs/cgroup/pids/pids.max 2>/dev/null)
 case "$limit" in

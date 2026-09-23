@@ -12,15 +12,17 @@ namespace's default deny is already the answer for it.
 from __future__ import annotations
 
 import ipaddress
+from dataclasses import replace
 from typing import Any
 
 import pytest
 
 from crucible.adapters.execution import k8sspec
-from crucible.adapters.execution.k8sspec import SpecError
+from crucible.adapters.execution.k8sspec import EgressPlan, SpecError
 from crucible.adapters.execution.kubernetes import KubernetesConfig
+from crucible.domain.cluster_egress import ClusterEgress
 from crucible.ports.execution import CleanupPolicy, ProviderError
-from tests.unit.kubernetes_fixtures import build, spec
+from tests.unit.kubernetes_fixtures import build, fake_resolver, spec
 
 DENIED_BY_26 = (
     # the cluster's API server and every other service address
@@ -63,8 +65,9 @@ def allows(policy: dict[str, Any], address: str, port: int, protocol: str = "TCP
 
 
 async def policies(**kwargs: Any) -> dict[str, dict[str, Any]]:
-    """Every NetworkPolicy one whole attempt creates, by the role it selects."""
-    api, _registry, provider = build()
+    """Every NetworkPolicy one whole attempt creates, by the role it selects. The
+    readiness canary's own policy is not the attempt's and is tested on its own."""
+    api, _registry, provider = build(config=kwargs.pop("config", None))
     launch = spec(**kwargs)
     workspace = await provider.prepare(launch)
     handle = await provider.launch(workspace, launch)
@@ -76,6 +79,8 @@ async def policies(**kwargs: Any) -> dict[str, dict[str, Any]]:
         row["body"]["spec"]["podSelector"]["matchLabels"][k8sspec.LABEL_ROLE]: row["body"]
         for row in api.created
         if row["kind"] == "networkpolicies"
+        and row["body"]["spec"]["podSelector"]["matchLabels"][k8sspec.LABEL_ROLE]
+        != k8sspec.ROLE_CANARY
     }
 
 
@@ -185,10 +190,14 @@ async def test_cluster_dns_is_port_53_on_the_dns_address_and_nothing_else(
 
 
 async def test_ipv6_is_denied_entirely(rendered: dict[str, dict[str, Any]]) -> None:
-    """Every rule is an IPv4 ipBlock, so a v6 destination matches nothing."""
+    """Every address rule is an IPv4 ipBlock, so a v6 destination matches nothing. The
+    only other peer is a pod selector, which names pods and never an address."""
     for policy in rendered.values():
         for rule in rules(policy):
             for destination in rule.get("to") or []:
+                if "ipBlock" not in destination:
+                    assert set(destination) == {"namespaceSelector", "podSelector"}
+                    continue
                 assert ipaddress.ip_network(destination["ipBlock"]["cidr"]).version == 4
 
 
@@ -299,6 +308,8 @@ async def test_the_rendered_rules_never_name_a_denied_address() -> None:
     for policy in rendered.values():
         for rule in rules(policy):
             for destination in rule.get("to") or []:
+                if "ipBlock" not in destination:
+                    continue
                 block = destination["ipBlock"]
                 if block["cidr"] == "0.0.0.0/0":
                     continue
@@ -358,3 +369,207 @@ async def test_the_verifier_does_not_get_the_git_remote_either() -> None:
         k8sspec.ROLE_VERIFIER,
     )
     assert set(plan.hosts) == {"pypi.org"}
+
+
+# ----- selectors that survive a translating CNI (crucible#91) ---------------
+
+IN_CLUSTER = ClusterEgress(
+    endpoint_namespace="litellm",
+    endpoint_pod_labels=(("app.kubernetes.io/name", "litellm"),),
+    endpoint_port=4000,
+)
+LITELLM_URL = "http://litellm.litellm.svc.cluster.local:80/v1"
+
+
+def selector_peers(policy: dict[str, Any]) -> list[tuple[dict[str, Any], list[dict[str, Any]]]]:
+    """Every (selector peer, ports) pair a policy carries."""
+    return [
+        (destination, rule.get("ports") or [])
+        for rule in rules(policy)
+        for destination in rule.get("to") or []
+        if "ipBlock" not in destination
+    ]
+
+
+def in_cluster_config(**overrides: Any) -> KubernetesConfig:
+    return KubernetesConfig(
+        poll_interval_seconds=0,
+        launch_timeout_seconds=5,
+        **{"egress": IN_CLUSTER, **overrides},
+    )
+
+
+async def test_dns_is_allowed_by_the_resolvers_pods_as_well_as_its_address(
+    rendered: dict[str, dict[str, Any]],
+) -> None:
+    """A CNI that translates the kube-dns ClusterIP to its pods before it evaluates
+    policy (Cilium with kube-proxy replacement) never matches the /32; it matches the
+    selector. Both sit in one rule, so both get port 53 and nothing else."""
+    for policy in rendered.values():
+        dns_rules = [
+            rule
+            for rule in rules(policy)
+            if any("podSelector" in d for d in rule["to"]) and rule["ports"][0]["port"] == 53
+        ]
+        assert len(dns_rules) == 1
+        rule = dns_rules[0]
+        assert rule["ports"] == [{"protocol": "UDP", "port": 53}, {"protocol": "TCP", "port": 53}]
+        assert {"ipBlock": {"cidr": "10.96.0.10/32"}} in rule["to"]
+        assert {
+            "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "kube-system"}},
+            "podSelector": {"matchLabels": {"k8s-app": "kube-dns"}},
+        } in rule["to"]
+
+
+async def test_an_in_cluster_local_endpoint_is_its_pods_on_the_backend_port() -> None:
+    """The Service's port (80 here) is not what a translating CNI sees; the pods' port
+    (4000) is, so the rule names the backend port and no address at all."""
+    rendered = await policies(
+        config=in_cluster_config(), endpoint="local", endpoint_url=LITELLM_URL
+    )
+    worker = rendered[k8sspec.ROLE_WORKER]
+    endpoint_rules = [
+        (peer, ports)
+        for peer, ports in selector_peers(worker)
+        if peer["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"] == "litellm"
+    ]
+    assert endpoint_rules == [
+        (
+            {
+                "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "litellm"}},
+                "podSelector": {"matchLabels": {"app.kubernetes.io/name": "litellm"}},
+            },
+            [{"protocol": "TCP", "port": 4000}],
+        )
+    ]
+    # The service name was never resolved into an address rule.
+    assert not allows(worker, "10.43.12.7", 80)
+    assert not allows(worker, "10.43.12.7", 4000)
+    # Only the worker gets the model endpoint.
+    for role, policy in rendered.items():
+        if role != k8sspec.ROLE_WORKER:
+            assert all(
+                p["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"] != "litellm"
+                for p, _ in selector_peers(policy)
+            )
+
+
+async def test_port_zero_means_the_endpoint_urls_own_port() -> None:
+    config = in_cluster_config(egress=replace(IN_CLUSTER, endpoint_port=0))
+    rendered = await policies(
+        config=config, endpoint="local", endpoint_url="http://litellm.litellm.svc:4000/v1"
+    )
+    ports = [
+        ports
+        for peer, ports in selector_peers(rendered[k8sspec.ROLE_WORKER])
+        if peer["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"] == "litellm"
+    ]
+    assert ports == [[{"protocol": "TCP", "port": 4000}]]
+
+
+async def test_an_out_of_cluster_endpoint_keeps_its_address_rule() -> None:
+    """With no endpoint namespace the local route is the resolved /32, as before."""
+
+    def resolver(host: str) -> list[str]:
+        return ["10.10.0.42/32"] if host == "llm.apps.int.sentania.net" else fake_resolver(host)
+
+    api, _registry, provider = build(
+        resolver=resolver,
+        config=KubernetesConfig(
+            poll_interval_seconds=0,
+            launch_timeout_seconds=5,
+            local_endpoint_cidrs=("10.10.0.0/24",),
+        ),
+    )
+    launch = spec(endpoint="local", endpoint_url="https://llm.apps.int.sentania.net:8443/v1")
+    workspace = await provider.prepare(launch)
+    await provider.launch(workspace, launch)
+    worker = next(
+        row["body"]
+        for row in api.created
+        if row["kind"] == "networkpolicies" and row["name"].startswith("np-worker")
+    )
+    assert allows(worker, "10.10.0.42", 8443)
+    assert all(
+        p["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"] == "kube-system"
+        for p, _ in selector_peers(worker)
+    )
+
+
+@pytest.mark.parametrize("address", DENIED_BY_26)
+async def test_a_selector_rule_never_opens_a_denied_address(address: str) -> None:
+    """26's denials hold with every selector configured: a selector names pods, adds no
+    address, and carries only its own port, so every denied address stays denied on
+    every port for every role."""
+    rendered = await policies(
+        config=in_cluster_config(), endpoint="local", endpoint_url=LITELLM_URL
+    )
+    for role, policy in rendered.items():
+        for port in (53, 80, 443, 4000, 6443, 8080):
+            for protocol in ("TCP", "UDP"):
+                if address == "10.96.0.10" and port == 53:
+                    continue
+                assert not allows(policy, address, port, protocol), f"{role} {address}:{port}"
+        for peer, ports in selector_peers(policy):
+            # One namespace by name, and a non-empty pod selector: never a whole
+            # namespace, never every namespace.
+            assert set(peer) == {"namespaceSelector", "podSelector"}
+            assert list(peer["namespaceSelector"]["matchLabels"]) == ["kubernetes.io/metadata.name"]
+            assert peer["podSelector"]["matchLabels"]
+            assert ports and all(p["port"] in (53, 4000) for p in ports)
+
+
+@pytest.mark.parametrize("namespace", ["crucible-workers", "crucible"])
+async def test_a_selector_into_the_workers_or_crucibles_namespace_is_refused(
+    namespace: str,
+) -> None:
+    """A selector into the workers namespace is a worker reaching another attempt; into
+    Crucible's own, a worker reaching its database. The provider refuses to render it
+    even if a document got past the admin check."""
+    config = in_cluster_config(egress=replace(IN_CLUSTER, endpoint_namespace=namespace))
+    _api, _registry, provider = build(config=config)
+    launch = spec(endpoint="local", endpoint_url=LITELLM_URL)
+    with pytest.raises(SpecError, match="may never reach"):
+        provider._policy_body(
+            "np",
+            {},
+            launch.attempt_id,
+            k8sspec.ROLE_WORKER,
+            provider._egress_plan(launch, k8sspec.ROLE_WORKER),
+        )
+    config = KubernetesConfig(egress=replace(ClusterEgress(), dns_namespace=namespace))
+    _api, _registry, provider = build(config=config)
+    with pytest.raises(SpecError, match="may never reach"):
+        provider._policy_body("np", {}, launch.attempt_id, k8sspec.ROLE_WORKER, EgressPlan())
+
+
+def test_an_empty_pod_selector_is_refused_at_render_time() -> None:
+    with pytest.raises(SpecError, match="no pod labels"):
+        k8sspec.egress_policy(
+            name="np",
+            namespace="crucible-workers",
+            object_labels={},
+            attempt_id="A",
+            role=k8sspec.ROLE_WORKER,
+            plan=EgressPlan(),
+            dns_server="",
+            dns_selector=k8sspec.PeerSelector("kube-system", ()),
+        )
+
+
+def test_an_empty_dns_namespace_leaves_the_address_rule_alone() -> None:
+    body = k8sspec.egress_policy(
+        name="np",
+        namespace="crucible-workers",
+        object_labels={},
+        attempt_id="A",
+        role=k8sspec.ROLE_WORKER,
+        plan=EgressPlan(),
+        dns_server="10.96.0.10",
+    )
+    assert body["spec"]["egress"] == [
+        {
+            "to": [{"ipBlock": {"cidr": "10.96.0.10/32"}}],
+            "ports": [{"protocol": "UDP", "port": 53}, {"protocol": "TCP", "port": 53}],
+        }
+    ]

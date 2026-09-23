@@ -154,6 +154,13 @@ class FakeKubernetesApi:
     # A canary whose output stops before the final line, which is a truncated log and
     # not a result.
     canary_done: bool = True
+    # What the canary's DNS check and local endpoint check report when its egress
+    # policy allows them (crucible#91): `resolved` or `failed` and `inconclusive` for
+    # the first, `reachable`, `unreachable`, `unresolved` or `inconclusive` for the
+    # second. A canary with no policy carrying a port 53 rule always fails its DNS
+    # check, which is what a namespace default deny does to it.
+    canary_dns: str = "resolved"
+    canary_endpoint: str = "reachable"
     pod_pid_limit: int | None = 4096
     node_name: str = "lab-node-1"
     quota_jobs: int | None = None
@@ -457,13 +464,39 @@ class FakeKubernetesApi:
             ],
         }
 
+    def _canary_policy(self, attempt_id: str) -> dict[str, Any] | None:
+        for (kind, _name), candidate in self.objects.items():
+            if kind != "networkpolicies" or candidate.deleted:
+                continue
+            selector = (candidate.body.get("spec") or {}).get("podSelector") or {}
+            if (selector.get("matchLabels") or {}).get(LABEL_ATTEMPT) == attempt_id:
+                return candidate.body
+        return None
+
     def _act_canary(self, obj: _Object, attempt_id: str) -> None:
         name = obj.name
         pid = "none" if self.pod_pid_limit is None else str(self.pod_pid_limit)
+        labels = (obj.body.get("metadata") or {}).get("labels") or {}
+        policy = self._canary_policy(str(labels.get(LABEL_ATTEMPT, "")))
+        dns_open = policy is not None and any(
+            int(port.get("port", 0)) == 53
+            for rule in (policy.get("spec") or {}).get("egress") or []
+            for port in rule.get("ports") or []
+        )
+        dns = self.canary_dns if dns_open or self.canary_dns == "inconclusive" else "failed"
+        env = {
+            item["name"]: item.get("value", "")
+            for container in (obj.body.get("spec") or {}).get("containers") or []
+            for item in container.get("env") or []
+        }
+        endpoint = self.canary_endpoint if env.get("CRUCIBLE_CANARY_ENDPOINT_URL") else "none"
         self.logs[name] = [
             "crucible-canary.tool=curl",
             f"crucible-canary.api={self.canary_answer}",
             f"crucible-canary.curl_exit={'7' if self.egress_enforced else '0'}",
+            f"crucible-canary.dns_tool={'none' if dns == 'inconclusive' else 'getent'}",
+            f"crucible-canary.dns={dns}",
+            f"crucible-canary.endpoint={endpoint}",
             f"crucible-canary.pids={pid}",
             *(["crucible-canary.done=1"] if self.canary_done else []),
         ]
