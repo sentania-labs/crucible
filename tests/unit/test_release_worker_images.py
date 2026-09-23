@@ -610,6 +610,16 @@ def test_a_signed_upload_state_in_a_location_is_not_logged() -> None:
     assert wi.redact("/v2/a/blobs/upload/1.x") == "/v2/a/blobs/upload/1.x"
 
 
+def test_userinfo_and_a_query_in_a_traced_location_are_dropped() -> None:
+    """A hostile registry's Location can carry a credential ahead of the `_url()`
+    check that would otherwise refuse it; only scheme, host and path are ever traced."""
+    assert (
+        wi.redact_location("https://user:secret@evil.example/v2/a/blobs/upload/1.x?_state=c2VjcmV0")
+        == "https://evil.example/v2/a/blobs/upload/1.x"
+    )
+    assert wi.redact_location("/v2/a/blobs/upload/1.x?_state=c2VjcmV0") == "/v2/a/blobs/upload/1.x"
+
+
 def test_a_tag_prefix_publishes_and_verifies_the_prefixed_tag_only(
     published: tuple[Path, Path, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:

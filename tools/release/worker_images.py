@@ -149,11 +149,22 @@ def redact(path: str) -> str:
     return f"{base}?{'&'.join(parts)}"
 
 
+def redact_location(location: str) -> str:
+    """`location` with userinfo and every query value dropped: a hostile registry's
+    Location can carry a credential (`https://user:secret@evil.example/...`) ahead of
+    the `_url()` check, and a query can carry signed upload state, so only scheme, host
+    and path are ever traced."""
+    parsed = urllib.parse.urlsplit(location)
+    if not parsed.scheme:
+        return parsed.path
+    return f"{parsed.scheme}://{parsed.hostname}{parsed.path}"
+
+
 def trace(method: str, path: str, status: int, reply: dict[str, str], body: bytes) -> None:
     fields = [f"{method} {redact(path)} -> {status}"]
     for name in TRACED_HEADERS:
         if name in reply:
-            value = redact(reply[name]) if name == "location" else reply[name]
+            value = redact_location(reply[name]) if name == "location" else reply[name]
             fields.append(f"{name}={value}")
     if status >= 300 and body:
         fields.append("body=" + body.decode("utf-8", "replace")[:300])
