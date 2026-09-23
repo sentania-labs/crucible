@@ -532,21 +532,24 @@ class KubernetesProvider:
             return self.probe
 
     async def _run_probe(self) -> NamespaceProbe:
+        """Two canary Pods, one after the other.
+
+        The first runs under the namespace's own rules and nothing else, which is what
+        a role with no egress gets: it must fail to reach the API server, and it reads
+        the pod PID limit. A canary with a policy of its own would be isolated by that
+        policy and could not tell a namespace with no default deny from one with it.
+
+        The second runs under the rules a worker gets (crucible#91): cluster DNS and the
+        enabled local endpoint, and nothing else. It must resolve a cluster name and
+        connect to the endpoint, and still fail to reach the API server."""
         image = self._probe_image()
         if not image:
             return NamespaceProbe(
                 False, False, None, "no image is configured to run the canary with", checked=False
             )
-        canary_id = new_id()
-        name = f"crucible-canary-{canary_id.lower()}"[:60]
-        object_labels = {
-            k8sspec.LABEL_ROLE: k8sspec.ROLE_CANARY,
-            k8sspec.LABEL_OWNER: "crucible",
-            k8sspec.LABEL_CANARY: canary_id,
-        }
-        # The canary runs under the rules a worker gets (crucible#91): cluster DNS and
-        # the local endpoint, and nothing else. What it proves is then what a worker
-        # will meet, and on a CNI where those rules do not match it says so.
+        namespace_run = await self._run_canary(image, scope="namespace")
+        if isinstance(namespace_run, NamespaceProbe):
+            return namespace_run
         endpoint_url = self.config.local_endpoint_url
         try:
             plan = await self._resolve_plan(self._local_endpoint_plan(EgressPlan(), endpoint_url))
@@ -559,15 +562,45 @@ class KubernetesProvider:
                 checked=False,
                 local_endpoint_reachable=False,
             )
-        policy_name = k8sspec.object_name("np-canary", canary_id)
-        policy = self._policy_body(
-            policy_name,
-            object_labels,
-            canary_id,
-            k8sspec.ROLE_CANARY,
-            plan,
-            pod_selector={k8sspec.LABEL_CANARY: canary_id, k8sspec.LABEL_ROLE: k8sspec.ROLE_CANARY},
+        rules_run = await self._run_canary(
+            image, scope="worker", plan=plan, endpoint_url=endpoint_url
         )
+        if isinstance(rules_run, NamespaceProbe):
+            return rules_run
+        return _read_probe(namespace_run, rules_run)
+
+    async def _run_canary(
+        self,
+        image: str,
+        *,
+        scope: Literal["namespace", "worker"],
+        plan: EgressPlan | None = None,
+        endpoint_url: str = "",
+    ) -> str | NamespaceProbe:
+        """Run one canary Pod to its end and return its log, or the probe that says why
+        it could not run. `plan` is its own NetworkPolicy; None runs it under the
+        namespace's rules alone."""
+        canary_id = new_id()
+        name = f"crucible-canary-{'ns' if scope == 'namespace' else 'rules'}-{canary_id.lower()}"
+        object_labels = {
+            k8sspec.LABEL_ROLE: k8sspec.ROLE_CANARY,
+            k8sspec.LABEL_OWNER: "crucible",
+            k8sspec.LABEL_CANARY: canary_id,
+        }
+        policy_name: str | None = None
+        if plan is not None:
+            policy_name = k8sspec.object_name("np-canary", canary_id)
+            policy = self._policy_body(
+                policy_name,
+                object_labels,
+                canary_id,
+                k8sspec.ROLE_CANARY,
+                plan,
+                pod_selector={
+                    k8sspec.LABEL_CANARY: canary_id,
+                    k8sspec.LABEL_ROLE: k8sspec.ROLE_CANARY,
+                },
+            )
         limits = k8sspec.limits_from_policy({})
         pod = k8sspec.bare_pod(
             name=name,
@@ -580,6 +613,7 @@ class KubernetesProvider:
                     command=["sh", "-c", _CANARY_SCRIPT],
                     limits=limits,
                     env={
+                        "CRUCIBLE_CANARY_SCOPE": scope,
                         "CRUCIBLE_CANARY_DNS_NAME": CANARY_DNS_NAME,
                         **({"CRUCIBLE_CANARY_ENDPOINT_URL": endpoint_url} if endpoint_url else {}),
                     },
@@ -590,17 +624,19 @@ class KubernetesProvider:
                 )
             ),
         )
-        try:
-            await self._call(self.client.create, "networkpolicies", policy)
-        except KubernetesApiError as exc:
-            return NamespaceProbe(
-                False, False, None, f"the canary NetworkPolicy was refused: {exc}", False
-            )
+        if policy_name is not None:
+            try:
+                await self._call(self.client.create, "networkpolicies", policy)
+            except KubernetesApiError as exc:
+                return NamespaceProbe(
+                    False, False, None, f"the canary NetworkPolicy was refused: {exc}", False
+                )
         try:
             await self._call(self.client.create, "pods", pod)
         except KubernetesApiError as exc:
-            with contextlib.suppress(KubernetesApiError):
-                await self._call(self.client.delete, "networkpolicies", policy_name)
+            if policy_name is not None:
+                with contextlib.suppress(KubernetesApiError):
+                    await self._call(self.client.delete, "networkpolicies", policy_name)
             return NamespaceProbe(False, False, None, f"the canary Pod was refused: {exc}", False)
         try:
             phase = await self._await_pod(name, timeout=self.config.launch_timeout_seconds)
@@ -618,14 +654,14 @@ class KubernetesProvider:
                 container=k8sspec.CONTAINER_NAME,
                 timestamps=False,
             )
-            output = b"".join(frame.payload for frame in body).decode("utf-8", "replace")
+            return b"".join(frame.payload for frame in body).decode("utf-8", "replace")
         finally:
             with contextlib.suppress(KubernetesApiError):
                 await self._call(self.client.delete, "pods", name, grace_period_seconds=0)
             await self._await_pod_gone(name)
-            with contextlib.suppress(KubernetesApiError):
-                await self._call(self.client.delete, "networkpolicies", policy_name)
-        return _read_probe(output)
+            if policy_name is not None:
+                with contextlib.suppress(KubernetesApiError):
+                    await self._call(self.client.delete, "networkpolicies", policy_name)
 
     def _probe_image(self) -> str:
         """What the readiness canary runs: an image an attempt already resolved, else the
@@ -2645,25 +2681,35 @@ def _extract(raw: bytes, into: Path) -> None:
         tar.extractall(into, filter="data")
 
 
-def _read_probe(output: str) -> NamespaceProbe:
-    """Parse the canary's answers. Anything but a definite refusal fails the probe.
-
-    `done=1` is what says the script ran to the end; without it the output is a
-    truncated log and nothing in it is a result."""
+def _canary_fields(output: str) -> dict[str, str]:
     fields: dict[str, str] = {}
     for line in output.splitlines():
         key, _, value = line.partition("=")
         if key.startswith("crucible-canary."):
             fields[key[len("crucible-canary.") :].strip()] = value.strip()
+    return fields
+
+
+def _read_probe(output: str, rules_output: str | None = None) -> NamespaceProbe:
+    """Parse the canaries' answers. Anything but a definite answer fails the probe.
+
+    `output` is the canary under the namespace's own rules: the API server and the PID
+    limit. `rules_output` is the canary under a worker's rules: DNS, the local endpoint,
+    and the API server again. `done=1` is what says a script ran to the end; without it
+    the output is a truncated log and nothing in it is a result."""
+    fields = _canary_fields(output)
     if "api" not in fields or fields.get("done") != "1":
         return NamespaceProbe(False, False, None, "the canary produced no result", checked=False)
+    rules = fields if rules_output is None else _canary_fields(rules_output)
+    if rules.get("done") != "1":
+        rules = {}
     answer = fields["api"]
     enforced = answer == "unreachable"
     raw = fields.get("pids", "")
     pid_limit = int(raw) if raw.isdigit() else None
     # A canary that did not say is a canary that could not tell, never a pass.
-    dns = fields.get("dns", "inconclusive")
-    endpoint = fields.get("endpoint", "inconclusive")
+    dns = rules.get("dns", "inconclusive")
+    endpoint = rules.get("endpoint", "inconclusive")
     problems = []
     if answer == "reachable":
         problems.append("the canary reached the API server, so the CNI is not enforcing egress")
@@ -2671,6 +2717,13 @@ def _read_probe(output: str) -> NamespaceProbe:
         problems.append(
             "the canary could not tell whether it reached the API server "
             f"(tool {fields.get('tool', 'unknown')}, curl exit {fields.get('curl_exit', 'none')})"
+        )
+    elif rules_output is not None and rules.get("api") != "unreachable":
+        # The worker rules must deny the API server too; a selector never opens it.
+        enforced = False
+        problems.append(
+            "the canary under the worker egress rules did not prove the API server "
+            f"unreachable ({rules.get('api', 'no result')})"
         )
     if dns == "failed":
         problems.append(
@@ -2782,6 +2835,9 @@ else
   esac
   echo "crucible-canary.curl_exit=$rc"
 fi
+# The namespace-scope canary has no policy of its own, so DNS and the endpoint are not
+# its question; the worker-scope canary answers them.
+if [ "${CRUCIBLE_CANARY_SCOPE:-worker}" != namespace ]; then
 name=${CRUCIBLE_CANARY_DNS_NAME:-kubernetes.default.svc}
 bounded=""
 command -v timeout >/dev/null 2>&1 && bounded="timeout 30"
@@ -2825,6 +2881,7 @@ else
     *) echo "crucible-canary.endpoint=inconclusive" ;;
   esac
   echo "crucible-canary.endpoint_curl_exit=$rc"
+fi
 fi
 limit=$(cat /sys/fs/cgroup/pids.max 2>/dev/null || cat /sys/fs/cgroup/pids/pids.max 2>/dev/null)
 case "$limit" in

@@ -232,10 +232,11 @@ Done means seen working, so all three:
    }
    ```
 
-   `namespace_ready` is 26's readiness canary. It runs under the same egress rules a
-   worker gets and must fail to reach the API server, resolve a cluster name, and connect
-   to the enabled local endpoint (`local_endpoint_reachable` is `null` when no local model
-   is enabled). `egress_enforced: false` means the CNI is not enforcing egress
+   `namespace_ready` is 26's readiness canary, two short-lived Pods. The first runs
+   under the namespace's own rules and must fail to reach the API server. The second runs
+   under the egress rules a worker gets and must resolve a cluster name, connect to the
+   enabled local endpoint (`local_endpoint_reachable` is `null` when no local model is
+   enabled), and also fail to reach the API server. `egress_enforced: false` means the CNI is not enforcing egress
    NetworkPolicy and the provider will refuse every launch, which is the correct
    behaviour and not a bug to route around. `dns_resolves: false` or
    `local_endpoint_reachable: false` means the rules do not match on this CNI: set the

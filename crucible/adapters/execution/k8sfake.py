@@ -506,13 +506,21 @@ class FakeKubernetesApi:
             for item in container.get("env") or []
         }
         endpoint = self.canary_endpoint if env.get("CRUCIBLE_CANARY_ENDPOINT_URL") else "none"
+        # The namespace-scope canary answers the API server and the PID limit only.
+        egress_lines = (
+            []
+            if env.get("CRUCIBLE_CANARY_SCOPE") == "namespace"
+            else [
+                f"crucible-canary.dns_tool={'none' if dns == 'inconclusive' else 'getent'}",
+                f"crucible-canary.dns={dns}",
+                f"crucible-canary.endpoint={endpoint}",
+            ]
+        )
         self.logs[name] = [
             "crucible-canary.tool=curl",
             f"crucible-canary.api={self.canary_answer}",
             f"crucible-canary.curl_exit={'7' if self.egress_enforced else '0'}",
-            f"crucible-canary.dns_tool={'none' if dns == 'inconclusive' else 'getent'}",
-            f"crucible-canary.dns={dns}",
-            f"crucible-canary.endpoint={endpoint}",
+            *egress_lines,
             f"crucible-canary.pids={pid}",
             *(["crucible-canary.done=1"] if self.canary_done else []),
         ]

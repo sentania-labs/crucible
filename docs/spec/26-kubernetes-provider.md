@@ -246,17 +246,20 @@ restart. Until a process has read it back, that process keeps launching under th
 values it last proved. (Added 2026-09-23 for crucible#91.)
 
 **Readiness.** If the cluster's CNI does not enforce egress NetworkPolicy, the
-provider refuses to launch: readiness of the namespace is probed by a canary pod
-and the result is recorded and shown on the admin status page (25). The canary
-runs under its own NetworkPolicy, rendered exactly as a worker's is (cluster DNS,
-and the enabled local endpoint of the routing policy in force when there is one),
-and must:
+provider refuses to launch: readiness of the namespace is probed by two canary
+pods, one after the other, and the result is recorded and shown on the admin
+status page (25).
 
-1. fail to reach the API server (`egress_enforced`);
-2. resolve a cluster name, `kubernetes.default.svc`, through that policy
-   (`dns_resolves`);
-3. connect to the enabled local endpoint's URL through that policy, when one is
-   enabled (`local_endpoint_reachable`).
+- The first runs under the namespace's own rules and no policy of its own, which
+  is what a role with no egress gets. It must fail to reach the API server
+  (`egress_enforced`), and it reads the pod PID limit. A canary with a policy of
+  its own would be isolated by that policy, so it could not tell a namespace that
+  lost its default deny from one that has it.
+- The second runs under its own NetworkPolicy, rendered exactly as a worker's is
+  (cluster DNS, and the enabled local endpoint of the routing policy in force
+  when there is one). It must resolve a cluster name, `kubernetes.default.svc`
+  (`dns_resolves`), connect to the enabled local endpoint's URL when one is
+  enabled (`local_endpoint_reachable`), and still fail to reach the API server.
 
 A failure of any of them is `namespace_ready: false` with a detail naming the
 check that failed, and every launch is refused until it passes. A missing tool in

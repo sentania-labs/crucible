@@ -60,7 +60,7 @@ async def test_the_canary_runs_under_its_own_policy_and_removes_it() -> None:
     canary = next(
         row["body"]
         for row in api.created
-        if row["kind"] == "pods" and row["name"].startswith("crucible-canary-")
+        if row["kind"] == "pods" and row["name"].startswith("crucible-canary-rules-")
     )
     # The policy selects the canary Pod and nothing else.
     assert canary["metadata"]["labels"][k8sspec.LABEL_CANARY] == selector[k8sspec.LABEL_CANARY]
@@ -109,7 +109,7 @@ async def test_a_configured_local_endpoint_is_connected_to_under_its_selector() 
     canary = next(
         row["body"]
         for row in api.created
-        if row["kind"] == "pods" and row["name"].startswith("crucible-canary-")
+        if row["kind"] == "pods" and row["name"].startswith("crucible-canary-rules-")
     )
     env = {e["name"]: e["value"] for e in canary["spec"]["containers"][0]["env"]}
     assert env["CRUCIBLE_CANARY_ENDPOINT_URL"] == LITELLM
@@ -152,7 +152,7 @@ async def test_an_endpoint_no_rule_can_permit_fails_the_probe_without_a_canary()
     )
     assert probe.passed is False
     assert "local endpoint check failed" in probe.detail
-    assert not [row for row in api.created if row["name"].startswith("crucible-canary-")]
+    assert not [row for row in api.created if row["name"].startswith("crucible-canary-rules-")]
 
 
 def test_an_old_canary_output_without_the_new_answers_does_not_pass() -> None:
@@ -250,7 +250,8 @@ async def test_the_retention_sweep_never_takes_a_canary_mid_run() -> None:
 
     api.pod_log = pod_log  # type: ignore[method-assign]
     assert (await provider.ensure_ready()).passed
-    assert len(in_flight) == 2
+    # The namespace canary alone, then the worker-rules canary and its policy.
+    assert len(in_flight) == 1 + 2
     assert not [name for name in swept if "canary" in name]
 
 
@@ -283,7 +284,8 @@ async def test_a_probe_proved_under_rules_that_changed_while_it_ran_is_not_kept(
     api.pod_log = pod_log  # type: ignore[method-assign]
     probe = await provider.ensure_ready()
     assert probe.passed
-    assert len(runs) == 2 and runs[1] == IN_CLUSTER
+    # Two canary Pods per run: the first run was discarded, the second kept.
+    assert len(runs) == 4 and runs[2:] == [IN_CLUSTER, IN_CLUSTER]
     assert provider.probe is probe
 
 
@@ -312,3 +314,51 @@ async def test_a_refused_document_still_follows_the_endpoint_url() -> None:
     provider.apply_settings(bad, LITELLM)
     assert provider.config.egress == IN_CLUSTER
     assert provider.config.local_endpoint_url == LITELLM
+
+
+async def test_a_namespace_without_its_default_deny_fails_even_with_worker_rules() -> None:
+    """The canary with a policy of its own would be isolated by it; the namespace-scope
+    canary has none, so a namespace that lost its default deny still fails the probe
+    (readiness row 12, and the e2e-kind case that deletes the default deny)."""
+    api, _registry, provider = build()
+    await provider.prepare(spec())
+    real_log = api.pod_log
+
+    def pod_log(name: str, **kwargs: Any) -> Any:
+        # The API server answers whoever has no policy of their own.
+        if "-ns-" in name:
+            api.logs[name] = [
+                line.replace("api=unreachable", "api=reachable") for line in api.logs[name]
+            ]
+        return real_log(name, **kwargs)
+
+    api.pod_log = pod_log  # type: ignore[method-assign]
+    probe = await provider.ensure_ready()
+    assert probe.passed is False and probe.egress_enforced is False
+    assert "reached the API server" in probe.detail
+    namespace_canary = next(
+        row["body"]
+        for row in api.created
+        if row["kind"] == "pods" and row["name"].startswith("crucible-canary-ns-")
+    )
+    selected = [
+        row
+        for row in api.created
+        if row["kind"] == "networkpolicies"
+        and row["body"]["spec"]["podSelector"]["matchLabels"].get(k8sspec.LABEL_CANARY)
+        == namespace_canary["metadata"]["labels"][k8sspec.LABEL_CANARY]
+    ]
+    assert selected == []
+
+
+def test_the_worker_rules_canary_must_also_find_the_api_server_unreachable() -> None:
+    namespace = (
+        "crucible-canary.api=unreachable\ncrucible-canary.pids=4096\ncrucible-canary.done=1\n"
+    )
+    rules = (
+        "crucible-canary.api=reachable\ncrucible-canary.dns=resolved\n"
+        "crucible-canary.endpoint=none\ncrucible-canary.done=1\n"
+    )
+    probe = _read_probe(namespace, rules)
+    assert probe.passed is False and probe.egress_enforced is False
+    assert "under the worker egress rules" in probe.detail

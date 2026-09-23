@@ -123,7 +123,8 @@ async def test_the_probe_requests_log_lines_without_timestamp_prefixes() -> None
 
     api.pod_log = pod_log  # type: ignore[method-assign]
     assert (await provider.ensure_ready()).passed
-    assert requested == [False]
+    # Two canaries: the namespace's own rules, then a worker's.
+    assert requested == [False, False]
 
 
 async def test_concurrent_readiness_checks_share_one_canary() -> None:
