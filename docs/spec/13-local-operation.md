@@ -178,13 +178,16 @@ Rules:
 - **The worker image follows accepted practice for application images, the
   same as the Crucible service image and ScarGuard's services** (the
   operator's decision, 2026-09-23). Every release tags the worker image
-  `crucible-worker:<version>` and moves `crucible-worker:latest`, and the
-  script-harness image `crucible-worker:script-harness-<version>` and
-  `crucible-worker:script-harness-latest`, `<version>` being the Crucible
-  release version, never the fingerprint tag (24). The fingerprint tag stays
-  the local build's own name and `images/manifest.env`'s record; it is
-  never pushed. Example manifests and the runbook's placeholder comments
-  say `latest`; a real deployment pins the exact tag and digest the release
+  `crucible-worker:<version>` and the script-harness image
+  `crucible-worker:script-harness-<version>`, `<version>` being the Crucible
+  release version, never the fingerprint tag (24). `latest` and
+  `script-harness-latest` move only when that version is the highest one
+  published, the same rule the Crucible service image's release step
+  applies; a lower version released after a higher one, or an old release
+  job re-run, leaves them where they are. The fingerprint tag stays the
+  local build's own name and `images/manifest.env`'s record; it is never
+  pushed. Example manifests and the runbook's placeholder comments say
+  `latest`; a real deployment pins the exact tag and digest the release
   body gives, the same as it pins the service image.
 - `build.sh` is itself a hashed build input, so editing it retags every
   image; the previous tags stay on the daemon and in the registry as the

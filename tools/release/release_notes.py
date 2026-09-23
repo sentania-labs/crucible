@@ -25,7 +25,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from worker_images import PublishError, Registry, declared_images
 
 
-def render(service_ref: str, service_digest: str, worker_ref: str, worker_digest: str) -> str:
+def render(
+    service_ref: str, service_digest: str, worker_ref: str, worker_digest: str, latest_note: str
+) -> str:
     return (
         "## Published image digests\n"
         "\n"
@@ -34,6 +36,7 @@ def render(service_ref: str, service_digest: str, worker_ref: str, worker_digest
         "\n"
         f"- `{service_ref}@{service_digest}`\n"
         f"- `{worker_ref}@{worker_digest}`\n"
+        f"{latest_note}"
     )
 
 
@@ -61,12 +64,26 @@ def main(argv: list[str] | None = None) -> int:
             raise PublishError(f"{args.service_image} is not published")
 
         worker_tag, declared_worker_digest = worker_image(args.worker_manifest, service_tag)
-        worker_digest = Registry(args.worker_repository).published_digest(worker_tag)
+        worker_registry = Registry(args.worker_repository)
+        worker_digest = worker_registry.published_digest(worker_tag)
         if worker_digest != declared_worker_digest:
             raise PublishError(
                 f"{args.worker_repository}:{worker_tag} carries {worker_digest or 'nothing'} "
                 f"on the registry, not the declared {declared_worker_digest}"
             )
+
+        # `images-publish` moves worker `latest` only when worker_tag was the highest
+        # published version; a lower version released after a higher one leaves it
+        # pointing elsewhere, which the notes say plainly rather than implying it moved.
+        latest_digest = worker_registry.published_digest("latest")
+        latest_note = (
+            ""
+            if latest_digest == worker_digest
+            else (
+                f"- `{args.worker_repository}:latest` was left alone: {worker_tag} is not "
+                "the highest published version.\n"
+            )
+        )
 
         sys.stdout.write(
             render(
@@ -74,6 +91,7 @@ def main(argv: list[str] | None = None) -> int:
                 service_digest,
                 f"{args.worker_repository}:{worker_tag}",
                 worker_digest,
+                latest_note,
             )
         )
     except PublishError as exc:

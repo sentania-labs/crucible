@@ -84,15 +84,21 @@ def write_manifest(path: Path, tag: str, digest: str) -> Path:
 
 
 class FakeRegistry:
-    """Records what publish would send; `existing` is what the tag already carries."""
+    """Records what publish would send; `existing` is what the tag already carries.
+    `tags` is what `list_tags()` answers: the other version tags already published,
+    the way a real registry would report them for the highest-version check."""
 
-    def __init__(self, existing: str | None) -> None:
+    def __init__(self, existing: str | None, tags: list[str] | None = None) -> None:
         self.existing = existing
+        self.tags = tags or []
         self.blobs: list[str] = []
         self.manifests: list[tuple[str, str, str]] = []
 
     def published_digest(self, tag: str) -> str | None:
         return self.existing
+
+    def list_tags(self) -> list[str]:
+        return self.tags
 
     def push_blob(self, digest: str, chunks: Any) -> None:
         data = b"".join(chunks)
@@ -257,6 +263,9 @@ class _FakeRegistryServer(http.server.ThreadingHTTPServer):
         self.token = secrets.token_hex(16)
         self.blobs: dict[str, bytes] = {}
         self.manifests: dict[str, tuple[str, bytes]] = {}
+        self.tags: list[str] = []
+        self.package_missing = False
+        self.loop_forever = False
         self.uploads: dict[str, bytearray] = {}
         self.chunk_sizes: list[int] = []
         self.blob_finalize_attempts = 0
@@ -359,6 +368,23 @@ class _FakeRegistryHandler(http.server.BaseHTTPRequestHandler):
                 return
             digest, body = entry
             self._send(200, {"Docker-Content-Digest": digest}, body)
+            return
+        if self.path.startswith(f"/v2/{self.server.name}/tags/list"):
+            if self.server.package_missing:
+                self._send(404)
+                return
+            # Two tags a page, regardless of the client's own `n`, so a small tag list
+            # still proves list_tags() follows Link: rel="next" rather than trusting
+            # the first page alone.
+            page_size = 2
+            parsed = urllib.parse.urlsplit(self.path)
+            start = int(dict(urllib.parse.parse_qsl(parsed.query)).get("page", "0"))
+            page = self.server.tags[start : start + page_size]
+            headers = {"Content-Type": "application/json"}
+            next_start = start + page_size
+            if self.server.loop_forever or next_start < len(self.server.tags):
+                headers["Link"] = f'<{parsed.path}?page={next_start}>; rel="next"'
+            self._send(200, headers, json.dumps({"tags": page}).encode())
             return
         self._send(404)
 
@@ -703,6 +729,96 @@ def test_a_rerun_of_the_same_release_version_still_moves_latest(
     assert registry.manifests == [("latest", "application/vnd.oci.image.manifest.v1+json", digest)]
 
 
+# Below: FDY-0094, PR 88 review round. `latest` follows the highest published
+# version, never the most recent push, the same rule the service image's release
+# step applies (tools/release/version.py, shared by both).
+
+
+def test_a_higher_version_than_any_published_moves_latest(
+    published: tuple[Path, Path, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest, archives, digest = published
+    registry = FakeRegistry(existing=None, tags=["0.4.0", "0.5.0"])
+    monkeypatch.setattr(wi, "Registry", lambda _repository: registry)
+    wi.publish(manifest, archives, "ghcr.io/sentania-labs/crucible-worker", version="0.5.2")
+    assert ("latest", "application/vnd.oci.image.manifest.v1+json", digest) in registry.manifests
+
+
+def test_a_lower_version_than_already_published_does_not_move_latest(
+    published: tuple[Path, Path, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest, archives, _ = published
+    registry = FakeRegistry(existing=None, tags=["0.4.0", "0.9.0"])
+    monkeypatch.setattr(wi, "Registry", lambda _repository: registry)
+    wi.publish(manifest, archives, "ghcr.io/sentania-labs/crucible-worker", version="0.5.2")
+    assert [tag for tag, _, _ in registry.manifests] == ["0.5.2"]
+
+
+def test_a_non_version_tag_never_confuses_the_comparison(
+    published: tuple[Path, Path, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The PR 88 review round: a tag that is not a version, such as a CI throwaway tag
+    or the other image's harness-prefixed tag, must never contend as though it were a
+    higher (or lower) release version."""
+    manifest, archives, digest = published
+    registry = FakeRegistry(
+        existing=None,
+        tags=["ci-0123abcd-20260916-aaaaaaaaaaaa", "script-harness-9.9.9", "latest", "9"],
+    )
+    monkeypatch.setattr(wi, "Registry", lambda _repository: registry)
+    wi.publish(manifest, archives, "ghcr.io/sentania-labs/crucible-worker", version="0.5.2")
+    assert ("latest", "application/vnd.oci.image.manifest.v1+json", digest) in registry.manifests
+
+
+def test_the_script_harness_prefix_is_stripped_before_comparing_versions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bare worker version tag must never be compared against a script-harness
+    version, and vice versa: each image's latest is judged against its own tags."""
+    archives = tmp_path / "out"
+    archives.mkdir()
+    tag = "script-harness-1.0.0-2db3cd7eb568"
+    digest = write_archive(archives / f"crucible-worker-{tag}.oci.tar")
+    manifest = tmp_path / "manifest.env"
+    manifest.write_text(
+        f"SCRIPT_HARNESS=crucible-worker:{tag}\nSCRIPT_HARNESS_DIGEST={digest}\n"
+        "SCRIPT_HARNESS_HARNESSES=script-harness:1.0.0\n",
+        encoding="utf-8",
+    )
+    # A higher bare worker version is published, which must not block the
+    # script-harness image's own, lower-numbered latest from moving.
+    registry = FakeRegistry(existing=None, tags=["9.9.9", "script-harness-0.4.0"])
+    monkeypatch.setattr(wi, "Registry", lambda _repository: registry)
+    wi.publish(manifest, archives, "ghcr.io/sentania-labs/crucible-worker", version="0.5.2")
+    assert [tag for tag, _, _ in registry.manifests] == [
+        "script-harness-0.5.2",
+        "script-harness-latest",
+    ]
+
+
+def test_verify_skips_latest_when_this_version_is_not_the_highest(
+    published: tuple[Path, Path, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest, _, digest = published
+
+    class HigherAlreadyPublished(FakeRegistry):
+        def published_digest(self, tag: str) -> str | None:
+            return digest if tag == "0.5.2" else None
+
+    monkeypatch.setattr(
+        wi, "Registry", lambda _repository: HigherAlreadyPublished(existing=None, tags=["0.9.0"])
+    )
+    wi.verify(manifest, "ghcr.io/sentania-labs/crucible-worker", version="0.5.2")
+
+
+def test_a_release_version_that_is_not_major_minor_patch_is_refused(
+    published: tuple[Path, Path, str],
+) -> None:
+    manifest, archives, _ = published
+    with pytest.raises(wi.PublishError, match="not a MAJOR"):
+        wi.publish(manifest, archives, "ghcr.io/sentania-labs/crucible-worker", version="0.5.2-rc1")
+
+
 def test_tag_prefix_and_release_version_are_mutually_exclusive(
     published: tuple[Path, Path, str],
 ) -> None:
@@ -748,6 +864,30 @@ def test_a_location_that_is_not_an_absolute_path_is_refused(
     for location in ("@evil.example/upload", "//evil.example/upload", ":8443/upload"):
         with pytest.raises(wi.PublishError, match="not a path"):
             registry.request("PATCH", location, body=b"", ok=(202,))
+
+
+def test_list_tags_follows_pagination_to_the_end(fake_registry: _FakeRegistryServer) -> None:
+    fake_registry.tags = ["0.1.0", "0.2.0", "0.3.0", "0.4.0", "0.5.0"]
+    registry = _client(fake_registry)
+    assert registry.list_tags() == fake_registry.tags
+
+
+def test_list_tags_on_an_unpublished_package_is_empty(fake_registry: _FakeRegistryServer) -> None:
+    fake_registry.package_missing = True
+    registry = _client(fake_registry)
+    assert registry.list_tags() == []
+
+
+def test_list_tags_gives_up_on_pagination_that_never_ends(
+    fake_registry: _FakeRegistryServer,
+) -> None:
+    """A Link header that always claims another page (a broken or hostile registry)
+    must not hang the release job; list_tags() is bounded the same way the release
+    workflow's own tag-listing loop already is."""
+    fake_registry.loop_forever = True
+    registry = _client(fake_registry)
+    with pytest.raises(wi.PublishError, match="did not finish the tag list"):
+        registry.list_tags()
 
 
 def test_an_off_host_location_is_refused_without_echoing_its_userinfo(

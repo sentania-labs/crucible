@@ -32,9 +32,25 @@ def test_render_names_both_images_by_their_read_back_digest() -> None:
         "sha256:" + "a" * 64,
         "ghcr.io/sentania-labs/crucible-worker:20260916-c6c15cef2f5c",
         "sha256:" + "b" * 64,
+        "",
     )
     assert "ghcr.io/sentania-labs/crucible:0.5.0@sha256:" + "a" * 64 in text
     assert "ghcr.io/sentania-labs/crucible-worker:20260916-c6c15cef2f5c@sha256:" + "b" * 64 in text
+
+
+def test_render_carries_the_latest_note_verbatim_when_given_one() -> None:
+    note = (
+        "- `ghcr.io/sentania-labs/crucible-worker:latest` was left alone: 0.5.2 is not "
+        "the highest published version.\n"
+    )
+    text = rn.render(
+        "ghcr.io/sentania-labs/crucible:0.5.2",
+        "sha256:" + "a" * 64,
+        "ghcr.io/sentania-labs/crucible-worker:0.5.2",
+        "sha256:" + "b" * 64,
+        note,
+    )
+    assert note in text
 
 
 def test_worker_image_reads_the_declared_digest_under_the_release_version(

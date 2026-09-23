@@ -32,7 +32,9 @@ release, and the push is skipped; present with any other digest stops the releas
 Only an explicit 404 counts as absent. Any other answer stops the job, because
 treating a network blip as "absent" would push over a tag that exists.
 
-`verify` reads every tag back and fails unless each carries the declared digest.
+`verify` reads every tag back and fails unless each carries the declared digest;
+`--release-version` checks `latest` only when this version is still the highest
+published, the same guard `publish` applies before deciding whether to move it.
 
 `--tag-prefix` publishes and verifies `<prefix><tag>` instead of `<tag>`: CI's
 `images-publish` job uses `ci-<short sha>-` to prove the whole path against the real
@@ -43,7 +45,11 @@ registry under throwaway tags (FDY-0090). It never sets `--release-version`.
 and `script-harness-latest`, in place of the manifest's own fingerprint tag: the
 input fingerprint is never part of a published name (the operator's decision,
 2026-09-23, spec 13, spec 24). The never-overwrite rule applies to the version tag
-exactly as to a fingerprint tag; `latest` always moves to the version just proved.
+exactly as to a fingerprint tag. `latest` moves only when `<version>` is the highest
+version published under that image's own tags, the same rule the service image's
+release step applies (`tools/release/version.py`, shared by both): a lower version
+released after a higher one, or an old release job re-run, publishes its version tag
+and leaves `latest` where it is, which the run log and the release notes say plainly.
 `--tag-prefix` and `--release-version` are mutually exclusive.
 
 Every step of a blob upload and every manifest push is logged to stderr: the method,
@@ -79,6 +85,9 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from version import highest_version, is_version
+
 MANIFEST_TYPES = (
     "application/vnd.oci.image.manifest.v1+json",
     "application/vnd.oci.image.index.v1+json",
@@ -95,7 +104,13 @@ CHUNK_SIZE = 8 * 1024 * 1024
 # release, FDY-0090); registry:2 ignores it, which is why a local proof passed.
 UPLOAD_HEADERS = {"Content-Type": "application/octet-stream"}
 # The response headers each upload step logs (FDY-0090). Never a request header.
-TRACED_HEADERS = ("location", "range", "docker-upload-uuid", "docker-content-digest")
+TRACED_HEADERS = ("location", "range", "docker-upload-uuid", "docker-content-digest", "link")
+# A tags/list answer's pagination Link header: `<url-or-path>; rel="next"`.
+LINK_NEXT = re.compile(r'<([^>]*)>\s*;\s*rel="next"', re.IGNORECASE)
+# The release workflow's own tag-list loop stops after this many pages (100 tags a
+# page); list_tags() bounds itself the same way rather than looping forever on a
+# Link header that never stops.
+MAX_TAG_PAGES = 20
 # The distribution spec's tag grammar; a prefix must keep every tag inside it.
 TAG_PREFIX = re.compile(r"(?:[A-Za-z0-9_][A-Za-z0-9._-]{0,63})?")
 # The distribution spec's tag grammar, for a release version on its own.
@@ -192,6 +207,11 @@ def trace(method: str, path: str, status: int, reply: dict[str, str], body: byte
 
 def sha256(data: bytes) -> str:
     return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+def _next_link(header: str) -> str:
+    match = LINK_NEXT.search(header)
+    return match.group(1) if match else ""
 
 
 @dataclass
@@ -401,6 +421,30 @@ class Registry:
             raise PublishError(f"{self.host} reports {header} for {tag} but served {digest}")
         return digest
 
+    def list_tags(self) -> list[str]:
+        """Every tag `<repository>` currently carries, paginated exactly as the GHCR
+        tags/list endpoint answers it: a `Link: <...>; rel="next"` is followed until
+        there is none, or until MAX_TAG_PAGES is reached (the release workflow's own
+        bash loop bounds itself the same way, at the same count). A 404 means the
+        package has never been published, which is an empty list of tags, not an
+        error: the first release of anything has none yet. A failed or unbounded
+        lookup is never treated as an empty list, because that would let `latest`
+        move forward past a version the caller could not actually see."""
+        tags: list[str] = []
+        path = f"/v2/{self.name}/tags/list?n=100"
+        for _ in range(MAX_TAG_PAGES):
+            if not path:
+                return tags
+            status, reply, body = self.request("GET", path, ok=(200, 404), traced=True)
+            if status == 404:
+                return tags
+            document = json.loads(body)
+            tags.extend(document.get("tags") or [])
+            path = _next_link(reply.get("link", ""))
+        if path:
+            raise PublishError(f"{self.host} did not finish the tag list in {MAX_TAG_PAGES} pages")
+        return tags
+
     def push_blob(self, digest: str, chunks: Iterator[bytes]) -> None:
         """Streams `chunks` (bounded reads, never the whole blob) as POST, one PATCH with
         chunked transfer encoding, PUT. Each request goes to the Location the previous
@@ -476,8 +520,8 @@ def checked_prefix(prefix: str) -> str:
 
 
 def checked_version(version: str) -> str:
-    if not TAG.fullmatch(version):
-        raise PublishError(f"--release-version {version!r} would not make a valid tag")
+    if not TAG.fullmatch(version) or not is_version(version):
+        raise PublishError(f"--release-version {version!r} is not a MAJOR.MINOR.PATCH version")
     return version
 
 
@@ -488,6 +532,16 @@ def release_tag_prefix(key: str) -> str:
         raise PublishError(f"{key} has no declared release tag name") from None
 
 
+def published_versions(tags: list[str], prefix: str) -> list[str]:
+    """Every tag in `tags` that carries `prefix`, with the prefix removed, so a
+    prefixed image (script-harness) compares versions to versions, never to a bare
+    worker tag or the other way around. `version.highest_version` filters the result
+    down to what is actually a bare version; a tag such as `ci-<sha>-...` or `latest`
+    that happens to start with an empty prefix passes through here unfiltered but is
+    dropped there."""
+    return [tag[len(prefix) :] for tag in tags if tag.startswith(prefix)]
+
+
 def publish(
     manifest: Path, archives: Path, repository: str, prefix: str = "", version: str = ""
 ) -> None:
@@ -496,6 +550,9 @@ def publish(
     registry = Registry(repository)
     prefix = checked_prefix(prefix)
     version = checked_version(version) if version else ""
+    # Read once: every image in this manifest shares the one repository, so its tag
+    # list does not change between images within the same run.
+    published_tags = registry.list_tags() if version else []
     for image in declared_images(manifest):
         tag = f"{release_tag_prefix(image.key)}{version}" if version else prefix + image.tag
         reference = f"{repository}:{tag}"
@@ -524,13 +581,22 @@ def publish(
             registry.push_manifest(tag, archive.media_type, archive.manifest_bytes)
             print(f"{reference} published with {image.digest}")
         if version:
-            # Every release moves `latest` to the version it just proved, the input
-            # fingerprint never being part of the published name (the operator's
-            # decision, 2026-09-23). The blobs are already on the registry, either
-            # from the push above or from the already-published check.
-            latest_tag = f"{release_tag_prefix(image.key)}latest"
-            registry.push_manifest(latest_tag, archive.media_type, archive.manifest_bytes)
-            print(f"{repository}:{latest_tag} now published with {image.digest}")
+            # `latest` follows the highest published version, not the most recent push,
+            # the same rule the service image's release step applies (tools/release/
+            # version.py, shared by both): re-tagging an old fix must never move it
+            # backwards. The blobs are already on the registry, either from the push
+            # above or from the already-published check.
+            image_prefix = release_tag_prefix(image.key)
+            latest_tag = f"{image_prefix}latest"
+            highest = highest_version(version, published_versions(published_tags, image_prefix))
+            if highest == version:
+                registry.push_manifest(latest_tag, archive.media_type, archive.manifest_bytes)
+                print(f"{repository}:{latest_tag} now published with {image.digest}")
+            else:
+                print(
+                    f"{repository}:{latest_tag} left alone: {version} is not the highest "
+                    f"published version ({highest} is)"
+                )
 
 
 def verify(manifest: Path, repository: str, prefix: str = "", version: str = "") -> None:
@@ -539,18 +605,22 @@ def verify(manifest: Path, repository: str, prefix: str = "", version: str = "")
     registry = Registry(repository)
     prefix = checked_prefix(prefix)
     version = checked_version(version) if version else ""
+    published_tags = registry.list_tags() if version else []
     failures: list[str] = []
     for image in declared_images(manifest):
-        tags = (
-            [f"{release_tag_prefix(image.key)}{version}", f"{release_tag_prefix(image.key)}latest"]
-            if version
-            else [prefix + image.tag]
-        )
+        if version:
+            image_prefix = release_tag_prefix(image.key)
+            tags = [f"{image_prefix}{version}"]
+            other_versions = published_versions(published_tags, image_prefix)
+            if highest_version(version, other_versions) == version:
+                tags.append(f"{image_prefix}latest")
+        else:
+            tags = [prefix + image.tag]
         for tag in tags:
             reference = f"{repository}:{tag}"
-            published = registry.published_digest(tag)
-            if published != image.digest:
-                failures.append(f"{reference} carries {published or 'nothing'}, not {image.digest}")
+            digest = registry.published_digest(tag)
+            if digest != image.digest:
+                failures.append(f"{reference} carries {digest or 'nothing'}, not {image.digest}")
             else:
                 print(f"{reference} carries the declared {image.digest}")
     if failures:

@@ -23,9 +23,10 @@
 # WORKER_TAG_PREFIX (publish only, default empty) publishes <prefix><tag> instead of
 # <tag>: CI's throwaway ci-<sha>- tags (FDY-0090). The release never sets it.
 # WORKER_RELEASE_VERSION (publish only, default empty) publishes the Crucible release
-# version and moves latest instead of the fingerprint tag (13, 24): the release sets
-# it, from the git tag, exactly as the service image build does; CI's ghcr-publish job
-# never sets it. Mutually exclusive with WORKER_TAG_PREFIX.
+# version instead of the fingerprint tag, and moves latest only when that version is
+# the highest published (13, 24): the release sets it, from the git tag, exactly as
+# the service image build does; CI's ghcr-publish job never sets it. Mutually
+# exclusive with WORKER_TAG_PREFIX.
 set -euo pipefail
 
 mode=${1:-}
