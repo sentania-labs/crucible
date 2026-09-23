@@ -25,6 +25,13 @@ COMPOSE ?= $(DOCKER) compose
 COMPOSE_UP_FLAGS ?= --build
 UV ?= uv
 
+# The cluster budget `make manifests` checks the rendered requests against (issue 93).
+# Left blank by default: tools/manifests/validate.sh falls back to the lab's own stated
+# CPU shape for CRUCIBLE_CLUSTER_CPU_BUDGET, and enforces no memory budget at all until
+# a deployment names its cluster's real memory.
+CRUCIBLE_CLUSTER_CPU_BUDGET ?=
+CRUCIBLE_CLUSTER_MEMORY_BUDGET_GI ?=
+
 # The rootless daemon's socket, derived, never hardcoded: the uid differs per host (S9).
 CRUCIBLE_UID := $(shell id -u crucible 2>/dev/null)
 CRUCIBLE_DOCKER_SOCKET ?= $(if $(CRUCIBLE_UID),/run/user/$(CRUCIBLE_UID)/docker.sock,/var/run/docker.sock)
@@ -204,7 +211,13 @@ e2e-kind: check-image-manifest ## Kubernetes-provider e2e on a disposable kind c
 	CRUCIBLE_E2E_DOCKER_SOCKET="$(CRUCIBLE_DOCKER_SOCKET)" \
 	tools/kind/e2e-kind.sh
 
+# CRUCIBLE_CLUSTER_CPU_BUDGET and CRUCIBLE_CLUSTER_MEMORY_BUDGET_GI (issue 93): the
+# cluster's CPU and memory ceiling the render-time resource check refuses to exceed.
+# CPU defaults inside validate.sh to the lab's own stated shape; memory has no such
+# default because no cluster memory fact lives in this repository.
 manifests: ## render deploy/kubernetes and validate every object; needs kubectl and kubeconform
+	CRUCIBLE_CLUSTER_CPU_BUDGET="$(CRUCIBLE_CLUSTER_CPU_BUDGET)" \
+	CRUCIBLE_CLUSTER_MEMORY_BUDGET_GI="$(CRUCIBLE_CLUSTER_MEMORY_BUDGET_GI)" \
 	UV="$(UV)" tools/manifests/validate.sh
 
 # Bring the deployment manifests up on a disposable kind cluster and run one task through
