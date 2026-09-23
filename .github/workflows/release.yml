@@ -261,9 +261,10 @@ jobs:
           HIGHEST=$(printf '%s\n' "$TAGS" | python3 tools/release/version.py "${VERSION}")
           echo "highest published version: $HIGHEST"
           if [ "$HIGHEST" = "${VERSION}" ]; then
-            # Three registry-side copies, one per image, each from that image's own
-            # version tag: a failure partway through leaves the remaining latest tags
-            # where they were rather than moved out of step with each other.
+            # Three registry-side copies, each from that image's own version tag. The
+            # service image goes last, so a failure partway leaves the service latest
+            # where it was rather than ahead of the worker images (the example
+            # manifests track latest).
             docker buildx imagetools create --prefer-index=false \
               -t "${WORKER_REGISTRY}:latest" "${WORKER_REGISTRY}:${VERSION}"
             docker buildx imagetools create --prefer-index=false \
