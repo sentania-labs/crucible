@@ -1,6 +1,7 @@
 # The tag push is the release (sdlc skill). This workflow owns every step after
-# it: refuse a bad tag, build, smoke the image an operator would run, prove and
-# publish the worker images, publish to GHCR, and only then cut the GitHub release.
+# it: refuse a bad tag, build, smoke the image an operator would run, prove the worker
+# images, push everything to GHCR with `docker push`, and only then cut the GitHub
+# release.
 #
 # GitHub-hosted runners: the smoke test is `docker compose`, which needs a real
 # Docker daemon, and the repository is public so hosted minutes are free
@@ -23,6 +24,7 @@ permissions:
 
 env:
   IMAGE: ghcr.io/sentania-labs/crucible
+  WORKER_REGISTRY: ghcr.io/sentania-labs/crucible-worker
 
 jobs:
   release:
@@ -185,23 +187,21 @@ jobs:
       # Gate 3, part three. The worker images (13, C11): the worker image carrying
       # Claude Code, Codex, AGY and Hermes, and the script-harness image. A build from
       # scratch on this fresh runner has to reproduce every tag, harness version and OCI
-      # digest images/manifest.env declares before anything is pushed. Then each OCI
-      # archive goes to ghcr.io/sentania-labs/crucible-worker:<version>, exactly as
-      # built, under this release's own VERSION (13, 24, the operator's decision of
-      # 2026-09-23), never its input fingerprint; the registry holds the declared
-      # digest, a version tag already there with that digest is a re-run and is left
-      # alone, and one there with any other digest stops the release (the
-      # never-overwrite rule the service image has). :latest moves only when VERSION
-      # is the highest version published, the same rule the "move latest" step below
-      # applies to the service image. Every published digest is then read back. It is
-      # the same script `make images` and the CI images job run, not a copy (the c7c,
-      # c7e and c7f lesson). It comes before the service image's version tag is
-      # pushed, so a release whose worker images cannot be proven publishes nothing.
-      - name: build, prove and publish the worker images
-        env:
-          REGISTRY_USERNAME: ${{ github.actor }}
-          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
-        run: make images-publish NO_CACHE=1 WORKER_RELEASE_VERSION="${VERSION}"
+      # digest images/manifest.env declares, with the same script `make images` and the
+      # CI images job run, not a copy (the c7c, c7e and c7f lesson). The build leaves
+      # both images loaded in the daemon.
+      - name: build and prove the worker images
+        run: make images-check NO_CACHE=1
+
+      # The worker images go out the way this image does, with `docker push` (the
+      # operator's decision, 2026-09-23): <version> and script-harness-<version> on
+      # WORKER_REGISTRY. The never-overwrite rule is the service image's: an existing
+      # tag built from the same inputs is a re-run and is skipped, one built from
+      # anything else stops the release, and only buildx's own "not found" counts as
+      # absent. It comes before the service image's version tag is pushed, so a release
+      # whose worker images cannot be pushed publishes no service version.
+      - name: push the worker images, never over an existing version
+        run: tools/release/push_worker_images.sh
 
       # Gate 4. Publish. An existing version tag is never overwritten: a re-run
       # after a transient failure skips the push instead of failing on it.
@@ -219,8 +219,12 @@ jobs:
       # that cannot be read is fatal: treating a failed lookup as "no versions
       # published" would move `latest` in exactly the direction this prevents.
       # The comparison itself (which tags are versions, which of them is highest)
-      # is tools/release/version.py, the same rule images-publish applies to the
-      # worker images' own latest tags, so there is only ever one such rule.
+      # is tools/release/version.py. The worker images' latest and
+      # script-harness-latest move here too, under the same answer, so there is one
+      # rule and one place. They are copied on the registry from the version tags
+      # (--prefer-index=false copies the manifest as is), so each latest carries
+      # exactly the digest its version tag does, even on a re-run that skipped the
+      # version push.
       - name: move latest only if this is the highest published version
         env:
           GHCR_USER: ${{ github.actor }}
@@ -258,18 +262,21 @@ jobs:
           echo "highest published version: $HIGHEST"
           if [ "$HIGHEST" = "${VERSION}" ]; then
             docker push "${IMAGE}:latest"
+            docker buildx imagetools create --prefer-index=false \
+              -t "${WORKER_REGISTRY}:latest" "${WORKER_REGISTRY}:${VERSION}"
+            docker buildx imagetools create --prefer-index=false \
+              -t "${WORKER_REGISTRY}:script-harness-latest" "${WORKER_REGISTRY}:script-harness-${VERSION}"
           else
             echo "${VERSION} is not the highest; leaving latest where it is"
           fi
 
-      # The runbook's source for REPLACE_ME_CRUCIBLE_DIGEST (docs/deployment.md): both
-      # images are on the registry by now, so their digests are read back from it, never
-      # guessed from a local build, through the same make target CI could call too.
+      # The runbook's source for REPLACE_ME_CRUCIBLE_DIGEST (docs/deployment.md): all
+      # three images are on the registry by now, so their digests are read back from it
+      # with `docker buildx imagetools inspect`, never taken from a local build: `docker
+      # push` re-encodes the layers, so the local OCI digest is not what anyone pulls.
       - name: render the release notes with the published digests
         env:
           CRUCIBLE_IMAGE: ${{ env.IMAGE }}:${{ env.VERSION }}
-          REGISTRY_USERNAME: ${{ github.actor }}
-          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
         run: make release-notes > release-notes.md
 
       # Gate 5. The release is created last, so a GitHub release never points at

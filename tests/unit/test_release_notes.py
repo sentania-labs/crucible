@@ -1,17 +1,23 @@
 """The release notes carry the published image digests, read back from the registry
-(FDY-0088). `render` is the pure formatting the CLI hands its registry read-back to; it
-is tested here on its own, without a network, the same way `worker_images.py`'s pure
-helpers are."""
+with `docker buildx imagetools inspect` (FDY-0088, FDY-0096). A stand-in `docker`
+answers from a table, so these run without a registry."""
 
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 REPOSITORY = Path(__file__).resolve().parents[2]
 SCRIPT = REPOSITORY / "tools" / "release" / "release_notes.py"
+
+SERVICE = "ghcr.io/sentania-labs/crucible"
+WORKER = "ghcr.io/sentania-labs/crucible-worker"
+A, B, C, D = ("sha256:" + ch * 64 for ch in "abcd")
 
 
 def _module() -> Any:
@@ -26,45 +32,89 @@ def _module() -> Any:
 rn = _module()
 
 
-def test_render_names_both_images_by_their_read_back_digest() -> None:
-    text = rn.render(
-        "ghcr.io/sentania-labs/crucible:0.5.0",
-        "sha256:" + "a" * 64,
-        "ghcr.io/sentania-labs/crucible-worker:20260916-c6c15cef2f5c",
-        "sha256:" + "b" * 64,
-        "",
+@pytest.fixture
+def registry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """A fake `docker` whose `buildx imagetools inspect <ref>` answers from `table`: a
+    digest, None for "not found", or any other string for an error it prints. Every
+    assignment is written through to the file the fake reads."""
+    state = tmp_path / "registry.json"
+    fake = tmp_path / "docker"
+    fake.write_text(
+        f"#!{sys.executable}\n"
+        "import json, sys\n"
+        f"table = json.load(open({str(state)!r}))\n"
+        "ref = sys.argv[4]\n"
+        "answer = table.get(ref)\n"
+        "if answer is None:\n"
+        "    print(f'ERROR: {ref}: not found', file=sys.stderr); sys.exit(1)\n"
+        "if not answer.startswith('sha256:'):\n"
+        "    print(answer, file=sys.stderr); sys.exit(1)\n"
+        "print(json.dumps(answer))\n"
     )
-    assert "ghcr.io/sentania-labs/crucible:0.5.0@sha256:" + "a" * 64 in text
-    assert "ghcr.io/sentania-labs/crucible-worker:20260916-c6c15cef2f5c@sha256:" + "b" * 64 in text
+    fake.chmod(0o755)
+    monkeypatch.setenv("DOCKER", str(fake))
+
+    class Table(dict[str, Any]):
+        def __setitem__(self, key: str, value: Any) -> None:
+            super().__setitem__(key, value)
+            state.write_text(json.dumps(self))
+
+    state.write_text("{}")
+    return Table()
 
 
-def test_render_carries_the_latest_note_verbatim_when_given_one() -> None:
-    note = (
-        "- `ghcr.io/sentania-labs/crucible-worker:latest` was left alone: 0.5.2 is not "
-        "the highest published version.\n"
-    )
-    text = rn.render(
-        "ghcr.io/sentania-labs/crucible:0.5.2",
-        "sha256:" + "a" * 64,
-        "ghcr.io/sentania-labs/crucible-worker:0.5.2",
-        "sha256:" + "b" * 64,
-        note,
-    )
-    assert note in text
+def _publish(registry: dict[str, Any], latest: str | None) -> None:
+    registry[f"{SERVICE}:0.5.3"] = A
+    registry[f"{WORKER}:0.5.3"] = B
+    registry[f"{WORKER}:script-harness-0.5.3"] = C
+    if latest is not None:
+        registry[f"{WORKER}:latest"] = latest
 
 
-def test_worker_image_reads_the_declared_digest_under_the_release_version(
-    tmp_path: Path,
+def _run(capsys: pytest.CaptureFixture[str]) -> tuple[int, str, str]:
+    code = rn.main(["--service-image", f"{SERVICE}:0.5.3", "--worker-repository", WORKER])
+    out, err = capsys.readouterr()
+    return code, out, err
+
+
+def test_notes_name_all_three_images_by_their_read_back_digest(
+    registry: dict[str, Any], capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """FDY-0093: the worker image's release tag is the Crucible release version, not
-    its own fingerprint tag; only the digest still comes from the manifest."""
-    manifest = tmp_path / "manifest.env"
-    manifest.write_text(
-        "SCRIPT_HARNESS=crucible-worker:script-harness-1.0.0\n"
-        "SCRIPT_HARNESS_DIGEST=sha256:" + "c" * 64 + "\n"
-        "WORKER=crucible-worker:20260916-c6c15cef2f5c\n"
-        "WORKER_DIGEST=sha256:" + "d" * 64 + "\n"
-    )
-    tag, digest = rn.worker_image(manifest, "0.5.2")
-    assert tag == "0.5.2"
-    assert digest == "sha256:" + "d" * 64
+    _publish(registry, latest=B)
+    code, out, _ = _run(capsys)
+    assert code == 0
+    assert out.startswith("## Published image digests\n")
+    assert f"- `{SERVICE}:0.5.3@{A}`" in out
+    assert f"- `{WORKER}:0.5.3@{B}`" in out
+    assert f"- `{WORKER}:script-harness-0.5.3@{C}`" in out
+    assert "left alone" not in out
+
+
+def test_notes_say_plainly_when_latest_did_not_move(
+    registry: dict[str, Any], capsys: pytest.CaptureFixture[str]
+) -> None:
+    _publish(registry, latest=D)
+    code, out, _ = _run(capsys)
+    assert code == 0
+    assert f"`{WORKER}:latest` was left alone: 0.5.3 is not the highest" in out
+
+
+def test_an_unpublished_worker_image_fails_rather_than_printing_a_digest(
+    registry: dict[str, Any], capsys: pytest.CaptureFixture[str]
+) -> None:
+    _publish(registry, latest=B)
+    registry[f"{WORKER}:script-harness-0.5.3"] = None
+    code, out, err = _run(capsys)
+    assert code == 1
+    assert out == ""
+    assert "script-harness-0.5.3 is not published" in err
+
+
+def test_a_registry_error_is_never_read_as_absent(
+    registry: dict[str, Any], capsys: pytest.CaptureFixture[str]
+) -> None:
+    _publish(registry, latest="ERROR: failed to do request: 429 Too Many Requests")
+    code, out, err = _run(capsys)
+    assert code == 1
+    assert out == ""
+    assert "429" in err
