@@ -322,7 +322,13 @@ the status page.
    separate Deployments on this topology. Object storage for artifacts would
    remove the second requirement and is a later phase.
    (Added 2026-09-22 during C9.)
-4. Nodes have a pod PID limit configured.
+4. Nodes have a pod PID limit configured (the kubelet's `podPidsLimit`, the
+   pod-level cgroup, not any one container's own `pids.max`). The canary
+   reads it from the parent of its own cgroup under cgroup v2, which the
+   container runtime must make visible for the probe to confirm it; on a
+   runtime that isolates the pod's cgroup from the container (the default on
+   current containerd and runc), the probe reports the limit as unconfirmed
+   rather than guess, and lab-admin verifies it another way (95).
 5. The cluster can pull the Crucible and worker images from the registry
    the release publishes to (24); a pull secret if the packages are private.
 6. Egress from `crucible-workers` to the model providers, the package
