@@ -31,6 +31,19 @@ treating a network blip as "absent" would push over a tag that exists.
 
 `verify` reads every tag back and fails unless each carries the declared digest.
 
+`--tag-prefix` publishes and verifies `<prefix><tag>` instead of `<tag>`: CI's
+`images-publish` job uses `ci-<short sha>-` to prove the whole path against the real
+registry under throwaway tags (FDY-0090). The release passes no prefix. The
+never-overwrite rule and the read-back apply to the prefixed tag exactly as to a
+release tag.
+
+Every step of a blob upload and every manifest push is logged to stderr: the method,
+the path, the status, and the Location, Range and Docker-Upload-UUID the registry
+answered, plus the body of any refusal. That is what diagnosed FDY-0090 against GHCR.
+No request header is ever logged, so no credential is; query values other than a
+digest are replaced by their length, because a registry may carry signed upload state
+there.
+
 Stdlib only, like compose_images.py: the release job does not install the project's
 Python environment. Credentials come from REGISTRY_USERNAME and REGISTRY_PASSWORD in
 the environment, never an argument, and are sent only where the registry's own
@@ -46,6 +59,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import ssl
 import sys
 import tarfile
@@ -67,6 +81,10 @@ TIMEOUT = 120.0
 # bytes (FDY-0074). 8 MiB is well inside every registry's chunk-size limits, including
 # GHCR's.
 CHUNK_SIZE = 8 * 1024 * 1024
+# The response headers each upload step logs (FDY-0090). Never a request header.
+TRACED_HEADERS = ("location", "range", "docker-upload-uuid", "docker-content-digest")
+# The distribution spec's tag grammar; a prefix must keep every tag inside it.
+TAG_PREFIX = re.compile(r"(?:[A-Za-z0-9_][A-Za-z0-9._-]{0,63})?")
 
 
 class PublishError(Exception):
@@ -109,6 +127,30 @@ def declared_images(manifest: Path) -> list[DeclaredImage]:
     if not images:
         raise PublishError(f"{manifest} declares no image")
     return images
+
+
+def redact(path: str) -> str:
+    """`path` with every query value except a digest replaced by its length: the upload
+    state some registries put in a Location is opaque and may be signed."""
+    base, sep, query = path.partition("?")
+    if not sep:
+        return path
+    parts = []
+    for pair in query.split("&"):
+        key, eq, value = pair.partition("=")
+        parts.append(pair if key == "digest" or not eq else f"{key}=<{len(value)} chars>")
+    return f"{base}?{'&'.join(parts)}"
+
+
+def trace(method: str, path: str, status: int, reply: dict[str, str], body: bytes) -> None:
+    fields = [f"{method} {redact(path)} -> {status}"]
+    for name in TRACED_HEADERS:
+        if name in reply:
+            value = redact(reply[name]) if name == "location" else reply[name]
+            fields.append(f"{name}={value}")
+    if status >= 300 and body:
+        fields.append("body=" + body.decode("utf-8", "replace")[:300])
+    print("worker_images: " + " ".join(fields), file=sys.stderr, flush=True)
 
 
 def sha256(data: bytes) -> str:
@@ -261,9 +303,11 @@ class Registry:
         body: bytes | None = None,
         headers: dict[str, str] | None = None,
         ok: tuple[int, ...] = (200,),
+        traced: bool = False,
     ) -> tuple[int, dict[str, str], bytes]:
         """One request, re-sent once after answering a 401 challenge. A status outside
-        `ok` is an error, so a caller never mistakes a refusal for an answer."""
+        `ok` is an error, so a caller never mistakes a refusal for an answer. `traced`
+        logs the answer (see the module docstring for what is and is not logged)."""
         for attempt in (0, 1):
             request = urllib.request.Request(self._url(path), data=body, method=method)
             for key, value in (headers or {}).items():
@@ -285,11 +329,15 @@ class Registry:
             if status == 401 and attempt == 0:
                 self._authenticate(reply.get("www-authenticate", ""))
                 continue
+            if traced:
+                trace(method, path, status, reply, answer)
             if status not in ok:
                 detail = answer.decode("utf-8", "replace")[:300]
-                raise PublishError(f"{self.host} answered {status} to {method} {path}: {detail}")
+                raise PublishError(
+                    f"{self.host} answered {status} to {method} {redact(path)}: {detail}"
+                )
             return status, reply, answer
-        raise PublishError(f"{self.host} refused {method} {path} after authenticating")
+        raise PublishError(f"{self.host} refused {method} {redact(path)} after authenticating")
 
     def published_digest(self, tag: str) -> str | None:
         """The digest `<repository>:<tag>` carries, or None on an explicit 404."""
@@ -317,7 +365,9 @@ class Registry:
             for _ in chunks:
                 pass
             return
-        _, reply, _ = self.request("POST", f"/v2/{self.name}/blobs/uploads/", body=b"", ok=(202,))
+        _, reply, _ = self.request(
+            "POST", f"/v2/{self.name}/blobs/uploads/", body=b"", ok=(202,), traced=True
+        )
         location = reply.get("location", "")
         if not location:
             raise PublishError(f"{self.host} opened an upload with no location")
@@ -332,6 +382,7 @@ class Registry:
                     "Content-Range": f"{offset}-{offset + len(chunk) - 1}",
                 },
                 ok=(202,),
+                traced=True,
             )
             location = reply.get("location", location)
             offset += len(chunk)
@@ -341,6 +392,7 @@ class Registry:
             f"{location}{separator}digest={urllib.parse.quote(digest)}",
             body=b"",
             ok=(201,),
+            traced=True,
         )
 
     def push_manifest(self, tag: str, media_type: str, data: bytes) -> None:
@@ -350,23 +402,32 @@ class Registry:
             body=data,
             headers={"Content-Type": media_type},
             ok=(201,),
+            traced=True,
         )
         stored = reply.get("docker-content-digest")
         if stored and stored != sha256(data):
             raise PublishError(f"{self.host} stored {tag} as {stored}, not {sha256(data)}")
 
 
-def publish(manifest: Path, archives: Path, repository: str) -> None:
+def checked_prefix(prefix: str) -> str:
+    if not TAG_PREFIX.fullmatch(prefix):
+        raise PublishError(f"--tag-prefix {prefix!r} would not make a valid tag")
+    return prefix
+
+
+def publish(manifest: Path, archives: Path, repository: str, prefix: str = "") -> None:
     registry = Registry(repository)
+    prefix = checked_prefix(prefix)
     for image in declared_images(manifest):
-        reference = f"{repository}:{image.tag}"
+        tag = prefix + image.tag
+        reference = f"{repository}:{tag}"
         archive = OciArchive(archives / image.archive_name)
         if archive.digest != image.digest:
             raise PublishError(
                 f"{archive.path.name} holds {archive.digest}, but images/manifest.env "
                 f"declares {image.digest} for {image.key}; refusing to publish"
             )
-        existing = registry.published_digest(image.tag)
+        existing = registry.published_digest(tag)
         if existing == image.digest:
             print(f"{reference} is already published with {image.digest}; leaving it alone")
             continue
@@ -378,16 +439,18 @@ def publish(manifest: Path, archives: Path, repository: str) -> None:
             )
         for digest in archive.blobs:
             registry.push_blob(digest, archive.blob_chunks(digest))
-        registry.push_manifest(image.tag, archive.media_type, archive.manifest_bytes)
+        registry.push_manifest(tag, archive.media_type, archive.manifest_bytes)
         print(f"{reference} published with {image.digest}")
 
 
-def verify(manifest: Path, repository: str) -> None:
+def verify(manifest: Path, repository: str, prefix: str = "") -> None:
     registry = Registry(repository)
+    prefix = checked_prefix(prefix)
     failures: list[str] = []
     for image in declared_images(manifest):
-        reference = f"{repository}:{image.tag}"
-        published = registry.published_digest(image.tag)
+        tag = prefix + image.tag
+        reference = f"{repository}:{tag}"
+        published = registry.published_digest(tag)
         if published != image.digest:
             failures.append(f"{reference} carries {published or 'nothing'}, not {image.digest}")
         else:
@@ -403,15 +466,17 @@ def main(argv: list[str] | None = None) -> int:
     push.add_argument("--manifest", type=Path, required=True)
     push.add_argument("--archives", type=Path, required=True)
     push.add_argument("--repository", required=True)
+    push.add_argument("--tag-prefix", default="")
     check = sub.add_parser("verify")
     check.add_argument("--manifest", type=Path, required=True)
     check.add_argument("--repository", required=True)
+    check.add_argument("--tag-prefix", default="")
     args = parser.parse_args(argv)
     try:
         if args.command == "publish":
-            publish(args.manifest, args.archives, args.repository)
+            publish(args.manifest, args.archives, args.repository, args.tag_prefix)
         else:
-            verify(args.manifest, args.repository)
+            verify(args.manifest, args.repository, args.tag_prefix)
     except PublishError as exc:
         print(f"worker_images: {exc}", file=sys.stderr)
         return 1
