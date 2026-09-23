@@ -256,6 +256,16 @@ jobs:
             echo "${VERSION} is not the highest; leaving latest where it is"
           fi
 
+      # The runbook's source for REPLACE_ME_CRUCIBLE_DIGEST (docs/deployment.md): both
+      # images are on the registry by now, so their digests are read back from it, never
+      # guessed from a local build, through the same make target CI could call too.
+      - name: render the release notes with the published digests
+        env:
+          CRUCIBLE_IMAGE: ${{ env.IMAGE }}:${{ env.VERSION }}
+          REGISTRY_USERNAME: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        run: make release-notes > release-notes.md
+
       # Gate 5. The release is created last, so a GitHub release never points at
       # a version that is not consumable from the registry.
       - name: create the GitHub release
@@ -266,5 +276,6 @@ jobs:
           if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
             echo "release ${GITHUB_REF_NAME} already exists"
           else
-            gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" --generate-notes
+            gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" \
+              --notes-file release-notes.md --generate-notes
           fi

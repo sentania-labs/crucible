@@ -59,7 +59,7 @@ CRUCIBLE_DEPLOY_PORT ?= 8080
 .PHONY: up dev down reset lint check-image-manifest scan scan-tree scan-history smoke test test-unit \
 	test-integration e2e e2e-github e2e-live e2e-admin e2e-image build proxy-config proxies preflight \
 	e2e-kind manifests deploy-kind release-images-classify release-images-pull release-images-verify \
-	deploy-local deploy-local-down images images-check images-publish
+	deploy-local deploy-local-down images images-check images-publish release-notes
 
 up: preflight proxy-config ## normal mode: postgres, proxies, migrate, crucible
 	@test -f .env || cp .env.example .env
@@ -148,6 +148,13 @@ images-check: ## build both images and fail if any tag, harness version or OCI d
 images-publish: ## release only: images-check, then push each OCI archive to WORKER_REGISTRY, never over another digest
 	DOCKER="$(DOCKER)" CACHE_DIR="$(CACHE_DIR)" NO_CACHE="$(NO_CACHE)" \
 	  WORKER_REGISTRY="$(WORKER_REGISTRY)" tools/images/images.sh publish
+
+# Needs REGISTRY_USERNAME and REGISTRY_PASSWORD in the environment, the same as
+# images-publish: reading a manifest back is still an authenticated registry call.
+release-notes: ## release only: print the published service and worker image digests, read back from the registry, as release notes markdown
+	@test -n "$(CRUCIBLE_IMAGE)" || { echo "set CRUCIBLE_IMAGE"; exit 2; }
+	python3 tools/release/release_notes.py --service-image "$(CRUCIBLE_IMAGE)" \
+	  --worker-manifest images/manifest.env --worker-repository "$(WORKER_REGISTRY)"
 
 scan: scan-tree scan-history ## secret scan; needs gitleaks on PATH
 
