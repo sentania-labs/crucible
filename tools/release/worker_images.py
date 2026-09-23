@@ -36,9 +36,15 @@ treating a network blip as "absent" would push over a tag that exists.
 
 `--tag-prefix` publishes and verifies `<prefix><tag>` instead of `<tag>`: CI's
 `images-publish` job uses `ci-<short sha>-` to prove the whole path against the real
-registry under throwaway tags (FDY-0090). The release passes no prefix. The
-never-overwrite rule and the read-back apply to the prefixed tag exactly as to a
-release tag.
+registry under throwaway tags (FDY-0090). It never sets `--release-version`.
+
+`--release-version` (the release only) publishes and verifies the worker image as
+`<version>` and `latest`, and the script-harness image as `script-harness-<version>`
+and `script-harness-latest`, in place of the manifest's own fingerprint tag: the
+input fingerprint is never part of a published name (the operator's decision,
+2026-09-23, spec 13, spec 24). The never-overwrite rule applies to the version tag
+exactly as to a fingerprint tag; `latest` always moves to the version just proved.
+`--tag-prefix` and `--release-version` are mutually exclusive.
 
 Every step of a blob upload and every manifest push is logged to stderr: the method,
 the path, the status, and the Location, Range and Docker-Upload-UUID the registry
@@ -92,6 +98,13 @@ UPLOAD_HEADERS = {"Content-Type": "application/octet-stream"}
 TRACED_HEADERS = ("location", "range", "docker-upload-uuid", "docker-content-digest")
 # The distribution spec's tag grammar; a prefix must keep every tag inside it.
 TAG_PREFIX = re.compile(r"(?:[A-Za-z0-9_][A-Za-z0-9._-]{0,63})?")
+# The distribution spec's tag grammar, for a release version on its own.
+TAG = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,127}")
+# What each declared image's release tag is named after its key, never its fingerprint
+# tag (the operator's decision, 2026-09-23, spec 13, spec 24): the worker image is
+# `<version>` and `latest`; the script-harness image keeps its own `script-harness-`
+# name inside the version, exactly as it does in its fingerprint tag today.
+RELEASE_TAG_PREFIX = {"WORKER": "", "SCRIPT_HARNESS": "script-harness-"}
 
 
 class PublishError(Exception):
@@ -462,11 +475,29 @@ def checked_prefix(prefix: str) -> str:
     return prefix
 
 
-def publish(manifest: Path, archives: Path, repository: str, prefix: str = "") -> None:
+def checked_version(version: str) -> str:
+    if not TAG.fullmatch(version):
+        raise PublishError(f"--release-version {version!r} would not make a valid tag")
+    return version
+
+
+def release_tag_prefix(key: str) -> str:
+    try:
+        return RELEASE_TAG_PREFIX[key]
+    except KeyError:
+        raise PublishError(f"{key} has no declared release tag name") from None
+
+
+def publish(
+    manifest: Path, archives: Path, repository: str, prefix: str = "", version: str = ""
+) -> None:
+    if prefix and version:
+        raise PublishError("--tag-prefix and --release-version are mutually exclusive")
     registry = Registry(repository)
     prefix = checked_prefix(prefix)
+    version = checked_version(version) if version else ""
     for image in declared_images(manifest):
-        tag = prefix + image.tag
+        tag = f"{release_tag_prefix(image.key)}{version}" if version else prefix + image.tag
         reference = f"{repository}:{tag}"
         archive = OciArchive(archives / image.archive_name)
         if archive.digest != image.digest:
@@ -477,31 +508,47 @@ def publish(manifest: Path, archives: Path, repository: str, prefix: str = "") -
         existing = registry.published_digest(tag)
         if existing == image.digest:
             print(f"{reference} is already published with {image.digest}; leaving it alone")
-            continue
-        if existing is not None:
+        elif existing is not None:
             raise PublishError(
                 f"{reference} is already published with {existing}, not the declared "
                 f"{image.digest}. A published tag is never overwritten; change the build "
                 "inputs so the image gets a new tag."
             )
-        for digest in archive.blobs:
-            registry.push_blob(digest, archive.blob_chunks(digest))
-        registry.push_manifest(tag, archive.media_type, archive.manifest_bytes)
-        print(f"{reference} published with {image.digest}")
+        else:
+            for digest in archive.blobs:
+                registry.push_blob(digest, archive.blob_chunks(digest))
+            registry.push_manifest(tag, archive.media_type, archive.manifest_bytes)
+            print(f"{reference} published with {image.digest}")
+        if version:
+            # Every release moves `latest` to the version it just proved, the input
+            # fingerprint never being part of the published name (the operator's
+            # decision, 2026-09-23). The blobs are already on the registry, either
+            # from the push above or from the already-published check.
+            latest_tag = f"{release_tag_prefix(image.key)}latest"
+            registry.push_manifest(latest_tag, archive.media_type, archive.manifest_bytes)
+            print(f"{repository}:{latest_tag} now published with {image.digest}")
 
 
-def verify(manifest: Path, repository: str, prefix: str = "") -> None:
+def verify(manifest: Path, repository: str, prefix: str = "", version: str = "") -> None:
+    if prefix and version:
+        raise PublishError("--tag-prefix and --release-version are mutually exclusive")
     registry = Registry(repository)
     prefix = checked_prefix(prefix)
+    version = checked_version(version) if version else ""
     failures: list[str] = []
     for image in declared_images(manifest):
-        tag = prefix + image.tag
-        reference = f"{repository}:{tag}"
-        published = registry.published_digest(tag)
-        if published != image.digest:
-            failures.append(f"{reference} carries {published or 'nothing'}, not {image.digest}")
-        else:
-            print(f"{reference} carries the declared {image.digest}")
+        tags = (
+            [f"{release_tag_prefix(image.key)}{version}", f"{release_tag_prefix(image.key)}latest"]
+            if version
+            else [prefix + image.tag]
+        )
+        for tag in tags:
+            reference = f"{repository}:{tag}"
+            published = registry.published_digest(tag)
+            if published != image.digest:
+                failures.append(f"{reference} carries {published or 'nothing'}, not {image.digest}")
+            else:
+                print(f"{reference} carries the declared {image.digest}")
     if failures:
         raise PublishError("; ".join(failures))
 
@@ -514,16 +561,20 @@ def main(argv: list[str] | None = None) -> int:
     push.add_argument("--archives", type=Path, required=True)
     push.add_argument("--repository", required=True)
     push.add_argument("--tag-prefix", default="")
+    push.add_argument("--release-version", default="")
     check = sub.add_parser("verify")
     check.add_argument("--manifest", type=Path, required=True)
     check.add_argument("--repository", required=True)
     check.add_argument("--tag-prefix", default="")
+    check.add_argument("--release-version", default="")
     args = parser.parse_args(argv)
     try:
         if args.command == "publish":
-            publish(args.manifest, args.archives, args.repository, args.tag_prefix)
+            publish(
+                args.manifest, args.archives, args.repository, args.tag_prefix, args.release_version
+            )
         else:
-            verify(args.manifest, args.repository, args.tag_prefix)
+            verify(args.manifest, args.repository, args.tag_prefix, args.release_version)
     except PublishError as exc:
         print(f"worker_images: {exc}", file=sys.stderr)
         return 1

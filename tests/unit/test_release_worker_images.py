@@ -639,6 +639,100 @@ def test_a_tag_prefix_publishes_and_verifies_the_prefixed_tag_only(
         wi.publish(manifest, archives, "ghcr.io/sentania-labs/crucible-worker", "-bad/")
 
 
+# Below: FDY-0093, the operator's decision of 2026-09-23. The release publishes the
+# worker image under the Crucible release version and moves latest, never the
+# manifest's own fingerprint tag.
+
+
+def test_a_release_version_publishes_the_worker_image_as_version_and_latest(
+    published: tuple[Path, Path, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest, archives, digest = published
+    registry = FakeRegistry(existing=None)
+    monkeypatch.setattr(wi, "Registry", lambda _repository: registry)
+    wi.publish(manifest, archives, "ghcr.io/sentania-labs/crucible-worker", version="0.5.2")
+    assert registry.manifests == [
+        ("0.5.2", "application/vnd.oci.image.manifest.v1+json", digest),
+        ("latest", "application/vnd.oci.image.manifest.v1+json", digest),
+    ]
+    # The blobs were only ever pushed once, for the version tag; latest reuses them.
+    assert len(registry.blobs) == 2
+
+
+def test_a_script_harness_release_tag_carries_its_own_name_inside_the_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archives = tmp_path / "out"
+    archives.mkdir()
+    tag = "script-harness-1.0.0-2db3cd7eb568"
+    digest = write_archive(archives / f"crucible-worker-{tag}.oci.tar")
+    manifest = tmp_path / "manifest.env"
+    manifest.write_text(
+        f"SCRIPT_HARNESS=crucible-worker:{tag}\nSCRIPT_HARNESS_DIGEST={digest}\n"
+        "SCRIPT_HARNESS_HARNESSES=script-harness:1.0.0\n",
+        encoding="utf-8",
+    )
+    registry = FakeRegistry(existing=None)
+    monkeypatch.setattr(wi, "Registry", lambda _repository: registry)
+    wi.publish(manifest, archives, "ghcr.io/sentania-labs/crucible-worker", version="0.5.2")
+    assert [tag for tag, _, _ in registry.manifests] == [
+        "script-harness-0.5.2",
+        "script-harness-latest",
+    ]
+
+
+def test_a_release_version_that_already_exists_with_a_different_digest_fails(
+    published: tuple[Path, Path, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest, archives, _ = published
+    registry = FakeRegistry(existing="sha256:" + "9" * 64)
+    monkeypatch.setattr(wi, "Registry", lambda _repository: registry)
+    with pytest.raises(wi.PublishError, match="never overwritten"):
+        wi.publish(manifest, archives, "ghcr.io/sentania-labs/crucible-worker", version="0.5.2")
+    assert registry.blobs == [] and registry.manifests == []
+
+
+def test_a_rerun_of_the_same_release_version_still_moves_latest(
+    published: tuple[Path, Path, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest, archives, digest = published
+    registry = FakeRegistry(existing=digest)
+    monkeypatch.setattr(wi, "Registry", lambda _repository: registry)
+    wi.publish(manifest, archives, "ghcr.io/sentania-labs/crucible-worker", version="0.5.2")
+    assert registry.blobs == []
+    assert registry.manifests == [("latest", "application/vnd.oci.image.manifest.v1+json", digest)]
+
+
+def test_tag_prefix_and_release_version_are_mutually_exclusive(
+    published: tuple[Path, Path, str],
+) -> None:
+    manifest, archives, _ = published
+    with pytest.raises(wi.PublishError, match="mutually exclusive"):
+        wi.publish(
+            manifest,
+            archives,
+            "ghcr.io/sentania-labs/crucible-worker",
+            prefix="ci-abc-",
+            version="0.5.2",
+        )
+
+
+def test_verify_checks_both_the_version_tag_and_latest(
+    published: tuple[Path, Path, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest, _, digest = published
+    monkeypatch.setattr(wi, "Registry", lambda _repository: FakeRegistry(existing=digest))
+    wi.verify(manifest, "ghcr.io/sentania-labs/crucible-worker", version="0.5.2")
+
+    class HalfPublished(FakeRegistry):
+        def published_digest(self, tag: str) -> str | None:
+            return digest if tag == "0.5.2" else None
+
+    monkeypatch.setattr(wi, "Registry", lambda _repository: HalfPublished(existing=digest))
+    with pytest.raises(wi.PublishError, match=r"latest carries nothing"):
+        wi.verify(manifest, "ghcr.io/sentania-labs/crucible-worker", version="0.5.2")
+
+
 def test_an_empty_blob_streams_and_finalizes(fake_registry: _FakeRegistryServer) -> None:
     digest = _digest(b"")
     registry = _client(fake_registry)

@@ -37,10 +37,12 @@ def render(service_ref: str, service_digest: str, worker_ref: str, worker_digest
     )
 
 
-def worker_image(manifest: Path) -> tuple[str, str]:
+def worker_image(manifest: Path, version: str) -> tuple[str, str]:
+    """The worker image's release tag (the Crucible release version, not its own
+    fingerprint tag: `images-publish` no longer pushes that) and its declared digest."""
     for image in declared_images(manifest):
         if image.key == "WORKER":
-            return image.tag, image.digest
+            return version, image.digest
     raise PublishError(f"{manifest} declares no WORKER image")
 
 
@@ -58,7 +60,7 @@ def main(argv: list[str] | None = None) -> int:
         if service_digest is None:
             raise PublishError(f"{args.service_image} is not published")
 
-        worker_tag, declared_worker_digest = worker_image(args.worker_manifest)
+        worker_tag, declared_worker_digest = worker_image(args.worker_manifest, service_tag)
         worker_digest = Registry(args.worker_repository).published_digest(worker_tag)
         if worker_digest != declared_worker_digest:
             raise PublishError(

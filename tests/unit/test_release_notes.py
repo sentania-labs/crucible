@@ -37,7 +37,11 @@ def test_render_names_both_images_by_their_read_back_digest() -> None:
     assert "ghcr.io/sentania-labs/crucible-worker:20260916-c6c15cef2f5c@sha256:" + "b" * 64 in text
 
 
-def test_worker_image_reads_the_declared_worker_entry(tmp_path: Path) -> None:
+def test_worker_image_reads_the_declared_digest_under_the_release_version(
+    tmp_path: Path,
+) -> None:
+    """FDY-0093: the worker image's release tag is the Crucible release version, not
+    its own fingerprint tag; only the digest still comes from the manifest."""
     manifest = tmp_path / "manifest.env"
     manifest.write_text(
         "SCRIPT_HARNESS=crucible-worker:script-harness-1.0.0\n"
@@ -45,6 +49,6 @@ def test_worker_image_reads_the_declared_worker_entry(tmp_path: Path) -> None:
         "WORKER=crucible-worker:20260916-c6c15cef2f5c\n"
         "WORKER_DIGEST=sha256:" + "d" * 64 + "\n"
     )
-    tag, digest = rn.worker_image(manifest)
-    assert tag == "20260916-c6c15cef2f5c"
+    tag, digest = rn.worker_image(manifest, "0.5.2")
+    assert tag == "0.5.2"
     assert digest == "sha256:" + "d" * 64
