@@ -119,8 +119,9 @@ its enable flag; for an image, `promote` while it is a supported candidate;
 for an exhaustion mark, `clear-exhaustion` while it is active; for a verified
 bootstrap import, `commit`; for an audit page, the next page. The local
 model endpoint offers one `set-local-endpoint:<model_id>` per model, already
-set to flip its current enabled state. Their commands carry the `--api-url`
-or `--config` the command ran with.
+set to flip its current enabled state. The Kubernetes egress selectors offer
+one `set-egress`, prefilled with the values in force. Their commands carry the
+`--api-url` or `--config` the command ran with.
 
 ## Principals
 
