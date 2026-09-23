@@ -14,8 +14,8 @@
 # build on its daemon cannot use images/ in place. `make images` (FDY-0072) copies
 # images/ to a scratch directory it can read, builds the worker image and the
 # script-harness image there with images/build.sh, and writes images/manifest.env
-# back. CI and the release run the same script through `images-check` and
-# `images-publish`; on their rootful daemon the staging is merely harmless:
+# back. CI and the release run the same script through `images-check`; on their
+# rootful daemon the staging is merely harmless:
 #
 #   make images DOCKER='<the rootless daemon wrapper above>'
 DOCKER ?= docker
@@ -59,7 +59,7 @@ CRUCIBLE_DEPLOY_PORT ?= 8080
 .PHONY: up dev down reset lint check-image-manifest scan scan-tree scan-history smoke test test-unit \
 	test-integration e2e e2e-github e2e-live e2e-admin e2e-image build proxy-config proxies preflight \
 	e2e-kind manifests deploy-kind release-images-classify release-images-pull release-images-verify \
-	deploy-local deploy-local-down images images-check images-publish release-notes
+	deploy-local deploy-local-down images images-check release-notes
 
 up: preflight proxy-config ## normal mode: postgres, proxies, migrate, crucible
 	@test -f .env || cp .env.example .env
@@ -129,22 +129,15 @@ check-image-manifest: ## fail when a declared worker-image tag is stale
 	images/check-manifest.sh
 
 # The worker images (13, C11). One worker image carries Claude Code, Codex, AGY and
-# Hermes; the script-harness image is the e2e tier's. All three targets build both from
-# a staged copy of images/ (see the header) with images/build.sh.
+# Hermes; the script-harness image is the e2e tier's. Both targets build both from a
+# staged copy of images/ (see the header) with images/build.sh. Neither pushes: the
+# release pushes what images-check loaded with `docker push`
+# (tools/release/push_worker_images.sh, 24).
 #
 # CACHE_DIR is a BuildKit layer cache directory that CI keeps between runs; it never
 # changes a digest. NO_CACHE=1 builds from scratch. WORKER_REGISTRY is where the
-# release publishes; nothing else pushes, and no credential is ever a value here (the
-# release passes REGISTRY_USERNAME and REGISTRY_PASSWORD in the environment).
-# WORKER_TAG_PREFIX is empty for the release; CI's ghcr-publish job sets ci-<sha>- to
-# prove the same publish against the real registry under throwaway tags (FDY-0090).
-# WORKER_RELEASE_VERSION is the Crucible release version (from the tag, as the service
-# image build gets VERSION); the release passes it so the worker and script-harness
-# images publish as <version> and move latest instead of their fingerprint tag (13,
-# 24). Empty everywhere else, and mutually exclusive with WORKER_TAG_PREFIX.
+# release publishes the worker images.
 WORKER_REGISTRY ?= ghcr.io/sentania-labs/crucible-worker
-WORKER_TAG_PREFIX ?=
-WORKER_RELEASE_VERSION ?=
 CACHE_DIR ?=
 NO_CACHE ?=
 images: ## FDY-0072: build both images from a staged copy the daemon's user can read; writes images/manifest.env
@@ -153,18 +146,12 @@ images: ## FDY-0072: build both images from a staged copy the daemon's user can 
 images-check: ## build both images and fail if any tag, harness version or OCI digest differs from images/manifest.env
 	DOCKER="$(DOCKER)" CACHE_DIR="$(CACHE_DIR)" NO_CACHE="$(NO_CACHE)" tools/images/images.sh check
 
-images-publish: ## release and CI's ghcr-publish: images-check, then push each OCI archive to WORKER_REGISTRY, never over another digest
-	DOCKER="$(DOCKER)" CACHE_DIR="$(CACHE_DIR)" NO_CACHE="$(NO_CACHE)" \
-	  WORKER_REGISTRY="$(WORKER_REGISTRY)" WORKER_TAG_PREFIX="$(WORKER_TAG_PREFIX)" \
-	  WORKER_RELEASE_VERSION="$(WORKER_RELEASE_VERSION)" \
-	  tools/images/images.sh publish
-
-# Needs REGISTRY_USERNAME and REGISTRY_PASSWORD in the environment, the same as
-# images-publish: reading a manifest back is still an authenticated registry call.
+# Reads the registry through DOCKER, so log it in first: reading a manifest back is
+# still an authenticated registry call.
 release-notes: ## release only: print the published service and worker image digests, read back from the registry, as release notes markdown
 	@test -n "$(CRUCIBLE_IMAGE)" || { echo "set CRUCIBLE_IMAGE"; exit 2; }
-	@python3 tools/release/release_notes.py --service-image "$(CRUCIBLE_IMAGE)" \
-	  --worker-manifest images/manifest.env --worker-repository "$(WORKER_REGISTRY)"
+	@DOCKER="$(DOCKER)" python3 tools/release/release_notes.py --service-image "$(CRUCIBLE_IMAGE)" \
+	  --worker-repository "$(WORKER_REGISTRY)"
 
 scan: scan-tree scan-history ## secret scan; needs gitleaks on PATH
 

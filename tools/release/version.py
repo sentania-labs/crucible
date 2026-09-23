@@ -4,18 +4,16 @@
     version.py <candidate> [tag ...]
     printf '%s\\n' "$TAGS" | version.py <candidate>
 
-Both the service image's release step (`.github/workflows/release.yml`, the "move
-latest only if this is the highest published version" step) and the worker images'
-`publish()` (`tools/release/worker_images.py`) call this rule before moving a mutable
-`latest` tag: `latest` follows the highest published version, never merely the most
+The release's "move latest only if this is the highest published version" step
+(`.github/workflows/release.yml`) calls this rule once, before moving the service
+image's `latest` and the worker images' `latest` and `script-harness-latest` together:
+`latest` follows the highest published version, never merely the most
 recent push, so re-publishing an old fix or re-running an old release job never moves
 it backwards.
 
 Only a tag that is exactly `N.N.N` (all-numeric components) counts as a version;
-anything else, a build-id tag such as `ci-<sha>-...`, a harness-prefixed tag such as
-`script-harness-1.0.0`, or `latest` itself, is ignored. A caller comparing a prefixed
-tag (the script-harness image) strips its own prefix before calling this, so the
-comparison never sees the prefix and cannot be confused by it.
+anything else, a build-id tag, a harness-prefixed tag such as
+`script-harness-1.0.0`, or `latest` itself, is ignored.
 
 `candidate` is always included in the comparison pool, so the answer is never empty
 even when nothing is published yet.
