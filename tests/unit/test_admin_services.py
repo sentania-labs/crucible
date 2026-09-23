@@ -336,6 +336,49 @@ def test_the_registry_refuses_a_login_whose_cli_is_not_installed_and_accepts_a_r
     assert registry.get("codex") is None
 
 
+def test_a_host_login_finds_the_cli_on_path_and_a_container_login_uses_the_image_path(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """On the host the CLI is wherever the operator installed it (~/.local/bin for a
+    user-scoped install), so the default is the bare name found on PATH. Inside the
+    worker image the adapters launch each CLI by absolute path (C11), and the login
+    runs the same file."""
+    from crucible.application.admin.login import LoginRegistry  # noqa: PLC0415
+    from crucible.ports.harness import (  # noqa: PLC0415
+        AGY_BINARY,
+        CLAUDE_CODE_BINARY,
+        CODEX_BINARY,
+    )
+
+    bin_dir = tmp_path / ".local" / "bin"
+    bin_dir.mkdir(parents=True)
+    for name in ("claude", "codex", "agy"):
+        fake_cli(bin_dir, name, "#!/bin/bash\nexit 0\n")
+    monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin:/bin")
+    host = LoginRegistry()
+    ctx = _bare_context()
+    assert host.resolve(ctx, "claude_code") == ("claude", "setup-token")
+    assert host.resolve(ctx, "codex") == ("codex", "login", "--device-auth")
+    assert host.resolve(ctx, "agy")[0] == "agy"
+
+    class Runner:
+        def run_login_container(self) -> None:  # pragma: no cover - never called
+            raise AssertionError
+
+    in_image = _bare_context(providers={"docker": Runner()})
+    # The image paths need not exist on this host: the container has them.
+    monkeypatch.setenv("PATH", "/nonexistent")
+    assert host.resolve(in_image, "claude_code") == (CLAUDE_CODE_BINARY, "setup-token")
+    assert host.resolve(in_image, "codex") == (CODEX_BINARY, "login", "--device-auth")
+    assert host.resolve(in_image, "agy")[0] == AGY_BINARY
+    assert host.resolve(in_image, "agy")[1:] == FLOWS["agy"].argv[1:]
+    # An operator-configured command is used as given in either mode.
+    configured = _bare_context(
+        providers={"docker": Runner()}, login_commands={"codex": ("my-codex", "login")}
+    )
+    assert host.resolve(configured, "codex") == ("my-codex", "login")
+
+
 def test_a_thread_that_cannot_start_leaves_no_login_in_progress(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
@@ -403,9 +446,8 @@ def _bare_context(**overrides: Any) -> AdminContext:
     return AdminContext(
         uow_factory=factory,
         clock=SystemClock(),
-        providers={},
         harnesses=default_registry(),
-        **overrides,
+        **{"providers": {}, **overrides},
     )
 
 

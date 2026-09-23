@@ -46,6 +46,7 @@ def test_stub_device_login_uses_one_credential_mount_and_reaps_container(
     flow = LoginFlow(
         harness="script-harness",
         argv=("crucible-script-harness", "login-stub"),
+        image_binary="/usr/local/bin/crucible-script-harness",
         directory_env="CRUCIBLE_LOGIN_DIR",
         directory_subdir="",
         pastes_code=False,
