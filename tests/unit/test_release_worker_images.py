@@ -287,6 +287,23 @@ class _FakeRegistryHandler(http.server.BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         return self.rfile.read(length) if length else b""
 
+    def _chunked_body(self) -> list[bytes] | None:
+        """A chunked-transfer-encoded body, piece by piece as it crossed the wire, or
+        None when the stream ends before its terminating chunk (the client aborted)."""
+        pieces: list[bytes] = []
+        while True:
+            size_line = self.rfile.readline()
+            if not size_line:
+                return None
+            size = int(size_line.split(b";")[0].strip() or b"0", 16)
+            if size == 0:
+                self.rfile.readline()
+                return pieces
+            piece = self.rfile.read(size)
+            if len(piece) != size or self.rfile.readline() != b"\r\n":
+                return None
+            pieces.append(piece)
+
     def _send(self, status: int, headers: dict[str, str] | None = None, body: bytes = b"") -> None:
         self.send_response(status)
         for key, value in (headers or {}).items():
@@ -386,16 +403,27 @@ class _FakeRegistryHandler(http.server.BaseHTTPRequestHandler):
             return
         if not self._octet_stream():
             return
-        start, _, end = self.headers.get("Content-Range", "").partition("-")
-        body = self._body()
-        if not (start.isdigit() and end.isdigit()) or int(start) != len(buf):
-            self._send(416)
-            return
-        if int(end) - int(start) + 1 != len(body):
-            self._send(416)
-            return
-        self.server.chunk_sizes.append(len(body))
-        buf.extend(body)
+        # The streamed PATCH the publisher sends, and GHCR takes: the whole blob, chunked
+        # transfer encoding, no Content-Range. Each wire chunk's size is recorded, which is
+        # what shows the publisher sent the blob in bounded pieces.
+        if self.headers.get("Transfer-Encoding", "").lower() == "chunked":
+            pieces = self._chunked_body()
+            if pieces is None:
+                self.close_connection = True
+                return
+            self.server.chunk_sizes.extend(len(piece) for piece in pieces)
+            buf.extend(b"".join(pieces))
+        else:
+            start, _, end = self.headers.get("Content-Range", "").partition("-")
+            body = self._body()
+            if not (start.isdigit() and end.isdigit()) or int(start) != len(buf):
+                self._send(416)
+                return
+            if int(end) - int(start) + 1 != len(body):
+                self._send(416)
+                return
+            self.server.chunk_sizes.append(len(body))
+            buf.extend(body)
         self._send(
             202,
             {
@@ -592,3 +620,20 @@ def test_a_tag_prefix_publishes_and_verifies_the_prefixed_tag_only(
     assert [tag for tag, _, _ in registry.manifests] == ["ci-0123abcd-20260916-aaaaaaaaaaaa"]
     with pytest.raises(wi.PublishError, match="would not make a valid tag"):
         wi.publish(manifest, archives, "ghcr.io/sentania-labs/crucible-worker", "-bad/")
+
+
+def test_an_empty_blob_streams_and_finalizes(fake_registry: _FakeRegistryServer) -> None:
+    digest = _digest(b"")
+    registry = _client(fake_registry)
+    registry.push_blob(digest, iter([]))
+    assert fake_registry.blobs[digest] == b""
+
+
+def test_a_location_that_is_not_an_absolute_path_is_refused(
+    fake_registry: _FakeRegistryServer,
+) -> None:
+    """`@evil.example/x` glued onto the registry host would be userinfo plus another host."""
+    registry = _client(fake_registry)
+    for location in ("@evil.example/upload", "//evil.example/upload", ":8443/upload"):
+        with pytest.raises(wi.PublishError, match="not a path"):
+            registry.request("PATCH", location, body=b"", ok=(202,))
