@@ -19,3 +19,10 @@ patches:
   - path: settings.yaml
   - path: resources.yaml
   - path: pull-secret.yaml
+# The deployer's pin. The base tracks `latest`; this is the one place in a real
+# deployment repository that names an exact release. The deployer sets both from the
+# GitHub release before the first sync, never Argo and never this repository.
+images:
+  - name: ghcr.io/sentania-labs/crucible
+    newTag: REPLACE_ME_CRUCIBLE_TAG
+    digest: REPLACE_ME_CRUCIBLE_DIGEST
