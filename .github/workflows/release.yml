@@ -261,11 +261,14 @@ jobs:
           HIGHEST=$(printf '%s\n' "$TAGS" | python3 tools/release/version.py "${VERSION}")
           echo "highest published version: $HIGHEST"
           if [ "$HIGHEST" = "${VERSION}" ]; then
-            docker push "${IMAGE}:latest"
+            # The two registry-side copies go first: they are cheap and fail fast, so a
+            # failure here leaves every latest tag where it was, instead of the service
+            # latest moved and the worker ones stale (the example manifests track latest).
             docker buildx imagetools create --prefer-index=false \
               -t "${WORKER_REGISTRY}:latest" "${WORKER_REGISTRY}:${VERSION}"
             docker buildx imagetools create --prefer-index=false \
               -t "${WORKER_REGISTRY}:script-harness-latest" "${WORKER_REGISTRY}:script-harness-${VERSION}"
+            docker push "${IMAGE}:latest"
           else
             echo "${VERSION} is not the highest; leaving latest where it is"
           fi

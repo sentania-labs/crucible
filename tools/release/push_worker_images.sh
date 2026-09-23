@@ -66,5 +66,9 @@ push_one() {
     fi
 }
 
-push_one "$(declared WORKER)" "$VERSION"
-push_one "$(declared SCRIPT_HARNESS)" "script-harness-$VERSION"
+# Resolved before the calls: a `declared` failure inside "$(...)" would only leave the
+# subshell, and push_one would then run with an empty ref and a misleading error.
+worker_ref=$(declared WORKER)
+harness_ref=$(declared SCRIPT_HARNESS)
+push_one "$worker_ref" "$VERSION"
+push_one "$harness_ref" "script-harness-$VERSION"

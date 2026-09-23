@@ -3,9 +3,12 @@
 name: ci
 
 # Every branch push runs every job, so a change is proven on its branch before there is
-# a pull request, and the pull request's required checks are that run's, on its head
-# commit. There is deliberately no pull_request trigger: a second run whose jobs were
-# all skipped would report the same check names as passed.
+# a pull request, and the pull request's required checks (matched by name on the head
+# commit) are that run's. There is no pull_request trigger because it would run the
+# whole suite a second time on the same commit, including a second e2e-kind. The cost
+# of that choice: a pull request from a fork never triggers this workflow, so it cannot
+# satisfy the required checks; this repository takes no fork contributions today
+# (operator decision, 2026-09-23).
 on:
   push:
     branches: ["**"]
