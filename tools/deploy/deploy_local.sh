@@ -98,12 +98,25 @@ if [ "$action" = "down" ]; then
 fi
 
 [ -n "$DEPLOY_IMAGE" ] || die "set CRUCIBLE_DEPLOY_IMAGE, or DEPLOY_TAG when calling make"
+# A digest, when there is one, is its own colon-bearing suffix ('@sha256:...') and must
+# not be mistaken for the tag: stripped off first, so the tag is read from what is left.
 case "$DEPLOY_IMAGE" in
-  *:latest|*:latest@*) die "a deployment pins an exact tag; 'latest' is not one (docs/implementation-notes/release.md)" ;;
-  *:*) ;;
-  *) die "CRUCIBLE_DEPLOY_IMAGE must carry an exact version tag" ;;
+  *@sha256:*) repo_and_tag="${DEPLOY_IMAGE%%@sha256:*}" ;;
+  *) repo_and_tag="$DEPLOY_IMAGE" ;;
 esac
-deploy_version="${DEPLOY_IMAGE##*:}"
+# The tag, if there is one, is read from the last path segment only, so a registry
+# port ('localhost:5000/repo') is never mistaken for one.
+last_segment="${repo_and_tag##*/}"
+case "$last_segment" in
+  *:latest) die "a deployment pins an exact tag; 'latest' is not one (docs/implementation-notes/release.md)" ;;
+  *:*) deploy_version="${last_segment##*:}" ;;
+  *)
+    [ "$repo_and_tag" != "$DEPLOY_IMAGE" ] || die "CRUCIBLE_DEPLOY_IMAGE must carry an exact version tag or digest"
+    # repo@sha256:... with no tag: there is no version string to check /v1/health
+    # against below, and that is fine, the digest is already the exact pin.
+    deploy_version=""
+    ;;
+esac
 
 # Through sudo: /run/user/<uid> is mode 700, so the operator cannot stat the socket,
 # which is the same wall this whole target exists to work around.
@@ -260,7 +273,9 @@ trap 'rm -f "$tmp"' EXIT INT TERM
   done < "$EXAMPLE"
   echo "# The rootless daemon's socket, mounted into the socket proxy and nothing else."
   printf '%s\n' "CRUCIBLE_DOCKER_SOCKET=${SOCKET}"
-  echo "# The pinned release, agreeing with compose.deploy.yaml."
+  echo "# The pinned release, agreeing with compose.deploy.yaml. This local deployment"
+  echo "# pins the exact image it was given; compose.yaml's own default is only the"
+  echo "# example, which tracks latest."
   printf '%s\n' "CRUCIBLE_IMAGE=${DEPLOY_IMAGE}"
   echo "# The configured local model endpoint. Its presence enables the local route."
   [ -z "$LOCAL_ENDPOINT_URL" ] || printf '%s\n' "CRUCIBLE_LOCAL_ENDPOINT_URL=${LOCAL_ENDPOINT_URL}"
@@ -291,6 +306,16 @@ esac
 # 7. Bring it up as the service user, on its own daemon.
 compose pull --quiet postgres docker-socket-proxy egress-proxy
 compose pull --quiet crucible migrate
+if [ -z "$deploy_version" ]; then
+  # repo@sha256:... carries no tag: the pulled image's own OCI label is the version
+  # /v1/health will report (crucible/__init__.py reads the same value from the
+  # package, and the release workflow's own gate checks the label against it).
+  deploy_version="$(as_service_user docker image inspect "$DEPLOY_IMAGE" \
+    --format '{{index .Config.Labels "org.opencontainers.image.version"}}')"
+  case "$deploy_version" in
+    ""|"<no value>") die "$DEPLOY_IMAGE carries no org.opencontainers.image.version label to check /v1/health against" ;;
+  esac
+fi
 compose up -d --wait
 if [ "$egress_changed" = 1 ]; then
   echo "deploy-local: the egress allowlist changed, recreating the proxy so it reads the new rules"
@@ -298,7 +323,8 @@ if [ "$egress_changed" = 1 ]; then
 fi
 
 # 8. Prove it is this deployment answering on that port, not something else that owns it:
-#    /v1/health reports the version the image was built from, which must be the tag.
+#    /v1/health reports the version the image was built from, which must be the tag
+#    (or, for a digest-only reference, the label read back from the pulled image above).
 echo
 echo "deploy-local: GET /v1/health"
 health="$(curl -sS --fail-with-body "http://127.0.0.1:${DEPLOY_PORT}/v1/health")"

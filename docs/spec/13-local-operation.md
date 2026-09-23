@@ -316,6 +316,11 @@ The artifact root is the one thing that gets harder rather than simpler: it is
 one named volume locally and has to be a `ReadWriteMany` claim there, because
 the api serves what the supervisor wrote.
 
+`deploy/kubernetes` is examples, not a deployable record: the base tracks `latest`
+and a real deployment copies `overlays/lab` into the deployer's own GitOps
+repository and pins there (24, docs/deployment.md). Nothing in this repository's
+manifests is what a cluster ends up running.
+
 ## GitHub webhook ingress
 
 Polling is the complete observation path and the local default; no

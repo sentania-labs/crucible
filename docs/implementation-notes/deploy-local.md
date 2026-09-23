@@ -53,9 +53,12 @@ needs and nothing the operator's home provides:
    deliberately ignored here: its fallback is the host's rootful socket, and a
    stray environment variable must not be able to put this deployment on the
    daemon whose compromise is a compromise of the host.
-3. Refuses an image reference that is `latest` or carries no tag. A deployment
-   pins one exact version; that pin is what makes a redeploy reproducible and a
-   rollback a one-word change.
+3. Refuses an image reference that is `latest` or carries neither a tag nor a
+   digest. A deployment pins one exact version; that pin is what makes a
+   redeploy reproducible and a rollback a one-word change. `repo:tag`,
+   `repo:tag@sha256:...` and `repo@sha256:...` are all accepted, and the
+   reference is passed through to the deployment's `compose.deploy.yaml` and
+   `.env` unchanged.
 4. Creates `/var/lib/crucible/deploy` (750) and `/var/lib/crucible/credentials`
    (700) with one empty directory per harness plus `github`, all owned by the
    service user. The layout is created and nothing more: a credential enters
@@ -81,6 +84,8 @@ needs and nothing the operator's home provides:
    `CRUCIBLE_WORKERS_SUBNET` are appended, so the deployed application's declared
    allowlist and subnet are the same values the deployed `squid.conf` was
    generated from and cannot drift from them inside the deployment directory.
+   This local deployment pins the exact image it was given as `CRUCIBLE_IMAGE`;
+   `compose.yaml`'s own checked-in default is only the example, and it tracks `latest`.
 8. Asserts that nothing under the deployment directory names a path in `/home`.
    That is the whole point of the directory, so it is checked rather than
    assumed, and "could not look" is a failure distinct from "found nothing".
@@ -91,10 +96,11 @@ needs and nothing the operator's home provides:
    running container would otherwise keep the old rules while the target
    reported success.
 10. Reads `/v1/health` and refuses to report success unless the version it
-    reports is the tag that was deployed. Loopback ports are shared with
-    whatever else is running on the workstation, and a `/v1/ready` from
-    somebody else's service is not evidence about this one. Then prints
-    `/v1/ready`.
+    reports matches: the tag, when the reference carried one, or otherwise
+    the `org.opencontainers.image.version` label read back from the pulled,
+    digest-only image. Loopback ports are shared with whatever else is
+    running on the workstation, and a `/v1/ready` from somebody else's
+    service is not evidence about this one. Then prints `/v1/ready`.
 
 `deploy-local-down` is `docker compose down` without `--volumes`:
 `crucible_crucible-pg` and `crucible_crucible-artifacts` survive, because a

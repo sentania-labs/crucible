@@ -54,6 +54,11 @@ spec:
         # nothing else; the password in it is never printed, parsed or logged.
         - name: wait-for-database
           image: ghcr.io/sentania-labs/crucible
+          # The base tracks `latest`, and Kubernetes defaults an unpinned `latest` tag to
+          # `imagePullPolicy: Always`; explicit here so a local proof never reaches a
+          # registry and a real deployment's exact-pinned tag still resolves once, at
+          # whichever digest the deployer set (24).
+          imagePullPolicy: IfNotPresent
           command:
             - python
             - -c
@@ -93,6 +98,7 @@ spec:
       containers:
         - name: api
           image: ghcr.io/sentania-labs/crucible
+          imagePullPolicy: IfNotPresent
           command: ["crucible", "serve", "--api"]
           securityContext:
             allowPrivilegeEscalation: false

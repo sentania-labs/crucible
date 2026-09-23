@@ -538,7 +538,7 @@ def promote_worker_image(base_url: str, token: str) -> dict[str, Any]:
         items = [
             item
             for item in field(listing, "items", "GET /v1/admin/images")
-            if item.get("harness") == "script-harness"
+            if "script-harness" in (item.get("harnesses") or {})
         ]
         if items:
             break

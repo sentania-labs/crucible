@@ -91,3 +91,8 @@ Not an approval workflow system. One decision, one contract, one tag. A
 standing release policy (`require_operator_approval: false` for a
 repository) may be added later by the operator and is itself a recorded
 decision.
+
+Not a deployment trigger. `deploy/kubernetes` in this repository is examples that
+track `latest` and never pin themselves; a real deployment copies the lab overlay
+into the deployer's own GitOps repository and pins the tag this release cuts there
+(13, docs/deployment.md). A tag here changes nothing a cluster is running.

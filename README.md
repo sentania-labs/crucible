@@ -182,20 +182,27 @@ worker image the policy allowlist admits), `POST
 
 ### Running the released image on the rootless daemon
 
+> These manifests are examples that track `latest`. A real deployment copies them into
+> the deployer's own repository and pins the exact tag and digest there. `make
+> deploy-local` below applies that same pin locally: give it `CRUCIBLE_DEPLOY_IMAGE` or
+> `DEPLOY_TAG` as `tag` or `tag@sha256:...` and it runs exactly that reference.
+
 `make up` runs your working tree, which means the compose client must read it,
 which means it must run as the daemon's owner. On a workstation where the
 `crucible` service user cannot read the operator's home (mode 750, correctly),
 that cannot work. `make deploy-local` is the arrangement that does:
 
 ```sh
-make deploy-local                    # the pin in DEPLOY_TAG
-make deploy-local DEPLOY_TAG=0.2.2   # or another published release
-make deploy-local-down               # containers down, volumes kept
+make deploy-local                              # the pin in DEPLOY_TAG
+make deploy-local DEPLOY_TAG=0.2.2             # or another published release
+make deploy-local DEPLOY_TAG=0.2.2@sha256:...  # tag and digest, passed through unchanged
+make deploy-local-down                         # containers down, volumes kept
 ```
 
 It creates `/var/lib/crucible/deploy` owned by the service user, containing
-`compose.yaml`, an override that pins `ghcr.io/sentania-labs/crucible:<tag>` and
-drops the build section, a generated `.env` whose database password is created
+`compose.yaml`, an override that pins `ghcr.io/sentania-labs/crucible:<tag>` (or
+`<tag>@sha256:...`, unchanged) and drops the build section, a generated `.env` whose
+database password is created
 once and never printed, and the egress allowlist; creates the credential root
 layout under `/var/lib/crucible/credentials`; then brings the stack up as that
 user against its own daemon and prints `/v1/ready`. Nothing in the deployment
