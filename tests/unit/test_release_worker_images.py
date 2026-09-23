@@ -15,6 +15,7 @@ import sys
 import tarfile
 import threading
 import urllib.parse
+import uuid
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -265,6 +266,17 @@ class _FakeRegistryServer(http.server.ThreadingHTTPServer):
         self.socket = context.wrap_socket(self.socket, server_side=True)
 
 
+# What GHCR itself answered in CI run 35831556330 (FDY-0090), and so what the fake does:
+# an upload's Location is /v2/<name>/blobs/upload/<n>.<uuid> (singular `upload`, not the
+# POST's `uploads/`), echoed in Docker-Upload-UUID, with an inclusive Range; and a PATCH
+# or finalizing PUT whose Content-Type is not application/octet-stream is refused with
+# 404 BLOB_UPLOAD_INVALID "invalid content-type". registry:2 accepts the latter, which is
+# how the v0.5.0 release reached GHCR with a publish that had only ever passed locally.
+_GHCR_INVALID_CONTENT_TYPE = json.dumps(
+    {"errors": [{"code": "BLOB_UPLOAD_INVALID", "message": "invalid content-type"}]}
+).encode()
+
+
 class _FakeRegistryHandler(http.server.BaseHTTPRequestHandler):
     server: _FakeRegistryServer
 
@@ -339,40 +351,67 @@ class _FakeRegistryHandler(http.server.BaseHTTPRequestHandler):
         digest = self.path.rsplit("/", 1)[-1]
         self._send(200 if digest in self.server.blobs else 404)
 
+    def _upload_location(self, upload_id: str) -> str:
+        return f"/v2/{self.server.name}/blobs/upload/{upload_id}"
+
+    def _octet_stream(self) -> bool:
+        if self.headers.get("Content-Type") == "application/octet-stream":
+            return True
+        self._body()
+        self._send(404, {"Content-Type": "application/json"}, _GHCR_INVALID_CONTENT_TYPE)
+        return False
+
     def do_POST(self) -> None:
         if not self._require_auth():
             return
-        upload_id = secrets.token_hex(8)
+        self._body()
+        upload_id = f"1.{uuid.uuid4()}"
         self.server.uploads[upload_id] = bytearray()
         if self.server.redirect_off_host:
             location = "https://evil.example/upload"
         else:
-            location = f"/v2/{self.server.name}/blobs/uploads/{upload_id}"
-        self._send(202, {"Location": location, "Range": "0-0"})
+            location = self._upload_location(upload_id)
+        self._send(202, {"Location": location, "Range": "0-0", "Docker-Upload-UUID": upload_id})
 
     def do_PATCH(self) -> None:
         if not self._require_auth():
             return
         upload_id = self.path.rsplit("/", 1)[-1]
+        if not self.path.startswith(self._upload_location("")):
+            self._send(404)
+            return
         buf = self.server.uploads.get(upload_id)
         if buf is None:
             self._send(404)
             return
-        start = self.headers.get("Content-Range", "").partition("-")[0]
-        if start and int(start) != len(buf):
+        if not self._octet_stream():
+            return
+        start, _, end = self.headers.get("Content-Range", "").partition("-")
+        body = self._body()
+        if not (start.isdigit() and end.isdigit()) or int(start) != len(buf):
             self._send(416)
             return
-        body = self._body()
+        if int(end) - int(start) + 1 != len(body):
+            self._send(416)
+            return
         self.server.chunk_sizes.append(len(body))
         buf.extend(body)
-        location = f"/v2/{self.server.name}/blobs/uploads/{upload_id}"
-        self._send(202, {"Location": location, "Range": f"0-{max(len(buf) - 1, 0)}"})
+        self._send(
+            202,
+            {
+                "Location": self._upload_location(upload_id),
+                "Range": f"0-{max(len(buf) - 1, 0)}",
+                "Docker-Upload-UUID": upload_id,
+            },
+        )
 
     def do_PUT(self) -> None:
         if not self._require_auth():
             return
-        if self.path.startswith(f"/v2/{self.server.name}/blobs/uploads/"):
+        if self.path.startswith(self._upload_location("")):
             self.server.blob_finalize_attempts += 1
+            if not self._octet_stream():
+                return
             tail = self.path.rsplit("/", 1)[-1]
             upload_id, _, query = tail.partition("?")
             digest = urllib.parse.unquote(
@@ -500,3 +539,56 @@ def test_a_manifest_push_answers_the_bearer_challenge(fake_registry: _FakeRegist
     assert body == data and digest == _digest(data)
     assert registry.published_digest("a-tag") == _digest(data)
     assert registry.published_digest("missing-tag") is None
+
+
+def test_the_fake_refuses_what_ghcr_refused_in_the_v0_5_0_release(
+    fake_registry: _FakeRegistryServer,
+) -> None:
+    """The fake must fail the way GHCR did, or the tests above prove nothing about GHCR:
+    a finalizing PUT without an octet-stream Content-Type (what urllib sends for an
+    empty body when none is given) is 404 BLOB_UPLOAD_INVALID (FDY-0090)."""
+    registry = _client(fake_registry)
+    _, reply, _ = registry.request(
+        "POST",
+        f"/v2/{fake_registry.name}/blobs/uploads/",
+        body=b"",
+        headers=wi.UPLOAD_HEADERS,
+        ok=(202,),
+    )
+    assert reply["location"].startswith(f"/v2/{fake_registry.name}/blobs/upload/1.")
+    assert reply["docker-upload-uuid"] == reply["location"].rsplit("/", 1)[-1]
+    with pytest.raises(wi.PublishError, match="404 .*invalid content-type"):
+        registry.request("PUT", f"{reply['location']}?digest={_digest(b'')}", body=b"", ok=(201,))
+
+
+def test_every_upload_request_logs_its_answer_and_never_a_credential(
+    fake_registry: _FakeRegistryServer, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data = b"logged upload"
+    registry = _client(fake_registry)
+    registry.push_blob(_digest(data), iter([data]))
+    log = capsys.readouterr().err
+    assert "POST /v2/" in log and "PATCH /v2/" in log and "PUT /v2/" in log
+    assert "docker-upload-uuid=1." in log and "range=0-12" in log
+    assert fake_registry.token not in log and fake_registry.password not in log
+    assert "Bearer" not in log and "Basic" not in log
+
+
+def test_a_signed_upload_state_in_a_location_is_not_logged() -> None:
+    assert (
+        wi.redact("/v2/a/blobs/upload/1.x?_state=c2VjcmV0&digest=sha256%3Aab")
+        == "/v2/a/blobs/upload/1.x?_state=<8 chars>&digest=sha256%3Aab"
+    )
+    assert wi.redact("/v2/a/blobs/upload/1.x") == "/v2/a/blobs/upload/1.x"
+
+
+def test_a_tag_prefix_publishes_and_verifies_the_prefixed_tag_only(
+    published: tuple[Path, Path, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest, archives, digest = published
+    registry = FakeRegistry(existing=None)
+    monkeypatch.setattr(wi, "Registry", lambda _repository: registry)
+    wi.publish(manifest, archives, "ghcr.io/sentania-labs/crucible-worker", "ci-0123abcd-")
+    assert [tag for tag, _, _ in registry.manifests] == ["ci-0123abcd-20260916-aaaaaaaaaaaa"]
+    with pytest.raises(wi.PublishError, match="would not make a valid tag"):
+        wi.publish(manifest, archives, "ghcr.io/sentania-labs/crucible-worker", "-bad/")

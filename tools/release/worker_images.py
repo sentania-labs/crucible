@@ -81,6 +81,11 @@ TIMEOUT = 120.0
 # bytes (FDY-0074). 8 MiB is well inside every registry's chunk-size limits, including
 # GHCR's.
 CHUNK_SIZE = 8 * 1024 * 1024
+# Every blob upload request says what it carries. urllib gives a request with a body
+# and no Content-Type `application/x-www-form-urlencoded`, which GHCR refuses on the
+# finalizing PUT with 404 BLOB_UPLOAD_INVALID "invalid content-type" (the v0.5.0
+# release, FDY-0090); registry:2 ignores it, which is why a local proof passed.
+UPLOAD_HEADERS = {"Content-Type": "application/octet-stream"}
 # The response headers each upload step logs (FDY-0090). Never a request header.
 TRACED_HEADERS = ("location", "range", "docker-upload-uuid", "docker-content-digest")
 # The distribution spec's tag grammar; a prefix must keep every tag inside it.
@@ -357,16 +362,26 @@ class Registry:
 
     def push_blob(self, digest: str, chunks: Iterator[bytes]) -> None:
         """Streams `chunks` (bounded reads, never the whole blob) through the registry's
-        POST, PATCH, PUT chunked-upload sequence. When the blob is already present, the
-        chunks are still drained and hashed (never sent) so a tampered archive is caught
-        the same way whether or not the registry needs the bytes again."""
+        POST, PATCH, PUT chunked-upload sequence. Each request goes to the Location the
+        previous answer gave, verbatim; the digest is added to that Location's own query
+        string for the PUT. Every request carries an explicit octet-stream Content-Type
+        and Content-Length, each PATCH its inclusive Content-Range, and each PATCH's
+        answered Range must cover exactly the bytes sent so far. When the blob is already
+        present, the chunks are still drained and hashed (never sent) so a tampered
+        archive is caught the same way whether or not the registry needs the bytes
+        again."""
         status, _, _ = self.request("HEAD", f"/v2/{self.name}/blobs/{digest}", ok=(200, 404))
         if status == 200:
             for _ in chunks:
                 pass
             return
         _, reply, _ = self.request(
-            "POST", f"/v2/{self.name}/blobs/uploads/", body=b"", ok=(202,), traced=True
+            "POST",
+            f"/v2/{self.name}/blobs/uploads/",
+            body=b"",
+            headers=UPLOAD_HEADERS | {"Content-Length": "0"},
+            ok=(202,),
+            traced=True,
         )
         location = reply.get("location", "")
         if not location:
@@ -377,8 +392,9 @@ class Registry:
                 "PATCH",
                 location,
                 body=chunk,
-                headers={
-                    "Content-Type": "application/octet-stream",
+                headers=UPLOAD_HEADERS
+                | {
+                    "Content-Length": str(len(chunk)),
                     "Content-Range": f"{offset}-{offset + len(chunk) - 1}",
                 },
                 ok=(202,),
@@ -386,11 +402,16 @@ class Registry:
             )
             location = reply.get("location", location)
             offset += len(chunk)
+            if reply.get("range", f"0-{offset - 1}") != f"0-{offset - 1}":
+                raise PublishError(
+                    f"{self.host} holds {reply['range']} of an upload that sent {offset} bytes"
+                )
         separator = "&" if "?" in location else "?"
         self.request(
             "PUT",
             f"{location}{separator}digest={urllib.parse.quote(digest)}",
             body=b"",
+            headers=UPLOAD_HEADERS | {"Content-Length": "0"},
             ok=(201,),
             traced=True,
         )
