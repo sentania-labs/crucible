@@ -978,13 +978,15 @@ class Supervisor:
                     log.exception("launch step failed; continuing with the next attempt")
         return launched
 
-    def _build_spec(
+    async def _build_spec(
         self,
         attempt: Attempt,
         execution: Execution,
         task: Task,
         contract: dict[str, Any],
         repository_url: str = "",
+        *,
+        credential_mounted: bool | None = None,
     ) -> LaunchSpec:
         env: dict[str, str] = {}
         if execution.role is ExecutionRole.REVIEW and task.head_sha:
@@ -1027,6 +1029,18 @@ class Supervisor:
             return spec
         credential = adapter.credential_spec()
         source = self._credential_sources.get(selected_harness)
+        if credential_mounted is None:
+            if credential is not None:
+                if source is not None and credential.held_by(source.path):
+                    credential_mounted = True
+                elif execution.provider in self._providers:
+                    credential_mounted = await self._providers[
+                        execution.provider
+                    ].credential_available(selected_harness)
+                else:
+                    credential_mounted = False
+            else:
+                credential_mounted = False
         # 07: the adapter's launch shape. Argv carries the pointer; the identity and
         # the contract are files; a credential value is never in any of it.
         launch = adapter.build_launch(
@@ -1038,15 +1052,7 @@ class Supervisor:
                 identity_mount=IDENTITY_MOUNT,
                 report_mount=REPORT_MOUNT,
                 repo_mount=REPO_MOUNT,
-                credential_mounted=(
-                    credential is not None
-                    and (
-                        (source is not None and credential.held_by(source.path))
-                        or self._providers[execution.provider].credential_available(
-                            selected_harness
-                        )
-                    )
-                ),
+                credential_mounted=credential_mounted,
                 endpoint=endpoint,
                 endpoint_url=endpoint_url,
             )
@@ -1061,19 +1067,34 @@ class Supervisor:
             transcript_path=launch.transcript_path,
         )
 
-    def _spec_for(self, attempt: Attempt) -> LaunchSpec | None:
+    async def _spec_for(self, attempt: Attempt) -> LaunchSpec | None:
         """Rebuild the launch spec from the database, for a collect after a restart."""
-        with self._uow_factory() as uow:
-            execution = uow.executions.get(attempt.execution_id)
-            task = uow.tasks.get(attempt.task_id)
-            if execution is None or task is None:
-                return None
-            stored = uow.contracts.get(task.id, execution.contract_version)
-            if stored is None:
-                return None
-            repository = uow.repositories.get(task.repository_id)
-            return self._build_spec(
+
+        def _fetch() -> tuple[Any, Any, Any, Any]:
+            with self._uow_factory() as uow:
+                execution = uow.executions.get(attempt.execution_id)
+                task = uow.tasks.get(attempt.task_id)
+                if execution is None or task is None:
+                    return None, None, None, None
+                stored = uow.contracts.get(task.id, execution.contract_version)
+                repository = uow.repositories.get(task.repository_id)
+                return execution, task, stored, repository
+
+        execution, task, stored, repository = await self._db(_fetch)
+        if execution is None or task is None or stored is None:
+            return None
+        try:
+            return await self._build_spec(
                 attempt, execution, task, stored.document, repository.url if repository else ""
+            )
+        except LaunchRefusedError:
+            return await self._build_spec(
+                attempt,
+                execution,
+                task,
+                stored.document,
+                repository.url if repository else "",
+                credential_mounted=False,
             )
 
     @staticmethod
@@ -1421,8 +1442,10 @@ class Supervisor:
                 return False
         elif not await self._db(partial(self._mark_preparing, attempt.id)):
             return False
-        spec = self._build_spec(attempt, execution, task, item.contract, item.repository_url)
         try:
+            spec = await self._build_spec(
+                attempt, execution, task, item.contract, item.repository_url
+            )
             ws = await provider.prepare(spec)
         except LaunchRefusedError as exc:
             await self._db(partial(self._refuse_launch, attempt.id, "prepare", str(exc)))
@@ -2010,7 +2033,7 @@ class Supervisor:
                 "keep_diff_only": CleanupPolicy.KEEP_DIFF_ONLY,
             }.get(choice, CleanupPolicy.KEEP)
             try:
-                spec = await self._db(partial(self._spec_for, attempt))
+                spec = await self._spec_for(attempt)
                 await provider.cleanup(self._workspace_for(attempt), policy, spec)
             except ProviderError:
                 log.exception("cleanup failed; the next tick tries again")
@@ -2224,7 +2247,7 @@ class Supervisor:
             await self._discard(
                 provider,
                 self._workspace_for(attempt),
-                await self._db(partial(self._spec_for, attempt)),
+                await self._spec_for(attempt),
             )
             await self._db(partial(self._mark_logs_drained, attempt.id))
             await self._db(partial(self._finish_lost, attempt.id, observation.detail))
@@ -2232,7 +2255,7 @@ class Supervisor:
         # The final drain before anything is collected or cleaned up (08, 10).
         await self._pull_logs(attempt, provider, handle)
         await self._db(partial(self._mark_logs_drained, attempt.id))
-        spec = await self._db(partial(self._spec_for, attempt))
+        spec = await self._spec_for(attempt)
         collection_error: str | None = None
         try:
             outputs = await provider.collect(handle, self._workspace_for(attempt), spec)
@@ -2331,7 +2354,7 @@ class Supervisor:
         attempt = await self._db(lambda: self._attempt_by_id(attempt_id))
         if attempt is None:
             return
-        spec = await self._db(partial(self._spec_for, attempt))
+        spec = await self._spec_for(attempt)
         if spec is None:
             await self._db(
                 partial(

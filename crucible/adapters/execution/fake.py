@@ -339,7 +339,7 @@ class FakeProvider:
             max_concurrency=16,
         )
 
-    def credential_available(self, harness: str) -> bool:
+    async def credential_available(self, harness: str) -> bool:
         return False
 
     async def prepare(self, spec: LaunchSpec) -> Workspace:
