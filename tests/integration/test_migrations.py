@@ -39,8 +39,8 @@ def test_up_down_up_from_empty(database_url: str) -> None:
     ok, detail = migrate.is_current(engine, database_url)
     assert ok, detail
     with engine.connect() as conn:
-        # The migrations seed versions 1 through 4 of default-software.
-        assert conn.execute(text("SELECT count(*) FROM policies")).scalar() == 4
+        # C10 adds immutable version 6 and intentionally does not rewrite older rows.
+        assert conn.execute(text("SELECT count(*) FROM policies")).scalar() == 5
     migrate.downgrade(database_url, "base")
     assert "tasks" not in inspect(engine).get_table_names()
     migrate.upgrade(database_url)
@@ -114,8 +114,8 @@ def test_0004_creates_the_c2_tables_and_seeds_the_routing_policy(migrated: str) 
         "attempt_metrics",
     } <= names
     with engine.connect() as conn:
-        # 0004 seeds version 1; 0008 adds version 2 with the model ids the C5 live runs
-        # verified; 0011 adds version 3 and 0013 adds the disabled Hermes route in 4.
+        # Older migrations always seed 1 through 4. The optional old endpoint seed may
+        # add 5; C10 takes the next free number and leaves every prior document intact.
         versions = (
             conn.execute(
                 text(
@@ -125,7 +125,16 @@ def test_0004_creates_the_c2_tables_and_seeds_the_routing_policy(migrated: str) 
             .scalars()
             .all()
         )
-        assert versions == [1, 2, 3, 4]
+        assert versions == list(range(1, max(versions) + 1))
+        assert max(versions) in (5, 6)
+        seeded = conn.execute(
+            text(
+                "SELECT count(*) FROM routing_policies WHERE name='default-routing' "
+                "AND EXISTS (SELECT 1 FROM jsonb_array_elements(document -> 'models') AS model "
+                "WHERE model ->> 'disabled_reason' LIKE '%0017_lab_local%')"
+            )
+        ).scalar_one()
+        assert seeded == 1
         # Later revisions add immutable policy versions that name their matching
         # routing version (05b).
         policy_versions = conn.execute(
@@ -135,10 +144,7 @@ def test_0004_creates_the_c2_tables_and_seeds_the_routing_policy(migrated: str) 
             )
         ).all()
         assert [(v, int(r)) for v, r in policy_versions] == [
-            (1, 1),
-            (2, 2),
-            (3, 3),
-            (4, 4),
+            (version, version) for version in versions
         ]
         routing = conn.execute(
             text(
@@ -196,6 +202,279 @@ def test_0013_materializes_the_configured_spark_url(
     assert enabled.endpoint_url == "http://192.0.2.41:11434/v1"
     assert int(policy_ref) == 5
     engine.dispose()
+
+
+def test_0017_replaces_the_spark_pin_with_the_disabled_coder_route(migrated: str) -> None:
+    engine = make_engine(migrated)
+    with engine.connect() as conn:
+        seeded_policy = conn.execute(
+            text(
+                "SELECT document FROM policies WHERE name='default-software' "
+                "AND document ->> 'description' = "
+                "'Authenticated Hermes lab-local route seeded by 0017_lab_local.'"
+            )
+        ).scalar_one()
+        routing_version = int(seeded_policy["routing"]["policy"]["version"])
+        document = conn.execute(
+            text(
+                "SELECT document FROM routing_policies "
+                "WHERE name='default-routing' AND version=:version"
+            ),
+            {"version": routing_version},
+        ).scalar_one()
+    routing = RoutingPolicyV1.model_validate(document)
+    local = [model for model in routing.models if model.harness == "hermes"]
+    assert [model.id for model in local] == ["coder"]
+    assert not local[0].enabled
+    assert local[0].chat_template_kwargs.enable_thinking is False
+    assert routing.pools["lab-local"].max_concurrency == 4
+    assert "spark-local" not in routing.pools
+    assert routing.version == routing_version
+    engine.dispose()
+
+
+def test_0017_preserves_an_operator_created_version_six(database_url: str) -> None:
+    migrate.downgrade(database_url, "base")
+    migrate.upgrade(database_url, "0016_disposition_versions")
+    engine = make_engine(database_url)
+    with engine.begin() as conn:
+        routing = conn.execute(
+            text(
+                "SELECT document FROM routing_policies WHERE name='default-routing' "
+                "ORDER BY version DESC LIMIT 1"
+            )
+        ).scalar_one()
+        policy = conn.execute(
+            text(
+                "SELECT document FROM policies WHERE name='default-software' "
+                "ORDER BY version DESC LIMIT 1"
+            )
+        ).scalar_one()
+        routing["version"] = 6
+        policy["version"] = 6
+        policy["description"] = "operator-created version six"
+        policy["routing"] = {"policy": {"name": "default-routing", "version": 6}}
+        conn.execute(
+            text(
+                "INSERT INTO routing_policies(name, version, document, created_at) "
+                "VALUES ('default-routing', 6, CAST(:document AS jsonb), now())"
+            ),
+            {"document": json.dumps(routing)},
+        )
+        conn.execute(
+            text(
+                "INSERT INTO policies(name, version, document, created_at) "
+                "VALUES ('default-software', 6, CAST(:document AS jsonb), now())"
+            ),
+            {"document": json.dumps(policy)},
+        )
+    engine.dispose()
+
+    migrate.upgrade(database_url)
+    engine = make_engine(database_url)
+    with engine.connect() as conn:
+        assert (
+            conn.execute(
+                text(
+                    "SELECT document ->> 'description' FROM policies "
+                    "WHERE name='default-software' AND version=6"
+                )
+            ).scalar_one()
+            == "operator-created version six"
+        )
+        assert (
+            conn.execute(
+                text(
+                    "SELECT document -> 'routing' -> 'policy' ->> 'version' FROM policies "
+                    "WHERE name='default-software' AND version=7"
+                )
+            ).scalar_one()
+            == "7"
+        )
+    engine.dispose()
+
+    migrate.downgrade(database_url, "0016_disposition_versions")
+    engine = make_engine(database_url)
+    with engine.connect() as conn:
+        assert (
+            conn.execute(
+                text("SELECT count(*) FROM policies WHERE name='default-software' AND version=6")
+            ).scalar_one()
+            == 1
+        )
+        assert (
+            conn.execute(
+                text("SELECT count(*) FROM policies WHERE name='default-software' AND version=7")
+            ).scalar_one()
+            == 0
+        )
+    engine.dispose()
+    migrate.upgrade(database_url)
+
+
+def test_0017_seeds_from_the_routing_in_force_not_an_unreferenced_draft(
+    database_url: str,
+) -> None:
+    """An uploaded routing draft with a higher version, not named by default-software,
+    must not become what the migrated default points at."""
+    migrate.downgrade(database_url, "base")
+    migrate.upgrade(database_url, "0016_disposition_versions")
+    engine = make_engine(database_url)
+    with engine.begin() as conn:
+        policy = conn.execute(
+            text(
+                "SELECT document FROM policies WHERE name='default-software' "
+                "ORDER BY version DESC LIMIT 1"
+            )
+        ).scalar_one()
+        in_force = int(policy["routing"]["policy"]["version"])
+        routing = conn.execute(
+            text(
+                "SELECT document FROM routing_policies "
+                "WHERE name='default-routing' AND version=:version"
+            ),
+            {"version": in_force},
+        ).scalar_one()
+        draft_version = (
+            int(
+                conn.execute(
+                    text("SELECT max(version) FROM routing_policies WHERE name='default-routing'")
+                ).scalar_one()
+            )
+            + 1
+        )
+        draft = json.loads(json.dumps(routing))
+        draft["version"] = draft_version
+        experiment = {
+            **next(model for model in draft["models"] if model.get("harness") != "hermes"),
+            "id": "draft-only-experiment",
+            "enabled": True,
+            "disabled_reason": None,
+        }
+        draft["models"].append(experiment)
+        conn.execute(
+            text(
+                "INSERT INTO routing_policies(name, version, document, created_at) "
+                "VALUES ('default-routing', :version, CAST(:document AS jsonb), now())"
+            ),
+            {"version": draft_version, "document": json.dumps(draft)},
+        )
+    engine.dispose()
+
+    migrate.upgrade(database_url)
+    engine = make_engine(database_url)
+    with engine.connect() as conn:
+        seeded_policy = conn.execute(
+            text(
+                "SELECT document FROM policies WHERE name='default-software' "
+                "ORDER BY version DESC LIMIT 1"
+            )
+        ).scalar_one()
+        seeded_version = int(seeded_policy["routing"]["policy"]["version"])
+        seeded = conn.execute(
+            text(
+                "SELECT document FROM routing_policies "
+                "WHERE name='default-routing' AND version=:version"
+            ),
+            {"version": seeded_version},
+        ).scalar_one()
+        kept_draft = conn.execute(
+            text(
+                "SELECT document FROM routing_policies "
+                "WHERE name='default-routing' AND version=:version"
+            ),
+            {"version": draft_version},
+        ).scalar_one()
+    engine.dispose()
+    assert seeded_version == draft_version + 1
+    ids = [model["id"] for model in seeded["models"]]
+    assert "draft-only-experiment" not in ids
+    assert [model for model in seeded["models"] if model.get("harness") != "hermes"] == [
+        model for model in routing["models"] if model.get("harness") != "hermes"
+    ]
+    assert kept_draft == draft
+
+    migrate.downgrade(database_url, "0016_disposition_versions")
+    migrate.upgrade(database_url)
+
+
+def test_0017_extends_a_routing_policy_the_operator_named_differently(
+    database_url: str,
+) -> None:
+    """The policy in force may name a routing policy uploaded under another name. The
+    migration extends that one, under its own name, and its downgrade removes it."""
+    migrate.downgrade(database_url, "base")
+    migrate.upgrade(database_url, "0016_disposition_versions")
+    engine = make_engine(database_url)
+    with engine.begin() as conn:
+        policy = conn.execute(
+            text(
+                "SELECT document FROM policies WHERE name='default-software' "
+                "ORDER BY version DESC LIMIT 1"
+            )
+        ).scalar_one()
+        routing = conn.execute(
+            text(
+                "SELECT document FROM routing_policies "
+                "WHERE name='default-routing' AND version=:version"
+            ),
+            {"version": int(policy["routing"]["policy"]["version"])},
+        ).scalar_one()
+        routing["version"] = 1
+        conn.execute(
+            text(
+                "INSERT INTO routing_policies(name, version, document, created_at) "
+                "VALUES ('lab-routing', 1, CAST(:document AS jsonb), now())"
+            ),
+            {"document": json.dumps(routing)},
+        )
+        policy["version"] = int(policy["version"]) + 1
+        policy["routing"] = {"policy": {"name": "lab-routing", "version": 1}}
+        conn.execute(
+            text(
+                "INSERT INTO policies(name, version, document, created_at) "
+                "VALUES ('default-software', :version, CAST(:document AS jsonb), now())"
+            ),
+            {"version": policy["version"], "document": json.dumps(policy)},
+        )
+        default_routing_rows = conn.execute(
+            text("SELECT count(*) FROM routing_policies WHERE name='default-routing'")
+        ).scalar_one()
+    engine.dispose()
+
+    migrate.upgrade(database_url)
+    engine = make_engine(database_url)
+    with engine.connect() as conn:
+        seeded_policy = conn.execute(
+            text(
+                "SELECT document FROM policies WHERE name='default-software' "
+                "ORDER BY version DESC LIMIT 1"
+            )
+        ).scalar_one()
+        seeded = conn.execute(
+            text("SELECT document FROM routing_policies WHERE name='lab-routing' AND version=2")
+        ).scalar_one()
+        assert (
+            conn.execute(
+                text("SELECT count(*) FROM routing_policies WHERE name='default-routing'")
+            ).scalar_one()
+            == default_routing_rows
+        )
+    engine.dispose()
+    assert seeded_policy["routing"] == {"policy": {"name": "lab-routing", "version": 2}}
+    assert [model["id"] for model in seeded["models"] if model["harness"] == "hermes"] == ["coder"]
+
+    migrate.downgrade(database_url, "0016_disposition_versions")
+    engine = make_engine(database_url)
+    with engine.connect() as conn:
+        assert (
+            conn.execute(
+                text("SELECT max(version) FROM routing_policies WHERE name='lab-routing'")
+            ).scalar_one()
+            == 1
+        )
+    engine.dispose()
+    migrate.upgrade(database_url)
 
 
 def test_0004_down_and_up(database_url: str) -> None:

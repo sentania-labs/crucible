@@ -431,6 +431,12 @@ class DockerProvider:
             max_concurrency=self.config.max_concurrency,
         )
 
+    def credential_available(self, harness: str) -> bool:
+        source = self._credential_source(harness)
+        adapter = self.harnesses.get(harness)
+        credential = adapter.credential_spec() if adapter is not None else None
+        return source is not None and (credential is None or credential.held_by(source.path))
+
     async def prepare(self, spec: LaunchSpec) -> Workspace:
         repository = spec.contract.get("repository", {})
         url = spec.repository_url or str(repository.get("url", ""))
@@ -791,10 +797,14 @@ class DockerProvider:
         at launch: it would only fail authentication after spending an attempt."""
         adapter = self.harnesses.get(spec.harness)
         credential = adapter.credential_spec() if adapter is not None else None
-        if credential is None or spec.endpoint == "local":
+        if credential is None:
             return None
         source = self._credential_source(spec.harness)
+        if source is not None and not credential.held_by(source.path):
+            source = None
         if source is None:
+            if not credential.required_for_launch:
+                return None
             raise HarnessRefusedError(
                 f"refusing to launch: no credential directory is configured for "
                 f"harness {spec.harness!r} (credentials.{spec.harness}.path)"

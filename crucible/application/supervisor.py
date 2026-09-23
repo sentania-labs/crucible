@@ -1025,6 +1025,8 @@ class Supervisor:
         adapter = self._harnesses.get(selected_harness) if self._harnesses else None
         if adapter is None:
             return spec
+        credential = adapter.credential_spec()
+        source = self._credential_sources.get(selected_harness)
         # 07: the adapter's launch shape. Argv carries the pointer; the identity and
         # the contract are files; a credential value is never in any of it.
         launch = adapter.build_launch(
@@ -1036,7 +1038,15 @@ class Supervisor:
                 identity_mount=IDENTITY_MOUNT,
                 report_mount=REPORT_MOUNT,
                 repo_mount=REPO_MOUNT,
-                credential_mounted=(endpoint != "local" and adapter.credential_spec() is not None),
+                credential_mounted=(
+                    credential is not None
+                    and (
+                        (source is not None and credential.held_by(source.path))
+                        or self._providers[execution.provider].credential_available(
+                            selected_harness
+                        )
+                    )
+                ),
                 endpoint=endpoint,
                 endpoint_url=endpoint_url,
             )
@@ -1123,9 +1133,13 @@ class Supervisor:
             other_execution = uow.executions.get(other.execution_id)
             if other_execution is not None and other_execution.harness == execution.harness:
                 running += 1
-        # Subscription harnesses retain their credential and policy cap. Local workers
-        # share no credential, so their independent pool cap is the isolation boundary.
-        if (selected is None or selected.endpoint == "subscription") and running >= limit:
+        # A writable credential forces the per-harness cap even for a local route. The
+        # Hermes key is read-only, so its pool-wide limit remains the effective cap.
+        if (
+            selected is None
+            or selected.endpoint == "subscription"
+            or (credential is not None and credential.minimum_mode is MountMode.RW_NARROW)
+        ) and running >= limit:
             return f"{running} of {limit} {execution.harness} worker(s) already running"
         if selected is not None:
             assert routing is not None
@@ -1154,9 +1168,11 @@ class Supervisor:
                 if adapter is None:
                     continue
                 source = self._credential_sources.get(name)
+                credential = adapter.credential_spec()
                 if (
                     needs_credential
-                    and adapter.credential_spec() is not None
+                    and credential is not None
+                    and credential.required_for_launch
                     and (source is None or not Path(source.path).is_dir())
                 ):
                     continue

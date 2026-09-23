@@ -308,6 +308,16 @@ class RoutingTier(StrictModel):
         return self
 
 
+class ChatTemplateKwargs(StrictModel):
+    """Request options retained with one routing entry.
+
+    Hermes 0.19 cannot receive this option from its non-interactive CLI. Keeping the
+    value in the entry makes the operator's intent durable until that transport exists.
+    """
+
+    enable_thinking: bool = False
+
+
 class RoutingModel(StrictModel):
     id: str = Field(min_length=1)
     harness: str = Field(min_length=1)
@@ -320,6 +330,7 @@ class RoutingModel(StrictModel):
     weight: int = Field(ge=0)
     enabled: bool
     disabled_reason: str | None = None
+    chat_template_kwargs: ChatTemplateKwargs = Field(default_factory=ChatTemplateKwargs)
 
     @model_validator(mode="after")
     def _local_needs_endpoint(self) -> RoutingModel:

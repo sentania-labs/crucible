@@ -10,6 +10,7 @@ import os
 import stat
 import subprocess
 import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +21,7 @@ from crucible.adapters.harness.claude_code import ClaudeCodeAdapter
 from crucible.adapters.harness.codex import CodexAdapter
 from crucible.application.admin.audit import ADMIN_KINDS
 from crucible.application.admin.context import AdminContext
-from crucible.application.admin.credentials import check_shape, shred_file, shred_tree
+from crucible.application.admin.credentials import _http_status, check_shape, shred_file, shred_tree
 from crucible.application.admin.github import key_fingerprint
 from crucible.application.admin.login import FLOWS, LoginSession, run_login
 from crucible.domain.events import EventKind
@@ -28,6 +29,54 @@ from crucible.domain.events import EventKind
 
 def _token(prefix: str, count: int = 40) -> str:
     return prefix + "x" * count
+
+
+def test_the_hermes_probe_does_not_follow_a_redirect_with_the_bearer() -> None:
+    destination_hits: list[str | None] = []
+
+    class Destination(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            destination_hits.append(self.headers.get("Authorization"))
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, message: str, *args: object) -> None:
+            return
+
+    destination = ThreadingHTTPServer(("127.0.0.1", 0), Destination)
+
+    class Redirect(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            self.send_response(302)
+            self.send_header(
+                "Location",
+                f"http://127.0.0.1:{destination.server_address[1]}/capture",
+            )
+            self.end_headers()
+
+        def log_message(self, message: str, *args: object) -> None:
+            return
+
+    redirect = ThreadingHTTPServer(("127.0.0.1", 0), Redirect)
+    threads = [
+        threading.Thread(target=server.serve_forever, daemon=True)
+        for server in (destination, redirect)
+    ]
+    for thread in threads:
+        thread.start()
+    try:
+        status = _http_status(
+            f"http://127.0.0.1:{redirect.server_address[1]}/models",
+            bearer=_token("vk_"),
+            timeout=2,
+        )
+        assert status == 302
+        assert destination_hits == []
+    finally:
+        redirect.shutdown()
+        destination.shutdown()
+        redirect.server_close()
+        destination.server_close()
 
 
 # ----- the login driver against fake CLIs ----------------------------------------

@@ -23,6 +23,7 @@ ARG GIT_VERSION=1:2.39.5-0+deb12u3
 ARG CURL_VERSION=7.88.1-10+deb12u15
 ARG JQ_VERSION=1.6-2.1+deb12u2
 ARG CA_CERTIFICATES_VERSION=20250419~deb12u1
+ARG LAB_CA_SHA256=567f110bb80bb2179b44995c78c7a49a4149085a59f6acb73cf37c6503a0481a
 RUN set -eu; \
     printf '%s\n' \
         'Types: deb' \
@@ -50,14 +51,21 @@ RUN set -eu; \
     groupadd --gid 1000 worker; \
     useradd --uid 1000 --gid 1000 --create-home --home-dir /home/worker --shell /bin/bash worker; \
     find / -xdev -type f -perm /6000 -exec chmod a-s {} +
+COPY ca/sentania-lab-root.crt /usr/local/share/ca-certificates/sentania-lab-root.crt
+RUN set -eu; \
+    echo "${LAB_CA_SHA256}  /usr/local/share/ca-certificates/sentania-lab-root.crt" | sha256sum -c -; \
+    update-ca-certificates
 # The script is the harness. `touch` to the epoch for the same reason the real
 # images pin their CLI mtimes: a COPY keeps the source file's mtime, and the
 # build must be reproducible (S7).
-COPY --chmod=0755 harness.sh /usr/local/bin/crucible-script-harness
+COPY --chmod=0755 script-harness/harness.sh /usr/local/bin/crucible-script-harness
 RUN set -eu; \
     echo "${HARNESS_SCRIPT_SHA256}  /usr/local/bin/crucible-script-harness" | sha256sum -c -; \
     touch -h -d "@${SOURCE_DATE_EPOCH}" /usr/local/bin/crucible-script-harness
 
-ENV HOME=/home/worker
+ENV HOME=/home/worker \
+    NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt \
+    SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+    REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
 USER 1000:1000
 WORKDIR /home/worker

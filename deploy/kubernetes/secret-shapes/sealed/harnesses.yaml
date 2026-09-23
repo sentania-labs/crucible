@@ -4,8 +4,6 @@
 # collection. The keys are the adapter's declared auth file names with any path
 # separator replaced by an underscore (C8a).
 #
-# A harness with no credential at all (local Hermes) has no Secret and its launch spec
-# says so; it is deliberately absent from this file.
 apiVersion: bitnami.com/v1alpha1
 kind: SealedSecret
 metadata:
@@ -18,6 +16,20 @@ spec:
   template:
     metadata:
       name: crucible-harness-claude-code
+      namespace: crucible-workers
+    type: Opaque
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: crucible-harness-hermes
+  namespace: crucible-workers
+spec:
+  encryptedData:
+    api-key: REPLACE_WITH_SEALED_HERMES_API_KEY
+  template:
+    metadata:
+      name: crucible-harness-hermes
       namespace: crucible-workers
     type: Opaque
 ---

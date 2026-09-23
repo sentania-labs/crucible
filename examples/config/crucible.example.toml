@@ -1,7 +1,7 @@
 # Example Crucible configuration. All paths are illustrative.
-# Optional DGX Spark OpenAI-compatible endpoint. It must end in /v1. The migration
-# records a disabled local route with its reason when this is absent.
-spark_endpoint_url = "http://spark.internal.example:11434/v1"
+# Optional OpenAI-compatible local endpoint seed. It must end in /v1. After the first
+# migration, the routing value edited in the admin UI is authoritative.
+local_endpoint_url = "https://llm.apps.int.sentania.net/v1"
 
 [service]
 bind = "0.0.0.0:8080"
@@ -129,6 +129,11 @@ source = "directory"
 path = "/var/lib/crucible/credentials/agy"            # .gemini/antigravity-cli/antigravity-oauth-token
 mount_mode = "rw-narrow"   # the CLI rotated its token on the first run past expiry (C5 live run)
 
+[credentials.hermes]
+source = "directory"
+path = "/var/lib/crucible/credentials/hermes"        # api-key, written mode 600 by the admin surface
+mount_mode = "ro"
+
 # Administration (25, C5b): the same operations behind `/v1/admin` and `crucible-admin`.
 # A rotated credential's previous directory is kept for `credential_retention_hours`
 # beside the live one, then shredded on the supervisor's retention tick; remove shreds
@@ -142,6 +147,8 @@ mount_mode = "rw-narrow"   # the CLI rotated its token on the first run past exp
 credential_retention_hours = 24
 probe_timeout_seconds = 120
 login_timeout_seconds = 900    # Codex's device code lasts 15 minutes; AGY's 60 seconds
+proxy_config_path = "/var/lib/crucible/egress/squid.conf"
+proxy_subnet = "10.88.0.0/24"
 
 # Harness enablement (25, S1b). A launch needs this gate and the administrator's runtime
 # flag (`crucible-admin harnesses enable`, C5b; seeded the same way by migration 0008).

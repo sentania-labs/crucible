@@ -5,11 +5,14 @@ from __future__ import annotations
 import logging
 import os
 import socket
+from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import partial
+from pathlib import Path
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI
+from sqlalchemy.exc import SQLAlchemyError
 
 from crucible.adapters.api.app import create_app
 from crucible.adapters.api.deps import AppContext
@@ -34,8 +37,15 @@ from crucible.adapters.persistence.unit_of_work import SqlUnitOfWorkFactory, mak
 from crucible.adapters.storage.disk import DiskArtifactStore
 from crucible.application.admin.context import AdminContext, GitHubAppInfo
 from crucible.application.admin.credentials import sweep_retired
+from crucible.application.admin.routing import local_endpoint_view
 from crucible.application.delivery_tick import DeliveryConfig
+from crucible.application.errors import NotFoundError
 from crucible.application.harnesses import HarnessRegistry
+from crucible.application.proxy_config import (
+    enabled_local_endpoints,
+    install_worker_proxy_config,
+    worker_proxy_config,
+)
 from crucible.application.supervisor import Supervisor
 from crucible.domain.ids import new_id
 from crucible.ports.artifacts import ArtifactStore
@@ -117,11 +127,14 @@ def harness_gates(settings: Settings) -> dict[str, HarnessGate]:
     }
 
 
-def docker_config(settings: Settings) -> DockerConfig:
+def docker_config(
+    settings: Settings, *, local_endpoint_url: str | None = None, database_value: bool = False
+) -> DockerConfig:
     d = settings.docker
     local_endpoints = []
-    if settings.spark_endpoint_url:
-        parsed = urlsplit(settings.spark_endpoint_url)
+    endpoint = local_endpoint_url if database_value else settings.endpoint_seed
+    if endpoint:
+        parsed = urlsplit(endpoint)
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
         local_endpoints.append(f"{parsed.hostname}:{port}")
     return DockerConfig(
@@ -168,6 +181,7 @@ def kubernetes_config(settings: Settings) -> KubernetesConfig:
         api_timeout_seconds=k.api_timeout_seconds,
         cluster_dns_ip=k.cluster_dns_ip,
         denied_cidrs=tuple(k.denied_cidrs),
+        local_endpoint_cidrs=tuple(k.local_endpoint_cidrs),
         extra_image_allowlist=tuple(k.extra_image_allowlist),
         credential_secrets=dict(k.credential_secrets),
         # 25 step 7: a configured mount mode may raise the adapter's declared minimum
@@ -218,13 +232,58 @@ def github_client(settings: Settings) -> GitHubClient | None:
     return RestGitHubClient(authenticator, transport, allow_issue_comments=g.allow_issue_comments)
 
 
+def enabled_database_endpoint(routing_document: Mapping[str, object] | None) -> str | None:
+    """The one endpoint an enabled local model authorizes, or None.
+
+    A disabled model gets no Squid rule (`proxy_config.enabled_local_endpoints`); the
+    Docker provider's own allowlist, wired from this at startup, has to agree, or a
+    restart after disabling every local model puts the destination back.
+    """
+    if routing_document is None:
+        return None
+    endpoints = enabled_local_endpoints([routing_document])
+    return endpoints[0] if len(endpoints) == 1 else None
+
+
 def wire(settings: Settings) -> Wiring:
     engine = make_engine(settings.database.url)
+    factory = SqlUnitOfWorkFactory(engine)
+    database_endpoint: str | None = None
+    routing_document: dict[str, object] | None = None
+    database_value = False
+    try:
+        with factory() as uow:
+            local = local_endpoint_view(uow)
+            database_value = True
+            reference = local["routing_policy"]
+            record = uow.routing_policies.get(reference["name"], reference["version"])
+            routing_document = record.document if record is not None else None
+            database_endpoint = enabled_database_endpoint(routing_document)
+    except (SQLAlchemyError, NotFoundError):
+        # `migrate` and first-run commands can wire before the policy tables exist.
+        database_value = False
+    if settings.admin.proxy_config_path and routing_document is not None:
+        path = Path(settings.admin.proxy_config_path)
+        install_worker_proxy_config(
+            path,
+            worker_proxy_config(
+                settings.admin.proxy_subnet,
+                list(settings.docker.egress_allowlist),
+                [routing_document],
+            ),
+        )
     registry = default_registry()
     providers: dict[str, ExecutionProvider] = {"fake": FakeProvider()}
     docker: DockerProvider | None = None
     if settings.docker.enabled:
-        docker = DockerProvider(docker_config(settings), harnesses=registry)
+        docker = DockerProvider(
+            docker_config(
+                settings,
+                local_endpoint_url=database_endpoint,
+                database_value=database_value,
+            ),
+            harnesses=registry,
+        )
         providers["docker"] = docker
     if settings.kubernetes.enabled:
         # 26: the Kubernetes provider is reported by `GET /v1/capabilities` and
@@ -245,7 +304,7 @@ def wire(settings: Settings) -> Wiring:
     )
     github = github_client(settings)
     admin = AdminContext(
-        uow_factory=SqlUnitOfWorkFactory(engine),
+        uow_factory=factory,
         clock=SystemClock(),
         providers=providers,
         harnesses=registry,
@@ -265,9 +324,13 @@ def wire(settings: Settings) -> Wiring:
         probe_timeout_seconds=settings.admin.probe_timeout_seconds,
         login_timeout_seconds=settings.admin.login_timeout_seconds,
         login_commands={k: tuple(v) for k, v in settings.admin.login_commands.items()},
+        proxy_config_path=settings.admin.proxy_config_path,
+        proxy_subnet=settings.admin.proxy_subnet,
+        proxy_hosts=tuple(settings.docker.egress_allowlist),
+        proxy_reload_timeout_seconds=settings.admin.proxy_reload_timeout_seconds,
     )
     ctx = AppContext(
-        uow_factory=SqlUnitOfWorkFactory(engine),
+        uow_factory=factory,
         clock=SystemClock(),
         providers=list(providers.values()),
         database_url=settings.database.url,

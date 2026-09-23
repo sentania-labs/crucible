@@ -10,8 +10,10 @@
 2. One worker, one harness, one credential set. A Codex worker cannot see
    Claude Code's OAuth state, and vice versa.
 3. Credentials reach a worker only as a mount from a source Crucible can
-   read, referenced by name (`credential:codex`) in configuration, never
-   by value in any API body.
+   read, referenced by name (`credential:codex`) in configuration. The one
+   onboarding exception is the Hermes key paste: its value exists only in the
+   TLS-protected admin request and the immediate mode-0600 file write. It is never
+   returned, stored in the database, logged, or copied into an audit event.
 4. Read-only by default. A narrow writable volume only when a harness must
    refresh its own auth state, and then only the named auth files.
 5. Workers hold no GitHub credential, no Crucible API token, no database
@@ -95,6 +97,11 @@ mount_mode = "rw-narrow"       # the first Crucible-side run past the one-hour e
                                # token and the copy carried a newer expiry, which is the evidence
                                # S1 left open; the token file syncs back by that field
 
+[credentials.hermes]
+source = "directory"
+path = "/var/lib/crucible/credentials/hermes"         # contains only api-key
+mount_mode = "ro"                # the gateway key never refreshes and never syncs back
+
 [github.app]
 app_id = 0                     # public identifier, not a secret
 private_key_path = "/var/lib/crucible/credentials/github/app.pem"   # mounted read-only; never mounted into any worker
@@ -112,6 +119,15 @@ directory is what gets mounted. It is never a copy of the operator's
 daily-use directory: S1 showed Codex and AGY refresh their tokens on
 their own during a run, and a refresh from a copy races the operator's
 own session. No commercial API keys.
+
+Hermes is the narrow API-key exception. The admin UI and
+`crucible-admin credentials set --harness hermes` read the value from a password
+field or hidden stdin prompt, atomically replace `api-key` with mode 0600, and record
+only `credential set`. Validation first calls `/health/readiness` without a bearer,
+then calls `/v1/models` with the bearer. A 200 validates the key, a 401 is an
+authentication failure, and other responses are inconclusive. Workers receive only a
+read-only per-attempt copy. Kubernetes stores the same one-file shape in the
+`crucible-harness-hermes` Secret.
 
 `rw-narrow` means: a per-attempt copy holding **only the named auth files**
 of that harness (the adapter's `credential_spec` lists them), owned by the

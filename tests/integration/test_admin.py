@@ -24,6 +24,7 @@ from fastapi.testclient import TestClient
 from crucible.adapters.api.app import create_app
 from crucible.adapters.api.deps import AppContext
 from crucible.adapters.clock import SystemClock
+from crucible.adapters.execution.docker import DockerConfig
 from crucible.adapters.execution.fake import FakeProvider
 from crucible.adapters.persistence.unit_of_work import SqlUnitOfWorkFactory, make_engine
 from crucible.application.admin.context import AdminContext
@@ -50,7 +51,7 @@ def _token(prefix: str, count: int = 40) -> str:
 
 
 def seed_credentials(root: Path) -> dict[str, CredentialSource]:
-    """Shape-valid auth files for the three harnesses, built at runtime."""
+    """Shape-valid auth files plus an empty Hermes key directory, built at runtime."""
     (root / "claude_code").mkdir(parents=True)
     (root / "claude_code" / "oauth-token").write_text(_token("sk-ant-oat01-"), encoding="utf-8")
     (root / "codex").mkdir()
@@ -66,9 +67,13 @@ def seed_credentials(root: Path) -> dict[str, CredentialSource]:
         json.dumps({"token": {"access_token": _token("ya29."), "expiry": "2026-09-17T01:00:00Z"}}),
         encoding="utf-8",
     )
-    for directory in (root / "claude_code", root / "codex", root / "agy"):
+    (root / "hermes").mkdir()
+    for directory in (root / "claude_code", root / "codex", root / "agy", root / "hermes"):
         directory.chmod(0o700)
-    return {name: CredentialSource(str(root / name)) for name in ("claude_code", "codex", "agy")}
+    return {
+        name: CredentialSource(str(root / name))
+        for name in ("claude_code", "codex", "agy", "hermes")
+    }
 
 
 # One script per harness, because the three flows differ in exactly the way the driver
@@ -180,7 +185,7 @@ def config_file(migrated: str, credential_root: Path, tmp_path: Path) -> Path:
         "[admin.login_commands]",
         *[f'{name} = ["{argv[0]}"]' for name, argv in logins.items()],
     ]
-    for name in ("claude_code", "codex", "agy"):
+    for name in ("claude_code", "codex", "agy", "hermes"):
         lines += [f"[credentials.{name}]", f'path = "{credential_root / name}"']
     path = tmp_path / "crucible.toml"
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -614,7 +619,7 @@ def test_harnesses_list_enable_disable_through_api_and_cli(
         "claude_code": "configured",
         "codex": "configured",
         "agy": "configured",
-        "hermes": "not_required",
+        "hermes": "absent",
         "script-harness": "not_required",
     }
     disabled = admin_client.post(
@@ -683,6 +688,226 @@ def test_credentials_validate_and_probe_through_api_and_cli(
     assert ("credential_probed", "crucible-admin") in kinds
     status = run_cli(config_file, "credentials", "status", "--harness", "codex", capsys=capsys)
     assert status["state"] == "validated" and status["last_validated_at"]
+
+
+def test_hermes_key_before_endpoint_is_saved_and_audited_as_inconclusive(
+    admin_client: TestClient,
+    live_supervisor: Supervisor,
+    credential_root: Path,
+) -> None:
+    asyncio.run(live_supervisor.tick())
+    api_key = "vk_" + "n" * 40
+    response = admin_client.post(
+        "/v1/admin/credentials/hermes/set",
+        json={"reason": "stage key before route", "api_key": api_key},
+    )
+    assert response.status_code == 200, response.text
+    document = response.json()
+    assert document["validated"] is False
+    assert document["conclusive"] is False
+    assert document["cause"] == "endpoint_not_configured"
+    assert api_key not in response.text
+    assert (credential_root / "hermes" / "api-key").is_file()
+    audit = admin_client.get("/v1/admin/audit", params={"limit": 200}).text
+    assert "credential_set" in audit and api_key not in audit
+
+
+def test_local_endpoint_and_hermes_key_are_saved_without_exposing_the_key(
+    ctx: AppContext,
+    tokens: dict[str, str],
+    admin_client: TestClient,
+    admin_ctx: AdminContext,
+    live_supervisor: Supervisor,
+    credential_root: Path,
+    config_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """C10: policy and credential writes share the admin guard and the saved key is
+    used only in the authenticated models probe."""
+    from crucible.application.admin import credentials as credentials_service  # noqa: PLC0415
+
+    asyncio.run(live_supervisor.tick())
+    proxy_path = tmp_path / "egress" / "squid.conf"
+    admin_ctx.proxy_config_path = str(proxy_path)
+    admin_ctx.proxy_hosts = ("github.com",)
+    endpoint = "https://llm.apps.int.sentania.net/v1"
+    updated = admin_client.post(
+        "/v1/admin/routing/local-endpoint",
+        json={
+            "reason": "configure authenticated lab gateway",
+            "endpoint_url": endpoint,
+            "models": [{"id": "coder", "enabled": True, "enable_thinking": False}],
+            "max_concurrency": 3,
+        },
+    )
+    assert updated.status_code == 200, updated.text
+    view = updated.json()
+    assert view["endpoint_url"] == endpoint
+    assert view["models"][0]["id"] == "coder" and view["models"][0]["enabled"]
+    assert view["models"][0]["chat_template_kwargs"] == {"enable_thinking": False}
+    assert view["pool"]["max_concurrency"] == 3
+    assert "llm.apps.int.sentania.net" in proxy_path.read_text(encoding="utf-8")
+    assert (proxy_path.parent / "reload").is_file()
+    assert admin_client.get("/v1/admin/routing/local-endpoint").json() == view
+
+    observed: list[tuple[str, str | None]] = []
+
+    def http_status(url: str, *, bearer: str | None, timeout: float) -> int:
+        observed.append((url, bearer))
+        return 200
+
+    monkeypatch.setattr(credentials_service, "_http_status", http_status)
+    api_key = "vk_" + "q" * 40
+    saved = admin_client.post(
+        "/v1/admin/credentials/hermes/set",
+        json={"reason": "install virtual key", "api_key": api_key},
+    )
+    assert saved.status_code == 200, saved.text
+    document = saved.json()
+    assert document["validated"] is True
+    assert api_key not in saved.text
+    key_path = credential_root / "hermes" / "api-key"
+    assert key_path.read_text(encoding="utf-8").strip() == api_key
+    assert key_path.stat().st_mode & 0o777 == 0o600
+    assert observed == [
+        ("https://llm.apps.int.sentania.net/health/readiness", None),
+        ("https://llm.apps.int.sentania.net/v1/models", api_key),
+    ]
+    audit = admin_client.get("/v1/admin/audit", params={"limit": 200}).text
+    assert api_key not in audit
+    assert "credential_set" in audit and "local_endpoint_updated" in audit
+    assert "credential_validated" not in audit and "credential_probed" not in audit
+
+    cli_key = "vk_" + "z" * 40
+    monkeypatch.setattr(cli, "_read_api_key", lambda: cli_key)
+    cli_saved = run_cli(
+        config_file,
+        "--reason",
+        "rotate through CLI parity path",
+        "credentials",
+        "set",
+        "--harness",
+        "hermes",
+        capsys=capsys,
+    )
+    assert cli_saved["validated"] is True and cli_key not in json.dumps(cli_saved)
+    assert key_path.read_text(encoding="utf-8").strip() == cli_key
+    cli_route = run_cli(config_file, "routing", "local-endpoint", capsys=capsys)
+    assert cli_route["endpoint_url"] == endpoint and cli_route["models"][0]["id"] == "coder"
+
+    with TestClient(create_app(ctx)) as browser:
+        csrf = ui_sign_in(browser, tokens["admin"])
+        credentials_page = browser.get("/ui/credentials")
+        assert credentials_page.status_code == 200
+        assert 'action="/ui/actions/credential-set"' in credentials_page.text
+        assert 'name="api_key"' in credentials_page.text
+        assert 'type="password"' in credentials_page.text
+
+        ui_key = "vk_" + "u" * 40
+        ui_saved = browser.post(
+            "/ui/actions/credential-set",
+            data={
+                "csrf": csrf,
+                "api_key": ui_key,
+                "reason": "rotate through browser form",
+                "return_to": "/ui/credentials",
+            },
+            follow_redirects=False,
+        )
+        assert ui_saved.status_code == 303
+        assert key_path.read_text(encoding="utf-8").strip() == ui_key
+
+        routing_page = browser.get("/ui/routing")
+        assert routing_page.status_code == 200
+        assert 'action="/ui/actions/routing-local"' in routing_page.text
+        assert 'name="enable_thinking"' in routing_page.text
+        ui_routing = browser.post(
+            "/ui/actions/routing-local",
+            data={
+                "csrf": csrf,
+                "endpoint_url": endpoint,
+                "model_id": "coder",
+                "enabled": "true",
+                "enable_thinking": "true",
+                "max_concurrency": "2",
+                "reason": "save through browser form",
+                "return_to": "/ui/routing",
+            },
+            follow_redirects=False,
+        )
+        assert ui_routing.status_code == 303
+        ui_view = admin_client.get("/v1/admin/routing/local-endpoint").json()
+        assert ui_view["models"][0]["chat_template_kwargs"] == {"enable_thinking": True}
+        assert ui_view["pool"]["max_concurrency"] == 2
+
+
+def test_a_save_with_every_local_model_disabled_leaves_the_docker_allowlist_unchanged(
+    admin_client: TestClient,
+    admin_ctx: AdminContext,
+    live_supervisor: Supervisor,
+) -> None:
+    """A disabled model gets no rendered Squid rule (proxy_config.enabled_local_endpoints);
+    the in-process allowlist the Docker provider checks launches against must follow the
+    same rule, or a disabled destination would still be reachable from that provider."""
+
+    class _DockerStub:
+        def __init__(self, config: DockerConfig) -> None:
+            self.config = config
+
+    asyncio.run(live_supervisor.tick())
+    stub = _DockerStub(
+        DockerConfig(endpoint="tcp://127.0.0.1:1", artifact_root="/tmp/does-not-matter")
+    )
+    admin_ctx.providers["docker"] = stub  # type: ignore[assignment]
+    updated = admin_client.post(
+        "/v1/admin/routing/local-endpoint",
+        json={
+            "reason": "leave every local model disabled",
+            "endpoint_url": "https://llm.apps.int.sentania.net/v1",
+            "models": [{"id": "coder", "enabled": False, "enable_thinking": False}],
+            "max_concurrency": 3,
+        },
+    )
+    assert updated.status_code == 200, updated.text
+    assert stub.config.proxy_allowlist == ()
+
+
+@pytest.mark.parametrize("flag", ["enabled", "enable_thinking"])
+@pytest.mark.parametrize("value", ["false", "true", 0, 1, None])
+def test_a_non_boolean_local_model_flag_is_rejected_and_changes_nothing(
+    admin_client: TestClient,
+    admin_ctx: AdminContext,
+    live_supervisor: Supervisor,
+    tmp_path: Path,
+    flag: str,
+    value: object,
+) -> None:
+    """bool("false") is True, so a string flag would enable the model and open its proxy
+    destination. The API takes JSON booleans only and writes nothing otherwise."""
+    asyncio.run(live_supervisor.tick())
+    proxy_path = tmp_path / "egress" / "squid.conf"
+    admin_ctx.proxy_config_path = str(proxy_path)
+    admin_ctx.proxy_hosts = ("github.com",)
+    before = admin_client.get("/v1/admin/routing/local-endpoint").json()
+    settings: dict[str, object] = {"id": "coder", "enabled": False, "enable_thinking": False}
+    settings[flag] = value
+    response = admin_client.post(
+        "/v1/admin/routing/local-endpoint",
+        json={
+            "reason": "string flag from a direct caller",
+            "endpoint_url": "https://llm.apps.int.sentania.net/v1",
+            "models": [settings],
+            "max_concurrency": 3,
+        },
+    )
+    assert response.status_code == 422, response.text
+    assert response.json()["errors"] == [
+        {"path": f"body.models.0.{flag}", "message": f"{flag} must be a JSON boolean"}
+    ]
+    assert admin_client.get("/v1/admin/routing/local-endpoint").json() == before
+    assert not proxy_path.exists()
 
 
 def test_credentials_rotate_and_remove_through_api_and_cli(

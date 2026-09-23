@@ -68,11 +68,34 @@ services:
   egress-proxy:
     image: ubuntu/squid@sha256:6a097f68bae708cedbabd6188d68c7e2e7a38cedd05a176e1cc0ba29e3bbe029
     restart: unless-stopped
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        marker=/etc/squid/dynamic/reload
+        config=/etc/squid/dynamic/squid.conf
+        (
+          seen="$$(cat "$$marker" 2>/dev/null || true)"
+          while sleep 1; do
+            current="$$(cat "$$marker" 2>/dev/null || true)"
+            if [ -n "$$current" ] && [ "$$current" != "$$seen" ]; then
+              if /usr/sbin/squid -f "$$config" -k parse >/dev/null 2>&1 &&
+                 /usr/sbin/squid -f "$$config" -k reconfigure; then
+                printf '%s\n' "$$current" > /etc/squid/dynamic/.reloaded.incoming
+                mv /etc/squid/dynamic/.reloaded.incoming /etc/squid/dynamic/reloaded
+                seen="$$current"
+              fi
+            fi
+          done
+        ) &
+        exec /usr/local/bin/entrypoint.sh -f "$$config" -NYC
     volumes:
-      - ./var/egress/squid.conf:/etc/squid/squid.conf:ro
+      - crucible-egress:/etc/squid/dynamic
     networks:
       - default
       - crucible-workers
+    depends_on:
+      credential-init:
+        condition: service_completed_successfully
 
   # The publisher's only way out (23 step 3). A separate proxy from the workers' one
   # because its allowlist is narrower: the one container that holds a GitHub credential
@@ -100,7 +123,7 @@ services:
     command: ["crucible-admin", "migrate"]
     environment:
       CRUCIBLE_DATABASE__URL: postgresql+psycopg://crucible:${POSTGRES_PASSWORD}@postgres:5432/crucible
-      CRUCIBLE_SPARK_ENDPOINT_URL: "${CRUCIBLE_SPARK_ENDPOINT_URL:-}"
+      CRUCIBLE_LOCAL_ENDPOINT_URL: "${CRUCIBLE_LOCAL_ENDPOINT_URL:-${CRUCIBLE_SPARK_ENDPOINT_URL:-}}"
     depends_on:
       postgres:
         condition: service_healthy
@@ -112,9 +135,18 @@ services:
     image: ${CRUCIBLE_IMAGE:-ghcr.io/sentania-labs/crucible:latest}
     profiles: ["full"]
     user: "0:0"
-    command: ["chown", "1000:1000", "/var/lib/crucible/credentials"]
+    command:
+      - sh
+      - -c
+      - >-
+        chown 1000:1000 /var/lib/crucible/credentials &&
+        install -d -m 0700 -o 1000 -g 1000 /var/lib/crucible/credentials/hermes &&
+        install -d -m 0755 -o 1000 -g 1000 /var/lib/crucible/egress &&
+        install -m 0644 -o 1000 -g 1000 /seed/squid.conf /var/lib/crucible/egress/squid.conf
     volumes:
       - crucible-credentials:/var/lib/crucible/credentials
+      - crucible-egress:/var/lib/crucible/egress
+      - ./var/egress:/seed:ro
 
   crucible:
     # Tracks `latest`; deployments pin an exact tag (see migrate above).
@@ -144,7 +176,10 @@ services:
       # as JSON, and the list here must be the one `make proxy-config` gave squid.
       CRUCIBLE_DOCKER__EGRESS_ALLOWLIST: >-
         ${CRUCIBLE_EGRESS_ALLOWLIST:-["github.com","objects.githubusercontent.com","pypi.org","files.pythonhosted.org","registry.npmjs.org","api.anthropic.com","api.openai.com","auth.openai.com","chatgpt.com","daily-cloudcode-pa.googleapis.com","oauth2.googleapis.com","www.googleapis.com","lh3.googleusercontent.com"]}
-      CRUCIBLE_SPARK_ENDPOINT_URL: "${CRUCIBLE_SPARK_ENDPOINT_URL:-}"
+      CRUCIBLE_LOCAL_ENDPOINT_URL: "${CRUCIBLE_LOCAL_ENDPOINT_URL:-${CRUCIBLE_SPARK_ENDPOINT_URL:-}}"
+      CRUCIBLE_ADMIN__PROXY_CONFIG_PATH: /var/lib/crucible/egress/squid.conf
+      CRUCIBLE_ADMIN__PROXY_SUBNET: "${CRUCIBLE_WORKERS_SUBNET:-10.88.0.0/24}"
+      CRUCIBLE_ADMIN__PROXY_RELOAD_TIMEOUT_SECONDS: "10"
       # GitHub delivery (12, 23). Off until an App is configured. The App id is a public
       # identifier and the two secrets are *paths* to files in the credential directory
       # mounted below, which only this container ever sees: no worker, collector,
@@ -165,6 +200,7 @@ services:
       CRUCIBLE_CREDENTIALS__CLAUDE_CODE__PATH: /var/lib/crucible/credentials/claude_code
       CRUCIBLE_CREDENTIALS__CODEX__PATH: /var/lib/crucible/credentials/codex
       CRUCIBLE_CREDENTIALS__AGY__PATH: /var/lib/crucible/credentials/agy
+      CRUCIBLE_CREDENTIALS__HERMES__PATH: /var/lib/crucible/credentials/hermes
       # 25 and S1b: a harness ships disabled until its dedicated session and its
       # daily-session compatibility are verified. Claude Code and AGY are verified; Codex
       # waits on its Crucible-side refresh (S1b step 5). Enable by configuration here and
@@ -181,6 +217,7 @@ services:
       # harness volume starts empty, so a fresh deployment needs no host directories.
       - ${CRUCIBLE_CREDENTIAL_ROOT:-./var/credentials}/github:/var/lib/crucible/credentials/github:ro
       - crucible-credentials:/var/lib/crucible/credentials
+      - crucible-egress:/var/lib/crucible/egress
     ports:
       - "127.0.0.1:${CRUCIBLE_PORT:-8080}:8080"
     healthcheck:
@@ -226,3 +263,4 @@ volumes:
   crucible-pg:
   crucible-artifacts:
   crucible-credentials:
+  crucible-egress:

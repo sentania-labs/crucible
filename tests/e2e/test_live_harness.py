@@ -76,7 +76,7 @@ HARNESSES_ENV = "CRUCIBLE_LIVE_HARNESSES"
 MODELS_ENV = "CRUCIBLE_LIVE_MODELS"
 AGY_MODE_ENV = "CRUCIBLE_LIVE_AGY_MOUNT_MODE"
 REPORT_ENV = "CRUCIBLE_LIVE_REPORT"
-SPARK_ENDPOINT_ENV = "CRUCIBLE_SPARK_ENDPOINT_URL"
+LOCAL_ENDPOINT_ENV = "CRUCIBLE_LOCAL_ENDPOINT_URL"
 LOCAL_TZ = ZoneInfo("America/Chicago")
 
 # The cheapest model each harness offers that completes a trivial task: routing's rule
@@ -88,7 +88,7 @@ DEFAULT_MODELS = {
     "claude_code": "claude-haiku-4-5",
     "codex": "gpt-5.6-luna",
     "agy": "gemini-3.8-flash-low",
-    "hermes": "gpt-oss:120b",
+    "hermes": "coder",
 }
 IMAGES_ENV = "CRUCIBLE_LIVE_IMAGES"
 # AGY 1.2.4 refuses --effort for gemini-3.1-flash-lite (found live), so none is passed.
@@ -105,15 +105,15 @@ def _selected() -> tuple[str, ...]:
 
 def _why_not_configured() -> str:
     root = os.environ.get(CREDENTIAL_ROOT_ENV, "")
-    if any(harness != "hermes" for harness in _selected()) and not root:
+    if not root:
         return f"set {CREDENTIAL_ROOT_ENV} to the dedicated Crucible credential root (12)"
     if root and not Path(root).is_dir():
         return f"{CREDENTIAL_ROOT_ENV} does not name a directory"
     unknown = sorted(set(_selected()) - set(ALL_HARNESSES))
     if unknown:
         return f"{HARNESSES_ENV} names unknown harnesses: {unknown}"
-    if "hermes" in _selected() and not os.environ.get(SPARK_ENDPOINT_ENV, "").strip():
-        return f"set {SPARK_ENDPOINT_ENV} to the DGX Spark OpenAI-compatible /v1 endpoint"
+    if "hermes" in _selected() and not os.environ.get(LOCAL_ENDPOINT_ENV, "").strip():
+        return f"set {LOCAL_ENDPOINT_ENV} to the OpenAI-compatible /v1 endpoint"
     return github_live.why_not_configured()
 
 
@@ -149,6 +149,7 @@ def _sources(root: Path) -> dict[str, CredentialSource]:
         "claude_code": CredentialSource(str(root / "claude_code")),
         "codex": CredentialSource(str(root / "codex")),
         "agy": CredentialSource(str(root / "agy"), agy_mode),
+        "hermes": CredentialSource(str(root / "hermes"), MountMode.RO),
     }
 
 
@@ -274,16 +275,16 @@ def _routing(models: dict[str, str]) -> dict[str, Any]:
                 "id": model,
                 "harness": harness,
                 "endpoint": "local" if local else "subscription",
-                **({"endpoint_url": os.environ[SPARK_ENDPOINT_ENV]} if local else {}),
+                **({"endpoint_url": os.environ[LOCAL_ENDPOINT_ENV]} if local else {}),
                 "capability": "small",
                 "cost": "none" if local else "low",
                 "speed": "fast",
-                "pool": "spark-local" if local else "e2e",
+                "pool": "lab-local" if local else "e2e",
                 "weight": 1,
                 "enabled": True,
             }
         )
-    document["pools"]["spark-local"] = {
+    document["pools"]["lab-local"] = {
         "window": "1h",
         "budget_units": "attempts",
         "soft_limit": 0,
@@ -711,7 +712,7 @@ async def test_a_trivial_task_reaches_ready_for_merge_live(
         ).json()["items"]
         routing_row = next((item for item in history if item["attempt_id"] == attempt["id"]), None)
         assert routing_row is not None, "the live attempt is absent from routing history"
-        assert routing_row["pool"] == ("spark-local" if harness == "hermes" else "e2e")
+        assert routing_row["pool"] == ("lab-local" if harness == "hermes" else "e2e")
         assert routing_row["wall_ms"] == row.wall_ms
         entry["routing_history_recorded"] = True
         assert state == "awaiting_internal_review", entry
@@ -781,7 +782,7 @@ async def test_a_trivial_task_reaches_ready_for_merge_live(
         _record(entry)
 
 
-async def test_hermes_spark_pool_runs_four_and_defers_the_fifth_live(
+async def test_hermes_lab_local_pool_runs_four_and_defers_the_fifth_live(
     live_ctx: AppContext,
     live_client: TestClient,
     live_supervisor: Supervisor,
@@ -800,7 +801,7 @@ async def test_hermes_spark_pool_runs_four_and_defers_the_fifth_live(
         external_id = f"hermes-pool-{number}-{RUN_ID}"
         task_id = submit_and_start(
             live_client,
-            _contract("hermes", "gpt-oss:120b", image, live_config, external_id),
+            _contract("hermes", "coder", image, live_config, external_id),
         )
         task_ids.append(task_id)
         started[task_id] = datetime.now(UTC)
@@ -815,7 +816,7 @@ async def test_hermes_spark_pool_runs_four_and_defers_the_fifth_live(
     deferred = live_client.get(f"/v1/tasks/{task_ids[-1]}/events").json()["items"]
     assert any(
         event["kind"] == "harness_launch_deferred"
-        and "spark-local pool" in event["payload"]["detail"]
+        and "lab-local pool" in event["payload"]["detail"]
         for event in deferred
     )
     waiting = live_client.get(f"/v1/tasks/{task_ids[-1]}").json()
@@ -893,7 +894,7 @@ async def test_hermes_spark_pool_runs_four_and_defers_the_fifth_live(
     _record(
         {
             "kind": "hermes-pool-run",
-            "pool": "spark-local",
+            "pool": "lab-local",
             "max_concurrency": 4,
             "all_completed": all_completed,
             "runs": runs,

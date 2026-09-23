@@ -118,6 +118,14 @@ class RoutingPolicies:
         row = self._s.get(RoutingPolicyRow, (name, version))
         return self._to_entity(row) if row else None
 
+    def list_versions(self, name: str) -> Sequence[RoutingPolicyRecord]:
+        rows = self._s.scalars(
+            select(RoutingPolicyRow)
+            .where(RoutingPolicyRow.name == name)
+            .order_by(RoutingPolicyRow.version)
+        ).all()
+        return [self._to_entity(row) for row in rows]
+
     def is_referenced(self, name: str, version: int) -> bool:
         """A routing policy is referenced when a policy version points at it."""
         rows = self._s.scalars(select(PolicyRow)).all()

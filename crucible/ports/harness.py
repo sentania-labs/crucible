@@ -164,6 +164,9 @@ class CredentialSpec:
     # The adapter's declared minimum (07). A probe may raise it to rw-narrow; it is
     # never lowered (25 step 7).
     minimum_mode: MountMode
+    # Optional credentials keep the harness's documented unauthenticated fallback when
+    # no source is configured. If a source exists, providers still mount and validate it.
+    required_for_launch: bool = True
     # Which subdirectory of the configured credential path maps onto `mount_target`.
     source_subdir: str = ""
     # The environment variable that points the CLI at `mount_target`, if it has one.
@@ -185,6 +188,15 @@ class CredentialSpec:
         if self.source_subdir:
             base = base / self.source_subdir
         return base / name
+
+    def held_by(self, root: str) -> bool:
+        """Whether a configured source counts as mounted. A required credential is
+        mounted once configured, and its seeding refuses a missing file. An optional one
+        is mounted only when its required auth files exist: Compose creates its directory
+        empty, and an empty directory must keep the unauthenticated fallback."""
+        if self.required_for_launch:
+            return True
+        return all(self.source_path(root, a.name).is_file() for a in self.auth_files if a.required)
 
 
 @dataclass(frozen=True, slots=True)

@@ -7,6 +7,7 @@ from __future__ import annotations
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Body, Query
+from fastapi.exceptions import RequestValidationError
 
 from crucible.adapters.api.deps import Admin, Ctx, Orchestrator, UoW
 from crucible.application.admin import (
@@ -59,6 +60,53 @@ def admin_clear_routing_exhaustion(
 ) -> dict[str, Any]:
     result = routing.clear_exhaustion(
         _admin(ctx), uow, principal=principal.name, pool=pool, reason=_reason(body)
+    )
+    uow.commit()
+    return result
+
+
+@router.get("/admin/routing/local-endpoint")
+def admin_local_endpoint(ctx: Ctx, uow: UoW, _principal: Admin) -> dict[str, Any]:
+    _admin(ctx)
+    return routing.local_endpoint_view(uow)
+
+
+def _require_boolean_flags(models: list[dict[str, Any]]) -> None:
+    """The flags must be JSON booleans. Truthiness would read the string "false" as on,
+    enabling the model and opening its proxy destination."""
+    errors = [
+        {
+            "loc": ("body", "models", index, flag),
+            "msg": f"{flag} must be a JSON boolean",
+            "type": "bool_type",
+        }
+        for index, item in enumerate(models)
+        for flag in ("enabled", "enable_thinking")
+        if flag in item and not isinstance(item[flag], bool)
+    ]
+    if errors:
+        raise RequestValidationError(errors)
+
+
+@router.post("/admin/routing/local-endpoint")
+def admin_save_local_endpoint(
+    ctx: Ctx,
+    uow: UoW,
+    principal: Admin,
+    body: Annotated[dict[str, Any], Body()],
+) -> dict[str, Any]:
+    models = body.get("models")
+    if not isinstance(models, list) or not all(isinstance(item, dict) for item in models):
+        raise ConflictError("models must be a list of local model settings")
+    _require_boolean_flags(models)
+    result = routing.save_local_endpoint(
+        _admin(ctx),
+        uow,
+        principal=principal,
+        endpoint_url=str(body.get("endpoint_url", "")),
+        models=models,
+        max_concurrency=int(body.get("max_concurrency", 0)),
+        reason=_reason(body),
     )
     uow.commit()
     return result
@@ -138,6 +186,29 @@ async def admin_probe(
 ) -> dict[str, Any]:
     report = await credentials.probe(
         _admin(ctx), uow, principal=principal.name, harness=harness, reason=_reason(body)
+    )
+    uow.commit()
+    return report.as_dict()
+
+
+@router.post("/admin/credentials/{harness}/set")
+async def admin_set_credential(
+    harness: str,
+    ctx: Ctx,
+    uow: UoW,
+    principal: Admin,
+    body: Annotated[dict[str, Any], Body()],
+) -> dict[str, Any]:
+    value = body.get("api_key")
+    if not isinstance(value, str):
+        raise ConflictError("api_key must be a string")
+    report = await credentials.set_api_key(
+        _admin(ctx),
+        uow,
+        principal=principal.name,
+        harness=harness,
+        api_key=value,
+        reason=_reason(body),
     )
     uow.commit()
     return report.as_dict()

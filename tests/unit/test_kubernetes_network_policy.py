@@ -18,6 +18,7 @@ import pytest
 
 from crucible.adapters.execution import k8sspec
 from crucible.adapters.execution.k8sspec import SpecError
+from crucible.adapters.execution.kubernetes import KubernetesConfig
 from crucible.ports.execution import CleanupPolicy, ProviderError
 from tests.unit.kubernetes_fixtures import build, spec
 
@@ -191,22 +192,68 @@ async def test_ipv6_is_denied_entirely(rendered: dict[str, dict[str, Any]]) -> N
                 assert ipaddress.ip_network(destination["ipBlock"]["cidr"]).version == 4
 
 
-async def test_a_local_route_is_an_exact_address_and_port_inside_a_denied_range() -> None:
-    """05b, S16: the Spark is plain HTTP on a lab address, which the broad rule excepts.
-    It is allowed by its own exact rule, and only on its own port."""
-    rendered = await policies(endpoint="local", endpoint_url="http://10.10.0.42:8000/v1")
-    worker = rendered[k8sspec.ROLE_WORKER]
-    assert allows(worker, "10.10.0.42", 8000)
-    assert not allows(worker, "10.10.0.42", 443)
-    assert not allows(worker, "10.10.0.43", 8000)
+async def test_a_hostname_local_route_resolves_to_exact_addresses_and_port() -> None:
+    """C10: a configured gateway name may resolve into a private range, but the
+    generated exception is still only the resolved address and configured port."""
 
+    def resolver(host: str) -> list[str]:
+        return ["10.10.0.42/32"] if host == "llm.apps.int.sentania.net" else ["151.101.0.223/32"]
 
-async def test_a_hostname_local_route_is_refused_rather_than_widened() -> None:
-    """A name in an ipBlock would silently become "the whole internet on that port"."""
-    _api, _registry, provider = build()
-    launch = spec(endpoint="local", endpoint_url="http://spark.int.example:8000/v1")
+    api, _registry, provider = build(
+        resolver=resolver,
+        config=KubernetesConfig(
+            poll_interval_seconds=0,
+            launch_timeout_seconds=5,
+            local_endpoint_cidrs=("10.10.0.0/24",),
+        ),
+    )
+    launch = spec(endpoint="local", endpoint_url="https://llm.apps.int.sentania.net:8443/v1")
     workspace = await provider.prepare(launch)
-    with pytest.raises((ProviderError, SpecError), match="must be an IP address"):
+    handle = await provider.launch(workspace, launch)
+    rendered = {
+        row["body"]["spec"]["podSelector"]["matchLabels"][k8sspec.LABEL_ROLE]: row["body"]
+        for row in api.created
+        if row["kind"] == "networkpolicies"
+    }
+    worker = rendered[k8sspec.ROLE_WORKER]
+    assert allows(worker, "10.10.0.42", 8443)
+    assert not allows(worker, "10.10.0.42", 443)
+    assert not allows(worker, "10.10.0.43", 8443)
+    await provider.cleanup(workspace, CleanupPolicy.DELETE, launch)
+    assert handle
+
+
+async def test_a_direct_private_local_address_is_refused() -> None:
+    """C10 keeps names as the trust anchor and refuses a raw cluster or lab address."""
+    _api, _registry, provider = build()
+    launch = spec(endpoint="local", endpoint_url="http://10.10.0.42:8000/v1")
+    workspace = await provider.prepare(launch)
+    with pytest.raises((ProviderError, SpecError), match="names or resolves to an address"):
+        await provider.launch(workspace, launch)
+
+
+@pytest.mark.parametrize(
+    ("host", "address"),
+    [
+        ("kubernetes.default.svc", "10.96.0.1/32"),
+        ("service.other-namespace.svc", "10.244.3.7/32"),
+    ],
+)
+async def test_a_named_local_route_into_cluster_ranges_is_refused(host: str, address: str) -> None:
+    def resolver(candidate: str) -> list[str]:
+        return [address] if candidate == host else ["151.101.0.223/32"]
+
+    _api, _registry, provider = build(
+        resolver=resolver,
+        config=KubernetesConfig(
+            poll_interval_seconds=0,
+            launch_timeout_seconds=5,
+            local_endpoint_cidrs=("172.16.6.20/32",),
+        ),
+    )
+    launch = spec(endpoint="local", endpoint_url=f"https://{host}:443/v1")
+    workspace = await provider.prepare(launch)
+    with pytest.raises(ProviderError, match="resolves to an address"):
         await provider.launch(workspace, launch)
 
 
