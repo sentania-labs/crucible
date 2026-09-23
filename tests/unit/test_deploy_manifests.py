@@ -3,8 +3,8 @@
 These are the assertions a manifest edit has to get past. They are about the properties
 26 and 13 name, not about formatting: Pod Security admission at `restricted` on the
 workers namespace, a default deny that is really there, no cluster-scoped permission, no
-Docker socket, no hostPath, no `latest` tag, and the supervisor Role's verbs exactly as
-26 records them.
+Docker socket, no hostPath, no `latest` tag on anything but the example Crucible image
+itself, and the supervisor Role's verbs exactly as 26 records them.
 
 The objects are the *rendered* ones, because that is what a cluster sees: kustomize's
 `images` transformer is what puts the version on an image, and an overlay patch is what
@@ -34,8 +34,10 @@ ROOT = Path(__file__).resolve().parents[2]
 DEPLOY = ROOT / "deploy" / "kubernetes"
 TARGETS = ("base", "overlays/lab", "overlays/kind", "argocd")
 
-# The image the manifests pin, in the one place they pin it (base/kustomization.yaml).
-PINNED_IMAGE = "ghcr.io/sentania-labs/crucible:0.4.0"
+# The base is an example and tracks latest; only the deployer's own lab overlay pin is
+# exact, and it is a placeholder here, never a real tag or digest (24, docs/deployment.md).
+BASE_IMAGE = "ghcr.io/sentania-labs/crucible:latest"
+LAB_IMAGE = "ghcr.io/sentania-labs/crucible:REPLACE_ME_CRUCIBLE_TAG@REPLACE_ME_CRUCIBLE_DIGEST"
 
 # 26, as the implemented provider needs it. Each entry is (apiGroup, resource) -> verbs.
 SUPERVISOR_ROLE_RULES = {
@@ -273,14 +275,19 @@ def _pinned(image: str) -> bool:
     return ":" in last
 
 
-def test_every_image_is_pinned_and_none_is_latest(
+def test_every_image_but_the_example_crucible_one_is_pinned_and_none_is_latest(
     rendered: dict[str, list[dict[str, Any]]],
 ) -> None:
-    """A deployment pins an exact tag; `latest` is not one (sdlc skill, 24)."""
+    """A deployment pins an exact tag; `latest` is not one (sdlc skill, 24). The one
+    exception is `ghcr.io/sentania-labs/crucible` in this repository's own base and kind
+    overlay: those are examples that track `latest` on purpose, and a real deployment's
+    lab overlay is what carries the deployer's exact pin (test below)."""
     for target in TARGETS:
         for where, spec in _pod_specs(rendered[target]):
             for container in _containers(spec):
                 image = container["image"]
+                if image.rsplit(":", 1)[0] == "ghcr.io/sentania-labs/crucible":
+                    continue
                 assert not image.endswith(":latest"), f"{target}: {where} runs {image}"
                 assert _pinned(image), f"{target}: {where} runs {image} untagged"
 
@@ -297,9 +304,10 @@ def test_no_setting_names_a_latest_image(
                 assert not str(value).rstrip().endswith(":latest"), f"{target}: {key}"
 
 
-def test_the_crucible_image_tag_is_pinned_in_exactly_one_place() -> None:
+def test_the_crucible_image_tag_is_set_in_exactly_one_place() -> None:
     """The Deployments and the Job name the repository with no tag, so the kustomize
-    `images` entry is the only line a version can be changed in."""
+    `images` entry is the only line a version (or, in the base, `latest`) can be
+    changed in."""
     sources = [p for p in (DEPLOY / "base").rglob("*.yaml") if p.name != "kustomization.yaml"]
     for path in sources:
         for line in path.read_text(encoding="utf-8").splitlines():
@@ -310,7 +318,21 @@ def test_the_crucible_image_tag_is_pinned_in_exactly_one_place() -> None:
                 )
     kustomization = yaml.safe_load((DEPLOY / "base" / "kustomization.yaml").read_text())
     assert kustomization["images"] == [
-        {"name": "ghcr.io/sentania-labs/crucible", "newTag": "0.4.0"}
+        {"name": "ghcr.io/sentania-labs/crucible", "newTag": "latest"}
+    ]
+
+
+def test_the_lab_overlay_carries_the_deployers_pin_as_a_placeholder() -> None:
+    """26, 24: the base is an example; the lab overlay is where a real deployment's exact
+    tag and digest go, and here they are placeholders a deployer replaces, never a value
+    this repository fills in."""
+    kustomization = yaml.safe_load((DEPLOY / "overlays/lab" / "kustomization.yaml").read_text())
+    assert kustomization["images"] == [
+        {
+            "name": "ghcr.io/sentania-labs/crucible",
+            "newTag": "REPLACE_ME_CRUCIBLE_TAG",
+            "digest": "REPLACE_ME_CRUCIBLE_DIGEST",
+        }
     ]
 
 
@@ -318,20 +340,22 @@ def test_deploy_kind_derives_its_release_reference_from_the_base_pin() -> None:
     script = (ROOT / "tools/kind/deploy-kind.sh").read_text(encoding="utf-8")
     assert "deploy/kubernetes/base/kustomization.yaml" in script
     assert "release_image=$(awk" in script
-    assert "ghcr.io/sentania-labs/crucible:0.4.0" not in script
 
 
-def test_the_rendered_crucible_containers_run_the_pinned_image(
+def test_the_rendered_crucible_containers_run_the_example_or_the_placeholder_pin(
     rendered: dict[str, list[dict[str, Any]]],
 ) -> None:
-    for target in ("base", "overlays/lab", "overlays/kind"):
+    """`latest` in the base and kind proof, the deployer's unresolved placeholder in the
+    lab overlay: never a real tag or digest this repository chose."""
+    expected = {"base": BASE_IMAGE, "overlays/lab": LAB_IMAGE, "overlays/kind": BASE_IMAGE}
+    for target, image in expected.items():
         found = {
             container["image"]
             for _, spec in _pod_specs(rendered[target])
             for container in _containers(spec)
             if "sentania-labs/crucible" in container["image"]
         }
-        assert found == {PINNED_IMAGE}, f"{target}: {found}"
+        assert found == {image}, f"{target}: {found}"
 
 
 def test_the_app_key_is_mounted_on_the_control_plane_and_nowhere_else(
