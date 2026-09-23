@@ -286,7 +286,10 @@ def test_every_image_but_the_example_crucible_one_is_pinned_and_none_is_latest(
         for where, spec in _pod_specs(rendered[target]):
             for container in _containers(spec):
                 image = container["image"]
-                if image.rsplit(":", 1)[0] == "ghcr.io/sentania-labs/crucible":
+                is_example_crucible = target in ("base", "overlays/kind") and (
+                    image.rsplit(":", 1)[0] == "ghcr.io/sentania-labs/crucible"
+                )
+                if is_example_crucible:
                     continue
                 assert not image.endswith(":latest"), f"{target}: {where} runs {image}"
                 assert _pinned(image), f"{target}: {where} runs {image} untagged"
@@ -340,6 +343,7 @@ def test_deploy_kind_derives_its_release_reference_from_the_base_pin() -> None:
     script = (ROOT / "tools/kind/deploy-kind.sh").read_text(encoding="utf-8")
     assert "deploy/kubernetes/base/kustomization.yaml" in script
     assert "release_image=$(awk" in script
+    assert "ghcr.io/sentania-labs/crucible:latest" not in script
 
 
 def test_the_rendered_crucible_containers_run_the_example_or_the_placeholder_pin(
