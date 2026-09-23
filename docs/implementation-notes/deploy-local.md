@@ -53,9 +53,12 @@ needs and nothing the operator's home provides:
    deliberately ignored here: its fallback is the host's rootful socket, and a
    stray environment variable must not be able to put this deployment on the
    daemon whose compromise is a compromise of the host.
-3. Refuses an image reference that is `latest` or carries no tag. A deployment
-   pins one exact version; that pin is what makes a redeploy reproducible and a
-   rollback a one-word change.
+3. Refuses an image reference that is `latest` or carries neither a tag nor a
+   digest. A deployment pins one exact version; that pin is what makes a
+   redeploy reproducible and a rollback a one-word change. `repo:tag`,
+   `repo:tag@sha256:...` and `repo@sha256:...` are all accepted, and the
+   reference is passed through to the deployment's `compose.deploy.yaml` and
+   `.env` unchanged.
 4. Creates `/var/lib/crucible/deploy` (750) and `/var/lib/crucible/credentials`
    (700) with one empty directory per harness plus `github`, all owned by the
    service user. The layout is created and nothing more: a credential enters
@@ -92,11 +95,13 @@ needs and nothing the operator's home provides:
    `squid.conf` is a bind mount, replacing the file gives it a new inode, and a
    running container would otherwise keep the old rules while the target
    reported success.
-10. Reads `/v1/health` and refuses to report success unless the version it
-    reports is the tag that was deployed. Loopback ports are shared with
-    whatever else is running on the workstation, and a `/v1/ready` from
-    somebody else's service is not evidence about this one. Then prints
-    `/v1/ready`.
+10. Reads `/v1/health` and, when the reference carried a tag, refuses to report
+    success unless the version it reports is that tag. Loopback ports are
+    shared with whatever else is running on the workstation, and a
+    `/v1/ready` from somebody else's service is not evidence about this one.
+    A digest-only reference carries no tag to check `/v1/health` against, and
+    the digest is already the exact pin, so this check is skipped for it.
+    Then prints `/v1/ready`.
 
 `deploy-local-down` is `docker compose down` without `--volumes`:
 `crucible_crucible-pg` and `crucible_crucible-artifacts` survive, because a

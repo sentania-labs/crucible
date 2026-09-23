@@ -98,12 +98,22 @@ if [ "$action" = "down" ]; then
 fi
 
 [ -n "$DEPLOY_IMAGE" ] || die "set CRUCIBLE_DEPLOY_IMAGE, or DEPLOY_TAG when calling make"
+# A digest, when there is one, is its own colon-bearing suffix ('@sha256:...') and must
+# not be mistaken for the tag: stripped off first, so the tag is read from what is left.
 case "$DEPLOY_IMAGE" in
-  *:latest|*:latest@*) die "a deployment pins an exact tag; 'latest' is not one (docs/implementation-notes/release.md)" ;;
-  *:*) ;;
-  *) die "CRUCIBLE_DEPLOY_IMAGE must carry an exact version tag" ;;
+  *@sha256:*) repo_and_tag="${DEPLOY_IMAGE%%@sha256:*}" ;;
+  *) repo_and_tag="$DEPLOY_IMAGE" ;;
 esac
-deploy_version="${DEPLOY_IMAGE##*:}"
+case "$repo_and_tag" in
+  *:latest) die "a deployment pins an exact tag; 'latest' is not one (docs/implementation-notes/release.md)" ;;
+  *:*) deploy_version="${repo_and_tag##*:}" ;;
+  *)
+    [ "$repo_and_tag" != "$DEPLOY_IMAGE" ] || die "CRUCIBLE_DEPLOY_IMAGE must carry an exact version tag or digest"
+    # repo@sha256:... with no tag: there is no version string to check /v1/health
+    # against below, and that is fine, the digest is already the exact pin.
+    deploy_version=""
+    ;;
+esac
 
 # Through sudo: /run/user/<uid> is mode 700, so the operator cannot stat the socket,
 # which is the same wall this whole target exists to work around.
@@ -305,10 +315,12 @@ echo
 echo "deploy-local: GET /v1/health"
 health="$(curl -sS --fail-with-body "http://127.0.0.1:${DEPLOY_PORT}/v1/health")"
 echo "$health"
-case "$health" in
-  *"\"version\":\"${deploy_version}\""*) ;;
-  *) die "127.0.0.1:${DEPLOY_PORT} did not answer as ${DEPLOY_IMAGE}; something else owns that port" ;;
-esac
+if [ -n "$deploy_version" ]; then
+  case "$health" in
+    *"\"version\":\"${deploy_version}\""*) ;;
+    *) die "127.0.0.1:${DEPLOY_PORT} did not answer as ${DEPLOY_IMAGE}; something else owns that port" ;;
+  esac
+fi
 
 echo
 echo "deploy-local: GET /v1/ready"
