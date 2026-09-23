@@ -6,7 +6,7 @@ create `/v2`; `/v1` keeps serving for at least one minor release after.
 
 ## Authentication
 
-Bearer tokens, created by `crucible-admin token create --principal <name>
+Bearer tokens, created by `crucible admin token create --principal <name>
 --role <role>`. Stored as salted hashes. Roles:
 
 | Role | May |
@@ -132,6 +132,35 @@ endpoint's existing role requirements.
 |---|---|---|
 | POST | `/import/bootstrap` | Accept a `BootstrapExportV1` bundle; returns a verification report. Admin. Detail in 15. |
 | POST | `/import/bootstrap/{id}/commit` | Make the imported records authoritative after verification. |
+
+## The client
+
+`crucible` is the one command-line client of this API, shipped with it; its
+orchestrator verbs (`tasks`, `task`, `wakes`, `submit`, `start`, `accept`,
+`review`, `dispositions`, `corrections`, `ci-decision`, `head-decision`,
+`decisions`, `cancel`, `close`, `republish`, `health`) are Foundry's former
+`foundry-crucible` verb for verb, with the same arguments, paths, bodies and
+`X-Foundry-Reason` header, and `crucible admin` is 25's CLI. docs/client.md is
+the reference; what binds the API is this:
+
+- Every command prints one JSON envelope: `ok`, `kind`, `state`, `data` (this
+  API's response, never reworded), `next`, `warnings`, and on failure `error`
+  carrying the problem document above whole. Exit 0, 1 on a refusal or failure,
+  2 on usage. `crucible schema` prints the envelope's schema and each `kind`'s,
+  the orchestrator ones generated from the response models here.
+- `next` is the actions valid from the record's state for the principal in use,
+  each as an argv with what it needs. It follows the lifecycle table (09) and
+  each endpoint's state guard; a verb this section marks orchestrator-only is
+  offered only to an orchestrator or operator, and an orchestrator is reminded
+  of the task's owner, because it may act only on its own tasks. What a state
+  cannot show (a live lease, a matching review comment) stays the API's to refuse.
+- The client never decides a role itself. A verb whose route admits one role
+  class proves it by succeeding; otherwise the client asks this API with two
+  read-only requests, `GET /admin/audit?limit=1` (admin guard) and
+  `GET /capabilities` (orchestrator guard), and an answer other than 200 or 403
+  leaves the role unknown and `next` empty. Neither request records anything.
+- The bearer token comes from the environment or a token file, never a flag,
+  and is redacted from everything the client prints. Redirects are refused.
 
 ## Wake delivery
 

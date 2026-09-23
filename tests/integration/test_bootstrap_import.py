@@ -25,7 +25,10 @@ from crucible.application.admin import bootstrap
 from crucible.application.admin.context import AdminContext
 from crucible.application.supervisor import Supervisor
 from crucible.cli import admin as cli
+from crucible.client.config import ADMIN_TOKEN_ENV
+from crucible.client.http import Api
 from crucible.domain.bootstrap import SOURCE_CLOSED_STATES, STATE_MAP
+from tests.admin_cli import admin_main, envelope_data
 from tests.fixtures import bootstrap_event, bootstrap_task, synthetic_bundle
 from tests.unit.test_bootstrap_bundle import producer_bundle
 
@@ -97,9 +100,8 @@ def config_file(migrated: str, tmp_path: Path) -> Path:
 
 
 def run_cli(config: Path, *argv: str, capsys: pytest.CaptureFixture[str]) -> Any:
-    cli.main(["--config", str(config), *argv])
-    out = capsys.readouterr().out.strip().splitlines()
-    return json.loads(out[-1])
+    admin_main(["--config", str(config), *argv])
+    return envelope_data(capsys)
 
 
 def bundle_file(tmp_path: Path, bundle: dict[str, Any], name: str = "crucible.json") -> Path:
@@ -572,7 +574,7 @@ def test_bootstrap_through_the_cli_matches_the_api(
     broken["tasks"][0]["state"] = "missing"
     broken_path = bundle_file(tmp_path, broken, "broken.json")
     with pytest.raises(SystemExit):
-        cli.main(
+        admin_main(
             [
                 "--config",
                 str(config_file),
@@ -584,7 +586,7 @@ def test_bootstrap_through_the_cli_matches_the_api(
                 str(broken_path),
             ]
         )
-    err = capsys.readouterr().err
+    err = capsys.readouterr().out
     assert "bootstrap-bundle-invalid" in err and "tasks[0].state" in err
 
 
@@ -593,19 +595,21 @@ def test_the_cli_remote_mode_builds_the_bootstrap_calls(
 ) -> None:
     calls: list[tuple[str, str, Any]] = []
 
-    def fake_call(self: Any, method: str, path: str, body: Any = None) -> Any:
+    def fake_call(self: Any, method: str, path: str, body: Any = None, **_: Any) -> Any:
         calls.append((method, path, body))
         return {"ok": True}
 
-    monkeypatch.setattr(cli.Remote, "call", fake_call)
-    monkeypatch.setenv(cli.TOKEN_ENV, "cru_" + "0" * 26 + "." + "s" * 40)
+    monkeypatch.setattr(Api, "call", fake_call)
+    monkeypatch.setenv(ADMIN_TOKEN_ENV, "cru_" + "0" * 26 + "." + "s" * 40)
     raw = synthetic_bundle()
     path = bundle_file(tmp_path, raw)
     base = ["--api-url", "http://127.0.0.1:1"]
-    cli.main([*base, "--reason", "r", "bootstrap", "submit", "--file", str(path), "--owner", OWNER])
-    cli.main([*base, "bootstrap", "show", "imp-1"])
-    cli.main([*base, "bootstrap", "list"])
-    cli.main([*base, "--reason", "r", "bootstrap", "commit", "imp-1"])
+    admin_main(
+        [*base, "--reason", "r", "bootstrap", "submit", "--file", str(path), "--owner", OWNER]
+    )
+    admin_main([*base, "bootstrap", "show", "imp-1"])
+    admin_main([*base, "bootstrap", "list"])
+    admin_main([*base, "--reason", "r", "bootstrap", "commit", "imp-1"])
     assert calls == [
         ("POST", f"/v1/import/bootstrap?reason=r&owner={OWNER}", raw),
         ("GET", "/v1/import/bootstrap/imp-1", None),

@@ -77,7 +77,11 @@ Produced by `foundry-ledger export --format crucible`:
    configuration, its identity, and the read-only archive.
 
 After step 6, Foundry is a client. Any harness, or a person with the token,
-can carry on from Crucible's state alone.
+can carry on from Crucible's state alone. The client it uses is `crucible`
+(04, docs/client.md): step 8's start-of-session reads are `crucible tasks
+--state ...` and `crucible wakes`, and each task's envelope lists the actions
+valid from its state for Foundry's principal, so a session resumes from the
+envelope rather than from a procedure of its own.
 
 ## `source.migrated`
 

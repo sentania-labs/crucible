@@ -162,7 +162,7 @@ validation error instead of a JSON traceback. A missing field in a response is
 reported the same way rather than as a `KeyError`, a task that lands in a dead
 end such as `blocked` or `pre_pr_gates_failed` fails immediately instead of
 waiting out the poll budget and reporting as stuck, and the output of
-`crucible-admin token create` is never echoed into a failure message, because a
+`crucible admin token create` is never echoed into a failure message, because a
 failed release run is a public log.
 
 The release path drives an `artifacts` deliverable to `accepted`, where its old

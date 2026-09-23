@@ -1,0 +1,1005 @@
+{
+  "crucible-admin": {
+    "ref": "c7cd915",
+    "tree": {
+      "": {
+        "options": {
+          "--api-url": {
+            "choices": null,
+            "default": null,
+            "dest": "api_url",
+            "flag": false,
+            "required": false,
+            "type": null
+          },
+          "--config": {
+            "choices": null,
+            "default": null,
+            "dest": "config",
+            "flag": false,
+            "required": false,
+            "type": null
+          },
+          "--reason": {
+            "choices": null,
+            "default": null,
+            "dest": "reason",
+            "flag": false,
+            "required": false,
+            "type": null
+          }
+        },
+        "positionals": []
+      },
+      "audit": {
+        "options": {},
+        "positionals": []
+      },
+      "audit tail": {
+        "options": {
+          "--cursor": {
+            "choices": null,
+            "default": null,
+            "dest": "cursor",
+            "flag": false,
+            "required": false,
+            "type": "int"
+          },
+          "--limit": {
+            "choices": null,
+            "default": 50,
+            "dest": "limit",
+            "flag": false,
+            "required": false,
+            "type": "int"
+          }
+        },
+        "positionals": []
+      },
+      "bootstrap": {
+        "options": {},
+        "positionals": []
+      },
+      "bootstrap commit": {
+        "options": {},
+        "positionals": [
+          "import_id"
+        ]
+      },
+      "bootstrap list": {
+        "options": {},
+        "positionals": []
+      },
+      "bootstrap show": {
+        "options": {},
+        "positionals": [
+          "import_id"
+        ]
+      },
+      "bootstrap submit": {
+        "options": {
+          "--file": {
+            "choices": null,
+            "default": null,
+            "dest": "file",
+            "flag": false,
+            "required": true,
+            "type": null
+          },
+          "--owner": {
+            "choices": null,
+            "default": null,
+            "dest": "owner",
+            "flag": false,
+            "required": false,
+            "type": null
+          }
+        },
+        "positionals": []
+      },
+      "credentials": {
+        "options": {},
+        "positionals": []
+      },
+      "credentials login": {
+        "options": {
+          "--harness": {
+            "choices": null,
+            "default": null,
+            "dest": "harness",
+            "flag": false,
+            "required": true,
+            "type": null
+          },
+          "--replace": {
+            "choices": null,
+            "default": false,
+            "dest": "replace",
+            "flag": true,
+            "required": false,
+            "type": null
+          }
+        },
+        "positionals": []
+      },
+      "credentials probe": {
+        "options": {
+          "--harness": {
+            "choices": null,
+            "default": null,
+            "dest": "harness",
+            "flag": false,
+            "required": true,
+            "type": null
+          }
+        },
+        "positionals": []
+      },
+      "credentials remove": {
+        "options": {
+          "--harness": {
+            "choices": null,
+            "default": null,
+            "dest": "harness",
+            "flag": false,
+            "required": true,
+            "type": null
+          }
+        },
+        "positionals": []
+      },
+      "credentials rotate": {
+        "options": {
+          "--harness": {
+            "choices": null,
+            "default": null,
+            "dest": "harness",
+            "flag": false,
+            "required": true,
+            "type": null
+          },
+          "--new-path": {
+            "choices": null,
+            "default": null,
+            "dest": "new_path",
+            "flag": false,
+            "required": true,
+            "type": null
+          }
+        },
+        "positionals": []
+      },
+      "credentials set": {
+        "options": {
+          "--harness": {
+            "choices": [
+              "hermes"
+            ],
+            "default": "hermes",
+            "dest": "harness",
+            "flag": false,
+            "required": false,
+            "type": null
+          }
+        },
+        "positionals": []
+      },
+      "credentials status": {
+        "options": {
+          "--harness": {
+            "choices": null,
+            "default": null,
+            "dest": "harness",
+            "flag": false,
+            "required": true,
+            "type": null
+          }
+        },
+        "positionals": []
+      },
+      "credentials validate": {
+        "options": {
+          "--harness": {
+            "choices": null,
+            "default": null,
+            "dest": "harness",
+            "flag": false,
+            "required": true,
+            "type": null
+          }
+        },
+        "positionals": []
+      },
+      "github": {
+        "options": {},
+        "positionals": []
+      },
+      "github check": {
+        "options": {},
+        "positionals": []
+      },
+      "github status": {
+        "options": {},
+        "positionals": []
+      },
+      "harnesses": {
+        "options": {},
+        "positionals": []
+      },
+      "harnesses disable": {
+        "options": {},
+        "positionals": [
+          "name"
+        ]
+      },
+      "harnesses enable": {
+        "options": {},
+        "positionals": [
+          "name"
+        ]
+      },
+      "harnesses list": {
+        "options": {},
+        "positionals": []
+      },
+      "images": {
+        "options": {},
+        "positionals": []
+      },
+      "images list": {
+        "options": {},
+        "positionals": []
+      },
+      "images promote": {
+        "options": {},
+        "positionals": [
+          "digest"
+        ]
+      },
+      "migrate": {
+        "options": {},
+        "positionals": []
+      },
+      "providers": {
+        "options": {},
+        "positionals": []
+      },
+      "providers status": {
+        "options": {},
+        "positionals": []
+      },
+      "repositories": {
+        "options": {},
+        "positionals": []
+      },
+      "repositories list": {
+        "options": {},
+        "positionals": []
+      },
+      "repositories register": {
+        "options": {
+          "--attest-external-review-all-prs": {
+            "choices": null,
+            "default": false,
+            "dest": "attest_external_review_all_prs",
+            "flag": true,
+            "required": false,
+            "type": null
+          },
+          "--attested-by": {
+            "choices": null,
+            "default": null,
+            "dest": "attested_by",
+            "flag": false,
+            "required": false,
+            "type": null
+          },
+          "--default-branch": {
+            "choices": null,
+            "default": "main",
+            "dest": "default_branch",
+            "flag": false,
+            "required": false,
+            "type": null
+          },
+          "--installation-id": {
+            "choices": null,
+            "default": null,
+            "dest": "installation_id",
+            "flag": false,
+            "required": false,
+            "type": "int"
+          },
+          "--name": {
+            "choices": null,
+            "default": null,
+            "dest": "name",
+            "flag": false,
+            "required": true,
+            "type": null
+          },
+          "--policy": {
+            "choices": null,
+            "default": "default-software",
+            "dest": "policy",
+            "flag": false,
+            "required": false,
+            "type": null
+          },
+          "--url": {
+            "choices": null,
+            "default": null,
+            "dest": "url",
+            "flag": false,
+            "required": true,
+            "type": null
+          }
+        },
+        "positionals": []
+      },
+      "repositories remove": {
+        "options": {},
+        "positionals": [
+          "name"
+        ]
+      },
+      "repository": {
+        "options": {},
+        "positionals": []
+      },
+      "repository list": {
+        "options": {},
+        "positionals": []
+      },
+      "repository register": {
+        "options": {
+          "--attest-external-review-all-prs": {
+            "choices": null,
+            "default": false,
+            "dest": "attest_external_review_all_prs",
+            "flag": true,
+            "required": false,
+            "type": null
+          },
+          "--attested-by": {
+            "choices": null,
+            "default": null,
+            "dest": "attested_by",
+            "flag": false,
+            "required": false,
+            "type": null
+          },
+          "--default-branch": {
+            "choices": null,
+            "default": "main",
+            "dest": "default_branch",
+            "flag": false,
+            "required": false,
+            "type": null
+          },
+          "--installation-id": {
+            "choices": null,
+            "default": null,
+            "dest": "installation_id",
+            "flag": false,
+            "required": false,
+            "type": "int"
+          },
+          "--name": {
+            "choices": null,
+            "default": null,
+            "dest": "name",
+            "flag": false,
+            "required": true,
+            "type": null
+          },
+          "--policy": {
+            "choices": null,
+            "default": "default-software",
+            "dest": "policy",
+            "flag": false,
+            "required": false,
+            "type": null
+          },
+          "--url": {
+            "choices": null,
+            "default": null,
+            "dest": "url",
+            "flag": false,
+            "required": true,
+            "type": null
+          }
+        },
+        "positionals": []
+      },
+      "repository remove": {
+        "options": {},
+        "positionals": [
+          "name"
+        ]
+      },
+      "routing": {
+        "options": {},
+        "positionals": []
+      },
+      "routing clear-exhaustion": {
+        "options": {},
+        "positionals": [
+          "pool"
+        ]
+      },
+      "routing exhaustion": {
+        "options": {},
+        "positionals": []
+      },
+      "routing local-endpoint": {
+        "options": {},
+        "positionals": []
+      },
+      "routing set-local-endpoint": {
+        "options": {
+          "--disable": {
+            "choices": null,
+            "default": false,
+            "dest": "disable",
+            "flag": true,
+            "required": false,
+            "type": null
+          },
+          "--enable": {
+            "choices": null,
+            "default": false,
+            "dest": "enable",
+            "flag": true,
+            "required": false,
+            "type": null
+          },
+          "--enable-thinking": {
+            "choices": null,
+            "default": false,
+            "dest": "enable_thinking",
+            "flag": true,
+            "required": false,
+            "type": null
+          },
+          "--endpoint-url": {
+            "choices": null,
+            "default": null,
+            "dest": "endpoint_url",
+            "flag": false,
+            "required": true,
+            "type": null
+          },
+          "--max-concurrency": {
+            "choices": null,
+            "default": 4,
+            "dest": "max_concurrency",
+            "flag": false,
+            "required": false,
+            "type": "int"
+          },
+          "--model": {
+            "choices": null,
+            "default": "coder",
+            "dest": "model",
+            "flag": false,
+            "required": false,
+            "type": null
+          }
+        },
+        "positionals": []
+      },
+      "status": {
+        "options": {},
+        "positionals": []
+      },
+      "task": {
+        "options": {},
+        "positionals": []
+      },
+      "task republish": {
+        "options": {
+          "--reason": {
+            "choices": null,
+            "default": null,
+            "dest": "reason",
+            "flag": false,
+            "required": true,
+            "type": null
+          }
+        },
+        "positionals": [
+          "task_id"
+        ]
+      },
+      "token": {
+        "options": {},
+        "positionals": []
+      },
+      "token create": {
+        "options": {
+          "--principal": {
+            "choices": null,
+            "default": null,
+            "dest": "principal",
+            "flag": false,
+            "required": true,
+            "type": null
+          },
+          "--role": {
+            "choices": [
+              "admin",
+              "observer",
+              "operator",
+              "orchestrator"
+            ],
+            "default": null,
+            "dest": "role",
+            "flag": false,
+            "required": true,
+            "type": null
+          },
+          "--rotate": {
+            "choices": null,
+            "default": false,
+            "dest": "rotate",
+            "flag": true,
+            "required": false,
+            "type": null
+          }
+        },
+        "positionals": []
+      },
+      "token list": {
+        "options": {},
+        "positionals": []
+      },
+      "token revoke": {
+        "options": {},
+        "positionals": [
+          "principal_id"
+        ]
+      }
+    }
+  },
+  "foundry-crucible": {
+    "ref": "0cb2401",
+    "tree": {
+      "": {
+        "options": {
+          "--table": {
+            "choices": null,
+            "default": false,
+            "dest": "table",
+            "flag": true,
+            "required": false,
+            "type": null
+          }
+        },
+        "positionals": []
+      },
+      "accept": {
+        "options": {
+          "--head-sha": {
+            "choices": null,
+            "default": null,
+            "dest": "head_sha",
+            "flag": false,
+            "required": false,
+            "type": null
+          },
+          "--reason": {
+            "choices": null,
+            "default": null,
+            "dest": "reason",
+            "flag": false,
+            "required": true,
+            "type": null
+          },
+          "--verdict": {
+            "choices": [
+              "accepted",
+              "needs_more_work",
+              "rejected"
+            ],
+            "default": null,
+            "dest": "verdict",
+            "flag": false,
+            "required": true,
+            "type": null
+          }
+        },
+        "positionals": [
+          "id"
+        ]
+      },
+      "cancel": {
+        "options": {
+          "--decided-by": {
+            "choices": null,
+            "default": "foundry",
+            "dest": "decided_by",
+            "flag": false,
+            "required": false,
+            "type": null
+          },
+          "--reason": {
+            "choices": null,
+            "default": null,
+            "dest": "reason",
+            "flag": false,
+            "required": true,
+            "type": null
+          },
+          "--verbatim": {
+            "choices": null,
+            "default": null,
+            "dest": "verbatim",
+            "flag": false,
+            "required": true,
+            "type": null
+          }
+        },
+        "positionals": [
+          "id"
+        ]
+      },
+      "ci-decision": {
+        "options": {
+          "--action": {
+            "choices": null,
+            "default": null,
+            "dest": "action",
+            "flag": false,
+            "required": true,
+            "type": null
+          },
+          "--cause": {
+            "choices": null,
+            "default": null,
+            "dest": "cause",
+            "flag": false,
+            "required": true,
+            "type": null
+          },
+          "--reason": {
+            "choices": null,
+            "default": null,
+            "dest": "reason",
+            "flag": false,
+            "required": true,
+            "type": null
+          }
+        },
+        "positionals": [
+          "id"
+        ]
+      },
+      "close": {
+        "options": {
+          "--reason": {
+            "choices": null,
+            "default": null,
+            "dest": "reason",
+            "flag": false,
+            "required": true,
+            "type": null
+          }
+        },
+        "positionals": [
+          "id"
+        ]
+      },
+      "corrections": {
+        "options": {
+          "--reason": {
+            "choices": null,
+            "default": null,
+            "dest": "reason",
+            "flag": false,
+            "required": true,
+            "type": null
+          }
+        },
+        "positionals": [
+          "id",
+          "file"
+        ]
+      },
+      "decisions": {
+        "options": {
+          "--escalation-id": {
+            "choices": null,
+            "default": null,
+            "dest": "escalation_id",
+            "flag": false,
+            "required": false,
+            "type": null
+          },
+          "--kind": {
+            "choices": null,
+            "default": null,
+            "dest": "kind",
+            "flag": false,
+            "required": true,
+            "type": null
+          },
+          "--reason": {
+            "choices": null,
+            "default": null,
+            "dest": "reason",
+            "flag": false,
+            "required": true,
+            "type": null
+          },
+          "--reschedule": {
+            "choices": null,
+            "default": false,
+            "dest": "reschedule",
+            "flag": true,
+            "required": false,
+            "type": null
+          },
+          "--resolves": {
+            "choices": null,
+            "default": null,
+            "dest": "resolves",
+            "flag": false,
+            "required": true,
+            "type": null
+          },
+          "--verbatim": {
+            "choices": null,
+            "default": null,
+            "dest": "verbatim",
+            "flag": false,
+            "required": true,
+            "type": null
+          }
+        },
+        "positionals": [
+          "id"
+        ]
+      },
+      "dispositions": {
+        "options": {
+          "--reason": {
+            "choices": null,
+            "default": null,
+            "dest": "reason",
+            "flag": false,
+            "required": true,
+            "type": null
+          }
+        },
+        "positionals": [
+          "id",
+          "file"
+        ]
+      },
+      "head-decision": {
+        "options": {
+          "--action": {
+            "choices": null,
+            "default": null,
+            "dest": "action",
+            "flag": false,
+            "required": true,
+            "type": null
+          },
+          "--reason": {
+            "choices": null,
+            "default": null,
+            "dest": "reason",
+            "flag": false,
+            "required": true,
+            "type": null
+          }
+        },
+        "positionals": [
+          "id"
+        ]
+      },
+      "health": {
+        "options": {},
+        "positionals": []
+      },
+      "republish": {
+        "options": {
+          "--reason": {
+            "choices": null,
+            "default": null,
+            "dest": "reason",
+            "flag": false,
+            "required": true,
+            "type": null
+          }
+        },
+        "positionals": [
+          "id"
+        ]
+      },
+      "review": {
+        "options": {
+          "--reason": {
+            "choices": null,
+            "default": null,
+            "dest": "reason",
+            "flag": false,
+            "required": true,
+            "type": null
+          }
+        },
+        "positionals": [
+          "id",
+          "file"
+        ]
+      },
+      "start": {
+        "options": {
+          "--effort": {
+            "choices": null,
+            "default": null,
+            "dest": "effort",
+            "flag": false,
+            "required": false,
+            "type": null
+          },
+          "--harness": {
+            "choices": null,
+            "default": null,
+            "dest": "harness",
+            "flag": false,
+            "required": false,
+            "type": null
+          },
+          "--image": {
+            "choices": null,
+            "default": null,
+            "dest": "image",
+            "flag": false,
+            "required": false,
+            "type": null
+          },
+          "--model": {
+            "choices": null,
+            "default": null,
+            "dest": "model",
+            "flag": false,
+            "required": false,
+            "type": null
+          },
+          "--policy-version": {
+            "choices": null,
+            "default": null,
+            "dest": "policy_version",
+            "flag": false,
+            "required": true,
+            "type": "int"
+          },
+          "--provider": {
+            "choices": null,
+            "default": null,
+            "dest": "provider",
+            "flag": false,
+            "required": false,
+            "type": null
+          },
+          "--reason": {
+            "choices": null,
+            "default": null,
+            "dest": "reason",
+            "flag": false,
+            "required": true,
+            "type": null
+          }
+        },
+        "positionals": [
+          "id"
+        ]
+      },
+      "submit": {
+        "options": {
+          "--reason": {
+            "choices": null,
+            "default": null,
+            "dest": "reason",
+            "flag": false,
+            "required": true,
+            "type": null
+          }
+        },
+        "positionals": [
+          "file"
+        ]
+      },
+      "task": {
+        "options": {
+          "--attempts": {
+            "choices": null,
+            "default": false,
+            "dest": "attempts",
+            "flag": true,
+            "required": false,
+            "type": null
+          },
+          "--events": {
+            "choices": null,
+            "default": false,
+            "dest": "events",
+            "flag": true,
+            "required": false,
+            "type": null
+          },
+          "--evidence": {
+            "choices": null,
+            "default": false,
+            "dest": "evidence",
+            "flag": true,
+            "required": false,
+            "type": null
+          },
+          "--gates": {
+            "choices": null,
+            "default": false,
+            "dest": "gates",
+            "flag": true,
+            "required": false,
+            "type": null
+          },
+          "--pull-request": {
+            "choices": null,
+            "default": false,
+            "dest": "pull_request",
+            "flag": true,
+            "required": false,
+            "type": null
+          },
+          "--report": {
+            "choices": null,
+            "default": false,
+            "dest": "report",
+            "flag": true,
+            "required": false,
+            "type": null
+          }
+        },
+        "positionals": [
+          "id"
+        ]
+      },
+      "tasks": {
+        "options": {
+          "--state": {
+            "choices": null,
+            "default": null,
+            "dest": "state",
+            "flag": false,
+            "required": false,
+            "type": null
+          }
+        },
+        "positionals": []
+      },
+      "wakes": {
+        "options": {},
+        "positionals": []
+      },
+      "wakes ack": {
+        "options": {
+          "--reason": {
+            "choices": null,
+            "default": null,
+            "dest": "reason",
+            "flag": false,
+            "required": true,
+            "type": null
+          }
+        },
+        "positionals": [
+          "id"
+        ]
+      }
+    }
+  }
+}

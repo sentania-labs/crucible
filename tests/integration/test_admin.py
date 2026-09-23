@@ -32,9 +32,12 @@ from crucible.application.auth import authenticate
 from crucible.application.errors import ApplicationError
 from crucible.application.supervisor import Supervisor
 from crucible.cli import admin as cli
+from crucible.client.config import ADMIN_TOKEN_ENV
+from crucible.client.http import Api
 from crucible.domain.entities import ImagePromotion, Role
 from crucible.ports.execution import ImageInfo
 from crucible.ports.harness import CredentialSource
+from tests.admin_cli import admin_main, envelope_data
 
 pytestmark = pytest.mark.integration
 
@@ -201,9 +204,8 @@ def config_file(migrated: str, credential_root: Path, tmp_path: Path) -> Path:
 
 
 def run_cli(config: Path, *argv: str, capsys: pytest.CaptureFixture[str]) -> Any:
-    cli.main(["--config", str(config), *argv])
-    out = capsys.readouterr().out.strip().splitlines()
-    return json.loads(out[-1])
+    admin_main(["--config", str(config), *argv])
+    return envelope_data(capsys)
 
 
 def audit_kinds(client: TestClient) -> list[tuple[str, str]]:
@@ -333,12 +335,12 @@ def test_ui_mutation_uses_the_same_harness_service_and_rejects_bad_csrf(
 def test_migrate_creates_and_prints_the_first_admin_once(
     migrated: str, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    cli._ensure_first_admin(migrated)
-    first = capsys.readouterr().out
+    cli.ensure_first_admin(migrated)
+    first = capsys.readouterr().err
     assert "CRUCIBLE FIRST-RUN ADMIN TOKEN, SHOWN ONCE" in first
     shown = next(line for line in first.splitlines() if line.startswith("cru_"))
-    cli._ensure_first_admin(migrated)
-    assert capsys.readouterr().out == ""
+    cli.ensure_first_admin(migrated)
+    assert capsys.readouterr().err == ""
     engine = make_engine(migrated)
     try:
         with SqlUnitOfWorkFactory(engine)() as uow:
@@ -347,8 +349,8 @@ def test_migrate_creates_and_prints_the_first_admin_once(
             assert principal.name == "first-run-admin" and principal.role is Role.ADMIN
             uow.principals.disable(principal.id, SystemClock().now())
             uow.commit()
-        cli._ensure_first_admin(migrated)
-        recovery = capsys.readouterr().out
+        cli.ensure_first_admin(migrated)
+        recovery = capsys.readouterr().err
         recovered_token = next(line for line in recovery.splitlines() if line.startswith("cru_"))
         with SqlUnitOfWorkFactory(engine)() as uow:
             recovered = authenticate(uow, recovered_token)
@@ -597,8 +599,10 @@ def test_a_mutation_is_refused_without_a_live_supervisor(
     assert response.status_code == 503, response.text
     assert response.json()["type"].endswith("supervisor-not-live")
     with pytest.raises(SystemExit):
-        cli.main(["--config", str(config_file), "--reason", "test", "harnesses", "disable", "agy"])
-    assert "supervisor-not-live" in capsys.readouterr().err
+        admin_main(
+            ["--config", str(config_file), "--reason", "test", "harnesses", "disable", "agy"]
+        )
+    assert "supervisor-not-live" in capsys.readouterr().out
 
 
 def test_a_mutation_requires_a_reason(
@@ -1032,7 +1036,7 @@ def test_login_through_api_and_cli_against_the_fake_cli(
     assert finished["shape"]["ok"]
     assert "sk-ant-" not in json.dumps(finished) + json.dumps(state)
 
-    monkeypatch.setattr("builtins.input", lambda prompt="": "ABCD-EFGH")
+    monkeypatch.setattr("crucible.cli.admin._read_code", lambda: "ABCD-EFGH")
     result = run_cli(
         config_file,
         "--reason",
@@ -1097,10 +1101,10 @@ def test_images_list_and_promote_through_api_and_cli(
     assert back["promotion_state"] == "default" and back["retained"] == ["sha256:" + "e" * 64]
     assert run_cli(config_file, "images", "list", capsys=capsys)["items"] == []
     with pytest.raises(SystemExit):
-        cli.main(
+        admin_main(
             ["--config", str(config_file), "--reason", "x", "images", "promote", "sha256:nope"]
         )
-    assert "not-found" in capsys.readouterr().err
+    assert "not-found" in capsys.readouterr().out
     assert ("image_promoted", "admin-principal") in audit_kinds(admin_client)
 
 
@@ -1123,7 +1127,7 @@ def test_providers_github_audit_status_and_capabilities(
     assert run_cli(config_file, "github", "status", capsys=capsys)["configured"] is False
     assert admin_client.post("/v1/admin/github/check", json={"reason": "x"}).status_code == 409
     with pytest.raises(SystemExit):
-        cli.main(["--config", str(config_file), "--reason", "x", "github", "check"])
+        admin_main(["--config", str(config_file), "--reason", "x", "github", "check"])
 
     # A registration under /admin is a mutation like any other: a reason, and a live lease.
     assert (
@@ -1217,14 +1221,14 @@ def test_providers_github_audit_status_and_capabilities(
 def test_the_cli_remote_mode_builds_the_same_calls(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[tuple[str, str, Any]] = []
 
-    def fake_call(self: Any, method: str, path: str, body: Any = None) -> Any:
+    def fake_call(self: Any, method: str, path: str, body: Any = None, **_: Any) -> Any:
         calls.append((method, path, body))
         return {"ok": True}
 
-    monkeypatch.setattr(cli.Remote, "call", fake_call)
-    monkeypatch.setenv(cli.TOKEN_ENV, "cru_" + "0" * 26 + "." + "s" * 40)
-    cli.main(["--api-url", "http://127.0.0.1:1", "--reason", "r", "harnesses", "disable", "agy"])
-    cli.main(
+    monkeypatch.setattr(Api, "call", fake_call)
+    monkeypatch.setenv(ADMIN_TOKEN_ENV, "cru_" + "0" * 26 + "." + "s" * 40)
+    admin_main(["--api-url", "http://127.0.0.1:1", "--reason", "r", "harnesses", "disable", "agy"])
+    admin_main(
         [
             "--api-url",
             "http://127.0.0.1:1",
@@ -1236,9 +1240,11 @@ def test_the_cli_remote_mode_builds_the_same_calls(monkeypatch: pytest.MonkeyPat
             "codex",
         ]
     )
-    cli.main(["--api-url", "http://127.0.0.1:1", "audit", "tail", "--cursor", "5", "--limit", "10"])
-    cli.main(["--api-url", "http://127.0.0.1:1", "routing", "exhaustion"])
-    cli.main(
+    admin_main(
+        ["--api-url", "http://127.0.0.1:1", "audit", "tail", "--cursor", "5", "--limit", "10"]
+    )
+    admin_main(["--api-url", "http://127.0.0.1:1", "routing", "exhaustion"])
+    admin_main(
         [
             "--api-url",
             "http://127.0.0.1:1",
@@ -1270,7 +1276,7 @@ def test_remote_login_submits_the_reason_with_the_code(
         ]
     )
 
-    def fake_call(self: Any, method: str, path: str, body: Any = None) -> Any:
+    def fake_call(self: Any, method: str, path: str, body: Any = None, **_: Any) -> Any:
         calls.append((method, path, body))
         if method == "GET":
             return next(states)
@@ -1278,11 +1284,11 @@ def test_remote_login_submits_the_reason_with_the_code(
             return {"window": "login window"}
         return {"state": "finished"}
 
-    monkeypatch.setattr(cli.Remote, "call", fake_call)
+    monkeypatch.setattr(Api, "call", fake_call)
     monkeypatch.setattr("crucible.cli.admin.time.sleep", lambda _seconds: None)
-    monkeypatch.setattr("builtins.input", lambda _prompt: "operator-code")
-    monkeypatch.setenv(cli.TOKEN_ENV, "cru_" + "0" * 26 + "." + "s" * 40)
-    cli.main(
+    monkeypatch.setattr("crucible.cli.admin._read_code", lambda: "operator-code")
+    monkeypatch.setenv(ADMIN_TOKEN_ENV, "cru_" + "0" * 26 + "." + "s" * 40)
+    admin_main(
         [
             "--api-url",
             "http://127.0.0.1:1",
@@ -1322,7 +1328,7 @@ def test_a_secret_shaped_reason_is_refused_on_both_entry_points(
     assert response.json()["errors"][0]["path"] == "reason"
     assert secret not in response.text
     with pytest.raises(SystemExit):
-        cli.main(
+        admin_main(
             [
                 "--config",
                 str(config_file),
@@ -1333,7 +1339,7 @@ def test_a_secret_shaped_reason_is_refused_on_both_entry_points(
                 "agy",
             ]
         )
-    err = capsys.readouterr().err
+    err = capsys.readouterr().out
     assert "contract-validation" in err or "reason" in err
     assert secret not in err
     kinds = audit_kinds(admin_client)
@@ -1355,7 +1361,7 @@ def test_registering_a_repository_takes_both_guards_on_both_entry_points(
     down = admin_client.put("/v1/admin/repositories/guarded", json={**body, "reason": "x"})
     assert down.status_code == 503, down.text
     with pytest.raises(SystemExit):
-        cli.main(
+        admin_main(
             [
                 "--config",
                 str(config_file),
@@ -1370,11 +1376,11 @@ def test_registering_a_repository_takes_both_guards_on_both_entry_points(
                 "--attest-external-review-all-prs",
             ]
         )
-    assert "supervisor-not-live" in capsys.readouterr().err
+    assert "supervisor-not-live" in capsys.readouterr().out
     asyncio.run(live_supervisor.tick())
     assert admin_client.put("/v1/admin/repositories/guarded", json=body).status_code == 422
     with pytest.raises(SystemExit):
-        cli.main(
+        admin_main(
             [
                 "--config",
                 str(config_file),
@@ -1387,7 +1393,7 @@ def test_registering_a_repository_takes_both_guards_on_both_entry_points(
                 "--attest-external-review-all-prs",
             ]
         )
-    assert "reason" in capsys.readouterr().err
+    assert "reason" in capsys.readouterr().out
 
 
 def test_finishing_a_login_takes_both_guards(

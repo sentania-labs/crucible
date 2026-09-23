@@ -53,7 +53,7 @@ Crucible only records.
   certification, merge observation (23).
 - Release contract and lifecycle designed; implemented after readiness (24).
 - Worker image version pinning, digest recording, and promotion (13).
-- Administration: versioned admin API, `crucible-admin` CLI on the same
+- Administration: versioned admin API, `crucible admin` CLI on the same
   services, credential onboarding and validation, sanitized status (25).
 - Foundry wake channel (webhook and poll).
 - Bootstrap-ledger import API and authority handoff.

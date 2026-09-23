@@ -356,7 +356,7 @@ class LoginRegistry:
             # the difference between a clear message and a session that never finishes.
             raise ConflictError(
                 f"{argv[0]} is not installed on this host, so the {harness} login cannot "
-                "run here; run `crucible-admin credentials login` in local mode on a host "
+                "run here; run `crucible admin credentials login` in local mode on a host "
                 f"that has {argv[0]}"
             )
         return argv

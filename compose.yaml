@@ -120,7 +120,7 @@ services:
     image: ${CRUCIBLE_IMAGE:-ghcr.io/sentania-labs/crucible:latest}
     build: .
     profiles: ["full"]
-    command: ["crucible-admin", "migrate"]
+    command: ["crucible", "admin", "migrate"]
     environment:
       CRUCIBLE_DATABASE__URL: postgresql+psycopg://crucible:${POSTGRES_PASSWORD}@postgres:5432/crucible
       CRUCIBLE_LOCAL_ENDPOINT_URL: "${CRUCIBLE_LOCAL_ENDPOINT_URL:-${CRUCIBLE_SPARK_ENDPOINT_URL:-}}"
@@ -204,7 +204,7 @@ services:
       # 25 and S1b: a harness ships disabled until its dedicated session and its
       # daily-session compatibility are verified. Claude Code and AGY are verified; Codex
       # waits on its Crucible-side refresh (S1b step 5). Enable by configuration here and
-      # by `crucible-admin harnesses enable` (C5b) once verified.
+      # by `crucible admin harnesses enable` (C5b) once verified.
       CRUCIBLE_HARNESSES__CODEX__ENABLED: "${CRUCIBLE_HARNESS_CODEX_ENABLED:-false}"
       CRUCIBLE_HARNESSES__CODEX__REASON: "unverified: Crucible-side refresh not yet observed (S1b step 5)"
       CRUCIBLE_HARNESSES__AGY__ENABLED: "${CRUCIBLE_HARNESS_AGY_ENABLED:-true}"

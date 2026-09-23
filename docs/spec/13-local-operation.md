@@ -21,7 +21,7 @@ attempt or job. Workers, collectors, and verifiers sit on the
 own internal network with its own proxy, because the one container that
 holds a GitHub credential must not reach the model endpoints the workers'
 allowlist permits (23). `docker
-compose down` does not remove running workers by design; `crucible-admin
+compose down` does not remove running workers by design; `crucible admin
 drain` does.
 
 ## The credential root is the operator's to create
@@ -39,7 +39,7 @@ So the credential root and each per-harness directory under it are created
 before the stack starts, by the operator or by the deployment script, owned
 by the Crucible service user and mode 0700. `tools/deploy/deploy_local.sh`
 does exactly that and creates the layout and nothing else; a credential
-itself enters only through `crucible-admin credentials login` (25).
+itself enters only through `crucible admin credentials login` (25).
 
 Crucible refuses at startup when a configured credential directory is
 missing, is not owned by the service user, or is not mode 0700, and names the

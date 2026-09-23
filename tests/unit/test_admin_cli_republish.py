@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 from typing import Any
 
 from crucible.cli.admin import _remote, build_parser
@@ -16,12 +17,12 @@ class RecordingRemote:
         return {"state": "publishing"}
 
 
-def test_remote_cli_republish_calls_the_task_api(capsys: Any) -> None:
-    args = build_parser().parse_args(
+def test_remote_cli_republish_calls_the_task_api() -> None:
+    args = build_parser(argparse.ArgumentParser()).parse_args(
         ["task", "republish", "01TASK", "--reason", "service recovered"]
     )
     remote = RecordingRemote()
-    _remote(args, remote)  # type: ignore[arg-type]
+    document = _remote(args, remote)  # type: ignore[arg-type]
     assert remote.calls == [
         (
             "POST",
@@ -29,4 +30,4 @@ def test_remote_cli_republish_calls_the_task_api(capsys: Any) -> None:
             {"reason": "service recovered"},
         )
     ]
-    assert '"state": "publishing"' in capsys.readouterr().out
+    assert document == {"state": "publishing"}

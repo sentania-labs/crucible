@@ -122,7 +122,7 @@ make e2e-live HARNESS=claude_code \
 ```
 
 Administration (25) is one set of operations behind three entry points: the
-server-rendered `/ui`, `/v1/admin`, and `crucible-admin`. They call the same
+server-rendered `/ui`, `/v1/admin`, and `crucible admin`. They call the same
 services and own no separate state. On a fresh deployment, retrieve the
 one-time administrator token from `docker compose logs migrate`, then open
 `http://127.0.0.1:8080/ui`. Every mutation takes a reason, needs a live
@@ -130,21 +130,21 @@ supervisor, and leaves an event with the principal and a before/after summary,
 never a value:
 
 ```sh
-crucible-admin status                                        # the sanitized status document
-crucible-admin harnesses list
-crucible-admin --reason "refresh unverified" harnesses disable codex
-crucible-admin credentials status --harness claude_code      # presence, permissions, expiry class
-crucible-admin credentials validate --harness claude_code    # shape and expiry, no network
-crucible-admin credentials probe --harness claude_code       # bounded run of the hardened image
-crucible-admin --reason "..." credentials login --harness codex   # prints the URL and the code; token file mode 600
-crucible-admin --reason "..." credentials rotate --harness agy --new-path /path/to/staged
-crucible-admin --reason "..." credentials remove --harness codex
-crucible-admin images list
-crucible-admin --reason "..." images promote <digest>
-crucible-admin providers status
-crucible-admin github status
-crucible-admin github check                                  # mints and discards a token per registered repository
-crucible-admin audit tail --limit 50
+crucible admin status                                        # the sanitized status document
+crucible admin harnesses list
+crucible admin --reason "refresh unverified" harnesses disable codex
+crucible admin credentials status --harness claude_code      # presence, permissions, expiry class
+crucible admin credentials validate --harness claude_code    # shape and expiry, no network
+crucible admin credentials probe --harness claude_code       # bounded run of the hardened image
+crucible admin --reason "..." credentials login --harness codex   # prints the URL and the code; token file mode 600
+crucible admin --reason "..." credentials rotate --harness agy --new-path /path/to/staged
+crucible admin --reason "..." credentials remove --harness codex
+crucible admin images list
+crucible admin --reason "..." images promote <digest>
+crucible admin providers status
+crucible admin github status
+crucible admin github check                                  # mints and discards a token per registered repository
+crucible admin audit tail --limit 50
 ```
 
 The UI and API run `credentials login` inside the promoted worker image with
@@ -168,7 +168,7 @@ build of this branch). Before the first tagged release the answer is
 ```sh
 docker compose logs migrate     # copy the framed first-run administrator token
 # Open http://127.0.0.1:8080/ui and create any additional principals there.
-docker compose exec crucible crucible-admin --reason "onboarding" repository register \
+docker compose exec crucible crucible admin --reason "onboarding" repository register \
   --name example-service --url https://github.com/example-org/example-service \
   --installation-id 0 --attest-external-review-all-prs
 curl -s http://127.0.0.1:8080/v1/ready
@@ -217,6 +217,21 @@ POST /v1/tasks/{id}/accept              # Foundry's AcceptanceResult; Crucible n
 POST /v1/tasks/{id}/corrections         # a narrowed contract version and a `correct` execution
 GET  /v1/wakes                          # what needs judgment; poll is the durable path
 POST /v1/wakes/{id}/ack                 # what you did about it
+```
+
+The same operations from the command line are `crucible`'s orchestrator verbs,
+which replace Foundry's `foundry-crucible` verb for verb. Each prints one JSON
+envelope: the API's record as `data`, and in `next` the commands valid from
+the record's state for the token in use, so an agent follows `next` rather
+than a procedure of its own. [docs/client.md](docs/client.md) is the reference.
+
+```sh
+export CRUCIBLE_URL=http://127.0.0.1:8080 CRUCIBLE_TOKEN="$(cat ~/.config/crucible/token)"
+crucible tasks --state awaiting_acceptance
+crucible task 01M3...                    # the task, its state, and its `next` actions
+crucible accept 01M3... --verdict accepted --reason "checked the evidence"
+crucible wakes
+crucible schema                          # the envelope and every kind's JSON schema
 ```
 
 The gate rows say `pending` for `internal_review_recorded` until a non-author
@@ -276,8 +291,8 @@ handoff is an import, not a copy:
 POST /v1/import/bootstrap?reason=&owner=   # admin; the body is the exported bundle, verbatim
 GET  /v1/import/bootstrap/{id}             # the verification report
 POST /v1/import/bootstrap/{id}/commit      # makes the import authoritative
-crucible-admin bootstrap submit --file crucible.json --owner foundry   # the same, in process
-crucible-admin bootstrap show|list|commit
+crucible admin bootstrap submit --file crucible.json --owner foundry   # the same, in process
+crucible admin bootstrap show|list|commit
 ```
 
 The bundle is validated in full (schema version, recomputed content hash, counts, id
@@ -303,7 +318,8 @@ release. Details: [docs/implementation-notes/release.md](docs/implementation-not
 ## Layout
 
 ```
-crucible/       the service: domain, contracts, application, ports, adapters, scheduler, cli
+crucible/       the service: domain, contracts, application, ports, adapters, scheduler, cli,
+                and client (the library every `crucible` command group uses; docs/client.md)
 tests/          unit (no I/O) and integration (PostgreSQL in a container, fake provider)
 docs/spec/      the specification, one concern per file
 docs/adr/       architectural decision records

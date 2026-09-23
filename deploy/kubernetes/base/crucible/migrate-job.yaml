@@ -79,7 +79,7 @@ spec:
       containers:
         - name: migrate
           image: ghcr.io/sentania-labs/crucible
-          command: ["crucible-admin", "migrate"]
+          command: ["crucible", "admin", "migrate"]
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

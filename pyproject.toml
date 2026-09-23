@@ -21,8 +21,8 @@ dependencies = [
 ]
 
 [project.scripts]
-crucible = "crucible.cli.serve:main"
-crucible-admin = "crucible.cli.admin:main"
+crucible = "crucible.cli.main:main"
+crucible-admin = "crucible.cli.main:admin_shim"
 
 [dependency-groups]
 dev = [
@@ -98,7 +98,7 @@ name = "Dependencies point inward only"
 type = "layers"
 layers = [
     "crucible.cli",
-    "crucible.adapters | crucible.scheduler",
+    "crucible.adapters | crucible.scheduler | crucible.client",
     "crucible.application",
     "crucible.ports",
     "crucible.contracts",
@@ -114,6 +114,16 @@ forbidden_modules = [
     "pydantic_settings", "uvicorn", "yaml", "docker",
     "crucible.settings", "crucible.logs", "crucible.contracts", "crucible.ports",
     "crucible.application", "crucible.adapters", "crucible.scheduler", "crucible.cli",
+]
+
+[[tool.importlinter.contracts]]
+name = "The client library speaks HTTP and nothing else of the server"
+type = "forbidden"
+source_modules = ["crucible.client"]
+forbidden_modules = [
+    "fastapi", "starlette", "sqlalchemy", "alembic", "psycopg", "uvicorn", "docker",
+    "crucible.settings", "crucible.logs", "crucible.ports", "crucible.application",
+    "crucible.adapters", "crucible.scheduler", "crucible.cli",
 ]
 
 [[tool.importlinter.contracts]]

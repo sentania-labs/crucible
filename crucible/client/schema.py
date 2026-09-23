@@ -1,0 +1,279 @@
+"""`crucible schema`: the envelope's JSON schema and the schema of every `kind`'s `data`.
+
+The orchestrator records are the API's own response models (04), so their schemas are
+generated from those models and cannot drift from them. The administrative documents
+(25) are plain objects the admin services build; their schemas name the fields a caller
+can rely on and leave the rest open (`additionalProperties` true), which is what the
+admin API itself promises.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from pydantic import BaseModel
+
+from crucible.client.envelope import ENVELOPE_VERSION
+from crucible.client.next import ROLES
+from crucible.contracts.api import (
+    AttemptView,
+    CompletionClaimView,
+    EventList,
+    EvidenceList,
+    GateList,
+    HealthView,
+    ImageView,
+    PullRequestView,
+    TaskList,
+    TaskView,
+    WakeList,
+    WakeView,
+)
+
+JSON_SCHEMA = "https://json-schema.org/draft/2020-12/schema"
+
+
+def _model(model: type[BaseModel]) -> dict[str, Any]:
+    return model.model_json_schema(mode="serialization")
+
+
+def _obj(
+    description: str,
+    required: dict[str, Any] | None = None,
+    optional: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    properties = {**(required or {}), **(optional or {})}
+    return {
+        "type": "object",
+        "description": description,
+        "properties": properties,
+        "required": sorted(required or {}),
+        "additionalProperties": True,
+    }
+
+
+def _items(description: str, item: dict[str, Any]) -> dict[str, Any]:
+    return _obj(description, {"items": {"type": "array", "items": item}})
+
+
+STR = {"type": "string"}
+NSTR = {"type": ["string", "null"]}
+BOOL = {"type": "boolean"}
+ANY_OBJ = {"type": "object", "additionalProperties": True}
+
+ACTION = {
+    "type": "object",
+    "description": "One action valid from the record's state for the principal in use.",
+    "properties": {
+        "action": {"type": "string", "description": "the action's name"},
+        "description": {"type": "string"},
+        "command": {
+            "type": "array",
+            "items": STR,
+            "description": "argv that performs it; `{name}` tokens are filled from `needs`",
+        },
+        "needs": {
+            "type": "object",
+            "description": "what each `{name}` token must be: a description, or "
+            "{choices: [...]} when the API takes a fixed set",
+        },
+        "optional": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"flag": STR, "description": STR},
+                "required": ["flag", "description"],
+            },
+        },
+        "requires": {
+            "type": "object",
+            "properties": {
+                "roles": {"type": "array", "items": {"enum": list(ROLES)}},
+                "owner": {
+                    "type": "string",
+                    "description": "the task's principal; an orchestrator acts only on "
+                    "its own tasks",
+                },
+            },
+            "required": ["roles"],
+        },
+    },
+    "required": ["action", "description", "command", "needs", "requires"],
+    "additionalProperties": False,
+}
+
+ERROR = {
+    "type": "object",
+    "properties": {
+        "code": {
+            "type": "string",
+            "description": "the API problem type's slug (e.g. `forbidden`, "
+            "`transition-not-allowed`), or a client code: `usage`, `config`, "
+            "`unreachable`, `protocol`",
+        },
+        "message": STR,
+        "hint": {"type": ["string", "null"], "description": "what the caller can do"},
+        "status": {"type": "integer", "description": "the HTTP status, when there was one"},
+        "problem": {
+            "type": "object",
+            "description": "the API's RFC 9457 problem detail, whole, when there is one",
+        },
+    },
+    "required": ["code", "message", "hint"],
+    "additionalProperties": False,
+}
+
+
+def envelope_schema() -> dict[str, Any]:
+    return {
+        "$schema": JSON_SCHEMA,
+        "title": "crucible command envelope",
+        "description": "Every `crucible` command except `serve` prints exactly one of these "
+        "on stdout. Exit code 0 when `ok`, 1 when the operation was refused or failed, 2 on "
+        "usage.",
+        "type": "object",
+        "properties": {
+            "ok": BOOL,
+            "envelope": {"const": ENVELOPE_VERSION},
+            "kind": {"type": "string", "description": "names the schema of `data`"},
+            "state": {
+                "type": ["string", "null"],
+                "description": "the record's lifecycle state, where it has one",
+            },
+            "principal_role": {
+                "type": ["string", "null"],
+                "enum": [*ROLES, None],
+                "description": "the role the token in use holds, as the API showed it; "
+                "`orchestrator` also stands for operator; null when unknown",
+            },
+            "data": {"description": "the API's record, exactly as the API returned it"},
+            "next": {"type": "array", "items": ACTION},
+            "warnings": {"type": "array", "items": STR},
+            "error": ERROR,
+        },
+        "required": [
+            "ok",
+            "envelope",
+            "kind",
+            "state",
+            "principal_role",
+            "data",
+            "next",
+            "warnings",
+        ],
+        "additionalProperties": False,
+    }
+
+
+def kind_schemas() -> dict[str, dict[str, Any]]:
+    credential = _obj(
+        "a credential's state (25): presence, permissions, expiry class; never a value",
+        {"state": {"enum": ["not_required", "absent", "configured", "invalid", "validated"]}},
+        {
+            "mount_mode": NSTR,
+            "source_fingerprint": NSTR,
+            "files": {"type": "array"},
+            "detail": STR,
+            "session_compatibility": STR,
+        },
+    )
+    bootstrap = _obj(
+        "a bootstrap import's verification report (15)",
+        {"import_id": STR, "state": STR},
+    )
+    return {
+        # the orchestrator verbs (04)
+        "task": _model(TaskView),
+        "task_list": _model(TaskList),
+        "task_detail": _obj(
+            "a task with the related records its flags asked for",
+            {"task": _model(TaskView)},
+            {
+                "events": _model(EventList),
+                "pull_request": _model(PullRequestView),
+                "attempts": {"type": "array", "items": _model(AttemptView)},
+                "gates": _model(GateList),
+                "report": _model(CompletionClaimView),
+                "evidence": _model(EvidenceList),
+            },
+        ),
+        "wake": _model(WakeView),
+        "wake_list": _model(WakeList),
+        "health": _model(HealthView),
+        # the admin group (25)
+        "migration": _obj("the schema head migrations reached", {"migrated_to": NSTR}),
+        "admin_status": _obj(
+            "the sanitized status document (25)",
+            {"harnesses": {"type": "array"}, "providers": {"type": "array"}},
+        ),
+        "token_list": _items(
+            "principals without token values",
+            _obj(
+                "a principal",
+                {"id": STR, "name": STR, "role": STR, "created_at": STR, "disabled_at": NSTR},
+            ),
+        ),
+        "token_created": _obj(
+            "a new principal and its token, printed this once and never stored in clear",
+            {"principal": STR, "role": STR, "token": STR},
+        ),
+        "token_revoked": _obj("the revoked principal", {"id": STR, "name": STR, "revoked": BOOL}),
+        "repository_list": _items("registered repositories", ANY_OBJ),
+        "repository": _obj("a registered repository", {}),
+        "repository_removed": _obj("the removed repository", {}),
+        "harness_list": _items(
+            "harnesses with their enable flags, credential and images",
+            _obj(
+                "a harness",
+                {"name": STR, "enabled": BOOL, "enabled_by_administrator": BOOL},
+            ),
+        ),
+        "harness": _obj(
+            "a harness after enable or disable",
+            {"harness": STR, "enabled": BOOL},
+            {"reason": STR, "session_compatibility": STR, "running_attempts": {"type": "integer"}},
+        ),
+        "credential_state": credential,
+        "credential_report": _obj(
+            "what a credential operation found and did",
+            {"harness": STR},
+            {"credential": credential, "shape": ANY_OBJ, "probe": ANY_OBJ},
+        ),
+        "credential_login": _obj(
+            "a finished harness login",
+            {"harness": STR},
+            {"login": ANY_OBJ, "shape": ANY_OBJ},
+        ),
+        "image_list": _items("worker images and their promotion state", _model(ImageView)),
+        "image_promotion": _obj("the promoted image", {}, {"promotion_state": STR}),
+        "provider_list": _items("execution providers and their health", ANY_OBJ),
+        "github_status": _obj("the GitHub App's health", {"configured": BOOL}),
+        "github_check": _obj("the per-repository token check", {}),
+        "audit_page": _obj(
+            "one page of the audit log, oldest first",
+            {"items": {"type": "array"}},
+            {"next_cursor": {"type": ["integer", "null"]}},
+        ),
+        "exhaustion_list": _items(
+            "reactive quota exhaustion marks",
+            _obj("a mark", {"pool": STR, "active": BOOL}),
+        ),
+        "exhaustion_cleared": _obj("the cleared mark", {}),
+        "local_endpoint": _obj(
+            "the local model endpoint panel: its URL, model entries, and pool",
+            {"endpoint_url": NSTR, "models": {"type": "array"}, "pool": ANY_OBJ},
+            {"policy": ANY_OBJ, "routing_policy": ANY_OBJ},
+        ),
+        "bootstrap_import": bootstrap,
+        "bootstrap_import_list": _items("bootstrap imports", ANY_OBJ),
+        # this command
+        "schema": _obj(
+            "this document",
+            {"envelope": ANY_OBJ, "kinds": ANY_OBJ},
+        ),
+        "error": {"type": "null", "description": "a failure carries no data; see `error`"},
+    }
+
+
+def document() -> dict[str, Any]:
+    return {"envelope": envelope_schema(), "kinds": kind_schemas()}

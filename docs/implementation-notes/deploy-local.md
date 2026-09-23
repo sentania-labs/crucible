@@ -59,7 +59,7 @@ needs and nothing the operator's home provides:
 4. Creates `/var/lib/crucible/deploy` (750) and `/var/lib/crucible/credentials`
    (700) with one empty directory per harness plus `github`, all owned by the
    service user. The layout is created and nothing more: a credential enters
-   only through `crucible-admin credentials login` (25), which points the
+   only through `crucible admin credentials login` (25), which points the
    harness's own interactive login at its directory here. The target never reads,
    copies or references the operator's own harness credentials.
 5. Copies `compose.yaml` and the generated `squid.conf` in, rather than
@@ -99,7 +99,7 @@ needs and nothing the operator's home provides:
 `deploy-local-down` is `docker compose down` without `--volumes`:
 `crucible_crucible-pg` and `crucible_crucible-artifacts` survive, because a
 deployment's database is not a development scratch database. Workers are not
-compose services, so a running worker is left alone (13); `crucible-admin drain`
+compose services, so a running worker is left alone (13); `crucible admin drain`
 is what removes those.
 
 ## Authenticated local gateway
@@ -183,7 +183,7 @@ next `make deploy-local` because `migrate` runs before `crucible` starts.
 - `make deploy-local-down` exits non-zero when a worker is still running: the
   worker holds the `crucible-workers` network open and compose cannot remove it.
   The container is left alone, which is what 13 asks for, but the exit status
-  says something failed. `crucible-admin drain` first is the clean order.
+  says something failed. `crucible admin drain` first is the clean order.
 - `tools/deploy/deploy_local.sh` is not linted by `make lint` or by CI, which
   cover Python. It is `shellcheck`-clean as written and nothing keeps it that
   way.

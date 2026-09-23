@@ -1,15 +1,17 @@
-"""`crucible-admin` (25): every row of the operations table, through the same application
+"""`crucible admin` (25): every row of the operations table, through the same application
 services the API calls. Local mode runs them in process against the configured
-database and daemon; `--api-url` with a token runs the same operations against a
-running API. Results go to stdout as JSON; logs to stderr.
+database and daemon; `--api-url` (or `--remote`) with a token runs the same operations
+against a running API. Each prints one envelope (docs/client.md) on stdout; logs and the
+interactive parts of a login go to stderr. `crucible-admin` is the same group behind a
+deprecation line.
 
 Two gaps are deliberate and named here rather than implied. 25 lists four CLI-only
 operations; `migrate` and `token create` are below, the bootstrap import of 15 is the
 `bootstrap` group below (C6, with its API under `/v1/import/bootstrap`), and the
-portable `export` of 14 is not implemented yet. And `credentials login` runs the
-harness's own CLI, so it works only where that CLI is installed: local mode on a host
-that has it. The Crucible service image carries none of the three, so the API form of
-login refuses there with that reason rather than hanging.
+portable `export` of 14 is not implemented yet. `credentials login` runs the harness's
+own CLI: in local mode, directly on this host, and it needs that CLI installed there;
+remotely, the API runs it in the promoted worker image and refuses with a clear reason
+when none is available, rather than hanging.
 """
 
 from __future__ import annotations
@@ -18,12 +20,9 @@ import argparse
 import asyncio
 import getpass
 import json
-import os
 import sys
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from typing import Any
 
 from crucible.adapters.clock import SystemClock
@@ -53,11 +52,16 @@ from crucible.application.queries import task_view
 from crucible.application.republish import republish_task
 from crucible.application.transitions import record_event
 from crucible.cli.wiring import Wiring, wire
+from crucible.client import next as nx
+from crucible.client.config import ADMIN_TOKEN_ENV, TOKEN_ENV, require_remote, resolve
+from crucible.client.envelope import ClientError, Result, UsageError
+from crucible.client.http import Api
 from crucible.contracts.api import (
     ExternalReviewAttestation,
     PublishRetryRequest,
     RepositoryRegistration,
 )
+from crucible.contracts.problem import problem_type
 from crucible.domain.entities import Principal, Role
 from crucible.domain.events import EventKind
 from crucible.domain.ids import new_id
@@ -65,69 +69,102 @@ from crucible.logs import configure_logging
 from crucible.settings import load_settings
 
 CLI_PRINCIPAL = "crucible-admin"
-TOKEN_ENV = "CRUCIBLE_ADMIN_TOKEN"
+TOKEN_ENVS = (ADMIN_TOKEN_ENV, TOKEN_ENV)
+
+DESCRIPTION = """\
+The operator's console (25): harness gates, credentials and login, image promotion,
+tokens, repositories, routing, the bootstrap import, audit. Runs in process against the
+configured database by default; with --api-url URL (or --remote, which takes the URL
+from CRUCIBLE_URL or the client configuration file) it calls the running API with the
+token in CRUCIBLE_ADMIN_TOKEN, else CRUCIBLE_TOKEN. Every mutation takes --reason,
+placed before the verb: `crucible admin --reason TEXT harnesses disable codex`.
+Output is one JSON envelope (see `crucible --help`)."""
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="crucible-admin")
-    parser.add_argument("--config", default=None, help="TOML configuration file")
+def build_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    """The admin group's arguments, unchanged from `crucible-admin`, onto `parser`."""
+    parser.description = DESCRIPTION
+    parser.formatter_class = argparse.RawDescriptionHelpFormatter
+    parser.add_argument(
+        "--config", default=None, help="the server's TOML configuration file (local mode)"
+    )
     parser.add_argument(
         "--api-url",
         default=None,
-        help=f"remote mode: the API base (token from {TOKEN_ENV}); default runs in process",
+        help="remote mode: the API base; token from CRUCIBLE_ADMIN_TOKEN, else CRUCIBLE_TOKEN",
     )
-    parser.add_argument("--reason", default=None, help="the reason recorded on a mutation")
+    parser.add_argument(
+        "--remote",
+        action="store_true",
+        help="remote mode with the base URL from CRUCIBLE_URL or the client configuration",
+    )
+    parser.add_argument(
+        "--reason", default=None, help="the reason recorded on a mutation (required on one)"
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("migrate", help="apply migrations to head")
-    sub.add_parser("status", help="the status document (25)")
+    sub.add_parser("migrate", help="apply migrations to head (local only)")
+    sub.add_parser("status", help="the sanitized status document (25)")
 
     task = sub.add_parser("task", help="task recovery operations")
     task_sub = task.add_subparsers(dest="task_command", required=True)
     republish = task_sub.add_parser("republish", help="retry a failed publication")
-    republish.add_argument("task_id")
-    republish.add_argument("--reason", required=True)
+    republish.add_argument("task_id", help="the task in publish_failed")
+    republish.add_argument("--reason", required=True, help="why the retry is safe now")
 
     token = sub.add_parser("token", help="token management")
     token_sub = token.add_subparsers(dest="token_command", required=True)
     token_sub.add_parser("list", help="list principals without token values")
     create = token_sub.add_parser("create", help="create a principal and print its token once")
-    create.add_argument("--principal", required=True)
+    create.add_argument("--principal", required=True, help="the new principal's name")
     create.add_argument("--role", required=True, choices=[r.value for r in Role])
-    create.add_argument("--rotate", action="store_true", help="replace an existing token")
+    create.add_argument("--rotate", action="store_true", help="refused: revoke and create")
     revoke = token_sub.add_parser("revoke", help="disable a principal token")
-    revoke.add_argument("principal_id")
+    revoke.add_argument("principal_id", help="an id from `token list`")
 
     for name in ("repository", "repositories"):
         repo = sub.add_parser(name, help="repository registry")
         repo_sub = repo.add_subparsers(dest="repo_command", required=True)
-        repo_sub.add_parser("list")
-        register = repo_sub.add_parser("register")
+        repo_sub.add_parser("list", help="registered repositories")
+        register = repo_sub.add_parser("register", help="register or update a repository")
         register.add_argument("--name", required=True)
-        register.add_argument("--url", required=True)
+        register.add_argument("--url", required=True, help="https://github.com/OWNER/REPO")
         register.add_argument("--default-branch", default="main")
-        register.add_argument("--policy", default="default-software")
-        register.add_argument("--installation-id", type=int, default=None)
-        register.add_argument("--attest-external-review-all-prs", action="store_true")
-        register.add_argument("--attested-by", default=None)
-        remove = repo_sub.add_parser("remove")
+        register.add_argument("--policy", default="default-software", help="the policy name")
+        register.add_argument(
+            "--installation-id", type=int, default=None, help="the GitHub App installation"
+        )
+        register.add_argument(
+            "--attest-external-review-all-prs",
+            action="store_true",
+            help="attest the external reviewer reviews every pull request (23)",
+        )
+        register.add_argument("--attested-by", default=None, help="who attests")
+        remove = repo_sub.add_parser("remove", help="remove a registered repository")
         remove.add_argument("name")
 
     h = sub.add_parser("harnesses", help="list, enable, disable")
     h_sub = h.add_subparsers(dest="harness_command", required=True)
-    h_sub.add_parser("list")
+    h_sub.add_parser("list", help="harnesses, their enable flags, credentials and images")
     for verb in ("enable", "disable"):
-        p = h_sub.add_parser(verb)
-        p.add_argument("name")
+        p = h_sub.add_parser(verb, help=f"{verb} a harness for new launches")
+        p.add_argument("name", help="claude_code, codex, agy, hermes")
 
-    c = sub.add_parser("credentials", help="set, validate, probe, login, rotate, remove")
+    c = sub.add_parser("credentials", help="status, set, validate, probe, login, rotate, remove")
     c_sub = c.add_subparsers(dest="credential_command", required=True)
+    words = {
+        "status": "presence, permissions, expiry class; never a value",
+        "validate": "shape check of the auth files, then the bounded probe",
+        "probe": "a bounded run of the hardened image",
+        "remove": "retain and shred the credential",
+    }
     for verb in ("status", "validate", "probe", "remove"):
-        p = c_sub.add_parser(verb)
+        p = c_sub.add_parser(verb, help=words[verb])
         p.add_argument("--harness", required=True)
     login_cmd = c_sub.add_parser(
         "login",
-        help="run the harness's own login (needs that CLI on this host; see the module docstring)",
+        help="run the harness's own login (locally, or in the worker image remotely; "
+        "see the module docstring)",
     )
     login_cmd.add_argument("--harness", required=True)
     login_cmd.add_argument(
@@ -135,7 +172,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="retain and shred the existing credential first; refused without it when one is valid",
     )
-    rotate = c_sub.add_parser("rotate")
+    rotate = c_sub.add_parser("rotate", help="copy a prepared credential directory in")
     rotate.add_argument("--harness", required=True)
     rotate.add_argument(
         "--new-path",
@@ -147,29 +184,29 @@ def build_parser() -> argparse.ArgumentParser:
 
     i = sub.add_parser("images", help="list and promote")
     i_sub = i.add_subparsers(dest="image_command", required=True)
-    i_sub.add_parser("list")
-    promote = i_sub.add_parser("promote")
-    promote.add_argument("digest")
+    i_sub.add_parser("list", help="worker images and their promotion state")
+    promote = i_sub.add_parser("promote", help="promote a candidate image")
+    promote.add_argument("digest", help="the image's digest or reference")
 
-    pr = sub.add_parser("providers")
+    pr = sub.add_parser("providers", help="execution providers")
     pr_sub = pr.add_subparsers(dest="provider_command", required=True)
-    pr_sub.add_parser("status")
+    pr_sub.add_parser("status", help="each provider's health")
 
-    g = sub.add_parser("github")
+    g = sub.add_parser("github", help="the GitHub App")
     g_sub = g.add_subparsers(dest="github_command", required=True)
-    g_sub.add_parser("status")
-    g_sub.add_parser("check")
+    g_sub.add_parser("status", help="the App's configuration and key")
+    g_sub.add_parser("check", help="mint and discard a token per registered repository")
 
-    a = sub.add_parser("audit")
+    a = sub.add_parser("audit", help="the audit log")
     a_sub = a.add_subparsers(dest="audit_command", required=True)
-    tail = a_sub.add_parser("tail")
-    tail.add_argument("--cursor", type=int, default=None)
+    tail = a_sub.add_parser("tail", help="administrative events, oldest first")
+    tail.add_argument("--cursor", type=int, default=None, help="a next_cursor from a page")
     tail.add_argument("--limit", type=int, default=50)
 
     route = sub.add_parser("routing", help="local endpoint and reactive quota exhaustion")
     route_sub = route.add_subparsers(dest="routing_command", required=True)
-    route_sub.add_parser("exhaustion")
-    clear = route_sub.add_parser("clear-exhaustion")
+    route_sub.add_parser("exhaustion", help="the exhaustion marks")
+    clear = route_sub.add_parser("clear-exhaustion", help="clear a pool's exhaustion mark")
     clear.add_argument("pool")
     route_sub.add_parser("local-endpoint")
     local_set = route_sub.add_parser("set-local-endpoint")
@@ -197,10 +234,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     show = b_sub.add_parser("show", help="the verification report of one import")
     show.add_argument("import_id")
-    b_sub.add_parser("list")
+    b_sub.add_parser("list", help="every import")
     commit = b_sub.add_parser("commit", help="make a verified import authoritative")
     commit.add_argument("import_id")
     return parser
+
+
+def _read_code() -> str:
+    """The login code a person pastes. The prompt goes to stderr and the code is read
+    from stdin, so stdout carries the envelope alone even when stdin is not a terminal."""
+    print("paste the code: ", end="", file=sys.stderr, flush=True)
+    return sys.stdin.readline().rstrip("\r\n")
 
 
 def _read_bundle(path: str) -> Any:
@@ -209,12 +253,27 @@ def _read_bundle(path: str) -> Any:
         with open(path, encoding="utf-8") as handle:
             return json.load(handle)
     except (OSError, ValueError) as exc:
-        print(f"cannot read a bundle from {path}: {exc}", file=sys.stderr)
-        sys.exit(2)
+        raise UsageError(f"cannot read a bundle from {path}: {exc}") from None
 
 
-def _emit(document: Any) -> None:
-    print(json.dumps(document, sort_keys=True, default=str))
+def _not_configured() -> ClientError:
+    return ClientError(
+        "admin-not-configured",
+        "the administrative surface is not configured",
+        hint="set the [admin] section of the server configuration (25)",
+    )
+
+
+def application_error(exc: ApplicationError) -> ClientError:
+    """A local refusal in the shape the API would have sent it (RFC 9457)."""
+    problem = {
+        "type": problem_type(exc.slug),
+        "title": exc.title,
+        "status": exc.status,
+        "detail": exc.detail,
+        "errors": exc.errors or [],
+    }
+    return ClientError(exc.slug, exc.detail or exc.title, problem=problem, status=exc.status)
 
 
 def _read_api_key() -> str:
@@ -229,178 +288,118 @@ def _read_api_key() -> str:
 # ----- remote mode -------------------------------------------------------------
 
 
-class Remote:
-    """The same operations against a running API, so a machine without the database
-    or the daemon administers through the one surface (25)."""
-
-    def __init__(self, base: str, token: str) -> None:
-        self.base = base.rstrip("/")
-        self.token = token
-
-    def call(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
-        data = json.dumps(body).encode("utf-8") if body is not None else None
-        request = urllib.request.Request(
-            self.base + path,
-            data=data,
-            method=method,
-            headers={
-                "Authorization": f"Bearer {self.token}",
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-            },
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=300) as response:
-                return json.loads(response.read().decode("utf-8") or "null")
-        except urllib.error.HTTPError as exc:
-            raw = exc.read().decode("utf-8", "replace")
-            print(raw, file=sys.stderr)
-            sys.exit(2)
-
-
-def _remote(args: argparse.Namespace, remote: Remote) -> None:
+def _remote(args: argparse.Namespace, remote: Api) -> Any:
     reason = {"reason": args.reason or ""}
     command = args.command
     if command == "status":
-        _emit(remote.call("GET", "/v1/admin/status"))
-    elif command == "task":
-        _emit(
-            remote.call(
-                "POST",
-                f"/v1/tasks/{args.task_id}/republish",
-                {"reason": args.reason},
-            )
-        )
-    elif command == "token":
+        return remote.call("GET", "/v1/admin/status")
+    if command == "task":
+        return remote.call("POST", f"/v1/tasks/{args.task_id}/republish", {"reason": args.reason})
+    if command == "token":
         if args.token_command == "list":
-            _emit(remote.call("GET", "/v1/admin/tokens"))
-        elif args.token_command == "revoke":
-            _emit(remote.call("POST", f"/v1/admin/tokens/{args.principal_id}/revoke", reason))
-        else:
-            if args.rotate:
-                print("remote token rotation is not supported; revoke and create", file=sys.stderr)
-                sys.exit(2)
-            _emit(
-                remote.call(
-                    "POST",
-                    "/v1/admin/tokens",
-                    {**reason, "name": args.principal, "role": args.role},
-                )
-            )
-    elif command == "harnesses":
+            return remote.call("GET", "/v1/admin/tokens")
+        if args.token_command == "revoke":
+            return remote.call("POST", f"/v1/admin/tokens/{args.principal_id}/revoke", reason)
+        if args.rotate:
+            raise UsageError("remote token rotation is not supported; revoke and create")
+        return remote.call(
+            "POST", "/v1/admin/tokens", {**reason, "name": args.principal, "role": args.role}
+        )
+    if command == "harnesses":
         if args.harness_command == "list":
-            _emit(remote.call("GET", "/v1/admin/harnesses"))
-        else:
-            _emit(
-                remote.call(
-                    "POST", f"/v1/admin/harnesses/{args.name}/{args.harness_command}", reason
-                )
-            )
-    elif command == "credentials":
+            return remote.call("GET", "/v1/admin/harnesses")
+        return remote.call(
+            "POST", f"/v1/admin/harnesses/{args.name}/{args.harness_command}", reason
+        )
+    if command == "credentials":
         verb = args.credential_command
         if verb == "status":
-            _emit(remote.call("GET", f"/v1/admin/credentials/{args.harness}"))
-        elif verb == "set":
-            _emit(
-                remote.call(
-                    "POST",
-                    f"/v1/admin/credentials/{args.harness}/set",
-                    {**reason, "api_key": _read_api_key()},
-                )
+            return remote.call("GET", f"/v1/admin/credentials/{args.harness}")
+        if verb == "set":
+            return remote.call(
+                "POST",
+                f"/v1/admin/credentials/{args.harness}/set",
+                {**reason, "api_key": _read_api_key()},
             )
-        elif verb == "rotate":
-            _emit(
-                remote.call(
-                    "POST",
-                    f"/v1/admin/credentials/{args.harness}/rotate",
-                    {**reason, "new_path": args.new_path},
-                )
+        if verb == "rotate":
+            return remote.call(
+                "POST",
+                f"/v1/admin/credentials/{args.harness}/rotate",
+                {**reason, "new_path": args.new_path},
             )
-        elif verb == "login":
-            _remote_login(args, remote, reason)
-        else:
-            _emit(remote.call("POST", f"/v1/admin/credentials/{args.harness}/{verb}", reason))
-    elif command == "images":
+        if verb == "login":
+            return _remote_login(args, remote, reason)
+        return remote.call("POST", f"/v1/admin/credentials/{args.harness}/{verb}", reason)
+    if command == "images":
         if args.image_command == "list":
-            _emit(remote.call("GET", "/v1/admin/images"))
-        else:
-            _emit(remote.call("POST", f"/v1/admin/images/{args.digest}/promote", reason))
-    elif command == "providers":
-        _emit(remote.call("GET", "/v1/admin/providers"))
-    elif command == "github":
+            return remote.call("GET", "/v1/admin/images")
+        return remote.call("POST", f"/v1/admin/images/{args.digest}/promote", reason)
+    if command == "providers":
+        return remote.call("GET", "/v1/admin/providers")
+    if command == "github":
         if args.github_command == "status":
-            _emit(remote.call("GET", "/v1/admin/github"))
-        else:
-            _emit(remote.call("POST", "/v1/admin/github/check", reason))
-    elif command == "audit":
+            return remote.call("GET", "/v1/admin/github")
+        return remote.call("POST", "/v1/admin/github/check", reason)
+    if command == "audit":
         query = f"?limit={args.limit}" + (f"&cursor={args.cursor}" if args.cursor else "")
-        _emit(remote.call("GET", "/v1/admin/audit" + query))
-    elif command == "routing":
+        return remote.call("GET", "/v1/admin/audit" + query)
+    if command == "routing":
         if args.routing_command == "exhaustion":
-            _emit(remote.call("GET", "/v1/admin/routing/exhaustion"))
-        elif args.routing_command == "clear-exhaustion":
-            _emit(remote.call("POST", f"/v1/admin/routing/exhaustion/{args.pool}/clear", reason))
-        elif args.routing_command == "local-endpoint":
-            _emit(remote.call("GET", "/v1/admin/routing/local-endpoint"))
-        else:
-            _emit(
-                remote.call(
-                    "POST",
-                    "/v1/admin/routing/local-endpoint",
+            return remote.call("GET", "/v1/admin/routing/exhaustion")
+        if args.routing_command == "clear-exhaustion":
+            return remote.call("POST", f"/v1/admin/routing/exhaustion/{args.pool}/clear", reason)
+        if args.routing_command == "local-endpoint":
+            return remote.call("GET", "/v1/admin/routing/local-endpoint")
+        return remote.call(
+            "POST",
+            "/v1/admin/routing/local-endpoint",
+            {
+                **reason,
+                "endpoint_url": args.endpoint_url,
+                "models": [
                     {
-                        **reason,
-                        "endpoint_url": args.endpoint_url,
-                        "models": [
-                            {
-                                "id": args.model,
-                                "enabled": args.enable,
-                                "enable_thinking": args.enable_thinking,
-                            }
-                        ],
-                        "max_concurrency": args.max_concurrency,
-                    },
-                )
-            )
-    elif command == "bootstrap":
+                        "id": args.model,
+                        "enabled": args.enable,
+                        "enable_thinking": args.enable_thinking,
+                    }
+                ],
+                "max_concurrency": args.max_concurrency,
+            },
+        )
+    if command == "bootstrap":
         verb = args.bootstrap_command
         if verb == "submit":
             query = "?" + urllib.parse.urlencode(
                 {k: v for k, v in (("reason", args.reason), ("owner", args.owner)) if v}
             )
-            _emit(remote.call("POST", "/v1/import/bootstrap" + query, _read_bundle(args.file)))
-        elif verb == "show":
-            _emit(remote.call("GET", f"/v1/import/bootstrap/{args.import_id}"))
-        elif verb == "list":
-            _emit(remote.call("GET", "/v1/import/bootstrap"))
-        else:
-            _emit(remote.call("POST", f"/v1/import/bootstrap/{args.import_id}/commit", reason))
-    elif command in ("repository", "repositories"):
+            return remote.call("POST", "/v1/import/bootstrap" + query, _read_bundle(args.file))
+        if verb == "show":
+            return remote.call("GET", f"/v1/import/bootstrap/{args.import_id}")
+        if verb == "list":
+            return remote.call("GET", "/v1/import/bootstrap")
+        return remote.call("POST", f"/v1/import/bootstrap/{args.import_id}/commit", reason)
+    if command in ("repository", "repositories"):
         if args.repo_command == "list":
-            _emit(remote.call("GET", "/v1/admin/repositories"))
-        elif args.repo_command == "remove":
-            _emit(remote.call("DELETE", f"/v1/admin/repositories/{args.name}", reason))
-        else:
-            _emit(
-                remote.call(
-                    "PUT",
-                    f"/v1/admin/repositories/{args.name}",
-                    {
-                        **reason,
-                        "url": args.url,
-                        "default_branch": args.default_branch,
-                        "policy_name": args.policy,
-                        "installation_id": args.installation_id,
-                        "attested_all_prs": args.attest_external_review_all_prs,
-                        "attested_by": args.attested_by,
-                    },
-                )
-            )
-    else:
-        print(f"{command} is CLI-only and runs in local mode", file=sys.stderr)
-        sys.exit(2)
+            return remote.call("GET", "/v1/admin/repositories")
+        if args.repo_command == "remove":
+            return remote.call("DELETE", f"/v1/admin/repositories/{args.name}", reason)
+        return remote.call(
+            "PUT",
+            f"/v1/admin/repositories/{args.name}",
+            {
+                **reason,
+                "url": args.url,
+                "default_branch": args.default_branch,
+                "policy_name": args.policy,
+                "installation_id": args.installation_id,
+                "attested_all_prs": args.attest_external_review_all_prs,
+                "attested_by": args.attested_by,
+            },
+        )
+    raise UsageError(f"{command} is CLI-only and runs in local mode; drop --api-url")
 
 
-def _remote_login(args: argparse.Namespace, remote: Remote, reason: dict[str, str]) -> None:
+def _remote_login(args: argparse.Namespace, remote: Api, reason: dict[str, str]) -> Any:
     started = remote.call(
         "POST",
         f"/v1/admin/credentials/{args.harness}/login",
@@ -415,7 +414,7 @@ def _remote_login(args: argparse.Namespace, remote: Remote, reason: dict[str, st
                 shown.add(line)
                 print(line, file=sys.stderr)
         if state["state"] == "waiting_for_code":
-            code = input("paste the code: ")
+            code = _read_code()
             remote.call(
                 "POST",
                 f"/v1/admin/credentials/{args.harness}/login/code",
@@ -424,13 +423,13 @@ def _remote_login(args: argparse.Namespace, remote: Remote, reason: dict[str, st
         elif state["state"] in ("finished", "failed"):
             break
         time.sleep(1)
-    _emit(remote.call("POST", f"/v1/admin/credentials/{args.harness}/login/finish", reason))
+    return remote.call("POST", f"/v1/admin/credentials/{args.harness}/login/finish", reason)
 
 
 # ----- local mode --------------------------------------------------------------
 
 
-def _local_login(args: argparse.Namespace, wiring: Wiring, admin: AdminContext) -> None:
+def _local_login(args: argparse.Namespace, wiring: Wiring, admin: AdminContext) -> Any:
     registry = LoginRegistry()
     with wiring.ctx.uow_factory() as uow:
         started = login.start_login(
@@ -452,7 +451,7 @@ def _local_login(args: argparse.Namespace, wiring: Wiring, admin: AdminContext) 
             print(line, file=sys.stderr)
         shown = len(session.lines)
         if session.state == "waiting_for_code":
-            session.submit_code(input("paste the code: "))
+            session.submit_code(_read_code())
         time.sleep(0.5)
     for line in session.lines[shown:]:
         print(line, file=sys.stderr)
@@ -461,20 +460,19 @@ def _local_login(args: argparse.Namespace, wiring: Wiring, admin: AdminContext) 
             admin, uow, registry, principal=CLI_PRINCIPAL, harness=args.harness, reason=args.reason
         )
         uow.commit()
-    _emit(result)
+    return result
 
 
-def _local(args: argparse.Namespace, wiring: Wiring) -> None:
+def _local(args: argparse.Namespace, wiring: Wiring) -> Any:
     admin = wiring.admin
     if admin is None:
-        print("the administrative surface is not configured", file=sys.stderr)
-        sys.exit(2)
+        raise _not_configured()
     principal = CLI_PRINCIPAL
     command = args.command
     if command == "status":
         with wiring.ctx.uow_factory() as uow:
-            _emit(asyncio.run(status_admin.status(admin, uow)))
-    elif command == "task":
+            return asyncio.run(status_admin.status(admin, uow))
+    if command == "task":
         with wiring.ctx.uow_factory() as uow:
             task = republish_task(
                 uow,
@@ -489,160 +487,138 @@ def _local(args: argparse.Namespace, wiring: Wiring) -> None:
                 request=PublishRetryRequest(reason=args.reason),
             )
             uow.commit()
-            _emit(task_view(uow, task.id).model_dump(mode="json"))
-    elif command == "harnesses":
+            return task_view(uow, task.id).model_dump(mode="json")
+    if command == "harnesses":
         with wiring.ctx.uow_factory() as uow:
             if args.harness_command == "list":
                 found = asyncio.run(harnesses.list_images(admin))
-                _emit({"items": harnesses.list_harnesses(admin, uow, [i for _, i in found])})
-            else:
-                _emit(
-                    harnesses.set_enabled(
-                        admin,
-                        uow,
-                        principal=principal,
-                        harness=args.name,
-                        enabled=args.harness_command == "enable",
-                        reason=args.reason,
-                    )
-                )
-                uow.commit()
-    elif command == "credentials":
-        verb = args.credential_command
-        if verb == "login":
-            _local_login(args, wiring, admin)
-            return
-        with wiring.ctx.uow_factory() as uow:
-            if verb == "status":
-                _emit(credentials.state_view(admin, uow, args.harness))
-            elif verb == "set":
-                _emit(
-                    asyncio.run(
-                        credentials.set_api_key(
-                            admin,
-                            uow,
-                            principal=principal,
-                            harness=args.harness,
-                            api_key=_read_api_key(),
-                            reason=args.reason,
-                        )
-                    ).as_dict()
-                )
-            elif verb == "validate":
-                _emit(
-                    asyncio.run(
-                        credentials.validate(
-                            admin,
-                            uow,
-                            principal=principal,
-                            harness=args.harness,
-                            reason=args.reason,
-                        )
-                    ).as_dict()
-                )
-            elif verb == "probe":
-                _emit(
-                    asyncio.run(
-                        credentials.probe(
-                            admin,
-                            uow,
-                            principal=principal,
-                            harness=args.harness,
-                            reason=args.reason,
-                        )
-                    ).as_dict()
-                )
-            elif verb == "rotate":
-                _emit(
-                    credentials.rotate(
-                        admin,
-                        uow,
-                        principal=principal,
-                        harness=args.harness,
-                        new_path=args.new_path,
-                        reason=args.reason,
-                    ).as_dict()
-                )
-            elif verb == "remove":
-                _emit(
-                    credentials.remove(
-                        admin, uow, principal=principal, harness=args.harness, reason=args.reason
-                    ).as_dict()
-                )
+                return {"items": harnesses.list_harnesses(admin, uow, [i for _, i in found])}
+            result = harnesses.set_enabled(
+                admin,
+                uow,
+                principal=principal,
+                harness=args.name,
+                enabled=args.harness_command == "enable",
+                reason=args.reason,
+            )
             uow.commit()
-    elif command == "images":
+            return result
+    if command == "credentials":
+        return _local_credentials(args, wiring, admin, principal)
+    if command == "images":
         with wiring.ctx.uow_factory() as uow:
             if args.image_command == "list":
-                _emit({"items": asyncio.run(images.list_all(admin, uow))})
-            else:
-                _emit(
-                    asyncio.run(
-                        images.promote(
-                            admin, uow, principal=principal, digest=args.digest, reason=args.reason
-                        )
-                    )
+                return {"items": asyncio.run(images.list_all(admin, uow))}
+            result = asyncio.run(
+                images.promote(
+                    admin, uow, principal=principal, digest=args.digest, reason=args.reason
                 )
-                uow.commit()
-    elif command == "providers":
-        _emit({"items": asyncio.run(providers_admin.providers_status(admin))})
-    elif command == "github":
+            )
+            uow.commit()
+            return result
+    if command == "providers":
+        return {"items": asyncio.run(providers_admin.providers_status(admin))}
+    if command == "github":
         with wiring.ctx.uow_factory() as uow:
             if args.github_command == "status":
-                _emit(github.status(admin, uow))
-            else:
-                _emit(github.check(admin, uow, principal=principal, reason=args.reason))
-                uow.commit()
-    elif command == "audit":
+                return github.status(admin, uow)
+            result = github.check(admin, uow, principal=principal, reason=args.reason)
+            uow.commit()
+            return result
+    if command == "audit":
         with wiring.ctx.uow_factory() as uow:
-            _emit(audit.tail(uow, cursor=args.cursor, limit=args.limit))
-    elif command == "routing":
+            return audit.tail(uow, cursor=args.cursor, limit=args.limit)
+    if command == "routing":
         with wiring.ctx.uow_factory() as uow:
             if args.routing_command == "exhaustion":
-                _emit(routing.list_exhaustions(admin, uow))
-            elif args.routing_command == "clear-exhaustion":
-                _emit(
-                    routing.clear_exhaustion(
-                        admin,
-                        uow,
-                        principal=principal,
-                        pool=args.pool,
-                        reason=args.reason,
-                    )
+                return routing.list_exhaustions(admin, uow)
+            if args.routing_command == "clear-exhaustion":
+                result = routing.clear_exhaustion(
+                    admin, uow, principal=principal, pool=args.pool, reason=args.reason
                 )
                 uow.commit()
-            elif args.routing_command == "local-endpoint":
-                _emit(routing.local_endpoint_view(uow))
-            else:
-                _emit(
-                    routing.save_local_endpoint(
-                        admin,
-                        uow,
-                        principal=Principal(
-                            id=CLI_PRINCIPAL,
-                            name=CLI_PRINCIPAL,
-                            role=Role.ADMIN,
-                            created_at=wiring.ctx.clock.now(),
-                        ),
-                        endpoint_url=args.endpoint_url,
-                        models=[
-                            {
-                                "id": args.model,
-                                "enabled": args.enable,
-                                "enable_thinking": args.enable_thinking,
-                            }
-                        ],
-                        max_concurrency=args.max_concurrency,
-                        reason=args.reason,
-                    )
+                return result
+            if args.routing_command == "local-endpoint":
+                return routing.local_endpoint_view(uow)
+            result = routing.save_local_endpoint(
+                admin,
+                uow,
+                principal=Principal(
+                    id=CLI_PRINCIPAL,
+                    name=CLI_PRINCIPAL,
+                    role=Role.ADMIN,
+                    created_at=wiring.ctx.clock.now(),
+                ),
+                endpoint_url=args.endpoint_url,
+                models=[
+                    {
+                        "id": args.model,
+                        "enabled": args.enable,
+                        "enable_thinking": args.enable_thinking,
+                    }
+                ],
+                max_concurrency=args.max_concurrency,
+                reason=args.reason,
+            )
+            uow.commit()
+            return result
+    if command == "bootstrap":
+        return _local_bootstrap(args, wiring, admin, principal)
+    raise UsageError(f"unknown command: {command}")
+
+
+def _local_credentials(
+    args: argparse.Namespace, wiring: Wiring, admin: AdminContext, principal: str
+) -> Any:
+    verb = args.credential_command
+    if verb == "login":
+        return _local_login(args, wiring, admin)
+    with wiring.ctx.uow_factory() as uow:
+        if verb == "status":
+            return credentials.state_view(admin, uow, args.harness)
+        if verb == "set":
+            result = asyncio.run(
+                credentials.set_api_key(
+                    admin,
+                    uow,
+                    principal=principal,
+                    harness=args.harness,
+                    api_key=_read_api_key(),
+                    reason=args.reason,
                 )
-                uow.commit()
-    elif command == "bootstrap":
-        _local_bootstrap(args, wiring, admin, principal)
+            ).as_dict()
+        elif verb == "validate":
+            result = asyncio.run(
+                credentials.validate(
+                    admin, uow, principal=principal, harness=args.harness, reason=args.reason
+                )
+            ).as_dict()
+        elif verb == "probe":
+            result = asyncio.run(
+                credentials.probe(
+                    admin, uow, principal=principal, harness=args.harness, reason=args.reason
+                )
+            ).as_dict()
+        elif verb == "rotate":
+            result = credentials.rotate(
+                admin,
+                uow,
+                principal=principal,
+                harness=args.harness,
+                new_path=args.new_path,
+                reason=args.reason,
+            ).as_dict()
+        else:
+            result = credentials.remove(
+                admin, uow, principal=principal, harness=args.harness, reason=args.reason
+            ).as_dict()
+        uow.commit()
+        return result
 
 
 def _local_bootstrap(
     args: argparse.Namespace, wiring: Wiring, admin: AdminContext, principal: str
-) -> None:
+) -> Any:
     """15 through the same services the API calls. The bundle file is read here and
     handed over parsed; every rule of step 2 is the service's, on both entry points."""
     verb = args.bootstrap_command
@@ -658,80 +634,37 @@ def _local_bootstrap(
                 owner=args.owner,
             )
             uow.commit()
-        _emit(report)
-        return
+        return report
     with wiring.ctx.uow_factory() as uow:
         if verb == "show":
-            _emit(bootstrap.show(uow, args.import_id))
-        elif verb == "list":
-            _emit({"items": bootstrap.list_imports(uow)})
-        else:
-            _emit(
-                bootstrap.commit(
-                    admin, uow, principal=principal, import_id=args.import_id, reason=args.reason
-                )
-            )
-            uow.commit()
-
-
-def main(argv: list[str] | None = None) -> None:
-    args = build_parser().parse_args(argv)
-    if args.api_url:
-        token = os.environ.get(TOKEN_ENV, "")
-        if not token:
-            print(f"set {TOKEN_ENV} for remote mode", file=sys.stderr)
-            sys.exit(2)
-        _remote(args, Remote(args.api_url, token))
-        return
-    settings = load_settings(args.config)
-    # Results go to stdout as JSON; logs go to stderr so callers can parse stdout.
-    configure_logging(settings.service.log_level, stream=sys.stderr)
-    if args.command == "migrate":
-        upgrade(settings.database.url)
-        _ensure_first_admin(settings.database.url)
-        _emit({"migrated_to": head_revision(settings.database.url)})
-        return
-    wiring = wire(settings)
-    try:
-        if args.command == "token":
-            _token(args, wiring)
-        elif args.command in ("repository", "repositories"):
-            if wiring.admin is None:
-                print("the administrative surface is not configured", file=sys.stderr)
-                sys.exit(2)
-            _register(args, wiring, wiring.admin)
-        else:
-            _local(args, wiring)
-    except ApplicationError as exc:
-        print(
-            json.dumps({"error": exc.slug, "detail": exc.detail, "errors": exc.errors}),
-            file=sys.stderr,
+            return bootstrap.show(uow, args.import_id)
+        if verb == "list":
+            return {"items": bootstrap.list_imports(uow)}
+        result = bootstrap.commit(
+            admin, uow, principal=principal, import_id=args.import_id, reason=args.reason
         )
-        sys.exit(1)
+        uow.commit()
+        return result
 
 
-def _token(args: argparse.Namespace, wiring: Wiring) -> None:
+def _token(args: argparse.Namespace, wiring: Wiring) -> Any:
     if wiring.admin is None:
-        raise ApplicationError("the administrative surface is not configured")
+        raise _not_configured()
     with wiring.ctx.uow_factory() as uow:
         if args.token_command == "list":
-            _emit({"items": tokens_admin.list_principals(uow)})
-            return
+            return {"items": tokens_admin.list_principals(uow)}
         if args.token_command == "revoke":
-            _emit(
-                tokens_admin.revoke(
-                    wiring.admin,
-                    uow,
-                    principal=CLI_PRINCIPAL,
-                    principal_id=args.principal_id,
-                    reason=args.reason,
-                )
+            result = tokens_admin.revoke(
+                wiring.admin,
+                uow,
+                principal=CLI_PRINCIPAL,
+                principal_id=args.principal_id,
+                reason=args.reason,
             )
             uow.commit()
-            return
+            return result
         if args.rotate:
-            print("token rotation is replaced by revoke and create", file=sys.stderr)
-            sys.exit(2)
+            raise UsageError("token rotation is replaced by revoke and create")
         minted = tokens_admin.create(
             wiring.admin,
             uow,
@@ -742,20 +675,19 @@ def _token(args: argparse.Namespace, wiring: Wiring) -> None:
         )
         uow.commit()
     # The token is printed exactly once and never stored in clear.
-    _emit(
-        {
-            "principal": minted.principal.name,
-            "role": minted.principal.role.value,
-            "token": minted.token,
-        }
-    )
+    return {
+        "principal": minted.principal.name,
+        "role": minted.principal.role.value,
+        "token": minted.token,
+    }
 
 
-def _ensure_first_admin(database_url: str) -> None:
+def ensure_first_admin(database_url: str) -> None:
     """Create the first browser principal only when no administrator exists.
 
-    The value is printed by the migration process once and only its salted hash is
-    committed. A rerun sees the principal and emits nothing.
+    The value is printed by the migration process once, on stderr, and only its salted
+    hash is committed; stdout carries the envelope alone. A rerun sees the principal and
+    emits nothing.
     """
     engine = make_engine(database_url)
     try:
@@ -788,33 +720,29 @@ def _ensure_first_admin(database_url: str) -> None:
             )
             uow.commit()
         border = "=" * 72
-        print(border)
-        print("CRUCIBLE FIRST-RUN ADMIN TOKEN, SHOWN ONCE")
-        print(minted.token)
-        print("Open /ui and sign in. Store this token before logs are rotated.")
-        print(border)
+        for line in (
+            border,
+            "CRUCIBLE FIRST-RUN ADMIN TOKEN, SHOWN ONCE",
+            minted.token,
+            "Open /ui and sign in. Store this token before logs are rotated.",
+            border,
+        ):
+            print(line, file=sys.stderr)
     finally:
         engine.dispose()
 
 
-def _register(args: argparse.Namespace, wiring: Wiring, admin: AdminContext) -> None:
+def _register(args: argparse.Namespace, wiring: Wiring, admin: AdminContext) -> Any:
     """The same guarded service the API route calls, returning the same document."""
     with wiring.ctx.uow_factory() as uow:
         if args.repo_command == "list":
-            _emit({"items": repositories_admin.list_all(uow)})
-            return
+            return {"items": repositories_admin.list_all(uow)}
         if args.repo_command == "remove":
-            _emit(
-                repositories_admin.remove(
-                    admin,
-                    uow,
-                    principal=CLI_PRINCIPAL,
-                    name=args.name,
-                    reason=args.reason,
-                )
+            result = repositories_admin.remove(
+                admin, uow, principal=CLI_PRINCIPAL, name=args.name, reason=args.reason
             )
             uow.commit()
-            return
+            return result
         result = repositories_admin.register(
             admin,
             uow,
@@ -833,8 +761,170 @@ def _register(args: argparse.Namespace, wiring: Wiring, admin: AdminContext) -> 
             reason=args.reason,
         )
         uow.commit()
-    _emit(result)
+    return result
 
 
-if __name__ == "__main__":
-    main()
+# ----- the envelope ------------------------------------------------------------
+
+
+def kind_of(args: argparse.Namespace) -> str:
+    """The `kind` each verb's document is (crucible/client/schema.py)."""
+    command = str(args.command)
+    verb = {
+        "task": "task_command",
+        "token": "token_command",
+        "repository": "repo_command",
+        "repositories": "repo_command",
+        "harnesses": "harness_command",
+        "credentials": "credential_command",
+        "images": "image_command",
+        "providers": "provider_command",
+        "github": "github_command",
+        "audit": "audit_command",
+        "routing": "routing_command",
+        "bootstrap": "bootstrap_command",
+    }.get(command)
+    sub = getattr(args, verb) if verb else None
+    table: dict[tuple[str, str | None], str] = {
+        ("migrate", None): "migration",
+        ("status", None): "admin_status",
+        ("task", "republish"): "task",
+        ("token", "list"): "token_list",
+        ("token", "create"): "token_created",
+        ("token", "revoke"): "token_revoked",
+        ("repository", "list"): "repository_list",
+        ("repository", "register"): "repository",
+        ("repository", "remove"): "repository_removed",
+        ("harnesses", "list"): "harness_list",
+        ("harnesses", "enable"): "harness",
+        ("harnesses", "disable"): "harness",
+        ("credentials", "status"): "credential_state",
+        ("credentials", "login"): "credential_login",
+        ("images", "list"): "image_list",
+        ("images", "promote"): "image_promotion",
+        ("providers", "status"): "provider_list",
+        ("github", "status"): "github_status",
+        ("github", "check"): "github_check",
+        ("audit", "tail"): "audit_page",
+        ("routing", "exhaustion"): "exhaustion_list",
+        ("routing", "clear-exhaustion"): "exhaustion_cleared",
+        ("routing", "local-endpoint"): "local_endpoint",
+        ("routing", "set-local-endpoint"): "local_endpoint",
+        ("bootstrap", "list"): "bootstrap_import_list",
+    }
+    key = ("repository" if command == "repositories" else command, sub)
+    if key in table:
+        return table[key]
+    if command == "credentials":
+        return "credential_report"
+    if command == "bootstrap":
+        return "bootstrap_import"
+    return command
+
+
+def _items(document: Any) -> list[Any]:
+    items = document.get("items") if isinstance(document, dict) else None
+    return items if isinstance(items, list) else []
+
+
+def result_for(
+    args: argparse.Namespace,
+    document: Any,
+    *,
+    prefix: list[str],
+    top_prefix: list[str],
+    local: bool,
+    role: str,
+) -> Result:
+    kind = kind_of(args)
+    state: str | None = None
+    actions: list[dict[str, Any]] = []
+    if kind == "task":
+        state = document.get("state") if isinstance(document, dict) else None
+        if local:
+            # In process the principal is this CLI's admin; its one task verb is republish.
+            if state == "publish_failed":
+                actions = [
+                    nx.action(
+                        "republish",
+                        "retry the failed publication once",
+                        [*prefix, "task", "republish", str(document["id"]), "--reason", "{reason}"],
+                        needs=nx.REASON,
+                        roles=(nx.ADMIN,),
+                    )
+                ]
+        else:
+            actions = nx.task_actions(document, role, top_prefix)
+    elif kind in ("credential_state", "credential_report"):
+        credential = document.get("credential", document) if isinstance(document, dict) else {}
+        state = credential.get("state") if isinstance(credential, dict) else None
+        actions = nx.credential_actions(args.harness, state, prefix)
+    elif kind == "harness_list":
+        actions = nx.harness_actions(_items(document), prefix)
+    elif kind == "harness" and isinstance(document, dict):
+        state = "enabled" if document.get("enabled") else "disabled"
+        actions = nx.harness_actions(
+            [{"name": args.name, "enabled_by_administrator": args.harness_command == "enable"}],
+            prefix,
+        )
+    elif kind == "image_list":
+        actions = nx.image_actions(_items(document), prefix)
+    elif kind == "exhaustion_list":
+        actions = nx.exhaustion_actions(_items(document), prefix)
+    elif kind == "token_list":
+        actions = nx.token_actions(_items(document), prefix)
+    elif kind == "bootstrap_import" and isinstance(document, dict):
+        state = document.get("state")
+        actions = nx.bootstrap_actions(document, prefix)
+    elif kind == "local_endpoint":
+        actions = nx.local_endpoint_actions(document, prefix)
+    elif kind == "audit_page":
+        actions = nx.audit_actions(document, prefix, args.limit, args.cursor)
+    return Result(kind=kind, data=document, state=state, next=actions, role=role)
+
+
+def run(args: argparse.Namespace, *, root_api_url: str | None, timezone: str | None) -> Result:
+    """One admin verb, local or remote, as a Result for the envelope."""
+    api_url = args.api_url or root_api_url
+    if api_url or args.remote:
+        if args.command == "migrate":
+            raise UsageError("migrate is CLI-only and runs in local mode; drop --api-url")
+        config = resolve(api_url=api_url, timezone=timezone, token_envs=TOKEN_ENVS)
+        base_url, token = require_remote(config, TOKEN_ENVS)
+        remote_document = _remote(args, Api(base_url, token))
+        flag = ["--api-url", base_url] if api_url else ["--remote"]
+        top = ["crucible", *(["--api-url", base_url] if api_url else [])]
+        # Every admin route admits only an admin; `task republish` is the orchestrator's.
+        role = nx.PROBED_ORCHESTRATOR if args.command == "task" else nx.ADMIN
+        return result_for(
+            args,
+            remote_document,
+            prefix=["crucible", "admin", *flag],
+            top_prefix=top,
+            local=False,
+            role=role,
+        )
+    settings = load_settings(args.config)
+    # Results go to stdout as JSON; logs go to stderr so callers can parse stdout.
+    configure_logging(settings.service.log_level, stream=sys.stderr)
+    prefix = ["crucible", "admin", *(["--config", args.config] if args.config else [])]
+    try:
+        if args.command == "migrate":
+            upgrade(settings.database.url)
+            ensure_first_admin(settings.database.url)
+            document: Any = {"migrated_to": head_revision(settings.database.url)}
+        else:
+            wiring = wire(settings)
+            if args.command == "token":
+                document = _token(args, wiring)
+            elif args.command in ("repository", "repositories"):
+                if wiring.admin is None:
+                    raise _not_configured()
+                document = _register(args, wiring, wiring.admin)
+            else:
+                document = _local(args, wiring)
+    except ApplicationError as exc:
+        raise application_error(exc) from None
+    return result_for(
+        args, document, prefix=prefix, top_prefix=["crucible"], local=True, role=nx.ADMIN
+    )
