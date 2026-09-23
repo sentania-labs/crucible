@@ -29,11 +29,12 @@ deploy/kubernetes/
   argocd/application.yaml  the Application template, automated sync off
 ```
 
-The Crucible image tag is pinned in exactly one place, `base/kustomization.yaml`, and is
-never `latest`. Changing the deployed version is that one line and a sync.
-
-> `0.4.0` is the first release carrying the Kubernetes provider, and its tag is cut after
-> this change merges.
+The manifests in this repository are examples, and `base/kustomization.yaml` tracks
+`latest` on purpose (spec 13, spec 24). A real deployment is a copy: lab-admin copies
+`overlays/lab` into their own GitOps repository and pins the image there, at
+`REPLACE_ME_CRUCIBLE_TAG` and `REPLACE_ME_CRUCIBLE_DIGEST` below. Argo tracks that
+repository, never this one, and changing the deployed version is that one pin and a
+sync, in the deployer's own history.
 
 ## What lab-admin provides
 
@@ -66,6 +67,7 @@ Spec 26's checklist, made concrete. Each row is either a placeholder in
 | `REPLACE_ME_IMAGE_PULL_SECRET` | `overlays/lab/settings.yaml`, `overlays/lab/pull-secret.yaml` | the pull secret's name, in both namespaces. Delete the `pull-secret.yaml` patch and blank the setting when the packages are public |
 | `REPLACE_ME_LOCAL_ENDPOINT_CIDRS` | `overlays/lab/settings.yaml` | the resolved address of the local endpoint host, as a `/32`. Reviewed when the gateway moves |
 | `REPLACE_ME_PROBE_IMAGE` | `overlays/lab/settings.yaml` comment | the one worker image reference, exact: `ghcr.io/sentania-labs/crucible-worker:<tag>` with the `WORKER=` tag of `images/manifest.env` at the release being deployed. 26's readiness canary runs it, and a bare repository would mean `:latest` to a kubelet. The committed default is blank, so set it only when that release's worker image is published. |
+| `REPLACE_ME_CRUCIBLE_TAG`, `REPLACE_ME_CRUCIBLE_DIGEST` | `overlays/lab/kustomization.yaml` | the exact tag and its digest from the GitHub release being deployed. The base tracks `latest`; this is the deployer's own pin, set here and nowhere in this repository |
 | `REPLACE_ME_ARGOCD_PROJECT`, `REPLACE_ME_MANIFEST_REPO_URL`, `REPLACE_ME_MANIFEST_REVISION` | `argocd/application.yaml` | the Argo project, the repository holding these manifests, and an exact tag or commit. Never a branch: this field plus the pinned image tag are the deployment's record of what is running |
 | `REPLACE_ME_SECRET_STORE_NAME`, `REPLACE_ME_REMOTE_PATH` | `secret-shapes/external/database.yaml` | only on a cluster using external-secrets instead of sealed ones |
 
