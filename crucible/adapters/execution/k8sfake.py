@@ -135,6 +135,17 @@ class _Object:
     deleted: bool = False
 
 
+def _opens_dns(peer: Mapping[str, Any], translates_services: bool) -> bool:
+    """Whether one policy peer lets a pod reach the fake cluster's resolver."""
+    if "ipBlock" in peer:
+        return not translates_services
+    namespace = (peer.get("namespaceSelector") or {}).get("matchLabels") or {}
+    pods = (peer.get("podSelector") or {}).get("matchLabels") or {}
+    return namespace == {"kubernetes.io/metadata.name": "kube-system"} and pods == {
+        "k8s-app": "kube-dns"
+    }
+
+
 @dataclass
 class FakeKubernetesApi:
     """Everything the provider calls on `KubernetesClient`, in memory.
@@ -162,6 +173,10 @@ class FakeKubernetesApi:
     # check, which is what a namespace default deny does to it.
     canary_dns: str = "resolved"
     canary_endpoint: str = "reachable"
+    # A CNI that translates a service address to its pods before it evaluates policy
+    # (Cilium with kube-proxy replacement): only a selector on the kube-dns pods opens
+    # DNS, and an address rule on the DNS service never does (crucible#91).
+    translates_services: bool = False
     pod_pid_limit: int | None = 4096
     node_name: str = "lab-node-1"
     quota_jobs: int | None = None
@@ -480,9 +495,9 @@ class FakeKubernetesApi:
         labels = (obj.body.get("metadata") or {}).get("labels") or {}
         policy = self._canary_policy(str(labels.get(LABEL_CANARY, "")))
         dns_open = policy is not None and any(
-            int(port.get("port", 0)) == 53
+            any(int(port.get("port", 0)) == 53 for port in rule.get("ports") or [])
+            and any(_opens_dns(peer, self.translates_services) for peer in rule.get("to") or [])
             for rule in (policy.get("spec") or {}).get("egress") or []
-            for port in rule.get("ports") or []
         )
         dns = self.canary_dns if dns_open or self.canary_dns == "inconclusive" else "failed"
         env = {

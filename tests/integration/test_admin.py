@@ -1956,6 +1956,7 @@ def test_kubernetes_egress_through_api_cli_and_ui(
         "/v1/admin/kubernetes/egress",
         json={
             "reason": "api: into the workers namespace",
+            "dns": {"namespace": "kube-system", "pod_labels": {"k8s-app": "kube-dns"}},
             "local_endpoint": {"namespace": "crucible-workers", "pod_labels": {"a": "b"}},
         },
     )
@@ -1963,6 +1964,16 @@ def test_kubernetes_egress_through_api_cli_and_ui(
     assert "may never reach" in refused.text
     no_reason = admin_client.post("/v1/admin/kubernetes/egress", json={"dns": {"namespace": ""}})
     assert no_reason.status_code == 422
+    # Leaving `dns` out of an edit of the endpoint must not read as "no DNS selector".
+    partial = admin_client.post(
+        "/v1/admin/kubernetes/egress",
+        json={
+            "reason": "api: endpoint only",
+            "local_endpoint": {"namespace": "litellm", "pod_labels": {"a": "b"}},
+        },
+    )
+    assert partial.status_code == 422
+    assert "dns must be given" in partial.text
     assert (
         admin_client.get("/v1/admin/kubernetes/egress").json()["document"]
         == (saved.json()["document"])

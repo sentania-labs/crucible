@@ -252,3 +252,63 @@ async def test_the_retention_sweep_never_takes_a_canary_mid_run() -> None:
     assert (await provider.ensure_ready()).passed
     assert len(in_flight) == 2
     assert not [name for name in swept if "canary" in name]
+
+
+async def test_on_a_translating_cni_the_address_rule_alone_fails_the_dns_check() -> None:
+    """Issue 91 in the fake: with the DNS selector turned off, only the ClusterIP rule
+    is left, which a translating CNI never matches; with it on, DNS works."""
+    _api, _provider, probe = await ready(
+        config=config(egress=ClusterEgress(dns_namespace="", dns_pod_labels=())),
+        translates_services=True,
+    )
+    assert probe.passed is False and probe.dns_resolves is False
+    _api, _provider, probe = await ready(config=config(), translates_services=True)
+    assert probe.passed and probe.dns_resolves is True
+
+
+async def test_a_probe_proved_under_rules_that_changed_while_it_ran_is_not_kept() -> None:
+    """A refresh during a canary run: the answer is about rules no longer in force, so
+    the canary runs again under the new ones before anything is stored."""
+    api, _registry, provider = build()
+    await provider.prepare(spec())
+    real_log = api.pod_log
+    runs: list[ClusterEgress] = []
+
+    def pod_log(name: str, **kwargs: Any) -> Any:
+        runs.append(provider.config.egress)
+        if len(runs) == 1:
+            provider.apply_settings(IN_CLUSTER.as_document(), None)
+        return real_log(name, **kwargs)
+
+    api.pod_log = pod_log  # type: ignore[method-assign]
+    probe = await provider.ensure_ready()
+    assert probe.passed
+    assert len(runs) == 2 and runs[1] == IN_CLUSTER
+    assert provider.probe is probe
+
+
+async def test_a_launch_after_a_settings_change_is_gated_again() -> None:
+    """The gate and the worker's rules are the same settings: a change between them
+    runs the canary again, and a failure refuses the launch."""
+    api, _registry, provider = build(config=config())
+    launch = spec()
+    workspace = await provider.prepare(launch)
+    assert (await provider.ensure_ready()).passed
+    real_resolve = provider._resolve_image
+
+    async def resolve_and_change(launch_spec: Any) -> str:
+        provider.apply_settings(IN_CLUSTER.as_document(), LITELLM)
+        api.canary_endpoint = "unreachable"
+        return await real_resolve(launch_spec)
+
+    provider._resolve_image = resolve_and_change  # type: ignore[method-assign,assignment]
+    with pytest.raises(LaunchRefusedError, match="local endpoint check failed"):
+        await provider.launch(workspace, launch)
+
+
+async def test_a_refused_document_still_follows_the_endpoint_url() -> None:
+    _api, _registry, provider = build(config=config(egress=IN_CLUSTER))
+    bad = {"local_endpoint": {"namespace": "crucible-workers", "pod_labels": {"a": "b"}}}
+    provider.apply_settings(bad, LITELLM)
+    assert provider.config.egress == IN_CLUSTER
+    assert provider.config.local_endpoint_url == LITELLM

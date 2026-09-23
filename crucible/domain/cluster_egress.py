@@ -62,6 +62,8 @@ def parse_labels(text: str) -> dict[str, str]:
         key, separator, value = item.partition("=")
         if not separator:
             raise ValueError(f"{item!r} is not a key=value label")
+        if key.strip() in out:
+            raise ValueError(f"the label {key.strip()!r} is given twice")
         out[key.strip()] = value.strip()
     return out
 
@@ -117,7 +119,9 @@ def _section(
     section = document.get(key) or {}
     if not isinstance(section, Mapping):
         raise ValueError(f"{key} must be an object")
-    namespace = section.get("namespace") or ""
+    namespace = section.get("namespace")
+    if namespace is None:
+        namespace = ""
     if not isinstance(namespace, str):
         raise ValueError(f"{what} namespace must be a string")
     namespace = namespace.strip()

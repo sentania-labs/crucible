@@ -169,7 +169,7 @@ def save_local_endpoint(
             proxy_allowlist=tuple(dict.fromkeys([*base_hosts, *enabled_destinations])),
         )
     # The Kubernetes readiness canary proves a connection to the enabled local endpoint;
-    # a new one is read back, and proved again, before the next launch (crucible#91).
+    # a new one is read back, and proved again before a launch uses it (crucible#91).
     kubernetes = ctx.providers.get("kubernetes")
     reload = getattr(kubernetes, "reload_settings", None)
     if callable(reload):

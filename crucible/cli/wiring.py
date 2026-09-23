@@ -227,8 +227,9 @@ def kubernetes_config(
         poll_interval_seconds=k.poll_interval_seconds,
         api_timeout_seconds=k.api_timeout_seconds,
         cluster_dns_ip=k.cluster_dns_ip,
-        # A bad seed stops the service at start rather than rendering a rule nobody
-        # meant; the same check refuses it through the admin surfaces.
+        # A bad seed is refused here (wire() then leaves the provider out) rather than
+        # rendering a rule nobody meant; the same check refuses it through the admin
+        # surfaces.
         egress=parse_cluster_egress(
             kubernetes_egress_seed(settings),
             protected_namespaces=kubernetes_protected_namespaces(settings),
@@ -363,6 +364,11 @@ def wire(settings: Settings) -> Wiring:
             )
         except KubernetesApiError as exc:
             log.error("the kubernetes provider is enabled but unreachable: %s", exc)
+        except ValueError as exc:
+            # A `kubernetes.egress` seed that names a protected namespace or an empty
+            # selector: the provider is left out rather than rendering a rule nobody
+            # meant, and the API stays up to say so.
+            log.error("the kubernetes provider is enabled but its settings are refused: %s", exc)
     artifact_store = DiskArtifactStore(settings.service.artifact_root)
     wake_deliverer = WebhookWakeDeliverer(
         settings.wake.webhook_url,

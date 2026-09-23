@@ -921,8 +921,8 @@ def routing_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                     "endpoint when the CNI translates service addresses before it applies "
                     "policy (Cilium with kube-proxy replacement). Labels are key=value, "
                     "comma separated. Leave the endpoint namespace empty for an endpoint "
-                    "outside the cluster. Saving re-runs the namespace readiness canary "
-                    "before the next launch."
+                    "outside the cluster. Every process picks a save up within 15 seconds "
+                    "and re-runs the namespace readiness canary before a launch uses it."
                 ),
                 "form": {
                     "action": "/ui/actions/kubernetes-egress",

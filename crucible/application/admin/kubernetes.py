@@ -2,9 +2,9 @@
 
 `kubernetes.egress` names the cluster resolver's pods and, when the local model
 endpoint runs inside the cluster, the gateway's pods and port (crucible#91). The
-settings file seeds it; a save writes the database row every process reads back, so
-the supervisor follows an edit made here without a restart, and the readiness canary
-runs again under the new rules before the next launch.
+settings file seeds it; a save writes the database row every process reads back
+within 15 seconds, so the supervisor follows an edit made here without a restart, and
+the readiness canary runs again under the new values before any launch uses them.
 """
 
 from __future__ import annotations
@@ -57,6 +57,15 @@ def save_egress(
         ctx, uow, reason, principal=principal, operation="kubernetes set-egress"
     )
     try:
+        # A save replaces the whole setting, so both halves are stated. A missing one
+        # would otherwise read as "no selector", and leaving `dns` out of an edit of
+        # the endpoint would quietly take DNS away from every worker on a Cilium cluster.
+        missing = [key for key in ("dns", "local_endpoint") if key not in document]
+        if missing:
+            raise ValueError(
+                f"{' and '.join(missing)} must be given; an empty namespace is how a "
+                "selector is turned off"
+            )
         egress = parse_cluster_egress(
             document, protected_namespaces=ctx.kubernetes_protected_namespaces
         )

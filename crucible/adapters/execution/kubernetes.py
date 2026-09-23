@@ -477,8 +477,9 @@ class KubernetesProvider:
             try:
                 egress = parse_cluster_egress(document, protected_namespaces=self._protected())
             except ValueError as exc:
+                # What is in force stays in force; the endpoint URL is still followed.
                 log.error("the kubernetes.egress setting is refused: %s", exc)
-                return
+                egress = self.config.egress
         updated = replace(self.config, egress=egress, local_endpoint_url=endpoint_url or "")
         if updated != self.config:
             self.config = updated
@@ -513,7 +514,21 @@ class KubernetesProvider:
         async with self._probe_lock:
             if self.probe is not None and self.probe.passed:
                 return self.probe
-            self.probe = await self._run_probe()
+            # A canary proves the rules it ran under. If a refresh changed them while it
+            # ran, its answer is about rules no longer in force and is not kept.
+            for _ in range(3):
+                proved_under = self.config
+                probe = await self._run_probe()
+                if self.config is proved_under:
+                    self.probe = probe
+                    return probe
+            self.probe = NamespaceProbe(
+                False,
+                False,
+                None,
+                "the egress settings changed while the canary ran; it runs again next time",
+                checked=False,
+            )
             return self.probe
 
     async def _run_probe(self) -> NamespaceProbe:
@@ -787,6 +802,7 @@ class KubernetesProvider:
 
     async def launch(self, ws: Workspace, spec: LaunchSpec) -> Handle:
         probe = await self.ensure_ready()
+        gated_under = self.config
         if not probe.passed:
             # 26: a namespace whose egress enforcement or pod PID limit is not proven
             # does not run a worker. This is a refusal, not a retry: the next attempt
@@ -803,6 +819,15 @@ class KubernetesProvider:
         credential_keys = await self._credential_keys(spec.attempt_id) if copy else []
         job_name = k8sspec.object_name("worker", spec.attempt_id)
         try:
+            if self.config is not gated_under:
+                # The egress settings changed after the gate: the worker's rules are the
+                # new ones, so the canary proves them first (crucible#91).
+                probe = await self.ensure_ready()
+                if not probe.passed:
+                    raise HarnessRefusedError(
+                        f"refusing to launch: the workers namespace is not ready ({probe.detail})"
+                    )
+                plan = self._egress_plan(spec, k8sspec.ROLE_WORKER)
             policy_name = await self._apply_policy(spec, k8sspec.ROLE_WORKER, plan)
             body = k8sspec.job(
                 name=job_name,
@@ -2739,14 +2764,20 @@ if ! command -v curl >/dev/null 2>&1; then
   echo "crucible-canary.tool=none"
 else
   echo "crucible-canary.tool=curl"
-  curl -sS -k -o /dev/null --max-time 5 "https://$host:$port/version" 2>/dev/null
+  connected=$(curl -sS -k -o /dev/null -w '%{time_connect}' --max-time 5 \
+    "https://$host:$port/version" 2>/dev/null)
   rc=$?
   case "$rc" in
     # Connected: 0 is a response, and 22/35/52/56/60 are TLS or HTTP outcomes that all
     # required a completed TCP connection to the API server.
     0|22|35|52|56|60) echo "crucible-canary.api=reachable" ;;
-    # 7 is "failed to connect", 28 is "timed out": the CNI refused the packet.
-    7|28) echo "crucible-canary.api=unreachable" ;;
+    # 7 is "failed to connect", 28 is "timed out": the CNI refused the packet, unless
+    # the connection completed first and only the answer was slow.
+    7|28)
+      case "$connected" in
+        ''|0|0.000000) echo "crucible-canary.api=unreachable" ;;
+        *) echo "crucible-canary.api=reachable" ;;
+      esac ;;
     *) echo "crucible-canary.api=inconclusive" ;;
   esac
   echo "crucible-canary.curl_exit=$rc"
@@ -2778,12 +2809,19 @@ if [ -z "$url" ]; then
 elif ! command -v curl >/dev/null 2>&1; then
   echo "crucible-canary.endpoint=inconclusive"
 else
-  curl -sS -k -o /dev/null --max-time 10 "$url" 2>/dev/null
+  # The question is whether a TCP connection is accepted, so a gateway that connects
+  # and is slow to answer (a cold model) is reachable, not refused.
+  connected=$(curl -sS -k -o /dev/null -w '%{time_connect}' --connect-timeout 10 \
+    --max-time 20 "$url" 2>/dev/null)
   rc=$?
   case "$rc" in
     0|22|35|52|56|60) echo "crucible-canary.endpoint=reachable" ;;
     6) echo "crucible-canary.endpoint=unresolved" ;;
-    7|28) echo "crucible-canary.endpoint=unreachable" ;;
+    7|28)
+      case "$connected" in
+        ''|0|0.000000) echo "crucible-canary.endpoint=unreachable" ;;
+        *) echo "crucible-canary.endpoint=reachable" ;;
+      esac ;;
     *) echo "crucible-canary.endpoint=inconclusive" ;;
   esac
   echo "crucible-canary.endpoint_curl_exit=$rc"

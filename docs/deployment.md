@@ -111,8 +111,10 @@ These file values only seed the `kubernetes.egress` setting. Once the deployment
 change them from the admin UI (Routing, "Edit Kubernetes egress selectors"), from
 `crucible admin kubernetes set-egress`, or with `POST /v1/admin/kubernetes/egress`; a
 saved value wins over the file, is audited, and reaches the supervisor within 15 seconds
-without a restart. No selector may name `crucible` or `crucible-workers`, and none may be
-empty. The readiness canary runs again under the new rules before the next launch.
+without a restart. A save states both halves: an empty namespace is how a selector is
+turned off, and a request that leaves one out is refused. No selector may name
+`crucible` or `crucible-workers`, and none may be empty. The readiness canary runs again
+under the new values before any launch uses them.
 
 ### The Secrets
 
@@ -244,8 +246,9 @@ Done means seen working, so all three:
 
 2. **The probe, after a change.** The answer is cached while it passes and re-run while
    it fails, so fixing the CNI does not need a Crucible restart. Saving the
-   `kubernetes.egress` setting or the local endpoint forgets a passed answer, so the
-   canary runs again before the next launch.
+   `kubernetes.egress` setting or the local endpoint forgets a passed answer once the
+   provider reads it back (within 15 seconds), so the canary runs again before any
+   launch uses the new values.
 
 3. **One task.** Submit a trivial task against a registered repository with
    `execution_request.provider: "kubernetes"` and drive it to `accepted`. What that looks

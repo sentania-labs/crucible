@@ -90,3 +90,15 @@ def test_a_protected_namespace_is_refused(section: str) -> None:
             {section: {"namespace": "crucible-workers", "pod_labels": {"a": "b"}}},
             protected_namespaces=("crucible-workers", "crucible"),
         )
+
+
+def test_a_namespace_that_is_not_a_string_is_refused_not_read_as_off() -> None:
+    values: tuple[object, ...] = (0, False, [])
+    for value in values:
+        with pytest.raises(ValueError, match="must be a string"):
+            parse_cluster_egress({"dns": {"namespace": value, "pod_labels": {}}})
+
+
+def test_a_label_given_twice_is_refused() -> None:
+    with pytest.raises(ValueError, match="given twice"):
+        parse_labels("app=a,app=b")

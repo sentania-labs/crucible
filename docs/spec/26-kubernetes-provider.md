@@ -240,9 +240,10 @@ from the admin API (`GET` and `POST /v1/admin/kubernetes/egress`), the CLI
 (`crucible admin kubernetes egress` and `set-egress`) or the Routing page of the
 admin UI. A saved value is a `provider_settings` row that wins over the file,
 every edit is an audited `kubernetes_egress_updated` event, and each process's
-provider reads the row back (within 15 seconds, and at once in the process that
+provider reads the row back within 15 seconds (usually sooner in the process that
 took the edit), so the supervisor follows an edit made through the API without a
-restart. (Added 2026-09-23 for crucible#91.)
+restart. Until a process has read it back, that process keeps launching under the
+values it last proved. (Added 2026-09-23 for crucible#91.)
 
 **Readiness.** If the cluster's CNI does not enforce egress NetworkPolicy, the
 provider refuses to launch: readiness of the namespace is probed by a canary pod
@@ -260,8 +261,10 @@ and must:
 A failure of any of them is `namespace_ready: false` with a detail naming the
 check that failed, and every launch is refused until it passes. A missing tool in
 the canary image (no curl, no getent or nslookup) is inconclusive and never a
-pass. A passed probe is kept until the `kubernetes.egress` setting or the enabled
-local endpoint changes; then it runs again before the next launch.
+pass. A passed probe is kept until the provider reads back a changed
+`kubernetes.egress` setting or enabled local endpoint; the canary then runs again
+under the new values before any launch uses them, and an answer proved under values
+that changed while the canary ran is discarded rather than kept.
 
 The canary runs the first worker image reference the provider knows of, which
 before any attempt has resolved one is the first entry of
