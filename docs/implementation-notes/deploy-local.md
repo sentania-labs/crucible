@@ -95,13 +95,12 @@ needs and nothing the operator's home provides:
    `squid.conf` is a bind mount, replacing the file gives it a new inode, and a
    running container would otherwise keep the old rules while the target
    reported success.
-10. Reads `/v1/health` and, when the reference carried a tag, refuses to report
-    success unless the version it reports is that tag. Loopback ports are
-    shared with whatever else is running on the workstation, and a
-    `/v1/ready` from somebody else's service is not evidence about this one.
-    A digest-only reference carries no tag to check `/v1/health` against, and
-    the digest is already the exact pin, so this check is skipped for it.
-    Then prints `/v1/ready`.
+10. Reads `/v1/health` and refuses to report success unless the version it
+    reports matches: the tag, when the reference carried one, or otherwise
+    the `org.opencontainers.image.version` label read back from the pulled,
+    digest-only image. Loopback ports are shared with whatever else is
+    running on the workstation, and a `/v1/ready` from somebody else's
+    service is not evidence about this one. Then prints `/v1/ready`.
 
 `deploy-local-down` is `docker compose down` without `--volumes`:
 `crucible_crucible-pg` and `crucible_crucible-artifacts` survive, because a

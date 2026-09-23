@@ -104,9 +104,12 @@ case "$DEPLOY_IMAGE" in
   *@sha256:*) repo_and_tag="${DEPLOY_IMAGE%%@sha256:*}" ;;
   *) repo_and_tag="$DEPLOY_IMAGE" ;;
 esac
-case "$repo_and_tag" in
+# The tag, if there is one, is read from the last path segment only, so a registry
+# port ('localhost:5000/repo') is never mistaken for one.
+last_segment="${repo_and_tag##*/}"
+case "$last_segment" in
   *:latest) die "a deployment pins an exact tag; 'latest' is not one (docs/implementation-notes/release.md)" ;;
-  *:*) deploy_version="${repo_and_tag##*:}" ;;
+  *:*) deploy_version="${last_segment##*:}" ;;
   *)
     [ "$repo_and_tag" != "$DEPLOY_IMAGE" ] || die "CRUCIBLE_DEPLOY_IMAGE must carry an exact version tag or digest"
     # repo@sha256:... with no tag: there is no version string to check /v1/health
@@ -303,6 +306,16 @@ esac
 # 7. Bring it up as the service user, on its own daemon.
 compose pull --quiet postgres docker-socket-proxy egress-proxy
 compose pull --quiet crucible migrate
+if [ -z "$deploy_version" ]; then
+  # repo@sha256:... carries no tag: the pulled image's own OCI label is the version
+  # /v1/health will report (crucible/__init__.py reads the same value from the
+  # package, and the release workflow's own gate checks the label against it).
+  deploy_version="$(as_service_user docker image inspect "$DEPLOY_IMAGE" \
+    --format '{{index .Config.Labels "org.opencontainers.image.version"}}')"
+  case "$deploy_version" in
+    ""|"<no value>") die "$DEPLOY_IMAGE carries no org.opencontainers.image.version label to check /v1/health against" ;;
+  esac
+fi
 compose up -d --wait
 if [ "$egress_changed" = 1 ]; then
   echo "deploy-local: the egress allowlist changed, recreating the proxy so it reads the new rules"
@@ -310,17 +323,16 @@ if [ "$egress_changed" = 1 ]; then
 fi
 
 # 8. Prove it is this deployment answering on that port, not something else that owns it:
-#    /v1/health reports the version the image was built from, which must be the tag.
+#    /v1/health reports the version the image was built from, which must be the tag
+#    (or, for a digest-only reference, the label read back from the pulled image above).
 echo
 echo "deploy-local: GET /v1/health"
 health="$(curl -sS --fail-with-body "http://127.0.0.1:${DEPLOY_PORT}/v1/health")"
 echo "$health"
-if [ -n "$deploy_version" ]; then
-  case "$health" in
-    *"\"version\":\"${deploy_version}\""*) ;;
-    *) die "127.0.0.1:${DEPLOY_PORT} did not answer as ${DEPLOY_IMAGE}; something else owns that port" ;;
-  esac
-fi
+case "$health" in
+  *"\"version\":\"${deploy_version}\""*) ;;
+  *) die "127.0.0.1:${DEPLOY_PORT} did not answer as ${DEPLOY_IMAGE}; something else owns that port" ;;
+esac
 
 echo
 echo "deploy-local: GET /v1/ready"
