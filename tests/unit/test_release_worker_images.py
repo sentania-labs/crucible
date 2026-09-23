@@ -620,6 +620,13 @@ def test_userinfo_and_a_query_in_a_traced_location_are_dropped() -> None:
     assert wi.redact_location("/v2/a/blobs/upload/1.x?_state=c2VjcmV0") == "/v2/a/blobs/upload/1.x"
 
 
+def test_userinfo_without_a_scheme_in_a_traced_location_is_still_dropped() -> None:
+    """A Location with no `https://` still has a colon in front of the `@`, which
+    `urlsplit` would misread as the scheme rather than as userinfo."""
+    assert wi.redact_location("user:secret@evil.example/upload") == "evil.example/upload"
+    assert wi.redact_location("ghp_abc123:x@evil.example/upload") == "evil.example/upload"
+
+
 def test_a_tag_prefix_publishes_and_verifies_the_prefixed_tag_only(
     published: tuple[Path, Path, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:

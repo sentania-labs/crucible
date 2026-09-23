@@ -151,13 +151,19 @@ def redact(path: str) -> str:
 
 def redact_location(location: str) -> str:
     """`location` with userinfo and every query value dropped: a hostile registry's
-    Location can carry a credential (`https://user:secret@evil.example/...`) ahead of
-    the `_url()` check, and a query can carry signed upload state, so only scheme, host
-    and path are ever traced."""
-    parsed = urllib.parse.urlsplit(location)
-    if not parsed.scheme:
-        return parsed.path
-    return f"{parsed.scheme}://{parsed.hostname}{parsed.path}"
+    Location can carry a credential (`https://user:secret@evil.example/...`, or the
+    same without the scheme, which `urlsplit` would misread as a scheme itself) ahead
+    of the `_url()` check, and a query can carry signed upload state, so only scheme,
+    host and path are ever traced."""
+    location = location.partition("#")[0].partition("?")[0]
+    scheme, sep, rest = location.partition("://")
+    if not sep:
+        scheme, rest = "", location
+    authority, slash, path = rest.partition("/")
+    if "@" in authority:
+        authority = authority.rpartition("@")[2]
+    result = f"{authority}{slash}{path}"
+    return f"{scheme}://{result}" if sep else result
 
 
 def trace(method: str, path: str, status: int, reply: dict[str, str], body: bytes) -> None:
