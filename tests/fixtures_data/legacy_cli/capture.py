@@ -7,7 +7,7 @@ the new command to the old trees even after the old code is gone:
     uv run python tests/fixtures_data/legacy_cli/capture.py \\
         --admin-source <crucible-admin's admin.py at the base commit> \\
         --foundry-source <foundry-crucible's foundry_crucible/cli.py> \\
-        --admin-ref 0cf0075 --foundry-ref <foundry commit> > trees.json
+        --admin-ref 6198913 --foundry-ref <foundry commit> > trees.json
 """
 
 from __future__ import annotations

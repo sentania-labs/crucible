@@ -15,6 +15,7 @@ from typing import Any
 
 import pytest
 
+from crucible.cli import admin as admin_cli
 from crucible.cli.main import build_parser, run
 from crucible.client.config import ADMIN_TOKEN_ENV
 from crucible.client.http import Api
@@ -50,8 +51,8 @@ def test_every_old_command_maps_to_a_new_one_with_the_same_arguments(
 
 
 def test_the_trees_were_captured_from_the_sources_the_contract_names() -> None:
-    assert TREES["crucible-admin"]["ref"] == "0cf0075"
-    assert len(TREES["crucible-admin"]["tree"]) == 46
+    assert TREES["crucible-admin"]["ref"] == "6198913"
+    assert len(TREES["crucible-admin"]["tree"]) == 49
     assert len(TREES["foundry-crucible"]["tree"]) == 18
 
 
@@ -124,6 +125,10 @@ ADMIN_CALLS: list[tuple[list[str], tuple[str, str, Any]]] = [
         ["--reason", "r", "credentials", "rotate", "--harness", "agy", "--new-path", "/p"],
         ("POST", "/v1/admin/credentials/agy/rotate", {"reason": "r", "new_path": "/p"}),
     ),
+    (
+        ["--reason", "r", "credentials", "set", "--harness", "hermes"],
+        ("POST", "/v1/admin/credentials/hermes/set", {"reason": "r", "api_key": "vk_test_key"}),
+    ),
     (["images", "list"], ("GET", "/v1/admin/images", None)),
     (
         ["--reason", "r", "images", "promote", "sha256:abc"],
@@ -141,6 +146,30 @@ ADMIN_CALLS: list[tuple[list[str], tuple[str, str, Any]]] = [
     (
         ["--reason", "r", "routing", "clear-exhaustion", "pool-a"],
         ("POST", "/v1/admin/routing/exhaustion/pool-a/clear", {"reason": "r"}),
+    ),
+    (["routing", "local-endpoint"], ("GET", "/v1/admin/routing/local-endpoint", None)),
+    (
+        [
+            "--reason",
+            "r",
+            "routing",
+            "set-local-endpoint",
+            "--endpoint-url",
+            "https://llm.example/v1",
+            "--model",
+            "coder",
+            "--enable",
+        ],
+        (
+            "POST",
+            "/v1/admin/routing/local-endpoint",
+            {
+                "reason": "r",
+                "endpoint_url": "https://llm.example/v1",
+                "models": [{"id": "coder", "enabled": True, "enable_thinking": False}],
+                "max_concurrency": 4,
+            },
+        ),
     ),
     (["bootstrap", "show", "I1"], ("GET", "/v1/import/bootstrap/I1", None)),
     (["bootstrap", "list"], ("GET", "/v1/import/bootstrap", None)),
@@ -160,6 +189,7 @@ def recorded(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, Any]]:
         return {"ok": True}
 
     monkeypatch.setattr(Api, "call", fake_call)
+    monkeypatch.setattr(admin_cli, "_read_api_key", lambda: "vk_test_key")
     monkeypatch.setenv(ADMIN_TOKEN_ENV, "cru_" + "0" * 26 + "." + "s" * 40)
     return calls
 

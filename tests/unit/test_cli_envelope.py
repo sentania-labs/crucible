@@ -285,6 +285,10 @@ def test_schema_names_every_kind_a_command_can_print(capsys: pytest.CaptureFixtu
         for flag, option in shape["options"].items():
             if option["required"]:
                 argv += [flag, (option["choices"] or ["x"])[0]]
+        if path == "admin routing set-local-endpoint":
+            # A required mutually-exclusive group; walk() records its members but not
+            # the group's own requiredness, so synthesize the missing choice here.
+            argv += ["--enable"]
         produced.add(admin.kind_of(build_parser().parse_args(argv)))
     assert produced | {"schema", "error"} <= set(kinds), produced - set(kinds)
     assert document["data"]["envelope"] == envelope_schema()

@@ -1,6 +1,6 @@
 {
   "crucible-admin": {
-    "ref": "0cf0075",
+    "ref": "6198913",
     "tree": {
       "": {
         "options": {
@@ -164,6 +164,21 @@
             "dest": "new_path",
             "flag": false,
             "required": true,
+            "type": null
+          }
+        },
+        "positionals": []
+      },
+      "credentials set": {
+        "options": {
+          "--harness": {
+            "choices": [
+              "hermes"
+            ],
+            "default": "hermes",
+            "dest": "harness",
+            "flag": false,
+            "required": false,
             "type": null
           }
         },
@@ -415,6 +430,63 @@
       },
       "routing exhaustion": {
         "options": {},
+        "positionals": []
+      },
+      "routing local-endpoint": {
+        "options": {},
+        "positionals": []
+      },
+      "routing set-local-endpoint": {
+        "options": {
+          "--disable": {
+            "choices": null,
+            "default": false,
+            "dest": "disable",
+            "flag": true,
+            "required": false,
+            "type": null
+          },
+          "--enable": {
+            "choices": null,
+            "default": false,
+            "dest": "enable",
+            "flag": true,
+            "required": false,
+            "type": null
+          },
+          "--enable-thinking": {
+            "choices": null,
+            "default": false,
+            "dest": "enable_thinking",
+            "flag": true,
+            "required": false,
+            "type": null
+          },
+          "--endpoint-url": {
+            "choices": null,
+            "default": null,
+            "dest": "endpoint_url",
+            "flag": false,
+            "required": true,
+            "type": null
+          },
+          "--max-concurrency": {
+            "choices": null,
+            "default": 4,
+            "dest": "max_concurrency",
+            "flag": false,
+            "required": false,
+            "type": "int"
+          },
+          "--model": {
+            "choices": null,
+            "default": "coder",
+            "dest": "model",
+            "flag": false,
+            "required": false,
+            "type": null
+          }
+        },
         "positionals": []
       },
       "status": {
