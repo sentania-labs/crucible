@@ -57,6 +57,10 @@ data:
   # the setting contributes nothing at all, so a deployment that leaves it empty behaves
   # exactly as it did before the setting existed.
   CRUCIBLE_KUBERNETES__PROBE_IMAGE: ""
+  # The namespace readiness canary is a shell script with curl, not a role pod, so it
+  # requests a fixed small size rather than the policy's limits (26, issue 93).
+  CRUCIBLE_KUBERNETES__CANARY_CPU_MILLICORES: "100"
+  CRUCIBLE_KUBERNETES__CANARY_MEMORY: 64Mi
   # The harness credential Secret in `crucible-workers`, per harness (12, 26). The
   # default for a harness that is absent here is `crucible-harness-<harness>`; it is
   # written out so the runbook and the cluster name the same objects.

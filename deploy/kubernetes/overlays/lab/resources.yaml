@@ -3,6 +3,12 @@
 # The Job count is five per attempt and the provider reports it as attempt capacity. This
 # object sets the shared ceiling, and the claim count is the structural cap, one claim
 # per attempt.
+#
+# `requests.cpu` is `limits.cpu` times the default policy's `cpu_request_fraction`
+# (0.5), not `limits.cpu` itself (issue 93): a lab that raises concurrency or the
+# default CPU limit recomputes this by hand, the same as the base quota's comment
+# explains. `requests.memory` stays equal to `limits.memory` at the default
+# `memory_request_fraction` of 1.
 apiVersion: v1
 kind: ResourceQuota
 metadata:
@@ -12,7 +18,7 @@ spec:
   hard:
     count/jobs.batch: "30"
     persistentvolumeclaims: "24"
-    requests.cpu: "12"
+    requests.cpu: "6"
     requests.memory: 24Gi
     limits.cpu: "12"
     limits.memory: 24Gi
