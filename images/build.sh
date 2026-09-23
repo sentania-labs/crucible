@@ -37,6 +37,16 @@ images=("$@")
 [ ${#images[@]} -gt 0 ] || images=(worker script-harness)
 for image in "${images[@]}"; do
     [ -f "$here/$image/Dockerfile" ] || { echo "build.sh: no Dockerfile for image '$image'" >&2; exit 2; }
+    # A file copied from the build context keeps the checkout's mode, which follows the
+    # cloner's umask and is not a build input, so the same tag would get a different
+    # digest on another machine. Every such COPY or ADD states its mode.
+    unpinned=$(grep -n -E '^[[:space:]]*(COPY|ADD)[[:space:]]' "$here/$image/Dockerfile" \
+        | grep -v -e '--from=' -e '--chmod=' || true)
+    [ -z "$unpinned" ] || {
+        echo "build.sh: $image/Dockerfile copies from the build context without --chmod:" >&2
+        echo "$unpinned" >&2
+        exit 2
+    }
 done
 no_cache=""
 case "${NO_CACHE:-0}" in 0|"") ;; *) no_cache="--no-cache" ;; esac
