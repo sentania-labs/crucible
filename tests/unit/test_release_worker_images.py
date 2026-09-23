@@ -637,3 +637,12 @@ def test_a_location_that_is_not_an_absolute_path_is_refused(
     for location in ("@evil.example/upload", "//evil.example/upload", ":8443/upload"):
         with pytest.raises(wi.PublishError, match="not a path"):
             registry.request("PATCH", location, body=b"", ok=(202,))
+
+
+def test_an_off_host_location_is_refused_without_echoing_its_userinfo(
+    fake_registry: _FakeRegistryServer,
+) -> None:
+    registry = _client(fake_registry)
+    with pytest.raises(wi.PublishError, match="elsewhere") as refused:
+        registry.request("PATCH", "https://user:hunter2@evil.example/x", body=b"", ok=(202,))
+    assert "hunter2" not in str(refused.value) and "evil.example" in str(refused.value)

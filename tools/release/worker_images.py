@@ -264,7 +264,8 @@ class Registry:
         # carries its credential.
         parsed = urllib.parse.urlsplit(path)
         if parsed.scheme != "https" or parsed.netloc != self.host:
-            raise PublishError(f"{self.host} sent the upload elsewhere: {parsed.netloc}")
+            # The hostname only: userinfo in a hostile Location is never echoed to a log.
+            raise PublishError(f"{self.host} sent the upload elsewhere: {parsed.hostname}")
         return path
 
     def _basic(self) -> str | None:
