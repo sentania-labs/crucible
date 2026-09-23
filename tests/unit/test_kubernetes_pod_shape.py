@@ -60,6 +60,7 @@ async def test_the_pod_security_context_is_26s_verbatim(ran: Any, prefix: str) -
         "runAsUser": 1000,
         "runAsGroup": 1000,
         "fsGroup": 1000,
+        "fsGroupChangePolicy": "OnRootMismatch",
         "seccompProfile": {"type": "RuntimeDefault"},
     }
 

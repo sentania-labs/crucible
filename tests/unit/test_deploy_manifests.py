@@ -262,6 +262,21 @@ def test_no_pod_is_privileged_or_shares_a_host_namespace(
                 assert not security.get("capabilities", {}).get("add"), where
 
 
+def test_api_and_supervisor_pods_set_fsgroup_change_policy_on_root_mismatch(
+    rendered: dict[str, list[dict[str, Any]]],
+) -> None:
+    """94: api and supervisor pods set fsGroupChangePolicy: OnRootMismatch."""
+    for target in ("base", "overlays/lab", "overlays/kind"):
+        for name in ("crucible-api", "crucible-supervisor"):
+            deployment = _named(rendered[target], "Deployment", name)
+            spec = deployment["spec"]["template"]["spec"]
+            security = spec.get("securityContext") or {}
+            assert security.get("fsGroup") == 1000, f"{target}: {name} fsGroup"
+            assert security.get("fsGroupChangePolicy") == "OnRootMismatch", (
+                f"{target}: {name} fsGroupChangePolicy"
+            )
+
+
 def _pinned(image: str) -> bool:
     """A reference carrying an explicit tag or digest.
 
