@@ -52,26 +52,29 @@ real Docker daemon. Each step gates the next:
    pulling or rebuilding over the candidate before it then runs `make smoke`,
    which is
    `tools/smoke/compose_smoke.py`, the same file CI runs on every pull request.
-5. **Prove and publish the worker images** (C11). `make images-publish` builds
-   the worker image (all four harness CLIs) and the script-harness image from
-   scratch on the fresh runner with the same `tools/images/images.sh` that
-   `make images` and CI's `images` job run, and refuses to push anything unless
-   every tag, harness version and OCI digest equals `images/manifest.env`. Each
-   OCI archive is then pushed to `ghcr.io/sentania-labs/crucible-worker:<tag>`
-   byte for byte (`tools/release/worker_images.py`), so the registry stores the
-   declared digest rather than a re-encoding of it. The never-overwrite rule is
-   the service image's: only an explicit 404 is absent; the declared digest
-   already there is a re-run and is skipped; any other digest stops the
-   release. Every published digest is read back at the end. This runs before
-   the version tag is pushed, so a release whose worker images cannot be proven
-   publishes nothing.
+5. **Prove and push the worker images** (C11). `make images-check NO_CACHE=1`
+   builds the worker image (all four harness CLIs) and the script-harness image
+   from scratch with the same `tools/images/images.sh` that `make images` and
+   CI's `images` job run, and fails unless every tag, harness version and OCI
+   digest equals `images/manifest.env`. `tools/release/push_worker_images.sh`
+   then pushes them with `docker push` as
+   `ghcr.io/sentania-labs/crucible-worker:<version>` and
+   `:script-harness-<version>`, the way the service image and every ScarGuard
+   service are pushed (the operator's decision, 2026-09-23, which retired a
+   hand-written registry uploader and the CI job that proved it on GHCR). Only
+   buildx's own "not found" is absent; a tag already there from the same
+   `crucible.build_inputs` is a re-run and is skipped; any other answer stops
+   the release. This runs before the service version tag is pushed.
 6. **Publish.** Whether the version already exists is decided by the registry
    API, where only an explicit HTTP 404 means absent: a blip, a rate limit or an
    auth failure stops the job rather than being read as "not published". An
    existing version from this same commit is a re-run and the push is skipped;
    an existing version from a different commit means the tag was moved, which
    fails the job. Push `:latest` only when this version is the highest already
-   published, so re-tagging an old fix does not move `latest` backwards.
+   published, so re-tagging an old fix does not move `latest` backwards; the
+   worker images' `latest` and `script-harness-latest` move in the same step,
+   copied on the registry from their version tags. The release notes then read
+   every digest back with `docker buildx imagetools inspect`.
 7. **Create the GitHub release** with generated notes, last, so a release never
    points at a version that is not consumable from the registry.
 
