@@ -3,12 +3,12 @@
 name: ci
 
 # Every branch push runs every job, so a change is proven on its branch before there is
-# a pull request. A pull request from this repository already has those checks on its
-# head commit, so the pull_request event runs the jobs only for a fork's pull request.
+# a pull request, and the pull request's required checks are that run's, on its head
+# commit. There is deliberately no pull_request trigger: a second run whose jobs were
+# all skipped would report the same check names as passed.
 on:
   push:
     branches: ["**"]
-  pull_request:
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -19,7 +19,6 @@ permissions:
 
 jobs:
   lint:
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
@@ -30,7 +29,6 @@ jobs:
         run: make lint
 
   scan:
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
@@ -45,21 +43,21 @@ jobs:
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
       - name: scan the tracked tree
         run: make scan-tree
-      # The first push of a new branch has no `before` (all zeros), so its range is
+      # The first push of a new branch has no `before` (all zeros), and a force push's
+      # `before` is on no ref, so the clone does not have it; either way the range is
       # everything the branch adds to main.
       - name: scan the commits that just landed
-        if: github.event_name == 'push'
         env:
           BEFORE: ${{ github.event.before }}
           SHA: ${{ github.sha }}
         run: |
-          case "$BEFORE" in
-            *[!0]*) make scan-history SCAN_RANGE="$BEFORE..$SHA" ;;
-            *) make scan-history SCAN_RANGE="origin/main..$SHA" ;;
-          esac
+          if git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            make scan-history SCAN_RANGE="$BEFORE..$SHA"
+          else
+            make scan-history SCAN_RANGE="origin/main..$SHA"
+          fi
 
   test:
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
@@ -72,7 +70,6 @@ jobs:
   # the dedicated rootless daemon (13, S9); this is the same tier, same targets, on the
   # arrangement CI has.
   e2e:
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -96,7 +93,7 @@ jobs:
   # it is proved on a machine the author does not control. GitHub-hosted, because it
   # needs a Docker daemon and buildx (github-ci skill).
   #
-  # Branch pushes and pull requests import the BuildKit layer cache the last push to
+  # Branch pushes import the BuildKit layer cache the last push to
   # main exported, so the job takes minutes. The digest is always computed from what the
   # build output, but a network step (apt, pip, ADD <url>) is cached on its instruction
   # text, not on the bytes it would fetch today, so a branch's pass is not on its own
@@ -105,7 +102,6 @@ jobs:
   # the release, which builds from scratch again and pushes nothing unless the digests
   # match.
   images:
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -121,7 +117,7 @@ jobs:
         env:
           NO_CACHE: ${{ github.ref == 'refs/heads/main' && '1' || '' }}
         run: make images-check CACHE_DIR="$RUNNER_TEMP/buildkit-cache" NO_CACHE="$NO_CACHE"
-      - name: keep the layer cache for branches and pull requests
+      - name: keep the layer cache for branches
         if: github.ref == 'refs/heads/main'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -132,7 +128,6 @@ jobs:
   # This belongs beside the Docker tier on GitHub-hosted infrastructure: it needs a
   # daemon but no lab access (github-ci skill).
   e2e-kind:
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -159,7 +154,6 @@ jobs:
   # `lab` pool, which exists to reach the lab and would only queue for a job that needs
   # nothing from it.
   manifests:
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
@@ -194,7 +188,6 @@ jobs:
         run: make manifests
 
   compose-smoke:
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
