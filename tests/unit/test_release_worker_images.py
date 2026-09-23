@@ -557,7 +557,7 @@ def test_the_fake_refuses_what_ghcr_refused_in_the_v0_5_0_release(
     )
     assert reply["location"].startswith(f"/v2/{fake_registry.name}/blobs/upload/1.")
     assert reply["docker-upload-uuid"] == reply["location"].rsplit("/", 1)[-1]
-    with pytest.raises(wi.PublishError, match="404 .*invalid content-type"):
+    with pytest.raises(wi.PublishError, match=r"404 .*invalid content-type"):
         registry.request("PUT", f"{reply['location']}?digest={_digest(b'')}", body=b"", ok=(201,))
 
 
@@ -585,7 +585,7 @@ def test_a_signed_upload_state_in_a_location_is_not_logged() -> None:
 def test_a_tag_prefix_publishes_and_verifies_the_prefixed_tag_only(
     published: tuple[Path, Path, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    manifest, archives, digest = published
+    manifest, archives, _ = published
     registry = FakeRegistry(existing=None)
     monkeypatch.setattr(wi, "Registry", lambda _repository: registry)
     wi.publish(manifest, archives, "ghcr.io/sentania-labs/crucible-worker", "ci-0123abcd-")
