@@ -119,7 +119,7 @@ jobs:
         run: |
           set -euo pipefail
           docker build --build-arg "VERSION=${VERSION}" --build-arg "REVISION=${GITHUB_SHA}" \
-            -t "${IMAGE}:${VERSION}" -t "${IMAGE}:latest" .
+            -t "${IMAGE}:${VERSION}" .
 
       - name: the image reports the tagged version
         run: |
@@ -219,12 +219,12 @@ jobs:
       # that cannot be read is fatal: treating a failed lookup as "no versions
       # published" would move `latest` in exactly the direction this prevents.
       # The comparison itself (which tags are versions, which of them is highest)
-      # is tools/release/version.py. The worker images' latest and
-      # script-harness-latest move here too, under the same answer, so there is one
-      # rule and one place. They are copied on the registry from the version tags
-      # (--prefer-index=false copies the manifest as is), so each latest carries
-      # exactly the digest its version tag does, even on a re-run that skipped the
-      # version push.
+      # is tools/release/version.py. All three images' latest move here, under
+      # the same answer, one rule and one step: each is copied on the registry
+      # from its own just-confirmed version tag (--prefer-index=false copies the
+      # manifest as is), never pushed from this job's local build, so latest
+      # always carries exactly the digest the version tag does, even on a re-run
+      # that skipped the version push because the tag was already there.
       - name: move latest only if this is the highest published version
         env:
           GHCR_USER: ${{ github.actor }}
@@ -261,14 +261,15 @@ jobs:
           HIGHEST=$(printf '%s\n' "$TAGS" | python3 tools/release/version.py "${VERSION}")
           echo "highest published version: $HIGHEST"
           if [ "$HIGHEST" = "${VERSION}" ]; then
-            # The two registry-side copies go first: they are cheap and fail fast, so a
-            # failure here leaves every latest tag where it was, instead of the service
-            # latest moved and the worker ones stale (the example manifests track latest).
+            # Three registry-side copies, one per image, each from that image's own
+            # version tag: a failure partway through leaves the remaining latest tags
+            # where they were rather than moved out of step with each other.
             docker buildx imagetools create --prefer-index=false \
               -t "${WORKER_REGISTRY}:latest" "${WORKER_REGISTRY}:${VERSION}"
             docker buildx imagetools create --prefer-index=false \
               -t "${WORKER_REGISTRY}:script-harness-latest" "${WORKER_REGISTRY}:script-harness-${VERSION}"
-            docker push "${IMAGE}:latest"
+            docker buildx imagetools create --prefer-index=false \
+              -t "${IMAGE}:latest" "${IMAGE}:${VERSION}"
           else
             echo "${VERSION} is not the highest; leaving latest where it is"
           fi

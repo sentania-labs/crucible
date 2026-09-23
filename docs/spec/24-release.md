@@ -103,9 +103,11 @@ decisions, 2026-09-23, 13): the tag workflow pushes `crucible-worker` and the
 script-harness image under the contract's `version`, never over an existing
 version tag, and its one "move latest" step moves the service image's `latest`
 and the worker images' `latest` and `script-harness-latest` together, only when
-that version is the highest one published (`tools/release/version.py`). A lower
-version released after a higher one, or an old release job re-run, leaves
-`latest` where it is, which the run log and the release notes say plainly. The
+that version is the highest one published (`tools/release/version.py`), each
+copied on the registry from its own version tag rather than pushed from a local
+build (2026-09-23). A lower version released after a higher one, or an old
+release job re-run, leaves `latest` where it is, which the run log and the
+release notes say plainly. The
 release body records all three images as `name:<version>@<digest>`, read back
 from the registry after the push, so a deployer pins from the release, never
 from a local guess.
