@@ -125,9 +125,10 @@ def downgrade() -> None:
     # not retired (an earlier downgrade may have retired one). A copy the operator
     # uploaded later keeps the description verbatim and is left alone.
     # A version a task was submitted against is retired, not deleted, as 0011 keeps
-    # the rows tasks reference: the task still resolves its policy and routing, and the
-    # version before it is back in force. The routing version is kept, unchanged, while
-    # any policy, retired or not, still names it.
+    # the rows tasks reference: the task still resolves its policy and routing, and
+    # the latest version that is not retired is in force again (the one before 0019,
+    # unless the operator uploaded a newer one). The routing version is kept,
+    # unchanged, while any policy, retired or not, still names it.
     connection = op.get_bind()
     rows = connection.execute(
         sa.text(
@@ -143,6 +144,15 @@ def downgrade() -> None:
             "name": str(reference.get("name", "")),
             "version": int(reference.get("version", 0)),
         }
+        # What 0019 wrote names a routing version carrying its entry exactly as written.
+        # A marked copy the operator uploaded naming a routing version where Opus 5.5 is
+        # enabled or edited is theirs, whatever an earlier downgrade retired.
+        document = connection.execute(
+            sa.text("SELECT document FROM routing_policies WHERE name=:name AND version=:version"),
+            routing,
+        ).scalar_one_or_none()
+        if document is None or _opus_entry() not in (document.get("models") or []):
+            continue
         connection.execute(
             sa.text(
                 "UPDATE policies p SET retired_at = now() "

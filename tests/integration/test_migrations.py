@@ -608,8 +608,8 @@ def test_0019_downgrade_keeps_the_version_a_task_was_submitted_against(
         assert client.get(f"/v1/tasks/{task_id}").status_code == 200
         migrate.upgrade(migrated)
         with engine.connect() as conn:
-            again = _active(conn)[0]
-        assert again > version
+            again, _, routing_again, _ = _active(conn)
+        assert again > version and routing_again > routing_version
         migrate.downgrade(migrated, "0018_combined_worker_image")
         with engine.connect() as conn:
             assert _active(conn)[0] < version
@@ -619,10 +619,77 @@ def test_0019_downgrade_keeps_the_version_a_task_was_submitted_against(
                     text("SELECT version, retired_at FROM policies WHERE name='default-software'")
                 )
             }
+            routings = set(
+                conn.execute(
+                    text("SELECT version FROM routing_policies WHERE name=:name"),
+                    {"name": policy.document["routing"]["policy"]["name"]},
+                ).scalars()
+            )
         assert again not in versions
         assert versions[version] is not None
+        assert routing_again not in routings and routing_version in routings
     finally:
         migrate.upgrade(migrated)
+        engine.dispose()
+
+
+def test_0019_downgrade_leaves_an_operator_copy_that_enabled_opus_alone(
+    database_url: str,
+) -> None:
+    """A copy the operator uploaded keeps 0019's description, marker included. Once an
+    earlier downgrade has removed 0019's own version, the copy is the lowest marked one
+    left; if it names a routing version where the operator enabled Opus 5.5, it is theirs
+    and a second downgrade leaves it, and that routing version, in force."""
+    migrate.upgrade(database_url)
+    engine = make_engine(database_url)
+    with engine.begin() as conn:
+        version, policy, routing_version, routing = _active(conn)
+        name = policy["routing"]["policy"]["name"]
+        enabled = json.loads(json.dumps(routing))
+        for model in enabled["models"]:
+            if model["id"] == "claude-opus-5-5":
+                model["enabled"] = True
+                model.pop("disabled_reason", None)
+        operator_routing = routing_version + 1
+        enabled["version"] = operator_routing
+        conn.execute(
+            text(
+                "INSERT INTO routing_policies(name, version, document, created_at) "
+                "VALUES (:name, :version, CAST(:document AS jsonb), now())"
+            ),
+            {"name": name, "version": operator_routing, "document": json.dumps(enabled)},
+        )
+        copy = json.loads(json.dumps(policy))
+        copy["version"] = version + 1
+        copy["routing"] = {"policy": {"name": name, "version": operator_routing}}
+        conn.execute(
+            text(
+                "INSERT INTO policies(name, version, document, created_at) "
+                "VALUES ('default-software', :version, CAST(:document AS jsonb), now())"
+            ),
+            {"version": version + 1, "document": json.dumps(copy)},
+        )
+    try:
+        migrate.downgrade(database_url, "0018_combined_worker_image")
+        with engine.connect() as conn:
+            assert _active(conn)[:3:2] == (version + 1, operator_routing)
+        # The upgrade finds Opus 5.5 already in the routing in force and writes nothing.
+        migrate.upgrade(database_url)
+        migrate.downgrade(database_url, "0018_combined_worker_image")
+        with engine.connect() as conn:
+            assert _active(conn)[:3:2] == (version + 1, operator_routing)
+    finally:
+        with engine.begin() as conn:
+            conn.execute(
+                text("DELETE FROM policies WHERE name='default-software' AND version=:version"),
+                {"version": version + 1},
+            )
+            conn.execute(
+                text("DELETE FROM routing_policies WHERE name=:name AND version=:version"),
+                {"name": name, "version": operator_routing},
+            )
+        migrate.downgrade(database_url, "0018_combined_worker_image")
+        migrate.upgrade(database_url)
         engine.dispose()
 
 
