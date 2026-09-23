@@ -17,7 +17,11 @@
 # `limits.memory`: the default `memory_request_fraction` is 1, unchanged from before
 # issue 93 (Guaranteed-for-memory, 16). A policy that changes either fraction, or a
 # deployment that changes `max_concurrency`, keeps this quota's requests consistent with
-# that math by hand; it is not computed from the running configuration.
+# that math by hand; it is not computed from the running configuration. Raising
+# `cpu_request_fraction` above 0.5 without raising `requests.cpu` to match does not
+# break anything, it only shrinks how many attempts admit at once (a policy at fraction
+# 1 fits one attempt in the 3 CPU this quota allows, not three), so a stale quota fails
+# closed: fewer concurrent launches, never an unbounded one.
 apiVersion: v1
 kind: ResourceQuota
 metadata:

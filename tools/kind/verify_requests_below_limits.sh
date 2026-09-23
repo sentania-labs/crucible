@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
-# The kind proof for issue 93 (contract FDY-0107, requirement 8): a ResourceQuota that
-# mirrors the lab's tight CPU budget refuses the old pod shape (request equal to limit)
-# and admits and schedules the new shape (request a fraction of the limit).
+# The kind proof for issue 93 (contract FDY-0107, requirement 8): the real
+# crucible-workers ResourceQuota (deploy/kubernetes/base/workers/resourcequota.yaml,
+# requests.cpu 3, max_concurrency 3) refuses two concurrent pods of the old shape
+# (request equal to the 2-CPU limit, 4 CPU total) and admits three concurrent pods of
+# the new shape (request half the limit, 3 CPU total: the exact concurrency the base
+# quota is sized for).
 #
 # A disposable kind cluster, unique name, deleted on exit even on failure (sdlc skill's
-# kind pattern). No Calico, no registry, no Crucible process: this proof is about one
-# container's `resources` block against one ResourceQuota, not the whole provider.
+# kind pattern). No Calico, no registry, no Crucible process: this proof is about the
+# rendered ResourceQuota and one container's `resources` block, not the whole provider.
 set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -13,6 +16,7 @@ run_id=${CRUCIBLE_KIND_RUN_ID:-$(date +%s)-$$}
 cluster="crucible-req-${run_id}"
 namespace="crucible-verify"
 cluster_created=0
+scratch=$(mktemp -d -t crucible-verify.XXXXXX)
 
 cleanup() {
   status=$?
@@ -20,6 +24,7 @@ cleanup() {
   if [ "$cluster_created" -eq 1 ]; then
     kind delete cluster --name "$cluster" >/dev/null 2>&1 || :
   fi
+  rm -rf "$scratch"
   exit "$status"
 }
 trap cleanup EXIT HUP INT TERM
@@ -35,49 +40,64 @@ kind load docker-image busybox:1.36 --name "$cluster"
 kubectl create namespace "$namespace"
 kubectl -n "$namespace" create serviceaccount crucible-worker
 
-# Mirrors the lab: a tight requests.cpu budget with headroom on limits.cpu, the same
-# shape as deploy/kubernetes/base/workers/resourcequota.yaml (requests well below
-# limits so a Burstable pod can still schedule).
-kubectl apply -f - <<EOF
-apiVersion: v1
-kind: ResourceQuota
-metadata:
-  name: verify-budget
-  namespace: $namespace
-spec:
-  hard:
-    requests.cpu: "1"
-    requests.memory: 1Gi
-    limits.cpu: "4"
-    limits.memory: 4Gi
-EOF
+echo "verify: applying the real base ResourceQuota, renamespaced to $namespace"
+"${UV:-uv}" run python - "$root/deploy/kubernetes/base/workers" "$namespace" <<'PY' > "$scratch/quota.yaml"
+import subprocess
+import sys
 
-old_pod=$("${UV:-uv}" run python "$root/tools/kind/render_request_pod.py" \
-  --name old-shape --namespace "$namespace" --cpu-request-fraction 1.0)
-new_pod=$("${UV:-uv}" run python "$root/tools/kind/render_request_pod.py" \
-  --name new-shape --namespace "$namespace" --cpu-request-fraction 0.5)
+import yaml
 
-echo "verify: applying the old shape (request equals the 2-CPU limit)"
-if echo "$old_pod" | kubectl apply -f - 2>old_shape.err; then
-  echo "verify: FAIL: the old shape was admitted; it should have exceeded the quota" >&2
-  cat old_shape.err >&2
+base, namespace = sys.argv[1], sys.argv[2]
+rendered = subprocess.run(
+    ["kubectl", "kustomize", base], check=True, capture_output=True, text=True
+).stdout
+for doc in yaml.safe_load_all(rendered):
+    if doc and doc.get("kind") == "ResourceQuota":
+        doc["metadata"]["namespace"] = namespace
+        print(yaml.safe_dump(doc))
+PY
+cat "$scratch/quota.yaml"
+kubectl apply -f "$scratch/quota.yaml"
+requests_cpu=$("${UV:-uv}" run python -c "
+import yaml
+print(yaml.safe_load(open('$scratch/quota.yaml'))['spec']['hard']['requests.cpu'])
+")
+echo "verify: quota's requests.cpu is $requests_cpu (base/workers/resourcequota.yaml)"
+
+for n in 1 2; do
+  "${UV:-uv}" run python "$root/tools/kind/render_request_pod.py" \
+    --name "old-shape-$n" --namespace "$namespace" --cpu-request-fraction 1.0 \
+    > "$scratch/old-$n.json"
+done
+for n in 1 2 3; do
+  "${UV:-uv}" run python "$root/tools/kind/render_request_pod.py" \
+    --name "new-shape-$n" --namespace "$namespace" --cpu-request-fraction 0.5 \
+    > "$scratch/new-$n.json"
+done
+
+echo "verify: applying two old-shape pods (2 CPU request each, 4 CPU total against a $requests_cpu CPU quota)"
+kubectl apply -f "$scratch/old-1.json"
+if kubectl apply -f "$scratch/old-2.json" 2>"$scratch/old-2.err"; then
+  echo "verify: FAIL: the second old-shape pod was admitted; it should have exceeded the quota" >&2
   exit 1
 fi
-echo "verify: old shape refused, as expected:"
-cat old_shape.err
-if ! grep -q "exceeded quota" old_shape.err; then
-  echo "verify: FAIL: refusal was not the quota (see above)" >&2
+echo "verify: second old-shape pod refused, as expected:"
+cat "$scratch/old-2.err"
+if ! grep -q "exceeded quota" "$scratch/old-2.err"; then
+  echo "verify: FAIL: the refusal was not the quota (see above)" >&2
   exit 1
 fi
-rm -f old_shape.err
+kubectl -n "$namespace" delete pod old-shape-1 --now >/dev/null
 
-echo "verify: applying the new shape (request is half the 2-CPU limit)"
-echo "$new_pod" | kubectl apply -f -
+echo "verify: applying three new-shape pods (1 CPU request each, 3 CPU total: max_concurrency)"
+for n in 1 2 3; do
+  kubectl apply -f "$scratch/new-$n.json"
+done
+for n in 1 2 3; do
+  kubectl -n "$namespace" wait --for=condition=Ready "pod/new-shape-$n" --timeout=60s
+done
+kubectl -n "$namespace" get pods -o wide
 
-echo "verify: waiting for the new shape to schedule and run"
-kubectl -n "$namespace" wait --for=condition=Ready pod/new-shape --timeout=60s
-kubectl -n "$namespace" get pod new-shape -o wide
-kubectl -n "$namespace" get pod new-shape -o jsonpath='{.spec.containers[0].resources}{"\n"}'
-
-echo "verify: PASS: the old (request == limit) shape does not schedule under the lab's"
-echo "verify: budget, and the new (request < limit) shape does."
+echo "verify: PASS: under the real base ResourceQuota, the old (request == limit) shape"
+echo "verify: cannot run two concurrent attempts, and the new (request < limit) shape"
+echo "verify: runs three, the base's own max_concurrency."

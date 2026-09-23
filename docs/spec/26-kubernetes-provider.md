@@ -389,7 +389,9 @@ this version.
    whose total exceeds a stated cluster CPU or memory budget
    (`docs/deployment.md`), which catches the quota drifting from the policy
    but not a policy whose fraction alone makes the math wrong; that is a
-   review-time check, not a rendered one.
+   review-time check, not a rendered one. A quota left stale after a policy
+   raises its fraction fails closed: fewer concurrent attempts admit, never
+   more than the quota allows.
 
 The manifests that satisfy the Crucible half of this list are
 `deploy/kubernetes`, and the operator-facing runbook, including every

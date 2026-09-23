@@ -15,21 +15,27 @@ from __future__ import annotations
 
 import argparse
 import sys
-from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
 import yaml
 
+# Order matters: a suffix checked before its own prefix (`Ki` before `k`) would never
+# match, since both are valid trailing substrings of the same string.
 _MEMORY_UNITS = {
     "Ki": 1024,
     "Mi": 1024**2,
     "Gi": 1024**3,
     "Ti": 1024**4,
-    "K": 1000,
+    "Pi": 1024**5,
+    "Ei": 1024**6,
+    # Kubernetes' decimal SI suffixes: lowercase `k` for kilo, uppercase for the rest.
+    "k": 1000,
     "M": 1000**2,
     "G": 1000**3,
     "T": 1000**4,
+    "P": 1000**5,
+    "E": 1000**6,
 }
 
 
@@ -48,41 +54,63 @@ def parse_memory(value: Any) -> float:
     return float(text)
 
 
-def _pod_containers(obj: dict[str, Any]) -> Iterable[dict[str, Any]]:
-    """Every container and init container a Deployment, StatefulSet or Job carries."""
-    kind = obj.get("kind")
-    if kind not in ("Deployment", "StatefulSet", "Job", "DaemonSet"):
-        return
+def _request(container: dict[str, Any], key: str, parse: Any) -> float:
+    """A container's request for one resource, falling back to its limit: Kubernetes
+    defaults an unset request to the container's own limit, not to zero."""
+    resources = container.get("resources") or {}
+    requests = resources.get("requests") or {}
+    if key in requests:
+        return float(parse(requests[key]))
+    limits = resources.get("limits") or {}
+    if key in limits:
+        return float(parse(limits[key]))
+    return 0.0
+
+
+def _pod_request(obj: dict[str, Any]) -> tuple[float, float]:
+    """One Pod template's effective request: Kubernetes takes the larger of the sum of
+    its app containers and any single init container, since init containers run one at
+    a time before the app containers ever start."""
     template = ((obj.get("spec") or {}).get("template") or {}).get("spec") or {}
-    yield from template.get("containers") or []
-    yield from template.get("initContainers") or []
+    app_cpu = sum(_request(c, "cpu", parse_cpu) for c in template.get("containers") or [])
+    app_memory = sum(_request(c, "memory", parse_memory) for c in template.get("containers") or [])
+    init_cpu = max(
+        (_request(c, "cpu", parse_cpu) for c in template.get("initContainers") or []), default=0.0
+    )
+    init_memory = max(
+        (_request(c, "memory", parse_memory) for c in template.get("initContainers") or []),
+        default=0.0,
+    )
+    return max(app_cpu, init_cpu), max(app_memory, init_memory)
 
 
 def control_plane_requests(objects: list[dict[str, Any]], namespace: str) -> tuple[float, float]:
-    """The CPU and memory requests of every container in one namespace's workloads."""
+    """The CPU and memory requests of every workload in one namespace, one pod's
+    request times its replica count (Deployment, StatefulSet); a Job runs one pod
+    regardless of what `replicas` would mean elsewhere, so it is not multiplied."""
     cpu = 0.0
     memory = 0.0
     for obj in objects:
         if (obj.get("metadata") or {}).get("namespace") != namespace:
             continue
-        for container in _pod_containers(obj):
-            requests = ((container.get("resources") or {}).get("requests")) or {}
-            if "cpu" in requests:
-                cpu += parse_cpu(requests["cpu"])
-            if "memory" in requests:
-                memory += parse_memory(requests["memory"])
+        if obj.get("kind") not in ("Deployment", "StatefulSet", "Job", "DaemonSet"):
+            continue
+        replicas = int((obj.get("spec") or {}).get("replicas") or 1) if obj["kind"] != "Job" else 1
+        pod_cpu, pod_memory = _pod_request(obj)
+        cpu += pod_cpu * replicas
+        memory += pod_memory * replicas
     return cpu, memory
 
 
-def workers_quota_requests(objects: list[dict[str, Any]]) -> tuple[float, float]:
-    """`requests.cpu` / `requests.memory` of the workers ResourceQuota: the configured
+def workers_quota_requests(objects: list[dict[str, Any]], namespace: str) -> tuple[float, float]:
+    """`requests.cpu` / `requests.memory` of the named ResourceQuota: the configured
     concurrency's worth of attempts, already sized for the running policy (26)."""
     for obj in objects:
         if obj.get("kind") != "ResourceQuota":
             continue
-        hard = (obj.get("spec") or {}).get("hard") or {}
-        if "requests.cpu" not in hard and "requests.memory" not in hard:
+        if (obj.get("metadata") or {}).get("namespace") != namespace:
             continue
+        hard = (obj.get("spec") or {}).get("hard") or {}
         cpu = parse_cpu(hard["requests.cpu"]) if "requests.cpu" in hard else 0.0
         memory = parse_memory(hard["requests.memory"]) if "requests.memory" in hard else 0.0
         return cpu, memory
@@ -111,7 +139,7 @@ def main(argv: list[str] | None = None) -> int:
 
     objects = [doc for doc in yaml.safe_load_all(args.manifest.read_text()) if doc]
     control_cpu, control_memory = control_plane_requests(objects, "crucible")
-    quota_cpu, quota_memory = workers_quota_requests(objects)
+    quota_cpu, quota_memory = workers_quota_requests(objects, "crucible-workers")
     total_cpu = control_cpu + quota_cpu
     total_memory = control_memory + quota_memory
 

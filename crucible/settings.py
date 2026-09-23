@@ -153,8 +153,10 @@ class KubernetesSettings(BaseModel):
     extra_image_allowlist: list[str] = Field(default_factory=list)
     use_reference_cache: bool = True
     # 26, issue 93: the canary is a shell script with curl, not a role pod, so it asks
-    # for a fixed small size instead of the policy's limits.
-    canary_cpu_millicores: int = 100
+    # for a fixed small size instead of the policy's limits. `ge=1`: zero or negative
+    # renders a CPU limit of `0m`, which the API server refuses outright, and the
+    # namespace then reports not ready for a reason that is not about the namespace.
+    canary_cpu_millicores: int = Field(default=100, ge=1)
     canary_memory: str = "64Mi"
 
 
