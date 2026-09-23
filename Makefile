@@ -153,7 +153,7 @@ images-publish: ## release only: images-check, then push each OCI archive to WOR
 # images-publish: reading a manifest back is still an authenticated registry call.
 release-notes: ## release only: print the published service and worker image digests, read back from the registry, as release notes markdown
 	@test -n "$(CRUCIBLE_IMAGE)" || { echo "set CRUCIBLE_IMAGE"; exit 2; }
-	python3 tools/release/release_notes.py --service-image "$(CRUCIBLE_IMAGE)" \
+	@python3 tools/release/release_notes.py --service-image "$(CRUCIBLE_IMAGE)" \
 	  --worker-manifest images/manifest.env --worker-repository "$(WORKER_REGISTRY)"
 
 scan: scan-tree scan-history ## secret scan; needs gitleaks on PATH
