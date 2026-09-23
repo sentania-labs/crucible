@@ -509,10 +509,14 @@ def publish(
         if existing == image.digest:
             print(f"{reference} is already published with {image.digest}; leaving it alone")
         elif existing is not None:
+            reason = (
+                "cut a new release version"
+                if version
+                else "change the build inputs so the image gets a new tag"
+            )
             raise PublishError(
                 f"{reference} is already published with {existing}, not the declared "
-                f"{image.digest}. A published tag is never overwritten; change the build "
-                "inputs so the image gets a new tag."
+                f"{image.digest}. A published tag is never overwritten; {reason}."
             )
         else:
             for digest in archive.blobs:
