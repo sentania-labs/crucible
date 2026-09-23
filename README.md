@@ -182,6 +182,10 @@ worker image the policy allowlist admits), `POST
 
 ### Running the released image on the rootless daemon
 
+> These manifests are examples that track `latest`. A real deployment copies them into
+> the deployer's own repository and pins the exact tag and digest there. `make
+> deploy-local` below already applies that pin locally, from the tag you give it.
+
 `make up` runs your working tree, which means the compose client must read it,
 which means it must run as the daemon's owner. On a workstation where the
 `crucible` service user cannot read the operator's home (mode 750, correctly),

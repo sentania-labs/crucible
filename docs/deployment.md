@@ -1,5 +1,8 @@
 # Deploying Crucible on Kubernetes
 
+> **These manifests are examples that track `latest`.** A real deployment copies them
+> into the deployer's own repository and pins the exact tag and digest there.
+
 The operator-facing runbook for the manifests in `deploy/kubernetes`. It covers what
 lab-admin provides, what Crucible provides, how the deployment is applied through Argo,
 how the harnesses are logged in once it is up, how to verify that it works, and the one

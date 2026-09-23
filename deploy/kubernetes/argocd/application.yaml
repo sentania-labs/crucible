@@ -1,5 +1,9 @@
 # The Argo Application that consumes the lab overlay (26 checklist item 7, 20 phase C9).
 #
+# These manifests are examples that track `latest`. A real deployment copies them into
+# the deployer's own repository and pins the exact tag and digest there: `repoURL` below
+# must point at the deployer's own repository, never this one.
+#
 # Automated sync is off on purpose. The first sync creates two namespaces, a database,
 # RBAC and the Secret objects, and the SealedSecret placeholders in the overlay are not
 # real ciphertext until lab-admin seals them. A person looking at the diff before the
@@ -8,7 +12,8 @@
 #
 # `repoURL` and `targetRevision` are placeholders because this manifest is a template for
 # lab-admin's own GitOps repository, which is where an Application object actually lives.
-# Crucible's repository is the source of the manifests, not the source of the deployment.
+# Crucible's repository is where the example manifests are copied from, never the
+# `repoURL` Argo tracks.
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
