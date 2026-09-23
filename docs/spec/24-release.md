@@ -96,3 +96,11 @@ Not a deployment trigger. `deploy/kubernetes` in this repository is examples tha
 track `latest` and never pin themselves; a real deployment copies the lab overlay
 into the deployer's own GitOps repository and pins the tag this release cuts there
 (13, docs/deployment.md). A tag here changes nothing a cluster is running.
+
+**The worker image publishes under this release's version, the same as the
+service image** (the operator's decision, 2026-09-23, 13): the tag workflow's
+`images-publish` step tags `crucible-worker` (and the script-harness image)
+with the contract's `version` and moves `latest`, never republishing over an
+existing version tag. The release body records both the service and the
+worker image as `name:<version>@<digest>`, read back from the registry, so a
+deployer pins from the release, never from a local guess.
