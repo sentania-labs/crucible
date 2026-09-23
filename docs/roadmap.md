@@ -37,8 +37,9 @@ All of these are the operator's decisions.
 - This roadmap and the vision are committed.
 - v0.5.3 is tagged as the last Crucible-era release (the operator's go).
 
-**Exit:** the release run is green and both images pull by the digests the release
-names.
+**Exit:** the release run is green, both images pull by the digests the release
+names, and every `latest` tag resolves on the registry to the same digest as its
+version tag.
 
 ### M0b: an honest, usable lab deployment
 
