@@ -39,9 +39,14 @@ for image in "${images[@]}"; do
     [ -f "$here/$image/Dockerfile" ] || { echo "build.sh: no Dockerfile for image '$image'" >&2; exit 2; }
     # A file copied from the build context keeps the checkout's mode, which follows the
     # cloner's umask and is not a build input, so the same tag would get a different
-    # digest on another machine. Every such COPY or ADD states its mode.
-    unpinned=$(grep -n -E '^[[:space:]]*(COPY|ADD)[[:space:]]' "$here/$image/Dockerfile" \
-        | grep -v -e '--from=' -e '--chmod=' || true)
+    # digest on another machine. Every such COPY or ADD states its mode among its own
+    # flags. Instructions are case-insensitive and may follow ONBUILD.
+    unpinned=$(grep -n -i -E '^[[:space:]]*(onbuild[[:space:]]+)?(copy|add)([[:space:]]|$)' \
+        "$here/$image/Dockerfile" | while IFS= read -r line; do
+            flags=$(sed -E 's/^[0-9]+:[[:space:]]*([Oo][Nn][Bb][Uu][Ii][Ll][Dd][[:space:]]+)?[A-Za-z]+//' \
+                <<<"$line" | grep -o -E '^([[:space:]]+--[^[:space:]]+)*' || true)
+            grep -q -E -e '--(from|chmod)=' <<<"$flags" || printf '%s\n' "$line"
+        done)
     [ -z "$unpinned" ] || {
         echo "build.sh: $image/Dockerfile copies from the build context without --chmod:" >&2
         echo "$unpinned" >&2
@@ -56,6 +61,18 @@ case "${NO_CACHE:-0}" in 0|"") ;; *) no_cache="--no-cache" ;; esac
 : "${BASE_IMAGE:?}" "${DEBIAN_SNAPSHOT:?}" "${GIT_VERSION:?}" "${CURL_VERSION:?}" \
   "${JQ_VERSION:?}" "${CA_CERTIFICATES_VERSION:?}" "${LAB_CA_SHA256:?}" \
   "${SOURCE_DATE_EPOCH:?}" "${BUILDKIT_IMAGE:?}"
+
+# rewrite-timestamp only clamps a file newer than SOURCE_DATE_EPOCH. A context file at
+# or before it (a checkout from before an epoch bump) would keep its own mtime in the
+# COPY layer, and a later RUN that sets the mtime to the epoch would no longer change
+# it, so the layers would depend on when the machine checked out. Every context file
+# must be newer, so every machine clamps it the same way.
+stale=$(find "$here" -path "$here/out" -prune -o -type f ! -newermt "@$SOURCE_DATE_EPOCH" -print)
+[ -z "$stale" ] || {
+    echo "build.sh: these build-context files are not newer than SOURCE_DATE_EPOCH; touch them:" >&2
+    echo "$stale" >&2
+    exit 2
+}
 
 # The docker driver inside dockerd cannot write OCI output, and the OCI
 # manifest digest is the one a registry would report, so builds run on a
