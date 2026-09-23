@@ -2,9 +2,9 @@
 # integration tier needs a Docker daemon and the repository is public (github-ci skill).
 name: ci
 
-# Every branch push, not only main, so the ghcr-publish job below can prove a change to
-# the worker image publish against GHCR before there is a pull request (FDY-0090). The
-# other jobs keep their old triggers, main pushes and pull requests, through their `if`.
+# Every branch push runs every job, so a change is proven on its branch before there is
+# a pull request. A pull request from this repository already has those checks on its
+# head commit, so the pull_request event runs the jobs only for a fork's pull request.
 on:
   push:
     branches: ["**"]
@@ -19,7 +19,7 @@ permissions:
 
 jobs:
   lint:
-    if: github.event_name != 'push' || github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
@@ -30,7 +30,7 @@ jobs:
         run: make lint
 
   scan:
-    if: github.event_name != 'push' || github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
@@ -45,12 +45,21 @@ jobs:
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
       - name: scan the tracked tree
         run: make scan-tree
+      # The first push of a new branch has no `before` (all zeros), so its range is
+      # everything the branch adds to main.
       - name: scan the commits that just landed
         if: github.event_name == 'push'
-        run: make scan-history SCAN_RANGE="${{ github.event.before }}..${{ github.sha }}"
+        env:
+          BEFORE: ${{ github.event.before }}
+          SHA: ${{ github.sha }}
+        run: |
+          case "$BEFORE" in
+            *[!0]*) make scan-history SCAN_RANGE="$BEFORE..$SHA" ;;
+            *) make scan-history SCAN_RANGE="origin/main..$SHA" ;;
+          esac
 
   test:
-    if: github.event_name != 'push' || github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
@@ -63,7 +72,7 @@ jobs:
   # the dedicated rootless daemon (13, S9); this is the same tier, same targets, on the
   # arrangement CI has.
   e2e:
-    if: github.event_name != 'push' || github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -87,22 +96,22 @@ jobs:
   # it is proved on a machine the author does not control. GitHub-hosted, because it
   # needs a Docker daemon and buildx (github-ci skill).
   #
-  # Pull requests import the BuildKit layer cache the last push to main exported, so
-  # the job takes minutes. The digest is always computed from what the build output,
-  # but a network step (apt, pip, ADD <url>) is cached on its instruction text, not on
-  # the bytes it would fetch today, so a pull request's pass is not on its own proof
-  # that upstream still serves those bytes. That proof is every push to main, which
+  # Branch pushes and pull requests import the BuildKit layer cache the last push to
+  # main exported, so the job takes minutes. The digest is always computed from what the
+  # build output, but a network step (apt, pip, ADD <url>) is cached on its instruction
+  # text, not on the bytes it would fetch today, so a branch's pass is not on its own
+  # proof that upstream still serves those bytes. That proof is every push to main, which
   # builds from scratch (NO_CACHE=1, nothing restored) before exporting the cache, and
-  # the release, which builds from scratch again and publishes nothing unless the
-  # digests match.
+  # the release, which builds from scratch again and pushes nothing unless the digests
+  # match.
   images:
-    if: github.event_name != 'push' || github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
       - name: restore the BuildKit layer cache
-        if: github.event_name != 'push'
+        if: github.ref != 'refs/heads/main'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/buildkit-cache
@@ -110,56 +119,20 @@ jobs:
           restore-keys: worker-images-
       - name: build both images and compare with images/manifest.env
         env:
-          NO_CACHE: ${{ github.event_name == 'push' && '1' || '' }}
+          NO_CACHE: ${{ github.ref == 'refs/heads/main' && '1' || '' }}
         run: make images-check CACHE_DIR="$RUNNER_TEMP/buildkit-cache" NO_CACHE="$NO_CACHE"
-      - name: keep the layer cache for pull requests
-        if: github.event_name == 'push'
+      - name: keep the layer cache for branches and pull requests
+        if: github.ref == 'refs/heads/main'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/buildkit-cache
           key: worker-images-${{ hashFiles('images/**') }}
 
-  # The worker image publish, proved against the real registry (FDY-0090). The v0.5.0
-  # release failed on GHCR's answer to a blob upload that a local registry:2 and the
-  # unit tests' fake had both accepted, so the only proof that counts is GHCR itself.
-  # This is `make images-publish`, the release's own target and script: build both
-  # images, refuse unless they reproduce images/manifest.env, push each OCI archive
-  # never over another digest, and read every digest back. The only difference is the
-  # tag, ci-<short sha>-<declared tag>, a throwaway that is never a release tag. They
-  # accumulate on ghcr.io/sentania-labs/crucible-worker; deleting them is an operator
-  # call. Every branch push and every pull request from this repository; a fork's pull
-  # request has no package write and is skipped. GitHub-hosted, like `images`.
-  ghcr-publish:
-    if: >-
-      github.event_name == 'push'
-      || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
-      - name: restore the BuildKit layer cache
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ runner.temp }}/buildkit-cache
-          key: worker-images-${{ hashFiles('images/**') }}
-          restore-keys: worker-images-
-      - name: build, prove and publish both images under ci-<sha> tags, then read them back
-        env:
-          REGISTRY_USERNAME: ${{ github.actor }}
-          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
-          SHA: ${{ github.sha }}
-        run: |
-          make images-publish CACHE_DIR="$RUNNER_TEMP/buildkit-cache" \
-            WORKER_TAG_PREFIX="ci-${SHA:0:12}-"
-
   # A real API server, kubelet, enforcing CNI and PVC on the runner's Docker daemon.
   # This belongs beside the Docker tier on GitHub-hosted infrastructure: it needs a
   # daemon but no lab access (github-ci skill).
   e2e-kind:
-    if: github.event_name != 'push' || github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -186,7 +159,7 @@ jobs:
   # `lab` pool, which exists to reach the lab and would only queue for a job that needs
   # nothing from it.
   manifests:
-    if: github.event_name != 'push' || github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
@@ -221,7 +194,7 @@ jobs:
         run: make manifests
 
   compose-smoke:
-    if: github.event_name != 'push' || github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
