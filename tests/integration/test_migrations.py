@@ -392,15 +392,29 @@ def test_0017_seeds_from_the_routing_in_force_not_an_unreferenced_draft(
             {"version": draft_version},
         ).scalar_one()
     engine.dispose()
-    assert seeded_version == draft_version + 1
+    # 0017 mints one new version on top of the draft, then C11's 0019 mints another
+    # beside it, so the in-force chain now runs two steps past the draft, not one.
+    assert seeded_version == draft_version + 2
     ids = [model["id"] for model in seeded["models"]]
     assert "draft-only-experiment" not in ids
-    assert [model for model in seeded["models"] if model.get("harness") != "hermes"] == [
-        model for model in routing["models"] if model.get("harness") != "hermes"
-    ]
+    assert [
+        model
+        for model in seeded["models"]
+        if model.get("harness") != "hermes" and model["id"] != "claude-opus-5-5"
+    ] == [model for model in routing["models"] if model.get("harness") != "hermes"]
     assert kept_draft == draft
 
     migrate.downgrade(database_url, "0016_disposition_versions")
+    # The draft this test inserted by hand is unreferenced, so no downgrade removes
+    # it either: left alone it would occupy a version number forever and throw off
+    # every later test's "next free version" math in the shared database.
+    engine = make_engine(database_url)
+    with engine.begin() as conn:
+        conn.execute(
+            text("DELETE FROM routing_policies WHERE name='default-routing' AND version=:version"),
+            {"version": draft_version},
+        )
+    engine.dispose()
     migrate.upgrade(database_url)
 
 
@@ -467,7 +481,9 @@ def test_0017_extends_a_routing_policy_the_operator_named_differently(
             == default_routing_rows
         )
     engine.dispose()
-    assert seeded_policy["routing"] == {"policy": {"name": "lab-routing", "version": 2}}
+    # 0017 extends lab-routing to version 2; C11's 0019 then extends it again to 3,
+    # and that is what the in-force policy now names.
+    assert seeded_policy["routing"] == {"policy": {"name": "lab-routing", "version": 3}}
     assert [model["id"] for model in seeded["models"] if model["harness"] == "hermes"] == ["coder"]
 
     migrate.downgrade(database_url, "0016_disposition_versions")
@@ -479,6 +495,17 @@ def test_0017_extends_a_routing_policy_the_operator_named_differently(
             ).scalar_one()
             == 1
         )
+    # The version this test inserted by hand, not through a migration: no downgrade
+    # knows to remove it, so it would otherwise stay in force for every test after
+    # this one in the shared database.
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "DELETE FROM policies WHERE name='default-software' "
+                "AND document -> 'routing' -> 'policy' ->> 'name' = 'lab-routing'"
+            )
+        )
+        conn.execute(text("DELETE FROM routing_policies WHERE name='lab-routing'"))
     engine.dispose()
     migrate.upgrade(database_url)
 
