@@ -401,39 +401,53 @@ def credential_actions(
 
 
 def local_endpoint_actions(document: Any, prefix: Sequence[str]) -> list[dict[str, Any]]:
-    """The panel always offers an update; the current values are advisory context,
-    not defaults the client should assume for the caller."""
+    """One action per model in data.models, already set to flip its current state:
+    `enable` for a disabled model, `disable` for an enabled one. The parser's
+    `--enable`/`--disable` are a required mutually exclusive pair, so the flag is baked
+    into the command rather than advertised as an appendable option: an `--enable`
+    already in the command and an offered `--disable` are a usage error together."""
     if not isinstance(document, dict):
         return []
-    return [
-        action(
-            "set-local-endpoint",
-            "update the local model endpoint, its models, and concurrency",
-            [
-                *prefix,
-                "--reason",
-                "{reason}",
-                "routing",
-                "set-local-endpoint",
-                "--endpoint-url",
-                "{endpoint_url}",
-                "--model",
-                "{model}",
-                "--enable",
-            ],
-            needs={
-                "endpoint_url": "the local endpoint's base URL",
-                "model": "a model id from data.models",
-                **REASON,
-            },
-            optional=[
-                {"flag": "--disable", "description": "disable the model instead of enabling it"},
-                {"flag": "--enable-thinking", "description": "turn on the model's thinking mode"},
-                {"flag": "--max-concurrency", "description": "the pool's concurrency (default 4)"},
-            ],
-            roles=(ADMIN,),
+    models = document.get("models")
+    if not isinstance(models, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for model in models:
+        if not isinstance(model, dict) or not model.get("id"):
+            continue
+        model_id = str(model["id"])
+        verb = "disable" if model.get("enabled") is True else "enable"
+        out.append(
+            action(
+                f"set-local-endpoint:{model_id}",
+                f"{verb} the {model_id} model on the local endpoint",
+                [
+                    *prefix,
+                    "--reason",
+                    "{reason}",
+                    "routing",
+                    "set-local-endpoint",
+                    "--endpoint-url",
+                    "{endpoint_url}",
+                    "--model",
+                    model_id,
+                    f"--{verb}",
+                ],
+                needs={"endpoint_url": "the local endpoint's base URL", **REASON},
+                optional=[
+                    {
+                        "flag": "--enable-thinking",
+                        "description": "turn on the model's thinking mode",
+                    },
+                    {
+                        "flag": "--max-concurrency",
+                        "description": "the pool's concurrency (default 4)",
+                    },
+                ],
+                roles=(ADMIN,),
+            )
         )
-    ]
+    return out
 
 
 def harness_actions(items: Iterable[Any], prefix: Sequence[str]) -> list[dict[str, Any]]:

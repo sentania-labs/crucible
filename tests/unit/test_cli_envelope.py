@@ -12,6 +12,7 @@ from crucible.application.corrections import CORRECTABLE_STATES
 from crucible.cli import admin
 from crucible.cli.main import build_parser, run
 from crucible.client import next as nx
+from crucible.client.envelope import UsageError
 from crucible.client.schema import envelope_schema, kind_schemas
 from crucible.domain.lifecycle import _CANCELLABLE_AT_ONCE, TASK_TRANSITIONS, TaskState
 from tests.fake_crucible import FakeCrucible, fake
@@ -254,6 +255,79 @@ def test_login_is_offered_remotely_too(state: str) -> None:
     assert parsed.group == "admin"
 
     assert nx.credential_actions("hermes", "not_required", []) == []
+
+
+def _every_next_action() -> list[dict[str, Any]]:
+    """Every action every `next` rule can offer, across states, roles, and documents, so
+    a defect in any one rule's `optional` flags is caught without special-casing a verb."""
+    prefix = ["crucible"]
+    admin_prefix = ["crucible", "admin"]
+    escalation = {"id": "E1", "state": "open", "question": "q?"}
+    entries: list[dict[str, Any]] = []
+    for state in TaskState:
+        for role in nx.ROLES:
+            entries += nx.task_actions(
+                _task(state.value, open_escalations=[escalation]), role, prefix
+            )
+    entries += nx.task_list_actions({"items": [{"id": "T1"}]}, prefix)
+    entries += nx.wake_actions(
+        {"items": [{"id": "W1", "task_id": "T1", "acked_at": None}]}, nx.ORCHESTRATOR, prefix
+    )
+    for harness in ("codex", "claude_code", "agy", "hermes"):
+        for credential_state in ("absent", "configured", "invalid", "validated"):
+            entries += nx.credential_actions(harness, credential_state, admin_prefix)
+    entries += nx.local_endpoint_actions(
+        {"models": [{"id": "coder", "enabled": True}, {"id": "other", "enabled": False}]},
+        admin_prefix,
+    )
+    entries += nx.harness_actions([{"name": "codex", "enabled": True}], admin_prefix)
+    entries += nx.harness_actions([{"name": "codex", "enabled": False}], admin_prefix)
+    entries += nx.image_actions(
+        [
+            {
+                "digest": "sha256:x",
+                "harnesses": ["codex"],
+                "supported": True,
+                "promotion_state": "candidate",
+            }
+        ],
+        admin_prefix,
+    )
+    entries += nx.exhaustion_actions([{"pool": "p1", "active": True}], admin_prefix)
+    entries += nx.token_actions([{"id": "P1", "disabled_at": None}], admin_prefix)
+    entries += nx.bootstrap_actions({"state": "verified", "import_id": "I1"}, admin_prefix)
+    entries += nx.audit_actions({"next_cursor": 5}, admin_prefix, 100, 0)
+    return entries
+
+
+def test_every_next_action_and_its_optional_flags_parse() -> None:
+    """Every `next` argv parses, and so does every advertised optional flag added to it,
+    whether it takes a value or not: the class of defect where an advertised flag
+    contradicts one already baked into the command (set-local-endpoint's --enable and
+    --disable) is not specific to one verb."""
+    entries = _every_next_action()
+    assert entries
+    for entry in entries:
+        fill = {
+            name: (need["choices"][0] if isinstance(need, dict) else "x")
+            for name, need in entry["needs"].items()
+        }
+        base = [
+            re.sub(r"\{(\w+)\}", lambda m, f=fill: f[m.group(1)], arg)  # type: ignore[misc]
+            for arg in entry["command"][1:]
+        ]
+        build_parser().parse_args(base)
+        for optional in entry.get("optional", []):
+            flag = optional["flag"]
+            parses = False
+            for argv in ([*base, flag], [*base, flag, "x"], [*base, flag, "1"]):
+                try:
+                    build_parser().parse_args(argv)
+                    parses = True
+                    break
+                except UsageError:
+                    continue
+            assert parses, f"{entry['action']}: no encoding of {flag} parses on {base}"
 
 
 def test_a_remote_admin_command_names_its_url_in_next(
