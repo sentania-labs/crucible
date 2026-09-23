@@ -271,12 +271,18 @@ class NamespaceProbe:
     pid_limit: int | None
     detail: str = ""
     checked: bool = True
+    # Where `pid_limit` came from, or why there is none (95): "cgroup-v2-parent" when
+    # the pod-level cgroup was read directly, "cgroupns-private" when the container's
+    # cgroup namespace hides it, "cgroup-v1" when the hierarchy is the unsupported one,
+    # or "" when the probe never got far enough to know.
+    pid_limit_source: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "namespace_ready": self.passed,
             "egress_enforced": self.egress_enforced,
             "pod_pid_limit": self.pid_limit,
+            "pod_pid_limit_source": self.pid_limit_source,
             "runtime_class": "standard",
             "detail": self.detail,
         }
@@ -1007,6 +1013,7 @@ class KubernetesProvider:
             "node": (launched.node if launched else "") or "",
             "limits": self._limits(spec).as_dict(),
             "pod_pid_limit": probe.pid_limit if probe else None,
+            "pod_pid_limit_source": probe.pid_limit_source if probe else "",
             "runtime_class": "standard",
             "network_policy": (launched.network_policy if launched else None),
             "egress": list(self._egress_plan(spec, k8sspec.ROLE_WORKER).hosts),
@@ -2458,8 +2465,6 @@ def _read_probe(output: str) -> NamespaceProbe:
         return NamespaceProbe(False, False, None, "the canary produced no result", checked=False)
     answer = fields["api"]
     enforced = answer == "unreachable"
-    raw = fields.get("pids", "")
-    pid_limit = int(raw) if raw.isdigit() else None
     problems = []
     if answer == "reachable":
         problems.append("the canary reached the API server, so the CNI is not enforcing egress")
@@ -2468,8 +2473,9 @@ def _read_probe(output: str) -> NamespaceProbe:
             "the canary could not tell whether it reached the API server "
             f"(tool {fields.get('tool', 'unknown')}, curl exit {fields.get('curl_exit', 'none')})"
         )
-    if pid_limit is None:
-        problems.append("the node has no pod PID limit configured")
+    pid_limit, pid_source, pid_problem = _read_pod_pid_limit(fields)
+    if pid_problem:
+        problems.append(pid_problem)
     return NamespaceProbe(
         passed=not problems,
         egress_enforced=enforced,
@@ -2478,6 +2484,38 @@ def _read_probe(output: str) -> NamespaceProbe:
         # An inconclusive answer is not a probe that ran: the status page should say so
         # rather than showing a namespace that merely failed.
         checked=answer != "inconclusive",
+        pid_limit_source=pid_source,
+    )
+
+
+def _read_pod_pid_limit(fields: Mapping[str, str]) -> tuple[int | None, str, str | None]:
+    """The pod-level PID limit is the kubelet's `podPidsLimit`, set on the parent of the
+    canary container's own cgroup (95): the container's own `pids.max` is its runtime's
+    per-container default and says nothing about a pod-level limit, which is why the
+    gate no longer reads it directly. Whether the parent is even visible depends on the
+    cgroup namespace the container runtime gave this container; when it is not, the
+    number cannot be established from inside the pod and the probe must say so rather
+    than pass on a container-scope number that was never the kubelet's setting."""
+    raw = fields.get("pod_pids", "")
+    source = fields.get("pod_pids_source", "")
+    if raw.isdigit():
+        return int(raw), source, None
+    if raw == "none":
+        return (
+            None,
+            source,
+            ("the kubelet podPidsLimit is not set (the pod-level cgroup shows no limit)"),
+        )
+    if raw == "unsupported":
+        return None, source, "the pod-level PID limit is not readable under cgroup v1 (unsupported)"
+    return (
+        None,
+        source,
+        (
+            "the pod-level PID limit could not be confirmed: the pod cgroup is not visible "
+            "from inside the container (cgroup namespace isolation), so the kubelet "
+            "podPidsLimit cannot be established from here"
+        ),
     )
 
 
@@ -2540,6 +2578,39 @@ case "$limit" in
   ''|max) echo "crucible-canary.pids=none" ;;
   *) echo "crucible-canary.pids=$limit" ;;
 esac
+
+# The pod-level limit the kubelet's podPidsLimit sets lands on the parent of this
+# container's own cgroup, one level above what /sys/fs/cgroup shows here (95). Whether
+# that parent is visible depends on the cgroup namespace the container runtime gave
+# this container; when it is not (the container's own path in /proc/self/cgroup is its
+# own root), the number cannot be read from here at all.
+if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
+  selfline=$(grep '^0::' /proc/self/cgroup 2>/dev/null)
+  path=${selfline#0::}
+  if [ -z "$path" ] || [ "$path" = "/" ]; then
+    echo "crucible-canary.pod_pids=unknown"
+    echo "crucible-canary.pod_pids_source=cgroupns-private"
+  else
+    parent=$(dirname "$path")
+    podlimit=$(cat "/sys/fs/cgroup$parent/pids.max" 2>/dev/null)
+    if [ -z "$podlimit" ]; then
+      echo "crucible-canary.pod_pids=unknown"
+      echo "crucible-canary.pod_pids_source=cgroup-v2-parent-unreadable"
+    else
+      case "$podlimit" in
+        max) echo "crucible-canary.pod_pids=none" ;;
+        *) echo "crucible-canary.pod_pids=$podlimit" ;;
+      esac
+      echo "crucible-canary.pod_pids_source=cgroup-v2-parent"
+    fi
+  fi
+elif [ -d /sys/fs/cgroup/pids ]; then
+  echo "crucible-canary.pod_pids=unsupported"
+  echo "crucible-canary.pod_pids_source=cgroup-v1"
+else
+  echo "crucible-canary.pod_pids=unknown"
+  echo "crucible-canary.pod_pids_source=no-pids-controller"
+fi
 echo "crucible-canary.done=1"
 """
 

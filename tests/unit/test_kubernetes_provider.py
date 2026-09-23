@@ -103,11 +103,14 @@ async def test_the_probe_passes_when_the_canary_cannot_reach_the_api_server() ->
     _api, _registry, provider = build()
     await provider.prepare(spec())
     probe = await provider.ensure_ready()
-    assert probe == NamespaceProbe(True, True, 4096, "namespace ready")
+    assert probe == NamespaceProbe(
+        True, True, 4096, "namespace ready", pid_limit_source="cgroup-v2-parent"
+    )
     health = await provider.health()
     assert health.state == "ok"
     assert health.checks["egress_enforced"] is True
     assert health.checks["pod_pid_limit"] == 4096
+    assert health.checks["pod_pid_limit_source"] == "cgroup-v2-parent"
     assert health.checks["runtime_class"] == "standard"
 
 
@@ -157,7 +160,37 @@ async def test_a_node_with_no_pod_pid_limit_refuses_every_launch() -> None:
     _api, _registry, provider, launch, workspace = await prepared(build={"pod_pid_limit": None})
     probe = await provider.ensure_ready()
     assert probe.passed is False and probe.pid_limit is None
-    assert "pod PID limit" in probe.detail
+    assert "podPidsLimit is not set" in probe.detail
+    assert probe.pid_limit_source == "cgroup-v2-parent"
+    with pytest.raises(LaunchRefusedError, match="not ready"):
+        await provider.launch(workspace, launch)
+
+
+async def test_a_private_cgroup_namespace_reports_inconclusive_not_a_pass() -> None:
+    """The container's own cgroup limit (95's bug) must never stand in for the pod-level
+    one: when the runtime hides the parent cgroup, the gate says so and still refuses,
+    even though a container-scope number is sitting right there in `pids.max`."""
+    _api, _registry, provider, launch, workspace = await prepared(
+        build={"pod_pid_limit_source": "cgroupns-private"}
+    )
+    probe = await provider.ensure_ready()
+    assert probe.passed is False
+    assert probe.pid_limit is None
+    assert probe.pid_limit_source == "cgroupns-private"
+    assert "cgroup namespace isolation" in probe.detail
+    with pytest.raises(LaunchRefusedError, match="not ready"):
+        await provider.launch(workspace, launch)
+
+
+async def test_cgroup_v1_pod_pid_limit_is_unsupported_not_a_pass() -> None:
+    _api, _registry, provider, launch, workspace = await prepared(
+        build={"pod_pid_limit_source": "cgroup-v1"}
+    )
+    probe = await provider.ensure_ready()
+    assert probe.passed is False
+    assert probe.pid_limit is None
+    assert probe.pid_limit_source == "cgroup-v1"
+    assert "unsupported" in probe.detail
     with pytest.raises(LaunchRefusedError, match="not ready"):
         await provider.launch(workspace, launch)
 
