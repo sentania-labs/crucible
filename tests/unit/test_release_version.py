@@ -1,6 +1,6 @@
-"""The single highest-published-version rule the service image's release step and the
-worker images' publish() both apply before moving a mutable `latest` tag (FDY-0094, PR
-88 review round)."""
+"""The single highest-published-version rule the release's "move latest" step applies
+before moving the service image's and the worker images' mutable `latest` tags
+(FDY-0094, PR 88 review round; FDY-0096)."""
 
 from __future__ import annotations
 
@@ -59,7 +59,7 @@ def test_numeric_ordering_not_lexical_ordering() -> None:
 
 
 def test_a_non_version_tag_never_contends() -> None:
-    tags = ["ci-0123abcd-20260916-aaaaaaaaaaaa", "script-harness-9.9.9", "latest", "9"]
+    tags = ["20260916-aaaaaaaaaaaa", "script-harness-9.9.9", "latest", "9"]
     assert v.highest_version("0.5.2", tags) == "0.5.2"
 
 

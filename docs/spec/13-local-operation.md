@@ -169,10 +169,13 @@ Rules:
   requests import a BuildKit layer cache; every push to main builds from
   scratch before exporting it.
 - The release publishes both to `ghcr.io/sentania-labs/crucible-worker`
-  (`make images-publish`, 24): it builds from scratch, refuses to push
-  unless the build reproduces the manifest, pushes each OCI archive as
-  built so the registry holds the declared digest, never over a tag that
-  already carries another digest, and reads every published digest back.
+  with `docker push`, the way the service image and every ScarGuard service
+  are pushed (the operator's decision, 2026-09-23; 24): it builds from
+  scratch with `make images-check`, refuses to push unless the build
+  reproduces the manifest, and never pushes over an existing version tag
+  built from other inputs. `docker push` re-encodes the layers, so the
+  registry digest differs from the manifest's local OCI digest; nothing
+  compares the two, and the release notes carry the registry's.
   A cluster resolves the worker image there (`kubernetes.image_repositories`,
   26); a compose deployment uses the local daemon's `crucible-worker` images.
 - **The worker image follows accepted practice for application images, the

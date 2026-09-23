@@ -4,9 +4,9 @@
 #   tools/images/images.sh build     build every image and write images/manifest.env back
 #   tools/images/images.sh check     build every image; fail when any tag, harness list
 #                                    or OCI digest differs from images/manifest.env
-#   tools/images/images.sh publish   check, then push each image's OCI archive to
-#                                    WORKER_REGISTRY:<tag>, never over a different
-#                                    digest, and verify every published digest
+#
+# Either way the images end up loaded in the daemon under their manifest tags, which is
+# where the release pushes them from (tools/release/push_worker_images.sh).
 #
 # Why a staged copy: on the reference workstation the build daemon is the `crucible`
 # service user's rootless daemon, and that user cannot read a checkout under the
@@ -18,21 +18,13 @@
 #
 # Environment: DOCKER (the Docker CLI or the rootless wrapper), NO_CACHE and CACHE_DIR
 # (passed to build.sh), IMAGES_STAGE_ROOT (where the scratch directory goes, default
-# TMPDIR or /tmp), and for publish WORKER_REGISTRY plus, when the registry wants them,
-# REGISTRY_USERNAME and REGISTRY_PASSWORD. No credential is ever an argument.
-# WORKER_TAG_PREFIX (publish only, default empty) publishes <prefix><tag> instead of
-# <tag>: CI's throwaway ci-<sha>- tags (FDY-0090). The release never sets it.
-# WORKER_RELEASE_VERSION (publish only, default empty) publishes the Crucible release
-# version instead of the fingerprint tag, and moves latest only when that version is
-# the highest published (13, 24): the release sets it, from the git tag, exactly as
-# the service image build does; CI's ghcr-publish job never sets it. Mutually
-# exclusive with WORKER_TAG_PREFIX.
+# TMPDIR or /tmp).
 set -euo pipefail
 
 mode=${1:-}
 case "$mode" in
-    build|check|publish) ;;
-    *) echo "images.sh: usage: images.sh build|check|publish" >&2; exit 2 ;;
+    build|check) ;;
+    *) echo "images.sh: usage: images.sh build|check" >&2; exit 2 ;;
 esac
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -51,8 +43,17 @@ chmod -R a+rX "$stage"
 chmod 1777 "$stage/out"
 
 # Every image is built, so the manifest is written fresh: an entry for an image
-# directory that no longer exists cannot survive a build.
-rm -f "$stage/manifest.env"
+# directory that no longer exists cannot survive a build. The header is written here,
+# not by build.sh, because build.sh is a build input and editing it would change every
+# tag; build.sh keeps an existing header.
+cat > "$stage/manifest.env" <<'HEADER'
+# Written by tools/images/images.sh: the tag, OCI manifest digest and harness versions
+# of each image. The declared pin the tiers read; never chosen by creation time (13, C5).
+# The digest is the local build's OCI digest, the record `make images-check` reproduces.
+# It is not the registry's: the release pushes with `docker push`, which re-encodes the
+# layers, and nothing compares the two (the operator's decision, 2026-09-23). The
+# release notes carry the digest the registry reports.
+HEADER
 OUT="$stage/out" MANIFEST="$stage/manifest.env" "$stage/build.sh"
 
 case "$mode" in
@@ -60,7 +61,7 @@ case "$mode" in
         cp "$stage/manifest.env" "$source_dir/manifest.env"
         echo "images.sh: wrote images/manifest.env"
         ;;
-    check|publish)
+    check)
         # The whole file, not a subset: a tag, a harness version or a digest that the
         # build did not reproduce is drift, and so is an entry the build did not write.
         if ! diff -u "$source_dir/manifest.env" "$stage/manifest.env"; then
@@ -71,13 +72,3 @@ case "$mode" in
         ;;
 esac
 
-if [ "$mode" = publish ]; then
-    : "${WORKER_REGISTRY:?set WORKER_REGISTRY, for example ghcr.io/sentania-labs/crucible-worker}"
-    python3 "$repo_root/tools/release/worker_images.py" publish \
-        --manifest "$source_dir/manifest.env" --archives "$stage/out" \
-        --repository "$WORKER_REGISTRY" --tag-prefix "${WORKER_TAG_PREFIX:-}" \
-        --release-version "${WORKER_RELEASE_VERSION:-}"
-    python3 "$repo_root/tools/release/worker_images.py" verify \
-        --manifest "$source_dir/manifest.env" --repository "$WORKER_REGISTRY" \
-        --tag-prefix "${WORKER_TAG_PREFIX:-}" --release-version "${WORKER_RELEASE_VERSION:-}"
-fi

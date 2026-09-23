@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
-"""Render the published image digests as GitHub release notes (FDY-0088).
+"""Render the published image digests as GitHub release notes (FDY-0088, FDY-0096).
 
-    release_notes.py --service-image ghcr.io/sentania-labs/crucible:0.5.0 \
-        --worker-manifest images/manifest.env \
+    release_notes.py --service-image ghcr.io/sentania-labs/crucible:0.5.3 \
         --worker-repository ghcr.io/sentania-labs/crucible-worker
 
-By the time this runs, the release workflow has already pushed the service image and
-`images-publish` has already pushed and verified the worker image, so both are on the
-registry. Every digest printed here is read back from the registry over the same OCI
-distribution API `worker_images.py` uses, never taken from a local build or a manifest
-file: a runbook that quoted a local digest could describe an image nobody can pull.
+By the time this runs, the release workflow has pushed the service image and both
+worker images with `docker push`, so all three are on the registry. Every digest
+printed here is read back from the registry with `docker buildx imagetools inspect`,
+never taken from a local build or images/manifest.env: `docker push` re-encodes the
+layers, so the local OCI digest is not what anyone pulls.
+
+The worker images' release tags are the service image's own version, `<version>` and
+`script-harness-<version>` (13, 24). DOCKER (default `docker`) is the Docker CLI or
+the rootless wrapper, already logged in.
 
 Prints markdown to stdout; the release workflow puts it in front of `gh release
 create --notes-file` and `--generate-notes` appends the usual changelog after it.
@@ -18,83 +21,85 @@ create --notes-file` and `--generate-notes` appends the usual changelog after it
 from __future__ import annotations
 
 import argparse
+import json
+import os
+import shlex
+import subprocess
 import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from worker_images import PublishError, Registry, declared_images
 
 
-def render(
-    service_ref: str, service_digest: str, worker_ref: str, worker_digest: str, latest_note: str
-) -> str:
+class NotesError(Exception):
+    pass
+
+
+def render(refs: list[tuple[str, str]], latest_note: str) -> str:
+    lines = "".join(f"- `{ref}@{digest}`\n" for ref, digest in refs)
     return (
         "## Published image digests\n"
         "\n"
         "Read back from the registry at release time; if this release predates this "
         "section, `docs/deployment.md` gives the equivalent registry command.\n"
         "\n"
-        f"- `{service_ref}@{service_digest}`\n"
-        f"- `{worker_ref}@{worker_digest}`\n"
+        f"{lines}"
         f"{latest_note}"
     )
 
 
-def worker_image(manifest: Path, version: str) -> tuple[str, str]:
-    """The worker image's release tag (the Crucible release version, not its own
-    fingerprint tag: `images-publish` no longer pushes that) and its declared digest."""
-    for image in declared_images(manifest):
-        if image.key == "WORKER":
-            return version, image.digest
-    raise PublishError(f"{manifest} declares no WORKER image")
+def registry_digest(ref: str) -> str | None:
+    """The manifest digest the registry holds under `ref`, or None when the registry
+    says it has no such tag. Any other failure is an error, never "absent"."""
+    command = [
+        *shlex.split(os.environ.get("DOCKER", "docker")),
+        "buildx",
+        "imagetools",
+        "inspect",
+        ref,
+        "--format",
+        "{{json .Manifest.Digest}}",
+    ]
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        if stderr.splitlines()[-1:] == [f"ERROR: {ref}: not found"]:
+            return None
+        raise NotesError(f"cannot read {ref} from the registry: {stderr}")
+    digest = json.loads(result.stdout)
+    if not isinstance(digest, str) or not digest.startswith("sha256:"):
+        raise NotesError(f"{ref}: the registry answered {result.stdout.strip()!r}")
+    return digest
+
+
+def published(ref: str) -> str:
+    digest = registry_digest(ref)
+    if digest is None:
+        raise NotesError(f"{ref} is not published")
+    return digest
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0] if __doc__ else None)
-    parser.add_argument("--service-image", required=True, help="repository:tag")
-    parser.add_argument("--worker-manifest", type=Path, required=True)
+    parser.add_argument("--service-image", required=True, help="repository:version")
     parser.add_argument("--worker-repository", required=True)
     args = parser.parse_args(argv)
     try:
-        service_repository, sep, service_tag = args.service_image.rpartition(":")
-        if not sep:
-            raise PublishError(f"--service-image {args.service_image!r} names no tag")
-        service_digest = Registry(service_repository).published_digest(service_tag)
-        if service_digest is None:
-            raise PublishError(f"{args.service_image} is not published")
+        _, sep, version = args.service_image.rpartition(":")
+        if not sep or "/" in version:
+            raise NotesError(f"--service-image {args.service_image!r} names no tag")
+        worker = f"{args.worker_repository}:{version}"
+        harness = f"{args.worker_repository}:script-harness-{version}"
+        refs = [(ref, published(ref)) for ref in (args.service_image, worker, harness)]
 
-        worker_tag, declared_worker_digest = worker_image(args.worker_manifest, service_tag)
-        worker_registry = Registry(args.worker_repository)
-        worker_digest = worker_registry.published_digest(worker_tag)
-        if worker_digest != declared_worker_digest:
-            raise PublishError(
-                f"{args.worker_repository}:{worker_tag} carries {worker_digest or 'nothing'} "
-                f"on the registry, not the declared {declared_worker_digest}"
-            )
-
-        # `images-publish` moves worker `latest` only when worker_tag was the highest
-        # published version; a lower version released after a higher one leaves it
+        # The "move latest" step moves worker latest only when this version is the
+        # highest published; a lower version released after a higher one leaves it
         # pointing elsewhere, which the notes say plainly rather than implying it moved.
-        latest_digest = worker_registry.published_digest("latest")
+        latest = f"{args.worker_repository}:latest"
         latest_note = (
             ""
-            if latest_digest == worker_digest
-            else (
-                f"- `{args.worker_repository}:latest` was left alone: {worker_tag} is not "
-                "the highest published version.\n"
-            )
+            if registry_digest(latest) == refs[1][1]
+            else f"- `{latest}` was left alone: {version} is not the highest published version.\n"
         )
-
-        sys.stdout.write(
-            render(
-                args.service_image,
-                service_digest,
-                f"{args.worker_repository}:{worker_tag}",
-                worker_digest,
-                latest_note,
-            )
-        )
-    except PublishError as exc:
+        sys.stdout.write(render(refs, latest_note))
+    except NotesError as exc:
         print(f"release_notes: {exc}", file=sys.stderr)
         return 1
     return 0
