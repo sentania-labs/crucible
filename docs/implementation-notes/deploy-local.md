@@ -81,6 +81,8 @@ needs and nothing the operator's home provides:
    `CRUCIBLE_WORKERS_SUBNET` are appended, so the deployed application's declared
    allowlist and subnet are the same values the deployed `squid.conf` was
    generated from and cannot drift from them inside the deployment directory.
+   This local deployment pins the exact image it was given as `CRUCIBLE_IMAGE`;
+   `compose.yaml`'s own checked-in default is only the example, and it tracks `latest`.
 8. Asserts that nothing under the deployment directory names a path in `/home`.
    That is the whole point of the directory, so it is checked rather than
    assumed, and "could not look" is a failure distinct from "found nothing".
