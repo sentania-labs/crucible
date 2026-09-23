@@ -111,8 +111,14 @@ carries), `crucible.harness.<name>.version` for each of them (read by
 `images/build.sh` from the Dockerfile's `ARG HARNESS_<NAME>_VERSION` lines),
 and `crucible.build_inputs` (hash). An image built before C11 carries
 `crucible.harness` and `crucible.harness_version` instead and is still read.
-Reproducible: pinned base digest, pinned package versions,
-`SOURCE_DATE_EPOCH`. Project-specific toolchains come from a per-project
+Reproducible, byte for byte across machines: pinned base digest, pinned
+package versions, a pinned BuildKit, `SOURCE_DATE_EPOCH`, and a stated
+`--chmod` on every file copied from the build context (a copied file
+otherwise keeps the mode of the checkout, which follows the cloner's umask
+and is not a build input). Two builds of the same inputs on different
+machines produce the same OCI manifest digest; the CI `images` job checks
+the digest in `images/manifest.env` on every pull request, and the release
+publishes only a build that reproduces it. Project-specific toolchains come from a per-project
 image the task contract names, built `FROM` the worker image; the
 provider's image allowlist controls what may run.
 
