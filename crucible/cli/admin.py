@@ -8,10 +8,10 @@ deprecation line.
 Two gaps are deliberate and named here rather than implied. 25 lists four CLI-only
 operations; `migrate` and `token create` are below, the bootstrap import of 15 is the
 `bootstrap` group below (C6, with its API under `/v1/import/bootstrap`), and the
-portable `export` of 14 is not implemented yet. And `credentials login` runs the
-harness's own CLI, so it works only where that CLI is installed: local mode on a host
-that has it. The Crucible service image carries none of the three, so the API form of
-login refuses there with that reason rather than hanging.
+portable `export` of 14 is not implemented yet. `credentials login` runs the harness's
+own CLI: in local mode, directly on this host, and it needs that CLI installed there;
+remotely, the API runs it in the promoted worker image and refuses with a clear reason
+when none is available, rather than hanging.
 """
 
 from __future__ import annotations
@@ -163,7 +163,8 @@ def build_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         p.add_argument("--harness", required=True)
     login_cmd = c_sub.add_parser(
         "login",
-        help="run the harness's own login (needs that CLI on this host; see the module docstring)",
+        help="run the harness's own login (locally, or in the worker image remotely; "
+        "see the module docstring)",
     )
     login_cmd.add_argument("--harness", required=True)
     login_cmd.add_argument(

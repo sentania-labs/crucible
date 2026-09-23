@@ -112,13 +112,15 @@ back in `error`; read the record again and follow its new `next`.
 
 List kinds offer a read of each item (`crucible task {task_id}`); a wake list
 offers `ack` while a wake is pending. `crucible admin` records offer admin
-verbs: for a credential, what its state allows (`login` only in local mode,
-where the harness's own CLI can run, with `--replace` when a credential is
-present); for a harness, the other value of its enable flag; for an image,
-`promote` while it is a supported candidate; for an exhaustion mark,
-`clear-exhaustion` while it is active; for a verified bootstrap import,
-`commit`; for an audit page, the next page. Their commands carry the
-`--api-url` or `--config` the command ran with.
+verbs: for a credential, what its state allows (`login`, which runs the
+harness's own CLI locally or in the promoted worker image remotely, with
+`--replace` when a credential is present); for a harness, the other value of
+its enable flag; for an image, `promote` while it is a supported candidate;
+for an exhaustion mark, `clear-exhaustion` while it is active; for a verified
+bootstrap import, `commit`; for an audit page, the next page. The local
+model endpoint offers one `set-local-endpoint:<model_id>` per model, already
+set to flip its current enabled state. Their commands carry the `--api-url`
+or `--config` the command ran with.
 
 ## Principals
 

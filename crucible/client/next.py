@@ -367,7 +367,7 @@ CREDENTIAL_WORDS = {
     "probe": "run the bounded probe of the hardened image",
     "rotate": "copy a prepared credential directory in",
     "remove": "retain and shred the credential",
-    "login": "run the harness's own login (needs its CLI on this host)",
+    "login": "run the harness's own login (on this host, or in the worker image remotely)",
 }
 
 # `set` is the LiteLLM virtual key path; only hermes takes one (`--harness` is
@@ -429,8 +429,7 @@ def local_endpoint_actions(document: Any, prefix: Sequence[str]) -> list[dict[st
                     "set-local-endpoint",
                     "--endpoint-url",
                     "{endpoint_url}",
-                    "--model",
-                    model_id,
+                    f"--model={model_id}",
                     f"--{verb}",
                 ],
                 needs={"endpoint_url": "the local endpoint's base URL", **REASON},
