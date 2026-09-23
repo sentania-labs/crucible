@@ -2,7 +2,10 @@
 #
 # These manifests are examples that track `latest`. A real deployment copies them into
 # the deployer's own repository and pins the exact tag and digest there: `repoURL` below
-# must point at the deployer's own repository, never this one.
+# must point at the deployer's own repository, never this one. It is the whole
+# `deploy/kubernetes` tree that gets copied, not only this overlay, because this
+# overlay's own kustomization resolves `../../base` and `../../secret-shapes/sealed` as
+# relative paths.
 #
 # Automated sync is off on purpose. The first sync creates two namespaces, a database,
 # RBAC and the Secret objects, and the SealedSecret placeholders in the overlay are not

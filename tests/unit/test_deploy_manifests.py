@@ -339,6 +339,28 @@ def test_the_lab_overlay_carries_the_deployers_pin_as_a_placeholder() -> None:
     ]
 
 
+def test_the_lab_overlay_renders_from_a_copy_of_the_whole_tree(tmp_path: Path) -> None:
+    """docs/deployment.md's instruction, proven: a deployer copies the whole
+    `deploy/kubernetes` tree, keeping the relative paths, and `overlays/lab`'s
+    `../../base` and `../../secret-shapes/sealed` references still resolve from that
+    copy, wherever it lands. Copying `overlays/lab` alone would not."""
+    if shutil.which("kubectl") is None:
+        message = "kubectl is needed to render the deployment manifests"
+        if os.environ.get("CRUCIBLE_MANIFESTS_REQUIRED"):
+            raise AssertionError(message)
+        pytest.skip(message)
+    copy = tmp_path / "deploy" / "kubernetes"
+    shutil.copytree(DEPLOY, copy)
+    raw = subprocess.run(
+        ["kubectl", "kustomize", str(copy / "overlays" / "lab")],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    objects = [doc for doc in yaml.safe_load_all(raw) if doc]
+    assert objects
+
+
 def test_deploy_kind_derives_its_release_reference_from_the_base_pin() -> None:
     script = (ROOT / "tools/kind/deploy-kind.sh").read_text(encoding="utf-8")
     assert "deploy/kubernetes/base/kustomization.yaml" in script

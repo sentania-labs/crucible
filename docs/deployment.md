@@ -34,10 +34,17 @@ deploy/kubernetes/
 
 The manifests in this repository are examples, and `base/kustomization.yaml` tracks
 `latest` on purpose (spec 13, spec 24). A real deployment is a copy: lab-admin copies
-`overlays/lab` into their own GitOps repository and pins the image there, at
-`REPLACE_ME_CRUCIBLE_TAG` and `REPLACE_ME_CRUCIBLE_DIGEST` below. Argo tracks that
-repository, never this one, and changing the deployed version is that one pin and a
-sync, in the deployer's own history.
+the **whole `deploy/kubernetes` tree** (`base`, `overlays`, `secret-shapes`, `argocd`) into
+their own GitOps repository **at the same `deploy/kubernetes` path**, because
+`overlays/lab`'s own kustomization resolves `../../base` and `../../secret-shapes/sealed`
+as relative paths and `argocd/application.yaml` names `deploy/kubernetes/overlays/lab` as
+the Application's `source.path`; copying only the overlay, or copying the tree somewhere
+else, leaves one of those pointing at nothing. lab-admin then
+pins the image in the copied `overlays/lab`, at `REPLACE_ME_CRUCIBLE_TAG` and
+`REPLACE_ME_CRUCIBLE_DIGEST` below; keeping the same path means `argocd/application.yaml`'s
+`source.path` needs no edit. Argo tracks that repository, never this
+one, and changing the deployed version is that one pin and a sync, in the deployer's own
+history.
 
 ## What lab-admin provides
 
@@ -117,8 +124,8 @@ drift nor prunes them.
 
 ## Applying it
 
-1. Fill every placeholder above in a copy of these manifests in lab-admin's GitOps
-   repository, or by overlaying this repository's `overlays/lab` from there.
+1. Copy the whole `deploy/kubernetes` tree into lab-admin's GitOps repository, keeping
+   its relative paths intact, then fill every placeholder above in that copy.
 2. Seal or source the Secrets.
 3. Create the Application from `argocd/application.yaml`.
 4. Sync it, by hand. **Automated sync is off by default and the first sync is a person
