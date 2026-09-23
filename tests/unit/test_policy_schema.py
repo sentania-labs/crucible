@@ -185,6 +185,26 @@ def test_timeout_bounds_must_be_ordered() -> None:
     assert any("min <= default <= max" in e for e in _errors(document))
 
 
+def test_resources_request_fractions_default_and_validate() -> None:
+    """Issue 93: a policy that omits the new request fractions still validates (a
+    seeded policy predates them), and a fraction outside (0, 1] is rejected."""
+    policy = parse_policy(seeded_policy())
+    assert policy.resources.cpu_request_fraction == 0.5
+    assert policy.resources.memory_request_fraction == 1.0
+
+    document = seeded_policy()
+    document["resources"]["cpu_request_fraction"] = 0
+    assert _errors(document)
+
+    document = seeded_policy()
+    document["resources"]["cpu_request_fraction"] = 1.5
+    assert _errors(document)
+
+    document = seeded_policy()
+    document["resources"]["memory_request_fraction"] = 0.25
+    assert parse_policy(document).resources.memory_request_fraction == 0.25
+
+
 def routing_document() -> dict[str, Any]:
     routing: dict[str, Any] = copy.deepcopy(m4.DEFAULT_ROUTING)
     return routing
