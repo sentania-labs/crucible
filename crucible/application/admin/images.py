@@ -1,5 +1,6 @@
 """Image administration (13, 25): list and promote. Promotion is an explicit admin act
-recorded as an event; the previous default of the same harness becomes `retained`."""
+recorded as an event; a previous default the promoted image fully covers becomes
+`retained`."""
 
 from __future__ import annotations
 
@@ -34,23 +35,37 @@ def _find(images: list[tuple[str, ImageInfo]], digest: str) -> ImageInfo:
 async def promote(
     ctx: AdminContext, uow: UnitOfWork, *, principal: str, digest: str, reason: str | None
 ) -> dict[str, Any]:
+    """Make one image the default for every harness it carries (13, 25).
+
+    The worker image carries all four real harnesses (C11), so promoting it switches all
+    four at once, and promoting the previous digest rolls all four back at once. Every
+    harness the image carries must be inside its adapter's tested range; an image with
+    one harness outside it is refused whole, because promoting it would put that harness
+    on an untested version. A previous default is retained only when the new image
+    carries every harness it did, so promoting a narrower image never leaves a harness
+    with no default."""
     reason = guard_mutation(ctx, uow, reason, principal=principal, operation="images promote")
     image = _find(await provider_images(ctx), digest)
-    if not image.harness:
-        raise NotFoundError(f"image {image.reference} carries no crucible.harness label")
-    adapter = ctx.harnesses.get(image.harness)
-    if adapter is None or not image.harness_version:
-        raise NotFoundError(f"image {image.reference} names an unknown harness or no version")
-    if not adapter.supported_versions.supports(image.harness_version):
-        raise NotFoundError(
-            f"image {image.reference} carries {image.harness} {image.harness_version}, "
-            f"outside the adapter's range {adapter.supported_versions.text}"
-        )
+    if not image.harnesses:
+        raise NotFoundError(f"image {image.reference} declares no harness")
+    for harness, version in sorted(image.harnesses.items()):
+        adapter = ctx.harnesses.get(harness)
+        if adapter is None or not version:
+            raise NotFoundError(
+                f"image {image.reference} names an unknown harness {harness!r} or no version"
+            )
+        if not adapter.supported_versions.supports(version):
+            raise NotFoundError(
+                f"image {image.reference} carries {harness} {version}, "
+                f"outside the adapter's range {adapter.supported_versions.text}"
+            )
     now = ctx.clock.now()
     before: dict[str, Any] = {}
     after: dict[str, Any] = {}
     for existing in uow.image_promotions.list_all():
-        if existing.harness == image.harness and existing.state == "default":
+        if existing.digest == image.digest or existing.state != "default":
+            continue
+        if set(existing.harnesses) <= set(image.harnesses):
             before[existing.digest] = existing.state
             existing.state = "retained"
             existing.updated_at = now
@@ -64,8 +79,7 @@ async def promote(
         ImagePromotion(
             digest=image.digest,
             reference=image.reference,
-            harness=image.harness,
-            harness_version=image.harness_version,
+            harnesses=dict(image.harnesses),
             state="default",
             updated_at=now,
             updated_by=principal,
@@ -81,15 +95,14 @@ async def promote(
         reason=reason,
         before=before,
         after=after,
-        harness=image.harness,
+        harnesses=dict(image.harnesses),
         digest=image.digest,
         reference=image.reference,
     )
     return {
         "digest": promoted.digest,
         "reference": promoted.reference,
-        "harness": promoted.harness,
-        "harness_version": promoted.harness_version,
+        "harnesses": dict(promoted.harnesses),
         "promotion_state": promoted.state,
         "retained": [d for d, s in after.items() if s == "retained"],
     }

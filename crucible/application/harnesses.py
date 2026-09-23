@@ -28,6 +28,12 @@ from crucible.domain.entities import HarnessState
 from crucible.domain.events import PRINCIPAL_CRUCIBLE, PRINCIPAL_WORKER, EventKind
 from crucible.domain.secrets import redact
 from crucible.ports.clock import Clock
+from crucible.ports.execution import (
+    HARNESSES_LABEL,
+    LEGACY_HARNESS_LABEL,
+    harness_version_label,
+    image_harnesses,
+)
 from crucible.ports.harness import (
     CredentialSource,
     CredentialSpec,
@@ -121,31 +127,42 @@ class HarnessCheck:
 def check_image_version(
     registry: HarnessRegistry, harness: str, labels: Mapping[str, str]
 ) -> HarnessCheck:
-    """Compare the image's `crucible.harness_version` label with the tested range (13)."""
+    """Compare the version the image's labels pin for this harness with the adapter's
+    tested range (13). One worker image carries every harness (C11), so the check is
+    per harness: the label `crucible.harness.<name>.version` of the harness launched."""
     adapter = registry.get(harness)
     if adapter is None:
         return HarnessCheck(False, f"no adapter declares harness {harness!r}")
     supported = adapter.supported_versions.text
     endpoints = adapter.capabilities().endpoints
-    labelled = labels.get("crucible.harness")
-    installed = labels.get("crucible.harness_version")
-    if not labelled:
+    carried = image_harnesses(labels)
+    if not carried:
         # 13: an image that does not say which harness it carries is not launched with
-        # any harness's credential, whatever its version label says.
-        return HarnessCheck(
-            False, "the image carries no crucible.harness label", installed, supported, endpoints
-        )
-    if labelled != harness:
+        # any harness's credential, whatever else its labels say.
         return HarnessCheck(
             False,
-            f"the image declares harness {labelled!r}, the execution asks for {harness!r}",
-            installed,
+            f"the image carries no {HARNESSES_LABEL} (or {LEGACY_HARNESS_LABEL}) label",
+            None,
             supported,
             endpoints,
         )
-    if not installed:
+    if harness not in carried:
         return HarnessCheck(
-            False, "the image carries no crucible.harness_version label", None, supported, endpoints
+            False,
+            f"the image declares harness {', '.join(sorted(carried))}, "
+            f"the execution asks for {harness!r}",
+            None,
+            supported,
+            endpoints,
+        )
+    installed = carried[harness] or None
+    if installed is None:
+        return HarnessCheck(
+            False,
+            f"the image carries no {harness_version_label(harness)} label",
+            None,
+            supported,
+            endpoints,
         )
     if not adapter.supported_versions.supports(installed):
         return HarnessCheck(

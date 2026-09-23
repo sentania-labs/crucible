@@ -67,7 +67,7 @@ resource.
 | onboard a credential | `POST /admin/credentials/{harness}/login` (starts) | `credentials login --harness` | interactive flow below; the service runs the login in the promoted worker image and the CLI retains its local-host mode |
 | rotate or replace a credential source | `POST /admin/credentials/{harness}/rotate` | `credentials rotate --harness` | the operator's prepared directory is shape-checked, copied in, and left exactly as it was found; the swap is two renames; the previous directory is retained for `credential_retention_hours` then shredded; a failed swap rolls back; every step an event |
 | remove a credential | `POST /admin/credentials/{harness}/remove` | `credentials remove --harness` | harness becomes `absent`; the directory is shredded at once rather than retained, because the operator said remove, and the harness is disabled with that reason |
-| list images and promote | `GET /admin/images`, `POST /admin/images/{digest}/promote` | `images list|promote` | 13; one default per harness, and promoting a digest marks the previous default `retained`. The probe and the live tiers run the promoted image |
+| list images and promote | `GET /admin/images`, `POST /admin/images/{digest}/promote` | `images list|promote` | 13; each image lists every harness it carries with its version (`harnesses`), and the one worker image carries all four (C11), so one promotion makes it the default for all four, refused whole if any of them is outside its adapter's range. A previous default the promoted image fully covers becomes `retained`. Rollback is promoting the previous digest, which rolls all four harnesses back together. The probe and the live tiers run the promoted image |
 | provider health | `GET /admin/providers` | `providers status` | |
 | GitHub health | `GET /admin/github`, `POST /admin/github/check` | `github status|check` | check mints a token per registered repository and discards it |
 | register a repository | `PUT /admin/repositories/{name}` | `repositories register` | 04; an administrative mutation like any other, guarded and audited here, with the previous registration as the before summary. 04's own `PUT /repositories/{name}` is a different, non-administrative surface |
@@ -99,15 +99,15 @@ nowhere (12).
 ## The bounded probe: conclusive or inconclusive
 
 The probe is not a special path. It builds the same container an attempt
-builds (the harness's promoted image, the per-attempt credential copy of 12,
+builds (the promoted worker image, the per-attempt credential copy of 12,
 the egress proxy with an empty task allowlist so only the adapter's own
 endpoints are reachable, the same CPU and memory bounds, 120 s), runs the
 adapter's own launch for a one-line prompt, and classifies the exit through
 the adapter. Its model is the cheapest enabled model for that harness in the
 routing policy in force (05b); a harness that takes a model flag and has no
 enabled model is a refusal that says so, never a guess, because the CLIs
-reject an unknown model id. When a daemon carries several labelled images for
-a harness and none is promoted, the probe refuses and says to promote one.
+reject an unknown model id. When a daemon carries several images labelled with
+a harness and none of them is promoted, the probe refuses and says to promote one.
 Stdout and stderr tails are classified and dropped. Everything the probe
 created is removed on every path, including a failure before the credential
 is seeded.

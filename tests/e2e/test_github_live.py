@@ -198,8 +198,7 @@ def live_client(
                 ImagePromotion(
                     digest=worker.digest,
                     reference=worker.reference,
-                    harness="script-harness",
-                    harness_version=worker.harness_version or "1.0.0",
+                    harnesses=dict(worker.harnesses) or {"script-harness": "1.0.0"},
                     state="default",
                     updated_at=ctx.clock.now(),
                     updated_by="e2e-github",

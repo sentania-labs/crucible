@@ -42,6 +42,7 @@ from crucible.application.admin.credentials import (
 from crucible.application.errors import ConflictError
 from crucible.domain.events import EventKind
 from crucible.domain.secrets import redact
+from crucible.ports.harness import AGY_BINARY, CLAUDE_CODE_BINARY, CODEX_BINARY
 from crucible.ports.repository import UnitOfWork
 
 URL_RE = re.compile(r"https?://[^\s'\"<>]+")
@@ -62,7 +63,11 @@ class LoginFlow:
     """One harness's login as the pty driver runs it."""
 
     harness: str
+    # On the host the CLI is found on PATH, wherever the operator installed it. In the
+    # worker image the first word becomes `image_binary`, the absolute path the adapters
+    # launch it by (C11), so a login and a launch run the same file.
     argv: tuple[str, ...]
+    image_binary: str
     # The variable that points the CLI at the dedicated directory (25 step 2).
     directory_env: str
     # Which subdirectory of the configured path that variable names ("" for the root).
@@ -80,6 +85,7 @@ FLOWS: dict[str, LoginFlow] = {
     "claude_code": LoginFlow(
         harness="claude_code",
         argv=("claude", "setup-token"),
+        image_binary=CLAUDE_CODE_BINARY,
         directory_env="CLAUDE_CONFIG_DIR",
         directory_subdir="",
         pastes_code=True,
@@ -94,6 +100,7 @@ FLOWS: dict[str, LoginFlow] = {
     "codex": LoginFlow(
         harness="codex",
         argv=("codex", "login", "--device-auth"),
+        image_binary=CODEX_BINARY,
         directory_env="CODEX_HOME",
         directory_subdir="",
         pastes_code=False,
@@ -105,6 +112,7 @@ FLOWS: dict[str, LoginFlow] = {
     "agy": LoginFlow(
         harness="agy",
         argv=("agy", "-p", "Reply with exactly the word OK and nothing else."),
+        image_binary=AGY_BINARY,
         directory_env="HOME",
         directory_subdir="",
         pastes_code=True,
@@ -337,8 +345,11 @@ class LoginRegistry:
         if existing is not None and existing.state not in ("finished", "failed"):
             raise ConflictError(f"a login for {harness} is already in progress")
         flow = FLOWS[harness]
-        argv = tuple(ctx.login_commands.get(harness) or flow.argv)
         runner = self.container_runner(ctx)
+        # An operator-configured command is used as given, in either mode.
+        argv = tuple(ctx.login_commands.get(harness) or ())
+        if not argv:
+            argv = flow.argv if runner is None else (flow.image_binary, *flow.argv[1:])
         if runner is None and shutil.which(argv[0]) is None and not Path(argv[0]).exists():
             # The login drives the harness's own CLI, and only the worker images carry
             # the three; the Crucible service image carries none (13). Refusing here is
@@ -505,11 +516,19 @@ def start_login(
     image = None
     runner = getattr(registry, "container_runner", lambda _ctx: None)(ctx)
     if runner is not None:
+        # The promoted worker image carries every harness (C11); the most recent
+        # default that carries this one is what a launch would use too.
         promoted = next(
-            (
-                item
-                for item in uow.image_promotions.list_all()
-                if item.harness == harness and item.state == "default"
+            iter(
+                sorted(
+                    (
+                        item
+                        for item in uow.image_promotions.list_all()
+                        if item.carries(harness) and item.state == "default"
+                    ),
+                    key=lambda item: (item.updated_at, item.digest),
+                    reverse=True,
+                )
             ),
             None,
         )

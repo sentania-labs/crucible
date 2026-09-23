@@ -706,8 +706,8 @@ class ImagePromotionRow(Base):
     __tablename__ = "image_promotions"
     digest: Mapped[str] = mapped_column(String(160), primary_key=True)
     reference: Mapped[str] = mapped_column(Text)
-    harness: Mapped[str] = mapped_column(String(32))
-    harness_version: Mapped[str] = mapped_column(String(32))
+    # Harness name to pinned version, every harness the image carries (C11).
+    harnesses: Mapped[dict[str, str]] = mapped_column(JSONB)
     state: Mapped[str] = mapped_column(String(16))
     reason: Mapped[str] = mapped_column(Text)
     updated_at: Mapped[datetime] = mapped_column(TZ)

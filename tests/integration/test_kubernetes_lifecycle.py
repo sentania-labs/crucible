@@ -102,8 +102,7 @@ def k8s_client(k8s_ctx: AppContext) -> Iterator[TestClient]:
             ImagePromotion(
                 digest="sha256:" + "c" * 64,
                 reference=IMAGE,
-                harness="script-harness",
-                harness_version="1.0.0",
+                harnesses={"script-harness": "1.0.0"},
                 state="default",
                 updated_at=k8s_ctx.clock.now(),
                 updated_by="tests",

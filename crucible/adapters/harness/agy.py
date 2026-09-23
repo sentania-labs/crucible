@@ -24,6 +24,7 @@ from typing import Any
 from crucible.adapters.harness import base
 from crucible.domain.exit_class import ExitClass
 from crucible.ports.harness import (
+    AGY_BINARY,
     AdapterLaunch,
     AuthFile,
     CredentialSpec,
@@ -126,7 +127,7 @@ class AgyAdapter:
         )
 
     def build_launch(self, ctx: LaunchContext) -> AdapterLaunch:
-        argv: list[str] = ["agy", "-p", base.POINTER_PROMPT, "--model", ctx.model]
+        argv: list[str] = [AGY_BINARY, "-p", base.POINTER_PROMPT, "--model", ctx.model]
         if ctx.effort:
             argv += ["--effort", ctx.effort]
         argv += [

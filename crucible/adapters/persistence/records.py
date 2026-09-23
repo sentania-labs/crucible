@@ -874,8 +874,7 @@ class ImagePromotions:
         return ImagePromotion(
             digest=row.digest,
             reference=row.reference,
-            harness=row.harness,
-            harness_version=row.harness_version,
+            harnesses={str(k): str(v) for k, v in (row.harnesses or {}).items()},
             state=row.state,
             updated_at=ensure_utc(row.updated_at),
             updated_by=row.updated_by,
@@ -887,9 +886,7 @@ class ImagePromotions:
         return self._to_entity(row) if row else None
 
     def list_all(self) -> Sequence[ImagePromotion]:
-        rows = self._s.scalars(
-            select(ImagePromotionRow).order_by(ImagePromotionRow.harness, ImagePromotionRow.digest)
-        ).all()
+        rows = self._s.scalars(select(ImagePromotionRow).order_by(ImagePromotionRow.digest)).all()
         return [self._to_entity(r) for r in rows]
 
     def put(self, promotion: ImagePromotion) -> ImagePromotion:
@@ -898,8 +895,7 @@ class ImagePromotions:
             row = ImagePromotionRow(digest=promotion.digest)
             self._s.add(row)
         row.reference = promotion.reference
-        row.harness = promotion.harness
-        row.harness_version = promotion.harness_version
+        row.harnesses = dict(promotion.harnesses)
         row.state = promotion.state
         row.reason = promotion.reason
         row.updated_at = promotion.updated_at

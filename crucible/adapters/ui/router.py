@@ -787,13 +787,18 @@ async def images_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
     sections: list[dict[str, Any]] = [
         {
             "title": "Worker images",
-            "columns": ["Harness", "Reference", "Digest", "Version", "Promotion"],
+            # One worker image carries all four harnesses (C11): the row lists the
+            # version of each, and promoting it switches (or rolls back) all four.
+            "columns": ["Harnesses", "Reference", "Digest", "Supported", "Promotion"],
             "rows": [
                 [
-                    item.get("harness"),
+                    ", ".join(
+                        f"{name} {version}"
+                        for name, version in sorted((item.get("harnesses") or {}).items())
+                    ),
                     item.get("reference"),
                     item.get("digest"),
-                    item.get("harness_version"),
+                    "yes" if item.get("supported") else "no",
                     item.get("promotion_state"),
                 ]
                 for item in items

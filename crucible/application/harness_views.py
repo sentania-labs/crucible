@@ -37,11 +37,7 @@ def harness_list(
         gate = gates.get(adapter.name, HarnessGate())
         by_admin = state.enabled if state is not None else True
         installed = sorted(
-            {
-                str(i.harness_version)
-                for i in images
-                if i.harness == adapter.name and i.harness_version
-            }
+            {version for i in images if (version := i.version_of(adapter.name)) is not None}
         )
         credential = credential_state(adapter.credential_spec(), sources.get(adapter.name), state)
         reasons = [
@@ -86,19 +82,17 @@ def image_list(
     promotions = {p.digest: p for p in uow.image_promotions.list_all()}
     items: list[ImageView] = []
     for provider_name, image in images:
-        adapter = registry.get(image.harness) if registry and image.harness else None
-        supported = bool(
-            adapter is not None
-            and image.harness_version
-            and adapter.supported_versions.supports(image.harness_version)
+        supported = bool(image.harnesses) and all(
+            (adapter := registry.get(harness) if registry else None) is not None
+            and adapter.supported_versions.supports(version)
+            for harness, version in image.harnesses.items()
         )
         promotion = promotions.get(image.digest)
         items.append(
             ImageView(
                 reference=image.reference,
                 digest=image.digest,
-                harness=image.harness,
-                harness_version=image.harness_version,
+                harnesses=dict(image.harnesses),
                 supported=supported,
                 promotion_state=promotion.state if promotion else "candidate",
                 provider=provider_name,

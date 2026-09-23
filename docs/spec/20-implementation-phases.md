@@ -170,6 +170,13 @@ Lab-side prerequisites are the checklist in 26 and are lab-admin work.
 Renovate configuration, candidate image build in CI, canary procedure,
 promotion endpoint, GHCR publication from the release workflow.
 
+C11 (2026-09-22) delivered the build and publication half: one worker image
+carrying all four harnesses (the operator's decision, 13), `make images`, the
+CI `images` job that proves the manifest digests on a fresh runner, and the
+release step that publishes both images to
+`ghcr.io/sentania-labs/crucible-worker` under the never-overwrite rule.
+Renovate and the canary procedure remain.
+
 ## Later (not scheduled)
 
 Kubernetes provider with kind tests; deployment manifests; object storage

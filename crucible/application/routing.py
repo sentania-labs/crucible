@@ -213,10 +213,14 @@ class Selection:
 
 
 def image_for_harness(uow: UnitOfWork, harness: str, provider: str) -> str | None:
+    """The promoted image that carries the harness (13). Since C11 one worker image
+    carries all four real harnesses, so one promotion normally answers for all four; if
+    a narrower image was promoted after it, the more recent promotion wins for the
+    harnesses it carries."""
     defaults = [
         item
         for item in uow.image_promotions.list_all()
-        if item.harness == harness and item.state == "default"
+        if item.carries(harness) and item.state == "default"
     ]
     if defaults:
         return sorted(defaults, key=lambda item: (item.updated_at, item.digest), reverse=True)[
@@ -295,7 +299,7 @@ def select_model(
                 (
                     item
                     for item in uow.image_promotions.list_all()
-                    if item.harness == entry.harness
+                    if item.carries(entry.harness)
                     and item.reference == image
                     and item.state == "default"
                 ),
@@ -307,7 +311,9 @@ def select_model(
                 adapter = harnesses.get(entry.harness)
                 if adapter is None:
                     reasons.append("derived image names an unknown harness")
-                elif not adapter.supported_versions.supports(promotion.harness_version):
+                elif not adapter.supported_versions.supports(
+                    promotion.harnesses.get(entry.harness, "")
+                ):
                     reasons.append(
                         "derived image harness version is outside the adapter supported range"
                     )

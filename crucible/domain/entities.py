@@ -479,16 +479,22 @@ class BootstrapImport:
 @dataclass(slots=True)
 class ImagePromotion:
     """One worker image's promotion state (13): `candidate` until an explicit admin act
-    makes it `default`; the previous default becomes `retained`."""
+    makes it `default`; a previous default it fully supersedes becomes `retained`.
+
+    `harnesses` is every harness the image carries, name to pinned version. Since C11
+    that is all four real harnesses in one image, so one promotion covers all four and
+    promoting the previous digest rolls all four back together."""
 
     digest: str
     reference: str
-    harness: str
-    harness_version: str
+    harnesses: dict[str, str]
     state: str
     updated_at: datetime
     updated_by: str
     reason: str = ""
+
+    def carries(self, harness: str) -> bool:
+        return harness in self.harnesses
 
 
 # ----- GitHub delivery (23) ---------------------------------------------

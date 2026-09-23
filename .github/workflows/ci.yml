@@ -73,6 +73,44 @@ jobs:
           docker ps -a --filter label=crucible.attempt
           docker network ls
 
+  # The worker images (13, C11): the worker image carrying Claude Code, Codex, AGY and
+  # Hermes, and the script-harness image, built from the pinned inputs with the same
+  # script as `make images`. The job fails when any tag, harness version or OCI digest
+  # differs from images/manifest.env: reproducibility is the contract, and this is where
+  # it is proved on a machine the author does not control. GitHub-hosted, because it
+  # needs a Docker daemon and buildx (github-ci skill).
+  #
+  # Pull requests import the BuildKit layer cache the last push to main exported, so
+  # the job takes minutes. The digest is always computed from what the build output,
+  # but a network step (apt, pip, ADD <url>) is cached on its instruction text, not on
+  # the bytes it would fetch today, so a pull request's pass is not on its own proof
+  # that upstream still serves those bytes. That proof is every push to main, which
+  # builds from scratch (NO_CACHE=1, nothing restored) before exporting the cache, and
+  # the release, which builds from scratch again and publishes nothing unless the
+  # digests match.
+  images:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: restore the BuildKit layer cache
+        if: github.event_name != 'push'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/buildkit-cache
+          key: worker-images-${{ hashFiles('images/**') }}
+          restore-keys: worker-images-
+      - name: build both images and compare with images/manifest.env
+        env:
+          NO_CACHE: ${{ github.event_name == 'push' && '1' || '' }}
+        run: make images-check CACHE_DIR="$RUNNER_TEMP/buildkit-cache" NO_CACHE="$NO_CACHE"
+      - name: keep the layer cache for pull requests
+        if: github.event_name == 'push'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/buildkit-cache
+          key: worker-images-${{ hashFiles('images/**') }}
+
   # A real API server, kubelet, enforcing CNI and PVC on the runner's Docker daemon.
   # This belongs beside the Docker tier on GitHub-hosted infrastructure: it needs a
   # daemon but no lab access (github-ci skill).

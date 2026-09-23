@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 
 import pytest
-from sqlalchemy import inspect, text
+from fastapi.testclient import TestClient
+from sqlalchemy import Connection, inspect, text
 
 from crucible.adapters.persistence import migrate
-from crucible.adapters.persistence.unit_of_work import make_engine
+from crucible.adapters.persistence.unit_of_work import SqlUnitOfWorkFactory, make_engine
+from crucible.application.routing import load_routing
 from crucible.contracts.policy import RoutingPolicyV1
 from tests.fixtures import contract_document
+from tests.integration.conftest import submit_and_start
 
 pytestmark = pytest.mark.integration
 
@@ -39,8 +43,9 @@ def test_up_down_up_from_empty(database_url: str) -> None:
     ok, detail = migrate.is_current(engine, database_url)
     assert ok, detail
     with engine.connect() as conn:
-        # C10 adds immutable version 6 and intentionally does not rewrite older rows.
-        assert conn.execute(text("SELECT count(*) FROM policies")).scalar() == 5
+        # C10 adds immutable version 6 and intentionally does not rewrite older rows;
+        # C11 adds the next version for Opus 5.5.
+        assert conn.execute(text("SELECT count(*) FROM policies")).scalar() == 6
     migrate.downgrade(database_url, "base")
     assert "tasks" not in inspect(engine).get_table_names()
     migrate.upgrade(database_url)
@@ -115,7 +120,9 @@ def test_0004_creates_the_c2_tables_and_seeds_the_routing_policy(migrated: str) 
     } <= names
     with engine.connect() as conn:
         # Older migrations always seed 1 through 4. The optional old endpoint seed may
-        # add 5; C10 takes the next free number and leaves every prior document intact.
+        # add 5. C10 takes the next free number for the lab-local route, and C11 takes
+        # the next free number again for Opus 5.5, each leaving every prior document
+        # intact.
         versions = (
             conn.execute(
                 text(
@@ -126,7 +133,7 @@ def test_0004_creates_the_c2_tables_and_seeds_the_routing_policy(migrated: str) 
             .all()
         )
         assert versions == list(range(1, max(versions) + 1))
-        assert max(versions) in (5, 6)
+        assert max(versions) in (6, 7)
         seeded = conn.execute(
             text(
                 "SELECT count(*) FROM routing_policies WHERE name='default-routing' "
@@ -134,7 +141,9 @@ def test_0004_creates_the_c2_tables_and_seeds_the_routing_policy(migrated: str) 
                 "WHERE model ->> 'disabled_reason' LIKE '%0017_lab_local%')"
             )
         ).scalar_one()
-        assert seeded == 1
+        # Every later migration that copies the routing document forward without
+        # touching this model keeps the marker, so this only checks it was seeded.
+        assert seeded >= 1
         # Later revisions add immutable policy versions that name their matching
         # routing version (05b).
         policy_versions = conn.execute(
@@ -386,15 +395,29 @@ def test_0017_seeds_from_the_routing_in_force_not_an_unreferenced_draft(
             {"version": draft_version},
         ).scalar_one()
     engine.dispose()
-    assert seeded_version == draft_version + 1
+    # 0017 mints one new version on top of the draft, then C11's 0019 mints another
+    # beside it, so the in-force chain now runs two steps past the draft, not one.
+    assert seeded_version == draft_version + 2
     ids = [model["id"] for model in seeded["models"]]
     assert "draft-only-experiment" not in ids
-    assert [model for model in seeded["models"] if model.get("harness") != "hermes"] == [
-        model for model in routing["models"] if model.get("harness") != "hermes"
-    ]
+    assert [
+        model
+        for model in seeded["models"]
+        if model.get("harness") != "hermes" and model["id"] != "claude-opus-5-5"
+    ] == [model for model in routing["models"] if model.get("harness") != "hermes"]
     assert kept_draft == draft
 
     migrate.downgrade(database_url, "0016_disposition_versions")
+    # The draft this test inserted by hand is unreferenced, so no downgrade removes
+    # it either: left alone it would occupy a version number forever and throw off
+    # every later test's "next free version" math in the shared database.
+    engine = make_engine(database_url)
+    with engine.begin() as conn:
+        conn.execute(
+            text("DELETE FROM routing_policies WHERE name='default-routing' AND version=:version"),
+            {"version": draft_version},
+        )
+    engine.dispose()
     migrate.upgrade(database_url)
 
 
@@ -461,7 +484,9 @@ def test_0017_extends_a_routing_policy_the_operator_named_differently(
             == default_routing_rows
         )
     engine.dispose()
-    assert seeded_policy["routing"] == {"policy": {"name": "lab-routing", "version": 2}}
+    # 0017 extends lab-routing to version 2; C11's 0019 then extends it again to 3,
+    # and that is what the in-force policy now names.
+    assert seeded_policy["routing"] == {"policy": {"name": "lab-routing", "version": 3}}
     assert [model["id"] for model in seeded["models"] if model["harness"] == "hermes"] == ["coder"]
 
     migrate.downgrade(database_url, "0016_disposition_versions")
@@ -473,8 +498,245 @@ def test_0017_extends_a_routing_policy_the_operator_named_differently(
             ).scalar_one()
             == 1
         )
+    # The version this test inserted by hand, not through a migration: no downgrade
+    # knows to remove it, so it would otherwise stay in force for every test after
+    # this one in the shared database.
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "DELETE FROM policies WHERE name='default-software' "
+                "AND document -> 'routing' -> 'policy' ->> 'name' = 'lab-routing'"
+            )
+        )
+        conn.execute(text("DELETE FROM routing_policies WHERE name='lab-routing'"))
     engine.dispose()
     migrate.upgrade(database_url)
+
+
+def _active(conn: Connection) -> tuple[int, dict[str, Any], int, dict[str, Any]]:
+    """The delivery policy in force and the routing version it names."""
+    policy = conn.execute(
+        text(
+            "SELECT version, document FROM policies WHERE name='default-software' "
+            "AND retired_at IS NULL ORDER BY version DESC LIMIT 1"
+        )
+    ).one()
+    reference = policy.document["routing"]["policy"]
+    routing = conn.execute(
+        text("SELECT document FROM routing_policies WHERE name=:name AND version=:version"),
+        {"name": reference["name"], "version": reference["version"]},
+    ).scalar_one()
+    return policy.version, policy.document, int(reference["version"]), routing
+
+
+def test_0019_adds_opus_5_5_disabled_beside_the_frontier_entry(database_url: str) -> None:
+    """C11: the id from Claude Code's own model catalog, in the Claude Code pool at the
+    frontier tier, disabled until the operator enables it, in new immutable versions
+    at the next free numbers (the admin UI mints versions too), which the down
+    migration removes again."""
+    migrate.upgrade(database_url)
+    engine = make_engine(database_url)
+    migrate.downgrade(database_url, "0018_combined_worker_image")
+    with engine.connect() as conn:
+        before_policy, _, before_routing, source = _active(conn)
+        highest = conn.execute(text("SELECT max(version) FROM routing_policies")).scalar_one()
+        highest_policy = conn.execute(text("SELECT max(version) FROM policies")).scalar_one()
+    assert not any(model["id"] == "claude-opus-5-5" for model in source["models"])
+    migrate.upgrade(database_url)
+    with engine.connect() as conn:
+        policy_version, policy, routing_version, document = _active(conn)
+    assert (policy_version, routing_version) == (highest_policy + 1, highest + 1)
+    assert "Opus 5.5" in policy["description"]
+    routing = RoutingPolicyV1.model_validate(document)
+    opus = routing.model("claude-opus-5-5")
+    assert opus is not None
+    assert (opus.harness, opus.endpoint, opus.capability, opus.pool) == (
+        "claude_code",
+        "subscription",
+        "frontier",
+        "anthropic-sub",
+    )
+    assert not opus.enabled and opus.disabled_reason
+    ids = [model.id for model in routing.models]
+    assert ids.index("claude-opus-5-5") == ids.index("claude-fable-5-1") + 1
+    # Everything else is the routing version it was copied from, unchanged.
+    assert [m for m in document["models"] if m["id"] != "claude-opus-5-5"] == source["models"]
+    migrate.downgrade(database_url, "0018_combined_worker_image")
+    with engine.connect() as conn:
+        assert _active(conn)[0] == before_policy and _active(conn)[2] == before_routing
+    migrate.upgrade(database_url)
+    engine.dispose()
+
+
+def test_0019_downgrade_keeps_the_version_a_task_was_submitted_against(
+    client: TestClient, migrated: str
+) -> None:
+    """A rollback after a submission must not strand the task: the policy version 0019
+    wrote is retired, not deleted, and its routing version stays, so the task still
+    resolves both, while the version before 0019 is back in force. A second round
+    removes only the version the re-upgrade wrote."""
+    engine = make_engine(migrated)
+    with engine.connect() as conn:
+        version, _, routing_version, _ = _active(conn)
+    task_id = submit_and_start(
+        client,
+        "crucible-worker:fake-succeed",
+        "MIG-0019",
+        start=False,
+        policy={"name": "default-software", "version": version},
+    )
+    try:
+        migrate.downgrade(migrated, "0018_combined_worker_image")
+        with engine.connect() as conn:
+            assert _active(conn)[0] < version
+            retired = conn.execute(
+                text(
+                    "SELECT retired_at FROM policies "
+                    "WHERE name='default-software' AND version=:version"
+                ),
+                {"version": version},
+            ).scalar_one()
+            assert retired is not None
+        with SqlUnitOfWorkFactory(engine)() as uow:
+            task = uow.tasks.get(task_id)
+            assert task is not None and task.policy_version == version
+            policy = uow.policies.get(task.policy_name, task.policy_version)
+            assert policy is not None
+            routing = load_routing(uow, policy.document)
+            assert routing is not None and routing.version == routing_version
+            assert routing.model("claude-opus-5-5") is not None
+        assert client.get(f"/v1/tasks/{task_id}").status_code == 200
+        migrate.upgrade(migrated)
+        with engine.connect() as conn:
+            again, _, routing_again, _ = _active(conn)
+        assert again > version and routing_again > routing_version
+        migrate.downgrade(migrated, "0018_combined_worker_image")
+        with engine.connect() as conn:
+            assert _active(conn)[0] < version
+            versions = {
+                row.version: row.retired_at
+                for row in conn.execute(
+                    text("SELECT version, retired_at FROM policies WHERE name='default-software'")
+                )
+            }
+            routings = set(
+                conn.execute(
+                    text("SELECT version FROM routing_policies WHERE name=:name"),
+                    {"name": policy.document["routing"]["policy"]["name"]},
+                ).scalars()
+            )
+        assert again not in versions
+        assert versions[version] is not None
+        assert routing_again not in routings and routing_version in routings
+    finally:
+        migrate.upgrade(migrated)
+        engine.dispose()
+
+
+def test_0019_downgrade_leaves_an_operator_copy_that_enabled_opus_alone(
+    database_url: str,
+) -> None:
+    """A copy the operator uploaded keeps 0019's description, marker included. Once an
+    earlier downgrade has removed 0019's own version, the copy is the lowest marked one
+    left; if it names a routing version where the operator enabled Opus 5.5, it is theirs
+    and a second downgrade leaves it, and that routing version, in force."""
+    migrate.upgrade(database_url)
+    engine = make_engine(database_url)
+    with engine.begin() as conn:
+        version, policy, routing_version, routing = _active(conn)
+        name = policy["routing"]["policy"]["name"]
+        enabled = json.loads(json.dumps(routing))
+        for model in enabled["models"]:
+            if model["id"] == "claude-opus-5-5":
+                model["enabled"] = True
+                model.pop("disabled_reason", None)
+        operator_routing = routing_version + 1
+        enabled["version"] = operator_routing
+        conn.execute(
+            text(
+                "INSERT INTO routing_policies(name, version, document, created_at) "
+                "VALUES (:name, :version, CAST(:document AS jsonb), now())"
+            ),
+            {"name": name, "version": operator_routing, "document": json.dumps(enabled)},
+        )
+        copy = json.loads(json.dumps(policy))
+        copy["version"] = version + 1
+        copy["routing"] = {"policy": {"name": name, "version": operator_routing}}
+        conn.execute(
+            text(
+                "INSERT INTO policies(name, version, document, created_at) "
+                "VALUES ('default-software', :version, CAST(:document AS jsonb), now())"
+            ),
+            {"version": version + 1, "document": json.dumps(copy)},
+        )
+    try:
+        migrate.downgrade(database_url, "0018_combined_worker_image")
+        with engine.connect() as conn:
+            assert _active(conn)[:3:2] == (version + 1, operator_routing)
+        # The upgrade finds Opus 5.5 already in the routing in force and writes nothing.
+        migrate.upgrade(database_url)
+        migrate.downgrade(database_url, "0018_combined_worker_image")
+        with engine.connect() as conn:
+            assert _active(conn)[:3:2] == (version + 1, operator_routing)
+    finally:
+        with engine.begin() as conn:
+            conn.execute(
+                text("DELETE FROM policies WHERE name='default-software' AND version=:version"),
+                {"version": version + 1},
+            )
+            conn.execute(
+                text("DELETE FROM routing_policies WHERE name=:name AND version=:version"),
+                {"name": name, "version": operator_routing},
+            )
+        migrate.downgrade(database_url, "0018_combined_worker_image")
+        migrate.upgrade(database_url)
+        engine.dispose()
+
+
+def test_0018_keeps_a_promotion_across_down_and_up(database_url: str) -> None:
+    """C11: a promotion records every harness the image carries. A row from before C11
+    becomes a one-harness document; the downgrade keeps the row readable."""
+    migrate.upgrade(database_url)
+    engine = make_engine(database_url)
+    migrate.downgrade(database_url, "0017_lab_local")
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM image_promotions"))
+        conn.execute(
+            text(
+                "INSERT INTO image_promotions (digest, reference, harness, harness_version, "
+                "state, reason, updated_at, updated_by) VALUES ('sha256:c5', "
+                "'crucible-worker:codex-0.153.4-x', 'codex', '0.153.4', 'default', '', now(), "
+                "'tests')"
+            )
+        )
+    migrate.upgrade(database_url)
+    with engine.connect() as conn:
+        harnesses = conn.execute(
+            text("SELECT harnesses FROM image_promotions WHERE digest='sha256:c5'")
+        ).scalar_one()
+    assert harnesses == {"codex": "0.153.4"}
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO image_promotions (digest, reference, harnesses, state, reason, "
+                "updated_at, updated_by) VALUES ('sha256:c11', 'crucible-worker:20260916-x', "
+                "CAST(:harnesses AS jsonb), 'default', '', now(), 'tests')"
+            ),
+            {"harnesses": json.dumps({"codex": "0.156.0", "agy": "1.2.8"})},
+        )
+    migrate.downgrade(database_url, "0017_lab_local")
+    with engine.connect() as conn:
+        rows = {
+            str(digest): str(value)
+            for digest, value in conn.execute(
+                text("SELECT digest, harness || ' ' || harness_version FROM image_promotions")
+            ).all()
+        }
+    assert rows == {"sha256:c5": "codex 0.153.4", "sha256:c11": "agy 1.2.8"}
+    migrate.upgrade(database_url)
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM image_promotions"))
+    engine.dispose()
 
 
 def test_0004_down_and_up(database_url: str) -> None:

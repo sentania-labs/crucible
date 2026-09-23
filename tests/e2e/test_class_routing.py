@@ -98,14 +98,13 @@ def _promote_second_tag(ctx: AppContext, worker_image: str) -> str:
         current = next(
             image
             for image in uow.image_promotions.list_all()
-            if image.harness == "script-harness" and image.state == "default"
+            if image.carries("script-harness") and image.state == "default"
         )
         uow.image_promotions.put(
             ImagePromotion(
                 digest=current.digest,
                 reference=second_image,
-                harness=current.harness,
-                harness_version=current.harness_version,
+                harnesses=dict(current.harnesses),
                 state="default",
                 updated_at=ctx.clock.now(),
                 updated_by="e2e",

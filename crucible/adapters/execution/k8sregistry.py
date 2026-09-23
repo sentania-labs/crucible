@@ -1,8 +1,8 @@
 """Resolving a worker image through the container registry (11, 13, 26).
 
 The Docker provider asks the daemon what an image reference is: the daemon holds the
-image, so `inspect_image` answers with a digest and the `crucible.harness` labels that
-decide whether the reference may run with a harness's credential. A cluster holds no
+image, so `inspect_image` answers with a digest and the harness labels that decide
+whether the reference may run with a harness's credential. A cluster holds no
 image on Crucible's side. 26 therefore resolves through the registry the release
 publishes to, before the Job is created, because the version refusal (07) has to happen
 before anything is seeded or scheduled, not after a kubelet has already pulled.
@@ -255,13 +255,7 @@ class HttpRegistryClient:
         }
         if not digest:
             raise RegistryError(f"{reference!r} resolved to no digest")
-        return ImageInfo(
-            reference=parsed.pinned(digest),
-            digest=digest,
-            harness=labels.get("crucible.harness"),
-            harness_version=labels.get("crucible.harness_version"),
-            labels=labels,
-        )
+        return ImageInfo.from_labels(parsed.pinned(digest), digest, labels)
 
     def list_tags(self, repository: str) -> list[str]:
         parsed = parse_reference(repository)

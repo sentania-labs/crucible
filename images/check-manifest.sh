@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Verify that every declared worker-image tag matches images/build.sh without
-# building an image. build.sh remains the one definition of the build-input hash.
+# Verify that every declared worker-image tag, and the harness versions each image
+# declares, match images/build.sh without building an image. build.sh remains the
+# one definition of the build-input hash and of the harness labels.
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -8,12 +9,12 @@ manifest="$here/manifest.env"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
-harnesses=()
+images=()
 for dir in "$here"/*; do
     [ -f "$dir/Dockerfile" ] || continue
-    harnesses+=("${dir##*/}")
+    images+=("${dir##*/}")
 done
-[ ${#harnesses[@]} -gt 0 ] || {
+[ ${#images[@]} -gt 0 ] || {
     echo "check-manifest.sh: no image directories found under $here" >&2
     exit 2
 }
@@ -47,9 +48,14 @@ case "${1:-}:${2:-}" in
         }
         scratch=$(mktemp -d)
         trap 'rm -rf "$scratch"' EXIT
-        printf '%s\n' '{"manifests":[{"digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"}]}' \
-            > "$scratch/index.json"
-        tar -cf "$oci_dest" -C "$scratch" index.json
+        # A manifest naming the all-zero config, which is the ID `image inspect` reports
+        # below, so build.sh's loaded-image check passes.
+        mkdir -p "$scratch/blobs/sha256"
+        manifest='{"config":{"digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"}}'
+        manifest_hex=$(printf '%s' "$manifest" | sha256sum | cut -c1-64)
+        printf '%s' "$manifest" > "$scratch/blobs/sha256/$manifest_hex"
+        printf '{"manifests":[{"digest":"sha256:%s"}]}\n' "$manifest_hex" > "$scratch/index.json"
+        tar -cf "$oci_dest" -C "$scratch" index.json blobs
         ;;
     load:-q)
         exit 0
@@ -70,29 +76,35 @@ EOF
 chmod +x "$tmp/bin/docker"
 
 PATH="$tmp/bin:$PATH" MANIFEST="$tmp/expected.env" OUT="$tmp/out" \
-    "$here/build.sh" "${harnesses[@]}" >/dev/null
+    "$here/build.sh" "${images[@]}" >/dev/null
 
 failed=0
 declare -A expected_keys=()
-for harness in "${harnesses[@]}"; do
-    key=$(printf '%s' "$harness" | tr 'a-z-' 'A-Z_')
+for image in "${images[@]}"; do
+    key=$(printf '%s' "$image" | tr 'a-z-' 'A-Z_')
     expected_keys["$key"]=1
     expected=$(sed -n "s/^${key}=//p" "$tmp/expected.env")
+    expected_carried=$(sed -n "s/^${key}_HARNESSES=//p" "$tmp/expected.env")
     count=$(grep -c "^${key}=" "$manifest" 2>/dev/null || true)
     actual=$(sed -n "s/^${key}=//p" "$manifest" 2>/dev/null || true)
+    carried_count=$(grep -c "^${key}_HARNESSES=" "$manifest" 2>/dev/null || true)
+    actual_carried=$(sed -n "s/^${key}_HARNESSES=//p" "$manifest" 2>/dev/null || true)
     digest_count=$(grep -c "^${key}_DIGEST=" "$manifest" 2>/dev/null || true)
     valid_digest_count=$(
         grep -c "^${key}_DIGEST=sha256:[0-9a-f]\{64\}$" "$manifest" 2>/dev/null || true
     )
 
     if [ "$count" -ne 1 ]; then
-        echo "image manifest drift: $harness has $count tag entries; run 'images/build.sh $harness'" >&2
+        echo "image manifest drift: $image has $count tag entries; run 'images/build.sh $image'" >&2
         failed=1
     elif [ "$actual" != "$expected" ]; then
-        echo "image manifest drift: $harness declares '$actual', expected '$expected'; run 'images/build.sh $harness'" >&2
+        echo "image manifest drift: $image declares '$actual', expected '$expected'; run 'images/build.sh $image'" >&2
+        failed=1
+    elif [ "$carried_count" -ne 1 ] || [ "$actual_carried" != "$expected_carried" ]; then
+        echo "image manifest drift: $image declares harnesses '$actual_carried', expected '$expected_carried'; run 'images/build.sh $image'" >&2
         failed=1
     elif [ "$digest_count" -ne 1 ] || [ "$valid_digest_count" -ne 1 ]; then
-        echo "image manifest drift: $harness has no single valid digest entry; run 'images/build.sh $harness'" >&2
+        echo "image manifest drift: $image has no single valid digest entry; run 'images/build.sh $image'" >&2
         failed=1
     fi
 done
@@ -102,6 +114,7 @@ if [ -f "$manifest" ]; then
     while IFS='=' read -r manifest_key _; do
         case "$manifest_key" in ""|'#'*) continue ;; esac
         base_key=${manifest_key%_DIGEST}
+        base_key=${base_key%_HARNESSES}
         if [ -z "${expected_keys[$base_key]+present}" ] && [ -z "${orphaned_keys[$base_key]+seen}" ]; then
             echo "image manifest drift: manifest key $base_key has no image directory; remove its entries from images/manifest.env" >&2
             orphaned_keys["$base_key"]=1
@@ -111,4 +124,4 @@ if [ -f "$manifest" ]; then
 fi
 
 [ "$failed" -eq 0 ] || exit 1
-printf 'image manifest: %d image tags match build.sh\n' "${#harnesses[@]}"
+printf 'image manifest: %d image tags match build.sh\n' "${#images[@]}"

@@ -65,12 +65,12 @@ def list_harnesses(
         entry["images"] = [
             {
                 "reference": i.reference,
-                "harness_version": i.harness_version,
+                "harness_version": i.version_of(view.name),
                 "digest": i.digest,
                 "promotion_state": promotions.get(i.digest, "candidate"),
             }
             for i in images
-            if i.harness == view.name
+            if i.carries(view.name)
         ]
         out.append(entry)
     return out

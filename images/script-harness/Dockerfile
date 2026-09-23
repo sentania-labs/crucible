@@ -51,7 +51,11 @@ RUN set -eu; \
     groupadd --gid 1000 worker; \
     useradd --uid 1000 --gid 1000 --create-home --home-dir /home/worker --shell /bin/bash worker; \
     find / -xdev -type f -perm /6000 -exec chmod a-s {} +
-COPY ca/sentania-lab-root.crt /usr/local/share/ca-certificates/sentania-lab-root.crt
+# --chmod on every COPY from the build context: without it the file keeps the mode of
+# the checkout, which follows the cloner's umask (0664 under 002, 0644 under 022). The
+# mode is in the layer but not in crucible.build_inputs, so two machines built the same
+# tag with different digests (FDY-0082). build.sh refuses a context COPY without it.
+COPY --chmod=0644 ca/sentania-lab-root.crt /usr/local/share/ca-certificates/sentania-lab-root.crt
 RUN set -eu; \
     echo "${LAB_CA_SHA256}  /usr/local/share/ca-certificates/sentania-lab-root.crt" | sha256sum -c -; \
     update-ca-certificates

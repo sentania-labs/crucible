@@ -297,14 +297,15 @@ def _seed_policies(ctx: AppContext, admin_token: str) -> None:
 
 
 def _promote_pins(ctx: AppContext, provider: DockerProvider, admin_token: str) -> None:
-    """The pinned images must be the only ones the probe can choose, or it refuses; a
-    daemon carrying older builds beside the pins gets the pins promoted."""
+    """The pinned image must be the only one the probe can choose, or it refuses; a
+    daemon carrying older builds beside the pin gets the pin promoted. One worker image
+    carries every harness (C11), so the pin is the same for each."""
     for harness in ALL_HARNESSES:
-        images = [i for i in asyncio.run(provider.list_images()) if i.harness == harness]
+        images = [i for i in asyncio.run(provider.list_images()) if i.carries(harness)]
         if len({i.reference for i in images}) > 1:
             from tests.e2e import daemon  # noqa: PLC0415
 
-            pinned = daemon.manifest_pins()[harness]
+            pinned = daemon.manifest_pins()["worker"]
             with _client(ctx, admin_token) as admin:
                 promoted = admin.post(
                     f"/v1/admin/images/{pinned}/promote",
@@ -539,11 +540,11 @@ def test_every_other_operation_through_api_and_cli_on_the_live_stack(
         assert not any(p.is_file() for p in (scratch_root / "agy").rglob("*"))
         # images: list and promote the pinned codex image
         images = admin.get("/v1/admin/images").json()["items"]
-        codex_images = [i for i in images if i["harness"] == "codex"]
+        codex_images = [i for i in images if "codex" in i["harnesses"]]
         assert codex_images
         from tests.e2e import daemon  # noqa: PLC0415
 
-        pin = daemon.manifest_pins()["codex"]
+        pin = daemon.manifest_pins()["worker"]
         promoted = _cli(config, "--reason", "live promote", "images", "promote", pin, capsys=capsys)
         assert promoted["promotion_state"] == "default"
         states = {

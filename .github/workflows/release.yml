@@ -1,6 +1,6 @@
 # The tag push is the release (sdlc skill). This workflow owns every step after
-# it: refuse a bad tag, build, smoke the image an operator would run, publish to
-# GHCR, and only then cut the GitHub release.
+# it: refuse a bad tag, build, smoke the image an operator would run, prove and
+# publish the worker images, publish to GHCR, and only then cut the GitHub release.
 #
 # GitHub-hosted runners: the smoke test is `docker compose`, which needs a real
 # Docker daemon, and the repository is public so hosted minutes are free
@@ -181,6 +181,23 @@ jobs:
         env:
           CRUCIBLE_IMAGE: ghcr.io/sentania-labs/crucible:${{ env.VERSION }}
         run: make down
+
+      # Gate 3, part three. The worker images (13, C11): the worker image carrying
+      # Claude Code, Codex, AGY and Hermes, and the script-harness image. A build from
+      # scratch on this fresh runner has to reproduce every tag, harness version and OCI
+      # digest images/manifest.env declares before anything is pushed. Then each OCI
+      # archive goes to ghcr.io/sentania-labs/crucible-worker:<tag> exactly as built, so
+      # the registry holds the declared digest; a tag already there with that digest is
+      # a re-run and is left alone, and one there with any other digest stops the
+      # release (the never-overwrite rule the service image has). Every published digest
+      # is then read back. It is the same script `make images` and the CI images job
+      # run, not a copy (the c7c, c7e and c7f lesson). It comes before the version tag
+      # is pushed, so a release whose worker images cannot be proven publishes nothing.
+      - name: build, prove and publish the worker images
+        env:
+          REGISTRY_USERNAME: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        run: make images-publish NO_CACHE=1
 
       # Gate 4. Publish. An existing version tag is never overwritten: a re-run
       # after a transient failure skips the push instead of failing on it.

@@ -177,6 +177,54 @@ async def test_an_image_outside_the_tested_range_is_refused(tmp_path: Path) -> N
         await provider(tmp_path, client)._resolve_image(spec())
 
 
+async def test_the_worker_image_is_resolved_for_each_harness_it_carries(tmp_path: Path) -> None:
+    """C11: one image, four harnesses. Each launch checks the version its own harness is
+    pinned at, and a harness the image does not list is refused."""
+    worker = {
+        "crucible.harnesses": "agy,claude_code,codex,hermes",
+        "crucible.harness.agy.version": "1.2.8",
+        "crucible.harness.claude_code.version": "2.1.280",
+        "crucible.harness.codex.version": "0.156.0",
+        "crucible.harness.hermes.version": "0.19.0",
+    }
+    docker = provider(tmp_path, StubClient(labels=worker))
+    for harness in ("agy", "claude_code", "codex", "hermes"):
+        launch = spec()
+        object.__setattr__(launch, "harness", harness)
+        assert await docker._resolve_image(launch) == DIGEST
+    with pytest.raises(ProviderError, match="declares harness agy, claude_code, codex, hermes"):
+        await docker._resolve_image(spec())
+
+
+async def test_the_image_listing_reads_both_label_shapes(tmp_path: Path) -> None:
+    """Docker ANDs label filters, so the worker image's `crucible.harnesses` and an older
+    image's `crucible.harness` are two queries, merged by image id."""
+    worker = {
+        "crucible.harnesses": "codex,agy",
+        "crucible.harness.codex.version": "0.156.0",
+        "crucible.harness.agy.version": "1.2.8",
+    }
+    rows = {
+        "crucible.harnesses": [
+            {"Id": "sha256:w", "RepoTags": ["crucible-worker:20260916-a"], "Labels": worker}
+        ],
+        "crucible.harness": [
+            {
+                "Id": "sha256:s",
+                "RepoTags": ["crucible-worker:script-harness-1.0.0-b"],
+                "Labels": LABELS,
+            }
+        ],
+    }
+    client = StubClient()
+    client.list_images = lambda filters: rows[filters["label"][0]]  # type: ignore[attr-defined]
+    images = await provider(tmp_path, client).list_images()
+    assert [(i.reference, dict(i.harnesses)) for i in images] == [
+        ("crucible-worker:20260916-a", {"agy": "1.2.8", "codex": "0.156.0"}),
+        ("crucible-worker:script-harness-1.0.0-b", {"script-harness": "1.0.0"}),
+    ]
+
+
 # ----- a throwaway container that never finishes -----------------------------
 
 

@@ -49,7 +49,7 @@ def context(**overrides: Any) -> LaunchContext:
 def test_claude_code_launch_matches_07() -> None:
     launch = ClaudeCodeAdapter().build_launch(context())
     assert launch.argv == (
-        "claude",
+        "/usr/local/bin/claude",
         "-p",
         "--permission-mode",
         "bypassPermissions",
@@ -71,7 +71,7 @@ def test_claude_code_launch_matches_07() -> None:
 def test_codex_launch_matches_07_with_s1_and_s6_flags() -> None:
     launch = CodexAdapter().build_launch(context(effort="low"))
     argv = launch.argv
-    assert argv[:2] == ("codex", "exec")
+    assert argv[:2] == ("/usr/local/bin/codex", "exec")
     assert "--dangerously-bypass-approvals-and-sandbox" in argv  # S2: the container is the boundary
     assert "--skip-git-repo-check" in argv  # S1: the checkout is not a trusted host uid's
     assert argv[argv.index("--disable") + 1] == "plugins"  # S6
@@ -92,7 +92,7 @@ def test_codex_launch_matches_07_with_s1_and_s6_flags() -> None:
 def test_agy_launch_matches_07_and_stays_under_the_argv_ceiling() -> None:
     launch = AgyAdapter().build_launch(context(effort="low", timeout_seconds=1200))
     argv = launch.argv
-    assert argv[:3] == ("agy", "-p", POINTER)
+    assert argv[:3] == ("/usr/local/bin/agy", "-p", POINTER)
     assert argv[argv.index("--model") + 1] == "model-x"
     assert argv[argv.index("--effort") + 1] == "low"
     assert "--dangerously-skip-permissions" in argv
@@ -116,7 +116,7 @@ def test_hermes_launch_matches_07_and_uses_the_optional_api_key() -> None:
         )
     )
     assert launch.argv == (
-        "crucible-hermes",
+        "/usr/local/bin/crucible-hermes",
         "--ignore-user-config",
         "--ignore-rules",
         "--safe-mode",
@@ -133,6 +133,7 @@ def test_hermes_launch_matches_07_and_uses_the_optional_api_key() -> None:
         POINTER,
     )
     assert launch.env == {
+        "PATH": "/opt/hermes/bin:/usr/local/bin:/usr/bin:/bin",
         "HERMES_HOME": "/home/worker/.hermes",
         "OPENAI_BASE_URL": "http://spark.example.internal:11434/v1",
         "OPENAI_API_KEY": "local-no-auth",
@@ -255,7 +256,9 @@ def test_configuration_may_raise_the_mount_mode_and_never_lower_it() -> None:
 def test_the_registry_knows_the_five_harnesses() -> None:
     registry = default_registry()
     assert registry.names() == ("claude_code", "codex", "agy", "hermes", "script-harness")
-    assert registry.require("codex").supported_versions.text == ">=0.153.0,<0.154.0"
+    # C11: 0.154, 0.155 and 0.156 keep every flag the launch uses (codex exec --help of
+    # 0.156.0; their changelogs remove only `codex mcp-server`, which is not used).
+    assert registry.require("codex").supported_versions.text == ">=0.153.0,<0.157.0"
     assert registry.require("claude_code").supported_versions.text == ">=2.1.277,<2.2.0"
     assert registry.require("agy").supported_versions.text == ">=1.2.0,<1.3.0"
     assert registry.require("hermes").supported_versions.text == ">=0.19.0,<0.20.0"

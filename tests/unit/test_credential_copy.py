@@ -304,7 +304,7 @@ async def test_the_script_harness_gets_no_credential_and_no_wrapper(tmp_path: Pa
 
 
 async def test_a_version_outside_the_range_is_a_refusal(tmp_path: Path) -> None:
-    client = StubClient("codex", "0.154.0")
+    client = StubClient("codex", "0.157.0")
     provider = DockerProvider(
         config(tmp_path, codex=CredentialSource(str(codex_source(tmp_path)))),
         client=client,  # type: ignore[arg-type]

@@ -11,6 +11,8 @@ from typing import Any
 from crucible.adapters.harness import base
 from crucible.domain.exit_class import ExitClass, classify_exit
 from crucible.ports.harness import (
+    HERMES_BINARY,
+    HERMES_PATH,
     AdapterLaunch,
     AuthFile,
     CredentialSpec,
@@ -135,7 +137,7 @@ class HermesAdapter:
         assert spec is not None
         return AdapterLaunch(
             argv=(
-                "crucible-hermes",
+                HERMES_BINARY,
                 "--ignore-user-config",
                 # This disables AGENTS.md, skills, and memory injection. The identity
                 # bundle remains the only instruction source for the attempt.
@@ -157,6 +159,9 @@ class HermesAdapter:
                 base.POINTER_PROMPT,
             ),
             env={
+                # The worker image leaves the Hermes venv off PATH (C11); Hermes's own
+                # process gets it first, as its dedicated image used to give it.
+                "PATH": HERMES_PATH,
                 "HERMES_HOME": HERMES_HOME,
                 "OPENAI_BASE_URL": ctx.endpoint_url,
                 "OPENAI_API_KEY": "local-no-auth",

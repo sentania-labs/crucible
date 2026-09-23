@@ -266,12 +266,14 @@ class HarnessList(Response):
 
 
 class ImageView(Response):
-    """13: a worker image the provider can see, with its promotion state."""
+    """13: a worker image the provider can see, with its promotion state. `harnesses`
+    is every harness the image carries, name to pinned version: all four real harnesses
+    for the worker image (C11). `supported` is true when every one of them is inside
+    its adapter's tested range, which is what promotion requires."""
 
     reference: str
     digest: str
-    harness: str | None
-    harness_version: str | None
+    harnesses: dict[str, str]
     supported: bool
     promotion_state: str
     provider: str

@@ -137,7 +137,7 @@ def test_an_orchestrator_principal_may_not_set_an_operator_only_field(
     ctx: AppContext, tokens: dict[str, str], section: str, field: str, value: bool
 ) -> None:
     document = seeded_policy()
-    document["version"] = 8
+    document["version"] = 9
     document[section][field] = value
     with ctx.uow_factory() as uow:
         orchestrator = uow.principals.get_by_name("orchestrator-principal")
@@ -148,27 +148,27 @@ def test_an_orchestrator_principal_may_not_set_an_operator_only_field(
                 ctx.clock,
                 principal=orchestrator,
                 name="default-software",
-                version=8,
+                version=9,
                 document=document,
             )
     assert [e["path"] for e in exc.value.errors] == [f"{section}.{field}"]
     with ctx.uow_factory() as uow:
-        assert uow.policies.get("default-software", 8) is None
+        assert uow.policies.get("default-software", 9) is None
 
 
 def test_the_upload_route_is_admin_only(client: TestClient, tokens: dict[str, str]) -> None:
     document = seeded_policy()
-    document["version"] = 9
+    document["version"] = 10
     for role in ("orchestrator", "operator", "observer"):
         r = client.put(
-            "/v1/policies/default-software/9",
+            "/v1/policies/default-software/10",
             json=document,
             headers={"Authorization": f"Bearer {tokens[role]}"},
         )
         assert r.status_code == 403, role
     assert (
         client.put(
-            "/v1/policies/default-software/9", json=document, headers=admin(tokens)
+            "/v1/policies/default-software/10", json=document, headers=admin(tokens)
         ).status_code
         == 200
     )

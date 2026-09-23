@@ -79,7 +79,9 @@ from crucible.domain.exit_class import ExitClass
 from crucible.domain.ids import new_id
 from crucible.domain.time import parse_rfc3339
 from crucible.ports.execution import (
+    HARNESSES_LABEL,
     IDENTITY_MOUNT,
+    LEGACY_HARNESS_LABEL,
     OUTPUT_MOUNT,
     REPO_MOUNT,
     REPORT_MOUNT,
@@ -106,6 +108,7 @@ from crucible.ports.execution import (
     VerificationRun,
     Workspace,
     WorkspaceState,
+    image_harnesses,
 )
 from crucible.ports.harness import (
     AuthFile,
@@ -1486,7 +1489,9 @@ class DockerProvider:
         return ProbeResult(
             exit_code=exit_code,
             image_digest=resolved,
-            harness_version=labels.labels.get("crucible.harness_version") if labels else None,
+            harness_version=(
+                image_harnesses(labels.labels).get(request.harness) or None if labels else None
+            ),
             duration_seconds=time.monotonic() - started,
             timed_out=timed_out,
             oom_killed=oom,
@@ -1682,26 +1687,28 @@ class DockerProvider:
                     await self._call(self.client.remove_container, container_id, force=True)
 
     async def list_images(self) -> list[ImageInfo]:
-        """Every image on the daemon that carries the `crucible.harness` label (13)."""
-        try:
-            rows = await self._call(self.client.list_images, {"label": ["crucible.harness"]})
-        except DockerApiError as exc:
-            raise ProviderError(f"image listing failed: {exc}") from exc
+        """Every image on the daemon that declares a harness (13): the worker image's
+        `crucible.harnesses` label (C11), or the single `crucible.harness` label of an
+        image built before it. Docker ANDs label filters, so each is its own query."""
+        rows: dict[str, dict[str, Any]] = {}
+        for label in (HARNESSES_LABEL, LEGACY_HARNESS_LABEL):
+            try:
+                found = await self._call(self.client.list_images, {"label": [label]})
+            except DockerApiError as exc:
+                raise ProviderError(f"image listing failed: {exc}") from exc
+            for row in found:
+                rows.setdefault(str(row.get("Id", "")), row)
         images: list[ImageInfo] = []
-        for row in rows:
+        for row in rows.values():
             labels = {str(k): str(v) for k, v in (row.get("Labels") or {}).items()}
             digests = [str(d) for d in (row.get("RepoDigests") or [])]
             tags = [str(t) for t in (row.get("RepoTags") or []) if t and t != "<none>:<none>"]
             for reference in tags or [str(row.get("Id", ""))]:
-                images.append(
-                    ImageInfo(
-                        reference=reference,
-                        digest=digests[0] if digests else str(row.get("Id", "")),
-                        harness=labels.get("crucible.harness"),
-                        harness_version=labels.get("crucible.harness_version"),
-                        labels=labels,
-                    )
+                image = ImageInfo.from_labels(
+                    reference, digests[0] if digests else str(row.get("Id", "")), labels
                 )
+                if image.harnesses:
+                    images.append(image)
         return sorted(images, key=lambda i: i.reference)
 
 
