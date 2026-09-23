@@ -131,18 +131,26 @@ def _bytes(value: Any, default: int) -> int:
 
 @dataclass(frozen=True, slots=True)
 class Limits:
-    """The effective resource limits of one attempt, recorded in its evidence (26)."""
+    """The effective resource limits of one attempt, recorded in its evidence (26).
+
+    `cpu_request_fraction` and `memory_request_fraction` (issue 93) are what a pod
+    requests as a fraction of what it limits, so a small cluster can schedule a
+    Burstable pod instead of a Guaranteed one that demands the whole limit up front."""
 
     cpus: float
     memory_bytes: int
     ephemeral_storage: str
     tmpfs_bytes: int
     grace_seconds: int
+    cpu_request_fraction: float = 1.0
+    memory_request_fraction: float = 1.0
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "cpu": self.cpu,
             "memory": self.memory,
+            "cpu_request": self.cpu_request,
+            "memory_request": self.memory_request,
             "ephemeral_storage": self.ephemeral_storage,
             "tmpfs": self.tmpfs,
             "termination_grace_seconds": self.grace_seconds,
@@ -155,6 +163,16 @@ class Limits:
     @property
     def memory(self) -> str:
         return f"{self.memory_bytes}"
+
+    @property
+    def cpu_request(self) -> str:
+        # At least 1m: a request of 0 is "unbounded" to the scheduler, which is not
+        # what a fraction close to zero means.
+        return f"{max(1, round(self.cpus * self.cpu_request_fraction * 1000))}m"
+
+    @property
+    def memory_request(self) -> str:
+        return f"{max(1, round(self.memory_bytes * self.memory_request_fraction))}"
 
     @property
     def tmpfs(self) -> str:
@@ -172,6 +190,24 @@ def limits_from_policy(
         ephemeral_storage=str(resources.get("ephemeral_storage") or default_ephemeral),
         tmpfs_bytes=_bytes(resources.get("tmpfs_per_mount"), default_tmpfs_mb * 1024**2),
         grace_seconds=grace,
+        cpu_request_fraction=float(resources.get("cpu_request_fraction") or 0.5),
+        memory_request_fraction=float(resources.get("memory_request_fraction") or 1.0),
+    )
+
+
+def canary_limits(*, cpu_millicores: int, memory: str) -> Limits:
+    """26's readiness canary (issue 93): a shell script with curl, not a role pod.
+
+    Fixed small ephemeral storage, tmpfs and grace period: the canary writes nothing of
+    size and is deleted as soon as its one-shot phase is terminal. Request equals limit
+    here, unlike a role pod's `Limits`, because the canary's limit is already the
+    smallest useful size; splitting it further buys nothing."""
+    return Limits(
+        cpus=cpu_millicores / 1000,
+        memory_bytes=_bytes(memory, 64 * 1024**2),
+        ephemeral_storage="128Mi",
+        tmpfs_bytes=16 * 1024**2,
+        grace_seconds=5,
     )
 
 
@@ -229,10 +265,17 @@ def pod_spec(request: PodRequest) -> dict[str, Any]:
                 "memory": request.limits.memory,
                 "ephemeral-storage": request.limits.ephemeral_storage,
             },
-            # Requests equal to limits: a worker that was promised the policy's memory
-            # gets Guaranteed QoS and is not the first thing evicted under node pressure,
-            # which would otherwise show up as a `lost` attempt nobody caused (16).
-            "requests": {"cpu": request.limits.cpu, "memory": request.limits.memory},
+            # The request is a fraction of the limit (issue 93), so a small cluster can
+            # schedule a Burstable pod instead of demanding the whole limit up front.
+            # Memory defaults its fraction to 1 (request equals limit), which keeps a
+            # worker promised the policy's memory from being the first thing evicted
+            # under node pressure, an eviction that would otherwise show up as a `lost`
+            # attempt nobody caused (16); CPU has no such eviction risk; a policy may
+            # still lower memory's fraction for a memory-constrained cluster.
+            "requests": {
+                "cpu": request.limits.cpu_request,
+                "memory": request.limits.memory_request,
+            },
         },
         "volumeMounts": [_mount(m) for m in request.mounts],
         "terminationMessagePolicy": "FallbackToLogsOnError",
@@ -578,6 +621,7 @@ __all__ = [
     "bare_pod",
     "base_mounts",
     "base_volumes",
+    "canary_limits",
     "config_map",
     "denied_by",
     "egress_policy",

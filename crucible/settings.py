@@ -152,6 +152,10 @@ class KubernetesSettings(BaseModel):
     credential_secrets: dict[str, str] = Field(default_factory=dict)
     extra_image_allowlist: list[str] = Field(default_factory=list)
     use_reference_cache: bool = True
+    # 26, issue 93: the canary is a shell script with curl, not a role pod, so it asks
+    # for a fixed small size instead of the policy's limits.
+    canary_cpu_millicores: int = 100
+    canary_memory: str = "64Mi"
 
 
 class CredentialSettings(BaseModel):
