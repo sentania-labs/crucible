@@ -14,7 +14,9 @@ per request.
 kubelet writes pod logs to the node's disk, so a rotated credential read back through a
 log would be a credential on a node (12). The exec stream is the same channel
 `kubectl cp` uses and it is what the reader Pod hands the collected outputs and the
-rotated auth files back on.
+rotated auth files back on. It is also the one way a value goes into a Pod: the code an
+operator pastes into a harness login (25) travels on the exec's stdin channel, never in
+the exec's argv, which the API server can record in its audit log.
 """
 
 from __future__ import annotations
@@ -321,11 +323,14 @@ class KubernetesClient:
         *,
         grace_period_seconds: int | None = None,
         propagation: str = "Background",
+        uid: str | None = None,
     ) -> None:
         """Delete one object. A 404 is the state delete was asked to produce.
 
         `propagation` is Background by default so deleting a Job takes its Pod with it;
-        Orphan would leave a worker Pod running with nothing tracking it (26)."""
+        Orphan would leave a worker Pod running with nothing tracking it (26). `uid`
+        deletes only that incarnation of the name: the API server answers 409 when the
+        object there now is a different one (the login lock, 25)."""
         body: dict[str, Any] = {
             "apiVersion": "meta.k8s.io/v1",
             "kind": "DeleteOptions",
@@ -333,6 +338,8 @@ class KubernetesClient:
         }
         if grace_period_seconds is not None:
             body["gracePeriodSeconds"] = grace_period_seconds
+        if uid is not None:
+            body["preconditions"] = {"uid": uid}
         try:
             self._json("DELETE", f"{self._base(kind)}/{quote(name, safe='')}", body=body)
         except KubernetesApiError as exc:
@@ -399,24 +406,36 @@ class KubernetesClient:
         container: str | None = None,
         timeout: float | None = None,
         limit: int = 64 * 1024 * 1024,
+        stdin: bytes | None = None,
     ) -> ExecResult:
         """Run one command in a Pod and return both streams and its exit status.
 
         The WebSocket form of `pods/exec` (`v4.channel.k8s.io`), which is the transport
-        `kubectl cp` uses. No stdin is opened: this client never writes to a Pod, so a
-        value cannot travel into one this way."""
-        params: dict[str, Any] = {"stdout": "true", "stderr": "true", "stdin": "false"}
+        `kubectl cp` uses. Stdin is opened only when `stdin` is given, and then the bytes
+        are sent once on channel 0. The v4 protocol has no way to close stdin, so the
+        command must stop reading on its own (a `read` of one line does)."""
+        params: dict[str, Any] = {
+            "stdout": "true",
+            "stderr": "true",
+            "stdin": "true" if stdin is not None else "false",
+        }
         if container:
             params["container"] = container
         query = urlencode([*params.items(), *[("command", c) for c in command]])
         path = f"{self._base('pods')}/{quote(name, safe='')}/exec?{query}"
         return _exec_over_websocket(
-            self._connect(timeout), self._headers(), self.access.server, path, limit=limit
+            self._connect(timeout),
+            self._headers(),
+            self.access.server,
+            path,
+            limit=limit,
+            stdin=stdin,
         )
 
 
 # ----- the exec stream ---------------------------------------------------
 
+_CHANNEL_STDIN = 0
 _CHANNEL_STDOUT = 1
 _CHANNEL_STDERR = 2
 _CHANNEL_ERROR = 3
@@ -430,6 +449,7 @@ def _exec_over_websocket(
     path: str,
     *,
     limit: int,
+    stdin: bytes | None = None,
 ) -> ExecResult:
     key = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
     parsed = urlsplit(server)
@@ -458,9 +478,25 @@ def _exec_over_websocket(
         sock = conn.sock
         if sock is None:
             raise KubernetesApiError(0, "the exec upgrade carried no socket", path=path)
+        if stdin is not None:
+            sock.sendall(_client_frame(bytes([_CHANNEL_STDIN]) + stdin))
         return _read_exec_channels(sock, limit=limit)
     finally:
         conn.close()
+
+
+def _client_frame(payload: bytes) -> bytes:
+    """One final binary frame from a client, masked as RFC 6455 requires of a client."""
+    length = len(payload)
+    if length < 126:
+        header = bytes([0x82, 0x80 | length])
+    elif length < 1 << 16:
+        header = bytes([0x82, 0x80 | 126]) + length.to_bytes(2, "big")
+    else:
+        header = bytes([0x82, 0x80 | 127]) + length.to_bytes(8, "big")
+    mask = secrets.token_bytes(4)
+    masked = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+    return header + mask + masked
 
 
 def _read_exec_channels(sock: Any, *, limit: int) -> ExecResult:

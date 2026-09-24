@@ -42,6 +42,21 @@ LABEL_RETAIN = "crucible.retain"
 # The readiness canary's own id. Never `crucible.attempt`: the retention sweep deletes
 # whatever carries an attempt id Crucible does not track, which a canary always is.
 LABEL_CANARY = "crucible.canary"
+# What an administrative run is (`login` or `probe`, 25). The probe borrows an attempt's
+# objects and so carries `crucible.attempt` too; this label is what keeps the retention
+# sweep and reconcile off it while the API process that owns it is still running.
+LABEL_ADMIN = "crucible.admin"
+# A login Job's own id and the harness it signs in. A login never carries
+# `crucible.attempt`, so nothing that sweeps attempts can reach it.
+LABEL_LOGIN = "crucible.login"
+LABEL_HARNESS = "crucible.harness"
+# The harness credential Secret is the service's own (ADR 0015): created by it when
+# absent, written only by it (login, the Hermes key, sync-back), and never by GitOps.
+LABEL_MANAGED_BY = "app.kubernetes.io/managed-by"
+MANAGED_BY_CRUCIBLE = "crucible"
+LABEL_CREDENTIAL = "crucible.credential"
+ADMIN_LOGIN = "login"
+ADMIN_PROBE = "probe"
 ANNOTATION_EGRESS = "crucible.io/egress-hosts"
 
 ROLE_WORKER = "worker"
@@ -51,6 +66,8 @@ ROLE_BUNDLE = "bundle-verifier"
 ROLE_VERIFIER = "verifier"
 ROLE_PUBLISHER = "publisher"
 ROLE_LOGIN = "login"
+# The ConfigMap that is one harness's login lock across every api replica (25, 26).
+ROLE_LOGIN_LOCK = "login-lock"
 ROLE_READER = "reader"
 ROLE_CLEANER = "cleaner"
 ROLE_CANARY = "canary"
@@ -355,12 +372,17 @@ def job(
     pod: Mapping[str, Any],
     active_deadline_seconds: int,
     annotations: Mapping[str, str] | None = None,
+    ttl_seconds_after_finished: int | None = None,
 ) -> dict[str, Any]:
     """One Job per role per attempt (26): one Pod, no retries, its own deadline.
 
     `backoffLimit: 0` and `restartPolicy: Never` together are what make an exit an
-    exit: Kubernetes must never re-run a worker Crucible already classified (16)."""
-    return {
+    exit: Kubernetes must never re-run a worker Crucible already classified (16).
+
+    `ttl_seconds_after_finished` is for the login Job only. An attempt's Jobs are
+    deleted by Crucible after `logs_drained`; a login Job is deleted by the API process
+    that runs it, and the TTL is what removes it when that process died first."""
+    body: dict[str, Any] = {
         "apiVersion": "batch/v1",
         "kind": "Job",
         "metadata": {
@@ -379,6 +401,9 @@ def job(
             "template": {"metadata": {"labels": dict(object_labels)}, "spec": dict(pod)},
         },
     }
+    if ttl_seconds_after_finished is not None:
+        body["spec"]["ttlSecondsAfterFinished"] = ttl_seconds_after_finished
+    return body
 
 
 def bare_pod(
@@ -690,6 +715,8 @@ def egress_policy(
 
 
 __all__ = [
+    "ADMIN_LOGIN",
+    "ADMIN_PROBE",
     "ANNOTATION_EGRESS",
     "CACHE_MOUNT",
     "CONTAINER_NAME",
@@ -700,12 +727,18 @@ __all__ = [
     "DEFAULT_DNS_NAMESPACE",
     "DEFAULT_DNS_POD_LABELS",
     "IDENTITY_MOUNT",
+    "LABEL_ADMIN",
     "LABEL_ATTEMPT",
     "LABEL_CANARY",
+    "LABEL_CREDENTIAL",
+    "LABEL_HARNESS",
+    "LABEL_LOGIN",
+    "LABEL_MANAGED_BY",
     "LABEL_OWNER",
     "LABEL_RETAIN",
     "LABEL_ROLE",
     "LABEL_TASK",
+    "MANAGED_BY_CRUCIBLE",
     "NAMESPACE_NAME_LABEL",
     "OUTPUT_MOUNT",
     "REPORT_MOUNT",
@@ -715,6 +748,7 @@ __all__ = [
     "ROLE_CLEANER",
     "ROLE_COLLECTOR",
     "ROLE_LOGIN",
+    "ROLE_LOGIN_LOCK",
     "ROLE_PREPARER",
     "ROLE_PUBLISHER",
     "ROLE_READER",

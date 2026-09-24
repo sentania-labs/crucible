@@ -432,6 +432,25 @@ def test_no_secret_value_is_committed(
     assert {s["metadata"]["name"] for s in plain} == {"crucible-database"}
 
 
+def test_gitops_delivers_no_harness_credential_secret(
+    rendered: dict[str, list[dict[str, Any]]],
+) -> None:
+    """ADR 0015: the harness Secrets are the service's own, written by the login, the
+    Hermes key and the sync-back. A copy GitOps also applied would drift, so no rendered
+    target carries one in any form, and their documented shape is in no kustomization."""
+    for target in TARGETS:
+        for obj in rendered[target]:
+            if obj["kind"] in {"Secret", "SealedSecret", "ExternalSecret"}:
+                name = str(obj["metadata"]["name"])
+                assert not name.startswith("crucible-harness-"), f"{target}: {name}"
+    shapes = DEPLOY / "secret-shapes"
+    assert (shapes / "service-owned-harnesses.yaml").is_file()
+    for kustomization in DEPLOY.rglob("kustomization.yaml"):
+        assert "harnesses.yaml" not in kustomization.read_text(), kustomization
+    documented = yaml.safe_load((shapes / "service-owned-harnesses.yaml").read_text())
+    assert documented is None, "the harness shape is documentation, never an object"
+
+
 def test_the_argo_application_does_not_sync_automatically(
     rendered: dict[str, list[dict[str, Any]]],
 ) -> None:

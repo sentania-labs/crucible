@@ -13,6 +13,15 @@
 # pods/log is a GET, so `get` is its verb. pods/exec carries both: the client opens the
 # reader Pod's tar stream as a GET WebSocket upgrade, and the API server authorizes an
 # exec against `create` as well, so a Role with only `get` is refused at the upgrade.
+#
+# The admin login Job and the service-owned harness Secrets (25, ADR 0015) need nothing
+# more. The login is a Job with its own NetworkPolicy (create, list, delete), its URL is
+# read from pods/log, the pasted code and the auth files cross on pods/exec, and the
+# harness Secret is created when absent and replaced with one merge patch (create, get,
+# patch). The api Deployment runs the login and uses this same account (26). The login
+# lock that keeps two api replicas from logging one harness in at once is a ConfigMap
+# (create, get, delete, the verbs already here). `update` is deliberately absent:
+# nothing replaces an object whole.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:

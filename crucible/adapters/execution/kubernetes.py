@@ -36,6 +36,7 @@ import socket
 import tarfile
 import tempfile
 import time
+import weakref
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -194,6 +195,33 @@ CREDENTIAL_READ_LIMIT = 1024 * 1024
 # is the diff, the bundle, the report copy and the verifier logs.
 OUTPUT_READ_LIMIT = 256 * 1024 * 1024
 
+# How long an administrative run's objects (a probe's claim and Jobs, a login's policy)
+# are left alone by the retention sweep. The API process that created them removes them
+# itself; this is how long the supervisor waits before deciding that process died.
+ADMIN_GRACE_SECONDS = 2 * 3600
+
+# The login Job's size (25, 26). A login runs one CLI and holds a few kilobytes of auth
+# state on its memory-backed home, so it asks for a fraction of a worker.
+LOGIN_POLICY: dict[str, Any] = {
+    "resources": {
+        "cpus": 1,
+        "memory": "1GiB",
+        "memory_request_fraction": 0.5,
+        "tmpfs_per_mount": "128MiB",
+    },
+    "limits": {"grace_seconds": 5},
+}
+# How long the login Pod waits after its CLI exits for the service to read the auth
+# files off it over exec, before its deadline ends it. The TTL then removes the Job.
+LOGIN_READBACK_SECONDS = 300
+LOGIN_TTL_SECONDS = 60
+# How long past the login's own deadline its lock outlives it: the image resolution and
+# the namespace probe before the Job exists, and the Job's removal after. Only an api
+# that died holding the lock ever waits this out; a login that ends releases it.
+LOGIN_LOCK_SLACK_SECONDS = 300
+ANNOTATION_LOCK_HOLDER = "crucible.io/login-holder"
+ANNOTATION_LOCK_EXPIRES = "crucible.io/login-lock-expires"
+
 # Pod phases that are not a running worker but not a loss either.
 _PENDING_PHASES = frozenset({"Pending"})
 # `status.reason` values that mean the Pod is gone because the cluster took it (26).
@@ -203,6 +231,10 @@ _LOST_REASONS = frozenset({"Evicted", "NodeShutdown", "Shutdown", "NodeAffinity"
 class CollectionFailedError(ProviderError):
     """The collector could not produce the outputs. The attempt is an `environment`
     failure and nothing is collected from it (16)."""
+
+
+class LoginLockHeldError(ProviderError):
+    """Another login of the harness holds its lock, in this api replica or another."""
 
 
 HarnessRefusedError = LaunchRefusedError
@@ -261,6 +293,8 @@ class KubernetesConfig:
     resolve_ttl_seconds: float = 300.0
     extra_image_allowlist: tuple[str, ...] = ()
     # The harness credential Secrets in the workers namespace, by harness name (12, 26).
+    # The service creates and owns them (ADR 0015); this only names them, and a harness
+    # left out is `crucible-harness-<harness>` with `_` as `-`.
     credential_secrets: Mapping[str, str] = field(default_factory=dict)
     # The operator's declared mount mode per harness, as the Docker configuration
     # carries it. It may raise the adapter's minimum and never lowers it (25 step 7).
@@ -288,7 +322,11 @@ class KubernetesConfig:
     pod_pid_limit_override: int | None = None
 
     def credential_secret_name(self, harness: str) -> str:
-        return self.credential_secrets.get(harness) or f"crucible-harness-{harness}"
+        # A Secret name is a DNS subdomain, which has no underscore: claude_code's
+        # default is `crucible-harness-claude-code`, the name the deployment maps it to.
+        return self.credential_secrets.get(harness) or (
+            f"crucible-harness-{harness.replace('_', '-')}"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -349,6 +387,18 @@ class _CredentialCopy:
     @property
     def writable(self) -> bool:
         return self.mode is MountMode.RW_NARROW
+
+
+@dataclass(frozen=True, slots=True)
+class LoginLock:
+    """One harness's login lock as this process took it: the ConfigMap's name and the
+    uid of the incarnation it created, so a release or a store check never mistakes a
+    lock another replica took after this one expired for its own."""
+
+    harness: str
+    name: str
+    uid: str
+    holder: str
 
 
 @dataclass(slots=True)
@@ -413,7 +463,18 @@ class KubernetesProvider:
         self._images: dict[str, ImageInfo] = {}
         self.last_error: dict[str, str] = {}
         self.probe: NamespaceProbe | None = None
-        self._probe_lock = asyncio.Lock()
+        # One lock per event loop: the API serves requests on its own loop and runs each
+        # login on a loop of its own thread, and an asyncio lock belongs to one loop.
+        self._probe_locks: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock] = (
+            weakref.WeakKeyDictionary()
+        )
+        # The attempt ids of the administrative runs this process has in flight (25),
+        # with what each one is; their objects carry `crucible.admin` (see `_labels`).
+        self._admin_runs: dict[str, str] = {}
+        # The sha256 of each auth file as `prepare` seeded it, until `launch` takes it,
+        # so the sync-back can say whether the harness changed a file (12). In memory
+        # only: after a restart the copy is compared by issued-at alone, as before.
+        self._seeded: dict[str, dict[str, str | None]] = {}
         self._quota_concurrency: int | None = None
         self._pull_auths_loaded = False
         self._resolved: dict[str, tuple[float, tuple[str, ...]]] = {}
@@ -424,7 +485,12 @@ class KubernetesProvider:
         return await asyncio.to_thread(fn, *args, **kwargs)
 
     def _labels(self, spec: LaunchSpec, role: str) -> dict[str, str]:
-        return k8sspec.labels(spec, role)
+        out = k8sspec.labels(spec, role)
+        admin = self._admin_runs.get(spec.attempt_id)
+        if admin:
+            out[k8sspec.LABEL_ADMIN] = admin
+            out[k8sspec.LABEL_HARNESS] = spec.harness
+        return out
 
     def _limits(self, spec: LaunchSpec) -> Limits:
         return k8sspec.limits_from_policy(spec.policy)
@@ -545,7 +611,7 @@ class KubernetesProvider:
         await self._refresh_settings()
         if self.probe is not None and self._probe_is_settled(self.probe):
             return self.probe
-        async with self._probe_lock:
+        async with self._probe_locks.setdefault(asyncio.get_running_loop(), asyncio.Lock()):
             if self.probe is not None and self._probe_is_settled(self.probe):
                 return self.probe
             # A canary proves the rules it ran under. If a refresh changed them while it
@@ -764,11 +830,18 @@ class KubernetesProvider:
         )
 
     async def credential_available(self, harness: str) -> bool:
-        if harness not in self.config.credential_secrets:
-            return False
+        """Whether the harness's Secret will be mounted. A required credential always
+        is, and its seeding refuses a Secret that is missing or empty with the reason.
+        An optional one (Hermes) is mounted when its Secret holds the declared file.
+
+        The Secret's name is the configured one or `crucible-harness-<harness>`, which
+        is the name the service creates it under (ADR 0015); a mapping is no longer
+        what makes a harness have a credential."""
         adapter = self.harnesses.get(harness)
         credential = adapter.credential_spec() if adapter is not None else None
-        if credential is None or credential.required_for_launch:
+        if credential is None:
+            return False
+        if credential.required_for_launch:
             return True
         secret_name = self.config.credential_secret_name(harness)
         try:
@@ -824,6 +897,7 @@ class KubernetesProvider:
         copy = self._credential_copy(spec)
         if copy is not None:
             await self._seed_credential(spec, copy)
+            self._seeded[spec.attempt_id] = dict(copy.seeded)
         try:
             return await self._prepare_checkout(
                 spec,
@@ -956,6 +1030,8 @@ class KubernetesProvider:
         resolved = await self._resolve_image(spec)
         limits = self._limits(spec)
         copy = self._credential_copy(spec)
+        if copy is not None:
+            copy.seeded.update(self._seeded.pop(spec.attempt_id, {}))
         plan = self._egress_plan(spec, k8sspec.ROLE_WORKER)
         policy_name: str | None = None
         identity_paths = await self._identity_paths(spec.attempt_id)
@@ -1379,6 +1455,7 @@ class KubernetesProvider:
         """12: remove anything secret placed for an attempt that will never be
         collected. The per-attempt Secret always, and the writable copy on the claim
         when one was seeded. Nothing else of the workspace is touched."""
+        self._seeded.pop(ws.attempt_id, None)
         await self._delete_credential_secret(ws.attempt_id)
         launched = self._launched.get(ws.attempt_id)
         spec = spec or (launched.spec if launched else None)
@@ -1438,6 +1515,7 @@ class KubernetesProvider:
                     {"metadata": {"labels": {k8sspec.LABEL_RETAIN: policy.value}}},
                 )
         self._launched.pop(ws.attempt_id, None)
+        self._seeded.pop(ws.attempt_id, None)
 
     async def reconcile(self) -> list[Handle]:
         """Adopt by label (10, 26). A Job is a handle while its Pod is alive, or while
@@ -1456,6 +1534,10 @@ class KubernetesProvider:
             attempt_id = str((metadata.get("labels") or {}).get(k8sspec.LABEL_ATTEMPT, ""))
             name = str(metadata.get("name", ""))
             if not attempt_id or not name:
+                continue
+            if (metadata.get("labels") or {}).get(k8sspec.LABEL_ADMIN):
+                # A credential probe's worker (25) belongs to the API process running
+                # it, not to any attempt the supervisor could adopt.
                 continue
             try:
                 pod = await self._pod_of(name)
@@ -1547,6 +1629,14 @@ class KubernetesProvider:
                 metadata = row.get("metadata") or {}
                 labels = metadata.get("labels") or {}
                 attempt_id = str(labels.get(k8sspec.LABEL_ATTEMPT, ""))
+                if (
+                    labels.get(k8sspec.LABEL_ADMIN)
+                    and _age_seconds(str(metadata.get("creationTimestamp", "")))
+                    < ADMIN_GRACE_SECONDS
+                ):
+                    # A probe in flight in the API process: its own `finally` removes
+                    # it, and the sweep only takes over once that process is gone.
+                    continue
                 if kind == "persistentvolumeclaims" and labels.get(k8sspec.LABEL_RETAIN):
                     # A claim a cleanup policy deliberately kept carries the retention
                     # label; the sweep honours it (26) and the workspace retention
@@ -1556,6 +1646,43 @@ class KubernetesProvider:
                     with contextlib.suppress(KubernetesApiError):
                         await self._call(self.client.delete, kind, str(metadata.get("name", "")))
                         removed += 1
+        return removed + await self._sweep_login_policies()
+
+    async def _sweep_login_policies(self) -> int:
+        """A login's NetworkPolicy whose Job is gone. The API process deletes both when
+        the login ends; the Job's own deadline and TTL remove it when that process died,
+        and this removes the policy it leaves behind. A policy younger than a minute is
+        skipped: the login creates it just before its Job."""
+        try:
+            policies = await self._call(
+                self.client.list_objects,
+                "networkpolicies",
+                label_selector=k8sspec.selector(**{k8sspec.LABEL_ROLE: k8sspec.ROLE_LOGIN}),
+            )
+            jobs = await self._call(
+                self.client.list_objects,
+                "jobs",
+                label_selector=k8sspec.selector(**{k8sspec.LABEL_ROLE: k8sspec.ROLE_LOGIN}),
+            )
+        except KubernetesApiError:
+            return 0
+        running = {
+            str(((job.get("metadata") or {}).get("labels") or {}).get(k8sspec.LABEL_LOGIN, ""))
+            for job in jobs
+        }
+        removed = 0
+        for policy in policies:
+            metadata = policy.get("metadata") or {}
+            login_id = str((metadata.get("labels") or {}).get(k8sspec.LABEL_LOGIN, ""))
+            if login_id in running:
+                continue
+            if _age_seconds(str(metadata.get("creationTimestamp", ""))) < 60:
+                continue
+            with contextlib.suppress(KubernetesApiError):
+                await self._call(
+                    self.client.delete, "networkpolicies", str(metadata.get("name", ""))
+                )
+                removed += 1
         return removed
 
     async def list_images(self) -> list[ImageInfo]:
@@ -1604,14 +1731,693 @@ class KubernetesProvider:
         """25: run the hardened image with the credential mounted for one prompt under a
         hard timeout, sync the named files back, and remove everything.
 
-        The Kubernetes form of the probe is a worker Job with no workspace claim: the
-        prompt needs a credential and an identity file, not a checkout. Everything it
-        creates is labelled with the probe's own id and removed in the `finally`."""
-        raise ProviderError(
-            "the bounded credential probe runs where the harness image and its "
-            "credential directory are; on Kubernetes it is the login Job of 26, which "
-            "is not part of this provider yet (C8a)"
+        The Kubernetes form is the attempt path cut down to what a prompt needs, as the
+        Docker probe is: a claim, an identity ConfigMap holding only the probe's
+        IDENTITY.md and the adapter's templates, the per-run copy of the harness Secret,
+        a preparer that only makes the directories, then the worker Job under the
+        worker's own egress rules and the namespace readiness gate. The rotated auth
+        files come back through the reader Pod and are synced exactly as an attempt's
+        are (12). Everything carries `crucible.admin=probe` and is removed in the
+        `finally` under the delete policy."""
+        probe_id = f"probe{new_id()}"[:26]
+        spec = LaunchSpec(
+            attempt_id=probe_id,
+            task_id=probe_id,
+            external_id="probe",
+            role="probe",
+            harness=request.harness,
+            model="probe",
+            image=request.image,
+            timeout_seconds=request.timeout_seconds,
+            contract={"repository": {}},
+            env=dict(request.env),
+            command=tuple(request.argv),
+            policy=request.policy,
+            owner="crucible-admin",
+            env_from_files=dict(request.env_from_files),
+            stdin_files=tuple(request.stdin_files),
+            stdin_text=request.stdin_text,
         )
+        root = f"k8s://{self.config.namespace}/{k8sspec.object_name('ws', probe_id)}"
+        ws = Workspace(
+            attempt_id=probe_id,
+            checkout_path=f"{root}/repo",
+            identity_path=f"{root}/identity",
+            report_path=f"{root}/report",
+            output_path=f"{root}/output",
+        )
+        self._admin_runs[probe_id] = k8sspec.ADMIN_PROBE
+        started = time.monotonic()
+        timed_out = False
+        exit_code: int | None = None
+        oom = False
+        stdout_tail = stderr_tail = ""
+        sync: CredentialSync | None = None
+        detail = ""
+        resolved = ""
+        try:
+            resolved = await self._resolve_image(spec)
+            limits = self._limits(spec)
+            await self._create(
+                "persistentvolumeclaims",
+                k8sspec.workspace_claim(
+                    name=k8sspec.object_name("ws", probe_id),
+                    namespace=self.config.namespace,
+                    object_labels=self._labels(spec, k8sspec.ROLE_WORKER),
+                    size=self.config.workspace_size,
+                    storage_class=self.config.storage_class,
+                ),
+            )
+            data, paths = _probe_identity(request, self.harnesses)
+            await self._create(
+                "configmaps",
+                k8sspec.config_map(
+                    name=k8sspec.object_name("identity", probe_id),
+                    namespace=self.config.namespace,
+                    object_labels=self._labels(spec, k8sspec.ROLE_WORKER),
+                    data=data,
+                    annotations={ANNOTATION_IDENTITY_PATHS: json.dumps(paths, sort_keys=True)},
+                ),
+            )
+            copy = self._credential_copy(spec)
+            if copy is not None:
+                # 12: a login is about to replace the Secret; a probe's copy of the one
+                # it replaces would sync a superseded session back over it.
+                if request.harness in await self.logins_in_progress():
+                    raise ProviderError(
+                        f"a login for {request.harness} is running; probe it once the "
+                        "login has finished"
+                    )
+                await self._seed_credential(spec, copy)
+                self._seeded[probe_id] = dict(copy.seeded)
+            code = await self._run_role_job(
+                spec,
+                role=k8sspec.ROLE_PREPARER,
+                image=resolved,
+                script=(
+                    f"set -eu; mkdir -p {WORK_MOUNT}/repo {WORK_MOUNT}/report; "
+                    f"mkdir -m 0700 -p {WORK_MOUNT}/{k8sspec.CREDENTIAL_LEAF}\n"
+                ),
+                mounts=[Mount("ws", WORK_MOUNT)],
+                volumes=[self._claim_volume(probe_id)],
+                limits=limits,
+                timeout=self.config.prepare_timeout_seconds,
+                plan=EgressPlan(),
+            )
+            if code != 0:
+                raise ProviderError(
+                    f"the probe could not prepare its workspace (exit {code}): "
+                    f"{self.last_error.get(k8sspec.ROLE_PREPARER, '')}"
+                )
+            handle = await self.launch(ws, spec)
+            started = time.monotonic()
+            # The Pod's scheduling and image pull are not the harness's time; the
+            # Job's own deadline still ends a harness that runs past the timeout.
+            code_seen = await self._await_job(
+                handle.ref,
+                timeout=request.timeout_seconds + self.config.launch_timeout_seconds,
+            )
+            if code_seen is None:
+                timed_out = True
+                detail = f"the probe did not finish within {request.timeout_seconds}s"
+                with contextlib.suppress(Exception):
+                    await self.terminate(handle, "kill")
+            elif code_seen != 0 and await self._job_deadline_exceeded(handle.ref):
+                # The Job's own deadline is shorter than this wait, so a hanging harness
+                # is ended by the cluster first: the exit code or the missing Pod that
+                # leaves behind is the timeout, not a crash (25).
+                timed_out = True
+                detail = (
+                    f"the probe did not finish within {request.timeout_seconds}s; the "
+                    "Job's deadline ended it"
+                )
+            observation = await self.observe(handle)
+            if observation.state is ObservationState.EXITED:
+                exit_code = observation.exit_code
+                oom = observation.oom_killed
+            stdout_tail, stderr_tail = await self._worker_tails(handle)
+            sync = await self._sync_credential(handle, spec, limits)
+        finally:
+            with contextlib.suppress(Exception):
+                await self.cleanup(ws, CleanupPolicy.DELETE, spec)
+            with contextlib.suppress(Exception):
+                await self._delete_credential_secret(probe_id)
+            self._launched.pop(probe_id, None)
+            self._seeded.pop(probe_id, None)
+            self._admin_runs.pop(probe_id, None)
+        cached = self._images.get(spec.image)
+        return ProbeResult(
+            exit_code=exit_code,
+            image_digest=resolved,
+            harness_version=cached.version_of(request.harness) if cached else None,
+            duration_seconds=time.monotonic() - started,
+            timed_out=timed_out,
+            oom_killed=oom,
+            stdout_tail=stdout_tail,
+            stderr_tail=stderr_tail,
+            credential_sync=sync,
+            detail=detail,
+        )
+
+    # ----- the harness credential Secret (12, ADR 0015) -----------------
+
+    def credential_secret(self, harness: str) -> str:
+        return self.config.credential_secret_name(harness)
+
+    def read_credential_secret(self, harness: str) -> dict[str, Any] | None:
+        """The harness Secret as the API server returns it, or None when it does not
+        exist. Blocking: the admin services call it from their own thread."""
+        try:
+            return self.client.get("secrets", self.credential_secret(harness))
+        except KubernetesApiError as exc:
+            if exc.status == 404:
+                return None
+            raise ProviderError(
+                f"the credential Secret {self.credential_secret(harness)!r} is not readable "
+                f"in {self.config.namespace} ({exc.status})"
+            ) from exc
+
+    def read_credential_files(self, harness: str) -> dict[str, bytes] | None:
+        """The adapter's declared auth files the Secret holds, by auth file name. None
+        when the Secret does not exist; a declared file it lacks is simply absent."""
+        adapter = self.harnesses.require(harness)
+        credential = adapter.credential_spec()
+        body = self.read_credential_secret(harness)
+        if body is None:
+            return None
+        data = body.get("data") or {}
+        out: dict[str, bytes] = {}
+        for auth in credential.auth_files if credential is not None else ():
+            raw = data.get(_secret_key(auth.name))
+            if raw is None:
+                continue
+            with contextlib.suppress(ValueError):
+                out[auth.name] = base64.b64decode(str(raw))
+        return out
+
+    def write_credential_files(self, harness: str, files: Mapping[str, bytes]) -> dict[str, Any]:
+        """Make the harness Secret hold exactly these auth files (ADR 0015).
+
+        Created, labelled as the service's own, when it is absent; otherwise its data is
+        replaced by one merge patch that also removes every key these files do not
+        name, so the Secret never mixes two sessions. The values travel in the request
+        body only. Returns what was done, never a value."""
+        adapter = self.harnesses.require(harness)
+        credential = adapter.credential_spec()
+        if credential is None:
+            raise ProviderError(f"harness {harness!r} needs no credential")
+        declared = {a.name for a in credential.auth_files}
+        unknown = sorted(set(files) - declared)
+        if unknown:
+            raise ProviderError(f"{unknown} are not auth files the {harness} adapter declares")
+        name = self.credential_secret(harness)
+        payload = {_secret_key(n): value for n, value in files.items()}
+        body = k8sspec.secret(
+            name=name,
+            namespace=self.config.namespace,
+            object_labels=_owned_labels(harness),
+            data=payload,
+        )
+        try:
+            self.client.create("secrets", body)
+            return {"secret": name, "created": True, "files": sorted(files)}
+        except KubernetesApiError as exc:
+            if exc.status != 409:
+                raise ProviderError(
+                    f"the credential Secret {name!r} could not be created ({exc.status})"
+                ) from exc
+        try:
+            current = self.client.get("secrets", name)
+            stale = {k: None for k in (current.get("data") or {}) if k not in payload}
+            self.client.patch(
+                "secrets",
+                name,
+                {
+                    "metadata": {"labels": _owned_labels(harness)},
+                    "data": {**body["data"], **stale},
+                },
+            )
+        except KubernetesApiError as exc:
+            raise ProviderError(
+                f"the credential Secret {name!r} could not be written ({exc.status})"
+            ) from exc
+        return {"secret": name, "created": False, "files": sorted(files)}
+
+    def probes_holding(self, harness: str) -> list[str]:
+        """The credential probes that hold a copy of `harness`'s credential now: their
+        per-run Secret exists from the seeding until the sync-back removed it (12).
+        Blocking, for the login's own thread. Any api replica's probe counts."""
+        selector = k8sspec.selector(
+            **{k8sspec.LABEL_ADMIN: k8sspec.ADMIN_PROBE, k8sspec.LABEL_HARNESS: harness}
+        )
+        try:
+            rows = self.client.list_objects("secrets", label_selector=selector)
+        except KubernetesApiError as exc:
+            raise ProviderError(f"the credential probes could not be listed: {exc}") from exc
+        return sorted(
+            str(((row.get("metadata") or {}).get("labels") or {}).get(k8sspec.LABEL_ATTEMPT, ""))
+            for row in rows
+        )
+
+    # ----- the login lock (25, 26) --------------------------------------
+
+    def login_lock_name(self, harness: str) -> str:
+        return f"login-lock-{harness.replace('_', '-')}"[:63]
+
+    def acquire_login_lock(self, harness: str, *, holder: str, timeout: int) -> LoginLock:
+        """Take `harness`'s login lock for every api replica at once (25).
+
+        Each api process keeps its own logins in memory, so two replicas (a rollout, or
+        an overlay with more than one) could each start a login Job for the same
+        harness and the last to finish would silently replace the Secret. The lock is a
+        ConfigMap with a fixed name per harness: `create` is atomic on the API server,
+        so exactly one replica gets it and every other gets 409 and is told who holds
+        it. It carries its expiry, the login's own deadline plus slack, so the lock of
+        an api that died mid-login is taken over once that deadline has passed; the
+        takeover deletes that exact incarnation by uid, so two replicas reclaiming at
+        once cannot both win. Blocking, for the admin service's own thread."""
+        name = self.login_lock_name(harness)
+        seconds = timeout + LOGIN_READBACK_SECONDS + LOGIN_LOCK_SLACK_SECONDS
+        expires = datetime.fromtimestamp(time.time() + seconds, tz=UTC)
+        body = k8sspec.config_map(
+            name=name,
+            namespace=self.config.namespace,
+            object_labels={
+                k8sspec.LABEL_ROLE: k8sspec.ROLE_LOGIN_LOCK,
+                k8sspec.LABEL_HARNESS: harness,
+                k8sspec.LABEL_OWNER: "crucible-admin",
+            },
+            data={},
+            annotations={
+                ANNOTATION_LOCK_HOLDER: holder,
+                ANNOTATION_LOCK_EXPIRES: expires.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            },
+        )
+        for _ in range(3):
+            try:
+                created = self.client.create("configmaps", body)
+                uid = str((created.get("metadata") or {}).get("uid") or "")
+                return LoginLock(harness=harness, name=name, uid=uid, holder=holder)
+            except KubernetesApiError as exc:
+                if exc.status != 409:
+                    raise ProviderError(
+                        f"the {harness} login lock could not be taken ({exc.status}): {exc}"
+                    ) from exc
+            try:
+                current = self.client.get("configmaps", name)
+            except KubernetesApiError as exc:
+                if exc.status == 404:
+                    continue  # released between the create and the look; try again
+                raise ProviderError(
+                    f"the {harness} login lock could not be read ({exc.status}): {exc}"
+                ) from exc
+            metadata = current.get("metadata") or {}
+            annotations = metadata.get("annotations") or {}
+            held_by = str(annotations.get(ANNOTATION_LOCK_HOLDER) or "an unnamed holder")
+            left = _seconds_until(str(annotations.get(ANNOTATION_LOCK_EXPIRES) or ""))
+            if left > 0:
+                raise LoginLockHeldError(
+                    f"a login for {harness} is already in progress, held by {held_by}; if "
+                    f"that api process has died its lock is taken over in {_minutes(left)}"
+                )
+            with contextlib.suppress(KubernetesApiError):
+                self.client.delete("configmaps", name, uid=str(metadata.get("uid") or ""))
+        raise LoginLockHeldError(
+            f"a login for {harness} is already in progress: another api replica took its "
+            "lock at the same moment"
+        )
+
+    def login_lock_held(self, lock: LoginLock) -> bool:
+        """Whether `lock` is still this process's: the ConfigMap there is the one it
+        created. A login whose lock expired and was taken over does not store."""
+        try:
+            current = self.client.get("configmaps", lock.name)
+        except KubernetesApiError:
+            return False
+        return str((current.get("metadata") or {}).get("uid") or "") == lock.uid
+
+    def release_login_lock(self, lock: LoginLock) -> None:
+        """Give the lock back. Only the incarnation this process created is deleted; a
+        lock another replica took over after this one expired is left alone."""
+        with contextlib.suppress(KubernetesApiError):
+            self.client.delete("configmaps", lock.name, uid=lock.uid or None)
+
+    # ----- the login Job (25, 26) ---------------------------------------
+
+    async def logins_in_progress(self) -> frozenset[str]:
+        """The harnesses whose login Job exists and has not finished (12, 25).
+
+        A Job is the whole of a login: it exists from before the CLI starts until the
+        service has read the auth files off it and written the Secret. That makes it
+        the lock another process (the supervisor) can see."""
+        try:
+            rows = await self._call(
+                self.client.list_objects,
+                "jobs",
+                label_selector=k8sspec.selector(**{k8sspec.LABEL_ROLE: k8sspec.ROLE_LOGIN}),
+            )
+        except KubernetesApiError as exc:
+            raise ProviderError(f"the login Jobs could not be listed: {exc}") from exc
+        running: set[str] = set()
+        for row in rows:
+            metadata = row.get("metadata") or {}
+            status = row.get("status") or {}
+            if metadata.get("deletionTimestamp"):
+                continue
+            if int(status.get("succeeded") or 0) or int(status.get("failed") or 0):
+                continue
+            harness = str((metadata.get("labels") or {}).get(k8sspec.LABEL_HARNESS, ""))
+            if harness:
+                running.add(harness)
+        return frozenset(running)
+
+    async def run_login_job(
+        self,
+        *,
+        flow: Any,
+        image: str,
+        session: Any,
+        argv: tuple[str, ...],
+        timeout: int,
+        accept: Callable[[Mapping[str, bytes]], Sequence[str]],
+    ) -> None:
+        """Run one harness login as a Job and store what it wrote in the Secret (25).
+
+        The Pod runs the harness's own CLI under a pseudo-terminal from the promoted
+        worker image, with no workspace, no credential mounted, and a NetworkPolicy for
+        the adapter's login endpoints only (crucible#58). Its home is memory-backed, so
+        the auth files it writes never reach a disk. Inside the Pod a driver keeps the
+        one-time token Claude Code prints out of the log (it goes to `oauth-token` and
+        the log says so), and strips terminal control codes, so the Pod log carries the
+        URL, the device code and the prompts and nothing secret; the service reads that
+        log for the operator. A pasted code goes in over exec stdin. After the CLI exits
+        the service reads the declared auth files back over exec, never through a log,
+        hands them to `accept` (the shape check and the concurrency rule), writes the
+        Secret when `accept` finds no problem, and deletes the Job.
+
+        Whatever the CLI's exit code, files that pass are stored: the Docker login
+        leaves what the CLI wrote in the directory whatever its exit, and AGY's login
+        command ends with a prompt the login Job cannot send to a model endpoint."""
+        from crucible.application.admin.login import _consume  # noqa: PLC0415
+
+        login_id = f"login{new_id()}"[:26]
+        adapter = self.harnesses.require(flow.harness)
+        credential = adapter.credential_spec()
+        if credential is None:
+            raise ProviderError(f"harness {flow.harness!r} has no credential")
+        root = _login_root(credential)
+        spec = LaunchSpec(
+            attempt_id=login_id,
+            task_id=login_id,
+            external_id="login",
+            role="login",
+            harness=flow.harness,
+            model="login",
+            image=image,
+            timeout_seconds=timeout,
+            contract={"repository": {}},
+            policy={**LOGIN_POLICY, "images": {"allowlist": [image]}},
+            owner="crucible-admin",
+        )
+        name = f"login-{flow.harness.replace('_', '-')}-{login_id.lower()}"[:63]
+        object_labels = {
+            k8sspec.LABEL_ROLE: k8sspec.ROLE_LOGIN,
+            k8sspec.LABEL_ADMIN: k8sspec.ADMIN_LOGIN,
+            k8sspec.LABEL_LOGIN: login_id,
+            k8sspec.LABEL_HARNESS: flow.harness,
+            k8sspec.LABEL_OWNER: "crucible-admin",
+        }
+        policy_name: str | None = None
+        job_created = False
+        session.credential_written = False
+        try:
+            # The image first: a namespace probed for the first time runs its canary on
+            # an image an attempt already resolved, and this is one.
+            resolved = await self._resolve_image(spec)
+            probe = await self.ensure_ready()
+            if not probe.passed:
+                raise HarnessRefusedError(
+                    f"refusing to start the {flow.harness} login: the workers namespace is "
+                    f"not ready ({probe.detail})"
+                )
+            if session.cancel_requested:
+                session.state = "failed"
+                session.error = "login cancelled"
+                return
+            plan = self._egress_plan(spec, k8sspec.ROLE_LOGIN)
+            if not plan.empty:
+                plan = await self._resolve_plan(plan)
+                policy_name = k8sspec.object_name("np-login", login_id)
+                await self._call(
+                    self.client.create,
+                    "networkpolicies",
+                    self._policy_body(
+                        policy_name,
+                        object_labels,
+                        login_id,
+                        k8sspec.ROLE_LOGIN,
+                        plan,
+                        pod_selector={
+                            k8sspec.LABEL_LOGIN: login_id,
+                            k8sspec.LABEL_ROLE: k8sspec.ROLE_LOGIN,
+                        },
+                    ),
+                )
+            limits = k8sspec.limits_from_policy(LOGIN_POLICY)
+            env = {
+                "HOME": "/home/worker",
+                "TERM": "xterm",
+                "SHELL": "/bin/bash",
+                flow.directory_env: root,
+                "CRUCIBLE_LOGIN_DIR": root,
+                "CRUCIBLE_EGRESS_ALLOWLIST": ",".join(plan.hosts),
+            }
+            if flow.captures_token and flow.token_pattern:
+                env["CRUCIBLE_LOGIN_TOKEN_PATTERN"] = flow.token_pattern
+                env["CRUCIBLE_LOGIN_TOKEN_FILE"] = flow.token_file
+            mounts = list(k8sspec.base_mounts())
+            volumes = list(k8sspec.base_volumes(limits))
+            if not (root + "/").startswith("/home/worker/"):
+                mounts.append(Mount("login", root))
+                volumes.append(k8sspec.memory_volume("login", limits.tmpfs_bytes))
+            body = k8sspec.job(
+                name=name,
+                namespace=self.config.namespace,
+                object_labels=object_labels,
+                pod=k8sspec.pod_spec(
+                    PodRequest(
+                        role=k8sspec.ROLE_LOGIN,
+                        image=resolved,
+                        command=["bash", "-c", _LOGIN_DRIVER, "crucible-login", *argv],
+                        limits=limits,
+                        env=env,
+                        mounts=mounts,
+                        volumes=volumes,
+                        service_account=self.config.service_account,
+                        image_pull_secret=self.config.image_pull_secret,
+                    )
+                ),
+                active_deadline_seconds=timeout + LOGIN_READBACK_SECONDS,
+                ttl_seconds_after_finished=LOGIN_TTL_SECONDS,
+            )
+            await self._call(self.client.create, "jobs", body)
+            job_created = True
+            session.state = "waiting_for_operator"
+            pod_name, exit_code = await self._follow_login(
+                name, flow, session, timeout=timeout, consume=_consume, root=root
+            )
+            session.exit_code = exit_code
+            if exit_code is not None and pod_name and not session.cancel_requested:
+                await self._store_login(pod_name, flow, credential, root, session, accept)
+            if session.cancel_requested and not session.credential_written:
+                session.state = "failed"
+                session.error = session.error or "login cancelled"
+            elif exit_code == 0 and session.error is None:
+                session.state = "finished"
+            else:
+                session.state = "failed"
+                if session.error is None:
+                    session.error = f"the login command exited {exit_code}"
+                    if session.credential_written:
+                        session.error += (
+                            "; the auth files it wrote passed the shape check and are "
+                            "stored in the Secret, so validate decides whether they work"
+                        )
+        except Exception as exc:
+            session.state = "failed"
+            session.error = f"the login Job failed: {type(exc).__name__}: {exc}"
+        finally:
+            if job_created:
+                with contextlib.suppress(Exception):
+                    await self._call(self.client.delete, "jobs", name, grace_period_seconds=0)
+                with contextlib.suppress(Exception):
+                    await self._await_job_pods_gone(name)
+            if policy_name:
+                with contextlib.suppress(Exception):
+                    await self._call(self.client.delete, "networkpolicies", policy_name)
+
+    async def _follow_login(
+        self,
+        name: str,
+        flow: Any,
+        session: Any,
+        *,
+        timeout: int,
+        consume: Callable[..., str],
+        root: str,
+    ) -> tuple[str | None, int | None]:
+        """Read the login Pod's log for the operator until the CLI exits, feeding back a
+        pasted code. Returns the Pod's name and the CLI's exit code, None when it never
+        exited (cancelled, timed out, or the Pod ended first)."""
+        deadline = time.monotonic() + timeout
+        started = time.monotonic()
+        pod_name: str | None = None
+        consumed = 0
+        buffer = ""
+        exit_code: int | None = None
+        while True:
+            if session.cancel_requested:
+                session.error = "login cancelled"
+                break
+            if time.monotonic() >= deadline:
+                session.error = "login timed out"
+                break
+            try:
+                pod = await self._pod_of(name)
+            except KubernetesApiError:
+                pod = None
+            if pod is None and time.monotonic() - started > self.config.launch_timeout_seconds:
+                session.error = (
+                    f"the login Job has had no Pod for {self.config.launch_timeout_seconds}s; "
+                    "the namespace's ResourceQuota or admission may be refusing it (see the "
+                    "Job's events in crucible-workers)"
+                )
+                break
+            if pod is not None:
+                pod_name = str((pod.get("metadata") or {}).get("name") or "")
+                status = pod.get("status") or {}
+                phase = str(status.get("phase", ""))
+                if (
+                    phase in _PENDING_PHASES
+                    and time.monotonic() - started > self.config.launch_timeout_seconds
+                ):
+                    session.error = (
+                        "the login Pod did not start: "
+                        f"{self._pending_failure(pod).detail or 'still Pending'}"
+                    )
+                    break
+                try:
+                    frames = await self._call(
+                        self.client.pod_log,
+                        pod_name,
+                        container=k8sspec.CONTAINER_NAME,
+                        timestamps=False,
+                    )
+                except KubernetesApiError:
+                    frames = []
+                text = b"".join(f.payload for f in frames).decode("utf-8", "replace")
+                if len(text) < consumed:
+                    consumed = 0
+                fresh, consumed = text[consumed:], len(text)
+                shown: list[str] = []
+                for line in fresh.splitlines(keepends=True):
+                    marker = line.strip()
+                    if marker.startswith(_LOGIN_EXIT_MARKER):
+                        with contextlib.suppress(ValueError):
+                            exit_code = int(marker[len(_LOGIN_EXIT_MARKER) :])
+                        continue
+                    shown.append(line)
+                buffer = consume(buffer + "".join(shown), flow, None, Path(root), session, None)
+                if exit_code is not None:
+                    break
+                if session.state == "waiting_for_code":
+                    code = session.wait_for_code(0)
+                    if code is not None:
+                        await self._send_login_code(pod_name, code)
+                        session.state = "waiting_for_operator"
+                if _terminated_state(status) is not None or phase in ("Succeeded", "Failed"):
+                    session.error = (
+                        f"the login Pod ended ({phase or 'terminated'}) before the login "
+                        "command reported its exit"
+                    )
+                    break
+            await asyncio.sleep(max(self.config.poll_interval_seconds, 0.05))
+        if buffer:
+            consume(buffer + "\n", flow, None, Path(root), session, None)
+        return pod_name, exit_code
+
+    async def _send_login_code(self, pod: str, code: str) -> None:
+        """The pasted code, into the CLI's terminal, over exec stdin (25). Never in the
+        exec's argv, which the API server may audit, and never in an environment."""
+        result = await self._call(
+            self.client.pod_exec,
+            pod,
+            ["sh", "-c", _LOGIN_CODE_SCRIPT],
+            container=k8sspec.CONTAINER_NAME,
+            limit=4096,
+            stdin=(code.strip() + "\n").encode("utf-8"),
+        )
+        if result.exit_code != 0:
+            raise ProviderError(
+                f"the pasted code could not be handed to the login (exit {result.exit_code})"
+            )
+
+    async def _store_login(
+        self,
+        pod: str,
+        flow: Any,
+        credential: CredentialSpec,
+        root: str,
+        session: Any,
+        accept: Callable[[Mapping[str, bytes]], Sequence[str]],
+    ) -> None:
+        files: dict[str, bytes] = {}
+        problems: list[str] = []
+        for auth in credential.auth_files:
+            data = await self._exec_read(pod, str(credential.source_path(root, auth.name)))
+            if data is None:
+                continue
+            if data is _TRUNCATED:
+                problems.append(f"{auth.name}: larger than the read limit")
+            elif data is _UNREADABLE:
+                problems.append(f"{auth.name}: could not be read back from the login Pod")
+            else:
+                files[auth.name] = data
+        if flow.captures_token and flow.token_file in files:
+            session.token_written = True
+        if not problems:
+            problems.extend(await asyncio.to_thread(accept, files))
+        if problems:
+            session.error = "the login's auth files were not stored: " + "; ".join(problems)
+            return
+        await asyncio.to_thread(self.write_credential_files, flow.harness, files)
+        session.credential_written = True
+
+    async def _exec_read(self, pod: str, path: str, limit: int = CREDENTIAL_READ_LIMIT) -> Any:
+        """One file off a running Pod over exec: its bytes, None when it is absent, or
+        `_TRUNCATED` / `_UNREADABLE`. Never through a log (12)."""
+        try:
+            result: ExecResult = await self._call(
+                self.client.pod_exec,
+                pod,
+                ["sh", "-c", _read_one_script(path, limit)],
+                container=k8sspec.CONTAINER_NAME,
+                limit=limit * 2,
+            )
+        except KubernetesApiError:
+            return _UNREADABLE
+        if result.exit_code != 0:
+            return _UNREADABLE
+        status, _, payload = result.stdout.partition(b"\n")
+        token = status.decode("ascii", "replace").strip()
+        if token == "ok":
+            try:
+                return base64.b64decode(payload)
+            except ValueError:
+                return _UNREADABLE
+        if token == "too-large":
+            return _TRUNCATED
+        return None
 
     # ----- the pod bodies ----------------------------------------------
 
@@ -1904,8 +2710,10 @@ class KubernetesProvider:
             # GitHub is not reachable from a worker.
             wanted = ("api.github.com", "github.com")
         elif role == k8sspec.ROLE_LOGIN:
+            # 26: "the harness's login endpoints only" (crucible#58). The adapter's
+            # `endpoints` include its model API, which a login has no reason to reach.
             adapter = self.harnesses.get(spec.harness)
-            wanted = tuple(sorted(adapter.capabilities().endpoints)) if adapter else ()
+            wanted = tuple(sorted(adapter.capabilities().login_endpoints)) if adapter else ()
         elif role == k8sspec.ROLE_VERIFIER:
             # 26: the verifier gets the registries only when the policy says so. The
             # policy's own allowlist is that statement; the harness endpoints are not
@@ -2097,11 +2905,8 @@ class KubernetesProvider:
         credential = adapter.credential_spec() if adapter is not None else None
         if credential is None:
             return None
-        if (
-            not credential.required_for_launch
-            and spec.harness not in self.config.credential_secrets
-        ):
-            return None
+        # An optional credential whose Secret is absent is not seeded (see
+        # `_seed_credential`), which keeps the adapter's unauthenticated fallback.
         secret_name = self.config.credential_secret_name(spec.harness)
         mode = credential.minimum_mode
         if self.config.credential_modes.get(spec.harness) is MountMode.RW_NARROW:
@@ -2131,7 +2936,12 @@ class KubernetesProvider:
         Only the named auth files, never the whole Secret: a harness Secret can hold
         state the adapter did not declare, and a copy is the narrowest thing that can
         authenticate (12). A required file that is missing refuses the launch rather
-        than seeding a copy that cannot."""
+        than seeding a copy that cannot.
+
+        A login running for the same harness does not stop the seeding: the supervisor
+        holds a launch back while one runs, and a launch that slipped past that check
+        holds a copy of the credential as it stands, which the login then declines to
+        replace (12). Nothing an attempt holds is ever mixed with a new session."""
         try:
             source = await self._call(self.client.get, "secrets", copy.source_secret)
         except KubernetesApiError as exc:
@@ -2284,7 +3094,10 @@ class KubernetesProvider:
                 self.client.patch,
                 "secrets",
                 copy.source_secret,
-                {"data": {_secret_key(auth.name): base64.b64encode(data).decode("ascii")}},
+                {
+                    "metadata": {"labels": _owned_labels(copy.spec.harness)},
+                    "data": {_secret_key(auth.name): base64.b64encode(data).decode("ascii")},
+                },
             )
         except KubernetesApiError as exc:
             return CredentialFileSync(
@@ -2466,25 +3279,12 @@ class KubernetesProvider:
         out: dict[str, bytes] = {}
         async with self._reader(spec, limits) as pod:
             for path in paths:
-                result: ExecResult = await self._call(
-                    self.client.pod_exec,
-                    pod,
-                    ["sh", "-c", _read_one_script(f"{WORK_MOUNT}/{path}", limit)],
-                    container=k8sspec.CONTAINER_NAME,
-                    limit=limit * 2,
-                )
-                if result.exit_code != 0:
-                    # The stream ended before the command reported a status. "Could not
-                    # read" is not "the file was absent", and 12 records the difference.
-                    out[path] = _UNREADABLE
-                    continue
-                status, _, payload = result.stdout.partition(b"\n")
-                token = status.decode("ascii", "replace").strip()
-                if token == "ok":
-                    with contextlib.suppress(ValueError):
-                        out[path] = base64.b64decode(payload)
-                elif token == "too-large":
-                    out[path] = _TRUNCATED
+                # A stream that ended before the command reported a status is
+                # `_UNREADABLE`: "could not read" is not "the file was absent", and 12
+                # records the difference.
+                data = await self._exec_read(pod, f"{WORK_MOUNT}/{path}", limit)
+                if data is not None:
+                    out[path] = data
         return out
 
     async def _read_workspace(self, spec: LaunchSpec, into: Path, limits: Limits) -> None:
@@ -2578,6 +3378,30 @@ class KubernetesProvider:
                     return JOB_API_ERROR
             await asyncio.sleep(self.config.poll_interval_seconds)
         return None
+
+    async def _job_deadline_exceeded(self, name: str) -> bool:
+        """Whether the Job controller ended this Job for running past its
+        `activeDeadlineSeconds`. The controller records the condition before it removes
+        the Pod, so it is there by the time the Pod's end has been seen; a few looks
+        cover an API server that answers from a lagging cache."""
+        for look in range(3):
+            if look:
+                await asyncio.sleep(self.config.poll_interval_seconds)
+            try:
+                job = await self._call(self.client.get, "jobs", name)
+            except KubernetesApiError:
+                continue
+            for condition in (job.get("status") or {}).get("conditions") or []:
+                if (
+                    isinstance(condition, dict)
+                    and str(condition.get("type")) in ("Failed", "FailureTarget")
+                    and str(condition.get("status")) == "True"
+                    and str(condition.get("reason")) == "DeadlineExceeded"
+                ):
+                    return True
+            if int((job.get("status") or {}).get("failed") or 0):
+                return False
+        return False
 
     async def _await_pod(self, name: str, *, timeout: int) -> str | None:
         deadline = time.monotonic() + timeout
@@ -2736,6 +3560,21 @@ class KubernetesProvider:
 # ----- pure helpers -------------------------------------------------------
 
 
+def _seconds_until(timestamp: str) -> float:
+    """Seconds from now until an RFC 3339 UTC stamp; 0 for one that is past or that
+    does not parse, so a lock whose expiry is unreadable is reclaimable."""
+    try:
+        moment = datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+    except ValueError:
+        return 0.0
+    return max(0.0, moment.timestamp() - time.time())
+
+
+def _minutes(seconds: float) -> str:
+    minutes = max(1, round(seconds / 60))
+    return f"{minutes} minute" + ("" if minutes == 1 else "s")
+
+
 def _age_seconds(timestamp: str) -> float:
     """How long ago an object was created, from its RFC 3339 `creationTimestamp`."""
     if not timestamp:
@@ -2769,6 +3608,42 @@ _UNREADABLE = b"\x00__crucible_unreadable__"
 def _secret_key(name: str) -> str:
     """A Secret key for an auth file name. Keys may not contain a path separator."""
     return name.replace("/", "_")
+
+
+def _owned_labels(harness: str) -> dict[str, str]:
+    """The labels that mark a harness Secret as the service's own (ADR 0015)."""
+    return {
+        k8sspec.LABEL_MANAGED_BY: k8sspec.MANAGED_BY_CRUCIBLE,
+        k8sspec.LABEL_CREDENTIAL: harness,
+    }
+
+
+def _login_root(credential: CredentialSpec) -> str:
+    """The directory a login writes into: the credential's mount target, or its parent
+    when the auth files are named from a subdirectory of the root (AGY's are under
+    `.gemini`, and its CLI is pointed at the home directory above it)."""
+    target = credential.mount_target.rstrip("/")
+    subdir = credential.source_subdir.strip("/")
+    if subdir and target.endswith("/" + subdir):
+        return target[: -len(subdir) - 1]
+    return target
+
+
+def _probe_identity(
+    request: ProbeRequest, harnesses: HarnessRegistry
+) -> tuple[dict[str, str], dict[str, str]]:
+    """The probe's identity ConfigMap: IDENTITY.md with the probe prompt and the
+    adapter's templates, the two things the Docker probe writes (25). Keys and the paths
+    they project back to, as `prepare` records them for an attempt."""
+    files = {"IDENTITY.md": request.identity_text}
+    adapter = harnesses.get(request.harness)
+    credential = adapter.credential_spec() if adapter is not None else None
+    if credential is not None:
+        for name, content in credential.templates.items():
+            files[f"{k8sspec.TEMPLATE_PREFIX}/{name}"] = content
+    data = {_bundle_key(path): content for path, content in files.items()}
+    paths = {_bundle_key(path): path for path in files}
+    return data, paths
 
 
 def _has_declared_auth_file(credential: CredentialSpec, secret_body: Mapping[str, Any]) -> bool:
@@ -3207,6 +4082,106 @@ else
 fi
 echo "crucible-canary.done=1"
 """
+
+
+# The login Pod's driver (25, 26). It runs the harness's own CLI under a pseudo-terminal
+# (`script`, util-linux, in every Debian image) and is the reason the Pod log can be the
+# operator's view of a login without carrying anything secret:
+#
+# - the CLI's output is filtered line by line before it reaches stdout, which is the
+#   log. The terminal is 4096 columns wide so nothing the CLI prints wraps; control
+#   sequences (CSI, OSC and the two-byte escapes) are stripped, and a carriage return
+#   keeps only what was drawn after it, as a terminal would show it;
+# - the one-time token a CLI prints (Claude Code's `setup-token`) is written to the
+#   token file under the login directory, mode 0600, and replaced in the line by the
+#   note the Docker login shows;
+# - a partial line is held until its newline, except a prompt waiting for input (the
+#   same pattern as `PASTE_RE`), which is shown so the operator knows to paste. A
+#   partial line that already matches the token pattern is never shown early;
+# - the code the operator pastes arrives over exec stdin into a FIFO that is the CLI's
+#   input, and is masked wherever the terminal echoes it.
+#
+# When the CLI exits the driver prints its exit code and waits for the service to read
+# the auth files off it over exec and delete the Job; the Job's deadline ends it if the
+# service never comes back.
+_LOGIN_EXIT_MARKER = "crucible-login.exit="
+_LOGIN_DRIVER = r"""set -u
+dir=${CRUCIBLE_LOGIN_DIR:?}
+ctl=/tmp/crucible-login
+umask 077
+mkdir -p "$dir" "$ctl"
+chmod 0700 "$dir" "$ctl"
+rm -f "$ctl/in" "$ctl/pasted"
+mkfifo "$ctl/in"
+exec 3<>"$ctl/in"
+shopt -s extglob
+# The patterns below use character ranges, which bash reads in the collation order of
+# the locale; C is the only order in which they mean what they say. Not exported, so
+# the CLI keeps whatever locale the Pod gives it.
+LC_ALL=C
+token_re=${CRUCIBLE_LOGIN_TOKEN_PATTERN:-}
+token_file=${CRUCIBLE_LOGIN_TOKEN_FILE:-}
+prompt_re='((paste|enter).{0,40}(code|token).{0,20}|code|token)[[:space:]]*[:>?][[:space:]]*$'
+show() {
+  local line=$1 tok pasted
+  line=${line%$'\r'}
+  line=${line##*$'\r'}
+  line=${line//$'\e'\[*([0-?])*([\ -\/])[@-~]/}
+  line=${line//$'\e'\]*([!$'\a'$'\e'])@($'\a'|$'\e'\\)/}
+  line=${line//$'\e'?([()])?[A-Za-z0-9=>]/}
+  if [ -n "$token_re" ] && [[ $line =~ $token_re ]]; then
+    tok=${BASH_REMATCH[1]}
+    printf '%s\n' "$tok" > "$dir/$token_file"
+    chmod 0600 "$dir/$token_file"
+    line=${line//"$tok"/[captured to $token_file]}
+  fi
+  if [ -s "$ctl/pasted" ]; then
+    pasted=$(cat "$ctl/pasted")
+    [ -n "$pasted" ] && line=${line//"$pasted"/[pasted code]}
+  fi
+  printf '%s\n' "$line"
+}
+filter() {
+  local buf='' chunk status lower
+  while :; do
+    chunk=''
+    IFS= read -r -t 1 chunk
+    status=$?
+    if [ "$status" -eq 0 ]; then
+      show "$buf$chunk"
+      buf=''
+      continue
+    fi
+    buf=$buf$chunk
+    if [ "$status" -le 128 ]; then
+      [ -n "$buf" ] && show "$buf"
+      return 0
+    fi
+    [ -n "$buf" ] || continue
+    lower=${buf,,}
+    if [[ $lower =~ $prompt_re ]] && ! { [ -n "$token_re" ] && [[ $buf =~ $token_re ]]; }; then
+      show "$buf"
+      buf=''
+    fi
+  done
+}
+# A wide terminal, so a CLI never wraps a token or a pasted code across two lines: the
+# filter works line by line, and a wrapped tail would reach the log unmasked.
+cmd="stty cols 4096 rows 50 2>/dev/null; exec $(printf '%q ' "$@")"
+COLUMNS=4096 LINES=50 SHELL=/bin/bash script -qfec "$cmd" /dev/null < "$ctl/in" 2>&1 | filter
+code=${PIPESTATUS[0]}
+exec 3>&-
+echo "crucible-login.exit=$code"
+while :; do sleep 5; done
+"""
+
+# Hands the pasted code to the login driver: the mask first, so the terminal's echo of
+# the code is already masked when it arrives, then the CLI's input.
+_LOGIN_CODE_SCRIPT = (
+    "IFS= read -r c || exit 3; umask 077; "
+    'printf "%s" "$c" > /tmp/crucible-login/pasted; '
+    'printf "%s\\n" "$c" > /tmp/crucible-login/in'
+)
 
 
 def _seed_script(spec: CredentialSpec) -> str:

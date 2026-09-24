@@ -56,8 +56,12 @@ carries and what a unit test holds it to (C9):
 | `batch/jobs` | create, get, list, watch, delete |
 | `networking.k8s.io/networkpolicies` | create, get, list, watch, delete |
 
-The three additions to the sentence above are the ones the implemented
-provider needs: `patch` on PersistentVolumeClaims writes the retention label
+The admin login Job and the service-owned harness Secrets (ADR 0015) need no
+verb beyond this table: the Job and its NetworkPolicy are `create`, `list` and
+`delete`, the URL is `pods/log`, the pasted code and the auth files cross on
+`pods/exec`, and the Secret is `create` when absent and one merge `patch` after
+that. There is no `update` on anything. The three additions to the sentence
+above are the ones the implemented provider needs: `patch` on PersistentVolumeClaims writes the retention label
 `cleanup` leaves behind, `patch` on Secrets is the `rw-narrow` credential
 sync-back (12), and reading the ResourceQuota is where `max_concurrency` on
 `GET /providers` comes from. `pods/exec` needs `create` as well as `get`
@@ -95,7 +99,10 @@ Per attempt the provider creates, in `crucible-workers`, all labelled
 | Job `verify-bundle-<attempt>` | `git bundle verify`, no network | until complete |
 | Job `verifier-<attempt>` | re-runs `required_verification` on an independent clone from the bundle (10, 11) | until complete |
 | Job `publish-<attempt>` | pushes the sealed bundle with a token on an in-memory volume (23) | until complete |
-| Job `login-<harness>-<n>` (admin flow, 25) | the harness's own login in its worker image, credential Secret writable, no workspace | until finished, cancelled, or timed out |
+| Job `login-<harness>-<id>` (admin flow, 25) | the harness's own login in the promoted worker image, no workspace, no credential mounted, a memory-backed home; the service reads the auth files back over exec and writes the harness Secret (ADR 0015). Labelled `crucible.role=login`, `crucible.harness`, `crucible.login` and never `crucible.attempt` | until the service has read it back, cancelled, or timed out; its own deadline and a TTL remove it if the api died |
+| NetworkPolicy `np-login-<id>` | the login Job's egress: the adapter's `login_endpoints` only | with its Job; the retention sweep removes one whose Job is gone |
+| ConfigMap `login-lock-<harness>` (admin flow, 25) | the harness's login lock across every api replica: created before the login Job, so exactly one replica gets it and the others are refused naming its holder. Carries the holder and an expiry (the login deadline, the read-back window and five minutes). Labelled `crucible.role=login-lock` and `crucible.harness`, never `crucible.attempt` | deleted by the api that took it, by uid, however the login ends; a lock past its expiry (its api died) is deleted by uid and replaced by the next login |
+| the probe's claim, ConfigMap, per-run Secret and Jobs (admin flow, 25) | the bounded credential probe: an attempt's objects for one prompt, labelled `crucible.admin=probe` | removed by the probe; neither swept nor adopted by the supervisor for two hours |
 
 A Job per role keeps the same separation the Docker provider has (worker,
 collector, verifier, publisher are distinct processes with distinct
@@ -223,7 +230,11 @@ supports them:
 - collector, bundle verifier, verifier: no egress at all (the verifier
   gets the registries only when `required_verification` needs them and the
   policy says so).
-- login Job: the harness's login endpoints only.
+- login Job: the harness's login endpoints only, the adapter's
+  `login_endpoints` (Claude Code `platform.claude.com`, Codex
+  `auth.openai.com`, AGY `oauth2.googleapis.com` and `www.googleapis.com`),
+  never its model API (crucible#58). A harness without login endpoints gets no
+  policy at all, and so no egress. (Made concrete 2026-09-24, FDY-0112.)
 
 A `networking.k8s.io/v1` policy has no deny verb and no FQDN rule, so the
 allowlist's names are resolved to addresses when the policy is written and the
@@ -389,8 +400,14 @@ the filesystem fingerprint come from the PVC through the reader Pod, and
 ## Credentials on the cluster (12, made concrete)
 
 Each harness's dedicated credential directory becomes one Secret in
-`crucible-workers` that only the supervisor's ServiceAccount can read,
-delivered through the GitOps repository as a SealedSecret or ExternalSecret.
+`crucible-workers` that only the supervisor's ServiceAccount can read. The
+service owns it (ADR 0015, the operator's decisions of 2026-09-23): it creates
+it when absent, labelled `app.kubernetes.io/managed-by: crucible` and
+`crucible.credential: <harness>`, and it is the only writer, from the login Job,
+the Hermes key entry and the sync-back. GitOps does not deliver it; the
+database, GitHub App and TLS Secrets stay with GitOps. Its name is
+`kubernetes.credential_secrets[<harness>]`, else `crucible-harness-<harness>`
+with `_` as `-`.
 Per attempt, the provider copies it into `cred-<attempt>`, taking only the
 auth files the adapter declares. A Secret key cannot hold a path separator, so
 a harness whose auth file sits in a subdirectory (AGY's token) is keyed with
@@ -410,12 +427,33 @@ or not. This matches the Docker provider: a valid newer refresh is durable state
 even when the task itself fails.
 (Made concrete 2026-09-21 during C8a.)
 The per-attempt Secret is deleted under every cleanup policy. The admin
-login flow (25) runs the harness's login in a login Job with the harness
-Secret writable and the device URL captured from the Pod log. Hermes declares optional
-read-only credential file `api-key`. When `crucible-harness-hermes` is configured, the
-provider copies that file into the per-attempt credential Secret and never syncs it
-back. When the Secret mapping is absent, the launch uses the adapter's explicit
-unauthenticated placeholder.
+login flow (25) runs the harness's login in a login Job and captures the device
+URL from the Pod log; a Secret volume cannot be written, so the CLI writes into
+the Pod's memory-backed home and the service reads the files back over exec and
+writes the harness Secret itself, only after they pass the shape check. Hermes
+declares optional read-only credential file `api-key`. When the Hermes Secret
+exists and holds it, the provider copies that file into the per-attempt
+credential Secret and never syncs it back; when it does not, the launch uses the
+adapter's explicit unauthenticated placeholder. The Routing page's key entry
+writes that Secret. (Made concrete 2026-09-24, FDY-0112.)
+
+The supervisor defers a launch while a login Job for its harness exists,
+because the login is about to replace the credential (12). A launch that raced
+past that check seeds the credential as it stands, and the login then declines
+to write over it; a credential probe refuses outright while a login Job exists.
+
+Each api process keeps its logins in memory, so two replicas (a rollout, or an
+overlay with more than one) would each start a login for the same harness and
+the last to finish would silently replace the Secret. The `login-lock-<harness>`
+ConfigMap stops that: `create` is atomic, so only one replica starts a Job, and
+a login stores its files only if the lock is still the one it created. The
+Docker provider runs in one api process by design and keeps the in-memory check
+alone.
+
+A credential probe whose harness hangs is ended by the worker Job's
+`activeDeadlineSeconds` before the provider's own wait runs out. The provider
+reads the Job's `DeadlineExceeded` condition and records that probe as a
+timeout, not a crash.
 
 ## Observability and administration
 

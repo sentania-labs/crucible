@@ -1,0 +1,28 @@
+# Documentation only: the layout of the harness credential Secrets, which Crucible
+# creates and owns (ADR 0015). This file is deliberately all comments, it is in no
+# kustomization, and GitOps must not deliver these Secrets: a Secret written by both the
+# service (the login, the Hermes key, the sync-back of a refreshed token) and GitOps
+# drifts, and every sync would put back a token the harness has already rotated.
+#
+# One Secret per harness in `crucible-workers`, readable only by the supervisor's
+# account (12, 26). The service creates it the first time a login or the Hermes key
+# writes it, labels it as its own, and replaces its data whole on each later write. The
+# provider copies the declared auth files into `cred-<attempt>` per attempt and writes
+# a newer refreshed token back when the attempt reaches collection. Keys are the
+# adapter's declared auth file names with any path separator replaced by an underscore
+# (C8a).
+#
+# apiVersion: v1
+# kind: Secret
+# type: Opaque
+# metadata:
+#   name: crucible-harness-claude-code        # also -codex, -agy, -hermes
+#   namespace: crucible-workers
+#   labels:
+#     app.kubernetes.io/managed-by: crucible
+#     crucible.credential: claude_code         # the harness name
+# data:
+#   # claude_code: oauth-token, and optionally .claude.json
+#   # codex:       auth.json
+#   # agy:         antigravity-cli_antigravity-oauth-token
+#   # hermes:      api-key

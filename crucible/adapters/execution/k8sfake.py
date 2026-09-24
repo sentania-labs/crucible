@@ -47,6 +47,8 @@ from crucible.adapters.execution.k8sspec import (
     ROLE_CANARY,
     ROLE_CLEANER,
     ROLE_COLLECTOR,
+    ROLE_LOGIN,
+    ROLE_LOGIN_LOCK,
     ROLE_PREPARER,
     ROLE_READER,
     ROLE_VERIFIER,
@@ -116,6 +118,34 @@ class _Worker:
     terminated: bool = False
     drained: bool = False
     kills: int = 0
+
+
+@dataclass
+class FakeLogin:
+    """What the fake cluster's login Pod acts out (25, 26): the lines its CLI prints, a
+    prompt it waits at for a pasted code (or none, for a device flow that finishes on
+    its own), the files it leaves under its home, and its exit code. Paths are the
+    absolute paths inside the Pod."""
+
+    lines: list[str] = field(
+        default_factory=lambda: ["Open https://example.invalid/device", "Device code C7AA-TEST"]
+    )
+    prompt: str | None = None
+    after_code: list[str] = field(default_factory=list)
+    files: dict[str, bytes] = field(default_factory=dict)
+    exit_code: int = 0
+    # How many log reads a flow without a prompt takes before its CLI exits.
+    finish_after: int = 1
+    # A Pod that never reports the CLI's exit (it is still waiting when time runs out).
+    never_exits: bool = False
+
+
+@dataclass
+class _LoginRun:
+    script: FakeLogin
+    reads: int = 0
+    codes: list[bytes] = field(default_factory=list)
+    exited: bool = False
 
 
 @dataclass(frozen=True)
@@ -209,6 +239,17 @@ class FakeKubernetesApi:
     no_pod_yet: set[str] = field(default_factory=set)
     created: list[dict[str, Any]] = field(default_factory=list)
     deleted: list[tuple[str, str]] = field(default_factory=list)
+    # What the next login Pod acts out, and each login Pod's run by Pod name.
+    login: FakeLogin = field(default_factory=FakeLogin)
+    login_runs: dict[str, _LoginRun] = field(default_factory=dict)
+    # Every stdin an exec was given, by Pod name, so a test sees what went in.
+    exec_stdin: dict[str, list[bytes]] = field(default_factory=dict)
+    # The Job controller's `activeDeadlineSeconds` firing on a hanging worker before
+    # Crucible's own wait ends: the Job is marked failed with `DeadlineExceeded` and its
+    # Pod is removed (or left terminated with 137 when `deadline_keeps_pod`).
+    job_deadline_fires: bool = False
+    deadline_keeps_pod: bool = False
+    _uids: int = 0
 
     # ----- test controls ------------------------------------------------
 
@@ -245,12 +286,18 @@ class FakeKubernetesApi:
     def secret_exists(self, name: str) -> bool:
         return ("secrets", name) in self.objects
 
-    def put_harness_secret(self, name: str, data: Mapping[str, bytes]) -> None:
+    def put_harness_secret(
+        self, name: str, data: Mapping[str, bytes], labels: Mapping[str, str] | None = None
+    ) -> None:
         self.objects[("secrets", name)] = _Object(
             "secrets",
             name,
             {
-                "metadata": {"name": name, "namespace": self.namespace},
+                "metadata": {
+                    "name": name,
+                    "namespace": self.namespace,
+                    **({"labels": dict(labels)} if labels else {}),
+                },
                 "data": {k: base64.b64encode(v).decode("ascii") for k, v in data.items()},
             },
         )
@@ -277,6 +324,13 @@ class FakeKubernetesApi:
         if (kind, name) in self.objects:
             raise KubernetesApiError(409, f"{kind}/{name} already exists")
         stored: dict[str, Any] = json.loads(json.dumps(dict(body)))
+        if (
+            kind == "configmaps"
+            and (stored.get("metadata") or {}).get("labels", {}).get(LABEL_ROLE) == ROLE_LOGIN_LOCK
+        ):
+            # The API server gives every object a uid; the login lock is deleted by it.
+            self._uids += 1
+            stored["metadata"]["uid"] = f"uid-{self._uids}"
         self.objects[(kind, name)] = _Object(kind, name, stored)
         self.created.append({"kind": kind, "name": name, "body": stored})
         if kind == "persistentvolumeclaims":
@@ -320,10 +374,13 @@ class FakeKubernetesApi:
         *,
         grace_period_seconds: int | None = None,
         propagation: str = "Background",
+        uid: str | None = None,
     ) -> None:
         obj = self.objects.get((kind, name))
         if obj is None:
             return
+        if uid is not None and (obj.body.get("metadata") or {}).get("uid") != uid:
+            raise KubernetesApiError(409, f"{kind}/{name} precondition failed: uid differs")
         if kind == "pods":
             labels = (obj.body.get("metadata") or {}).get("labels") or {}
             worker = self.workers.get(str(labels.get(LABEL_ATTEMPT, "")))
@@ -375,6 +432,12 @@ class FakeKubernetesApi:
                 _, separator, body = line.partition(" ")
                 raw_lines.append(body if separator else line)
             lines = raw_lines
+        run = self.login_runs.get(name)
+        if run is not None:
+            self._advance_login(name, run)
+            lines = self.logs.get(name, [])
+            if not timestamps:
+                lines = [line.partition(" ")[2] for line in lines]
         if since_time:
             lines = [line for line in lines if line[: len(since_time)] >= since_time]
         payload = ("\n".join(lines) + "\n").encode("utf-8") if lines else b""
@@ -388,10 +451,16 @@ class FakeKubernetesApi:
         container: str | None = None,
         timeout: float | None = None,
         limit: int = 0,
+        stdin: bytes | None = None,
     ) -> ExecResult:
         obj = self.objects.get(("pods", name))
         if obj is None:
             raise KubernetesApiError(404, f"pods/{name} not found")
+        if stdin is not None:
+            self.exec_stdin.setdefault(name, []).append(stdin)
+        run = self.login_runs.get(name)
+        if run is not None:
+            return self._login_exec(name, run, command[-1], stdin)
         claim = self._claim_of(obj)
         script = command[-1]
         if "tar cf -" in script:
@@ -464,6 +533,7 @@ class FakeKubernetesApi:
             ROLE_CLEANER: self._act_cleaner,
             ROLE_CANARY: self._act_canary,
             ROLE_WORKER: self._act_worker,
+            ROLE_LOGIN: self._act_login,
         }.get(role)
         if handler is not None:
             handler(obj, attempt_id)
@@ -479,6 +549,29 @@ class FakeKubernetesApi:
         if match is None or match.group("behavior") not in BEHAVIORS:
             return self.default_behavior or ("succeed", 1)
         return match.group("behavior"), int(match.group("n") or 1)
+
+    def _deadline_exceeded(self, obj: _Object, worker: _Worker) -> None:
+        worker.terminated = True
+        worker.exit_code = 137
+        job_name = str(((obj.body.get("metadata") or {}).get("labels") or {}).get("job-name", ""))
+        job = self.objects.get(("jobs", job_name))
+        if job is not None:
+            condition = {
+                "status": "True",
+                "reason": "DeadlineExceeded",
+                "message": "Job was active longer than specified deadline",
+            }
+            job.body["status"] = {
+                "failed": 1,
+                "conditions": [
+                    {"type": "FailureTarget", **condition},
+                    {"type": "Failed", **condition},
+                ],
+            }
+        if self.deadline_keeps_pod:
+            self._finish(obj, 137, reason="Error")
+        else:
+            self.objects.pop(("pods", obj.name), None)
 
     def _finish(self, obj: _Object, code: int, *, reason: str = "Completed") -> None:
         obj.body["status"] = {
@@ -651,7 +744,67 @@ class FakeKubernetesApi:
                 del claim[path]
         self._finish(obj, 0)
 
+    def _act_login(self, obj: _Object, attempt_id: str) -> None:
+        """The login Pod's driver: the CLI's lines in the log, stamped as the API server
+        stamps them, then the prompt it waits at, if it has one."""
+        script = self.login
+        self.login_runs[obj.name] = _LoginRun(script=script)
+        shown = [*script.lines, *([script.prompt] if script.prompt else [])]
+        self.logs[obj.name] = [f"{_stamp(i)} {line}" for i, line in enumerate(shown)]
+
+    def _advance_login(self, name: str, run: _LoginRun) -> None:
+        run.reads += 1
+        if run.exited or run.script.never_exits:
+            return
+        if run.script.prompt is not None and not run.codes:
+            return
+        if run.script.prompt is None and run.reads < run.script.finish_after:
+            return
+        run.exited = True
+        lines = self.logs.setdefault(name, [])
+        for line in [*run.script.after_code, f"crucible-login.exit={run.script.exit_code}"]:
+            lines.append(f"{_stamp(len(lines))} {line}")
+
+    def _login_exec(
+        self, name: str, run: _LoginRun, script: str, stdin: bytes | None
+    ) -> ExecResult:
+        if "/tmp/crucible-login/in" in script:
+            if stdin is None:
+                return ExecResult(b"", b"no code on stdin\n", 3)
+            run.codes.append(stdin)
+            return ExecResult(b"", b"", 0)
+        match = re.match(r"^p='(?P<path>[^']*)'", script)
+        if match is None:
+            return ExecResult(b"", b"the fake has no answer for this command\n", 1)
+        if not run.exited:
+            return ExecResult(b"absent\n", b"", 0)
+        data = run.script.files.get(match.group("path"))
+        if data is None:
+            return ExecResult(b"absent\n", b"", 0)
+        return ExecResult(b"ok\n" + base64.b64encode(data), b"", 0)
+
+    def _seed_claim(self, obj: _Object) -> None:
+        """The `credential-seed` init container: the per-attempt Secret's projected
+        files, copied into the claim's `credential` leaf (26)."""
+        spec = obj.body.get("spec") or {}
+        if not any(c.get("name") == "credential-seed" for c in spec.get("initContainers") or []):
+            return
+        for volume in spec.get("volumes") or []:
+            if volume.get("name") != "cred-source":
+                continue
+            source = volume.get("secret") or {}
+            secret = self.objects.get(("secrets", str(source.get("secretName", ""))))
+            if secret is None:
+                return
+            data = secret.body.get("data") or {}
+            claim = self._claim_of(obj)
+            for item in source.get("items") or []:
+                raw = data.get(item.get("key"))
+                if raw is not None:
+                    claim[f"credential/{item.get('path')}"] = base64.b64decode(str(raw))
+
     def _act_worker(self, obj: _Object, attempt_id: str) -> None:
+        self._seed_claim(obj)
         behavior, after = self._behavior(attempt_id, obj)
         self.workers[attempt_id] = _Worker(behavior=behavior, remaining=after)
         self.logs[obj.name] = [
@@ -668,6 +821,8 @@ class FakeKubernetesApi:
         if worker is None or worker.terminated:
             return
         if worker.behavior in ("hang", "immortal"):
+            if self.job_deadline_fires:
+                self._deadline_exceeded(obj, worker)
             return
         worker.observations += 1
         if worker.observations < worker.remaining:
@@ -723,8 +878,11 @@ def _parse_selector(selector: str | None) -> dict[str, str | None]:
 
 
 def _merge(target: dict[str, Any], patch: Mapping[str, Any]) -> None:
+    """A JSON merge patch (RFC 7386): a null removes the key."""
     for key, value in patch.items():
-        if isinstance(value, dict) and isinstance(target.get(key), dict):
+        if value is None:
+            target.pop(key, None)
+        elif isinstance(value, dict) and isinstance(target.get(key), dict):
             _merge(target[key], value)
         else:
             target[key] = value
@@ -744,4 +902,4 @@ def _tar(claim: Mapping[str, bytes]) -> bytes:
     return buffer.getvalue()
 
 
-__all__ = ["FakeKubernetesApi", "FakeRegistry"]
+__all__ = ["FakeKubernetesApi", "FakeLogin", "FakeRegistry"]

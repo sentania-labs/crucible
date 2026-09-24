@@ -37,6 +37,7 @@ from crucible.application.errors import ApplicationError
 from crucible.application.evidence import record_collection_evidence, store_artifact
 from crucible.application.gates import evaluate_and_advance, gate_input
 from crucible.application.harnesses import (
+    CREDENTIAL_HOLDING_STATES,
     HarnessRegistry,
     effective_mount_mode,
     ingest_progress,
@@ -217,6 +218,19 @@ class _Pending:
     repository_url: str = ""
 
 
+def _secret_holds(provider: Any, harness: str, credential: Any) -> bool:
+    """Whether a provider's harness Secret holds every required auth file, so routing
+    never picks a harness nobody has logged in (ADR 0015). A Secret that cannot be read
+    right now is not held against the harness: the seeding says why if it still cannot."""
+    try:
+        files = provider.read_credential_files(harness)
+    except ProviderError:
+        return True
+    return files is not None and all(
+        files.get(auth.name) for auth in credential.auth_files if auth.required
+    )
+
+
 class Supervisor:
     def __init__(
         self,
@@ -263,6 +277,8 @@ class Supervisor:
         self.fenced_token: int | None = None
         self._handles: dict[str, Handle] = {}
         self._workspaces: dict[str, Workspace] = {}
+        # The harnesses a login is running for, read once per launch pass (12, 25).
+        self._logins_now: frozenset[str] = frozenset()
         self._workspace_fingerprints: dict[str, tuple[int, int, int]] = {}
         # The delivery half (23). With no GitHub client configured it is inert, which is
         # what every tier below the live one runs with.
@@ -1118,6 +1134,23 @@ class Supervisor:
             return exc.reason
         return None
 
+    async def _logins_in_progress(self) -> frozenset[str]:
+        """The harnesses a login is running for, on any provider that can say (12, 25).
+        A login is about to replace the credential, so a launch of that harness waits
+        for it the way it waits for the per-harness cap. A listing that fails holds
+        nothing back here; the provider refuses the seeding itself if a login is
+        running when it gets there."""
+        running: set[str] = set()
+        for provider in self._providers.values():
+            listing = getattr(provider, "logins_in_progress", None)
+            if not callable(listing):
+                continue
+            try:
+                running.update(await listing())
+            except ProviderError as exc:
+                log.warning("the running logins could not be listed: %s", exc)
+        return frozenset(running)
+
     def _harness_busy(self, execution: Execution) -> str | None:
         """05b: per-harness concurrency, which is 1 whenever the credential mounts
         rw-narrow (12). A launch over the limit waits; it is not a failure."""
@@ -1125,6 +1158,11 @@ class Supervisor:
             return self._harness_busy_in_uow(uow, execution)
 
     def _harness_busy_in_uow(self, uow: UnitOfWork, execution: Execution) -> str | None:
+        if execution.harness in self._logins_now:
+            return (
+                f"a login for {execution.harness} is running and will replace its "
+                "credential; the launch waits for it"
+            )
         policy = execution.policy_snapshot or {}
         routing = load_routing(uow, policy)
         selected = routing.model(execution.model) if routing is not None else None
@@ -1140,15 +1178,7 @@ class Supervisor:
         # An attempt holds its credential copy until collect has synced it back and
         # removed it, which is after `exited`: a second seeding before that is the
         # refresh race 12 gives as the reason for the cap.
-        live = uow.attempts.list_in_states(
-            [
-                AttemptState.PREPARING,
-                AttemptState.LAUNCHING,
-                AttemptState.RUNNING,
-                AttemptState.TERMINATING,
-                AttemptState.EXITED,
-            ]
-        )
+        live = uow.attempts.list_in_states(list(CREDENTIAL_HOLDING_STATES))
         running = 0
         for other in live:
             other_execution = uow.executions.get(other.execution_id)
@@ -1179,9 +1209,16 @@ class Supervisor:
             held = uow.leases.get_checkout_lease(key)
         return held is None or held.holder == attempt_id or held.expires_at <= self._clock.now()
 
-    def _eligible_harnesses(self, *, needs_credential: bool = True) -> set[str] | None:
+    def _eligible_harnesses(
+        self, *, needs_credential: bool = True, provider: str | None = None
+    ) -> set[str] | None:
         if self._harnesses is None:
             return None
+        # A provider that keeps the credentials itself (the Kubernetes provider's
+        # service-owned Secrets, ADR 0015) has no directory to check here. Its seeding
+        # refuses a missing or empty Secret with the reason, as it does for a pin.
+        holder = self._providers.get(provider or "")
+        secret_held = callable(getattr(holder, "read_credential_files", None))
         eligible: set[str] = set()
         with self._uow_factory() as uow:
             for name in self._harnesses.names():
@@ -1192,9 +1229,18 @@ class Supervisor:
                 credential = adapter.credential_spec()
                 if (
                     needs_credential
+                    and not secret_held
                     and credential is not None
                     and credential.required_for_launch
                     and (source is None or not Path(source.path).is_dir())
+                ):
+                    continue
+                if (
+                    needs_credential
+                    and secret_held
+                    and credential is not None
+                    and credential.required_for_launch
+                    and not _secret_holds(holder, name, credential)
                 ):
                     continue
                 try:
@@ -1217,7 +1263,10 @@ class Supervisor:
         eligible = (
             None
             if request.pinned_model is not None
-            else self._eligible_harnesses(needs_credential=request.provider.value != "fake")
+            else self._eligible_harnesses(
+                needs_credential=request.provider.value != "fake",
+                provider=request.provider.value,
+            )
         )
         selection = select_model(
             uow,
@@ -1397,6 +1446,9 @@ class Supervisor:
     async def _launch_one(self, item: _Pending) -> bool:
         attempt, execution, task = item.attempt, item.execution, item.task
         review = execution.role is ExecutionRole.REVIEW
+        # Read per attempt, not per pass: a login started while this pass runs holds
+        # back the next launch of its harness rather than racing it (12).
+        self._logins_now = await self._logins_in_progress()
         if not review:
             selection = await self._db(partial(self._preview_route, item))
             if selection is None or selection.selected is None or selection.image is None:

@@ -26,6 +26,7 @@ from urllib.parse import urlsplit
 from crucible.application.transitions import record_event
 from crucible.domain.entities import HarnessState
 from crucible.domain.events import PRINCIPAL_CRUCIBLE, PRINCIPAL_WORKER, EventKind
+from crucible.domain.lifecycle import AttemptState
 from crucible.domain.secrets import redact
 from crucible.ports.clock import Clock
 from crucible.ports.execution import (
@@ -234,22 +235,45 @@ class CredentialState:
 
 
 def credential_state(
-    spec: CredentialSpec | None, source: CredentialSource | None, state: HarnessState | None
+    spec: CredentialSpec | None,
+    source: CredentialSource | None,
+    state: HarnessState | None,
+    *,
+    stored_sizes: Mapping[str, int] | None = None,
+    stored_in: str = "",
 ) -> CredentialState:
     """`absent`, `configured`, `invalid` or `validated` from the files' presence and the
-    recorded observations. The fingerprint is a sha256 of names and sizes only."""
+    recorded observations. The fingerprint is a sha256 of names and sizes only.
+
+    `stored_in` names where the files are when that is not a directory (the harness
+    Secret, ADR 0015), and `stored_sizes` is what it holds by auth file name, None when
+    it does not exist."""
     if spec is None:
         return CredentialState("not_required", None, None, (), "this harness needs no credential")
-    if source is None or not source.path:
+    if stored_in:
+        if stored_sizes is None:
+            return CredentialState(
+                "absent",
+                effective_mount_mode(spec, source).value,
+                None,
+                (),
+                f"{stored_in} does not exist",
+            )
+    elif source is None or not source.path:
         return CredentialState("absent", None, None, (), "no credential path is configured")
     mode = effective_mount_mode(spec, source).value
     files: list[dict[str, Any]] = []
     missing: list[str] = []
     digest = hashlib.sha256()
     for auth in spec.auth_files:
-        path = spec.source_path(source.path, auth.name)
         try:
-            size = path.stat().st_size
+            if stored_in:
+                if stored_sizes is None or auth.name not in stored_sizes:
+                    raise FileNotFoundError(auth.name)
+                size = stored_sizes[auth.name]
+            else:
+                assert source is not None
+                size = spec.source_path(source.path, auth.name).stat().st_size
         except OSError:
             files.append({"name": auth.name, "present": False, "required": auth.required})
             if auth.required:
@@ -273,6 +297,28 @@ def credential_state(
     if state is not None and state.last_validated_at is not None:
         return CredentialState("validated", mode, fingerprint, tuple(files))
     return CredentialState("configured", mode, fingerprint, tuple(files))
+
+
+# The attempt states in which an attempt holds its harness credential: from the seeding
+# in `prepare` until collect has synced the copy back and removed it, which is after
+# `exited` (12). The per-harness cap counts these, and a login refuses while any exists.
+CREDENTIAL_HOLDING_STATES: tuple[AttemptState, ...] = (
+    AttemptState.PREPARING,
+    AttemptState.LAUNCHING,
+    AttemptState.RUNNING,
+    AttemptState.TERMINATING,
+    AttemptState.EXITED,
+)
+
+
+def credential_holders(uow: UnitOfWork, harness: str) -> list[str]:
+    """The attempts that hold `harness`'s credential right now (12), by id."""
+    holders: list[str] = []
+    for attempt in uow.attempts.list_in_states(list(CREDENTIAL_HOLDING_STATES)):
+        execution = uow.executions.get(attempt.execution_id)
+        if execution is not None and execution.harness == harness:
+            holders.append(attempt.id)
+    return sorted(holders)
 
 
 def fingerprint_directory(root: Path, names: Iterable[str]) -> str | None:

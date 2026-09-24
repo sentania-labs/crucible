@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import time
+from dataclasses import replace
 from http.client import HTTPConnection
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,7 @@ from crucible.adapters.api.app import create_app
 from crucible.adapters.api.deps import AppContext
 from crucible.adapters.clock import SystemClock
 from crucible.adapters.execution import k8sspec
+from crucible.adapters.execution.fake import FakeProvider
 from crucible.adapters.execution.k8sapi import (
     KubernetesApiError,
     KubernetesClient,
@@ -31,6 +33,8 @@ from crucible.adapters.harness.registry import default_registry as application_h
 from crucible.adapters.harness.script import ScriptHarnessAdapter
 from crucible.adapters.persistence.unit_of_work import SqlUnitOfWorkFactory
 from crucible.adapters.storage.disk import DiskArtifactStore
+from crucible.application.admin.context import AdminContext
+from crucible.application.admin.login import LoginFlow
 from crucible.application.auth import mint_token
 from crucible.application.harnesses import HarnessRegistry
 from crucible.application.supervisor import Supervisor
@@ -42,7 +46,14 @@ from crucible.ports.execution import (
     LogOffset,
     ObservationState,
 )
-from crucible.ports.harness import AuthFile, CredentialSpec, MountMode
+from crucible.ports.harness import (
+    AdapterLaunch,
+    AuthFile,
+    CredentialSpec,
+    HarnessCapabilities,
+    LaunchContext,
+    MountMode,
+)
 from tests.e2e.conftest import (
     e2e_contract,
     event_kinds,
@@ -818,3 +829,273 @@ async def test_probe_refuses_launches_without_default_deny(
         }
         api.create("networkpolicies", restored)
         await provider.cleanup(workspace, CleanupPolicy.DELETE, spec)
+
+
+# ----- the login Job, the service-owned Secret and the probe (25, 26, ADR 0015) ----------
+
+# The stand-in harness's credential directory and its "model endpoint". The endpoint is
+# a public name the worker's policy permits (the tier's provider renders the broad rule),
+# so the attempt reaching it and the login Job not reaching it is the policy's doing.
+STAND_IN_DIR = "/home/worker/.crucible-login"
+STAND_IN_MODEL_ENDPOINT = "example.com"
+
+
+def _reach(host: str) -> str:
+    return (
+        "r=refused; for i in 1 2 3; do "
+        f"if curl -sS -o /dev/null --connect-timeout 5 --max-time 10 https://{host}/; "
+        "then r=reached; break; fi; sleep 1; done; "
+        'echo "model-endpoint=$r"; '
+    )
+
+
+class StandInLoginAdapter(ScriptHarnessAdapter):
+    """A subscription harness stood in for by the script-harness image, the way that
+    image stands in for the real harnesses: its login (`crucible-script-harness
+    login-stub`) prints a device URL and code and writes `session.json`, its credential
+    is that one file, rw-narrow like the real three, and it declares a model endpoint
+    and no login endpoint. Its launch refuses to run without the credential."""
+
+    def capabilities(self) -> HarnessCapabilities:
+        return replace(
+            super().capabilities(), endpoints=(STAND_IN_MODEL_ENDPOINT,), login_endpoints=()
+        )
+
+    def credential_spec(self) -> CredentialSpec:
+        return CredentialSpec(
+            harness=self.name,
+            mount_target=STAND_IN_DIR,
+            auth_files=(AuthFile("session.json", json=True, json_keys=("authenticated",)),),
+            minimum_mode=MountMode.RW_NARROW,
+            config_dir_env="CRUCIBLE_LOGIN_DIR",
+        )
+
+    def build_launch(self, ctx: LaunchContext) -> AdapterLaunch:
+        guard = (
+            f'test -s "{STAND_IN_DIR}/session.json" '
+            '|| { echo "no stand-in credential" >&2; exit 70; }; '
+            "echo credential-present; " + _reach(STAND_IN_MODEL_ENDPOINT)
+        )
+        if ctx.attempt_id == "probe":
+            return AdapterLaunch(argv=("sh", "-c", guard + "exit 0"), workdir=ctx.repo_mount)
+        return AdapterLaunch(
+            argv=("sh", "-c", guard + "exec crucible-script-harness"), workdir=ctx.repo_mount
+        )
+
+
+STAND_IN_FLOW = LoginFlow(
+    harness="script-harness",
+    argv=("crucible-script-harness", "login-stub"),
+    image_binary="/usr/local/bin/crucible-script-harness",
+    directory_env="CRUCIBLE_LOGIN_DIR",
+    directory_subdir="",
+    pastes_code=False,
+    captures_token=False,
+    token_pattern="",
+    token_file="",
+    window="stand-in device flow",
+)
+
+
+def _poll_login(admin: TestClient, *states: str, timeout: float = 180) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout
+    state: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        state = admin.get("/v1/admin/credentials/script-harness/login").json()
+        if state["state"] in states:
+            return state
+        time.sleep(0.5)
+    raise AssertionError(f"the stand-in login never reached {states}: {state}")
+
+
+async def test_login_from_an_empty_secret_to_a_probe_and_an_attempt_through_the_admin_api(
+    engine: Engine,
+    migrated: str,
+    artifact_root: Path,
+    api: KubernetesClient,
+    registry: LocalHttpRegistry,
+) -> None:
+    """#92 and #58 on a real cluster: the admin API runs the stand-in harness's login as
+    a Job, stores what it wrote in the Secret the service owns, probes it, and one routed
+    attempt runs with it. The login Job cannot reach the model endpoint the attempt can."""
+    harnesses = HarnessRegistry((StandInLoginAdapter(),))
+    provider = _provider(api, registry, harnesses=harnesses)
+    clock = SystemClock()
+    secret = provider.credential_secret("script-harness")
+    with contextlib.suppress(KubernetesApiError):
+        api.delete("secrets", secret)
+    # What a GitOps-era deployment leaves behind: the Secret exists and holds nothing.
+    api.create(
+        "secrets",
+        {
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {"name": secret, "namespace": "crucible-workers"},
+            "type": "Opaque",
+        },
+    )
+    ctx = AppContext(
+        uow_factory=SqlUnitOfWorkFactory(engine),
+        clock=clock,
+        providers=[provider],
+        database_url=migrated,
+        engine=engine,
+        artifact_store=DiskArtifactStore(artifact_root / "kind-login-store"),
+        harnesses=harnesses,
+    )
+    ctx.admin = AdminContext(
+        uow_factory=ctx.uow_factory,
+        clock=clock,
+        providers={"fake": FakeProvider(), "kubernetes": provider},
+        harnesses=harnesses,
+        # The supervisor below ticks once up front; its lease outlives the login.
+        lease_ttl_seconds=300,
+        login_timeout_seconds=180,
+        probe_timeout_seconds=120,
+        login_flows={"script-harness": STAND_IN_FLOW},
+        # The stand-in's CLI checks the model endpoint before it logs in, so the
+        # login's own output says whether its Job could reach it.
+        login_commands={
+            "script-harness": (
+                "sh",
+                "-c",
+                _reach(STAND_IN_MODEL_ENDPOINT)
+                + "exec /usr/local/bin/crucible-script-harness login-stub",
+            )
+        },
+    )
+    tokens: dict[str, str] = {}
+    with ctx.uow_factory() as uow:
+        for role in Role:
+            tokens[role.value] = mint_token(uow, clock, name=f"login-{role.value}", role=role).token
+        uow.commit()
+    supervisor = Supervisor(
+        ctx.uow_factory,
+        {"kubernetes": provider},
+        clock,
+        holder="e2e-kind-login",
+        artifact_store=ctx.artifact_store,
+        lease_ttl_seconds=300,
+        grace_seconds=5,
+        harnesses=harnesses,
+    )
+    await supervisor.tick()
+    image = os.environ["CRUCIBLE_E2E_KIND_REGISTRY"]
+    resolved = await asyncio.to_thread(registry.resolve, image)
+    app = create_app(ctx)
+    try:
+        with TestClient(app, headers={"Authorization": f"Bearer {tokens['admin']}"}) as admin:
+            routing = e2e_routing_document()
+            assert admin.put(
+                f"/v1/routing/{routing['name']}/{routing['version']}", json=routing
+            ).status_code in (200, 201)
+            policy = e2e_policy_document()
+            policy["images"]["allowlist"] = ["localhost:*/*"]
+            policy["resources"] = {
+                "cpus": 1,
+                "memory": "256MiB",
+                "pids": 128,
+                "tmpfs_total": "256MiB",
+            }
+            uploaded = admin.put(f"/v1/policies/{policy['name']}/{policy['version']}", json=policy)
+            assert uploaded.status_code in (200, 201), uploaded.text
+            with ctx.uow_factory() as uow:
+                uow.image_promotions.put(
+                    ImagePromotion(
+                        digest=resolved.digest,
+                        reference=resolved.reference,
+                        harnesses=dict(resolved.harnesses),
+                        state="default",
+                        updated_at=clock.now(),
+                        updated_by="e2e-kind",
+                        reason="the stand-in login's image",
+                    )
+                )
+                uow.commit()
+
+            before = admin.get("/v1/admin/credentials/script-harness").json()
+            assert before["state"] == "absent", before
+            assert before["source"]["exists"] is True
+            assert before["source"]["service_owned"] is False
+
+            started = admin.post(
+                "/v1/admin/credentials/script-harness/login", json={"reason": "kind login"}
+            )
+            assert started.status_code == 200, started.text
+            state = _poll_login(admin, "finished", "failed")
+            print("login:", json.dumps(state, indent=2))
+            assert state["state"] == "finished", state
+            assert state["url"] == "https://example.invalid/device"
+            assert state["code"] == "C7AA-TEST"
+            assert state["credential_written"] is True
+            # The login lock (25, 26) was taken on the real API server and is released
+            # by uid once the Job is gone.
+            lock_selector = f"{k8sspec.LABEL_ROLE}={k8sspec.ROLE_LOGIN_LOCK}"
+            for _ in range(60):
+                if not api.list_objects("configmaps", label_selector=lock_selector):
+                    break
+                time.sleep(0.5)
+            assert not api.list_objects("configmaps", label_selector=lock_selector)
+            # 58: the login Job's egress is its login endpoints, and this harness has
+            # none, so the model endpoint is refused from it.
+            assert "model-endpoint=refused" in state["output_tail"], state
+            finished = admin.post(
+                "/v1/admin/credentials/script-harness/login/finish",
+                json={"reason": "kind login done"},
+            )
+            assert finished.json()["shape"]["ok"] is True, finished.text
+            stored = api.get("secrets", secret)
+            print("secret labels:", stored["metadata"].get("labels"))
+            assert stored["metadata"]["labels"][k8sspec.LABEL_MANAGED_BY] == "crucible"
+            assert set(stored["data"]) == {"session.json"}
+            assert not api.list_objects(
+                "jobs", label_selector=f"{k8sspec.LABEL_ROLE}={k8sspec.ROLE_LOGIN}"
+            )
+            assert not api.list_objects(
+                "networkpolicies", label_selector=f"{k8sspec.LABEL_ROLE}={k8sspec.ROLE_LOGIN}"
+            )
+
+            validated = admin.post(
+                "/v1/admin/credentials/script-harness/validate", json={"reason": "kind probe"}
+            )
+            assert validated.status_code == 200, validated.text
+            report = validated.json()
+            print("validate:", json.dumps(report, indent=2))
+            assert report["probe"]["exit_class"] == "completed", report
+            assert report["validated"] is True
+            assert report["credential"]["state"] == "validated"
+            assert not api.list_objects(
+                "persistentvolumeclaims", label_selector=f"{k8sspec.LABEL_ADMIN}=probe"
+            )
+
+        with TestClient(app, headers={"Authorization": f"Bearer {tokens['operator']}"}) as client:
+            register(ctx, "kind-login", _origin("kind-login"))
+            document = e2e_contract("E2E-KIND-LOGIN", "kind-login", image)
+            document["execution_request"]["provider"] = "kubernetes"
+            task_id = submit_and_start(client, document)
+            result = await run_until(
+                supervisor,
+                client,
+                task_id,
+                {"awaiting_internal_review", "pre_pr_gates_failed"},
+                max_ticks=120,
+                pause=0.5,
+            )
+            attempt = client.get(f"/v1/tasks/{task_id}").json()["latest_attempt"]
+            print("attempt:", task_id, attempt["state"], attempt.get("exit_class"), result)
+            with engine.begin() as connection:
+                chunks = connection.execute(
+                    text("SELECT content, gzipped FROM log_chunks WHERE attempt_id = :id"),
+                    {"id": attempt["id"]},
+                ).all()
+            body = b"".join(c.content for c in chunks if not c.gzipped).decode("utf-8", "replace")
+            print("attempt log:", body[-1500:])
+            assert "credential-present" in body
+            assert "model-endpoint=reached" in body, body
+            assert attempt["exit_class"] == "completed", attempt
+            events = client.get(f"/v1/tasks/{task_id}/events", params={"limit": 200}).json()
+            synced = [e for e in events["items"] if e["kind"] == "credential_synced"]
+            print("credential sync:", json.dumps([e["payload"] for e in synced], indent=2))
+    finally:
+        with contextlib.suppress(KubernetesApiError):
+            api.delete("secrets", secret)

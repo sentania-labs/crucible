@@ -90,6 +90,10 @@ never retry.
 - Endpoints: `api.anthropic.com` (plus `mcp-proxy.anthropic.com` only if
   account MCP connectors are wanted). Confirmed by a task completed
   through the filtering proxy, so the list is no longer provisional.
+- Login endpoints (the Kubernetes login Job's whole egress, 26):
+  `platform.claude.com`, where `setup-token` exchanges the pasted code. Read
+  from the pinned binary's strings on 2026-09-24, not yet observed on a live
+  login.
 - Shim: one-line untracked `AGENTS.md` pointing at the identity file when the
   checkout has no `AGENTS.md`. Claude Code alone suppresses that shim when the
   checkout has its own `CLAUDE.md`, because it reads that file when it wins
@@ -121,6 +125,8 @@ never retry.
   (`auth_mode = chatgpt`) that host is the backend, and a run without it
   reconnects until it is permitted and never reaches the model.
   `ab.chatgpt.com` stays denied.
+- Login endpoints: `auth.openai.com`, the device-code and token endpoints
+  (the pinned binary's strings, 2026-09-24).
 - The worker image carries the code-mode host companion binary the CLI
   spawns for the 5.6 model family; without it those models fail closed.
   It is an asset of the same pinned CLI release and is pinned by the
@@ -153,6 +159,11 @@ never retry.
   fetches the account's profile picture before any turn and fails closed
   when either is refused. Neither is a model endpoint; both are what the
   CLI needs. The list is no longer provisional.
+- Login endpoints: `oauth2.googleapis.com` and `www.googleapis.com`, the
+  code exchange and the userinfo call (the pinned binary's strings,
+  2026-09-24). AGY's login command ends with a prompt to its model API, which
+  a Kubernetes login Job cannot reach, so it exits non-zero there; the token
+  it wrote is judged by its shape and then by the probe.
 - Shim: untracked `AGENTS.md` if absent (AGY reads `AGENTS.md`; it does not
   read `GEMINI.md` reliably in headless mode per the operator's setup notes).
 - Templates: none. AGY's config directory carries no settings file the

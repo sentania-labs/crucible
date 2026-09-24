@@ -1282,7 +1282,7 @@ async def test_an_absent_optional_auth_file_is_not_projected() -> None:
     api, registry, provider = build(harness="claude_code")
     image = "crucible-worker:claude-fake-succeed-2"
     registry.register(image, harness="claude_code", version="2.1.277")
-    api.put_harness_secret("crucible-harness-claude_code", {"oauth-token": b"not-a-real-value"})
+    api.put_harness_secret("crucible-harness-claude-code", {"oauth-token": b"not-a-real-value"})
     launch = spec(harness="claude_code", image=image)
     workspace = await provider.prepare(launch)
     await provider.launch(workspace, launch)
