@@ -106,6 +106,10 @@ class CodexAdapter:
             # chatgpt.com until it is permitted. ab.chatgpt.com stays denied.
             endpoints=("api.openai.com", "auth.openai.com", "chatgpt.com"),
             shim="AGENTS.md",
+            # `login --device-auth` asks auth.openai.com for the user code, polls its
+            # deviceauth token endpoint and exchanges at /oauth/token there (the pinned
+            # 0.156.0 binary's strings, 2026-09-24). api.openai.com is the model API.
+            login_endpoints=("auth.openai.com",),
         )
 
     def credential_spec(self) -> CredentialSpec:

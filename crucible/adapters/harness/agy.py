@@ -102,6 +102,12 @@ class AgyAdapter:
                 "www.googleapis.com",
             ),
             shim="AGENTS.md",
+            # The Google OAuth code exchange (oauth2.googleapis.com/token) and the
+            # userinfo call (www.googleapis.com/oauth2/v2/userinfo), from the pinned
+            # 1.2.8 binary's strings on 2026-09-24. daily-cloudcode-pa is the model API,
+            # so the prompt AGY's login command ends with cannot reach it from a login
+            # Job; the token is judged by its shape and then by the probe.
+            login_endpoints=("oauth2.googleapis.com", "www.googleapis.com"),
         )
 
     def credential_spec(self) -> CredentialSpec:

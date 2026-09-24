@@ -132,6 +132,11 @@ class HarnessCapabilities:
     shim: str | None = None
     # Whether a project CLAUDE.md takes precedence over the generated AGENTS.md shim.
     claude_md_wins: bool = False
+    # The hostnames the harness's own login CLI reaches to finish a sign-in (25, 26),
+    # and nothing else. The Kubernetes login Job gets these and not `endpoints`, so a
+    # login can never reach a model API (crucible#58). Empty for a harness with no
+    # interactive login.
+    login_endpoints: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -142,6 +147,7 @@ class HarnessCapabilities:
             "endpoints": list(self.endpoints),
             "shim": self.shim,
             "claude_md_wins": self.claude_md_wins,
+            "login_endpoints": list(self.login_endpoints),
         }
 
 
