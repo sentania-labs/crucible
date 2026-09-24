@@ -106,6 +106,28 @@ def test_login_template_has_refresh_fallback_and_only_polling_script() -> None:
     assert "setTimeout" in rendered
 
 
+def test_a_finishing_login_says_it_is_cleaning_up_and_offers_no_cancel() -> None:
+    context = base_context("/ui/credentials/codex/login")
+    context["principal"] = SimpleNamespace(name="admin", role=SimpleNamespace(value="admin"))
+    rendered = templates.get_template("login.html").render(
+        **context,
+        harness="codex",
+        login={
+            "state": "finishing",
+            "window": "Device flow",
+            "url": None,
+            "code": None,
+            "output_tail": [],
+            "error": None,
+        },
+    )
+    assert "nothing left to cancel" in rendered
+    assert "/ui/actions/login-cancel" not in rendered
+    assert "/ui/actions/login-code" not in rendered
+    assert "/ui/actions/login-finish" not in rendered
+    assert "setTimeout" in rendered
+
+
 def test_reader_login_page_has_state_but_no_operator_controls() -> None:
     rendered = templates.get_template("login.html").render(
         **base_context("/ui/credentials/codex/login"),

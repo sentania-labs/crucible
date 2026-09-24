@@ -140,13 +140,21 @@ FLOWS: dict[str, LoginFlow] = {
 }
 
 
+# A session in one of these states has its outcome decided: nothing the operator sends
+# changes it.
+_ENDED_STATES = ("finishing", "finished", "failed")
+
+
 @dataclass(slots=True)
 class LoginSession:
     """What an in-progress or finished login shows: never a token."""
 
     harness: str
     started_at: float
-    state: str = "starting"  # starting, waiting_for_operator, waiting_for_code, finished, failed
+    # starting, waiting_for_operator, waiting_for_code, finishing, finished, failed.
+    # `finishing` (Kubernetes): the CLI's part is over and the service is storing what it
+    # wrote, deleting the Job and releasing the lock; a cancel or a code is refused.
+    state: str = "starting"
     url: str | None = None
     code: str | None = None
     prompt: str | None = None
@@ -160,6 +168,7 @@ class LoginSession:
     cancel_requested: bool = False
     _code_from_operator: str | None = None
     _wake: threading.Event = field(default_factory=threading.Event)
+    _guard: threading.Lock = field(default_factory=threading.Lock)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -179,6 +188,37 @@ class LoginSession:
     def submit_code(self, code: str) -> None:
         self._code_from_operator = code
         self._wake.set()
+
+    def accept_code(self, code: str) -> bool:
+        """Hand the operator's code to the login only while it waits for one. The check
+        and the hand-over hold the same lock `begin_finishing` takes, so a code is never
+        accepted for a CLI that has already exited."""
+        with self._guard:
+            if self.state != "waiting_for_code":
+                return False
+            self._code_from_operator = code
+        self._wake.set()
+        return True
+
+    def request_cancel(self) -> str | None:
+        """Mark the login cancelled and return the state it was cancelled in, or None
+        when its outcome is already decided (`finishing`, `finished`, `failed`) and a
+        cancel would be recorded as accepted and then overwritten."""
+        with self._guard:
+            if self.state in _ENDED_STATES:
+                return None
+            before = self.state
+            self.cancel_requested = True
+        self._wake.set()
+        return before
+
+    def begin_finishing(self) -> bool:
+        """The CLI's part is over: from here the session refuses a cancel and a code, and
+        reads `finishing` until the terminal state is set. Returns whether a cancel was
+        accepted before, which the outcome then honours."""
+        with self._guard:
+            self.state = "finishing"
+            return self.cancel_requested
 
     def wait_for_code(self, timeout: float) -> str | None:
         if self._wake.wait(timeout):
@@ -365,6 +405,11 @@ class LoginRegistry:
         that only surfaced inside `start` left the credential renamed aside with no login
         running and the retention sweep free to shred it."""
         existing = self._sessions.get(harness)
+        if existing is not None and existing.state == "finishing":
+            raise ConflictError(
+                f"the last login for {harness} has ended and is still cleaning up its Job "
+                "and lock; retry once it reads finished or failed"
+            )
         if existing is not None and existing.state not in ("finished", "failed"):
             raise ConflictError(f"a login for {harness} is already in progress")
         flow = flows_for(ctx)[harness]
@@ -466,11 +511,11 @@ class LoginRegistry:
             # A registered session that never reaches a terminal state refuses every later
             # login for the harness as one already in progress (correction 17), and a
             # thread that could not be created is exactly that case.
-            session.state = "failed"
-            session.error = f"the login thread could not be started: {type(exc).__name__}"
             self._threads.pop(harness, None)
             if lock is not None:
                 _release_lock(job, lock)
+            session.error = f"the login thread could not be started: {type(exc).__name__}"
+            session.state = "failed"
             raise
         deadline = time.monotonic() + 5.0
         while session.state == "starting" and thread.is_alive() and time.monotonic() < deadline:
@@ -523,6 +568,7 @@ class LoginRegistry:
         *,
         timeout: int,
     ) -> None:
+        failure: str | None = None
         try:
             import asyncio  # noqa: PLC0415
 
@@ -534,19 +580,22 @@ class LoginRegistry:
                     argv=argv,
                     timeout=timeout,
                     accept=accept,
+                    lock=lock,
                 )
             )
         except Exception as exc:
-            session.state = "failed"
-            session.error = f"the login Job failed: {type(exc).__name__}: {exc}"
+            failure = f"the login Job failed: {type(exc).__name__}: {exc}"
         finally:
-            # Success, failure, cancel and timeout all end here, after the Job is gone.
-            if lock is not None:
-                _release_lock(provider, lock)
-        if session.state not in ("finished", "failed"):
-            # A session that never reaches a terminal state refuses every later login.
-            session.state = "failed"
-            session.error = session.error or "the login Job ended without a result"
+            # The provider releases the lock before it ends the session. When it raised
+            # or was interrupted first, the lock is released here, still before the
+            # session reads failed: an operator who retries at once is not refused by
+            # this login's own lock. A session that never reaches a terminal state
+            # refuses every later login.
+            if failure is not None or session.state not in ("finished", "failed"):
+                if lock is not None:
+                    _release_lock(provider, lock)
+                session.error = failure or session.error or "the login Job ended without a result"
+                session.state = "failed"
 
     @staticmethod
     def _run_container(
@@ -1013,7 +1062,7 @@ def submit_code(
 ) -> dict[str, Any]:
     session = registry.get(harness)
     if session is None or session.state != "waiting_for_code":
-        raise ConflictError(f"no login for {harness} is waiting for a code")
+        raise ConflictError(_not_waiting(harness, session))
     audited_reason: str | None = None
     if ctx is not None and uow is not None:
         audited_reason = guard_mutation(
@@ -1023,7 +1072,8 @@ def submit_code(
             principal=principal,
             operation=f"credentials login code {harness}",
         )
-    session.submit_code(code)
+    if not session.accept_code(code):
+        raise ConflictError(_not_waiting(harness, session))
     if ctx is not None and uow is not None:
         assert audited_reason is not None
         admin_event(
@@ -1039,6 +1089,15 @@ def submit_code(
     return session.as_dict()
 
 
+def _not_waiting(harness: str, session: LoginSession | None) -> str:
+    if session is not None and session.state == "finishing":
+        return (
+            f"the login for {harness} has already ended and is cleaning up its Job and lock; "
+            "it no longer takes a code"
+        )
+    return f"no login for {harness} is waiting for a code"
+
+
 def cancel_login(
     registry: LoginRegistry,
     harness: str,
@@ -1052,17 +1111,21 @@ def cancel_login(
         ctx, uow, reason, principal=principal, operation=f"credentials login cancel {harness}"
     )
     session = registry.get(harness)
-    if session is None or session.state in ("finished", "failed"):
+    before = session.request_cancel() if session is not None else None
+    if session is None or before is None:
+        if session is not None and session.state == "finishing":
+            raise ConflictError(
+                f"the login for {harness} has already ended and is cleaning up its Job and "
+                "lock; there is nothing left to cancel"
+            )
         raise ConflictError(f"no login for {harness} is in progress")
-    session.cancel_requested = True
-    session._wake.set()
     admin_event(
         uow,
         ctx,
         EventKind.CREDENTIAL_LOGIN_CANCELLED,
         principal=principal,
         reason=reason,
-        before={"state": session.state},
+        before={"state": before},
         after={"cancel_requested": True},
         harness=harness,
     )
