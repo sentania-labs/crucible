@@ -107,7 +107,12 @@ async def test_the_probe_passes_when_the_canary_cannot_reach_the_api_server() ->
     await provider.prepare(spec())
     probe = await provider.ensure_ready()
     assert probe == NamespaceProbe(
-        True, True, 4096, "namespace ready", pid_limit_source="cgroup-v2-parent"
+        True,
+        True,
+        4096,
+        "namespace ready",
+        dns_resolves=True,
+        pid_limit_source="cgroup-v2-parent",
     )
     health = await provider.health()
     assert health.state == "ok"
@@ -115,6 +120,32 @@ async def test_the_probe_passes_when_the_canary_cannot_reach_the_api_server() ->
     assert health.checks["pod_pid_limit"] == 4096
     assert health.checks["pod_pid_limit_source"] == "cgroup-v2-parent"
     assert health.checks["runtime_class"] == "standard"
+
+
+async def test_the_canary_requests_a_small_fixed_size_not_the_role_pods_size() -> None:
+    """Issue 93: the canary is a shell script with curl, not a role pod, so it must
+    never inherit the policy's 2-CPU / 4Gi default limits."""
+    api, _registry, provider = build(
+        config=KubernetesConfig(
+            poll_interval_seconds=0,
+            launch_timeout_seconds=5,
+            storage_class="lab-ssd",
+            image_pull_secret="ghcr-pull",
+            canary_cpu_millicores=50,
+            canary_memory="32Mi",
+        )
+    )
+    await provider.prepare(spec())
+    assert (await provider.ensure_ready()).passed
+    pod = next(
+        row["body"]["spec"]
+        for row in api.created
+        if str(row["name"]).startswith("crucible-canary-")
+    )
+    resources = pod["containers"][0]["resources"]
+    assert resources["limits"]["cpu"] == "50m"
+    assert resources["limits"]["memory"] == str(32 * 1024**2)
+    assert resources["requests"] == {"cpu": "50m", "memory": str(32 * 1024**2)}
 
 
 async def test_the_probe_requests_log_lines_without_timestamp_prefixes() -> None:
@@ -129,7 +160,8 @@ async def test_the_probe_requests_log_lines_without_timestamp_prefixes() -> None
 
     api.pod_log = pod_log  # type: ignore[method-assign]
     assert (await provider.ensure_ready()).passed
-    assert requested == [False]
+    # Two canaries: the namespace's own rules, then a worker's.
+    assert requested == [False, False]
 
 
 async def test_concurrent_readiness_checks_share_one_canary() -> None:

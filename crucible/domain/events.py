@@ -180,6 +180,7 @@ class EventKind(StrEnum):
     GITHUB_CHECKED = "github_checked"
     ADMIN_REFUSED = "admin_refused"
     LOCAL_ENDPOINT_UPDATED = "local_endpoint_updated"
+    KUBERNETES_EGRESS_UPDATED = "kubernetes_egress_updated"
     # the bootstrap ledger handoff (15, C6)
     BOOTSTRAP_IMPORT_VERIFIED = "bootstrap_import_verified"
     BOOTSTRAP_IMPORT_COMMITTED = "bootstrap_import_committed"

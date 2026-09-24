@@ -26,7 +26,11 @@ from crucible.adapters.execution.k8sapi import (
     kubeconfig_access,
 )
 from crucible.adapters.execution.k8sregistry import HttpRegistryClient
-from crucible.adapters.execution.kubernetes import KubernetesConfig, KubernetesProvider
+from crucible.adapters.execution.kubernetes import (
+    KubernetesConfig,
+    KubernetesProvider,
+    SettingsSource,
+)
 from crucible.adapters.execution.publisher import DockerPublisher, PublisherConfig
 from crucible.adapters.github.appauth import AppAuthenticator, AppConfig
 from crucible.adapters.github.client import RestGitHubClient
@@ -47,6 +51,7 @@ from crucible.application.proxy_config import (
     worker_proxy_config,
 )
 from crucible.application.supervisor import Supervisor
+from crucible.domain.cluster_egress import SETTING_NAME, parse_cluster_egress
 from crucible.domain.ids import new_id
 from crucible.ports.artifacts import ArtifactStore
 from crucible.ports.execution import ExecutionProvider
@@ -54,6 +59,7 @@ from crucible.ports.github import GitHubClient
 from crucible.ports.harness import CredentialSource, HarnessGate, MountMode
 from crucible.ports.notification import WakeDeliverer
 from crucible.ports.publish import Publisher
+from crucible.ports.repository import UnitOfWorkFactory
 from crucible.settings import Settings
 
 log = logging.getLogger("crucible.wiring")
@@ -162,7 +168,48 @@ def docker_config(
     )
 
 
-def kubernetes_config(settings: Settings) -> KubernetesConfig:
+def kubernetes_protected_namespaces(settings: Settings) -> tuple[str, ...]:
+    """The namespaces no egress selector may name: the workers' own and Crucible's."""
+    k = settings.kubernetes
+    return tuple(dict.fromkeys(n for n in (k.workers_namespace, k.namespace) if n))
+
+
+def kubernetes_egress_seed(settings: Settings) -> dict[str, object]:
+    """The settings file's `kubernetes.egress` values, as the admin setting's document."""
+    k = settings.kubernetes
+    return {
+        "dns": {"namespace": k.dns_namespace, "pod_labels": dict(k.dns_pod_labels)},
+        "local_endpoint": {
+            "namespace": k.local_endpoint_namespace,
+            "pod_labels": dict(k.local_endpoint_pod_labels),
+            "port": k.local_endpoint_port,
+        },
+    }
+
+
+def kubernetes_settings_source(factory: UnitOfWorkFactory) -> SettingsSource:
+    """What the provider reads back on each refresh: the saved `kubernetes.egress`
+    document, if any, and the enabled local endpoint of the routing policy in force."""
+
+    def read() -> tuple[Mapping[str, object] | None, str | None]:
+        with factory() as uow:
+            row = uow.provider_settings.get(SETTING_NAME)
+            endpoint: str | None = None
+            try:
+                reference = local_endpoint_view(uow)["routing_policy"]
+            except NotFoundError:
+                reference = None
+            if reference is not None:
+                record = uow.routing_policies.get(reference["name"], reference["version"])
+                endpoint = enabled_database_endpoint(record.document if record else None)
+        return (row.document if row is not None else None, endpoint)
+
+    return read
+
+
+def kubernetes_config(
+    settings: Settings, *, local_endpoint_url: str | None = None
+) -> KubernetesConfig:
     k = settings.kubernetes
     return KubernetesConfig(
         namespace=k.workers_namespace,
@@ -180,6 +227,15 @@ def kubernetes_config(settings: Settings) -> KubernetesConfig:
         poll_interval_seconds=k.poll_interval_seconds,
         api_timeout_seconds=k.api_timeout_seconds,
         cluster_dns_ip=k.cluster_dns_ip,
+        # A bad seed is refused here (wire() then leaves the provider out) rather than
+        # rendering a rule nobody meant; the same check refuses it through the admin
+        # surfaces.
+        egress=parse_cluster_egress(
+            kubernetes_egress_seed(settings),
+            protected_namespaces=kubernetes_protected_namespaces(settings),
+        ),
+        control_namespace=k.namespace,
+        local_endpoint_url=local_endpoint_url or "",
         denied_cidrs=tuple(k.denied_cidrs),
         local_endpoint_cidrs=tuple(k.local_endpoint_cidrs),
         extra_image_allowlist=tuple(k.extra_image_allowlist),
@@ -196,11 +252,19 @@ def kubernetes_config(settings: Settings) -> KubernetesConfig:
         image_repositories=tuple(k.image_repositories),
         probe_image=k.probe_image,
         use_reference_cache=k.use_reference_cache,
+        canary_cpu_millicores=k.canary_cpu_millicores,
+        canary_memory=k.canary_memory,
         pod_pid_limit_override=k.pod_pid_limit_override,
     )
 
 
-def kubernetes_provider(settings: Settings, registry: HarnessRegistry) -> KubernetesProvider:
+def kubernetes_provider(
+    settings: Settings,
+    registry: HarnessRegistry,
+    *,
+    factory: UnitOfWorkFactory | None = None,
+    local_endpoint_url: str | None = None,
+) -> KubernetesProvider:
     """The provider of 26. The access is either a kubeconfig path or the in-cluster
     ServiceAccount; neither is a credential value in configuration (12)."""
     k = settings.kubernetes
@@ -211,7 +275,11 @@ def kubernetes_provider(settings: Settings, registry: HarnessRegistry) -> Kubern
     )
     client = KubernetesClient(access, k.workers_namespace, timeout=k.api_timeout_seconds)
     return KubernetesProvider(
-        kubernetes_config(settings), client, HttpRegistryClient(), harnesses=registry
+        kubernetes_config(settings, local_endpoint_url=local_endpoint_url),
+        client,
+        HttpRegistryClient(),
+        harnesses=registry,
+        settings_source=kubernetes_settings_source(factory) if factory is not None else None,
     )
 
 
@@ -294,9 +362,16 @@ def wire(settings: Settings) -> Wiring:
         # service that will not start: the Docker provider and the API are still the
         # operator's way of finding out what is wrong (25).
         try:
-            providers["kubernetes"] = kubernetes_provider(settings, registry)
+            providers["kubernetes"] = kubernetes_provider(
+                settings, registry, factory=factory, local_endpoint_url=database_endpoint
+            )
         except KubernetesApiError as exc:
             log.error("the kubernetes provider is enabled but unreachable: %s", exc)
+        except ValueError as exc:
+            # A `kubernetes.egress` seed that names a protected namespace or an empty
+            # selector: the provider is left out rather than rendering a rule nobody
+            # meant, and the API stays up to say so.
+            log.error("the kubernetes provider is enabled but its settings are refused: %s", exc)
     artifact_store = DiskArtifactStore(settings.service.artifact_root)
     wake_deliverer = WebhookWakeDeliverer(
         settings.wake.webhook_url,
@@ -329,6 +404,8 @@ def wire(settings: Settings) -> Wiring:
         proxy_subnet=settings.admin.proxy_subnet,
         proxy_hosts=tuple(settings.docker.egress_allowlist),
         proxy_reload_timeout_seconds=settings.admin.proxy_reload_timeout_seconds,
+        kubernetes_egress_seed=kubernetes_egress_seed(settings),
+        kubernetes_protected_namespaces=kubernetes_protected_namespaces(settings),
     )
     ctx = AppContext(
         uow_factory=factory,

@@ -124,7 +124,7 @@ containers:
     capabilities: {drop: ["ALL"]}
   resources:                # from policy limits
     limits: {cpu: ..., memory: ..., ephemeral-storage: ...}
-    requests: {cpu: ..., memory: ...}
+    requests: {cpu: ..., memory: ...}   # a fraction of the limit, not the limit (issue 93)
   volumeMounts:
   - {name: tmp, mountPath: /tmp}           # emptyDir, medium Memory, sizeLimit
   - {name: home, mountPath: /home/worker}  # emptyDir, medium Memory, sizeLimit
@@ -160,6 +160,45 @@ plus a SIGTERM from Crucible's `drain` gives the harness the same window.
 sets; the provider records the effective limit in the launch evidence and
 refuses to launch if none is configured). A runtime class is not set in this
 version; the field is reserved and documented as the microVM step.
+
+### Requests below limits (issue 93)
+
+A role pod that requests exactly its limit (2 CPU / 4Gi by default) cannot
+schedule on a small cluster that is otherwise busy: no node has 2 CPU
+unreserved even at 10% utilization on three 4-CPU nodes, and every launch
+times out. Requests are therefore a fraction of the limit, not the limit
+itself, carried on the policy's `resources` block:
+
+- `resources.cpu_request_fraction` (default 0.5): the container's CPU
+  request as a fraction of `resources.cpus`. A fraction rather than an
+  absolute value tracks the limit automatically when a task's policy raises
+  or lowers it, and can never itself exceed the limit. At the default, one
+  attempt requests 1 CPU while still being allowed to burst to 2, and three
+  concurrent attempts (`max_concurrency`) request 3 CPU rather than 6,
+  which is what the 3 x 4-CPU lab needs to actually schedule anything.
+- `resources.memory_request_fraction` (default 1, operator decision
+  2026-09-23): memory stays request-equals-limit by default. Requesting the
+  full memory limit gives Guaranteed QoS for memory pressure, so a worker
+  promised the policy's memory is not the first thing evicted, which would
+  otherwise show up as a `lost` attempt nobody caused (16). CPU carries no
+  equivalent eviction risk, so it alone gets the lower default. A deployment
+  whose cluster is memory-constrained as well as CPU-constrained may lower
+  this fraction too; both fractions are ordinary policy fields, so they are
+  editable and versioned exactly where `resources.cpus` and
+  `resources.memory` already are (04, 05b), with no separate settings
+  surface of their own.
+
+The pod's effective request is the larger of its app containers' sum and any
+one init container's request, so the writable-credential init container
+(`rw-narrow` harnesses, below) carries the same fraction as the main
+container; left at the full limit it would silently cancel the role pod's
+lower request.
+
+The readiness canary (`ROLE_CANARY`) is a shell script with curl, never a
+role pod, so it does not use the policy's resources at all: both of its pods
+request and limit a fixed small size, `kubernetes.canary_cpu_millicores` (default
+100m) and `kubernetes.canary_memory` (default 64Mi), configured the same
+way as `kubernetes.probe_image`.
 
 ## Networking: NetworkPolicy replaces the egress proxy
 
@@ -204,11 +243,71 @@ through: cluster DNS is allowed on port 53 UDP and TCP to the cluster's DNS
 service and nothing else on that address, and the Kubernetes API service,
 the node network, the pod network of other namespaces, link-local
 `169.254.0.0/16`, and the lab's private ranges are denied. The e2e tier
-proves each denial from inside a worker pod (18). If the cluster's CNI does
-not enforce egress NetworkPolicy, the provider refuses to launch: readiness
-of the namespace is probed once at supervisor start by creating a canary
-pod that must fail to reach the API server, and the result is recorded and
-shown on the admin status page (25).
+proves each denial from inside a worker pod (18).
+
+**Selectors for a CNI that translates service addresses first.** Some CNIs
+translate a service or LoadBalancer address to its backend pod addresses before
+they evaluate policy; Cilium with kube-proxy replacement is the one the lab runs.
+There an `ipBlock` on the kube-dns ClusterIP or on a gateway's service address
+never matches, and a worker has no DNS and no model (crucible#91). So the policy
+also names those destinations by where they actually are, with a standard
+`networking.k8s.io/v1` peer of one `namespaceSelector` (on
+`kubernetes.io/metadata.name`) and one non-empty `podSelector`:
+
+- cluster DNS: the resolver's pods, `kube-system` and `k8s-app: kube-dns` by
+  default, in the same rule as the address and therefore on port 53 UDP and
+  TCP and nothing else. An empty DNS namespace leaves the address rule alone.
+- an in-cluster local endpoint: when a namespace is set for it, the worker's
+  local route is allowed as the pods that take its connections on their own
+  port (the Service's `targetPort`, or the URL's port when that is 0), and the
+  URL's host is not resolved into an address rule at all. With no namespace set
+  the endpoint is outside the cluster and keeps the resolved-address rule above.
+  The pods to name are the ones the URL's connection lands on: the gateway's own
+  when the URL is its Service, the ingress controller's when it goes through an
+  ingress.
+
+A selector never widens a denial: it adds no address, it carries only port 53 or
+the endpoint's one port, it may not be empty, and it may not name the workers
+namespace or Crucible's own (a worker reaching another attempt or Crucible's
+database). Those rules are checked when the setting is saved, when the service
+starts, and again when a policy is rendered. No Cilium-specific policy is used;
+every CNI that enforces NetworkPolicy matches both forms.
+
+The selectors are the `kubernetes.egress` setting. The settings file seeds it
+(`kubernetes.dns_namespace`, `dns_pod_labels`, `local_endpoint_namespace`,
+`local_endpoint_pod_labels`, `local_endpoint_port`); an administrator edits it
+from the admin API (`GET` and `POST /v1/admin/kubernetes/egress`), the CLI
+(`crucible admin kubernetes egress` and `set-egress`) or the Routing page of the
+admin UI. A saved value is a `provider_settings` row that wins over the file,
+every edit is an audited `kubernetes_egress_updated` event, and each process's
+provider reads the row back within 15 seconds (usually sooner in the process that
+took the edit), so the supervisor follows an edit made through the API without a
+restart. Until a process has read it back, that process keeps launching under the
+values it last proved. (Added 2026-09-23 for crucible#91.)
+
+**Readiness.** If the cluster's CNI does not enforce egress NetworkPolicy, the
+provider refuses to launch: readiness of the namespace is probed by two canary
+pods, one after the other, and the result is recorded and shown on the admin
+status page (25).
+
+- The first runs under the namespace's own rules and no policy of its own, which
+  is what a role with no egress gets. It must fail to reach the API server
+  (`egress_enforced`), and it reads the pod PID limit. A canary with a policy of
+  its own would be isolated by that policy, so it could not tell a namespace that
+  lost its default deny from one that has it.
+- The second runs under its own NetworkPolicy, rendered exactly as a worker's is
+  (cluster DNS, and the enabled local endpoint of the routing policy in force
+  when there is one). It must resolve a cluster name, `kubernetes.default.svc`
+  (`dns_resolves`), connect to the enabled local endpoint's URL when one is
+  enabled (`local_endpoint_reachable`), and still fail to reach the API server.
+
+A failure of any of them is `namespace_ready: false` with a detail naming the
+check that failed, and every launch is refused until it passes. A missing tool in
+the canary image (no curl, no getent or nslookup) is inconclusive and never a
+pass. A passed probe is kept until the provider reads back a changed
+`kubernetes.egress` setting or enabled local endpoint; the canary then runs again
+under the new values before any launch uses them, and an answer proved under values
+that changed while the canary ran is discarded rather than kept.
 
 The canary runs the first worker image reference the provider knows of, which
 before any attempt has resolved one is the first entry of
@@ -307,11 +406,14 @@ unauthenticated placeholder.
 ## Observability and administration
 
 Attempt evidence that has no field of its own on the provider port (the Job and
-Pod names, the node, the effective limits, the pod PID limit and the
-NetworkPolicy applied) is stored as one `report/kubernetes-launch.json`
+Pod names, the node, the effective limits and requests, the pod PID limit and
+the NetworkPolicy applied) is stored as one `report/kubernetes-launch.json`
 artifact of the attempt, which carries an `artifact_present` evidence row like
 any other per-attempt fact Crucible observed (11). The image digest stays on
-the attempt row. (Made concrete 2026-09-21 during C8a.)
+the attempt row. (Made concrete 2026-09-21 during C8a.) `limits.as_dict()`
+(issue 93) carries `cpu_request` and `memory_request` beside `cpu` and
+`memory`, so the evidence records what was actually asked of the scheduler
+next to what was allowed to run.
 
 `GET /providers` reports the Kubernetes provider with `isolation: pod`,
 `network_control: true`, `resource_limits: true`, `shared_disk: false`, the
@@ -320,7 +422,7 @@ namespace's ResourceQuota. The admin status page (25) shows the namespace
 readiness probe, the CNI egress enforcement result, the pod PID limit, and
 the runtime class in use ("standard" in this version). Attempt evidence
 records the image digest, the Job and Pod names, the node, the effective
-limits, and the NetworkPolicy applied.
+limits and requests, and the NetworkPolicy applied.
 
 ## What the cluster must guarantee first (lab-admin)
 
@@ -331,7 +433,10 @@ the status page.
 1. The two namespaces exist; `crucible-workers` has Pod Security admission
    at `restricted` and a default-deny NetworkPolicy.
 2. The CNI enforces egress NetworkPolicy (the canary must fail to reach the
-   API server).
+   API server), and the worker rules match on it: the canary must resolve a
+   cluster name and reach the enabled local endpoint. On a CNI that translates
+   service addresses first, the `kubernetes.egress` selectors are what make the
+   second half true.
 3. A storage class for the workspace PVCs with `ReadWriteOnce` and a size
    the policy's workspace cap fits, and one with `ReadWriteMany` for the
    artifact root: the api serves what the supervisor wrote and they are
@@ -361,6 +466,20 @@ the status page.
 A runtime class for worker pods (gVisor or Kata) is not a prerequisite for
 this version.
 
+9. The namespace's `requests.cpu` and `requests.memory` (`resourcequota.yaml`)
+   stay consistent with the running policy's request fractions and
+   `max_concurrency` by hand: `requests.cpu` is `max_concurrency` times
+   `resources.cpus * cpu_request_fraction`, and `requests.memory` the same
+   with `memory_request_fraction` (issue 93). `limits.cpu` and
+   `limits.memory` stay `max_concurrency` times the plain limits, unchanged
+   by this. `make manifests` prints the rendered total and refuses a target
+   whose total exceeds a stated cluster CPU or memory budget
+   (`docs/deployment.md`), which catches the quota drifting from the policy
+   but not a policy whose fraction alone makes the math wrong; that is a
+   review-time check, not a rendered one. A quota left stale after a policy
+   raises its fraction fails closed: fewer concurrent attempts admit, never
+   more than the quota allows.
+
 The manifests that satisfy the Crucible half of this list are
 `deploy/kubernetes`, and the operator-facing runbook, including every
 placeholder lab-admin fills in and the public DNS record the operator creates
@@ -383,6 +502,15 @@ manifests, and runs the same cases as the Docker tier plus:
 - supervisor restart re-attaches to a running Job and logs resume;
 - the readiness probe refuses launches when egress enforcement is absent
   (run once with the enforcing CNI removed).
+
+`tools/kind/cilium-egress.sh` is the same kind of disposable cluster running
+Cilium with kube-proxy replacement instead of Calico. It puts a stand-in model
+gateway behind a Service and shows, from a pod under each policy, that the
+address-only rules of before crucible#91 leave a worker with no DNS and no
+gateway while the selector rules give it both, with the API server, the rest
+of the resolver's ports and the internet still unreachable; then it runs the
+provider's own readiness canary in both forms. It is a local proof, not a CI
+job. (Added 2026-09-23.)
 
 It runs in CI on the same runner class as the Docker tier. The readiness
 rows 5, 7, 11, 12, and 23 are re-proven on this tier and cited in 19 with

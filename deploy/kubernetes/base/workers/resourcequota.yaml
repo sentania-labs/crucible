@@ -8,6 +8,20 @@
 # attempt capacity, so this limit of 15 reports three attempts rather than 15.
 # The claim count is the structural cap, one claim per attempt. No Pod count is used,
 # because a Pod count also cannot distinguish attempts from their supporting Pods.
+#
+# `requests.cpu` is three attempts at the default policy's request, not its limit
+# (issue 93): the default `cpu_request_fraction` is 0.5 of the 2-CPU default limit, so
+# one attempt requests 1 CPU even though it may burst to 2. `requests.cpu` therefore
+# stays below `limits.cpu`, and `make manifests` prints the sum this quota implies
+# against a stated cluster budget (docs/deployment.md). `requests.memory` stays equal to
+# `limits.memory`: the default `memory_request_fraction` is 1, unchanged from before
+# issue 93 (Guaranteed-for-memory, 16). A policy that changes either fraction, or a
+# deployment that changes `max_concurrency`, keeps this quota's requests consistent with
+# that math by hand; it is not computed from the running configuration. Raising
+# `cpu_request_fraction` above 0.5 without raising `requests.cpu` to match does not
+# break anything, it only shrinks how many attempts admit at once (a policy at fraction
+# 1 fits one attempt in the 3 CPU this quota allows, not three), so a stale quota fails
+# closed: fewer concurrent launches, never an unbounded one.
 apiVersion: v1
 kind: ResourceQuota
 metadata:
@@ -19,7 +33,7 @@ spec:
   hard:
     count/jobs.batch: "15"
     persistentvolumeclaims: "12"
-    requests.cpu: "6"
+    requests.cpu: "3"
     requests.memory: 12Gi
     limits.cpu: "6"
     limits.memory: 12Gi

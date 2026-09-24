@@ -119,6 +119,20 @@ class KubernetesSettings(BaseModel):
     # The cluster DNS service address. 26 allows port 53 on this address and nothing
     # else on it, and denies everything else inside the cluster.
     cluster_dns_ip: str = "10.96.0.10"
+    # The cluster resolver's pods, allowed on port 53 beside the address above. A CNI
+    # that translates a service address to its pods before it evaluates policy (Cilium
+    # with kube-proxy replacement) matches only this (crucible#91). An empty namespace
+    # leaves the address rule alone. These seed the `kubernetes.egress` admin setting;
+    # a value saved through the admin API, CLI or UI wins over them.
+    dns_namespace: str = "kube-system"
+    dns_pod_labels: dict[str, str] = Field(default_factory=lambda: {"k8s-app": "kube-dns"})
+    # An in-cluster local model endpoint (a LiteLLM gateway behind a Service): its
+    # namespace, its pods' labels, and the pods' port (0: the endpoint URL's port). An
+    # empty namespace means the endpoint is outside the cluster and keeps its resolved
+    # address rule. Also seeds of `kubernetes.egress`.
+    local_endpoint_namespace: str = ""
+    local_endpoint_pod_labels: dict[str, str] = Field(default_factory=dict)
+    local_endpoint_port: int = 0
     # What a worker's egress rule excludes: the API server, the node network, other
     # namespaces' pod network, link-local, and the lab's private ranges (26).
     denied_cidrs: list[str] = Field(
@@ -177,6 +191,12 @@ class KubernetesSettings(BaseModel):
     credential_secrets: dict[str, str] = Field(default_factory=dict)
     extra_image_allowlist: list[str] = Field(default_factory=list)
     use_reference_cache: bool = True
+    # 26, issue 93: the canary is a shell script with curl, not a role pod, so it asks
+    # for a fixed small size instead of the policy's limits. `ge=1`: zero or negative
+    # renders a CPU limit of `0m`, which the API server refuses outright, and the
+    # namespace then reports not ready for a reason that is not about the namespace.
+    canary_cpu_millicores: int = Field(default=100, ge=1)
+    canary_memory: str = "64Mi"
 
 
 class CredentialSettings(BaseModel):

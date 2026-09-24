@@ -35,6 +35,7 @@ ADMIN_KINDS: frozenset[str] = frozenset(
         EventKind.BOOTSTRAP_IMPORT_COMMITTED.value,
         EventKind.POOL_EXHAUSTION_CLEARED.value,
         EventKind.LOCAL_ENDPOINT_UPDATED.value,
+        EventKind.KUBERNETES_EGRESS_UPDATED.value,
     }
 )
 

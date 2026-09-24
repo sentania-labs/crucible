@@ -54,6 +54,7 @@ from crucible.adapters.persistence.records import (
     HarnessStates,
     ImagePromotions,
     Policies,
+    ProviderSettings,
     ReviewReports,
     RoutingPolicies,
     Wakes,
@@ -112,6 +113,7 @@ from crucible.ports.repository import (
     PolicyRepository,
     PoolExhaustionRepository,
     PrincipalRepository,
+    ProviderSettingRepository,
     PullRequestHeadRepository,
     PullRequestRepository,
     ReactionRepository,
@@ -1327,6 +1329,7 @@ class SqlUnitOfWork:
     harnesses: HarnessStateRepository
     image_promotions: ImagePromotionRepository
     bootstrap_imports: BootstrapImportRepository
+    provider_settings: ProviderSettingRepository
 
     def __init__(self, session_factory: sessionmaker[Session]) -> None:
         self._factory = session_factory
@@ -1380,6 +1383,7 @@ class SqlUnitOfWork:
         self.harnesses = HarnessStates(s)
         self.image_promotions = ImagePromotions(s)
         self.bootstrap_imports = BootstrapImports(s)
+        self.provider_settings = ProviderSettings(s)
         return self
 
     def __exit__(

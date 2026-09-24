@@ -19,6 +19,12 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from crucible.domain.cluster_egress import (
+    DEFAULT_DNS_NAMESPACE,
+    DEFAULT_DNS_POD_LABELS,
+    label_problem,
+    namespace_problem,
+)
 from crucible.ports.execution import (
     IDENTITY_MOUNT,
     OUTPUT_MOUNT,
@@ -33,6 +39,9 @@ LABEL_TASK = "crucible.task"
 LABEL_OWNER = "crucible.owner"
 LABEL_ROLE = "crucible.role"
 LABEL_RETAIN = "crucible.retain"
+# The readiness canary's own id. Never `crucible.attempt`: the retention sweep deletes
+# whatever carries an attempt id Crucible does not track, which a canary always is.
+LABEL_CANARY = "crucible.canary"
 ANNOTATION_EGRESS = "crucible.io/egress-hosts"
 
 ROLE_WORKER = "worker"
@@ -74,6 +83,12 @@ DEFAULT_DENIED_CIDRS: tuple[str, ...] = (
     "100.64.0.0/10",
     "127.0.0.0/8",
 )
+
+
+# The label every namespace carries with its own name (Kubernetes 1.21 and later). A
+# selector names its namespace through it, because a namespaceSelector is the only way a
+# `networking.k8s.io/v1` peer can say "that namespace and no other".
+NAMESPACE_NAME_LABEL = "kubernetes.io/metadata.name"
 
 
 class SpecError(Exception):
@@ -131,18 +146,26 @@ def _bytes(value: Any, default: int) -> int:
 
 @dataclass(frozen=True, slots=True)
 class Limits:
-    """The effective resource limits of one attempt, recorded in its evidence (26)."""
+    """The effective resource limits of one attempt, recorded in its evidence (26).
+
+    `cpu_request_fraction` and `memory_request_fraction` (issue 93) are what a pod
+    requests as a fraction of what it limits, so a small cluster can schedule a
+    Burstable pod instead of a Guaranteed one that demands the whole limit up front."""
 
     cpus: float
     memory_bytes: int
     ephemeral_storage: str
     tmpfs_bytes: int
     grace_seconds: int
+    cpu_request_fraction: float = 1.0
+    memory_request_fraction: float = 1.0
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "cpu": self.cpu,
             "memory": self.memory,
+            "cpu_request": self.cpu_request,
+            "memory_request": self.memory_request,
             "ephemeral_storage": self.ephemeral_storage,
             "tmpfs": self.tmpfs,
             "termination_grace_seconds": self.grace_seconds,
@@ -155,6 +178,16 @@ class Limits:
     @property
     def memory(self) -> str:
         return f"{self.memory_bytes}"
+
+    @property
+    def cpu_request(self) -> str:
+        # At least 1m: a request of 0 is "unbounded" to the scheduler, which is not
+        # what a fraction close to zero means.
+        return f"{max(1, round(self.cpus * self.cpu_request_fraction * 1000))}m"
+
+    @property
+    def memory_request(self) -> str:
+        return f"{max(1, round(self.memory_bytes * self.memory_request_fraction))}"
 
     @property
     def tmpfs(self) -> str:
@@ -172,6 +205,24 @@ def limits_from_policy(
         ephemeral_storage=str(resources.get("ephemeral_storage") or default_ephemeral),
         tmpfs_bytes=_bytes(resources.get("tmpfs_per_mount"), default_tmpfs_mb * 1024**2),
         grace_seconds=grace,
+        cpu_request_fraction=float(resources.get("cpu_request_fraction") or 0.5),
+        memory_request_fraction=float(resources.get("memory_request_fraction") or 1.0),
+    )
+
+
+def canary_limits(*, cpu_millicores: int, memory: str) -> Limits:
+    """26's readiness canary (issue 93): a shell script with curl, not a role pod.
+
+    Fixed small ephemeral storage, tmpfs and grace period: the canary writes nothing of
+    size and is deleted as soon as its one-shot phase is terminal. Request equals limit
+    here, unlike a role pod's `Limits`, because the canary's limit is already the
+    smallest useful size; splitting it further buys nothing."""
+    return Limits(
+        cpus=cpu_millicores / 1000,
+        memory_bytes=_bytes(memory, 64 * 1024**2),
+        ephemeral_storage="128Mi",
+        tmpfs_bytes=16 * 1024**2,
+        grace_seconds=5,
     )
 
 
@@ -229,10 +280,17 @@ def pod_spec(request: PodRequest) -> dict[str, Any]:
                 "memory": request.limits.memory,
                 "ephemeral-storage": request.limits.ephemeral_storage,
             },
-            # Requests equal to limits: a worker that was promised the policy's memory
-            # gets Guaranteed QoS and is not the first thing evicted under node pressure,
-            # which would otherwise show up as a `lost` attempt nobody caused (16).
-            "requests": {"cpu": request.limits.cpu, "memory": request.limits.memory},
+            # The request is a fraction of the limit (issue 93), so a small cluster can
+            # schedule a Burstable pod instead of demanding the whole limit up front.
+            # Memory defaults its fraction to 1 (request equals limit), which keeps a
+            # worker promised the policy's memory from being the first thing evicted
+            # under node pressure, an eviction that would otherwise show up as a `lost`
+            # attempt nobody caused (16); CPU has no such eviction risk; a policy may
+            # still lower memory's fraction for a memory-constrained cluster.
+            "requests": {
+                "cpu": request.limits.cpu_request,
+                "memory": request.limits.memory_request,
+            },
         },
         "volumeMounts": [_mount(m) for m in request.mounts],
         "terminationMessagePolicy": "FallbackToLogsOnError",
@@ -408,6 +466,65 @@ def secret(
 
 
 @dataclass(frozen=True, slots=True)
+class PeerSelector:
+    """Pods in one namespace, named by their labels (26, crucible#91).
+
+    This is the form of a destination that survives a CNI which translates a service
+    address to its backend pods before it evaluates policy, which is what Cilium does
+    with kube-proxy replacement: an `ipBlock` on a ClusterIP or a LoadBalancer address
+    never matches there, and a selector on the backends always does. Calico and every
+    other conforming CNI match it too, so it is plain `networking.k8s.io/v1`.
+
+    A selector is always one namespace and at least one label. An empty pod selector
+    would be every pod in that namespace, which is not a destination anybody chose."""
+
+    namespace: str
+    pod_labels: tuple[tuple[str, str], ...]
+
+    @classmethod
+    def of(cls, namespace: str, pod_labels: Mapping[str, str]) -> PeerSelector:
+        return cls(namespace, tuple(sorted((str(k), str(v)) for k, v in pod_labels.items())))
+
+    def peer(self) -> dict[str, Any]:
+        return {
+            "namespaceSelector": {"matchLabels": {NAMESPACE_NAME_LABEL: self.namespace}},
+            "podSelector": {"matchLabels": dict(self.pod_labels)},
+        }
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"namespace": self.namespace, "pod_labels": dict(self.pod_labels)}
+
+
+def check_selector(
+    selector: PeerSelector, *, what: str, protected_namespaces: Sequence[str] = ()
+) -> PeerSelector:
+    """Refuse a selector that would open more than one set of pods in one namespace.
+
+    The protected namespaces are the workers namespace and Crucible's own: a selector
+    into the first is a worker reaching another attempt's pods, and into the second is a
+    worker reaching Crucible's database. Neither is ever the cluster resolver or a
+    model gateway, so neither is ever allowed."""
+    problem = namespace_problem(selector.namespace)
+    if problem is not None:
+        raise SpecError(f"the {what} namespace {problem}")
+    if selector.namespace in protected_namespaces:
+        raise SpecError(
+            f"the {what} selector names the {selector.namespace!r} namespace, which a worker "
+            "may never reach"
+        )
+    if not selector.pod_labels:
+        raise SpecError(
+            f"the {what} selector names no pod labels, which would allow every pod in "
+            f"{selector.namespace!r}"
+        )
+    for key, value in selector.pod_labels:
+        problem = label_problem(key, value)
+        if problem is not None:
+            raise SpecError(f"the {what} pod label {problem}")
+    return selector
+
+
+@dataclass(frozen=True, slots=True)
 class EgressPlan:
     """What one role may reach.
 
@@ -427,10 +544,15 @@ class EgressPlan:
     endpoints: tuple[str, ...] = ()
     https_port: int = 443
     broad: bool = False
+    # An in-cluster local endpoint, as its backend pods and their port (crucible#91).
+    # When it is set the provider has replaced `endpoints` with it: the service address
+    # a name resolves to is exactly what a translating CNI never matches.
+    endpoint_selector: PeerSelector | None = None
+    endpoint_ports: tuple[int, ...] = ()
 
     @property
     def empty(self) -> bool:
-        return not self.hosts and not self.endpoints
+        return not self.hosts and not self.endpoints and self.endpoint_selector is None
 
 
 def _endpoint_rule(endpoint: str) -> dict[str, Any]:
@@ -481,6 +603,8 @@ def egress_policy(
     plan: EgressPlan,
     dns_server: str,
     denied_cidrs: Sequence[str] = DEFAULT_DENIED_CIDRS,
+    dns_selector: PeerSelector | None = None,
+    pod_selector: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """One attempt's one role's egress, as the only thing that opens the default deny.
 
@@ -488,17 +612,27 @@ def egress_policy(
     adds and never subtracts: every destination not named here stays denied, and the
     ranges in `denied_cidrs` stay denied even though the broad rule is `0.0.0.0/0`,
     because they are its `except`. There is no ingress section at all: nothing ever
-    connects to a worker."""
+    connects to a worker.
+
+    Cluster DNS is allowed twice over, as the resolver's service address and as its
+    pods. A CNI that evaluates policy before it translates a service address matches
+    the first; one that translates first, as Cilium does with kube-proxy replacement,
+    matches only the second (crucible#91). Either way it is port 53 and nothing else."""
     rules: list[dict[str, Any]] = []
+    dns_peers: list[dict[str, Any]] = []
     if dns_server:
         try:
             resolver = ipaddress.ip_address(dns_server)
         except ValueError as exc:
             raise SpecError(f"the cluster DNS address {dns_server!r} is not an IP address") from exc
-        # 26: port 53 on that one address, both protocols, and nothing else on it.
+        dns_peers.append({"ipBlock": {"cidr": f"{resolver}/32"}})
+    if dns_selector is not None:
+        dns_peers.append(check_selector(dns_selector, what="cluster DNS").peer())
+    if dns_peers:
+        # 26: port 53, both protocols, and nothing else on the resolver.
         rules.append(
             {
-                "to": [{"ipBlock": {"cidr": f"{resolver}/32"}}],
+                "to": dns_peers,
                 "ports": [
                     {"protocol": "UDP", "port": 53},
                     {"protocol": "TCP", "port": 53},
@@ -523,6 +657,17 @@ def egress_policy(
                 }
             )
     rules.extend(_endpoint_rule(endpoint) for endpoint in plan.endpoints)
+    if plan.endpoint_selector is not None:
+        if not plan.endpoint_ports or any(not 0 < p < 65536 for p in plan.endpoint_ports):
+            raise SpecError(
+                f"the in-cluster local endpoint needs a TCP port, not {plan.endpoint_ports!r}"
+            )
+        rules.append(
+            {
+                "to": [check_selector(plan.endpoint_selector, what="local endpoint").peer()],
+                "ports": [{"protocol": "TCP", "port": p} for p in plan.endpoint_ports],
+            }
+        )
     return {
         "apiVersion": "networking.k8s.io/v1",
         "kind": "NetworkPolicy",
@@ -533,7 +678,11 @@ def egress_policy(
             "annotations": {ANNOTATION_EGRESS: ",".join(plan.hosts)},
         },
         "spec": {
-            "podSelector": {"matchLabels": {LABEL_ATTEMPT: attempt_id, LABEL_ROLE: role}},
+            "podSelector": {
+                "matchLabels": dict(pod_selector)
+                if pod_selector is not None
+                else {LABEL_ATTEMPT: attempt_id, LABEL_ROLE: role}
+            },
             "policyTypes": ["Egress"],
             "egress": rules,
         },
@@ -548,12 +697,16 @@ __all__ = [
     "CREDENTIAL_LEAF",
     "CREDENTIAL_SOURCE_MOUNT",
     "DEFAULT_DENIED_CIDRS",
+    "DEFAULT_DNS_NAMESPACE",
+    "DEFAULT_DNS_POD_LABELS",
     "IDENTITY_MOUNT",
     "LABEL_ATTEMPT",
+    "LABEL_CANARY",
     "LABEL_OWNER",
     "LABEL_RETAIN",
     "LABEL_ROLE",
     "LABEL_TASK",
+    "NAMESPACE_NAME_LABEL",
     "OUTPUT_MOUNT",
     "REPORT_MOUNT",
     "REPO_MOUNT",
@@ -574,11 +727,14 @@ __all__ = [
     "EgressPlan",
     "Limits",
     "Mount",
+    "PeerSelector",
     "PodRequest",
     "SpecError",
     "bare_pod",
     "base_mounts",
     "base_volumes",
+    "canary_limits",
+    "check_selector",
     "config_map",
     "denied_by",
     "egress_policy",

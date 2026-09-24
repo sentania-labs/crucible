@@ -2,14 +2,27 @@
 # REPLACE: REPLACE_ME_STORAGE_CLASS_RWO    the class for each attempt workspace (26)
 # REPLACE: REPLACE_ME_IMAGE_PULL_SECRET    the private-registry pull Secret, or blank it
 # REPLACE: REPLACE_ME_RENDER_TIMEZONE       the operator's zone, an IANA name (01)
-# REPLACE: REPLACE_ME_LOCAL_ENDPOINT_CIDRS  the resolved address of the local endpoint
-#                                            host, as a /32, reviewed when the gateway moves
+# REPLACE: REPLACE_ME_LOCAL_ENDPOINT_NAMESPACE  the namespace of the pods that take the
+#                                            local endpoint's connections (crucible#91)
+# REPLACE: REPLACE_ME_LOCAL_ENDPOINT_LABEL  those pods' label, key and value; see
+#                                            `kubectl -n <namespace> get pods --show-labels`
+# REPLACE: REPLACE_ME_LOCAL_ENDPOINT_PORT   those pods' port: the Service's targetPort
 # OPTIONAL: REPLACE_ME_PROBE_IMAGE          example: ghcr.io/sentania-labs/crucible-worker:latest (26)
 #                                            the deployer pins <version>@<digest> from the release body
 #
 # 26 checklist item 2 and the DNS denial: the provider allows port 53 on this one address
-# and denies everything else inside the cluster. A wrong address is a worker with no name
-# resolution; it is never a worker with more reach.
+# and on the kube-dns pods (the base's selector), and denies everything else inside the
+# cluster. A wrong address is a worker with no name resolution; it is never a worker with
+# more reach.
+#
+# The lab cluster is k3s on Cilium with kube-proxy replacement, and its LiteLLM gateway
+# runs in the cluster. Cilium translates a service or LoadBalancer address to the backend
+# pods before it evaluates policy, so an address rule never matches there (crucible#91):
+# the gateway is allowed by its pods' selector instead, and LOCAL_ENDPOINT_CIDRS stays
+# empty. The pods to name are the ones the endpoint URL's connection lands on: LiteLLM's
+# own when the URL is its Service, the ingress controller's when the URL goes through an
+# ingress. The readiness canary connects to the endpoint under this rule and reports the
+# namespace not ready when it cannot.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -20,6 +33,9 @@ data:
   CRUCIBLE_SERVICE__RENDER_TIMEZONE: REPLACE_ME_RENDER_TIMEZONE
   CRUCIBLE_KUBERNETES__STORAGE_CLASS: REPLACE_ME_STORAGE_CLASS_RWO
   CRUCIBLE_KUBERNETES__IMAGE_PULL_SECRET: REPLACE_ME_IMAGE_PULL_SECRET
-  CRUCIBLE_KUBERNETES__LOCAL_ENDPOINT_CIDRS: '["REPLACE_ME_LOCAL_ENDPOINT_CIDRS"]'
+  CRUCIBLE_KUBERNETES__LOCAL_ENDPOINT_CIDRS: "[]"
+  CRUCIBLE_KUBERNETES__LOCAL_ENDPOINT_NAMESPACE: REPLACE_ME_LOCAL_ENDPOINT_NAMESPACE
+  CRUCIBLE_KUBERNETES__LOCAL_ENDPOINT_POD_LABELS: '{"REPLACE_ME_LOCAL_ENDPOINT_LABEL_KEY":"REPLACE_ME_LOCAL_ENDPOINT_LABEL_VALUE"}'
+  CRUCIBLE_KUBERNETES__LOCAL_ENDPOINT_PORT: REPLACE_ME_LOCAL_ENDPOINT_PORT
   # Leave blank unless the operator has a pullable exact worker-image reference.
   CRUCIBLE_KUBERNETES__PROBE_IMAGE: ""

@@ -19,6 +19,7 @@ that skip into a failure so CI can never lose the assertions quietly.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -485,7 +486,9 @@ LAB_STARTUP_PLACEHOLDER_KEYS = frozenset(
         "CRUCIBLE_KUBERNETES__STORAGE_CLASS",
         "CRUCIBLE_KUBERNETES__IMAGE_PULL_SECRET",
         "CRUCIBLE_SERVICE__RENDER_TIMEZONE",
-        "CRUCIBLE_KUBERNETES__LOCAL_ENDPOINT_CIDRS",
+        "CRUCIBLE_KUBERNETES__LOCAL_ENDPOINT_NAMESPACE",
+        "CRUCIBLE_KUBERNETES__LOCAL_ENDPOINT_POD_LABELS",
+        "CRUCIBLE_KUBERNETES__LOCAL_ENDPOINT_PORT",
     }
 )
 
@@ -507,6 +510,30 @@ def test_the_base_config_carries_no_lab_local_endpoint_address(
     for target in ("base", "overlays/kind"):
         settings = _named(rendered[target], "ConfigMap", "crucible-settings")["data"]
         assert settings["CRUCIBLE_KUBERNETES__LOCAL_ENDPOINT_CIDRS"] == "[]", target
+        assert settings["CRUCIBLE_KUBERNETES__LOCAL_ENDPOINT_NAMESPACE"] == "", target
+
+
+def test_every_config_allows_dns_by_the_resolvers_pods(
+    rendered: dict[str, list[dict[str, Any]]],
+) -> None:
+    """crucible#91: the kube-dns selector is in every rendered config, so a cluster whose
+    CNI translates the DNS service address first still resolves names."""
+    for target in ("base", "overlays/lab", "overlays/kind"):
+        settings = _named(rendered[target], "ConfigMap", "crucible-settings")["data"]
+        assert settings["CRUCIBLE_KUBERNETES__DNS_NAMESPACE"] == "kube-system", target
+        assert json.loads(settings["CRUCIBLE_KUBERNETES__DNS_POD_LABELS"]) == {
+            "k8s-app": "kube-dns"
+        }, target
+
+
+def test_the_lab_overlay_allows_its_in_cluster_gateway_by_selector(
+    rendered: dict[str, list[dict[str, Any]]],
+) -> None:
+    """The lab runs Cilium with kube-proxy replacement and an in-cluster LiteLLM: the
+    gateway is a selector the deployer fills in, and no address rule is left to rot."""
+    settings = _named(rendered["overlays/lab"], "ConfigMap", "crucible-settings")["data"]
+    assert settings["CRUCIBLE_KUBERNETES__LOCAL_ENDPOINT_CIDRS"] == "[]"
+    assert settings["CRUCIBLE_KUBERNETES__LOCAL_ENDPOINT_NAMESPACE"].startswith("REPLACE_ME_")
 
 
 def test_the_kubernetes_provider_is_on_and_docker_is_off(
