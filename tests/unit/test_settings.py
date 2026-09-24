@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from crucible.cli.wiring import kubernetes_config
 from crucible.settings import Settings, load_settings
@@ -106,3 +107,17 @@ def test_without_a_probe_image_the_field_is_empty() -> None:
     config = kubernetes_config(settings)
     assert config.image_repositories == ("registry.example/w",)
     assert config.probe_image == ""
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_a_non_positive_pod_pid_limit_override_is_refused(value: int) -> None:
+    """-1 is the kubelet's own "PID limiting disabled"; copying it from a node config
+    here would make the readiness gate pass with no pod-level limit in force (95's
+    Codex correction)."""
+    with pytest.raises(ValidationError, match="positive integer"):
+        Settings(kubernetes={"pod_pid_limit_override": value})
+
+
+def test_a_positive_pod_pid_limit_override_is_accepted() -> None:
+    settings = Settings(kubernetes={"pod_pid_limit_override": 512})
+    assert settings.kubernetes.pod_pid_limit_override == 512

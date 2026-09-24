@@ -106,11 +106,14 @@ async def test_the_probe_passes_when_the_canary_cannot_reach_the_api_server() ->
     _api, _registry, provider = build()
     await provider.prepare(spec())
     probe = await provider.ensure_ready()
-    assert probe == NamespaceProbe(True, True, 4096, "namespace ready")
+    assert probe == NamespaceProbe(
+        True, True, 4096, "namespace ready", pid_limit_source="cgroup-v2-parent"
+    )
     health = await provider.health()
     assert health.state == "ok"
     assert health.checks["egress_enforced"] is True
     assert health.checks["pod_pid_limit"] == 4096
+    assert health.checks["pod_pid_limit_source"] == "cgroup-v2-parent"
     assert health.checks["runtime_class"] == "standard"
 
 
@@ -160,7 +163,112 @@ async def test_a_node_with_no_pod_pid_limit_refuses_every_launch() -> None:
     _api, _registry, provider, launch, workspace = await prepared(build={"pod_pid_limit": None})
     probe = await provider.ensure_ready()
     assert probe.passed is False and probe.pid_limit is None
-    assert "pod PID limit" in probe.detail
+    assert "podPidsLimit is not set" in probe.detail
+    assert probe.pid_limit_source == "cgroup-v2-parent"
+    with pytest.raises(LaunchRefusedError, match="not ready"):
+        await provider.launch(workspace, launch)
+
+
+async def test_a_private_cgroup_namespace_reports_inconclusive_not_a_pass() -> None:
+    """The container's own cgroup limit (95's bug) must never stand in for the pod-level
+    one: when the runtime hides the parent cgroup, the gate says so and still refuses,
+    even though a container-scope number is sitting right there in `pids.max`."""
+    _api, _registry, provider, launch, workspace = await prepared(
+        build={"pod_pid_limit_source": "cgroupns-private"}
+    )
+    probe = await provider.ensure_ready()
+    assert probe.passed is False
+    assert probe.pid_limit is None
+    assert probe.pid_limit_source == "cgroupns-private"
+    assert "cgroup namespace isolation" in probe.detail
+    with pytest.raises(LaunchRefusedError, match="not ready"):
+        await provider.launch(workspace, launch)
+
+
+async def test_an_operator_declared_limit_covers_a_private_cgroup_namespace() -> None:
+    """95's follow-up: a cluster whose runtime hides the pod cgroup (the common case)
+    would otherwise never launch anything. lab-admin's explicit, out-of-band
+    attestation is the one way past that, and it is clearly not the same thing as the
+    canary confirming the number itself."""
+    config = KubernetesConfig(
+        poll_interval_seconds=0,
+        launch_timeout_seconds=5,
+        storage_class="lab-ssd",
+        image_pull_secret="ghcr-pull",
+        pod_pid_limit_override=512,
+    )
+    _api, _registry, provider, launch, workspace = await prepared(
+        build={"config": config, "pod_pid_limit_source": "cgroupns-private"}
+    )
+    probe = await provider.ensure_ready()
+    assert probe.passed is True
+    assert probe.pid_limit == 512
+    assert probe.pid_limit_source == "operator-declared"
+    await provider.launch(workspace, launch)
+
+
+async def test_an_operator_declared_limit_never_overrides_a_confirmed_absence() -> None:
+    """The override fills a gap the canary could not see into; it never contradicts an
+    answer the canary actually read, since that answer is more current than a
+    declaration lab-admin made once at deploy time."""
+    config = KubernetesConfig(
+        poll_interval_seconds=0,
+        launch_timeout_seconds=5,
+        storage_class="lab-ssd",
+        image_pull_secret="ghcr-pull",
+        pod_pid_limit_override=512,
+    )
+    _api, _registry, provider, launch, workspace = await prepared(
+        build={"config": config, "pod_pid_limit": None}
+    )
+    probe = await provider.ensure_ready()
+    assert probe.passed is False
+    assert probe.pid_limit is None
+    assert probe.pid_limit_source == "cgroup-v2-parent"
+    with pytest.raises(LaunchRefusedError, match="not ready"):
+        await provider.launch(workspace, launch)
+
+
+async def test_a_zero_pod_pid_limit_from_the_canary_is_not_a_limit() -> None:
+    """0 is not a value `podPidsLimit` takes; a canary reporting it must not be read as
+    a confirmed limit (95's Codex correction)."""
+    _api, _registry, provider, launch, workspace = await prepared(build={"pod_pid_limit": 0})
+    probe = await provider.ensure_ready()
+    assert probe.passed is False and probe.pid_limit is None
+    assert "podPidsLimit is not set" in probe.detail
+    with pytest.raises(LaunchRefusedError, match="not ready"):
+        await provider.launch(workspace, launch)
+
+
+async def test_a_non_positive_override_never_passes_the_gate() -> None:
+    """The settings model refuses a non-positive override before it reaches here
+    (95's Codex correction), but the gate itself never trusts one either: defense in
+    depth for any caller that builds `KubernetesConfig` directly."""
+    config = KubernetesConfig(
+        poll_interval_seconds=0,
+        launch_timeout_seconds=5,
+        storage_class="lab-ssd",
+        image_pull_secret="ghcr-pull",
+        pod_pid_limit_override=-1,
+    )
+    _api, _registry, provider, launch, workspace = await prepared(
+        build={"config": config, "pod_pid_limit_source": "cgroupns-private"}
+    )
+    probe = await provider.ensure_ready()
+    assert probe.passed is False and probe.pid_limit is None
+    with pytest.raises(LaunchRefusedError, match="not ready"):
+        await provider.launch(workspace, launch)
+
+
+async def test_cgroup_v1_pod_pid_limit_is_unsupported_not_a_pass() -> None:
+    _api, _registry, provider, launch, workspace = await prepared(
+        build={"pod_pid_limit_source": "cgroup-v1"}
+    )
+    probe = await provider.ensure_ready()
+    assert probe.passed is False
+    assert probe.pid_limit is None
+    assert probe.pid_limit_source == "cgroup-v1"
+    assert "unsupported" in probe.detail
     with pytest.raises(LaunchRefusedError, match="not ready"):
         await provider.launch(workspace, launch)
 
