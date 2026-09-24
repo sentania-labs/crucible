@@ -12,6 +12,8 @@
 set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+# shellcheck source=tools/kind/cluster.sh
+. "$root/tools/kind/cluster.sh"
 run_id=${CRUCIBLE_KIND_RUN_ID:-$(date +%s)-$$}
 cluster="crucible-req-${run_id}"
 namespace="crucible-verify"
@@ -29,12 +31,15 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
+crucible_kind_docker_shim "$scratch"
+
 echo "verify: creating kind cluster $cluster"
 kind create cluster --name "$cluster" --wait 0s
 cluster_created=1
 kubectl wait --for=condition=Ready nodes --all --timeout=180s
 
-echo "verify: pulling busybox into the cluster so scheduling is the only thing tested"
+echo "verify: pulling busybox into the daemon, then loading it into the cluster so scheduling is the only thing tested"
+docker pull busybox:1.36 >/dev/null
 kind load docker-image busybox:1.36 --name "$cluster"
 
 kubectl create namespace "$namespace"
