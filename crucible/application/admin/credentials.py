@@ -211,6 +211,11 @@ def state_view(ctx: AdminContext, uow: UnitOfWork, harness: str) -> dict[str, An
         view = _secret_state(store, spec, ctx.credential_sources.get(harness), state, harness)
     else:
         view = credential_state(spec, ctx.credential_sources.get(harness), state).as_dict()
+    if harness == HERMES:
+        # The key is never echoed; whether one is set is all any surface says (12).
+        view["key_set"] = any(
+            f.get("present") and int(f.get("size") or 0) > 1 for f in view.get("files") or []
+        )
     view.update(
         {
             "session_compatibility": state.session_compatibility if state else "unverified",
@@ -262,9 +267,6 @@ def _secret_state(
         "exists": body is not None,
         "service_owned": labels.get("app.kubernetes.io/managed-by") == "crucible",
     }
-    if harness == HERMES:
-        # The key is never echoed; whether one is set is all any surface says (12).
-        view["key_set"] = bool(files and files.get("api-key", b"").strip())
     return view
 
 

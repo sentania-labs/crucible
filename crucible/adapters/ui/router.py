@@ -700,8 +700,9 @@ async def credentials_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
             {
                 "title": "Set Hermes API key",
                 "note": (
-                    "The value is written mode 0600, then discarded from the request. "
-                    "It is never displayed or included in audit details."
+                    "The value is written to the Hermes credential (a file mode 0600, or "
+                    "on Kubernetes the Secret Crucible owns), then discarded from the "
+                    "request. It is never displayed or included in audit details."
                 ),
                 "form": {
                     "action": "/ui/actions/credential-set",
@@ -852,8 +853,18 @@ def routing_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
     exhaustion = routing.list_exhaustions(ctx.admin, uow)
     local = routing.local_endpoint_view(uow)
     egress = kubernetes_admin.egress_view(ctx.admin, uow)
+    hermes: dict[str, Any] = {}
+    if "hermes" in ctx.admin.harnesses.names():
+        view = credentials.state_view(ctx.admin, uow, "hermes")
+        # Whether a key is set and where it is kept; the key itself is never shown (12).
+        hermes = {
+            "key_set": view.get("key_set", False),
+            "state": view.get("state"),
+            "stored_in": view.get("source") or "the configured credential directory",
+        }
     sections: list[dict[str, Any]] = [
         _document_section("Local endpoint", local),
+        *([_document_section("Hermes API key", hermes)] if hermes else []),
         _document_section("Kubernetes egress selectors", egress),
         _document_section("Active policy", policy.document if policy else {}),
         _document_section("Routing policy", routing_record.document if routing_record else {}),
@@ -904,6 +915,31 @@ def routing_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                                 "label": "Pool max concurrency",
                                 "kind": "number",
                                 "value": local["pool"].get("max_concurrency", 1),
+                                "required": True,
+                            },
+                            {"name": "reason", "label": "Reason", "required": True},
+                        ],
+                    },
+                }
+            )
+        if hermes:
+            sections.append(
+                {
+                    "title": "Set Hermes API key",
+                    "note": (
+                        "The LiteLLM virtual key Hermes sends to the local endpoint. It is "
+                        "written to the Hermes credential (a file mode 0600, or on Kubernetes "
+                        "the Secret Crucible owns), then probed, and never displayed or "
+                        "included in audit details."
+                    ),
+                    "form": {
+                        "action": "/ui/actions/credential-set",
+                        "label": "Set and probe",
+                        "fields": [
+                            {
+                                "name": "api_key",
+                                "label": "LiteLLM virtual key",
+                                "kind": "password",
                                 "required": True,
                             },
                             {"name": "reason", "label": "Reason", "required": True},
