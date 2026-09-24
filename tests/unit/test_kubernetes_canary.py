@@ -362,3 +362,20 @@ def test_the_worker_rules_canary_must_also_find_the_api_server_unreachable() -> 
     probe = _read_probe(namespace, rules)
     assert probe.passed is False and probe.egress_enforced is False
     assert "under the worker egress rules" in probe.detail
+
+
+async def test_a_canary_is_small_so_it_never_holds_the_workers_quota() -> None:
+    """Two canaries at a worker's size (2 CPU, 4 GiB each) filled the kind tier's 8 GiB
+    quota until the quota controller caught up, and the worker Pod after them waited."""
+    api, _provider, probe = await ready()
+    assert probe.passed
+    canaries = [
+        row["body"]
+        for row in api.created
+        if row["kind"] == "pods" and row["name"].startswith("crucible-canary-")
+    ]
+    assert len(canaries) == 2
+    for pod in canaries:
+        resources = pod["spec"]["containers"][0]["resources"]
+        assert resources["requests"] == {"cpu": "250m", "memory": str(128 * 1024**2)}
+        assert resources["limits"]["cpu"] == "250m"

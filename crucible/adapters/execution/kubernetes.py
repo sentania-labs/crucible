@@ -129,6 +129,18 @@ PROVIDER_NAME = "kubernetes"
 # A name to the addresses a NetworkPolicy may name.
 Resolver = Callable[[str], list[str]]
 
+# What a canary Pod asks for. It runs a shell, curl and getent for a few seconds, and it
+# counts against the workers namespace's ResourceQuota like any Pod: at a worker's size,
+# two canaries whose usage the quota controller has not yet released can hold the
+# quota full for a moment and delay the worker Pod that follows them.
+CANARY_LIMITS = k8sspec.Limits(
+    cpus=0.25,
+    memory_bytes=128 * 1024**2,
+    ephemeral_storage="64Mi",
+    tmpfs_bytes=16 * 1024**2,
+    grace_seconds=5,
+)
+
 # What the canary resolves to prove cluster DNS works: a name every cluster serves, looked
 # up through the pod's search path so the cluster domain need not be known here.
 CANARY_DNS_NAME = "kubernetes.default.svc"
@@ -601,7 +613,7 @@ class KubernetesProvider:
                     k8sspec.LABEL_ROLE: k8sspec.ROLE_CANARY,
                 },
             )
-        limits = k8sspec.limits_from_policy({})
+        limits = CANARY_LIMITS
         pod = k8sspec.bare_pod(
             name=name,
             namespace=self.config.namespace,
