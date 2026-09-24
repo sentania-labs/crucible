@@ -498,6 +498,36 @@ def test_the_lock_is_released_however_the_login_ends(
     assert not [n for n in k8s_api.object_names("jobs") if n.startswith("login-")]
 
 
+def test_a_cancelled_login_reads_failed_only_once_its_lock_is_gone(
+    admin: TestClient,
+    k8s_api: FakeKubernetesApi,
+    k8s_provider: KubernetesProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The operator who retries the moment a cancel reads `failed` is not refused by
+    the cancelled login's own lock. A slow release widens the window that once let the
+    session read `failed` while the lock ConfigMap still stood."""
+    release = k8s_provider.release_login_lock
+
+    def slow_release(lock: Any) -> None:
+        time.sleep(0.5)
+        release(lock)
+
+    monkeypatch.setattr(k8s_provider, "release_login_lock", slow_release)
+    k8s_api.login = FakeLogin(never_exits=True)
+    started = admin.post("/v1/admin/credentials/codex/login", json={"reason": "onboarding"})
+    assert started.status_code == 200, started.text
+    poll(admin, "codex", "waiting_for_operator")
+    admin.post("/v1/admin/credentials/codex/login/cancel", json={"reason": "stop"})
+    assert poll(admin, "codex", "finished", "failed")["error"] == "login cancelled"
+    assert lock_names(k8s_api) == []
+    again = admin.post("/v1/admin/credentials/codex/login", json={"reason": "retry"})
+    assert again.status_code == 200, again.text
+    admin.post("/v1/admin/credentials/codex/login/cancel", json={"reason": "stop"})
+    poll(admin, "codex", "failed")
+    assert lock_names(k8s_api) == []
+
+
 def test_a_login_that_lost_its_lock_does_not_store(
     admin_ctx: AdminContext, k8s_api: FakeKubernetesApi, k8s_provider: KubernetesProvider
 ) -> None:
