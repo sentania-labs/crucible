@@ -2745,21 +2745,21 @@ def _read_probe(output: str, rules_output: str | None = None) -> NamespaceProbe:
     elif dns != "resolved":
         problems.append(
             "DNS check inconclusive: the canary image has no getent or nslookup "
-            f"(tool {fields.get('dns_tool', 'unknown')})"
+            f"(tool {rules.get('dns_tool', 'unknown')})"
         )
     if endpoint in ("unreachable", "unresolved"):
         problems.append(
             "local endpoint check failed: the canary could not "
             + ("resolve" if endpoint == "unresolved" else "connect to")
             + " the configured local endpoint under the worker egress rules "
-            f"(curl exit {fields.get('endpoint_curl_exit', 'none')}; check "
+            f"(curl exit {rules.get('endpoint_curl_exit', 'none')}; check "
             "kubernetes.egress local_endpoint)"
         )
     elif endpoint not in ("reachable", "none"):
         problems.append(
             "local endpoint check inconclusive: the canary could not tell whether it "
-            f"connected (tool {fields.get('tool', 'unknown')}, curl exit "
-            f"{fields.get('endpoint_curl_exit', 'none')})"
+            f"connected (tool {rules.get('tool', 'unknown')}, curl exit "
+            f"{rules.get('endpoint_curl_exit', 'none')})"
         )
     if pid_limit is None:
         problems.append("the node has no pod PID limit configured")

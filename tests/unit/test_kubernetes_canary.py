@@ -379,3 +379,17 @@ async def test_a_canary_is_small_so_it_never_holds_the_workers_quota() -> None:
         resources = pod["spec"]["containers"][0]["resources"]
         assert resources["requests"] == {"cpu": "250m", "memory": str(128 * 1024**2)}
         assert resources["limits"]["cpu"] == "250m"
+
+
+def test_the_failure_detail_quotes_the_worker_rules_canarys_own_curl_exit() -> None:
+    namespace = (
+        "crucible-canary.api=unreachable\ncrucible-canary.pids=4096\ncrucible-canary.done=1\n"
+    )
+    rules = (
+        "crucible-canary.api=unreachable\ncrucible-canary.dns=resolved\n"
+        "crucible-canary.endpoint=unreachable\ncrucible-canary.endpoint_curl_exit=28\n"
+        "crucible-canary.done=1\n"
+    )
+    probe = _read_probe(namespace, rules)
+    assert probe.passed is False
+    assert "curl exit 28" in probe.detail
