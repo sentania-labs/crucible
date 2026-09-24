@@ -37,6 +37,7 @@ from crucible.application.errors import ApplicationError
 from crucible.application.evidence import record_collection_evidence, store_artifact
 from crucible.application.gates import evaluate_and_advance, gate_input
 from crucible.application.harnesses import (
+    CREDENTIAL_HOLDING_STATES,
     HarnessRegistry,
     effective_mount_mode,
     ingest_progress,
@@ -263,6 +264,8 @@ class Supervisor:
         self.fenced_token: int | None = None
         self._handles: dict[str, Handle] = {}
         self._workspaces: dict[str, Workspace] = {}
+        # The harnesses a login is running for, read once per launch pass (12, 25).
+        self._logins_now: frozenset[str] = frozenset()
         self._workspace_fingerprints: dict[str, tuple[int, int, int]] = {}
         # The delivery half (23). With no GitHub client configured it is inert, which is
         # what every tier below the live one runs with.
@@ -965,7 +968,10 @@ class Supervisor:
 
     async def _launch_pending(self) -> int:
         launched = 0
-        for item in await self._db(self._list_pending):
+        pending = await self._db(self._list_pending)
+        if pending:
+            self._logins_now = await self._logins_in_progress()
+        for item in pending:
             with log_context(
                 task_id=item.task.id, execution_id=item.execution.id, attempt_id=item.attempt.id
             ):
@@ -1118,6 +1124,23 @@ class Supervisor:
             return exc.reason
         return None
 
+    async def _logins_in_progress(self) -> frozenset[str]:
+        """The harnesses a login is running for, on any provider that can say (12, 25).
+        A login is about to replace the credential, so a launch of that harness waits
+        for it the way it waits for the per-harness cap. A listing that fails holds
+        nothing back here; the provider refuses the seeding itself if a login is
+        running when it gets there."""
+        running: set[str] = set()
+        for provider in self._providers.values():
+            listing = getattr(provider, "logins_in_progress", None)
+            if not callable(listing):
+                continue
+            try:
+                running.update(await listing())
+            except ProviderError as exc:
+                log.warning("the running logins could not be listed: %s", exc)
+        return frozenset(running)
+
     def _harness_busy(self, execution: Execution) -> str | None:
         """05b: per-harness concurrency, which is 1 whenever the credential mounts
         rw-narrow (12). A launch over the limit waits; it is not a failure."""
@@ -1125,6 +1148,11 @@ class Supervisor:
             return self._harness_busy_in_uow(uow, execution)
 
     def _harness_busy_in_uow(self, uow: UnitOfWork, execution: Execution) -> str | None:
+        if execution.harness in self._logins_now:
+            return (
+                f"a login for {execution.harness} is running and will replace its "
+                "credential; the launch waits for it"
+            )
         policy = execution.policy_snapshot or {}
         routing = load_routing(uow, policy)
         selected = routing.model(execution.model) if routing is not None else None
@@ -1140,15 +1168,7 @@ class Supervisor:
         # An attempt holds its credential copy until collect has synced it back and
         # removed it, which is after `exited`: a second seeding before that is the
         # refresh race 12 gives as the reason for the cap.
-        live = uow.attempts.list_in_states(
-            [
-                AttemptState.PREPARING,
-                AttemptState.LAUNCHING,
-                AttemptState.RUNNING,
-                AttemptState.TERMINATING,
-                AttemptState.EXITED,
-            ]
-        )
+        live = uow.attempts.list_in_states(list(CREDENTIAL_HOLDING_STATES))
         running = 0
         for other in live:
             other_execution = uow.executions.get(other.execution_id)

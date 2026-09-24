@@ -131,6 +131,8 @@ LABEL_ATTEMPT = "crucible.attempt"
 LABEL_TASK = "crucible.task"
 LABEL_OWNER = "crucible.owner"
 LABEL_ROLE = "crucible.role"
+# Which harness a login container signs in, so another process can see the login (12).
+LABEL_HARNESS = "crucible.harness"
 ROLE_WORKER = "worker"
 ROLE_PREPARER = "preparer"
 ROLE_CLEANER = "cleaner"
@@ -1295,6 +1297,24 @@ class DockerProvider:
             timeout=120,
         )
 
+    async def logins_in_progress(self) -> frozenset[str]:
+        """The harnesses whose login container is running (12, 25). The login writes
+        into the credential directory as it runs, so a launch that seeded from it now
+        would copy a half-written session; the supervisor holds such a launch back."""
+        try:
+            rows = await self._call(
+                self.client.list_containers,
+                all_states=False,
+                filters={"label": [f"{LABEL_ROLE}={ROLE_LOGIN}"]},
+            )
+        except DockerApiError as exc:
+            raise ProviderError(f"the login containers could not be listed: {exc}") from exc
+        return frozenset(
+            str((row.get("Labels") or {}).get(LABEL_HARNESS, ""))
+            for row in rows
+            if (row.get("Labels") or {}).get(LABEL_HARNESS)
+        )
+
     async def _containers_for(self, attempt_id: str) -> list[dict[str, Any]]:
         try:
             return await self._call(  # type: ignore[no-any-return]
@@ -1609,7 +1629,7 @@ class DockerProvider:
             "User": "1000:1000",
             "WorkingDir": "/tmp",
             "Env": [f"{key}={value}" for key, value in sorted(env.items())],
-            "Labels": self._labels(spec, ROLE_LOGIN),
+            "Labels": {**self._labels(spec, ROLE_LOGIN), LABEL_HARNESS: flow.harness},
             "Tty": True,
             "OpenStdin": True,
             "AttachStdin": True,

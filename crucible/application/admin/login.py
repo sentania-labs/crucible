@@ -7,6 +7,12 @@ displaying it. The operator's daily-use directories are never read, copied or
 referenced: the login's home or config variable is the dedicated directory and nothing
 else (12). The timing constraints are stated up front: Codex's device code expires in
 15 minutes; AGY waits 60 seconds for the pasted code (S1b).
+
+On Kubernetes the login is a Job in the workers namespace (26) and the credential is the
+harness Secret the service owns (ADR 0015): nothing is written until the CLI has exited
+and the files it wrote pass the shape check, and then the Secret is replaced whole. A
+login and an attempt of the same harness never overlap (12): a login refuses while an
+attempt holds the credential, and a launch waits while a login runs.
 """
 
 from __future__ import annotations
@@ -20,8 +26,9 @@ import shutil
 import subprocess
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -36,10 +43,14 @@ from crucible.application.admin.credentials import (
     RETIRED_MARK,
     CredentialAdminError,
     check_shape,
+    check_shape_files,
+    secret_store,
     source_for,
     spec_for,
+    stored_files,
 )
 from crucible.application.errors import ConflictError
+from crucible.application.harnesses import credential_holders
 from crucible.domain.events import EventKind
 from crucible.domain.secrets import redact
 from crucible.ports.harness import AGY_BINARY, CLAUDE_CODE_BINARY, CODEX_BINARY
@@ -140,6 +151,9 @@ class LoginSession:
     lines: list[str] = field(default_factory=list)
     exit_code: int | None = None
     token_written: bool = False
+    # Whether the login's auth files were stored in the harness Secret (Kubernetes, ADR
+    # 0015). None where the CLI writes straight into the credential directory.
+    credential_written: bool | None = None
     error: str | None = None
     cancel_requested: bool = False
     _code_from_operator: str | None = None
@@ -155,6 +169,7 @@ class LoginSession:
             "output_tail": self.lines[-20:],
             "exit_code": self.exit_code,
             "token_written": self.token_written,
+            "credential_written": self.credential_written,
             "error": self.error,
             "cancel_requested": self.cancel_requested,
         }
@@ -324,6 +339,12 @@ def _write_token(path: Path, value: str) -> None:
 # ----- the service ------------------------------------------------------------
 
 
+def flows_for(ctx: AdminContext) -> dict[str, LoginFlow]:
+    """The login flows this deployment knows: the three harnesses', plus any a test
+    registers for a stand-in harness."""
+    return {**FLOWS, **ctx.login_flows}
+
+
 class LoginRegistry:
     """The in-progress logins of this process, one per harness (25: the API form
     returns the URL and polls for completion)."""
@@ -344,8 +365,8 @@ class LoginRegistry:
         existing = self._sessions.get(harness)
         if existing is not None and existing.state not in ("finished", "failed"):
             raise ConflictError(f"a login for {harness} is already in progress")
-        flow = FLOWS[harness]
-        runner = self.container_runner(ctx)
+        flow = flows_for(ctx)[harness]
+        runner = self.container_runner(ctx) or self.job_runner(ctx)
         # An operator-configured command is used as given, in either mode.
         argv = tuple(ctx.login_commands.get(harness) or ())
         if not argv:
@@ -372,6 +393,15 @@ class LoginRegistry:
             None,
         )
 
+    @staticmethod
+    def job_runner(ctx: AdminContext) -> Any | None:
+        """The provider that runs a login as a Job and stores it in a Secret (26, ADR
+        0015), when this deployment keeps its credentials that way."""
+        store = secret_store(ctx)
+        if store is None or not callable(getattr(store, "run_login_job", None)):
+            return None
+        return store
+
     def start(
         self,
         ctx: AdminContext,
@@ -379,15 +409,28 @@ class LoginRegistry:
         directory: str,
         *,
         image: str | None = None,
+        accept: Callable[[Mapping[str, bytes]], Sequence[str]] | None = None,
     ) -> LoginSession:
         argv = self.resolve(ctx, harness)
-        flow = FLOWS[harness]
+        flow = flows_for(ctx)[harness]
         runner = self.container_runner(ctx)
-        if runner is not None and not image:
+        job = self.job_runner(ctx) if runner is None else None
+        if (runner is not None or job is not None) and not image:
             raise ConflictError(f"no promoted worker image is available for {harness}")
         session = LoginSession(harness=harness, started_at=time.time())
         self._sessions[harness] = session
-        if runner is not None:
+        if job is not None:
+            if image is None or accept is None:
+                raise ConflictError(f"the {harness} login needs an image and a store check")
+            session.credential_written = False
+            thread = threading.Thread(
+                target=self._run_job,
+                args=(job, flow, image, session, argv, accept),
+                kwargs={"timeout": ctx.login_timeout_seconds},
+                daemon=True,
+                name=f"login-{harness}",
+            )
+        elif runner is not None:
             assert image is not None
             thread = threading.Thread(
                 target=self._run_container,
@@ -439,6 +482,38 @@ class LoginRegistry:
             session.state = "failed"
             if session.error is None:
                 session.error = f"the login driver failed: {type(exc).__name__}: {exc}"
+
+    @staticmethod
+    def _run_job(
+        provider: Any,
+        flow: LoginFlow,
+        image: str,
+        session: LoginSession,
+        argv: tuple[str, ...],
+        accept: Callable[[Mapping[str, bytes]], Sequence[str]],
+        *,
+        timeout: int,
+    ) -> None:
+        try:
+            import asyncio  # noqa: PLC0415
+
+            asyncio.run(
+                provider.run_login_job(
+                    flow=flow,
+                    image=image,
+                    session=session,
+                    argv=argv,
+                    timeout=timeout,
+                    accept=accept,
+                )
+            )
+        except Exception as exc:
+            session.state = "failed"
+            session.error = f"the login Job failed: {type(exc).__name__}: {exc}"
+        if session.state not in ("finished", "failed"):
+            # A session that never reaches a terminal state refuses every later login.
+            session.state = "failed"
+            session.error = session.error or "the login Job ended without a result"
 
     @staticmethod
     def _run_container(
@@ -495,11 +570,23 @@ def start_login(
     reason = guard_mutation(
         ctx, uow, reason, principal=principal, operation=f"credentials login {harness}"
     )
-    if harness not in FLOWS:
+    flows = flows_for(ctx)
+    if harness not in flows:
         raise ConflictError(f"harness {harness!r} has no interactive login flow")
     spec = spec_for(ctx, harness)
+    refuse_while_held(uow, harness)
+    if registry.job_runner(ctx) is not None and registry.container_runner(ctx) is None:
+        return _start_job_login(
+            ctx,
+            uow,
+            registry,
+            principal=principal,
+            harness=harness,
+            reason=reason,
+            replace=replace,
+        )
     source = source_for(ctx, harness)
-    flow = FLOWS[harness]
+    flow = flows[harness]
     # Every refusal first: the harness is known, the credential spec and directory are
     # configured, the CLI exists, no login is already running, the directory can be
     # written, and `replace` is set when a credential is there to be replaced. The event
@@ -516,27 +603,7 @@ def start_login(
     image = None
     runner = getattr(registry, "container_runner", lambda _ctx: None)(ctx)
     if runner is not None:
-        # The promoted worker image carries every harness (C11); the most recent
-        # default that carries this one is what a launch would use too.
-        promoted = next(
-            iter(
-                sorted(
-                    (
-                        item
-                        for item in uow.image_promotions.list_all()
-                        if item.carries(harness) and item.state == "default"
-                    ),
-                    key=lambda item: (item.updated_at, item.digest),
-                    reverse=True,
-                )
-            ),
-            None,
-        )
-        if promoted is None:
-            raise ConflictError(
-                f"no promoted worker image is available for {harness}; promote one first"
-            )
-        image = promoted.reference
+        image = promoted_image(uow, harness)
     retired = (
         _retire_existing(ctx, uow, source, principal=principal, harness=harness, reason=reason)
         if replaceable
@@ -585,6 +652,120 @@ def start_login(
         "retained_as": retired,
         **session.as_dict(),
     }
+
+
+def promoted_image(uow: UnitOfWork, harness: str) -> str:
+    """The promoted worker image carries every harness (C11); the most recent default
+    that carries this one is what a launch would use too, so a login runs it."""
+    promoted = next(
+        iter(
+            sorted(
+                (
+                    item
+                    for item in uow.image_promotions.list_all()
+                    if item.carries(harness) and item.state == "default"
+                ),
+                key=lambda item: (item.updated_at, item.digest),
+                reverse=True,
+            )
+        ),
+        None,
+    )
+    if promoted is None:
+        raise ConflictError(
+            f"no promoted worker image is available for {harness}; promote one first"
+        )
+    return promoted.reference
+
+
+def refuse_while_held(uow: UnitOfWork, harness: str) -> None:
+    """12: a login replaces the credential, and an attempt that holds a copy of the one
+    it replaces would sync a refresh of a superseded session back over it. So a login
+    waits until no attempt of the harness holds the credential."""
+    holders = credential_holders(uow, harness)
+    if holders:
+        raise ConflictError(
+            f"an attempt of {harness} holds its credential ({', '.join(holders[:3])}); a "
+            "login would replace it underneath that attempt. Start the login once the "
+            "attempt has been collected"
+        )
+
+
+def _start_job_login(
+    ctx: AdminContext,
+    uow: UnitOfWork,
+    registry: LoginRegistry,
+    *,
+    principal: str,
+    harness: str,
+    reason: str,
+    replace: bool,
+) -> dict[str, Any]:
+    """25 steps 1 to 3 on Kubernetes: the login runs as a Job (26) and its files go
+    into the harness Secret the service owns (ADR 0015).
+
+    Nothing is retired up front. The Secret is only replaced once the CLI has exited and
+    its files pass the shape check, so a login that fails, is cancelled or times out
+    leaves the credential exactly as it was, and there is no retained copy to shred. A
+    credential that still passes the shape check is still not replaced without
+    `replace`, the Docker rule."""
+    flow = flows_for(ctx)[harness]
+    spec = spec_for(ctx, harness)
+    store = registry.job_runner(ctx)
+    if store is None:
+        raise ConflictError("no provider on this deployment runs a login Job")
+    argv = registry.resolve(ctx, harness)
+    refuse_secret_shaped(" ".join(argv), field="login command")
+    current = stored_files(store, harness)
+    if current and check_shape_files(spec, current).ok and not replace:
+        raise ConflictError(
+            f"the {harness} credential in the Secret {store.credential_secret(harness)} "
+            "already passes the shape check; a login would replace it. Pass replace to "
+            "replace it once the new login's files pass the shape check"
+        )
+    image = promoted_image(uow, harness)
+    session = registry.start(
+        ctx, harness, "", image=image, accept=partial(_accept_login, ctx, harness)
+    )
+    admin_event(
+        uow,
+        ctx,
+        EventKind.CREDENTIAL_LOGIN_STARTED,
+        principal=principal,
+        reason=reason,
+        before=None,
+        after=None,
+        harness=harness,
+        window=flow.window,
+        command=list(argv),
+        image=image,
+        retained_as=None,
+        secret=store.credential_secret(harness),
+    )
+    return {
+        "harness": harness,
+        "window": flow.window,
+        "retained_as": None,
+        "secret": store.credential_secret(harness),
+        **session.as_dict(),
+    }
+
+
+def _accept_login(ctx: AdminContext, harness: str, files: Mapping[str, bytes]) -> list[str]:
+    """Whether a Kubernetes login's files may replace the Secret: they pass the shape
+    check, and no attempt of the harness has come to hold the credential while the
+    login ran (12). Checked at the moment of the write, which is the moment it matters.
+    Problems are named; nothing is ever quoted."""
+    problems = list(check_shape_files(spec_for(ctx, harness), files).problems)
+    with ctx.uow_factory() as uow:
+        holders = credential_holders(uow, harness)
+    if holders:
+        problems.append(
+            f"an attempt of {harness} ({', '.join(holders[:3])}) came to hold the "
+            "credential while the login ran, so the new one was not stored; run the "
+            "login again once it has been collected"
+        )
+    return problems
 
 
 def _check_writable(source: Any, *, harness: str, reuse: bool) -> None:
@@ -822,8 +1003,11 @@ def finish_login(
     if session is None or session.state not in ("finished", "failed"):
         raise ConflictError(f"the login for {harness} has not finished")
     spec = spec_for(ctx, harness)
-    source = source_for(ctx, harness)
-    shape = check_shape(spec, source.path)
+    store = secret_store(ctx)
+    if store is not None:
+        shape = check_shape_files(spec, stored_files(store, harness) or {})
+    else:
+        shape = check_shape(spec, source_for(ctx, harness).path)
     state = uow.harnesses.get(harness)
     if state is not None:
         state.session_compatibility = "unverified"
@@ -841,6 +1025,7 @@ def finish_login(
         harness=harness,
         exit_code=session.exit_code,
         token_written=session.token_written,
+        credential_written=session.credential_written,
         shape=shape.as_dict(),
     )
     return {"harness": harness, "login": session.as_dict(), "shape": shape.as_dict()}

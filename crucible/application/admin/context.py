@@ -55,6 +55,9 @@ class AdminContext:
     proxy_reload_timeout_seconds: float = 0
     # The command each harness's login runs, overridable for the fake-CLI tests.
     login_commands: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    # Login flows beyond the three harnesses' (`login.FLOWS`), by harness name: the
+    # stand-in login the end-to-end tiers drive. Never set by a deployment.
+    login_flows: dict[str, Any] = field(default_factory=dict)
     # The settings file's `kubernetes.egress` values, shown until a save replaces them,
     # and the namespaces no selector may name (crucible#91).
     kubernetes_egress_seed: dict[str, Any] = field(default_factory=dict)

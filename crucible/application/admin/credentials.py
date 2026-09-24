@@ -5,6 +5,12 @@ the named files (they exist, they parse, they carry the expected keys); the prob
 run in the hardened image that records exit facts and whether the files changed; rotate
 is an atomic rename with the previous directory retained and then shredded; remove
 shreds. Every step is an event with the principal and the reason.
+
+Where the credentials live depends on the deployment. With the Docker provider they are
+directories under the credential root. On a deployment whose provider is Kubernetes
+they are the harness Secrets in the workers namespace, which the service owns (ADR
+0015): state, the shape check, the probe, the Hermes key and the login read and write
+the Secret, and rotate and remove, which move directories, are not offered there.
 """
 
 from __future__ import annotations
@@ -17,6 +23,7 @@ import shutil
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -162,6 +169,29 @@ def spec_for(ctx: AdminContext, harness: str) -> CredentialSpec:
     return credential
 
 
+def secret_store(ctx: AdminContext) -> Any | None:
+    """The provider that keeps the harness credentials as Secrets, or None when they are
+    directories (ADR 0015). That is the Kubernetes provider whenever it is wired and the
+    Docker provider is not: a deployment runs one or the other, and the directories are
+    the Docker provider's."""
+    if "docker" in ctx.providers:
+        return None
+    provider = ctx.providers.get("kubernetes")
+    if provider is None or not callable(getattr(provider, "write_credential_files", None)):
+        return None
+    return provider
+
+
+def stored_files(store: Any, harness: str) -> dict[str, bytes] | None:
+    """The declared auth files the harness Secret holds, None when it does not exist.
+    A Secret the API server will not return is a refusal, not an absence."""
+    try:
+        files: dict[str, bytes] | None = store.read_credential_files(harness)
+    except ProviderError as exc:
+        raise CredentialAdminError(str(exc)) from exc
+    return files
+
+
 def source_for(ctx: AdminContext, harness: str) -> CredentialSource:
     source = ctx.credential_sources.get(harness)
     if source is None or not source.path:
@@ -175,9 +205,12 @@ def source_for(ctx: AdminContext, harness: str) -> CredentialSource:
 def state_view(ctx: AdminContext, uow: UnitOfWork, harness: str) -> dict[str, Any]:
     adapter = adapter_for(ctx, harness)
     state = uow.harnesses.get(harness)
-    view = credential_state(
-        adapter.credential_spec(), ctx.credential_sources.get(harness), state
-    ).as_dict()
+    spec = adapter.credential_spec()
+    store = secret_store(ctx) if spec is not None else None
+    if store is not None:
+        view = _secret_state(store, spec, ctx.credential_sources.get(harness), state, harness)
+    else:
+        view = credential_state(spec, ctx.credential_sources.get(harness), state).as_dict()
     view.update(
         {
             "session_compatibility": state.session_compatibility if state else "unverified",
@@ -189,6 +222,49 @@ def state_view(ctx: AdminContext, uow: UnitOfWork, harness: str) -> dict[str, An
             "last_launch_outcome": state.last_launch_outcome if state else None,
         }
     )
+    return view
+
+
+def _secret_state(
+    store: Any,
+    spec: CredentialSpec | None,
+    source: CredentialSource | None,
+    state: Any,
+    harness: str,
+) -> dict[str, Any]:
+    """The state of a Secret-held credential: what `credential_state` says of a
+    directory, read from the Secret, plus which Secret it is and whether the service
+    owns it. Sizes only; never a value."""
+    name = store.credential_secret(harness)
+    try:
+        body = store.read_credential_secret(harness)
+    except ProviderError as exc:
+        return {
+            "state": "unreadable",
+            "mount_mode": None,
+            "fingerprint": None,
+            "files": [],
+            "detail": str(exc),
+            "source": {"kind": "secret", "name": name, "exists": None, "service_owned": None},
+        }
+    files = stored_files(store, harness) if body is not None else None
+    view = credential_state(
+        spec,
+        source,
+        state,
+        stored_sizes=None if files is None else {k: len(v) for k, v in files.items()},
+        stored_in=f"the Secret {name}",
+    ).as_dict()
+    labels = ((body or {}).get("metadata") or {}).get("labels") or {}
+    view["source"] = {
+        "kind": "secret",
+        "name": name,
+        "exists": body is not None,
+        "service_owned": labels.get("app.kubernetes.io/managed-by") == "crucible",
+    }
+    if harness == HERMES:
+        # The key is never echoed; whether one is set is all any surface says (12).
+        view["key_set"] = bool(files and files.get("api-key", b"").strip())
     return view
 
 
@@ -239,6 +315,52 @@ def check_shape(spec: CredentialSpec, path: str) -> ShapeCheck:
     return ShapeCheck(ok=not problems, files=tuple(files), problems=tuple(problems))
 
 
+def check_shape_files(spec: CredentialSpec, files: Mapping[str, bytes]) -> ShapeCheck:
+    """`check_shape` for auth files held in memory: what a login Job wrote, or what a
+    harness Secret holds (ADR 0015). The same rules, and the same record: which file
+    failed and why, never what it held."""
+    entries: list[dict[str, Any]] = []
+    problems: list[str] = []
+    for auth in spec.auth_files:
+        entry: dict[str, Any] = {"name": auth.name, "required": auth.required}
+        content = files.get(auth.name)
+        if content is None:
+            entry["present"] = False
+            if auth.required:
+                problems.append(f"{auth.name}: missing")
+            entries.append(entry)
+            continue
+        entry["present"] = True
+        entry["size"] = len(content)
+        if not content:
+            problems.append(f"{auth.name}: empty")
+        if auth.json:
+            try:
+                document = json.loads(content.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                problems.append(f"{auth.name}: not JSON")
+                entry["parses"] = False
+                entries.append(entry)
+                continue
+            entry["parses"] = isinstance(document, dict)
+            if not isinstance(document, dict):
+                problems.append(f"{auth.name}: not a JSON object")
+            else:
+                missing = [k for k in auth.json_keys if k not in document]
+                if missing:
+                    problems.append(f"{auth.name}: missing keys {missing}")
+        entries.append(entry)
+    return ShapeCheck(ok=not problems, files=tuple(entries), problems=tuple(problems))
+
+
+def current_shape(ctx: AdminContext, spec: CredentialSpec, harness: str) -> ShapeCheck:
+    """The shape of the credential as it stands, wherever this deployment keeps it."""
+    store = secret_store(ctx)
+    if store is not None:
+        return check_shape_files(spec, stored_files(store, harness) or {})
+    return check_shape(spec, source_for(ctx, harness).path)
+
+
 async def set_api_key(
     ctx: AdminContext,
     uow: UnitOfWork,
@@ -260,6 +382,39 @@ async def set_api_key(
             "an API key is required", errors=[{"path": "api_key", "message": "must not be empty"}]
         )
     spec = spec_for(ctx, harness)
+    store = secret_store(ctx)
+    if store is not None:
+        # The Secret is the service's own (ADR 0015): created when absent, and the key
+        # is its only file. The value is in the request body to the API server and
+        # nowhere else.
+        try:
+            written = await asyncio.to_thread(
+                store.write_credential_files, harness, {"api-key": value.encode("utf-8") + b"\n"}
+            )
+        except ProviderError as exc:
+            raise CredentialAdminError(str(exc)) from exc
+        admin_event(
+            uow,
+            ctx,
+            EventKind.CREDENTIAL_SET,
+            principal=principal,
+            reason=reason,
+            before={"harness": harness},
+            after={
+                "harness": harness,
+                "state": "credential set",
+                "secret": written["secret"],
+                "created": written["created"],
+            },
+        )
+        return await validate(
+            ctx,
+            uow,
+            principal=principal,
+            harness=harness,
+            reason=reason,
+            audit_events=False,
+        )
     source = source_for(ctx, harness)
     directory = Path(source.path)
     try:
@@ -317,9 +472,8 @@ async def validate(
         ctx, uow, reason, principal=principal, operation=f"credentials validate {harness}"
     )
     spec = spec_for(ctx, harness)
-    source = source_for(ctx, harness)
     before = state_view(ctx, uow, harness)
-    shape = check_shape(spec, source.path)
+    shape = current_shape(ctx, spec, harness)
     probe: ProbeRecord | None = None
     if shape.ok:
         probe = await _probe_async(
@@ -388,9 +542,13 @@ async def validate(
 
 
 def _probe_provider(ctx: AdminContext) -> ExecutionProvider:
-    docker = ctx.providers.get("docker")
-    if docker is not None:
-        return docker
+    """Where the probe runs: where the credentials are. Docker when it is wired, then
+    Kubernetes (the fake provider is always wired and runs behaviours, not credentials,
+    so it is only ever the answer when nothing else is)."""
+    for name in ("docker", "kubernetes"):
+        provider = ctx.providers.get(name)
+        if provider is not None:
+            return provider
     if ctx.providers:
         return next(iter(ctx.providers.values()))
     raise CredentialAdminError("no execution provider is configured for the probe")
@@ -486,7 +644,11 @@ async def _probe_async(
         )
     adapter = adapter_for(ctx, harness)
     spec = spec_for(ctx, harness)
-    source = source_for(ctx, harness)
+    source = (
+        ctx.credential_sources.get(harness)
+        if secret_store(ctx) is not None
+        else source_for(ctx, harness)
+    )
     provider = _probe_provider(ctx)
     image = await probe_image(ctx, uow, provider, harness)
     mode = effective_mount_mode(spec, source)
@@ -619,9 +781,14 @@ async def _hermes_probe_async(
     audit_event: bool = True,
 ) -> ProbeRecord:
     """Probe LiteLLM without running a model or exposing its bearer in process output."""
-    source = source_for(ctx, harness)
-    key_path = spec_for(ctx, harness).source_path(source.path, "api-key")
-    bearer = key_path.read_text(encoding="utf-8").strip()
+    store = secret_store(ctx)
+    if store is not None:
+        held = await asyncio.to_thread(stored_files, store, harness)
+        bearer = (held or {}).get("api-key", b"").decode("utf-8", "replace").strip()
+    else:
+        source = source_for(ctx, harness)
+        key_path = spec_for(ctx, harness).source_path(source.path, "api-key")
+        bearer = key_path.read_text(encoding="utf-8").strip()
     endpoint = local_endpoint_view(uow).get("endpoint_url")
     started = time.monotonic()
     if not isinstance(endpoint, str) or not endpoint:
@@ -797,7 +964,8 @@ async def probe(
         ctx, uow, reason, principal=principal, operation=f"credentials probe {harness}"
     )
     spec_for(ctx, harness)
-    source_for(ctx, harness)
+    if secret_store(ctx) is None:
+        source_for(ctx, harness)
     record = await _probe_async(ctx, uow, harness=harness, principal=principal, reason=reason)
     return CredentialReport(harness, state_view(ctx, uow, harness), probe=record)
 
@@ -924,6 +1092,7 @@ def rotate(
     reason = guard_mutation(
         ctx, uow, reason, principal=principal, operation=f"credentials rotate {harness}"
     )
+    _refuse_for_secret(ctx, harness, "rotate")
     spec = spec_for(ctx, harness)
     source = source_for(ctx, harness)
     incoming = Path(new_path)
@@ -1038,6 +1207,20 @@ def _swap(
         ) from exc
 
 
+def _refuse_for_secret(ctx: AdminContext, harness: str, verb: str) -> None:
+    """Rotate and remove move and shred directories. Where the credential is a Secret
+    the service owns (ADR 0015) there is no directory, and a login with `replace` is
+    how it is replaced; this says so rather than asking for a path nobody configured."""
+    store = secret_store(ctx)
+    if store is None:
+        return
+    raise CredentialAdminError(
+        f"{verb} works on a credential directory, and on this deployment the {harness} "
+        f"credential is the Secret {store.credential_secret(harness)} that Crucible owns; "
+        "run the login with replace to put a new one in its place"
+    )
+
+
 def _tighten(root: Path) -> None:
     os.chmod(root, 0o700)
     for path in root.rglob("*"):
@@ -1055,6 +1238,7 @@ def remove(
     reason = guard_mutation(
         ctx, uow, reason, principal=principal, operation=f"credentials remove {harness}"
     )
+    _refuse_for_secret(ctx, harness, "remove")
     spec_for(ctx, harness)
     source = source_for(ctx, harness)
     before = state_view(ctx, uow, harness)
