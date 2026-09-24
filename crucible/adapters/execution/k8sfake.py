@@ -41,6 +41,7 @@ from crucible.adapters.execution.k8sregistry import RegistryError
 from crucible.adapters.execution.k8sspec import (
     CONTAINER_NAME,
     LABEL_ATTEMPT,
+    LABEL_CANARY,
     LABEL_ROLE,
     ROLE_BUNDLE,
     ROLE_CANARY,
@@ -134,6 +135,17 @@ class _Object:
     deleted: bool = False
 
 
+def _opens_dns(peer: Mapping[str, Any], translates_services: bool) -> bool:
+    """Whether one policy peer lets a pod reach the fake cluster's resolver."""
+    if "ipBlock" in peer:
+        return not translates_services
+    namespace = (peer.get("namespaceSelector") or {}).get("matchLabels") or {}
+    pods = (peer.get("podSelector") or {}).get("matchLabels") or {}
+    return namespace == {"kubernetes.io/metadata.name": "kube-system"} and pods == {
+        "k8s-app": "kube-dns"
+    }
+
+
 @dataclass
 class FakeKubernetesApi:
     """Everything the provider calls on `KubernetesClient`, in memory.
@@ -154,6 +166,17 @@ class FakeKubernetesApi:
     # A canary whose output stops before the final line, which is a truncated log and
     # not a result.
     canary_done: bool = True
+    # What the canary's DNS check and local endpoint check report when its egress
+    # policy allows them (crucible#91): `resolved` or `failed` and `inconclusive` for
+    # the first, `reachable`, `unreachable`, `unresolved` or `inconclusive` for the
+    # second. A canary with no policy carrying a port 53 rule always fails its DNS
+    # check, which is what a namespace default deny does to it.
+    canary_dns: str = "resolved"
+    canary_endpoint: str = "reachable"
+    # A CNI that translates a service address to its pods before it evaluates policy
+    # (Cilium with kube-proxy replacement): only a selector on the kube-dns pods opens
+    # DNS, and an address rule on the DNS service never does (crucible#91).
+    translates_services: bool = False
     pod_pid_limit: int | None = 4096
     # The canary's source for `pod_pid_limit` (95): the default simulates a cgroup
     # namespace that lets the container see its pod's parent cgroup. A test can set
@@ -462,6 +485,15 @@ class FakeKubernetesApi:
             ],
         }
 
+    def _canary_policy(self, canary_id: str) -> dict[str, Any] | None:
+        for (kind, _name), candidate in self.objects.items():
+            if kind != "networkpolicies" or candidate.deleted:
+                continue
+            selector = (candidate.body.get("spec") or {}).get("podSelector") or {}
+            if canary_id and (selector.get("matchLabels") or {}).get(LABEL_CANARY) == canary_id:
+                return candidate.body
+        return None
+
     def _act_canary(self, obj: _Object, attempt_id: str) -> None:
         name = obj.name
         if self.pod_pid_limit_source == "cgroupns-private":
@@ -470,10 +502,35 @@ class FakeKubernetesApi:
             pod_pids = "unsupported"
         else:
             pod_pids = "none" if self.pod_pid_limit is None else str(self.pod_pid_limit)
+        labels = (obj.body.get("metadata") or {}).get("labels") or {}
+        policy = self._canary_policy(str(labels.get(LABEL_CANARY, "")))
+        dns_open = policy is not None and any(
+            any(int(port.get("port", 0)) == 53 for port in rule.get("ports") or [])
+            and any(_opens_dns(peer, self.translates_services) for peer in rule.get("to") or [])
+            for rule in (policy.get("spec") or {}).get("egress") or []
+        )
+        dns = self.canary_dns if dns_open or self.canary_dns == "inconclusive" else "failed"
+        env = {
+            item["name"]: item.get("value", "")
+            for container in (obj.body.get("spec") or {}).get("containers") or []
+            for item in container.get("env") or []
+        }
+        endpoint = self.canary_endpoint if env.get("CRUCIBLE_CANARY_ENDPOINT_URL") else "none"
+        # The namespace-scope canary answers the API server and the PID limit only.
+        egress_lines = (
+            []
+            if env.get("CRUCIBLE_CANARY_SCOPE") == "namespace"
+            else [
+                f"crucible-canary.dns_tool={'none' if dns == 'inconclusive' else 'getent'}",
+                f"crucible-canary.dns={dns}",
+                f"crucible-canary.endpoint={endpoint}",
+            ]
+        )
         self.logs[name] = [
             "crucible-canary.tool=curl",
             f"crucible-canary.api={self.canary_answer}",
             f"crucible-canary.curl_exit={'7' if self.egress_enforced else '0'}",
+            *egress_lines,
             # The container's own cgroup limit, kept for diagnostics only (95): the
             # gate never decides on this number.
             "crucible-canary.pids=19093",

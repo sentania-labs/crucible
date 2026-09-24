@@ -35,6 +35,7 @@ from crucible.domain.entities import (
     Policy,
     PoolExhaustion,
     Principal,
+    ProviderSetting,
     PullRequest,
     PullRequestHead,
     PullRequestState,
@@ -513,6 +514,14 @@ class ImagePromotionRepository(Protocol):
     def put(self, promotion: ImagePromotion) -> ImagePromotion: ...
 
 
+class ProviderSettingRepository(Protocol):
+    """Runtime provider settings by name (25, crucible#91). None: never saved."""
+
+    def get(self, name: str) -> ProviderSetting | None: ...
+
+    def put(self, setting: ProviderSetting) -> ProviderSetting: ...
+
+
 class BootstrapImportRepository(Protocol):
     """The imports of 15, newest first when listed."""
 
@@ -590,6 +599,7 @@ class UnitOfWork(Protocol):
     harnesses: HarnessStateRepository
     image_promotions: ImagePromotionRepository
     bootstrap_imports: BootstrapImportRepository
+    provider_settings: ProviderSettingRepository
 
     def __enter__(self) -> UnitOfWork: ...
 

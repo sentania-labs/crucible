@@ -195,8 +195,8 @@ container; left at the full limit it would silently cancel the role pod's
 lower request.
 
 The readiness canary (`ROLE_CANARY`) is a shell script with curl, never a
-role pod, so it does not use the policy's resources at all: it requests and
-limits a fixed small size, `kubernetes.canary_cpu_millicores` (default
+role pod, so it does not use the policy's resources at all: both of its pods
+request and limit a fixed small size, `kubernetes.canary_cpu_millicores` (default
 100m) and `kubernetes.canary_memory` (default 64Mi), configured the same
 way as `kubernetes.probe_image`.
 
@@ -243,11 +243,71 @@ through: cluster DNS is allowed on port 53 UDP and TCP to the cluster's DNS
 service and nothing else on that address, and the Kubernetes API service,
 the node network, the pod network of other namespaces, link-local
 `169.254.0.0/16`, and the lab's private ranges are denied. The e2e tier
-proves each denial from inside a worker pod (18). If the cluster's CNI does
-not enforce egress NetworkPolicy, the provider refuses to launch: readiness
-of the namespace is probed once at supervisor start by creating a canary
-pod that must fail to reach the API server, and the result is recorded and
-shown on the admin status page (25).
+proves each denial from inside a worker pod (18).
+
+**Selectors for a CNI that translates service addresses first.** Some CNIs
+translate a service or LoadBalancer address to its backend pod addresses before
+they evaluate policy; Cilium with kube-proxy replacement is the one the lab runs.
+There an `ipBlock` on the kube-dns ClusterIP or on a gateway's service address
+never matches, and a worker has no DNS and no model (crucible#91). So the policy
+also names those destinations by where they actually are, with a standard
+`networking.k8s.io/v1` peer of one `namespaceSelector` (on
+`kubernetes.io/metadata.name`) and one non-empty `podSelector`:
+
+- cluster DNS: the resolver's pods, `kube-system` and `k8s-app: kube-dns` by
+  default, in the same rule as the address and therefore on port 53 UDP and
+  TCP and nothing else. An empty DNS namespace leaves the address rule alone.
+- an in-cluster local endpoint: when a namespace is set for it, the worker's
+  local route is allowed as the pods that take its connections on their own
+  port (the Service's `targetPort`, or the URL's port when that is 0), and the
+  URL's host is not resolved into an address rule at all. With no namespace set
+  the endpoint is outside the cluster and keeps the resolved-address rule above.
+  The pods to name are the ones the URL's connection lands on: the gateway's own
+  when the URL is its Service, the ingress controller's when it goes through an
+  ingress.
+
+A selector never widens a denial: it adds no address, it carries only port 53 or
+the endpoint's one port, it may not be empty, and it may not name the workers
+namespace or Crucible's own (a worker reaching another attempt or Crucible's
+database). Those rules are checked when the setting is saved, when the service
+starts, and again when a policy is rendered. No Cilium-specific policy is used;
+every CNI that enforces NetworkPolicy matches both forms.
+
+The selectors are the `kubernetes.egress` setting. The settings file seeds it
+(`kubernetes.dns_namespace`, `dns_pod_labels`, `local_endpoint_namespace`,
+`local_endpoint_pod_labels`, `local_endpoint_port`); an administrator edits it
+from the admin API (`GET` and `POST /v1/admin/kubernetes/egress`), the CLI
+(`crucible admin kubernetes egress` and `set-egress`) or the Routing page of the
+admin UI. A saved value is a `provider_settings` row that wins over the file,
+every edit is an audited `kubernetes_egress_updated` event, and each process's
+provider reads the row back within 15 seconds (usually sooner in the process that
+took the edit), so the supervisor follows an edit made through the API without a
+restart. Until a process has read it back, that process keeps launching under the
+values it last proved. (Added 2026-09-23 for crucible#91.)
+
+**Readiness.** If the cluster's CNI does not enforce egress NetworkPolicy, the
+provider refuses to launch: readiness of the namespace is probed by two canary
+pods, one after the other, and the result is recorded and shown on the admin
+status page (25).
+
+- The first runs under the namespace's own rules and no policy of its own, which
+  is what a role with no egress gets. It must fail to reach the API server
+  (`egress_enforced`), and it reads the pod PID limit. A canary with a policy of
+  its own would be isolated by that policy, so it could not tell a namespace that
+  lost its default deny from one that has it.
+- The second runs under its own NetworkPolicy, rendered exactly as a worker's is
+  (cluster DNS, and the enabled local endpoint of the routing policy in force
+  when there is one). It must resolve a cluster name, `kubernetes.default.svc`
+  (`dns_resolves`), connect to the enabled local endpoint's URL when one is
+  enabled (`local_endpoint_reachable`), and still fail to reach the API server.
+
+A failure of any of them is `namespace_ready: false` with a detail naming the
+check that failed, and every launch is refused until it passes. A missing tool in
+the canary image (no curl, no getent or nslookup) is inconclusive and never a
+pass. A passed probe is kept until the provider reads back a changed
+`kubernetes.egress` setting or enabled local endpoint; the canary then runs again
+under the new values before any launch uses them, and an answer proved under values
+that changed while the canary ran is discarded rather than kept.
 
 The canary runs the first worker image reference the provider knows of, which
 before any attempt has resolved one is the first entry of
@@ -358,7 +418,10 @@ the status page.
 1. The two namespaces exist; `crucible-workers` has Pod Security admission
    at `restricted` and a default-deny NetworkPolicy.
 2. The CNI enforces egress NetworkPolicy (the canary must fail to reach the
-   API server).
+   API server), and the worker rules match on it: the canary must resolve a
+   cluster name and reach the enabled local endpoint. On a CNI that translates
+   service addresses first, the `kubernetes.egress` selectors are what make the
+   second half true.
 3. A storage class for the workspace PVCs with `ReadWriteOnce` and a size
    the policy's workspace cap fits, and one with `ReadWriteMany` for the
    artifact root: the api serves what the supervisor wrote and they are
@@ -424,6 +487,15 @@ manifests, and runs the same cases as the Docker tier plus:
 - supervisor restart re-attaches to a running Job and logs resume;
 - the readiness probe refuses launches when egress enforcement is absent
   (run once with the enforcing CNI removed).
+
+`tools/kind/cilium-egress.sh` is the same kind of disposable cluster running
+Cilium with kube-proxy replacement instead of Calico. It puts a stand-in model
+gateway behind a Service and shows, from a pod under each policy, that the
+address-only rules of before crucible#91 leave a worker with no DNS and no
+gateway while the selector rules give it both, with the API server, the rest
+of the resolver's ports and the internet still unreachable; then it runs the
+provider's own readiness canary in both forms. It is a local proof, not a CI
+job. (Added 2026-09-23.)
 
 It runs in CI on the same runner class as the Docker tier. The readiness
 rows 5, 7, 11, 12, and 23 are re-proven on this tier and cited in 19 with

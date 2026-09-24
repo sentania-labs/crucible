@@ -712,3 +712,15 @@ class ImagePromotionRow(Base):
     reason: Mapped[str] = mapped_column(Text)
     updated_at: Mapped[datetime] = mapped_column(TZ)
     updated_by: Mapped[str] = mapped_column(String(160))
+
+
+# ----- runtime provider settings (25, crucible#91) --------------------------
+
+
+class ProviderSettingRow(Base):
+    __tablename__ = "provider_settings"
+    name: Mapped[str] = mapped_column(String(64), primary_key=True)
+    document: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    reason: Mapped[str] = mapped_column(Text)
+    updated_at: Mapped[datetime] = mapped_column(TZ)
+    updated_by: Mapped[str] = mapped_column(String(160))

@@ -20,6 +20,7 @@ from crucible.application.admin import (
     routing,
     tokens,
 )
+from crucible.application.admin import kubernetes as kubernetes_admin
 from crucible.application.admin import providers as providers_admin
 from crucible.application.admin import repositories as repositories_admin
 from crucible.application.admin import status as status_admin
@@ -106,6 +107,31 @@ def admin_save_local_endpoint(
         endpoint_url=str(body.get("endpoint_url", "")),
         models=models,
         max_concurrency=int(body.get("max_concurrency", 0)),
+        reason=_reason(body),
+    )
+    uow.commit()
+    return result
+
+
+@router.get("/admin/kubernetes/egress")
+def admin_kubernetes_egress(ctx: Ctx, uow: UoW, _principal: Admin) -> dict[str, Any]:
+    return kubernetes_admin.egress_view(_admin(ctx), uow)
+
+
+@router.post("/admin/kubernetes/egress")
+def admin_save_kubernetes_egress(
+    ctx: Ctx,
+    uow: UoW,
+    principal: Admin,
+    body: Annotated[dict[str, Any], Body()],
+) -> dict[str, Any]:
+    """The body is the `kubernetes.egress` document (`dns`, `local_endpoint`) and a
+    `reason`; the service checks the document and refuses it naming the field."""
+    result = kubernetes_admin.save_egress(
+        _admin(ctx),
+        uow,
+        principal=principal.name,
+        document={key: body[key] for key in ("dns", "local_endpoint") if key in body},
         reason=_reason(body),
     )
     uow.commit()

@@ -19,6 +19,12 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from crucible.domain.cluster_egress import (
+    DEFAULT_DNS_NAMESPACE,
+    DEFAULT_DNS_POD_LABELS,
+    label_problem,
+    namespace_problem,
+)
 from crucible.ports.execution import (
     IDENTITY_MOUNT,
     OUTPUT_MOUNT,
@@ -33,6 +39,9 @@ LABEL_TASK = "crucible.task"
 LABEL_OWNER = "crucible.owner"
 LABEL_ROLE = "crucible.role"
 LABEL_RETAIN = "crucible.retain"
+# The readiness canary's own id. Never `crucible.attempt`: the retention sweep deletes
+# whatever carries an attempt id Crucible does not track, which a canary always is.
+LABEL_CANARY = "crucible.canary"
 ANNOTATION_EGRESS = "crucible.io/egress-hosts"
 
 ROLE_WORKER = "worker"
@@ -74,6 +83,12 @@ DEFAULT_DENIED_CIDRS: tuple[str, ...] = (
     "100.64.0.0/10",
     "127.0.0.0/8",
 )
+
+
+# The label every namespace carries with its own name (Kubernetes 1.21 and later). A
+# selector names its namespace through it, because a namespaceSelector is the only way a
+# `networking.k8s.io/v1` peer can say "that namespace and no other".
+NAMESPACE_NAME_LABEL = "kubernetes.io/metadata.name"
 
 
 class SpecError(Exception):
@@ -451,6 +466,65 @@ def secret(
 
 
 @dataclass(frozen=True, slots=True)
+class PeerSelector:
+    """Pods in one namespace, named by their labels (26, crucible#91).
+
+    This is the form of a destination that survives a CNI which translates a service
+    address to its backend pods before it evaluates policy, which is what Cilium does
+    with kube-proxy replacement: an `ipBlock` on a ClusterIP or a LoadBalancer address
+    never matches there, and a selector on the backends always does. Calico and every
+    other conforming CNI match it too, so it is plain `networking.k8s.io/v1`.
+
+    A selector is always one namespace and at least one label. An empty pod selector
+    would be every pod in that namespace, which is not a destination anybody chose."""
+
+    namespace: str
+    pod_labels: tuple[tuple[str, str], ...]
+
+    @classmethod
+    def of(cls, namespace: str, pod_labels: Mapping[str, str]) -> PeerSelector:
+        return cls(namespace, tuple(sorted((str(k), str(v)) for k, v in pod_labels.items())))
+
+    def peer(self) -> dict[str, Any]:
+        return {
+            "namespaceSelector": {"matchLabels": {NAMESPACE_NAME_LABEL: self.namespace}},
+            "podSelector": {"matchLabels": dict(self.pod_labels)},
+        }
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"namespace": self.namespace, "pod_labels": dict(self.pod_labels)}
+
+
+def check_selector(
+    selector: PeerSelector, *, what: str, protected_namespaces: Sequence[str] = ()
+) -> PeerSelector:
+    """Refuse a selector that would open more than one set of pods in one namespace.
+
+    The protected namespaces are the workers namespace and Crucible's own: a selector
+    into the first is a worker reaching another attempt's pods, and into the second is a
+    worker reaching Crucible's database. Neither is ever the cluster resolver or a
+    model gateway, so neither is ever allowed."""
+    problem = namespace_problem(selector.namespace)
+    if problem is not None:
+        raise SpecError(f"the {what} namespace {problem}")
+    if selector.namespace in protected_namespaces:
+        raise SpecError(
+            f"the {what} selector names the {selector.namespace!r} namespace, which a worker "
+            "may never reach"
+        )
+    if not selector.pod_labels:
+        raise SpecError(
+            f"the {what} selector names no pod labels, which would allow every pod in "
+            f"{selector.namespace!r}"
+        )
+    for key, value in selector.pod_labels:
+        problem = label_problem(key, value)
+        if problem is not None:
+            raise SpecError(f"the {what} pod label {problem}")
+    return selector
+
+
+@dataclass(frozen=True, slots=True)
 class EgressPlan:
     """What one role may reach.
 
@@ -470,10 +544,15 @@ class EgressPlan:
     endpoints: tuple[str, ...] = ()
     https_port: int = 443
     broad: bool = False
+    # An in-cluster local endpoint, as its backend pods and their port (crucible#91).
+    # When it is set the provider has replaced `endpoints` with it: the service address
+    # a name resolves to is exactly what a translating CNI never matches.
+    endpoint_selector: PeerSelector | None = None
+    endpoint_ports: tuple[int, ...] = ()
 
     @property
     def empty(self) -> bool:
-        return not self.hosts and not self.endpoints
+        return not self.hosts and not self.endpoints and self.endpoint_selector is None
 
 
 def _endpoint_rule(endpoint: str) -> dict[str, Any]:
@@ -524,6 +603,8 @@ def egress_policy(
     plan: EgressPlan,
     dns_server: str,
     denied_cidrs: Sequence[str] = DEFAULT_DENIED_CIDRS,
+    dns_selector: PeerSelector | None = None,
+    pod_selector: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """One attempt's one role's egress, as the only thing that opens the default deny.
 
@@ -531,17 +612,27 @@ def egress_policy(
     adds and never subtracts: every destination not named here stays denied, and the
     ranges in `denied_cidrs` stay denied even though the broad rule is `0.0.0.0/0`,
     because they are its `except`. There is no ingress section at all: nothing ever
-    connects to a worker."""
+    connects to a worker.
+
+    Cluster DNS is allowed twice over, as the resolver's service address and as its
+    pods. A CNI that evaluates policy before it translates a service address matches
+    the first; one that translates first, as Cilium does with kube-proxy replacement,
+    matches only the second (crucible#91). Either way it is port 53 and nothing else."""
     rules: list[dict[str, Any]] = []
+    dns_peers: list[dict[str, Any]] = []
     if dns_server:
         try:
             resolver = ipaddress.ip_address(dns_server)
         except ValueError as exc:
             raise SpecError(f"the cluster DNS address {dns_server!r} is not an IP address") from exc
-        # 26: port 53 on that one address, both protocols, and nothing else on it.
+        dns_peers.append({"ipBlock": {"cidr": f"{resolver}/32"}})
+    if dns_selector is not None:
+        dns_peers.append(check_selector(dns_selector, what="cluster DNS").peer())
+    if dns_peers:
+        # 26: port 53, both protocols, and nothing else on the resolver.
         rules.append(
             {
-                "to": [{"ipBlock": {"cidr": f"{resolver}/32"}}],
+                "to": dns_peers,
                 "ports": [
                     {"protocol": "UDP", "port": 53},
                     {"protocol": "TCP", "port": 53},
@@ -566,6 +657,17 @@ def egress_policy(
                 }
             )
     rules.extend(_endpoint_rule(endpoint) for endpoint in plan.endpoints)
+    if plan.endpoint_selector is not None:
+        if not plan.endpoint_ports or any(not 0 < p < 65536 for p in plan.endpoint_ports):
+            raise SpecError(
+                f"the in-cluster local endpoint needs a TCP port, not {plan.endpoint_ports!r}"
+            )
+        rules.append(
+            {
+                "to": [check_selector(plan.endpoint_selector, what="local endpoint").peer()],
+                "ports": [{"protocol": "TCP", "port": p} for p in plan.endpoint_ports],
+            }
+        )
     return {
         "apiVersion": "networking.k8s.io/v1",
         "kind": "NetworkPolicy",
@@ -576,7 +678,11 @@ def egress_policy(
             "annotations": {ANNOTATION_EGRESS: ",".join(plan.hosts)},
         },
         "spec": {
-            "podSelector": {"matchLabels": {LABEL_ATTEMPT: attempt_id, LABEL_ROLE: role}},
+            "podSelector": {
+                "matchLabels": dict(pod_selector)
+                if pod_selector is not None
+                else {LABEL_ATTEMPT: attempt_id, LABEL_ROLE: role}
+            },
             "policyTypes": ["Egress"],
             "egress": rules,
         },
@@ -591,12 +697,16 @@ __all__ = [
     "CREDENTIAL_LEAF",
     "CREDENTIAL_SOURCE_MOUNT",
     "DEFAULT_DENIED_CIDRS",
+    "DEFAULT_DNS_NAMESPACE",
+    "DEFAULT_DNS_POD_LABELS",
     "IDENTITY_MOUNT",
     "LABEL_ATTEMPT",
+    "LABEL_CANARY",
     "LABEL_OWNER",
     "LABEL_RETAIN",
     "LABEL_ROLE",
     "LABEL_TASK",
+    "NAMESPACE_NAME_LABEL",
     "OUTPUT_MOUNT",
     "REPORT_MOUNT",
     "REPO_MOUNT",
@@ -617,12 +727,14 @@ __all__ = [
     "EgressPlan",
     "Limits",
     "Mount",
+    "PeerSelector",
     "PodRequest",
     "SpecError",
     "bare_pod",
     "base_mounts",
     "base_volumes",
     "canary_limits",
+    "check_selector",
     "config_map",
     "denied_by",
     "egress_policy",

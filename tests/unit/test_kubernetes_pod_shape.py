@@ -236,6 +236,8 @@ async def test_every_object_carries_26s_four_labels_and_lives_in_the_workers_nam
         row
         for row in api.created
         if (row["body"].get("metadata") or {}).get("labels", {}).get(k8sspec.LABEL_ATTEMPT)
+        # The readiness canary and its policy carry the canary's own id, not an attempt's.
+        and row["body"]["metadata"]["labels"].get(k8sspec.LABEL_ROLE) != k8sspec.ROLE_CANARY
     ]
     assert attempt_objects
     for row in attempt_objects:

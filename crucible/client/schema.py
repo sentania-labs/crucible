@@ -264,6 +264,12 @@ def kind_schemas() -> dict[str, dict[str, Any]]:
             {"endpoint_url": NSTR, "models": {"type": "array"}, "pool": ANY_OBJ},
             {"policy": ANY_OBJ, "routing_policy": ANY_OBJ},
         ),
+        "kubernetes_egress": _obj(
+            "the kubernetes.egress setting: the resolver's and an in-cluster local "
+            "endpoint's namespace and pod labels, and where the values came from",
+            {"setting": STR, "source": STR, "document": ANY_OBJ},
+            {"settings_file": ANY_OBJ, "provider_enabled": BOOL},
+        ),
         "bootstrap_import": bootstrap,
         "bootstrap_import_list": _items("bootstrap imports", ANY_OBJ),
         # this command

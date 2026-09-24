@@ -33,11 +33,13 @@ from crucible.application.admin import (
     status,
     tokens,
 )
+from crucible.application.admin import kubernetes as kubernetes_admin
 from crucible.application.admin.context import guard_mutation
 from crucible.application.auth import authenticate
 from crucible.application.errors import ApplicationError, ConflictError, ForbiddenError
 from crucible.application.policies import put_policy, put_routing_policy
 from crucible.contracts.api import ExternalReviewAttestation, RepositoryRegistration
+from crucible.domain.cluster_egress import format_labels, parse_labels
 from crucible.domain.entities import Principal, Role
 from crucible.domain.secrets import redact, scan_text
 from crucible.ports.repository import UnitOfWork
@@ -849,8 +851,10 @@ def routing_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
     assert ctx.admin is not None
     exhaustion = routing.list_exhaustions(ctx.admin, uow)
     local = routing.local_endpoint_view(uow)
+    egress = kubernetes_admin.egress_view(ctx.admin, uow)
     sections: list[dict[str, Any]] = [
         _document_section("Local endpoint", local),
+        _document_section("Kubernetes egress selectors", egress),
         _document_section("Active policy", policy.document if policy else {}),
         _document_section("Routing policy", routing_record.document if routing_record else {}),
         _document_section("Pool exhaustion", exhaustion),
@@ -907,6 +911,54 @@ def routing_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                     },
                 }
             )
+        dns = egress["document"].get("dns") or {}
+        endpoint = egress["document"].get("local_endpoint") or {}
+        sections.append(
+            {
+                "title": "Edit Kubernetes egress selectors",
+                "note": (
+                    "How a Kubernetes worker reaches cluster DNS and an in-cluster local "
+                    "endpoint when the CNI translates service addresses before it applies "
+                    "policy (Cilium with kube-proxy replacement). Labels are key=value, "
+                    "comma separated. Leave the endpoint namespace empty for an endpoint "
+                    "outside the cluster. Every process picks a save up within 15 seconds "
+                    "and re-runs the namespace readiness canary before a launch uses it."
+                ),
+                "form": {
+                    "action": "/ui/actions/kubernetes-egress",
+                    "label": "Save egress selectors",
+                    "fields": [
+                        {
+                            "name": "dns_namespace",
+                            "label": "DNS namespace",
+                            "value": dns.get("namespace", ""),
+                        },
+                        {
+                            "name": "dns_labels",
+                            "label": "DNS pod labels",
+                            "value": format_labels(dns.get("pod_labels") or {}),
+                        },
+                        {
+                            "name": "endpoint_namespace",
+                            "label": "Local endpoint namespace",
+                            "value": endpoint.get("namespace", ""),
+                        },
+                        {
+                            "name": "endpoint_labels",
+                            "label": "Local endpoint pod labels",
+                            "value": format_labels(endpoint.get("pod_labels") or {}),
+                        },
+                        {
+                            "name": "endpoint_port",
+                            "label": "Local endpoint pod port (0: the URL's port)",
+                            "kind": "number",
+                            "value": endpoint.get("port", 0),
+                        },
+                        {"name": "reason", "label": "Reason", "required": True},
+                    ],
+                },
+            }
+        )
         sections.extend(
             [
                 {
@@ -1431,6 +1483,19 @@ def _flatten(value: Any, prefix: str = "") -> list[tuple[str, Any]]:
     return [(prefix, value)]
 
 
+# The settings-file keys the `kubernetes.egress` admin setting replaces at runtime.
+_EGRESS_SEEDS = [
+    ["kubernetes", key]
+    for key in (
+        "dns_namespace",
+        "dns_pod_labels",
+        "local_endpoint_namespace",
+        "local_endpoint_pod_labels",
+        "local_endpoint_port",
+    )
+]
+
+
 def _settings_rows(settings: Any) -> list[list[Any]]:
     if settings is None or not hasattr(settings, "model_dump"):
         return []
@@ -1475,6 +1540,8 @@ def _settings_rows(settings: Any) -> list[list[Any]]:
         reason = (
             "Read at process start; restart required. Secret value is never shown."
             if path in sensitive
+            else "Seeds kubernetes.egress; edit it on Routing, where a saved value wins."
+            if path.split(".")[:2] in _EGRESS_SEEDS
             else "Read at process start; restart required."
         )
         rows.append([path, shown, source, reason])
@@ -1654,6 +1721,24 @@ async def action(request: Request, action: str, ctx: Ctx, uow: UoW) -> Response:
                     }
                 ],
                 max_concurrency=int(form.get("max_concurrency", "0")),
+                reason=reason,
+            )
+        elif action == "kubernetes-egress":
+            kubernetes_admin.save_egress(
+                ctx.admin,
+                uow,
+                principal=principal.name,
+                document={
+                    "dns": {
+                        "namespace": form.get("dns_namespace", ""),
+                        "pod_labels": parse_labels(form.get("dns_labels", "")),
+                    },
+                    "local_endpoint": {
+                        "namespace": form.get("endpoint_namespace", ""),
+                        "pod_labels": parse_labels(form.get("endpoint_labels", "")),
+                        "port": int(form.get("endpoint_port") or "0"),
+                    },
+                },
                 reason=reason,
             )
         elif action in ("routing-upload", "policy-upload"):

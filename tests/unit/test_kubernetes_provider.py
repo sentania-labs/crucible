@@ -107,7 +107,12 @@ async def test_the_probe_passes_when_the_canary_cannot_reach_the_api_server() ->
     await provider.prepare(spec())
     probe = await provider.ensure_ready()
     assert probe == NamespaceProbe(
-        True, True, 4096, "namespace ready", pid_limit_source="cgroup-v2-parent"
+        True,
+        True,
+        4096,
+        "namespace ready",
+        dns_resolves=True,
+        pid_limit_source="cgroup-v2-parent",
     )
     health = await provider.health()
     assert health.state == "ok"
@@ -155,7 +160,8 @@ async def test_the_probe_requests_log_lines_without_timestamp_prefixes() -> None
 
     api.pod_log = pod_log  # type: ignore[method-assign]
     assert (await provider.ensure_ready()).passed
-    assert requested == [False]
+    # Two canaries: the namespace's own rules, then a worker's.
+    assert requested == [False, False]
 
 
 async def test_concurrent_readiness_checks_share_one_canary() -> None:

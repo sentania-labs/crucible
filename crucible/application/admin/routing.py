@@ -168,6 +168,12 @@ def save_local_endpoint(
             docker.config,
             proxy_allowlist=tuple(dict.fromkeys([*base_hosts, *enabled_destinations])),
         )
+    # The Kubernetes readiness canary proves a connection to the enabled local endpoint;
+    # a new one is read back, and proved again before a launch uses it (crucible#91).
+    kubernetes = ctx.providers.get("kubernetes")
+    reload = getattr(kubernetes, "reload_settings", None)
+    if callable(reload):
+        reload()
     after = {
         "policy": {"name": policy.name, "version": next_policy_version},
         "routing_policy": {"name": routing.name, "version": next_routing_version},

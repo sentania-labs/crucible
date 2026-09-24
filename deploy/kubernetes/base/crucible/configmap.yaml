@@ -42,6 +42,13 @@ data:
   # inside the cluster, so a wrong value here is a worker with no name resolution, not a
   # worker with more reach. The overlay sets the cluster's own value.
   CRUCIBLE_KUBERNETES__CLUSTER_DNS_IP: 10.96.0.10
+  # The same resolver as its pods, allowed on port 53 beside the address above. A CNI
+  # that translates a service address before it applies policy (Cilium with kube-proxy
+  # replacement) matches only this (crucible#91). CoreDNS carries these labels on kind,
+  # k3s and kubeadm. These seed the `kubernetes.egress` admin setting; a value saved from
+  # the admin UI, API or CLI wins over them.
+  CRUCIBLE_KUBERNETES__DNS_NAMESPACE: kube-system
+  CRUCIBLE_KUBERNETES__DNS_POD_LABELS: '{"k8s-app":"kube-dns"}'
   # The worker image repositories `GET /v1/admin/images` reports the promoted tags of
   # (13, 25). A JSON array: pydantic-settings decodes a complex field from the
   # environment as JSON.
@@ -74,6 +81,12 @@ data:
   # denied even when DNS returns one of their addresses. Empty here on purpose: the
   # local endpoint host's address is a cluster fact, and the overlay sets it.
   CRUCIBLE_KUBERNETES__LOCAL_ENDPOINT_CIDRS: "[]"
+  # An in-cluster local endpoint as the pods that take its connections, their namespace
+  # and their port (0: the endpoint URL's port). Empty namespace: the endpoint is outside
+  # the cluster and keeps its resolved-address rule above. Seeds of `kubernetes.egress`.
+  CRUCIBLE_KUBERNETES__LOCAL_ENDPOINT_NAMESPACE: ""
+  CRUCIBLE_KUBERNETES__LOCAL_ENDPOINT_POD_LABELS: "{}"
+  CRUCIBLE_KUBERNETES__LOCAL_ENDPOINT_PORT: "0"
 
   # 12: all three subscription harnesses refresh their own token in place, so the mount
   # mode is `rw-narrow` and the provider's init container copies the named auth files off

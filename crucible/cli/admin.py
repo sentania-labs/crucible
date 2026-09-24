@@ -38,6 +38,7 @@ from crucible.application.admin import (
     login,
     routing,
 )
+from crucible.application.admin import kubernetes as kubernetes_admin
 from crucible.application.admin import providers as providers_admin
 from crucible.application.admin import repositories as repositories_admin
 from crucible.application.admin import status as status_admin
@@ -62,6 +63,7 @@ from crucible.contracts.api import (
     RepositoryRegistration,
 )
 from crucible.contracts.problem import problem_type
+from crucible.domain.cluster_egress import parse_labels
 from crucible.domain.entities import Principal, Role
 from crucible.domain.events import EventKind
 from crucible.domain.ids import new_id
@@ -218,6 +220,40 @@ def build_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     local_set.add_argument("--enable-thinking", action="store_true")
     local_set.add_argument("--max-concurrency", type=int, default=4)
 
+    kube = sub.add_parser(
+        "kubernetes", help="the Kubernetes provider's cluster egress selectors (26, #91)"
+    )
+    kube_sub = kube.add_subparsers(dest="kubernetes_command", required=True)
+    kube_sub.add_parser("egress", help="the kubernetes.egress setting in force and its source")
+    egress_set = kube_sub.add_parser(
+        "set-egress",
+        help="replace kubernetes.egress: the resolver's pods and an in-cluster local endpoint",
+    )
+    egress_set.add_argument(
+        "--dns-namespace",
+        default="kube-system",
+        help="the cluster resolver's namespace; empty for its service address alone",
+    )
+    egress_set.add_argument(
+        "--dns-labels",
+        default="k8s-app=kube-dns",
+        help="the resolver's pod labels, key=value[,key=value]",
+    )
+    egress_set.add_argument(
+        "--endpoint-namespace",
+        default="",
+        help="an in-cluster local endpoint's namespace; empty when it is outside the cluster",
+    )
+    egress_set.add_argument(
+        "--endpoint-labels", default="", help="its pod labels, key=value[,key=value]"
+    )
+    egress_set.add_argument(
+        "--endpoint-port",
+        type=int,
+        default=0,
+        help="its pods' port; 0 for the endpoint URL's own port",
+    )
+
     b = sub.add_parser(
         "bootstrap", help="the bootstrap ledger handoff (15): submit, show, list, commit"
     )
@@ -274,6 +310,24 @@ def application_error(exc: ApplicationError) -> ClientError:
         "errors": exc.errors or [],
     }
     return ClientError(exc.slug, exc.detail or exc.title, problem=problem, status=exc.status)
+
+
+def _egress(args: argparse.Namespace) -> dict[str, Any]:
+    """`set-egress` flags as the `kubernetes.egress` document the service checks."""
+    try:
+        return {
+            "dns": {
+                "namespace": args.dns_namespace,
+                "pod_labels": parse_labels(args.dns_labels),
+            },
+            "local_endpoint": {
+                "namespace": args.endpoint_namespace,
+                "pod_labels": parse_labels(args.endpoint_labels),
+                "port": args.endpoint_port,
+            },
+        }
+    except ValueError as exc:
+        raise UsageError(str(exc)) from None
 
 
 def _read_api_key() -> str:
@@ -366,6 +420,10 @@ def _remote(args: argparse.Namespace, remote: Api) -> Any:
                 "max_concurrency": args.max_concurrency,
             },
         )
+    if command == "kubernetes":
+        if args.kubernetes_command == "egress":
+            return remote.call("GET", "/v1/admin/kubernetes/egress")
+        return remote.call("POST", "/v1/admin/kubernetes/egress", {**reason, **_egress(args)})
     if command == "bootstrap":
         verb = args.bootstrap_command
         if verb == "submit":
@@ -559,6 +617,15 @@ def _local(args: argparse.Namespace, wiring: Wiring) -> Any:
                 ],
                 max_concurrency=args.max_concurrency,
                 reason=args.reason,
+            )
+            uow.commit()
+            return result
+    if command == "kubernetes":
+        with wiring.ctx.uow_factory() as uow:
+            if args.kubernetes_command == "egress":
+                return kubernetes_admin.egress_view(admin, uow)
+            result = kubernetes_admin.save_egress(
+                admin, uow, principal=principal, document=_egress(args), reason=args.reason
             )
             uow.commit()
             return result
@@ -782,6 +849,7 @@ def kind_of(args: argparse.Namespace) -> str:
         "github": "github_command",
         "audit": "audit_command",
         "routing": "routing_command",
+        "kubernetes": "kubernetes_command",
         "bootstrap": "bootstrap_command",
     }.get(command)
     sub = getattr(args, verb) if verb else None
@@ -810,6 +878,8 @@ def kind_of(args: argparse.Namespace) -> str:
         ("routing", "clear-exhaustion"): "exhaustion_cleared",
         ("routing", "local-endpoint"): "local_endpoint",
         ("routing", "set-local-endpoint"): "local_endpoint",
+        ("kubernetes", "egress"): "kubernetes_egress",
+        ("kubernetes", "set-egress"): "kubernetes_egress",
         ("bootstrap", "list"): "bootstrap_import_list",
     }
     key = ("repository" if command == "repositories" else command, sub)
@@ -878,6 +948,8 @@ def result_for(
         actions = nx.bootstrap_actions(document, prefix)
     elif kind == "local_endpoint":
         actions = nx.local_endpoint_actions(document, prefix)
+    elif kind == "kubernetes_egress":
+        actions = nx.kubernetes_egress_actions(document, prefix)
     elif kind == "audit_page":
         actions = nx.audit_actions(document, prefix, args.limit, args.cursor)
     return Result(kind=kind, data=document, state=state, next=actions, role=role)
