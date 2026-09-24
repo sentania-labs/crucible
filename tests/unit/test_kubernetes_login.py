@@ -566,6 +566,35 @@ async def test_the_supervisor_neither_sweeps_nor_adopts_a_probe_in_flight() -> N
     assert result["probe"].timed_out
 
 
+async def test_a_login_or_probe_job_with_no_pod_yet_is_never_adopted() -> None:
+    """26, crucible#103: `reconcile` adopts a worker Job the controller has not yet
+    given a Pod, but a probe's worker Job and a login Job belong to the API process,
+    so neither is an attempt even before its Pod exists."""
+    api, provider = login_provider()
+    probe = {
+        k8sspec.LABEL_ROLE: k8sspec.ROLE_WORKER,
+        k8sspec.LABEL_ATTEMPT: "probe01",
+        k8sspec.LABEL_ADMIN: k8sspec.ADMIN_PROBE,
+    }
+    login = {
+        k8sspec.LABEL_ROLE: k8sspec.ROLE_LOGIN,
+        k8sspec.LABEL_ATTEMPT: "login01",
+        k8sspec.LABEL_ADMIN: k8sspec.ADMIN_LOGIN,
+        k8sspec.LABEL_LOGIN: "login01",
+    }
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    for name, labels in (("worker-probe01", probe), ("login-codex-login01", login)):
+        api.no_pod_yet.add(name)
+        api.create(
+            "jobs",
+            {"metadata": {"name": name, "labels": labels, "creationTimestamp": now}},
+        )
+    assert not api.object_names("pods")
+    assert await provider.reconcile() == []
+    assert await provider.retention([]) == 0
+    assert api.object_names("jobs") == ["login-codex-login01", "worker-probe01"]
+
+
 async def test_retention_removes_a_login_policy_whose_job_is_gone() -> None:
     api, provider = login_provider()
     labels = {k8sspec.LABEL_ROLE: k8sspec.ROLE_LOGIN}
