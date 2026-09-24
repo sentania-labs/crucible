@@ -575,7 +575,9 @@ def start_login(
         raise ConflictError(f"harness {harness!r} has no interactive login flow")
     spec = spec_for(ctx, harness)
     refuse_while_held(uow, harness)
-    if registry.job_runner(ctx) is not None and registry.container_runner(ctx) is None:
+    job_runner = getattr(registry, "job_runner", lambda _ctx: None)(ctx)
+    container_runner = getattr(registry, "container_runner", lambda _ctx: None)(ctx)
+    if job_runner is not None and container_runner is None:
         return _start_job_login(
             ctx,
             uow,
@@ -1012,6 +1014,10 @@ def finish_login(
     if state is not None:
         state.session_compatibility = "unverified"
         state.last_validated_at = None
+        if session.credential_written:
+            # The Secret now holds a different credential, so an auth failure seen on
+            # the one it replaced says nothing about it, as after a rotate.
+            state.last_auth_failure_at = None
         state.updated_at = ctx.clock.now()
         uow.harnesses.put(state)
     admin_event(
