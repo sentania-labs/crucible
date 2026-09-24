@@ -49,6 +49,16 @@ class AppContext:
     ui_signing_key: bytes = field(default_factory=lambda: secrets.token_bytes(32))
     settings: object | None = None
 
+    @property
+    def secret_providers(self) -> frozenset[str]:
+        """The providers that keep the harness credentials themselves, as Secrets they
+        own (ADR 0015), so a harness's credential there is not a configured directory."""
+        return frozenset(
+            provider.name
+            for provider in self.providers
+            if callable(getattr(provider, "read_credential_files", None))
+        )
+
 
 def app_context(request: Request) -> AppContext:
     ctx: AppContext = request.app.state.ctx

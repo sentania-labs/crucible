@@ -65,6 +65,7 @@ async def submit(
             harnesses=ctx.harnesses,
             harness_gates=ctx.harness_gates,
             credential_sources=ctx.credential_sources,
+            secret_providers=ctx.secret_providers,
         )
         return 201, task_view(uow, task.id).model_dump(mode="json")
 
@@ -266,6 +267,7 @@ async def corrections(
             harnesses=ctx.harnesses,
             harness_gates=ctx.harness_gates,
             credential_sources=ctx.credential_sources,
+            secret_providers=ctx.secret_providers,
         )
         return 200, task_view(uow, task.id).model_dump(mode="json")
 
@@ -302,6 +304,7 @@ async def amend(
             harnesses=ctx.harnesses,
             harness_gates=ctx.harness_gates,
             credential_sources=ctx.credential_sources,
+            secret_providers=ctx.secret_providers,
         )
         return 200, task_view(uow, task.id).model_dump(mode="json")
 

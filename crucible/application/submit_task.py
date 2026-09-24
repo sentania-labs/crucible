@@ -4,7 +4,7 @@ record task_submitted. Does not launch (04)."""
 from __future__ import annotations
 
 import fnmatch
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -277,11 +277,15 @@ def eligible_harness_names(
     harnesses: HarnessRegistry | None,
     harness_gates: Mapping[str, HarnessGate] | None,
     credential_sources: Mapping[str, CredentialSource] | None,
+    secret_providers: Collection[str] = (),
 ) -> set[str] | None:
     if harnesses is None:
         return None
     eligible: set[str] = set()
-    needs_credential = contract.execution_request.provider.value != "fake"
+    provider = contract.execution_request.provider.value
+    # A provider that keeps the credentials as Secrets it owns (ADR 0015) has no
+    # directory to check; its seeding refuses a missing Secret with the reason.
+    needs_credential = provider != "fake" and provider not in secret_providers
     for name in harnesses.names():
         adapter = harnesses.get(name)
         if adapter is None:
@@ -310,6 +314,7 @@ def submit_task(
     harnesses: HarnessRegistry | None = None,
     harness_gates: Mapping[str, HarnessGate] | None = None,
     credential_sources: Mapping[str, CredentialSource] | None = None,
+    secret_providers: Collection[str] = (),
 ) -> tuple[Task, TaskContract]:
     contract = parse_contract(body)
     require_operator_for_pin(principal, contract)
@@ -320,6 +325,7 @@ def submit_task(
         harnesses=harnesses,
         harness_gates=harness_gates,
         credential_sources=credential_sources,
+        secret_providers=secret_providers,
     )
     problems = validate_against_registry(
         uow, clock, contract, eligible_harnesses=eligible_harnesses, harnesses=harnesses

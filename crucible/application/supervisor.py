@@ -1199,9 +1199,17 @@ class Supervisor:
             held = uow.leases.get_checkout_lease(key)
         return held is None or held.holder == attempt_id or held.expires_at <= self._clock.now()
 
-    def _eligible_harnesses(self, *, needs_credential: bool = True) -> set[str] | None:
+    def _eligible_harnesses(
+        self, *, needs_credential: bool = True, provider: str | None = None
+    ) -> set[str] | None:
         if self._harnesses is None:
             return None
+        # A provider that keeps the credentials itself (the Kubernetes provider's
+        # service-owned Secrets, ADR 0015) has no directory to check here. Its seeding
+        # refuses a missing or empty Secret with the reason, as it does for a pin.
+        secret_held = callable(
+            getattr(self._providers.get(provider or ""), "read_credential_files", None)
+        )
         eligible: set[str] = set()
         with self._uow_factory() as uow:
             for name in self._harnesses.names():
@@ -1212,6 +1220,7 @@ class Supervisor:
                 credential = adapter.credential_spec()
                 if (
                     needs_credential
+                    and not secret_held
                     and credential is not None
                     and credential.required_for_launch
                     and (source is None or not Path(source.path).is_dir())
@@ -1237,7 +1246,10 @@ class Supervisor:
         eligible = (
             None
             if request.pinned_model is not None
-            else self._eligible_harnesses(needs_credential=request.provider.value != "fake")
+            else self._eligible_harnesses(
+                needs_credential=request.provider.value != "fake",
+                provider=request.provider.value,
+            )
         )
         selection = select_model(
             uow,

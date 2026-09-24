@@ -167,4 +167,7 @@ export KUBECONFIG="$kubeconfig"
 
 cd "$root"
 uv sync --frozen --quiet
-uv run pytest tests/e2e/test_kind.py -q -m e2e
+# CRUCIBLE_E2E_KIND_PYTEST_ARGS narrows the run (for example `-k login -s`) when one
+# case is being proven on its own cluster; CI leaves it empty and runs the whole tier.
+read -r -a extra_args <<< "${CRUCIBLE_E2E_KIND_PYTEST_ARGS:-}"
+uv run pytest tests/e2e/test_kind.py -q -m e2e "${extra_args[@]}"

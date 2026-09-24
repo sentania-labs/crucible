@@ -7,6 +7,7 @@ correction section, allowed only where 04 says."""
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from typing import Any
 
 from crucible.application.errors import (
@@ -90,6 +91,7 @@ def attach_correction(
     harnesses: HarnessRegistry | None = None,
     harness_gates: dict[str, HarnessGate] | None = None,
     credential_sources: dict[str, CredentialSource] | None = None,
+    secret_providers: Collection[str] = (),
 ) -> Task:
     task = uow.tasks.get(task_id, for_update=True)
     if task is None:
@@ -128,6 +130,7 @@ def attach_correction(
         harnesses=harnesses,
         harness_gates=harness_gates,
         credential_sources=credential_sources,
+        secret_providers=secret_providers,
     )
     problems: list[dict[str, Any]] = validate_against_registry(
         uow, clock, contract, eligible_harnesses=eligible, harnesses=harnesses
@@ -207,6 +210,7 @@ def amend_task(
     harnesses: HarnessRegistry | None = None,
     harness_gates: dict[str, HarnessGate] | None = None,
     credential_sources: dict[str, CredentialSource] | None = None,
+    secret_providers: Collection[str] = (),
 ) -> Task:
     task = uow.tasks.get(task_id, for_update=True)
     if task is None:
@@ -232,6 +236,7 @@ def amend_task(
         harnesses=harnesses,
         harness_gates=harness_gates,
         credential_sources=credential_sources,
+        secret_providers=secret_providers,
     )
     problems: list[dict[str, Any]] = validate_against_registry(
         uow, clock, contract, eligible_harnesses=eligible, harnesses=harnesses
