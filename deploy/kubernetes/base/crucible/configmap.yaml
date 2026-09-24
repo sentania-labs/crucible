@@ -64,6 +64,10 @@ data:
   # The harness credential Secret in `crucible-workers`, per harness (12, 26). The
   # default for a harness that is absent here is `crucible-harness-<harness>`; it is
   # written out so the runbook and the cluster name the same objects.
+  # Mapping a harness here does not force a credential mount if the Secret contains
+  # none of the adapter's declared auth files: an optional credential whose Secret is
+  # empty counts as absent (matching Docker), while a required credential in the same
+  # state fails the launch with a clear message naming the empty Secret.
   CRUCIBLE_KUBERNETES__CREDENTIAL_SECRETS: >-
     {"claude_code":"crucible-harness-claude-code","codex":"crucible-harness-codex","agy":"crucible-harness-agy","hermes":"crucible-harness-hermes"}
   # A named endpoint may enter only this private range. Service and Pod ranges remain

@@ -142,6 +142,11 @@ def _provider(
             cluster_dns_ip=os.environ["CRUCIBLE_E2E_KIND_DNS_IP"],
             broad_egress=True,
             image_repositories=(os.environ["CRUCIBLE_E2E_KIND_REGISTRY"],),
+            # kind's containerd gives every container a private cgroup namespace, so the
+            # canary cannot see the pod-level cgroup `tools/kind/e2e-kind.sh` configures
+            # `podPidsLimit: 512` on (95); this is lab-admin's attestation of that same
+            # number for this disposable cluster, the same way a real deployment would.
+            pod_pid_limit_override=512,
         ),
         api,
         registry,

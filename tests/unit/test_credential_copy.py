@@ -245,7 +245,7 @@ async def test_agy_mounts_rw_narrow_and_a_configured_ro_never_lowers_it(
         assert seeded["antigravity-cli"].isdir() and seeded["antigravity-cli"].mode == 0o700
 
 
-def test_an_empty_optional_credential_directory_is_not_mounted(tmp_path: Path) -> None:
+async def test_an_empty_optional_credential_directory_is_not_mounted(tmp_path: Path) -> None:
     """Hermes's key is optional and Compose creates its directory empty. An empty
     directory is no credential: nothing is mounted or seeded, so the launch keeps the
     no-key fallback instead of refusing over a missing `api-key`."""
@@ -255,12 +255,12 @@ def test_an_empty_optional_credential_directory_is_not_mounted(tmp_path: Path) -
     launch = spec("hermes", image="crucible-worker:hermes-0.19.0-abc")
     assert provider._credential_copy(launch) is None
     assert provider._credential_mounts(launch) == []
-    assert not provider.credential_available("hermes")
+    assert not await provider.credential_available("hermes")
     assert provider._launch_context(launch).credential_mounted is False
 
     (source / "api-key").write_text("placeholder-for-the-test\n", encoding="utf-8")
     assert provider._credential_copy(launch) is not None
-    assert provider.credential_available("hermes")
+    assert await provider.credential_available("hermes")
     assert provider._launch_context(launch).credential_mounted is True
 
 

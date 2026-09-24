@@ -57,7 +57,7 @@ Spec 26's checklist, made concrete. Each row is either a placeholder in
 | 2 | A CNI that enforces egress NetworkPolicy | verified by the readiness canary, shown on the status page |
 | 3 | A `ReadWriteOnce` storage class for PostgreSQL, the reference cache and the attempt workspaces | `REPLACE_ME_STORAGE_CLASS_RWO` |
 | 3b | A `ReadWriteMany` storage class for the artifact root | `REPLACE_ME_STORAGE_CLASS_RWX` |
-| 4 | A pod PID limit configured on the nodes (a kubelet setting) | reported on the status page; the provider refuses to launch without one |
+| 4 | A pod PID limit configured on the nodes (the kubelet's `podPidsLimit`) | reported on the status page when the canary can see it; the provider refuses to launch without a confirmed one (95: on a runtime that isolates the pod's cgroup from the container, the canary cannot see it at all, and lab-admin attests to it with `kubernetes.pod_pid_limit_override` instead) |
 | 5 | The cluster can pull `ghcr.io/sentania-labs/crucible` and `ghcr.io/sentania-labs/crucible-worker` (the release publishes both); a pull secret if the packages are private | `REPLACE_ME_IMAGE_PULL_SECRET` |
 | 6 | Egress from `crucible-workers` to the model providers, the package registries, GitHub and the Spark is possible at the network edge | the per-attempt NetworkPolicy narrows it; the edge must not block it |
 | 7 | The Argo Application | `argocd/application.yaml`, with `REPLACE_ME_ARGOCD_PROJECT`, `REPLACE_ME_MANIFEST_REPO_URL`, `REPLACE_ME_MANIFEST_REVISION` |
@@ -191,6 +191,7 @@ Done means seen working, so all three:
      "namespace_ready": true,
      "egress_enforced": true,
      "pod_pid_limit": <a number, not null>,
+     "pod_pid_limit_source": "cgroup-v2-parent",
      "runtime_class": "standard"
    }
    ```
@@ -198,7 +199,29 @@ Done means seen working, so all three:
    `namespace_ready` is 26's readiness canary: a Pod that must fail to reach the API
    server. `egress_enforced: false` means the CNI is not enforcing egress NetworkPolicy
    and the provider will refuse every launch, which is the correct behaviour and not a
-   bug to route around. `pod_pid_limit: null` means checklist item 4 is not done.
+   bug to route around.
+
+   `pod_pid_limit` is the kubelet's `podPidsLimit` (the `--pod-pids-limit` flag, or the
+   `podPidsLimit` field of the node's `KubeletConfiguration`), not a number the canary's
+   own container carries: a container's own cgroup always has some `pids.max`, and it is
+   not this setting (95). `pod_pid_limit: null` means the gate could not confirm one is
+   in force, which is never treated as a pass; `pod_pid_limit_source` says why:
+   - `cgroup-v2-parent`: read directly from the pod's own cgroup. A number here is a
+     limit in force; `null` here means checklist item 4 is not done.
+   - `cgroupns-private`: the container runtime gave this container its own cgroup
+     namespace, so the pod-level cgroup is not visible from inside it at all. This is
+     the default on current containerd and runc, so `pod_pid_limit` reads `null` here
+     whether or not lab-admin has set `podPidsLimit` on the node; the canary cannot
+     confirm it.
+   - `cgroup-v1`: the node runs the v1 cgroup hierarchy, where the same visibility
+     problem applies and is not implemented; treat as unconfirmed.
+   - `operator-declared`: `kubernetes.pod_pid_limit_override` in settings. On a cluster
+     whose runtime hides the pod cgroup (the `cgroupns-private` case above, which is
+     most current clusters), the canary can never confirm the limit itself; this setting
+     is lab-admin's attestation, made once after checking the node's kubelet
+     configuration directly, that item 4 is done. It never overrides a limit the canary
+     positively read as absent (a `cgroup-v2-parent` result of `null`): only a result
+     the canary could not read at all falls back to it.
 
 2. **The probe, after a change.** The answer is cached while it passes and re-run while
    it fails, so fixing the CNI does not need a Crucible restart.

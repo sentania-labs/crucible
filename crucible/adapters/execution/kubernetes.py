@@ -256,6 +256,12 @@ class KubernetesConfig:
     # namespace readiness probe never itself contests the budget a role pod needs.
     canary_cpu_millicores: int = 100
     canary_memory: str = "64Mi"
+    # An operator-declared pod-level PID limit (95), for a cluster whose container
+    # runtime hides the pod's own cgroup from the canary (a private cgroup namespace,
+    # the default on current containerd and runc). Only fills in for a canary result the
+    # gate could not read at all; a canary that positively read no limit still fails
+    # regardless of this value.
+    pod_pid_limit_override: int | None = None
 
     def credential_secret_name(self, harness: str) -> str:
         return self.credential_secrets.get(harness) or f"crucible-harness-{harness}"
@@ -276,12 +282,18 @@ class NamespaceProbe:
     pid_limit: int | None
     detail: str = ""
     checked: bool = True
+    # Where `pid_limit` came from, or why there is none (95): "cgroup-v2-parent" when
+    # the pod-level cgroup was read directly, "cgroupns-private" when the container's
+    # cgroup namespace hides it, "cgroup-v1" when the hierarchy is the unsupported one,
+    # or "" when the probe never got far enough to know.
+    pid_limit_source: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "namespace_ready": self.passed,
             "egress_enforced": self.egress_enforced,
             "pod_pid_limit": self.pid_limit,
+            "pod_pid_limit_source": self.pid_limit_source,
             "runtime_class": "standard",
             "detail": self.detail,
         }
@@ -498,7 +510,7 @@ class KubernetesProvider:
             with contextlib.suppress(KubernetesApiError):
                 await self._call(self.client.delete, "pods", name, grace_period_seconds=0)
             await self._await_pod_gone(name)
-        return _read_probe(output)
+        return _read_probe(output, override=self.config.pod_pid_limit_override)
 
     def _probe_image(self) -> str:
         """What the readiness canary runs: an image an attempt already resolved, else the
@@ -531,8 +543,24 @@ class KubernetesProvider:
             max_concurrency=self._quota_concurrency or self.config.max_concurrency,
         )
 
-    def credential_available(self, harness: str) -> bool:
-        return harness in self.config.credential_secrets
+    async def credential_available(self, harness: str) -> bool:
+        if harness not in self.config.credential_secrets:
+            return False
+        adapter = self.harnesses.get(harness)
+        credential = adapter.credential_spec() if adapter is not None else None
+        if credential is None or credential.required_for_launch:
+            return True
+        secret_name = self.config.credential_secret_name(harness)
+        try:
+            source = await self._call(self.client.get, "secrets", secret_name)
+        except KubernetesApiError as exc:
+            if exc.status == 404:
+                return False
+            raise HarnessRefusedError(
+                f"refusing to launch: the credential Secret {secret_name!r} for harness "
+                f"{harness!r} is not readable in {self.config.namespace} ({exc.status})"
+            ) from exc
+        return _has_declared_auth_file(credential, source)
 
     async def prepare(self, spec: LaunchSpec) -> Workspace:
         repository = spec.contract.get("repository", {})
@@ -688,7 +716,21 @@ class KubernetesProvider:
         plan = self._egress_plan(spec, k8sspec.ROLE_WORKER)
         policy_name: str | None = None
         identity_paths = await self._identity_paths(spec.attempt_id)
-        credential_keys = await self._credential_keys(spec.attempt_id) if copy else []
+        cred_secret_name = k8sspec.object_name("cred", spec.attempt_id)
+        try:
+            credential_keys = await self._credential_keys(spec.attempt_id) if copy else []
+        except KubernetesApiError as exc:
+            raise HarnessRefusedError(
+                f"refusing to launch: the credential Secret {cred_secret_name!r} for harness "
+                f"{spec.harness!r} is not readable in {self.config.namespace} ({exc.status})"
+            ) from exc
+        if copy is not None and not credential_keys:
+            if copy.spec.required_for_launch:
+                raise HarnessRefusedError(
+                    f"refusing to launch: the credential Secret {cred_secret_name!r} for harness "
+                    f"{spec.harness!r} holds none of its copied auth files"
+                )
+            copy = None
         job_name = k8sspec.object_name("worker", spec.attempt_id)
         try:
             policy_name = await self._apply_policy(spec, k8sspec.ROLE_WORKER, plan)
@@ -1015,6 +1057,7 @@ class KubernetesProvider:
             "node": (launched.node if launched else "") or "",
             "limits": self._limits(spec).as_dict(),
             "pod_pid_limit": probe.pid_limit if probe else None,
+            "pod_pid_limit_source": probe.pid_limit_source if probe else "",
             "runtime_class": "standard",
             "network_policy": (launched.network_policy if launched else None),
             "egress": list(self._egress_plan(spec, k8sspec.ROLE_WORKER).hosts),
@@ -1320,6 +1363,8 @@ class KubernetesProvider:
         identity_paths: Mapping[str, str],
         credential_keys: Sequence[str],
     ) -> dict[str, Any]:
+        if copy is None and spec.env_from_files:
+            spec = replace(spec, env_from_files={})
         command, launch_env = self._command(spec)
         env = {
             "CRUCIBLE_ATTEMPT_ID": spec.attempt_id,
@@ -1508,7 +1553,16 @@ class KubernetesProvider:
             env["CRUCIBLE_TRANSCRIPT"] = spec.transcript_path
         return ["bash", "-o", "pipefail", "-c", LAUNCH_WRAPPER, "crucible-launch", *argv], env
 
-    def _launch_context(self, spec: LaunchSpec) -> LaunchContext:
+    def _launch_context(
+        self, spec: LaunchSpec, *, credential_mounted: bool | None = None
+    ) -> LaunchContext:
+        if credential_mounted is None:
+            adapter = self.harnesses.get(spec.harness)
+            credential = adapter.credential_spec() if adapter is not None else None
+            credential_mounted = bool(spec.env_from_files) or (
+                self._credential_copy(spec) is not None
+                and bool(credential and credential.required_for_launch)
+            )
         return LaunchContext(
             attempt_id=spec.attempt_id,
             model=spec.model,
@@ -1517,7 +1571,7 @@ class KubernetesProvider:
             identity_mount=IDENTITY_MOUNT,
             report_mount=REPORT_MOUNT,
             repo_mount=REPO_MOUNT,
-            credential_mounted=self._credential_copy(spec) is not None,
+            credential_mounted=credential_mounted,
             endpoint=spec.endpoint,
             endpoint_url=spec.endpoint_url,
         )
@@ -1698,13 +1752,19 @@ class KubernetesProvider:
 
     async def _credential_keys(self, attempt_id: str) -> list[str]:
         """Which auth files the per-attempt Secret actually holds, read back rather than
-        assumed, so a restart between `prepare` and `launch` still projects the truth."""
+        assumed, so a restart between `prepare` and `launch` still projects the truth.
+
+        A missing Secret (404) is absence: `[]`. Any other failure is not, and is
+        raised rather than folded into absence, so a required credential does not
+        read a transient API error as "no keys" and launch unauthenticated."""
         try:
             body = await self._call(
                 self.client.get, "secrets", k8sspec.object_name("cred", attempt_id)
             )
-        except KubernetesApiError:
-            return []
+        except KubernetesApiError as exc:
+            if exc.status == 404:
+                return []
+            raise
         return [str(key) for key in (body.get("data") or {})]
 
     async def _seed_credential(self, spec: LaunchSpec, copy: _CredentialCopy) -> None:
@@ -1717,16 +1777,25 @@ class KubernetesProvider:
         try:
             source = await self._call(self.client.get, "secrets", copy.source_secret)
         except KubernetesApiError as exc:
+            if not copy.spec.required_for_launch and exc.status == 404:
+                return
             raise HarnessRefusedError(
                 f"refusing to launch: the credential Secret {copy.source_secret!r} for harness "
                 f"{spec.harness!r} is not readable in {self.config.namespace} ({exc.status})"
             ) from exc
+        if not _has_declared_auth_file(copy.spec, source):
+            if not copy.spec.required_for_launch:
+                return
+            raise HarnessRefusedError(
+                f"refusing to launch: the credential Secret {copy.source_secret!r} is empty: "
+                f"missing its auth file {copy.spec.auth_files[0].name!r}"
+            )
         data = source.get("data") or {}
         payload: dict[str, bytes] = {}
         for auth in copy.spec.auth_files:
             key = _secret_key(auth.name)
             raw = data.get(key)
-            if raw is None:
+            if raw is None or len(raw) == 0:
                 if auth.required:
                     raise HarnessRefusedError(
                         f"refusing to launch: the credential Secret {copy.source_secret!r} is "
@@ -2344,6 +2413,15 @@ def _secret_key(name: str) -> str:
     return name.replace("/", "_")
 
 
+def _has_declared_auth_file(credential: CredentialSpec, secret_body: Mapping[str, Any]) -> bool:
+    """True when the Secret carries at least one declared, non-empty auth file."""
+    data = secret_body.get("data") or {}
+    return any(
+        _secret_key(auth.name) in data and bool(data[_secret_key(auth.name)])
+        for auth in credential.auth_files
+    )
+
+
 def _bundle_key(relative: str) -> str:
     """A ConfigMap key for a bundle file. Keys are `[-._a-zA-Z0-9]+`, so the one
     separator a bundle path can carry becomes a double underscore and the volume's
@@ -2460,7 +2538,7 @@ def _extract(raw: bytes, into: Path) -> None:
         tar.extractall(into, filter="data")
 
 
-def _read_probe(output: str) -> NamespaceProbe:
+def _read_probe(output: str, override: int | None = None) -> NamespaceProbe:
     """Parse the canary's answers. Anything but a definite refusal fails the probe.
 
     `done=1` is what says the script ran to the end; without it the output is a
@@ -2474,8 +2552,6 @@ def _read_probe(output: str) -> NamespaceProbe:
         return NamespaceProbe(False, False, None, "the canary produced no result", checked=False)
     answer = fields["api"]
     enforced = answer == "unreachable"
-    raw = fields.get("pids", "")
-    pid_limit = int(raw) if raw.isdigit() else None
     problems = []
     if answer == "reachable":
         problems.append("the canary reached the API server, so the CNI is not enforcing egress")
@@ -2484,8 +2560,9 @@ def _read_probe(output: str) -> NamespaceProbe:
             "the canary could not tell whether it reached the API server "
             f"(tool {fields.get('tool', 'unknown')}, curl exit {fields.get('curl_exit', 'none')})"
         )
-    if pid_limit is None:
-        problems.append("the node has no pod PID limit configured")
+    pid_limit, pid_source, pid_problem = _read_pod_pid_limit(fields, override)
+    if pid_problem:
+        problems.append(pid_problem)
     return NamespaceProbe(
         passed=not problems,
         egress_enforced=enforced,
@@ -2494,6 +2571,52 @@ def _read_probe(output: str) -> NamespaceProbe:
         # An inconclusive answer is not a probe that ran: the status page should say so
         # rather than showing a namespace that merely failed.
         checked=answer != "inconclusive",
+        pid_limit_source=pid_source,
+    )
+
+
+def _read_pod_pid_limit(
+    fields: Mapping[str, str], override: int | None
+) -> tuple[int | None, str, str | None]:
+    """The pod-level PID limit is the kubelet's `podPidsLimit`, set on the parent of the
+    canary container's own cgroup (95): the container's own `pids.max` is its runtime's
+    per-container default and says nothing about a pod-level limit, which is why the
+    gate no longer reads it directly. Whether the parent is even visible depends on the
+    cgroup namespace the container runtime gave this container; when it is not, the
+    number cannot be established from inside the pod at all.
+
+    `override` is the operator's declared limit, used only when the canary could not
+    read anything: a canary that positively read "no limit" is never overridden, since
+    the operator's number could be stale and the canary's own answer is the more recent
+    one. A non-positive number, from either source, is never a limit: -1 is the
+    kubelet's own "PID limiting disabled", and 0 is not a value `podPidsLimit` takes."""
+    raw = fields.get("pod_pids", "")
+    source = fields.get("pod_pids_source", "")
+    if raw.isdigit() and int(raw) > 0:
+        return int(raw), source, None
+    if raw == "none" or (raw.isdigit() and int(raw) <= 0):
+        return (
+            None,
+            source,
+            "the kubelet podPidsLimit is not set (the pod-level cgroup shows no limit)",
+        )
+    if override is not None and override > 0:
+        return override, "operator-declared", None
+    if raw == "unsupported":
+        return None, source, "the pod-level PID limit is not readable under cgroup v1 (unsupported)"
+    if source == "cgroupns-private":
+        unreadable = (
+            "the pod cgroup is not visible from inside the container (cgroup namespace isolation)"
+        )
+    elif source == "no-pids-controller":
+        unreadable = "the container has no pids cgroup controller mounted"
+    else:
+        unreadable = "the pod-level cgroup could not be read"
+    return (
+        None,
+        source,
+        f"the pod-level PID limit could not be confirmed: {unreadable}, so the kubelet "
+        "podPidsLimit cannot be established from here",
     )
 
 
@@ -2556,6 +2679,52 @@ case "$limit" in
   ''|max) echo "crucible-canary.pids=none" ;;
   *) echo "crucible-canary.pids=$limit" ;;
 esac
+
+# The pod-level limit the kubelet's podPidsLimit sets lands on the parent of this
+# container's own cgroup, one level above what /sys/fs/cgroup shows here (95). Whether
+# that parent is visible depends on the cgroup namespace the container runtime gave
+# this container; when it is not (the container's own path in /proc/self/cgroup is its
+# own root), the number cannot be read from here at all.
+if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
+  selfline=$(grep '^0::' /proc/self/cgroup 2>/dev/null)
+  path=${selfline#0::}
+  if [ -z "$path" ] || [ "$path" = "/" ]; then
+    echo "crucible-canary.pod_pids=unknown"
+    echo "crucible-canary.pod_pids_source=cgroupns-private"
+  else
+    parent=$(dirname "$path")
+    case "$parent" in
+      /|*[!a-zA-Z0-9_./-]*) parent="" ;;
+    esac
+    # `parent`'s own name, not the whole path, must look like a pod-level cgroup (both
+    # cgroup drivers name it with "pod": "kubepods-besteffort-pod<uid>.slice" under
+    # systemd, "pod<uid>" under cgroupfs); an ancestor further up the path saying "pod"
+    # does not count, or a runtime that nests one more cgroup inside the container's own
+    # scope would have this match that inner cgroup, which is the container-scope
+    # mistake this fix exists to remove, just moved one level up.
+    base=${parent##*/}
+    case "$base" in
+      *pod*) podlimit=$(cat "/sys/fs/cgroup$parent/pids.max" 2>/dev/null) ;;
+      *) podlimit="" ;;
+    esac
+    if [ -z "$podlimit" ]; then
+      echo "crucible-canary.pod_pids=unknown"
+      echo "crucible-canary.pod_pids_source=cgroup-v2-parent-unreadable"
+    else
+      case "$podlimit" in
+        max) echo "crucible-canary.pod_pids=none" ;;
+        *) echo "crucible-canary.pod_pids=$podlimit" ;;
+      esac
+      echo "crucible-canary.pod_pids_source=cgroup-v2-parent"
+    fi
+  fi
+elif [ -d /sys/fs/cgroup/pids ]; then
+  echo "crucible-canary.pod_pids=unsupported"
+  echo "crucible-canary.pod_pids_source=cgroup-v1"
+else
+  echo "crucible-canary.pod_pids=unknown"
+  echo "crucible-canary.pod_pids_source=no-pids-controller"
+fi
 echo "crucible-canary.done=1"
 """
 
