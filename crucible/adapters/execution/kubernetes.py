@@ -696,8 +696,20 @@ class KubernetesProvider:
         plan = self._egress_plan(spec, k8sspec.ROLE_WORKER)
         policy_name: str | None = None
         identity_paths = await self._identity_paths(spec.attempt_id)
-        credential_keys = await self._credential_keys(spec.attempt_id) if copy else []
+        cred_secret_name = k8sspec.object_name("cred", spec.attempt_id)
+        try:
+            credential_keys = await self._credential_keys(spec.attempt_id) if copy else []
+        except KubernetesApiError as exc:
+            raise HarnessRefusedError(
+                f"refusing to launch: the credential Secret {cred_secret_name!r} for harness "
+                f"{spec.harness!r} is not readable in {self.config.namespace} ({exc.status})"
+            ) from exc
         if copy is not None and not credential_keys:
+            if copy.spec.required_for_launch:
+                raise HarnessRefusedError(
+                    f"refusing to launch: the credential Secret {cred_secret_name!r} for harness "
+                    f"{spec.harness!r} holds none of its copied auth files"
+                )
             copy = None
         job_name = k8sspec.object_name("worker", spec.attempt_id)
         try:
@@ -1711,13 +1723,19 @@ class KubernetesProvider:
 
     async def _credential_keys(self, attempt_id: str) -> list[str]:
         """Which auth files the per-attempt Secret actually holds, read back rather than
-        assumed, so a restart between `prepare` and `launch` still projects the truth."""
+        assumed, so a restart between `prepare` and `launch` still projects the truth.
+
+        A missing Secret (404) is absence: `[]`. Any other failure is not, and is
+        raised rather than folded into absence, so a required credential does not
+        read a transient API error as "no keys" and launch unauthenticated."""
         try:
             body = await self._call(
                 self.client.get, "secrets", k8sspec.object_name("cred", attempt_id)
             )
-        except KubernetesApiError:
-            return []
+        except KubernetesApiError as exc:
+            if exc.status == 404:
+                return []
+            raise
         return [str(key) for key in (body.get("data") or {})]
 
     async def _seed_credential(self, spec: LaunchSpec, copy: _CredentialCopy) -> None:

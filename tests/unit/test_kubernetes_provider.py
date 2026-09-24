@@ -17,6 +17,7 @@ import pytest
 from crucible.adapters.execution import k8sspec
 from crucible.adapters.execution import kubernetes as kubernetes_module
 from crucible.adapters.execution.k8sapi import ExecResult, KubernetesApiError
+from crucible.adapters.execution.k8sfake import FakeKubernetesApi
 from crucible.adapters.execution.kubernetes import (
     CollectionFailedError,
     HarnessRefusedError,
@@ -438,6 +439,46 @@ async def test_the_per_attempt_secret_is_copied_from_the_harness_secret() -> Non
     copy = api.harness_secret("cred-01attempt0000000000000000a")
     assert list(copy) == ["auth.json"]
     assert copy["auth.json"] == _auth("2026-09-20T00:00:00Z")
+
+
+async def test_a_required_credential_with_no_copied_keys_at_launch_refuses_it() -> None:
+    """A required credential's per-attempt Secret copied by `prepare` but gone or
+    emptied by the time `launch` runs must refuse rather than launch unauthenticated."""
+    api, provider, launch, workspace = await codex_attempt()
+    api.delete("secrets", "cred-01attempt0000000000000000a")
+    with pytest.raises(
+        HarnessRefusedError,
+        match=(
+            r"the credential Secret 'cred-01attempt0000000000000000a' for harness "
+            r"'codex' holds none of its copied auth files"
+        ),
+    ):
+        await provider.launch(workspace, launch)
+
+
+async def test_a_failed_read_of_the_copy_at_launch_refuses_a_required_credential() -> None:
+    """A transient API error reading the per-attempt Secret must not read as an empty
+    (and therefore absent) credential for a required credential."""
+    api: FakeKubernetesApi
+    api, provider, launch, workspace = await codex_attempt()
+
+    orig_get = api.get
+
+    def fail_get(kind: str, name: str) -> dict[str, Any]:
+        if kind == "secrets" and name == "cred-01attempt0000000000000000a":
+            raise KubernetesApiError(500, "Internal Server Error")
+        return orig_get(kind, name)
+
+    api.get = fail_get  # type: ignore[method-assign]
+
+    with pytest.raises(
+        HarnessRefusedError,
+        match=(
+            r"the credential Secret 'cred-01attempt0000000000000000a' for harness "
+            r"'codex' is not readable in crucible-workers \(500\)"
+        ),
+    ):
+        await provider.launch(workspace, launch)
 
 
 async def test_a_missing_required_auth_file_refuses_the_launch() -> None:
