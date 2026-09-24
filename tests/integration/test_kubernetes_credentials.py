@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import time
 from collections.abc import Iterator
 from functools import partial
@@ -526,6 +527,91 @@ def test_a_cancelled_login_reads_failed_only_once_its_lock_is_gone(
     admin.post("/v1/admin/credentials/codex/login/cancel", json={"reason": "stop"})
     poll(admin, "codex", "failed")
     assert lock_names(k8s_api) == []
+
+
+def held_release(
+    k8s_provider: KubernetesProvider, monkeypatch: pytest.MonkeyPatch
+) -> threading.Event:
+    """Hold the login's lock release until the returned event is set, so the window
+    between a login's decided outcome and its terminal state stays open for the test."""
+    release = k8s_provider.release_login_lock
+    go = threading.Event()
+
+    def held(lock: Any) -> None:
+        go.wait(10)
+        release(lock)
+
+    monkeypatch.setattr(k8s_provider, "release_login_lock", held)
+    return go
+
+
+def audit_count(client: TestClient, kind: str) -> int:
+    items = client.get("/v1/admin/audit", params={"limit": 200}).json()["items"]
+    return sum(1 for row in items if row["kind"] == kind)
+
+
+def test_a_login_whose_cli_exited_refuses_a_cancel_while_it_cleans_up(
+    admin: TestClient,
+    k8s_api: FakeKubernetesApi,
+    k8s_provider: KubernetesProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Once the CLI has exited the outcome is decided: a cancel sent while the Job and
+    the lock are cleaned up is refused, not audited as accepted and then overwritten,
+    and the session reads `finished` only once the lock is gone."""
+    go = held_release(k8s_provider, monkeypatch)
+    k8s_api.login = FakeLogin(files={"/home/worker/.codex/auth.json": CODEX_AUTH})
+    admin.post("/v1/admin/credentials/codex/login", json={"reason": "onboarding"})
+    poll(admin, "codex", "finishing")
+    cancel = admin.post("/v1/admin/credentials/codex/login/cancel", json={"reason": "stop"})
+    assert cancel.status_code == 409, cancel.text
+    assert "nothing left to cancel" in cancel.json()["detail"]
+    retry = admin.post("/v1/admin/credentials/codex/login", json={"reason": "retry"})
+    assert retry.status_code == 409 and "cleaning up" in retry.json()["detail"]
+    state = admin.get("/v1/admin/credentials/codex/login").json()
+    assert state["state"] == "finishing" and state["cancel_requested"] is False
+    assert lock_names(k8s_api) == ["login-lock-codex"]
+    go.set()
+    assert poll(admin, "codex", "finished", "failed")["state"] == "finished"
+    assert lock_names(k8s_api) == []
+    assert audit_count(admin, "credential_login_cancelled") == 0
+
+
+def test_a_cancelled_login_refuses_a_code_and_a_second_cancel_while_it_cleans_up(
+    admin: TestClient,
+    k8s_api: FakeKubernetesApi,
+    k8s_provider: KubernetesProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A login cancelled at its code prompt is past taking a code: the code and a second
+    cancel are refused while it cleans up, neither is audited as accepted, and it reads
+    `failed` only once the lock is gone."""
+    go = held_release(k8s_provider, monkeypatch)
+    k8s_api.login = FakeLogin(
+        lines=["https://platform.claude.com/oauth/authorize?code=true"],
+        prompt="Paste code here if prompted > ",
+    )
+    admin.post("/v1/admin/credentials/claude_code/login", json={"reason": "onboarding"})
+    poll(admin, "claude_code", "waiting_for_code")
+    first = admin.post("/v1/admin/credentials/claude_code/login/cancel", json={"reason": "stop"})
+    assert first.status_code == 200, first.text
+    poll(admin, "claude_code", "finishing")
+    code = admin.post(
+        "/v1/admin/credentials/claude_code/login/code",
+        json={"code": "the-code#state", "reason": "complete onboarding"},
+    )
+    assert code.status_code == 409, code.text
+    assert "no longer takes a code" in code.json()["detail"]
+    again = admin.post("/v1/admin/credentials/claude_code/login/cancel", json={"reason": "again"})
+    assert again.status_code == 409, again.text
+    assert admin.get("/v1/admin/credentials/claude_code/login").json()["state"] == "finishing"
+    assert lock_names(k8s_api) == ["login-lock-claude-code"]
+    go.set()
+    done = poll(admin, "claude_code", "finished", "failed")
+    assert done["state"] == "failed" and done["error"] == "login cancelled"
+    assert lock_names(k8s_api) == []
+    assert audit_count(admin, "credential_login_cancelled") == 1
+    assert audit_count(admin, "credential_login_code_submitted") == 0
 
 
 def test_a_login_that_lost_its_lock_does_not_store(
