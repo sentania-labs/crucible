@@ -251,7 +251,9 @@ Done means seen working, so all three:
    refuse every launch: it refuses only a launch whose selected model routes to that
    local endpoint (today, Hermes), while a Claude Code or Codex attempt on a
    subscription endpoint still launches; `local_endpoint_detail` and the refused
-   launch's own error name the endpoint check as the reason.
+   launch's own error name the endpoint check as the reason. The same holds when no
+   NetworkPolicy can permit the endpoint at all (it resolves into a denied range):
+   the detail says `no rule can permit it`, and only local-route launches are refused.
 
 
 

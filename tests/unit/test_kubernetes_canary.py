@@ -198,18 +198,61 @@ async def test_an_endpoint_recovery_admits_hermes_again_with_no_manual_reset() -
     await provider.launch(local_workspace, local_launch)
 
 
-async def test_an_endpoint_no_rule_can_permit_fails_the_probe_without_a_canary() -> None:
+async def test_an_endpoint_no_rule_can_permit_refuses_only_launches_routed_to_it() -> None:
     """Out of the cluster, a name that resolves into a denied range with no
-    `local_endpoint_cidrs` declaration is refused for a worker; the canary says so."""
-    api, _provider, probe = await ready(
-        config=config(local_endpoint_url="http://gateway.lab.example:4000/v1"),
+    `local_endpoint_cidrs` declaration is refused for a worker; the canary says so. That
+    is the endpoint's failure, not the namespace's (crucible#110): the worker rules
+    canary still runs without the endpoint, so DNS keeps its own answer, and only a
+    launch routed to the local endpoint is refused."""
+    gateway = "http://gateway.lab.example:4000/v1"
+    api, _registry, provider = build(
+        config=config(local_endpoint_url=gateway),
         resolver=lambda host: (
             ["10.20.0.5/32"] if host == "gateway.lab.example" else fake_resolver(host)
         ),
     )
+    local_launch = spec(endpoint="local", endpoint_url=gateway)
+    subscription_launch = spec(attempt_id="01ATTEMPT0000000000000000B")
+    local_workspace = await provider.prepare(local_launch)
+    subscription_workspace = await provider.prepare(subscription_launch)
+    probe = await provider.ensure_ready()
+    assert probe.passed is True
+    assert probe.dns_resolves is True
+    assert probe.local_endpoint_reachable is False
+    assert "local endpoint check failed: no rule can permit it" in probe.detail
+    assert "10.20.0.5" in (probe.local_endpoint_detail or "")
+    # The worker rules canary ran, under DNS alone: the endpoint is not in its policy.
+    [policy] = canary_policies(api)
+    [rule] = policy["spec"]["egress"]
+    assert {p["port"] for p in rule["ports"]} == {53}
+    with pytest.raises(LaunchRefusedError, match="no rule can permit it"):
+        await provider.launch(local_workspace, local_launch)
+    await provider.launch(subscription_workspace, subscription_launch)
+
+
+async def test_worker_rules_that_cannot_be_written_refuse_every_launch() -> None:
+    """A worker egress plan that fails for a reason other than the local endpoint (here
+    a DNS selector naming the workers namespace, which a worker may never reach) still
+    fails the whole probe (crucible#110): no worker could run under those rules."""
+    api, _registry, provider = build(config=config(egress=IN_CLUSTER, local_endpoint_url=LITELLM))
+    local_launch = spec(endpoint="local", endpoint_url=LITELLM)
+    subscription_launch = spec(attempt_id="01ATTEMPT0000000000000000B")
+    local_workspace = await provider.prepare(local_launch)
+    subscription_workspace = await provider.prepare(subscription_launch)
+    # The admin setting refuses this selector, so it is put in force directly: it stands
+    # for any worker rules the canary's policy cannot be built from.
+    provider.config = replace(
+        provider.config, egress=replace(IN_CLUSTER, dns_namespace=provider.config.namespace)
+    )
+    provider.probe = None
+    probe = await provider.ensure_ready()
     assert probe.passed is False
-    assert "local endpoint check failed" in probe.detail
-    assert not [row for row in api.created if row["name"].startswith("crucible-canary-rules-")]
+    assert "the worker egress rules cannot be written" in probe.detail
+    with pytest.raises(LaunchRefusedError, match="the workers namespace is not ready"):
+        await provider.launch(local_workspace, local_launch)
+    with pytest.raises(LaunchRefusedError, match="the workers namespace is not ready"):
+        await provider.launch(subscription_workspace, subscription_launch)
+    assert not canary_policies(api)
 
 
 def test_an_old_canary_output_without_the_new_answers_does_not_pass() -> None:

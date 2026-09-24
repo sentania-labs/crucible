@@ -308,6 +308,10 @@ provider." An unreachable `local_endpoint_reachable` does not turn
 `namespace_ready` false: it refuses only the launch whose own route (the routing
 policy's `endpoint` field on its selected model, carried onto `LaunchSpec.endpoint`)
 is `local` (crucible#91, crucible#110), and admits every launch routed elsewhere. A
+local endpoint no NetworkPolicy can permit (it resolves into a denied range, or its
+selector is refused) is the same endpoint failure: the second canary runs without
+it, so DNS and the API server are still proved, and only local-route launches are
+refused; worker rules that cannot be written for any other reason fail the probe. A
 missing tool in the canary image (no curl, no getent or nslookup) is inconclusive
 and never a pass. A probe whose API server, default-deny, DNS and local endpoint
 checks all settled (passed, or the endpoint reachable or none configured) is kept

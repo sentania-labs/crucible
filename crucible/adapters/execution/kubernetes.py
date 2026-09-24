@@ -585,25 +585,47 @@ class KubernetesProvider:
         if isinstance(namespace_run, NamespaceProbe):
             return namespace_run
         endpoint_url = self.config.local_endpoint_url
+        endpoint_problem: str | None = None
         try:
-            plan = await self._resolve_plan(self._local_endpoint_plan(EgressPlan(), endpoint_url))
+            plan = await self._canary_endpoint_plan(endpoint_url)
         except (ProviderError, SpecError) as exc:
-            detail = f"local endpoint check failed: no rule can permit it ({exc})"
-            return NamespaceProbe(
-                False,
-                False,
-                None,
-                detail,
-                checked=False,
-                local_endpoint_reachable=False,
-                local_endpoint_detail=detail,
+            # A local endpoint no rule can permit is the endpoint's failure, not the
+            # namespace's (crucible#110): the worker rules canary still runs without it,
+            # so DNS, default deny and the PID limit keep gating every launch, and the
+            # endpoint refuses only the launches routed to it.
+            endpoint_problem = (
+                f"local endpoint check failed: no rule can permit it ({exc}); this blocks "
+                "only launches routed to a local endpoint"
             )
+            endpoint_url = ""
+            plan = EgressPlan()
         rules_run = await self._run_canary(
             image, scope="worker", plan=plan, endpoint_url=endpoint_url
         )
         if isinstance(rules_run, NamespaceProbe):
             return rules_run
-        return _read_probe(namespace_run, rules_run, override=self.config.pod_pid_limit_override)
+        probe = _read_probe(namespace_run, rules_run, override=self.config.pod_pid_limit_override)
+        if endpoint_problem is None:
+            return probe
+        return replace(
+            probe,
+            detail=endpoint_problem if probe.passed else f"{probe.detail}; {endpoint_problem}",
+            local_endpoint_reachable=False,
+            local_endpoint_detail=endpoint_problem,
+        )
+
+    async def _canary_endpoint_plan(self, endpoint_url: str) -> EgressPlan:
+        """The worker rules canary's plan: cluster DNS and the configured local endpoint.
+        Everything that can refuse the endpoint is checked here, before any object is
+        created, so a failure raised from here is always the endpoint's own."""
+        plan = await self._resolve_plan(self._local_endpoint_plan(EgressPlan(), endpoint_url))
+        if plan.endpoint_selector is not None:
+            k8sspec.check_selector(
+                plan.endpoint_selector,
+                what="local endpoint",
+                protected_namespaces=self._protected(),
+            )
+        return plan
 
     async def _run_canary(
         self,
@@ -626,17 +648,25 @@ class KubernetesProvider:
         policy_name: str | None = None
         if plan is not None:
             policy_name = k8sspec.object_name("np-canary", canary_id)
-            policy = self._policy_body(
-                policy_name,
-                object_labels,
-                canary_id,
-                k8sspec.ROLE_CANARY,
-                plan,
-                pod_selector={
-                    k8sspec.LABEL_CANARY: canary_id,
-                    k8sspec.LABEL_ROLE: k8sspec.ROLE_CANARY,
-                },
-            )
+            try:
+                policy = self._policy_body(
+                    policy_name,
+                    object_labels,
+                    canary_id,
+                    k8sspec.ROLE_CANARY,
+                    plan,
+                    pod_selector={
+                        k8sspec.LABEL_CANARY: canary_id,
+                        k8sspec.LABEL_ROLE: k8sspec.ROLE_CANARY,
+                    },
+                )
+            except SpecError as exc:
+                # The worker egress rules themselves cannot be written (a DNS selector
+                # that names a protected namespace, say): no worker could run under
+                # them, so the whole probe fails, whatever the route.
+                return NamespaceProbe(
+                    False, False, None, f"the worker egress rules cannot be written: {exc}", False
+                )
         limits = k8sspec.canary_limits(
             cpu_millicores=self.config.canary_cpu_millicores,
             memory=self.config.canary_memory,
