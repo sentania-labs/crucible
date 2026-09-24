@@ -251,6 +251,11 @@ class KubernetesConfig:
     # round trip per tag on every `GET /admin/images`.
     probe_image: str = ""
     use_reference_cache: bool = True
+    # 26, issue 93: the canary is a shell script with curl, not a role pod, so it asks
+    # for a fixed small size instead of the policy's limits. Small enough that a
+    # namespace readiness probe never itself contests the budget a role pod needs.
+    canary_cpu_millicores: int = 100
+    canary_memory: str = "64Mi"
     # An operator-declared pod-level PID limit (95), for a cluster whose container
     # runtime hides the pod's own cgroup from the canary (a private cgroup namespace,
     # the default on current containerd and runc). Only fills in for a canary result the
@@ -456,7 +461,10 @@ class KubernetesProvider:
                 False, False, None, "no image is configured to run the canary with", checked=False
             )
         name = f"crucible-canary-{new_id().lower()}"[:60]
-        limits = k8sspec.limits_from_policy({})
+        limits = k8sspec.canary_limits(
+            cpu_millicores=self.config.canary_cpu_millicores,
+            memory=self.config.canary_memory,
+        )
         pod = k8sspec.bare_pod(
             name=name,
             namespace=self.config.namespace,
@@ -1475,7 +1483,15 @@ class KubernetesProvider:
                             "memory": limits.memory,
                             "ephemeral-storage": limits.ephemeral_storage,
                         },
-                        "requests": {"cpu": limits.cpu, "memory": limits.memory},
+                        # The same fraction as the main container's request (issue 93):
+                        # Kubernetes takes a pod's effective request as the larger of the
+                        # sum of its app containers and any one init container, so an
+                        # init container left at the full limit would silently undo the
+                        # role pod's smaller request.
+                        "requests": {
+                            "cpu": limits.cpu_request,
+                            "memory": limits.memory_request,
+                        },
                     },
                     "volumeMounts": [
                         {

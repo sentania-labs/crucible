@@ -100,6 +100,19 @@ class Resources(StrictModel):
     memory: str = Field(min_length=1)
     pids: int = Field(ge=1)
     tmpfs_total: str = Field(min_length=1)
+    # Kubernetes-only (26, issue 93): the container's CPU request as a fraction of
+    # `cpus`, so a small cluster can schedule a Burstable pod instead of demanding the
+    # whole limit up front. A fraction rather than an absolute value tracks `cpus`
+    # automatically when a task's policy changes it, and never exceeds the limit by
+    # construction. Defaults to a value that fits the 3 x 4-CPU lab (issue 93): three
+    # concurrent attempts at the default 2-CPU limit request 3 CPU total, not 6.
+    cpu_request_fraction: float = Field(default=0.5, gt=0, le=1)
+    # Kubernetes-only (26): the memory request as a fraction of `memory`. Defaults to 1
+    # (request equals limit), which keeps the existing Guaranteed-for-memory behavior:
+    # a worker promised the policy's memory is not the first thing evicted under node
+    # pressure (16). A deployment whose cluster is memory-constrained as well as
+    # CPU-constrained may lower this the same way.
+    memory_request_fraction: float = Field(default=1.0, gt=0, le=1)
 
 
 class Network(StrictModel):

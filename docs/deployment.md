@@ -264,6 +264,26 @@ make deploy-kind   # the whole thing on a disposable kind cluster, one task thro
 `kind`, `openssl` and a Docker daemon, and builds the worker image first
 (`make e2e-image`).
 
+`make manifests` also prints a resource budget line for `base`, `overlays/lab` and
+`overlays/kind` (issue 93): the CPU and memory each target's Deployments, StatefulSets
+and Jobs in the `crucible` namespace request, plus `crucible-workers`'s ResourceQuota
+`requests.cpu` / `requests.memory`, which is the manifests' own record of what the
+configured concurrency requests at once. `CRUCIBLE_CLUSTER_CPU_BUDGET` refuses a target
+whose total exceeds it; it defaults to `12`, the lab's own stated shape (three 4-CPU
+nodes, issue 93). `CRUCIBLE_CLUSTER_MEMORY_BUDGET_GI` does the same for memory and has
+no default, because no cluster memory fact lives in this repository; set it to your
+cluster's real memory to have this check mean anything for memory. Both are `make`
+variables:
+
+```sh
+make manifests CRUCIBLE_CLUSTER_CPU_BUDGET=12 CRUCIBLE_CLUSTER_MEMORY_BUDGET_GI=48
+```
+
+This catches the `crucible-workers` ResourceQuota drifting from what the deployed
+policy and `max_concurrency` actually request; it does not catch a policy whose request
+fraction alone makes the arithmetic wrong, which is a review-time check on the policy
+document, not a rendered one (spec 26, "Requests below limits").
+
 CI runs `make manifests`, from this same definition, on every pull request. It does
 **not** run `make deploy-kind`: that builds an image and stands up a kind cluster with
 Calico, a TLS registry and a full task lifecycle, which is the `e2e-kind` job's cost

@@ -196,6 +196,8 @@ def kubernetes_config(settings: Settings) -> KubernetesConfig:
         image_repositories=tuple(k.image_repositories),
         probe_image=k.probe_image,
         use_reference_cache=k.use_reference_cache,
+        canary_cpu_millicores=k.canary_cpu_millicores,
+        canary_memory=k.canary_memory,
         pod_pid_limit_override=k.pod_pid_limit_override,
     )
 
