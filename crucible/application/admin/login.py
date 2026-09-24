@@ -534,17 +534,21 @@ class LoginRegistry:
                     argv=argv,
                     timeout=timeout,
                     accept=accept,
+                    lock=lock,
                 )
             )
         except Exception as exc:
-            session.state = "failed"
-            session.error = f"the login Job failed: {type(exc).__name__}: {exc}"
-        finally:
-            # Success, failure, cancel and timeout all end here, after the Job is gone.
+            # The provider raised before it took charge of the lock. Released before the
+            # session reads failed, as the provider does on every other ending: an
+            # operator who retries at once is not refused by this login's own lock.
             if lock is not None:
                 _release_lock(provider, lock)
+            session.state = "failed"
+            session.error = f"the login Job failed: {type(exc).__name__}: {exc}"
         if session.state not in ("finished", "failed"):
             # A session that never reaches a terminal state refuses every later login.
+            if lock is not None:
+                _release_lock(provider, lock)
             session.state = "failed"
             session.error = session.error or "the login Job ended without a result"
 

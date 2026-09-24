@@ -2100,6 +2100,7 @@ class KubernetesProvider:
         argv: tuple[str, ...],
         timeout: int,
         accept: Callable[[Mapping[str, bytes]], Sequence[str]],
+        lock: LoginLock | None = None,
     ) -> None:
         """Run one harness login as a Job and store what it wrote in the Secret (25).
 
@@ -2117,7 +2118,11 @@ class KubernetesProvider:
 
         Whatever the CLI's exit code, files that pass are stored: the Docker login
         leaves what the CLI wrote in the directory whatever its exit, and AGY's login
-        command ends with a prompt the login Job cannot send to a model endpoint."""
+        command ends with a prompt the login Job cannot send to a model endpoint.
+
+        The session reads `finished` or `failed` only once the Job is gone and `lock`
+        is released, so an operator who retries the moment a login ends (a cancel
+        above all) is never refused by that same login's lock."""
         from crucible.application.admin.login import _consume  # noqa: PLC0415
 
         login_id = f"login{new_id()}"[:26]
@@ -2149,6 +2154,7 @@ class KubernetesProvider:
         }
         policy_name: str | None = None
         job_created = False
+        outcome = "failed"
         session.credential_written = False
         try:
             # The image first: a namespace probed for the first time runs its canary on
@@ -2161,7 +2167,6 @@ class KubernetesProvider:
                     f"not ready ({probe.detail})"
                 )
             if session.cancel_requested:
-                session.state = "failed"
                 session.error = "login cancelled"
                 return
             plan = self._egress_plan(spec, k8sspec.ROLE_LOGIN)
@@ -2230,21 +2235,18 @@ class KubernetesProvider:
             if exit_code is not None and pod_name and not session.cancel_requested:
                 await self._store_login(pod_name, flow, credential, root, session, accept)
             if session.cancel_requested and not session.credential_written:
-                session.state = "failed"
                 session.error = session.error or "login cancelled"
             elif exit_code == 0 and session.error is None:
-                session.state = "finished"
-            else:
-                session.state = "failed"
-                if session.error is None:
-                    session.error = f"the login command exited {exit_code}"
-                    if session.credential_written:
-                        session.error += (
-                            "; the auth files it wrote passed the shape check and are "
-                            "stored in the Secret, so validate decides whether they work"
-                        )
+                outcome = "finished"
+            elif session.error is None:
+                session.error = f"the login command exited {exit_code}"
+                if session.credential_written:
+                    session.error += (
+                        "; the auth files it wrote passed the shape check and are "
+                        "stored in the Secret, so validate decides whether they work"
+                    )
         except Exception as exc:
-            session.state = "failed"
+            outcome = "failed"
             session.error = f"the login Job failed: {type(exc).__name__}: {exc}"
         finally:
             if job_created:
@@ -2255,6 +2257,11 @@ class KubernetesProvider:
             if policy_name:
                 with contextlib.suppress(Exception):
                     await self._call(self.client.delete, "networkpolicies", policy_name)
+            if lock is not None:
+                # Best effort: a lock that could not be deleted expires on its own.
+                with contextlib.suppress(Exception):
+                    await self._call(self.release_login_lock, lock)
+            session.state = outcome
 
     async def _follow_login(
         self,

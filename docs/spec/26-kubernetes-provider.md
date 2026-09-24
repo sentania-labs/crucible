@@ -446,8 +446,10 @@ Each api process keeps its logins in memory, so two replicas (a rollout, or an
 overlay with more than one) would each start a login for the same harness and
 the last to finish would silently replace the Secret. The `login-lock-<harness>`
 ConfigMap stops that: `create` is atomic, so only one replica starts a Job, and
-a login stores its files only if the lock is still the one it created. The
-Docker provider runs in one api process by design and keeps the in-memory check
+a login stores its files only if the lock is still the one it created. A login
+reads `finished` or `failed` only after its Job is gone and its lock is
+released, so an operator who retries the moment a login ends, a cancelled one
+included, is never refused by that login's own lock. The Docker provider runs in one api process by design and keeps the in-memory check
 alone.
 
 A credential probe whose harness hangs is ended by the worker Job's
