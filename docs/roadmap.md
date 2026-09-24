@@ -60,15 +60,18 @@ version tag.
    database, GitHub App and TLS Secrets stay with GitOps.
 4. `docs/deployment.md` matches what ships.
 
-**Exit (seen working):** on a deployment whose GitOps repository carries no harness
-credential Secret, the operator logs Claude Code in and enters the Hermes key in the
-browser, then one real attempt on Claude Code and one on Hermes each reach a terminal
-state with evidence Foundry has read.
+**Exit (seen working):** on a disposable kind cluster running Cilium with kube-proxy
+replacement and no harness credential Secret provided up front, Claude Code is logged
+in and the Hermes key entered from the browser, then one real attempt on Claude Code
+and one on Hermes each reach a terminal state with evidence Foundry has read. The
+release carrying it is published. Deploying it to the lab is the deployer's, and what
+a cluster must provide (kubelet PID limit, gateway selectors) is stated in
+`docs/deployment.md`.
 
 ### M0c: authority handoff
 
 Register the repositories (spec 25), then import, verify and commit the Foundry
-bootstrap ledger on the deployed instance (spec 15). Commit and mark-migrated are irreversible
+bootstrap ledger on the instance the deployer runs (spec 15). Commit and mark-migrated are irreversible
 and wait for the operator's verbatim go. Foundry's start-of-session then reads tasks
 and wakes from Hades only.
 
