@@ -2120,9 +2120,11 @@ class KubernetesProvider:
         leaves what the CLI wrote in the directory whatever its exit, and AGY's login
         command ends with a prompt the login Job cannot send to a model endpoint.
 
-        The session reads `finished` or `failed` only once the Job is gone and `lock`
-        is released, so an operator who retries the moment a login ends (a cancel
-        above all) is never refused by that same login's lock."""
+        The session reads `finished` or `failed` only after the Job's deletion, the wait
+        for its Pods and the release of `lock` have run, so an operator who retries the
+        moment a login ends (a cancel above all) is not refused by that same login's
+        lock. Each of those steps is best effort: a lock that could not be deleted
+        expires on its own."""
         from crucible.application.admin.login import _consume  # noqa: PLC0415
 
         login_id = f"login{new_id()}"[:26]

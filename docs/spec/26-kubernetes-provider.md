@@ -447,9 +447,11 @@ overlay with more than one) would each start a login for the same harness and
 the last to finish would silently replace the Secret. The `login-lock-<harness>`
 ConfigMap stops that: `create` is atomic, so only one replica starts a Job, and
 a login stores its files only if the lock is still the one it created. A login
-reads `finished` or `failed` only after its Job is gone and its lock is
-released, so an operator who retries the moment a login ends, a cancelled one
-included, is never refused by that login's own lock. The Docker provider runs in one api process by design and keeps the in-memory check
+reads `finished` or `failed` only after the service has deleted its Job, waited
+for its Pods and released its lock, so an operator who retries the moment a
+login ends, a cancelled one included, is not refused by that login's own lock.
+Each step is best effort: a lock whose delete failed expires on its own. The
+Docker provider runs in one api process by design and keeps the in-memory check
 alone.
 
 A credential probe whose harness hangs is ended by the worker Job's

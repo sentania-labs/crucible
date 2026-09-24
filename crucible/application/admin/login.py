@@ -466,11 +466,11 @@ class LoginRegistry:
             # A registered session that never reaches a terminal state refuses every later
             # login for the harness as one already in progress (correction 17), and a
             # thread that could not be created is exactly that case.
-            session.state = "failed"
-            session.error = f"the login thread could not be started: {type(exc).__name__}"
             self._threads.pop(harness, None)
             if lock is not None:
                 _release_lock(job, lock)
+            session.error = f"the login thread could not be started: {type(exc).__name__}"
+            session.state = "failed"
             raise
         deadline = time.monotonic() + 5.0
         while session.state == "starting" and thread.is_alive() and time.monotonic() < deadline:
@@ -523,6 +523,7 @@ class LoginRegistry:
         *,
         timeout: int,
     ) -> None:
+        failure: str | None = None
         try:
             import asyncio  # noqa: PLC0415
 
@@ -538,19 +539,18 @@ class LoginRegistry:
                 )
             )
         except Exception as exc:
-            # The provider raised before it took charge of the lock. Released before the
-            # session reads failed, as the provider does on every other ending: an
-            # operator who retries at once is not refused by this login's own lock.
-            if lock is not None:
-                _release_lock(provider, lock)
-            session.state = "failed"
-            session.error = f"the login Job failed: {type(exc).__name__}: {exc}"
-        if session.state not in ("finished", "failed"):
-            # A session that never reaches a terminal state refuses every later login.
-            if lock is not None:
-                _release_lock(provider, lock)
-            session.state = "failed"
-            session.error = session.error or "the login Job ended without a result"
+            failure = f"the login Job failed: {type(exc).__name__}: {exc}"
+        finally:
+            # The provider releases the lock before it ends the session. When it raised
+            # or was interrupted first, the lock is released here, still before the
+            # session reads failed: an operator who retries at once is not refused by
+            # this login's own lock. A session that never reaches a terminal state
+            # refuses every later login.
+            if failure is not None or session.state not in ("finished", "failed"):
+                if lock is not None:
+                    _release_lock(provider, lock)
+                session.error = failure or session.error or "the login Job ended without a result"
+                session.state = "failed"
 
     @staticmethod
     def _run_container(
