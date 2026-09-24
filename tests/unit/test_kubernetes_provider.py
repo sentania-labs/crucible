@@ -325,12 +325,48 @@ async def test_an_oom_kill_is_flagged_rather_than_parsed_out_of_the_detail() -> 
 
 
 async def test_a_pod_that_is_gone_with_nothing_crucible_did_is_lost() -> None:
-    """26: the Job or Pod no longer exists, so the worker is lost, not exited."""
+    """26: a Pod that existed and disappeared is lost, not exited. The observer must
+    have actually seen it first, or there is nothing to tell it apart from a Job whose
+    Pod the controller has not created yet (below)."""
     api, _registry, provider, launch, workspace = await prepared()
     handle = await provider.launch(workspace, launch)
+    assert (await provider.observe(handle)).state is ObservationState.RUNNING
     api.remove_pod_out_of_band(launch.attempt_id)
     observation = await provider.observe(handle)
     assert observation.state is ObservationState.LOST
+
+
+async def test_a_job_with_no_pod_yet_is_pending_not_lost() -> None:
+    """103, 26: a Job controller that has not created a Pod yet (a busy node, a slow
+    tick) reads as pending, not lost, until the launch timeout."""
+    api, _registry, provider, launch, workspace = await prepared()
+    api.no_pod_yet.add(launch.attempt_id)
+    handle = await provider.launch(workspace, launch)
+    observation = await provider.observe(handle)
+    assert observation.state is ObservationState.RUNNING
+
+
+async def test_a_job_with_no_pod_past_the_launch_timeout_is_a_launch_failure() -> None:
+    """103, 26: past the launch timeout with no Pod, it is a launch failure naming the
+    Job controller, the same class of outcome as a Pod stuck Pending."""
+    api, _registry, provider, launch, workspace = await prepared()
+    assert (await provider.ensure_ready()).passed
+    api.no_pod_yet.add(launch.attempt_id)
+    provider.config = replace(provider.config, launch_timeout_seconds=0)
+    handle = await provider.launch(workspace, launch)
+    observation = await provider.observe(handle)
+    assert observation.state is ObservationState.EXITED and observation.exit_code == 70
+    assert "the Job controller never created a Pod" in (observation.detail or "")
+
+
+async def test_a_job_that_itself_disappeared_is_lost() -> None:
+    """26: a Job that no longer exists at all is lost, even inside the launch window."""
+    api, _registry, provider, launch, workspace = await prepared()
+    handle = await provider.launch(workspace, launch)
+    api.delete("jobs", handle.ref)
+    observation = await provider.observe(handle)
+    assert observation.state is ObservationState.LOST
+    assert "no such Job" in (observation.detail or "")
 
 
 async def test_an_evicted_pod_is_lost() -> None:
@@ -520,6 +556,35 @@ async def test_reconcile_does_not_adopt_a_job_whose_pod_is_finished() -> None:
     _api, _registry, provider, launch, workspace = await prepared()
     handle = await provider.launch(workspace, launch)
     await run_to_exit(provider, handle)
+    assert await provider.reconcile() == []
+
+
+async def test_reconcile_adopts_a_job_with_no_pod_yet_after_a_restart() -> None:
+    """103, 26: a restarted supervisor has no memory of the launch, so a Job the
+    controller has not yet given a Pod must still be adopted, or the launch timeout
+    of 26 can never apply to it and `_reconcile_stranded` fails it immediately."""
+    api, _registry, provider, launch, workspace = await prepared()
+    api.no_pod_yet.add(launch.attempt_id)
+    handle = await provider.launch(workspace, launch)
+    provider._launched.clear()
+    adopted = await provider.reconcile()
+    assert [(h.attempt_id, h.ref) for h in adopted] == [(launch.attempt_id, handle.ref)]
+    observation = await provider.observe(adopted[0])
+    assert observation.state is ObservationState.RUNNING
+
+
+async def test_reconcile_does_not_adopt_a_finished_job_with_no_pod() -> None:
+    """A Job that already finished before this restart and had its Pod reaped is not a
+    launch still in flight; the normal cleanup pass handles it, not reconcile."""
+    api, _registry, provider, launch, workspace = await prepared()
+    handle = await provider.launch(workspace, launch)
+    await run_to_exit(provider, handle)
+    api.objects[("jobs", handle.ref)].body["status"] = {
+        "succeeded": 1,
+        "conditions": [{"type": "Complete", "status": "True"}],
+    }
+    api.remove_pod_out_of_band(launch.attempt_id)
+    provider._launched.clear()
     assert await provider.reconcile() == []
 
 
