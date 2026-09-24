@@ -2507,18 +2507,19 @@ def _read_pod_pid_limit(
     `override` is the operator's declared limit, used only when the canary could not
     read anything: a canary that positively read "no limit" is never overridden, since
     the operator's number could be stale and the canary's own answer is the more recent
-    one."""
+    one. A non-positive number, from either source, is never a limit: -1 is the
+    kubelet's own "PID limiting disabled", and 0 is not a value `podPidsLimit` takes."""
     raw = fields.get("pod_pids", "")
     source = fields.get("pod_pids_source", "")
-    if raw.isdigit():
+    if raw.isdigit() and int(raw) > 0:
         return int(raw), source, None
-    if raw == "none":
+    if raw == "none" or (raw.isdigit() and int(raw) <= 0):
         return (
             None,
             source,
             "the kubelet podPidsLimit is not set (the pod-level cgroup shows no limit)",
         )
-    if override is not None:
+    if override is not None and override > 0:
         return override, "operator-declared", None
     if raw == "unsupported":
         return None, source, "the pod-level PID limit is not readable under cgroup v1 (unsupported)"

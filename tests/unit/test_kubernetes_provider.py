@@ -226,6 +226,37 @@ async def test_an_operator_declared_limit_never_overrides_a_confirmed_absence() 
         await provider.launch(workspace, launch)
 
 
+async def test_a_zero_pod_pid_limit_from_the_canary_is_not_a_limit() -> None:
+    """0 is not a value `podPidsLimit` takes; a canary reporting it must not be read as
+    a confirmed limit (95's Codex correction)."""
+    _api, _registry, provider, launch, workspace = await prepared(build={"pod_pid_limit": 0})
+    probe = await provider.ensure_ready()
+    assert probe.passed is False and probe.pid_limit is None
+    assert "podPidsLimit is not set" in probe.detail
+    with pytest.raises(LaunchRefusedError, match="not ready"):
+        await provider.launch(workspace, launch)
+
+
+async def test_a_non_positive_override_never_passes_the_gate() -> None:
+    """The settings model refuses a non-positive override before it reaches here
+    (95's Codex correction), but the gate itself never trusts one either: defense in
+    depth for any caller that builds `KubernetesConfig` directly."""
+    config = KubernetesConfig(
+        poll_interval_seconds=0,
+        launch_timeout_seconds=5,
+        storage_class="lab-ssd",
+        image_pull_secret="ghcr-pull",
+        pod_pid_limit_override=-1,
+    )
+    _api, _registry, provider, launch, workspace = await prepared(
+        build={"config": config, "pod_pid_limit_source": "cgroupns-private"}
+    )
+    probe = await provider.ensure_ready()
+    assert probe.passed is False and probe.pid_limit is None
+    with pytest.raises(LaunchRefusedError, match="not ready"):
+        await provider.launch(workspace, launch)
+
+
 async def test_cgroup_v1_pod_pid_limit_is_unsupported_not_a_pass() -> None:
     _api, _registry, provider, launch, workspace = await prepared(
         build={"pod_pid_limit_source": "cgroup-v1"}
