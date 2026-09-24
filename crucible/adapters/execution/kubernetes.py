@@ -535,8 +535,24 @@ class KubernetesProvider:
             max_concurrency=self._quota_concurrency or self.config.max_concurrency,
         )
 
-    def credential_available(self, harness: str) -> bool:
-        return harness in self.config.credential_secrets
+    async def credential_available(self, harness: str) -> bool:
+        if harness not in self.config.credential_secrets:
+            return False
+        adapter = self.harnesses.get(harness)
+        credential = adapter.credential_spec() if adapter is not None else None
+        if credential is None or credential.required_for_launch:
+            return True
+        secret_name = self.config.credential_secret_name(harness)
+        try:
+            source = await self._call(self.client.get, "secrets", secret_name)
+        except KubernetesApiError as exc:
+            if exc.status == 404:
+                return False
+            raise HarnessRefusedError(
+                f"refusing to launch: the credential Secret {secret_name!r} for harness "
+                f"{harness!r} is not readable in {self.config.namespace} ({exc.status})"
+            ) from exc
+        return _has_declared_auth_file(credential, source)
 
     async def prepare(self, spec: LaunchSpec) -> Workspace:
         repository = spec.contract.get("repository", {})
@@ -692,7 +708,21 @@ class KubernetesProvider:
         plan = self._egress_plan(spec, k8sspec.ROLE_WORKER)
         policy_name: str | None = None
         identity_paths = await self._identity_paths(spec.attempt_id)
-        credential_keys = await self._credential_keys(spec.attempt_id) if copy else []
+        cred_secret_name = k8sspec.object_name("cred", spec.attempt_id)
+        try:
+            credential_keys = await self._credential_keys(spec.attempt_id) if copy else []
+        except KubernetesApiError as exc:
+            raise HarnessRefusedError(
+                f"refusing to launch: the credential Secret {cred_secret_name!r} for harness "
+                f"{spec.harness!r} is not readable in {self.config.namespace} ({exc.status})"
+            ) from exc
+        if copy is not None and not credential_keys:
+            if copy.spec.required_for_launch:
+                raise HarnessRefusedError(
+                    f"refusing to launch: the credential Secret {cred_secret_name!r} for harness "
+                    f"{spec.harness!r} holds none of its copied auth files"
+                )
+            copy = None
         job_name = k8sspec.object_name("worker", spec.attempt_id)
         try:
             policy_name = await self._apply_policy(spec, k8sspec.ROLE_WORKER, plan)
@@ -1325,6 +1355,8 @@ class KubernetesProvider:
         identity_paths: Mapping[str, str],
         credential_keys: Sequence[str],
     ) -> dict[str, Any]:
+        if copy is None and spec.env_from_files:
+            spec = replace(spec, env_from_files={})
         command, launch_env = self._command(spec)
         env = {
             "CRUCIBLE_ATTEMPT_ID": spec.attempt_id,
@@ -1505,7 +1537,16 @@ class KubernetesProvider:
             env["CRUCIBLE_TRANSCRIPT"] = spec.transcript_path
         return ["bash", "-o", "pipefail", "-c", LAUNCH_WRAPPER, "crucible-launch", *argv], env
 
-    def _launch_context(self, spec: LaunchSpec) -> LaunchContext:
+    def _launch_context(
+        self, spec: LaunchSpec, *, credential_mounted: bool | None = None
+    ) -> LaunchContext:
+        if credential_mounted is None:
+            adapter = self.harnesses.get(spec.harness)
+            credential = adapter.credential_spec() if adapter is not None else None
+            credential_mounted = bool(spec.env_from_files) or (
+                self._credential_copy(spec) is not None
+                and bool(credential and credential.required_for_launch)
+            )
         return LaunchContext(
             attempt_id=spec.attempt_id,
             model=spec.model,
@@ -1514,7 +1555,7 @@ class KubernetesProvider:
             identity_mount=IDENTITY_MOUNT,
             report_mount=REPORT_MOUNT,
             repo_mount=REPO_MOUNT,
-            credential_mounted=self._credential_copy(spec) is not None,
+            credential_mounted=credential_mounted,
             endpoint=spec.endpoint,
             endpoint_url=spec.endpoint_url,
         )
@@ -1695,13 +1736,19 @@ class KubernetesProvider:
 
     async def _credential_keys(self, attempt_id: str) -> list[str]:
         """Which auth files the per-attempt Secret actually holds, read back rather than
-        assumed, so a restart between `prepare` and `launch` still projects the truth."""
+        assumed, so a restart between `prepare` and `launch` still projects the truth.
+
+        A missing Secret (404) is absence: `[]`. Any other failure is not, and is
+        raised rather than folded into absence, so a required credential does not
+        read a transient API error as "no keys" and launch unauthenticated."""
         try:
             body = await self._call(
                 self.client.get, "secrets", k8sspec.object_name("cred", attempt_id)
             )
-        except KubernetesApiError:
-            return []
+        except KubernetesApiError as exc:
+            if exc.status == 404:
+                return []
+            raise
         return [str(key) for key in (body.get("data") or {})]
 
     async def _seed_credential(self, spec: LaunchSpec, copy: _CredentialCopy) -> None:
@@ -1714,16 +1761,25 @@ class KubernetesProvider:
         try:
             source = await self._call(self.client.get, "secrets", copy.source_secret)
         except KubernetesApiError as exc:
+            if not copy.spec.required_for_launch and exc.status == 404:
+                return
             raise HarnessRefusedError(
                 f"refusing to launch: the credential Secret {copy.source_secret!r} for harness "
                 f"{spec.harness!r} is not readable in {self.config.namespace} ({exc.status})"
             ) from exc
+        if not _has_declared_auth_file(copy.spec, source):
+            if not copy.spec.required_for_launch:
+                return
+            raise HarnessRefusedError(
+                f"refusing to launch: the credential Secret {copy.source_secret!r} is empty: "
+                f"missing its auth file {copy.spec.auth_files[0].name!r}"
+            )
         data = source.get("data") or {}
         payload: dict[str, bytes] = {}
         for auth in copy.spec.auth_files:
             key = _secret_key(auth.name)
             raw = data.get(key)
-            if raw is None:
+            if raw is None or len(raw) == 0:
                 if auth.required:
                     raise HarnessRefusedError(
                         f"refusing to launch: the credential Secret {copy.source_secret!r} is "
@@ -2339,6 +2395,15 @@ _UNREADABLE = b"\x00__crucible_unreadable__"
 def _secret_key(name: str) -> str:
     """A Secret key for an auth file name. Keys may not contain a path separator."""
     return name.replace("/", "_")
+
+
+def _has_declared_auth_file(credential: CredentialSpec, secret_body: Mapping[str, Any]) -> bool:
+    """True when the Secret carries at least one declared, non-empty auth file."""
+    data = secret_body.get("data") or {}
+    return any(
+        _secret_key(auth.name) in data and bool(data[_secret_key(auth.name)])
+        for auth in credential.auth_files
+    )
 
 
 def _bundle_key(relative: str) -> str:

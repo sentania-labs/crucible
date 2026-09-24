@@ -115,6 +115,7 @@ securityContext:            # pod
   runAsUser: 1000
   runAsGroup: 1000
   fsGroup: 1000
+  fsGroupChangePolicy: OnRootMismatch
   seccompProfile: {type: RuntimeDefault}
 containers:
 - securityContext:          # container
