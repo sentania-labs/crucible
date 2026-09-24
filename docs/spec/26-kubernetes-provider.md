@@ -232,12 +232,24 @@ the namespace. A deployment therefore names one exact, pullable reference in
 - `launch`: resolve the worker image to a digest through the image registry
   (11, 25) and record it; refuse an unsupported harness version; create the
   NetworkPolicy and the worker Job; return the Job name as the handle.
-- `observe`: read the Job and its Pod; `running` while the Pod is Pending
-  or Running, `exited(code)` from the terminated container status, `lost`
-  when the Job or Pod no longer exists or the Pod was evicted or its node is
-  gone. Pending longer than the policy's launch timeout (image pull, no
-  schedulable node, PVC unbound) is a launch failure with the Pod's
-  conditions as detail, not a stall.
+- `observe`: read the Job and its Pod.
+
+  | Job | Pod | Result |
+  |---|---|---|
+  | gone | — | `lost` ("the namespace has no such Job") |
+  | exists | Pending or Running, within the launch timeout | `running` |
+  | exists | Pending past the launch timeout | launch failure, the Pod's conditions as detail (image pull, no schedulable node, PVC unbound), not a stall |
+  | exists | terminated container | `exited(code)` |
+  | exists | evicted, or its node is gone | `lost` |
+  | exists | none yet, within the launch timeout | `running` (a Job controller can take a few seconds to create a Pod on a busy node; this is not a loss, 103) |
+  | exists | none yet, past the launch timeout | launch failure ("the Job controller never created a Pod") |
+  | exists | had one, now gone | `lost` (the Pod existed and disappeared, unlike the row above) |
+
+  Distinguishing the last two rows needs the observer's own memory of whether
+  it ever saw this attempt's Pod (103): a Job it has watched since launch
+  keeps that memory in the process; one adopted by `reconcile` after a
+  restart never had the chance, so it starts in the "none yet" row with the
+  Job's own creation time standing in for the launch time.
 - `logs`: `pods/log` with timestamps, `sinceTime` from the stored offset,
   resumed strict-after by the (timestamp, line hash) pair (10). A restarted
   supervisor re-attaches by Job name.
@@ -252,7 +264,10 @@ the namespace. A deployment therefore names one exact, pullable reference in
   per policy (retained PVCs carry a retention label the sweep honours);
   release the lease.
 - `reconcile`: list Jobs by label; a Job with no live attempt row is
-  orphaned and deleted; a live attempt with no Job is `lost`.
+  orphaned and deleted; a live attempt with no Job is `lost`. A Job still
+  waiting on its Pod is adopted like a running one (103), its launch time
+  taken from the Job's own creation timestamp; one whose Pod already
+  finished and was reaped is left alone for cleanup, not adopted.
 
 Heartbeats and stall detection (10, C6c) are unchanged: log progress and
 the filesystem fingerprint come from the PVC through the reader Pod, and
