@@ -251,6 +251,7 @@ def pod_spec(request: PodRequest) -> dict[str, Any]:
             "runAsUser": WORKER_UID,
             "runAsGroup": WORKER_UID,
             "fsGroup": WORKER_UID,
+            "fsGroupChangePolicy": "OnRootMismatch",
             "seccompProfile": {"type": "RuntimeDefault"},
         },
         "containers": [container],

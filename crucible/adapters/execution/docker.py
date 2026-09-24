@@ -434,7 +434,7 @@ class DockerProvider:
             max_concurrency=self.config.max_concurrency,
         )
 
-    def credential_available(self, harness: str) -> bool:
+    async def credential_available(self, harness: str) -> bool:
         source = self._credential_source(harness)
         adapter = self.harnesses.get(harness)
         credential = adapter.credential_spec() if adapter is not None else None

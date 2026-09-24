@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -16,8 +17,10 @@ import pytest
 from crucible.adapters.execution import k8sspec
 from crucible.adapters.execution import kubernetes as kubernetes_module
 from crucible.adapters.execution.k8sapi import ExecResult, KubernetesApiError
+from crucible.adapters.execution.k8sfake import FakeKubernetesApi
 from crucible.adapters.execution.kubernetes import (
     CollectionFailedError,
+    HarnessRefusedError,
     KubernetesConfig,
     KubernetesProvider,
     NamespaceProbe,
@@ -34,7 +37,7 @@ from crucible.ports.execution import (
 from crucible.ports.execution import (
     CleanupPolicy as Cleanup,
 )
-from tests.unit.kubernetes_fixtures import IMAGE, build, spec
+from tests.unit.kubernetes_fixtures import IMAGE, build, pod_of, spec
 
 CODEX_IMAGE = "crucible-worker:codex-fake-succeed-2"
 
@@ -438,6 +441,46 @@ async def test_the_per_attempt_secret_is_copied_from_the_harness_secret() -> Non
     assert copy["auth.json"] == _auth("2026-09-20T00:00:00Z")
 
 
+async def test_a_required_credential_with_no_copied_keys_at_launch_refuses_it() -> None:
+    """A required credential's per-attempt Secret copied by `prepare` but gone or
+    emptied by the time `launch` runs must refuse rather than launch unauthenticated."""
+    api, provider, launch, workspace = await codex_attempt()
+    api.delete("secrets", "cred-01attempt0000000000000000a")
+    with pytest.raises(
+        HarnessRefusedError,
+        match=(
+            r"the credential Secret 'cred-01attempt0000000000000000a' for harness "
+            r"'codex' holds none of its copied auth files"
+        ),
+    ):
+        await provider.launch(workspace, launch)
+
+
+async def test_a_failed_read_of_the_copy_at_launch_refuses_a_required_credential() -> None:
+    """A transient API error reading the per-attempt Secret must not read as an empty
+    (and therefore absent) credential for a required credential."""
+    api: FakeKubernetesApi
+    api, provider, launch, workspace = await codex_attempt()
+
+    orig_get = api.get
+
+    def fail_get(kind: str, name: str) -> dict[str, Any]:
+        if kind == "secrets" and name == "cred-01attempt0000000000000000a":
+            raise KubernetesApiError(500, "Internal Server Error")
+        return orig_get(kind, name)
+
+    api.get = fail_get  # type: ignore[method-assign]
+
+    with pytest.raises(
+        HarnessRefusedError,
+        match=(
+            r"the credential Secret 'cred-01attempt0000000000000000a' for harness "
+            r"'codex' is not readable in crucible-workers \(500\)"
+        ),
+    ):
+        await provider.launch(workspace, launch)
+
+
 async def test_a_missing_required_auth_file_refuses_the_launch() -> None:
     api, registry, provider = build(harness="codex")
     registry.register(CODEX_IMAGE, harness="codex", version="0.153.4")
@@ -482,12 +525,193 @@ async def test_hermes_uses_no_secret_when_its_optional_credential_is_unconfigure
     assert not api.secret_exists("cred-01attempt0000000000000000a")
 
 
-def test_kubernetes_reports_a_configured_hermes_secret_as_available() -> None:
-    _api, _registry, provider = build(
+async def test_kubernetes_reports_a_configured_hermes_secret_as_available() -> None:
+    api, _registry, provider = build(
         harness="hermes",
         config=KubernetesConfig(credential_secrets={"hermes": "crucible-harness-hermes"}),
     )
-    assert provider.credential_available("hermes")
+    assert not await provider.credential_available("hermes")
+    api.put_harness_secret("crucible-harness-hermes", {})
+    assert not await provider.credential_available("hermes")
+    api.put_harness_secret("crucible-harness-hermes", {"api-key": b"secret-token"})
+    assert await provider.credential_available("hermes")
+
+
+async def test_an_empty_optional_credential_secret_counts_as_absent() -> None:
+    """89: an optional credential whose Secret exists but contains none of the declared
+    auth files counts as absent, matching the Docker provider."""
+
+    def resolver(host: str) -> list[str]:
+        return ["10.10.0.42/32"] if host == "llm.apps.int.sentania.net" else ["151.101.0.223/32"]
+
+    api, registry, provider = build(
+        harness="hermes",
+        resolver=resolver,
+        config=KubernetesConfig(
+            poll_interval_seconds=0,
+            launch_timeout_seconds=5,
+            local_endpoint_cidrs=("10.10.0.0/24",),
+            credential_secrets={"hermes": "crucible-harness-hermes"},
+        ),
+    )
+    api.put_harness_secret("crucible-harness-hermes", {})
+    image = "crucible-worker:hermes-fake-succeed-1"
+    registry.register(image, harness="hermes", version="0.19.0")
+    launch = spec(
+        harness="hermes",
+        image=image,
+        endpoint="local",
+        endpoint_url="https://llm.apps.int.sentania.net/v1",
+        model="coder",
+    )
+    assert not await provider.credential_available("hermes")
+    ctx = provider._launch_context(launch)
+    assert ctx.credential_mounted is False
+
+    adapter = provider.harnesses.require("hermes")
+    adapter_launch = adapter.build_launch(ctx)
+    assert adapter_launch.env["OPENAI_API_KEY"] == "local-no-auth"
+    assert adapter_launch.env_from_files == {}
+    launch = replace(
+        launch,
+        command=tuple(adapter_launch.argv),
+        env=dict(adapter_launch.env),
+        env_from_files=dict(adapter_launch.env_from_files),
+    )
+
+    workspace = await provider.prepare(launch)
+    assert not api.secret_exists("cred-01attempt0000000000000000a")
+    await provider.launch(workspace, launch)
+    assert not api.secret_exists("cred-01attempt0000000000000000a")
+
+    worker_pod = pod_of(api, "worker-")
+    volume_names = [v["name"] for v in worker_pod["volumes"]]
+    assert "cred" not in volume_names
+    assert "cred-source" not in volume_names
+    container = worker_pod["containers"][0]
+    container_env = {e["name"]: e["value"] for e in container["env"]}
+    assert "CRUCIBLE_ENV_FROM_FILES" not in container_env
+    assert container_env.get("OPENAI_API_KEY") == "local-no-auth"
+
+
+async def test_kubernetes_optional_credential_404_launches_with_placeholder() -> None:
+    """A 404 on an optional credential launches with the placeholder."""
+
+    def resolver(host: str) -> list[str]:
+        return ["10.10.0.42/32"] if host == "llm.apps.int.sentania.net" else ["151.101.0.223/32"]
+
+    api, registry, provider = build(
+        harness="hermes",
+        resolver=resolver,
+        config=KubernetesConfig(
+            poll_interval_seconds=0,
+            launch_timeout_seconds=5,
+            local_endpoint_cidrs=("10.10.0.0/24",),
+            credential_secrets={"hermes": "crucible-harness-hermes"},
+        ),
+    )
+    # The Secret is mapped in config but does not exist in Kubernetes (404)
+    assert not await provider.credential_available("hermes")
+
+    image = "crucible-worker:hermes-fake-succeed-1"
+    registry.register(image, harness="hermes", version="0.19.0")
+    launch = spec(
+        harness="hermes",
+        image=image,
+        endpoint="local",
+        endpoint_url="https://llm.apps.int.sentania.net/v1",
+        model="coder",
+    )
+    ctx = provider._launch_context(launch)
+    assert ctx.credential_mounted is False
+
+    adapter = provider.harnesses.require("hermes")
+    adapter_launch = adapter.build_launch(ctx)
+    assert adapter_launch.env["OPENAI_API_KEY"] == "local-no-auth"
+    assert adapter_launch.env_from_files == {}
+    launch = replace(
+        launch,
+        command=tuple(adapter_launch.argv),
+        env=dict(adapter_launch.env),
+        env_from_files=dict(adapter_launch.env_from_files),
+    )
+
+    workspace = await provider.prepare(launch)
+    assert not api.secret_exists("cred-01attempt0000000000000000a")
+    await provider.launch(workspace, launch)
+    assert not api.secret_exists("cred-01attempt0000000000000000a")
+
+    worker_pod = pod_of(api, "worker-")
+    volume_names = [v["name"] for v in worker_pod["volumes"]]
+    assert "cred" not in volume_names
+    assert "cred-source" not in volume_names
+    container = worker_pod["containers"][0]
+    container_env = {e["name"]: e["value"] for e in container["env"]}
+    assert "CRUCIBLE_ENV_FROM_FILES" not in container_env
+    assert container_env.get("OPENAI_API_KEY") == "local-no-auth"
+
+
+async def test_kubernetes_optional_credential_500_refuses_launch_naming_status() -> None:
+    """A 500 on an optional credential refuses the launch naming the status."""
+    api, registry, provider = build(
+        harness="hermes",
+        config=KubernetesConfig(credential_secrets={"hermes": "crucible-harness-hermes"}),
+    )
+
+    orig_get = api.get
+
+    def fail_get(kind: str, name: str) -> dict[str, Any]:
+        if kind == "secrets" and name == "crucible-harness-hermes":
+            raise KubernetesApiError(500, "Internal Server Error")
+        return orig_get(kind, name)
+
+    api.get = fail_get  # type: ignore[method-assign]
+
+    refuses_naming_500 = (
+        r"refusing to launch: the credential Secret 'crucible-harness-hermes' "
+        r"for harness 'hermes' is not readable in crucible-workers \(500\)"
+    )
+
+    with pytest.raises(HarnessRefusedError, match=refuses_naming_500):
+        await provider.credential_available("hermes")
+
+    image = "crucible-worker:hermes-fake-succeed-1"
+    registry.register(image, harness="hermes", version="0.19.0")
+    launch = spec(harness="hermes", image=image)
+    with pytest.raises(HarnessRefusedError, match=refuses_naming_500):
+        await provider.prepare(launch)
+
+
+async def test_a_required_credential_with_an_empty_secret_fails_naming_the_secret() -> None:
+    """89: a required credential whose Secret is empty fails naming the empty Secret."""
+    api, registry, provider = build(harness="codex")
+    registry.register(CODEX_IMAGE, harness="codex", version="0.153.4")
+    api.put_harness_secret("crucible-harness-codex", {})
+    launch = spec(harness="codex", image=CODEX_IMAGE)
+    with pytest.raises(
+        LaunchRefusedError,
+        match=(
+            r"the credential Secret 'crucible-harness-codex' is empty: "
+            r"missing its auth file 'auth\.json'"
+        ),
+    ):
+        await provider.prepare(launch)
+
+
+async def test_a_required_credential_with_no_declared_auth_files_fails_naming_the_secret() -> None:
+    """89: a required credential whose Secret holds no declared auth files fails."""
+    api, registry, provider = build(harness="codex")
+    registry.register(CODEX_IMAGE, harness="codex", version="0.153.4")
+    api.put_harness_secret("crucible-harness-codex", {"unrelated.json": b"foo"})
+    launch = spec(harness="codex", image=CODEX_IMAGE)
+    with pytest.raises(
+        LaunchRefusedError,
+        match=(
+            r"the credential Secret 'crucible-harness-codex' is empty: "
+            r"missing its auth file 'auth\.json'"
+        ),
+    ):
+        await provider.prepare(launch)
 
 
 async def test_a_rotated_auth_file_is_written_back_and_the_copy_removed() -> None:
