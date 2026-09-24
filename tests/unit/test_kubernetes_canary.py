@@ -9,6 +9,7 @@ connect to it. Anything it cannot tell is inconclusive, never a pass.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -116,29 +117,73 @@ async def test_a_configured_local_endpoint_is_connected_to_under_its_selector() 
 
 
 @pytest.mark.parametrize("answer", ["unreachable", "unresolved"])
-async def test_an_unreachable_local_endpoint_fails_the_probe_and_every_launch(answer: str) -> None:
+async def test_an_unreachable_local_endpoint_refuses_only_launches_routed_to_it(
+    answer: str,
+) -> None:
+    """crucible#110, the operator 2026-09-23: "a down provider should only block that
+    provider." The endpoint result no longer fails the whole probe; it refuses only the
+    launch whose own route (`LaunchSpec.endpoint`) is `local` (today: Hermes to the
+    local gateway), and admits a launch routed elsewhere (a Claude Code or Codex
+    attempt on a subscription endpoint, which never touches it)."""
     api, _registry, provider = build(
         config=config(egress=IN_CLUSTER, local_endpoint_url=LITELLM), canary_endpoint=answer
     )
-    launch = spec()
-    workspace = await provider.prepare(launch)
+    local_launch = spec(endpoint="local", endpoint_url=LITELLM)
+    subscription_launch = spec(attempt_id="01ATTEMPT0000000000000000B")
+    local_workspace = await provider.prepare(local_launch)
+    subscription_workspace = await provider.prepare(subscription_launch)
     probe = await provider.ensure_ready()
-    assert probe.passed is False
+    assert probe.passed is True
     assert probe.local_endpoint_reachable is False
     assert "local endpoint check failed" in probe.detail
     with pytest.raises(LaunchRefusedError, match="local endpoint check failed"):
-        await provider.launch(workspace, launch)
+        await provider.launch(local_workspace, local_launch)
+    await provider.launch(subscription_workspace, subscription_launch)
     assert api
 
 
-async def test_an_inconclusive_local_endpoint_check_is_never_a_pass() -> None:
-    _api, _provider, probe = await ready(
+async def test_an_inconclusive_local_endpoint_check_refuses_only_launches_routed_to_it() -> None:
+    _api, provider, probe = await ready(
         config=config(egress=IN_CLUSTER, local_endpoint_url=LITELLM),
         canary_endpoint="inconclusive",
     )
-    assert probe.passed is False and probe.checked is False
+    assert probe.passed is True and probe.checked is False
     assert probe.local_endpoint_reachable is None
     assert "local endpoint check inconclusive" in probe.detail
+    local_launch = spec(endpoint="local", endpoint_url=LITELLM)
+    local_workspace = await provider.prepare(local_launch)
+    with pytest.raises(LaunchRefusedError, match="local endpoint check inconclusive"):
+        await provider.launch(local_workspace, local_launch)
+    subscription_launch = spec(attempt_id="01ATTEMPT0000000000000000B")
+    subscription_workspace = await provider.prepare(subscription_launch)
+    await provider.launch(subscription_workspace, subscription_launch)
+
+
+async def test_dns_down_refuses_every_launch_and_endpoint_recovery_admits_hermes_again() -> None:
+    """crucible#110, requirement 5: DNS still gates every launch, whatever the route;
+    once the local endpoint recovers, the launch that uses it is admitted again."""
+    api, _registry, provider = build(
+        config=config(egress=IN_CLUSTER, local_endpoint_url=LITELLM), canary_dns="failed"
+    )
+    local_launch = spec(endpoint="local", endpoint_url=LITELLM)
+    subscription_launch = spec(attempt_id="01ATTEMPT0000000000000000B")
+    local_workspace = await provider.prepare(local_launch)
+    subscription_workspace = await provider.prepare(subscription_launch)
+    probe = await provider.ensure_ready()
+    assert probe.passed is False
+    with pytest.raises(LaunchRefusedError, match="the workers namespace is not ready"):
+        await provider.launch(local_workspace, local_launch)
+    with pytest.raises(LaunchRefusedError, match="the workers namespace is not ready"):
+        await provider.launch(subscription_workspace, subscription_launch)
+
+    # The endpoint recovers (and so does DNS, since the same canary run proves both):
+    # a fresh probe admits the Hermes launch again.
+    api.canary_dns = "resolved"
+    provider.probe = None
+    probe = await provider.ensure_ready()
+    assert probe.passed is True
+    assert probe.local_endpoint_reachable is True
+    await provider.launch(local_workspace, local_launch)
 
 
 async def test_an_endpoint_no_rule_can_permit_fails_the_probe_without_a_canary() -> None:
@@ -331,14 +376,18 @@ async def test_a_probe_proved_under_rules_that_changed_while_it_ran_is_not_kept(
 async def test_a_launch_after_a_settings_change_is_gated_again() -> None:
     """The gate and the worker's rules are the same settings: a change between them
     runs the canary again, and a failure refuses the launch."""
-    api, _registry, provider = build(config=config())
-    launch = spec()
+    api, _registry, provider = build(config=config(egress=IN_CLUSTER, local_endpoint_url=LITELLM))
+    launch = spec(endpoint="local", endpoint_url=LITELLM)
     workspace = await provider.prepare(launch)
-    assert (await provider.ensure_ready()).passed
+    probe = await provider.ensure_ready()
+    assert probe.passed and probe.local_endpoint_reachable is True
     real_resolve = provider._resolve_image
+    changed_egress = replace(IN_CLUSTER, dns_namespace="kube-system-alt")
 
     async def resolve_and_change(launch_spec: Any) -> str:
-        provider.apply_settings(IN_CLUSTER.as_document(), LITELLM)
+        # The endpoint URL is unchanged; what changes is the cluster's own egress
+        # settings (a different DNS selector), which forces the re-gate.
+        provider.apply_settings(changed_egress.as_document(), LITELLM)
         api.canary_endpoint = "unreachable"
         return await real_resolve(launch_spec)
 
@@ -423,7 +472,8 @@ async def test_both_canaries_take_the_configured_canary_size() -> None:
 
 def test_the_failure_detail_quotes_the_worker_rules_canarys_own_curl_exit() -> None:
     namespace = (
-        "crucible-canary.api=unreachable\ncrucible-canary.pids=4096\ncrucible-canary.done=1\n"
+        "crucible-canary.api=unreachable\ncrucible-canary.pod_pids=4096\n"
+        "crucible-canary.pod_pids_source=cgroup-v2-parent\ncrucible-canary.done=1\n"
     )
     rules = (
         "crucible-canary.api=unreachable\ncrucible-canary.dns=resolved\n"
@@ -431,5 +481,8 @@ def test_the_failure_detail_quotes_the_worker_rules_canarys_own_curl_exit() -> N
         "crucible-canary.done=1\n"
     )
     probe = _read_probe(namespace, rules)
-    assert probe.passed is False
+    # crucible#110: an unreachable local endpoint alone no longer fails the probe.
+    assert probe.passed is True
+    assert probe.local_endpoint_reachable is False
     assert "curl exit 28" in probe.detail
+    assert "curl exit 28" in (probe.local_endpoint_detail or "")
