@@ -178,6 +178,11 @@ class FakeKubernetesApi:
     # DNS, and an address rule on the DNS service never does (crucible#91).
     translates_services: bool = False
     pod_pid_limit: int | None = 4096
+    # The canary's source for `pod_pid_limit` (95): the default simulates a cgroup
+    # namespace that lets the container see its pod's parent cgroup. A test can set
+    # this to `cgroupns-private` (the parent is not visible, `pod_pid_limit` is then
+    # ignored) or `cgroup-v1` (unsupported) to exercise those probe outcomes.
+    pod_pid_limit_source: str = "cgroup-v2-parent"
     node_name: str = "lab-node-1"
     quota_jobs: int | None = None
 
@@ -491,7 +496,12 @@ class FakeKubernetesApi:
 
     def _act_canary(self, obj: _Object, attempt_id: str) -> None:
         name = obj.name
-        pid = "none" if self.pod_pid_limit is None else str(self.pod_pid_limit)
+        if self.pod_pid_limit_source == "cgroupns-private":
+            pod_pids = "unknown"
+        elif self.pod_pid_limit_source == "cgroup-v1":
+            pod_pids = "unsupported"
+        else:
+            pod_pids = "none" if self.pod_pid_limit is None else str(self.pod_pid_limit)
         labels = (obj.body.get("metadata") or {}).get("labels") or {}
         policy = self._canary_policy(str(labels.get(LABEL_CANARY, "")))
         dns_open = policy is not None and any(
@@ -521,7 +531,11 @@ class FakeKubernetesApi:
             f"crucible-canary.api={self.canary_answer}",
             f"crucible-canary.curl_exit={'7' if self.egress_enforced else '0'}",
             *egress_lines,
-            f"crucible-canary.pids={pid}",
+            # The container's own cgroup limit, kept for diagnostics only (95): the
+            # gate never decides on this number.
+            "crucible-canary.pids=19093",
+            f"crucible-canary.pod_pids={pod_pids}",
+            f"crucible-canary.pod_pids_source={self.pod_pid_limit_source}",
             *(["crucible-canary.done=1"] if self.canary_done else []),
         ]
         self._finish(obj, 0)

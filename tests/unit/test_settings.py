@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from crucible.cli.wiring import kubernetes_config
 from crucible.domain.cluster_egress import ClusterEgress
@@ -139,3 +140,17 @@ def test_a_seed_into_the_workers_namespace_stops_the_service_at_start() -> None:
     )
     with pytest.raises(ValueError, match="may never reach"):
         kubernetes_config(settings)
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_a_non_positive_pod_pid_limit_override_is_refused(value: int) -> None:
+    """-1 is the kubelet's own "PID limiting disabled"; copying it from a node config
+    here would make the readiness gate pass with no pod-level limit in force (95's
+    Codex correction)."""
+    with pytest.raises(ValidationError, match="positive integer"):
+        Settings(kubernetes={"pod_pid_limit_override": value})
+
+
+def test_a_positive_pod_pid_limit_override_is_accepted() -> None:
+    settings = Settings(kubernetes={"pod_pid_limit_override": 512})
+    assert settings.kubernetes.pod_pid_limit_override == 512

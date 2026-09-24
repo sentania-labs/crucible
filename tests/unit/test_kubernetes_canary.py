@@ -403,9 +403,10 @@ def test_the_worker_rules_canary_must_also_find_the_api_server_unreachable() -> 
     assert "under the worker egress rules" in probe.detail
 
 
-async def test_a_canary_is_small_so_it_never_holds_the_workers_quota() -> None:
+async def test_both_canaries_take_the_configured_canary_size() -> None:
     """Two canaries at a worker's size (2 CPU, 4 GiB each) filled the kind tier's 8 GiB
-    quota until the quota controller caught up, and the worker Pod after them waited."""
+    quota until the quota controller caught up, and the worker Pod after them waited.
+    Both take `canary_limits()` from settings (93), the defaults here."""
     api, _provider, probe = await ready()
     assert probe.passed
     canaries = [
@@ -416,8 +417,8 @@ async def test_a_canary_is_small_so_it_never_holds_the_workers_quota() -> None:
     assert len(canaries) == 2
     for pod in canaries:
         resources = pod["spec"]["containers"][0]["resources"]
-        assert resources["requests"] == {"cpu": "250m", "memory": str(128 * 1024**2)}
-        assert resources["limits"]["cpu"] == "250m"
+        assert resources["requests"] == {"cpu": "100m", "memory": str(64 * 1024**2)}
+        assert resources["limits"]["cpu"] == "100m"
 
 
 def test_the_failure_detail_quotes_the_worker_rules_canarys_own_curl_exit() -> None:

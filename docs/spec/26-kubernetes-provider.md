@@ -115,6 +115,7 @@ securityContext:            # pod
   runAsUser: 1000
   runAsGroup: 1000
   fsGroup: 1000
+  fsGroupChangePolicy: OnRootMismatch
   seccompProfile: {type: RuntimeDefault}
 containers:
 - securityContext:          # container
@@ -123,7 +124,7 @@ containers:
     capabilities: {drop: ["ALL"]}
   resources:                # from policy limits
     limits: {cpu: ..., memory: ..., ephemeral-storage: ...}
-    requests: {cpu: ..., memory: ...}
+    requests: {cpu: ..., memory: ...}   # a fraction of the limit, not the limit (issue 93)
   volumeMounts:
   - {name: tmp, mountPath: /tmp}           # emptyDir, medium Memory, sizeLimit
   - {name: home, mountPath: /home/worker}  # emptyDir, medium Memory, sizeLimit
@@ -159,6 +160,45 @@ plus a SIGTERM from Crucible's `drain` gives the harness the same window.
 sets; the provider records the effective limit in the launch evidence and
 refuses to launch if none is configured). A runtime class is not set in this
 version; the field is reserved and documented as the microVM step.
+
+### Requests below limits (issue 93)
+
+A role pod that requests exactly its limit (2 CPU / 4Gi by default) cannot
+schedule on a small cluster that is otherwise busy: no node has 2 CPU
+unreserved even at 10% utilization on three 4-CPU nodes, and every launch
+times out. Requests are therefore a fraction of the limit, not the limit
+itself, carried on the policy's `resources` block:
+
+- `resources.cpu_request_fraction` (default 0.5): the container's CPU
+  request as a fraction of `resources.cpus`. A fraction rather than an
+  absolute value tracks the limit automatically when a task's policy raises
+  or lowers it, and can never itself exceed the limit. At the default, one
+  attempt requests 1 CPU while still being allowed to burst to 2, and three
+  concurrent attempts (`max_concurrency`) request 3 CPU rather than 6,
+  which is what the 3 x 4-CPU lab needs to actually schedule anything.
+- `resources.memory_request_fraction` (default 1, operator decision
+  2026-09-23): memory stays request-equals-limit by default. Requesting the
+  full memory limit gives Guaranteed QoS for memory pressure, so a worker
+  promised the policy's memory is not the first thing evicted, which would
+  otherwise show up as a `lost` attempt nobody caused (16). CPU carries no
+  equivalent eviction risk, so it alone gets the lower default. A deployment
+  whose cluster is memory-constrained as well as CPU-constrained may lower
+  this fraction too; both fractions are ordinary policy fields, so they are
+  editable and versioned exactly where `resources.cpus` and
+  `resources.memory` already are (04, 05b), with no separate settings
+  surface of their own.
+
+The pod's effective request is the larger of its app containers' sum and any
+one init container's request, so the writable-credential init container
+(`rw-narrow` harnesses, below) carries the same fraction as the main
+container; left at the full limit it would silently cancel the role pod's
+lower request.
+
+The readiness canary (`ROLE_CANARY`) is a shell script with curl, never a
+role pod, so it does not use the policy's resources at all: both of its pods
+request and limit a fixed small size, `kubernetes.canary_cpu_millicores` (default
+100m) and `kubernetes.canary_memory` (default 64Mi), configured the same
+way as `kubernetes.probe_image`.
 
 ## Networking: NetworkPolicy replaces the egress proxy
 
@@ -351,11 +391,14 @@ unauthenticated placeholder.
 ## Observability and administration
 
 Attempt evidence that has no field of its own on the provider port (the Job and
-Pod names, the node, the effective limits, the pod PID limit and the
-NetworkPolicy applied) is stored as one `report/kubernetes-launch.json`
+Pod names, the node, the effective limits and requests, the pod PID limit and
+the NetworkPolicy applied) is stored as one `report/kubernetes-launch.json`
 artifact of the attempt, which carries an `artifact_present` evidence row like
 any other per-attempt fact Crucible observed (11). The image digest stays on
-the attempt row. (Made concrete 2026-09-21 during C8a.)
+the attempt row. (Made concrete 2026-09-21 during C8a.) `limits.as_dict()`
+(issue 93) carries `cpu_request` and `memory_request` beside `cpu` and
+`memory`, so the evidence records what was actually asked of the scheduler
+next to what was allowed to run.
 
 `GET /providers` reports the Kubernetes provider with `isolation: pod`,
 `network_control: true`, `resource_limits: true`, `shared_disk: false`, the
@@ -364,7 +407,7 @@ namespace's ResourceQuota. The admin status page (25) shows the namespace
 readiness probe, the CNI egress enforcement result, the pod PID limit, and
 the runtime class in use ("standard" in this version). Attempt evidence
 records the image digest, the Job and Pod names, the node, the effective
-limits, and the NetworkPolicy applied.
+limits and requests, and the NetworkPolicy applied.
 
 ## What the cluster must guarantee first (lab-admin)
 
@@ -385,7 +428,15 @@ the status page.
    separate Deployments on this topology. Object storage for artifacts would
    remove the second requirement and is a later phase.
    (Added 2026-09-22 during C9.)
-4. Nodes have a pod PID limit configured.
+4. Nodes have a pod PID limit configured (the kubelet's `podPidsLimit`, the
+   pod-level cgroup, not any one container's own `pids.max`). The canary
+   reads it from the parent of its own cgroup under cgroup v2, which the
+   container runtime must make visible for the probe to confirm it; on a
+   runtime that isolates the pod's cgroup from the container (the default on
+   current containerd and runc), the probe reports the limit as unconfirmed
+   rather than guess, and lab-admin attests to it with
+   `kubernetes.pod_pid_limit_override` instead, once, after checking the
+   node's kubelet configuration directly (95).
 5. The cluster can pull the Crucible and worker images from the registry
    the release publishes to (24); a pull secret if the packages are private.
 6. Egress from `crucible-workers` to the model providers, the package
@@ -399,6 +450,20 @@ the status page.
 
 A runtime class for worker pods (gVisor or Kata) is not a prerequisite for
 this version.
+
+9. The namespace's `requests.cpu` and `requests.memory` (`resourcequota.yaml`)
+   stay consistent with the running policy's request fractions and
+   `max_concurrency` by hand: `requests.cpu` is `max_concurrency` times
+   `resources.cpus * cpu_request_fraction`, and `requests.memory` the same
+   with `memory_request_fraction` (issue 93). `limits.cpu` and
+   `limits.memory` stay `max_concurrency` times the plain limits, unchanged
+   by this. `make manifests` prints the rendered total and refuses a target
+   whose total exceeds a stated cluster CPU or memory budget
+   (`docs/deployment.md`), which catches the quota drifting from the policy
+   but not a policy whose fraction alone makes the math wrong; that is a
+   review-time check, not a rendered one. A quota left stale after a policy
+   raises its fraction fails closed: fewer concurrent attempts admit, never
+   more than the quota allows.
 
 The manifests that satisfy the Crucible half of this list are
 `deploy/kubernetes`, and the operator-facing runbook, including every

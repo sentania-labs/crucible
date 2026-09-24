@@ -60,6 +60,7 @@ async def test_the_pod_security_context_is_26s_verbatim(ran: Any, prefix: str) -
         "runAsUser": 1000,
         "runAsGroup": 1000,
         "fsGroup": 1000,
+        "fsGroupChangePolicy": "OnRootMismatch",
         "seccompProfile": {"type": "RuntimeDefault"},
     }
 
@@ -105,10 +106,49 @@ async def test_the_limits_come_from_policy_and_the_grace_period_with_them(
     assert resources["limits"]["cpu"] == "2000m"
     assert resources["limits"]["memory"] == str(4 * 1024**3)
     assert resources["limits"]["ephemeral-storage"] == "2Gi"
-    # Requests equal limits: a worker promised the policy's memory is not the first
-    # thing evicted, which would show up as a `lost` attempt nobody caused (16).
-    assert resources["requests"] == {"cpu": "2000m", "memory": str(4 * 1024**3)}
+    # CPU requests default to half the limit (issue 93), so a small cluster schedules a
+    # Burstable pod instead of demanding the whole limit up front. Memory still requests
+    # equal to its limit by default: a worker promised the policy's memory is not the
+    # first thing evicted, which would show up as a `lost` attempt nobody caused (16).
+    assert resources["requests"] == {"cpu": "1000m", "memory": str(4 * 1024**3)}
     assert pod["terminationGracePeriodSeconds"] == 30
+
+
+async def test_the_request_fractions_are_configurable_per_policy() -> None:
+    """Issue 93: a policy may set its own request fractions, and the worker's writable
+    credential init container (rw-narrow harnesses) must track the same fraction as the
+    main container or it silently dominates the pod's effective request."""
+    codex_image = "crucible-worker:codex-fake-succeed-2"
+    api, registry, provider = build()
+    registry.register(codex_image, harness="codex", version="0.153.4")
+    api.put_harness_secret("crucible-harness-codex", {"auth.json": b"{}"})
+    launch = spec(
+        harness="codex",
+        image=codex_image,
+        policy={
+            "images": {"allowlist": ["crucible-worker:*"]},
+            "network": {"mode": "egress-proxy", "egress_allowlist": ["pypi.org", "github.com"]},
+            "resources": {
+                "cpus": 4,
+                "memory": "8GiB",
+                "cpu_request_fraction": 0.25,
+                "memory_request_fraction": 0.5,
+            },
+            "limits": {"grace_seconds": 30},
+        },
+    )
+    workspace = await provider.prepare(launch)
+    await provider.launch(workspace, launch)
+    pod = pod_of(api, "worker-")
+    resources = pod["containers"][0]["resources"]
+    assert resources["limits"] == {
+        "cpu": "4000m",
+        "memory": str(8 * 1024**3),
+        "ephemeral-storage": "2Gi",
+    }
+    assert resources["requests"] == {"cpu": "1000m", "memory": str(4 * 1024**3)}
+    init = pod["initContainers"][0]
+    assert init["resources"]["requests"] == {"cpu": "1000m", "memory": str(4 * 1024**3)}
 
 
 @pytest.mark.parametrize("prefix", ROLE_PREFIXES)
