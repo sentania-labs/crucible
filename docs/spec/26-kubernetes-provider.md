@@ -446,13 +446,17 @@ Each api process keeps its logins in memory, so two replicas (a rollout, or an
 overlay with more than one) would each start a login for the same harness and
 the last to finish would silently replace the Secret. The `login-lock-<harness>`
 ConfigMap stops that: `create` is atomic, so only one replica starts a Job, and
-a login stores its files only if the lock is still the one it created. A login
-reads `finished` or `failed` only after the service has deleted its Job, waited
-for its Pods and released its lock, so an operator who retries the moment a
-login ends, a cancelled one included, is not refused by that login's own lock.
-Each step is best effort: a lock whose delete failed expires on its own. The
-Docker provider runs in one api process by design and keeps the in-memory check
-alone.
+a login stores its files only if the lock is still the one it created. Once its
+outcome is decided (the CLI exited, the login failed, or it was cancelled) a
+login reads `finishing`: the API and the UI refuse a cancel or a code for it,
+since the CLI is gone, and neither is audited as accepted. It reads `finished`
+or `failed` only after the service has deleted its Job, waited for its Pods and
+released its lock, so an operator who retries the moment a login ends, a
+cancelled one included, is not refused by that login's own lock. Each step is
+best effort: a lock whose delete failed expires on its own. The Docker provider
+runs in one api process by design and keeps the in-memory check alone; it sets
+`finished` or `failed` before it removes the login container, so it never reads
+`finishing`.
 
 A credential probe whose harness hangs is ended by the worker Job's
 `activeDeadlineSeconds` before the provider's own wait runs out. The provider

@@ -2120,11 +2120,12 @@ class KubernetesProvider:
         leaves what the CLI wrote in the directory whatever its exit, and AGY's login
         command ends with a prompt the login Job cannot send to a model endpoint.
 
-        The session reads `finished` or `failed` only after the Job's deletion, the wait
-        for its Pods and the release of `lock` have run, so an operator who retries the
-        moment a login ends (a cancel above all) is not refused by that same login's
-        lock. Each of those steps is best effort: a lock that could not be deleted
-        expires on its own."""
+        Once the CLI has exited (or the login failed or was cancelled) the session reads
+        `finishing`, which refuses a cancel and a code. It reads `finished` or `failed`
+        only after the Job's deletion, the wait for its Pods and the release of `lock`
+        have run, so an operator who retries the moment a login ends (a cancel above all)
+        is not refused by that same login's lock. Each of those steps is best effort: a
+        lock that could not be deleted expires on its own."""
         from crucible.application.admin.login import _consume  # noqa: PLC0415
 
         login_id = f"login{new_id()}"[:26]
@@ -2157,6 +2158,7 @@ class KubernetesProvider:
         policy_name: str | None = None
         job_created = False
         outcome = "failed"
+        cancelled = False
         session.credential_written = False
         try:
             # The image first: a namespace probed for the first time runs its canary on
@@ -2234,9 +2236,12 @@ class KubernetesProvider:
                 name, flow, session, timeout=timeout, consume=_consume, root=root
             )
             session.exit_code = exit_code
-            if exit_code is not None and pod_name and not session.cancel_requested:
+            # The outcome is decided from here: a cancel or a code the operator sends
+            # now would be accepted for a CLI that has already exited.
+            cancelled = session.begin_finishing()
+            if exit_code is not None and pod_name and not cancelled:
                 await self._store_login(pod_name, flow, credential, root, session, accept)
-            if session.cancel_requested and not session.credential_written:
+            if cancelled and not session.credential_written:
                 session.error = session.error or "login cancelled"
             elif exit_code == 0 and session.error is None:
                 outcome = "finished"
@@ -2251,6 +2256,7 @@ class KubernetesProvider:
             outcome = "failed"
             session.error = f"the login Job failed: {type(exc).__name__}: {exc}"
         finally:
+            session.begin_finishing()
             if job_created:
                 with contextlib.suppress(Exception):
                     await self._call(self.client.delete, "jobs", name, grace_period_seconds=0)
