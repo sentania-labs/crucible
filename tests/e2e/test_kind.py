@@ -1025,6 +1025,14 @@ async def test_login_from_an_empty_secret_to_a_probe_and_an_attempt_through_the_
             assert state["url"] == "https://example.invalid/device"
             assert state["code"] == "C7AA-TEST"
             assert state["credential_written"] is True
+            # The login lock (25, 26) was taken on the real API server and is released
+            # by uid once the Job is gone.
+            lock_selector = f"{k8sspec.LABEL_ROLE}={k8sspec.ROLE_LOGIN_LOCK}"
+            for _ in range(60):
+                if not api.list_objects("configmaps", label_selector=lock_selector):
+                    break
+                time.sleep(0.5)
+            assert not api.list_objects("configmaps", label_selector=lock_selector)
             # 58: the login Job's egress is its login endpoints, and this harness has
             # none, so the model endpoint is refused from it.
             assert "model-endpoint=refused" in state["output_tail"], state
