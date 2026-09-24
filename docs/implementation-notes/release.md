@@ -70,11 +70,15 @@ real Docker daemon. Each step gates the next:
    auth failure stops the job rather than being read as "not published". An
    existing version from this same commit is a re-run and the push is skipped;
    an existing version from a different commit means the tag was moved, which
-   fails the job. Push `:latest` only when this version is the highest already
-   published, so re-tagging an old fix does not move `latest` backwards; the
-   worker images' `latest` and `script-harness-latest` move in the same step,
-   copied on the registry from their version tags. The release notes then read
-   every digest back with `docker buildx imagetools inspect`.
+   fails the job. Move `latest` only when this version is the highest already
+   published, so re-tagging an old fix does not move `latest` backwards. All
+   three images' `latest` (the service image, `crucible-worker`'s, and
+   `script-harness-latest`) move the same way in the same step: copied on the
+   registry from each one's own just-confirmed version tag, never pushed from
+   this job's local build, so a re-run that skips the version push still
+   leaves every `latest` on a digest a version tag also carries (2026-09-23).
+   The release notes then read every digest back with
+   `docker buildx imagetools inspect`.
 7. **Create the GitHub release** with generated notes, last, so a release never
    points at a version that is not consumable from the registry.
 
