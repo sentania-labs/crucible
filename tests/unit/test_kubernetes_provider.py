@@ -369,6 +369,21 @@ async def test_a_job_that_itself_disappeared_is_lost() -> None:
     assert "no such Job" in (observation.detail or "")
 
 
+async def test_a_job_that_failed_before_any_pod_was_seen_is_lost() -> None:
+    """103, 26: `backoffLimit: 0` fails the Job the moment its one Pod does, so a Pod
+    gone before any poll caught it alive is still a Pod that existed and disappeared,
+    not a Job that never got one, and the Job's own Failed condition says so."""
+    api, _registry, provider, launch, workspace = await prepared()
+    handle = await provider.launch(workspace, launch)
+    api.remove_pod_out_of_band(launch.attempt_id)
+    api.objects[("jobs", handle.ref)].body["status"] = {
+        "failed": 1,
+        "conditions": [{"type": "Failed", "status": "True", "reason": "BackoffLimitExceeded"}],
+    }
+    observation = await provider.observe(handle)
+    assert observation.state is ObservationState.LOST
+
+
 async def test_an_evicted_pod_is_lost() -> None:
     api, _registry, provider, launch, workspace = await prepared()
     handle = await provider.launch(workspace, launch)
@@ -571,6 +586,22 @@ async def test_reconcile_adopts_a_job_with_no_pod_yet_after_a_restart() -> None:
     assert [(h.attempt_id, h.ref) for h in adopted] == [(launch.attempt_id, handle.ref)]
     observation = await provider.observe(adopted[0])
     assert observation.state is ObservationState.RUNNING
+
+
+async def test_reconcile_adopts_a_job_with_no_pod_already_past_the_launch_timeout() -> None:
+    """103, 26: the Job's own creation time stands in for the launch time, so an
+    attempt already past the launch timeout when a restarted supervisor finds it is
+    caught on the first observation instead of being given the window again."""
+    api, _registry, provider, launch, workspace = await prepared()
+    api.no_pod_yet.add(launch.attempt_id)
+    provider.config = replace(provider.config, launch_timeout_seconds=1)
+    handle = await provider.launch(workspace, launch)
+    api.objects[("jobs", handle.ref)].body["metadata"]["creationTimestamp"] = "2020-01-01T00:00:00Z"
+    provider._launched.clear()
+    adopted = await provider.reconcile()
+    assert [(h.attempt_id, h.ref) for h in adopted] == [(launch.attempt_id, handle.ref)]
+    observation = await provider.observe(adopted[0])
+    assert observation.state is ObservationState.EXITED and observation.exit_code == 70
 
 
 async def test_reconcile_does_not_adopt_a_finished_job_with_no_pod() -> None:

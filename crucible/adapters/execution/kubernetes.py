@@ -872,6 +872,13 @@ class KubernetesProvider:
                     exit_code=KILL_EXIT_CODE,
                     detail="the Job deadline killed the Pod",
                 )
+            if str(condition.get("type")) == "Failed":
+                # 103: `backoffLimit: 0` fails the Job the moment its one Pod does, so a
+                # Pod gone before any poll saw it is still a Pod that existed, not a
+                # Job that never got one.
+                return Observation(
+                    ObservationState.LOST, detail="the Job failed before Crucible saw a Pod"
+                )
         if not job:
             return Observation(ObservationState.LOST, detail="the namespace has no such Job")
         if launched is not None and launched.pod_name:
@@ -1204,7 +1211,9 @@ class KubernetesProvider:
                     continue
             else:
                 finished = any(
-                    isinstance(condition, dict) and str(condition.get("status")) == "True"
+                    isinstance(condition, dict)
+                    and str(condition.get("status")) == "True"
+                    and str(condition.get("type")) in ("Complete", "Failed")
                     for condition in (row.get("status") or {}).get("conditions") or []
                 )
                 if finished:
@@ -1235,6 +1244,10 @@ class KubernetesProvider:
                     launched_at=time.monotonic() - created,
                 )
             launched = self._launched[attempt_id]
+            if pod is not None and not launched.pod_name:
+                # So a Pod that vanishes between this reconcile and the first `observe`
+                # reads as lost, not as one the Job controller never created (103).
+                launched.pod_name = str((pod.get("metadata") or {}).get("name") or "")
             handles.append(
                 Handle(
                     provider=self.name,

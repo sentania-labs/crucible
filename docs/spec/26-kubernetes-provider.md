@@ -236,7 +236,7 @@ the namespace. A deployment therefore names one exact, pullable reference in
 
   | Job | Pod | Result |
   |---|---|---|
-  | gone | — | `lost` ("the namespace has no such Job") |
+  | gone | n/a | `lost` ("the namespace has no such Job") |
   | exists | Pending or Running, within the launch timeout | `running` |
   | exists | Pending past the launch timeout | launch failure, the Pod's conditions as detail (image pull, no schedulable node, PVC unbound), not a stall |
   | exists | terminated container | `exited(code)` |
