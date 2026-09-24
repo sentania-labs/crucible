@@ -301,10 +301,15 @@ status page (25).
   (`dns_resolves`), connect to the enabled local endpoint's URL when one is
   enabled (`local_endpoint_reachable`), and still fail to reach the API server.
 
-A failure of any of them is `namespace_ready: false` with a detail naming the
-check that failed, and every launch is refused until it passes. A missing tool in
-the canary image (no curl, no getent or nslookup) is inconclusive and never a
-pass. A passed probe is kept until the provider reads back a changed
+A failure of the API-server, default-deny or DNS check is `namespace_ready: false`
+with a detail naming the check that failed, and every launch is refused until it
+passes. The operator, 2026-09-23: "a down provider should only block that
+provider." An unreachable `local_endpoint_reachable` does not turn
+`namespace_ready` false: it refuses only the launch whose own route (the routing
+policy's `endpoint` field on its selected model, carried onto `LaunchSpec.endpoint`)
+is `local` (crucible#91, crucible#110), and admits every launch routed elsewhere. A
+missing tool in the canary image (no curl, no getent or nslookup) is inconclusive
+and never a pass. A passed probe is kept until the provider reads back a changed
 `kubernetes.egress` setting or enabled local endpoint; the canary then runs again
 under the new values before any launch uses them, and an answer proved under values
 that changed while the canary ran is discarded rather than kept.

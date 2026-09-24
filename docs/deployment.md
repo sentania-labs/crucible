@@ -227,6 +227,7 @@ Done means seen working, so all three:
      "egress_enforced": true,
      "dns_resolves": true,
      "local_endpoint_reachable": true,
+     "local_endpoint_detail": null,
      "pod_pid_limit": <a number, not null>,
      "pod_pid_limit_source": "cgroup-v2-parent",
      "runtime_class": "standard"
@@ -240,11 +241,19 @@ Done means seen working, so all three:
    `null` when no local model is enabled), and also fail to reach the API server.
    `egress_enforced: false` means the CNI is not enforcing egress NetworkPolicy and the
    provider will refuse every launch, which is the correct behaviour and not a bug to
-   route around. `dns_resolves: false` or
-   `local_endpoint_reachable: false` means the rules do not match on this CNI: set the
+   route around. `dns_resolves: false` means the rules do not match on this CNI: set the
    `kubernetes.egress` selectors above; the `detail` field names the check that failed.
    A `null` with `namespace_ready: false` is a canary that could not tell (its image has
    no curl, getent or nslookup), which never passes.
+
+   The operator, 2026-09-23: "a down provider should only block that provider."
+   `local_endpoint_reachable: false` does not turn `namespace_ready` false and does not
+   refuse every launch: it refuses only a launch whose selected model routes to that
+   local endpoint (today, Hermes), while a Claude Code or Codex attempt on a
+   subscription endpoint still launches; `local_endpoint_detail` and the refused
+   launch's own error name the endpoint check as the reason.
+
+
 
    `pod_pid_limit` is the kubelet's `podPidsLimit` (the `--pod-pids-limit` flag, or the
    `podPidsLimit` field of the node's `KubeletConfiguration`), not a number the canary's
