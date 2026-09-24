@@ -604,6 +604,46 @@ async def test_reconcile_adopts_a_job_with_no_pod_already_past_the_launch_timeou
     assert observation.state is ObservationState.EXITED and observation.exit_code == 70
 
 
+async def test_an_adopted_job_with_no_pod_yet_collects_with_the_real_image() -> None:
+    """103: an attempt adopted before its Pod existed takes its image and grace period
+    from the Job's template, so once the Pod appears and exits the helper Pods of
+    collection run the worker image, not an empty reference the API server rejects."""
+    api, _registry, provider, launch, workspace = await prepared()
+    api.no_pod_yet.add(launch.attempt_id)
+    handle = await provider.launch(workspace, launch)
+    provider._launched.clear()
+    adopted = await provider.reconcile()
+    assert provider._launched[launch.attempt_id].image_digest == handle.image_digest
+    assert provider._launched[launch.attempt_id].limits.grace_seconds == 30
+    # The Job controller gets round to it after the restart.
+    api.no_pod_yet.discard(launch.attempt_id)
+    api._start_job(api.objects[("jobs", handle.ref)].body)
+    await run_to_exit(provider, adopted[0])
+    before = len(api.created)
+    await provider.collect(adopted[0], workspace, launch)
+    helpers = [
+        c["body"]["spec"]["template"]["spec"]["containers"][0]["image"]
+        for c in api.created[before:]
+        if c["kind"] == "jobs"
+    ]
+    assert helpers and all(image == handle.image_digest for image in helpers)
+
+
+async def test_an_adopted_attempt_records_its_node() -> None:
+    """A Pod found by reconcile is the only chance to learn its node, since `observe`
+    restores the node only when it first learns the Pod's name (26)."""
+    _api, _registry, provider, launch, workspace = await prepared()
+    handle = await provider.launch(workspace, launch)
+    provider._launched.clear()
+    adopted = await provider.reconcile()
+    await run_to_exit(provider, adopted[0])
+    outputs = await provider.collect(adopted[0], workspace, launch)
+    evidence = next(a for a in outputs.artifacts if a.name == "report/kubernetes-launch.json")
+    document = json.loads(evidence.content)
+    assert document["pod"] == f"{handle.ref}-abc12"
+    assert document["node"] == "lab-node-1"
+
+
 async def test_reconcile_does_not_adopt_a_finished_job_with_no_pod() -> None:
     """A Job that already finished before this restart and had its Pod reaped is not a
     launch still in flight; the normal cleanup pass handles it, not reconcile."""

@@ -1225,17 +1225,19 @@ class KubernetesProvider:
                 # creation timestamp, not from now, so an attempt already past the
                 # window is caught on the first observation rather than given it again.
                 created = _age_seconds(str(metadata.get("creationTimestamp", "")))
-                if pod is not None:
+                # The Job's template is what the Pod is built from, and it is there
+                # whether or not a Pod exists yet. An empty image here would reach the
+                # helper Pods of collection, which the API server rejects (103).
+                template_spec = ((row.get("spec") or {}).get("template") or {}).get("spec") or {}
+                pod_spec = template_spec if template_spec.get("containers") else {}
+                if not pod_spec and pod is not None:
                     pod_spec = pod.get("spec") or {}
-                    containers = pod_spec.get("containers") or []
-                    image = str((containers[0] if containers else {}).get("image", ""))
-                    limits = replace(
-                        k8sspec.limits_from_policy({}),
-                        grace_seconds=int(pod_spec.get("terminationGracePeriodSeconds") or 60),
-                    )
-                else:
-                    image = ""
-                    limits = k8sspec.limits_from_policy({})
+                containers = pod_spec.get("containers") or []
+                image = str((containers[0] if containers else {}).get("image", ""))
+                limits = replace(
+                    k8sspec.limits_from_policy({}),
+                    grace_seconds=int(pod_spec.get("terminationGracePeriodSeconds") or 60),
+                )
                 self._launched[attempt_id] = _Launched(
                     job_name=name,
                     spec=_ADOPTED_SPEC,
@@ -1248,6 +1250,9 @@ class KubernetesProvider:
                 # So a Pod that vanishes between this reconcile and the first `observe`
                 # reads as lost, not as one the Job controller never created (103).
                 launched.pod_name = str((pod.get("metadata") or {}).get("name") or "")
+                # `observe` restores the node only alongside the Pod name, so it is
+                # restored here too or the launch evidence records no node.
+                launched.node = str((pod.get("spec") or {}).get("nodeName") or "") or None
             handles.append(
                 Handle(
                     provider=self.name,
