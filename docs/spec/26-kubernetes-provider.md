@@ -407,9 +407,10 @@ credential Secret and never syncs it back; when it does not, the launch uses the
 adapter's explicit unauthenticated placeholder. The Routing page's key entry
 writes that Secret. (Made concrete 2026-09-24, FDY-0112.)
 
-A seeding refuses while a login Job for the same harness exists, and the
-supervisor defers the launch before it gets there, because the login is about
-to replace the credential (12).
+The supervisor defers a launch while a login Job for its harness exists,
+because the login is about to replace the credential (12). A launch that raced
+past that check seeds the credential as it stands, and the login then declines
+to write over it; a credential probe refuses outright while a login Job exists.
 
 ## Observability and administration
 

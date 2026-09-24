@@ -194,9 +194,12 @@ Once the api is reachable, sign in at `/ui` with that token and, for each harnes
    where the harness asks for one (Claude Code, AGY). The code has a window (Codex
    fifteen minutes, AGY sixty seconds). When the CLI exits the service reads the auth
    files off the Pod, never through its log, checks their shape, writes the harness
-   Secret, and deletes the Job. A login that fails, is cancelled or times out leaves the
-   Secret as it was. A credential that already passes the shape check is only replaced
-   when the login is started with replace.
+   Secret, and deletes the Job. A login that is cancelled, times out, or whose files fail
+   the shape check leaves the Secret as it was; files that pass are stored even when the
+   CLI exits non-zero (AGY always does here, because its login ends with a prompt to a
+   model API the login Job cannot reach), and the page says so. A credential that
+   already passes the shape check is only replaced when the login is started with
+   replace.
 2. **Finish**, then **Validate**: finish records the shape of what is now in the
    Secret, and validate runs the bounded probe in the hardened image against it (a
    worker Job with the per-run copy of the Secret and the worker's own egress rules),

@@ -218,6 +218,19 @@ class _Pending:
     repository_url: str = ""
 
 
+def _secret_holds(provider: Any, harness: str, credential: Any) -> bool:
+    """Whether a provider's harness Secret holds every required auth file, so routing
+    never picks a harness nobody has logged in (ADR 0015). A Secret that cannot be read
+    right now is not held against the harness: the seeding says why if it still cannot."""
+    try:
+        files = provider.read_credential_files(harness)
+    except ProviderError:
+        return True
+    return files is not None and all(
+        files.get(auth.name) for auth in credential.auth_files if auth.required
+    )
+
+
 class Supervisor:
     def __init__(
         self,
@@ -968,10 +981,7 @@ class Supervisor:
 
     async def _launch_pending(self) -> int:
         launched = 0
-        pending = await self._db(self._list_pending)
-        if pending:
-            self._logins_now = await self._logins_in_progress()
-        for item in pending:
+        for item in await self._db(self._list_pending):
             with log_context(
                 task_id=item.task.id, execution_id=item.execution.id, attempt_id=item.attempt.id
             ):
@@ -1207,9 +1217,8 @@ class Supervisor:
         # A provider that keeps the credentials itself (the Kubernetes provider's
         # service-owned Secrets, ADR 0015) has no directory to check here. Its seeding
         # refuses a missing or empty Secret with the reason, as it does for a pin.
-        secret_held = callable(
-            getattr(self._providers.get(provider or ""), "read_credential_files", None)
-        )
+        holder = self._providers.get(provider or "")
+        secret_held = callable(getattr(holder, "read_credential_files", None))
         eligible: set[str] = set()
         with self._uow_factory() as uow:
             for name in self._harnesses.names():
@@ -1224,6 +1233,14 @@ class Supervisor:
                     and credential is not None
                     and credential.required_for_launch
                     and (source is None or not Path(source.path).is_dir())
+                ):
+                    continue
+                if (
+                    needs_credential
+                    and secret_held
+                    and credential is not None
+                    and credential.required_for_launch
+                    and not _secret_holds(holder, name, credential)
                 ):
                     continue
                 try:
@@ -1429,6 +1446,9 @@ class Supervisor:
     async def _launch_one(self, item: _Pending) -> bool:
         attempt, execution, task = item.attempt, item.execution, item.task
         review = execution.role is ExecutionRole.REVIEW
+        # Read per attempt, not per pass: a login started while this pass runs holds
+        # back the next launch of its harness rather than racing it (12).
+        self._logins_now = await self._logins_in_progress()
         if not review:
             selection = await self._db(partial(self._preview_route, item))
             if selection is None or selection.selected is None or selection.image is None:

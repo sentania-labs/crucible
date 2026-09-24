@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import dataclasses
 import json
 import os
 import shutil
@@ -339,7 +340,10 @@ async def test_no_login_job_on_a_namespace_that_failed_its_readiness_probe() -> 
 # ----- the login is a lock another process can see (12) ---------------------------
 
 
-async def test_a_running_login_is_listed_and_refuses_the_seeding_of_that_harness() -> None:
+async def test_a_running_login_is_listed_and_a_probe_waits_for_it() -> None:
+    """12: the login Job is what another process sees. A probe refuses while it runs; an
+    attempt that raced past the supervisor's check seeds the credential as it stands,
+    and the login declines to write over it (the admin tier holds that half)."""
     api, provider = login_provider()
     api.put_harness_secret("crucible-harness-codex", {"auth.json": CODEX_AUTH})
     api.login = FakeLogin(never_exits=True)
@@ -349,14 +353,41 @@ async def test_a_running_login_is_listed_and_refuses_the_seeding_of_that_harness
     async def while_running() -> None:
         await wait_for_state(session, "waiting_for_operator")
         seen.append(await provider.logins_in_progress())
-        launch = spec(harness="codex", image=WORKER)
         with pytest.raises(ProviderError, match="a login for codex is running"):
-            await provider.prepare(launch)
+            await provider.probe_credential(probe_request())
+        launch = spec(harness="codex", image=WORKER)
+        workspace = await provider.prepare(launch)
+        assert api.secret_exists(k8sspec.object_name("cred", launch.attempt_id))
+        await provider.discard(workspace, launch)
         session.cancel_requested = True
 
     await run_login(provider, "codex", session, during=while_running)
     assert seen == [frozenset({"codex"})]
     assert await provider.logins_in_progress() == frozenset()
+    assert not [n for n in api.object_names("persistentvolumeclaims") if "probe" in n]
+
+
+async def test_a_probe_in_flight_is_seen_as_holding_the_credential() -> None:
+    api, provider = login_provider()
+    api.put_harness_secret("crucible-harness-codex", {"auth.json": CODEX_AUTH})
+    api.script_all("hang")
+    held: list[list[str]] = []
+
+    async def watch() -> None:
+        for _ in range(400):
+            found = provider.probes_holding("codex")
+            if found:
+                held.append(found)
+                return
+            await asyncio.sleep(0.01)
+
+    request = dataclasses.replace(probe_request(), timeout_seconds=1)
+    watcher = asyncio.create_task(watch())
+    await provider.probe_credential(request)
+    await watcher
+    assert held and held[0][0].startswith("probe")
+    assert provider.probes_holding("codex") == []
+    assert provider.probes_holding("claude_code") == []
 
 
 # ----- the service-owned Secret (ADR 0015) -------------------------------------------
@@ -569,6 +600,9 @@ def test_the_driver_masks_the_token_and_the_pasted_code_and_reports_the_exit(
     cli = tmp_path / "fake-cli"
     cli.write_text(
         "#!/bin/bash\n"
+        "echo \"cols=$(stty size | cut -d' ' -f2)\"\n"
+        "printf '\\033]8;;https://x.invalid\\033\\\\link\\033]8;;\\033\\\\\\n'\n"
+        "printf '\\033[>4;1mwide\\033[?25l\\n'\n"
         "echo 'Use the url below to sign in:'\n"
         "printf '\\033[1mhttps://example.invalid/oauth?x=1\\033[0m\\n'\n"
         "printf 'Paste code here if prompted > '\n"
@@ -635,9 +669,33 @@ def test_the_driver_masks_the_token_and_the_pasted_code_and_reports_the_exit(
     assert "[pasted code]" in text
     assert "got 14 characters" in text
     assert "\ndone\n" in text
+    assert "cols=4096" in text
+    assert "\nlink\n" in text and "\nwide\n" in text
     assert "crucible-login.exit=3" in text
     assert "sk-ant-" not in text and "MY-PASTED-CODE" not in text
     assert "\x1b" not in text
     token = login_dir / "oauth-token"
     assert token.read_text().startswith("sk-ant-oat01-")
     assert token.stat().st_mode & 0o777 == 0o600
+
+
+def test_routing_counts_a_harness_only_once_its_secret_holds_the_credential() -> None:
+    """Class routing on Kubernetes (ADR 0015): a harness nobody logged in is not a
+    candidate, a logged-in one is, and a Secret that cannot be read right now is left to
+    the seeding to explain rather than silently narrowing the choice."""
+    from crucible.adapters.harness.codex import CodexAdapter  # noqa: PLC0415
+    from crucible.application.supervisor import _secret_holds  # noqa: PLC0415
+
+    api, provider = login_provider()
+    credential = CodexAdapter().credential_spec()
+    assert _secret_holds(provider, "codex", credential) is False
+    api.put_harness_secret("crucible-harness-codex", {})
+    assert _secret_holds(provider, "codex", credential) is False
+    provider.write_credential_files("codex", {"auth.json": CODEX_AUTH})
+    assert _secret_holds(provider, "codex", credential) is True
+
+    class Unreadable:
+        def read_credential_files(self, harness: str) -> dict[str, bytes]:
+            raise ProviderError("the API server answered 503")
+
+    assert _secret_holds(Unreadable(), "codex", credential) is True

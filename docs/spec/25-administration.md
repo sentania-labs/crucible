@@ -200,8 +200,9 @@ disabled at the time a contract is submitted is a contract problem then
    NetworkPolicy for the adapter's `login_endpoints` only, which never include
    its model API (crucible#58). The Job needs the namespace readiness probe to
    have passed, as a worker does. A driver in the Pod runs the CLI under a
-   pseudo-terminal and filters its output line by line before it reaches the Pod
-   log: terminal control codes are stripped, the token Claude Code prints once
+   pseudo-terminal 4096 columns wide, so nothing wraps, and filters its output
+   line by line before it reaches the Pod log: terminal control codes are
+   stripped, the token Claude Code prints once
    is written to `oauth-token` mode 0600 and replaced by
    `[captured to oauth-token]`, and a pasted code is masked where the terminal
    echoes it. The service reads that log for the URL, the device code and the
@@ -211,8 +212,9 @@ disabled at the time a contract is submitted is a contract problem then
    shape-checks them, re-checks that no attempt has come to hold the credential,
    and only then writes the harness Secret whole, creating it and labelling it
    as the service's own when it is absent. It then deletes the Job and the
-   policy. A failed, cancelled or timed-out login leaves the Secret exactly as it
-   was; files that pass are stored whatever the CLI's exit code, as a Docker
+   policy. A login that is cancelled, times out, or whose files fail the check
+   leaves the Secret exactly as it was; files that pass are stored whatever the
+   CLI's exit code, as a Docker
    login leaves in its directory whatever the CLI wrote. The Job carries its own
    deadline and a TTL, so a login whose api process died still goes away.
 1. Create or select the dedicated Crucible credential directory for the

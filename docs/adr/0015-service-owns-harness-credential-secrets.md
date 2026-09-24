@@ -41,18 +41,23 @@ has to carry the whole flow itself; the deployment only has to give it room to.
    token Claude Code prints, and the code the operator pastes, out of that log. A pasted
    code goes in over exec stdin. The auth files come back over exec, never through a
    log. They are written to the Secret only after the CLI has exited and they pass the
-   shape check, so a failed, cancelled or timed-out login leaves the credential exactly
-   as it was, and there is no retired copy to keep and shred as there is on Docker.
+   shape check, so a login that is cancelled, times out, or whose files fail the check
+   leaves the credential exactly as it was, and there is no retired copy to keep and
+   shred as there is on Docker. Files that pass are stored whatever the CLI's exit
+   code, as a Docker login leaves what the CLI wrote. The Pod's terminal is 4096
+   columns wide so the CLI never wraps a token across the line the driver masks.
 3. **The probe runs on the cluster.** `probe_credential` is the attempt path cut down to
    one prompt: a claim, a two-file identity ConfigMap, the per-run copy of the Secret,
    the worker Job under the worker's egress and the namespace readiness gate, the
    sync-back, and removal of everything. It is labelled `crucible.admin=probe`, so the
    supervisor's retention sweep and reconcile leave it alone while the api runs it.
 4. **A login and an attempt of one harness never overlap** (12's rotation rules). A
-   login refuses while an attempt holds that harness's credential, and checks again at
-   the moment it writes. A launch waits, deferred rather than failed, while a login Job
-   for its harness exists, and the provider refuses to seed a copy if one appeared in
-   between. The login Job is the lock: it is the one object both processes can see.
+   login refuses while an attempt or a credential probe holds that harness's
+   credential, and checks again at the moment it writes: if one came to hold it while
+   the login ran, the new files are not stored and the login says so. A launch waits,
+   deferred rather than failed, while a login Job for its harness exists (the
+   supervisor reads that before each launch), and a probe refuses while one exists.
+   The login Job is the lock: it is the one object every process can see.
 
 ## Alternatives considered
 

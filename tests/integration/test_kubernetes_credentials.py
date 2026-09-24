@@ -27,6 +27,7 @@ from crucible.adapters.execution.k8sfake import FakeKubernetesApi, FakeLogin, Fa
 from crucible.adapters.execution.kubernetes import KubernetesConfig, KubernetesProvider
 from crucible.adapters.harness.registry import default_registry
 from crucible.application.admin.context import AdminContext
+from crucible.application.admin.login import _accept_login
 from crucible.application.supervisor import Supervisor
 from crucible.domain.entities import ImagePromotion
 from crucible.domain.lifecycle import AttemptState
@@ -274,7 +275,11 @@ def test_the_hermes_key_is_set_from_the_routing_page_and_never_shown(
 
 
 async def test_a_login_refuses_while_an_attempt_holds_the_credential(
-    admin: TestClient, live: Supervisor, tokens: dict[str, str], k8s_api: FakeKubernetesApi
+    admin: TestClient,
+    admin_ctx: AdminContext,
+    live: Supervisor,
+    tokens: dict[str, str],
+    k8s_api: FakeKubernetesApi,
 ) -> None:
     """12: a login replaces the credential, so it waits for an attempt that holds a
     copy of it; once that attempt has been collected the login may start."""
@@ -287,6 +292,11 @@ async def test_a_login_refuses_while_an_attempt_holds_the_credential(
     assert refused.status_code == 409, refused.text
     assert "holds its credential" in refused.json()["detail"]
     assert view["latest_attempt"]["id"] in refused.json()["detail"]
+    # A login already running when an attempt comes to hold the credential declines to
+    # write at the end; this is the check it makes at that moment.
+    problems = _accept_login(admin_ctx, "codex", {"auth.json": CODEX_AUTH})
+    assert any("came to hold the codex credential" in p for p in problems), problems
+    assert not k8s_api.secret_exists("crucible-harness-codex")
     with live._fenced() as uow:
         attempt = uow.attempts.get(view["latest_attempt"]["id"], for_update=True)
         assert attempt is not None

@@ -461,6 +461,7 @@ class KubernetesProvider:
         admin = self._admin_runs.get(spec.attempt_id)
         if admin:
             out[k8sspec.LABEL_ADMIN] = admin
+            out[k8sspec.LABEL_HARNESS] = spec.harness
         return out
 
     def _limits(self, spec: LaunchSpec) -> Limits:
@@ -1661,6 +1662,13 @@ class KubernetesProvider:
             )
             copy = self._credential_copy(spec)
             if copy is not None:
+                # 12: a login is about to replace the Secret; a probe's copy of the one
+                # it replaces would sync a superseded session back over it.
+                if request.harness in await self.logins_in_progress():
+                    raise ProviderError(
+                        f"a login for {request.harness} is running; probe it once the "
+                        "login has finished"
+                    )
                 await self._seed_credential(spec, copy)
                 self._seeded[probe_id] = dict(copy.seeded)
             code = await self._run_role_job(
@@ -1807,6 +1815,22 @@ class KubernetesProvider:
             ) from exc
         return {"secret": name, "created": False, "files": sorted(files)}
 
+    def probes_holding(self, harness: str) -> list[str]:
+        """The credential probes that hold a copy of `harness`'s credential now: their
+        per-run Secret exists from the seeding until the sync-back removed it (12).
+        Blocking, for the login's own thread. Any api replica's probe counts."""
+        selector = k8sspec.selector(
+            **{k8sspec.LABEL_ADMIN: k8sspec.ADMIN_PROBE, k8sspec.LABEL_HARNESS: harness}
+        )
+        try:
+            rows = self.client.list_objects("secrets", label_selector=selector)
+        except KubernetesApiError as exc:
+            raise ProviderError(f"the credential probes could not be listed: {exc}") from exc
+        return sorted(
+            str(((row.get("metadata") or {}).get("labels") or {}).get(k8sspec.LABEL_ATTEMPT, ""))
+            for row in rows
+        )
+
     # ----- the login Job (25, 26) ---------------------------------------
 
     async def logins_in_progress(self) -> frozenset[str]:
@@ -1905,6 +1929,10 @@ class KubernetesProvider:
                     f"refusing to start the {flow.harness} login: the workers namespace is "
                     f"not ready ({probe.detail})"
                 )
+            if session.cancel_requested:
+                session.state = "failed"
+                session.error = "login cancelled"
+                return
             plan = self._egress_plan(spec, k8sspec.ROLE_LOGIN)
             if not plan.empty:
                 plan = await self._resolve_plan(plan)
@@ -1968,9 +1996,9 @@ class KubernetesProvider:
                 name, flow, session, timeout=timeout, consume=_consume, root=root
             )
             session.exit_code = exit_code
-            if exit_code is not None and pod_name:
+            if exit_code is not None and pod_name and not session.cancel_requested:
                 await self._store_login(pod_name, flow, credential, root, session, accept)
-            if session.cancel_requested:
+            if session.cancel_requested and not session.credential_written:
                 session.state = "failed"
                 session.error = session.error or "login cancelled"
             elif exit_code == 0 and session.error is None:
@@ -2027,6 +2055,13 @@ class KubernetesProvider:
                 pod = await self._pod_of(name)
             except KubernetesApiError:
                 pod = None
+            if pod is None and time.monotonic() - started > self.config.launch_timeout_seconds:
+                session.error = (
+                    f"the login Job has had no Pod for {self.config.launch_timeout_seconds}s; "
+                    "the namespace's ResourceQuota or admission may be refusing it (see the "
+                    "Job's events in crucible-workers)"
+                )
+                break
             if pod is not None:
                 pod_name = str((pod.get("metadata") or {}).get("name") or "")
                 status = pod.get("status") or {}
@@ -2672,15 +2707,10 @@ class KubernetesProvider:
         authenticate (12). A required file that is missing refuses the launch rather
         than seeding a copy that cannot.
 
-        A login for the same harness refuses the seeding (12): the login is about to
-        replace the Secret, and a copy of the credential it replaces would sync back a
-        refresh of a session the login just superseded. The supervisor already holds a
-        launch back while a login runs; this is the check at the moment it matters."""
-        if spec.harness in await self.logins_in_progress():
-            raise HarnessRefusedError(
-                f"refusing to launch: a login for {spec.harness} is running and will "
-                "replace its credential; the next attempt waits for it"
-            )
+        A login running for the same harness does not stop the seeding: the supervisor
+        holds a launch back while one runs, and a launch that slipped past that check
+        holds a copy of the credential as it stands, which the login then declines to
+        replace (12). Nothing an attempt holds is ever mixed with a new session."""
         try:
             source = await self._call(self.client.get, "secrets", copy.source_secret)
         except KubernetesApiError as exc:
@@ -3780,8 +3810,9 @@ echo "crucible-canary.done=1"
 # operator's view of a login without carrying anything secret:
 #
 # - the CLI's output is filtered line by line before it reaches stdout, which is the
-#   log. Terminal control sequences are stripped and a carriage return keeps only what
-#   was drawn after it, as a terminal would show it;
+#   log. The terminal is 4096 columns wide so nothing the CLI prints wraps; control
+#   sequences (CSI, OSC and the two-byte escapes) are stripped, and a carriage return
+#   keeps only what was drawn after it, as a terminal would show it;
 # - the one-time token a CLI prints (Claude Code's `setup-token`) is written to the
 #   token file under the login directory, mode 0600, and replaced in the line by the
 #   note the Docker login shows;
@@ -3805,6 +3836,10 @@ rm -f "$ctl/in" "$ctl/pasted"
 mkfifo "$ctl/in"
 exec 3<>"$ctl/in"
 shopt -s extglob
+# The patterns below use character ranges, which bash reads in the collation order of
+# the locale; C is the only order in which they mean what they say. Not exported, so
+# the CLI keeps whatever locale the Pod gives it.
+LC_ALL=C
 token_re=${CRUCIBLE_LOGIN_TOKEN_PATTERN:-}
 token_file=${CRUCIBLE_LOGIN_TOKEN_FILE:-}
 prompt_re='((paste|enter).{0,40}(code|token).{0,20}|code|token)[[:space:]]*[:>?][[:space:]]*$'
@@ -3812,8 +3847,8 @@ show() {
   local line=$1 tok pasted
   line=${line%$'\r'}
   line=${line##*$'\r'}
-  line=${line//$'\e'\[*([0-9;?])[@-~]/}
-  line=${line//$'\e'\]*([!$'\a'])$'\a'/}
+  line=${line//$'\e'\[*([0-?])*([\ -\/])[@-~]/}
+  line=${line//$'\e'\]*([!$'\a'$'\e'])@($'\a'|$'\e'\\)/}
   line=${line//$'\e'?([()])?[A-Za-z0-9=>]/}
   if [ -n "$token_re" ] && [[ $line =~ $token_re ]]; then
     tok=${BASH_REMATCH[1]}
@@ -3851,8 +3886,10 @@ filter() {
     fi
   done
 }
-cmd=$(printf '%q ' "$@")
-SHELL=/bin/bash script -qfec "$cmd" /dev/null < "$ctl/in" 2>&1 | filter
+# A wide terminal, so a CLI never wraps a token or a pasted code across two lines: the
+# filter works line by line, and a wrapped tail would reach the log unmasked.
+cmd="stty cols 4096 rows 50 2>/dev/null; exec $(printf '%q ' "$@")"
+COLUMNS=4096 LINES=50 SHELL=/bin/bash script -qfec "$cmd" /dev/null < "$ctl/in" 2>&1 | filter
 code=${PIPESTATUS[0]}
 exec 3>&-
 echo "crucible-login.exit=$code"

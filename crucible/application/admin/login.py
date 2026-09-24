@@ -574,8 +574,8 @@ def start_login(
     if harness not in flows:
         raise ConflictError(f"harness {harness!r} has no interactive login flow")
     spec = spec_for(ctx, harness)
-    refuse_while_held(uow, harness)
     job_runner = getattr(registry, "job_runner", lambda _ctx: None)(ctx)
+    refuse_while_held(uow, harness, job_runner)
     container_runner = getattr(registry, "container_runner", lambda _ctx: None)(ctx)
     if job_runner is not None and container_runner is None:
         return _start_job_login(
@@ -680,10 +680,10 @@ def promoted_image(uow: UnitOfWork, harness: str) -> str:
     return promoted.reference
 
 
-def refuse_while_held(uow: UnitOfWork, harness: str) -> None:
-    """12: a login replaces the credential, and an attempt that holds a copy of the one
-    it replaces would sync a refresh of a superseded session back over it. So a login
-    waits until no attempt of the harness holds the credential."""
+def refuse_while_held(uow: UnitOfWork, harness: str, store: Any | None = None) -> None:
+    """12: a login replaces the credential, and an attempt or a credential probe that
+    holds a copy of the one it replaces would sync a refresh of a superseded session
+    back over it. So a login waits until nothing of the harness holds the credential."""
     holders = credential_holders(uow, harness)
     if holders:
         raise ConflictError(
@@ -691,6 +691,24 @@ def refuse_while_held(uow: UnitOfWork, harness: str) -> None:
             "login would replace it underneath that attempt. Start the login once the "
             "attempt has been collected"
         )
+    probes = _probes_holding(store, harness)
+    if probes:
+        raise ConflictError(
+            f"a credential probe of {harness} holds its credential ({', '.join(probes[:3])}); "
+            "start the login once the probe has finished"
+        )
+
+
+def _probes_holding(store: Any | None, harness: str) -> list[str]:
+    listing = getattr(store, "probes_holding", None)
+    if not callable(listing):
+        return []
+    try:
+        return list(listing(harness))
+    except Exception as exc:
+        raise ConflictError(
+            f"whether a credential probe of {harness} is running could not be read: {exc}"
+        ) from exc
 
 
 def _start_job_login(
@@ -707,10 +725,11 @@ def _start_job_login(
     into the harness Secret the service owns (ADR 0015).
 
     Nothing is retired up front. The Secret is only replaced once the CLI has exited and
-    its files pass the shape check, so a login that fails, is cancelled or times out
-    leaves the credential exactly as it was, and there is no retained copy to shred. A
-    credential that still passes the shape check is still not replaced without
-    `replace`, the Docker rule."""
+    its files pass the shape check, so a login that is cancelled, times out, or whose
+    files fail the check leaves the credential exactly as it was, and there is no
+    retained copy to shred. Files that pass are stored whatever the CLI's exit code, as
+    a Docker login leaves what the CLI wrote. A credential that still passes the shape
+    check is still not replaced without `replace`, the Docker rule."""
     flow = flows_for(ctx)[harness]
     spec = spec_for(ctx, harness)
     store = registry.job_runner(ctx)
@@ -761,11 +780,15 @@ def _accept_login(ctx: AdminContext, harness: str, files: Mapping[str, bytes]) -
     problems = list(check_shape_files(spec_for(ctx, harness), files).problems)
     with ctx.uow_factory() as uow:
         holders = credential_holders(uow, harness)
+    try:
+        holders += _probes_holding(secret_store(ctx), harness)
+    except ConflictError as exc:
+        problems.append(str(exc))
     if holders:
         problems.append(
-            f"an attempt of {harness} ({', '.join(holders[:3])}) came to hold the "
-            "credential while the login ran, so the new one was not stored; run the "
-            "login again once it has been collected"
+            f"{', '.join(holders[:3])} came to hold the {harness} credential while the "
+            "login ran, so the new one was not stored; run the login again once that "
+            "has finished"
         )
     return problems
 

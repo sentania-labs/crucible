@@ -186,8 +186,9 @@ an attempt holding a copy of the one it replaced would sync a refresh of a
 superseded session back over it. So a login refuses while any attempt of the
 harness holds the credential (the same states the cap counts), a launch of the
 harness waits while a login for it runs, and on Kubernetes the login checks
-again at the moment it writes the Secret and the provider refuses to seed a
-copy while a login Job for the harness exists.
+again at the moment it writes the Secret (an attempt or a credential probe that
+came to hold a copy while it ran means the new files are not stored), and a
+probe refuses while a login Job for the harness exists.
 
 ## GitHub App credentials
 
