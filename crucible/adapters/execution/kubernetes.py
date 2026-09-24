@@ -215,6 +215,12 @@ LOGIN_POLICY: dict[str, Any] = {
 # files off it over exec, before its deadline ends it. The TTL then removes the Job.
 LOGIN_READBACK_SECONDS = 300
 LOGIN_TTL_SECONDS = 60
+# How long past the login's own deadline its lock outlives it: the image resolution and
+# the namespace probe before the Job exists, and the Job's removal after. Only an api
+# that died holding the lock ever waits this out; a login that ends releases it.
+LOGIN_LOCK_SLACK_SECONDS = 300
+ANNOTATION_LOCK_HOLDER = "crucible.io/login-holder"
+ANNOTATION_LOCK_EXPIRES = "crucible.io/login-lock-expires"
 
 # Pod phases that are not a running worker but not a loss either.
 _PENDING_PHASES = frozenset({"Pending"})
@@ -225,6 +231,10 @@ _LOST_REASONS = frozenset({"Evicted", "NodeShutdown", "Shutdown", "NodeAffinity"
 class CollectionFailedError(ProviderError):
     """The collector could not produce the outputs. The attempt is an `environment`
     failure and nothing is collected from it (16)."""
+
+
+class LoginLockHeldError(ProviderError):
+    """Another login of the harness holds its lock, in this api replica or another."""
 
 
 HarnessRefusedError = LaunchRefusedError
@@ -371,6 +381,18 @@ class _CredentialCopy:
     @property
     def writable(self) -> bool:
         return self.mode is MountMode.RW_NARROW
+
+
+@dataclass(frozen=True, slots=True)
+class LoginLock:
+    """One harness's login lock as this process took it: the ConfigMap's name and the
+    uid of the incarnation it created, so a release or a store check never mistakes a
+    lock another replica took after this one expired for its own."""
+
+    harness: str
+    name: str
+    uid: str
+    holder: str
 
 
 @dataclass(slots=True)
@@ -1703,6 +1725,15 @@ class KubernetesProvider:
                 detail = f"the probe did not finish within {request.timeout_seconds}s"
                 with contextlib.suppress(Exception):
                     await self.terminate(handle, "kill")
+            elif code_seen != 0 and await self._job_deadline_exceeded(handle.ref):
+                # The Job's own deadline is shorter than this wait, so a hanging harness
+                # is ended by the cluster first: the exit code or the missing Pod that
+                # leaves behind is the timeout, not a crash (25).
+                timed_out = True
+                detail = (
+                    f"the probe did not finish within {request.timeout_seconds}s; the "
+                    "Job's deadline ended it"
+                )
             observation = await self.observe(handle)
             if observation.state is ObservationState.EXITED:
                 exit_code = observation.exit_code
@@ -1830,6 +1861,89 @@ class KubernetesProvider:
             str(((row.get("metadata") or {}).get("labels") or {}).get(k8sspec.LABEL_ATTEMPT, ""))
             for row in rows
         )
+
+    # ----- the login lock (25, 26) --------------------------------------
+
+    def login_lock_name(self, harness: str) -> str:
+        return f"login-lock-{harness.replace('_', '-')}"[:63]
+
+    def acquire_login_lock(self, harness: str, *, holder: str, timeout: int) -> LoginLock:
+        """Take `harness`'s login lock for every api replica at once (25).
+
+        Each api process keeps its own logins in memory, so two replicas (a rollout, or
+        an overlay with more than one) could each start a login Job for the same
+        harness and the last to finish would silently replace the Secret. The lock is a
+        ConfigMap with a fixed name per harness: `create` is atomic on the API server,
+        so exactly one replica gets it and every other gets 409 and is told who holds
+        it. It carries its expiry, the login's own deadline plus slack, so the lock of
+        an api that died mid-login is taken over once that deadline has passed; the
+        takeover deletes that exact incarnation by uid, so two replicas reclaiming at
+        once cannot both win. Blocking, for the admin service's own thread."""
+        name = self.login_lock_name(harness)
+        seconds = timeout + LOGIN_READBACK_SECONDS + LOGIN_LOCK_SLACK_SECONDS
+        expires = datetime.fromtimestamp(time.time() + seconds, tz=UTC)
+        body = k8sspec.config_map(
+            name=name,
+            namespace=self.config.namespace,
+            object_labels={
+                k8sspec.LABEL_ROLE: k8sspec.ROLE_LOGIN_LOCK,
+                k8sspec.LABEL_HARNESS: harness,
+                k8sspec.LABEL_OWNER: "crucible-admin",
+            },
+            data={},
+            annotations={
+                ANNOTATION_LOCK_HOLDER: holder,
+                ANNOTATION_LOCK_EXPIRES: expires.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            },
+        )
+        for _ in range(3):
+            try:
+                created = self.client.create("configmaps", body)
+                uid = str((created.get("metadata") or {}).get("uid") or "")
+                return LoginLock(harness=harness, name=name, uid=uid, holder=holder)
+            except KubernetesApiError as exc:
+                if exc.status != 409:
+                    raise ProviderError(
+                        f"the {harness} login lock could not be taken ({exc.status}): {exc}"
+                    ) from exc
+            try:
+                current = self.client.get("configmaps", name)
+            except KubernetesApiError as exc:
+                if exc.status == 404:
+                    continue  # released between the create and the look; try again
+                raise ProviderError(
+                    f"the {harness} login lock could not be read ({exc.status}): {exc}"
+                ) from exc
+            metadata = current.get("metadata") or {}
+            annotations = metadata.get("annotations") or {}
+            held_by = str(annotations.get(ANNOTATION_LOCK_HOLDER) or "an unnamed holder")
+            left = _seconds_until(str(annotations.get(ANNOTATION_LOCK_EXPIRES) or ""))
+            if left > 0:
+                raise LoginLockHeldError(
+                    f"a login for {harness} is already in progress, held by {held_by}; if "
+                    f"that api process has died its lock is taken over in {_minutes(left)}"
+                )
+            with contextlib.suppress(KubernetesApiError):
+                self.client.delete("configmaps", name, uid=str(metadata.get("uid") or ""))
+        raise LoginLockHeldError(
+            f"a login for {harness} is already in progress: another api replica took its "
+            "lock at the same moment"
+        )
+
+    def login_lock_held(self, lock: LoginLock) -> bool:
+        """Whether `lock` is still this process's: the ConfigMap there is the one it
+        created. A login whose lock expired and was taken over does not store."""
+        try:
+            current = self.client.get("configmaps", lock.name)
+        except KubernetesApiError:
+            return False
+        return str((current.get("metadata") or {}).get("uid") or "") == lock.uid
+
+    def release_login_lock(self, lock: LoginLock) -> None:
+        """Give the lock back. Only the incarnation this process created is deleted; a
+        lock another replica took over after this one expired is left alone."""
+        with contextlib.suppress(KubernetesApiError):
+            self.client.delete("configmaps", lock.name, uid=lock.uid or None)
 
     # ----- the login Job (25, 26) ---------------------------------------
 
@@ -3148,6 +3262,30 @@ class KubernetesProvider:
             await asyncio.sleep(self.config.poll_interval_seconds)
         return None
 
+    async def _job_deadline_exceeded(self, name: str) -> bool:
+        """Whether the Job controller ended this Job for running past its
+        `activeDeadlineSeconds`. The controller records the condition before it removes
+        the Pod, so it is there by the time the Pod's end has been seen; a few looks
+        cover an API server that answers from a lagging cache."""
+        for look in range(3):
+            if look:
+                await asyncio.sleep(self.config.poll_interval_seconds)
+            try:
+                job = await self._call(self.client.get, "jobs", name)
+            except KubernetesApiError:
+                continue
+            for condition in (job.get("status") or {}).get("conditions") or []:
+                if (
+                    isinstance(condition, dict)
+                    and str(condition.get("type")) in ("Failed", "FailureTarget")
+                    and str(condition.get("status")) == "True"
+                    and str(condition.get("reason")) == "DeadlineExceeded"
+                ):
+                    return True
+            if int((job.get("status") or {}).get("failed") or 0):
+                return False
+        return False
+
     async def _await_pod(self, name: str, *, timeout: int) -> str | None:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -3303,6 +3441,21 @@ class KubernetesProvider:
 
 
 # ----- pure helpers -------------------------------------------------------
+
+
+def _seconds_until(timestamp: str) -> float:
+    """Seconds from now until an RFC 3339 UTC stamp; 0 for one that is past or that
+    does not parse, so a lock whose expiry is unreadable is reclaimable."""
+    try:
+        moment = datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+    except ValueError:
+        return 0.0
+    return max(0.0, moment.timestamp() - time.time())
+
+
+def _minutes(seconds: float) -> str:
+    minutes = max(1, round(seconds / 60))
+    return f"{minutes} minute" + ("" if minutes == 1 else "s")
 
 
 def _age_seconds(timestamp: str) -> float:

@@ -13,6 +13,7 @@ import asyncio
 import json
 import time
 from collections.abc import Iterator
+from functools import partial
 from typing import Any
 
 import pytest
@@ -24,10 +25,21 @@ from crucible.adapters.clock import SystemClock
 from crucible.adapters.execution import k8sspec
 from crucible.adapters.execution.fake import FakeProvider
 from crucible.adapters.execution.k8sfake import FakeKubernetesApi, FakeLogin, FakeRegistry
-from crucible.adapters.execution.kubernetes import KubernetesConfig, KubernetesProvider
+from crucible.adapters.execution.kubernetes import (
+    ANNOTATION_LOCK_EXPIRES,
+    ANNOTATION_LOCK_HOLDER,
+    KubernetesConfig,
+    KubernetesProvider,
+)
 from crucible.adapters.harness.registry import default_registry
 from crucible.application.admin.context import AdminContext
-from crucible.application.admin.login import _accept_login
+from crucible.application.admin.login import (
+    LoginRegistry,
+    _accept_login,
+    _accept_while_locked,
+    start_login,
+)
+from crucible.application.errors import ConflictError
 from crucible.application.supervisor import Supervisor
 from crucible.domain.entities import ImagePromotion
 from crucible.domain.lifecycle import AttemptState
@@ -357,3 +369,167 @@ async def test_a_launch_waits_while_a_login_for_its_harness_runs(
     await supervisor.tick()
     await supervisor.tick()
     assert client.get(f"/v1/tasks/{task_id}").json()["state"] != "scheduled"
+
+
+# ----- one login per harness across every api replica (25, 26) -------------------
+
+
+def lock_names(api: FakeKubernetesApi) -> list[str]:
+    return [n for n in api.object_names("configmaps") if n.startswith("login-lock-")]
+
+
+def test_a_second_replica_is_refused_while_the_lock_is_held_and_starts_after(
+    admin: TestClient, ctx: AppContext, admin_ctx: AdminContext, k8s_api: FakeKubernetesApi
+) -> None:
+    """Two api replicas each keep their own logins in memory; the lock ConfigMap is what
+    both see. The second start is refused naming the holder, and no second Job exists."""
+    k8s_api.login = FakeLogin(never_exits=True)
+    started = admin.post("/v1/admin/credentials/codex/login", json={"reason": "replica one"})
+    assert started.status_code == 200, started.text
+    poll(admin, "codex", "waiting_for_operator")
+    assert lock_names(k8s_api) == ["login-lock-codex"]
+    other = LoginRegistry()  # the second replica's memory: it knows of no login
+    with ctx.uow_factory() as uow, pytest.raises(ConflictError) as refused:
+        start_login(
+            admin_ctx,
+            uow,
+            other,
+            principal="second-principal",
+            harness="codex",
+            reason="replica two",
+        )
+    assert "already in progress" in str(refused.value.detail)
+    assert "admin-principal on " in str(refused.value.detail)
+    assert other.get("codex") is None
+    assert len([r for r in k8s_api.created if r["kind"] == "jobs"]) == 1
+
+    cancelled = admin.post("/v1/admin/credentials/codex/login/cancel", json={"reason": "stop"})
+    assert cancelled.status_code == 200, cancelled.text
+    assert poll(admin, "codex", "failed")["error"] == "login cancelled"
+    assert lock_names(k8s_api) == []
+    k8s_api.login = FakeLogin(files={"/home/worker/.codex/auth.json": CODEX_AUTH})
+    with ctx.uow_factory() as uow:
+        start_login(
+            admin_ctx, uow, other, principal="second-principal", harness="codex", reason="now"
+        )
+        uow.commit()
+    for _ in range(400):
+        session = other.get("codex")
+        if session is not None and session.state in ("finished", "failed"):
+            break
+        time.sleep(0.02)
+    assert session is not None and session.state == "finished", session
+    assert k8s_api.harness_secret("crucible-harness-codex") == {"auth.json": CODEX_AUTH}
+    assert lock_names(k8s_api) == []
+
+
+def test_the_lock_of_an_api_that_died_is_taken_over_once_it_expires(
+    admin: TestClient, k8s_api: FakeKubernetesApi, k8s_provider: KubernetesProvider
+) -> None:
+    """A lock left by an api that died mid-login holds until its expiry, then the next
+    login deletes exactly that lock and takes its own."""
+    k8s_api.create(
+        "configmaps",
+        k8sspec.config_map(
+            name="login-lock-codex",
+            namespace=k8s_api.namespace,
+            object_labels={
+                k8sspec.LABEL_ROLE: k8sspec.ROLE_LOGIN_LOCK,
+                k8sspec.LABEL_HARNESS: "codex",
+            },
+            data={},
+            annotations={
+                ANNOTATION_LOCK_HOLDER: "someone on crucible-api-dead",
+                ANNOTATION_LOCK_EXPIRES: "2099-01-01T00:00:00Z",
+            },
+        ),
+    )
+    held = admin.post("/v1/admin/credentials/codex/login", json={"reason": "onboarding"})
+    assert held.status_code == 409, held.text
+    assert "held by someone on crucible-api-dead" in held.json()["detail"]
+    assert not [r for r in k8s_api.created if r["kind"] == "jobs"]
+
+    stale = k8s_api.objects[("configmaps", "login-lock-codex")].body
+    stale["metadata"]["annotations"][ANNOTATION_LOCK_EXPIRES] = "2026-01-01T00:00:00Z"
+    stale_uid = stale["metadata"]["uid"]
+    k8s_api.login = FakeLogin(never_exits=True)
+    started = admin.post("/v1/admin/credentials/codex/login", json={"reason": "onboarding"})
+    assert started.status_code == 200, started.text
+    poll(admin, "codex", "waiting_for_operator")
+    lock = k8s_api.objects[("configmaps", "login-lock-codex")].body["metadata"]
+    assert lock["uid"] != stale_uid
+    assert lock["annotations"][ANNOTATION_LOCK_HOLDER].startswith("admin-principal on ")
+    admin.post("/v1/admin/credentials/codex/login/cancel", json={"reason": "stop"})
+    poll(admin, "codex", "failed")
+    assert lock_names(k8s_api) == []
+
+
+@pytest.mark.parametrize("ending", ["success", "failure", "cancel", "timeout"])
+def test_the_lock_is_released_however_the_login_ends(
+    ending: str, admin: TestClient, admin_ctx: AdminContext, k8s_api: FakeKubernetesApi
+) -> None:
+    seen: list[list[str]] = []
+    if ending == "success":
+        k8s_api.login = FakeLogin(
+            files={"/home/worker/.codex/auth.json": CODEX_AUTH}, finish_after=5
+        )
+    elif ending == "failure":
+        k8s_api.login = FakeLogin(exit_code=2, finish_after=5)
+    else:
+        k8s_api.login = FakeLogin(never_exits=True)
+    if ending == "timeout":
+        admin_ctx.login_timeout_seconds = 1
+    started = admin.post("/v1/admin/credentials/codex/login", json={"reason": ending})
+    assert started.status_code == 200, started.text
+    seen.append(lock_names(k8s_api))
+    if ending == "cancel":
+        poll(admin, "codex", "waiting_for_operator")
+        admin.post("/v1/admin/credentials/codex/login/cancel", json={"reason": "stop"})
+    state = poll(admin, "codex", "finished", "failed")
+    expected = {
+        "success": ("finished", None),
+        "failure": ("failed", "the login's auth files were not stored: auth.json: missing"),
+        "cancel": ("failed", "login cancelled"),
+        "timeout": ("failed", "login timed out"),
+    }[ending]
+    assert (state["state"], state["error"]) == expected, state
+    assert seen == [["login-lock-codex"]]
+    assert lock_names(k8s_api) == []
+    assert not [n for n in k8s_api.object_names("jobs") if n.startswith("login-")]
+
+
+def test_a_login_that_lost_its_lock_does_not_store(
+    admin_ctx: AdminContext, k8s_api: FakeKubernetesApi, k8s_provider: KubernetesProvider
+) -> None:
+    """A login that outlived its lock may have been overtaken by another replica's; the
+    store check at the moment of the write refuses it."""
+    lock = k8s_provider.acquire_login_lock("codex", holder="replica one", timeout=10)
+    accept = partial(
+        _accept_while_locked, k8s_provider, lock, partial(_accept_login, admin_ctx, "codex")
+    )
+    assert accept({"auth.json": CODEX_AUTH}) == []
+    k8s_api.delete("configmaps", "login-lock-codex")
+    taken = k8s_provider.acquire_login_lock("codex", holder="replica two", timeout=10)
+    assert taken.uid != lock.uid
+    problems = accept({"auth.json": CODEX_AUTH})
+    assert any("lock expired and another login took it over" in p for p in problems), problems
+    # Its release leaves the other replica's lock alone.
+    k8s_provider.release_login_lock(lock)
+    assert lock_names(k8s_api) == ["login-lock-codex"]
+    k8s_provider.release_login_lock(taken)
+    assert lock_names(k8s_api) == []
+
+
+def test_a_probe_the_job_deadline_ended_is_recorded_as_a_timeout(
+    admin: TestClient, k8s_api: FakeKubernetesApi
+) -> None:
+    """A hanging probe harness is ended by the worker Job's own deadline before the
+    provider's longer wait; validation records a timeout, not a crash."""
+    k8s_api.put_harness_secret("crucible-harness-codex", {"auth.json": CODEX_AUTH})
+    k8s_api.script_all("hang")
+    k8s_api.job_deadline_fires = True
+    validated = admin.post("/v1/admin/credentials/codex/validate", json={"reason": "probe"})
+    assert validated.status_code == 200, validated.text
+    probe = validated.json()["probe"]
+    assert probe["exit_class"] == "timeout", probe
+    assert "the Job's deadline ended it" in probe["detail"]

@@ -276,6 +276,12 @@ the removal of its synced copy, and a launch of that harness is deferred, not
 failed, while a login for it runs. On Kubernetes the login Job is what the
 supervisor sees; on Docker it is the login container.
 
+Only one login of a harness runs at a time. On Kubernetes that holds across api
+replicas: a second start, from any replica, is refused naming the holder of the
+harness's login lock (26), and the lock of an api that died is taken over once
+the login's deadline has passed. On Docker the api is one process and its own
+record of running logins is the lock.
+
 The local gateway panel is the runtime authority after migration. An environment value
 may seed version 6 on first migration, but later restarts read the active database
 policy and do not overwrite it. Each save creates a new routing-policy version and a

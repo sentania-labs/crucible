@@ -101,6 +101,7 @@ Per attempt the provider creates, in `crucible-workers`, all labelled
 | Job `publish-<attempt>` | pushes the sealed bundle with a token on an in-memory volume (23) | until complete |
 | Job `login-<harness>-<id>` (admin flow, 25) | the harness's own login in the promoted worker image, no workspace, no credential mounted, a memory-backed home; the service reads the auth files back over exec and writes the harness Secret (ADR 0015). Labelled `crucible.role=login`, `crucible.harness`, `crucible.login` and never `crucible.attempt` | until the service has read it back, cancelled, or timed out; its own deadline and a TTL remove it if the api died |
 | NetworkPolicy `np-login-<id>` | the login Job's egress: the adapter's `login_endpoints` only | with its Job; the retention sweep removes one whose Job is gone |
+| ConfigMap `login-lock-<harness>` (admin flow, 25) | the harness's login lock across every api replica: created before the login Job, so exactly one replica gets it and the others are refused naming its holder. Carries the holder and an expiry (the login deadline, the read-back window and five minutes). Labelled `crucible.role=login-lock` and `crucible.harness`, never `crucible.attempt` | deleted by the api that took it, by uid, however the login ends; a lock past its expiry (its api died) is deleted by uid and replaced by the next login |
 | the probe's claim, ConfigMap, per-run Secret and Jobs (admin flow, 25) | the bounded credential probe: an attempt's objects for one prompt, labelled `crucible.admin=probe` | removed by the probe; neither swept nor adopted by the supervisor for two hours |
 
 A Job per role keeps the same separation the Docker provider has (worker,
@@ -411,6 +412,19 @@ The supervisor defers a launch while a login Job for its harness exists,
 because the login is about to replace the credential (12). A launch that raced
 past that check seeds the credential as it stands, and the login then declines
 to write over it; a credential probe refuses outright while a login Job exists.
+
+Each api process keeps its logins in memory, so two replicas (a rollout, or an
+overlay with more than one) would each start a login for the same harness and
+the last to finish would silently replace the Secret. The `login-lock-<harness>`
+ConfigMap stops that: `create` is atomic, so only one replica starts a Job, and
+a login stores its files only if the lock is still the one it created. The
+Docker provider runs in one api process by design and keeps the in-memory check
+alone.
+
+A credential probe whose harness hangs is ended by the worker Job's
+`activeDeadlineSeconds` before the provider's own wait runs out. The provider
+reads the Job's `DeadlineExceeded` condition and records that probe as a
+timeout, not a crash.
 
 ## Observability and administration
 

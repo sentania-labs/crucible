@@ -17,12 +17,14 @@ attempt holds the credential, and a launch waits while a login runs.
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import os
 import pty
 import re
 import select
 import shutil
+import socket
 import subprocess
 import threading
 import time
@@ -410,6 +412,7 @@ class LoginRegistry:
         *,
         image: str | None = None,
         accept: Callable[[Mapping[str, bytes]], Sequence[str]] | None = None,
+        holder: str = "",
     ) -> LoginSession:
         argv = self.resolve(ctx, harness)
         flow = flows_for(ctx)[harness]
@@ -417,15 +420,24 @@ class LoginRegistry:
         job = self.job_runner(ctx) if runner is None else None
         if (runner is not None or job is not None) and not image:
             raise ConflictError(f"no promoted worker image is available for {harness}")
-        session = LoginSession(harness=harness, started_at=time.time())
-        self._sessions[harness] = session
+        lock = None
         if job is not None:
             if image is None or accept is None:
                 raise ConflictError(f"the {harness} login needs an image and a store check")
+            # The check in `resolve` sees this process's logins only; the lock is what
+            # every api replica sees. Taken before anything is registered, so a refusal
+            # leaves no session behind.
+            lock = self._take_lock(job, harness, holder, ctx.login_timeout_seconds)
+            if lock is not None:
+                accept = partial(_accept_while_locked, job, lock, accept)
+        session = LoginSession(harness=harness, started_at=time.time())
+        self._sessions[harness] = session
+        if job is not None:
+            assert image is not None and accept is not None
             session.credential_written = False
             thread = threading.Thread(
                 target=self._run_job,
-                args=(job, flow, image, session, argv, accept),
+                args=(job, flow, image, session, argv, accept, lock),
                 kwargs={"timeout": ctx.login_timeout_seconds},
                 daemon=True,
                 name=f"login-{harness}",
@@ -457,6 +469,8 @@ class LoginRegistry:
             session.state = "failed"
             session.error = f"the login thread could not be started: {type(exc).__name__}"
             self._threads.pop(harness, None)
+            if lock is not None:
+                _release_lock(job, lock)
             raise
         deadline = time.monotonic() + 5.0
         while session.state == "starting" and thread.is_alive() and time.monotonic() < deadline:
@@ -464,6 +478,20 @@ class LoginRegistry:
         if session.state == "failed":
             raise ConflictError(session.error or f"the {harness} login failed to start")
         return session
+
+    @staticmethod
+    def _take_lock(job: Any, harness: str, holder: str, timeout: int) -> Any | None:
+        """The harness's login lock across every api replica, from a provider that has
+        one (Kubernetes). The Docker provider runs in one api process by design, so the
+        in-memory check in `resolve` is its whole lock."""
+        acquire = getattr(job, "acquire_login_lock", None)
+        if not callable(acquire):
+            return None
+        who = f"{holder or 'the admin service'} on {socket.gethostname()}"
+        try:
+            return acquire(harness, holder=who, timeout=timeout)
+        except Exception as exc:
+            raise ConflictError(str(exc)) from exc
 
     @staticmethod
     def _run(
@@ -491,6 +519,7 @@ class LoginRegistry:
         session: LoginSession,
         argv: tuple[str, ...],
         accept: Callable[[Mapping[str, bytes]], Sequence[str]],
+        lock: Any | None = None,
         *,
         timeout: int,
     ) -> None:
@@ -510,6 +539,10 @@ class LoginRegistry:
         except Exception as exc:
             session.state = "failed"
             session.error = f"the login Job failed: {type(exc).__name__}: {exc}"
+        finally:
+            # Success, failure, cancel and timeout all end here, after the Job is gone.
+            if lock is not None:
+                _release_lock(provider, lock)
         if session.state not in ("finished", "failed"):
             # A session that never reaches a terminal state refuses every later login.
             session.state = "failed"
@@ -542,6 +575,30 @@ class LoginRegistry:
         except Exception as exc:
             session.state = "failed"
             session.error = f"the login container failed: {type(exc).__name__}: {exc}"
+
+
+def _release_lock(provider: Any, lock: Any) -> None:
+    """Best effort: a lock that could not be deleted expires on its own."""
+    with contextlib.suppress(Exception):
+        provider.release_login_lock(lock)
+
+
+def _accept_while_locked(
+    provider: Any,
+    lock: Any,
+    accept: Callable[[Mapping[str, bytes]], Sequence[str]],
+    files: Mapping[str, bytes],
+) -> list[str]:
+    """`accept`, and the lock is still this login's at the moment of the write: a login
+    that outlived its lock may have been overtaken by another replica's."""
+    problems = list(accept(files))
+    held = getattr(provider, "login_lock_held", None)
+    if callable(held) and not held(lock):
+        problems.append(
+            f"the {lock.harness} login lock expired and another login took it over, so "
+            "this login's files were not stored"
+        )
+    return problems
 
 
 def start_login(
@@ -746,7 +803,12 @@ def _start_job_login(
         )
     image = promoted_image(uow, harness)
     session = registry.start(
-        ctx, harness, "", image=image, accept=partial(_accept_login, ctx, harness)
+        ctx,
+        harness,
+        "",
+        image=image,
+        accept=partial(_accept_login, ctx, harness),
+        holder=principal,
     )
     admin_event(
         uow,

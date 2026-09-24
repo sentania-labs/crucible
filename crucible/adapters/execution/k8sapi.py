@@ -323,11 +323,14 @@ class KubernetesClient:
         *,
         grace_period_seconds: int | None = None,
         propagation: str = "Background",
+        uid: str | None = None,
     ) -> None:
         """Delete one object. A 404 is the state delete was asked to produce.
 
         `propagation` is Background by default so deleting a Job takes its Pod with it;
-        Orphan would leave a worker Pod running with nothing tracking it (26)."""
+        Orphan would leave a worker Pod running with nothing tracking it (26). `uid`
+        deletes only that incarnation of the name: the API server answers 409 when the
+        object there now is a different one (the login lock, 25)."""
         body: dict[str, Any] = {
             "apiVersion": "meta.k8s.io/v1",
             "kind": "DeleteOptions",
@@ -335,6 +338,8 @@ class KubernetesClient:
         }
         if grace_period_seconds is not None:
             body["gracePeriodSeconds"] = grace_period_seconds
+        if uid is not None:
+            body["preconditions"] = {"uid": uid}
         try:
             self._json("DELETE", f"{self._base(kind)}/{quote(name, safe='')}", body=body)
         except KubernetesApiError as exc:

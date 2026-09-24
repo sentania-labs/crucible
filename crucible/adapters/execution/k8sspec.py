@@ -66,6 +66,8 @@ ROLE_BUNDLE = "bundle-verifier"
 ROLE_VERIFIER = "verifier"
 ROLE_PUBLISHER = "publisher"
 ROLE_LOGIN = "login"
+# The ConfigMap that is one harness's login lock across every api replica (25, 26).
+ROLE_LOGIN_LOCK = "login-lock"
 ROLE_READER = "reader"
 ROLE_CLEANER = "cleaner"
 ROLE_CANARY = "canary"
@@ -746,6 +748,7 @@ __all__ = [
     "ROLE_CLEANER",
     "ROLE_COLLECTOR",
     "ROLE_LOGIN",
+    "ROLE_LOGIN_LOCK",
     "ROLE_PREPARER",
     "ROLE_PUBLISHER",
     "ROLE_READER",

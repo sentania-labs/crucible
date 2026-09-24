@@ -23,12 +23,15 @@ from typing import Any
 import pytest
 
 from crucible.adapters.execution import k8sspec
-from crucible.adapters.execution.k8sapi import _client_frame
+from crucible.adapters.execution.k8sapi import ClusterAccess, KubernetesClient, _client_frame
 from crucible.adapters.execution.k8sfake import FakeKubernetesApi, FakeLogin
 from crucible.adapters.execution.kubernetes import (
     _LOGIN_CODE_SCRIPT,
     _LOGIN_DRIVER,
+    ANNOTATION_LOCK_EXPIRES,
+    ANNOTATION_LOCK_HOLDER,
     KubernetesProvider,
+    LoginLockHeldError,
 )
 from crucible.application.admin.login import FLOWS, LoginSession
 from crucible.ports.execution import ProbeRequest, ProviderError
@@ -506,6 +509,29 @@ async def test_the_probe_runs_a_worker_on_the_secret_and_removes_everything() ->
     assert api.object_names("secrets") == ["crucible-harness-codex"]
 
 
+@pytest.mark.parametrize("keeps_pod", [False, True])
+async def test_a_probe_the_job_deadline_ended_is_a_timeout(keeps_pod: bool) -> None:
+    """The worker Job's deadline is shorter than the probe's wait, so a hanging harness
+    is ended by the cluster first. Whether the Pod is removed (the wait sees a failed
+    Job) or left terminated with 137, the probe is a timeout, not a crash."""
+    api, provider = login_provider(job_deadline_fires=True, deadline_keeps_pod=keeps_pod)
+    api.put_harness_secret("crucible-harness-codex", {"auth.json": CODEX_AUTH})
+    api.script_all("hang")
+    result = await provider.probe_credential(probe_request())
+    assert result.timed_out is True, result
+    assert "the Job's deadline ended it" in result.detail
+    for kind in ("jobs", "pods", "networkpolicies", "configmaps", "persistentvolumeclaims"):
+        assert not [n for n in api.object_names(kind) if "probe" in n], kind
+
+
+async def test_a_probe_that_crashes_is_not_a_timeout() -> None:
+    api, provider = login_provider()
+    api.put_harness_secret("crucible-harness-codex", {"auth.json": CODEX_AUTH})
+    api.script_all("crash")
+    result = await provider.probe_credential(probe_request())
+    assert result.timed_out is False and result.exit_code == 1, result
+
+
 async def test_a_probe_with_no_secret_is_refused_and_leaves_nothing() -> None:
     api, provider = login_provider()
     with pytest.raises(ProviderError, match="not readable"):
@@ -699,3 +725,56 @@ def test_routing_counts_a_harness_only_once_its_secret_holds_the_credential() ->
             raise ProviderError("the API server answered 503")
 
     assert _secret_holds(Unreadable(), "codex", credential) is True
+
+
+# ----- the login lock every api replica sees (25, 26) ------------------------------
+
+
+def test_the_login_lock_is_refused_while_held_and_names_the_holder() -> None:
+    api, provider = login_provider()
+    lock = provider.acquire_login_lock("claude_code", holder="alice on api-0", timeout=900)
+    body = api.objects[("configmaps", "login-lock-claude-code")].body
+    assert body["metadata"]["labels"][k8sspec.LABEL_ROLE] == k8sspec.ROLE_LOGIN_LOCK
+    assert body["metadata"]["annotations"][ANNOTATION_LOCK_HOLDER] == "alice on api-0"
+    assert lock.uid == body["metadata"]["uid"]
+    with pytest.raises(LoginLockHeldError, match="held by alice on api-0") as refused:
+        provider.acquire_login_lock("claude_code", holder="bob on api-1", timeout=900)
+    # The login deadline, the read-back window and the slack: 25 minutes.
+    assert "taken over in 25 minutes" in str(refused.value)
+    provider.release_login_lock(lock)
+    assert not api.object_names("configmaps")
+    again = provider.acquire_login_lock("claude_code", holder="bob on api-1", timeout=900)
+    assert again.uid != lock.uid
+
+
+@pytest.mark.parametrize("expiry", ["2026-01-01T00:00:00Z", "not a time"])
+def test_an_expired_or_unreadable_login_lock_is_taken_over(expiry: str) -> None:
+    api, provider = login_provider()
+    stale = provider.acquire_login_lock("codex", holder="dead on api-0", timeout=1)
+    api.objects[("configmaps", "login-lock-codex")].body["metadata"]["annotations"][
+        ANNOTATION_LOCK_EXPIRES
+    ] = expiry
+    taken = provider.acquire_login_lock("codex", holder="alive on api-1", timeout=900)
+    assert taken.uid != stale.uid
+    assert provider.login_lock_held(taken) and not provider.login_lock_held(stale)
+    assert ("configmaps", "login-lock-codex") in api.deleted
+    # The dead api's late release does not remove the lock that replaced its own.
+    provider.release_login_lock(stale)
+    assert api.object_names("configmaps") == ["login-lock-codex"]
+
+
+def test_the_login_lock_is_never_swept_as_an_attempt_object() -> None:
+    api, provider = login_provider()
+    provider.acquire_login_lock("codex", holder="alice on api-0", timeout=900)
+    assert asyncio.run(provider.retention(keep=[])) == 0
+    assert api.object_names("configmaps") == ["login-lock-codex"]
+
+
+def test_a_delete_by_uid_sends_the_precondition(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = KubernetesClient(ClusterAccess(server="https://127.0.0.1:1"), "crucible-workers")
+    sent: list[Any] = []
+    monkeypatch.setattr(client, "_json", lambda method, path, *, body=None, **_: sent.append(body))
+    client.delete("configmaps", "login-lock-codex", uid="uid-7")
+    client.delete("configmaps", "login-lock-codex")
+    assert sent[0]["preconditions"] == {"uid": "uid-7"}
+    assert "preconditions" not in sent[1]

@@ -48,6 +48,7 @@ from crucible.adapters.execution.k8sspec import (
     ROLE_CLEANER,
     ROLE_COLLECTOR,
     ROLE_LOGIN,
+    ROLE_LOGIN_LOCK,
     ROLE_PREPARER,
     ROLE_READER,
     ROLE_VERIFIER,
@@ -240,6 +241,12 @@ class FakeKubernetesApi:
     login_runs: dict[str, _LoginRun] = field(default_factory=dict)
     # Every stdin an exec was given, by Pod name, so a test sees what went in.
     exec_stdin: dict[str, list[bytes]] = field(default_factory=dict)
+    # The Job controller's `activeDeadlineSeconds` firing on a hanging worker before
+    # Crucible's own wait ends: the Job is marked failed with `DeadlineExceeded` and its
+    # Pod is removed (or left terminated with 137 when `deadline_keeps_pod`).
+    job_deadline_fires: bool = False
+    deadline_keeps_pod: bool = False
+    _uids: int = 0
 
     # ----- test controls ------------------------------------------------
 
@@ -314,6 +321,13 @@ class FakeKubernetesApi:
         if (kind, name) in self.objects:
             raise KubernetesApiError(409, f"{kind}/{name} already exists")
         stored: dict[str, Any] = json.loads(json.dumps(dict(body)))
+        if (
+            kind == "configmaps"
+            and (stored.get("metadata") or {}).get("labels", {}).get(LABEL_ROLE) == ROLE_LOGIN_LOCK
+        ):
+            # The API server gives every object a uid; the login lock is deleted by it.
+            self._uids += 1
+            stored["metadata"]["uid"] = f"uid-{self._uids}"
         self.objects[(kind, name)] = _Object(kind, name, stored)
         self.created.append({"kind": kind, "name": name, "body": stored})
         if kind == "persistentvolumeclaims":
@@ -357,10 +371,13 @@ class FakeKubernetesApi:
         *,
         grace_period_seconds: int | None = None,
         propagation: str = "Background",
+        uid: str | None = None,
     ) -> None:
         obj = self.objects.get((kind, name))
         if obj is None:
             return
+        if uid is not None and (obj.body.get("metadata") or {}).get("uid") != uid:
+            raise KubernetesApiError(409, f"{kind}/{name} precondition failed: uid differs")
         if kind == "pods":
             labels = (obj.body.get("metadata") or {}).get("labels") or {}
             worker = self.workers.get(str(labels.get(LABEL_ATTEMPT, "")))
@@ -526,6 +543,29 @@ class FakeKubernetesApi:
         if match is None or match.group("behavior") not in BEHAVIORS:
             return self.default_behavior or ("succeed", 1)
         return match.group("behavior"), int(match.group("n") or 1)
+
+    def _deadline_exceeded(self, obj: _Object, worker: _Worker) -> None:
+        worker.terminated = True
+        worker.exit_code = 137
+        job_name = str(((obj.body.get("metadata") or {}).get("labels") or {}).get("job-name", ""))
+        job = self.objects.get(("jobs", job_name))
+        if job is not None:
+            condition = {
+                "status": "True",
+                "reason": "DeadlineExceeded",
+                "message": "Job was active longer than specified deadline",
+            }
+            job.body["status"] = {
+                "failed": 1,
+                "conditions": [
+                    {"type": "FailureTarget", **condition},
+                    {"type": "Failed", **condition},
+                ],
+            }
+        if self.deadline_keeps_pod:
+            self._finish(obj, 137, reason="Error")
+        else:
+            self.objects.pop(("pods", obj.name), None)
 
     def _finish(self, obj: _Object, code: int, *, reason: str = "Completed") -> None:
         obj.body["status"] = {
@@ -775,6 +815,8 @@ class FakeKubernetesApi:
         if worker is None or worker.terminated:
             return
         if worker.behavior in ("hang", "immortal"):
+            if self.job_deadline_fires:
+                self._deadline_exceeded(obj, worker)
             return
         worker.observations += 1
         if worker.observations < worker.remaining:
