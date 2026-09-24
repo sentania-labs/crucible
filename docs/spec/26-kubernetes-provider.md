@@ -309,10 +309,15 @@ provider." An unreachable `local_endpoint_reachable` does not turn
 policy's `endpoint` field on its selected model, carried onto `LaunchSpec.endpoint`)
 is `local` (crucible#91, crucible#110), and admits every launch routed elsewhere. A
 missing tool in the canary image (no curl, no getent or nslookup) is inconclusive
-and never a pass. A passed probe is kept until the provider reads back a changed
-`kubernetes.egress` setting or enabled local endpoint; the canary then runs again
-under the new values before any launch uses them, and an answer proved under values
-that changed while the canary ran is discarded rather than kept.
+and never a pass. A probe whose API server, default-deny, DNS and local endpoint
+checks all settled (passed, or the endpoint reachable or none configured) is kept
+until the provider reads back a changed `kubernetes.egress` setting or enabled
+local endpoint; the canary then runs again under the new values before any launch
+uses them, and an answer proved under values that changed while the canary ran is
+discarded rather than kept. A probe whose only problem is the local endpoint
+(unreachable, unresolved or inconclusive) is not kept: the next `launch` or status
+read runs the canary again on its own, so a gateway that comes back is picked up
+without a settings change or a restart.
 
 The canary runs the first worker image reference the provider knows of, which
 before any attempt has resolved one is the first entry of

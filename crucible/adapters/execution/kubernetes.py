@@ -528,14 +528,25 @@ class KubernetesProvider:
             return
         self.apply_settings(document, endpoint_url)
 
+    @staticmethod
+    def _probe_is_settled(probe: NamespaceProbe) -> bool:
+        """Whether `probe` needs no retry: `passed` on its own is not enough, because a
+        local endpoint that failed or could not be told (crucible#110) no longer fails
+        `passed`, and keeping that stale answer would refuse every Hermes launch until a
+        settings change, never re-checking a gateway that came back. A problem with the
+        endpoint always leaves `local_endpoint_detail` set; its absence means the
+        endpoint is reachable or none is configured, either of which is settled."""
+        return probe.passed and probe.local_endpoint_detail is None
+
     async def ensure_ready(self) -> NamespaceProbe:
-        """Probe the namespace once, and keep the answer. A failed probe is re-run on
-        the next call: lab-admin fixing the CNI must not need a Crucible restart."""
+        """Probe the namespace once, and keep the answer. A failed probe, or one whose
+        local endpoint result is not settled, is re-run on the next call: lab-admin
+        fixing the CNI, or the endpoint coming back, must not need a Crucible restart."""
         await self._refresh_settings()
-        if self.probe is not None and self.probe.passed:
+        if self.probe is not None and self._probe_is_settled(self.probe):
             return self.probe
         async with self._probe_lock:
-            if self.probe is not None and self.probe.passed:
+            if self.probe is not None and self._probe_is_settled(self.probe):
                 return self.probe
             # A canary proves the rules it ran under. If a refresh changed them while it
             # ran, its answer is about rules no longer in force and is not kept.

@@ -159,9 +159,8 @@ async def test_an_inconclusive_local_endpoint_check_refuses_only_launches_routed
     await provider.launch(subscription_workspace, subscription_launch)
 
 
-async def test_dns_down_refuses_every_launch_and_endpoint_recovery_admits_hermes_again() -> None:
-    """crucible#110, requirement 5: DNS still gates every launch, whatever the route;
-    once the local endpoint recovers, the launch that uses it is admitted again."""
+async def test_dns_down_refuses_every_launch_whatever_the_route() -> None:
+    """crucible#110, requirement 5: DNS still gates every launch, whatever the route."""
     api, _registry, provider = build(
         config=config(egress=IN_CLUSTER, local_endpoint_url=LITELLM), canary_dns="failed"
     )
@@ -175,11 +174,24 @@ async def test_dns_down_refuses_every_launch_and_endpoint_recovery_admits_hermes
         await provider.launch(local_workspace, local_launch)
     with pytest.raises(LaunchRefusedError, match="the workers namespace is not ready"):
         await provider.launch(subscription_workspace, subscription_launch)
+    assert api
 
-    # The endpoint recovers (and so does DNS, since the same canary run proves both):
-    # a fresh probe admits the Hermes launch again.
-    api.canary_dns = "resolved"
-    provider.probe = None
+
+async def test_an_endpoint_recovery_admits_hermes_again_with_no_manual_reset() -> None:
+    """crucible#110: a probe that only failed on the local endpoint must not be kept
+    once it is settled false, or a gateway blip refuses Hermes until a settings change.
+    `ensure_ready()` alone, with no cache reset, must pick the recovery up."""
+    api, _registry, provider = build(
+        config=config(egress=IN_CLUSTER, local_endpoint_url=LITELLM), canary_endpoint="unreachable"
+    )
+    local_launch = spec(endpoint="local", endpoint_url=LITELLM)
+    local_workspace = await provider.prepare(local_launch)
+    probe = await provider.ensure_ready()
+    assert probe.passed is True and probe.local_endpoint_reachable is False
+    with pytest.raises(LaunchRefusedError, match="local endpoint check failed"):
+        await provider.launch(local_workspace, local_launch)
+
+    api.canary_endpoint = "reachable"
     probe = await provider.ensure_ready()
     assert probe.passed is True
     assert probe.local_endpoint_reachable is True
