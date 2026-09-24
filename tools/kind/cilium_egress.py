@@ -87,6 +87,9 @@ async def canary(args: argparse.Namespace) -> dict[str, Any]:
         local_endpoint_url=args.endpoint_url,
         local_endpoint_cidrs=(f"{args.gateway_ip}/32",) if args.form == "main" else (),
         probe_image=args.image,
+        # kind's containerd hides the pod-level cgroup from the canary, so the podPidsLimit
+        # the cluster config sets is attested here, as deploy-kind.sh does (95).
+        pod_pid_limit_override=512,
         launch_timeout_seconds=240,
         poll_interval_seconds=1,
     )
