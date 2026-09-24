@@ -204,6 +204,9 @@ class FakeKubernetesApi:
     # rest of the attempt.
     refuse_roles: set[str] = field(default_factory=set)
     pending_forever: set[str] = field(default_factory=set)
+    # A Job whose Pod the fake never creates, so a test can exercise the launch
+    # window before the Job controller has produced anything to observe (26).
+    no_pod_yet: set[str] = field(default_factory=set)
     created: list[dict[str, Any]] = field(default_factory=list)
     deleted: list[tuple[str, str]] = field(default_factory=list)
 
@@ -416,6 +419,9 @@ class FakeKubernetesApi:
         template = (job.get("spec") or {}).get("template") or {}
         labels = dict((template.get("metadata") or {}).get("labels") or {})
         labels["job-name"] = name
+        attempt_id = str(labels.get(LABEL_ATTEMPT, ""))
+        if name in self.no_pod_yet or attempt_id in self.no_pod_yet:
+            return
         pod_name = f"{name}-abc12"
         pod: dict[str, Any] = {
             "apiVersion": "v1",

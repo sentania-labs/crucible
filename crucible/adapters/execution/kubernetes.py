@@ -1099,7 +1099,10 @@ class KubernetesProvider:
     def _observation_without_pod(
         self, h: Handle, launched: _Launched | None, job: Mapping[str, Any]
     ) -> Observation:
-        """A Job whose Pod is gone. What that means depends on who removed it."""
+        """A Job whose Pod is gone, or not created yet (26). A Pod that existed and
+        then disappeared is lost; a Job that has never had one is pending until the
+        launch timeout, then a launch failure. The Job controller taking a few seconds
+        to create the Pod on a busy node is not a loss."""
         if launched is not None and launched.exit_code is not None:
             # The exit was already observed; the Pod being reaped afterwards is not a
             # second event.
@@ -1130,10 +1133,27 @@ class KubernetesProvider:
                     exit_code=KILL_EXIT_CODE,
                     detail="the Job deadline killed the Pod",
                 )
+            if str(condition.get("type")) == "Failed":
+                # 103: `backoffLimit: 0` fails the Job the moment its one Pod does, so a
+                # Pod gone before any poll saw it is still a Pod that existed, not a
+                # Job that never got one.
+                return Observation(
+                    ObservationState.LOST, detail="the Job failed before Crucible saw a Pod"
+                )
         if not job:
             return Observation(ObservationState.LOST, detail="the namespace has no such Job")
+        if launched is not None and launched.pod_name:
+            # 26: this attempt had a Pod and it is gone now, unlike the case below
+            # where one was never created.
+            return Observation(ObservationState.LOST, detail="the Job's Pod disappeared")
         if launched is not None and self._pending_too_long(launched):
-            return self._pending_failure(None)
+            return Observation(
+                ObservationState.EXITED,
+                exit_code=70,
+                detail="the Job controller never created a Pod",
+            )
+        if launched is not None:
+            return Observation(ObservationState.RUNNING, detail="Pending")
         return Observation(ObservationState.LOST, detail="the Job has no Pod")
 
     def _pending_too_long(self, launched: _Launched | None) -> bool:
@@ -1420,7 +1440,8 @@ class KubernetesProvider:
         self._launched.pop(ws.attempt_id, None)
 
     async def reconcile(self) -> list[Handle]:
-        """Adopt by label (10, 26). Only Jobs whose Pod is alive are handles."""
+        """Adopt by label (10, 26). A Job is a handle while its Pod is alive, or while
+        it has none yet and may still get one before the launch timeout."""
         try:
             rows = await self._call(
                 self.client.list_objects,
@@ -1441,20 +1462,37 @@ class KubernetesProvider:
             except KubernetesApiError:
                 continue
             # A Job's `status.active` lags its Pod, so the Pod is what says whether a
-            # worker is alive: 08 adopts only what is actually running.
-            if pod is None:
-                continue
-            phase = str((pod.get("status") or {}).get("phase", ""))
-            if phase not in ("Pending", "Running"):
-                continue
+            # worker is alive: 08 adopts what is running, and (26) what is still
+            # waiting on the Job controller to create its Pod. A Job with no Pod and
+            # a finished condition already ran its course before this restart, not a
+            # launch still in flight, so it is left for the normal cleanup pass.
+            if pod is not None:
+                phase = str((pod.get("status") or {}).get("phase", ""))
+                if phase not in ("Pending", "Running"):
+                    continue
+            else:
+                finished = any(
+                    isinstance(condition, dict)
+                    and str(condition.get("status")) == "True"
+                    and str(condition.get("type")) in ("Complete", "Failed")
+                    for condition in (row.get("status") or {}).get("conditions") or []
+                )
+                if finished:
+                    continue
             if attempt_id not in self._launched:
-                # A restarted supervisor has no memory of the launch, so the Pending
-                # timeout of 26 would never fire for an adopted Pod that will never
-                # schedule. The clock comes from the Job's own creation timestamp, not
-                # from now, so a Pod that has already been Pending too long is caught on
-                # the first observation rather than being given the window again.
+                # A restarted supervisor has no memory of the launch, so the launch
+                # timeout of 26 would never fire for an adopted attempt that will never
+                # schedule or never gets a Pod. The clock comes from the Job's own
+                # creation timestamp, not from now, so an attempt already past the
+                # window is caught on the first observation rather than given it again.
                 created = _age_seconds(str(metadata.get("creationTimestamp", "")))
-                pod_spec = pod.get("spec") or {}
+                # The Job's template is what the Pod is built from, and it is there
+                # whether or not a Pod exists yet. An empty image here would reach the
+                # helper Pods of collection, which the API server rejects (103).
+                template_spec = ((row.get("spec") or {}).get("template") or {}).get("spec") or {}
+                pod_spec = template_spec if template_spec.get("containers") else {}
+                if not pod_spec and pod is not None:
+                    pod_spec = pod.get("spec") or {}
                 containers = pod_spec.get("containers") or []
                 image = str((containers[0] if containers else {}).get("image", ""))
                 limits = replace(
@@ -1469,6 +1507,13 @@ class KubernetesProvider:
                     launched_at=time.monotonic() - created,
                 )
             launched = self._launched[attempt_id]
+            if pod is not None and not launched.pod_name:
+                # So a Pod that vanishes between this reconcile and the first `observe`
+                # reads as lost, not as one the Job controller never created (103).
+                launched.pod_name = str((pod.get("metadata") or {}).get("name") or "")
+                # `observe` restores the node only alongside the Pod name, so it is
+                # restored here too or the launch evidence records no node.
+                launched.node = str((pod.get("spec") or {}).get("nodeName") or "") or None
             handles.append(
                 Handle(
                     provider=self.name,
