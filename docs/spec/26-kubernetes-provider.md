@@ -312,13 +312,27 @@ status page (25).
   (`dns_resolves`), connect to the enabled local endpoint's URL when one is
   enabled (`local_endpoint_reachable`), and still fail to reach the API server.
 
-A failure of any of them is `namespace_ready: false` with a detail naming the
-check that failed, and every launch is refused until it passes. A missing tool in
-the canary image (no curl, no getent or nslookup) is inconclusive and never a
-pass. A passed probe is kept until the provider reads back a changed
-`kubernetes.egress` setting or enabled local endpoint; the canary then runs again
-under the new values before any launch uses them, and an answer proved under values
-that changed while the canary ran is discarded rather than kept.
+A failure of the API-server, default-deny or DNS check is `namespace_ready: false`
+with a detail naming the check that failed, and every launch is refused until it
+passes. The operator, 2026-09-23: "a down provider should only block that
+provider." An unreachable `local_endpoint_reachable` does not turn
+`namespace_ready` false: it refuses only the launch whose own route (the routing
+policy's `endpoint` field on its selected model, carried onto `LaunchSpec.endpoint`)
+is `local` (crucible#91, crucible#110), and admits every launch routed elsewhere. A
+local endpoint no NetworkPolicy can permit (it resolves into a denied range, or its
+selector is refused) is the same endpoint failure: the second canary runs without
+it, so DNS and the API server are still proved, and only local-route launches are
+refused; worker rules that cannot be written for any other reason fail the probe. A
+missing tool in the canary image (no curl, no getent or nslookup) is inconclusive
+and never a pass. A probe whose API server, default-deny, DNS and local endpoint
+checks all settled (passed, or the endpoint reachable or none configured) is kept
+until the provider reads back a changed `kubernetes.egress` setting or enabled
+local endpoint; the canary then runs again under the new values before any launch
+uses them, and an answer proved under values that changed while the canary ran is
+discarded rather than kept. A probe whose only problem is the local endpoint
+(unreachable, unresolved or inconclusive) is not kept: the next `launch` or status
+read runs the canary again on its own, so a gateway that comes back is picked up
+without a settings change or a restart.
 
 The canary runs the first worker image reference the provider knows of, which
 before any attempt has resolved one is the first entry of
@@ -342,12 +356,24 @@ the namespace. A deployment therefore names one exact, pullable reference in
 - `launch`: resolve the worker image to a digest through the image registry
   (11, 25) and record it; refuse an unsupported harness version; create the
   NetworkPolicy and the worker Job; return the Job name as the handle.
-- `observe`: read the Job and its Pod; `running` while the Pod is Pending
-  or Running, `exited(code)` from the terminated container status, `lost`
-  when the Job or Pod no longer exists or the Pod was evicted or its node is
-  gone. Pending longer than the policy's launch timeout (image pull, no
-  schedulable node, PVC unbound) is a launch failure with the Pod's
-  conditions as detail, not a stall.
+- `observe`: read the Job and its Pod.
+
+  | Job | Pod | Result |
+  |---|---|---|
+  | gone | n/a | `lost` ("the namespace has no such Job") |
+  | exists | Pending or Running, within the launch timeout | `running` |
+  | exists | Pending past the launch timeout | launch failure, the Pod's conditions as detail (image pull, no schedulable node, PVC unbound), not a stall |
+  | exists | terminated container | `exited(code)` |
+  | exists | evicted, or its node is gone | `lost` |
+  | exists | none yet, within the launch timeout | `running` (a Job controller can take a few seconds to create a Pod on a busy node; this is not a loss, 103) |
+  | exists | none yet, past the launch timeout | launch failure ("the Job controller never created a Pod") |
+  | exists | had one, now gone | `lost` (the Pod existed and disappeared, unlike the row above) |
+
+  Distinguishing the last two rows needs the observer's own memory of whether
+  it ever saw this attempt's Pod (103): a Job it has watched since launch
+  keeps that memory in the process; one adopted by `reconcile` after a
+  restart never had the chance, so it starts in the "none yet" row with the
+  Job's own creation time standing in for the launch time.
 - `logs`: `pods/log` with timestamps, `sinceTime` from the stored offset,
   resumed strict-after by the (timestamp, line hash) pair (10). A restarted
   supervisor re-attaches by Job name.
@@ -362,7 +388,10 @@ the namespace. A deployment therefore names one exact, pullable reference in
   per policy (retained PVCs carry a retention label the sweep honours);
   release the lease.
 - `reconcile`: list Jobs by label; a Job with no live attempt row is
-  orphaned and deleted; a live attempt with no Job is `lost`.
+  orphaned and deleted; a live attempt with no Job is `lost`. A Job still
+  waiting on its Pod is adopted like a running one (103), its launch time
+  taken from the Job's own creation timestamp; one whose Pod already
+  finished and was reaped is left alone for cleanup, not adopted.
 
 Heartbeats and stall detection (10, C6c) are unchanged: log progress and
 the filesystem fingerprint come from the PVC through the reader Pod, and

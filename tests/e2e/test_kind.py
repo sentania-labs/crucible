@@ -713,6 +713,9 @@ async def test_deleted_pod_is_lost_and_sigterm_ignoring_pod_dies_at_grace(
     lost_ws = await provider.prepare(lost_spec)
     lost_handle = await provider.launch(lost_ws, lost_spec)
     await _running(provider, lost_handle)
+    # 103: lost requires having seen the Pod at least once, to tell it apart from a
+    # Job whose Pod the controller has not created yet.
+    assert (await provider.observe(lost_handle)).state is ObservationState.RUNNING
     pod = await provider._pod_of(lost_handle.ref)
     assert pod is not None
     api.delete("pods", str(pod["metadata"]["name"]), grace_period_seconds=0)

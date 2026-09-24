@@ -349,6 +349,11 @@ class NamespaceProbe:
     # TCP connection. None is "not checked" (no local endpoint) or "could not tell".
     dns_resolves: bool | None = None
     local_endpoint_reachable: bool | None = None
+    # The endpoint-specific failure text, set only when `local_endpoint_reachable` is not
+    # True (crucible#110). Kept apart from `detail`'s pass/fail verdict because a down
+    # local endpoint no longer fails the probe by itself: it names the reason a launch
+    # routed to that endpoint is refused, while every other launch keeps running.
+    local_endpoint_detail: str | None = None
     # Where `pid_limit` came from, or why there is none (95): "cgroup-v2-parent" when
     # the pod-level cgroup was read directly, "cgroupns-private" when the container's
     # cgroup namespace hides it, "cgroup-v1" when the hierarchy is the unsupported one,
@@ -361,6 +366,7 @@ class NamespaceProbe:
             "egress_enforced": self.egress_enforced,
             "dns_resolves": self.dns_resolves,
             "local_endpoint_reachable": self.local_endpoint_reachable,
+            "local_endpoint_detail": self.local_endpoint_detail,
             "pod_pid_limit": self.pid_limit,
             "pod_pid_limit_source": self.pid_limit_source,
             "runtime_class": "standard",
@@ -588,14 +594,25 @@ class KubernetesProvider:
             return
         self.apply_settings(document, endpoint_url)
 
+    @staticmethod
+    def _probe_is_settled(probe: NamespaceProbe) -> bool:
+        """Whether `probe` needs no retry: `passed` on its own is not enough, because a
+        local endpoint that failed or could not be told (crucible#110) no longer fails
+        `passed`, and keeping that stale answer would refuse every Hermes launch until a
+        settings change, never re-checking a gateway that came back. A problem with the
+        endpoint always leaves `local_endpoint_detail` set; its absence means the
+        endpoint is reachable or none is configured, either of which is settled."""
+        return probe.passed and probe.local_endpoint_detail is None
+
     async def ensure_ready(self) -> NamespaceProbe:
-        """Probe the namespace once, and keep the answer. A failed probe is re-run on
-        the next call: lab-admin fixing the CNI must not need a Crucible restart."""
+        """Probe the namespace once, and keep the answer. A failed probe, or one whose
+        local endpoint result is not settled, is re-run on the next call: lab-admin
+        fixing the CNI, or the endpoint coming back, must not need a Crucible restart."""
         await self._refresh_settings()
-        if self.probe is not None and self.probe.passed:
+        if self.probe is not None and self._probe_is_settled(self.probe):
             return self.probe
         async with self._probe_locks.setdefault(asyncio.get_running_loop(), asyncio.Lock()):
-            if self.probe is not None and self.probe.passed:
+            if self.probe is not None and self._probe_is_settled(self.probe):
                 return self.probe
             # A canary proves the rules it ran under. If a refresh changed them while it
             # ran, its answer is about rules no longer in force and is not kept.
@@ -634,23 +651,47 @@ class KubernetesProvider:
         if isinstance(namespace_run, NamespaceProbe):
             return namespace_run
         endpoint_url = self.config.local_endpoint_url
+        endpoint_problem: str | None = None
         try:
-            plan = await self._resolve_plan(self._local_endpoint_plan(EgressPlan(), endpoint_url))
+            plan = await self._canary_endpoint_plan(endpoint_url)
         except (ProviderError, SpecError) as exc:
-            return NamespaceProbe(
-                False,
-                False,
-                None,
-                f"local endpoint check failed: no rule can permit it ({exc})",
-                checked=False,
-                local_endpoint_reachable=False,
+            # A local endpoint no rule can permit is the endpoint's failure, not the
+            # namespace's (crucible#110): the worker rules canary still runs without it,
+            # so DNS, default deny and the PID limit keep gating every launch, and the
+            # endpoint refuses only the launches routed to it.
+            endpoint_problem = (
+                f"local endpoint check failed: no rule can permit it ({exc}); this blocks "
+                "only launches routed to a local endpoint"
             )
+            endpoint_url = ""
+            plan = EgressPlan()
         rules_run = await self._run_canary(
             image, scope="worker", plan=plan, endpoint_url=endpoint_url
         )
         if isinstance(rules_run, NamespaceProbe):
             return rules_run
-        return _read_probe(namespace_run, rules_run, override=self.config.pod_pid_limit_override)
+        probe = _read_probe(namespace_run, rules_run, override=self.config.pod_pid_limit_override)
+        if endpoint_problem is None:
+            return probe
+        return replace(
+            probe,
+            detail=endpoint_problem if probe.passed else f"{probe.detail}; {endpoint_problem}",
+            local_endpoint_reachable=False,
+            local_endpoint_detail=endpoint_problem,
+        )
+
+    async def _canary_endpoint_plan(self, endpoint_url: str) -> EgressPlan:
+        """The worker rules canary's plan: cluster DNS and the configured local endpoint.
+        Everything that can refuse the endpoint is checked here, before any object is
+        created, so a failure raised from here is always the endpoint's own."""
+        plan = await self._resolve_plan(self._local_endpoint_plan(EgressPlan(), endpoint_url))
+        if plan.endpoint_selector is not None:
+            k8sspec.check_selector(
+                plan.endpoint_selector,
+                what="local endpoint",
+                protected_namespaces=self._protected(),
+            )
+        return plan
 
     async def _run_canary(
         self,
@@ -673,17 +714,25 @@ class KubernetesProvider:
         policy_name: str | None = None
         if plan is not None:
             policy_name = k8sspec.object_name("np-canary", canary_id)
-            policy = self._policy_body(
-                policy_name,
-                object_labels,
-                canary_id,
-                k8sspec.ROLE_CANARY,
-                plan,
-                pod_selector={
-                    k8sspec.LABEL_CANARY: canary_id,
-                    k8sspec.LABEL_ROLE: k8sspec.ROLE_CANARY,
-                },
-            )
+            try:
+                policy = self._policy_body(
+                    policy_name,
+                    object_labels,
+                    canary_id,
+                    k8sspec.ROLE_CANARY,
+                    plan,
+                    pod_selector={
+                        k8sspec.LABEL_CANARY: canary_id,
+                        k8sspec.LABEL_ROLE: k8sspec.ROLE_CANARY,
+                    },
+                )
+            except SpecError as exc:
+                # The worker egress rules themselves cannot be written (a DNS selector
+                # that names a protected namespace, say): no worker could run under
+                # them, so the whole probe fails, whatever the route.
+                return NamespaceProbe(
+                    False, False, None, f"the worker egress rules cannot be written: {exc}", False
+                )
         limits = k8sspec.canary_limits(
             cpu_millicores=self.config.canary_cpu_millicores,
             memory=self.config.canary_memory,
@@ -950,6 +999,23 @@ class KubernetesProvider:
             .strip(),
         )
 
+    def _check_endpoint_ready(self, probe: NamespaceProbe, spec: LaunchSpec) -> None:
+        """The operator, 2026-09-23: "a down provider should only block that provider."
+        DNS, default-deny and the API-server result gate every launch through
+        `probe.passed`; the local endpoint gates only the launch whose own route (05's
+        `LaunchSpec.endpoint`, the routing policy's field) is `local`. Nothing to check
+        (`config.local_endpoint_url` empty) is not this route's failure to report; once
+        the probe has something to say about it, anything but a definite pass refuses,
+        the same standard the probe itself uses."""
+        if spec.endpoint != "local" or not self.config.local_endpoint_url:
+            return
+        if probe.local_endpoint_reachable is True:
+            return
+        raise HarnessRefusedError(
+            "refusing to launch: the local endpoint check failed for this launch's route "
+            f"({probe.local_endpoint_detail or probe.detail})"
+        )
+
     async def launch(self, ws: Workspace, spec: LaunchSpec) -> Handle:
         probe = await self.ensure_ready()
         gated_under = self.config
@@ -960,6 +1026,7 @@ class KubernetesProvider:
             raise HarnessRefusedError(
                 f"refusing to launch: the workers namespace is not ready ({probe.detail})"
             )
+        self._check_endpoint_ready(probe, spec)
         resolved = await self._resolve_image(spec)
         limits = self._limits(spec)
         copy = self._credential_copy(spec)
@@ -993,6 +1060,7 @@ class KubernetesProvider:
                     raise HarnessRefusedError(
                         f"refusing to launch: the workers namespace is not ready ({probe.detail})"
                     )
+                self._check_endpoint_ready(probe, spec)
                 plan = self._egress_plan(spec, k8sspec.ROLE_WORKER)
             policy_name = await self._apply_policy(spec, k8sspec.ROLE_WORKER, plan)
             body = k8sspec.job(
@@ -1107,7 +1175,10 @@ class KubernetesProvider:
     def _observation_without_pod(
         self, h: Handle, launched: _Launched | None, job: Mapping[str, Any]
     ) -> Observation:
-        """A Job whose Pod is gone. What that means depends on who removed it."""
+        """A Job whose Pod is gone, or not created yet (26). A Pod that existed and
+        then disappeared is lost; a Job that has never had one is pending until the
+        launch timeout, then a launch failure. The Job controller taking a few seconds
+        to create the Pod on a busy node is not a loss."""
         if launched is not None and launched.exit_code is not None:
             # The exit was already observed; the Pod being reaped afterwards is not a
             # second event.
@@ -1138,10 +1209,27 @@ class KubernetesProvider:
                     exit_code=KILL_EXIT_CODE,
                     detail="the Job deadline killed the Pod",
                 )
+            if str(condition.get("type")) == "Failed":
+                # 103: `backoffLimit: 0` fails the Job the moment its one Pod does, so a
+                # Pod gone before any poll saw it is still a Pod that existed, not a
+                # Job that never got one.
+                return Observation(
+                    ObservationState.LOST, detail="the Job failed before Crucible saw a Pod"
+                )
         if not job:
             return Observation(ObservationState.LOST, detail="the namespace has no such Job")
+        if launched is not None and launched.pod_name:
+            # 26: this attempt had a Pod and it is gone now, unlike the case below
+            # where one was never created.
+            return Observation(ObservationState.LOST, detail="the Job's Pod disappeared")
         if launched is not None and self._pending_too_long(launched):
-            return self._pending_failure(None)
+            return Observation(
+                ObservationState.EXITED,
+                exit_code=70,
+                detail="the Job controller never created a Pod",
+            )
+        if launched is not None:
+            return Observation(ObservationState.RUNNING, detail="Pending")
         return Observation(ObservationState.LOST, detail="the Job has no Pod")
 
     def _pending_too_long(self, launched: _Launched | None) -> bool:
@@ -1430,7 +1518,8 @@ class KubernetesProvider:
         self._seeded.pop(ws.attempt_id, None)
 
     async def reconcile(self) -> list[Handle]:
-        """Adopt by label (10, 26). Only Jobs whose Pod is alive are handles."""
+        """Adopt by label (10, 26). A Job is a handle while its Pod is alive, or while
+        it has none yet and may still get one before the launch timeout."""
         try:
             rows = await self._call(
                 self.client.list_objects,
@@ -1455,20 +1544,37 @@ class KubernetesProvider:
             except KubernetesApiError:
                 continue
             # A Job's `status.active` lags its Pod, so the Pod is what says whether a
-            # worker is alive: 08 adopts only what is actually running.
-            if pod is None:
-                continue
-            phase = str((pod.get("status") or {}).get("phase", ""))
-            if phase not in ("Pending", "Running"):
-                continue
+            # worker is alive: 08 adopts what is running, and (26) what is still
+            # waiting on the Job controller to create its Pod. A Job with no Pod and
+            # a finished condition already ran its course before this restart, not a
+            # launch still in flight, so it is left for the normal cleanup pass.
+            if pod is not None:
+                phase = str((pod.get("status") or {}).get("phase", ""))
+                if phase not in ("Pending", "Running"):
+                    continue
+            else:
+                finished = any(
+                    isinstance(condition, dict)
+                    and str(condition.get("status")) == "True"
+                    and str(condition.get("type")) in ("Complete", "Failed")
+                    for condition in (row.get("status") or {}).get("conditions") or []
+                )
+                if finished:
+                    continue
             if attempt_id not in self._launched:
-                # A restarted supervisor has no memory of the launch, so the Pending
-                # timeout of 26 would never fire for an adopted Pod that will never
-                # schedule. The clock comes from the Job's own creation timestamp, not
-                # from now, so a Pod that has already been Pending too long is caught on
-                # the first observation rather than being given the window again.
+                # A restarted supervisor has no memory of the launch, so the launch
+                # timeout of 26 would never fire for an adopted attempt that will never
+                # schedule or never gets a Pod. The clock comes from the Job's own
+                # creation timestamp, not from now, so an attempt already past the
+                # window is caught on the first observation rather than given it again.
                 created = _age_seconds(str(metadata.get("creationTimestamp", "")))
-                pod_spec = pod.get("spec") or {}
+                # The Job's template is what the Pod is built from, and it is there
+                # whether or not a Pod exists yet. An empty image here would reach the
+                # helper Pods of collection, which the API server rejects (103).
+                template_spec = ((row.get("spec") or {}).get("template") or {}).get("spec") or {}
+                pod_spec = template_spec if template_spec.get("containers") else {}
+                if not pod_spec and pod is not None:
+                    pod_spec = pod.get("spec") or {}
                 containers = pod_spec.get("containers") or []
                 image = str((containers[0] if containers else {}).get("image", ""))
                 limits = replace(
@@ -1483,6 +1589,13 @@ class KubernetesProvider:
                     launched_at=time.monotonic() - created,
                 )
             launched = self._launched[attempt_id]
+            if pod is not None and not launched.pod_name:
+                # So a Pod that vanishes between this reconcile and the first `observe`
+                # reads as lost, not as one the Job controller never created (103).
+                launched.pod_name = str((pod.get("metadata") or {}).get("name") or "")
+                # `observe` restores the node only alongside the Pod name, so it is
+                # restored here too or the launch evidence records no node.
+                launched.node = str((pod.get("spec") or {}).get("nodeName") or "") or None
             handles.append(
                 Handle(
                     provider=self.name,
@@ -1608,7 +1721,11 @@ class KubernetesProvider:
         checks.update(probe.as_dict())
         if not probe.checked:
             return ProviderHealth("degraded", checks)
-        return ProviderHealth("ok" if probe.passed else "degraded", checks)
+        # An unreachable local endpoint no longer fails the probe (crucible#110: it
+        # blocks only launches routed to it), but it is still a real outage worth
+        # surfacing here rather than reporting the provider as fully "ok".
+        ok = probe.passed and probe.local_endpoint_reachable is not False
+        return ProviderHealth("ok" if ok else "degraded", checks)
 
     async def probe_credential(self, request: ProbeRequest) -> ProbeResult:
         """25: run the hardened image with the credential mounted for one prompt under a
@@ -3708,28 +3825,36 @@ def _read_probe(
             "DNS check inconclusive: the canary image has no getent or nslookup "
             f"(tool {rules.get('dns_tool', 'unknown')})"
         )
+    # The operator, 2026-09-23: "a down provider should only block that provider." An
+    # unreachable local endpoint is kept out of `problems` (and so out of `passed`): the
+    # DNS, default-deny and API-server results gate every launch, but the endpoint result
+    # gates only the launches whose route uses it (see `_check_endpoint_ready`).
+    endpoint_detail: str | None = None
     if endpoint in ("unreachable", "unresolved"):
-        problems.append(
+        endpoint_detail = (
             "local endpoint check failed: the canary could not "
             + ("resolve" if endpoint == "unresolved" else "connect to")
             + " the configured local endpoint under the worker egress rules "
             f"(curl exit {rules.get('endpoint_curl_exit', 'none')}; check "
-            "kubernetes.egress local_endpoint)"
+            "kubernetes.egress local_endpoint); this blocks only launches routed to a "
+            "local endpoint"
         )
     elif endpoint not in ("reachable", "none"):
-        problems.append(
+        endpoint_detail = (
             "local endpoint check inconclusive: the canary could not tell whether it "
             f"connected (tool {rules.get('tool', 'unknown')}, curl exit "
-            f"{rules.get('endpoint_curl_exit', 'none')})"
+            f"{rules.get('endpoint_curl_exit', 'none')}); this blocks only launches "
+            "routed to a local endpoint"
         )
     pid_limit, pid_source, pid_problem = _read_pod_pid_limit(fields, override)
     if pid_problem:
         problems.append(pid_problem)
+    detail_parts = list(problems) + ([endpoint_detail] if endpoint_detail else [])
     return NamespaceProbe(
         passed=not problems,
         egress_enforced=enforced,
         pid_limit=pid_limit,
-        detail="; ".join(problems) or "namespace ready",
+        detail="; ".join(detail_parts) or "namespace ready",
         # An inconclusive answer is not a probe that ran: the status page should say so
         # rather than showing a namespace that merely failed.
         checked=answer != "inconclusive"
@@ -3741,6 +3866,7 @@ def _read_probe(
             "unreachable": False,
             "unresolved": False,
         }.get(endpoint),
+        local_endpoint_detail=endpoint_detail,
         pid_limit_source=pid_source,
     )
 
