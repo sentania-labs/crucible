@@ -4,13 +4,14 @@ Crucible's repository holds no secret value and no sealed ciphertext. What it ho
 the *shape* of every Secret the deployment reads, so lab-admin can seal or source the
 real values without guessing a key name.
 
-Four kinds of secret, and where each is mounted:
+Four kinds of secret, and where each comes from. Three are delivered by GitOps. The
+harness credential Secrets are not: Crucible creates and owns them (ADR 0015).
 
 | Object | Namespace | Keys | Read by |
 |---|---|---|---|
 | `crucible-database` | `crucible` | `password`, `url` | the PostgreSQL StatefulSet (`password`) and the api, supervisor and migration Job (`url`) |
 | `crucible-github-app` | `crucible` | `app.pem`, `webhook.secret` | the api and supervisor pods only, as files (12) |
-| `crucible-harness-<harness>` | `crucible-workers` | one per auth file the adapter declares | the supervisor's account, copied per attempt into `cred-<attempt>` (12, 26) |
+| `crucible-harness-<harness>` | `crucible-workers` | one per auth file the adapter declares | written only by Crucible (the login, the Hermes key, the sync-back); copied per attempt into `cred-<attempt>` (12, 26). **Never delivered by GitOps.** |
 | an image pull secret | both | `.dockerconfigjson` | the kubelet, when the packages are private |
 
 `password` and `url` must agree: `url` is the whole DSN
@@ -20,8 +21,25 @@ pydantic-settings reads one environment variable and does no interpolation.
 A harness whose auth file sits in a subdirectory is keyed with the separator replaced by
 an underscore, and the volume projects it back to the declared path (C8a). AGY's
 `antigravity-cli/antigravity-oauth-token` is therefore the key
-`antigravity-cli_antigravity-oauth-token`. **Lab-admin's harness Secrets must use the
-flattened key.**
+`antigravity-cli_antigravity-oauth-token`.
+
+## The harness Secrets are Crucible's
+
+`service-owned-harnesses.yaml` documents their layout and is in no kustomization. The
+service creates each one the first time the admin login (or, for Hermes, the key entry
+on the Routing page) writes it, labels it `app.kubernetes.io/managed-by: crucible`, and
+replaces its data whole on each later write; the supervisor writes a newer refreshed
+token back after an attempt. A Secret written by both Crucible and GitOps drifts, and a
+sync would restore a token the harness has already rotated, so none of these is sealed,
+sourced or applied by GitOps. The supervisor's Role already carries the verbs this needs
+(`create`, `get` and `patch` on Secrets in `crucible-workers`).
+
+A deployment that delivered them through GitOps before this change removes them from
+its GitOps repository first. Argo's prune deletes a Secret it stops tracking, which
+would delete the credential, so either take the objects out of Argo's tracking without
+pruning them, or accept that each harness is logged in again from the UI afterwards. On
+its first write Crucible takes over a Secret that already exists: it sets its labels and
+replaces its data.
 
 ## `sealed/`
 

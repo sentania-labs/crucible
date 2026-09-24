@@ -118,26 +118,33 @@ under the new values before any launch uses them.
 
 ### The Secrets
 
-`deploy/kubernetes/secret-shapes/README.md` is the authority on the shapes. In short:
+`deploy/kubernetes/secret-shapes/README.md` is the authority on the shapes. GitOps
+delivers two Secrets:
 
 | Object | Namespace | Keys |
 |---|---|---|
 | `crucible-database` | `crucible` | `password`, and `url`, the whole DSN, which must carry the same password |
 | `crucible-github-app` | `crucible` | `app.pem`, `webhook.secret` |
+
+**The harness credential Secrets are not GitOps's.** Crucible creates and owns them
+(ADR 0015): the login flow below writes each one, the Hermes key entry on the Routing
+page writes Hermes's, and the supervisor writes a refreshed token back after an attempt.
+A Secret written by both Crucible and GitOps drifts, and a sync would restore a token the
+harness has already rotated. They are:
+
+| Object | Namespace | Keys |
+|---|---|---|
 | `crucible-harness-claude-code` | `crucible-workers` | `oauth-token`, `.claude.json` |
 | `crucible-harness-codex` | `crucible-workers` | `auth.json` |
 | `crucible-harness-agy` | `crucible-workers` | `antigravity-cli_antigravity-oauth-token` |
 | `crucible-harness-hermes` | `crucible-workers` | `api-key` |
 
-A Secret key cannot hold a path separator, so AGY's auth file is keyed with the
-separator replaced by an underscore and the volume projects it back (C8a). **The harness
-Secrets must use the flattened key**, or the provider will not find the file.
-
-The harness Secrets may be left absent at first. The login flow below fills them.
-Hermes is different: place its LiteLLM virtual key in the one-file Secret through the
-same sealed or external-secret path as the other harnesses. It is projected read-only
-and never synced back. The browser paste flow is for the directory-backed Docker
-deployment; it does not bypass cluster GitOps authority.
+Each carries `app.kubernetes.io/managed-by: crucible`. The names come from
+`CRUCIBLE_KUBERNETES__CREDENTIAL_SECRETS` in the settings ConfigMap, which the base
+already sets. Nothing has to exist before the first login, and the supervisor's Role
+already carries the verbs Crucible needs for them. A deployment that sealed harness
+Secrets before this change takes them out of its GitOps repository first; see the
+secret-shapes README for doing that without Argo's prune deleting the credential.
 
 The placeholders in `secret-shapes/sealed/` are deliberately not valid ciphertext: the
 sealed-secrets controller refuses them, so nothing starts with a wrong value. Seal the
@@ -153,9 +160,10 @@ concurrency bound, the reference cache claim, PostgreSQL for the lab, the migrat
 the api and supervisor Deployments, the Service, and the Ingress route without a host.
 
 Everything an attempt becomes (Jobs, Pods, ConfigMaps, per-attempt Secrets,
-NetworkPolicies and workspace claims) is created by Crucible at runtime and is not part
-of the desired state. Argo tracks only what it applied, so it neither reports those as
-drift nor prunes them.
+NetworkPolicies and workspace claims), every login Job and probe, and the harness
+credential Secrets are created by Crucible at runtime and are not part of the desired
+state. Argo tracks only what it applied, so it neither reports those as drift nor
+prunes them.
 
 ## Applying it
 
@@ -177,13 +185,24 @@ drift nor prunes them.
 Once the api is reachable, sign in at `/ui` with that token and, for each harness
 (25, step by step in that document):
 
-1. **Credentials**: start the login. The service runs the harness's own CLI inside the
-   promoted worker image, with the credential Secret writable and no
-   workspace, and captures the device or browser URL from the Pod log. Finish the
-   authorization with the provider; the code has a window (Codex fifteen minutes, AGY
-   sixty seconds, Claude Code's pasted token).
-2. The flow validates the resulting files, runs the bounded probe in the hardened image,
-   records the result, and removes everything it created.
+1. **Credentials**: start the login (the harness's Login page, `crucible admin
+   credentials login`, or `POST /v1/admin/credentials/{harness}/login`). The service runs
+   the harness's own CLI as a Job in `crucible-workers` from the promoted worker image,
+   with a memory-backed home, no workspace, no credential mounted, and a NetworkPolicy
+   for that harness's login endpoints only (never its model API). The page shows the
+   device or browser URL and the device code read from the Pod log; paste the code back
+   where the harness asks for one (Claude Code, AGY). The code has a window (Codex
+   fifteen minutes, AGY sixty seconds). When the CLI exits the service reads the auth
+   files off the Pod, never through its log, checks their shape, writes the harness
+   Secret, and deletes the Job. A login that fails, is cancelled or times out leaves the
+   Secret as it was. A credential that already passes the shape check is only replaced
+   when the login is started with replace.
+2. **Finish**, then **Validate**: finish records the shape of what is now in the
+   Secret, and validate runs the bounded probe in the hardened image against it (a
+   worker Job with the per-run copy of the Secret and the worker's own egress rules),
+   records the result, and removes everything it created. A login is refused while an
+   attempt of that harness holds its credential, and a launch of that harness waits
+   while a login runs.
 3. The harness stays `session_compatibility: unverified` until the daily-session
    compatibility test passes for it (21, S1b). A harness is not enabled for normal
    workers before that.
@@ -207,9 +226,13 @@ older image can no longer be promoted; roll the Crucible release back with it.
 
 For Hermes, use **Routing** to set the HTTPS `/v1` gateway URL, model `coder`, thinking
 preference, enabled state, and pool concurrency. Saving creates immutable policy
-versions. Confirm unauthenticated `/health/readiness` returns 200, then validate the
-Hermes Secret by checking authenticated `/v1/models`. The committed lab CA is already
-installed in the worker image trust store.
+versions. Then set the LiteLLM virtual key on the same page ("Set Hermes API key"; also
+`crucible admin credentials set --harness hermes` or `POST
+/v1/admin/credentials/hermes/set`). Crucible writes it into the `crucible-harness-hermes`
+Secret, creating it if it is absent, and probes it: unauthenticated
+`/health/readiness` must return 200, then authenticated `/v1/models` decides. The key is
+never shown again; the page and `GET /v1/admin/credentials/hermes` report only
+`key_set`. The committed lab CA is already installed in the worker image trust store.
 
 The operator's own daily-use harness directories are never read, copied or referenced
 (12). These are dedicated Crucible logins.

@@ -216,7 +216,7 @@ def test_a_claude_login_takes_the_pasted_code_and_never_shows_the_token(
     assert done["state"] == "finished", done
     assert done["token_written"] is True and done["credential_written"] is True
     assert "[captured to oauth-token]" in done["output_tail"]
-    assert k8s_api.harness_secret("crucible-harness-claude_code") == {
+    assert k8s_api.harness_secret("crucible-harness-claude-code") == {
         "oauth-token": b"not-a-real-value\n"
     }
     # A second login does not replace a credential that passes the shape check unless

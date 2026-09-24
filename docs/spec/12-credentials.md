@@ -12,8 +12,9 @@
 3. Credentials reach a worker only as a mount from a source Crucible can
    read, referenced by name (`credential:codex`) in configuration. The one
    onboarding exception is the Hermes key paste: its value exists only in the
-   TLS-protected admin request and the immediate mode-0600 file write. It is never
-   returned, stored in the database, logged, or copied into an audit event.
+   TLS-protected admin request and the immediate mode-0600 file write (on
+   Kubernetes, the request that writes the service-owned Secret, ADR 0015). It is
+   never returned, stored in the database, logged, or copied into an audit event.
 4. Read-only by default. A narrow writable volume only when a harness must
    refresh its own auth state, and then only the named auth files.
 5. Workers hold no GitHub credential, no Crucible API token, no database
@@ -51,6 +52,15 @@ workflow (25): a dedicated directory, the harness's own interactive login
 pointed at it, validation, a bounded probe in the hardened image, and the
 daily-session compatibility test (21, S1b) before the harness is enabled.
 The operator's daily-use directories are never copied.
+
+On Kubernetes the credential is the harness Secret in `crucible-workers`, and
+the service is its only writer (ADR 0015, the operator's decisions of
+2026-09-23): it creates the Secret when absent, labels it as its own, and writes
+it from the login Job (25), the Hermes key entry, and the sync-back below. GitOps
+does not deliver it, because a Secret with two writers drifts and a sync would
+restore a token the harness has already rotated. A login's files reach the
+Secret only after they pass the shape check, over exec and never through a Pod
+log, which the kubelet writes to the node's disk.
 
 The credential root and the per-harness directory under it are created by
 the operator or by the deployment script, owned by the Crucible service
@@ -127,7 +137,8 @@ only `credential set`. Validation first calls `/health/readiness` without a bear
 then calls `/v1/models` with the bearer. A 200 validates the key, a 401 is an
 authentication failure, and other responses are inconclusive. Workers receive only a
 read-only per-attempt copy. Kubernetes stores the same one-file shape in the
-`crucible-harness-hermes` Secret.
+`crucible-harness-hermes` Secret, which the same key entry (also on the Routing
+page) writes, and every surface reports only whether a key is set.
 
 `rw-narrow` means: a per-attempt copy holding **only the named auth files**
 of that harness (the adapter's `credential_spec` lists them), owned by the
@@ -169,6 +180,14 @@ from the source before that is the refresh race below. Per-harness concurrency i
 (05b enforces this), because refresh tokens rotate and two concurrent
 refreshes leave one worker with a revoked token and every later worker
 locked out. Spike S1 records what each harness actually writes and where.
+
+A login is the same race from the other side: it replaces the credential, and
+an attempt holding a copy of the one it replaced would sync a refresh of a
+superseded session back over it. So a login refuses while any attempt of the
+harness holds the credential (the same states the cap counts), a launch of the
+harness waits while a login for it runs, and on Kubernetes the login checks
+again at the moment it writes the Secret and the provider refuses to seed a
+copy while a login Job for the harness exists.
 
 ## GitHub App credentials
 

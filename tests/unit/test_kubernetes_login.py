@@ -250,7 +250,7 @@ async def test_a_pasted_code_goes_in_over_exec_stdin_and_never_in_an_argv() -> N
     assert stdin == [b"the-pasted-code#state\n"]
     everything = json.dumps(api.created)
     assert "the-pasted-code" not in everything
-    assert api.harness_secret("crucible-harness-claude_code") == {
+    assert api.harness_secret("crucible-harness-claude-code") == {
         "oauth-token": b"not-a-real-value\n"
     }
 
@@ -368,14 +368,14 @@ def test_the_service_creates_the_secret_and_then_replaces_it_whole() -> None:
         "claude_code", {"oauth-token": b"a\n", ".claude.json": b"{}"}
     )
     assert first == {
-        "secret": "crucible-harness-claude_code",
+        "secret": "crucible-harness-claude-code",
         "created": True,
         "files": [".claude.json", "oauth-token"],
     }
     second = provider.write_credential_files("claude_code", {"oauth-token": b"b\n"})
     assert second["created"] is False
-    assert api.harness_secret("crucible-harness-claude_code") == {"oauth-token": b"b\n"}
-    labels = api.objects[("secrets", "crucible-harness-claude_code")].body["metadata"]["labels"]
+    assert api.harness_secret("crucible-harness-claude-code") == {"oauth-token": b"b\n"}
+    labels = api.objects[("secrets", "crucible-harness-claude-code")].body["metadata"]["labels"]
     assert labels[k8sspec.LABEL_MANAGED_BY] == "crucible"
 
 

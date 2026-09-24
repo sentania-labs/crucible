@@ -283,6 +283,8 @@ class KubernetesConfig:
     resolve_ttl_seconds: float = 300.0
     extra_image_allowlist: tuple[str, ...] = ()
     # The harness credential Secrets in the workers namespace, by harness name (12, 26).
+    # The service creates and owns them (ADR 0015); this only names them, and a harness
+    # left out is `crucible-harness-<harness>` with `_` as `-`.
     credential_secrets: Mapping[str, str] = field(default_factory=dict)
     # The operator's declared mount mode per harness, as the Docker configuration
     # carries it. It may raise the adapter's minimum and never lowers it (25 step 7).
@@ -310,7 +312,11 @@ class KubernetesConfig:
     pod_pid_limit_override: int | None = None
 
     def credential_secret_name(self, harness: str) -> str:
-        return self.credential_secrets.get(harness) or f"crucible-harness-{harness}"
+        # A Secret name is a DNS subdomain, which has no underscore: claude_code's
+        # default is `crucible-harness-claude-code`, the name the deployment maps it to.
+        return self.credential_secrets.get(harness) or (
+            f"crucible-harness-{harness.replace('_', '-')}"
+        )
 
 
 @dataclass(frozen=True, slots=True)

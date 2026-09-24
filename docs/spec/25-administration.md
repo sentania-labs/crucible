@@ -83,11 +83,11 @@ resource.
 | list harnesses | `GET /admin/harnesses` | `harnesses list` | |
 | disable or enable a harness | `POST /admin/harnesses/{name}/disable` and `/enable` | `harnesses disable|enable` | flips the administrator's flag only; configuration retained; running attempts finish; new launches refused with a wake |
 | validate a credential | `POST /admin/credentials/{harness}/validate` | `credentials validate --harness` | shape check of the named auth files, then the bounded probe (below); returns state, timestamps, and the probe's `conclusive` and `cause`, never a verdict the run did not support |
-| set the Hermes API key | `POST /admin/credentials/hermes/set` | `credentials set --harness hermes` | reads the value from a password field or stdin, atomically writes `api-key` mode 0600, returns no value, and audits only `credential set`; immediately probes readiness without auth and models with auth |
+| set the Hermes API key | `POST /admin/credentials/hermes/set` | `credentials set --harness hermes` | reads the value from a password field (the Credentials and Routing pages) or stdin, atomically writes `api-key` mode 0600 (on Kubernetes, into the `crucible-harness-hermes` Secret the service owns, creating it when absent; ADR 0015), returns no value, and audits only `credential set`; immediately probes readiness without auth and models with auth. Every view reports only `key_set` |
 | bounded auth probe | `POST /admin/credentials/{harness}/probe` | `credentials probe --harness` | launches the promoted worker image with the credential mounted, runs a one-line prompt with a 120 s timeout, records exit class, conclusiveness and cause, harness version, image digest, whether auth files changed (by hash), mount mode and duration, removes everything; never shows output beyond the exit class |
-| onboard a credential | `POST /admin/credentials/{harness}/login` (starts) | `credentials login --harness` | interactive flow below; the service runs the login in the promoted worker image and the CLI retains its local-host mode |
-| rotate or replace a credential source | `POST /admin/credentials/{harness}/rotate` | `credentials rotate --harness` | the operator's prepared directory is shape-checked, copied in, and left exactly as it was found; the swap is two renames; the previous directory is retained for `credential_retention_hours` then shredded; a failed swap rolls back; every step an event |
-| remove a credential | `POST /admin/credentials/{harness}/remove` | `credentials remove --harness` | harness becomes `absent`; the directory is shredded at once rather than retained, because the operator said remove, and the harness is disabled with that reason |
+| onboard a credential | `POST /admin/credentials/{harness}/login` (starts) | `credentials login --harness` | interactive flow below; the service runs the login in the promoted worker image (a container on Docker, a Job on Kubernetes) and the CLI retains its local-host mode. Refused while an attempt of that harness holds its credential (12) |
+| rotate or replace a credential source | `POST /admin/credentials/{harness}/rotate` | `credentials rotate --harness` | the operator's prepared directory is shape-checked, copied in, and left exactly as it was found; the swap is two renames; the previous directory is retained for `credential_retention_hours` then shredded; a failed swap rolls back; every step an event. Directory-held credentials only: where the credential is a Secret (Kubernetes, ADR 0015) it refuses and names the Secret, and a login with `replace` is the replacement |
+| remove a credential | `POST /admin/credentials/{harness}/remove` | `credentials remove --harness` | harness becomes `absent`; the directory is shredded at once rather than retained, because the operator said remove, and the harness is disabled with that reason. Directory-held credentials only, as rotate |
 | list images and promote | `GET /admin/images`, `POST /admin/images/{digest}/promote` | `images list|promote` | 13; each image lists every harness it carries with its version (`harnesses`), and the one worker image carries all four (C11), so one promotion makes it the default for all four, refused whole if any of them is outside its adapter's range. A previous default the promoted image fully covers becomes `retained`. Rollback is promoting the previous digest, which rolls all four harnesses back together. The probe and the live tiers run the promoted image |
 | provider health | `GET /admin/providers` | `providers status` | |
 | GitHub health | `GET /admin/github`, `POST /admin/github/check` | `github status|check` | check mints a token per registered repository and discards it |
@@ -193,6 +193,28 @@ disabled at the time a contract is submitted is a contract problem then
    This keeps a one-time token out of Docker logs while allowing the service to
    capture it to the named credential file. The CLI keeps local-host mode for
    an operator workstation that already carries the executable.
+
+   **On Kubernetes** (26, ADR 0015) the login is a Job in `crucible-workers`,
+   `login-<harness>-<id>`, from the promoted worker image: no workspace claim, no
+   credential mounted, a memory-backed home the CLI writes into, and a
+   NetworkPolicy for the adapter's `login_endpoints` only, which never include
+   its model API (crucible#58). The Job needs the namespace readiness probe to
+   have passed, as a worker does. A driver in the Pod runs the CLI under a
+   pseudo-terminal and filters its output line by line before it reaches the Pod
+   log: terminal control codes are stripped, the token Claude Code prints once
+   is written to `oauth-token` mode 0600 and replaced by
+   `[captured to oauth-token]`, and a pasted code is masked where the terminal
+   echoes it. The service reads that log for the URL, the device code and the
+   prompts, exactly as the Docker flow reads its TTY. A pasted code goes in over
+   exec stdin, never in an argv or an environment. When the CLI exits the
+   service reads the declared auth files back over exec (never through a log),
+   shape-checks them, re-checks that no attempt has come to hold the credential,
+   and only then writes the harness Secret whole, creating it and labelling it
+   as the service's own when it is absent. It then deletes the Job and the
+   policy. A failed, cancelled or timed-out login leaves the Secret exactly as it
+   was; files that pass are stored whatever the CLI's exit code, as a Docker
+   login leaves in its directory whatever the CLI wrote. The Job carries its own
+   deadline and a TTL, so a login whose api process died still goes away.
 1. Create or select the dedicated Crucible credential directory for the
    harness under the configured credential root (`credentials.<harness>.path`,
    mode 0700, owned by the Crucible service user; 13 for who creates it). A
@@ -201,7 +223,9 @@ disabled at the time a contract is submitted is a contract problem then
    replacement retires the existing directory under rotation's retained name
    so the retention sweep shreds it on schedule. Silently truncating a
    working credential is the one thing rotation is careful about, and login
-   is held to the same rule.
+   is held to the same rule. On Kubernetes the same refusal applies to a
+   Secret that passes the shape check; nothing is retired, because the Secret
+   is only replaced once the new files have passed.
 2. Run that harness's supported interactive login with its configuration
    and home variables pointed **directly** at that directory: Claude Code
    with `CLAUDE_CONFIG_DIR`, Codex with `CODEX_HOME`, AGY with its config
@@ -213,7 +237,11 @@ disabled at the time a contract is submitted is a contract problem then
    URL.
 4. Validate the resulting credential structure: the named auth files
    exist, parse, and carry the expected fields; nothing is printed.
-5. Run the bounded auth probe in the hardened worker image.
+5. Run the bounded auth probe in the hardened worker image (`credentials
+   validate` after the login is finished). On Kubernetes the probe is a worker
+   Job on a claim of its own with the per-run copy of the Secret, under the
+   worker's egress rules and the namespace readiness gate, labelled
+   `crucible.admin=probe` so the supervisor neither sweeps nor adopts it.
 6. Record only: validation result, `mount_mode`, file names and sizes,
    harness version, image digest, timestamp, and whether the auth files
    changed during the probe (which sets `refresh_requires_rw`).
@@ -239,6 +267,12 @@ code lasts fifteen minutes, AGY's sixty seconds, and Claude Code's
 `setup-token` takes the pasted code and prints the long-lived token, which
 the driver captures into the credential file mode 0600 and never displays.
 The CLI's own output is not echoed.
+
+A login and an attempt of the same harness never overlap (12). The login
+refuses to start while an attempt of the harness is between `preparing` and
+the removal of its synced copy, and a launch of that harness is deferred, not
+failed, while a login for it runs. On Kubernetes the login Job is what the
+supervisor sees; on Docker it is the login container.
 
 The local gateway panel is the runtime authority after migration. An environment value
 may seed version 6 on first migration, but later restarts read the active database
