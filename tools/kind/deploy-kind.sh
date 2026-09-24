@@ -248,6 +248,11 @@ metadata:
 data:
   CRUCIBLE_KUBERNETES__IMAGE_REPOSITORIES: '["${registry_host}:5000/crucible-worker"]'
   CRUCIBLE_KUBERNETES__PROBE_IMAGE: ${worker_ref}
+  # kind's containerd gives every container a private cgroup namespace, so the readiness
+  # canary cannot see the pod-level cgroup the KubeletConfiguration above sets
+  # podPidsLimit: 512 on (95). This is lab-admin's attestation of that same number for
+  # this disposable cluster, the same way a real deployment would state it.
+  CRUCIBLE_KUBERNETES__POD_PID_LIMIT_OVERRIDE: "512"
   # Python's default HTTPS context reads this, and the Kubernetes API client does not:
   # it builds its own context from the ServiceAccount's ca.crt (k8sapi.py). So the only
   # thing this changes is which registry the provider will trust.
