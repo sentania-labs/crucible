@@ -222,6 +222,45 @@ async def test_the_provider_reads_its_settings_back_from_the_source() -> None:
     assert len(reads) == 2
 
 
+async def test_prepare_refreshes_settings_before_rendering_its_policy() -> None:
+    """crucible#102 (Codex): the supervisor calls `prepare()` before `launch()`, so a
+    stale file seed must not survive into the preparer's own NetworkPolicy. Only
+    `launch()`, `health()` and `ensure_ready()` read the runtime settings back before
+    this fix; a cluster whose stored DNS selector differs from the seed had every
+    attempt fail in `prepare()`, before the fix loaded from `launch()` was ever
+    reached."""
+    stored = ClusterEgress(dns_namespace="cilium-dns-relay", dns_pod_labels=(("app", "dns-relay"),))
+
+    def source() -> tuple[dict[str, Any] | None, str | None]:
+        return stored.as_document(), None
+
+    api = FakeKubernetesApi()
+    registry = FakeRegistry(api)
+    registry.register(IMAGE, harness="script-harness", version="1.0.0")
+    provider = KubernetesProvider(
+        config(settings_refresh_seconds=3600),
+        api,  # type: ignore[arg-type]
+        registry,
+        resolver=fake_resolver,
+        settings_source=source,
+    )
+    await provider.prepare(spec())
+    [preparer] = [
+        row["body"]
+        for row in api.created
+        if row["kind"] == "networkpolicies"
+        and row["body"]["spec"]["podSelector"]["matchLabels"][k8sspec.LABEL_ROLE]
+        == k8sspec.ROLE_PREPARER
+    ]
+    peers = [
+        d for rule in preparer["spec"]["egress"] for d in rule.get("to") or [] if "ipBlock" not in d
+    ]
+    assert {
+        "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "cilium-dns-relay"}},
+        "podSelector": {"matchLabels": {"app": "dns-relay"}},
+    } in peers
+
+
 async def test_the_retention_sweep_never_takes_a_canary_mid_run() -> None:
     """The supervisor's retention sweep deletes whatever carries an attempt id Crucible
     does not track. A canary is never an attempt, so it carries its own label and the

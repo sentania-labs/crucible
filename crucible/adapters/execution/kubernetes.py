@@ -710,6 +710,10 @@ class KubernetesProvider:
         return harness in self.config.credential_secrets
 
     async def prepare(self, spec: LaunchSpec) -> Workspace:
+        # 26: the preparer renders its own egress policy (the DNS selector included),
+        # and the supervisor calls prepare() before launch(). Refresh here too, or a
+        # stale seed's policy is rendered and launch()'s own refresh is never reached.
+        await self._refresh_settings()
         repository = spec.contract.get("repository", {})
         url = spec.repository_url or str(repository.get("url", ""))
         if not url:
