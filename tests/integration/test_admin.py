@@ -27,6 +27,7 @@ from crucible.adapters.api.deps import AppContext
 from crucible.adapters.clock import SystemClock
 from crucible.adapters.execution.docker import DockerConfig
 from crucible.adapters.execution.fake import FakeProvider
+from crucible.adapters.first_run import FileDelivery
 from crucible.adapters.persistence.unit_of_work import SqlUnitOfWorkFactory, make_engine
 from crucible.application.admin.context import AdminContext
 from crucible.application.auth import authenticate, mint_token
@@ -336,15 +337,24 @@ def test_ui_mutation_uses_the_same_harness_service_and_rejects_bad_csrf(
         assert state.enabled is False and state.reason == "ui parity test"
 
 
-def test_migrate_creates_and_prints_the_first_admin_once(
-    migrated: str, capsys: pytest.CaptureFixture[str]
+@pytest.mark.usefixtures("engine")
+def test_migrate_delivers_the_first_admin_token_and_never_prints_it(
+    migrated: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    cli.ensure_first_admin(migrated)
-    first = capsys.readouterr().err
-    assert "CRUCIBLE FIRST-RUN ADMIN TOKEN, SHOWN ONCE" in first
-    shown = next(line for line in first.splitlines() if line.startswith("cru_"))
-    cli.ensure_first_admin(migrated)
+    """crucible#122: the token goes to the delivery, mode 0600, and never to stdout or
+    stderr; the log names where it is."""
+    delivery = FileDelivery(tmp_path / "first-run-admin-token")
+    cli.ensure_first_admin(migrated, delivery)
+    first = capsys.readouterr()
+    shown = delivery.path.read_text(encoding="utf-8").strip()
+    assert shown.startswith("cru_")
+    assert shown not in first.out and shown not in first.err
+    assert "cru_" not in first.out + first.err
+    assert str(delivery.path) in first.err
+    assert os.stat(delivery.path).st_mode & 0o777 == 0o600
+    cli.ensure_first_admin(migrated, delivery)
     assert capsys.readouterr().err == ""
+    assert delivery.path.read_text(encoding="utf-8").strip() == shown
     engine = make_engine(migrated)
     try:
         with SqlUnitOfWorkFactory(engine)() as uow:
@@ -353,9 +363,11 @@ def test_migrate_creates_and_prints_the_first_admin_once(
             assert principal.name == "first-run-admin" and principal.role is Role.ADMIN
             uow.principals.disable(principal.id, SystemClock().now())
             uow.commit()
-        cli.ensure_first_admin(migrated)
-        recovery = capsys.readouterr().err
-        recovered_token = next(line for line in recovery.splitlines() if line.startswith("cru_"))
+        cli.ensure_first_admin(migrated, delivery)
+        recovery = capsys.readouterr()
+        assert "cru_" not in recovery.out + recovery.err
+        recovered_token = delivery.path.read_text(encoding="utf-8").strip()
+        assert recovered_token != shown
         with SqlUnitOfWorkFactory(engine)() as uow:
             recovered = authenticate(uow, recovered_token)
             assert recovered is not None
@@ -363,6 +375,79 @@ def test_migrate_creates_and_prints_the_first_admin_once(
             assert recovered.role is Role.ADMIN and recovered.disabled_at is None
     finally:
         engine.dispose()
+
+
+@pytest.mark.usefixtures("engine")
+def test_migrate_mints_nothing_it_cannot_deliver(
+    migrated: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class Refusing:
+        def where(self) -> str:
+            return "nowhere"
+
+        def deliver(self, token: str) -> None:
+            raise RuntimeError("403 on secrets: forbidden")
+
+        def discard(self) -> None:
+            raise AssertionError("never reached")
+
+    with pytest.raises(RuntimeError, match="forbidden"):
+        cli.ensure_first_admin(migrated, Refusing())
+    cli.ensure_first_admin(migrated, None)
+    printed = capsys.readouterr()
+    assert "cru_" not in printed.out + printed.err
+    assert "No first-run administrator was created" in printed.err
+    engine = make_engine(migrated)
+    try:
+        with SqlUnitOfWorkFactory(engine)() as uow:
+            assert not [p for p in uow.principals.list_all() if p.role is Role.ADMIN]
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.usefixtures("engine")
+def test_the_first_sign_in_removes_the_first_run_token(
+    ctx: AppContext, admin_ctx: AdminContext, migrated: str, tmp_path: Path
+) -> None:
+    delivery = FileDelivery(tmp_path / "first-run-admin-token")
+    cli.ensure_first_admin(migrated, delivery)
+    token = delivery.path.read_text(encoding="utf-8").strip()
+    ctx.first_run = delivery
+    with TestClient(create_app(ctx)) as browser:
+        page = browser.get("/ui/sign-in").text
+        # The page names this deployment's place, not `docker compose logs migrate`.
+        assert str(delivery.path) in page and "logs migrate" not in page
+        ui_sign_in(browser, token)
+    assert not delivery.path.exists()
+
+
+def test_a_revoke_removes_the_first_run_token_and_the_prefix_is_reserved(
+    ctx: AppContext,
+    tokens: dict[str, str],
+    admin_ctx: AdminContext,
+    admin_client: TestClient,
+    live_supervisor: Supervisor,
+    migrated: str,
+    tmp_path: Path,
+) -> None:
+    asyncio.run(live_supervisor.tick())
+    delivery = FileDelivery(tmp_path / "first-run-admin-token")
+    admin_ctx.first_run = delivery
+    with ctx.uow_factory() as uow:
+        minted = mint_token(uow, ctx.clock, name="first-run-admin", role=Role.ADMIN)
+        uow.commit()
+    delivery.deliver(minted.token)
+    reserved = admin_client.post(
+        "/v1/admin/tokens",
+        json={"name": "first-run-admin-2", "role": "admin", "reason": "x"},
+    )
+    assert reserved.status_code == 409, reserved.text
+    assert "reserved" in reserved.text
+    revoked = admin_client.post(
+        f"/v1/admin/tokens/{minted.principal.id}/revoke", json={"reason": "leaked"}
+    )
+    assert revoked.status_code == 200, revoked.text
+    assert not delivery.path.exists()
 
 
 def test_token_and_repository_mutations_have_ui_api_and_cli_parity(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import json
 import os
@@ -37,6 +38,7 @@ from crucible.application.admin import kubernetes as kubernetes_admin
 from crucible.application.admin.context import guard_mutation
 from crucible.application.auth import authenticate
 from crucible.application.errors import ApplicationError, ConflictError, ForbiddenError
+from crucible.application.first_run import discard_after_use
 from crucible.application.policies import put_policy, put_routing_policy
 from crucible.contracts.api import ExternalReviewAttestation, RepositoryRegistration
 from crucible.domain.cluster_egress import format_labels, parse_labels
@@ -484,7 +486,13 @@ def _sign_in_form(
 ) -> Response:
     csrf = os.urandom(24).hex()
     context = _base(request, None, title="Sign in", active="")
-    context.update(next=next_path, csrf=csrf, message=message, message_kind="bad")
+    context.update(
+        next=next_path,
+        csrf=csrf,
+        message=message,
+        message_kind="bad",
+        first_run_where=ctx.first_run.where() if ctx.first_run is not None else None,
+    )
     response = templates.TemplateResponse(
         request=request, name="signin.html", context=context, status_code=status_code
     )
@@ -525,6 +533,9 @@ async def sign_in(request: Request, ctx: Ctx, uow: UoW) -> Response:
             message="Token not recognized.",
             status_code=401,
         )
+    # ADR 0016: the first-run token has done its job once it has signed someone in;
+    # it does not stay in its Secret or file for the next reader.
+    await asyncio.to_thread(discard_after_use, ctx.first_run, principal)
     csrf = os.urandom(24).hex()
     value = _serializer(ctx).dumps({"token": token, "csrf": csrf})
     target = form.get("next", "/ui")

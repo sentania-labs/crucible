@@ -7,6 +7,7 @@ from typing import Any
 from crucible.application.admin.context import AdminContext, admin_event, guard_mutation
 from crucible.application.auth import MintedToken, mint_token
 from crucible.application.errors import ConflictError
+from crucible.application.first_run import FIRST_RUN_PREFIX, discard_after_use, is_first_run
 from crucible.domain.entities import Role
 from crucible.domain.events import EventKind
 from crucible.ports.repository import UnitOfWork
@@ -35,6 +36,10 @@ def create(
     reason: str | None,
 ) -> MintedToken:
     reason = guard_mutation(ctx, uow, reason, principal=principal, operation="tokens create")
+    if is_first_run(name):
+        # Reserved, so that a name with this prefix is always the migration's first-run
+        # principal, whose delivered token a sign-in removes (ADR 0016).
+        raise ConflictError(f"principal names starting {FIRST_RUN_PREFIX!r} are reserved")
     try:
         selected = Role(role)
         minted = mint_token(uow, ctx.clock, name=name, role=selected)
@@ -67,6 +72,9 @@ def revoke(
     if target.name == principal:
         raise ConflictError("an administrator cannot revoke the token in use")
     uow.principals.disable(principal_id, ctx.clock.now())
+    # ADR 0016: a revoked first-run principal's token has nothing left to open, and is
+    # not left lying in its Secret or file.
+    discard_after_use(ctx.first_run, target)
     admin_event(
         uow,
         ctx,
