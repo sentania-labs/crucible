@@ -807,3 +807,14 @@ def test_a_delete_by_uid_sends_the_precondition(monkeypatch: pytest.MonkeyPatch)
     client.delete("configmaps", "login-lock-codex")
     assert sent[0]["preconditions"] == {"uid": "uid-7"}
     assert "preconditions" not in sent[1]
+
+
+async def test_a_probe_on_a_namespace_that_failed_its_readiness_probe_seeds_nothing() -> None:
+    """Issue 59: the probe's claim, its preparer Pod and its copy of the harness Secret
+    are all made after the readiness gate, not only its worker."""
+    api, provider = login_provider(egress_enforced=False)
+    api.put_harness_secret("crucible-harness-codex", {"auth.json": CODEX_AUTH})
+    with pytest.raises(ProviderError, match="not ready"):
+        await provider.probe_credential(probe_request())
+    for kind in ("jobs", "persistentvolumeclaims", "configmaps", "secrets"):
+        assert not [row for row in api.created if row["kind"] == kind], kind

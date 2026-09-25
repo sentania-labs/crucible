@@ -899,6 +899,11 @@ class KubernetesProvider:
         work_branch = str(repository.get("work_branch") or f"crucible/{spec.external_id}")
         resolved = await self._resolve_image(spec)
         limits = self._limits(spec)
+        # 26, issue 59: the preparer is a Pod with GitHub egress and the per-attempt
+        # Secret is a credential copy, so neither is made in a namespace whose egress
+        # enforcement and PID limit are unproven. The image is resolved first because
+        # the canary runs the image an attempt resolved when no probe image is named.
+        await self._require_ready(spec)
 
         # 26: the PVC, the ConfigMap and the per-attempt Secret, then the preparer Job.
         await self._delete_attempt_objects(spec.attempt_id)
@@ -1047,17 +1052,20 @@ class KubernetesProvider:
             f"({probe.local_endpoint_detail or probe.detail})"
         )
 
-    async def launch(self, ws: Workspace, spec: LaunchSpec) -> Handle:
+    async def _require_ready(self, spec: LaunchSpec) -> None:
+        """26: a namespace whose egress enforcement or pod PID limit is not proven runs
+        no Pod of an attempt and holds no copy of its credential. This is a refusal, not
+        a retry: the next attempt would meet the same cluster."""
         probe = await self.ensure_ready()
-        gated_under = self.config
         if not probe.passed:
-            # 26: a namespace whose egress enforcement or pod PID limit is not proven
-            # does not run a worker. This is a refusal, not a retry: the next attempt
-            # would meet the same cluster.
             raise HarnessRefusedError(
                 f"refusing to launch: the workers namespace is not ready ({probe.detail})"
             )
         self._check_endpoint_ready(probe, spec)
+
+    async def launch(self, ws: Workspace, spec: LaunchSpec) -> Handle:
+        await self._require_ready(spec)
+        gated_under = self.config
         resolved = await self._resolve_image(spec)
         limits = self._limits(spec)
         copy = self._credential_copy(spec)
@@ -1843,6 +1851,8 @@ class KubernetesProvider:
         try:
             resolved = await self._resolve_image(spec)
             limits = self._limits(spec)
+            # Issue 59: nothing is created, and no credential copied, before the gate.
+            await self._require_ready(spec)
             await self._create(
                 "persistentvolumeclaims",
                 k8sspec.workspace_claim(

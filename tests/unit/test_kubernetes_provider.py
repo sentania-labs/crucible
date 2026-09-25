@@ -62,6 +62,19 @@ async def prepared(**kwargs: Any) -> Any:
     return api, registry, provider, launch, workspace
 
 
+async def refused_at_prepare(**kwargs: Any) -> Any:
+    """Issue 59: a namespace the probe has not passed gets no object of the attempt,
+    no preparer Pod and no copy of its credential, not only no worker."""
+    api, _registry, provider = build(**kwargs.pop("build", {}))
+    with pytest.raises(LaunchRefusedError, match="not ready"):
+        await provider.prepare(spec(**kwargs))
+    for kind in ("persistentvolumeclaims", "configmaps", "secrets", "jobs"):
+        assert not [row for row in api.created if row["kind"] == kind], (
+            f"prepare created {kind} before the readiness gate"
+        )
+    return api, provider
+
+
 # ----- the port ------------------------------------------------------------
 
 
@@ -150,7 +163,7 @@ async def test_the_canary_requests_a_small_fixed_size_not_the_role_pods_size() -
 
 async def test_the_probe_requests_log_lines_without_timestamp_prefixes() -> None:
     api, _registry, provider = build()
-    await provider.prepare(spec())
+    await provider._resolve_image(spec())
     real = api.pod_log
     requested: list[bool] = []
 
@@ -166,7 +179,7 @@ async def test_the_probe_requests_log_lines_without_timestamp_prefixes() -> None
 
 async def test_concurrent_readiness_checks_share_one_canary() -> None:
     _api, _registry, provider = build()
-    await provider.prepare(spec())
+    await provider._resolve_image(spec())
     real = provider._run_probe
     calls = 0
 
@@ -183,38 +196,30 @@ async def test_concurrent_readiness_checks_share_one_canary() -> None:
 
 
 async def test_a_namespace_whose_cni_does_not_enforce_egress_refuses_every_launch() -> None:
-    _api, _registry, provider, launch, workspace = await prepared(build={"egress_enforced": False})
+    _api, provider = await refused_at_prepare(build={"egress_enforced": False})
     probe = await provider.ensure_ready()
     assert probe.passed is False and probe.egress_enforced is False
-    with pytest.raises(LaunchRefusedError, match="not ready"):
-        await provider.launch(workspace, launch)
     assert (await provider.health()).state == "degraded"
 
 
 async def test_a_node_with_no_pod_pid_limit_refuses_every_launch() -> None:
-    _api, _registry, provider, launch, workspace = await prepared(build={"pod_pid_limit": None})
+    _api, provider = await refused_at_prepare(build={"pod_pid_limit": None})
     probe = await provider.ensure_ready()
     assert probe.passed is False and probe.pid_limit is None
     assert "podPidsLimit is not set" in probe.detail
     assert probe.pid_limit_source == "cgroup-v2-parent"
-    with pytest.raises(LaunchRefusedError, match="not ready"):
-        await provider.launch(workspace, launch)
 
 
 async def test_a_private_cgroup_namespace_reports_inconclusive_not_a_pass() -> None:
     """The container's own cgroup limit (95's bug) must never stand in for the pod-level
     one: when the runtime hides the parent cgroup, the gate says so and still refuses,
     even though a container-scope number is sitting right there in `pids.max`."""
-    _api, _registry, provider, launch, workspace = await prepared(
-        build={"pod_pid_limit_source": "cgroupns-private"}
-    )
+    _api, provider = await refused_at_prepare(build={"pod_pid_limit_source": "cgroupns-private"})
     probe = await provider.ensure_ready()
     assert probe.passed is False
     assert probe.pid_limit is None
     assert probe.pid_limit_source == "cgroupns-private"
     assert "cgroup namespace isolation" in probe.detail
-    with pytest.raises(LaunchRefusedError, match="not ready"):
-        await provider.launch(workspace, launch)
 
 
 async def test_an_operator_declared_limit_covers_a_private_cgroup_namespace() -> None:
@@ -250,26 +255,20 @@ async def test_an_operator_declared_limit_never_overrides_a_confirmed_absence() 
         image_pull_secret="ghcr-pull",
         pod_pid_limit_override=512,
     )
-    _api, _registry, provider, launch, workspace = await prepared(
-        build={"config": config, "pod_pid_limit": None}
-    )
+    _api, provider = await refused_at_prepare(build={"config": config, "pod_pid_limit": None})
     probe = await provider.ensure_ready()
     assert probe.passed is False
     assert probe.pid_limit is None
     assert probe.pid_limit_source == "cgroup-v2-parent"
-    with pytest.raises(LaunchRefusedError, match="not ready"):
-        await provider.launch(workspace, launch)
 
 
 async def test_a_zero_pod_pid_limit_from_the_canary_is_not_a_limit() -> None:
     """0 is not a value `podPidsLimit` takes; a canary reporting it must not be read as
     a confirmed limit (95's Codex correction)."""
-    _api, _registry, provider, launch, workspace = await prepared(build={"pod_pid_limit": 0})
+    _api, provider = await refused_at_prepare(build={"pod_pid_limit": 0})
     probe = await provider.ensure_ready()
     assert probe.passed is False and probe.pid_limit is None
     assert "podPidsLimit is not set" in probe.detail
-    with pytest.raises(LaunchRefusedError, match="not ready"):
-        await provider.launch(workspace, launch)
 
 
 async def test_a_non_positive_override_never_passes_the_gate() -> None:
@@ -283,26 +282,20 @@ async def test_a_non_positive_override_never_passes_the_gate() -> None:
         image_pull_secret="ghcr-pull",
         pod_pid_limit_override=-1,
     )
-    _api, _registry, provider, launch, workspace = await prepared(
+    _api, provider = await refused_at_prepare(
         build={"config": config, "pod_pid_limit_source": "cgroupns-private"}
     )
     probe = await provider.ensure_ready()
     assert probe.passed is False and probe.pid_limit is None
-    with pytest.raises(LaunchRefusedError, match="not ready"):
-        await provider.launch(workspace, launch)
 
 
 async def test_cgroup_v1_pod_pid_limit_is_unsupported_not_a_pass() -> None:
-    _api, _registry, provider, launch, workspace = await prepared(
-        build={"pod_pid_limit_source": "cgroup-v1"}
-    )
+    _api, provider = await refused_at_prepare(build={"pod_pid_limit_source": "cgroup-v1"})
     probe = await provider.ensure_ready()
     assert probe.passed is False
     assert probe.pid_limit is None
     assert probe.pid_limit_source == "cgroup-v1"
     assert "unsupported" in probe.detail
-    with pytest.raises(LaunchRefusedError, match="not ready"):
-        await provider.launch(workspace, launch)
 
 
 # ----- images (07, 13) -----------------------------------------------------
@@ -1164,20 +1157,15 @@ async def test_a_canary_that_cannot_tell_does_not_pass_the_probe() -> None:
     script would have reported `unreachable` on a namespace with no egress enforcement
     at all. An answer that is not a definite refusal to connect is `inconclusive`, and
     an inconclusive probe refuses every launch."""
-    _api, _registry, provider, launch, workspace = await prepared(
-        build={"canary_answer": "inconclusive"}
-    )
+    _api, provider = await refused_at_prepare(build={"canary_answer": "inconclusive"})
     probe = await provider.ensure_ready()
     assert probe.passed is False and probe.checked is False
     assert "could not tell" in probe.detail
-    with pytest.raises(LaunchRefusedError, match="not ready"):
-        await provider.launch(workspace, launch)
     assert (await provider.health()).state == "degraded"
 
 
 async def test_a_canary_whose_output_never_finished_is_not_a_result() -> None:
-    _api, _registry, provider = build(canary_done=False)
-    await provider.prepare(spec())
+    _api, provider = await refused_at_prepare(build={"canary_done": False})
     probe = await provider.ensure_ready()
     assert probe.passed is False and probe.checked is False
 
