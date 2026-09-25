@@ -16,7 +16,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Protocol
+from typing import Any, Protocol
 
 
 class GitHubError(Exception):
@@ -267,3 +267,63 @@ class GitHubClient(Protocol):
     def list_required_checks(
         self, token: InstallationToken, *, repository: str, branch: str
     ) -> Sequence[str]: ...
+
+
+# ----- the App credential the service owns (ADR 0017) ----------------------------------
+
+
+class GitHubAppStoreError(Exception):
+    """The App credential's store refused a read or a write. The message names the
+    store and the status, never a value."""
+
+
+@dataclass(frozen=True, slots=True)
+class AppCredential:
+    """The App's id and its private key, read for one signature and dropped. `repr`
+    never shows the key."""
+
+    app_id: int
+    private_key: bytes = field(repr=False)
+
+
+class GitHubAppCredentials(Protocol):
+    """Where the App credential lives and the one writer of it (ADR 0017).
+
+    On Kubernetes that is the `crucible-github-app` Secret in the service's namespace;
+    with the Docker provider it is the files beside `github.app.private_key_path`. A
+    credential counts as configured when it has an App id and a key and either the
+    service wrote it (the Connect GitHub flow) or `github.enabled` says a deployment
+    placed it there on purpose."""
+
+    def describe(self) -> dict[str, Any]:
+        """Where it lives and what is there: never a value."""
+        ...
+
+    def read(self) -> AppCredential | None:
+        """The credential when it is configured, else None. Blocking."""
+        ...
+
+    def write(
+        self, *, app_id: int, private_key: bytes, webhook_secret: bytes | None
+    ) -> dict[str, Any]:
+        """Replace the credential whole. Returns what was done, never a value."""
+        ...
+
+
+class GitHubAppDirectory(Protocol):
+    """What the App itself can see (crucible#120): its own identity, the accounts it is
+    installed on, and the repositories each installation covers. Every token minted to
+    list them is discarded before the call returns."""
+
+    def app(self, credential: AppCredential | None = None) -> dict[str, Any]:
+        """`GET /app`, signed with `credential` when one is given (to check an id and key
+        before they are stored), else with the stored one."""
+        ...
+
+    def installations(self) -> list[dict[str, Any]]:
+        """`GET /app/installations`: id, account login and type, repository selection."""
+        ...
+
+    def installation_repositories(self, installation_id: int) -> list[dict[str, Any]]:
+        """`GET /installation/repositories` under that installation."""
+        ...

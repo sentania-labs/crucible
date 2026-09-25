@@ -858,11 +858,11 @@ def test_local_endpoint_and_hermes_key_are_saved_without_exposing_the_key(
 
     observed: list[tuple[str, str | None]] = []
 
-    def http_status(url: str, *, bearer: str | None, timeout: float) -> int:
+    def http_get(url: str, *, bearer: str | None, timeout: float) -> tuple[int, bytes]:
         observed.append((url, bearer))
-        return 200
+        return 200, b'{"data": [{"id": "coder"}]}'
 
-    monkeypatch.setattr(credentials_service, "_http_status", http_status)
+    monkeypatch.setattr(credentials_service, "_http_get", http_get)
     api_key = "vk_" + "q" * 40
     saved = admin_client.post(
         "/v1/admin/credentials/hermes/set",
@@ -903,45 +903,61 @@ def test_local_endpoint_and_hermes_key_are_saved_without_exposing_the_key(
 
     with TestClient(create_app(ctx)) as browser:
         csrf = ui_sign_in(browser, tokens["admin"])
+        # crucible#119: one place for the URL and the key, linked from Credentials and
+        # Routing; neither page carries a key form of its own any more.
         credentials_page = browser.get("/ui/credentials")
         assert credentials_page.status_code == 200
-        assert 'action="/ui/actions/credential-set"' in credentials_page.text
-        assert 'name="api_key"' in credentials_page.text
-        assert 'type="password"' in credentials_page.text
+        assert 'href="/ui/gateway"' in credentials_page.text
+        assert "credential-set" not in credentials_page.text
+        routing_page = browser.get("/ui/routing")
+        assert routing_page.status_code == 200
+        assert 'href="/ui/gateway"' in routing_page.text
+        assert "routing-local" not in routing_page.text
+        gateway_page = browser.get("/ui/gateway")
+        assert gateway_page.status_code == 200
+        assert 'action="/ui/actions/gateway-save"' in gateway_page.text
+        assert 'name="api_key"' in gateway_page.text
+        assert 'type="password"' in gateway_page.text
+        assert cli_key not in gateway_page.text
 
         ui_key = "vk_" + "u" * 40
         ui_saved = browser.post(
-            "/ui/actions/credential-set",
+            "/ui/actions/gateway-save",
             data={
                 "csrf": csrf,
+                "endpoint_url": endpoint,
                 "api_key": ui_key,
                 "reason": "rotate through browser form",
-                "return_to": "/ui/credentials",
+                "return_to": "/ui/gateway",
             },
             follow_redirects=False,
         )
         assert ui_saved.status_code == 303
         assert key_path.read_text(encoding="utf-8").strip() == ui_key
+        message = unquote(ui_saved.headers["location"])
+        assert f"Gateway {endpoint} reachable, key accepted, 1 model." in message
+        assert ui_key not in message
 
-        routing_page = browser.get("/ui/routing")
-        assert routing_page.status_code == 200
-        assert 'action="/ui/actions/routing-local"' in routing_page.text
-        assert 'name="enable_thinking"' in routing_page.text
-        ui_routing = browser.post(
-            "/ui/actions/routing-local",
+        # #121: the model is picked from the gateway's own list, not typed.
+        gateway_page = browser.get("/ui/gateway")
+        assert 'name="model.0.id" value="coder"' in gateway_page.text
+        assert 'name="model.0.enabled"' in gateway_page.text
+        ui_models = browser.post(
+            "/ui/actions/gateway-models",
             data={
                 "csrf": csrf,
-                "endpoint_url": endpoint,
-                "model_id": "coder",
-                "enabled": "true",
-                "enable_thinking": "true",
+                "model.0.id": "coder",
+                "model.0.enabled": "true",
+                "model.0.thinking": "true",
+                "model.0.capability": "mid",
                 "max_concurrency": "2",
                 "reason": "save through browser form",
-                "return_to": "/ui/routing",
+                "return_to": "/ui/gateway",
             },
             follow_redirects=False,
         )
-        assert ui_routing.status_code == 303
+        assert ui_models.status_code == 303, ui_models.text
+        assert "kind=ok" in ui_models.headers["location"]
         ui_view = admin_client.get("/v1/admin/routing/local-endpoint").json()
         assert ui_view["models"][0]["chat_template_kwargs"] == {"enable_thinking": True}
         assert ui_view["pool"]["max_concurrency"] == 2
@@ -1273,8 +1289,13 @@ def test_providers_github_audit_status_and_capabilities(
         "retention",
         "bootstrap",
         "audit",
+        "readiness",
     }
     assert document["supervisor"]["healthy"] is True
+    # crucible#123: the to-do list is part of the one status document, so the API and
+    # the CLI read the same list the Status page shows, and the script harness (a test
+    # fixture) is never in it.
+    assert "script-harness" not in {h["name"] for h in document["readiness"]["harnesses"]}
     assert document["bootstrap"] == {"authoritative": None, "imports": []}
     assert {r["repository"] for r in document["github"]["repositories"]} >= {"second", "third"}
     local = run_cli(config_file, "status", capsys=capsys)

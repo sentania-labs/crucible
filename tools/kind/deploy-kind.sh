@@ -8,6 +8,11 @@
 #
 # What it deliberately does not prove (github-ci skill): anything cluster-specific. No
 # Longhorn, no NFS ReadWriteMany, no ingress controller, no lab network, no DNS record.
+#
+# CRUCIBLE_DEPLOY_KIND_FIRST_RUN=1 (`make first-run-kind`) runs the first-run proof
+# instead of the task smoke (crucible#119, #120, #121, #123, #79): it also pushes the
+# combined worker image images/manifest.env pins, points the GitHub API at the stand-ins
+# tools/smoke/first_run_smoke.py deploys, and walks gateway, models, GitHub and Status.
 set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -26,6 +31,8 @@ certs="$scratch/certs"
 overlay="$root/var/deploy-kind/$run_id"
 worker_ref=""
 push_ref=""
+first_run=${CRUCIBLE_DEPLOY_KIND_FIRST_RUN:-0}
+combined_push_ref=""
 built_image=""
 release_image=""
 cluster_created=0
@@ -62,7 +69,7 @@ cleanup() {
   # The shared worker image must be left exactly as the other tiers expect to find it:
   # a leftover repository digest made a later Docker e2e run select the wrong reference
   # once already (C8b defect 4).
-  for ref in "$push_ref" "$built_image"; do
+  for ref in "$push_ref" "$combined_push_ref" "$built_image"; do
     [ -n "$ref" ] || continue
     docker image rm "$ref" >/dev/null 2>&1 || :
     if docker image inspect "$ref" >/dev/null 2>&1; then
@@ -164,6 +171,21 @@ worker_ref="${registry_host}:5000/crucible-worker:${run_id}"
 docker tag "$worker_image" "$push_ref"
 docker push "$push_ref" >/dev/null
 echo "deploy-kind: the worker image is $worker_ref"
+if [ "$first_run" = 1 ]; then
+  # The combined worker image carries Hermes, so promoting it is the first-run step that
+  # gives Hermes a promoted image. Only its tag is pushed and removed; the host image
+  # the other tiers use stays exactly as it was.
+  combined_image=$(awk -F= '$1 == "WORKER" {print $2}' "$root/images/manifest.env")
+  if ! docker image inspect "$combined_image" >/dev/null 2>&1; then
+    echo "deploy-kind: images/manifest.env pins $combined_image but the host daemon lacks it" >&2
+    echo "deploy-kind: run 'make images' first" >&2
+    exit 2
+  fi
+  combined_push_ref="127.0.0.1:${registry_port}/crucible-worker:combined-${run_id}"
+  docker tag "$combined_image" "$combined_push_ref"
+  docker push "$combined_push_ref" >/dev/null
+  echo "deploy-kind: the combined worker image is ${registry_host}:5000/crucible-worker:combined-${run_id}"
+fi
 
 cat > "$scratch/kind.yaml" <<EOF
 kind: Cluster
@@ -260,6 +282,13 @@ data:
   # registry the provider will trust.
   SSL_CERT_FILE: /etc/crucible-registry-ca/ca.crt
 EOF
+if [ "$first_run" = 1 ]; then
+  # The stand-in GitHub API tools/smoke/first_run_smoke.py deploys. The real GitHub API
+  # is never called on this cluster.
+  cat >> "$overlay/settings.yaml" <<EOF
+  CRUCIBLE_GITHUB__API_BASE: http://crucible-stubs.crucible-stubs.svc.cluster.local:8080
+EOF
+fi
 for component in api supervisor; do
   cat > "$overlay/${component}-registry-access.yaml" <<EOF
 # The disposable registry is a Docker container on the kind network, so the deployed pods
@@ -309,4 +338,9 @@ echo "deploy-kind: the deployment is up"
 kubectl -n crucible get deploy,sts,svc,ingress,job
 kubectl -n crucible-workers get sa,role,rolebinding,networkpolicy,resourcequota,pvc
 
-CRUCIBLE_DEPLOY_KIND_WORKER_IMAGE="$worker_ref" python3 "$root/tools/smoke/kubernetes_smoke.py"
+if [ "$first_run" = 1 ]; then
+  CRUCIBLE_DEPLOY_KIND_STUB_IMAGE="$release_image" \
+    "${UV:-uv}" run --frozen python "$root/tools/smoke/first_run_smoke.py"
+else
+  CRUCIBLE_DEPLOY_KIND_WORKER_IMAGE="$worker_ref" python3 "$root/tools/smoke/kubernetes_smoke.py"
+fi

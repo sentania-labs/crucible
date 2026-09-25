@@ -117,7 +117,22 @@ class DeliveryCoordinator:
 
     @property
     def enabled(self) -> bool:
-        return self._github is not None
+        return self._github_ready()
+
+    async def _github_ready_async(self) -> bool:
+        """`_github_ready` off the event loop: on Kubernetes it reads the App Secret
+        through the API server, which must never stall the supervisor's tick."""
+        if self._github is None:
+            return False
+        return await asyncio.to_thread(self._github_ready)
+
+    def _github_ready(self) -> bool:
+        """A client exists and, when it can say so, an App credential is in place. The
+        credential may arrive at runtime from the Connect GitHub flow (ADR 0017)."""
+        if self._github is None:
+            return False
+        configured = getattr(self._github, "configured", None)
+        return not callable(configured) or bool(configured())
 
     def _fenced(self) -> Iterator[UnitOfWork]:  # pragma: no cover - thin delegate
         raise NotImplementedError
@@ -125,7 +140,7 @@ class DeliveryCoordinator:
     # ----- publication --------------------------------------------------
 
     async def publish(self) -> int:
-        if self._github is None or self._publisher is None:
+        if self._publisher is None or not await self._github_ready_async():
             return 0
         plans = await self._host._db(self._take_publishing)
         done = 0
@@ -136,7 +151,7 @@ class DeliveryCoordinator:
 
     async def push_quota_checkpoint(self, attempt_id: str, *, required: bool) -> tuple[bool, str]:
         """Push a collected quota checkpoint without opening or updating a pull request."""
-        if self._github is None or self._publisher is None:
+        if self._github is None or self._publisher is None or not await self._github_ready_async():
             if required:
                 return False, "the GitHub publisher is not configured"
             return True, "a publisher is not required for this repository"
@@ -523,7 +538,7 @@ class DeliveryCoordinator:
     # ----- observation --------------------------------------------------
 
     async def observe(self) -> int:
-        if self._github is None:
+        if not await self._github_ready_async():
             return 0
         plans = await self._host._db(self._due_polls)
         polled = 0
