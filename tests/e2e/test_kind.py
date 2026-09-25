@@ -687,6 +687,25 @@ async def test_network_policy_denies_every_kubernetes_destination_from_the_worke
         assert f"{name}=denied" in body, body
         assert f"{name}=reached" not in body, body
     await provider.cleanup(workspace, CleanupPolicy.DELETE, spec)
+    # 73: the reachable control ran once, before the denial phase, with no proof any
+    # destination was still reachable once the policy came off again. A destination
+    # that went away between phases for reasons other than the policy would read as
+    # denied either way, so re-run the control with the same budget after.
+    default_deny = api.get("networkpolicies", "default-deny")
+    api.delete("networkpolicies", "default-deny")
+    try:
+        control = await _unrestricted_network_control(api, destinations)
+        for name in destinations:
+            assert f"{name}=reached" in control, control
+    finally:
+        restored = {key: value for key, value in default_deny.items() if key != "status"}
+        metadata = restored["metadata"]
+        restored["metadata"] = {
+            key: value
+            for key, value in metadata.items()
+            if key in ("name", "namespace", "labels", "annotations")
+        }
+        api.create("networkpolicies", restored)
 
 
 async def test_deleted_pod_is_lost_and_sigterm_ignoring_pod_dies_at_grace(
