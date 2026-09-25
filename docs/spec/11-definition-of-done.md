@@ -90,7 +90,7 @@ it cannot check stays with Foundry or the user.
 | Gate | Passes when | Evidence consumed |
 |---|---|---|
 | `report_present` | report parsed, all fields present | CompletionClaim artifact |
-| `exit_clean` | exit code 0 | attempt exit info |
+| `exit_clean` | exit code 0 and exit class `completed` or `completed_without_report` (an `incomplete` attempt exits 0 too, issue 128) | attempt exit info |
 | `commits_present` | the collected `work_branch` has at least one commit beyond `base_ref`, the bundle verifies, and the bundle head equals the reported `head_sha` | branch bundle from `collect` |
 | `scope_contained` | every changed path matches `allowed_paths` and none matches `prohibited_paths` | diff path list from `collect` |
 | `no_injected_files` | `AGENTS.md`, `CLAUDE.md`, other shims, `.crucible/`, and identity paths absent from diff and from any commit on `work_branch` | diff, `git log --stat` |

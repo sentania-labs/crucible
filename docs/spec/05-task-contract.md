@@ -78,7 +78,7 @@ execution_request:                 # the class of work; Crucible selects the mod
   tier: "standard"                 # trivial | standard | complex, from the routing policy (05b)
   provider: "docker"
   timeout_seconds: 5400
-  command_timeout_ms: 1800000      # optional; narrows the policy's per-command timeout (05b, issue 128)
+  command_timeout_ms: 1800000      # optional; per-command timeout within the policy's bounds (05b, issue 128)
   rationale: "mechanical change; standard tier"
   effort: "high"                   # optional; passed through where the selected harness has an effort flag (07)
   pin: null                        # operator pin only: { harness, model, pin_reason }; Foundry never sets it

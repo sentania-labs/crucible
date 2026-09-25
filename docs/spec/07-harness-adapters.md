@@ -236,10 +236,11 @@ A headless harness runs each shell command under a timeout of its own, and some
 of them move a command that outlives it to the background. In a headless run the
 turn can then end, the process exits, the command dies with it, and the attempt
 looks finished. Every adapter launches its harness with the attempt's command
-timeout (05b `limits.command_timeout_ms`, narrowed by the contract, capped at
-`timeout_seconds`), and reads the harness's own record of what was still running
-at exit. A clean exit (`completed` or `completed_without_report`) with anything
-in that record is classified `incomplete`, and the list is recorded on the
+timeout (05b `limits.command_timeout_ms`, set by the contract within the
+policy's bounds, capped at `timeout_seconds`), and reads the harness's own
+record of what was still running at exit. A clean exit (`completed` or
+`completed_without_report`) with anything in that record is classified
+`incomplete`, and the list is recorded on the
 `attempt_collected` event as `work_in_flight`. Each fact below was established on
 the pinned worker image on 2026-09-25, against a stub model server with no
 network and no login (`make e2e-command-timeout`).

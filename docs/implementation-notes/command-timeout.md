@@ -7,11 +7,19 @@ it's equivilant) for all harnesess, and the timeout should be set by the task
 launch. i.e. configurable at a hades level or dispatched at run time."
 
 Implemented as a policy limit, `limits.command_timeout_ms` {min, max, default},
-default 3,600,000 ms (60 minutes), which a contract narrows with
-`execution_request.command_timeout_ms` and which a launch never sets above the
-attempt's `timeout_seconds`. It is edited in place from the admin API, CLI and UI;
-each save writes a new policy version. Existing policy versions were not
-rewritten: one without the field takes the default bounds.
+default 3,600,000 ms (60 minutes). A contract may set any value within the
+policy's bounds with `execution_request.command_timeout_ms` (by design, like
+`timeout_seconds`, it is not held under the default), and a launch never sets
+it above the attempt's `timeout_seconds`. It is edited in place from the admin
+API, CLI and UI; each save writes a new policy version. Existing policy
+versions were not rewritten: one without the field takes the default bounds.
+
+`incomplete` exits 0, so nothing downstream may treat a zero exit code alone as
+success (Codex round on PR 151, 2026-09-25). The pre-PR `exit_clean` gate needs
+exit code 0 and class `completed` or `completed_without_report`, and a review
+execution's report is recorded, and the execution succeeds, only on that same
+clean exit. Foundry ruled the same day that a contract value above the policy
+default is by design, as long as it stays within the policy's min and max.
 
 ## What each harness does, and the evidence
 
