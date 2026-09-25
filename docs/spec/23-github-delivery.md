@@ -22,7 +22,8 @@ delivery half of the task lifecycle (09).
   installation covers, grouped by account, using a token scoped to
   `metadata: read` that is discarded before the listing returns, and a pick
   registers the repository with that installation ID and the default branch
-  GitHub reports.
+  GitHub reports. A private repository is listed but refused ("private: not
+  supported yet"): the preparer clones without a credential.
 - **The push remote is derived from the repository's `owner/name`, not from
   its registered url.** The registered url is the fetch source: it is what
   the preparer and the collector clone, and those containers hold no GitHub

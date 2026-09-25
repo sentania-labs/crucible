@@ -8,7 +8,9 @@ then owns the credential (the `crucible-github-app` Secret on Kubernetes, the fi
 beside `github.app.private_key_path` with Docker). The App's install link comes from its
 own `html_url`. The repository picker lists what each installation covers, grouped by
 account, and registers a pick with the installation id and the default branch GitHub
-reports."""
+reports. A private repository is listed but not registered: the preparation step clones
+without a credential (`scripts.preparer_script`), so its first task could only fail.
+Private checkout is a separate operator decision."""
 
 from __future__ import annotations
 
@@ -32,6 +34,17 @@ from crucible.ports.repository import UnitOfWork
 class GitHubConnectError(ConflictError):
     slug = "github-connect"
     title = "GitHub App refused"
+
+
+PRIVATE_NOT_SUPPORTED = "private: not supported yet"
+
+
+def unsupported(repository: dict[str, Any]) -> str | None:
+    """Why the picker cannot register this repository, in the words the page, the API
+    and the CLI all show, or None when it can."""
+    if repository.get("private"):
+        return PRIVATE_NOT_SUPPORTED
+    return None
 
 
 def key_fingerprint(path: str | None) -> str | None:
@@ -341,7 +354,13 @@ def apps_view(ctx: AdminContext, uow: UnitOfWork) -> dict[str, Any]:
             repositories = []
         for repository in sorted(repositories, key=lambda r: str(r.get("full_name")).lower()):
             url = str(repository.get("html_url") or "").rstrip("/").lower()
-            entry["repositories"].append({**repository, "registered_as": registered.get(url)})
+            entry["repositories"].append(
+                {
+                    **repository,
+                    "registered_as": registered.get(url),
+                    "unsupported": unsupported(repository),
+                }
+            )
         view["installations"].append(entry)
     return view
 
@@ -386,6 +405,11 @@ def add_repository(
         )
     if found.get("archived"):
         raise GitHubConnectError(f"{found['full_name']} is archived and cannot take a pull request")
+    if unsupported(found):
+        raise GitHubConnectError(
+            f"{found['full_name']} is {PRIVATE_NOT_SUPPORTED}: the preparation step clones "
+            "without a credential, so a task on it would fail before it started"
+        )
     url = str(found.get("html_url") or f"https://github.com/{found['full_name']}")
     chosen = (name or "").strip() or str(found["full_name"]).rsplit("/", 1)[-1]
     existing = uow.repositories.get_by_name(chosen)

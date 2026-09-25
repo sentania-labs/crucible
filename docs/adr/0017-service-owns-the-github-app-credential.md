@@ -56,7 +56,10 @@ building an app/seevice."
    `GET /installation/repositories` and discarded before the call returns. A pick
    registers the repository with the installation id, the clone URL and the default
    branch GitHub reported at that moment, and the default policy unless another is named.
-   The free-text registration stays for anything the picker cannot show.
+   The free-text registration stays for anything the picker cannot show. A private
+   repository is listed and marked "private: not supported yet", and a pick of one is
+   refused with those words: the preparation step clones without a credential, so its
+   first task could only fail. Private checkout is a separate operator decision.
 
 ## Alternatives considered
 

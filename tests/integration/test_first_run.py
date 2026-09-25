@@ -36,6 +36,7 @@ from crucible.adapters.github.apps import RestGitHubApps
 from crucible.adapters.github.client import RestGitHubClient
 from crucible.adapters.github.credentials import SecretAppCredentials
 from crucible.adapters.github.transport import RestTransport
+from crucible.application.admin import github as github_admin
 from crucible.application.admin.context import AdminContext
 from crucible.application.supervisor import Supervisor
 from crucible.cli import admin as cli
@@ -105,6 +106,7 @@ def stubs(app_key: tuple[str, str]) -> Iterator[Any]:
                     {"full_name": "octo-lab/widgets", "default_branch": "trunk"},
                     {"full_name": "octo-lab/gadgets", "default_branch": "main"},
                     {"full_name": "octo-lab/old", "archived": True},
+                    {"full_name": "octo-lab/secret", "private": True},
                 ],
             },
             {
@@ -477,6 +479,38 @@ def test_github_is_connected_installed_and_a_repository_picked(
         json={"reason": "archived", "installation_id": 7, "repository": "octo-lab/old"},
     )
     assert archived.status_code == 409 and "archived" in archived.json()["detail"]
+
+    # Checkout carries no credential, so a private repository is listed, marked, and
+    # refused with the same plain words through the API and the application call the
+    # CLI's local mode makes.
+    secret = next(
+        r for r in picker["installations"][0]["repositories"] if r["full_name"].endswith("secret")
+    )
+    assert secret["private"] is True and secret["unsupported"] == "private: not supported yet"
+    assert widgets["unsupported"] is None
+    refused_private = admin.post(
+        "/v1/admin/github/repositories",
+        json={"reason": "private", "installation_id": 7, "repository": "octo-lab/secret"},
+    )
+    assert refused_private.status_code == 409
+    assert "octo-lab/secret is private: not supported yet" in refused_private.json()["detail"]
+    assert ctx.admin is not None
+    with ctx.uow_factory() as uow, pytest.raises(github_admin.GitHubConnectError) as local:
+        github_admin.add_repository(
+            ctx.admin,
+            uow,
+            principal="cli",
+            installation_id=7,
+            repository="octo-lab/secret",
+            name=None,
+            policy_name="default-software",
+            attested_all_prs=True,
+            attested_by=None,
+            reason="private from the CLI",
+        )
+    assert "private: not supported yet" in str(local.value)
+    names = {r["repository"] for r in admin.get("/v1/admin/repositories").json()["items"]}
+    assert "secret" not in names
     steps = admin.get("/v1/admin/status").json()["readiness"]["steps"]
     assert "no_repository" not in [s["code"] for s in steps]
 
@@ -488,6 +522,23 @@ def test_github_is_connected_installed_and_a_repository_picked(
         assert 'href="https://github.com/apps/crucible-test/installations/new"' in page.text
         assert '<option value="octo-lab/gadgets"' in page.text
         assert '<option value="octo-lab/widgets"' not in page.text
+        assert '<option value="octo-lab/secret"' not in page.text
+        assert "private: not supported yet" in page.text
+        forced = browser.post(
+            "/ui/actions/github-add-repository",
+            data={
+                "csrf": csrf,
+                "installation_id": "7",
+                "repository": "octo-lab/secret",
+                "name": "",
+                "policy_name": "default-software",
+                "reason": "private through the form",
+                "return_to": "/ui/github",
+            },
+            follow_redirects=False,
+        )
+        assert forced.status_code == 303
+        assert "private: not supported yet" in unquote(forced.headers["location"])
         assert "PRIVATE KEY" not in page.text
         posted = browser.post(
             "/ui/actions/github-add-repository",

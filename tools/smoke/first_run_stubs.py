@@ -146,7 +146,7 @@ class _Handler(BaseHTTPRequestHandler):
                     "html_url": f"https://github.com/{repo['full_name']}",
                     "clone_url": f"https://github.com/{repo['full_name']}.git",
                     "default_branch": repo.get("default_branch", "main"),
-                    "private": repo.get("private", True),
+                    "private": repo.get("private", False),
                     "archived": repo.get("archived", False),
                 }
                 for repo in found.get("repositories") or []

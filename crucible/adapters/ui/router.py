@@ -1417,7 +1417,7 @@ def github_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                     [
                         repo["full_name"],
                         repo["default_branch"],
-                        repo["private"],
+                        repo.get("unsupported") or repo["private"],
                         repo["archived"],
                         repo["registered_as"] or "not registered",
                     ]
@@ -1427,7 +1427,7 @@ def github_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
             choices = [
                 (repo["full_name"], repo["full_name"])
                 for repo in repositories
-                if not repo["archived"] and not repo["registered_as"]
+                if not repo["archived"] and not repo["registered_as"] and not repo.get("unsupported")
             ]
             if admin and choices:
                 section["form"] = {
