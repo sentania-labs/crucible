@@ -1241,6 +1241,17 @@ async def test_a_prepare_that_fails_after_seeding_leaves_no_secret(break_it: str
     assert "credential/auth.json" not in api.claims.get("ws-01attempt0000000000000000a", {})
 
 
+async def test_a_preparer_failure_keeps_every_word_of_its_raw_untimestamped_log() -> None:
+    """75: the fake's preparer failure log carries no stamp, like the real API's
+    un-timestamped read. Stripping a stamp that is not there must not eat the line's
+    first word the way partitioning on the first space did."""
+    api, _registry, provider = build()
+    launch = spec()
+    api.script(launch.attempt_id, "prepare-fails")
+    with pytest.raises(ProviderError, match="the fake preparer could not clone"):
+        await provider.prepare(launch)
+
+
 async def test_retention_removes_a_claim_for_an_attempt_crucible_forgot() -> None:
     """A failed prepare leaves a workspace claim behind; nothing else would remove it."""
     api, _registry, provider = build()

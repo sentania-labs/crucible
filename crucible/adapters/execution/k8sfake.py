@@ -424,20 +424,16 @@ class FakeKubernetesApi:
         lines = self.logs.get(name, [])
         if not timestamps:
             # Worker lines carry the API server's timestamp prefix in this fake. The
-            # readiness canary's fixture is the raw, un-timestamped body already, so
-            # preserve a line that has no separator instead of turning it into empty
-            # text.
-            raw_lines: list[str] = []
-            for line in lines:
-                _, separator, body = line.partition(" ")
-                raw_lines.append(body if separator else line)
-            lines = raw_lines
+            # readiness canary's fixture and a preparer failure are the raw,
+            # un-timestamped body already: only a genuine stamp prefix is stripped, so
+            # a real un-timestamped line keeps every word (75).
+            lines = [_strip_stamp(line) for line in lines]
         run = self.login_runs.get(name)
         if run is not None:
             self._advance_login(name, run)
             lines = self.logs.get(name, [])
             if not timestamps:
-                lines = [line.partition(" ")[2] for line in lines]
+                lines = [_strip_stamp(line) for line in lines]
         if since_time:
             lines = [line for line in lines if line[: len(since_time)] >= since_time]
         payload = ("\n".join(lines) + "\n").encode("utf-8") if lines else b""
@@ -865,6 +861,18 @@ def _running(node: str) -> dict[str, Any]:
 
 def _stamp(offset: int) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(1_760_000_000 + offset)) + ".000000000Z"
+
+
+_STAMP_PREFIX = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z ")
+
+
+def _strip_stamp(line: str) -> str:
+    """Remove a `_stamp`-shaped prefix if the line has one. A line with none is a real
+    API un-timestamped read already (the readiness canary's fixture, a preparer
+    failure): returning it unchanged, rather than partitioning on the first space it
+    happens to contain, is what keeps a multi-word raw line intact (75)."""
+    match = _STAMP_PREFIX.match(line)
+    return line[match.end() :] if match else line
 
 
 def _parse_selector(selector: str | None) -> dict[str, str | None]:
