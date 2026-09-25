@@ -40,17 +40,25 @@ crucible_kind_docker_shim() {
 # Start the disposable OCI registry on the `kind` Docker network and wait for it to
 # answer. Sets CRUCIBLE_KIND_REGISTRY_PORT (the host-loopback port) and
 # CRUCIBLE_KIND_REGISTRY_IP (its address on the `kind` network, which is how a Pod
-# reaches it). Extra arguments are passed to `docker run`.
+# reaches it). Extra arguments are passed to `docker run`. Also sets
+# CRUCIBLE_KIND_NETWORK_CREATED=1 when the `kind` network did not already exist, so a
+# caller that made it is the one that can try to clean it up (77): the name is shared
+# by every kind cluster on the host, so a caller that finds it already there never owns
+# its removal.
 crucible_kind_start_registry() {
   local name=$1
   shift
-  docker network inspect kind >/dev/null 2>&1 || docker network create kind >/dev/null
+  CRUCIBLE_KIND_NETWORK_CREATED=0
+  if ! docker network inspect kind >/dev/null 2>&1; then
+    docker network create kind >/dev/null
+    CRUCIBLE_KIND_NETWORK_CREATED=1
+  fi
   docker run -d --restart=no --network kind --name "$name" \
     -p 127.0.0.1::5000 "$@" "$CRUCIBLE_REGISTRY_IMAGE" >/dev/null
   CRUCIBLE_KIND_REGISTRY_PORT=$(docker port "$name" 5000/tcp | awk -F: 'NR == 1 {print $NF}')
   CRUCIBLE_KIND_REGISTRY_IP=$(docker inspect -f \
     '{{(index .NetworkSettings.Networks "kind").IPAddress}}' "$name")
-  export CRUCIBLE_KIND_REGISTRY_PORT CRUCIBLE_KIND_REGISTRY_IP
+  export CRUCIBLE_KIND_REGISTRY_PORT CRUCIBLE_KIND_REGISTRY_IP CRUCIBLE_KIND_NETWORK_CREATED
 }
 
 # Wait for a registry to answer /v2/ on the given base URL.

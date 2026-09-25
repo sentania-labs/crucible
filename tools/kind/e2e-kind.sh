@@ -15,11 +15,16 @@ registry_ref=""
 cluster_created=0
 registry_started=0
 tag_created=0
+network_created=0
 
 cleanup() {
   status=$?
   cleanup_failed=0
-  trap - EXIT HUP INT TERM
+  # A second interrupt during cleanup must not abort it partway: `trap -` would
+  # restore the default action (immediate termination), which is exactly what a
+  # second Ctrl-C during a slow `kind delete cluster` would do (77). Ignoring the
+  # signals here, not resetting them, is what lets cleanup run to completion.
+  trap '' EXIT HUP INT TERM
   if [ "$status" -ne 0 ]; then
     "$root/tools/kind/dump.sh" "$kubeconfig" "$scratch/canary.log" || cleanup_failed=1
   fi
@@ -44,9 +49,22 @@ cleanup() {
       cleanup_failed=1
     fi
   fi
+  if [ "$network_created" -eq 1 ]; then
+    # The name is shared by every kind cluster on the host; `network rm` on one a
+    # concurrent run still holds fails harmlessly (Docker refuses while an endpoint is
+    # attached), so this only ever removes what became ours to remove.
+    docker network rm kind >/dev/null 2>&1 || :
+    if docker network inspect kind >/dev/null 2>&1; then
+      echo "e2e-kind cleanup: network kind remains (a concurrent kind cluster may hold it)" >&2
+    fi
+  fi
+  # A pull failure here is not a leak: it only means the chmod below did not run, and
+  # the removal it was for is checked on its own right after (77). Treating the pull
+  # itself as fatal failed an otherwise clean run whenever it could not reach the
+  # registry.
   docker run --rm -v "$scratch:/cleanup" \
     busybox@sha256:9db7b59979c38555a39def84a31fb98b5296952f9e3afd4f6f11f05b07adfab0 \
-    chmod -R a+rwX /cleanup >/dev/null 2>&1 || cleanup_failed=1
+    chmod -R a+rwX /cleanup >/dev/null 2>&1 || :
   rm -rf "$scratch" || cleanup_failed=1
   if [ -e "$scratch" ]; then
     echo "e2e-kind cleanup: scratch path $scratch remains" >&2
@@ -81,6 +99,7 @@ fi
 
 registry_started=1
 crucible_kind_start_registry "$registry"
+network_created=$CRUCIBLE_KIND_NETWORK_CREATED
 registry_port=$CRUCIBLE_KIND_REGISTRY_PORT
 registry_ref="localhost:${registry_port}/crucible-worker:${run_id}"
 crucible_kind_await_registry "http://127.0.0.1:${registry_port}"
