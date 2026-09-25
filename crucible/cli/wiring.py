@@ -32,6 +32,7 @@ from crucible.adapters.execution.kubernetes import (
     SettingsSource,
 )
 from crucible.adapters.execution.publisher import DockerPublisher, PublisherConfig
+from crucible.adapters.first_run import FILE_NAME, FileDelivery, SecretDelivery
 from crucible.adapters.github.appauth import AppAuthenticator, AppConfig
 from crucible.adapters.github.apps import RestGitHubApps
 from crucible.adapters.github.client import RestGitHubClient
@@ -57,6 +58,7 @@ from crucible.domain.cluster_egress import SETTING_NAME, parse_cluster_egress
 from crucible.domain.ids import new_id
 from crucible.ports.artifacts import ArtifactStore
 from crucible.ports.execution import ExecutionProvider
+from crucible.ports.first_run import FirstRunDelivery
 from crucible.ports.github import GitHubAppCredentials, GitHubClient
 from crucible.ports.harness import CredentialSource, HarnessGate, MountMode
 from crucible.ports.notification import WakeDeliverer
@@ -285,8 +287,31 @@ def kubernetes_provider(
     )
 
 
+def first_run_delivery(settings: Settings) -> FirstRunDelivery | None:
+    """Where the first-run administrator token goes (ADR 0016, crucible#122).
+
+    On Kubernetes, the Secret in the service namespace; on Docker, a file in the
+    credential root. Anywhere else there is no private place Crucible knows of, and
+    None means the migration mints no token at all rather than print one."""
+    k = settings.kubernetes
+    if k.enabled:
+        try:
+            access = (
+                kubeconfig_access(k.kubeconfig, k.kubeconfig_context)
+                if k.kubeconfig
+                else in_cluster_access()
+            )
+        except (KubernetesApiError, OSError) as exc:
+            log.error("the first-run token Secret is unreachable: %s", exc)
+            return None
+        return SecretDelivery(KubernetesClient(access, k.namespace, timeout=k.api_timeout_seconds))
+    if settings.docker.credential_root:
+        return FileDelivery(Path(settings.docker.credential_root) / FILE_NAME)
+    return None
+
+
 def github_credentials(settings: Settings) -> GitHubAppCredentials | None:
-    """Where the App credential the service owns lives (ADR 0016): the Secret in the
+    """Where the App credential the service owns lives (ADR 0017): the Secret in the
     service's own namespace on Kubernetes, the files beside `private_key_path` with
     Docker, and nowhere when neither applies. The settings' App id and `enabled` still
     count for a credential a deployment placed there itself."""
@@ -352,7 +377,7 @@ def github_client(
     """The GitHub adapter and the App's own view, over one transport. The key is read
     from the store on each signature, in memory; nothing about it is a configuration
     value (12). With no store, the settings' file path is used when `github.enabled`
-    names a complete App, as before ADR 0016."""
+    names a complete App, as before ADR 0017."""
     g = settings.github
     transport = RestTransport(g.api_base, timeout=g.api_timeout_seconds)
     if credentials is None:
@@ -456,6 +481,7 @@ def wire(settings: Settings) -> Wiring:
     github_store = github_credentials(settings)
     github, github_apps = github_client(settings, github_store)
     report_github_credential(settings, github_store)
+    first_run = first_run_delivery(settings)
     admin = AdminContext(
         uow_factory=factory,
         clock=SystemClock(),
@@ -485,6 +511,7 @@ def wire(settings: Settings) -> Wiring:
         proxy_reload_timeout_seconds=settings.admin.proxy_reload_timeout_seconds,
         kubernetes_egress_seed=kubernetes_egress_seed(settings),
         kubernetes_protected_namespaces=kubernetes_protected_namespaces(settings),
+        first_run=first_run,
     )
     ctx = AppContext(
         uow_factory=factory,
@@ -501,6 +528,7 @@ def wire(settings: Settings) -> Wiring:
         credential_sources=credential_sources(settings),
         admin=admin,
         settings=settings,
+        first_run=first_run,
     )
     publisher: Publisher | None = None
     if docker is not None and github is not None:

@@ -12,6 +12,7 @@ from crucible.application.admin.harnesses import list_harnesses, list_images
 from crucible.application.admin.providers import providers_status
 from crucible.application.admin.routing import gateway_url
 from crucible.application.queries import supervisor_view
+from crucible.domain.entities import Principal, Role
 from crucible.domain.lifecycle import AttemptState, TaskState
 from crucible.ports.repository import UnitOfWork
 
@@ -25,7 +26,8 @@ LISTED_STATES = (
 CAPABILITY_PARTS = ("harnesses", "providers", "github", "workers", "tasks", "wakes")
 
 
-def workers(uow: UnitOfWork) -> list[dict[str, Any]]:
+def workers(uow: UnitOfWork, *, owner: str | None = None) -> list[dict[str, Any]]:
+    """Active attempts; with `owner`, only those of tasks that principal submitted."""
     out: list[dict[str, Any]] = []
     for attempt in uow.attempts.list_in_states(
         [
@@ -37,6 +39,8 @@ def workers(uow: UnitOfWork) -> list[dict[str, Any]]:
     ):
         execution = uow.executions.get(attempt.execution_id)
         task = uow.tasks.get(attempt.task_id)
+        if owner is not None and (task is None or task.principal_id != owner):
+            continue
         out.append(
             {
                 "attempt_id": attempt.id,
@@ -55,11 +59,14 @@ def workers(uow: UnitOfWork) -> list[dict[str, Any]]:
     return out
 
 
-def tasks(uow: UnitOfWork) -> dict[str, Any]:
+def tasks(uow: UnitOfWork, *, owner: str | None = None) -> dict[str, Any]:
+    """Counts by state and the listed states; with `owner`, only that principal's tasks."""
     counts: dict[str, int] = {}
     lists: dict[str, list[dict[str, Any]]] = {}
     for state in TaskState:
-        rows = uow.tasks.list_by_state(state)
+        rows = [
+            t for t in uow.tasks.list_by_state(state) if owner is None or t.principal_id == owner
+        ]
         if rows:
             counts[state.value] = len(rows)
         if state in LISTED_STATES:
@@ -70,21 +77,27 @@ def tasks(uow: UnitOfWork) -> dict[str, Any]:
     return {"counts": counts, "lists": lists}
 
 
-def wakes(uow: UnitOfWork) -> dict[str, Any]:
+def wakes(uow: UnitOfWork, *, owner: str | None = None) -> dict[str, Any]:
+    """Pending wakes per principal; with `owner`, that principal's alone, and `unacked`
+    counts only its own. Each principal's count comes from a count query, not the
+    (page-limited) list, so a principal with more than the page limit of pending
+    wakes still reports its true count."""
     per_principal: dict[str, int] = {}
     oldest: str | None = None
     for principal in uow.principals.list_all():
+        if owner is not None and principal.id != owner:
+            continue
         pending = uow.wakes.list_for_principal(
             principal.id, since=None, include_acked=False, limit=200
         )
         if pending:
-            per_principal[principal.name] = len(pending)
+            per_principal[principal.name] = uow.wakes.count_unacked_for_principal(principal.id)
             first = min(w.created_at for w in pending).isoformat()
             oldest = first if oldest is None or first < oldest else oldest
     return {
         "pending": per_principal,
         "oldest_pending": oldest,
-        "unacked": uow.wakes.count_unacked(),
+        "unacked": uow.wakes.count_unacked() if owner is None else sum(per_principal.values()),
     }
 
 
@@ -319,12 +332,21 @@ async def status(ctx: AdminContext, uow: UnitOfWork) -> dict[str, Any]:
     return document
 
 
-async def capabilities(ctx: AdminContext, uow: UnitOfWork) -> dict[str, Any]:
+async def capabilities(ctx: AdminContext, uow: UnitOfWork, principal: Principal) -> dict[str, Any]:
     """25: the orchestrator's read-only view: harnesses, providers, github health,
     workers, tasks, wakes; nothing it could mutate and no credential detail beyond the
-    state enumeration."""
+    state enumeration.
+
+    An orchestrator sees its own work only: the workers, tasks and wakes parts are
+    filtered to the tasks it submitted and the wakes addressed to it (crucible#40). An
+    operator is exempt, as it is from task ownership (04). Harness, provider and GitHub
+    health are the service's and not any one principal's, so every caller sees them."""
     document = await status(ctx, uow)
     view = {part: document[part] for part in CAPABILITY_PARTS}
+    if principal.role is not Role.OPERATOR:
+        view["workers"] = workers(uow, owner=principal.id)
+        view["tasks"] = tasks(uow, owner=principal.id)
+        view["wakes"] = wakes(uow, owner=principal.id)
     for harness in view["harnesses"]:
         harness["credential"] = {
             "state": harness["credential"]["state"],

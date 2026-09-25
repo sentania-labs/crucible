@@ -2,7 +2,7 @@
 
 `local_gateway_updated` records a save of the local gateway (its URL, whether a key was
 set) or of the models picked from it; `github_app_connected` records the GitHub App
-credential the service now owns (ADR 0016). The gateway URL itself is the
+credential the service now owns (ADR 0017). The gateway URL itself is the
 `local.gateway` row of `provider_settings` (0020) until a model entry carries it, so no
 table changes here.
 

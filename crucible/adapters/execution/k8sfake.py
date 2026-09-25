@@ -44,6 +44,7 @@ from crucible.adapters.execution.k8sspec import (
     LABEL_CANARY,
     LABEL_ROLE,
     ROLE_BUNDLE,
+    ROLE_CACHE_REFRESHER,
     ROLE_CANARY,
     ROLE_CLEANER,
     ROLE_COLLECTOR,
@@ -527,6 +528,7 @@ class FakeKubernetesApi:
             obj.body["status"] = _running(self.node_name)
         handler = {
             ROLE_PREPARER: self._act_preparer,
+            ROLE_CACHE_REFRESHER: self._act_cache_refresher,
             ROLE_COLLECTOR: self._act_collector,
             ROLE_BUNDLE: self._act_bundle,
             ROLE_VERIFIER: self._act_verifier,
@@ -637,6 +639,9 @@ class FakeKubernetesApi:
             f"crucible-canary.pod_pids_source={self.pod_pid_limit_source}",
             *(["crucible-canary.done=1"] if self.canary_done else []),
         ]
+        self._finish(obj, 0)
+
+    def _act_cache_refresher(self, obj: _Object, attempt_id: str) -> None:
         self._finish(obj, 0)
 
     def _act_preparer(self, obj: _Object, attempt_id: str) -> None:

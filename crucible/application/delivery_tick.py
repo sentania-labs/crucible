@@ -128,7 +128,7 @@ class DeliveryCoordinator:
 
     def _github_ready(self) -> bool:
         """A client exists and, when it can say so, an App credential is in place. The
-        credential may arrive at runtime from the Connect GitHub flow (ADR 0016)."""
+        credential may arrive at runtime from the Connect GitHub flow (ADR 0017)."""
         if self._github is None:
             return False
         configured = getattr(self._github, "configured", None)

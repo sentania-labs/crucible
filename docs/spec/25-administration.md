@@ -92,7 +92,7 @@ resource.
 | list images and promote | `GET /admin/images`, `POST /admin/images/{digest}/promote` | `images list|promote` | 13; each image lists every harness it carries with its version (`harnesses`), and the one worker image carries all four (C11), so one promotion makes it the default for all four, refused whole if any of them is outside its adapter's range. A previous default the promoted image fully covers becomes `retained`. Rollback is promoting the previous digest, which rolls all four harnesses back together. The probe and the live tiers run the promoted image |
 | provider health | `GET /admin/providers` | `providers status` | |
 | GitHub health | `GET /admin/github`, `POST /admin/github/check` | `github status|check` | check mints a token per registered repository and discards it |
-| connect the GitHub App | `POST /admin/github/app` | `github connect --app-id --private-key-file` | ADR 0016: an existing App's id and one of its private keys, checked with `GET /app` before anything is stored; a refusal stores nothing. The service then owns the credential (the `crucible-github-app` Secret on Kubernetes, the files beside `github.app.private_key_path` with Docker). Returns the App's install link, never the key; audited as `github_app_connected` with the key's public fingerprint |
+| connect the GitHub App | `POST /admin/github/app` | `github connect --app-id --private-key-file` | ADR 0017: an existing App's id and one of its private keys, checked with `GET /app` before anything is stored; a refusal stores nothing. The service then owns the credential (the `crucible-github-app` Secret on Kubernetes, the files beside `github.app.private_key_path` with Docker). Returns the App's install link, never the key; audited as `github_app_connected` with the key's public fingerprint |
 | pick repositories | `GET /admin/github/installations`, `POST /admin/github/repositories` | `github installations`, `github add-repository` | crucible#120: each installation's repositories grouped by account, each marked with the name it is registered under; a pick registers it with the installation id, the clone URL and the default branch GitHub reports, refusing a repository the installation does not cover or one that is archived. The free-text `register a repository` stays for anything the picker cannot show |
 | register a repository | `PUT /admin/repositories/{name}` | `repositories register` | 04; an administrative mutation like any other, guarded and audited here, with the previous registration as the before summary. 04's own `PUT /repositories/{name}` is a different, non-administrative surface |
 | audit | `GET /admin/audit?cursor=` | `audit tail` | admin events only; the cursor is the scan position and always moves forward, so a long stretch of non-administrative events cannot strand the pages behind it |
@@ -342,11 +342,21 @@ storage, startup timing, and secret-bearing paths at process start. Runtime
 policy and state remain editable through the application services.
 
 A fresh migrated database with no administrator receives one
-`first-run-admin` principal. The migration process prints its token once in a
-clearly framed block on stderr (stdout carries the envelope alone, so a caller
-parsing it never holds the token). Only the salted token hash is stored. The sign-in page
-directs the operator to `docker compose logs migrate`; a later migration run
-finds the principal and prints no token.
+`first-run-admin` principal. Its token never reaches stdout, stderr or any
+log, because a log stream is shipped and retained by whatever collects it
+(crucible#122, ADR 0016). The migration writes it, before it commits the
+principal, to one private place: on Kubernetes the Secret
+`crucible-first-run-admin` (key `token`) in the service namespace, which only
+the migrate Job's account may create and only the api's account may delete;
+on Docker the file `first-run-admin-token`, mode 0600, in the credential
+root. Its stderr says only where the token is. A token it cannot write is
+never minted, and with neither place configured it mints nothing and says how
+to create an administrator with `crucible admin --reason ... token create`. Only the salted
+token hash is stored. The sign-in page names the place for the running
+deployment. The api removes the Secret or file when the first-run principal
+first signs in at `/ui`, or when it is revoked. Principal names starting
+`first-run-admin` are reserved for the migration, so `token create` refuses
+them. A later migration run finds an active administrator and does nothing.
 
 ## What Foundry may do
 
@@ -376,9 +386,15 @@ harness, model, image digest, start time and last heartbeat; task counts by
 state together with the id, external id and update time of every task in
 `blocked`, `pre_pr_gates_failed`, `publish_failed`,
 `ci_certification_failed` and `head_diverged`; and pending wakes as a count
-per principal with the oldest pending timestamp and the total unacked. That
-is what an orchestrator needs to say which of its tasks is stuck and why,
-and it is its own work: the ids, models and image digests are of tasks it
-submitted and attempts Crucible ran for them. Nothing in the response is a
+per principal with the oldest pending timestamp and the total unacked. For
+an orchestrator principal these three parts are filtered to its own work
+(crucible#40): the active attempts and the task counts and lists cover only
+tasks it submitted, and `wakes` counts only the wakes addressed to it, so
+`unacked` is its own total. One orchestrator cannot read another's task ids,
+external ids or wake counts here. An operator principal is exempt, as it is
+from task ownership (04), and sees every principal's. The `harnesses`,
+`providers` and `github` parts describe the service rather than any one
+principal's work and are the same for every caller. That is what an
+orchestrator needs to say which of its tasks is stuck and why. Nothing in the response is a
 credential, a token, a key, a path, or a file name, and the view is
 read-only.

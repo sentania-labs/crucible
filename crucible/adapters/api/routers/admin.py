@@ -219,10 +219,10 @@ async def admin_status(ctx: Ctx, uow: UoW, _principal: Admin) -> dict[str, Any]:
 
 
 @router.get("/capabilities")
-async def capabilities(ctx: Ctx, uow: UoW, _principal: Orchestrator) -> dict[str, Any]:
-    """25: what Foundry may read: harnesses, providers, github health, workers, tasks,
-    wakes. Read-only; it never calls a mutation."""
-    return await status_admin.capabilities(_admin(ctx), uow)
+async def capabilities(ctx: Ctx, uow: UoW, principal: Orchestrator) -> dict[str, Any]:
+    """25: what Foundry may read: harnesses, providers, github health, and its own
+    workers, tasks and wakes. Read-only; it never calls a mutation."""
+    return await status_admin.capabilities(_admin(ctx), uow, principal)
 
 
 # ----- harnesses ---------------------------------------------------------------
@@ -462,7 +462,7 @@ def admin_github_check(
 def admin_github_connect(
     ctx: Ctx, uow: UoW, principal: Admin, body: Annotated[dict[str, Any], Body()]
 ) -> dict[str, Any]:
-    """Connect GitHub (crucible#120, ADR 0016): an existing App's id and private key,
+    """Connect GitHub (crucible#120, ADR 0017): an existing App's id and private key,
     checked against GitHub before they are stored. The answer never carries the key."""
     private_key = body.get("private_key")
     webhook_secret = body.get("webhook_secret")
@@ -602,6 +602,7 @@ def admin_revoke_token(
         reason=_reason(body),
     )
     uow.commit()
+    tokens.after_revoke(_admin(ctx), result)
     return result
 
 

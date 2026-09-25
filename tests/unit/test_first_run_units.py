@@ -1,5 +1,5 @@
 """The small pieces of the first-run setup (crucible#79, #119, #120, #121): the two
-stores of the GitHub App credential the service owns (ADR 0016), the configured rule,
+stores of the GitHub App credential the service owns (ADR 0017), the configured rule,
 and the plain words the gateway test and the Status page use."""
 
 from __future__ import annotations
@@ -58,7 +58,7 @@ def test_a_second_write_replaces_the_key_and_keeps_a_webhook_secret_not_given() 
 
 
 def test_a_gitops_secret_counts_only_with_the_settings_app_id_and_enabled() -> None:
-    """ADR 0016: a Secret a deployment placed itself (no `app-id` key) is configured
+    """ADR 0017: a Secret a deployment placed itself (no `app-id` key) is configured
     only when the settings name the App and turn GitHub on, as before the ADR."""
     api = FakeKubernetesApi()
     api.create(
@@ -86,7 +86,7 @@ def test_an_unreadable_secret_is_a_refusal_not_an_absence() -> None:
 
 
 def test_a_secret_of_another_type_under_the_name_is_never_used_or_adopted() -> None:
-    """ADR 0016: `create` cannot be narrowed by name, so a service-account token Secret
+    """ADR 0017: `create` cannot be narrowed by name, so a service-account token Secret
     could sit under this name; it is refused, not read as the App credential."""
     api = FakeKubernetesApi()
     body = k8sspec.secret(

@@ -4,7 +4,7 @@ over real loopback HTTP.
 
 The gateway half runs with the Docker provider's credential directories; the GitHub half
 runs on the Kubernetes provider's shape, with the App credential in a Secret the service
-owns (ADR 0016) on the in-memory API server. The kind proof drives the same flow on a
+owns (ADR 0017) on the in-memory API server. The kind proof drives the same flow on a
 real cluster (docs/implementation-notes/first-run.md)."""
 
 from __future__ import annotations

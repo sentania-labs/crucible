@@ -269,7 +269,7 @@ class GitHubClient(Protocol):
     ) -> Sequence[str]: ...
 
 
-# ----- the App credential the service owns (ADR 0016) ----------------------------------
+# ----- the App credential the service owns (ADR 0017) ----------------------------------
 
 
 class GitHubAppStoreError(Exception):
@@ -287,7 +287,7 @@ class AppCredential:
 
 
 class GitHubAppCredentials(Protocol):
-    """Where the App credential lives and the one writer of it (ADR 0016).
+    """Where the App credential lives and the one writer of it (ADR 0017).
 
     On Kubernetes that is the `crucible-github-app` Secret in the service's namespace;
     with the Docker provider it is the files beside `github.app.private_key_path`. A

@@ -8,7 +8,7 @@ delivery half of the task lifecycle (09).
 ## Authority model
 
 - Crucible holds a GitHub App private key (the credential it owns, 12, ADR
-  0016) and mints
+  0017) and mints
   short-lived installation tokens scoped to one repository, on demand, for
   one publisher job at a time. Tokens live in memory and in the tmpfs of
   the publisher container, never elsewhere.

@@ -1,4 +1,4 @@
-# ADR 0016: The service owns the GitHub App credential, and the UI connects the App
+# ADR 0017: The service owns the GitHub App credential, and the UI connects the App
 
 Status: accepted. The operator's feedback of 2026-09-25 (quoted below), made concrete by
 FDY-0117 the same day. Extends ADR 0015's ownership model from the harness credentials to
@@ -77,7 +77,8 @@ building an app/seevice."
 
 ## Consequences
 
-- The control-plane ServiceAccount gains its first permission in its own namespace: the
+- The control-plane ServiceAccount gains a second grant in its own namespace, beside
+  deleting the first-run Secret (ADR 0016): the
   Role `crucible-github-app` (`deploy/kubernetes/base/crucible/github-app-rbac.yaml`),
   `get` and `patch` on the one Secret by name, and `create` on Secrets, which RBAC cannot
   narrow by name. No `list`, `watch`, `update` or `delete`; the database Secret stays out
@@ -86,7 +87,10 @@ building an app/seevice."
   token Secret for another account in `crucible` and then read it. The service refuses to
   use or adopt a Secret of that name whose type is not `Opaque`, which keeps it from
   mistaking one for the App credential; it cannot stop a process that is already
-  compromised. `crucible` holds no account with more than this one's permissions.
+  compromised. `crucible` holds no account with more than this one's permissions: the
+  only other bound one, `crucible-migrate` (ADR 0016), may create Secrets and patch the
+  first-run Secret, and cannot read any. Both Roles grant `create` on Secrets in
+  `crucible`, to different accounts; neither can read the other's Secret.
 - A deployment that sealed `crucible-github-app` before this change removes it from its
   GitOps repository without pruning it (Argo's prune would delete the key), or connects
   the App again from the GitHub page afterwards. On its first write the service takes the

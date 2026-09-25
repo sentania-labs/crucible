@@ -125,7 +125,7 @@ delivers one Secret:
 |---|---|---|
 | `crucible-database` | `crucible` | `password`, and `url`, the whole DSN, which must carry the same password |
 
-**The GitHub App Secret is not GitOps's either** (ADR 0016). Connect the App on the
+**The GitHub App Secret is not GitOps's either** (ADR 0017). Connect the App on the
 GitHub page with its App ID and one of its private keys; Crucible checks them with
 GitHub, then creates `crucible-github-app` in `crucible` (keys `app-id`, `app.pem`,
 `webhook.secret`) and is its only writer. Install the App from the link the page shows,
@@ -162,7 +162,7 @@ repository. Nothing sealed, encrypted or plain belongs in Crucible's repository.
 
 Everything else: both namespaces with their admission labels and the default deny, the
 supervisor's Role scoped to `crucible-workers`, the one Role in `crucible` for the GitHub
-App Secret the service owns (ADR 0016), the worker
+App Secret the service owns (ADR 0017), the worker
 ServiceAccount with no permission at all, the ResourceQuota that is also the provider's
 concurrency bound, the reference cache claim, PostgreSQL for the lab, the migration Job,
 the api and supervisor Deployments, the Service, and the Ingress route without a host.
@@ -184,9 +184,19 @@ prunes them.
 5. Watch the migration Job complete. `crucible serve` refuses to start against a schema
    that is not at head, so the api and supervisor wait for it rather than corrupting
    anything.
-6. Read the one-time first-run administrator token out of the migration Job's log. It is
-   printed once, in a framed block, and only its salted hash is stored (25). Store it
-   before the log rotates.
+6. Read the one-time first-run administrator token from the Secret the migration Job
+   wrote. It is never in the Job's log (ADR 0016); the log says only where it is:
+
+   ```sh
+   kubectl -n crucible get secret crucible-first-run-admin \
+     -o jsonpath='{.data.token}' | base64 -d
+   ```
+
+   Only the migrate Job's account can create that Secret and only the api's account can
+   delete it; reading it takes your own cluster permissions. The api deletes it the
+   first time you sign in at `/ui` with it (or when that principal is revoked), so
+   create your own administrator before you lose the session. Only the token's salted
+   hash is stored (25).
 
 ## Logging the harnesses in
 

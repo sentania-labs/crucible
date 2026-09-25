@@ -132,7 +132,7 @@ class AppAuthenticator:
     ) -> None:
         self._config = config
         self._transport = transport
-        # The service-owned store (ADR 0016), read on each signature so a Connect GitHub
+        # The service-owned store (ADR 0017), read on each signature so a Connect GitHub
         # save is in force at once. Without one the key is the configured file.
         self._credentials = credentials
         self._cache: dict[tuple[int, str, str], _CachedToken] = {}

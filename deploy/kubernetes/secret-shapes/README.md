@@ -6,7 +6,7 @@ real values without guessing a key name.
 
 Four kinds of secret, and where each comes from. Two are delivered by GitOps. The
 harness credential Secrets and the GitHub App Secret are not: Crucible creates and owns
-them (ADR 0015, ADR 0016).
+them (ADR 0015, ADR 0017).
 
 | Object | Namespace | Keys | Read by |
 |---|---|---|---|

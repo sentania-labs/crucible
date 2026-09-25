@@ -2,7 +2,7 @@
 public-key fingerprint, and per registered repository whether an installation covers it
 and what the last check found. `check` mints a token per repository and discards it.
 
-Connect GitHub (crucible#120, ADR 0016): the operator enters an existing App's id and
+Connect GitHub (crucible#120, ADR 0017): the operator enters an existing App's id and
 private key, the service checks them against `GET /app` before it stores anything, and
 then owns the credential (the `crucible-github-app` Secret on Kubernetes, the files
 beside `github.app.private_key_path` with Docker). The App's install link comes from its
@@ -174,7 +174,7 @@ def check(
     return {"repositories": results, "checked": len(results)}
 
 
-# ----- Connect GitHub and the repository picker (crucible#120, ADR 0016) -------------
+# ----- Connect GitHub and the repository picker (crucible#120, ADR 0017) -------------
 
 
 def _install_url(app: dict[str, Any]) -> str | None:
@@ -253,7 +253,7 @@ def connect(
     if store is None or ctx.github_apps is None:
         raise ConflictError(
             "this deployment has nowhere to keep a GitHub App credential: run on the "
-            "Kubernetes provider, or set github.app.private_key_path (ADR 0016)"
+            "Kubernetes provider, or set github.app.private_key_path (ADR 0017)"
         )
     if isinstance(app_id, bool) or not isinstance(app_id, int) or app_id < 1:
         raise ContractValidationError(

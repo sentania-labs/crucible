@@ -28,8 +28,8 @@ import secrets
 import ssl
 import tempfile
 from collections.abc import Iterator, Mapping, Sequence
-from contextlib import contextmanager
-from dataclasses import dataclass
+from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass, field
 from http.client import HTTPConnection, HTTPResponse, HTTPSConnection
 from typing import Any
 from urllib.parse import quote, urlencode, urlsplit
@@ -89,15 +89,21 @@ class ClusterAccess:
 
     `token_path` rather than a token: an in-cluster ServiceAccount token is rotated by
     the kubelet, so it is read per request and never held (12's file-not-value rule
-    applied to Crucible's own credential)."""
+    applied to Crucible's own credential).
+
+    A kubeconfig's inline `-data` material is held here as bytes and never written
+    to a file that outlives the TLS handshake that needs it (crucible#65)."""
 
     server: str
     token_path: str | None = None
-    token: str | None = None
+    token: str | None = field(default=None, repr=False)
     ca_cert_path: str | None = None
     client_cert_path: str | None = None
     client_key_path: str | None = None
     verify: bool = True
+    ca_cert_data: bytes | None = field(default=None, repr=False)
+    client_cert_data: bytes | None = field(default=None, repr=False)
+    client_key_data: bytes | None = field(default=None, repr=False)
 
     def bearer(self) -> str | None:
         if self.token_path:
@@ -149,42 +155,63 @@ def kubeconfig_access(path: str, context: str | None = None) -> ClusterAccess:
     return ClusterAccess(
         server=server,
         token=str(user["token"]) if user.get("token") else None,
-        ca_cert_path=_material(cluster, "certificate-authority", "crucible-ca"),
-        client_cert_path=_material(user, "client-certificate", "crucible-cert"),
-        client_key_path=_material(user, "client-key", "crucible-key"),
+        ca_cert_path=_path(cluster, "certificate-authority"),
+        client_cert_path=_path(user, "client-certificate"),
+        client_key_path=_path(user, "client-key"),
         verify=not bool(cluster.get("insecure-skip-tls-verify")),
+        ca_cert_data=_inline(cluster, "certificate-authority"),
+        client_cert_data=_inline(user, "client-certificate"),
+        client_key_data=_inline(user, "client-key"),
     )
 
 
-def _material(entry: Mapping[str, Any], key: str, prefix: str) -> str | None:
-    """A certificate as a path, taking the inline `<key>-data` form when that is what
-    the kubeconfig carries.
-
-    Inline material is written to a private temporary file, because `ssl` loads a chain
-    from a path and nothing else. The file is mode 0600 and lives for the process."""
+def _path(entry: Mapping[str, Any], key: str) -> str | None:
     path = entry.get(key)
-    if path:
-        return str(path)
+    return str(path) if path else None
+
+
+def _inline(entry: Mapping[str, Any], key: str) -> bytes | None:
+    """The inline `<key>-data` form, decoded and kept in memory. A path, when the entry
+    also names one, wins, as it does for kubectl."""
+    if entry.get(key):
+        return None
     raw = entry.get(f"{key}-data")
     if not raw:
         return None
     try:
-        decoded = base64.b64decode(str(raw))
+        return base64.b64decode(str(raw))
     except ValueError as exc:
         raise KubernetesApiError(0, f"kubeconfig {key}-data is not base64") from exc
-    handle, name = tempfile.mkstemp(prefix=f"{prefix}-", suffix=".pem")
-    try:
-        os.fchmod(handle, 0o600)
-        os.write(handle, decoded)
-    finally:
-        os.close(handle)
-    _MATERIAL_FILES.append(name)
-    return name
 
 
-# What `_material` wrote, so a caller can remove it and so the files are not collected
-# while a connection still needs them.
-_MATERIAL_FILES: list[str] = []
+@contextmanager
+def _transient_file(data: bytes) -> Iterator[str]:
+    """A path `ssl` can read `data` from, gone when the block ends.
+
+    `ssl` loads a client certificate and key from a path and nothing else. On Linux the
+    path is an anonymous memory file (`memfd`), so the key never reaches a disk at all;
+    elsewhere it is a mode 0600 file in a private directory, unlinked as soon as the
+    context has loaded it. Nothing is kept for the life of the process (crucible#65)."""
+    memfd_create = getattr(os, "memfd_create", None)
+    if memfd_create is not None:
+        handle = memfd_create("crucible-tls", 0)
+        try:
+            os.write(handle, data)
+            yield f"/proc/self/fd/{handle}"
+        finally:
+            os.close(handle)
+        return
+    with tempfile.TemporaryDirectory(prefix="crucible-tls-") as directory:
+        name = os.path.join(directory, "material.pem")
+        handle = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.write(handle, data)
+        finally:
+            os.close(handle)
+        try:
+            yield name
+        finally:
+            os.unlink(name)
 
 
 def _named(entries: Any, name: str, kind: str) -> dict[str, Any]:
@@ -213,12 +240,21 @@ class KubernetesClient:
         parsed = urlsplit(self.access.server)
         if parsed.scheme != "https":
             return None
-        context = ssl.create_default_context(cafile=self.access.ca_cert_path)
-        if not self.access.verify:
+        access = self.access
+        cadata = access.ca_cert_data.decode("ascii", "replace") if access.ca_cert_data else None
+        context = ssl.create_default_context(cafile=access.ca_cert_path, cadata=cadata)
+        if not access.verify:
             context.check_hostname = False
             context.verify_mode = ssl.CERT_NONE
-        if self.access.client_cert_path:
-            context.load_cert_chain(self.access.client_cert_path, self.access.client_key_path)
+        if access.client_cert_path or access.client_cert_data:
+            with ExitStack() as stack:
+                cert = access.client_cert_path or stack.enter_context(
+                    _transient_file(access.client_cert_data or b"")
+                )
+                key = access.client_key_path
+                if key is None and access.client_key_data:
+                    key = stack.enter_context(_transient_file(access.client_key_data))
+                context.load_cert_chain(cert, key)
         return context
 
     def _connect(self, timeout: float | None = None) -> HTTPConnection:

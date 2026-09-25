@@ -1,4 +1,4 @@
-"""The GitHub App credential the service owns (ADR 0016, crucible#120, #79).
+"""The GitHub App credential the service owns (ADR 0017, crucible#120, #79).
 
 Two stores behind one port. On Kubernetes the credential is the `crucible-github-app`
 Secret in the service's own namespace: the service creates it the first time the
@@ -44,7 +44,7 @@ def _app_id(raw: bytes | None) -> int | None:
 def _resolve(
     files: dict[str, bytes] | None, *, settings_app_id: int, settings_enabled: bool
 ) -> AppCredential | None:
-    """The configured rule (ADR 0016): a key, and an App id that the service wrote beside
+    """The configured rule (ADR 0017): a key, and an App id that the service wrote beside
     it, or that the settings name with `github.enabled` on. A key alone is not enough."""
     if not files or not files.get(PRIVATE_KEY):
         return None
@@ -239,7 +239,7 @@ class DirectoryAppCredentials:
         if not self.directory.is_dir() or not os.access(self.directory, os.W_OK):
             raise GitHubAppStoreError(
                 f"the GitHub App directory {self.directory} is missing or read-only here; "
-                "the service needs it writable to own the credential (ADR 0016)"
+                "the service needs it writable to own the credential (ADR 0017)"
             )
         writes = [(self.app_id_path, str(app_id).encode("ascii")), (self.key_path, private_key)]
         if webhook_secret and self.webhook_path is not None:

@@ -673,6 +673,7 @@ def test_all_fifteen_sections_preserve_real_service_output_shapes() -> None:
         wakes=SimpleNamespace(
             list_for_principal=lambda *_args, **_kwargs: [wake],
             count_unacked=lambda: 1,
+            count_unacked_for_principal=lambda _principal_id: 1,
         ),
     )
     retention_action = RetentionAction(
