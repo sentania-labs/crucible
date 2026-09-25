@@ -270,6 +270,12 @@ def kind_schemas() -> dict[str, dict[str, Any]]:
             {"setting": STR, "source": STR, "document": ANY_OBJ},
             {"settings_file": ANY_OBJ, "provider_enabled": BOOL},
         ),
+        "command_timeout": _obj(
+            "the per-command timeout bounds of the policy in force, in milliseconds "
+            "(issue 128): a contract may narrow the default within them",
+            {"policy": ANY_OBJ, "command_timeout_ms": ANY_OBJ},
+            {"timeout_seconds": ANY_OBJ},
+        ),
         "bootstrap_import": bootstrap,
         "bootstrap_import_list": _items("bootstrap imports", ANY_OBJ),
         # this command

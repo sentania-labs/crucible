@@ -39,6 +39,7 @@ from crucible.application.admin import (
     routing,
 )
 from crucible.application.admin import kubernetes as kubernetes_admin
+from crucible.application.admin import limits as limits_admin
 from crucible.application.admin import providers as providers_admin
 from crucible.application.admin import repositories as repositories_admin
 from crucible.application.admin import status as status_admin
@@ -219,6 +220,23 @@ def build_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     state.add_argument("--disable", action="store_true")
     local_set.add_argument("--enable-thinking", action="store_true")
     local_set.add_argument("--max-concurrency", type=int, default=4)
+
+    lim = sub.add_parser("limits", help="policy limits edited in place (issue 128)")
+    lim_sub = lim.add_subparsers(dest="limits_command", required=True)
+    lim_sub.add_parser(
+        "command-timeout", help="the per-command timeout bounds of the policy in force"
+    )
+    timeout_set = lim_sub.add_parser(
+        "set-command-timeout",
+        help="write a new policy version with these per-command timeout bounds",
+    )
+    timeout_set.add_argument("--min", type=int, help="milliseconds; omitted keeps the value")
+    timeout_set.add_argument("--max", type=int, help="milliseconds; omitted keeps the value")
+    timeout_set.add_argument(
+        "--default",
+        type=int,
+        help="milliseconds, which a contract may narrow; omitted keeps the value",
+    )
 
     kube = sub.add_parser(
         "kubernetes", help="the Kubernetes provider's cluster egress selectors (26, #91)"
@@ -420,6 +438,25 @@ def _remote(args: argparse.Namespace, remote: Api) -> Any:
                 "max_concurrency": args.max_concurrency,
             },
         )
+    if command == "limits":
+        if args.limits_command == "command-timeout":
+            return remote.call("GET", "/v1/admin/limits/command-timeout")
+        return remote.call(
+            "POST",
+            "/v1/admin/limits/command-timeout",
+            {
+                **reason,
+                **{
+                    key: value
+                    for key, value in (
+                        ("min", args.min),
+                        ("max", args.max),
+                        ("default", args.default),
+                    )
+                    if value is not None
+                },
+            },
+        )
     if command == "kubernetes":
         if args.kubernetes_command == "egress":
             return remote.call("GET", "/v1/admin/kubernetes/egress")
@@ -616,6 +653,26 @@ def _local(args: argparse.Namespace, wiring: Wiring) -> Any:
                     }
                 ],
                 max_concurrency=args.max_concurrency,
+                reason=args.reason,
+            )
+            uow.commit()
+            return result
+    if command == "limits":
+        with wiring.ctx.uow_factory() as uow:
+            if args.limits_command == "command-timeout":
+                return limits_admin.command_timeout_view(uow)
+            result = limits_admin.save_command_timeout(
+                admin,
+                uow,
+                principal=Principal(
+                    id=CLI_PRINCIPAL,
+                    name=CLI_PRINCIPAL,
+                    role=Role.ADMIN,
+                    created_at=wiring.ctx.clock.now(),
+                ),
+                minimum=args.min,
+                maximum=args.max,
+                default=args.default,
                 reason=args.reason,
             )
             uow.commit()
@@ -850,6 +907,7 @@ def kind_of(args: argparse.Namespace) -> str:
         "audit": "audit_command",
         "routing": "routing_command",
         "kubernetes": "kubernetes_command",
+        "limits": "limits_command",
         "bootstrap": "bootstrap_command",
     }.get(command)
     sub = getattr(args, verb) if verb else None
@@ -880,6 +938,8 @@ def kind_of(args: argparse.Namespace) -> str:
         ("routing", "set-local-endpoint"): "local_endpoint",
         ("kubernetes", "egress"): "kubernetes_egress",
         ("kubernetes", "set-egress"): "kubernetes_egress",
+        ("limits", "command-timeout"): "command_timeout",
+        ("limits", "set-command-timeout"): "command_timeout",
         ("bootstrap", "list"): "bootstrap_import_list",
     }
     key = ("repository" if command == "repositories" else command, sub)
@@ -950,6 +1010,8 @@ def result_for(
         actions = nx.local_endpoint_actions(document, prefix)
     elif kind == "kubernetes_egress":
         actions = nx.kubernetes_egress_actions(document, prefix)
+    elif kind == "command_timeout":
+        actions = nx.command_timeout_actions(document, prefix)
     elif kind == "audit_page":
         actions = nx.audit_actions(document, prefix, args.limit, args.cursor)
     return Result(kind=kind, data=document, state=state, next=actions, role=role)
