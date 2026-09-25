@@ -30,7 +30,10 @@ spec 26 and spec 12; this note records the decisions behind them.
   line. `sinceTime` is one-second granular, so no request can resume inside such a
   second; the alternative, an unbounded read, is what the issue was about. The resume
   position after a skip names no line (`RESUME_AT_BOUNDARY` in `logstream`), so the
-  first line of the next second is kept.
+  first line of the next second is kept. Because one pull is now bounded, the
+  supervisor's final drain before `logs_drained` repeats until a pull brings nothing
+  (at most 256 pulls); a single bounded pull at exit would have lost the end of the
+  log, which the review round found.
 - **Limits are read back from the live Pod (66, 76).** Adoption already took the grace
   period from the Job template (C8b, #53); it now takes every limit from the live Pod
   when there is one, `observe` does the same for a Pod it launched, `terminate` reads

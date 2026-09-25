@@ -426,7 +426,8 @@ the namespace. A deployment therefore names one exact, pullable reference in
   resumed strict-after by the (timestamp, line hash) pair (10). A restarted
   supervisor re-attaches by Job name. Each poll also sends `limitBytes`
   (4 MiB), keeps only the whole lines of a capped read, and lets the next poll
-  resume from the last of them, so no poll holds a whole long-running log.
+  resume from the last of them, so no poll holds a whole long-running log; the
+  supervisor's final drain repeats the pull until it brings nothing (10).
   `sinceTime` is one-second granular, so a read that cannot get past its first
   second is retried larger up to 64 MiB; past that, the rest of the second is
   skipped with a `[crucible] log lines skipped` line in the log rather than
@@ -529,7 +530,8 @@ the attempt row. (Made concrete 2026-09-21 during C8a.) `limits.as_dict()`
 (issue 93) carries `cpu_request` and `memory_request` beside `cpu` and
 `memory`, so the evidence records what was actually asked of the scheduler
 next to what was allowed to run. The limits are read back from the live Pod
-once it has been seen, and `limits_source` says so (`pod`, else `policy`):
+once it has been seen, and `limits_source` says so (`pod`; `template` for an
+attempt adopted before its Pod existed; `policy` before any Pod was read):
 admission may rewrite what was asked for, and an attempt adopted after a
 supervisor restart has no policy in memory at all, so what the Pod carries is
 the observed fact. The same reading gives an adopted attempt's drain the grace

@@ -445,9 +445,10 @@ class _Launched:
     # deleted it is never reported as lost (16).
     terminated: str | None = None
     exit_code: int | None = None
-    # Whether `limits` was read from the live Pod rather than derived from the policy or
-    # from the Job's template, so the evidence says which of the two it records.
-    limits_observed: bool = False
+    # Where `limits` came from, so the evidence says what it records: `policy` at
+    # launch, `template` for an attempt adopted before its Pod existed, `pod` once the
+    # live Pod has been read.
+    limits_source: Literal["policy", "template", "pod"] = "policy"
 
 
 # What an adopted attempt's `_Launched` carries before the supervisor hands the real
@@ -1184,7 +1185,7 @@ class KubernetesProvider:
         if launched is not None and not launched.pod_name:
             launched.pod_name = str((pod.get("metadata") or {}).get("name") or "")
             launched.node = str((pod.get("spec") or {}).get("nodeName") or "") or None
-        if launched is not None and not launched.limits_observed:
+        if launched is not None and launched.limits_source != "pod":
             _observe_limits(launched, pod)
         terminated = _terminated_state(status)
         if terminated is not None:
@@ -1352,7 +1353,7 @@ class KubernetesProvider:
             if limit < LOG_READ_CEILING:
                 limit = min(limit * 4, LOG_READ_CEILING)
                 continue
-            return _skip_crowded_second(payload, limit)
+            return _skip_crowded_second(payload, limit, since)
 
     async def collect(
         self, h: Handle, ws: Workspace, spec: LaunchSpec | None = None
@@ -1477,7 +1478,7 @@ class KubernetesProvider:
             # What the live Pod carried when it was seen (issue 76), else what the policy
             # asked for, and which of the two this is.
             "limits": (launched.limits if launched else self._limits(spec)).as_dict(),
-            "limits_source": "pod" if launched and launched.limits_observed else "policy",
+            "limits_source": launched.limits_source if launched else "policy",
             "pod_pid_limit": probe.pid_limit if probe else None,
             "pod_pid_limit_source": probe.pid_limit_source if probe else "",
             "runtime_class": "standard",
@@ -1662,7 +1663,7 @@ class KubernetesProvider:
                     image_digest=image,
                     limits=k8sspec.limits_from_pod(pod_spec, k8sspec.limits_from_policy({})),
                     launched_at=time.monotonic() - created,
-                    limits_observed=pod_spec is live_spec,
+                    limits_source="pod" if pod_spec is live_spec else "template",
                 )
             launched = self._launched[attempt_id]
             if pod is not None and not launched.pod_name:
@@ -3687,17 +3688,32 @@ class KubernetesProvider:
 # ----- pure helpers -------------------------------------------------------
 
 
-def _skip_crowded_second(payload: bytes, limit: int) -> list[LogChunk]:
-    """More than `limit` bytes of log fall inside one second, so no read `sinceTime`
-    can express gets past it (issue 63). The resume moves to the start of the next
-    second with one notice line in the log saying so; the lines of that second beyond
-    the ceiling are not stored. The second is the latest one the capped read shows."""
+def _latest_stamp(lines: bytes) -> datetime | None:
     latest: datetime | None = None
-    for raw in payload.split(b"\n"):
+    for raw in lines.split(b"\n"):
         stamp = raw.partition(b" ")[0].decode("utf-8", "replace")
         with contextlib.suppress(ValueError):
             seen = parse_rfc3339(stamp)
             latest = seen if latest is None or seen > latest else latest
+    return latest
+
+
+def _skip_crowded_second(payload: bytes, limit: int, since: LogOffset) -> list[LogChunk]:
+    """More than `limit` bytes of log fall inside one second, so no read `sinceTime`
+    can express gets past it (issue 63). The resume moves to the start of the next
+    second with one notice line in the log saying so; the lines of that second beyond
+    the ceiling are not stored.
+
+    The crowded second is the latest one among the read's whole lines, all of which
+    were already stored; the line the cap cut belongs to a second that may be perfectly
+    readable. Only a read with no whole line at all (one line longer than the ceiling)
+    takes the cut line's second, and a read with no readable stamp the stored
+    position's, so every skip moves the position forward."""
+    whole, _, cut = payload.rpartition(b"\n")
+    latest = _latest_stamp(whole) or _latest_stamp(cut)
+    if latest is None and since.timestamp:
+        with contextlib.suppress(ValueError):
+            latest = parse_rfc3339(since.timestamp)
     if latest is None:
         log.warning("a capped log read carried no timestamp; the next poll tries again")
         return []
@@ -3725,7 +3741,7 @@ def _observe_limits(launched: _Launched, pod: Mapping[str, Any]) -> None:
     spec = pod.get("spec") or {}
     if spec.get("containers"):
         launched.limits = k8sspec.limits_from_pod(spec, launched.limits)
-        launched.limits_observed = True
+        launched.limits_source = "pod"
 
 
 def _seconds_until(timestamp: str) -> float:

@@ -69,8 +69,11 @@ logs each tick and appends. Resume position is the last stored
 that timestamp and skips until the hash matches, which avoids both
 duplicates and drops among lines sharing a timestamp (Docker has no byte
 offsets). Live tail streams chunks as they land. Log bytes advancing is one
-heartbeat signal. An attempt records `logs_drained` after the final pull
-following exit; cleanup never runs before it.
+heartbeat signal. An attempt records `logs_drained` after the final drain
+following exit; cleanup never runs before it. A provider may bound one pull
+(the Kubernetes provider reads a few MiB at a time), so the final drain pulls
+until a pull brings nothing, up to 256 pulls. (Made concrete 2026-09-25,
+issue 63.)
 
 ## Leases
 

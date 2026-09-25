@@ -775,7 +775,7 @@ async def test_an_adopted_attempt_drains_with_its_policy_grace_and_reports_pod_l
     pod = await successor._pod_of(adopted.ref)
     assert pod is not None
     print("live limits:", json.dumps(pod["spec"]["containers"][0]["resources"]))
-    assert launched.limits_observed is True
+    assert launched.limits_source == "pod"
     assert launched.limits.as_dict() == provider._limits(spec).as_dict()
     assert launched.limits.grace_seconds == 7
     await successor.terminate(adopted, "drain")

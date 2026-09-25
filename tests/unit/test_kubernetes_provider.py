@@ -736,6 +736,7 @@ async def test_an_adopted_job_with_no_pod_yet_collects_with_the_real_image() -> 
     adopted = await provider.reconcile()
     assert provider._launched[launch.attempt_id].image_digest == handle.image_digest
     assert provider._launched[launch.attempt_id].limits.grace_seconds == 30
+    assert provider._launched[launch.attempt_id].limits_source == "template"
     # The Job controller gets round to it after the restart.
     api.no_pod_yet.discard(launch.attempt_id)
     api._start_job(api.objects[("jobs", handle.ref)].body)
@@ -1618,3 +1619,29 @@ def test_without_a_probe_image_the_canary_falls_back_to_the_first_repository() -
         config=KubernetesConfig(image_repositories=("registry.example/crucible-worker",))
     )
     assert provider._probe_image() == "registry.example/crucible-worker"
+
+
+def test_a_skip_resumes_after_the_crowded_second_not_after_the_line_the_cap_cut() -> None:
+    """Review of issue 63: the cut line belongs to the next second, which may be
+    perfectly readable; the skip moves past the second of the whole lines only."""
+    payload = (
+        _stamped(20, 100_000_000, "a").encode()
+        + b"\n"
+        + _stamped(20, 200_000_000, "b").encode()
+        + b"\n"
+        + _stamped(21, 0, "the cap cut th").encode()
+    )
+    [notice] = kubernetes_module._skip_crowded_second(payload, 64, LogOffset())
+    assert notice.ts is not None and notice.ts.isoformat() == "2026-09-25T17:00:21+00:00"
+
+
+def test_a_skip_inside_one_line_longer_than_the_ceiling_passes_that_line() -> None:
+    payload = _stamped(21, 5, "x" * 200).encode()[:100]
+    [notice] = kubernetes_module._skip_crowded_second(payload, 100, LogOffset())
+    assert notice.ts is not None and notice.ts.isoformat() == "2026-09-25T17:00:22+00:00"
+
+
+def test_a_skip_with_no_readable_stamp_still_moves_past_the_stored_position() -> None:
+    since = LogOffset(timestamp="2026-09-25T17:00:30.500000+00:00", line_sha256="0" * 64)
+    [notice] = kubernetes_module._skip_crowded_second(b"no stamp here", 64, since)
+    assert notice.ts is not None and notice.ts.isoformat() == "2026-09-25T17:00:31+00:00"
