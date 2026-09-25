@@ -25,7 +25,7 @@ from crucible.application.admin import providers as providers_admin
 from crucible.application.admin import repositories as repositories_admin
 from crucible.application.admin import status as status_admin
 from crucible.application.admin.context import AdminContext
-from crucible.application.errors import ConflictError
+from crucible.application.errors import ConflictError, ContractValidationError
 from crucible.contracts.api import ExternalReviewAttestation, RepositoryRegistration
 
 router = APIRouter()
@@ -350,15 +350,49 @@ def admin_remove(
 
 @router.get("/admin/images")
 async def admin_images(ctx: Ctx, uow: UoW, _principal: Admin) -> dict[str, Any]:
-    return {"items": await images.list_all(_admin(ctx), uow)}
+    """Every image a provider sees, and one row per harness: its default, the image a
+    rollback returns to, and the images it may be promoted to (ADR 0016)."""
+    admin = _admin(ctx)
+    return {
+        "items": await images.list_all(admin, uow),
+        "defaults": await images.defaults(admin, uow),
+    }
+
+
+def _harness(body: dict[str, Any] | None) -> str:
+    value = (body or {}).get("harness")
+    if not isinstance(value, str) or not value:
+        raise ContractValidationError(
+            "promotion is per harness: name the harness",
+            errors=[{"path": "harness", "message": "must name a harness"}],
+        )
+    return value
 
 
 @router.post("/admin/images/{digest:path}/promote")
 async def admin_promote(
     digest: str, ctx: Ctx, uow: UoW, principal: Admin, body: Annotated[dict[str, Any], Body()]
 ) -> dict[str, Any]:
+    """Make the image the default for the one harness the body names (ADR 0016)."""
     result = await images.promote(
-        _admin(ctx), uow, principal=principal.name, digest=digest, reason=_reason(body)
+        _admin(ctx),
+        uow,
+        principal=principal.name,
+        harness=_harness(body),
+        digest=digest,
+        reason=_reason(body),
+    )
+    uow.commit()
+    return result
+
+
+@router.post("/admin/images/rollback")
+def admin_rollback(
+    ctx: Ctx, uow: UoW, principal: Admin, body: Annotated[dict[str, Any], Body()]
+) -> dict[str, Any]:
+    """Return the harness the body names to the image its last promotion replaced."""
+    result = images.rollback(
+        _admin(ctx), uow, principal=principal.name, harness=_harness(body), reason=_reason(body)
     )
     uow.commit()
     return result

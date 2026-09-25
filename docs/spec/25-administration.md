@@ -42,8 +42,9 @@ without Foundry.
   usage. `next` lists the admin verbs valid from the record's state: for a
   credential, what 25's operations accept from its state (`login` only in
   local mode, because only there can the harness's own CLI run); for a
-  harness, the enable flag's other value; for an image, `promote` while it
-  is a supported candidate; for a pool, `clear-exhaustion` while its mark
+  harness, the enable flag's other value; for each harness on the image
+  list, `promote` for each image offered for it that is not its default and
+  `rollback` while it has a previous image; for a pool, `clear-exhaustion` while its mark
   is active; for a verified import, `commit`. Each names its argv,
   including the `--api-url` or `--config` the command ran with, and what
   the caller must supply. Logs, and the interactive parts of a login, go to
@@ -66,7 +67,7 @@ resource.
 
 | Part | Fields |
 |---|---|
-| `harnesses[]` | name, both enablement gates with the reason each carries, adapter supported range, images known (reference, harness version, digest, promotion state), credential status (below), concurrency limit and current use, last launch outcome (a probe records itself there as `probe:<exit class>`, or `probe:inconclusive:<cause>` when it decided nothing) |
+| `harnesses[]` | name, both enablement gates with the reason each carries, adapter supported range, its default image and previous image (ADR 0016), images known (reference, harness version, digest, and whether it is this harness's default or previous image), credential status (below), concurrency limit and current use, last launch outcome (a probe records itself there as `probe:<exit class>`, or `probe:inconclusive:<cause>` when it decided nothing) |
 | `credentials[harness]` | `state`: `absent`, `configured` (files present, shape unchecked), `invalid` (the shape check failed, or a probe observed the provider refusing the credential; never a probe that merely did not finish), `validated` (a conclusive probe ran the credential); `mount_mode` (`ro`, `rw-narrow`); `last_validated_at`; `last_auth_failure_at` and its exit class (set only by those two conclusive outcomes); `refresh_verified` (bool, from the compatibility test); `source_fingerprint` (sha256 of the file **names and sizes**, never contents); `session_compatibility`: `unverified`, `verified`, `failed` |
 | `providers[]` | name, capabilities, `health`: `ok`, `degraded`, `unavailable` with detail (daemon reachable, proxy reachable, network present, disk headroom) |
 | `github` | App id and slug (public), key present (bool), key fingerprint (sha256 of the public key), installations visible, per registered repository: installation covers it, last successful token mint, last API failure, webhook enabled |
@@ -89,7 +90,7 @@ resource.
 | onboard a credential | `POST /admin/credentials/{harness}/login` (starts) | `credentials login --harness` | interactive flow below; the service runs the login in the promoted worker image (a container on Docker, a Job on Kubernetes) and the CLI retains its local-host mode. Refused while an attempt of that harness holds its credential (12) |
 | rotate or replace a credential source | `POST /admin/credentials/{harness}/rotate` | `credentials rotate --harness` | the operator's prepared directory is shape-checked, copied in, and left exactly as it was found; the swap is two renames; the previous directory is retained for `credential_retention_hours` then shredded; a failed swap rolls back; every step an event. Directory-held credentials only: where the credential is a Secret (Kubernetes, ADR 0015) it refuses and names the Secret, and a login with `replace` is the replacement |
 | remove a credential | `POST /admin/credentials/{harness}/remove` | `credentials remove --harness` | harness becomes `absent`; the directory is shredded at once rather than retained, because the operator said remove, and the harness is disabled with that reason. Directory-held credentials only, as rotate |
-| list images and promote | `GET /admin/images`, `POST /admin/images/{digest}/promote` | `images list|promote` | 13; each image lists every harness it carries with its version (`harnesses`), and the one worker image carries all four (C11), so one promotion makes it the default for all four, refused whole if any of them is outside its adapter's range. A previous default the promoted image fully covers becomes `retained`. Rollback is promoting the previous digest, which rolls all four harnesses back together. The probe and the live tiers run the promoted image |
+| list images, promote, roll back | `GET /admin/images`, `POST /admin/images/{digest}/promote`, `POST /admin/images/rollback` | `images list`, `images promote DIGEST --harness`, `images rollback --harness` | 13, ADR 0016: promotion is per harness (the operator's decision of 2026-09-25). The list adds `defaults`, one row per harness with its current image, its previous image, and the images it may be promoted to: those that carry it at a version inside its adapter's range, release versions and `latest`, never a `ci-*` proof tag. A promotion names the harness and moves only that harness, refused when the image does not carry it inside the range; the image it replaces becomes the harness's previous image. Rollback swaps a harness's default and previous image and moves no other harness. Launches, the probe, the harness test and a login run the launching harness's own default |
 | provider health | `GET /admin/providers` | `providers status` | |
 | GitHub health | `GET /admin/github`, `POST /admin/github/check` | `github status|check` | check mints a token per registered repository and discards it |
 | register a repository | `PUT /admin/repositories/{name}` | `repositories register` | 04; an administrative mutation like any other, guarded and audited here, with the previous registration as the before summary. 04's own `PUT /repositories/{name}` is a different, non-administrative surface |

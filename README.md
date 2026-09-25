@@ -97,8 +97,9 @@ the e2e script harness as the fourth adapter. Each adapter declares the version
 range it was tested with; the image label carries the installed version, and a
 launch outside the range is refused with a wake. `GET /v1/harnesses` reports
 installed and supported versions, both enable flags with their reasons, and a
-sanitized credential state; `GET /v1/images` lists every labelled image with its
-promotion state.
+sanitized credential state; `GET /v1/images` lists every labelled image with the
+harnesses it is the default image of. Each harness has its own default image,
+promoted and rolled back on its own (ADR 0016).
 
 A harness credential is a directory Crucible reads (`[credentials.<harness>]`,
 paths only), never the operator's own `~/.claude`, `~/.codex` or `~/.gemini`.
@@ -141,7 +142,8 @@ crucible admin credentials login --harness codex                 # prints the UR
 crucible admin credentials rotate --harness agy --new-path /path/to/staged
 crucible admin credentials remove --harness codex --reason "..."
 crucible admin images list
-crucible admin --reason "..." images promote <digest>
+crucible admin images promote <digest> --harness hermes   # per harness (ADR 0016)
+crucible admin images rollback --harness hermes
 crucible admin providers status
 crucible admin github status
 crucible admin github check                                  # mints and discards a token per registered repository

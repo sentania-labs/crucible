@@ -31,14 +31,16 @@ from crucible.adapters.persistence.unit_of_work import SqlUnitOfWorkFactory, mak
 from crucible.application.admin.context import AdminContext
 from crucible.application.auth import authenticate
 from crucible.application.errors import ApplicationError
+from crucible.application.routing import image_for_harness
 from crucible.application.supervisor import Supervisor
 from crucible.cli import admin as cli
 from crucible.client.config import ADMIN_TOKEN_ENV
 from crucible.client.http import Api
-from crucible.domain.entities import ImagePromotion, Role
+from crucible.domain.entities import Role
 from crucible.ports.execution import ImageInfo
 from crucible.ports.harness import CredentialSource
 from tests.admin_cli import admin_main, envelope_data
+from tests.fixtures import promote_for_test
 
 pytestmark = pytest.mark.integration
 
@@ -519,6 +521,7 @@ def test_every_remaining_ui_mutation_dispatches_to_the_shared_application_servic
         (ui.login, "cancel_login", stub("login-cancel")),
         (ui.login, "finish_login", stub("login-finish")),
         (ui.images, "promote", async_stub("image-promote")),
+        (ui.images, "rollback", stub("image-rollback")),
         (ui.routing, "clear_exhaustion", stub("routing-clear")),
         (ui.repositories, "register", stub("repository-register")),
         (ui.repositories, "remove", stub("repository-remove")),
@@ -543,7 +546,8 @@ def test_every_remaining_ui_mutation_dispatches_to_the_shared_application_servic
         ("login-code", {"harness": "codex", "code": "fixture-code"}),
         ("login-cancel", {"harness": "codex"}),
         ("login-finish", {"harness": "codex"}),
-        ("image-promote", {"digest": "sha256:" + "a" * 64}),
+        ("image-promote", {"harness": "hermes", "digest": "sha256:" + "a" * 64}),
+        ("image-rollback", {"harness": "hermes"}),
         ("routing-clear", {"pool": "primary"}),
         (
             "routing-upload",
@@ -585,6 +589,7 @@ def test_every_remaining_ui_mutation_dispatches_to_the_shared_application_servic
         "login-cancel",
         "login-finish",
         "image-promote",
+        "image-rollback",
         "routing-clear",
         "routing-upload",
         "policy-upload",
@@ -1073,58 +1078,90 @@ def test_login_through_api_and_cli_against_the_fake_cli(
     assert ("credential_login_finished", "crucible-admin") in kinds
 
 
-def test_images_list_and_promote_through_api_and_cli(
+def test_images_are_promoted_and_rolled_back_per_harness(
+    ctx: AppContext,
     admin_client: TestClient,
     live_supervisor: Supervisor,
     config_file: Path,
     provider: FakeProvider,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    """crucible#116, ADR 0016, the operator's decision of 2026-09-25: each harness has its
+    own default image. Promoting one image for Hermes and another for AGY leaves each
+    where it was put, a rollback moves only the harness it names, and a launch resolves
+    the launching harness's own image."""
     asyncio.run(live_supervisor.tick())
-    # The fake provider lists what a test hands it (08); the CLI's own provider lists
-    # nothing, so the promotion is exercised through the API and its refusal through
-    # both.
-    # One worker image carries all four harnesses (C11): the listing shows each version
-    # and promoting it switches all four.
-    image = ImageInfo(
-        reference="crucible-worker:20260916-aaaaaaaaaaaa",
+    first = ImageInfo(
+        reference="ghcr.io/sentania-labs/crucible-worker:0.5.5",
         digest="sha256:" + "d" * 64,
         harnesses=WORKER_HARNESSES,
     )
-    provider.images = [image]
-    listed = admin_client.get("/v1/admin/images").json()["items"]
-    assert listed[0]["promotion_state"] == "candidate" and listed[0]["supported"] is True
-    assert listed[0]["harnesses"] == WORKER_HARNESSES
-    promoted = admin_client.post(
-        f"/v1/admin/images/{image.digest}/promote", json={"reason": "canary passed"}
+    second = ImageInfo(
+        "ghcr.io/sentania-labs/crucible-worker:0.5.6", "sha256:" + "e" * 64, WORKER_HARNESSES
+    )
+    proof = ImageInfo(
+        "ghcr.io/sentania-labs/crucible-worker:ci-35000000000",
+        "sha256:" + "f" * 64,
+        WORKER_HARNESSES,
+    )
+    provider.images = [first, second, proof]
+    listed = admin_client.get("/v1/admin/images").json()
+    assert {i["promotion_state"] for i in listed["items"]} == {"candidate"}
+    hermes_row = next(row for row in listed["defaults"] if row["harness"] == "hermes")
+    assert hermes_row["current"] is None
+    # A CI proof tag is never offered (crucible#111).
+    assert [c["reference"] for c in hermes_row["choices"]] == [first.reference, second.reference]
+
+    for harness in ("hermes", "agy"):
+        promoted = admin_client.post(
+            f"/v1/admin/images/{first.digest}/promote", json={"harness": harness}
+        )
+        assert promoted.status_code == 200, promoted.text
+    moved = admin_client.post(
+        f"/v1/admin/images/{second.digest}/promote", json={"harness": "agy", "reason": "canary"}
     ).json()
-    assert promoted["promotion_state"] == "default"
-    assert promoted["harnesses"] == WORKER_HARNESSES
-    provider.images = [
-        image,
-        ImageInfo("crucible-worker:20260917-bbbbbbbbbbbb", "sha256:" + "e" * 64, WORKER_HARNESSES),
-    ]
-    again = admin_client.post(
-        "/v1/admin/images/sha256:" + "e" * 64 + "/promote", json={"reason": "next canary"}
-    ).json()
-    assert again["retained"] == [image.digest]
+    assert moved["harness"] == "agy" and moved["digest"] == second.digest
+    assert moved["previous"]["digest"] == first.digest
+    rows = {r["harness"]: r for r in admin_client.get("/v1/admin/images").json()["defaults"]}
+    assert rows["hermes"]["current"]["digest"] == first.digest
+    assert rows["agy"]["current"]["digest"] == second.digest
+    assert rows["claude_code"]["current"] is None
+    with ctx.uow_factory() as uow:
+        assert image_for_harness(uow, "hermes", "kubernetes") == first.reference
+        assert image_for_harness(uow, "agy", "kubernetes") == second.reference
+        assert image_for_harness(uow, "codex", "kubernetes") is None
+
+    # A rollback moves only the harness it names, and a second one undoes the first.
+    back = run_cli(config_file, "images", "rollback", "--harness", "agy", capsys=capsys)
+    assert back["digest"] == first.digest and back["previous"]["digest"] == second.digest
+    rows = {r["harness"]: r for r in admin_client.get("/v1/admin/images").json()["defaults"]}
+    assert rows["agy"]["current"]["digest"] == first.digest
+    assert rows["hermes"]["current"]["digest"] == first.digest
+    assert rows["hermes"]["previous"] is None
+    refused = admin_client.post("/v1/admin/images/rollback", json={"harness": "hermes"})
+    assert refused.status_code == 409, refused.text
+    unnamed = admin_client.post(f"/v1/admin/images/{first.digest}/promote", json={})
+    assert unnamed.status_code == 422 and unnamed.json()["errors"][0]["path"] == "harness"
     states = {
-        i["digest"]: i["promotion_state"]
+        i["digest"]: (i["promotion_state"], i["default_for"], i["previous_for"])
         for i in admin_client.get("/v1/admin/images").json()["items"]
     }
-    assert states[image.digest] == "retained" and states["sha256:" + "e" * 64] == "default"
-    # Rollback is promoting the previous digest, and it rolls back all four together.
-    back = admin_client.post(
-        f"/v1/admin/images/{image.digest}/promote", json={"reason": "roll back"}
-    ).json()
-    assert back["promotion_state"] == "default" and back["retained"] == ["sha256:" + "e" * 64]
-    assert run_cli(config_file, "images", "list", capsys=capsys)["items"] == []
+    assert states[first.digest] == ("default", ["agy", "hermes"], [])
+    assert states[second.digest] == ("retained", [], ["agy"])
+
     with pytest.raises(SystemExit):
         admin_main(
-            ["--config", str(config_file), "--reason", "x", "images", "promote", "sha256:nope"]
+            ["--config", str(config_file), "images", "promote", "sha256:nope", "--harness", "agy"]
         )
     assert "not-found" in capsys.readouterr().out
-    assert ("image_promoted", "admin-principal") in audit_kinds(admin_client)
+    events = admin_client.get("/v1/admin/audit", params={"limit": 200}).json()["items"]
+    promotions = [e["payload"] for e in events if e["kind"] == "image_promoted"]
+    assert [(p["harness"], p["rollback"]) for p in promotions] == [
+        ("hermes", False),
+        ("agy", False),
+        ("agy", False),
+        ("agy", True),
+    ]
 
 
 def test_providers_github_audit_status_and_capabilities(
@@ -1677,8 +1714,8 @@ def test_container_login_checks_promotion_before_retiring_a_credential(
             return object()
 
     with admin_ctx.uow_factory() as uow:
-        monkeypatch.setattr(uow.image_promotions, "list_all", lambda: [])
-        with pytest.raises(ApplicationError, match="no promoted worker image"):
+        monkeypatch.setattr(uow.harness_images, "get", lambda _harness: None)
+        with pytest.raises(ApplicationError, match="no worker image is promoted"):
             start_login(
                 admin_ctx,
                 uow,
@@ -1724,16 +1761,14 @@ def test_container_login_restores_a_credential_when_replacement_mkdir_fails(
 
     monkeypatch.setattr(Path, "mkdir", fail_replacement_mkdir)
     with admin_ctx.uow_factory() as uow:
-        uow.image_promotions.put(
-            ImagePromotion(
-                digest="sha256:" + "b" * 64,
-                reference="crucible-worker:codex-fixture",
-                harnesses={"codex": "fixture"},
-                state="default",
-                updated_at=admin_ctx.clock.now(),
-                updated_by="tests",
-                reason="mkdir rollback test",
-            )
+        promote_for_test(
+            uow,
+            digest="sha256:" + "b" * 64,
+            reference="crucible-worker:codex-fixture",
+            harnesses={"codex": "fixture"},
+            at=admin_ctx.clock.now(),
+            by="tests",
+            reason="mkdir rollback test",
         )
         uow.commit()
     with admin_ctx.uow_factory() as uow:

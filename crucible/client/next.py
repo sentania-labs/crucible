@@ -526,22 +526,41 @@ def harness_actions(items: Iterable[Any], prefix: Sequence[str]) -> list[dict[st
     return out
 
 
-def image_actions(items: Iterable[Any], prefix: Sequence[str]) -> list[dict[str, Any]]:
-    return [
-        action(
-            f"promote:{item['digest']}",
-            f"promote {item.get('reference', item['digest'])}",
-            [*prefix, "images", "promote", str(item["digest"])],
-            optional=OPTIONAL_REASON,
-            roles=(ADMIN,),
-        )
-        for item in items
-        if isinstance(item, dict)
-        and item.get("digest")
-        and item.get("harnesses")
-        and item.get("supported") is True
-        and item.get("promotion_state") == "candidate"
-    ]
+def image_actions(document: Any, prefix: Sequence[str]) -> list[dict[str, Any]]:
+    """Per harness (ADR 0016): promote each offered image that is not its default, and
+    roll back while it has a previous image."""
+    rows = document.get("defaults") if isinstance(document, dict) else None
+    out: list[dict[str, Any]] = []
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict) or not row.get("harness"):
+            continue
+        harness = str(row["harness"])
+        current: dict[str, Any] = row["current"] if isinstance(row.get("current"), dict) else {}
+        for choice in row.get("choices") or []:
+            if not isinstance(choice, dict) or not choice.get("digest"):
+                continue
+            if choice["digest"] == current.get("digest"):
+                continue
+            out.append(
+                action(
+                    f"promote:{harness}:{choice['digest']}",
+                    f"make {choice.get('reference', choice['digest'])} the {harness} default",
+                    [*prefix, "images", "promote", str(choice["digest"]), "--harness", harness],
+                    optional=OPTIONAL_REASON,
+                    roles=(ADMIN,),
+                )
+            )
+        if isinstance(row.get("previous"), dict):
+            out.append(
+                action(
+                    f"rollback:{harness}",
+                    f"return {harness} to {row['previous'].get('reference', 'its previous image')}",
+                    [*prefix, "images", "rollback", "--harness", harness],
+                    optional=OPTIONAL_REASON,
+                    roles=(ADMIN,),
+                )
+            )
+    return out
 
 
 def exhaustion_actions(items: Iterable[Any], prefix: Sequence[str]) -> list[dict[str, Any]]:

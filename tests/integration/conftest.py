@@ -41,7 +41,7 @@ TRUNCATE = (
     "pull_requests, attempt_metrics, pool_exhaustions, wakes, review_dispositions, "
     "decisions, escalations, "
     "acceptance_results, gate_results, review_reports, evidence, artifacts, "
-    "provider_settings, "
+    "provider_settings, harness_images, "
     "bootstrap_imports, idempotency_keys, supervisor_status, completion_claims, leases, events, "
     "attempts, executions, task_contracts, tasks, repositories, principals RESTART IDENTITY CASCADE"
 )

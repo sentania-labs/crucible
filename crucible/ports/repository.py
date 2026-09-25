@@ -27,9 +27,9 @@ from crucible.domain.entities import (
     ExternalReviewCycle,
     GateResultRecord,
     GitHubDelivery,
+    HarnessImage,
     HarnessState,
     Heartbeat,
-    ImagePromotion,
     Lease,
     LogChunkRecord,
     Policy,
@@ -506,12 +506,14 @@ class HarnessStateRepository(Protocol):
     def put(self, state: HarnessState) -> HarnessState: ...
 
 
-class ImagePromotionRepository(Protocol):
-    def get(self, digest: str) -> ImagePromotion | None: ...
+class HarnessImageRepository(Protocol):
+    """Each harness's default worker image (13, ADR 0016). None: never promoted."""
 
-    def list_all(self) -> Sequence[ImagePromotion]: ...
+    def get(self, harness: str) -> HarnessImage | None: ...
 
-    def put(self, promotion: ImagePromotion) -> ImagePromotion: ...
+    def list_all(self) -> Sequence[HarnessImage]: ...
+
+    def put(self, image: HarnessImage) -> HarnessImage: ...
 
 
 class ProviderSettingRepository(Protocol):
@@ -597,7 +599,7 @@ class UnitOfWork(Protocol):
     ci_decisions: CIDecisionRepository
     github_deliveries: GitHubDeliveryRepository
     harnesses: HarnessStateRepository
-    image_promotions: ImagePromotionRepository
+    harness_images: HarnessImageRepository
     bootstrap_imports: BootstrapImportRepository
     provider_settings: ProviderSettingRepository
 

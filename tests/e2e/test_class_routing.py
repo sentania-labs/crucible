@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 
 from crucible.adapters.api.deps import AppContext
 from crucible.application.supervisor import Supervisor
-from crucible.domain.entities import ImagePromotion, Policy, RoutingPolicyRecord
+from crucible.domain.entities import Policy, RoutingPolicyRecord
 from tests.e2e import daemon
 from tests.e2e.conftest import (
     RUN_ID,
@@ -95,22 +95,13 @@ def _promote_second_tag(ctx: AppContext, worker_image: str) -> str:
     second_image = f"crucible-worker:script-harness-reroute-{RUN_ID}"
     daemon.run("tag", worker_image, second_image)
     with ctx.uow_factory() as uow:
-        current = next(
-            image
-            for image in uow.image_promotions.list_all()
-            if image.carries("script-harness") and image.state == "default"
-        )
-        uow.image_promotions.put(
-            ImagePromotion(
-                digest=current.digest,
-                reference=second_image,
-                harnesses=dict(current.harnesses),
-                state="default",
-                updated_at=ctx.clock.now(),
-                updated_by="e2e",
-                reason="class routing second image",
-            )
-        )
+        current = uow.harness_images.get("script-harness")
+        assert current is not None
+        current.reference = second_image
+        current.updated_at = ctx.clock.now()
+        current.updated_by = "e2e"
+        current.reason = "class routing second image"
+        uow.harness_images.put(current)
         uow.commit()
     return second_image
 

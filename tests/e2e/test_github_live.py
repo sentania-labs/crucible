@@ -31,12 +31,12 @@ from crucible.application.delivery_tick import DeliveryConfig
 from crucible.application.repositories import register_repository
 from crucible.application.supervisor import Supervisor
 from crucible.contracts.api import ExternalReviewAttestation, RepositoryRegistration
-from crucible.domain.entities import ImagePromotion
 from crucible.domain.secrets import scan_text
 from tests.e2e import github_live
 from tests.e2e.conftest import RUN_ID, e2e_contract, run_until, submit_and_start, upload_review
 from tests.e2e.github_live import LiveConfig
 from tests.e2e.policy import e2e_policy_document, e2e_routing_document
+from tests.fixtures import promote_for_test
 
 NOT_CONFIGURED = github_live.why_not_configured()
 pytestmark = [
@@ -194,16 +194,14 @@ def live_client(
             item for item in asyncio.run(provider.list_images()) if item.reference == worker_image
         )
         with ctx.uow_factory() as uow:
-            uow.image_promotions.put(
-                ImagePromotion(
-                    digest=worker.digest,
-                    reference=worker.reference,
-                    harnesses=dict(worker.harnesses) or {"script-harness": "1.0.0"},
-                    state="default",
-                    updated_at=ctx.clock.now(),
-                    updated_by="e2e-github",
-                    reason="live GitHub script harness image",
-                )
+            promote_for_test(
+                uow,
+                digest=worker.digest,
+                reference=worker.reference,
+                harnesses=dict(worker.harnesses) or {"script-harness": "1.0.0"},
+                at=ctx.clock.now(),
+                by="e2e-github",
+                reason="live GitHub script harness image",
             )
             uow.commit()
     with TestClient(app, headers={"Authorization": f"Bearer {tokens['orchestrator']}"}) as c:

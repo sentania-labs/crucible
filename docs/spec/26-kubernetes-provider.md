@@ -99,7 +99,7 @@ Per attempt the provider creates, in `crucible-workers`, all labelled
 | Job `verify-bundle-<attempt>` | `git bundle verify`, no network | until complete |
 | Job `verifier-<attempt>` | re-runs `required_verification` on an independent clone from the bundle (10, 11) | until complete |
 | Job `publish-<attempt>` | pushes the sealed bundle with a token on an in-memory volume (23) | until complete |
-| Job `login-<harness>-<id>` (admin flow, 25) | the harness's own login in the promoted worker image, no workspace, no credential mounted, a memory-backed home; the service reads the auth files back over exec and writes the harness Secret (ADR 0015). Labelled `crucible.role=login`, `crucible.harness`, `crucible.login` and never `crucible.attempt` | until the service has read it back, cancelled, or timed out; its own deadline and a TTL remove it if the api died |
+| Job `login-<harness>-<id>` (admin flow, 25) | the harness's own login in that harness's default worker image (ADR 0016), no workspace, no credential mounted, a memory-backed home; the service reads the auth files back over exec and writes the harness Secret (ADR 0015). Labelled `crucible.role=login`, `crucible.harness`, `crucible.login` and never `crucible.attempt` | until the service has read it back, cancelled, or timed out; its own deadline and a TTL remove it if the api died |
 | NetworkPolicy `np-login-<id>` | the login Job's egress: the adapter's `login_endpoints` only | with its Job; the retention sweep removes one whose Job is gone |
 | ConfigMap `login-lock-<harness>` (admin flow, 25) | the harness's login lock across every api replica: created before the login Job, so exactly one replica gets it and the others are refused naming its holder. Carries the holder and an expiry (the login deadline, the read-back window and five minutes). Labelled `crucible.role=login-lock` and `crucible.harness`, never `crucible.attempt` | deleted by the api that took it, by uid, however the login ends; a lock past its expiry (its api died) is deleted by uid and replaced by the next login |
 | the probe's claim, ConfigMap, per-run Secret and Jobs (admin flow, 25) | the bounded credential probe: an attempt's objects for one prompt, labelled `crucible.admin=probe` | removed by the probe; neither swept nor adopted by the supervisor for two hours |
@@ -493,7 +493,7 @@ next to what was allowed to run.
 
 `GET /providers` reports the Kubernetes provider with `isolation: pod`,
 `network_control: true`, `resource_limits: true`, `shared_disk: false`, the
-harnesses whose images are promoted, and `max_concurrency` from the
+harnesses that have a default image (each harness its own, ADR 0016), and `max_concurrency` from the
 namespace's ResourceQuota. The admin status page (25) shows the namespace
 readiness probe, the CNI egress enforcement result, the pod PID limit, and
 the runtime class in use ("standard" in this version). Attempt evidence

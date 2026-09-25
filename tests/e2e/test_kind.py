@@ -37,7 +37,7 @@ from crucible.application.admin.login import LoginFlow
 from crucible.application.auth import mint_token
 from crucible.application.harnesses import HarnessRegistry
 from crucible.application.supervisor import Supervisor
-from crucible.domain.entities import ImagePromotion, Role
+from crucible.domain.entities import Role
 from crucible.ports.execution import (
     CleanupPolicy,
     LaunchRefusedError,
@@ -64,7 +64,7 @@ from tests.e2e.conftest import (
 )
 from tests.e2e.policy import e2e_policy_document, e2e_routing_document
 from tests.e2e.repo import make_origin
-from tests.fixtures import contract_document
+from tests.fixtures import contract_document, promote_for_test
 
 pytestmark = [
     pytest.mark.e2e,
@@ -388,16 +388,14 @@ async def test_rows_5_7_11_23_supervisor_restart_and_full_gate_lifecycle(
             f"/v1/policies/{policy['name']}/{policy['version']}", json=policy
         ).status_code in (200, 201)
         with ctx.uow_factory() as uow:
-            uow.image_promotions.put(
-                ImagePromotion(
-                    digest=resolved.digest,
-                    reference=resolved.reference,
-                    harnesses=dict(resolved.harnesses) or {"script-harness": "1.0.0"},
-                    state="default",
-                    updated_at=clock.now(),
-                    updated_by="e2e-kind",
-                    reason="kind script harness image",
-                )
+            promote_for_test(
+                uow,
+                digest=resolved.digest,
+                reference=resolved.reference,
+                harnesses=dict(resolved.harnesses) or {"script-harness": "1.0.0"},
+                at=clock.now(),
+                by="e2e-kind",
+                reason="kind script harness image",
             )
             uow.commit()
 
@@ -983,16 +981,14 @@ async def test_login_from_an_empty_secret_to_a_probe_and_an_attempt_through_the_
             uploaded = admin.put(f"/v1/policies/{policy['name']}/{policy['version']}", json=policy)
             assert uploaded.status_code in (200, 201), uploaded.text
             with ctx.uow_factory() as uow:
-                uow.image_promotions.put(
-                    ImagePromotion(
-                        digest=resolved.digest,
-                        reference=resolved.reference,
-                        harnesses=dict(resolved.harnesses),
-                        state="default",
-                        updated_at=clock.now(),
-                        updated_by="e2e-kind",
-                        reason="the stand-in login's image",
-                    )
+                promote_for_test(
+                    uow,
+                    digest=resolved.digest,
+                    reference=resolved.reference,
+                    harnesses=dict(resolved.harnesses),
+                    at=clock.now(),
+                    by="e2e-kind",
+                    reason="the stand-in login's image",
                 )
                 uow.commit()
 

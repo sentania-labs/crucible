@@ -51,8 +51,8 @@ from crucible.adapters.persistence.records import (
     Escalations,
     Evidences,
     GateResults,
+    HarnessImages,
     HarnessStates,
-    ImagePromotions,
     Policies,
     ProviderSettings,
     ReviewReports,
@@ -103,11 +103,11 @@ from crucible.ports.repository import (
     FencedTokenRejectedError,
     GateResultRepository,
     GitHubDeliveryRepository,
+    HarnessImageRepository,
     HarnessStateRepository,
     HeartbeatRepository,
     IdempotencyKeyTakenError,
     IdempotencyRepository,
-    ImagePromotionRepository,
     LeaseRepository,
     LogRepository,
     PolicyRepository,
@@ -1327,7 +1327,7 @@ class SqlUnitOfWork:
     ci_decisions: CIDecisionRepository
     github_deliveries: GitHubDeliveryRepository
     harnesses: HarnessStateRepository
-    image_promotions: ImagePromotionRepository
+    harness_images: HarnessImageRepository
     bootstrap_imports: BootstrapImportRepository
     provider_settings: ProviderSettingRepository
 
@@ -1381,7 +1381,7 @@ class SqlUnitOfWork:
         self.ci_decisions = CIDecisions(s)
         self.github_deliveries = GitHubDeliveries(s)
         self.harnesses = HarnessStates(s)
-        self.image_promotions = ImagePromotions(s)
+        self.harness_images = HarnessImages(s)
         self.bootstrap_imports = BootstrapImports(s)
         self.provider_settings = ProviderSettings(s)
         return self

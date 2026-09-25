@@ -509,6 +509,7 @@ async def test_gap_logic_reads_only_keys_from_real_status_document(
             "enabled_by_configuration": True,
             "credential": {"state": "absent"},
             "images": [],
+            "default_image": None,
         },
         {
             "name": "unpromoted",
@@ -516,6 +517,7 @@ async def test_gap_logic_reads_only_keys_from_real_status_document(
             "enabled_by_configuration": True,
             "credential": {"state": "valid"},
             "images": [{"promotion_state": "candidate"}],
+            "default_image": None,
         },
     ]
     supervisor = _supervisor_document(None, _status())

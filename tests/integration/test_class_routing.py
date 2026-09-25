@@ -19,7 +19,7 @@ from crucible.application import routing as routing_module
 from crucible.application.admin.context import AdminContext
 from crucible.application.harnesses import set_harness_enabled
 from crucible.application.supervisor import Supervisor
-from crucible.domain.entities import ImagePromotion, Policy, PoolExhaustion, RoutingPolicyRecord
+from crucible.domain.entities import HarnessImage, Policy, PoolExhaustion, RoutingPolicyRecord
 from crucible.ports.execution import CleanupPolicy
 from tests.fixtures import FakeClock, contract_document
 from tests.integration.conftest import make_supervisor
@@ -110,16 +110,12 @@ def _install_policy(
 
 def _promote(ctx: AppContext, clock: FakeClock, harness: str, image: str) -> None:
     with ctx.uow_factory() as uow:
-        for existing in uow.image_promotions.list_all():
-            if existing.carries(harness) and existing.state == "default":
-                existing.state = "retained"
-                uow.image_promotions.put(existing)
-        uow.image_promotions.put(
-            ImagePromotion(
+        uow.harness_images.put(
+            HarnessImage(
+                harness=harness,
                 digest=f"sha256:{harness}-{image}",
                 reference=image,
-                harnesses={harness: "1.0.0"},
-                state="default",
+                version="1.0.0",
                 updated_at=clock.now(),
                 updated_by="tests",
                 reason="class routing integration fixture",

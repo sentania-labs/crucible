@@ -212,20 +212,21 @@ Once the api is reachable, sign in at `/ui` with that token and, for each harnes
 4. **Harnesses**: flip the administrator's runtime gate. Both gates have to say yes: the
    configuration gate is the `CRUCIBLE_HARNESSES__*` entries in the settings ConfigMap
    and changing one is an edit and a restart; the runtime gate is this page.
-5. **Images**: promote the worker image to `default`. There is one worker image and it
-   carries all four harnesses (the operator's decision of 2026-09-22), so this is one
-   promotion, and the Images page lists the version of each harness it carries. A
-   launch is refused without it. The registry the page lists is
-   `CRUCIBLE_KUBERNETES__IMAGE_REPOSITORIES`, which the base settings already set to
-   `["ghcr.io/sentania-labs/crucible-worker"]`; compose deployments list the local
-   daemon's `crucible-worker` images instead and need no setting.
+5. **Images**: choose each harness's worker image. The page has one row per harness,
+   with a pulldown of the images that carry that harness at a supported version
+   (releases and `latest`); pick one and Promote. Promotion is per harness (the
+   operator's decision of 2026-09-25, ADR 0016): each harness can run a different
+   image, and promoting one never moves another. A launch of a harness with no image is
+   refused. The registry the page lists is `CRUCIBLE_KUBERNETES__IMAGE_REPOSITORIES`,
+   which the base settings already set to `["ghcr.io/sentania-labs/crucible-worker"]`;
+   compose deployments list the local daemon's `crucible-worker` images instead and need
+   no setting.
 
-**Rolling the worker image back** is promoting the previous digest from the same page.
-Because one image carries all four harnesses, that rolls all four back together; there is
-no way to roll back one harness alone, which is the trade the one-image decision made.
-Promotion checks every harness the image carries against the running release's tested
-ranges, so once a release raises a range's lower bound past an older image's pin, that
-older image can no longer be promoted; roll the Crucible release back with it.
+**Rolling a harness's image back** is Roll back on its row: it returns that harness to
+the image its last promotion replaced, and leaves every other harness where it is.
+Promotion checks the harness's version in the image against the running release's
+tested range, so once a release raises a range's lower bound past an older image's pin,
+that older image is no longer offered for it; roll the Crucible release back with it.
 
 For Hermes, use **Routing** to set the HTTPS `/v1` gateway URL, model `coder`, thinking
 preference, enabled state, and pool concurrency. Saving creates immutable policy

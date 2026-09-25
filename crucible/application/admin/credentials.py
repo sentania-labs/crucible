@@ -559,16 +559,11 @@ def _probe_provider(ctx: AdminContext) -> ExecutionProvider:
 async def probe_image(
     ctx: AdminContext, uow: UnitOfWork, provider: ExecutionProvider, harness: str
 ) -> str:
-    """The image the probe runs: the promoted default that carries the harness (the one
-    worker image, C11), else the one labelled image the provider has for it, else a
-    refusal naming the ambiguity (13)."""
-    promoted = sorted(
-        (p for p in uow.image_promotions.list_all() if p.carries(harness) and p.state == "default"),
-        key=lambda p: (p.updated_at, p.digest),
-        reverse=True,
-    )
-    if promoted:
-        return promoted[0].reference
+    """The image the probe runs: the harness's own default (ADR 0016), else the one
+    labelled image the provider has for it, else a refusal naming the ambiguity (13)."""
+    default = uow.harness_images.get(harness)
+    if default is not None:
+        return default.reference
     if provider.name == "fake":
         # The fake provider runs behaviours, not images (08).
         return "crucible-worker:fake-probe"
@@ -579,8 +574,8 @@ async def probe_image(
     if not references:
         raise CredentialAdminError(f"the provider has no image labelled for harness {harness!r}")
     raise CredentialAdminError(
-        f"{len(references)} images are labelled for {harness!r} and none is promoted; "
-        "promote one (images promote) so the probe knows which to run"
+        f"{len(references)} images are labelled for {harness!r} and none is promoted for "
+        "it; promote one (images promote --harness) so the probe knows which to run"
     )
 
 

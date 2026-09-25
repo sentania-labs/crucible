@@ -209,15 +209,18 @@ Image promotion (a Crucible repository process, C8):
    and report parsing.
 6. The supported-version declaration is updated in the same PR.
 7. Merge and tag publish the image to GHCR with its digest.
-8. `POST /images/{digest}/promote` to `default` is an explicit admin act,
-   recorded as a decision. The worker image carries all four harnesses, so
-   one promotion switches all four; every harness it carries must be inside
-   its adapter's range or the promotion is refused whole. A previous default
-   the new image fully covers becomes `retained`.
-9. At least one known-good prior digest stays `retained` for rollback.
-   **Rollback is promoting the previous digest, and it rolls all four
-   harnesses back together** (C11): with one image there is no rolling back
-   one harness alone.
+8. Promotion is per harness (ADR 0016, the operator's decision of
+   2026-09-25, crucible#116): `POST /admin/images/{digest}/promote` with a
+   `harness` makes the image that harness's default, an explicit admin act
+   recorded as an event. The image must carry that harness at a version
+   inside its adapter's range; the other harnesses it carries are neither
+   checked nor moved, so Hermes, AGY and Claude Code can each run a
+   different image.
+9. The image a harness's last promotion replaced is kept as its previous
+   image. **Rollback is per harness**: `POST /admin/images/rollback` with a
+   `harness` swaps its default and its previous image, and no other harness
+   moves. (Until 2026-09-25 one promotion switched all four harnesses and a
+   rollback moved all four together, C11.)
 
 ## Docker authority, stated honestly
 

@@ -42,9 +42,9 @@ from crucible.application.admin.login import (
 )
 from crucible.application.errors import ConflictError
 from crucible.application.supervisor import Supervisor
-from crucible.domain.entities import ImagePromotion
 from crucible.domain.lifecycle import AttemptState
 from crucible.domain.secrets import scan_text
+from tests.fixtures import promote_for_test
 from tests.integration.test_admin import ui_sign_in
 from tests.integration.test_harness_registry import _submit_pinned
 
@@ -111,16 +111,14 @@ def admin_ctx(
     )
     ctx.admin = admin
     with ctx.uow_factory() as uow:
-        uow.image_promotions.put(
-            ImagePromotion(
-                digest="sha256:" + "d" * 64,
-                reference=WORKER,
-                harnesses={k.rsplit(".", 2)[-2]: v for k, v in LABELS.items() if "version" in k},
-                state="default",
-                updated_at=ctx.clock.now(),
-                updated_by="tests",
-                reason="the worker image the login and the probe run",
-            )
+        promote_for_test(
+            uow,
+            digest="sha256:" + "d" * 64,
+            reference=WORKER,
+            harnesses={k.rsplit(".", 2)[-2]: v for k, v in LABELS.items() if "version" in k},
+            at=ctx.clock.now(),
+            by="tests",
+            reason="the worker image the login and the probe run",
         )
         uow.commit()
     return admin

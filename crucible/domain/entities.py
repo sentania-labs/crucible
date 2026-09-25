@@ -492,24 +492,24 @@ class ProviderSetting:
 
 
 @dataclass(slots=True)
-class ImagePromotion:
-    """One worker image's promotion state (13): `candidate` until an explicit admin act
-    makes it `default`; a previous default it fully supersedes becomes `retained`.
+class HarnessImage:
+    """One harness's default worker image (13, ADR 0016): what its launches, probes,
+    tests and logins run, and the one it replaced, which a rollback returns to.
 
-    `harnesses` is every harness the image carries, name to pinned version. Since C11
-    that is all four real harnesses in one image, so one promotion covers all four and
-    promoting the previous digest rolls all four back together."""
+    Promotion is per harness, the operator's decision of 2026-09-25 (crucible#116). A
+    worker image may carry several harnesses; each harness's default is chosen, and
+    rolled back, on its own. `version` is the version of this harness the image pins."""
 
+    harness: str
     digest: str
     reference: str
-    harnesses: dict[str, str]
-    state: str
+    version: str
     updated_at: datetime
     updated_by: str
     reason: str = ""
-
-    def carries(self, harness: str) -> bool:
-        return harness in self.harnesses
+    previous_digest: str | None = None
+    previous_reference: str | None = None
+    previous_version: str | None = None
 
 
 # ----- GitHub delivery (23) ---------------------------------------------

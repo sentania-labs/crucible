@@ -56,7 +56,6 @@ from crucible.adapters.harness.registry import default_registry
 from crucible.application.delivery_tick import DeliveryConfig
 from crucible.application.harnesses import set_harness_enabled
 from crucible.application.supervisor import Supervisor
-from crucible.domain.entities import ImagePromotion
 from crucible.domain.secrets import scan_text
 from crucible.ports.execution import image_harnesses
 from crucible.ports.harness import CredentialSource, MountMode
@@ -71,6 +70,7 @@ from tests.e2e.conftest import (
 from tests.e2e.github_live import LiveConfig
 from tests.e2e.policy import e2e_routing_document
 from tests.e2e.test_github_live import live_policy, register
+from tests.fixtures import promote_for_test
 
 CREDENTIAL_ROOT_ENV = "CRUCIBLE_LIVE_CREDENTIAL_ROOT"
 HARNESSES_ENV = "CRUCIBLE_LIVE_HARNESSES"
@@ -327,16 +327,14 @@ def live_client(
             for harness in _selected():
                 reference = overrides.get(harness) or daemon.worker_image()
                 image = available[reference]
-                uow.image_promotions.put(
-                    ImagePromotion(
-                        digest=image.digest,
-                        reference=image.reference,
-                        harnesses=dict(image.harnesses),
-                        state="default",
-                        updated_at=live_ctx.clock.now(),
-                        updated_by="e2e-live",
-                        reason="live harness image selected for this test run",
-                    )
+                promote_for_test(
+                    uow,
+                    digest=image.digest,
+                    reference=image.reference,
+                    harnesses=dict(image.harnesses),
+                    at=live_ctx.clock.now(),
+                    by="e2e-live",
+                    reason="live harness image selected for this test run",
                 )
             uow.commit()
     # The live contract pins the exact harness and model under test, which is an

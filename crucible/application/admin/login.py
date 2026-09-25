@@ -763,27 +763,14 @@ def start_login(
 
 
 def promoted_image(uow: UnitOfWork, harness: str) -> str:
-    """The promoted worker image carries every harness (C11); the most recent default
-    that carries this one is what a launch would use too, so a login runs it."""
-    promoted = next(
-        iter(
-            sorted(
-                (
-                    item
-                    for item in uow.image_promotions.list_all()
-                    if item.carries(harness) and item.state == "default"
-                ),
-                key=lambda item: (item.updated_at, item.digest),
-                reverse=True,
-            )
-        ),
-        None,
-    )
-    if promoted is None:
+    """The harness's own default worker image (ADR 0016), which is what a launch of it
+    would use too, so a login runs it."""
+    default = uow.harness_images.get(harness)
+    if default is None:
         raise ConflictError(
-            f"no promoted worker image is available for {harness}; promote one first"
+            f"no worker image is promoted for {harness}; promote one on Images first"
         )
-    return promoted.reference
+    return default.reference
 
 
 def refuse_while_held(uow: UnitOfWork, harness: str, store: Any | None = None) -> None:

@@ -22,32 +22,60 @@
   {% elif panel.kind == "empty" %}<p class="admin-empty">none</p>
   {% else %}{{ render_value(panel.value) }}{% endif %}
 {%- endmacro %}
+{% macro render_row_form(item) -%}
+  <form class="admin-row-form" method="post" action="{{ item.action }}">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <input type="hidden" name="return_to" value="{{ item.return_to or active }}">
+    {% for name, value in (item.hidden or {}).items() %}<input type="hidden" name="{{ name }}" value="{{ value }}">{% endfor %}
+    {% if item.select %}<select class="lat-select" name="{{ item.select.name }}" aria-label="{{ item.select.label or item.select.name }}">{% for value, label in item.select.options %}<option value="{{ value }}" {% if value == item.select.selected %}selected{% endif %}>{{ label }}</option>{% endfor %}</select>{% endif %}
+    {% if item.reason %}<input class="lat-input" name="reason" placeholder="Reason (required)" aria-label="Reason" required>{% endif %}
+    <button class="lat-btn {% if item.danger %}lat-btn--danger{% elif item.primary %}lat-btn--primary{% else %}lat-btn--ghost{% endif %}" type="submit">{{ item.label }}</button>
+  </form>
+{%- endmacro %}
+{% macro render_cell(cell, column) -%}
+  {% if cell is mapping and cell.kind == "actions" %}<div class="admin-actions">{% for item in cell["items"] %}{% if item.kind == "link" %}<a class="lat-btn lat-btn--ghost" href="{{ item.href }}">{{ item.label }}</a>{% else %}{{ render_row_form(item) }}{% endif %}{% endfor %}</div>
+  {% elif cell is mapping and cell.kind == "form" %}{{ render_row_form(cell) }}
+  {% elif cell is mapping and cell.kind == "link" %}<a href="{{ cell.href }}">{{ cell.label }}</a>
+  {% elif cell is mapping and cell.kind == "status" %}<span class="lat-badge lat-badge--{{ cell.tone or 'accent' }}">{{ cell.value }}</span>{% if cell.hint %}<div class="admin-hint">{{ cell.hint }}</div>{% endif %}
+  {% elif cell is mapping and cell.kind == "note" %}<div>{{ cell.value }}</div>{% if cell.hint %}<div class="admin-hint">{{ cell.hint }}</div>{% endif %}
+  {% elif cell is mapping and cell.kind == "steps" %}<ol class="admin-steps">{% for step in cell["items"] %}<li><span class="lat-badge lat-badge--{{ step.tone }}">{{ step.result }}</span> <b>{{ step.name }}</b>{% if step.detail %}: {{ step.detail }}{% endif %}</li>{% endfor %}</ol>
+  {% elif cell is string and cell.startswith('/ui') %}<a href="{{ cell }}">Open</a>
+  {% elif cell is mapping or (cell is sequence and cell is not string) %}{{ render_panel(panel_from_cell(cell)) }}
+  {% else %}{{ safe_value(column, cell) }}{% endif %}
+{%- endmacro %}
+{% macro render_section_body(section) -%}
+    {% if section.note %}<p class="lat-hint">{{ section.note }}</p>{% endif %}
+    {% if section.rows is defined %}
+      {% if section.rows %}<div class="admin-table-wrap lat-table-scroll"><table class="admin-table lat-table"><thead><tr>{% for column in section.columns %}<th>{{ column }}</th>{% endfor %}</tr></thead><tbody>
+      {% for row in section.rows %}<tr>{% for cell in row %}<td>{{ render_cell(cell, section.columns[loop.index0]) }}</td>{% endfor %}</tr>{% endfor %}
+      </tbody></table></div>{% else %}<p class="admin-empty">{{ section.empty or "Nothing to show." }}</p>{% endif %}
+    {% endif %}
+    {% if section.panel is defined %}{{ render_panel(section.panel) }}{% endif %}
+    {% if section.text is defined %}<pre class="lat-code admin-output">{{ section.text }}</pre>{% endif %}
+{%- endmacro %}
 {% block content %}
 <div class="admin-title"><div><h1>{{ heading }}</h1><p>{{ intro }}</p></div>{% if badge %}<span class="lat-badge lat-badge--{{ badge_kind }}">{{ badge }}</span>{% endif %}</div>
 <div class="admin-stack">
   {% for section in sections %}
   <section class="lat-card">
     <h2>{{ section.title }}</h2>
-    {% if section.note %}<p class="lat-hint">{{ section.note }}</p>{% endif %}
-    {% if section.rows is defined %}
-      {% if section.rows %}<div class="admin-table-wrap lat-table-scroll"><table class="admin-table lat-table"><thead><tr>{% for column in section.columns %}<th>{{ column }}</th>{% endfor %}</tr></thead><tbody>
-      {% for row in section.rows %}<tr>{% for cell in row %}<td>{% if cell is string and cell.startswith('/ui') %}<a href="{{ cell }}">Open</a>{% elif cell is mapping or (cell is sequence and cell is not string) %}{{ render_panel(panel_from_cell(cell)) }}{% else %}{{ safe_value(section.columns[loop.index0], cell) }}{% endif %}</td>{% endfor %}</tr>{% endfor %}
-      </tbody></table></div>{% else %}<p class="admin-empty">Nothing to show.</p>{% endif %}
-    {% endif %}
-    {% if section.panel is defined %}{{ render_panel(section.panel) }}{% endif %}
-    {% if section.text is defined %}<pre class="lat-code admin-output">{{ section.text }}</pre>{% endif %}
+    {{ render_section_body(section) }}
+    {% if section.details %}<details class="admin-details"><summary>{{ section.details_label or "Details" }}</summary>
+      {% for detail in section.details %}<div class="admin-detail"><h3>{{ detail.title }}</h3>{{ render_section_body(detail) }}</div>{% endfor %}
+    </details>{% endif %}
     {% if section.form %}
+    {% if section.form.collapsed %}<details class="admin-details"><summary>{{ section.form.collapsed }}</summary>{% endif %}
     <form class="admin-form" method="post" action="{{ section.form.action }}">
       <input type="hidden" name="csrf" value="{{ csrf }}">
       <input type="hidden" name="return_to" value="{{ active }}">
       <div class="admin-form-grid">{% for field in section.form.fields %}<label><span class="lat-label">{{ field.label }}</span>
         {% if field.kind == "textarea" %}<textarea class="lat-textarea" rows="{{ field.rows or 5 }}" name="{{ field.name }}" {% if field.required %}required{% endif %}>{{ field.value or "" }}</textarea>
-        {% elif field.kind == "select" %}<select class="lat-select" name="{{ field.name }}">{% for value, label in field.options %}<option value="{{ value }}">{{ label }}</option>{% endfor %}</select>
+        {% elif field.kind == "select" %}<select class="lat-select" name="{{ field.name }}">{% for value, label in field.options %}<option value="{{ value }}" {% if value == field.value %}selected{% endif %}>{{ label }}</option>{% endfor %}</select>
         {% elif field.kind == "checkbox" %}<input type="checkbox" name="{{ field.name }}" value="true" {% if field.value %}checked{% endif %}>
         {% else %}<input class="lat-input" type="{{ field.kind or 'text' }}" name="{{ field.name }}" value="{{ field.value or '' }}" {% if field.required %}required{% endif %}>{% endif %}
       </label>{% endfor %}</div>
       <button class="lat-btn {% if section.form.danger %}lat-btn--danger{% else %}lat-btn--primary{% endif %}" type="submit">{{ section.form.label }}</button>
-    </form>{% endif %}
+    </form>{% if section.form.collapsed %}</details>{% endif %}{% endif %}
   </section>
   {% endfor %}
 </div>

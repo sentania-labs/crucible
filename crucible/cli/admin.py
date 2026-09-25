@@ -189,11 +189,14 @@ def build_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     set_key = c_sub.add_parser("set", help="read an API key without placing it in argv")
     set_key.add_argument("--harness", default="hermes", choices=("hermes",))
 
-    i = sub.add_parser("images", help="list and promote")
+    i = sub.add_parser("images", help="list, promote, roll back: per harness (ADR 0016)")
     i_sub = i.add_subparsers(dest="image_command", required=True)
-    i_sub.add_parser("list", help="worker images and their promotion state")
-    promote = i_sub.add_parser("promote", help="promote a candidate image")
+    i_sub.add_parser("list", help="worker images, and each harness's default and choices")
+    promote = i_sub.add_parser("promote", help="make an image one harness's default")
     promote.add_argument("digest", help="the image's digest or reference")
+    promote.add_argument("--harness", required=True, help="the harness it becomes the default of")
+    back = i_sub.add_parser("rollback", help="return a harness to its previous image")
+    back.add_argument("--harness", required=True)
 
     pr = sub.add_parser("providers", help="execution providers")
     pr_sub = pr.add_subparsers(dest="provider_command", required=True)
@@ -408,7 +411,13 @@ def _remote(args: argparse.Namespace, remote: Api) -> Any:
     if command == "images":
         if args.image_command == "list":
             return remote.call("GET", "/v1/admin/images")
-        return remote.call("POST", f"/v1/admin/images/{args.digest}/promote", reason)
+        if args.image_command == "rollback":
+            return remote.call(
+                "POST", "/v1/admin/images/rollback", {**reason, "harness": args.harness}
+            )
+        return remote.call(
+            "POST", f"/v1/admin/images/{args.digest}/promote", {**reason, "harness": args.harness}
+        )
     if command == "providers":
         return remote.call("GET", "/v1/admin/providers")
     if command == "github":
@@ -587,12 +596,25 @@ def _local(args: argparse.Namespace, wiring: Wiring) -> Any:
     if command == "images":
         with wiring.ctx.uow_factory() as uow:
             if args.image_command == "list":
-                return {"items": asyncio.run(images.list_all(admin, uow))}
-            result = asyncio.run(
-                images.promote(
-                    admin, uow, principal=principal, digest=args.digest, reason=args.reason
+                return {
+                    "items": asyncio.run(images.list_all(admin, uow)),
+                    "defaults": asyncio.run(images.defaults(admin, uow)),
+                }
+            if args.image_command == "rollback":
+                result = images.rollback(
+                    admin, uow, principal=principal, harness=args.harness, reason=args.reason
                 )
-            )
+            else:
+                result = asyncio.run(
+                    images.promote(
+                        admin,
+                        uow,
+                        principal=principal,
+                        harness=args.harness,
+                        digest=args.digest,
+                        reason=args.reason,
+                    )
+                )
             uow.commit()
             return result
     if command == "providers":
@@ -891,6 +913,7 @@ def kind_of(args: argparse.Namespace) -> str:
         ("credentials", "login"): "credential_login",
         ("images", "list"): "image_list",
         ("images", "promote"): "image_promotion",
+        ("images", "rollback"): "image_promotion",
         ("providers", "status"): "provider_list",
         ("github", "status"): "github_status",
         ("github", "check"): "github_check",
@@ -959,7 +982,7 @@ def result_for(
             prefix,
         )
     elif kind == "image_list":
-        actions = nx.image_actions(_items(document), prefix)
+        actions = nx.image_actions(document, prefix)
     elif kind == "exhaustion_list":
         actions = nx.exhaustion_actions(_items(document), prefix)
     elif kind == "token_list":

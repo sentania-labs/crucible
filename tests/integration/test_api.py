@@ -8,8 +8,8 @@ from fastapi.testclient import TestClient
 from crucible.adapters.api.app import create_app
 from crucible.adapters.api.deps import AppContext
 from crucible.application.auth import mint_token
-from crucible.domain.entities import ImagePromotion, Role
-from tests.fixtures import FakeClock, contract_document
+from crucible.domain.entities import Role
+from tests.fixtures import FakeClock, contract_document, promote_for_test
 
 pytestmark = pytest.mark.integration
 
@@ -211,16 +211,14 @@ def test_only_registered_providers_are_accepted(
         }
     )
     with ctx.uow_factory() as uow:
-        uow.image_promotions.put(
-            ImagePromotion(
-                digest="sha256:integration-codex",
-                reference="crucible-worker:codex-integration",
-                harnesses={"codex": "0.156.0"},
-                state="default",
-                updated_at=clock.now(),
-                updated_by="tests",
-                reason="provider registry integration fixture",
-            )
+        promote_for_test(
+            uow,
+            digest="sha256:integration-codex",
+            reference="crucible-worker:codex-integration",
+            harnesses={"codex": "0.156.0"},
+            at=clock.now(),
+            by="tests",
+            reason="provider registry integration fixture",
         )
         uow.commit()
     assert (
