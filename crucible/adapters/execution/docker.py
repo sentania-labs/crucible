@@ -191,7 +191,8 @@ for pair in ${CRUCIBLE_AFTER_EXIT:-}; do
   if [ -f "$src" ] && [ ! -L "$src" ]; then
     dir=${CRUCIBLE_REPORT_DIR:-/crucible/report}
     tmp=$(mktemp "$dir/.after-exit.XXXXXX" 2>/dev/null) || continue
-    if head -c 1048576 -- "$src" > "$tmp" 2>/dev/null; then
+    # mktemp makes the file 0600; the collector reads it as the transcript is read.
+    if head -c 1048576 -- "$src" > "$tmp" 2>/dev/null && chmod 0644 -- "$tmp"; then
       mv -f -- "$tmp" "$dir/$name" 2>/dev/null || rm -f -- "$tmp"
     else
       rm -f -- "$tmp"

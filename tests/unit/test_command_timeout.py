@@ -362,5 +362,6 @@ def test_the_wrapper_replaces_a_link_planted_at_the_destination(tmp_path: Path) 
     assert completed.returncode == 0, completed.stderr
     copied = report / "hermes-processes.json"
     assert not copied.is_symlink() and json.loads(copied.read_text()) == [{"session_id": "p1"}]
+    assert copied.stat().st_mode & 0o777 == 0o644
     assert elsewhere.read_text() == "untouched"
     assert sorted(p.name for p in report.iterdir()) == ["hermes-processes.json", "transcript.jsonl"]
