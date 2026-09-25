@@ -84,7 +84,7 @@ from crucible.domain.entities import (
     Task,
 )
 from crucible.domain.events import PRINCIPAL_CRUCIBLE, EventKind
-from crucible.domain.exit_class import ExitClass, classify_exit
+from crucible.domain.exit_class import CLEAN_EXIT_CLASSES, ExitClass, classify_exit
 from crucible.domain.gates import GateName, GateResult, evaluate_gate
 from crucible.domain.ids import new_id
 from crucible.domain.lifecycle import (
@@ -3148,7 +3148,13 @@ class Supervisor:
         assert task is not None and execution is not None
         recorded = False
         detail = "no review report was produced"
-        if outputs.report is not None:
+        clean = attempt.exit_code == 0 and attempt.exit_class in CLEAN_EXIT_CLASSES
+        if outputs.report is not None and not clean:
+            # Issue 128: a review that exited with work in flight (or any unclean exit)
+            # did not finish, so its report is not recorded as a review.
+            exit_class = attempt.exit_class.value if attempt.exit_class else "unknown"
+            detail = f"the review execution ended {exit_class}, not a clean completion"
+        elif outputs.report is not None:
             try:
                 record_review_report(
                     uow,
@@ -3177,7 +3183,7 @@ class Supervisor:
             payload={"role": "review", "review_recorded": recorded, "detail": detail},
         )
         self._record_wall_time(uow, attempt)
-        if recorded and attempt.exit_code == 0:
+        if recorded:
             move_attempt(
                 uow, self._clock, attempt, AttemptState.SUCCEEDED, EventKind.ATTEMPT_SUCCEEDED
             )

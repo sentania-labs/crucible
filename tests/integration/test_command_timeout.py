@@ -35,9 +35,11 @@ IN_FLIGHT_TRANSCRIPT = [
 class InFlightProvider(FakeProvider):
     """A fake whose workspaces are real directories, so the adapter reads the report."""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, only_image: str | None = None) -> None:
         super().__init__()
         self.root = root
+        # When set, only attempts launched from this image leave work in flight.
+        self.only_image = only_image
 
     async def prepare(self, spec: LaunchSpec) -> Workspace:
         base = self.root / spec.attempt_id
@@ -54,6 +56,8 @@ class InFlightProvider(FakeProvider):
     async def collect(
         self, h: Handle, ws: Workspace, spec: LaunchSpec | None = None
     ) -> CollectedOutputs:
+        if self.only_image is not None and (spec is None or spec.image != self.only_image):
+            return await super().collect(h, ws, spec)
         report = Path(ws.checkout_path).parent / "output" / "report"
         report.mkdir(parents=True, exist_ok=True)
         (report / TRANSCRIPT_NAME).write_text(
@@ -123,3 +127,40 @@ async def test_a_harness_that_exits_with_work_in_flight_is_incomplete(
     events = client.get(f"/v1/tasks/{task_id}/events").json()["items"]
     collected = next(e for e in events if e["kind"] == "attempt_collected")
     assert collected["payload"]["work_in_flight"]
+    # The report is valid, yet exit_clean must not pass on the zero exit code alone.
+    gates = client.get(f"/v1/attempts/{attempt['id']}/gates").json()["items"]
+    assert all(g["result"] != "pass" for g in gates if g["gate"] == "exit_clean")
+
+
+async def test_a_review_that_exits_with_work_in_flight_is_not_recorded(
+    client: TestClient, ctx: AppContext, tmp_path: Path
+) -> None:
+    """A review worker that exits 0 with a valid ReviewReportV1 but a command still
+    running did not finish: no review is recorded and the attempt fails."""
+    provider = InFlightProvider(tmp_path, only_image="crucible-worker:fake-review")
+    supervisor = make_supervisor(ctx, provider)
+    task_id = submit_and_start(client, "crucible-worker:fake-succeed", "EX-0128E")
+    assert await run_to_settled(supervisor, client, task_id) == "awaiting_internal_review"
+    review = {
+        "harness": "codex",
+        "model": "gpt-5.6-luna",
+        "provider": "fake",
+        "image": "crucible-worker:fake-review",
+        "timeout_seconds": 600,
+        "rationale": "A non-author review of the collected head.",
+    }
+    r = client.post(f"/v1/tasks/{task_id}/review", json={"execution": review})
+    assert r.status_code == 200, r.text
+    assert await run_to_settled(supervisor, client, task_id, max_ticks=8) == (
+        "awaiting_internal_review"
+    )
+    view = client.get(f"/v1/tasks/{task_id}").json()
+    roles = {e["role"]: e for e in view["executions"]}
+    assert roles["review"]["state"] == "failed"
+    (attempt,) = roles["review"]["attempts"]
+    assert attempt["exit_code"] == 0
+    assert attempt["exit_class"] == "incomplete"
+    assert attempt["state"] == "failed"
+    assert view["review_reports"] == []
+    events = client.get(f"/v1/tasks/{task_id}/events").json()["items"]
+    assert "review_report_recorded" not in {e["kind"] for e in events}
