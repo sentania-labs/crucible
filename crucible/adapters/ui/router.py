@@ -813,7 +813,6 @@ async def harness_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                     "kind": "form",
                     "action": "/ui/actions/harness",
                     "label": "Disable" if item["enabled_by_administrator"] else "Enable",
-                    "danger": bool(item["enabled_by_administrator"]),
                     "hidden": {
                         "harness": name,
                         "enabled": "false" if item["enabled_by_administrator"] else "true",
