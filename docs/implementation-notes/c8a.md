@@ -82,7 +82,8 @@ FQDN rule, so the names are resolved when the policy is written and recorded in
 a `crucible.io/egress-hosts` annotation. A name that does not resolve refuses
 the launch rather than being dropped or widened, which is 13's rule for an
 attempt the egress path cannot actually permit. `broad_egress` is the opt-out
-for a deployment whose CNI enforces names some other way; it is off by default,
+for a deployment whose CNI enforces names some other way (the
+`kubernetes.broad_egress` setting since issue 61); it is off by default,
 because the broad form ("the internet on 443 minus every denied range") would
 let a worker reach GitHub. Every denial 26 names is the `except` of every
 allow, so a name that resolves into a denied range cannot open one. IPv6 never
@@ -215,8 +216,11 @@ Non-blockers carried forward rather than fixed, with the reasoning:
 - **The pod PID limit is read from the canary's node.** That is 26's design (it is a
   kubelet setting, not a pod field); on a multi-node cluster the canary can land
   somewhere other than the workers. The kind tier is where this becomes measurable.
+  (Documented as the operator-declared path on 2026-09-25, issue 60: the Pod API has
+  no per-pod PID field.)
 - **`pod_log` has no `limitBytes`.** Every poll reads the whole pod log into memory.
-  Worth a bound before a long-running worker on a real cluster.
+  Worth a bound before a long-running worker on a real cluster. (Bounded on
+  2026-09-25, issue 63.)
 - **A read-only harness with declared templates.** Mounting a template inside a Secret
   volume mount may fail at container creation, because a Secret volume is a read-only
   tmpfs. All three subscription harnesses are `rw-narrow` today, so the path is latent;

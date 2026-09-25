@@ -293,3 +293,108 @@ async def test_a_bundle_above_the_configmap_cap_is_refused_rather_than_truncated
     launch.contract["objective"] = "x" * (1024 * 1024 + 1)
     with pytest.raises(Exception, match="above the ConfigMap cap"):
         await provider.prepare(launch)
+
+
+# ----- reading a live Pod back (issues 66, 76) -------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("text", "value"),
+    [
+        ("2", 2.0),
+        ("1500m", 1.5),
+        ("0.5", 0.5),
+        ("4Gi", 4.0 * 1024**3),
+        ("512Mi", 512.0 * 1024**2),
+        ("1G", 1e9),
+        ("1e3", 1000.0),
+        ("4294967296", 4294967296.0),
+        (3, 3.0),
+    ],
+)
+def test_a_quantity_is_read_by_value(text: Any, value: float) -> None:
+    assert k8sspec.quantity(text) == pytest.approx(value)
+
+
+@pytest.mark.parametrize("text", ["", None, "lots", "-1", "Gi", True])
+def test_what_is_not_a_quantity_reads_as_none(text: Any) -> None:
+    assert k8sspec.quantity(text) is None
+
+
+def test_limits_read_back_from_a_rendered_pod_equal_the_ones_it_was_rendered_from() -> None:
+    limits = k8sspec.limits_from_policy(
+        {
+            "resources": {
+                "cpus": 1.5,
+                "memory": "3GiB",
+                "tmpfs_per_mount": "256MiB",
+                "cpu_request_fraction": 0.25,
+                "memory_request_fraction": 0.5,
+            },
+            "limits": {"grace_seconds": 45},
+        }
+    )
+    pod = k8sspec.pod_spec(
+        k8sspec.PodRequest(
+            role=k8sspec.ROLE_WORKER,
+            image="crucible-worker:1",
+            command=["true"],
+            limits=limits,
+            volumes=k8sspec.base_volumes(limits),
+        )
+    )
+    read = k8sspec.limits_from_pod(pod, k8sspec.limits_from_policy({}))
+    assert read.as_dict() == limits.as_dict()
+
+
+def test_a_pod_missing_a_field_keeps_the_fallback_for_that_field_only() -> None:
+    fallback = k8sspec.limits_from_policy({"limits": {"grace_seconds": 30}})
+    read = k8sspec.limits_from_pod(
+        {"containers": [{"name": "crucible", "resources": {"limits": {"memory": "1Gi"}}}]},
+        fallback,
+    )
+    assert read.memory_bytes == 1024**3
+    assert read.cpus == fallback.cpus
+    assert read.grace_seconds == 30
+    assert read.tmpfs_bytes == fallback.tmpfs_bytes
+
+
+def test_a_live_cpu_request_survives_a_missing_limit() -> None:
+    """A live Pod can carry a request with no limit, or a limit admission could not
+    parse. The request still says something about the attempt's actual usage, so it is
+    kept against the fallback limit instead of being discarded for the policy
+    default (issue 76 follow-up)."""
+    fallback = k8sspec.limits_from_policy({"resources": {"cpus": 2.0}})
+    read = k8sspec.limits_from_pod(
+        {
+            "containers": [
+                {
+                    "name": "crucible",
+                    "resources": {"requests": {"cpu": "500m"}},
+                }
+            ]
+        },
+        fallback,
+    )
+    assert read.cpus == fallback.cpus
+    assert read.cpu_request_fraction == pytest.approx(0.5 / 2.0)
+
+
+def test_a_live_memory_request_survives_an_unparsable_limit() -> None:
+    fallback = k8sspec.limits_from_policy({"resources": {"memory": "4GiB"}})
+    read = k8sspec.limits_from_pod(
+        {
+            "containers": [
+                {
+                    "name": "crucible",
+                    "resources": {
+                        "requests": {"memory": "1Gi"},
+                        "limits": {"memory": "not-a-quantity"},
+                    },
+                }
+            ]
+        },
+        fallback,
+    )
+    assert read.memory_bytes == fallback.memory_bytes
+    assert read.memory_request_fraction == pytest.approx(1024**3 / fallback.memory_bytes)

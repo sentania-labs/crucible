@@ -144,6 +144,10 @@ DEFAULT_LOG_RETENTION_DAYS = 90
 DEFAULT_WORKSPACE_RETENTION_DAYS = 14
 DEFAULT_WAKE_RETENTION_DAYS = 30
 RETENTION_BATCH = 200
+# How many pulls the final log drain makes before it stops (issue 63). A provider that
+# bounds one pull at 4 MiB drains 1 GiB of backlog in this many; past that the log is
+# still arriving faster than it is read, and the attempt moves on with what was stored.
+FINAL_DRAIN_PULLS = 256
 
 
 def worker_stall_action(
@@ -1974,6 +1978,30 @@ class Supervisor:
             return 0
         return int(await self._db(partial(self._store_logs, attempt.id, tuple(chunks))))
 
+    async def _drain_logs(
+        self, attempt: Attempt, provider: ExecutionProvider, handle: Handle
+    ) -> None:
+        """The final drain: pull until a pull brings nothing (08, 10). A provider may
+        bound one pull (the Kubernetes provider reads a few MiB at a time, issue 63), so
+        a single pull at exit could leave the end of the log behind. Each round resumes
+        from the position the last one stored, and the rounds are capped so a log that
+        never stops growing cannot hold the tick."""
+        current = attempt
+        for _ in range(FINAL_DRAIN_PULLS):
+            if not await self._pull_logs(current, provider, handle):
+                return
+            fresh: Attempt | None = await self._db(partial(self._fresh_attempt, attempt.id))
+            current = fresh or current
+        log.warning(
+            "the final log drain stopped after %d pulls with more still arriving",
+            FINAL_DRAIN_PULLS,
+            extra={"attempt_id": attempt.id},
+        )
+
+    def _fresh_attempt(self, attempt_id: str) -> Attempt | None:
+        with self._uow_factory() as uow:
+            return uow.attempts.get(attempt_id)
+
     def _store_logs(self, attempt_id: str, chunks: tuple[LogChunk, ...]) -> int:
         with self._fenced() as uow:
             attempt = uow.attempts.get(attempt_id, for_update=True)
@@ -2312,7 +2340,7 @@ class Supervisor:
             await self._db(partial(self._finish_lost, attempt.id, observation.detail))
             return True
         # The final drain before anything is collected or cleaned up (08, 10).
-        await self._pull_logs(attempt, provider, handle)
+        await self._drain_logs(attempt, provider, handle)
         await self._db(partial(self._mark_logs_drained, attempt.id))
         spec = await self._spec_for(attempt)
         collection_error: str | None = None

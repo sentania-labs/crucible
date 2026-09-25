@@ -172,6 +172,24 @@ sets; the provider records the effective limit in the launch evidence and
 refuses to launch if none is configured). A runtime class is not set in this
 version; the field is reserved and documented as the microVM step.
 
+The Docker provider sets `PidsLimit` per container from the policy; the Pod API
+has no equivalent. A container's `resources` take only `cpu`, `memory`,
+`ephemeral-storage` and huge pages, pod-level `resources` take the same, and
+the API server refuses a `pids` entry in either (proved on kind, issue 60). The
+only per-pod PID limit on Kubernetes is the kubelet's `podPidsLimit`, a node
+setting applied to every Pod on that node. So the limit is the
+**operator-declared path** (the operator accepted it on 2026-09-23, on
+condition it is documented): lab-admin sets `podPidsLimit` on every node that
+can run a Pod of `crucible-workers`, not only the one the canary happens to
+land on, and keeps it there through the node configuration pipeline. The
+canary confirms it on its own node where the runtime lets it see the pod-level
+cgroup; where it cannot, `kubernetes.pod_pid_limit_override` is lab-admin's
+attestation, and that attestation is about every such node. A node added to
+the pool later is covered only once its kubelet carries the same setting. The
+launch evidence records the node each attempt ran on beside the limit the
+probe established, so an attempt on a node the canary never measured is
+visible after the fact. (Made concrete 2026-09-25, issue 60.)
+
 ### Requests below limits (issue 93)
 
 A role pod that requests exactly its limit (2 CPU / 4Gi by default) cannot
@@ -252,6 +270,14 @@ address, or a name resolving to the Kubernetes API ClusterIP, another namespace,
 any denied range outside that declaration, is refused. General allowlist hostnames that
 resolve into a denied range remain refused. IPv6 never
 appears in a rule and is therefore denied entirely.
+A resolved address stays in a policy for `kubernetes.resolve_ttl_seconds`
+(default 300) before its name is looked up again. `kubernetes.broad_egress`
+(default false) replaces the resolved addresses with the broad rule, the
+public internet on 443 minus every denied range, for a CNI that enforces names
+some other way; that rule lets a worker reach GitHub, so a deployment turns it
+on deliberately or not at all. Both are restart-bound settings, set like
+`kubernetes.probe_image` and shown on the admin UI's settings page. (Made
+concrete 2026-09-25, issue 61.)
 
 Two destinations are denied explicitly, because a naive policy lets them
 through: cluster DNS is allowed on port 53 UDP and TCP to the cluster's DNS
@@ -303,7 +329,10 @@ values it last proved. (Added 2026-09-23 for crucible#91.)
 **Readiness.** If the cluster's CNI does not enforce egress NetworkPolicy, the
 provider refuses to launch: readiness of the namespace is probed by two canary
 pods, one after the other, and the result is recorded and shown on the admin
-status page (25).
+status page (25). The gate is consulted in `prepare`, before the claim, the
+per-attempt credential Secret or the preparer Job (which has GitHub egress)
+exist, and again in `launch`; a credential probe consults it before it creates
+anything too. (Made concrete 2026-09-25, issue 59.)
 
 - The first runs under the namespace's own rules and no policy of its own, which
   is what a role with no egress gets. It must fail to reach the API server
@@ -405,13 +434,21 @@ the namespace. A deployment therefore names one exact, pullable reference in
   Job's own creation time standing in for the launch time.
 - `logs`: `pods/log` with timestamps, `sinceTime` from the stored offset,
   resumed strict-after by the (timestamp, line hash) pair (10). A restarted
-  supervisor re-attaches by Job name.
+  supervisor re-attaches by Job name. Each poll also sends `limitBytes`
+  (4 MiB), keeps only the whole lines of a capped read, and lets the next poll
+  resume from the last of them, so no poll holds a whole long-running log; the
+  supervisor's final drain repeats the pull until it brings nothing (10).
+  `sinceTime` is one-second granular, so a read that cannot get past its first
+  second is retried larger up to 64 MiB; past that, the rest of the second is
+  skipped with a `[crucible] log lines skipped` line in the log rather than
+  read unbounded. (Made concrete 2026-09-25, issue 63.)
 - `collect`: the collector Job with the workspace mounted read-only and an
   output subpath read-write; then the bundle verifier Job; outputs are read
   by the supervisor from the PVC through a short-lived reader Pod, never by
   mounting the PVC into the Crucible pods.
-- `terminate`: `drain` deletes the Pod with the policy grace period
-  (SIGTERM, then SIGKILL by the kubelet); `kill` deletes with grace zero.
+- `terminate`: `drain` deletes the Pod with the policy grace period, read
+  off the Pod itself (SIGTERM, then SIGKILL by the kubelet); `kill` deletes
+  with grace zero.
 - `cleanup`: only after `logs_drained`; delete Jobs and NetworkPolicy;
   delete the per-attempt Secret under every policy; keep or delete the PVC
   per policy (retained PVCs carry a retention label the sweep honours);
@@ -503,7 +540,14 @@ any other per-attempt fact Crucible observed (11). The image digest stays on
 the attempt row. (Made concrete 2026-09-21 during C8a.) `limits.as_dict()`
 (issue 93) carries `cpu_request` and `memory_request` beside `cpu` and
 `memory`, so the evidence records what was actually asked of the scheduler
-next to what was allowed to run.
+next to what was allowed to run. The limits are read back from the live Pod
+once it has been seen, and `limits_source` says so (`pod`; `template` for an
+attempt adopted before its Pod existed; `policy` before any Pod was read):
+admission may rewrite what was asked for, and an attempt adopted after a
+supervisor restart has no policy in memory at all, so what the Pod carries is
+the observed fact. The same reading gives an adopted attempt's drain the grace
+period its Pod was created with, which is the task policy's. (Made concrete
+2026-09-25, issues 66 and 76.)
 
 `GET /providers` reports the Kubernetes provider with `isolation: pod`,
 `network_control: true`, `resource_limits: true`, `shared_disk: false`, the
@@ -533,8 +577,10 @@ the status page.
    separate Deployments on this topology. Object storage for artifacts would
    remove the second requirement and is a later phase.
    (Added 2026-09-22 during C9.)
-4. Nodes have a pod PID limit configured (the kubelet's `podPidsLimit`, the
-   pod-level cgroup, not any one container's own `pids.max`). The canary
+4. Every node that can run a Pod of `crucible-workers` has a pod PID limit
+   configured (the kubelet's `podPidsLimit`, the pod-level cgroup, not any one
+   container's own `pids.max`); there is no per-pod field to set instead (see
+   the pod shape above, issue 60). The canary
    reads it from the parent of its own cgroup under cgroup v2, which the
    container runtime must make visible for the probe to confirm it; on a
    runtime that isolates the pod's cgroup from the container (the default on

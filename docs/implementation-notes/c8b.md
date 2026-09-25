@@ -104,9 +104,10 @@ cluster is read.
 - `drain` still records 143 when a worker exits cleanly inside the grace
   period. Recovering the real code needs a watch rather than the current poll.
 - The PID limit is read from the canary's node. This tier has one node and
-  cannot prove a heterogeneous multi-node cluster.
+  cannot prove a heterogeneous multi-node cluster. (Documented as the
+  operator-declared path on 2026-09-25, issue 60.)
 - `pod_log` still has no `limitBytes`; a long-running worker can make a poll
-  read its complete log.
+  read its complete log. (Bounded on 2026-09-25, issue 63.)
 - No current harness combines a read-only credential with templates, so that
   latent projected-volume interaction remains unobserved.
 

@@ -46,9 +46,15 @@ def canary_policies(api: Any) -> list[dict[str, Any]]:
     ]
 
 
+async def resolved(provider: KubernetesProvider) -> None:
+    """Resolve an attempt's image, which is what the canary runs, without `prepare`:
+    `prepare` consults the probe itself (issue 59), and these tests watch it run."""
+    await provider._resolve_image(spec())
+
+
 async def ready(**build_kwargs: Any) -> tuple[Any, Any, NamespaceProbe]:
     api, _registry, provider = build(**build_kwargs)
-    await provider.prepare(spec())
+    await resolved(provider)
     return api, provider, await provider.ensure_ready()
 
 
@@ -130,16 +136,16 @@ async def test_an_unreachable_local_endpoint_refuses_only_launches_routed_to_it(
     )
     local_launch = spec(endpoint="local", endpoint_url=LITELLM)
     subscription_launch = spec(attempt_id="01ATTEMPT0000000000000000B")
-    local_workspace = await provider.prepare(local_launch)
-    subscription_workspace = await provider.prepare(subscription_launch)
+    # Issue 59: the refusal comes at prepare, before any object of the attempt exists.
+    with pytest.raises(LaunchRefusedError, match="local endpoint check failed"):
+        await provider.prepare(local_launch)
+    assert not api.object_names("persistentvolumeclaims")
     probe = await provider.ensure_ready()
     assert probe.passed is True
     assert probe.local_endpoint_reachable is False
     assert "local endpoint check failed" in probe.detail
-    with pytest.raises(LaunchRefusedError, match="local endpoint check failed"):
-        await provider.launch(local_workspace, local_launch)
+    subscription_workspace = await provider.prepare(subscription_launch)
     await provider.launch(subscription_workspace, subscription_launch)
-    assert api
 
 
 async def test_an_inconclusive_local_endpoint_check_refuses_only_launches_routed_to_it() -> None:
@@ -151,9 +157,8 @@ async def test_an_inconclusive_local_endpoint_check_refuses_only_launches_routed
     assert probe.local_endpoint_reachable is None
     assert "local endpoint check inconclusive" in probe.detail
     local_launch = spec(endpoint="local", endpoint_url=LITELLM)
-    local_workspace = await provider.prepare(local_launch)
     with pytest.raises(LaunchRefusedError, match="local endpoint check inconclusive"):
-        await provider.launch(local_workspace, local_launch)
+        await provider.prepare(local_launch)
     subscription_launch = spec(attempt_id="01ATTEMPT0000000000000000B")
     subscription_workspace = await provider.prepare(subscription_launch)
     await provider.launch(subscription_workspace, subscription_launch)
@@ -166,15 +171,13 @@ async def test_dns_down_refuses_every_launch_whatever_the_route() -> None:
     )
     local_launch = spec(endpoint="local", endpoint_url=LITELLM)
     subscription_launch = spec(attempt_id="01ATTEMPT0000000000000000B")
-    local_workspace = await provider.prepare(local_launch)
-    subscription_workspace = await provider.prepare(subscription_launch)
+    with pytest.raises(LaunchRefusedError, match="the workers namespace is not ready"):
+        await provider.prepare(local_launch)
+    with pytest.raises(LaunchRefusedError, match="the workers namespace is not ready"):
+        await provider.prepare(subscription_launch)
     probe = await provider.ensure_ready()
     assert probe.passed is False
-    with pytest.raises(LaunchRefusedError, match="the workers namespace is not ready"):
-        await provider.launch(local_workspace, local_launch)
-    with pytest.raises(LaunchRefusedError, match="the workers namespace is not ready"):
-        await provider.launch(subscription_workspace, subscription_launch)
-    assert api
+    assert not api.object_names("persistentvolumeclaims")
 
 
 async def test_an_endpoint_recovery_admits_hermes_again_with_no_manual_reset() -> None:
@@ -185,16 +188,16 @@ async def test_an_endpoint_recovery_admits_hermes_again_with_no_manual_reset() -
         config=config(egress=IN_CLUSTER, local_endpoint_url=LITELLM), canary_endpoint="unreachable"
     )
     local_launch = spec(endpoint="local", endpoint_url=LITELLM)
-    local_workspace = await provider.prepare(local_launch)
+    with pytest.raises(LaunchRefusedError, match="local endpoint check failed"):
+        await provider.prepare(local_launch)
     probe = await provider.ensure_ready()
     assert probe.passed is True and probe.local_endpoint_reachable is False
-    with pytest.raises(LaunchRefusedError, match="local endpoint check failed"):
-        await provider.launch(local_workspace, local_launch)
 
     api.canary_endpoint = "reachable"
     probe = await provider.ensure_ready()
     assert probe.passed is True
     assert probe.local_endpoint_reachable is True
+    local_workspace = await provider.prepare(local_launch)
     await provider.launch(local_workspace, local_launch)
 
 
@@ -213,7 +216,8 @@ async def test_an_endpoint_no_rule_can_permit_refuses_only_launches_routed_to_it
     )
     local_launch = spec(endpoint="local", endpoint_url=gateway)
     subscription_launch = spec(attempt_id="01ATTEMPT0000000000000000B")
-    local_workspace = await provider.prepare(local_launch)
+    with pytest.raises(LaunchRefusedError, match="no rule can permit it"):
+        await provider.prepare(local_launch)
     subscription_workspace = await provider.prepare(subscription_launch)
     probe = await provider.ensure_ready()
     assert probe.passed is True
@@ -221,12 +225,12 @@ async def test_an_endpoint_no_rule_can_permit_refuses_only_launches_routed_to_it
     assert probe.local_endpoint_reachable is False
     assert "local endpoint check failed: no rule can permit it" in probe.detail
     assert "10.20.0.5" in (probe.local_endpoint_detail or "")
-    # The worker rules canary ran, under DNS alone: the endpoint is not in its policy.
-    [policy] = canary_policies(api)
-    [rule] = policy["spec"]["egress"]
-    assert {p["port"] for p in rule["ports"]} == {53}
-    with pytest.raises(LaunchRefusedError, match="no rule can permit it"):
-        await provider.launch(local_workspace, local_launch)
+    # The worker rules canary ran, under DNS alone: the endpoint is in no policy of it.
+    # An unsettled endpoint answer is asked again on every gate, so there is one per run.
+    for policy in canary_policies(api):
+        [rule] = policy["spec"]["egress"]
+        assert {p["port"] for p in rule["ports"]} == {53}
+    assert canary_policies(api)
     await provider.launch(subscription_workspace, subscription_launch)
 
 
@@ -239,6 +243,7 @@ async def test_worker_rules_that_cannot_be_written_refuse_every_launch() -> None
     subscription_launch = spec(attempt_id="01ATTEMPT0000000000000000B")
     local_workspace = await provider.prepare(local_launch)
     subscription_workspace = await provider.prepare(subscription_launch)
+    proved = len(canary_policies(api))
     # The admin setting refuses this selector, so it is put in force directly: it stands
     # for any worker rules the canary's policy cannot be built from.
     provider.config = replace(
@@ -252,7 +257,8 @@ async def test_worker_rules_that_cannot_be_written_refuse_every_launch() -> None
         await provider.launch(local_workspace, local_launch)
     with pytest.raises(LaunchRefusedError, match="the workers namespace is not ready"):
         await provider.launch(subscription_workspace, subscription_launch)
-    assert not canary_policies(api)
+    # No canary policy could be written under the new rules.
+    assert len(canary_policies(api)) == proved
 
 
 def test_an_old_canary_output_without_the_new_answers_does_not_pass() -> None:
@@ -367,7 +373,7 @@ async def test_the_retention_sweep_never_takes_a_canary_mid_run() -> None:
     sweep's listing does not see it or its policy (found on `make deploy-kind`, where
     the supervisor's sweep deleted the API process's canary and the probe failed)."""
     api, _registry, provider = build()
-    await provider.prepare(spec())
+    await resolved(provider)
     real_log = api.pod_log
     swept: list[str] = []
     in_flight: list[str] = []
@@ -410,7 +416,7 @@ async def test_a_probe_proved_under_rules_that_changed_while_it_ran_is_not_kept(
     """A refresh during a canary run: the answer is about rules no longer in force, so
     the canary runs again under the new ones before anything is stored."""
     api, _registry, provider = build()
-    await provider.prepare(spec())
+    await resolved(provider)
     real_log = api.pod_log
     runs: list[ClusterEgress] = []
 
@@ -464,7 +470,7 @@ async def test_a_namespace_without_its_default_deny_fails_even_with_worker_rules
     canary has none, so a namespace that lost its default deny still fails the probe
     (readiness row 12, and the e2e-kind case that deletes the default deny)."""
     api, _registry, provider = build()
-    await provider.prepare(spec())
+    await resolved(provider)
     real_log = api.pod_log
 
     def pod_log(name: str, **kwargs: Any) -> Any:

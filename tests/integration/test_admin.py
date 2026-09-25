@@ -44,6 +44,7 @@ from crucible.domain.ids import new_id
 from crucible.domain.lifecycle import AttemptState, ExecutionState, TaskState
 from crucible.ports.execution import ImageInfo
 from crucible.ports.harness import CredentialSource
+from crucible.settings import Settings
 from tests.admin_cli import admin_main, envelope_data
 from tests.fixtures import contract_document
 
@@ -299,6 +300,28 @@ def test_ui_session_csrf_reader_access_and_page_walk(
         )
         assert forbidden.status_code == 303
         assert "admin%20role%20required" in forbidden.headers["location"]
+
+
+def test_the_settings_page_shows_broad_egress_and_the_resolve_ttl(
+    ctx: AppContext,
+    tokens: dict[str, str],
+    admin_ctx: AdminContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue 61: the two egress settings are on the rendered settings page beside every
+    other Kubernetes setting, with where each value came from."""
+    monkeypatch.delenv("CRUCIBLE_CONFIG", raising=False)
+    monkeypatch.setenv("CRUCIBLE_KUBERNETES__RESOLVE_TTL_SECONDS", "120")
+    ctx.settings = Settings()
+    with TestClient(create_app(ctx)) as browser:
+        ui_sign_in(browser, tokens["observer"])
+        page = browser.get("/ui/settings")
+    assert page.status_code == 200, page.text
+    text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", page.text))
+    assert re.search(r"kubernetes\.broad_egress no default", text), text
+    assert "GitHub included" in text
+    assert re.search(r"kubernetes\.resolve_ttl_seconds 120\.0 environment", text), text
+    assert re.search(r"kubernetes\.launch_timeout_seconds 300 default", text), text
 
 
 def test_ui_mutation_uses_the_same_harness_service_and_rejects_bad_csrf(

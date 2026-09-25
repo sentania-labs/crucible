@@ -18,7 +18,7 @@ import pytest
 
 from crucible.adapters.execution import k8sspec
 from crucible.adapters.execution import kubernetes as kubernetes_module
-from crucible.adapters.execution.k8sapi import ExecResult, KubernetesApiError
+from crucible.adapters.execution.k8sapi import ExecResult, KubernetesApiError, LogFrame
 from crucible.adapters.execution.k8sfake import FakeKubernetesApi
 from crucible.adapters.execution.kubernetes import (
     CollectionFailedError,
@@ -62,6 +62,19 @@ async def prepared(**kwargs: Any) -> Any:
     launch = spec(**kwargs)
     workspace = await provider.prepare(launch)
     return api, registry, provider, launch, workspace
+
+
+async def refused_at_prepare(**kwargs: Any) -> Any:
+    """Issue 59: a namespace the probe has not passed gets no object of the attempt,
+    no preparer Pod and no copy of its credential, not only no worker."""
+    api, _registry, provider = build(**kwargs.pop("build", {}))
+    with pytest.raises(LaunchRefusedError, match="not ready"):
+        await provider.prepare(spec(**kwargs))
+    for kind in ("persistentvolumeclaims", "configmaps", "secrets", "jobs"):
+        assert not [row for row in api.created if row["kind"] == kind], (
+            f"prepare created {kind} before the readiness gate"
+        )
+    return api, provider
 
 
 # ----- the port ------------------------------------------------------------
@@ -152,7 +165,7 @@ async def test_the_canary_requests_a_small_fixed_size_not_the_role_pods_size() -
 
 async def test_the_probe_requests_log_lines_without_timestamp_prefixes() -> None:
     api, _registry, provider = build()
-    await provider.prepare(spec())
+    await provider._resolve_image(spec())
     real = api.pod_log
     requested: list[bool] = []
 
@@ -168,7 +181,7 @@ async def test_the_probe_requests_log_lines_without_timestamp_prefixes() -> None
 
 async def test_concurrent_readiness_checks_share_one_canary() -> None:
     _api, _registry, provider = build()
-    await provider.prepare(spec())
+    await provider._resolve_image(spec())
     real = provider._run_probe
     calls = 0
 
@@ -185,38 +198,30 @@ async def test_concurrent_readiness_checks_share_one_canary() -> None:
 
 
 async def test_a_namespace_whose_cni_does_not_enforce_egress_refuses_every_launch() -> None:
-    _api, _registry, provider, launch, workspace = await prepared(build={"egress_enforced": False})
+    _api, provider = await refused_at_prepare(build={"egress_enforced": False})
     probe = await provider.ensure_ready()
     assert probe.passed is False and probe.egress_enforced is False
-    with pytest.raises(LaunchRefusedError, match="not ready"):
-        await provider.launch(workspace, launch)
     assert (await provider.health()).state == "degraded"
 
 
 async def test_a_node_with_no_pod_pid_limit_refuses_every_launch() -> None:
-    _api, _registry, provider, launch, workspace = await prepared(build={"pod_pid_limit": None})
+    _api, provider = await refused_at_prepare(build={"pod_pid_limit": None})
     probe = await provider.ensure_ready()
     assert probe.passed is False and probe.pid_limit is None
     assert "podPidsLimit is not set" in probe.detail
     assert probe.pid_limit_source == "cgroup-v2-parent"
-    with pytest.raises(LaunchRefusedError, match="not ready"):
-        await provider.launch(workspace, launch)
 
 
 async def test_a_private_cgroup_namespace_reports_inconclusive_not_a_pass() -> None:
     """The container's own cgroup limit (95's bug) must never stand in for the pod-level
     one: when the runtime hides the parent cgroup, the gate says so and still refuses,
     even though a container-scope number is sitting right there in `pids.max`."""
-    _api, _registry, provider, launch, workspace = await prepared(
-        build={"pod_pid_limit_source": "cgroupns-private"}
-    )
+    _api, provider = await refused_at_prepare(build={"pod_pid_limit_source": "cgroupns-private"})
     probe = await provider.ensure_ready()
     assert probe.passed is False
     assert probe.pid_limit is None
     assert probe.pid_limit_source == "cgroupns-private"
     assert "cgroup namespace isolation" in probe.detail
-    with pytest.raises(LaunchRefusedError, match="not ready"):
-        await provider.launch(workspace, launch)
 
 
 async def test_an_operator_declared_limit_covers_a_private_cgroup_namespace() -> None:
@@ -252,26 +257,20 @@ async def test_an_operator_declared_limit_never_overrides_a_confirmed_absence() 
         image_pull_secret="ghcr-pull",
         pod_pid_limit_override=512,
     )
-    _api, _registry, provider, launch, workspace = await prepared(
-        build={"config": config, "pod_pid_limit": None}
-    )
+    _api, provider = await refused_at_prepare(build={"config": config, "pod_pid_limit": None})
     probe = await provider.ensure_ready()
     assert probe.passed is False
     assert probe.pid_limit is None
     assert probe.pid_limit_source == "cgroup-v2-parent"
-    with pytest.raises(LaunchRefusedError, match="not ready"):
-        await provider.launch(workspace, launch)
 
 
 async def test_a_zero_pod_pid_limit_from_the_canary_is_not_a_limit() -> None:
     """0 is not a value `podPidsLimit` takes; a canary reporting it must not be read as
     a confirmed limit (95's Codex correction)."""
-    _api, _registry, provider, launch, workspace = await prepared(build={"pod_pid_limit": 0})
+    _api, provider = await refused_at_prepare(build={"pod_pid_limit": 0})
     probe = await provider.ensure_ready()
     assert probe.passed is False and probe.pid_limit is None
     assert "podPidsLimit is not set" in probe.detail
-    with pytest.raises(LaunchRefusedError, match="not ready"):
-        await provider.launch(workspace, launch)
 
 
 async def test_a_non_positive_override_never_passes_the_gate() -> None:
@@ -285,26 +284,20 @@ async def test_a_non_positive_override_never_passes_the_gate() -> None:
         image_pull_secret="ghcr-pull",
         pod_pid_limit_override=-1,
     )
-    _api, _registry, provider, launch, workspace = await prepared(
+    _api, provider = await refused_at_prepare(
         build={"config": config, "pod_pid_limit_source": "cgroupns-private"}
     )
     probe = await provider.ensure_ready()
     assert probe.passed is False and probe.pid_limit is None
-    with pytest.raises(LaunchRefusedError, match="not ready"):
-        await provider.launch(workspace, launch)
 
 
 async def test_cgroup_v1_pod_pid_limit_is_unsupported_not_a_pass() -> None:
-    _api, _registry, provider, launch, workspace = await prepared(
-        build={"pod_pid_limit_source": "cgroup-v1"}
-    )
+    _api, provider = await refused_at_prepare(build={"pod_pid_limit_source": "cgroup-v1"})
     probe = await provider.ensure_ready()
     assert probe.passed is False
     assert probe.pid_limit is None
     assert probe.pid_limit_source == "cgroup-v1"
     assert "unsupported" in probe.detail
-    with pytest.raises(LaunchRefusedError, match="not ready"):
-        await provider.launch(workspace, launch)
 
 
 # ----- images (07, 13) -----------------------------------------------------
@@ -485,6 +478,156 @@ async def test_logs_resume_strictly_after_the_stored_position() -> None:
     assert resumed == []
 
 
+def _stamped(second: int, nanos: int, text: str) -> str:
+    return f"2026-09-25T17:00:{second:02d}.{nanos:09d}Z {text}"
+
+
+async def _drain_logs(provider: KubernetesProvider, handle: Handle) -> list[bytes]:
+    """Poll as the supervisor does, carrying the resume position forward, until a poll
+    brings nothing new; every line stored, in order."""
+    offset = LogOffset()
+    stored: list[bytes] = []
+    for _ in range(50):
+        chunks = await provider.logs(handle, offset)
+        if not chunks:
+            return stored
+        for chunk in chunks:
+            stored.extend(chunk.content.splitlines())
+            offset = LogOffset(
+                index=offset.index + chunk.lines,
+                timestamp=chunk.ts.isoformat() if chunk.ts else None,
+                line_sha256=chunk.line_sha256,
+                occurrence=chunk.occurrence,
+            )
+    raise AssertionError("the log never stopped bringing new lines")
+
+
+async def _worker_with_log(lines: list[str]) -> tuple[FakeKubernetesApi, Any, Handle]:
+    api, _registry, provider, launch, workspace = await prepared()
+    handle = await provider.launch(workspace, launch)
+    await run_to_exit(provider, handle)
+    api.logs[f"{handle.ref}-abc12"] = lines
+    return api, provider, handle
+
+
+async def test_a_log_poll_asks_for_a_bounded_number_of_bytes() -> None:
+    """Issue 63: every observation poll passes `limitBytes`, so no poll reads the whole
+    log of a long-running worker into memory."""
+    api, provider, handle = await _worker_with_log([_stamped(0, 0, "hello")])
+    api.log_reads.clear()
+    await provider.logs(handle, LogOffset())
+    assert [r["limit_bytes"] for r in api.log_reads] == [kubernetes_module.LOG_READ_LIMIT]
+
+
+async def test_a_capped_log_read_resumes_with_the_line_it_cut(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue 63: a capped read can stop inside a line. Only whole lines are stored, and
+    the strict-after resume of 10 carries on from the last of them, so the log arrives
+    complete, in order and exactly once over several polls."""
+    # About 180 bytes a second against a 400-byte read: each poll gets past its first
+    # second and stops inside a later line.
+    monkeypatch.setattr(kubernetes_module, "LOG_READ_LIMIT", 400)
+    lines = [_stamped(s, n, f"line {s}.{n} " + "x" * 20) for s in range(6) for n in range(3)]
+    api, provider, handle = await _worker_with_log(lines)
+    api.log_reads.clear()
+    stored = await _drain_logs(provider, handle)
+    assert stored == [line.partition(" ")[2].encode() for line in lines]
+    assert len(api.log_reads) > 2
+    assert {r["limit_bytes"] for r in api.log_reads} == {400}
+
+
+async def test_a_short_truncated_log_response_resumes_with_the_whole_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue 63 follow-up: the kubelet can land short of `limitBytes` and still cut a
+    line in half. Detecting a capped read by the missing trailing newline, not by exact
+    byte equality against the limit, still resumes with the whole line."""
+    monkeypatch.setattr(kubernetes_module, "LOG_READ_LIMIT", 400)
+    lines = [_stamped(s, n, f"line {s}.{n} " + "x" * 20) for s in range(6) for n in range(3)]
+    api, provider, handle = await _worker_with_log(lines)
+    real = api.pod_log
+
+    def pod_log(*args: Any, **kwargs: Any) -> Any:
+        call_kwargs = dict(kwargs)
+        limit = call_kwargs.pop("limit_bytes", None)
+        frames = real(*args, **call_kwargs, limit_bytes=None)
+        payload = b"".join(f.payload for f in frames)
+        if limit is not None and len(payload) > limit:
+            # A real kubelet response can land a few bytes short of the exact
+            # limit and still cut a line in half.
+            payload = payload[: max(0, limit - 5)]
+        return [LogFrame("stdout", payload)] if payload else []
+
+    api.pod_log = pod_log  # type: ignore[method-assign]
+    api.log_reads.clear()
+    stored = await _drain_logs(provider, handle)
+    assert stored == [line.partition(" ")[2].encode() for line in lines]
+    assert len(api.log_reads) > 2
+
+
+async def test_an_unfinished_line_well_under_the_limit_waits_for_the_next_poll() -> None:
+    """Issue 63 follow-up: a worker partway through writing a line, with nothing else
+    new and a response nowhere near `limitBytes`, is not a capped read. It is left for
+    the next regular poll instead of being forced through a growth retry to the
+    ceiling, which would wrongly report it as a skipped crowded second."""
+    api, provider, handle = await _worker_with_log([])
+
+    def pod_log(name: str, **kwargs: Any) -> Any:
+        api.log_reads.append(
+            {
+                "name": name,
+                "since_time": kwargs.get("since_time"),
+                "limit_bytes": kwargs.get("limit_bytes"),
+            }
+        )
+        payload = _stamped(0, 0, "still writing").encode()[:20]
+        return [LogFrame("stdout", payload)] if payload else []
+
+    api.pod_log = pod_log  # type: ignore[method-assign]
+    api.log_reads.clear()
+    chunks = await provider.logs(handle, LogOffset())
+    assert chunks == []
+    assert len(api.log_reads) == 1
+
+
+async def test_a_second_fuller_than_one_read_is_read_again_larger(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`sinceTime` is one-second granular, so a read capped inside the first second it
+    returns cannot move on by resuming. It is read again larger, up to the ceiling."""
+    monkeypatch.setattr(kubernetes_module, "LOG_READ_LIMIT", 100)
+    monkeypatch.setattr(kubernetes_module, "LOG_READ_CEILING", 1600)
+    lines = [_stamped(0, n, f"burst {n} " + "y" * 30) for n in range(10)]
+    lines.append(_stamped(1, 0, "after"))
+    api, provider, handle = await _worker_with_log(lines)
+    api.log_reads.clear()
+    stored = await _drain_logs(provider, handle)
+    assert stored == [line.partition(" ")[2].encode() for line in lines]
+    assert max(r["limit_bytes"] for r in api.log_reads) == 1600
+
+
+async def test_a_second_fuller_than_the_ceiling_is_skipped_with_a_notice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Past the ceiling nothing `sinceTime` can say gets through the second, so the
+    resume moves to the next second and the log says what was skipped. The poll never
+    stalls and never reads unbounded."""
+    monkeypatch.setattr(kubernetes_module, "LOG_READ_LIMIT", 100)
+    monkeypatch.setattr(kubernetes_module, "LOG_READ_CEILING", 400)
+    lines = [_stamped(0, 0, "before")]
+    lines += [_stamped(1, n + 1, f"flood {n} " + "z" * 60) for n in range(20)]
+    lines += [_stamped(2, 5, "after the flood")]
+    api, provider, handle = await _worker_with_log(lines)
+    api.log_reads.clear()
+    stored = await _drain_logs(provider, handle)
+    assert stored[0] == b"before"
+    assert stored[-1] == b"after the flood"
+    notices = [line for line in stored if line.startswith(b"[crucible] log lines skipped")]
+    assert len(notices) == 1
+    assert all(r["limit_bytes"] <= 400 for r in api.log_reads)
+
+
 # ----- reconcile (10, 26) --------------------------------------------------
 
 
@@ -649,6 +792,7 @@ async def test_an_adopted_job_with_no_pod_yet_collects_with_the_real_image() -> 
     adopted = await provider.reconcile()
     assert provider._launched[launch.attempt_id].image_digest == handle.image_digest
     assert provider._launched[launch.attempt_id].limits.grace_seconds == 30
+    assert provider._launched[launch.attempt_id].limits_source == "template"
     # The Job controller gets round to it after the restart.
     api.no_pod_yet.discard(launch.attempt_id)
     api._start_job(api.objects[("jobs", handle.ref)].body)
@@ -676,6 +820,86 @@ async def test_an_adopted_attempt_records_its_node() -> None:
     document = json.loads(evidence.content)
     assert document["pod"] == f"{handle.ref}-abc12"
     assert document["node"] == "lab-node-1"
+
+
+def _record_deletes(api: FakeKubernetesApi) -> list[tuple[str, str, int | None]]:
+    """Every delete with the grace period it asked for; the fake itself keeps names."""
+    seen: list[tuple[str, str, int | None]] = []
+    real = api.delete
+
+    def delete(kind: str, name: str, **kwargs: Any) -> None:
+        seen.append((kind, name, kwargs.get("grace_period_seconds")))
+        real(kind, name, **kwargs)
+
+    api.delete = delete  # type: ignore[method-assign]
+    return seen
+
+
+async def test_an_adopted_attempt_drains_with_the_task_policys_grace_period() -> None:
+    """Issue 66: after a supervisor restart the adopted attempt has no policy in memory,
+    and a drain must still give the worker the policy's grace, not a 60 s default."""
+    policy = {
+        "images": {"allowlist": ["crucible-worker:*"]},
+        "resources": {"cpus": 2, "memory": "4GiB"},
+        "limits": {"grace_seconds": 45},
+    }
+    api, _registry, provider, launch, workspace = await prepared(policy=policy)
+    handle = await provider.launch(workspace, launch)
+    provider._launched.clear()
+    [adopted] = await provider.reconcile()
+    assert provider._launched[launch.attempt_id].limits.grace_seconds == 45
+    deletes = _record_deletes(api)
+    await provider.terminate(adopted, "drain")
+    assert deletes == [("pods", f"{handle.ref}-abc12", 45)]
+
+
+async def test_a_drain_on_a_handle_the_provider_never_saw_uses_the_pods_grace() -> None:
+    """Issue 66: a handle with no `_Launched` behind it (a terminate before any
+    reconcile) reads the grace period off the live Pod rather than guessing 60 s."""
+    api, _registry, provider, launch, workspace = await prepared()
+    handle = await provider.launch(workspace, launch)
+    provider._launched.clear()
+    deletes = _record_deletes(api)
+    await provider.terminate(handle, "drain")
+    assert deletes == [("pods", f"{handle.ref}-abc12", 30)]
+
+
+async def test_an_adopted_attempt_records_the_live_pods_limits() -> None:
+    """Issue 76: the hardening evidence of an adopted attempt is what its live Pod
+    carries (here, as an admission controller rewrote it), not the policy's intent."""
+    api, _registry, provider, launch, workspace = await prepared()
+    handle = await provider.launch(workspace, launch)
+    pod = api.objects[("pods", f"{handle.ref}-abc12")].body
+    container = pod["spec"]["containers"][0]
+    container["resources"] = {
+        "limits": {"cpu": "1500m", "memory": "3Gi", "ephemeral-storage": "1Gi"},
+        "requests": {"cpu": "750m", "memory": "3Gi"},
+    }
+    provider._launched.clear()
+    [adopted] = await provider.reconcile()
+    await run_to_exit(provider, adopted)
+    outputs = await provider.collect(adopted, workspace, launch)
+    evidence = next(a for a in outputs.artifacts if a.name == "report/kubernetes-launch.json")
+    document = json.loads(evidence.content)
+    assert document["limits_source"] == "pod"
+    assert document["limits"]["cpu"] == "1500m"
+    assert document["limits"]["memory"] == str(3 * 1024**3)
+    assert document["limits"]["cpu_request"] == "750m"
+    assert document["limits"]["ephemeral_storage"] == "1Gi"
+    assert document["limits"]["termination_grace_seconds"] == 30
+
+
+async def test_a_launched_attempt_records_limits_read_from_its_pod() -> None:
+    """Issue 76: without a restart too, the evidence is the Pod as the API server
+    stored it once the Pod has been seen."""
+    _api, _registry, provider, launch, workspace = await prepared()
+    handle = await provider.launch(workspace, launch)
+    await run_to_exit(provider, handle)
+    outputs = await provider.collect(handle, workspace, launch)
+    evidence = next(a for a in outputs.artifacts if a.name == "report/kubernetes-launch.json")
+    document = json.loads(evidence.content)
+    assert document["limits_source"] == "pod"
+    assert document["limits"] == provider._limits(launch).as_dict()
 
 
 async def test_reconcile_does_not_adopt_a_finished_job_with_no_pod() -> None:
@@ -993,7 +1217,7 @@ async def test_a_required_credential_with_no_declared_auth_files_fails_naming_th
 
 
 async def test_a_rotated_auth_file_is_written_back_and_the_copy_removed() -> None:
-    """12: on a clean exit, a valid, newer file is synced back and the copy removed."""
+    """12: a valid, newer file is synced back and the copy removed."""
     api, provider, launch, workspace = await codex_attempt()
     handle = await provider.launch(workspace, launch)
     claim = api.claims["ws-01attempt0000000000000000a"]
@@ -1010,6 +1234,26 @@ async def test_a_rotated_auth_file_is_written_back_and_the_copy_removed() -> Non
     )
     assert sync.removed and not api.secret_exists("cred-01attempt0000000000000000a")
     assert "credential/auth.json" not in claim
+
+
+async def test_a_failed_attempts_newer_auth_file_is_still_written_back() -> None:
+    """12, issue 56: a harness that refreshed its token before the task failed has
+    rotated the refresh token; the one in the harness Secret may already be revoked.
+    The newer, valid file is written back whatever the exit code."""
+    api, provider, launch, workspace = await codex_attempt()
+    api.script(launch.attempt_id, "crash")
+    handle = await provider.launch(workspace, launch)
+    api.claims["ws-01attempt0000000000000000a"]["credential/auth.json"] = _auth(
+        "2026-09-21T00:00:00Z"
+    )
+    observation = await run_to_exit(provider, handle)
+    assert observation.exit_code not in (None, 0)
+    outputs = await provider.collect(handle, workspace, launch)
+    assert outputs.credential_sync is not None
+    assert [(f.name, f.synced) for f in outputs.credential_sync.files] == [("auth.json", True)]
+    assert api.harness_secret("crucible-harness-codex")["auth.json"] == _auth(
+        "2026-09-21T00:00:00Z"
+    )
 
 
 async def test_an_older_auth_file_is_recorded_and_not_written_back() -> None:
@@ -1166,20 +1410,15 @@ async def test_a_canary_that_cannot_tell_does_not_pass_the_probe() -> None:
     script would have reported `unreachable` on a namespace with no egress enforcement
     at all. An answer that is not a definite refusal to connect is `inconclusive`, and
     an inconclusive probe refuses every launch."""
-    _api, _registry, provider, launch, workspace = await prepared(
-        build={"canary_answer": "inconclusive"}
-    )
+    _api, provider = await refused_at_prepare(build={"canary_answer": "inconclusive"})
     probe = await provider.ensure_ready()
     assert probe.passed is False and probe.checked is False
     assert "could not tell" in probe.detail
-    with pytest.raises(LaunchRefusedError, match="not ready"):
-        await provider.launch(workspace, launch)
     assert (await provider.health()).state == "degraded"
 
 
 async def test_a_canary_whose_output_never_finished_is_not_a_result() -> None:
-    _api, _registry, provider = build(canary_done=False)
-    await provider.prepare(spec())
+    _api, provider = await refused_at_prepare(build={"canary_done": False})
     probe = await provider.ensure_ready()
     assert probe.passed is False and probe.checked is False
 
@@ -1447,6 +1686,32 @@ def test_without_a_probe_image_the_canary_falls_back_to_the_first_repository() -
         config=KubernetesConfig(image_repositories=("registry.example/crucible-worker",))
     )
     assert provider._probe_image() == "registry.example/crucible-worker"
+
+
+def test_a_skip_resumes_after_the_crowded_second_not_after_the_line_the_cap_cut() -> None:
+    """Review of issue 63: the cut line belongs to the next second, which may be
+    perfectly readable; the skip moves past the second of the whole lines only."""
+    payload = (
+        _stamped(20, 100_000_000, "a").encode()
+        + b"\n"
+        + _stamped(20, 200_000_000, "b").encode()
+        + b"\n"
+        + _stamped(21, 0, "the cap cut th").encode()
+    )
+    [notice] = kubernetes_module._skip_crowded_second(payload, 64, LogOffset())
+    assert notice.ts is not None and notice.ts.isoformat() == "2026-09-25T17:00:21+00:00"
+
+
+def test_a_skip_inside_one_line_longer_than_the_ceiling_passes_that_line() -> None:
+    payload = _stamped(21, 5, "x" * 200).encode()[:100]
+    [notice] = kubernetes_module._skip_crowded_second(payload, 100, LogOffset())
+    assert notice.ts is not None and notice.ts.isoformat() == "2026-09-25T17:00:22+00:00"
+
+
+def test_a_skip_with_no_readable_stamp_still_moves_past_the_stored_position() -> None:
+    since = LogOffset(timestamp="2026-09-25T17:00:30.500000+00:00", line_sha256="0" * 64)
+    [notice] = kubernetes_module._skip_crowded_second(b"no stamp here", 64, since)
+    assert notice.ts is not None and notice.ts.isoformat() == "2026-09-25T17:00:31+00:00"
 
 
 # ----- the reference cache (26, crucible#55) -------------------------------
