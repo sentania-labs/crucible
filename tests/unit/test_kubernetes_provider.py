@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any
 
@@ -1434,3 +1435,98 @@ def test_without_a_probe_image_the_canary_falls_back_to_the_first_repository() -
         config=KubernetesConfig(image_repositories=("registry.example/crucible-worker",))
     )
     assert provider._probe_image() == "registry.example/crucible-worker"
+
+
+# ----- the reference cache (26, crucible#55) -------------------------------
+
+
+def _job_pod(api: FakeKubernetesApi, prefix: str) -> dict[str, Any]:
+    job = next(
+        c["body"] for c in api.created if c["kind"] == "jobs" and c["name"].startswith(prefix)
+    )
+    pod: dict[str, Any] = job["spec"]["template"]["spec"]
+    return pod
+
+
+def _cache_volume(pod: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    volume = next(v for v in pod["volumes"] if v["name"] == "cache")
+    mount = next(m for c in pod["containers"] for m in c["volumeMounts"] if m["name"] == "cache")
+    return volume, mount
+
+
+async def test_the_preparer_mounts_the_reference_cache_read_only() -> None:
+    config = KubernetesConfig(
+        poll_interval_seconds=0,
+        launch_timeout_seconds=5,
+        storage_class="lab-ssd",
+        image_pull_secret="ghcr-pull",
+        cache_claim="crucible-reference-cache",
+    )
+    api, _registry, _provider, _launch, _workspace = await prepared(build={"config": config})
+
+    kinds = [c["name"].split("-")[0] for c in api.created if c["kind"] == "jobs"]
+    # The refresher runs, and finishes, before the preparer starts.
+    assert kinds.index("refresh") < kinds.index("prepare")
+
+    refresher = _job_pod(api, "refresh-cache-")
+    volume, mount = _cache_volume(refresher)
+    assert volume["persistentVolumeClaim"] == {"claimName": "crucible-reference-cache"}
+    assert not mount.get("readOnly")
+    # The one Pod that writes the cache carries nothing of the attempt's.
+    assert {v["name"] for v in refresher["volumes"]} & {"ws", "identity", "credential"} == set()
+    script = refresher["containers"][0]["command"][-1]
+    assert "fetch --prune origin" in script and "clone --mirror" in script
+
+    preparer = _job_pod(api, "prepare-")
+    volume, mount = _cache_volume(preparer)
+    assert volume["persistentVolumeClaim"]["readOnly"] is True
+    assert mount["readOnly"] is True
+    script = preparer["containers"][0]["command"][-1]
+    assert "fetch --prune" not in script and "clone --mirror" not in script
+    assert "--reference" in script
+
+
+async def test_the_preparer_mounts_no_cache_when_none_is_configured() -> None:
+    api, _registry, _provider, _launch, _workspace = await prepared()
+    assert not [c for c in api.created if c["name"].startswith("refresh-cache-")]
+    assert "cache" not in {v["name"] for v in _job_pod(api, "prepare-")["volumes"]}
+
+
+async def test_a_refresh_waits_for_readers_and_holds_new_ones_back() -> None:
+    gate = kubernetes_module._CacheGate()
+    order: list[str] = []
+    reading = asyncio.Event()
+    release = asyncio.Event()
+
+    async def reader(name: str) -> None:
+        async with gate.reading():
+            order.append(f"{name} in")
+            reading.set()
+            await release.wait()
+            order.append(f"{name} out")
+
+    async def writer() -> None:
+        await reading.wait()
+        async with gate.writing():
+            order.append("write")
+
+    async def late_reader() -> None:
+        await asyncio.sleep(0)
+        await reading.wait()
+        await asyncio.sleep(0)
+        async with gate.reading():
+            order.append("late in")
+
+    tasks = [
+        asyncio.create_task(reader("first")),
+        asyncio.create_task(writer()),
+    ]
+    await reading.wait()
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert order == ["first in"]
+    release.set()
+    await asyncio.gather(*tasks)
+    assert order == ["first in", "first out", "write"]
+    await late_reader()
+    assert order[-1] == "late in"

@@ -38,7 +38,7 @@ import tarfile
 import tempfile
 import time
 import weakref
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -169,6 +169,7 @@ KILL_EXIT_CODE = 137
 # roles and that is the whole mapping.
 OBJECT_PREFIX: dict[str, str] = {
     k8sspec.ROLE_PREPARER: "prepare",
+    k8sspec.ROLE_CACHE_REFRESHER: "refresh-cache",
     k8sspec.ROLE_WORKER: "worker",
     k8sspec.ROLE_COLLECTOR: "collect",
     k8sspec.ROLE_BUNDLE: "verify-bundle",
@@ -443,6 +444,44 @@ _ADOPTED_SPEC = LaunchSpec(
 )
 
 
+class _CacheGate:
+    """A readers-writer gate over one reference cache in this process.
+
+    The refresher writes the mirror (a fetch can prune refs and repack); a preparer
+    reads it through `--reference`. Many preparers may read at once; a refresh waits
+    for them to finish and holds new ones back until it is done. Only the supervisor
+    prepares checkouts, so one process is the whole population (26)."""
+
+    def __init__(self) -> None:
+        self._condition = asyncio.Condition()
+        self._readers = 0
+        self._writing = False
+
+    @contextlib.asynccontextmanager
+    async def reading(self) -> AsyncIterator[None]:
+        async with self._condition:
+            await self._condition.wait_for(lambda: not self._writing)
+            self._readers += 1
+        try:
+            yield
+        finally:
+            async with self._condition:
+                self._readers -= 1
+                self._condition.notify_all()
+
+    @contextlib.asynccontextmanager
+    async def writing(self) -> AsyncIterator[None]:
+        async with self._condition:
+            await self._condition.wait_for(lambda: not self._writing and self._readers == 0)
+            self._writing = True
+        try:
+            yield
+        finally:
+            async with self._condition:
+                self._writing = False
+                self._condition.notify_all()
+
+
 class KubernetesProvider:
     """The provider of 08 on Jobs and Pods, as 26 specifies it."""
 
@@ -478,6 +517,11 @@ class KubernetesProvider:
         self._probe_locks: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock] = (
             weakref.WeakKeyDictionary()
         )
+        # One gate per reference cache (one per repository), per loop as above: a
+        # refresh writes the mirror only while no preparer is cloning from it (#55).
+        self._cache_gates: weakref.WeakKeyDictionary[
+            asyncio.AbstractEventLoop, dict[str, _CacheGate]
+        ] = weakref.WeakKeyDictionary()
         # The attempt ids of the administrative runs this process has in flight (25),
         # with what each one is; their objects carry `crucible.admin` (see `_labels`).
         self._admin_runs: dict[str, str] = {}
@@ -962,43 +1006,57 @@ class KubernetesProvider:
         cache_mounts: list[Mount] = []
         cache_volumes: list[dict[str, Any]] = []
         cache_name: str | None = None
+        gate: _CacheGate | None = None
         if self.config.use_reference_cache and self.config.cache_claim:
             cache_name = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
-            cache_mounts.append(Mount("cache", k8sspec.CACHE_MOUNT))
+            gate = self._cache_gate(cache_name)
+            async with gate.writing():
+                await self._refresh_cache(
+                    spec, url=url, cache_name=cache_name, image=resolved, limits=limits
+                )
+            # 26: the preparer reads the cache and never writes it. It is the one volume
+            # every attempt shares, so an attempt's Pod that could write it could poison
+            # every later checkout (#55). Read-only on the claim and on the mount.
+            cache_mounts.append(Mount("cache", k8sspec.CACHE_MOUNT, read_only=True))
             cache_volumes.append(
                 {
                     "name": "cache",
-                    "persistentVolumeClaim": {"claimName": self.config.cache_claim},
+                    "persistentVolumeClaim": {
+                        "claimName": self.config.cache_claim,
+                        "readOnly": True,
+                    },
                 }
             )
         git_policy = spec.policy.get("git", {})
-        exit_code = await self._run_role_job(
-            spec,
-            role=k8sspec.ROLE_PREPARER,
-            image=resolved,
-            script=scripts.preparer_script(
-                url=url,
-                base_ref=base_ref,
-                work_branch=work_branch,
-                from_remote_branch=spec.role == "correct"
-                or bool(repository.get("resume_from_work_branch")),
-                cache_name=cache_name,
-                author_name=str(git_policy.get("author_name", "crucible-worker")),
-                author_email=str(
-                    git_policy.get("author_email", "crucible-worker@users.noreply.github.com")
+        async with gate.reading() if gate is not None else contextlib.nullcontext():
+            exit_code = await self._run_role_job(
+                spec,
+                role=k8sspec.ROLE_PREPARER,
+                image=resolved,
+                script=scripts.preparer_script(
+                    url=url,
+                    base_ref=base_ref,
+                    work_branch=work_branch,
+                    from_remote_branch=spec.role == "correct"
+                    or bool(repository.get("resume_from_work_branch")),
+                    cache_name=cache_name,
+                    author_name=str(git_policy.get("author_name", "crucible-worker")),
+                    author_email=str(
+                        git_policy.get("author_email", "crucible-worker@users.noreply.github.com")
+                    ),
+                    origin_placeholder=workspace.ORIGIN_PLACEHOLDER,
+                    claude_md_wins=adapter.capabilities().claude_md_wins,
+                    shims=workspace.SHIM_NAMES,
+                    exclude_entries=workspace.EXCLUDE_ENTRIES,
+                    identity_mount=IDENTITY_MOUNT,
+                    refresh_cache=False,
                 ),
-                origin_placeholder=workspace.ORIGIN_PLACEHOLDER,
-                claude_md_wins=adapter.capabilities().claude_md_wins,
-                shims=workspace.SHIM_NAMES,
-                exclude_entries=workspace.EXCLUDE_ENTRIES,
-                identity_mount=IDENTITY_MOUNT,
-            ),
-            mounts=[Mount("ws", WORK_MOUNT), *cache_mounts],
-            volumes=[self._claim_volume(spec.attempt_id), *cache_volumes],
-            limits=limits,
-            timeout=self.config.prepare_timeout_seconds,
-            plan=self._egress_plan(spec, k8sspec.ROLE_PREPARER),
-        )
+                mounts=[Mount("ws", WORK_MOUNT), *cache_mounts],
+                volumes=[self._claim_volume(spec.attempt_id), *cache_volumes],
+                limits=limits,
+                timeout=self.config.prepare_timeout_seconds,
+                plan=self._egress_plan(spec, k8sspec.ROLE_PREPARER),
+            )
         if exit_code != 0:
             raise ProviderError(
                 f"the preparer Job could not build the checkout (exit {exit_code}): "
@@ -1023,6 +1081,43 @@ class KubernetesProvider:
             .decode("utf-8", "replace")
             .strip(),
         )
+
+    def _cache_gate(self, cache_name: str) -> _CacheGate:
+        gates = self._cache_gates.setdefault(asyncio.get_running_loop(), {})
+        return gates.setdefault(cache_name, _CacheGate())
+
+    async def _refresh_cache(
+        self, spec: LaunchSpec, *, url: str, cache_name: str, image: str, limits: Limits
+    ) -> None:
+        """26: refresh the reference cache in a Job of its own, the only Pod that mounts
+        it writable (#55). It carries no workspace, no identity bundle and no
+        credential, only the cache and the git remote. A refresh that fails is logged
+        and the preparer clones from the remote without a reference, as it would with
+        no cache at all: a stale or absent cache costs time, never correctness."""
+        code = await self._run_role_job(
+            spec,
+            role=k8sspec.ROLE_CACHE_REFRESHER,
+            image=image,
+            script=scripts.cache_refresh_script(url=url, cache_name=cache_name),
+            mounts=[Mount("cache", k8sspec.CACHE_MOUNT)],
+            volumes=[
+                {
+                    "name": "cache",
+                    "persistentVolumeClaim": {"claimName": self.config.cache_claim},
+                }
+            ],
+            limits=limits,
+            timeout=self.config.prepare_timeout_seconds,
+            plan=self._egress_plan(spec, k8sspec.ROLE_CACHE_REFRESHER),
+        )
+        if code != 0:
+            log.warning(
+                "the reference cache refresh failed; the preparer clones without it",
+                extra={
+                    "exit_code": code,
+                    "detail": self.last_error.get(k8sspec.ROLE_CACHE_REFRESHER, ""),
+                },
+            )
 
     def _check_endpoint_ready(self, probe: NamespaceProbe, spec: LaunchSpec) -> None:
         """The operator, 2026-09-23: "a down provider should only block that provider."
@@ -2778,8 +2873,13 @@ class KubernetesProvider:
                 )
                 if host not in WORKER_DENIED_HOSTS
             )
-        elif role in (k8sspec.ROLE_PREPARER, k8sspec.ROLE_PUBLISHER):
-            # 26: the preparer and the publisher do the git traffic, and nothing else.
+        elif role in (
+            k8sspec.ROLE_PREPARER,
+            k8sspec.ROLE_CACHE_REFRESHER,
+            k8sspec.ROLE_PUBLISHER,
+        ):
+            # 26: the preparer, the cache refresher and the publisher do the git
+            # traffic, and nothing else.
             # GitHub is not reachable from a worker.
             wanted = ("api.github.com", "github.com")
         elif role == k8sspec.ROLE_LOGIN:
