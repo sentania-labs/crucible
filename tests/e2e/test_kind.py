@@ -1047,8 +1047,17 @@ async def test_login_from_an_empty_secret_to_a_probe_and_an_attempt_through_the_
             assert report["probe"]["exit_class"] == "completed", report
             assert report["validated"] is True
             assert report["credential"]["state"] == "validated"
+            # The probe's PVC delete is issued, not waited for, and the
+            # `kubernetes.io/pvc-protection` finalizer keeps it listed for a moment (110).
+            probe_pvc_selector = f"{k8sspec.LABEL_ADMIN}=probe"
+            for _ in range(60):
+                if not api.list_objects(
+                    "persistentvolumeclaims", label_selector=probe_pvc_selector
+                ):
+                    break
+                time.sleep(0.5)
             assert not api.list_objects(
-                "persistentvolumeclaims", label_selector=f"{k8sspec.LABEL_ADMIN}=probe"
+                "persistentvolumeclaims", label_selector=probe_pvc_selector
             )
 
         with TestClient(app, headers={"Authorization": f"Bearer {tokens['operator']}"}) as client:
