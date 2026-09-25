@@ -65,7 +65,7 @@ CRUCIBLE_DEPLOY_PORT ?= 8080
 
 .PHONY: up dev down reset lint check-image-manifest scan scan-tree scan-history smoke test test-unit \
 	test-integration e2e e2e-github e2e-live e2e-admin e2e-image build proxy-config proxies preflight \
-	e2e-kind registry-check manifests deploy-kind release-images-classify release-images-pull release-images-verify \
+	e2e-kind registry-check manifests deploy-kind first-run-kind release-images-classify release-images-pull release-images-verify \
 	deploy-local deploy-local-down images images-check release-notes
 
 up: preflight proxy-config ## normal mode: postgres, proxies, migrate, crucible
@@ -237,6 +237,15 @@ manifests: ## render deploy/kubernetes and validate every object; needs kubectl 
 #
 deploy-kind: check-image-manifest ## deploy the manifests on a disposable kind cluster and run one task
 	CRUCIBLE_E2E_DOCKER="$(DOCKER)" \
+	  UV="$(UV)" tools/kind/deploy-kind.sh
+
+# The first-run path on a disposable kind cluster (crucible#119, #120, #121, #123, #79):
+# the same deployment as deploy-kind, then gateway URL and key, a model picked from the
+# gateway, a stand-in GitHub App connected and a repository picked, and Status reading
+# ready for Hermes. Stand-ins only: no real model and no real GitHub API. Needs the
+# combined worker image images/manifest.env pins on the host daemon (`make images`).
+first-run-kind: check-image-manifest ## deploy on a disposable kind cluster and walk the first-run setup
+	CRUCIBLE_E2E_DOCKER="$(DOCKER)" CRUCIBLE_DEPLOY_KIND_FIRST_RUN=1 \
 	  UV="$(UV)" tools/kind/deploy-kind.sh
 
 # The live GitHub tier (23). Local only, never in CI: it mints a real installation token
