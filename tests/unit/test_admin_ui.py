@@ -528,7 +528,7 @@ def test_hermes_steps_name_the_real_blocker_and_the_page_that_fixes_it(
     codes = [step["code"] for step in hermes["steps"]]
     assert codes == ["endpoint_not_configured", "credential_not_verified", "no_enabled_model"]
     assert {step["fix"] for step in hermes["steps"]} == {"/ui/gateway"}
-    assert "gateway URL is not set" in hermes["steps"][0]["text"]
+    assert "The gateway URL for hermes is not set" in hermes["steps"][0]["text"]
     assert [step["code"] for step in readiness["steps"]] == ["no_repository", "no_ready_harness"]
     assert all("script-harness" not in step["text"] for step in readiness["steps"])
 

@@ -17,7 +17,7 @@ from crucible.application.proxy_config import (
     worker_proxy_config,
 )
 from crucible.domain.endpoints import validate_endpoint
-from crucible.domain.entities import Principal
+from crucible.domain.entities import Principal, ProviderSetting
 from crucible.domain.events import EventKind
 from crucible.ports.repository import UnitOfWork
 
@@ -81,16 +81,21 @@ def local_endpoint_view(uow: UnitOfWork) -> dict[str, Any]:
 
 def gateway_url(uow: UnitOfWork) -> tuple[str | None, str]:
     """The gateway URL in force and where it comes from: `routing` when the local model
-    entries of the routing policy in force carry one URL, `saved` when only the
-    `local.gateway` setting has one (no entry exists yet, or none carries a URL), and
-    `none` otherwise. The Hermes probe, the gateway page and the Status page all read
-    this one answer."""
+    entries of the routing policy in force carry one URL, `mixed` (and no URL) when they
+    carry several, `saved` when only the `local.gateway` setting has one (no entry exists
+    yet, or none carries a URL), and `none` otherwise. The Hermes probe, the gateway page
+    and the Status page all read this one answer."""
     try:
         view = local_endpoint_view(uow)
     except NotFoundError:
         view = None
     if view is not None and view.get("endpoint_url"):
         return str(view["endpoint_url"]), "routing"
+    urls = {m.get("endpoint_url") for m in (view or {}).get("models", []) if m.get("endpoint_url")}
+    if len(urls) > 1:
+        # Entries that disagree (an uploaded policy can do that) name no one gateway;
+        # testing the saved URL instead would pass for a URL no entry uses.
+        return None, "mixed"
     row = uow.provider_settings.get(GATEWAY_SETTING)
     saved = (row.document or {}).get("endpoint_url") if row is not None else None
     if isinstance(saved, str) and saved:
@@ -230,6 +235,16 @@ def save_local_endpoint(
         routing_document=routing_document,
         reason=reason,
         note="Local endpoint update",
+    )
+    # The saved gateway URL follows, so it cannot come back stale if the entries go.
+    uow.provider_settings.put(
+        ProviderSetting(
+            name=GATEWAY_SETTING,
+            document={"endpoint_url": endpoint_url},
+            updated_at=ctx.clock.now(),
+            updated_by=principal.name,
+            reason=reason,
+        )
     )
     after = {
         "policy": {"name": policy.name, "version": next_policy_version},

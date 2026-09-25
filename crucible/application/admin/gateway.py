@@ -236,11 +236,6 @@ async def save_gateway(
     if HERMES not in ctx.harnesses.names():
         raise GatewayError("no Hermes adapter is registered, so there is no gateway to set")
     key_given = bool(api_key and api_key.strip())
-    if key_given:
-        assert api_key is not None
-        await credentials.write_api_key(
-            ctx, uow, principal=principal.name, harness=HERMES, api_key=api_key, reason=reason
-        )
     before, _ = gateway_url(uow)
     uow.provider_settings.put(
         ProviderSetting(
@@ -291,6 +286,24 @@ async def save_gateway(
         },
         change="gateway",
     )
+    if key_given or before != endpoint_url:
+        # A new key or URL has not been tested yet: an earlier pass must not keep the
+        # credential reading as verified if this test turns out inconclusive, and a new
+        # key has not been refused by anyone yet (#123).
+        state = uow.harnesses.get(HERMES)
+        if state is not None:
+            state.last_validated_at = None
+            if key_given:
+                state.last_auth_failure_at = None
+            state.updated_at = ctx.clock.now()
+            uow.harnesses.put(state)
+    if key_given:
+        # Last of the writes: the key leaves the transaction (a Secret or a file), so
+        # everything that can still refuse has already run (#119 review).
+        assert api_key is not None
+        await credentials.write_api_key(
+            ctx, uow, principal=principal.name, harness=HERMES, api_key=api_key, reason=reason
+        )
     return await _tested(ctx, uow, principal=principal.name, reason=reason)
 
 
@@ -391,7 +404,12 @@ async def save_models(
             f"{subscription} are subscription model entries of the routing policy in force, "
             "not local ones; pick a model the gateway offers"
         )
-    unoffered = sorted(i for i, pick in picks.items() if pick["enabled"] and i not in offered)
+    # A new model the gateway does not list is a typo or a stale page: refused by name.
+    # An entry already in force that the gateway stopped listing is disabled below with
+    # that reason, whatever the pick said, so a page saved as it was shown still saves.
+    unoffered = sorted(
+        i for i, pick in picks.items() if pick["enabled"] and i not in offered and i not in by_id
+    )
     if unoffered:
         raise GatewayError(
             f"gateway {endpoint} does not offer {unoffered}; only a model it lists can be enabled"

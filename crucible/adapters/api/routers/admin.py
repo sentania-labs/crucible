@@ -174,12 +174,14 @@ async def admin_save_gateway_models(
         raise ConflictError("models must be a list of model picks")
     _require_boolean_flags(models)
     limit = body.get("max_concurrency")
+    if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int)):
+        raise ConflictError("max_concurrency must be a whole number")
     result = await gateway.save_models(
         _admin(ctx),
         uow,
         principal=principal,
         models=models,
-        max_concurrency=int(limit) if limit is not None else None,
+        max_concurrency=limit,
         reason=_reason(body),
     )
     uow.commit()
