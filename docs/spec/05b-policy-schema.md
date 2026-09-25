@@ -14,6 +14,7 @@ description: "Software repositories consumed by something else: branch, PR, merg
 
 limits:
   timeout_seconds: { min: 300, max: 14400, default: 3600 }
+  command_timeout_ms: { min: 1000, max: 14400000, default: 3600000 }   # per shell command, see below
   max_attempts: { max: 3, default: 2 }
   grace_seconds: 60                    # drain before kill
   stall_warn_seconds: 300
@@ -193,9 +194,24 @@ retention:
   the operator uploaded (principal role `operator` or `admin`), which is
   recorded as a decision.
 
+## The per-command timeout
+
+`limits.command_timeout_ms` is the timeout every harness runs one shell command
+under, in milliseconds (issue 128; the operator's decision of 2026-09-25: "in the
+worker pods we should do this (or it's equivilant) for all harnesess, and the
+timeout should be set by the task launch. i.e. configurable at a hades level or
+dispatched at run time."). The attempt launches with the contract's
+`execution_request.command_timeout_ms` when it sets one, else this default, and
+never with more than its own `timeout_seconds`. A version uploaded before the
+field existed takes the default bounds shown above (60 minutes). The admin API,
+CLI and UI edit it in place (25), which writes a new policy version with only
+this limit changed. How each harness is held to it is in 07.
+
 ## Precedence with the task contract
 
 The contract may narrow but never widen: `timeout_seconds` within limits,
+`command_timeout_ms` within its limits and never above its own
+`timeout_seconds`,
 `max_attempts` at or under the cap, `retry_on` a subset of
 `eligible_classes`, `network` may select `none` under an `egress-proxy`
 policy but not the reverse, `required_verification` a superset of

@@ -78,6 +78,7 @@ execution_request:                 # the class of work; Crucible selects the mod
   tier: "standard"                 # trivial | standard | complex, from the routing policy (05b)
   provider: "docker"
   timeout_seconds: 5400
+  command_timeout_ms: 1800000      # optional; narrows the policy's per-command timeout (05b, issue 128)
   rationale: "mechanical change; standard tier"
   effort: "high"                   # optional; passed through where the selected harness has an effort flag (07)
   pin: null                        # operator pin only: { harness, model, pin_reason }; Foundry never sets it
@@ -172,6 +173,10 @@ of the previous version's. `required_verification` may not shrink.
 - `deliverables[].closes` entries are issues in the same repository.
 - No credential reference or value anywhere: the contract has no auth
   fields by design; repository auth is Crucible configuration.
+- `command_timeout_ms`, when set, within the policy's
+  `limits.command_timeout_ms` bounds and never above `timeout_seconds`
+  (issue 128). Absent, the attempt launches with the policy default, capped at
+  `timeout_seconds`.
 - `timeout_seconds` within policy bounds; `retry_on` a subset of both the
   `ExitClass` enum and the policy's `retry.eligible_classes`.
 - The contract is authoritative for tier, provider, pin, and policy; the
