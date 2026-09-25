@@ -466,6 +466,8 @@ class WakeRepository(Protocol):
 
     def count_unacked(self) -> int: ...
 
+    def count_unacked_for_principal(self, principal_id: str) -> int: ...
+
     def list_acked_before(self, cutoff: datetime, limit: int) -> Sequence[Wake]:
         """Wakes acked before the cutoff, oldest first. The caller applies each one's
         own policy window and records a RetentionAction per deletion (16)."""

@@ -77,7 +77,9 @@ def tasks(uow: UnitOfWork, *, owner: str | None = None) -> dict[str, Any]:
 
 def wakes(uow: UnitOfWork, *, owner: str | None = None) -> dict[str, Any]:
     """Pending wakes per principal; with `owner`, that principal's alone, and `unacked`
-    counts only its own."""
+    counts only its own. Each principal's count comes from a count query, not the
+    (page-limited) list, so a principal with more than the page limit of pending
+    wakes still reports its true count."""
     per_principal: dict[str, int] = {}
     oldest: str | None = None
     for principal in uow.principals.list_all():
@@ -87,7 +89,7 @@ def wakes(uow: UnitOfWork, *, owner: str | None = None) -> dict[str, Any]:
             principal.id, since=None, include_acked=False, limit=200
         )
         if pending:
-            per_principal[principal.name] = len(pending)
+            per_principal[principal.name] = uow.wakes.count_unacked_for_principal(principal.id)
             first = min(w.created_at for w in pending).isoformat()
             oldest = first if oldest is None or first < oldest else oldest
     return {

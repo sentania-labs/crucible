@@ -1404,6 +1404,58 @@ def test_capabilities_show_an_orchestrator_its_own_work_only(
     assert everything["wakes"]["unacked"] == 2
 
 
+def test_capabilities_wakes_count_is_not_truncated_by_the_page_limit(
+    ctx: AppContext,
+    tokens: dict[str, str],
+    admin_ctx: AdminContext,
+) -> None:
+    """Codex round on #130 (crucible#116): an orchestrator with more unacknowledged
+    wakes than the status page limit (200) still gets its true count, not the page
+    size, and another orchestrator's wakes are never counted against it."""
+    with ctx.uow_factory() as uow:
+        other = mint_token(uow, ctx.clock, name="other-orchestrator", role=Role.ORCHESTRATOR)
+        mine = uow.principals.get_by_name("orchestrator-principal")
+        assert mine is not None
+        for _ in range(205):
+            create_wake(
+                uow,
+                ctx.clock,
+                principal_id=mine.id,
+                reason=WakeReason.BLOCKED,
+                summary="blocked",
+                raised_by="tests",
+            )
+        create_wake(
+            uow,
+            ctx.clock,
+            principal_id=other.principal.id,
+            reason=WakeReason.BLOCKED,
+            summary="blocked",
+            raised_by="tests",
+        )
+        uow.commit()
+
+    def client(token: str) -> TestClient:
+        return TestClient(create_app(ctx), headers={"Authorization": f"Bearer {token}"})
+
+    with client(tokens["orchestrator"]) as mine_client, client(other.token) as theirs_client:
+        mine_view = mine_client.get("/v1/capabilities").json()
+        theirs_view = theirs_client.get("/v1/capabilities").json()
+
+    assert mine_view["wakes"]["pending"] == {"orchestrator-principal": 205}
+    assert mine_view["wakes"]["unacked"] == 205
+    assert theirs_view["wakes"]["pending"] == {"other-orchestrator": 1}
+    assert theirs_view["wakes"]["unacked"] == 1
+
+    with client(tokens["operator"]) as operator:
+        everything = operator.get("/v1/capabilities").json()
+    assert everything["wakes"]["pending"] == {
+        "orchestrator-principal": 205,
+        "other-orchestrator": 1,
+    }
+    assert everything["wakes"]["unacked"] == 206
+
+
 def test_the_cli_remote_mode_builds_the_same_calls(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[tuple[str, str, Any]] = []
 
