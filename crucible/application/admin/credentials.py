@@ -36,7 +36,7 @@ from crucible.application.admin.context import (
     guard_mutation,
     record_refusal,
 )
-from crucible.application.admin.routing import local_endpoint_view
+from crucible.application.admin.routing import gateway_url
 from crucible.application.errors import ConflictError, ContractValidationError, NotFoundError
 from crucible.application.harnesses import (
     credential_state,
@@ -376,6 +376,30 @@ async def set_api_key(
     reason = guard_mutation(
         ctx, uow, reason, principal=principal, operation=f"credentials set {harness}"
     )
+    await write_api_key(
+        ctx, uow, principal=principal, harness=harness, api_key=api_key, reason=reason
+    )
+    return await validate(
+        ctx,
+        uow,
+        principal=principal,
+        harness=harness,
+        reason=reason,
+        audit_events=False,
+    )
+
+
+async def write_api_key(
+    ctx: AdminContext,
+    uow: UnitOfWork,
+    *,
+    principal: str,
+    harness: str,
+    api_key: str,
+    reason: str,
+) -> None:
+    """The write half of `set_api_key`, for a caller that has already passed the guard
+    (the local gateway save, crucible#119). Records `credential_set`; never the value."""
     if harness != HERMES:
         raise CredentialAdminError("the paste credential flow is available only for Hermes")
     value = api_key.strip()
@@ -409,14 +433,7 @@ async def set_api_key(
                 "created": written["created"],
             },
         )
-        return await validate(
-            ctx,
-            uow,
-            principal=principal,
-            harness=harness,
-            reason=reason,
-            audit_events=False,
-        )
+        return
     source = source_for(ctx, harness)
     directory = Path(source.path)
     try:
@@ -448,14 +465,25 @@ async def set_api_key(
         before={"harness": harness},
         after={"harness": harness, "state": "credential set"},
     )
-    return await validate(
-        ctx,
-        uow,
-        principal=principal,
-        harness=harness,
-        reason=reason,
-        audit_events=False,
-    )
+
+
+def read_api_key(ctx: AdminContext, harness: str = HERMES) -> str | None:
+    """The stored Hermes key, for the one outbound call that sends it (the gateway's
+    `/models`). None when none is stored. Blocking; never logged or returned."""
+    store = secret_store(ctx)
+    if store is not None:
+        held = stored_files(store, harness)
+        value = (held or {}).get("api-key", b"").decode("utf-8", "replace").strip()
+        return value or None
+    source = ctx.credential_sources.get(harness)
+    if source is None or not source.path:
+        return None
+    key_path = spec_for(ctx, harness).source_path(source.path, "api-key")
+    try:
+        value = key_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return value or None
 
 
 async def validate(
@@ -751,7 +779,13 @@ async def _probe_async(
     return record
 
 
-def _http_status(url: str, *, bearer: str | None, timeout: float) -> int:
+MODELS_BODY_LIMIT = 1024 * 1024
+
+
+def _http_get(url: str, *, bearer: str | None, timeout: float) -> tuple[int, bytes]:
+    """One GET that never follows a redirect (the bearer must not travel to another
+    host) and reads at most MODELS_BODY_LIMIT bytes of the answer."""
+
     class _NoRedirect(urllib.request.HTTPRedirectHandler):
         def redirect_request(
             self,
@@ -768,9 +802,27 @@ def _http_status(url: str, *, bearer: str | None, timeout: float) -> int:
     request = urllib.request.Request(url, headers=headers, method="GET")
     try:
         with urllib.request.build_opener(_NoRedirect()).open(request, timeout=timeout) as response:
-            return int(response.status)
+            return int(response.status), response.read(MODELS_BODY_LIMIT)
     except urllib.error.HTTPError as exc:
-        return int(exc.code)
+        return int(exc.code), b""
+
+
+def _http_status(url: str, *, bearer: str | None, timeout: float) -> int:
+    return _http_get(url, bearer=bearer, timeout=timeout)[0]
+
+
+def model_ids(body: bytes) -> list[str]:
+    """The model ids of an OpenAI-compatible `/models` answer, `{"data": [{"id": ...}]}`,
+    in the order the gateway lists them. Anything else is no models."""
+    try:
+        document = json.loads(body.decode("utf-8", "replace"))
+    except ValueError:
+        return []
+    items = document.get("data") if isinstance(document, dict) else None
+    if not isinstance(items, list):
+        return []
+    ids = [str(item["id"]) for item in items if isinstance(item, dict) and item.get("id")]
+    return list(dict.fromkeys(ids))
 
 
 async def _hermes_probe_async(
@@ -782,40 +834,45 @@ async def _hermes_probe_async(
     reason: str,
     audit_event: bool = True,
 ) -> ProbeRecord:
-    """Probe LiteLLM without running a model or exposing its bearer in process output."""
-    store = secret_store(ctx)
-    if store is not None:
-        held = await asyncio.to_thread(stored_files, store, harness)
-        bearer = (held or {}).get("api-key", b"").decode("utf-8", "replace").strip()
-    else:
-        source = source_for(ctx, harness)
-        key_path = spec_for(ctx, harness).source_path(source.path, "api-key")
-        bearer = key_path.read_text(encoding="utf-8").strip()
-    endpoint = local_endpoint_view(uow).get("endpoint_url")
+    """Probe LiteLLM without running a model or exposing its bearer in process output.
+
+    The detail says in plain words what the probe proved and names the URL it used
+    (crucible#119): a `completed` probe is a gateway that answered its readiness check
+    and listed its models for the stored key."""
+    bearer = await asyncio.to_thread(read_api_key, ctx, harness)
+    endpoint, _source = gateway_url(uow)
     started = time.monotonic()
+    readiness_status: int | None = None
+    models_status: int | None = None
     if not isinstance(endpoint, str) or not endpoint:
-        readiness_status = None
-        models_status = None
         exit_class = ExitClass.ENVIRONMENT
         conclusive = False
         cause = "endpoint_not_configured"
-        detail = "the local endpoint is not configured"
+        detail = "The gateway URL is not set, so nothing was tested. Set it on Local gateway."
+    elif bearer is None:
+        exit_class = ExitClass.ENVIRONMENT
+        conclusive = False
+        cause = "key_not_set"
+        detail = f"No Hermes key is stored, so gateway {endpoint} was not tested."
     else:
         parsed = urlsplit(endpoint)
         readiness = urlunsplit((parsed.scheme, parsed.netloc, "/health/readiness", "", ""))
         models = endpoint.rstrip("/") + "/models"
         try:
-            readiness_status = await asyncio.to_thread(
-                _http_status, readiness, bearer=None, timeout=float(ctx.probe_timeout_seconds)
+            readiness_status, _ = await asyncio.to_thread(
+                _http_get, readiness, bearer=None, timeout=float(ctx.probe_timeout_seconds)
             )
             if readiness_status != 200:
                 exit_class = ExitClass.ENVIRONMENT
                 conclusive = False
                 cause = f"readiness_http_{readiness_status}"
-                models_status = None
+                detail = (
+                    f"Gateway {endpoint} answered its readiness check with HTTP "
+                    f"{readiness_status}; the key was not tested."
+                )
             else:
-                models_status = await asyncio.to_thread(
-                    _http_status,
+                models_status, body = await asyncio.to_thread(
+                    _http_get,
                     models,
                     bearer=bearer,
                     timeout=float(ctx.probe_timeout_seconds),
@@ -829,18 +886,24 @@ async def _hermes_probe_async(
                 )
                 conclusive = models_status in (200, 401)
                 cause = "" if conclusive else f"models_http_{models_status}"
+                if models_status == 200:
+                    count = len(model_ids(body))
+                    detail = (
+                        f"Gateway {endpoint} reachable, key accepted, "
+                        f"{count} model{'' if count == 1 else 's'}."
+                    )
+                elif models_status == 401:
+                    detail = f"Gateway {endpoint} reachable, but it refused the key (HTTP 401)."
+                else:
+                    detail = (
+                        f"Gateway {endpoint} reachable, but listing its models answered "
+                        f"HTTP {models_status}."
+                    )
         except (OSError, urllib.error.URLError, UnicodeError) as exc:
             exit_class = ExitClass.ENVIRONMENT
             conclusive = False
             cause = "endpoint_unreachable"
-            models_status = None
-            detail = type(exc).__name__
-        else:
-            detail = (
-                f"readiness HTTP {readiness_status}; models HTTP {models_status}"
-                if models_status is not None
-                else f"readiness HTTP {readiness_status}"
-            )
+            detail = f"Gateway {endpoint} could not be reached ({type(exc).__name__})."
     record = ProbeRecord(
         harness=harness,
         exit_class=exit_class.value,

@@ -21,6 +21,11 @@ from crucible.domain.entities import Principal
 from crucible.domain.events import EventKind
 from crucible.ports.repository import UnitOfWork
 
+# The saved local gateway (crucible#119): its URL, kept in `provider_settings` so it can be
+# set before any local model entry exists to carry it. Once an entry does, the entries'
+# URL is what workers use and what every view reports.
+GATEWAY_SETTING = "local.gateway"
+
 
 def list_exhaustions(ctx: AdminContext, uow: UnitOfWork) -> dict[str, Any]:
     now = ctx.clock.now()
@@ -74,6 +79,105 @@ def local_endpoint_view(uow: UnitOfWork) -> dict[str, Any]:
     }
 
 
+def gateway_url(uow: UnitOfWork) -> tuple[str | None, str]:
+    """The gateway URL in force and where it comes from: `routing` when the local model
+    entries of the routing policy in force carry one URL, `saved` when only the
+    `local.gateway` setting has one (no entry exists yet, or none carries a URL), and
+    `none` otherwise. The Hermes probe, the gateway page and the Status page all read
+    this one answer."""
+    try:
+        view = local_endpoint_view(uow)
+    except NotFoundError:
+        view = None
+    if view is not None and view.get("endpoint_url"):
+        return str(view["endpoint_url"]), "routing"
+    row = uow.provider_settings.get(GATEWAY_SETTING)
+    saved = (row.document or {}).get("endpoint_url") if row is not None else None
+    if isinstance(saved, str) and saved:
+        return saved, "saved"
+    return None, "none"
+
+
+def publish_routing(
+    ctx: AdminContext,
+    uow: UnitOfWork,
+    *,
+    principal: Principal,
+    policy: Any,
+    routing: Any,
+    routing_document: dict[str, Any],
+    reason: str,
+    note: str,
+) -> tuple[int, int]:
+    """Store `routing_document` as the next version of the routing policy in force and a
+    next delivery policy version that names it, then bring the worker egress in line:
+    the proxy allowlist, the Docker provider's allowlist, and the Kubernetes provider's
+    settings. Returns the new (policy version, routing version)."""
+    routing_versions = uow.routing_policies.list_versions(routing.name)
+    next_routing_version = max(item.version for item in routing_versions) + 1
+    routing_document["version"] = next_routing_version
+    put_routing_policy(
+        uow,
+        ctx.clock,
+        principal=principal,
+        name=routing.name,
+        version=next_routing_version,
+        document=routing_document,
+        reason=reason,
+    )
+    policy_document = copy.deepcopy(policy.document)
+    policy_versions = uow.policies.list_versions(policy.name)
+    next_policy_version = max(item.version for item in policy_versions) + 1
+    policy_document["version"] = next_policy_version
+    policy_document["description"] = (
+        f"{policy.document.get('description', 'Software delivery policy')} "
+        f"{note} in version {next_policy_version}."
+    )
+    policy_document["routing"] = {"policy": {"name": routing.name, "version": next_routing_version}}
+    put_policy(
+        uow,
+        ctx.clock,
+        principal=principal,
+        name=policy.name,
+        version=next_policy_version,
+        document=policy_document,
+        reason=reason,
+    )
+    if ctx.proxy_config_path:
+        rendered = worker_proxy_config(ctx.proxy_subnet, list(ctx.proxy_hosts), [routing_document])
+        install_worker_proxy_config(
+            Path(ctx.proxy_config_path),
+            rendered,
+            reload_timeout_seconds=ctx.proxy_reload_timeout_seconds,
+        )
+    docker = ctx.providers.get("docker")
+    if docker is not None and hasattr(docker, "config"):
+        base_hosts = tuple(
+            host for host in getattr(docker.config, "proxy_allowlist", ()) if ":" not in host
+        )
+        enabled_destinations = []
+        for endpoint in enabled_local_endpoints([routing_document]):
+            parsed = urlsplit(endpoint)
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+            enabled_destinations.append(f"{parsed.hostname}:{port}")
+        docker.config = replace(
+            docker.config,
+            proxy_allowlist=tuple(dict.fromkeys([*base_hosts, *enabled_destinations])),
+        )
+    # The Kubernetes readiness canary proves a connection to the enabled local endpoint;
+    # a new one is read back, and proved again before a launch uses it (crucible#91).
+    kubernetes = ctx.providers.get("kubernetes")
+    reload = getattr(kubernetes, "reload_settings", None)
+    if callable(reload):
+        reload()
+    return next_policy_version, next_routing_version
+
+
+def active_documents(uow: UnitOfWork) -> tuple[Any, Any]:
+    """The delivery policy in force and the routing policy it names."""
+    return _active_documents(uow)
+
+
 def save_local_endpoint(
     ctx: AdminContext,
     uow: UnitOfWork,
@@ -117,63 +221,16 @@ def save_local_endpoint(
             model["disabled_reason"] = "operator disabled from the local endpoint panel"
     pool_name = str(local_models[0]["pool"])
     routing_document["pools"][pool_name]["max_concurrency"] = max_concurrency
-    routing_versions = uow.routing_policies.list_versions(routing.name)
-    next_routing_version = max(item.version for item in routing_versions) + 1
-    routing_document["version"] = next_routing_version
-    put_routing_policy(
+    next_policy_version, next_routing_version = publish_routing(
+        ctx,
         uow,
-        ctx.clock,
         principal=principal,
-        name=routing.name,
-        version=next_routing_version,
-        document=routing_document,
+        policy=policy,
+        routing=routing,
+        routing_document=routing_document,
         reason=reason,
+        note="Local endpoint update",
     )
-    policy_document = copy.deepcopy(policy.document)
-    policy_versions = uow.policies.list_versions(policy.name)
-    next_policy_version = max(item.version for item in policy_versions) + 1
-    policy_document["version"] = next_policy_version
-    policy_document["description"] = (
-        f"{policy.document.get('description', 'Software delivery policy')} "
-        f"Local endpoint update in version {next_policy_version}."
-    )
-    policy_document["routing"] = {"policy": {"name": routing.name, "version": next_routing_version}}
-    put_policy(
-        uow,
-        ctx.clock,
-        principal=principal,
-        name=policy.name,
-        version=next_policy_version,
-        document=policy_document,
-        reason=reason,
-    )
-    if ctx.proxy_config_path:
-        rendered = worker_proxy_config(ctx.proxy_subnet, list(ctx.proxy_hosts), [routing_document])
-        install_worker_proxy_config(
-            Path(ctx.proxy_config_path),
-            rendered,
-            reload_timeout_seconds=ctx.proxy_reload_timeout_seconds,
-        )
-    docker = ctx.providers.get("docker")
-    if docker is not None and hasattr(docker, "config"):
-        base_hosts = tuple(
-            host for host in getattr(docker.config, "proxy_allowlist", ()) if ":" not in host
-        )
-        enabled_destinations = []
-        for endpoint in enabled_local_endpoints([routing_document]):
-            parsed = urlsplit(endpoint)
-            port = parsed.port or (443 if parsed.scheme == "https" else 80)
-            enabled_destinations.append(f"{parsed.hostname}:{port}")
-        docker.config = replace(
-            docker.config,
-            proxy_allowlist=tuple(dict.fromkeys([*base_hosts, *enabled_destinations])),
-        )
-    # The Kubernetes readiness canary proves a connection to the enabled local endpoint;
-    # a new one is read back, and proved again before a launch uses it (crucible#91).
-    kubernetes = ctx.providers.get("kubernetes")
-    reload = getattr(kubernetes, "reload_settings", None)
-    if callable(reload):
-        reload()
     after = {
         "policy": {"name": policy.name, "version": next_policy_version},
         "routing_policy": {"name": routing.name, "version": next_routing_version},
