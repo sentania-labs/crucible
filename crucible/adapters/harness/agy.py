@@ -20,10 +20,11 @@ wait continues in the background ("Background command is still running after %ds
 from the binary's strings, 2026-09-25); neither `agy --help` nor the public CLI docs
 name a setting that changes it. `--print-timeout` bounds the whole turn and is the
 attempt's own timeout. The one mitigation is in the prompt: run commands blocking, for
-up to the launch's command timeout, and never end the turn with one running. What print mode does with a background command at exit was not
-observed: AGY cannot run without a Google login, so it was not reproduced. Its
-transcript format for background commands is unknown, so this adapter has no in-flight
-evidence to read and its attempts are classified by exit code and report alone.
+up to the launch's command timeout, and never end the turn with one running. What print
+mode does with a background command at exit was not observed: AGY cannot run without a
+Google login, so it was not reproduced. Its transcript format for background commands
+is unknown, so this adapter has no in-flight evidence to read and its attempts are
+classified by exit code and report alone.
 """
 
 from __future__ import annotations
