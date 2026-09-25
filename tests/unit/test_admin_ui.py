@@ -932,13 +932,14 @@ def test_once_a_harness_is_ready_the_others_gaps_leave_the_to_do_list() -> None:
     from crucible.adapters.ui.router import _readiness_sections  # noqa: PLC0415
 
     step = {"code": "credential_missing", "text": "codex has no credential.", "fix": "/ui/x"}
-    ready = {
+    codex = {"name": "codex", "state": "not_ready", "note": "", "steps": [step]}
+    ready: dict[str, Any] = {
         "ready": True,
         "ready_harnesses": ["hermes"],
         "steps": [],
         "harnesses": [
             {"name": "hermes", "state": "ready", "note": "ready for a task", "steps": []},
-            {"name": "codex", "state": "not_ready", "note": "", "steps": [step]},
+            codex,
         ],
     }
     sections, (_summary, detail) = _readiness_sections(ready)
@@ -948,7 +949,7 @@ def test_once_a_harness_is_ready_the_others_gaps_leave_the_to_do_list() -> None:
         **ready,
         "ready": False,
         "ready_harnesses": [],
-        "harnesses": [ready["harnesses"][1]],
+        "harnesses": [codex],
     }
     sections, _ = _readiness_sections(none_ready)
     assert sections[0]["rows"] == [[step["text"], step["fix"]]]
