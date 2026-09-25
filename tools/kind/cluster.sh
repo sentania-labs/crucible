@@ -136,6 +136,11 @@ crucible_kind_install_calico() {
     -e "s#quay.io/calico/node:${CRUCIBLE_CALICO_VERSION}#quay.io/calico/node:${CRUCIBLE_CALICO_VERSION}@${CRUCIBLE_CALICO_NODE_DIGEST}#g" \
     -e "s#quay.io/calico/kube-controllers:${CRUCIBLE_CALICO_VERSION}#quay.io/calico/kube-controllers:${CRUCIBLE_CALICO_VERSION}@${CRUCIBLE_CALICO_KUBE_CONTROLLERS_DIGEST}#g" \
     "$calico"
+  # A new manifest that spells an image differently would slip past the rewrite above.
+  if grep -E '^[[:space:]]*image:' "$calico" | grep -v '@sha256:' >&2; then
+    echo "kind: the Calico manifest names an image not pinned by digest (67)" >&2
+    return 1
+  fi
   KUBECONFIG="$kubeconfig" kubectl apply -f "$calico" >/dev/null
   KUBECONFIG="$kubeconfig" kubectl -n kube-system rollout status daemonset/calico-node --timeout=180s
   KUBECONFIG="$kubeconfig" kubectl wait --for=condition=Ready nodes --all --timeout=180s
