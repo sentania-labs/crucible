@@ -246,12 +246,12 @@ Promotion checks the harness's version in the image against the running release'
 tested range, so once a release raises a range's lower bound past an older image's pin,
 that older image is no longer offered for it; roll the Crucible release back with it.
 
-For Hermes, use **Routing** to set the HTTPS `/v1` gateway URL, model `coder`, thinking
-preference, enabled state, and pool concurrency. Saving creates immutable policy
-versions. Then set the LiteLLM virtual key on the same page ("Set Hermes API key"; also
-`crucible admin credentials set --harness hermes` or `POST
-/v1/admin/credentials/hermes/set`). Crucible writes it into the `crucible-harness-hermes`
-Secret, creating it if it is absent, and probes it: unauthenticated
+For Hermes, use **Local gateway** to set the HTTPS `/v1` gateway URL and the LiteLLM
+virtual key together (also `crucible admin gateway set --endpoint-url URL --key` or
+`POST /v1/admin/gateway`), then tick the gateway's models to use, their thinking
+preference and capability, and the pool concurrency; saving the models writes a new
+routing policy version. Crucible writes the key into the `crucible-harness-hermes`
+Secret, creating it if it is absent, and tests both: unauthenticated
 `/health/readiness` must return 200, then authenticated `/v1/models` decides. The key is
 never shown again; the page and `GET /v1/admin/credentials/hermes` report only
 `key_set`. The committed lab CA is already installed in the worker image trust store.

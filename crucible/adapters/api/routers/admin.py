@@ -545,8 +545,9 @@ def admin_github(ctx: Ctx, uow: UoW, _principal: Admin) -> dict[str, Any]:
 
 @router.post("/admin/github/check")
 def admin_github_check(
-    ctx: Ctx, uow: UoW, principal: Admin, body: Annotated[dict[str, Any], Body()]
+    ctx: Ctx, uow: UoW, principal: Admin, body: Annotated[dict[str, Any] | None, Body()] = None
 ) -> dict[str, Any]:
+    """A check, so no reason is asked for; one given is recorded (crucible#117)."""
     result = github.check(_admin(ctx), uow, principal=principal.name, reason=_reason(body))
     uow.commit()
     return result
