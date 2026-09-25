@@ -48,6 +48,7 @@ APP_ID = 4242
 APP_SLUG = "crucible-kind"
 MODELS = ["kind-fast", "kind-large"]
 REPOSITORY = "octo-lab/widgets"
+PRIVATE_REPOSITORY = "octo-lab/secret-plans"
 
 
 def _smoke_module() -> Any:
@@ -347,6 +348,29 @@ def github(base_url: str, token: str, private_key: str) -> None:
         or registered["installation_id"] != installation["id"]
     ):
         raise SmokeError("the registration did not take GitHub's default branch and installation")
+    # Checkout carries no credential, so a private repository is listed, marked and refused.
+    private = next(
+        (r for r in installation["repositories"] if r["full_name"] == PRIVATE_REPOSITORY), None
+    )
+    if private is None or private.get("unsupported") != "private: not supported yet":
+        raise SmokeError(f"the picker did not mark {PRIVATE_REPOSITORY} as unsupported: {private}")
+    try:
+        request(
+            "POST",
+            f"{base_url}/v1/admin/github/repositories",
+            token=token,
+            body={
+                "reason": "first-run kind proof",
+                "installation_id": installation["id"],
+                "repository": PRIVATE_REPOSITORY,
+            },
+        )
+    except SmokeError as exc:
+        if "HTTP 409" not in str(exc) or "private: not supported yet" not in str(exc):
+            raise
+        show("private repository refused", str(exc).splitlines()[-1])
+    else:
+        raise SmokeError(f"{PRIVATE_REPOSITORY} was registered although it is private")
 
 
 def sign_in(base_url: str) -> Any:
@@ -401,6 +425,7 @@ def smoke(stub_image: str) -> None:
                     "repositories": [
                         {"full_name": REPOSITORY, "default_branch": "trunk"},
                         {"full_name": "octo-lab/gadgets", "default_branch": "main"},
+                        {"full_name": PRIVATE_REPOSITORY, "private": True},
                     ],
                 }
             ],
