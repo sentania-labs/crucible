@@ -11,6 +11,9 @@ EXIT_CODE_ENVIRONMENT = 70
 class ExitClass(StrEnum):
     COMPLETED = "completed"
     COMPLETED_WITHOUT_REPORT = "completed_without_report"
+    # The harness exited while its own tooling reported a command still running (issue
+    # 128): never a clean completion, whatever the exit code and the report say.
+    INCOMPLETE = "incomplete"
     BLOCKED = "blocked"
     ENVIRONMENT = "environment"
     AUTH_FAILURE = "auth_failure"

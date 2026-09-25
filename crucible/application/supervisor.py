@@ -2994,6 +2994,12 @@ class Supervisor:
                     "report_parsed": claim_ok,
                     "partial_report_kept_unparsed": cancelled and report_present,
                     "blocked_present": outputs.blocked_md is not None,
+                    # Issue 128: what the harness said was still running at its exit.
+                    **(
+                        {"work_in_flight": [redact(item) for item in parsed.in_flight]}
+                        if parsed is not None and parsed.in_flight
+                        else {}
+                    ),
                 },
             )
             uow.leases.release_attempt_lease(attempt.id)

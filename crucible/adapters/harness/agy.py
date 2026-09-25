@@ -12,6 +12,17 @@ the access token is past its one-hour expiry, and S1 saw the read-only mount ref
 save. The C5 live run supplied the evidence: the first Crucible-side run after the
 expiry rotated the token and the copy carried a newer `token.expiry`, so the minimum is
 rw-narrow and the file syncs back by that field.
+
+Commands (issue 128): the pinned 1.2.8 CLI has no launch-level command timeout and no
+switch for backgrounding. Its `run_command` tool takes `Blocking` and
+`WaitMsBeforeAsync` from the model, per call, and a command still running after that
+wait continues in the background ("Background command is still running after %ds",
+from the binary's strings, 2026-09-25); neither `agy --help` nor the public CLI docs
+name a setting that changes it. `--print-timeout` bounds the whole turn and is the
+attempt's own timeout. What print mode does with a background command at exit was not
+observed: AGY cannot run without a Google login, so it was not reproduced. Its
+transcript format for background commands is unknown, so this adapter has no in-flight
+evidence to read and its attempts are classified by exit code and report alone.
 """
 
 from __future__ import annotations

@@ -153,6 +153,10 @@ WORKER_UID = 1000
 # and never placed in the create request. CRUCIBLE_STDIN_FILES and CRUCIBLE_PROMPT are
 # what the harness reads on stdin; CRUCIBLE_TRANSCRIPT is where its stdout is teed so
 # the stream becomes an artifact. With `pipefail`, the wrapper's exit is the harness's.
+# CRUCIBLE_AFTER_EXIT names `path=name` pairs: state files the harness keeps outside the
+# report directory, copied into it once the harness has exited (issue 128), so the
+# adapter can read what the harness's own tooling said was still running. Only a regular
+# file is copied, never a link, and at most 1 MiB of it.
 LAUNCH_WRAPPER = r"""set -u
 for pair in ${CRUCIBLE_ENV_FROM_FILES:-}; do
   var=${pair%%=*}; file=${pair#*=}
@@ -179,6 +183,15 @@ if [ -n "${CRUCIBLE_TRANSCRIPT:-}" ]; then
 else
   run "$@"
 fi
+status=$?
+for pair in ${CRUCIBLE_AFTER_EXIT:-}; do
+  src=${pair%%=*}; name=${pair#*=}
+  case "$name" in ""|.*|*/*) continue ;; esac
+  if [ -f "$src" ] && [ ! -L "$src" ]; then
+    head -c 1048576 "$src" > "${CRUCIBLE_REPORT_DIR:-/crucible/report}/$name" 2>/dev/null || true
+  fi
+done
+exit "$status"
 """
 
 DEFAULT_IMAGE_ALLOWLIST: tuple[str, ...] = (
