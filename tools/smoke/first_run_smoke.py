@@ -350,19 +350,17 @@ def github(base_url: str, token: str, private_key: str) -> None:
 
 
 def sign_in(base_url: str) -> Any:
-    """The first-run administrator from the migration Job's framed block, as the operator
-    would; never printed."""
-    logs = kubectl(["-n", "crucible", "logs", "job/crucible-migrate"], redact=True, check=False)
-    match = re.search(r"\bcru_[A-Z0-9]{26}\.[A-Za-z0-9_-]+\b", logs)
-    if match is None:
-        raise SmokeError("the migration log has no one-time token")
+    """The first-run administrator from the Secret the migrate Job wrote (ADR 0016), as the
+    operator would; never printed. The deploy smoke's helper also proves the Job's log
+    does not carry it, and the Secret is gone once the token has signed in."""
+    first_run = KS.first_run_token()
     jar = http.cookiejar.CookieJar()
     opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
     with opener.open(f"{base_url}/ui/sign-in", timeout=60) as response:
         page = response.read().decode()
     csrf = re.search(r'name="csrf" value="([a-f0-9]+)"', page)
     assert csrf is not None
-    body = urllib.parse.urlencode({"csrf": csrf.group(1), "token": match.group(0), "next": "/ui"})
+    body = urllib.parse.urlencode({"csrf": csrf.group(1), "token": first_run, "next": "/ui"})
     post = urllib.request.Request(
         f"{base_url}/ui/sign-in",
         data=body.encode(),
@@ -371,6 +369,7 @@ def sign_in(base_url: str) -> Any:
     )
     with opener.open(post, timeout=120):
         pass
+    KS.await_first_run_secret_gone()
     return opener
 
 
