@@ -86,6 +86,32 @@ copy_report() {
 """
 
 
+def _cache_refresh(cache_dir: str) -> str:
+    """Fetch into the bare mirror, or clone it when it is absent or will not fetch."""
+    return f"""
+if [ -d "{cache_dir}" ]; then
+  {GIT} --git-dir "{cache_dir}" fetch --prune origin || rm -rf "{cache_dir}"
+fi
+if [ ! -d "{cache_dir}" ]; then
+  {GIT} clone --mirror -- "$CLONE_URL" "{cache_dir}" || true
+fi
+"""
+
+
+def cache_refresh_script(*, url: str, cache_name: str) -> str:
+    """26: the one writer of the reference cache on Kubernetes, run on its own before a
+    preparer that mounts the cache read-only (crucible#55). A refresh that fails leaves
+    no mirror rather than a half-fetched one, and the preparer then clones from the
+    remote directly; so this script exits 0 either way."""
+    cache_dir = f"{CACHE_MOUNT}/{cache_name}.git"
+    return f"""set -eu
+{GIT_ENV}
+printf '[safe]\n\tdirectory = *\n' > /tmp/gitconfig
+export GIT_CONFIG_GLOBAL=/tmp/gitconfig
+CLONE_URL={_quote(url)}
+{_cache_refresh(cache_dir)}"""
+
+
 def preparer_script(
     *,
     url: str,
@@ -100,30 +126,27 @@ def preparer_script(
     shims: tuple[str, ...],
     exclude_entries: tuple[str, ...],
     identity_mount: str,
+    refresh_cache: bool = True,
 ) -> str:
     """Clone, position, and seal the checkout (08).
 
-    The reference cache is a bare mirror this script refreshes and clones from with
+    The reference cache is a bare mirror the checkout is cloned from with
     `--dissociate`, so the checkout owns its objects and nothing shared is ever
-    mounted into a worker. The origin URL is replaced with a placeholder before the
-    worker sees it, and no credential helper is configured, so a push cannot start.
+    mounted into a worker. With `refresh_cache` this script refreshes the mirror
+    itself (the Docker provider); without it the mirror is only read, and something
+    else keeps it fresh (the Kubernetes provider's refresher Job, 26). The origin URL
+    is replaced with a placeholder before the worker sees it, and no credential helper
+    is configured, so a push cannot start.
     """
     cache_dir = f"{CACHE_MOUNT}/{cache_name}.git" if cache_name else ""
-    refresh = (
-        f"""
-if [ -d "{cache_dir}" ]; then
-  {GIT} --git-dir "{cache_dir}" fetch --prune origin || rm -rf "{cache_dir}"
-fi
-if [ ! -d "{cache_dir}" ]; then
-  {GIT} clone --mirror -- "$CLONE_URL" "{cache_dir}" || true
-fi
+    refresh = ""
+    if cache_name:
+        refresh = _cache_refresh(cache_dir) if refresh_cache else ""
+        refresh += f"""
 if [ -d "{cache_dir}" ]; then
   REFERENCE="--reference {cache_dir} --dissociate"
 fi
 """
-        if cache_name
-        else ""
-    )
     resume = "1" if from_remote_branch else "0"
     # Bound as literals, referenced quoted, and never concatenated into a command.
     bindings = "\n".join(

@@ -19,6 +19,7 @@ from crucible.domain.entities import Principal, Role
 from crucible.ports.artifacts import ArtifactStore
 from crucible.ports.clock import Clock
 from crucible.ports.execution import ExecutionProvider
+from crucible.ports.first_run import FirstRunDelivery
 from crucible.ports.harness import CredentialSource, HarnessGate
 from crucible.ports.repository import UnitOfWork, UnitOfWorkFactory
 
@@ -48,6 +49,9 @@ class AppContext:
     # bearer token remains the source of identity and is never copied into state.
     ui_signing_key: bytes = field(default_factory=lambda: secrets.token_bytes(32))
     settings: object | None = None
+    # Where the migration left the first-run administrator token, removed from there
+    # when that principal first signs in (ADR 0016). None where there is no such place.
+    first_run: FirstRunDelivery | None = None
 
     @property
     def secret_providers(self) -> frozenset[str]:

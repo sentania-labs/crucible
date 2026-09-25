@@ -29,6 +29,7 @@ from typing import Any
 import pytest
 import yaml
 
+from crucible.adapters.first_run import SECRET_NAME
 from crucible.settings import CredentialSettings, HarnessSettings, Settings
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -186,10 +187,13 @@ def test_the_only_rolebinding_names_the_control_plane_account(
     """A second subject, or a Group subject, is how the supervisor's Role would reach
     something other than Crucible."""
     for target in ("base", "overlays/lab", "overlays/kind"):
-        bindings = _of_kind(rendered[target], "RoleBinding")
+        bindings = [
+            b
+            for b in _of_kind(rendered[target], "RoleBinding")
+            if b["metadata"]["namespace"] == "crucible-workers"
+        ]
         assert len(bindings) == 1, f"{target}: {len(bindings)} RoleBinding objects"
         binding = bindings[0]
-        assert binding["metadata"]["namespace"] == "crucible-workers"
         assert binding["roleRef"] == {
             "apiGroup": "rbac.authorization.k8s.io",
             "kind": "Role",
@@ -198,6 +202,65 @@ def test_the_only_rolebinding_names_the_control_plane_account(
         assert binding["subjects"] == [
             {"kind": "ServiceAccount", "name": "crucible-supervisor", "namespace": "crucible"}
         ], target
+
+
+# ADR 0016: in the service namespace, the migrate account may create the first-run
+# Secret (Kubernetes cannot narrow `create` by name) and patch that one, and the api's
+# account may delete that one. Nothing in Crucible may read it.
+FIRST_RUN_GRANTS = {
+    "crucible-first-run-admin-writer": (
+        "crucible-migrate",
+        [
+            {"apiGroups": [""], "resources": ["secrets"], "verbs": ["create"]},
+            {
+                "apiGroups": [""],
+                "resources": ["secrets"],
+                "resourceNames": [SECRET_NAME],
+                "verbs": ["patch"],
+            },
+        ],
+    ),
+    "crucible-first-run-admin-remover": (
+        "crucible-supervisor",
+        [
+            {
+                "apiGroups": [""],
+                "resources": ["secrets"],
+                "resourceNames": [SECRET_NAME],
+                "verbs": ["delete"],
+            }
+        ],
+    ),
+}
+
+
+def test_the_first_run_secret_grants_are_exactly_adr_0016s(
+    rendered: dict[str, list[dict[str, Any]]],
+) -> None:
+    for target in ("base", "overlays/lab", "overlays/kind"):
+        roles = {
+            r["metadata"]["name"]: r
+            for r in _of_kind(rendered[target], "Role")
+            if r["metadata"]["namespace"] == "crucible"
+        }
+        bindings = {
+            b["metadata"]["name"]: b
+            for b in _of_kind(rendered[target], "RoleBinding")
+            if b["metadata"]["namespace"] == "crucible"
+        }
+        assert set(roles) == set(FIRST_RUN_GRANTS) == set(bindings), target
+        for name, (account, rules) in FIRST_RUN_GRANTS.items():
+            assert roles[name]["rules"] == rules, f"{target}: {name}"
+            assert bindings[name]["roleRef"] == {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "Role",
+                "name": name,
+            }
+            assert bindings[name]["subjects"] == [
+                {"kind": "ServiceAccount", "name": account, "namespace": "crucible"}
+            ], f"{target}: {name}"
+        job = _named(rendered[target], "Job", "crucible-migrate")
+        assert job["spec"]["template"]["spec"]["serviceAccountName"] == "crucible-migrate"
 
 
 def test_the_kind_tier_applies_the_deployed_rbac_files() -> None:

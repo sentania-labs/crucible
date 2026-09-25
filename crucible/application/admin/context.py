@@ -18,6 +18,7 @@ from crucible.domain.events import EventKind
 from crucible.domain.secrets import scan_text
 from crucible.ports.clock import Clock
 from crucible.ports.execution import ExecutionProvider
+from crucible.ports.first_run import FirstRunDelivery
 from crucible.ports.github import GitHubClient
 from crucible.ports.harness import CredentialSource, HarnessGate
 from crucible.ports.repository import UnitOfWork, UnitOfWorkFactory
@@ -62,6 +63,9 @@ class AdminContext:
     # and the namespaces no selector may name (crucible#91).
     kubernetes_egress_seed: dict[str, Any] = field(default_factory=dict)
     kubernetes_protected_namespaces: tuple[str, ...] = ()
+    # Where the first-run administrator token was delivered; a revoke of that principal
+    # removes it (ADR 0016).
+    first_run: FirstRunDelivery | None = None
 
 
 def record_refusal(ctx: AdminContext, *, principal: str, operation: str, detail: str) -> None:

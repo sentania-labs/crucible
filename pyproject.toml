@@ -25,6 +25,13 @@ crucible = "crucible.cli.main:main"
 crucible-admin = "crucible.cli.main:admin_shim"
 
 [dependency-groups]
+# Mirrors [build-system].requires so uv.lock hashes and pins the build backend too
+# (113): uv only locks [project].dependencies and dependency-groups, so without this
+# group hatchling and hatch-vcs would be resolved from the index unhashed at image
+# build time, and a new release of either could change or break the image the way
+# uvicorn 0.54.0 broke the worker image. The Dockerfile installs this group with
+# `uv sync --frozen --group build-backend` before building the project.
+build-backend = ["hatchling>=1.27", "hatch-vcs>=0.4"]
 dev = [
     "httpx>=0.28",
     "import-linter>=2.3",

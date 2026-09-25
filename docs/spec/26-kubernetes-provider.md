@@ -93,7 +93,8 @@ Per attempt the provider creates, in `crucible-workers`, all labelled
 | PersistentVolumeClaim `ws-<attempt>` | the workspace: `repo/`, `report/`, `output/` | attempt, then per cleanup policy |
 | ConfigMap `identity-<attempt>` (or a projected volume from an object store above the ConfigMap size cap, 08) | the identity bundle, read-only | attempt |
 | Secret `cred-<attempt>` | the per-attempt copy of one harness credential directory, seeded from the harness's dedicated Secret in `crucible-workers`, `rw-narrow` where the adapter declares it (12) | attempt, deleted under every cleanup policy |
-| Job `prepare-<attempt>` | the preparer: clone into the PVC from the reference cache, branch, shims, author identity, `origin` placeholder (08) | until complete, then deleted |
+| Job `refresh-cache-<attempt>` | the reference cache's only writer: fetches the repository's bare mirror on the cache PVC (or clones it when absent), with git egress only and no workspace, identity bundle or credential | until complete, then deleted, before the preparer starts |
+| Job `prepare-<attempt>` | the preparer: clone into the PVC from the reference cache, mounted read-only, then branch, shims, author identity, `origin` placeholder (08) | until complete, then deleted |
 | Job `worker-<attempt>` | the worker, one Pod, `backoffLimit: 0`, `restartPolicy: Never` | until terminal, then deleted after `logs_drained` |
 | Job `collect-<attempt>` | the collector, no network, repo and report read-only, output read-write (08) | until complete |
 | Job `verify-bundle-<attempt>` | `git bundle verify`, no network | until complete |
@@ -346,11 +347,17 @@ the namespace. A deployment therefore names one exact, pullable reference in
 
 ## Provider mechanics (08's interface)
 
-- `prepare`: create the PVC, ConfigMap, and per-attempt Secret; run the
-  preparer Job with the reference cache mounted read-write from a
-  cluster-side cache volume that Crucible refreshes with a short-lived
-  installation token (the token never enters the workspace); the Job
-  performs exactly what 08's Docker `prepare` performs. `prepare` returns
+- `prepare`: create the PVC, ConfigMap, and per-attempt Secret; when a
+  cluster-side reference cache volume is configured, run the refresher Job,
+  the only Pod that mounts that volume writable, to fetch the repository's
+  mirror on it; then run the preparer Job with the cache mounted read-only
+  (on the claim and on the mount). The cache is the one volume every attempt
+  shares, so a preparer that could write it could poison every later
+  checkout (crucible#55). In the supervisor a refresh waits for the
+  preparers cloning from that mirror to finish and holds new ones back until
+  it is done. A refresh that fails is logged and the preparer clones from the
+  remote without a reference. The preparer Job otherwise performs exactly
+  what 08's Docker `prepare` performs. `prepare` returns
   when the Job completes; a failed Job is a prepare failure with the Job's
   log excerpt as detail.
 - `launch`: resolve the worker image to a digest through the image registry
@@ -372,6 +379,9 @@ the namespace. A deployment therefore names one exact, pullable reference in
   shares it, and it is bounded at 12 seconds, below the 15 seconds the harness and
   image endpoints wait: past the bound no crane process is started and any still
   running is killed, and tags not resolved in time are left out of that listing.
+  Tags starting `ci-` are CI proof pushes, never promotable, and are skipped before
+  anything is resolved, so their number does not add to the listing's cost (111);
+  the Images page says so. Nothing on the registry is pruned.
 - `observe`: read the Job and its Pod.
 
   | Job | Pod | Result |

@@ -50,10 +50,11 @@ from crucible.application.admin.context import AdminContext
 from crucible.application.admin.login import LoginRegistry
 from crucible.application.auth import mint_token
 from crucible.application.errors import ApplicationError
+from crucible.application.first_run import FIRST_RUN_PREFIX
 from crucible.application.queries import task_view
 from crucible.application.republish import republish_task
 from crucible.application.transitions import record_event
-from crucible.cli.wiring import Wiring, wire
+from crucible.cli.wiring import Wiring, first_run_delivery, wire
 from crucible.client import next as nx
 from crucible.client.config import ADMIN_TOKEN_ENV, TOKEN_ENV, require_remote, resolve
 from crucible.client.envelope import ClientError, Result, UsageError
@@ -69,6 +70,7 @@ from crucible.domain.entities import Principal, Role
 from crucible.domain.events import EventKind
 from crucible.domain.ids import new_id
 from crucible.logs import configure_logging
+from crucible.ports.first_run import FirstRunDelivery
 from crucible.settings import load_settings
 
 CLI_PRINCIPAL = "crucible-admin"
@@ -187,7 +189,9 @@ def build_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
 
     i = sub.add_parser("images", help="list and promote")
     i_sub = i.add_subparsers(dest="image_command", required=True)
-    i_sub.add_parser("list", help="worker images and their promotion state")
+    i_sub.add_parser(
+        "list", help="worker images and their promotion state (ci-* tags are not listed)"
+    )
     promote = i_sub.add_parser("promote", help="promote a candidate image")
     promote.add_argument("digest", help="the image's digest or reference")
 
@@ -786,6 +790,7 @@ def _token(args: argparse.Namespace, wiring: Wiring) -> Any:
                 reason=args.reason,
             )
             uow.commit()
+            tokens_admin.after_revoke(wiring.admin, result)
             return result
         if args.rotate:
             raise UsageError("token rotation is replaced by revoke and create")
@@ -806,12 +811,15 @@ def _token(args: argparse.Namespace, wiring: Wiring) -> Any:
     }
 
 
-def ensure_first_admin(database_url: str) -> None:
+def ensure_first_admin(database_url: str, delivery: FirstRunDelivery | None) -> None:
     """Create the first browser principal only when no administrator exists.
 
-    The value is printed by the migration process once, on stderr, and only its salted
-    hash is committed; stdout carries the envelope alone. A rerun sees the principal and
-    emits nothing.
+    Its token never reaches stdout, stderr or a log (crucible#122, ADR 0016): it goes to
+    `delivery`, a Secret on Kubernetes or a mode 0600 file on Docker, before the
+    principal is committed, so a token that could not be handed over is never minted.
+    The log says only where to read it. Without a delivery nothing is minted and the log
+    says how to make an administrator instead. A rerun sees the principal and does
+    nothing.
     """
     engine = make_engine(database_url)
     try:
@@ -822,9 +830,19 @@ def ensure_first_admin(database_url: str) -> None:
                 for item in uow.principals.list_all()
             ):
                 return
-            name = "first-run-admin"
+            if delivery is None:
+                print(
+                    "No first-run administrator was created: this deployment has no "
+                    "private place for its token (the Kubernetes provider's Secret or the "
+                    "Docker credential root). With the supervisor running, create one "
+                    'with `crucible admin --reason "<why>" token create --principal '
+                    "<name> --role admin`.",
+                    file=sys.stderr,
+                )
+                return
+            name = FIRST_RUN_PREFIX
             if uow.principals.get_by_name(name) is not None:
-                name = f"first-run-admin-{new_id()[-8:].lower()}"
+                name = f"{FIRST_RUN_PREFIX}-{new_id()[-8:].lower()}"
             minted = mint_token(
                 uow,
                 SystemClock(),
@@ -842,13 +860,14 @@ def ensure_first_admin(database_url: str) -> None:
                     "first_run": True,
                 },
             )
+            delivery.deliver(minted.token)
             uow.commit()
         border = "=" * 72
         for line in (
             border,
-            "CRUCIBLE FIRST-RUN ADMIN TOKEN, SHOWN ONCE",
-            minted.token,
-            "Open /ui and sign in. Store this token before logs are rotated.",
+            f"CRUCIBLE FIRST-RUN ADMINISTRATOR {minted.principal.name!r} CREATED",
+            f"Its one-time token is in {delivery.where()}",
+            "Open /ui and sign in with it; that removes it from there.",
             border,
         ):
             print(line, file=sys.stderr)
@@ -1045,7 +1064,7 @@ def run(args: argparse.Namespace, *, root_api_url: str | None, timezone: str | N
     try:
         if args.command == "migrate":
             upgrade(settings.database.url)
-            ensure_first_admin(settings.database.url)
+            ensure_first_admin(settings.database.url, first_run_delivery(settings))
             document: Any = {"migrated_to": head_revision(settings.database.url)}
         else:
             wiring = wire(settings)

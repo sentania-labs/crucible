@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import json
 import os
@@ -43,6 +44,7 @@ from crucible.application.errors import (
     ContractValidationError,
     ForbiddenError,
 )
+from crucible.application.first_run import discard_after_use
 from crucible.application.policies import put_policy, put_routing_policy
 from crucible.contracts.api import ExternalReviewAttestation, RepositoryRegistration
 from crucible.domain.cluster_egress import format_labels, parse_labels
@@ -490,7 +492,13 @@ def _sign_in_form(
 ) -> Response:
     csrf = os.urandom(24).hex()
     context = _base(request, None, title="Sign in", active="")
-    context.update(next=next_path, csrf=csrf, message=message, message_kind="bad")
+    context.update(
+        next=next_path,
+        csrf=csrf,
+        message=message,
+        message_kind="bad",
+        first_run_where=ctx.first_run.where() if ctx.first_run is not None else None,
+    )
     response = templates.TemplateResponse(
         request=request, name="signin.html", context=context, status_code=status_code
     )
@@ -531,6 +539,9 @@ async def sign_in(request: Request, ctx: Ctx, uow: UoW) -> Response:
             message="Token not recognized.",
             status_code=401,
         )
+    # ADR 0016: the first-run token has done its job once it has signed someone in;
+    # it does not stay in its Secret or file for the next reader.
+    await asyncio.to_thread(discard_after_use, ctx.first_run, principal.name)
     csrf = os.urandom(24).hex()
     value = _serializer(ctx).dumps({"token": token, "csrf": csrf})
     target = form.get("next", "/ui")
@@ -834,7 +845,10 @@ async def images_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
         csrf,
         active="/ui/images",
         heading="Images",
-        intro="Images visible to providers and the explicit default per harness.",
+        intro=(
+            "Images visible to providers and the explicit default per harness. "
+            "CI proof tags (ci-*) are not resolved or listed."
+        ),
         sections=sections,
     )
 
@@ -1926,13 +1940,15 @@ async def action(request: Request, action: str, ctx: Ctx, uow: UoW) -> Response:
             response.headers["Cache-Control"] = "no-store"
             return response
         elif action == "token-revoke":
-            tokens.revoke(
+            revoked = tokens.revoke(
                 ctx.admin,
                 uow,
                 principal=principal.name,
                 principal_id=form.get("principal_id", ""),
                 reason=reason,
             )
+            uow.commit()
+            await asyncio.to_thread(tokens.after_revoke, ctx.admin, revoked)
         elif action == "github-check":
             github.check(ctx.admin, uow, principal=principal.name, reason=reason)
         elif action == "bootstrap-commit":

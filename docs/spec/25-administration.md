@@ -329,11 +329,21 @@ storage, startup timing, and secret-bearing paths at process start. Runtime
 policy and state remain editable through the application services.
 
 A fresh migrated database with no administrator receives one
-`first-run-admin` principal. The migration process prints its token once in a
-clearly framed block on stderr (stdout carries the envelope alone, so a caller
-parsing it never holds the token). Only the salted token hash is stored. The sign-in page
-directs the operator to `docker compose logs migrate`; a later migration run
-finds the principal and prints no token.
+`first-run-admin` principal. Its token never reaches stdout, stderr or any
+log, because a log stream is shipped and retained by whatever collects it
+(crucible#122, ADR 0016). The migration writes it, before it commits the
+principal, to one private place: on Kubernetes the Secret
+`crucible-first-run-admin` (key `token`) in the service namespace, which only
+the migrate Job's account may create and only the api's account may delete;
+on Docker the file `first-run-admin-token`, mode 0600, in the credential
+root. Its stderr says only where the token is. A token it cannot write is
+never minted, and with neither place configured it mints nothing and says how
+to create an administrator with `crucible admin --reason ... token create`. Only the salted
+token hash is stored. The sign-in page names the place for the running
+deployment. The api removes the Secret or file when the first-run principal
+first signs in at `/ui`, or when it is revoked. Principal names starting
+`first-run-admin` are reserved for the migration, so `token create` refuses
+them. A later migration run finds an active administrator and does nothing.
 
 ## What Foundry may do
 
@@ -363,9 +373,15 @@ harness, model, image digest, start time and last heartbeat; task counts by
 state together with the id, external id and update time of every task in
 `blocked`, `pre_pr_gates_failed`, `publish_failed`,
 `ci_certification_failed` and `head_diverged`; and pending wakes as a count
-per principal with the oldest pending timestamp and the total unacked. That
-is what an orchestrator needs to say which of its tasks is stuck and why,
-and it is its own work: the ids, models and image digests are of tasks it
-submitted and attempts Crucible ran for them. Nothing in the response is a
+per principal with the oldest pending timestamp and the total unacked. For
+an orchestrator principal these three parts are filtered to its own work
+(crucible#40): the active attempts and the task counts and lists cover only
+tasks it submitted, and `wakes` counts only the wakes addressed to it, so
+`unacked` is its own total. One orchestrator cannot read another's task ids,
+external ids or wake counts here. An operator principal is exempt, as it is
+from task ownership (04), and sees every principal's. The `harnesses`,
+`providers` and `github` parts describe the service rather than any one
+principal's work and are the same for every caller. That is what an
+orchestrator needs to say which of its tasks is stuck and why. Nothing in the response is a
 credential, a token, a key, a path, or a file name, and the view is
 read-only.
