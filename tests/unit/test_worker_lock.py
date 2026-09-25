@@ -19,29 +19,39 @@ DOCKERFILES = [*sorted(REPOSITORY.glob("images/*/Dockerfile")), REPOSITORY / "Do
 def run_instructions(dockerfile: Path) -> list[str]:
     """Each RUN instruction with its backslash continuations joined."""
     text = dockerfile.read_text(encoding="utf-8").replace("\\\n", " ")
-    return [line for line in text.splitlines() if re.match(r"\s*RUN\s", line)]
+    return [line for line in text.splitlines() if re.match(r"\s*RUN\s", line, re.I)]
 
 
-def lock_installs(run: str) -> list[str]:
-    return [
-        command
-        for command in run.split(";")
-        if "pip install" in command and re.search(r"\s(-r|--requirement)\s", command)
-    ]
+# pip, pip3 or python -m pip; -r lock, -rlock, --requirement lock or --requirement=lock.
+PIP_INSTALL = re.compile(r"(\bpip3?|-m\s+pip)\s+install\b")
+REQUIREMENT = re.compile(r"(\s-r|\s--requirement[\s=])")
+
+
+def commands(run: str) -> list[str]:
+    """The shell commands of a RUN, split on ; && || and |."""
+    return [part.strip() for part in re.split(r";|&&|\|\||\|", run)]
 
 
 def test_every_lock_install_is_the_whole_set_with_no_resolution() -> None:
     found = 0
     for dockerfile in DOCKERFILES:
+        text = dockerfile.read_text(encoding="utf-8")
+        # Heredoc and exec-form RUNs would hide an install from the scan below.
+        assert not re.search(r"^\s*RUN\s.*<<", text, re.M | re.I), dockerfile
+        assert not re.search(r"^\s*RUN\s+\[.*pip", text, re.M | re.I), dockerfile
         for run in run_instructions(dockerfile):
-            for command in lock_installs(run):
+            steps = commands(run)
+            for index, command in enumerate(steps):
+                if not (PIP_INSTALL.search(command) and REQUIREMENT.search(command)):
+                    continue
                 found += 1
-                where = f"{dockerfile.relative_to(REPOSITORY)}: {command.strip()}"
+                where = f"{dockerfile.relative_to(REPOSITORY)}: {command}"
                 assert "--require-hashes" in command, where
                 assert "--no-deps" in command, where
                 assert "--only-binary :all:" in command, where
-                assert "pip check" in run, where
-                assert "diff -u /tmp/locked /tmp/installed" in run, where
+                after = steps[index + 1 :]
+                assert any(re.search(r"\bpip3?\s+check\b", step) for step in after), where
+                assert "diff -u /tmp/locked /tmp/installed" in after, where
     # The worker image's Hermes venv is the one lock install today; a scan that finds
     # none has stopped looking, not proved anything.
     assert found >= 1
