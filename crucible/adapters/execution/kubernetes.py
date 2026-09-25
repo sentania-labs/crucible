@@ -202,6 +202,12 @@ LIST_IMAGES_CONCURRENCY = 6
 # Below the 15 seconds the harness and image endpoints wait for it, so a slow registry
 # ends the listing, and every crane process in it, before an endpoint gives up.
 LIST_IMAGES_DEADLINE = 12.0
+# A ci-* tag is a CI proof push (the images or registry job's own resolve check), never
+# a promotable image: resolving one costs the same two crane calls as a release tag, and
+# they accumulate forever since nothing prunes them (111). Skipping them by prefix, not
+# by requiring a release-version shape, keeps a future non-version tag (a hotfix build,
+# a manual pin) listable without a code change.
+LIST_IMAGES_SKIP_PREFIX = "ci-"
 # How much of a collected output tar is accepted. The tree is excluded from it, so this
 # is the diff, the bundle, the report copy and the verifier logs.
 OUTPUT_READ_LIMIT = 256 * 1024 * 1024
@@ -1873,6 +1879,7 @@ class KubernetesProvider:
                 )
             except RegistryError as exc:
                 raise ProviderError(f"image listing failed for {repository}: {exc}") from exc
+            tags = [tag for tag in tags if not tag.startswith(LIST_IMAGES_SKIP_PREFIX)]
             found = await asyncio.gather(*(resolve(f"{repository}:{tag}") for tag in tags))
             images.extend(info for info in found if info is not None)
         if time.monotonic() >= deadline:

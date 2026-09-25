@@ -70,8 +70,8 @@ cleanup() {
       cleanup_failed=1
     fi
   done
-  docker run --rm -v "$scratch:/cleanup" \
-    busybox@sha256:9db7b59979c38555a39def84a31fb98b5296952f9e3afd4f6f11f05b07adfab0 \
+  busybox=$(crucible_kind_pull "$CRUCIBLE_BUSYBOX_IMAGE" 2>/dev/null) || busybox=$CRUCIBLE_BUSYBOX_IMAGE
+  docker run --rm -v "$scratch:/cleanup" "$busybox" \
     chmod -R a+rwX /cleanup >/dev/null 2>&1 || cleanup_failed=1
   rm -rf "$scratch" "$overlay" || cleanup_failed=1
   rmdir "$root/var/deploy-kind" 2>/dev/null || :

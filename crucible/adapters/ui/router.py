@@ -839,7 +839,10 @@ async def images_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
         csrf,
         active="/ui/images",
         heading="Images",
-        intro="Images visible to providers and the explicit default per harness.",
+        intro=(
+            "Images visible to providers and the explicit default per harness. "
+            "CI proof tags (ci-*) are not resolved or listed."
+        ),
         sections=sections,
     )
 

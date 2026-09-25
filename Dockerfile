@@ -26,15 +26,27 @@ ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy UV_PYTHON_DOWNLOADS=never SOURCE_DAT
     SETUPTOOLS_SCM_PRETEND_VERSION=${VERSION}
 WORKDIR /app
 COPY pyproject.toml uv.lock .python-version README.md ./
+# uv.lock covers [project].dependencies, but not [build-system].requires: without the
+# build-backend group (pyproject.toml), uv would resolve hatchling and hatch-vcs from
+# the index unhashed at image build time, and a new release of either could change or
+# break this image the way uvicorn 0.54.0 broke the worker image (113). Installing the
+# group here hash-verifies them from uv.lock, same as every other dependency.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev --no-install-project
+    uv sync --frozen --no-dev --group build-backend --no-install-project
 COPY crucible ./crucible
 # No cache mount here, and --no-cache: uv keys its built-wheel cache on the
 # source tree and not on SETUPTOOLS_SCM_PRETEND_VERSION, so a warm cache would
 # reinstall a wheel built for a previous VERSION and the package version would
 # silently disagree with the image label. Dependencies are already installed by
 # the sync above, so this step only builds the project and costs nothing.
-RUN uv sync --frozen --no-dev --no-cache
+# --no-build-isolation-package crucible builds the project with the hashed
+# hatchling/hatch-vcs just installed, instead of letting uv fetch its own copy
+# from the index; --no-editable is required alongside it, or hatchling's editable
+# build looks for the (undeclared, unhashed) `editables` package. Leaving out
+# --group build-backend here uninstalls it again, so the final venv matches
+# uv.lock's default groups exactly. --network=none makes that a guarantee rather than
+# an expectation: if this step ever tries to fetch anything, the build fails.
+RUN --network=none uv sync --frozen --no-dev --no-cache --no-build-isolation-package crucible --no-editable
 
 FROM python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea
 ARG VERSION=0.0.0.dev0

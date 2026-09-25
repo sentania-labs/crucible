@@ -379,6 +379,9 @@ the namespace. A deployment therefore names one exact, pullable reference in
   shares it, and it is bounded at 12 seconds, below the 15 seconds the harness and
   image endpoints wait: past the bound no crane process is started and any still
   running is killed, and tags not resolved in time are left out of that listing.
+  Tags starting `ci-` are CI proof pushes, never promotable, and are skipped before
+  anything is resolved, so their number does not add to the listing's cost (111);
+  the Images page says so. Nothing on the registry is pruned.
 - `observe`: read the Job and its Pod.
 
   | Job | Pod | Result |
