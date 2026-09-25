@@ -27,7 +27,7 @@ release's own `checksums.txt`), checks the archive with `sha256sum -c` before
 extracting, and fails the build on a mismatch. `tools/crane/fetch.sh` reads the same two
 build args, so the unit, registry and kind tiers run the binary the image ships.
 
-The service image grows by 11.9 MB (216,959,578 to 228,828,081 bytes, local builds of
+The service image grows by 11.9 MB (216,959,578 to 228,829,876 bytes, local builds of
 e69829a and of this change).
 
 ## What was verified before building
@@ -61,6 +61,7 @@ provider fills from the image pull Secret).
   user's home. The directory is removed in a `finally`, on success, failure, timeout and
   a missing binary alike. The credential is never on the command line.
 - Each call is bounded by a timeout (20 seconds; the child is killed when it expires).
+- A registry crane would read over plain HTTP from another host is refused (below).
 - crane inherits the service's environment, so it trusts what the service trusts:
   `SSL_CERT_FILE` and the system store the lab CA is installed in.
 - A failure is a `RegistryError` carrying the registry name and crane's own `Error:`
@@ -75,11 +76,18 @@ provider fills from the image pull Secret).
   GHCR redirects to a name. A private registry that redirects blob downloads to a bare
   private IP would be refused; the stub registry in `tests/e2e/test_registry.py`
   redirects to `localhost` for this reason.
-- crane reaches `localhost`, loopback and RFC 1918 IP literals over plain HTTP when
-  HTTPS fails. A registry named by host name is HTTPS only. The kind tier relies on the
-  loopback case; `make deploy-kind` keeps its TLS registry.
-- `list_images` makes two crane calls per tag, one after the other. Against the 30 tags
-  on GHCR on 2026-09-24 a listing took about 15 seconds.
+- crane falls back from HTTPS to plain HTTP for `localhost`, loopback, names under
+  `.localhost` and RFC 1918 IP literals (`pkg/name/registry.go`, `Scheme`). The old
+  client was HTTPS only, and the review round showed crane sending the pull credential
+  in the clear to a private-IP listener. The adapter therefore refuses a registry named
+  by an RFC 1918 address or a `.localhost` name before crane runs, and so before any
+  credential is written. Loopback is still read: it never leaves the host, and the kind
+  tier relies on it. `make deploy-kind` keeps its TLS registry, named by host name.
+- `list_images` makes two crane calls per tag. Run one after another, a listing of the
+  30 tags on GHCR on 2026-09-24 took 14.8 seconds, against the 15 seconds the harness
+  and image endpoints wait for it. The provider now resolves six tags at a time
+  (`LIST_IMAGES_CONCURRENCY`, a constant, not a setting), and the same listing took
+  2.9 seconds.
 
 ## Proof
 

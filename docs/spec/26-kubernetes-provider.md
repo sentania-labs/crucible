@@ -363,7 +363,10 @@ the namespace. A deployment therefore names one exact, pullable reference in
   kubelet already uses, written for each call into a private `DOCKER_CONFIG`
   directory that is removed when the call returns; each call is bounded by a
   timeout, and crane trusts what the service trusts (`SSL_CERT_FILE`, the
-  system store with the lab CA). The operator's decision of 2026-09-24 (108).
+  system store with the lab CA). A registry named by a private (RFC 1918) IP
+  address or a `.localhost` name is refused, because crane would fall back to
+  plain HTTP for it; name the registry by a host name it serves HTTPS on. The
+  operator's decision of 2026-09-24 (108).
 - `observe`: read the Job and its Pod.
 
   | Job | Pod | Result |
