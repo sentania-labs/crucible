@@ -112,7 +112,7 @@ records who acted, when, and what changed whether or not one was given. It
 is required only where the operation is destructive or hard to reverse:
 revoking a token, removing a repository, removing a credential, and
 committing a bootstrap import. A read-only check (the GitHub connectivity
-check, a harness test) never asks for one. This is the operator's decision of
+check, a harness test, a gateway test) never asks for one. This is the operator's decision of
 2026-09-25 (crucible#117, "I shouldn't have to provide a reason for
 everything"); the API, the CLI and the UI apply the same rule, because they
 call the same guard. One guard applies the lease rule, the reason rule, and

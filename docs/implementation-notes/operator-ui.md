@@ -53,12 +53,34 @@ of the same UI.
   deployment set and puts the defaults behind a click; Audit shows who, what and why with
   the payload behind Details; plain lists lose their stray "Value" header.
 
-## Left for FDY-0117
+## After first-run setup merged (2026-09-25)
 
-Routing, Repositories (beyond the row Remove #127 asked for), GitHub, the Hermes key on
-Credentials, and the Status to-do list are being reworked by FDY-0117 (branch
-`feat/first-run-setup`). Their reason fields follow the central rule without an edit to
-those pages; their density was left for after that branch merges.
+FDY-0117 (first-run setup, #156) merged while this branch was open, with the command
+timeout (#151) and security (#130). The branch merged main rather than rebasing:
+
+- **Numbering:** the per-harness image decision is ADR 0018 (0016 and 0017 were taken by
+  #130 and #156), and its migrations are 0023 and 0024, after `0022_first_run_setup`.
+- **Status:** the readiness list #156 computes is the to-do list, one row per missing
+  step with its fix page. The per-harness readiness table moved behind Details with a
+  one-line Harnesses row in the Service table. `no_promoted_image` reads the harness's own
+  default (the `harness_images` row), not the image list.
+- **Routing:** one "In force" table (delivery and routing policy versions, the gateway,
+  the per-command timeout in hours or minutes, the Kubernetes egress in plain words); the
+  documents behind Details; exhausted pools listed with a Clear button on each row,
+  replacing the typed pool field; the edit and upload forms collapsed.
+- **GitHub:** a Connection table (App, key fingerprint, webhook, each repository's
+  coverage and last check); the stored document behind Details; the connectivity check is
+  a button on that table with no reason asked; Replace the App is collapsed once one is
+  connected.
+- **Local gateway:** one row (URL, key set, last test); the test is a button on it with no
+  reason asked; the URL and key form is collapsed once a URL is set; migration names are
+  left out of the model notes.
+- **Credentials:** one row per harness with its actions: Log in (or Local gateway for
+  Hermes), and Validate, Probe and Remove only once a credential is stored; Remove still
+  asks for a reason; session compatibility is behind Details; rotate is a collapsed form
+  only where credentials are directories.
+- **Reasons:** #156's and #151's new forms follow the central rule (optional note), and
+  the command timeout's `next` hint no longer lists a reason as required.
 
 ## Proof
 
