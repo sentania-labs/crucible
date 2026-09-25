@@ -85,6 +85,22 @@ def test_an_unreadable_secret_is_a_refusal_not_an_absence() -> None:
     assert store.describe()["exists"] is None
 
 
+def test_a_secret_of_another_type_under_the_name_is_never_used_or_adopted() -> None:
+    """ADR 0016: `create` cannot be narrowed by name, so a service-account token Secret
+    could sit under this name; it is refused, not read as the App credential."""
+    api = FakeKubernetesApi()
+    body = k8sspec.secret(
+        name="crucible-github-app", namespace="", object_labels={}, data={"app.pem": PEM}
+    )
+    body["type"] = "kubernetes.io/service-account-token"
+    api.create("secrets", body)
+    store = SecretAppCredentials(api, settings_app_id=7, settings_enabled=True)
+    with pytest.raises(GitHubAppStoreError, match="not Opaque"):
+        store.read()
+    with pytest.raises(GitHubAppStoreError, match="not Opaque"):
+        store.write(app_id=7, private_key=PEM, webhook_secret=None)
+
+
 def test_the_directory_store_writes_private_files_beside_the_key(tmp_path: Path) -> None:
     directory = tmp_path / "github"
     directory.mkdir(mode=0o700)

@@ -10,6 +10,7 @@ real cluster (docs/implementation-notes/first-run.md)."""
 from __future__ import annotations
 
 import asyncio
+import copy
 import importlib.util
 import json
 import re
@@ -39,6 +40,7 @@ from crucible.application.admin.context import AdminContext
 from crucible.application.supervisor import Supervisor
 from crucible.cli import admin as cli
 from tests.admin_cli import admin_main
+from tests.integration.conftest import put_seeded_policy_in_force
 from tests.integration.test_admin import (
     fake_login_cli,
     run_cli,
@@ -129,7 +131,7 @@ def admin_ctx(
     tmp_path: Path,
     stubs: Any,
     k8s_api: FakeKubernetesApi,
-) -> AdminContext:
+) -> Iterator[AdminContext]:
     """Credential directories for the harnesses (the Docker shape) and the GitHub App
     credential in a Secret on the in-memory API server (the Kubernetes shape), both
     pointed at the stubs."""
@@ -160,7 +162,28 @@ def admin_ctx(
     )
     admin.github_app = type(admin.github_app)(api_base=stubs.url)
     ctx.admin = admin
-    return admin
+    with ctx.uow_factory() as uow:
+        hermes_before = copy.deepcopy(uow.harnesses.get("hermes"))
+        if hermes_before is not None:
+            # Hermes as a fresh deployment has it: never tested, never refused. An
+            # earlier test's refusal, stamped by the system clock, would otherwise
+            # outrank this test's fixed clock.
+            fresh = copy.deepcopy(hermes_before)
+            fresh.last_validated_at = None
+            fresh.last_auth_failure_at = None
+            fresh.last_launch_at = None
+            fresh.last_launch_outcome = None
+            uow.harnesses.put(fresh)
+            uow.commit()
+    put_seeded_policy_in_force(ctx)
+    yield admin
+    # Policies and harness state outlive the per-test truncation; leave them as a fresh
+    # deployment has them for the tests that follow.
+    put_seeded_policy_in_force(ctx)
+    with ctx.uow_factory() as uow:
+        if hermes_before is not None:
+            uow.harnesses.put(hermes_before)
+            uow.commit()
 
 
 @pytest.fixture
@@ -272,17 +295,32 @@ def test_the_gateway_is_set_tested_and_its_models_picked(
     codes = [s["code"] for s in _readiness(admin, "hermes")["steps"]]
     assert codes == ["no_promoted_image"]
 
-    # A model the gateway stops offering is disabled with that reason, not removed.
+    # A model the gateway stops offering is disabled with that reason, not removed. The
+    # page still shows `fast` ticked, and saving it exactly as shown does that rather
+    # than refuse.
     stubs.stubs.config["models"] = ["coder-large"]
-    moved = admin.post(
-        "/v1/admin/gateway/models",
-        json={"reason": "gateway changed", "models": [{"id": "coder-large", "enabled": True}]},
-    )
-    assert moved.status_code == 200, moved.text
-    assert moved.json()["disabled_not_offered"] == ["fast"]
+    with TestClient(create_app(ctx)) as browser:
+        csrf = ui_sign_in(browser, tokens["admin"])
+        page = browser.get("/ui/gateway").text
+        assert "not offered by the gateway; saving disables it" in page
+        shown_rows = re.findall(r'name="model\.(\d+)\.id" value="([^"]+)"', page)
+        form = {"csrf": csrf, "reason": "saved as shown", "return_to": "/ui/gateway"}
+        form["max_concurrency"] = "2"
+        for index, model in shown_rows:
+            form[f"model.{index}.id"] = model
+            if model in ("fast", "coder-large"):
+                form[f"model.{index}.enabled"] = "true"
+        saved_as_shown = browser.post(
+            "/ui/actions/gateway-models", data=form, follow_redirects=False
+        )
+        assert saved_as_shown.status_code == 303, saved_as_shown.text
+        location = unquote(saved_as_shown.headers["location"])
+        assert "kind=ok" in location and "Disabled as no longer offered: fast." in location
     local = admin.get("/v1/admin/routing/local-endpoint").json()
     fast = next(m for m in local["models"] if m["id"] == "fast")
     assert fast["enabled"] is False and "no longer offers" in fast["disabled_reason"]
+    large = next(m for m in local["models"] if m["id"] == "coder-large")
+    assert large["enabled"] is True
 
     # The CLI reads and writes the same state.
     shown = run_cli(config_file, "gateway", "show", capsys=capsys)
@@ -312,6 +350,20 @@ def test_the_gateway_is_set_tested_and_its_models_picked(
     assert wrong.json()["test"]["summary"] == (
         f"Gateway {endpoint} reachable, but it refused the key (HTTP 401)."
     )
+    # A new URL whose test is inconclusive does not keep reading as verified (#123).
+    admin.post(
+        "/v1/admin/gateway",
+        json={"reason": "right key", "endpoint_url": endpoint, "api_key": GATEWAY_KEY},
+    )
+    assert admin.get("/v1/admin/gateway").json()["credential_state"] == "validated"
+    down = admin.post(
+        "/v1/admin/gateway",
+        json={"reason": "moved", "endpoint_url": "http://127.0.0.1:9/v1"},
+    )
+    assert down.status_code == 200 and down.json()["test"]["conclusive"] is False
+    assert down.json()["gateway"]["credential_state"] == "configured"
+    codes = [s["code"] for s in _readiness(admin, "hermes")["steps"]]
+    assert "credential_not_verified" in codes
     audit = admin.get("/v1/admin/audit", params={"limit": 200}).text
     assert "local_gateway_updated" in audit
     assert GATEWAY_KEY not in audit and "w" * 40 not in audit
@@ -321,11 +373,11 @@ def test_the_gateway_is_set_tested_and_its_models_picked(
         ui_sign_in(browser, tokens["admin"])
         page = browser.get("/ui/gateway")
         assert page.status_code == 200
-        assert endpoint in page.text and GATEWAY_KEY not in page.text
-        assert "the last test was refused" in page.text
-        # With the wrong key the gateway lists nothing, so the page says why and still
-        # shows the entries in force.
-        assert f"Gateway {endpoint} refused the key (HTTP 401)." in page.text
+        assert "http://127.0.0.1:9/v1" in page.text and GATEWAY_KEY not in page.text
+        assert "the last test was inconclusive" in page.text
+        # With the gateway down it lists nothing, so the page says why and still shows
+        # the entries in force.
+        assert "could not be reached" in page.text
         assert re.search(r'name="model\.\d\.id" value="coder-large"', page.text)
 
 
@@ -342,6 +394,24 @@ def test_github_is_connected_installed_and_a_repository_picked(
     assert admin.get("/v1/admin/github").json()["configured"] is False
     picker = admin.get("/v1/admin/github/installations").json()
     assert picker["connected"] is False and "No GitHub App is connected" in picker["error"]
+
+    # A key that is not RSA is refused plainly, before GitHub is asked.
+    from cryptography.hazmat.primitives.asymmetric import ec  # noqa: PLC0415
+
+    ec_pem = (
+        ec.generate_private_key(ec.SECP256R1())
+        .private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+        .decode()
+    )
+    not_rsa = admin.post(
+        "/v1/admin/github/app",
+        json={"reason": "connect", "app_id": APP_ID, "private_key": ec_pem},
+    )
+    assert not_rsa.status_code == 422 and "not an RSA private key" in not_rsa.text
 
     # A key that is not the App's is refused by GitHub, and nothing is stored.
     other, _ = _rsa_pem()

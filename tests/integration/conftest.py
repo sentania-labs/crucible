@@ -335,3 +335,41 @@ def correction_document(
     }
     document.update(overrides)
     return document
+
+
+# The description 0019_opus_5_5 gives the last delivery policy a migration seeds.
+SEEDED_POLICY_MARKER = "Claude Opus 5.5 added to the Claude Code pool, disabled (C11)."
+
+
+def put_seeded_policy_in_force(ctx: AppContext) -> None:
+    """Policies and routing policies are not truncated between tests, so the version in
+    force is whatever the last test left. A test that writes routing versions of its own
+    first puts a copy of the migration-seeded `default-software` in force, naming the
+    seeded routing policy, as a fresh deployment has."""
+    import copy  # noqa: PLC0415
+
+    from crucible.application.policies import put_policy  # noqa: PLC0415
+    from crucible.domain.entities import Principal  # noqa: PLC0415
+
+    with ctx.uow_factory() as uow:
+        versions = sorted(uow.policies.list_versions("default-software"), key=lambda p: p.version)
+        seeded = next(
+            p
+            for p in versions
+            if str(p.document.get("description", "")).endswith(SEEDED_POLICY_MARKER)
+        )
+        version = versions[-1].version + 1
+        document = copy.deepcopy(seeded.document)
+        document["version"] = version
+        put_policy(
+            uow,
+            ctx.clock,
+            principal=Principal(
+                id="tests", name="tests", role=Role.ADMIN, created_at=ctx.clock.now()
+            ),
+            name="default-software",
+            version=version,
+            document=document,
+            reason="tests: the seeded policy in force",
+        )
+        uow.commit()

@@ -45,6 +45,7 @@ from crucible.application.supervisor import Supervisor
 from crucible.domain.entities import ImagePromotion
 from crucible.domain.lifecycle import AttemptState
 from crucible.domain.secrets import scan_text
+from tests.integration.conftest import put_seeded_policy_in_force
 from tests.integration.test_admin import ui_sign_in
 from tests.integration.test_harness_registry import _submit_pinned
 
@@ -251,6 +252,7 @@ def test_the_hermes_key_is_set_from_the_gateway_page_and_never_shown(
     admin: TestClient, ctx: AppContext, tokens: dict[str, str], k8s_api: FakeKubernetesApi
 ) -> None:
     api_key = "vk_" + "q" * 40
+    put_seeded_policy_in_force(ctx)
     assert admin.get("/v1/admin/credentials/hermes").json()["key_set"] is False
     with TestClient(create_app(ctx)) as browser:
         csrf = ui_sign_in(browser, tokens["admin"])
