@@ -57,7 +57,7 @@ Spec 26's checklist, made concrete. Each row is either a placeholder in
 | 2 | A CNI that enforces egress NetworkPolicy, on which the worker DNS and local endpoint rules match | verified by the readiness canary, shown on the status page; on Cilium with kube-proxy replacement, see "Cilium and an in-cluster LiteLLM" below |
 | 3 | A `ReadWriteOnce` storage class for PostgreSQL, the reference cache and the attempt workspaces | `REPLACE_ME_STORAGE_CLASS_RWO` |
 | 3b | A `ReadWriteMany` storage class for the artifact root | `REPLACE_ME_STORAGE_CLASS_RWX` |
-| 4 | A pod PID limit configured on the nodes (the kubelet's `podPidsLimit`) | reported on the status page when the canary can see it; the provider refuses to launch without a confirmed one (95: on a runtime that isolates the pod's cgroup from the container, the canary cannot see it at all, and lab-admin attests to it with `kubernetes.pod_pid_limit_override` instead) |
+| 4 | A pod PID limit configured on every node that can run a `crucible-workers` Pod (the kubelet's `podPidsLimit`; Kubernetes has no per-pod PID field, issue 60) | reported on the status page when the canary can see it; the provider refuses to launch without a confirmed one (95: on a runtime that isolates the pod's cgroup from the container, the canary cannot see it at all, and lab-admin attests to it with `kubernetes.pod_pid_limit_override` instead) |
 | 5 | The cluster can pull `ghcr.io/sentania-labs/crucible` and `ghcr.io/sentania-labs/crucible-worker` (the release publishes both); a pull secret if the packages are private. The api and supervisor Pods also read the worker registry themselves, to resolve a tag to a digest and its harness labels before a launch and to list images for promotion: they run `crane`, which the service image ships, with the same pull Secret, so nothing else is configured. They need HTTPS egress to the registry and to the host it redirects blob downloads to (for GHCR, `pkg-containers.githubusercontent.com`). A registry must be named by a host name it serves HTTPS on: one named by a private IP address is refused, because crane would read it over plain HTTP | `REPLACE_ME_IMAGE_PULL_SECRET` |
 | 6 | Egress from `crucible-workers` to the model providers, the package registries, GitHub and the Spark is possible at the network edge | the per-attempt NetworkPolicy narrows it; the edge must not block it |
 | 7 | The Argo Application | `argocd/application.yaml`, with `REPLACE_ME_ARGOCD_PROJECT`, `REPLACE_ME_MANIFEST_REPO_URL`, `REPLACE_ME_MANIFEST_REVISION` |
@@ -304,6 +304,13 @@ Done means seen working, so all three:
      configuration directly, that item 4 is done. It never overrides a limit the canary
      positively read as absent (a `cgroup-v2-parent` result of `null`): only a result
      the canary could not read at all falls back to it.
+
+   On a cluster with more than one node, the canary measures only the node it lands
+   on. Item 4 is about every node that can run a worker, so a new node joins the pool
+   with the same `podPidsLimit` in its kubelet configuration before it takes work, and
+   an override covers every such node, not just the canary's. Each attempt's
+   `report/kubernetes-launch.json` names the node it ran on beside the limit, so an
+   attempt on a node that was never measured can be found afterwards (issue 60).
 
 2. **The probe, after a change.** The answer is cached while it passes and re-run while
    it fails, so fixing the CNI does not need a Crucible restart. Saving the
