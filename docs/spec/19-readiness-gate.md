@@ -16,7 +16,7 @@ passing evidence, presented by Foundry and approved by the operator.
 | Restart and reconcile active or interrupted executions | e2e: Crucible restart with running worker; integration: reconcile idempotence |
 | Enforce the required deterministic gates | unit: each gate; integration: a run that fails `scope_contained` reaches `pre_pr_gates_failed` |
 | Stop or terminate a worker safely | e2e: drain then kill; partial report captured; kind: `test_rows_5_7_11_23_supervisor_restart_and_full_gate_lifecycle` and `test_deleted_pod_is_lost_and_sigterm_ignoring_pod_dies_at_grace`; [kind CI run](https://github.com/sentania-labs/crucible/actions/runs/35692723709) |
-| Prevent concurrent workers from corrupting the same working tree | integration: checkout lease refusal; e2e: two attempts, one repo; kind: `test_row_12_concurrent_attempts_use_distinct_claims`; [kind CI run](https://github.com/sentania-labs/crucible/actions/runs/35692723709) |
+| Prevent concurrent workers from corrupting the same working tree | integration: checkout lease refusal; e2e: two attempts, one repo; kind: `test_row_12_concurrent_attempts_use_distinct_claims`, `test_network_policy_denies_every_kubernetes_destination_from_the_worker`, `test_per_attempt_secret_is_removed_under_every_cleanup_policy`, and `test_probe_refuses_launches_without_default_deny`; [kind CI run](https://github.com/sentania-labs/crucible/actions/runs/35692723709) |
 | Expose sufficient API state for Foundry to inspect and reconcile | integration: a scripted Foundry start-of-session (list tasks, wakes, events) reconstructs state from the API alone |
 | Demonstrate through automated tests | CI green on the release tag with all tiers except live; live results attached |
 
