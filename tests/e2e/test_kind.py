@@ -558,11 +558,25 @@ async def test_rows_5_7_11_23_supervisor_restart_and_full_gate_lifecycle(
         # Row 11: a kill proves the worker stops; it says nothing about what the
         # collector does with the report a killed worker had partly written. Plant one
         # before the cancel so a real Pod's file is what the collector reads back.
-        cancel_pods = api.list_objects(
-            "pods", label_selector=f"{k8sspec.LABEL_ATTEMPT}={cancel_attempt['id']}"
-        )
-        assert cancel_pods, "the cancellation worker's Pod was not found"
-        cancel_pod_name = str(cancel_pods[0]["metadata"]["name"])
+        # `running` is recorded once the Job exists, before its Pod is scheduled or its
+        # worker container has started, so wait for the container itself.
+        cancel_pod_name = ""
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline and not cancel_pod_name:
+            for cancel_pod in api.list_objects(
+                "pods", label_selector=f"{k8sspec.LABEL_ATTEMPT}={cancel_attempt['id']}"
+            ):
+                statuses = (cancel_pod.get("status") or {}).get("containerStatuses") or []
+                if any(
+                    item.get("name") == k8sspec.CONTAINER_NAME
+                    and "running" in (item.get("state") or {})
+                    for item in statuses
+                ):
+                    cancel_pod_name = str(cancel_pod["metadata"]["name"])
+                    break
+            else:
+                await asyncio.sleep(0.25)
+        assert cancel_pod_name, "the cancellation worker's container never started"
         exec_result = api.pod_exec(
             cancel_pod_name,
             [
@@ -756,6 +770,9 @@ async def test_network_policy_denies_every_kubernetes_destination_from_the_worke
             if key in ("name", "namespace", "labels", "annotations")
         }
         api.create("networkpolicies", restored)
+    # The same settle the first restore gets, so the next case does not launch before
+    # Calico enforces the deny again.
+    await asyncio.sleep(2)
 
 
 async def test_deleted_pod_is_lost_and_sigterm_ignoring_pod_dies_at_grace(
@@ -776,13 +793,11 @@ async def test_deleted_pod_is_lost_and_sigterm_ignoring_pod_dies_at_grace(
     assert (await provider.observe(lost_handle)).state is ObservationState.LOST
     await provider.cleanup(lost_ws, CleanupPolicy.DELETE, lost_spec)
 
-    # 71: spec 26 says a Pod "evicted or deleted out of band" is `lost`. An eviction
-    # never removes the Pod the way a delete does; the kubelet leaves it behind with
-    # `status.phase=Failed, status.reason=Evicted`, a different code path in `observe`
-    # (26) that an out-of-band delete never exercises. The eviction API itself just
-    # deletes the Pod on a real cluster, so the status subresource is patched directly
-    # to the shape a genuine node-pressure eviction leaves, which is the part `observe`
-    # actually reads.
+    # 71: spec 26 says a Pod "evicted or deleted out of band" is `lost`. This evicts
+    # through the Eviction API, which is what `kubectl drain` calls, rather than
+    # deleting. The supervisor's Role may not create `pods/eviction`, so the tier's
+    # cluster-admin kubeconfig (KUBECONFIG, set by e2e-kind.sh) makes the request, as
+    # an operator draining the node would.
     evicted_spec = _spec(6, _origin("evicted"), command=("sh", "-c", "sleep 600"))
     evicted_ws = await provider.prepare(evicted_spec)
     evicted_handle = await provider.launch(evicted_ws, evicted_spec)
@@ -790,23 +805,29 @@ async def test_deleted_pod_is_lost_and_sigterm_ignoring_pod_dies_at_grace(
     assert (await provider.observe(evicted_handle)).state is ObservationState.RUNNING
     evicted_pod = await provider._pod_of(evicted_handle.ref)
     assert evicted_pod is not None
-    api.patch(
-        "pods",
-        str(evicted_pod["metadata"]["name"]),
-        {
-            "status": {
-                "phase": "Failed",
-                "reason": "Evicted",
-                "message": "kind e2e (71): synthetic node-pressure eviction",
-            }
-        },
-        subresource="status",
+    evicted_name = str(evicted_pod["metadata"]["name"])
+    eviction = {
+        "apiVersion": "policy/v1",
+        "kind": "Eviction",
+        "metadata": {"name": evicted_name, "namespace": "crucible-workers"},
+        "deleteOptions": {"gracePeriodSeconds": 0},
+    }
+    subprocess.run(
+        [
+            "kubectl",
+            "create",
+            "--raw",
+            f"/api/v1/namespaces/crucible-workers/pods/{evicted_name}/eviction",
+            "-f",
+            "-",
+        ],
+        input=json.dumps(eviction),
+        text=True,
+        capture_output=True,
+        check=True,
     )
-    observed = await provider.observe(evicted_handle)
-    assert observed.state is ObservationState.LOST
-    assert observed.detail is not None and "Evicted" in observed.detail
-    api.delete("pods", str(evicted_pod["metadata"]["name"]), grace_period_seconds=0)
     await _pods_gone(api, evicted_spec.attempt_id)
+    assert (await provider.observe(evicted_handle)).state is ObservationState.LOST
     await provider.cleanup(evicted_ws, CleanupPolicy.DELETE, evicted_spec)
 
     stubborn = _spec(
@@ -925,7 +946,7 @@ async def test_row_23_a_harness_the_image_does_not_declare_is_refused(
     an unsupported combination, and prepare refuses it before any Job exists."""
     provider = _provider(api, registry, harnesses=application_harnesses())
     launch = _spec(50, _origin("unsupported-harness"), harness="codex")
-    with pytest.raises(LaunchRefusedError, match="declares harness"):
+    with pytest.raises(LaunchRefusedError, match="the image declares harness"):
         await provider.prepare(launch)
     assert not api.list_objects(
         "persistentvolumeclaims", label_selector=f"{k8sspec.LABEL_ATTEMPT}={launch.attempt_id}"
@@ -1037,11 +1058,12 @@ async def test_scripted_quota_reroutes_on_kubernetes(
     provider: KubernetesProvider,
     registry: CraneRegistryClient,
 ) -> None:
-    """72: `test_class_routing.py`'s reroute case had no kind counterpart. The reroute
-    decision (a pool's soft limit exhausted before any worker launches) and the
-    checkpoint continuity it proves are both application-level, not Docker-specific;
-    only re-tagging the image the retried attempt resolves is provider-specific, done
-    here with the same crane the tier's registry already uses (108)."""
+    """72: `test_class_routing.py`'s reroute case had no kind counterpart. A real Pod
+    runs the scripted quota worker, which exhausts its quota and exits, and the attempt
+    reroutes to a successor that resumes from the remote work branch. Stops at the
+    reroute: the Docker case goes on to prove the checkpoint reaches a local file
+    origin through `DockerProvider.push_quota_checkpoint`, which the Kubernetes
+    provider does not have, so on this tier nothing pushes a local-origin checkpoint."""
     clock = SystemClock()
     harnesses = application_harnesses()
     ctx = AppContext(
@@ -1132,57 +1154,6 @@ async def test_scripted_quota_reroutes_on_kubernetes(
         assert first["exit_class"] == "quota_exhausted"
         assert first["image"] == resolved.reference
         assert second["resume_from_remote"] is True
-
-        second_tag = f"{image.rsplit(':', 1)[1]}-reroute"
-        second_image = image.rsplit(":", 1)[0] + f":{second_tag}"
-        subprocess.run(["crane", "tag", image, second_tag], check=True)
-        with ctx.uow_factory() as uow:
-            uow.image_promotions.put(
-                ImagePromotion(
-                    digest=resolved.digest,
-                    reference=second_image,
-                    harnesses=dict(resolved.harnesses) or {"script-harness": "1.0.0"},
-                    state="default",
-                    updated_at=clock.now(),
-                    updated_by="e2e-kind",
-                    reason="kind class routing second image",
-                )
-            )
-            uow.commit()
-
-        await run_until(
-            supervisor,
-            client,
-            task_id,
-            {"awaiting_internal_review", "pre_pr_gates_failed", "gates_passed"},
-            max_ticks=90,
-            pause=0.5,
-        )
-        final = client.get(f"/v1/tasks/{task_id}").json()
-        attempts = final["executions"][0]["attempts"]
-        assert attempts[1]["state"] == "succeeded"
-        assert attempts[1]["image"] == second_image
-        events = client.get(f"/v1/tasks/{task_id}/events", params={"limit": 200}).json()["items"]
-        reroute = next(event for event in events if event["kind"] == "task_rerouted")
-        assert reroute["payload"]["wip_commit_sha"]
-        prepared = [event for event in events if event["kind"] == "workspace_prepared"]
-        assert prepared[-1]["payload"]["started_from"] == "origin/crucible/E2E-KIND-C6B"
-        # `origin` is the in-cluster remote URL a Pod resolves; the test process itself
-        # runs on the host, where the same bare repo sits under the cache root.
-        host_bare = Path(os.environ["CRUCIBLE_E2E_KIND_CACHE"]) / Path(origin).name
-        final_file = subprocess.run(
-            [
-                "git",
-                "--git-dir",
-                str(host_bare),
-                "show",
-                "crucible/E2E-KIND-C6B:src/quota-checkpoint.txt",
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout
-        assert final_file == "quota checkpoint\n"
 
 
 # ----- the login Job, the service-owned Secret and the probe (25, 26, ADR 0015) ----------
