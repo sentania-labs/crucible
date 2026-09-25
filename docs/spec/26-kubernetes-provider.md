@@ -366,7 +366,12 @@ the namespace. A deployment therefore names one exact, pullable reference in
   system store with the lab CA). A registry named by a private (RFC 1918) IP
   address or a `.localhost` name is refused, because crane would fall back to
   plain HTTP for it; name the registry by a host name it serves HTTPS on. The
-  operator's decision of 2026-09-24 (108).
+  operator's decision of 2026-09-24 (108). Registry reads run on a thread pool of
+  their own (six threads), so a slow registry cannot hold the threads Kubernetes
+  API calls run on. The image listing (25) runs one at a time and every caller
+  shares it, and it is bounded at 12 seconds, below the 15 seconds the harness and
+  image endpoints wait: past the bound no crane process is started and any still
+  running is killed, and tags not resolved in time are left out of that listing.
 - `observe`: read the Job and its Pod.
 
   | Job | Pod | Result |

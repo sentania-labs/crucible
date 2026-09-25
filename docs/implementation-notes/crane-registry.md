@@ -88,6 +88,16 @@ provider fills from the image pull Secret).
   and image endpoints wait for it. The provider now resolves six tags at a time
   (`LIST_IMAGES_CONCURRENCY`, a constant, not a setting), and the same listing took
   2.9 seconds.
+- The review of PR 109 (Codex, 2026-09-24) found that when an endpoint gave up on a
+  listing after 15 seconds, the crane calls already running carried on in Python's
+  shared thread pool, the one every Kubernetes API call also uses, so repeated
+  requests against a slow registry could stall unrelated cluster operations. Now:
+  registry reads have their own pool of `LIST_IMAGES_CONCURRENCY` threads; one
+  listing runs at a time and later callers wait on it rather than starting another;
+  and a listing carries a deadline (`LIST_IMAGES_DEADLINE`, 12 seconds, a constant)
+  that every crane call is clipped to, so the listing and every crane process in it
+  end before the endpoint's 15 seconds. crane's own timeout kill does the stopping,
+  and the `DOCKER_CONFIG` directory is removed on that path as on every other.
 
 ## Proof
 
