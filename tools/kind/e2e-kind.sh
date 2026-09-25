@@ -15,7 +15,9 @@ registry_ref=""
 cluster_created=0
 registry_started=0
 tag_created=0
-network_created=0
+# Set by crucible_kind_start_registry the moment it creates the `kind` network, so cleanup
+# sees it even when the registry's own `docker run` fails right after (77).
+CRUCIBLE_KIND_NETWORK_CREATED=0
 
 cleanup() {
   status=$?
@@ -49,7 +51,7 @@ cleanup() {
       cleanup_failed=1
     fi
   fi
-  if [ "$network_created" -eq 1 ]; then
+  if [ "${CRUCIBLE_KIND_NETWORK_CREATED:-0}" -eq 1 ]; then
     # The name is shared by every kind cluster on the host; `network rm` on one a
     # concurrent run still holds fails harmlessly (Docker refuses while an endpoint is
     # attached), so this only ever removes what became ours to remove.
@@ -99,7 +101,6 @@ fi
 
 registry_started=1
 crucible_kind_start_registry "$registry"
-network_created=$CRUCIBLE_KIND_NETWORK_CREATED
 registry_port=$CRUCIBLE_KIND_REGISTRY_PORT
 registry_ref="localhost:${registry_port}/crucible-worker:${run_id}"
 crucible_kind_await_registry "http://127.0.0.1:${registry_port}"
