@@ -26,6 +26,13 @@ class ExitClass(StrEnum):
     UNKNOWN = "unknown"
 
 
+# The classes that say the harness finished its turn cleanly. A zero exit code alone
+# is not enough: an `incomplete` attempt exits 0 too (issue 128).
+CLEAN_EXIT_CLASSES: frozenset[ExitClass] = frozenset(
+    {ExitClass.COMPLETED, ExitClass.COMPLETED_WITHOUT_REPORT}
+)
+
+
 def classify_exit(
     *,
     exit_code: int | None,
