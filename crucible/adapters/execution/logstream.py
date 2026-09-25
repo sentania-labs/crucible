@@ -20,7 +20,13 @@ from typing import Any
 from crucible.domain.time import parse_rfc3339
 from crucible.ports.execution import LogChunk, LogOffset
 
-__all__ = ["chunks", "split_frame"]
+__all__ = ["RESUME_AT_BOUNDARY", "chunks", "split_frame"]
+
+# A stored position whose hash is this names no line: the resume keeps every line at or
+# after its timestamp. It is what a provider hands back when it moved the position past
+# lines it could not read (issue 63), so the first line of the new position is kept
+# rather than taken for the one already stored.
+RESUME_AT_BOUNDARY = "crucible:resume-at-boundary"
 
 # One log line as the chunker sees it: which stream it came from, its parsed timestamp,
 # the raw stamp text, and the bytes after the stamp.
@@ -67,7 +73,9 @@ def chunks(frames: Sequence[Any], since: LogOffset) -> list[LogChunk]:
         except ValueError:
             boundary = None
     carried = 0
-    if boundary is not None:
+    if boundary is not None and since.line_sha256 == RESUME_AT_BOUNDARY:
+        lines = [e for e in lines if e[1] is not None and e[1] >= boundary]
+    elif boundary is not None:
         at_boundary = [index for index, entry in enumerate(lines) if entry[1] == boundary]
         position = since.occurrence
         matched = (

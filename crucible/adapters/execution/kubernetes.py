@@ -70,6 +70,7 @@ from crucible.adapters.execution.k8sspec import (
     PodRequest,
     SpecError,
 )
+from crucible.adapters.execution.logstream import RESUME_AT_BOUNDARY
 from crucible.adapters.execution.logstream import chunks as _chunks
 from crucible.adapters.harness.registry import default_registry
 from crucible.application.harnesses import (
@@ -3710,7 +3711,9 @@ def _skip_crowded_second(payload: bytes, limit: int) -> list[LogChunk]:
             stream="stdout",
             content=notice + b"\n",
             ts=resume,
-            line_sha256=hashlib.sha256(notice).hexdigest(),
+            # The notice is not a line of the log: the next read keeps everything at or
+            # after `resume`, including a line stamped in its first microsecond.
+            line_sha256=RESUME_AT_BOUNDARY,
             occurrence=0,
             lines=1,
         )
