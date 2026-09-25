@@ -2219,3 +2219,28 @@ def test_rows_carry_their_own_actions_instead_of_typed_ids(
         assert "reason" in unquote(revoked.headers["location"])
         missing = browser.get("/ui/bootstrap/01ABCDEFGHJKMNPQRSTVWXYZ00", follow_redirects=False)
         assert missing.status_code == 303 and "not%20found" in missing.headers["location"]
+
+
+def test_pages_lead_with_what_the_operator_acts_on(
+    ctx: AppContext,
+    admin_client: TestClient,
+    live_supervisor: Supervisor,
+    tokens: dict[str, str],
+) -> None:
+    """crucible#115: plain labels first, internals behind a details view, one provider
+    table, and navigation entries with nothing behind them left out."""
+    asyncio.run(live_supervisor.tick())
+    with TestClient(create_app(ctx)) as browser:
+        ui_sign_in(browser, tokens["admin"])
+        status_page = browser.get("/ui").text
+        settings_page = browser.get("/ui/settings").text
+    lead, _, details = status_page.partition("<details")
+    assert "Provider: fake" in lead and "Supervisor" in lead
+    assert "Fenced token" not in lead and "Fenced token" in details
+    assert lead.count("CHECKS") == 0
+    nav = status_page[status_page.index("admin-nav") : status_page.index("</nav>")]
+    assert 'href="/ui/bootstrap"' not in nav and 'href="/ui/retention"' not in nav
+    assert "Set up" in nav and "Work" in nav and "Admin" in nav
+    lead, _, defaults = settings_page.partition("<details")
+    assert "Defaults left unchanged" in defaults
+    assert "restart required" not in settings_page

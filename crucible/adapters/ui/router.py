@@ -54,23 +54,32 @@ COOKIE = "crucible_ui"
 PREAUTH_COOKIE = "crucible_ui_preauth"
 SESSION_MAX_AGE = 12 * 60 * 60
 PREAUTH_MAX_AGE = 10 * 60
+# Grouped so the operator's path reads in order (crucible#115): what to set up, the work
+# running, then administration. An entry with no link is a group's label.
 NAV = (
     ("/ui", "Status"),
+    ("", "Set up"),
     ("/ui/harnesses", "Harnesses"),
-    ("/ui/credentials", "Credentials"),
     ("/ui/images", "Images"),
+    ("/ui/credentials", "Credentials"),
     ("/ui/routing", "Routing"),
     ("/ui/repositories", "Repositories"),
-    ("/ui/tokens", "Tokens"),
     ("/ui/github", "GitHub"),
-    ("/ui/workers", "Workers"),
+    ("", "Work"),
     ("/ui/tasks", "Tasks"),
+    ("/ui/workers", "Workers"),
     ("/ui/wakes", "Wakes"),
-    ("/ui/retention", "Retention"),
+    ("", "Admin"),
+    ("/ui/tokens", "Tokens"),
     ("/ui/audit", "Audit"),
-    ("/ui/bootstrap", "Bootstrap"),
     ("/ui/settings", "Settings"),
+    ("/ui/retention", "Retention"),
+    ("/ui/bootstrap", "Bootstrap"),
 )
+# Shown only once they have something in them, or while one is open: a new deployment
+# has run no cleanup and imported no ledger (crucible#115).
+HIDDEN_WHEN_EMPTY = ("/ui/retention", "/ui/bootstrap")
+
 
 LABELS = {
     "active": "Currently active",
@@ -368,12 +377,13 @@ def _base(
     *,
     title: str,
     active: str,
+    hidden: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     return {
         "request": request,
         "title": title,
         "active": active,
-        "nav": NAV,
+        "nav": tuple(item for item in NAV if item[0] not in hidden or item[0] == active),
         "principal": principal,
         "csrf": csrf,
         "message": request.query_params.get("message"),
@@ -398,7 +408,9 @@ def _page(
     if settings is not None:
         timezone = settings.service.render_timezone
     sections = _reason_fields(_localize(sections, timezone))
-    context = _base(request, principal, csrf, title=heading, active=active)
+    context = _base(
+        request, principal, csrf, title=heading, active=active, hidden=_empty_sections(request)
+    )
     context.update(
         heading=heading,
         intro=intro,
@@ -407,6 +419,21 @@ def _page(
         badge_kind=badge_kind,
     )
     return templates.TemplateResponse(request=request, name="page.html", context=context)
+
+
+def _empty_sections(request: Request) -> frozenset[str]:
+    """The navigation entries with nothing behind them yet (HIDDEN_WHEN_EMPTY)."""
+    try:
+        factory = request.app.state.ctx.uow_factory
+    except (AttributeError, KeyError):
+        return frozenset()
+    empty: set[str] = set()
+    with factory() as uow:
+        if not list(uow.retention.list_recent(1)):
+            empty.add("/ui/retention")
+        if not list(uow.bootstrap_imports.list_all()):
+            empty.add("/ui/bootstrap")
+    return frozenset(empty)
 
 
 def _localize(value: Any, timezone: str) -> Any:
@@ -597,6 +624,37 @@ async def sign_out(request: Request, ctx: Ctx, uow: UoW) -> RedirectResponse:
     return response
 
 
+# Task states in the words an operator uses (crucible#115). A state not named here is
+# shown as its own name with the underscores taken out.
+STATE_WORDS = {
+    "blocked": "Blocked: needs a decision",
+    "pre_pr_gates_failed": "Checks failed before the pull request",
+    "publish_failed": "Publishing failed",
+    "ci_certification_failed": "CI did not certify",
+    "head_diverged": "Branch changed outside Crucible",
+    "awaiting_internal_review": "Awaiting internal review",
+    "awaiting_acceptance": "Awaiting acceptance",
+    "awaiting_external_review": "Awaiting external review",
+    "awaiting_ci_certification": "Awaiting CI",
+    "ready_for_merge": "Ready to merge",
+}
+PROVIDER_TONES = {"ok": "ok", "degraded": "warn", "unavailable": "bad"}
+
+
+def _state_words(state: str) -> str:
+    return STATE_WORDS.get(state, state.replace("_", " ").capitalize())
+
+
+def _provider_detail(item: dict[str, Any]) -> str:
+    """The one check an operator would act on: the first that failed, else capacity."""
+    checks = item.get("checks") or {}
+    for key, value in checks.items():
+        if value is False or (isinstance(value, str) and "fail" in value.lower()):
+            return f"{_operator_label(key)}: {_safe_value(key, value)}"
+    capacity = (item.get("capabilities") or {}).get("max_concurrency")
+    return f"up to {capacity} workers at once" if capacity else ""
+
+
 @router.get("", response_class=HTMLResponse)
 async def dashboard(request: Request, ctx: Ctx, uow: UoW) -> Response:
     found = _require(request, ctx, uow)
@@ -607,7 +665,11 @@ async def dashboard(request: Request, ctx: Ctx, uow: UoW) -> Response:
         raise ConflictError("the administrative surface is not configured")
     document = await status.status(ctx.admin, uow)
     gaps = _readiness_gaps(document, repository_registered=bool(uow.repositories.list_all()))
-    sections = []
+    supervisor = document["supervisor"]
+    tasks_part = document["tasks"]
+    attention = sum(len(rows) for rows in tasks_part["lists"].values())
+    running = len(document["workers"])
+    sections: list[dict[str, Any]] = []
     if gaps:
         sections.append(
             {
@@ -616,22 +678,76 @@ async def dashboard(request: Request, ctx: Ctx, uow: UoW) -> Response:
                 "columns": ["Action", "Fix page"],
             }
         )
-    sections.extend(
+    overview: list[list[Any]] = [
         [
-            _document_section("Supervisor", document["supervisor"]),
-            _document_section("Providers", document["providers"]),
-            _document_section("Task state", document["tasks"]),
-            _document_section("Pending wakes", document["wakes"]),
-        ]
+            "Supervisor",
+            {
+                "kind": "status",
+                "value": "healthy" if supervisor["healthy"] else "not healthy",
+                "tone": "ok" if supervisor["healthy"] else "bad",
+            },
+            {
+                "kind": "note",
+                "value": supervisor["health_detail"] if not supervisor["healthy"] else "",
+                "hint": f"last tick {supervisor['last_tick_at'] or 'never'}",
+            },
+        ],
+        *[
+            [
+                f"Provider: {item['name']}",
+                {
+                    "kind": "status",
+                    "value": item["health"],
+                    "tone": PROVIDER_TONES.get(str(item["health"]), "warn"),
+                },
+                _provider_detail(item),
+            ]
+            for item in document["providers"]
+        ],
+        [
+            "Work",
+            {
+                "kind": "status",
+                "value": f"{attention} need attention" if attention else "nothing waiting",
+                "tone": "warn" if attention else "ok",
+            },
+            {"kind": "link", "href": "/ui/tasks", "label": f"{running} running; open Tasks"},
+        ],
+        [
+            "Wakes",
+            {
+                "kind": "status",
+                "value": f"{document['wakes']['unacked']} pending",
+                "tone": "warn" if document["wakes"]["unacked"] else "ok",
+            },
+            {"kind": "link", "href": "/ui/wakes", "label": "Open Wakes"},
+        ],
+    ]
+    internals = {
+        key: value for key, value in supervisor.items() if key not in ("providers", "counts")
+    }
+    sections.append(
+        {
+            "title": "Service",
+            "columns": ["Part", "State", ""],
+            "rows": overview,
+            "details": [
+                {"title": "Supervisor", "panel": _panel(internals)},
+                *[
+                    {"title": f"Provider {item['name']} checks", "panel": _panel(item["checks"])}
+                    for item in document["providers"]
+                ],
+            ],
+        }
     )
-    ready = not gaps and document["supervisor"]["healthy"]
+    ready = not gaps and supervisor["healthy"]
     return _page(
         request,
         principal,
         csrf,
         active="/ui",
-        heading="System status",
-        intro="One operational view of readiness, work, providers, and actions needed.",
+        heading="Status",
+        intro="Whether Crucible can run a task now, and what needs you.",
         sections=sections,
         badge="ready" if ready else "attention needed",
         badge_kind="ok" if ready else "warn",
@@ -1564,14 +1680,36 @@ def tasks_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
     if isinstance(found, RedirectResponse):
         return found
     principal, csrf = found
+    document = status.tasks(uow)
+    attention = [
+        [item["external_id"] or item["id"], _state_words(state), item["updated_at"]]
+        for state, items in document["lists"].items()
+        for item in items
+    ]
     return _page(
         request,
         principal,
         csrf,
         active="/ui/tasks",
-        heading="Failed and blocked tasks",
-        intro="States that need operator attention, plus counts across the lifecycle.",
-        sections=[_document_section("Task state", status.tasks(uow))],
+        heading="Tasks",
+        intro="Tasks that need you, then every task by state.",
+        sections=[
+            {
+                "title": "Needs attention",
+                "empty": "No task needs attention.",
+                "columns": ["Task", "Why", "Since"],
+                "rows": attention,
+            },
+            {
+                "title": "Tasks by state",
+                "empty": "No tasks yet.",
+                "columns": ["State", "Tasks"],
+                "rows": [
+                    [_state_words(state), count]
+                    for state, count in sorted(document["counts"].items())
+                ],
+            },
+        ],
     )
 
 
@@ -1582,25 +1720,28 @@ def wakes_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
         return found
     principal, csrf = found
     rows = uow.wakes.list_for_principal(principal.id, since=None, include_acked=True, limit=200)
+    summary = status.wakes(uow)
     return _page(
         request,
         principal,
         csrf,
         active="/ui/wakes",
-        heading="Pending wakes",
-        intro="Durable operator notifications for the signed-in principal.",
+        heading="Wakes",
+        intro=(
+            f"Notifications for {principal.name}. {summary['unacked']} pending across "
+            "every principal."
+        ),
         sections=[
-            _document_section("Wakes", status.wakes(uow)),
             {
-                "title": "Your wake records",
-                "columns": ["ID", "Reason", "Created", "Acknowledged", "Payload"],
+                "title": "Your wakes",
+                "empty": "No wakes for you.",
+                "columns": ["Why", "Created", "Acknowledged", ""],
                 "rows": [
                     [
-                        item.id,
-                        item.reason,
+                        item.reason.replace("_", " ").capitalize(),
                         item.created_at.isoformat(),
-                        item.acked_at.isoformat() if item.acked_at else None,
-                        item.payload,
+                        item.acked_at.isoformat() if item.acked_at else "no",
+                        {"kind": "more", "label": "Details", "value": item.payload},
                     ]
                     for item in rows
                 ],
@@ -1616,23 +1757,23 @@ def retention_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
         return found
     principal, csrf = found
     recent = list(uow.retention.list_recent(200))
+    summary = status.retention(uow)
     return _page(
         request,
         principal,
         csrf,
         active="/ui/retention",
         heading="Retention and cleanup",
-        intro="Recent cleanup actions and the last observed sweep.",
+        intro=f"What the cleanup sweep removed. Last run: {summary['last_run'] or 'never'}.",
         sections=[
-            _document_section("Summary", status.retention(uow)),
             {
                 "title": "Recent actions",
-                "columns": ["Kind", "Subject", "Policy", "Time", "Detail"],
+                "empty": "The sweep has not removed anything yet.",
+                "columns": ["What", "Subject", "When", "Detail"],
                 "rows": [
                     [
-                        item.kind,
+                        item.kind.replace("_", " ").capitalize(),
                         item.subject,
-                        f"{item.policy_name}/{item.policy_version}",
                         item.acted_at.isoformat(),
                         item.detail,
                     ]
@@ -1651,23 +1792,49 @@ def audit_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
     principal, csrf = found
     cursor = int(request.query_params.get("cursor", "0") or 0)
     document = audit.tail(uow, cursor=cursor, limit=100)
+    more = document["next_cursor"] != cursor and bool(document["items"])
     return _page(
         request,
         principal,
         csrf,
         active="/ui/audit",
-        heading="Administrative audit",
-        intro="Cursor-paged changes, refusals, principals, and reasons.",
+        heading="Audit",
+        intro="Every administrative change and refusal: who, when, and why.",
         sections=[
             {
-                "title": f"Events after {cursor}",
-                "columns": ["Sequence", "Time", "Kind", "Principal", "Payload"],
+                "title": "Changes" if not cursor else f"Changes after {cursor}",
+                "empty": "No administrative change recorded.",
+                "columns": ["When", "What", "Who", "Reason", ""],
                 "rows": [
-                    [item["seq"], item["ts"], item["kind"], item["principal"], item["payload"]]
+                    [
+                        item["ts"],
+                        str(item["kind"]).replace("_", " ").capitalize(),
+                        item["principal"],
+                        (item["payload"] or {}).get("reason") or "none given",
+                        {"kind": "more", "label": "Details", "value": item["payload"]},
+                    ]
                     for item in document["items"]
                 ],
             },
-            _document_section("Next cursor", {"next_cursor": document["next_cursor"]}),
+            *(
+                [
+                    {
+                        "title": "More",
+                        "rows": [
+                            [
+                                {
+                                    "kind": "link",
+                                    "href": f"/ui/audit?cursor={document['next_cursor']}",
+                                    "label": "Next page",
+                                }
+                            ]
+                        ],
+                        "columns": [""],
+                    }
+                ]
+                if more
+                else []
+            ),
         ],
     )
 
@@ -1833,11 +2000,11 @@ def _settings_rows(settings: Any) -> list[list[Any]]:
                     )
                 )
         reason = (
-            "Read at process start; restart required. Secret value is never shown."
+            "The value is never shown."
             if path in sensitive
-            else "Seeds kubernetes.egress; edit it on Routing, where a saved value wins."
+            else "Seeds the egress selectors; edit them on Routing, where a saved value wins."
             if path.split(".")[:2] in _EGRESS_SEEDS
-            else "Read at process start; restart required."
+            else ""
         )
         rows.append([path, shown, source, reason])
     return rows
@@ -1849,21 +2016,34 @@ def settings_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
     if isinstance(found, RedirectResponse):
         return found
     principal, csrf = found
+    rows = _settings_rows(ctx.settings)
+    # Lead with what this deployment set; the defaults it left alone go behind a click
+    # (crucible#115).
+    chosen = [
+        [path, value, source, note] for path, value, source, note in rows if source != "default"
+    ]
+    defaults = [[path, value, note] for path, value, source, note in rows if source == "default"]
     return _page(
         request,
         principal,
         csrf,
         active="/ui/settings",
-        heading="Restart-bound settings",
+        heading="Settings",
         intro=(
-            "Effective process configuration, its source, and why it is read-only here. "
-            "Runtime policy knobs are on Routing."
+            "Read when the service starts: change one in the settings file or the "
+            "environment and restart. What can change while running is on Routing, "
+            "Harnesses and Images."
         ),
         sections=[
             {
-                "title": "Effective settings",
-                "columns": ["Setting", "Effective value", "Source", "Disposition"],
-                "rows": _settings_rows(ctx.settings),
+                "title": "Set on this deployment",
+                "empty": "Every setting is at its default.",
+                "columns": ["Setting", "Value", "Set in", "Note"],
+                "rows": chosen,
+                "details_label": f"Defaults left unchanged ({len(defaults)})",
+                "details": [
+                    {"title": "Defaults", "columns": ["Setting", "Value", "Note"], "rows": defaults}
+                ],
             }
         ],
     )
