@@ -5,9 +5,16 @@
 # because what has to be torn down differs between the two tiers.
 
 # Calico, because kind's default CNI does not enforce egress NetworkPolicy and 26's
-# readiness probe refuses to launch anything on a cluster that does not (C8b).
+# readiness probe refuses to launch anything on a cluster that does not (C8b). The
+# manifest is pinned by version and by the SHA-256 of the file itself, but the images
+# it names were tag-only (67): a retag at quay.io would still pass that check and pull
+# something the manifest was never proved against. Pin each by the digest quay.io
+# reported for v3.32.2 on 2026-09-25 (docker-content-digest of the manifest list).
 CRUCIBLE_CALICO_VERSION=v3.32.2
 CRUCIBLE_CALICO_SHA256=a8c828a06a87c629a282ebbc424895b77f3a030251993e41ea400a743675bb02
+CRUCIBLE_CALICO_CNI_DIGEST=sha256:0ef740bc587f25565905adf1d1f61a7faff0d571c449c6bdd789feed743d3ef7
+CRUCIBLE_CALICO_NODE_DIGEST=sha256:99b03fe91e8bfbcb153ae65ef4b701b24ce541ffdd74ff314eb041096008f7fd
+CRUCIBLE_CALICO_KUBE_CONTROLLERS_DIGEST=sha256:7870b67ebb13fabc3005252b44fe6e78b21635649bd3072b80afa1684b6565d0
 CRUCIBLE_REGISTRY_IMAGE='registry@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373'
 
 # Put a shim ahead of PATH so both the caller and kind use the daemon selected by the
@@ -76,7 +83,12 @@ crucible_kind_install_calico() {
     "https://raw.githubusercontent.com/projectcalico/calico/${CRUCIBLE_CALICO_VERSION}/manifests/calico.yaml" \
     -o "$calico"
   echo "${CRUCIBLE_CALICO_SHA256}  ${calico}" | sha256sum -c -
-  sed -i 's#192\.168\.0\.0/16#10.244.0.0/16#g' "$calico"
+  sed -i \
+    -e 's#192\.168\.0\.0/16#10.244.0.0/16#g' \
+    -e "s#quay.io/calico/cni:${CRUCIBLE_CALICO_VERSION}#quay.io/calico/cni:${CRUCIBLE_CALICO_VERSION}@${CRUCIBLE_CALICO_CNI_DIGEST}#g" \
+    -e "s#quay.io/calico/node:${CRUCIBLE_CALICO_VERSION}#quay.io/calico/node:${CRUCIBLE_CALICO_VERSION}@${CRUCIBLE_CALICO_NODE_DIGEST}#g" \
+    -e "s#quay.io/calico/kube-controllers:${CRUCIBLE_CALICO_VERSION}#quay.io/calico/kube-controllers:${CRUCIBLE_CALICO_VERSION}@${CRUCIBLE_CALICO_KUBE_CONTROLLERS_DIGEST}#g" \
+    "$calico"
   KUBECONFIG="$kubeconfig" kubectl apply -f "$calico" >/dev/null
   KUBECONFIG="$kubeconfig" kubectl -n kube-system rollout status daemonset/calico-node --timeout=180s
   KUBECONFIG="$kubeconfig" kubectl wait --for=condition=Ready nodes --all --timeout=180s
