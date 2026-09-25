@@ -29,6 +29,7 @@ from crucible.adapters.execution.k8sregistry import (
     RegistryAuth,
     RegistryError,
     auths_from_dockerconfigjson,
+    parse_reference,
 )
 from crucible.adapters.execution.kubernetes import (
     LIST_IMAGES_CONCURRENCY,
@@ -388,6 +389,7 @@ async def test_a_tagged_repository_entry_is_skipped_by_a_registry_404_not_a_pars
     `<repo:tag>:<tag>` for every tag the registry lists under it. `parse_reference`
     does not reject that shape; the registry still lists tags for it and only the
     manifest read 404s, dropping the entry the same way an unavailable one does."""
+    parse_reference("ghcr.io/o/worker:probe:t00")  # does not raise: the skip is not here
     registry = FakeRegistry()
     registry.register("ghcr.io/o/worker:t00")
     registry._tags["ghcr.io/o/worker:probe"] = ["t00"]
