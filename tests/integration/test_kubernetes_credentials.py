@@ -652,3 +652,68 @@ def test_a_probe_the_job_deadline_ended_is_recorded_as_a_timeout(
     probe = validated.json()["probe"]
     assert probe["exit_class"] == "timeout", probe
     assert "the Job's deadline ended it" in probe["detail"]
+
+
+def test_a_slow_secret_read_does_not_hold_the_status_handler(
+    ctx: AppContext,
+    admin_ctx: AdminContext,
+    k8s_provider: KubernetesProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Status reads each harness Secret once, on a worker thread, with a bounded wait:
+    an API server that does not answer turns into an unreadable row, and the event loop
+    keeps serving everything else meanwhile."""
+    from crucible.application.admin import credentials as credentials_admin  # noqa: PLC0415
+    from crucible.application.admin import status as status_admin  # noqa: PLC0415
+
+    release = threading.Event()
+    reads: list[str] = []
+    real = k8s_provider.read_credential_secret
+
+    def stalled(harness: str) -> Any:
+        reads.append(harness)
+        release.wait(30)
+        return real(harness)
+
+    monkeypatch.setattr(k8s_provider, "read_credential_secret", stalled)
+    monkeypatch.setattr(credentials_admin, "SECRET_READ_TIMEOUT_SECONDS", 0.5)
+
+    async def scenario() -> tuple[dict[str, Any], float, int]:
+        ticks = 0
+
+        async def other_requests() -> None:
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(0.02)
+                ticks += 1
+
+        running = asyncio.create_task(other_requests())
+        started = time.monotonic()
+        try:
+            with ctx.uow_factory() as uow:
+                document = await status_admin.status(admin_ctx, uow)
+        finally:
+            elapsed = time.monotonic() - started
+            running.cancel()
+            release.set()
+        return document, elapsed, ticks
+
+    document, elapsed, ticks = asyncio.run(scenario())
+
+    held = [
+        name
+        for name in admin_ctx.harnesses.names()
+        if (adapter := admin_ctx.harnesses.get(name)) and adapter.credential_spec() is not None
+    ]
+    assert held and sorted(reads) == sorted(held)  # one read per harness, readiness included
+    assert elapsed < 3, elapsed  # the reads waited together, not one after another
+    assert ticks >= 10, ticks  # the loop served other work while the reads were stalled
+    for item in document["harnesses"]:
+        if item["name"] in held:
+            assert item["credential"]["state"] == "unreadable"
+            assert "did not answer within 0.5 seconds" in item["credential"]["detail"]
+    # The to-do list reuses those reads: it names the unreadable credential too.
+    listed = [h for h in document["readiness"]["harnesses"] if h["state"] != "off"]
+    assert listed
+    for item in listed:
+        assert "credential_unreadable" in [s["code"] for s in item["steps"]], item

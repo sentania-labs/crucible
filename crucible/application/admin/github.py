@@ -14,6 +14,7 @@ Private checkout is a separate operator decision."""
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from pathlib import Path
 from typing import Any
@@ -73,7 +74,34 @@ def fingerprint_of(pem: bytes) -> str | None:
     return "sha256:" + hashlib.sha256(der).hexdigest()
 
 
-def _stored(ctx: AdminContext) -> tuple[dict[str, Any] | None, AppCredential | None]:
+Stored = tuple[dict[str, Any] | None, AppCredential | None]
+
+# How long Status waits for the App credential store before it says it did not answer.
+STORE_READ_TIMEOUT_SECONDS = 5.0
+
+
+async def read_stored(ctx: AdminContext, *, timeout: float = STORE_READ_TIMEOUT_SECONDS) -> Stored:
+    """`_stored` on a worker thread with a bounded wait, for an async handler: on
+    Kubernetes it is a read of the App's Secret, and a slow API server must not hold the
+    event loop."""
+    store = getattr(ctx, "github_credentials", None)
+    if store is None:
+        return None, None
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(_stored, ctx), timeout)
+    except TimeoutError:
+        described = {
+            "kind": "secret" if hasattr(store, "namespace") else "directory",
+            "name": getattr(store, "name", None),
+            "namespace": getattr(store, "namespace", None),
+            "path": str(getattr(store, "directory", "")) or None,
+            "exists": None,
+            "detail": f"the App credential store did not answer within {timeout:g} seconds",
+        }
+        return described, None
+
+
+def _stored(ctx: AdminContext) -> Stored:
     store = getattr(ctx, "github_credentials", None)
     if store is None:
         return None, None
@@ -99,7 +127,7 @@ def _last_checks(uow: UnitOfWork) -> dict[str, dict[str, Any]]:
     return out
 
 
-def status(ctx: AdminContext, uow: UnitOfWork) -> dict[str, Any]:
+def status(ctx: AdminContext, uow: UnitOfWork, *, stored: Stored | None = None) -> dict[str, Any]:
     app = ctx.github_app
     last = _last_checks(uow)
     repositories: list[dict[str, Any]] = []
@@ -112,7 +140,7 @@ def status(ctx: AdminContext, uow: UnitOfWork) -> dict[str, Any]:
         }
         entry.update({"last_check": last.get(name)})
         repositories.append(entry)
-    described, credential = _stored(ctx)
+    described, credential = stored if stored is not None else _stored(ctx)
     if described is None:
         return {
             "configured": ctx.github is not None,

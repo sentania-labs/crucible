@@ -616,7 +616,7 @@ async def harness_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
     principal, csrf = found
     assert ctx.admin is not None
     discovered = await harnesses.list_images(ctx.admin)
-    items = harnesses.list_harnesses(ctx.admin, uow, [item for _, item in discovered])
+    items, _ = await harnesses.read_harnesses(ctx.admin, uow, [item for _, item in discovered])
     rows = [
         [
             item["name"],
@@ -689,9 +689,10 @@ async def credentials_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
     principal, csrf = found
     assert ctx.admin is not None
     names = list(ctx.admin.harnesses.names())
+    secrets = await credentials.read_secrets(ctx.admin, names)
     rows: list[list[Any]] = []
     for name in names:
-        view = credentials.state_view(ctx.admin, uow, name)
+        view = credentials.state_view(ctx.admin, uow, name, secrets.get(name))
         rows.append(
             [
                 name,
@@ -784,7 +785,8 @@ async def gateway_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
         return found
     principal, csrf = found
     assert ctx.admin is not None
-    view = gateway.gateway_view(ctx.admin, uow)
+    secrets = await credentials.read_secrets(ctx.admin, [credentials.HERMES])
+    view = gateway.gateway_view(ctx.admin, uow, secrets.get(credentials.HERMES))
     offered = await gateway.models_view(ctx.admin, uow)
     summary = {
         "endpoint_url": view["endpoint_url"] or "not set",
@@ -1427,7 +1429,7 @@ def github_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
             choices = [
                 (repo["full_name"], repo["full_name"])
                 for repo in repositories
-                if not repo["archived"] and not repo["registered_as"] and not repo.get("unsupported")
+                if not (repo["archived"] or repo["registered_as"] or repo.get("unsupported"))
             ]
             if admin and choices:
                 section["form"] = {

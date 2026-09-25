@@ -23,7 +23,7 @@ import shutil
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -182,6 +182,61 @@ def secret_store(ctx: AdminContext) -> Any | None:
     return provider
 
 
+# How long a page waits for one harness Secret before it says the API server did not
+# answer. The read runs on a worker thread, so a slow API server delays only that
+# harness's row, never the event loop and the requests behind it (Codex review of PR 156).
+SECRET_READ_TIMEOUT_SECONDS = 5.0
+
+
+@dataclass(frozen=True, slots=True)
+class SecretRead:
+    """One read of a harness Secret: its body (None when absent), or why it failed."""
+
+    body: dict[str, Any] | None
+    error: str | None = None
+
+
+def read_secret(store: Any, harness: str) -> SecretRead:
+    """One blocking read of the harness Secret."""
+    try:
+        return SecretRead(store.read_credential_secret(harness))
+    except ProviderError as exc:
+        return SecretRead(None, str(exc))
+
+
+async def read_secrets(
+    ctx: AdminContext,
+    harnesses: Iterable[str],
+    *,
+    timeout: float | None = None,
+) -> dict[str, SecretRead]:
+    """Each named harness's Secret read once, all at the same time on worker threads,
+    each bounded by `timeout` (`SECRET_READ_TIMEOUT_SECONDS` unless given). Empty when
+    the credentials are directories."""
+    wait = SECRET_READ_TIMEOUT_SECONDS if timeout is None else timeout
+    store = secret_store(ctx)
+    if store is None:
+        return {}
+    names = [
+        name
+        for name in harnesses
+        if (adapter := ctx.harnesses.get(name)) is not None
+        and adapter.credential_spec() is not None
+    ]
+
+    async def one(name: str) -> SecretRead:
+        try:
+            return await asyncio.wait_for(asyncio.to_thread(read_secret, store, name), wait)
+        except TimeoutError:
+            return SecretRead(
+                None,
+                f"the credential Secret {store.credential_secret(name)!r} did not answer "
+                f"within {wait:g} seconds",
+            )
+
+    return dict(zip(names, await asyncio.gather(*(one(n) for n in names)), strict=True))
+
+
 def stored_files(store: Any, harness: str) -> dict[str, bytes] | None:
     """The declared auth files the harness Secret holds, None when it does not exist.
     A Secret the API server will not return is a refusal, not an absence."""
@@ -202,13 +257,24 @@ def source_for(ctx: AdminContext, harness: str) -> CredentialSource:
     return source
 
 
-def state_view(ctx: AdminContext, uow: UnitOfWork, harness: str) -> dict[str, Any]:
+def state_view(
+    ctx: AdminContext, uow: UnitOfWork, harness: str, secret: SecretRead | None = None
+) -> dict[str, Any]:
+    """The credential's state. On Kubernetes `secret` is the Secret as `read_secrets`
+    already read it off the event loop; without one it is read here, once, blocking."""
     adapter = adapter_for(ctx, harness)
     state = uow.harnesses.get(harness)
     spec = adapter.credential_spec()
     store = secret_store(ctx) if spec is not None else None
     if store is not None:
-        view = _secret_state(store, spec, ctx.credential_sources.get(harness), state, harness)
+        view = _secret_state(
+            store,
+            spec,
+            ctx.credential_sources.get(harness),
+            state,
+            harness,
+            secret if secret is not None else read_secret(store, harness),
+        )
     else:
         view = credential_state(spec, ctx.credential_sources.get(harness), state).as_dict()
     if harness == HERMES:
@@ -236,23 +302,23 @@ def _secret_state(
     source: CredentialSource | None,
     state: Any,
     harness: str,
+    secret: SecretRead,
 ) -> dict[str, Any]:
     """The state of a Secret-held credential: what `credential_state` says of a
     directory, read from the Secret, plus which Secret it is and whether the service
     owns it. Sizes only; never a value."""
     name = store.credential_secret(harness)
-    try:
-        body = store.read_credential_secret(harness)
-    except ProviderError as exc:
+    if secret.error is not None:
         return {
             "state": "unreadable",
             "mount_mode": None,
             "fingerprint": None,
             "files": [],
-            "detail": str(exc),
+            "detail": secret.error,
             "source": {"kind": "secret", "name": name, "exists": None, "service_owned": None},
         }
-    files = stored_files(store, harness) if body is not None else None
+    body = secret.body
+    files = store.credential_files_in(harness, body)
     view = credential_state(
         spec,
         source,

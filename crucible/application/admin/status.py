@@ -8,7 +8,7 @@ from typing import Any
 from crucible.application.admin import audit, bootstrap, credentials, github
 from crucible.application.admin.context import AdminContext
 from crucible.application.admin.gateway import plain_outcome
-from crucible.application.admin.harnesses import list_harnesses, list_images
+from crucible.application.admin.harnesses import list_images, read_harnesses
 from crucible.application.admin.providers import providers_status
 from crucible.application.admin.routing import gateway_url
 from crucible.application.queries import supervisor_view
@@ -138,6 +138,7 @@ def _harness_steps(
     enabled_models: set[str],
     endpoint: str | None,
     unreachable: str | None,
+    secret: credentials.SecretRead | None = None,
 ) -> list[dict[str, str]]:
     """What stands between one harness and its first task, in the order an operator
     fixes it, each naming the page that fixes it. Read from the same state the
@@ -151,7 +152,7 @@ def _harness_steps(
         steps.append(
             _step("disabled", f"{name} is disabled. Enable it on Harnesses.", "/ui/harnesses")
         )
-    view = credentials.state_view(ctx, uow, name)
+    view = credentials.state_view(ctx, uow, name, secret)
     state = view.get("state")
     if state == "absent":
         steps.append(
@@ -229,7 +230,12 @@ def _harness_steps(
     return steps
 
 
-def readiness(ctx: AdminContext, uow: UnitOfWork, document: dict[str, Any]) -> dict[str, Any]:
+def readiness(
+    ctx: AdminContext,
+    uow: UnitOfWork,
+    document: dict[str, Any],
+    secrets: dict[str, credentials.SecretRead] | None = None,
+) -> dict[str, Any]:
     """crucible#123: the "before a task can run" list. Each real harness is `ready`,
     `not_ready` with the steps that fix it, or `off` when its configuration gate is shut;
     test fixtures are left out. The system is ready when the supervisor is healthy, a
@@ -263,6 +269,7 @@ def readiness(ctx: AdminContext, uow: UnitOfWork, document: dict[str, Any]) -> d
             enabled_models=enabled_models,
             endpoint=endpoint,
             unreachable=unreachable,
+            secret=(secrets or {}).get(name),
         )
         harnesses.append(
             {
@@ -309,7 +316,8 @@ def readiness(ctx: AdminContext, uow: UnitOfWork, document: dict[str, Any]) -> d
 
 async def status(ctx: AdminContext, uow: UnitOfWork) -> dict[str, Any]:
     images = await list_images(ctx)
-    harnesses = list_harnesses(ctx, uow, [i for _, i in images])
+    harnesses, secrets = await read_harnesses(ctx, uow, [i for _, i in images])
+    stored = await github.read_stored(ctx)
     credential_states = {h["name"]: h["credential"] for h in harnesses}
     supervisor = supervisor_view(
         uow, list(ctx.providers.values()), ctx.clock.now(), ctx.lease_ttl_seconds
@@ -318,7 +326,7 @@ async def status(ctx: AdminContext, uow: UnitOfWork) -> dict[str, Any]:
         "harnesses": harnesses,
         "credentials": credential_states,
         "providers": await providers_status(ctx),
-        "github": github.status(ctx, uow),
+        "github": github.status(ctx, uow, stored=stored),
         "supervisor": supervisor,
         "workers": workers(uow),
         "tasks": tasks(uow),
@@ -328,7 +336,7 @@ async def status(ctx: AdminContext, uow: UnitOfWork) -> dict[str, Any]:
         "bootstrap": bootstrap.status_part(uow),
         "audit": {"cursor": audit.tail(uow, cursor=None, limit=1)["next_cursor"]},
     }
-    document["readiness"] = readiness(ctx, uow, document)
+    document["readiness"] = readiness(ctx, uow, document, secrets)
     return document
 
 

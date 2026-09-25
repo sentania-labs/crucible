@@ -117,14 +117,17 @@ def _local_entries(uow: UnitOfWork) -> tuple[list[dict[str, Any]], dict[str, Any
     return list(view["models"]), dict(view["pool"])
 
 
-def gateway_view(ctx: AdminContext, uow: UnitOfWork) -> dict[str, Any]:
+def gateway_view(
+    ctx: AdminContext, uow: UnitOfWork, secret: credentials.SecretRead | None = None
+) -> dict[str, Any]:
     """The URL in force and its source, whether a key is set, the credential state, the
-    last test in plain words, and the local model entries in force. Never the key."""
+    last test in plain words, and the local model entries in force. Never the key.
+    `secret` is the Hermes Secret an async handler already read off the event loop."""
     endpoint, source = gateway_url(uow)
     entries, pool = _local_entries(uow)
     credential: dict[str, Any] = {}
     if HERMES in ctx.harnesses.names():
-        credential = credentials.state_view(ctx, uow, HERMES)
+        credential = credentials.state_view(ctx, uow, HERMES, secret)
     outcome = credential.get("last_launch_outcome")
     return {
         "endpoint_url": endpoint,

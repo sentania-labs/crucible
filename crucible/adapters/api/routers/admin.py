@@ -232,7 +232,8 @@ async def capabilities(ctx: Ctx, uow: UoW, principal: Orchestrator) -> dict[str,
 async def admin_harnesses(ctx: Ctx, uow: UoW, _principal: Admin) -> dict[str, Any]:
     admin = _admin(ctx)
     found = await harnesses.list_images(admin)
-    return {"items": harnesses.list_harnesses(admin, uow, [i for _, i in found])}
+    items, _ = await harnesses.read_harnesses(admin, uow, [i for _, i in found])
+    return {"items": items}
 
 
 @router.post("/admin/harnesses/{name}/enable")

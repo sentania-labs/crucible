@@ -243,3 +243,38 @@ def test_model_ids_read_an_openai_list_and_nothing_else() -> None:
     assert model_ids(b'{"data": [{"id": "a"}, {"id": "b"}, {"id": "a"}, {"x": 1}]}') == ["a", "b"]
     assert model_ids(b"not json") == []
     assert model_ids(b'{"data": "nope"}') == []
+
+
+def test_status_waits_a_bounded_time_for_a_slow_app_credential_store() -> None:
+    import asyncio  # noqa: PLC0415
+    import threading  # noqa: PLC0415
+    from types import SimpleNamespace  # noqa: PLC0415
+
+    from crucible.application.admin import github as github_admin  # noqa: PLC0415
+
+    release = threading.Event()
+
+    class Stalled:
+        name = "crucible-github-app"
+        namespace = "crucible"
+
+        def describe(self) -> dict[str, object]:
+            release.wait(30)
+            return {}
+
+        def read(self) -> None:
+            return None
+
+    async def scenario() -> github_admin.Stored:
+        try:
+            return await github_admin.read_stored(
+                SimpleNamespace(github_credentials=Stalled()),  # type: ignore[arg-type]
+                timeout=0.2,
+            )
+        finally:
+            release.set()
+
+    described, credential = asyncio.run(scenario())
+    assert credential is None and described is not None
+    assert described["exists"] is None and described["name"] == "crucible-github-app"
+    assert "did not answer within 0.2 seconds" in str(described["detail"])
