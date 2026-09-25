@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import os
 import stat
 import subprocess
 from pathlib import Path
@@ -140,13 +141,16 @@ def test_kubeconfig_credential_plugin_refusal_never_spawns_a_process(
 ) -> None:
     """64: the security-relevant guarantee is not the error message, it is that
     `unsafe-command` never runs. Patch every process-spawning entry point `subprocess`
-    offers so a future regression that ran the plugin before refusing it fails here."""
+    and `os` offer so a future regression that ran the plugin before refusing it fails here."""
 
     def _must_not_spawn(*args: object, **kwargs: object) -> None:
         raise AssertionError("kubeconfig_access must never spawn a process")
 
     for name in ("Popen", "run", "call", "check_call", "check_output"):
         monkeypatch.setattr(subprocess, name, _must_not_spawn)
+    for name in ("system", "popen", "fork", "posix_spawn", "posix_spawnp", "execv", "execvp"):
+        if hasattr(os, name):
+            monkeypatch.setattr(os, name, _must_not_spawn)
 
     document = {
         "current-context": "plugin",
