@@ -249,6 +249,38 @@ def kind_schemas() -> dict[str, dict[str, Any]]:
         "provider_list": _items("execution providers and their health", ANY_OBJ),
         "github_status": _obj("the GitHub App's health", {"configured": BOOL}),
         "github_check": _obj("the per-repository token check", {}),
+        "github_connected": _obj(
+            "the connected GitHub App: its id, key fingerprint, where the service keeps it, "
+            "and its install link; never the key",
+            {"configured": BOOL},
+            {"app": ANY_OBJ, "install_url": NSTR, "stored_in": ANY_OBJ},
+        ),
+        "github_installations": _obj(
+            "the repository picker: the App, its install link, and each installation's "
+            "repositories grouped by account",
+            {"connected": BOOL, "installations": {"type": "array"}},
+            {"app": ANY_OBJ, "install_url": NSTR, "error": NSTR},
+        ),
+        "gateway": _obj(
+            "the local gateway: its URL and where it comes from, whether a key is set, the "
+            "last test in plain words, and the local model entries in force",
+            {"endpoint_url": NSTR, "url_source": STR, "key_set": BOOL},
+            {"last_test": STR, "models": {"type": "array"}},
+        ),
+        "gateway_test": _obj(
+            "a gateway save or test: the gateway and the test's result in plain words",
+            {"gateway": ANY_OBJ, "test": ANY_OBJ},
+        ),
+        "gateway_models": _obj(
+            "the models the key can see, one row per model, beside the entries in force",
+            {"models": {"type": "array"}, "reachable": BOOL},
+            {"endpoint_url": NSTR, "error": NSTR},
+        ),
+        "gateway_models_saved": _obj(
+            "the routing policy version the picks wrote and what they changed",
+            {"enabled": {"type": "array"}, "routing_policy": ANY_OBJ},
+            {"added": {"type": "array"}, "disabled_not_offered": {"type": "array"}},
+        ),
         "audit_page": _obj(
             "one page of the audit log, oldest first",
             {"items": {"type": "array"}},

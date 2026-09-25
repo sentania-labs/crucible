@@ -13,6 +13,7 @@ from crucible.adapters.api.deps import Admin, Ctx, Orchestrator, UoW
 from crucible.application.admin import (
     audit,
     credentials,
+    gateway,
     github,
     harnesses,
     images,
@@ -107,6 +108,78 @@ def admin_save_local_endpoint(
         endpoint_url=str(body.get("endpoint_url", "")),
         models=models,
         max_concurrency=int(body.get("max_concurrency", 0)),
+        reason=_reason(body),
+    )
+    uow.commit()
+    return result
+
+
+# ----- the local gateway (crucible#119, #121) ------------------------------------
+
+
+@router.get("/admin/gateway")
+def admin_gateway(ctx: Ctx, uow: UoW, _principal: Admin) -> dict[str, Any]:
+    return gateway.gateway_view(_admin(ctx), uow)
+
+
+@router.post("/admin/gateway")
+async def admin_save_gateway(
+    ctx: Ctx,
+    uow: UoW,
+    principal: Admin,
+    body: Annotated[dict[str, Any], Body()],
+) -> dict[str, Any]:
+    """The gateway URL and, when `api_key` is given, the Hermes key, in one step; then
+    both are tested. The answer never carries the key."""
+    api_key = body.get("api_key")
+    if api_key is not None and not isinstance(api_key, str):
+        raise ConflictError("api_key must be a string")
+    result = await gateway.save_gateway(
+        _admin(ctx),
+        uow,
+        principal=principal,
+        endpoint_url=str(body.get("endpoint_url", "")),
+        api_key=api_key,
+        reason=_reason(body),
+    )
+    uow.commit()
+    return result
+
+
+@router.post("/admin/gateway/test")
+async def admin_test_gateway(
+    ctx: Ctx, uow: UoW, principal: Admin, body: Annotated[dict[str, Any], Body()]
+) -> dict[str, Any]:
+    result = await gateway.test_gateway(_admin(ctx), uow, principal=principal, reason=_reason(body))
+    uow.commit()
+    return result
+
+
+@router.get("/admin/gateway/models")
+async def admin_gateway_models(ctx: Ctx, uow: UoW, _principal: Admin) -> dict[str, Any]:
+    return await gateway.models_view(_admin(ctx), uow)
+
+
+@router.post("/admin/gateway/models")
+async def admin_save_gateway_models(
+    ctx: Ctx,
+    uow: UoW,
+    principal: Admin,
+    body: Annotated[dict[str, Any], Body()],
+) -> dict[str, Any]:
+    """`models` is a list of `{id, enabled, enable_thinking, capability}`; a model the
+    gateway does not offer is refused by name."""
+    models = body.get("models")
+    if not isinstance(models, list) or not all(isinstance(item, dict) for item in models):
+        raise ConflictError("models must be a list of model picks")
+    _require_boolean_flags(models)
+    limit = body.get("max_concurrency")
+    result = await gateway.save_models(
+        _admin(ctx),
+        uow,
+        principal=principal,
+        models=models,
+        max_concurrency=int(limit) if limit is not None else None,
         reason=_reason(body),
     )
     uow.commit()
@@ -379,6 +452,64 @@ def admin_github_check(
     ctx: Ctx, uow: UoW, principal: Admin, body: Annotated[dict[str, Any], Body()]
 ) -> dict[str, Any]:
     result = github.check(_admin(ctx), uow, principal=principal.name, reason=_reason(body))
+    uow.commit()
+    return result
+
+
+@router.post("/admin/github/app")
+def admin_github_connect(
+    ctx: Ctx, uow: UoW, principal: Admin, body: Annotated[dict[str, Any], Body()]
+) -> dict[str, Any]:
+    """Connect GitHub (crucible#120, ADR 0016): an existing App's id and private key,
+    checked against GitHub before they are stored. The answer never carries the key."""
+    private_key = body.get("private_key")
+    webhook_secret = body.get("webhook_secret")
+    if not isinstance(private_key, str):
+        raise ConflictError("private_key must be a string (the .pem file's text)")
+    if webhook_secret is not None and not isinstance(webhook_secret, str):
+        raise ConflictError("webhook_secret must be a string")
+    app_id = body.get("app_id")
+    if isinstance(app_id, str) and app_id.strip().isdigit():
+        app_id = int(app_id)
+    result = github.connect(
+        _admin(ctx),
+        uow,
+        principal=principal.name,
+        app_id=app_id if isinstance(app_id, int) else 0,
+        private_key=private_key,
+        webhook_secret=webhook_secret,
+        reason=_reason(body),
+    )
+    uow.commit()
+    return result
+
+
+@router.get("/admin/github/installations")
+def admin_github_installations(ctx: Ctx, uow: UoW, _principal: Admin) -> dict[str, Any]:
+    return github.apps_view(_admin(ctx), uow)
+
+
+@router.post("/admin/github/repositories")
+def admin_github_add_repository(
+    ctx: Ctx, uow: UoW, principal: Admin, body: Annotated[dict[str, Any], Body()]
+) -> dict[str, Any]:
+    """Register a repository an installation covers, with the installation id and the
+    default branch GitHub reports."""
+    installation_id = body.get("installation_id")
+    if isinstance(installation_id, bool) or not isinstance(installation_id, int):
+        raise ConflictError("installation_id must be a number")
+    result = github.add_repository(
+        _admin(ctx),
+        uow,
+        principal=principal.name,
+        installation_id=installation_id,
+        repository=str(body.get("repository", "")),
+        name=body.get("name") if isinstance(body.get("name"), str) else None,
+        policy_name=str(body.get("policy_name") or "default-software"),
+        attested_all_prs=body.get("attested_all_prs") is True,
+        attested_by=body.get("attested_by") if isinstance(body.get("attested_by"), str) else None,
+        reason=_reason(body),
+    )
     uow.commit()
     return result
 

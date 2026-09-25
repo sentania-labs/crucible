@@ -24,6 +24,7 @@ from crucible.application.admin import (
     audit,
     bootstrap,
     credentials,
+    gateway,
     github,
     harnesses,
     images,
@@ -56,6 +57,7 @@ NAV = (
     ("/ui", "Status"),
     ("/ui/harnesses", "Harnesses"),
     ("/ui/credentials", "Credentials"),
+    ("/ui/gateway", "Local gateway"),
     ("/ui/images", "Images"),
     ("/ui/routing", "Routing"),
     ("/ui/repositories", "Repositories"),
@@ -430,41 +432,44 @@ def _redirect(form: dict[str, str], message: str, *, kind: str = "ok") -> Redire
     )
 
 
-def _readiness_gaps(document: dict[str, Any], *, repository_registered: bool) -> list[list[str]]:
-    """Plain operator actions derived only from fields in the status document."""
-    gaps: list[list[str]] = []
-    supervisor = document["supervisor"]
-    if not supervisor["healthy"]:
-        gaps.append([f"The supervisor is not ready: {supervisor['health_detail']}.", "/ui"])
-    for item in document["harnesses"]:
-        if item["enabled_by_configuration"] and not item["enabled"]:
-            gaps.append(
-                [f"{item['name']} is disabled. Open Harnesses to enable it.", "/ui/harnesses"]
-            )
-        if item["credential"]["state"] in ("absent", "invalid"):
-            gaps.append(
-                [
-                    f"{item['name']} needs a credential. Open Credentials to log in.",
-                    "/ui/credentials",
-                ]
-            )
-        if item["enabled"] and not any(
-            image["promotion_state"] == "default" for image in item["images"]
-        ):
-            gaps.append(
-                [
-                    f"{item['name']} has no promoted worker image. Open Images to choose one.",
-                    "/ui/images",
-                ]
-            )
-    if not repository_registered:
-        gaps.append(
-            [
-                "No repository is registered. Open Repositories before submitting work.",
-                "/ui/repositories",
-            ]
+def _readiness_sections(readiness: dict[str, Any]) -> list[dict[str, Any]]:
+    """crucible#123: the to-do list from the status document's `readiness` part, which is
+    computed from the same state the other pages show. One row per missing step, each
+    with the page that fixes it; test fixtures are not in it."""
+    sections: list[dict[str, Any]] = []
+    if readiness["steps"]:
+        sections.append(
+            {
+                "title": "Before a task can run",
+                "columns": ["Action", "Fix page"],
+                "rows": [[step["text"], step["fix"]] for step in readiness["steps"]],
+            }
         )
-    return gaps
+    rows: list[list[Any]] = []
+    for harness in readiness["harnesses"]:
+        if harness["steps"]:
+            rows.extend(
+                [harness["name"], "not ready", step["text"], step["fix"]]
+                for step in harness["steps"]
+            )
+        else:
+            rows.append(
+                [
+                    harness["name"],
+                    "ready" if harness["state"] == "ready" else "off",
+                    harness["note"],
+                    "",
+                ]
+            )
+    sections.append(
+        {
+            "title": "Harness readiness",
+            "note": "What each harness still needs before a task can run on it.",
+            "columns": ["Harness", "State", "What is missing", "Fix page"],
+            "rows": rows,
+        }
+    )
+    return sections
 
 
 @router.get("/sign-in", response_class=HTMLResponse)
@@ -563,16 +568,8 @@ async def dashboard(request: Request, ctx: Ctx, uow: UoW) -> Response:
     if ctx.admin is None:
         raise ConflictError("the administrative surface is not configured")
     document = await status.status(ctx.admin, uow)
-    gaps = _readiness_gaps(document, repository_registered=bool(uow.repositories.list_all()))
-    sections = []
-    if gaps:
-        sections.append(
-            {
-                "title": "Before a task can run",
-                "rows": gaps,
-                "columns": ["Action", "Fix page"],
-            }
-        )
+    readiness = document["readiness"]
+    sections = _readiness_sections(readiness)
     sections.extend(
         [
             _document_section("Supervisor", document["supervisor"]),
@@ -581,14 +578,19 @@ async def dashboard(request: Request, ctx: Ctx, uow: UoW) -> Response:
             _document_section("Pending wakes", document["wakes"]),
         ]
     )
-    ready = not gaps and document["supervisor"]["healthy"]
+    ready = readiness["ready"]
+    ready_names = ", ".join(readiness["ready_harnesses"])
     return _page(
         request,
         principal,
         csrf,
         active="/ui",
         heading="System status",
-        intro="One operational view of readiness, work, providers, and actions needed.",
+        intro=(
+            f"Ready for a task on {ready_names}."
+            if ready
+            else "One operational view of readiness, work, providers, and actions needed."
+        ),
         sections=sections,
         badge="ready" if ready else "attention needed",
         badge_kind="ok" if ready else "warn",
@@ -683,42 +685,22 @@ async def credentials_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
             [
                 name,
                 view.get("state"),
+                gateway.plain_outcome(view.get("last_launch_outcome")),
                 view.get("session_compatibility"),
-                f"/ui/credentials/{name}/login",
+                # Hermes has no login: its key and gateway URL are set together (#119).
+                "/ui/gateway" if name == credentials.HERMES else f"/ui/credentials/{name}/login",
             ]
         )
     sections: list[dict[str, Any]] = [
         {
             "title": "Credential state",
-            "columns": ["Harness", "State", "Compatibility", "Login page"],
+            "note": "Hermes has no login: set its key with the gateway URL on Local gateway.",
+            "columns": ["Harness", "State", "Last test", "Compatibility", "Set up"],
             "rows": rows,
         }
     ]
     if principal.role is Role.ADMIN:
         options = [(name, name) for name in names]
-        sections.append(
-            {
-                "title": "Set Hermes API key",
-                "note": (
-                    "The value is written to the Hermes credential (a file mode 0600, or "
-                    "on Kubernetes the Secret Crucible owns), then discarded from the "
-                    "request. It is never displayed or included in audit details."
-                ),
-                "form": {
-                    "action": "/ui/actions/credential-set",
-                    "label": "Set and probe",
-                    "fields": [
-                        {
-                            "name": "api_key",
-                            "label": "LiteLLM virtual key",
-                            "kind": "password",
-                            "required": True,
-                        },
-                        {"name": "reason", "label": "Reason", "required": True},
-                    ],
-                },
-            }
-        )
         sections.append(
             {
                 "title": "Validate, probe, or remove",
@@ -777,6 +759,163 @@ def login_page(request: Request, harness: str, ctx: Ctx, uow: UoW) -> Response:
     context = _base(request, principal, csrf, title=f"{harness} login", active="/ui/credentials")
     context.update(harness=harness, login=document)
     return templates.TemplateResponse(request=request, name="login.html", context=context)
+
+
+CAPABILITY_OPTIONS = [("small", "small"), ("mid", "mid"), ("frontier", "frontier")]
+
+
+@router.get("/gateway", response_class=HTMLResponse)
+async def gateway_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
+    """crucible#119, #121: the gateway URL and the Hermes key in one place, a test of
+    both in plain words, and the gateway's own model list to pick from."""
+    found = _require(request, ctx, uow)
+    if isinstance(found, RedirectResponse):
+        return found
+    principal, csrf = found
+    assert ctx.admin is not None
+    view = gateway.gateway_view(ctx.admin, uow)
+    offered = await gateway.models_view(ctx.admin, uow)
+    summary = {
+        "endpoint_url": view["endpoint_url"] or "not set",
+        "key": "set" if view["key_set"] else "not set",
+        "credential_state": view["credential_state"],
+        "last_test": view["last_test"],
+        "last_tested_at": view["last_tested_at"],
+    }
+    sections: list[dict[str, Any]] = [_document_section("Gateway", summary)]
+    listing: dict[str, Any] = {
+        "title": "Models the key can see",
+        "note": offered["error"]
+        or (
+            f"Gateway {offered['endpoint_url']} lists {offered['offered_count']} "
+            "model(s) for this key. Tick the ones to use; saving writes a new routing "
+            "policy version. A model the gateway no longer offers is disabled, not removed."
+        ),
+    }
+    if principal.role is not Role.ADMIN:
+        listing.update(
+            columns=["Model", "Offered", "In use", "Thinking", "Capability", "Note"],
+            rows=[
+                [
+                    row["id"],
+                    row["offered"],
+                    row["enabled"],
+                    row["enable_thinking"],
+                    row["capability"],
+                    row["note"],
+                ]
+                for row in offered["models"]
+            ],
+        )
+        sections.append(listing)
+    else:
+        sections.append(
+            {
+                "title": "Set the gateway URL and key",
+                "note": (
+                    "The URL is the gateway's OpenAI-compatible base, ending in /v1. The key "
+                    "is the LiteLLM virtual key Hermes sends; it is written to the Hermes "
+                    "credential (on Kubernetes the Secret Crucible owns, otherwise a file "
+                    "mode 0600) and never shown or audited. Leave it empty to keep the key "
+                    "already set. Saving tests both: the gateway's readiness check, then its "
+                    "model list with the key."
+                ),
+                "form": {
+                    "action": "/ui/actions/gateway-save",
+                    "label": "Save and test",
+                    "fields": [
+                        {
+                            "name": "endpoint_url",
+                            "label": "Gateway URL",
+                            "kind": "url",
+                            "value": view["endpoint_url"] or "",
+                            "placeholder": "https://llm.example.internal/v1",
+                            "required": True,
+                        },
+                        {
+                            "name": "api_key",
+                            "label": "Key (empty keeps the current one)"
+                            if view["key_set"]
+                            else "Key",
+                            "kind": "password",
+                            "required": not view["key_set"],
+                        },
+                        {"name": "reason", "label": "Reason", "required": True},
+                    ],
+                },
+            }
+        )
+        if view["endpoint_url"]:
+            sections.append(
+                {
+                    "title": "Test again",
+                    "form": {
+                        "action": "/ui/actions/gateway-test",
+                        "label": "Test the gateway",
+                        "fields": [{"name": "reason", "label": "Reason", "required": True}],
+                    },
+                }
+            )
+        if offered["models"]:
+            rows = []
+            for index, row in enumerate(offered["models"]):
+                rows.append(
+                    [
+                        {"kind": "hidden", "name": f"model.{index}.id", "value": row["id"]},
+                        {
+                            "kind": "checkbox",
+                            "name": f"model.{index}.enabled",
+                            "value": row["enabled"],
+                            "label": f"use {row['id']}",
+                        },
+                        {
+                            "kind": "checkbox",
+                            "name": f"model.{index}.thinking",
+                            "value": row["enable_thinking"],
+                            "label": f"thinking for {row['id']}",
+                        },
+                        {
+                            "kind": "select",
+                            "name": f"model.{index}.capability",
+                            "value": row["capability"],
+                            "options": CAPABILITY_OPTIONS,
+                            "label": f"capability of {row['id']}",
+                        },
+                        {"value": row["note"]},
+                    ]
+                )
+            listing["form"] = {
+                "action": "/ui/actions/gateway-models",
+                "label": "Save model choices",
+                "fields": [
+                    {
+                        "kind": "grid",
+                        "label": "",
+                        "columns": ["Model", "Use", "Thinking", "Capability", "Note"],
+                        "rows": rows,
+                    },
+                    {
+                        "name": "max_concurrency",
+                        "label": "Pool max concurrency",
+                        "kind": "number",
+                        "value": (offered["pool"] or {}).get("max_concurrency") or 4,
+                        "required": True,
+                    },
+                    {"name": "reason", "label": "Reason", "required": True},
+                ],
+            }
+        sections.append(listing)
+    return _page(
+        request,
+        principal,
+        csrf,
+        active="/ui/gateway",
+        heading="Local gateway",
+        intro="The gateway Hermes uses: its URL, its key, a test of both, and its models.",
+        sections=sections,
+        badge="tested" if view["last_outcome"] == "probe:completed" else "not verified",
+        badge_kind="ok" if view["last_outcome"] == "probe:completed" else "warn",
+    )
 
 
 @router.get("/images", response_class=HTMLResponse)
@@ -853,100 +992,30 @@ def routing_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
     exhaustion = routing.list_exhaustions(ctx.admin, uow)
     local = routing.local_endpoint_view(uow)
     egress = kubernetes_admin.egress_view(ctx.admin, uow)
-    hermes: dict[str, Any] = {}
-    if "hermes" in ctx.admin.harnesses.names():
-        view = credentials.state_view(ctx.admin, uow, "hermes")
-        # Whether a key is set and where it is kept; the key itself is never shown (12).
-        hermes = {
-            "key_set": view.get("key_set", False),
-            "state": view.get("state"),
-            "stored_in": view.get("source") or "the configured credential directory",
-        }
+    gateway_endpoint, _source = routing.gateway_url(uow)
     sections: list[dict[str, Any]] = [
+        {
+            "title": "Local gateway",
+            "note": (
+                "The gateway URL, the Hermes key, the test of both, and which of the "
+                "gateway's models to use are set in one place (crucible#119, #121)."
+            ),
+            "columns": ["Gateway URL", "Local models enabled", "Set up"],
+            "rows": [
+                [
+                    gateway_endpoint or "not set",
+                    ", ".join(m["id"] for m in local["models"] if m.get("enabled")) or "none",
+                    "/ui/gateway",
+                ]
+            ],
+        },
         _document_section("Local endpoint", local),
-        *([_document_section("Hermes API key", hermes)] if hermes else []),
         _document_section("Kubernetes egress selectors", egress),
         _document_section("Active policy", policy.document if policy else {}),
         _document_section("Routing policy", routing_record.document if routing_record else {}),
         _document_section("Pool exhaustion", exhaustion),
     ]
     if principal.role is Role.ADMIN:
-        for model in local["models"]:
-            sections.append(
-                {
-                    "title": f"Edit local model {model['id']}",
-                    "note": (
-                        "Saving creates new immutable routing and delivery policy versions "
-                        "and regenerates the worker proxy allowlist."
-                    ),
-                    "form": {
-                        "action": "/ui/actions/routing-local",
-                        "label": "Save local endpoint",
-                        "fields": [
-                            {
-                                "name": "endpoint_url",
-                                "label": "Endpoint URL",
-                                "kind": "url",
-                                "value": local.get("endpoint_url") or "",
-                                "required": True,
-                            },
-                            {
-                                "name": "model_id",
-                                "label": "Model",
-                                "value": model["id"],
-                                "required": True,
-                            },
-                            {
-                                "name": "enabled",
-                                "label": "Enabled",
-                                "kind": "checkbox",
-                                "value": model.get("enabled", False),
-                            },
-                            {
-                                "name": "enable_thinking",
-                                "label": "Thinking by default",
-                                "kind": "checkbox",
-                                "value": (model.get("chat_template_kwargs") or {}).get(
-                                    "enable_thinking", False
-                                ),
-                            },
-                            {
-                                "name": "max_concurrency",
-                                "label": "Pool max concurrency",
-                                "kind": "number",
-                                "value": local["pool"].get("max_concurrency", 1),
-                                "required": True,
-                            },
-                            {"name": "reason", "label": "Reason", "required": True},
-                        ],
-                    },
-                }
-            )
-        if hermes:
-            sections.append(
-                {
-                    "title": "Set Hermes API key",
-                    "note": (
-                        "The LiteLLM virtual key Hermes sends to the local endpoint. It is "
-                        "written to the Hermes credential (a file mode 0600, or on Kubernetes "
-                        "the Secret Crucible owns), then probed, and never displayed or "
-                        "included in audit details."
-                    ),
-                    "form": {
-                        "action": "/ui/actions/credential-set",
-                        "label": "Set and probe",
-                        "fields": [
-                            {
-                                "name": "api_key",
-                                "label": "LiteLLM virtual key",
-                                "kind": "password",
-                                "required": True,
-                            },
-                            {"name": "reason", "label": "Reason", "required": True},
-                        ],
-                    },
-                }
-            )
         dns = egress["document"].get("dns") or {}
         endpoint = egress["document"].get("local_endpoint") or {}
         sections.append(
@@ -1119,6 +1188,10 @@ def repositories_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
             [
                 {
                     "title": "Register or update",
+                    "note": (
+                        "For a repository the GitHub page's picker cannot show. The picker "
+                        "fills the installation ID and default branch from GitHub."
+                    ),
                     "form": {
                         "action": "/ui/actions/repository-register",
                         "label": "Save registration",
@@ -1244,15 +1317,144 @@ def tokens_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
 
 @router.get("/github", response_class=HTMLResponse)
 def github_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
+    """crucible#120: connect an existing App by its id and key, install it from its own
+    link, then pick repositories from what each installation covers."""
     found = _require(request, ctx, uow)
     if isinstance(found, RedirectResponse):
         return found
     principal, csrf = found
     assert ctx.admin is not None
-    sections: list[dict[str, Any]] = [
-        _document_section("App and repository connectivity", github.status(ctx.admin, uow))
-    ]
-    if principal.role is Role.ADMIN:
+    state = github.status(ctx.admin, uow)
+    picker = github.apps_view(ctx.admin, uow) if state["configured"] else None
+    sections: list[dict[str, Any]] = [_document_section("App and repository connectivity", state)]
+    admin = principal.role is Role.ADMIN
+    if admin:
+        sections.append(
+            {
+                "title": "Connect a GitHub App" if not state["configured"] else "Replace the App",
+                "note": (
+                    "An existing App's numeric ID and one of its private keys (the whole "
+                    ".pem file). GitHub is asked about them before anything is stored; the "
+                    "service then keeps them (on Kubernetes the Secret crucible-github-app "
+                    "in its own namespace, which it alone writes). The key is never shown or "
+                    "audited; its public fingerprint is."
+                ),
+                "form": {
+                    "action": "/ui/actions/github-connect",
+                    "label": "Check and connect",
+                    "fields": [
+                        {
+                            "name": "app_id",
+                            "label": "App ID",
+                            "kind": "number",
+                            "value": state["app_id"] or "",
+                            "required": True,
+                        },
+                        {
+                            "name": "private_key",
+                            "label": "Private key (.pem)",
+                            "kind": "textarea",
+                            "rows": 6,
+                            "required": True,
+                        },
+                        {
+                            "name": "webhook_secret",
+                            "label": "Webhook secret (optional)",
+                            "kind": "password",
+                        },
+                        {"name": "reason", "label": "Reason", "required": True},
+                    ],
+                },
+            }
+        )
+    if picker is not None:
+        if picker["error"]:
+            sections.append({"title": "Installations", "note": picker["error"]})
+        if picker["install_url"]:
+            sections.append(
+                {
+                    "title": "Install the App",
+                    "note": (
+                        "Install it on each account or organization whose repositories "
+                        "Crucible should deliver to, then come back here."
+                    ),
+                    "columns": ["App", "Install link"],
+                    "rows": [
+                        [
+                            (picker["app"] or {}).get("name") or (picker["app"] or {}).get("slug"),
+                            {"href": picker["install_url"], "label": picker["install_url"]},
+                        ]
+                    ],
+                }
+            )
+        for installation in picker["installations"]:
+            title = (
+                f"{installation.get('account')} ({installation.get('account_type') or 'account'}), "
+                f"installation {installation['id']}"
+            )
+            repositories = installation["repositories"]
+            section: dict[str, Any] = {
+                "title": title,
+                "note": installation["error"]
+                or f"{len(repositories)} repositor{'y' if len(repositories) == 1 else 'ies'} "
+                "this installation covers.",
+                "columns": ["Repository", "Default branch", "Private", "Archived", "Registered as"],
+                "rows": [
+                    [
+                        repo["full_name"],
+                        repo["default_branch"],
+                        repo["private"],
+                        repo["archived"],
+                        repo["registered_as"] or "not registered",
+                    ]
+                    for repo in repositories
+                ],
+            }
+            choices = [
+                (repo["full_name"], repo["full_name"])
+                for repo in repositories
+                if not repo["archived"] and not repo["registered_as"]
+            ]
+            if admin and choices:
+                section["form"] = {
+                    "action": "/ui/actions/github-add-repository",
+                    "label": "Register repository",
+                    "fields": [
+                        {"name": "installation_id", "kind": "hidden", "value": installation["id"]},
+                        {
+                            "name": "repository",
+                            "label": "Repository",
+                            "kind": "select",
+                            "options": choices,
+                        },
+                        {
+                            "name": "name",
+                            "label": "Registered name (empty: the repository's own)",
+                        },
+                        {
+                            "name": "policy_name",
+                            "label": "Policy",
+                            "value": "default-software",
+                            "required": True,
+                        },
+                        {
+                            "name": "attested_all_prs",
+                            "label": "External reviewer covers all PRs",
+                            "kind": "checkbox",
+                        },
+                        {"name": "reason", "label": "Reason", "required": True},
+                    ],
+                }
+            sections.append(section)
+        sections.append(
+            {
+                "title": "A repository the picker cannot show",
+                "note": "Register it by hand on Repositories.",
+                "columns": ["Page", "Open"],
+                "rows": [["Repositories", "/ui/repositories"]],
+            }
+        )
+    if admin and state["configured"]:
         sections.append(
             {
                 "title": "Connectivity check",
@@ -1269,8 +1471,10 @@ def github_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
         csrf,
         active="/ui/github",
         heading="GitHub",
-        intro="App identity, key presence, installation coverage, and last API results.",
+        intro="Connect the App, install it, and pick the repositories Crucible delivers to.",
         sections=sections,
+        badge="connected" if state["configured"] else "not connected",
+        badge_kind="ok" if state["configured"] else "warn",
     )
 
 
@@ -1684,14 +1888,94 @@ async def action(request: Request, action: str, ctx: Ctx, uow: UoW) -> Response:
                 )
             else:
                 raise ConflictError("unknown credential action")
-        elif action == "credential-set":
-            await credentials.set_api_key(
+        elif action == "gateway-save":
+            result = await gateway.save_gateway(
+                ctx.admin,
+                uow,
+                principal=principal,
+                endpoint_url=form.get("endpoint_url", ""),
+                api_key=form.get("api_key") or None,
+                reason=reason,
+            )
+            uow.commit()
+            return _redirect(
+                form,
+                f"Saved. {result['test']['summary']}",
+                kind="ok" if result["test"]["passed"] else "warn",
+            )
+        elif action == "gateway-test":
+            result = await gateway.test_gateway(ctx.admin, uow, principal=principal, reason=reason)
+            uow.commit()
+            return _redirect(
+                form,
+                result["test"]["summary"],
+                kind="ok" if result["test"]["passed"] else "warn",
+            )
+        elif action == "gateway-models":
+            picks = []
+            index = 0
+            while f"model.{index}.id" in form:
+                picks.append(
+                    {
+                        "id": form[f"model.{index}.id"],
+                        "enabled": form.get(f"model.{index}.enabled") == "true",
+                        "enable_thinking": form.get(f"model.{index}.thinking") == "true",
+                        "capability": form.get(f"model.{index}.capability") or None,
+                    }
+                )
+                index += 1
+            saved = await gateway.save_models(
+                ctx.admin,
+                uow,
+                principal=principal,
+                models=picks,
+                max_concurrency=int(form.get("max_concurrency") or "0") or None,
+                reason=reason,
+            )
+            uow.commit()
+            enabled = ", ".join(saved["enabled"]) or "none"
+            dropped = saved["disabled_not_offered"]
+            return _redirect(
+                form,
+                f"Saved routing policy version {saved['routing_policy']['version']}. "
+                f"Enabled: {enabled}."
+                + (f" Disabled as no longer offered: {', '.join(dropped)}." if dropped else ""),
+            )
+        elif action == "github-connect":
+            connected = github.connect(
                 ctx.admin,
                 uow,
                 principal=principal.name,
-                harness="hermes",
-                api_key=form.get("api_key", ""),
+                app_id=int(form.get("app_id") or "0"),
+                private_key=form.get("private_key", ""),
+                webhook_secret=form.get("webhook_secret") or None,
                 reason=reason,
+            )
+            uow.commit()
+            return _redirect(
+                form,
+                f"Connected App {connected['app_id']}"
+                + (f" ({connected['app'].get('slug')})" if connected["app"].get("slug") else "")
+                + ". Install it from the link below, then pick repositories.",
+            )
+        elif action == "github-add-repository":
+            added = github.add_repository(
+                ctx.admin,
+                uow,
+                principal=principal.name,
+                installation_id=int(form.get("installation_id") or "0"),
+                repository=form.get("repository", ""),
+                name=form.get("name") or None,
+                policy_name=form.get("policy_name") or "default-software",
+                attested_all_prs=form.get("attested_all_prs") == "true",
+                attested_by=None,
+                reason=reason,
+            )
+            uow.commit()
+            return _redirect(
+                form,
+                f"Registered {added['repository']} ({added['url']}, default branch "
+                f"{added['default_branch']}, installation {added['installation_id']}).",
             )
         elif action == "login-start":
             login.start_login(
@@ -1742,22 +2026,6 @@ async def action(request: Request, action: str, ctx: Ctx, uow: UoW) -> Response:
         elif action == "routing-clear":
             routing.clear_exhaustion(
                 ctx.admin, uow, principal=principal.name, pool=form.get("pool", ""), reason=reason
-            )
-        elif action == "routing-local":
-            routing.save_local_endpoint(
-                ctx.admin,
-                uow,
-                principal=principal,
-                endpoint_url=form.get("endpoint_url", ""),
-                models=[
-                    {
-                        "id": form.get("model_id", ""),
-                        "enabled": form.get("enabled") == "true",
-                        "enable_thinking": form.get("enable_thinking") == "true",
-                    }
-                ],
-                max_concurrency=int(form.get("max_concurrency", "0")),
-                reason=reason,
             )
         elif action == "kubernetes-egress":
             kubernetes_admin.save_egress(

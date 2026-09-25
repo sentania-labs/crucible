@@ -247,28 +247,29 @@ def test_rotate_and_remove_say_the_credential_is_a_secret(admin: TestClient) -> 
         assert "crucible-harness-codex" in response.json()["detail"]
 
 
-def test_the_hermes_key_is_set_from_the_routing_page_and_never_shown(
+def test_the_hermes_key_is_set_from_the_gateway_page_and_never_shown(
     admin: TestClient, ctx: AppContext, tokens: dict[str, str], k8s_api: FakeKubernetesApi
 ) -> None:
     api_key = "vk_" + "q" * 40
     assert admin.get("/v1/admin/credentials/hermes").json()["key_set"] is False
     with TestClient(create_app(ctx)) as browser:
         csrf = ui_sign_in(browser, tokens["admin"])
-        page = browser.get("/ui/routing")
+        page = browser.get("/ui/gateway")
         assert page.status_code == 200
-        assert "Hermes API key" in page.text and "Set Hermes API key" in page.text
+        assert "Set the gateway URL and key" in page.text
         saved = browser.post(
-            "/ui/actions/credential-set",
+            "/ui/actions/gateway-save",
             data={
                 "csrf": csrf,
+                "endpoint_url": "http://127.0.0.1:9/v1",
                 "api_key": api_key,
-                "reason": "hermes key from the routing page",
-                "return_to": "/ui/routing",
+                "reason": "hermes key from the gateway page",
+                "return_to": "/ui/gateway",
             },
             follow_redirects=False,
         )
         assert saved.status_code in (302, 303), saved.text
-        after = browser.get("/ui/routing").text
+        after = browser.get("/ui/gateway").text
         assert api_key not in after
     assert k8s_api.harness_secret("crucible-harness-hermes") == {
         "api-key": api_key.encode() + b"\n"
