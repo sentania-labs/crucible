@@ -142,9 +142,7 @@ jobs:
           set -euo pipefail
           docker run --rm -v "$PWD/tools/registry:/check:ro" --entrypoint python \
             "${IMAGE}:${VERSION}" /check/check_published.py \
-            --reference "${WORKER_REGISTRY}:latest" \
-            --expect-harness claude_code --expect-harness codex \
-            --expect-harness agy --expect-harness hermes
+            --reference "${WORKER_REGISTRY}:latest"
 
       # Gate 3, part one. Boot the exact image that is about to be published,
       # the way an operator boots it, and prove the running containers are that

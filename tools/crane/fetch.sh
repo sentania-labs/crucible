@@ -3,8 +3,8 @@
 #
 # The version and the release archive's SHA-256 are read from the Dockerfile's
 # CRANE_VERSION and CRANE_SHA256 build args, so the tests and CI run exactly the binary
-# the image carries, and a pin changes in one place. The archive is checked before it is
-# extracted and again on every call; a mismatch fails and leaves nothing behind.
+# the image carries, and a pin changes in one place. The archive is checked on every call
+# and the binary extracted from it again; a mismatch fails and leaves nothing behind.
 set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -30,13 +30,12 @@ if ! echo "${sha256}  ${archive}" | sha256sum -c - >/dev/null 2>&1; then
   fi
   mv "$partial" "$archive"
 fi
-if [ ! -x "$cache/crane" ]; then
-  # Extracted beside the cache and moved into place, so a concurrent caller never runs
-  # a half-written binary.
-  staging=$(mktemp -d "$cache/extract.XXXXXX")
-  tar -xzf "$archive" -C "$staging" crane
-  chmod 0755 "$staging/crane"
-  mv "$staging/crane" "$cache/crane"
-  rmdir "$staging"
-fi
+# Extracted from the checked archive on every call, beside the cache, and renamed into
+# place, so the binary run is always the archive's and a concurrent caller never runs a
+# half-written one.
+staging=$(mktemp -d "$cache/extract.XXXXXX")
+tar -xzf "$archive" -C "$staging" crane
+chmod 0755 "$staging/crane"
+mv -f "$staging/crane" "$cache/crane"
+rmdir "$staging"
 echo "$cache/crane"
