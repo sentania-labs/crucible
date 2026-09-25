@@ -151,6 +151,26 @@ async def test_the_request_fractions_are_configurable_per_policy() -> None:
     assert init["resources"]["requests"] == {"cpu": "1000m", "memory": str(4 * 1024**3)}
 
 
+async def test_the_writable_credential_init_container_carries_its_own_restricted_context() -> None:
+    """62: `rw-narrow` harnesses (Codex) copy their credential through a writable init
+    container, which carries its own security context rather than inheriting the main
+    container's. A future init container added without one would be rejected by Pod
+    Security admission at runtime, not caught here, so this asserts it directly."""
+    codex_image = "crucible-worker:codex-fake-succeed-2"
+    api, registry, provider = build()
+    registry.register(codex_image, harness="codex", version="0.153.4")
+    api.put_harness_secret("crucible-harness-codex", {"auth.json": b"{}"})
+    launch = spec(harness="codex", image=codex_image)
+    workspace = await provider.prepare(launch)
+    await provider.launch(workspace, launch)
+    pod = pod_of(api, "worker-")
+    assert pod["initContainers"]
+    for init in pod["initContainers"]:
+        assert init["securityContext"]["allowPrivilegeEscalation"] is False
+        assert init["securityContext"]["readOnlyRootFilesystem"] is True
+        assert init["securityContext"]["capabilities"] == {"drop": ["ALL"]}
+
+
 @pytest.mark.parametrize("prefix", ROLE_PREFIXES)
 async def test_tmp_and_home_are_memory_backed_and_size_limited(ran: Any, prefix: str) -> None:
     api, _provider, _launch = ran

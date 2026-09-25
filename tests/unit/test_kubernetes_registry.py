@@ -29,6 +29,7 @@ from crucible.adapters.execution.k8sregistry import (
     RegistryAuth,
     RegistryError,
     auths_from_dockerconfigjson,
+    parse_reference,
 )
 from crucible.adapters.execution.kubernetes import (
     LIST_IMAGES_CONCURRENCY,
@@ -412,6 +413,27 @@ async def test_list_images_resolves_a_few_tags_at_once_and_skips_failures() -> N
         f"ghcr.io/o/worker:t{n:02d}" for n in range(20) if n != 3
     ]
     assert 1 < registry.peak <= LIST_IMAGES_CONCURRENCY
+
+
+async def test_a_tagged_repository_entry_is_skipped_when_its_references_fail_to_resolve() -> None:
+    """80: `probe_image` mistakenly landing in `image_repositories` builds
+    `<repo:tag>:<tag>` for every tag the registry lists under it. `parse_reference`
+    does not reject that shape, so the skip is not a parse error in Crucible: resolving
+    the reference fails (the real crane refuses it locally), and the entry is dropped
+    the same way an unavailable one is."""
+    parse_reference("ghcr.io/o/worker:probe:t00")  # does not raise: the skip is not here
+    registry = FakeRegistry()
+    registry.register("ghcr.io/o/worker:t00")
+    registry._tags["ghcr.io/o/worker:probe"] = ["t00"]
+    provider = KubernetesProvider(
+        KubernetesConfig(image_repositories=("ghcr.io/o/worker", "ghcr.io/o/worker:probe")),
+        FakeKubernetesApi(),  # type: ignore[arg-type]
+        registry,
+    )
+
+    images = await provider.list_images()
+
+    assert [i.reference for i in images] == ["ghcr.io/o/worker:t00"]
 
 
 def _alive(pid: int) -> bool:
