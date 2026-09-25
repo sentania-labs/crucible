@@ -7,40 +7,43 @@ image on Crucible's side. 26 therefore resolves through the registry the release
 publishes to, before the Job is created, because the version refusal (07) has to happen
 before anything is seeded or scheduled, not after a kubelet has already pulled.
 
-This speaks the OCI distribution API and nothing else: a manifest read and a config blob
-read, both by GET, with the anonymous bearer-token dance registries answer 401 with. It
-never pushes, never deletes, and never sends a credential anywhere but the realm the
-registry's own challenge named.
+The registry is read with `crane` (go-containerregistry), which the service image ships
+at a pinned version. Registries differ in how they authenticate and where they serve a
+blob from (GHCR answers a blob GET with a 307 to another host, 108), and a widely used
+client already handles those differences; a hand-written one did not (the operator's
+decision, 2026-09-24). Only `crane digest`, `crane config` and `crane ls` are run: it
+never pushes and never deletes.
+
+The credential is the image pull Secret's, written for the one call into a private
+`DOCKER_CONFIG` directory that is removed when the call returns, whatever happened. It
+is never on a command line and never logged (12).
 """
 
 from __future__ import annotations
 
 import base64
 import json
-from collections.abc import Mapping
+import os
+import re
+import shutil
+import subprocess
+import tempfile
 from dataclasses import dataclass, field
-from http.client import HTTPSConnection
 from typing import Any, Protocol
-from urllib.parse import quote, urlencode
 
 from crucible.ports.execution import ImageInfo
 
 DOCKER_HUB = "docker.io"
-DOCKER_HUB_ENDPOINT = "registry-1.docker.io"
+# The key Docker Hub's credential is stored under in a Docker config file.
+DOCKER_HUB_AUTH_KEY = "https://index.docker.io/v1/"
+CRANE = "crane"
+# Per crane call. One resolve is two calls, so a registry that never answers holds a
+# launch for at most twice this.
 DEFAULT_TIMEOUT = 20.0
-
-MANIFEST_TYPES = (
-    "application/vnd.oci.image.index.v1+json",
-    "application/vnd.oci.image.manifest.v1+json",
-    "application/vnd.docker.distribution.manifest.list.v2+json",
-    "application/vnd.docker.distribution.manifest.v2+json",
-)
-INDEX_TYPES = frozenset(
-    {
-        "application/vnd.oci.image.index.v1+json",
-        "application/vnd.docker.distribution.manifest.list.v2+json",
-    }
-)
+# The one platform a lab node runs. For an index the recorded digest is still the
+# index's own; only the labels are read from this platform's image config.
+PLATFORM = "linux/amd64"
+DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 
 
 class RegistryError(Exception):
@@ -58,8 +61,10 @@ class ImageReference:
     digest: str | None = None
 
     @property
-    def wire_reference(self) -> str:
-        return self.digest or self.tag or "latest"
+    def canonical(self) -> str:
+        """The form handed to crane: registry named, and a digest or a tag, never both."""
+        suffix = f"@{self.digest}" if self.digest else f":{self.tag or 'latest'}"
+        return f"{self.registry}/{self.repository}{suffix}"
 
     def pinned(self, digest: str) -> str:
         """The immutable form of this reference, which is what an attempt records.
@@ -82,7 +87,7 @@ def parse_reference(reference: str) -> ImageReference:
         registry, path = head, rest
     else:
         registry, path = DOCKER_HUB, remainder
-    if digest is None and ":" in path.rsplit("/", 1)[-1]:
+    if ":" in path.rsplit("/", 1)[-1]:
         path, _, tag = path.rpartition(":")
     if registry == DOCKER_HUB and "/" not in path:
         path = f"library/{path}"
@@ -107,9 +112,8 @@ class RegistryAuth:
     username: str
     password: str
 
-    def basic(self) -> str:
-        raw = f"{self.username}:{self.password}".encode()
-        return "Basic " + base64.b64encode(raw).decode("ascii")
+    def encoded(self) -> str:
+        return base64.b64encode(f"{self.username}:{self.password}".encode()).decode("ascii")
 
 
 def auths_from_dockerconfigjson(raw: bytes) -> dict[str, RegistryAuth]:
@@ -143,154 +147,100 @@ def _host(value: str) -> str:
 
 
 @dataclass
-class HttpRegistryClient:
-    """A read-only OCI distribution client over HTTPS."""
+class CraneRegistryClient:
+    """A read-only registry client that runs the `crane` binary for each read."""
 
-    auths: Mapping[str, RegistryAuth] = field(default_factory=dict)
+    auths: dict[str, RegistryAuth] = field(default_factory=dict)
     timeout: float = DEFAULT_TIMEOUT
-    # Tokens the registry handed back for a scope, for the life of this client. A token
-    # is a value, so it is held here and never written anywhere.
-    _tokens: dict[str, str] = field(default_factory=dict, init=False, repr=False)
-
-    # ----- transport ---------------------------------------------------
-
-    def _endpoint(self, registry: str) -> str:
-        return DOCKER_HUB_ENDPOINT if registry == DOCKER_HUB else registry
-
-    def _get(
-        self, registry: str, path: str, accept: str, *, scope: str
-    ) -> tuple[bytes, dict[str, str]]:
-        for attempt in (0, 1):
-            headers = {"Accept": accept, "User-Agent": "crucible"}
-            token = self._tokens.get(scope)
-            if token:
-                headers["Authorization"] = f"Bearer {token}"
-            elif attempt == 0 and (auth := self.auths.get(registry)) is not None:
-                headers["Authorization"] = auth.basic()
-            conn = HTTPSConnection(self._endpoint(registry), timeout=self.timeout)
-            try:
-                conn.request("GET", path, headers=headers)
-                response = conn.getresponse()
-                body = response.read()
-                if response.status == 401 and attempt == 0:
-                    challenge = response.getheader("WWW-Authenticate") or ""
-                    self._tokens[scope] = self._bearer(registry, challenge, scope)
-                    continue
-                if response.status >= 400:
-                    raise RegistryError(
-                        f"{registry} answered {response.status} for {path}: "
-                        f"{body.decode('utf-8', 'replace')[:200]}"
-                    )
-                return body, {k.lower(): v for k, v in response.getheaders()}
-            except OSError as exc:
-                raise RegistryError(f"{registry} is unreachable: {type(exc).__name__}") from exc
-            finally:
-                conn.close()
-        raise RegistryError(f"{registry} refused the request for {path} twice")
-
-    def _bearer(self, registry: str, challenge: str, scope: str) -> str:
-        if not challenge.lower().startswith("bearer "):
-            raise RegistryError(f"{registry} needs an authentication scheme Crucible has not got")
-        fields: dict[str, str] = {}
-        for part in challenge[len("bearer ") :].split(","):
-            key, _, value = part.strip().partition("=")
-            fields[key.strip().lower()] = value.strip().strip('"')
-        realm = fields.get("realm")
-        if not realm:
-            raise RegistryError(f"{registry} sent a Bearer challenge with no realm")
-        query = urlencode(
-            {k: v for k, v in (("service", fields.get("service")), ("scope", scope)) if v}
-        )
-        host, _, path = realm.removeprefix("https://").partition("/")
-        headers = {"Accept": "application/json", "User-Agent": "crucible"}
-        if (auth := self.auths.get(registry)) is not None:
-            headers["Authorization"] = auth.basic()
-        conn = HTTPSConnection(host, timeout=self.timeout)
-        try:
-            conn.request("GET", f"/{path}?{query}", headers=headers)
-            response = conn.getresponse()
-            body = response.read()
-            if response.status >= 400:
-                raise RegistryError(f"{registry} refused a pull token: {response.status}")
-            document = json.loads(body.decode("utf-8"))
-        except (OSError, ValueError) as exc:
-            raise RegistryError(f"{registry} token request failed: {type(exc).__name__}") from exc
-        finally:
-            conn.close()
-        token = str(document.get("token") or document.get("access_token") or "")
-        if not token:
-            raise RegistryError(f"{registry} returned no pull token")
-        return token
-
-    # ----- the two calls the provider makes -----------------------------
+    binary: str = CRANE
 
     def resolve(self, reference: str) -> ImageInfo:
+        """The reference's own digest (an index's, when it is one) and the labels of
+        its linux/amd64 image config. The config is read by that digest, so a tag that
+        moves between the two calls cannot pair one image's digest with another's
+        labels."""
         parsed = parse_reference(reference)
-        scope = f"repository:{parsed.repository}:pull"
-        path = f"/v2/{parsed.repository}/manifests/{quote(parsed.wire_reference, safe=':')}"
-        body, headers = self._get(parsed.registry, path, ", ".join(MANIFEST_TYPES), scope=scope)
-        digest = headers.get("docker-content-digest", "") or parsed.digest or ""
-        manifest = _document(body, parsed.repository)
-        if str(manifest.get("mediaType", "")) in INDEX_TYPES:
-            child = _linux_amd64(manifest, parsed.repository)
-            body, _ = self._get(
-                parsed.registry,
-                f"/v2/{parsed.repository}/manifests/{quote(child, safe=':')}",
-                ", ".join(MANIFEST_TYPES),
-                scope=scope,
-            )
-            manifest = _document(body, parsed.repository)
-        config_digest = str((manifest.get("config") or {}).get("digest", ""))
-        if not config_digest:
-            raise RegistryError(f"{reference!r} has a manifest with no config descriptor")
-        blob, _ = self._get(
-            parsed.registry,
-            f"/v2/{parsed.repository}/blobs/{quote(config_digest, safe=':')}",
-            "application/json",
-            scope=scope,
-        )
-        config = _document(blob, parsed.repository)
+        digest = self._crane(parsed.registry, "digest", parsed.canonical).strip()
+        if not DIGEST.fullmatch(digest):
+            raise RegistryError(f"{reference!r} resolved to no digest")
+        by_digest = f"{parsed.registry}/{parsed.repository}@{digest}"
+        raw = self._crane(parsed.registry, "config", "--platform", PLATFORM, by_digest)
+        config = _document(raw, parsed.repository)
         labels = {
             str(k): str(v) for k, v in ((config.get("config") or {}).get("Labels") or {}).items()
         }
-        if not digest:
-            raise RegistryError(f"{reference!r} resolved to no digest")
         return ImageInfo.from_labels(parsed.pinned(digest), digest, labels)
 
     def list_tags(self, repository: str) -> list[str]:
         parsed = parse_reference(repository)
-        body, _ = self._get(
-            parsed.registry,
-            f"/v2/{parsed.repository}/tags/list",
-            "application/json",
-            scope=f"repository:{parsed.repository}:pull",
-        )
-        document = _document(body, parsed.repository)
-        return [str(tag) for tag in (document.get("tags") or [])]
+        out = self._crane(parsed.registry, "ls", f"{parsed.registry}/{parsed.repository}")
+        return [line.strip() for line in out.splitlines() if line.strip()]
+
+    # ----- running crane ------------------------------------------------
+
+    def _crane(self, registry: str, *args: str) -> str:
+        # mkdtemp creates the directory 0700 and owned by this process's user.
+        config_dir = tempfile.mkdtemp(prefix="crucible-crane-")
+        try:
+            _write_docker_config(config_dir, registry, self.auths.get(registry))
+            # The service's own environment, so crane trusts what the service trusts
+            # (SSL_CERT_FILE, the system store with the lab CA) and takes the same proxy.
+            env = {**os.environ, "DOCKER_CONFIG": config_dir}
+            try:
+                done = subprocess.run(
+                    [self.binary, *args],
+                    env=env,
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    timeout=self.timeout,
+                    check=False,
+                )
+            except FileNotFoundError as exc:
+                raise RegistryError(
+                    f"the registry client {self.binary!r} is not installed "
+                    "(the service image ships it)"
+                ) from exc
+            except subprocess.TimeoutExpired:
+                raise RegistryError(f"{registry} did not answer within {self.timeout:g}s") from None
+        finally:
+            shutil.rmtree(config_dir, ignore_errors=True)
+        if done.returncode != 0:
+            raise RegistryError(f"{registry}: {self._reason(done.stderr)}")
+        return done.stdout.decode("utf-8", "replace")
+
+    def _reason(self, stderr: bytes) -> str:
+        """crane's own `Error:` line, which names the request and the registry's answer
+        (`MANIFEST_UNKNOWN`, `UNAUTHORIZED`, `DENIED`). It carries no credential, and any
+        credential value that ever appeared in it is replaced anyway."""
+        lines = [line.strip() for line in stderr.decode("utf-8", "replace").splitlines()]
+        lines = [line for line in lines if line]
+        errors = [line.removeprefix("Error: ") for line in lines if line.startswith("Error: ")]
+        text = (errors or lines or ["crane failed with no message"])[-1]
+        for auth in self.auths.values():
+            for secret in (auth.password, auth.encoded()):
+                if secret:
+                    text = text.replace(secret, "[redacted]")
+        return text[:300]
 
 
-def _document(raw: bytes, repository: str) -> dict[str, Any]:
+def _write_docker_config(directory: str, registry: str, auth: RegistryAuth | None) -> None:
+    """A Docker config holding at most the one registry's credential, file mode 0600.
+
+    Written even when there is no credential, so crane never reads a config from the
+    service user's home instead."""
+    key = DOCKER_HUB_AUTH_KEY if registry == DOCKER_HUB else registry
+    auths = {key: {"auth": auth.encoded()}} if auth is not None else {}
+    path = os.path.join(directory, "config.json")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump({"auths": auths}, handle)
+
+
+def _document(raw: str, repository: str) -> dict[str, Any]:
     try:
-        parsed = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError) as exc:
+        parsed = json.loads(raw)
+    except ValueError as exc:
         raise RegistryError(f"{repository} returned something that is not JSON") from exc
     if not isinstance(parsed, dict):
         raise RegistryError(f"{repository} returned a document that is not an object")
     return parsed
-
-
-def _linux_amd64(index: Mapping[str, Any], repository: str) -> str:
-    """The one manifest of a multi-platform index a lab node runs.
-
-    A cluster of one architecture is what 26 describes; picking deliberately rather
-    than taking the first entry keeps the recorded digest the one that will run."""
-    entries = [m for m in (index.get("manifests") or []) if isinstance(m, dict)]
-    for entry in entries:
-        platform = entry.get("platform") or {}
-        if platform.get("os") == "linux" and platform.get("architecture") == "amd64":
-            return str(entry.get("digest", ""))
-    for entry in entries:
-        platform = entry.get("platform") or {}
-        if platform.get("os") == "linux":
-            return str(entry.get("digest", ""))
-    raise RegistryError(f"{repository} has no linux manifest in its index")

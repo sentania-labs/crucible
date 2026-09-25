@@ -23,7 +23,7 @@ from urllib.parse import urlsplit
 
 from crucible.adapters.execution import k8sspec
 from crucible.adapters.execution.k8sapi import KubernetesClient, kubeconfig_access
-from crucible.adapters.execution.k8sregistry import HttpRegistryClient
+from crucible.adapters.execution.k8sregistry import CraneRegistryClient
 from crucible.adapters.execution.kubernetes import KubernetesConfig, KubernetesProvider
 from crucible.domain.cluster_egress import ClusterEgress
 
@@ -101,7 +101,7 @@ async def canary(args: argparse.Namespace) -> dict[str, Any]:
     def resolver(host: str) -> list[str]:
         return [f"{args.gateway_ip}/32"] if host == gateway_host else []
 
-    provider = KubernetesProvider(config, client, HttpRegistryClient(), resolver=resolver)
+    provider = KubernetesProvider(config, client, CraneRegistryClient(), resolver=resolver)
     probe = await provider.ensure_ready()
     return {"form": args.form, "passed": probe.passed, "checked": probe.checked, **probe.as_dict()}
 

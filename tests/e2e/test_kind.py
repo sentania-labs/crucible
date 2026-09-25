@@ -9,7 +9,6 @@ import os
 import subprocess
 import time
 from dataclasses import replace
-from http.client import HTTPConnection
 from pathlib import Path
 from typing import Any
 
@@ -27,7 +26,7 @@ from crucible.adapters.execution.k8sapi import (
     KubernetesClient,
     kubeconfig_access,
 )
-from crucible.adapters.execution.k8sregistry import HttpRegistryClient, RegistryError
+from crucible.adapters.execution.k8sregistry import CraneRegistryClient
 from crucible.adapters.execution.kubernetes import KubernetesConfig, KubernetesProvider
 from crucible.adapters.harness.registry import default_registry as application_harnesses
 from crucible.adapters.harness.script import ScriptHarnessAdapter
@@ -75,25 +74,6 @@ pytestmark = [
 ATTEMPT_PREFIX = "01KIND00000000000000000"
 
 
-class LocalHttpRegistry(HttpRegistryClient):
-    """The disposable tier registry, using plain HTTP only on host loopback."""
-
-    def _get(
-        self, registry: str, path: str, accept: str, *, scope: str
-    ) -> tuple[bytes, dict[str, str]]:
-        del scope
-        conn = HTTPConnection(self._endpoint(registry), timeout=self.timeout)
-        try:
-            conn.request("GET", path, headers={"Accept": accept, "User-Agent": "crucible-e2e"})
-            response = conn.getresponse()
-            body = response.read()
-            if response.status >= 400:
-                raise RegistryError(f"{registry} answered {response.status} for {path}")
-            return body, {key.lower(): value for key, value in response.getheaders()}
-        finally:
-            conn.close()
-
-
 class RecordingKubernetesClient(KubernetesClient):
     """Keep the last real readiness log after its short-lived Pod is deleted."""
 
@@ -125,18 +105,21 @@ def api() -> KubernetesClient:
 
 
 @pytest.fixture(scope="session")
-def registry() -> LocalHttpRegistry:
-    return LocalHttpRegistry(timeout=15)
+def registry() -> CraneRegistryClient:
+    # The real crane against the tier's own registry on host loopback, which crane
+    # reaches over plain HTTP only because it is localhost (e2e-kind.sh puts the pinned
+    # binary on PATH).
+    return CraneRegistryClient(timeout=15)
 
 
 @pytest.fixture
-def provider(api: KubernetesClient, registry: LocalHttpRegistry) -> KubernetesProvider:
+def provider(api: KubernetesClient, registry: CraneRegistryClient) -> KubernetesProvider:
     return _provider(api, registry)
 
 
 def _provider(
     api: KubernetesClient,
-    registry: LocalHttpRegistry,
+    registry: CraneRegistryClient,
     *,
     harnesses: HarnessRegistry | None = None,
 ) -> KubernetesProvider:
@@ -361,7 +344,7 @@ async def test_rows_5_7_11_23_supervisor_restart_and_full_gate_lifecycle(
     artifact_root: Path,
     provider: KubernetesProvider,
     api: KubernetesClient,
-    registry: LocalHttpRegistry,
+    registry: CraneRegistryClient,
 ) -> None:
     """The shared app and Supervisor lifecycle, backed by a real Job and PVC."""
     clock = SystemClock()
@@ -739,7 +722,7 @@ async def test_deleted_pod_is_lost_and_sigterm_ignoring_pod_dies_at_grace(
 
 
 async def test_restart_adopts_the_job_and_resumes_logs(
-    provider: KubernetesProvider, api: KubernetesClient, registry: LocalHttpRegistry
+    provider: KubernetesProvider, api: KubernetesClient, registry: CraneRegistryClient
 ) -> None:
     """Readiness row 5: a fresh provider adopts the Job and resumes after its offset."""
     script = "i=1; while [ $i -le 8 ]; do echo resume-$i; i=$((i+1)); sleep 1; done"
@@ -772,7 +755,7 @@ async def test_restart_adopts_the_job_and_resumes_logs(
 @pytest.mark.parametrize("policy", list(CleanupPolicy))
 async def test_per_attempt_secret_is_removed_under_every_cleanup_policy(
     api: KubernetesClient,
-    registry: LocalHttpRegistry,
+    registry: CraneRegistryClient,
     policy: CleanupPolicy,
 ) -> None:
     harnesses = HarnessRegistry((CredentialScriptAdapter(),))
@@ -804,7 +787,7 @@ async def test_per_attempt_secret_is_removed_under_every_cleanup_policy(
 
 
 async def test_probe_refuses_launches_without_default_deny(
-    api: KubernetesClient, registry: LocalHttpRegistry
+    api: KubernetesClient, registry: CraneRegistryClient
 ) -> None:
     """Readiness row 12: removing enforcement makes the canary fail closed."""
     spec = _spec(20, _origin("probe-refusal"))
@@ -913,7 +896,7 @@ async def test_login_from_an_empty_secret_to_a_probe_and_an_attempt_through_the_
     migrated: str,
     artifact_root: Path,
     api: KubernetesClient,
-    registry: LocalHttpRegistry,
+    registry: CraneRegistryClient,
 ) -> None:
     """#92 and #58 on a real cluster: the admin API runs the stand-in harness's login as
     a Job, stores what it wrote in the Secret the service owns, probes it, and one routed
