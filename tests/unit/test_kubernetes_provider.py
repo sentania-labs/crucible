@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any
@@ -1495,38 +1496,75 @@ async def test_the_preparer_mounts_no_cache_when_none_is_configured() -> None:
 async def test_a_refresh_waits_for_readers_and_holds_new_ones_back() -> None:
     gate = kubernetes_module._CacheGate()
     order: list[str] = []
-    reading = asyncio.Event()
-    release = asyncio.Event()
+    first_in = asyncio.Event()
+    release_first = asyncio.Event()
 
-    async def reader(name: str) -> None:
+    async def first_reader() -> None:
         async with gate.reading():
-            order.append(f"{name} in")
-            reading.set()
-            await release.wait()
-            order.append(f"{name} out")
+            order.append("first in")
+            first_in.set()
+            await release_first.wait()
+            order.append("first out")
 
     async def writer() -> None:
-        await reading.wait()
         async with gate.writing():
             order.append("write")
 
     async def late_reader() -> None:
-        await asyncio.sleep(0)
-        await reading.wait()
-        await asyncio.sleep(0)
         async with gate.reading():
             order.append("late in")
 
-    tasks = [
-        asyncio.create_task(reader("first")),
-        asyncio.create_task(writer()),
-    ]
-    await reading.wait()
+    first = asyncio.create_task(first_reader())
+    await first_in.wait()
+    write = asyncio.create_task(writer())
+    for _ in range(5):
+        await asyncio.sleep(0)
+    # The refresh is waiting on the first reader; a reader that arrives now waits
+    # behind the refresh rather than starving it.
+    late = asyncio.create_task(late_reader())
     for _ in range(5):
         await asyncio.sleep(0)
     assert order == ["first in"]
+    release_first.set()
+    await asyncio.gather(first, write, late)
+    assert order == ["first in", "first out", "write", "late in"]
+
+
+async def test_refreshes_are_coalesced() -> None:
+    gate = kubernetes_module._CacheGate()
+    assert gate.refresh_due(0.0)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def writer() -> None:
+        async with gate.writing():
+            entered.set()
+            await release.wait()
+
+    task = asyncio.create_task(writer())
+    await entered.wait()
+    # A refresh running (or waiting) is the one every prepare that arrives now shares.
+    assert not gate.refresh_due(10_000.0)
     release.set()
-    await asyncio.gather(*tasks)
-    assert order == ["first in", "first out", "write"]
-    await late_reader()
-    assert order[-1] == "late in"
+    await task
+    now = time.monotonic()
+    assert not gate.refresh_due(now)
+    assert gate.refresh_due(now + kubernetes_module.CACHE_REFRESH_INTERVAL_SECONDS)
+
+
+async def test_attempts_of_one_repository_prepared_together_share_one_refresh() -> None:
+    config = KubernetesConfig(
+        poll_interval_seconds=0,
+        launch_timeout_seconds=5,
+        storage_class="lab-ssd",
+        image_pull_secret="ghcr-pull",
+        cache_claim="crucible-reference-cache",
+    )
+    api, _registry, provider = build(config=config)
+    await asyncio.gather(
+        provider.prepare(spec(attempt_id="01M3AAAAAAAAAAAAAAAAAAAAA1")),
+        provider.prepare(spec(attempt_id="01M3AAAAAAAAAAAAAAAAAAAAA2")),
+    )
+    jobs = [c["name"] for c in api.created if c["kind"] == "jobs"]
+    assert len([n for n in jobs if n.startswith("refresh-cache-")]) == 1
+    assert len([n for n in jobs if n.startswith("prepare-")]) == 2

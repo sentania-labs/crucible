@@ -444,23 +444,37 @@ _ADOPTED_SPEC = LaunchSpec(
 )
 
 
+# A refresh younger than this is fresh enough: a prepare that finds one skips its own and
+# only reads, so attempts of one repository started together clone side by side (#55).
+CACHE_REFRESH_INTERVAL_SECONDS = 60.0
+
+
 class _CacheGate:
     """A readers-writer gate over one reference cache in this process.
 
     The refresher writes the mirror (a fetch can prune refs and repack); a preparer
-    reads it through `--reference`. Many preparers may read at once; a refresh waits
-    for them to finish and holds new ones back until it is done. Only the supervisor
-    prepares checkouts, so one process is the whole population (26)."""
+    reads it through `--reference`. Many preparers may read at once. A refresh waits for
+    the readers already in to finish, and holds new ones back while it waits, so it is
+    never starved. Refreshes are coalesced: a prepare refreshes only when no refresh is
+    running or waiting and the last finished more than the interval ago. Only the
+    supervisor prepares checkouts, so one process is the whole population (26)."""
 
     def __init__(self) -> None:
         self._condition = asyncio.Condition()
         self._readers = 0
         self._writing = False
+        self._writers_waiting = 0
+        self._refreshed_at: float | None = None
+
+    def refresh_due(self, now: float, interval: float = CACHE_REFRESH_INTERVAL_SECONDS) -> bool:
+        if self._writing or self._writers_waiting:
+            return False
+        return self._refreshed_at is None or now - self._refreshed_at >= interval
 
     @contextlib.asynccontextmanager
     async def reading(self) -> AsyncIterator[None]:
         async with self._condition:
-            await self._condition.wait_for(lambda: not self._writing)
+            await self._condition.wait_for(lambda: not self._writing and not self._writers_waiting)
             self._readers += 1
         try:
             yield
@@ -471,14 +485,21 @@ class _CacheGate:
 
     @contextlib.asynccontextmanager
     async def writing(self) -> AsyncIterator[None]:
-        async with self._condition:
-            await self._condition.wait_for(lambda: not self._writing and self._readers == 0)
-            self._writing = True
+        # Counted before the first await, so a prepare that checks `refresh_due` right
+        # after this one sees the refresh coming and does not queue a second.
+        self._writers_waiting += 1
+        try:
+            async with self._condition:
+                await self._condition.wait_for(lambda: not self._writing and self._readers == 0)
+                self._writing = True
+        finally:
+            self._writers_waiting -= 1
         try:
             yield
         finally:
             async with self._condition:
                 self._writing = False
+                self._refreshed_at = time.monotonic()
                 self._condition.notify_all()
 
 
@@ -1010,10 +1031,11 @@ class KubernetesProvider:
         if self.config.use_reference_cache and self.config.cache_claim:
             cache_name = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
             gate = self._cache_gate(cache_name)
-            async with gate.writing():
-                await self._refresh_cache(
-                    spec, url=url, cache_name=cache_name, image=resolved, limits=limits
-                )
+            if gate.refresh_due(time.monotonic()):
+                async with gate.writing():
+                    await self._refresh_cache(
+                        spec, url=url, cache_name=cache_name, image=resolved, limits=limits
+                    )
             # 26: the preparer reads the cache and never writes it. It is the one volume
             # every attempt shares, so an attempt's Pod that could write it could poison
             # every later checkout (#55). Read-only on the claim and on the mount.
@@ -1091,9 +1113,11 @@ class KubernetesProvider:
     ) -> None:
         """26: refresh the reference cache in a Job of its own, the only Pod that mounts
         it writable (#55). It carries no workspace, no identity bundle and no
-        credential, only the cache and the git remote. A refresh that fails is logged
-        and the preparer clones from the remote without a reference, as it would with
-        no cache at all: a stale or absent cache costs time, never correctness."""
+        credential, only the cache and the git remote. A refresh that exits non-zero
+        is logged, and the preparer clones from the remote, or from the mirror as it
+        was: a stale or absent cache costs time, never correctness. A refresher whose
+        Pod cannot be confirmed gone fails the prepare instead (`_run_role_job` raises),
+        because that Pod may still hold the cache writable while a preparer reads it."""
         code = await self._run_role_job(
             spec,
             role=k8sspec.ROLE_CACHE_REFRESHER,
