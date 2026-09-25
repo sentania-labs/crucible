@@ -781,15 +781,22 @@ async def credentials_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
     principal, csrf = found
     assert ctx.admin is not None
     names = list(ctx.admin.harnesses.names())
+    # Where the credentials are Secrets the service owns (Kubernetes, ADR 0015), rotate
+    # and remove move and shred directories and are refused, so they are not offered
+    # (crucible#125).
+    secrets_held = credentials.secret_store(ctx.admin) is not None
     rows: list[list[Any]] = []
     for name in names:
         view = credentials.state_view(ctx.admin, uow, name)
+        # A login exists only for a harness that logs in: not Hermes, which takes a key,
+        # and not a harness that needs no credential (crucible#125).
+        logs_in = name != "hermes" and view.get("state") != "not_required"
         rows.append(
             [
                 name,
                 view.get("state"),
                 view.get("session_compatibility"),
-                f"/ui/credentials/{name}/login",
+                f"/ui/credentials/{name}/login" if logs_in else "none",
             ]
         )
     sections: list[dict[str, Any]] = [
@@ -800,7 +807,11 @@ async def credentials_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
         }
     ]
     if principal.role is Role.ADMIN:
-        options = [(name, name) for name in names]
+        options = [
+            (name, name)
+            for name in names
+            if credentials.state_view(ctx.admin, uow, name).get("state") != "not_required"
+        ]
         sections.append(
             {
                 "title": "Set Hermes API key",
@@ -844,19 +855,35 @@ async def credentials_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                             "options": [
                                 ("validate", "Validate"),
                                 ("probe", "Probe"),
-                                ("rotate", "Rotate from prepared server directory"),
-                                ("remove", "Remove"),
+                                *(
+                                    []
+                                    if secrets_held
+                                    else [
+                                        ("rotate", "Rotate from prepared server directory"),
+                                        ("remove", "Remove"),
+                                    ]
+                                ),
                             ],
                         },
                         {
                             "name": "reason",
                             "label": "Reason",
-                            "reason_label": "Reason (required to remove)",
+                            "reason_label": (
+                                "Reason (optional)"
+                                if secrets_held
+                                else "Reason (required to remove)"
+                            ),
                         },
-                        {
-                            "name": "new_path",
-                            "label": "Prepared directory (rotate only)",
-                        },
+                        *(
+                            []
+                            if secrets_held
+                            else [
+                                {
+                                    "name": "new_path",
+                                    "label": "Prepared directory (rotate only)",
+                                }
+                            ]
+                        ),
                     ],
                 },
             }
@@ -1708,6 +1735,19 @@ _EGRESS_SEEDS = [
 ]
 
 
+def _setting_applies(path: str, settings: Any) -> bool:
+    """Whether a restart-bound setting does anything on this deployment (crucible#125):
+    a provider's settings apply only while it is enabled (its `enabled` row stays, so
+    the page still says it is off), and a credential's directory settings do not apply
+    where the credentials are Secrets the service owns (Kubernetes without Docker, ADR
+    0015)."""
+    parts = path.split(".")
+    if parts[0] in ("docker", "kubernetes") and parts[-1] != "enabled":
+        return bool(getattr(settings, parts[0]).enabled)
+    secrets_held = settings.kubernetes.enabled and not settings.docker.enabled
+    return not (parts[0] == "credentials" and secrets_held and parts[-1] in ("path", "source"))
+
+
 def _settings_rows(settings: Any) -> list[list[Any]]:
     if settings is None or not hasattr(settings, "model_dump"):
         return []
@@ -1722,6 +1762,8 @@ def _settings_rows(settings: Any) -> list[list[Any]]:
     sensitive = {"database.url", "wake.secret", "wake.webhook_url"}
     rows = []
     for path, value in _flatten(settings.model_dump(mode="json")):
+        if not _setting_applies(path, settings):
+            continue
         env_name = "CRUCIBLE_" + path.replace(".", "__").upper()
         cursor: Any = file_document
         in_file = True

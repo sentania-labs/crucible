@@ -746,3 +746,24 @@ def test_a_reason_is_asked_for_only_where_the_service_requires_one() -> None:
     assert reasons[0] == [{"name": "reason", "label": "Reason", "required": True}]
     assert reasons[1] == [{"name": "reason", "label": "Reason (optional)", "required": False}]
     assert reasons[2] == []
+
+
+def test_settings_for_a_provider_that_is_off_are_not_listed() -> None:
+    """crucible#125: a Kubernetes deployment does not list the Docker provider's
+    settings, nor the credential directory settings its service-owned Secrets replace;
+    each provider's own `enabled` row stays so the page still says it is off."""
+    from crucible.settings import CredentialSettings, Settings  # noqa: PLC0415
+
+    kubernetes = Settings(kubernetes={"enabled": True}, docker={"enabled": False})
+    kubernetes.credentials = {"codex": CredentialSettings(path="/x")}
+    paths = [row[0] for row in ui_router._settings_rows(kubernetes)]
+    assert "docker.enabled" in paths
+    assert not [p for p in paths if p.startswith("docker.") and p != "docker.enabled"]
+    assert any(p.startswith("kubernetes.") and p != "kubernetes.enabled" for p in paths)
+    assert "credentials.codex.path" not in paths
+    assert "credentials.codex.mount_mode" in paths
+    docker = Settings(kubernetes={"enabled": False}, docker={"enabled": True})
+    docker.credentials = {"codex": CredentialSettings(path="/x")}
+    paths = [row[0] for row in ui_router._settings_rows(docker)]
+    assert "credentials.codex.path" in paths
+    assert not [p for p in paths if p.startswith("kubernetes.") and p != "kubernetes.enabled"]

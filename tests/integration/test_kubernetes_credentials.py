@@ -245,6 +245,23 @@ def test_rotate_and_remove_say_the_credential_is_a_secret(admin: TestClient) -> 
         assert "crucible-harness-codex" in response.json()["detail"]
 
 
+def test_the_credentials_page_offers_only_what_applies_to_a_secret(
+    admin: TestClient, ctx: AppContext, tokens: dict[str, str]
+) -> None:
+    """crucible#125: rotate and remove move and shred directories, which a Secret-held
+    credential has none of, so the page does not offer them or their prepared directory;
+    and Hermes, which takes a key, has no login page link."""
+    with TestClient(create_app(ctx)) as browser:
+        ui_sign_in(browser, tokens["admin"])
+        page = browser.get("/ui/credentials").text
+    assert "Rotate from prepared server directory" not in page
+    assert "Prepared directory" not in page
+    assert 'value="remove"' not in page
+    assert 'value="validate"' in page
+    assert "/ui/credentials/hermes/login" not in page
+    assert "/ui/credentials/codex/login" in page
+
+
 def test_the_hermes_key_is_set_from_the_routing_page_and_never_shown(
     admin: TestClient, ctx: AppContext, tokens: dict[str, str], k8s_api: FakeKubernetesApi
 ) -> None:
