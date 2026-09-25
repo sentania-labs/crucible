@@ -151,7 +151,7 @@ def ctx(
         database_url=migrated,
         engine=engine,
         artifact_store=artifact_store,
-        harnesses=default_registry(),
+        harnesses=default_registry(test_fixtures=True),
     )
 
 

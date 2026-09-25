@@ -183,7 +183,7 @@ def test_script_harness_is_a_plain_argv() -> None:
     assert ScriptHarnessAdapter().credential_spec() is None
 
 
-@pytest.mark.parametrize("adapter", default_adapters(), ids=lambda a: a.name)
+@pytest.mark.parametrize("adapter", default_adapters(test_fixtures=True), ids=lambda a: a.name)
 def test_nothing_secret_shaped_in_any_launch(adapter: HarnessAdapter) -> None:
     """12: argv and env carry names, paths and flags; the scanner finds nothing."""
     ctx = (
@@ -253,8 +253,10 @@ def test_configuration_may_raise_the_mount_mode_and_never_lower_it() -> None:
 # ----- the registry (07, 25) ----------------------------------------------------
 
 
-def test_the_registry_knows_the_five_harnesses() -> None:
-    registry = default_registry()
+def test_the_registry_knows_the_four_harnesses_and_the_fixture_only_when_asked() -> None:
+    """crucible#124: the script harness is a test fixture, off unless a tier enables it."""
+    assert default_registry().names() == ("claude_code", "codex", "agy", "hermes")
+    registry = default_registry(test_fixtures=True)
     assert registry.names() == ("claude_code", "codex", "agy", "hermes", "script-harness")
     # C11: 0.154, 0.155 and 0.156 keep every flag the launch uses (codex exec --help of
     # 0.156.0; their changelogs remove only `codex mcp-server`, which is not used).

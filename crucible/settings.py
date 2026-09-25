@@ -304,6 +304,11 @@ class Settings(BaseSettings):
     credentials: dict[str, CredentialSettings] = Field(default_factory=dict)
     harnesses: dict[str, HarnessSettings] = Field(default_factory=dict)
     admin: AdminSettings = Field(default_factory=AdminSettings)
+    # The test fixtures (18, crucible#124): the fake provider, which runs nothing, and the
+    # script harness, which reports completion without doing work. Off unless a test
+    # tier or a developer turns them on; a production deployment never shows or routes
+    # to either.
+    test_fixtures: bool = False
     local_endpoint_url: str | None = None
     # Compatibility seed for deployments created before C10. Database routing state
     # wins after the migration has created a local entry.

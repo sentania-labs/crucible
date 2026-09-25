@@ -188,6 +188,8 @@ def config_file(migrated: str, credential_root: Path, tmp_path: Path) -> Path:
     credential directories, the fake logins."""
     logins = fake_login_cli(tmp_path)
     lines = [
+        # The fake provider and the script harness are test fixtures (crucible#124).
+        "test_fixtures = true",
         "[database]",
         f'url = "{migrated}"',
         "[supervisor]",

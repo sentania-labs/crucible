@@ -348,7 +348,7 @@ async def test_rows_5_7_11_23_supervisor_restart_and_full_gate_lifecycle(
 ) -> None:
     """The shared app and Supervisor lifecycle, backed by a real Job and PVC."""
     clock = SystemClock()
-    harnesses = application_harnesses()
+    harnesses = application_harnesses(test_fixtures=True)
     ctx = AppContext(
         uow_factory=SqlUnitOfWorkFactory(engine),
         clock=clock,

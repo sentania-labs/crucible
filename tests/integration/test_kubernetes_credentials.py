@@ -87,7 +87,7 @@ def k8s_provider(k8s_api: FakeKubernetesApi) -> KubernetesProvider:
         ),
         k8s_api,  # type: ignore[arg-type]
         registry,
-        harnesses=default_registry(),
+        harnesses=default_registry(test_fixtures=True),
         resolver=lambda host: list(HOSTS.get(host, ["203.0.113.1/32"])),
     )
 

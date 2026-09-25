@@ -340,7 +340,7 @@ def ctx(engine: Engine, migrated: str, artifact_root: Path, provider: DockerProv
         database_url=migrated,
         engine=engine,
         artifact_store=DiskArtifactStore(artifact_root / "store"),
-        harnesses=default_registry(),
+        harnesses=default_registry(test_fixtures=True),
     )
 
 

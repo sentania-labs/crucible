@@ -341,8 +341,11 @@ def wire(settings: Settings) -> Wiring:
                 [routing_document],
             ),
         )
-    registry = default_registry()
-    providers: dict[str, ExecutionProvider] = {"fake": FakeProvider()}
+    registry = default_registry(test_fixtures=settings.test_fixtures)
+    # The fake provider runs nothing, so it is wired only for the test tiers (crucible#124).
+    providers: dict[str, ExecutionProvider] = (
+        {"fake": FakeProvider()} if settings.test_fixtures else {}
+    )
     docker: DockerProvider | None = None
     if settings.docker.enabled:
         docker = DockerProvider(

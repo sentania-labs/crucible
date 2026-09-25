@@ -468,7 +468,9 @@ class KubernetesProvider:
         self.resolve = resolver or _resolve_host
         self.client = client
         self.registry = registry
-        self.harnesses = harnesses or default_registry()
+        # `wire` always passes the deployment's registry; one built without it is a test's,
+        # which may launch the script harness (crucible#124).
+        self.harnesses = harnesses or default_registry(test_fixtures=True)
         self._launched: dict[str, _Launched] = {}
         self._images: dict[str, ImageInfo] = {}
         self.last_error: dict[str, str] = {}

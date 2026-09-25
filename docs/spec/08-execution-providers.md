@@ -36,6 +36,7 @@ Deterministic, no model, no containers. Scripted behaviors selected by a
 field on the launch spec in tests: succeed with a given report, exit 75,
 crash, hang until timeout, vanish (simulate loss), write outside allowed
 paths, emit N log lines. Every lifecycle and gate test runs against it.
+It is a test fixture: wired only when `test_fixtures` is on (18).
 
 ## Docker provider (local, v0.x)
 

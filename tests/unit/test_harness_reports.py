@@ -48,7 +48,7 @@ def write_lines(path: Path, events: list[dict[str, object]]) -> None:
 # ----- report parsing --------------------------------------------------------
 
 
-@pytest.mark.parametrize("adapter", default_adapters(), ids=lambda a: a.name)
+@pytest.mark.parametrize("adapter", default_adapters(test_fixtures=True), ids=lambda a: a.name)
 def test_a_valid_report_parses_for_every_adapter(tmp_path: Path, adapter: HarnessAdapter) -> None:
     (tmp_path / "report.yaml").write_text(json.dumps(CLAIM), encoding="utf-8")
     parsed = adapter.parse_report(tmp_path, exit_ok())
@@ -265,7 +265,7 @@ def test_quota_exhaustion_from_the_tails(adapter: HarnessAdapter, tail: str) -> 
     assert adapter.classify_exit(ExitInfo(exit_code=1), tail, "") is ExitClass.QUOTA_EXHAUSTED
 
 
-@pytest.mark.parametrize("adapter", default_adapters(), ids=lambda a: a.name)
+@pytest.mark.parametrize("adapter", default_adapters(test_fixtures=True), ids=lambda a: a.name)
 def test_a_pattern_never_turns_a_clean_exit_into_a_failure(adapter: HarnessAdapter) -> None:
     """Claude Code's rate_limit_event lines report utilization on successful runs (S1)."""
     noisy = '{"type":"rate_limit_event","utilization":0.4}\n{"type":"result","subtype":"success"}'

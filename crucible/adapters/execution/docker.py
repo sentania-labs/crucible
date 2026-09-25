@@ -299,7 +299,9 @@ class DockerProvider:
     ) -> None:
         self.config = config
         self.client = client or DockerClient(config.endpoint, timeout=config.api_timeout_seconds)
-        self.harnesses = harnesses or default_registry()
+        # `wire` always passes the deployment's registry; one built without it is a test's,
+        # which may launch the script harness (crucible#124).
+        self.harnesses = harnesses or default_registry(test_fixtures=True)
         self._launched: dict[str, _Launched] = {}
         self._images: dict[str, _ResolvedImage] = {}
         # The last failing output of each throwaway role, so an environment failure can
