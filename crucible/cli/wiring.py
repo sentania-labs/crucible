@@ -238,6 +238,8 @@ def kubernetes_config(
         local_endpoint_url=local_endpoint_url or "",
         denied_cidrs=tuple(k.denied_cidrs),
         local_endpoint_cidrs=tuple(k.local_endpoint_cidrs),
+        broad_egress=k.broad_egress,
+        resolve_ttl_seconds=k.resolve_ttl_seconds,
         extra_image_allowlist=tuple(k.extra_image_allowlist),
         credential_secrets=dict(k.credential_secrets),
         # 25 step 7: a configured mount mode may raise the adapter's declared minimum

@@ -1535,6 +1535,14 @@ _EGRESS_SEEDS = [
 ]
 
 
+# 26 and issue 61: the one restart-bound setting that widens what a worker can reach.
+_BROAD_EGRESS_REASON = (
+    "Read at process start; restart required. On, a worker's egress is the public "
+    "internet on 443 minus the denied ranges, GitHub included, instead of the resolved "
+    "allowlist."
+)
+
+
 def _settings_rows(settings: Any) -> list[list[Any]]:
     if settings is None or not hasattr(settings, "model_dump"):
         return []
@@ -1581,6 +1589,8 @@ def _settings_rows(settings: Any) -> list[list[Any]]:
             if path in sensitive
             else "Seeds kubernetes.egress; edit it on Routing, where a saved value wins."
             if path.split(".")[:2] in _EGRESS_SEEDS
+            else _BROAD_EGRESS_REASON
+            if path == "kubernetes.broad_egress"
             else "Read at process start; restart required."
         )
         rows.append([path, shown, source, reason])

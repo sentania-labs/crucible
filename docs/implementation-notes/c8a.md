@@ -82,7 +82,8 @@ FQDN rule, so the names are resolved when the policy is written and recorded in
 a `crucible.io/egress-hosts` annotation. A name that does not resolve refuses
 the launch rather than being dropped or widened, which is 13's rule for an
 attempt the egress path cannot actually permit. `broad_egress` is the opt-out
-for a deployment whose CNI enforces names some other way; it is off by default,
+for a deployment whose CNI enforces names some other way (the
+`kubernetes.broad_egress` setting since issue 61); it is off by default,
 because the broad form ("the internet on 443 minus every denied range") would
 let a worker reach GitHub. Every denial 26 names is the `except` of every
 allow, so a name that resolves into a denied range cannot open one. IPv6 never

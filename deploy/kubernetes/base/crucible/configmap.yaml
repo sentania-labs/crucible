@@ -81,6 +81,13 @@ data:
   # denied even when DNS returns one of their addresses. Empty here on purpose: the
   # local endpoint host's address is a cluster fact, and the overlay sets it.
   CRUCIBLE_KUBERNETES__LOCAL_ENDPOINT_CIDRS: "[]"
+  # 26: each allowlisted name is resolved and the worker's NetworkPolicy carries its
+  # addresses, re-resolved after this many seconds. `true` below swaps that for the
+  # broad rule (the internet on 443 minus every denied range), for a CNI that enforces
+  # names some other way; it lets a worker reach GitHub, which 26 forbids, so it stays
+  # off unless a deployment deliberately turns it on (issue 61).
+  CRUCIBLE_KUBERNETES__BROAD_EGRESS: "false"
+  CRUCIBLE_KUBERNETES__RESOLVE_TTL_SECONDS: "300"
   # An in-cluster local endpoint as the pods that take its connections, their namespace
   # and their port (0: the endpoint URL's port). Empty namespace: the endpoint is outside
   # the cluster and keeps its resolved-address rule above. Seeds of `kubernetes.egress`.

@@ -248,6 +248,14 @@ address, or a name resolving to the Kubernetes API ClusterIP, another namespace,
 any denied range outside that declaration, is refused. General allowlist hostnames that
 resolve into a denied range remain refused. IPv6 never
 appears in a rule and is therefore denied entirely.
+A resolved address stays in a policy for `kubernetes.resolve_ttl_seconds`
+(default 300) before its name is looked up again. `kubernetes.broad_egress`
+(default false) replaces the resolved addresses with the broad rule, the
+public internet on 443 minus every denied range, for a CNI that enforces names
+some other way; that rule lets a worker reach GitHub, so a deployment turns it
+on deliberately or not at all. Both are restart-bound settings, set like
+`kubernetes.probe_image` and shown on the admin UI's settings page. (Made
+concrete 2026-09-25, issue 61.)
 
 Two destinations are denied explicitly, because a naive policy lets them
 through: cluster DNS is allowed on port 53 UDP and TCP to the cluster's DNS
