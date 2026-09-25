@@ -16,6 +16,8 @@ from enum import StrEnum
 from functools import lru_cache
 from typing import Any
 
+from crucible.domain.exit_class import CLEAN_EXIT_CLASSES
+
 
 class GateName(StrEnum):
     # pre-PR (11)
@@ -245,8 +247,9 @@ def exit_clean(gi: GateInput) -> GateOutcome:
     if item is None:
         return _missing("exit_info")
     code = item.payload.get("exit_code")
-    if code == 0:
-        return GateOutcome(GateResult.PASS, "the worker exited 0", (item.id,))
+    # Issue 128: an `incomplete` attempt exits 0 too, so the class must also be clean.
+    if code == 0 and item.payload.get("exit_class") in CLEAN_EXIT_CLASSES:
+        return GateOutcome(GateResult.PASS, "the worker exited 0 and completed", (item.id,))
     return GateOutcome(
         GateResult.FAIL,
         f"exit code {code!r}, class {item.payload.get('exit_class')!r}",

@@ -143,8 +143,9 @@ attempt is not cancelling the task; `POST /tasks/{id}/cancel` is.
 `implement`, `correct`, or `review`. `succeeded` when the final attempt is
 `succeeded`; `failed` when attempts are exhausted or a non-retryable class
 occurred; `cancelled` on task cancel. A `review` execution's success means
-a parsed `ReviewReportV1` exists; its verdict does not change task state
-by itself (Foundry's acceptance does).
+a parsed `ReviewReportV1` exists from an attempt that exited 0 with a clean
+exit class (an `incomplete` review is not recorded, issue 128); its verdict
+does not change task state by itself (Foundry's acceptance does).
 
 ## Attempt
 

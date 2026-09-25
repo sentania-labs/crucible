@@ -181,6 +181,7 @@ class EventKind(StrEnum):
     ADMIN_REFUSED = "admin_refused"
     LOCAL_ENDPOINT_UPDATED = "local_endpoint_updated"
     KUBERNETES_EGRESS_UPDATED = "kubernetes_egress_updated"
+    COMMAND_TIMEOUT_UPDATED = "command_timeout_updated"
     # the bootstrap ledger handoff (15, C6)
     BOOTSTRAP_IMPORT_VERIFIED = "bootstrap_import_verified"
     BOOTSTRAP_IMPORT_COMMITTED = "bootstrap_import_committed"

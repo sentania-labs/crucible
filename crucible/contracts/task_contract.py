@@ -174,6 +174,9 @@ class ExecutionRequest(StrictModel):
     provider: ProviderName
     image: str | None = None
     timeout_seconds: int = Field(ge=1)
+    # Issue 128: narrows the policy's limits.command_timeout_ms for this task, the
+    # timeout each harness runs a shell command under. Absent: the policy default.
+    command_timeout_ms: int | None = Field(default=None, ge=1)
     rationale: str = Field(min_length=1)
 
     @model_validator(mode="after")
@@ -191,6 +194,11 @@ class ExecutionRequest(StrictModel):
             raise ValueError("a pinned model requires pin_reason")
         if self.pin_reason is not None and self.model is None:
             raise ValueError("pin_reason requires a pinned model")
+        if (
+            self.command_timeout_ms is not None
+            and self.command_timeout_ms > self.timeout_seconds * 1000
+        ):
+            raise ValueError("command_timeout_ms must not exceed timeout_seconds")
         return self
 
     @property

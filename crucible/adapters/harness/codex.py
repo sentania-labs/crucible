@@ -14,6 +14,16 @@ log state beside it and fails on a read-only directory before auth is tested (S1
 `auth.json` syncs back, chosen by the newer `last_refresh` (12). `config.toml` is a
 Crucible-owned template mounted read-only on top: the operator's per-project trust,
 MCP servers and hook trust hashes never reach a worker.
+
+Commands (issue 128): the pinned models run commands through unified exec
+(`shell_type: unified_exec` in the CLI's own model catalog), which returns after at most
+30 seconds with a session the model must poll with `write_stdin`; a turn that ends
+instead leaves the command to die with the process (reproduced on 0.156.0 against a
+stub model, 2026-09-25). Turning the `unified_exec` feature off does not change the
+tool, so nothing at the launch can make a command block. The launch sets
+`background_terminal_max_timeout`, the longest single poll, to the launch's command
+timeout so one poll can wait out a long build. A `command_execution` item the JSON
+stream started and never completed is work in flight.
 """
 
 from __future__ import annotations
@@ -139,6 +149,9 @@ class CodexAdapter:
             "plugins",
             "-c",
             "check_for_update_on_startup=false",
+            # Issue 128: the longest poll of a running command, from the launch.
+            "-c",
+            f"background_terminal_max_timeout={ctx.command_timeout}",
         ]
         if ctx.effort:
             argv += ["-c", f"model_reasoning_effort={_toml_string(ctx.effort)}"]
@@ -162,15 +175,44 @@ class CodexAdapter:
         )
 
     def parse_report(self, report_dir: Path, exit: ExitInfo) -> ParsedReport:
-        metrics, lines = _metrics(report_dir / base.TRANSCRIPT_NAME)
-        return base.parse_report_dir(report_dir, exit, metrics=metrics, transcript_lines=lines)
+        transcript = report_dir / base.TRANSCRIPT_NAME
+        metrics, lines = _metrics(transcript)
+        return base.parse_report_dir(
+            report_dir,
+            exit,
+            metrics=metrics,
+            transcript_lines=lines,
+            in_flight=in_flight(transcript),
+        )
 
     def classify_exit(
         self, exit: ExitInfo, stdout_tail: str, stderr_tail: str, report_dir: Path | None = None
     ) -> ExitClass:
-        return base.classify_with_patterns(
+        exit_class = base.classify_with_patterns(
             exit, stdout_tail, stderr_tail, auth=AUTH_PATTERNS, quota=QUOTA_PATTERNS
         )
+        pending = in_flight(report_dir / base.TRANSCRIPT_NAME) if report_dir else ()
+        return base.with_in_flight(exit_class, pending)
+
+
+def in_flight(transcript: Path) -> tuple[str, ...]:
+    """`command_execution` items the stream started and never completed."""
+    started: dict[str, str] = {}
+    for event in base.json_lines(transcript):
+        item = event.get("item")
+        if not isinstance(item, dict) or item.get("type") != "command_execution":
+            continue
+        item_id = item.get("id")
+        if not isinstance(item_id, str):
+            continue
+        if event.get("type") == "item.started":
+            started[item_id] = str(item.get("command") or item_id)
+        elif event.get("type") == "item.completed":
+            started.pop(item_id, None)
+    return tuple(
+        base.in_flight_summary(f"command {item_id}", command)
+        for item_id, command in started.items()
+    )
 
 
 def _toml_string(value: str) -> str:

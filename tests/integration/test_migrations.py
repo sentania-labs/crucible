@@ -1075,3 +1075,33 @@ def test_0020_provider_settings_down_and_up_keeps_the_audit_trail(database_url: 
     ok, detail = migrate.is_current(engine, database_url)
     assert ok, detail
     engine.dispose()
+
+
+def test_0021_command_timeout_down_and_up_keeps_the_audit_trail(database_url: str) -> None:
+    """crucible#128: a rollback archives the command timeout's audit events and the
+    next upgrade restores them."""
+    migrate.upgrade(database_url)
+    engine = make_engine(database_url)
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO events (seq, ts, kind, principal, verified, payload) "
+                "SELECT coalesce(max(seq), 0) + 1, now(), 'command_timeout_updated', "
+                "'tests', true, '{}'::jsonb FROM events"
+            )
+        )
+    migrate.downgrade(database_url, "0020_provider_settings")
+
+    def count() -> int:
+        with engine.connect() as conn:
+            value = conn.execute(
+                text("SELECT count(*) FROM events WHERE kind='command_timeout_updated'")
+            ).scalar()
+        return int(value or 0)
+
+    assert count() == 0
+    migrate.upgrade(database_url)
+    assert count() == 1
+    ok, detail = migrate.is_current(engine, database_url)
+    assert ok, detail
+    engine.dispose()
