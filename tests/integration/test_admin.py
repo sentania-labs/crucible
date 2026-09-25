@@ -2500,6 +2500,23 @@ def test_pages_lead_with_what_the_operator_acts_on(
         ui_sign_in(browser, tokens["admin"])
         status_page = browser.get("/ui").text
         settings_page = browser.get("/ui/settings").text
+        routing_page = browser.get("/ui/routing").text
+        github_page = browser.get("/ui/github").text
+        credentials_page = browser.get("/ui/credentials").text
+    # The pages first-run setup added (crucible#150): Routing leads with what is in force
+    # in plain words, its documents behind Details, and a pool is cleared from its row.
+    lead, _, details = routing_page.partition("<details")
+    assert "In force" in lead and "1 hour by default" in lead
+    assert "Delivery policy document" not in lead and "Delivery policy document" in details
+    assert 'name="pool"' not in routing_page and "issue 128" not in routing_page
+    lead, _, details = github_page.partition("<details")
+    assert "Connection" in lead and "Stored App and every repository" in details
+    assert "API base" not in lead
+    # Hermes has no key stored in this tier: nothing to validate, probe or remove, only the
+    # page that sets it.
+    assert 'name="harness" value="hermes"' not in credentials_page
+    assert 'href="/ui/gateway">Local gateway' in credentials_page
+    assert "/ui/credentials/codex/login" in credentials_page
     lead, _, details = status_page.partition("<details")
     assert "Provider: fake" in lead and "Supervisor" in lead
     assert "Fenced token" not in lead and "Fenced token" in details

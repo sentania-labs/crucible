@@ -258,7 +258,8 @@ def test_the_credentials_page_offers_only_what_applies_to_a_secret(
     assert "Rotate from prepared server directory" not in page
     assert "Prepared directory" not in page
     assert 'value="remove"' not in page
-    assert 'value="validate"' in page
+    # Nothing is stored yet, so each row offers only the way to set its credential up.
+    assert 'value="validate"' not in page
     assert "/ui/credentials/hermes/login" not in page
     assert "/ui/credentials/codex/login" in page
 

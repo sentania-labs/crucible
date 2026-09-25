@@ -358,6 +358,28 @@ def _panel(value: Any, *, key: str = "") -> dict[str, Any]:
     return {"kind": "value", "value": _safe_value(key, value)}
 
 
+def _check_words(check: Any) -> str:
+    """A repository's last connectivity check in one phrase."""
+    if not isinstance(check, dict) or not check:
+        return "not checked yet"
+    when = check.get("checked_at") or check.get("at") or ""
+    outcome = "passed" if check.get("ok") else f"failed: {check.get('error') or 'no detail'}"
+    return f"last check {outcome} {when}".strip()
+
+
+def _duration_words(milliseconds: Any) -> str:
+    """A millisecond bound in the unit an operator reads it in."""
+    try:
+        value = int(milliseconds)
+    except (TypeError, ValueError):
+        return str(milliseconds)
+    for unit, size in (("hour", 3_600_000), ("minute", 60_000), ("second", 1000)):
+        if value >= size and value % size == 0:
+            count = value // size
+            return f"{count} {unit}{'' if count == 1 else 's'}"
+    return f"{value} ms"
+
+
 def _document_section(title: str, document: Any) -> dict[str, Any]:
     return {"title": title, "panel": _panel(document)}
 
@@ -977,7 +999,9 @@ async def credentials_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
             actions.append(
                 {"kind": "link", "href": f"/ui/credentials/{name}/login", "label": "Log in"}
             )
-        if admin and needed:
+        # Validate, probe and remove act on a stored credential; with none there is only
+        # the way to set one up (crucible#115).
+        if admin and needed and state != "absent":
             for verb, label in (("validate", "Validate"), ("probe", "Probe")):
                 actions.append(
                     {
@@ -1166,14 +1190,26 @@ async def gateway_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
     secrets = await credentials.read_secrets(ctx.admin, [credentials.HERMES])
     view = gateway.gateway_view(ctx.admin, uow, secrets.get(credentials.HERMES))
     offered = await gateway.models_view(ctx.admin, uow)
-    summary = {
-        "endpoint_url": view["endpoint_url"] or "not set",
-        "key": "set" if view["key_set"] else "not set",
-        "credential_state": view["credential_state"],
-        "last_test": view["last_test"],
-        "last_tested_at": view["last_tested_at"],
-    }
-    sections: list[dict[str, Any]] = [_document_section("Gateway", summary)]
+    passed = view["last_outcome"] == "probe:completed"
+    # crucible#115: one row in plain words; the credential's state is on Credentials.
+    sections: list[dict[str, Any]] = [
+        {
+            "title": "Gateway",
+            "columns": ["URL", "Key", "Last test"],
+            "rows": [
+                [
+                    view["endpoint_url"] or "not set",
+                    "set" if view["key_set"] else "not set",
+                    {
+                        "kind": "status",
+                        "value": view["last_test"],
+                        "tone": "ok" if passed else "warn",
+                        "hint": view["last_tested_at"] or "",
+                    },
+                ]
+            ],
+        }
+    ]
     listing: dict[str, Any] = {
         "title": "Models the key can see",
         "note": offered["error"]
@@ -1204,16 +1240,14 @@ async def gateway_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
             {
                 "title": "Set the gateway URL and key",
                 "note": (
-                    "The URL is the gateway's OpenAI-compatible base, ending in /v1. The key "
-                    "is the LiteLLM virtual key Hermes sends; it is written to the Hermes "
-                    "credential (on Kubernetes the Secret Crucible owns, otherwise a file "
-                    "mode 0600) and never shown or audited. Leave it empty to keep the key "
-                    "already set. Saving tests both: the gateway's readiness check, then its "
-                    "model list with the key."
+                    "The URL ends in /v1. The key is the LiteLLM virtual key Hermes sends; "
+                    "it is stored as the Hermes credential and never shown. Saving tests "
+                    "both."
                 ),
                 "form": {
                     "action": "/ui/actions/gateway-save",
                     "label": "Save and test",
+                    "collapsed": "Change the URL or key" if view["endpoint_url"] else None,
                     "fields": [
                         {
                             "name": "endpoint_url",
@@ -1237,16 +1271,12 @@ async def gateway_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
             }
         )
         if view["endpoint_url"]:
-            sections.append(
-                {
-                    "title": "Test again",
-                    "form": {
-                        "action": "/ui/actions/gateway-test",
-                        "label": "Test the gateway",
-                        "fields": [{"name": "reason", "label": "Reason", "required": True}],
-                    },
-                }
-            )
+            # A check: no reason is asked for (crucible#117).
+            sections[0]["form"] = {
+                "action": "/ui/actions/gateway-test",
+                "label": "Test the gateway again",
+                "fields": [{"name": "reason", "label": "Reason"}],
+            }
         if offered["models"]:
             rows = []
             for index, row in enumerate(offered["models"]):
@@ -1272,7 +1302,8 @@ async def gateway_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                             "options": CAPABILITY_OPTIONS,
                             "label": f"capability of {row['id']}",
                         },
-                        {"value": row["note"]},
+                        # The note without the migration that wrote it (crucible#115).
+                        {"value": re.sub(r" \(\d{4}_[a-z0-9_]+\)", "", str(row["note"]))},
                     ]
                 )
             listing["form"] = {
@@ -1381,44 +1412,117 @@ def routing_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
     egress = kubernetes_admin.egress_view(ctx.admin, uow)
     gateway_endpoint, _source = routing.gateway_url(uow)
     command_timeout = limits_admin.command_timeout_view(uow)
+    admin = principal.role is Role.ADMIN
+    bounds = command_timeout["command_timeout_ms"]
+    dns = egress["document"].get("dns") or {}
+    endpoint = egress["document"].get("local_endpoint") or {}
+    local_models = ", ".join(m["id"] for m in local["models"] if m.get("enabled")) or "none"
+    # crucible#115: what is in force, one line each, in plain words; the documents behind
+    # them are under Details, and each is edited from its own form below.
+    in_force: list[list[Any]] = [
+        [
+            "Delivery policy",
+            f"{policy.name} version {policy.version}" if policy else "none",
+            "",
+        ],
+        [
+            "Routing policy",
+            f"{routing_ref.get('name')} version {routing_ref.get('version')}"
+            if routing_ref
+            else "none",
+            "",
+        ],
+        [
+            "Local gateway",
+            {
+                "kind": "note",
+                "value": gateway_endpoint or "not set",
+                "hint": f"models in use: {local_models}",
+            },
+            {"kind": "link", "href": "/ui/gateway", "label": "Set up on Local gateway"},
+        ],
+        [
+            "Per-command timeout",
+            {
+                "kind": "note",
+                "value": f"{_duration_words(bounds['default'])} by default",
+                "hint": (
+                    f"a task may set {_duration_words(bounds['min'])} "
+                    f"to {_duration_words(bounds['max'])}"
+                ),
+            },
+            "",
+        ],
+        [
+            "Kubernetes worker egress",
+            {
+                "kind": "note",
+                "value": (
+                    f"DNS: {dns.get('namespace') or 'any namespace'}; local endpoint: "
+                    f"{endpoint.get('namespace') or 'outside the cluster'}"
+                )
+                if egress["provider_enabled"]
+                else "not in use: the Kubernetes provider is off",
+            },
+            "",
+        ],
+    ]
+    marks = [item for item in exhaustion["items"] if item["active"]]
     sections: list[dict[str, Any]] = [
         {
-            "title": "Local gateway",
-            "note": (
-                "The gateway URL, the Hermes key, the test of both, and which of the "
-                "gateway's models to use are set in one place (crucible#119, #121)."
-            ),
-            "columns": ["Gateway URL", "Local models enabled", "Set up"],
-            "rows": [
-                [
-                    gateway_endpoint or "not set",
-                    ", ".join(m["id"] for m in local["models"] if m.get("enabled")) or "none",
-                    "/ui/gateway",
-                ]
+            "title": "In force",
+            "columns": ["Setting", "Value", ""],
+            "rows": in_force,
+            "details": [
+                _document_section("Local endpoint", local),
+                _document_section("Kubernetes egress selectors", egress),
+                _document_section("Per-command timeout", command_timeout),
+                _document_section("Delivery policy document", policy.document if policy else {}),
+                _document_section(
+                    "Routing policy document", routing_record.document if routing_record else {}
+                ),
             ],
         },
-        _document_section("Local endpoint", local),
-        _document_section("Kubernetes egress selectors", egress),
-        _document_section("Per-command timeout", command_timeout),
-        _document_section("Active policy", policy.document if policy else {}),
-        _document_section("Routing policy", routing_record.document if routing_record else {}),
-        _document_section("Pool exhaustion", exhaustion),
+        {
+            "title": "Exhausted pools",
+            "empty": "No pool is marked exhausted.",
+            "columns": ["Pool", "Since", "Resets", "Why", ""],
+            "rows": [
+                [
+                    item["pool"],
+                    item["exhausted_at"],
+                    item["reset_at"],
+                    item["reason"],
+                    # The row's own action, never a typed pool name (crucible#127).
+                    {
+                        "kind": "form",
+                        "action": "/ui/actions/routing-clear",
+                        "label": "Clear",
+                        "hidden": {"pool": item["pool"]},
+                    }
+                    if admin
+                    else "",
+                ]
+                for item in marks
+            ],
+            "details": [_document_section("Every mark, cleared ones too", exhaustion)]
+            if exhaustion["items"]
+            else [],
+        },
     ]
-    if principal.role is Role.ADMIN:
-        bounds = command_timeout["command_timeout_ms"]
+    if admin:
         sections.append(
             {
                 "title": "Edit per-command timeout",
                 "note": (
-                    "The timeout, in milliseconds, every harness runs a shell command under "
-                    "(issue 128). A task contract may narrow the default within min and max; "
-                    "a launch never exceeds the attempt's own timeout. Saving creates a new "
-                    "immutable delivery policy version; tasks whose contracts name that "
-                    "version launch with it."
+                    "The timeout, in milliseconds, every harness runs a shell command under. "
+                    "A task may narrow the default within min and max. Saving writes a new "
+                    "delivery policy version."
                 ),
                 "form": {
                     "action": "/ui/actions/command-timeout",
                     "label": "Save command timeout",
+                    "collapsed": "Change the per-command timeout",
                     "fields": [
                         {
                             "name": "min",
@@ -1446,8 +1550,6 @@ def routing_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                 },
             }
         )
-        dns = egress["document"].get("dns") or {}
-        endpoint = egress["document"].get("local_endpoint") or {}
         sections.append(
             {
                 "title": "Edit Kubernetes egress selectors",
@@ -1462,6 +1564,7 @@ def routing_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                 "form": {
                     "action": "/ui/actions/kubernetes-egress",
                     "label": "Save egress selectors",
+                    "collapsed": "Change the egress selectors",
                     "fields": [
                         {
                             "name": "dns_namespace",
@@ -1505,6 +1608,7 @@ def routing_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                     "form": {
                         "action": "/ui/actions/routing-upload",
                         "label": "Upload routing",
+                        "collapsed": "Upload a routing policy document",
                         "fields": [
                             {
                                 "name": "name",
@@ -1534,6 +1638,7 @@ def routing_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                     "form": {
                         "action": "/ui/actions/policy-upload",
                         "label": "Upload policy",
+                        "collapsed": "Upload a delivery policy document",
                         "fields": [
                             {
                                 "name": "name",
@@ -1558,17 +1663,6 @@ def routing_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                         ],
                     },
                 },
-                {
-                    "title": "Clear pool exhaustion",
-                    "form": {
-                        "action": "/ui/actions/routing-clear",
-                        "label": "Clear mark",
-                        "fields": [
-                            {"name": "pool", "label": "Pool", "required": True},
-                            {"name": "reason", "label": "Reason", "required": True},
-                        ],
-                    },
-                },
             ]
         )
     return _page(
@@ -1577,7 +1671,7 @@ def routing_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
         csrf,
         active="/ui/routing",
         heading="Routing",
-        intro="Policy versions, pools, model roster, limits, and exhaustion marks.",
+        intro="What routes and limits a task: the policies in force, the gateway, and pools.",
         sections=sections,
     )
 
@@ -1765,8 +1859,50 @@ def github_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
     assert ctx.admin is not None
     state = github.status(ctx.admin, uow)
     picker = github.apps_view(ctx.admin, uow) if state["configured"] else None
-    sections: list[dict[str, Any]] = [_document_section("App and repository connectivity", state)]
     admin = principal.role is Role.ADMIN
+    # crucible#115: the connection in plain words and the registered repositories first;
+    # the stored-credential document is behind Details.
+    connection: dict[str, Any] = {
+        "title": "Connection",
+        "note": "A repository the picker below cannot show is registered by hand on Repositories.",
+        "columns": ["Part", "State"],
+        "rows": [
+            [
+                "App",
+                {
+                    "kind": "status",
+                    "value": f"connected, App {state['app_id']}"
+                    if state["configured"]
+                    else "not connected",
+                    "tone": "ok" if state["configured"] else "warn",
+                },
+            ],
+            ["Private key", state["key_fingerprint"] or "none stored"],
+            ["Webhook", "on" if state["webhook_enabled"] else "off"],
+            *[
+                [
+                    f"Repository {repo['repository']}",
+                    {
+                        "kind": "note",
+                        "value": "covered by the installation"
+                        if repo["installation_covers"]
+                        else "no installation covers it",
+                        "hint": _check_words(repo.get("last_check")),
+                    },
+                ]
+                for repo in state["repositories"]
+            ],
+        ],
+        "details": [_document_section("Stored App and every repository", state)],
+    }
+    if admin and state["configured"]:
+        # A read-only check: no reason is asked for (crucible#117).
+        connection["form"] = {
+            "action": "/ui/actions/github-check",
+            "label": "Check every repository",
+            "fields": [{"name": "reason", "label": "Reason"}],
+        }
+    sections: list[dict[str, Any]] = [connection]
     if admin:
         sections.append(
             {
@@ -1781,6 +1917,7 @@ def github_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                 "form": {
                     "action": "/ui/actions/github-connect",
                     "label": "Check and connect",
+                    "collapsed": "Connect a different App" if state["configured"] else None,
                     "fields": [
                         {
                             "name": "app_id",
@@ -1885,25 +2022,6 @@ def github_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                     ],
                 }
             sections.append(section)
-        sections.append(
-            {
-                "title": "A repository the picker cannot show",
-                "note": "Register it by hand on Repositories.",
-                "columns": ["Page", "Open"],
-                "rows": [["Repositories", "/ui/repositories"]],
-            }
-        )
-    if admin and state["configured"]:
-        sections.append(
-            {
-                "title": "Connectivity check",
-                "form": {
-                    "action": "/ui/actions/github-check",
-                    "label": "Check every repository",
-                    "fields": [{"name": "reason", "label": "Reason", "required": True}],
-                },
-            }
-        )
     return _page(
         request,
         principal,
