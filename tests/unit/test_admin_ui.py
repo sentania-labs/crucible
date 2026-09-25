@@ -278,6 +278,10 @@ def test_harness_version_maps_are_shown_whatever_the_harness_is_called() -> None
     assert _safe_value("harnesses.claude_code", "2.1.280") == "2.1.280"
     assert _safe_value("claudeCode", "2.1.280") == "2.1.280"
     assert _safe_value("device_code", "ABCD-EFGH") == "not displayed"
+    for name in ("secret_key", "token_value", "password_hash", "verification_code"):
+        assert _safe_value(name, "x") == "not displayed", name
+    for name in ("exit_code", "error_code", "tokens_in", "api_key_set", "private_key_path"):
+        assert _safe_value(name, "x") == "x", name
 
 
 def test_nested_lists_stay_readable_and_suppress_secrets_at_any_depth() -> None:

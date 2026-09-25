@@ -155,6 +155,11 @@ async def _run(
     except ApplicationError as exc:
         steps.failed(WORKER, exc.detail or exc.title)
         return
+    except ValueError as exc:
+        # The adapter refused to build a launch for this route (Hermes without a local
+        # endpoint): a routing problem, reported, never a server error.
+        steps.failed(WORKER, f"the harness cannot be launched on this route: {exc}")
+        return
     if record.cause == "provider_unavailable":
         steps.failed(WORKER, f"the worker did not start: {record.detail}")
         return

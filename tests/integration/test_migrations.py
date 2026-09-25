@@ -1113,8 +1113,10 @@ def test_0021_carries_each_harness_default_forward_and_back(database_url: str) -
             str(r.harness): (r.digest, r.version, r.previous_digest, r.previous_version)
             for r in conn.execute(text("SELECT * FROM harness_images"))
         }
+    # agy's default replaced the combined image it was promoted over, which stayed the
+    # default for hermes; hermes's replaced the retained one.
     assert rows == {
-        "agy": ("sha256:agy", "1.2.9", "sha256:old", "1.2.7"),
+        "agy": ("sha256:agy", "1.2.9", "sha256:new", "1.2.8"),
         "hermes": ("sha256:new", "0.19.0", "sha256:old", "0.19.0"),
     }
     assert "image_promotions" not in inspect(engine).get_table_names()
@@ -1127,7 +1129,7 @@ def test_0021_carries_each_harness_default_forward_and_back(database_url: str) -
     assert back == {
         "sha256:agy": ("default", {"agy": "1.2.9"}),
         "sha256:new": ("default", {"hermes": "0.19.0"}),
-        "sha256:old": ("retained", {"agy": "1.2.7", "hermes": "0.19.0"}),
+        "sha256:old": ("retained", {"hermes": "0.19.0"}),
     }
     with engine.begin() as conn:
         conn.execute(text("DELETE FROM image_promotions"))

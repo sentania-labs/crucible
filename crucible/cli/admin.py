@@ -616,8 +616,10 @@ def _local(args: argparse.Namespace, wiring: Wiring) -> Any:
                     "defaults": asyncio.run(images.defaults(admin, uow)),
                 }
             if args.image_command == "rollback":
-                result = images.rollback(
-                    admin, uow, principal=principal, harness=args.harness, reason=args.reason
+                result = asyncio.run(
+                    images.rollback(
+                        admin, uow, principal=principal, harness=args.harness, reason=args.reason
+                    )
                 )
             else:
                 result = asyncio.run(

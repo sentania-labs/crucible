@@ -544,9 +544,10 @@ async def validate(
 
 
 def _probe_provider(ctx: AdminContext) -> ExecutionProvider:
-    """Where the probe runs: where the credentials are. Docker when it is wired, then
-    Kubernetes (the fake provider is always wired and runs behaviours, not credentials,
-    so it is only ever the answer when nothing else is)."""
+    """Where the probe and the harness test run: where the credentials are. Docker when
+    it is wired, then Kubernetes (the fake provider, wired only with test fixtures on,
+    runs behaviours, not credentials, so it is only ever the answer when nothing else
+    is)."""
     for name in ("docker", "kubernetes"):
         provider = ctx.providers.get(name)
         if provider is not None:
@@ -952,10 +953,19 @@ def probe_route(
             "put a policy in force that names a stored routing policy"
         )
     order = {"small": 0, "mid": 1, "frontier": 2}
-    best: tuple[int, dict[str, Any]] | None = None
+    # A subscription model before a local one: a local endpoint does not read the
+    # harness's own login, so a probe routed there would call a credential validated
+    # without using it. Hermes has only local models, which read its key; the script
+    # harness has no credential, and a local model is what gives it a model to call.
+    local_first = not needs_model
+    best: tuple[tuple[int, int], dict[str, Any]] | None = None
     for model in document.get("models", []):
         if model.get("harness") == harness and model.get("enabled"):
-            rank = order.get(str(model.get("capability")), 3)
+            is_local = model.get("endpoint") == "local"
+            rank = (
+                0 if is_local == local_first else 1,
+                order.get(str(model.get("capability")), 3),
+            )
             if best is None or rank < best[0]:
                 best = (rank, model)
     if best is None:

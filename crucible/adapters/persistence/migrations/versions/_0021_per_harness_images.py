@@ -7,7 +7,8 @@ image it replaced, which a rollback returns to.
 
 Existing state carries forward: each harness's current default (the most recent
 `default` row that carries it, which is what a launch resolved to) becomes its own
-default, and the most recent `retained` row that carries it becomes its previous image.
+default, and the most recent other row that carries it, `default` or `retained`, becomes
+its previous image.
 The downgrade folds the rows back into one row per image.
 
 Revision ID: 0021_per_harness_images
@@ -31,10 +32,11 @@ depends_on = None
 TZ = sa.DateTime(timezone=True)
 
 
-def _latest(rows: list[Any], harness: str, state: str) -> Any | None:
-    matching = [r for r in rows if r.state == state and harness in (r.harnesses or {})]
+def _carrying(rows: list[Any], harness: str, states: tuple[str, ...]) -> list[Any]:
+    """The rows in `states` that carry the harness, most recent first."""
+    matching = [r for r in rows if r.state in states and harness in (r.harnesses or {})]
     matching.sort(key=lambda r: (r.updated_at, r.digest), reverse=True)
-    return matching[0] if matching else None
+    return matching
 
 
 def upgrade() -> None:
@@ -62,10 +64,17 @@ def upgrade() -> None:
     )
     harnesses = sorted({name for row in rows for name in (row.harnesses or {})})
     for harness in harnesses:
-        current = _latest(rows, harness, "default")
-        if current is None:
+        defaults = _carrying(rows, harness, ("default",))
+        if not defaults:
             continue
-        previous = _latest(rows, harness, "retained")
+        current = defaults[0]
+        # What the current default replaced for this harness: the most recent other row
+        # that carries it, whether it went `retained` or stayed the default of the other
+        # harnesses a narrower image was promoted over.
+        previous = next(
+            (r for r in _carrying(rows, harness, ("default", "retained")) if r is not current),
+            None,
+        )
         connection.execute(
             sa.text(
                 "INSERT INTO harness_images (harness, digest, reference, version, "

@@ -132,8 +132,9 @@ LABELS = {
 }
 
 # A field is hidden when its own name says it holds a credential value (crucible#126).
-# The name is compared whole, or by a credential suffix, never as a substring: a harness
-# called `claude_code` is a harness, not a login code, and its version is not a secret.
+# The name is compared whole, or by a credential prefix or suffix, and the names that
+# only look like one are listed as what they are: a harness called `claude_code` is a
+# harness, not a login code, and its version is not a secret.
 SECRET_NAMES = {
     "access_token",
     "api_key",
@@ -158,12 +159,24 @@ SECRET_NAMES = {
     "token",
     "user_code",
 }
-SECRET_SUFFIXES = ("_api_key", "_password", "_private_key", "_secret", "_token")
+SECRET_SUFFIXES = ("_api_key", "_code", "_password", "_private_key", "_secret", "_token")
+SECRET_PREFIXES = (
+    "api_key_",
+    "authorization_",
+    "password_",
+    "private_key_",
+    "secret_",
+    "token_",
+)
 # Names that describe a credential without holding one: whether it is there, what it
 # fingerprints to, where it is kept, when it changed.
 DESCRIBES_SECRET_SUFFIXES = ("_at", "_fingerprint", "_path", "_present", "_set", "_source")
 NON_SECRET_FIELDS = {
+    "error_code",
+    "exit_code",
     "fenced_token",
+    "http_code",
+    "status_code",
     "tokens_in",
     "tokens_out",
     # Harness names key the version maps an image promotion records (crucible#126).
@@ -224,7 +237,9 @@ def _secret_field(key: str) -> bool:
     name = separated.rsplit(".", 1)[-1].replace("-", "_")
     if name in NON_SECRET_FIELDS or name.endswith(DESCRIBES_SECRET_SUFFIXES):
         return False
-    return name in SECRET_NAMES or name.endswith(SECRET_SUFFIXES)
+    return (
+        name in SECRET_NAMES or name.endswith(SECRET_SUFFIXES) or name.startswith(SECRET_PREFIXES)
+    )
 
 
 def _safe_value(key: str, value: Any) -> Any:
@@ -412,6 +427,7 @@ def _page(
     if settings is not None:
         timezone = settings.service.render_timezone
     sections = _reason_fields(_localize(sections, timezone))
+    intro = str(_localize(intro, timezone))
     context = _base(
         request, principal, csrf, title=heading, active=active, hidden=_empty_sections(request)
     )
@@ -2181,7 +2197,7 @@ async def action(request: Request, action: str, ctx: Ctx, uow: UoW) -> Response:
             )
             return _redirect(form, message, kind="ok" if result["ok"] else "bad")
         elif action == "image-rollback":
-            images.rollback(
+            await images.rollback(
                 ctx.admin,
                 uow,
                 principal=principal.name,

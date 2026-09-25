@@ -315,6 +315,7 @@ def submit_task(
     harness_gates: Mapping[str, HarnessGate] | None = None,
     credential_sources: Mapping[str, CredentialSource] | None = None,
     secret_providers: Collection[str] = (),
+    wired_providers: Collection[str] | None = None,
 ) -> tuple[Task, TaskContract]:
     contract = parse_contract(body)
     require_operator_for_pin(principal, contract)
@@ -337,6 +338,17 @@ def submit_task(
             harnesses.resolve(name, gates=harness_gates, state=uow.harnesses.get(name))
         except HarnessUnavailableError as exc:
             problems.append(_problem("execution_request.harness", exc.reason))
+    provider = contract.execution_request.provider.value
+    if wired_providers is not None and provider not in wired_providers:
+        # A provider this deployment does not run, the fake one above all when test
+        # fixtures are off (crucible#124), is refused here rather than left to fail at
+        # launch.
+        problems.append(
+            _problem(
+                "execution_request.provider",
+                f"{provider!r} is not a provider this deployment runs",
+            )
+        )
     if contract.correction is not None:
         problems.append(
             _problem("correction", "must be null on submit; corrections use /corrections")

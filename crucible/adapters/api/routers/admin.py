@@ -405,11 +405,11 @@ async def admin_promote(
 
 
 @router.post("/admin/images/rollback")
-def admin_rollback(
+async def admin_rollback(
     ctx: Ctx, uow: UoW, principal: Admin, body: Annotated[dict[str, Any], Body()]
 ) -> dict[str, Any]:
     """Return the harness the body names to the image its last promotion replaced."""
-    result = images.rollback(
+    result = await images.rollback(
         _admin(ctx), uow, principal=principal.name, harness=_harness(body), reason=_reason(body)
     )
     uow.commit()

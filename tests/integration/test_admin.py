@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import dataclasses
 import json
 import os
 import re
@@ -40,7 +41,7 @@ from crucible.domain.entities import Role
 from crucible.ports.execution import ImageInfo
 from crucible.ports.harness import CredentialSource
 from tests.admin_cli import admin_main, envelope_data
-from tests.fixtures import promote_for_test
+from tests.fixtures import contract_document, promote_for_test
 
 pytestmark = pytest.mark.integration
 
@@ -521,7 +522,7 @@ def test_every_remaining_ui_mutation_dispatches_to_the_shared_application_servic
         (ui.login, "cancel_login", stub("login-cancel")),
         (ui.login, "finish_login", stub("login-finish")),
         (ui.images, "promote", async_stub("image-promote")),
-        (ui.images, "rollback", stub("image-rollback")),
+        (ui.images, "rollback", async_stub("image-rollback")),
         (ui.routing, "clear_exhaustion", stub("routing-clear")),
         (ui.repositories, "register", stub("repository-register")),
         (ui.repositories, "remove", stub("repository-remove")),
@@ -1132,7 +1133,7 @@ def test_images_are_promoted_and_rolled_back_per_harness(
         assert image_for_harness(uow, "codex", "kubernetes") is None
 
     # A rollback moves only the harness it names, and a second one undoes the first.
-    back = run_cli(config_file, "images", "rollback", "--harness", "agy", capsys=capsys)
+    back = admin_client.post("/v1/admin/images/rollback", json={"harness": "agy"}).json()
     assert back["digest"] == first.digest and back["previous"]["digest"] == second.digest
     rows = {r["harness"]: r for r in admin_client.get("/v1/admin/images").json()["defaults"]}
     assert rows["agy"]["current"]["digest"] == first.digest
@@ -1140,6 +1141,8 @@ def test_images_are_promoted_and_rolled_back_per_harness(
     assert rows["hermes"]["previous"] is None
     refused = admin_client.post("/v1/admin/images/rollback", json={"harness": "hermes"})
     assert refused.status_code == 409, refused.text
+    ci = admin_client.post(f"/v1/admin/images/{proof.digest}/promote", json={"harness": "agy"})
+    assert ci.status_code == 409 and "CI proof tag" in ci.json()["detail"]
     unnamed = admin_client.post(f"/v1/admin/images/{first.digest}/promote", json={})
     assert unnamed.status_code == 422 and unnamed.json()["errors"][0]["path"] == "harness"
     states = {
@@ -1149,6 +1152,11 @@ def test_images_are_promoted_and_rolled_back_per_harness(
     assert states[first.digest] == ("default", ["agy", "hermes"], [])
     assert states[second.digest] == ("retained", [], ["agy"])
 
+    # A previous image no provider lists any more is not a rollback target.
+    provider.images = [first, proof]
+    gone = admin_client.post("/v1/admin/images/rollback", json={"harness": "agy"})
+    assert gone.status_code == 409 and "any more" in gone.json()["detail"], gone.text
+    provider.images = [first, second, proof]
     with pytest.raises(SystemExit):
         admin_main(
             ["--config", str(config_file), "images", "promote", "sha256:nope", "--harness", "agy"]
@@ -1459,8 +1467,8 @@ def test_finishing_a_login_takes_both_guards(
     # The reason is an optional note (crucible#117): with the lease held, what refuses a
     # finish with nothing to finish is the login state, not a missing reason.
     no_reason = admin_client.post("/v1/admin/credentials/codex/login/finish", json={})
-    assert no_reason.status_code != 422, no_reason.text
-    assert no_reason.status_code != 503, no_reason.text
+    assert no_reason.status_code == 409, no_reason.text
+    assert "reason" not in no_reason.json()["detail"]
 
 
 def test_a_failed_swap_leaves_the_configured_directory_exactly_as_it_was(
@@ -2244,3 +2252,19 @@ def test_pages_lead_with_what_the_operator_acts_on(
     lead, _, defaults = settings_page.partition("<details")
     assert "Defaults left unchanged" in defaults
     assert "restart required" not in settings_page
+
+
+def test_a_task_for_a_provider_this_deployment_does_not_run_is_refused_at_submit(
+    ctx: AppContext, tokens: dict[str, str], live_supervisor: Supervisor
+) -> None:
+    """crucible#124: with test fixtures off the fake provider is not wired, and a
+    contract naming it is refused when it is submitted, not left to fail at launch."""
+    asyncio.run(live_supervisor.tick())
+    production = dataclasses.replace(ctx, providers=[])
+    with TestClient(
+        create_app(production), headers={"Authorization": f"Bearer {tokens['orchestrator']}"}
+    ) as client:
+        response = client.post("/v1/tasks", json=contract_document(external_id="UNWIRED-1"))
+    assert response.status_code == 422, response.text
+    paths = [error["path"] for error in response.json()["errors"]]
+    assert "execution_request.provider" in paths

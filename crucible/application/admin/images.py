@@ -141,6 +141,11 @@ async def promote(
     if adapter is None:
         raise NotFoundError(f"no adapter declares harness {harness!r}")
     image = _find(await provider_images(ctx), digest)
+    if not offered_tag(image.reference):
+        raise ConflictError(
+            f"{image.reference} is a CI proof tag, which proves a build and is not a "
+            "candidate; promote a release or latest"
+        )
     version = image.version_of(harness)
     if version is None:
         raise NotFoundError(
@@ -195,7 +200,7 @@ async def promote(
     return _result(row)
 
 
-def rollback(
+async def rollback(
     ctx: AdminContext, uow: UnitOfWork, *, principal: str, harness: str, reason: str | None
 ) -> dict[str, Any]:
     """Return one harness to the image its last promotion replaced (ADR 0016). The two
@@ -213,6 +218,12 @@ def rollback(
         raise ConflictError(
             f"the previous image carries {harness} {existing.previous_version}, outside the "
             f"adapter's range {adapter.supported_versions.text}; promote a supported image"
+        )
+    listed = {image.digest for _, image in await provider_images(ctx)}
+    if existing.previous_digest not in listed:
+        raise ConflictError(
+            f"no provider lists {existing.previous_reference} any more, so {harness} "
+            "cannot go back to it; promote an image the providers see"
         )
     before = _view(existing)
     row = uow.harness_images.put(
