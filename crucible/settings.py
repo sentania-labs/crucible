@@ -230,6 +230,9 @@ class GitHubAppSettings(BaseModel):
     app_id: int = 0
     private_key_path: str | None = None
     webhook_secret_path: str | None = None
+    # On Kubernetes, the Secret in the service's own namespace that holds the App
+    # credential the service owns (ADR 0016).
+    secret_name: str = "crucible-github-app"
 
 
 class GitHubSettings(BaseModel):

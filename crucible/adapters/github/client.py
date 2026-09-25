@@ -55,6 +55,11 @@ class RestGitHubClient:
 
     # ----- auth ---------------------------------------------------------
 
+    def configured(self) -> bool:
+        """Whether an App credential is in place right now (ADR 0016). A client wired
+        for a store the operator has not filled yet says no, and delivery waits."""
+        return self._auth.configured()
+
     def installation_token(
         self, *, installation_id: int, repository: str, permissions: dict[str, str] | None = None
     ) -> InstallationToken:

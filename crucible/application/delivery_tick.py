@@ -117,7 +117,15 @@ class DeliveryCoordinator:
 
     @property
     def enabled(self) -> bool:
-        return self._github is not None
+        return self._github_ready()
+
+    def _github_ready(self) -> bool:
+        """A client exists and, when it can say so, an App credential is in place. The
+        credential may arrive at runtime from the Connect GitHub flow (ADR 0016)."""
+        if self._github is None:
+            return False
+        configured = getattr(self._github, "configured", None)
+        return not callable(configured) or bool(configured())
 
     def _fenced(self) -> Iterator[UnitOfWork]:  # pragma: no cover - thin delegate
         raise NotImplementedError
@@ -125,7 +133,7 @@ class DeliveryCoordinator:
     # ----- publication --------------------------------------------------
 
     async def publish(self) -> int:
-        if self._github is None or self._publisher is None:
+        if not self._github_ready() or self._publisher is None:
             return 0
         plans = await self._host._db(self._take_publishing)
         done = 0
@@ -136,7 +144,7 @@ class DeliveryCoordinator:
 
     async def push_quota_checkpoint(self, attempt_id: str, *, required: bool) -> tuple[bool, str]:
         """Push a collected quota checkpoint without opening or updating a pull request."""
-        if self._github is None or self._publisher is None:
+        if not self._github_ready() or self._github is None or self._publisher is None:
             if required:
                 return False, "the GitHub publisher is not configured"
             return True, "a publisher is not required for this repository"
@@ -523,7 +531,7 @@ class DeliveryCoordinator:
     # ----- observation --------------------------------------------------
 
     async def observe(self) -> int:
-        if self._github is None:
+        if not self._github_ready():
             return 0
         plans = await self._host._db(self._due_polls)
         polled = 0
