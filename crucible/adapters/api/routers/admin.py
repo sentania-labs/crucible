@@ -144,10 +144,10 @@ async def admin_status(ctx: Ctx, uow: UoW, _principal: Admin) -> dict[str, Any]:
 
 
 @router.get("/capabilities")
-async def capabilities(ctx: Ctx, uow: UoW, _principal: Orchestrator) -> dict[str, Any]:
-    """25: what Foundry may read: harnesses, providers, github health, workers, tasks,
-    wakes. Read-only; it never calls a mutation."""
-    return await status_admin.capabilities(_admin(ctx), uow)
+async def capabilities(ctx: Ctx, uow: UoW, principal: Orchestrator) -> dict[str, Any]:
+    """25: what Foundry may read: harnesses, providers, github health, and its own
+    workers, tasks and wakes. Read-only; it never calls a mutation."""
+    return await status_admin.capabilities(_admin(ctx), uow, principal)
 
 
 # ----- harnesses ---------------------------------------------------------------
@@ -469,6 +469,7 @@ def admin_revoke_token(
         reason=_reason(body),
     )
     uow.commit()
+    tokens.after_revoke(_admin(ctx), result)
     return result
 
 

@@ -32,6 +32,7 @@ from crucible.adapters.execution.kubernetes import (
     SettingsSource,
 )
 from crucible.adapters.execution.publisher import DockerPublisher, PublisherConfig
+from crucible.adapters.first_run import FILE_NAME, FileDelivery, SecretDelivery
 from crucible.adapters.github.appauth import AppAuthenticator, AppConfig
 from crucible.adapters.github.client import RestGitHubClient
 from crucible.adapters.github.transport import RestTransport
@@ -55,6 +56,7 @@ from crucible.domain.cluster_egress import SETTING_NAME, parse_cluster_egress
 from crucible.domain.ids import new_id
 from crucible.ports.artifacts import ArtifactStore
 from crucible.ports.execution import ExecutionProvider
+from crucible.ports.first_run import FirstRunDelivery
 from crucible.ports.github import GitHubClient
 from crucible.ports.harness import CredentialSource, HarnessGate, MountMode
 from crucible.ports.notification import WakeDeliverer
@@ -283,6 +285,29 @@ def kubernetes_provider(
     )
 
 
+def first_run_delivery(settings: Settings) -> FirstRunDelivery | None:
+    """Where the first-run administrator token goes (ADR 0016, crucible#122).
+
+    On Kubernetes, the Secret in the service namespace; on Docker, a file in the
+    credential root. Anywhere else there is no private place Crucible knows of, and
+    None means the migration mints no token at all rather than print one."""
+    k = settings.kubernetes
+    if k.enabled:
+        try:
+            access = (
+                kubeconfig_access(k.kubeconfig, k.kubeconfig_context)
+                if k.kubeconfig
+                else in_cluster_access()
+            )
+        except (KubernetesApiError, OSError) as exc:
+            log.error("the first-run token Secret is unreachable: %s", exc)
+            return None
+        return SecretDelivery(KubernetesClient(access, k.namespace, timeout=k.api_timeout_seconds))
+    if settings.docker.credential_root:
+        return FileDelivery(Path(settings.docker.credential_root) / FILE_NAME)
+    return None
+
+
 def github_client(settings: Settings) -> GitHubClient | None:
     """The GitHub adapter, when the App is configured. The key is a path Crucible reads
     to sign a JWT in memory; nothing about it is a configuration value (12)."""
@@ -379,6 +404,7 @@ def wire(settings: Settings) -> Wiring:
         timeout_seconds=settings.wake.timeout_seconds,
     )
     github = github_client(settings)
+    first_run = first_run_delivery(settings)
     admin = AdminContext(
         uow_factory=factory,
         clock=SystemClock(),
@@ -406,6 +432,7 @@ def wire(settings: Settings) -> Wiring:
         proxy_reload_timeout_seconds=settings.admin.proxy_reload_timeout_seconds,
         kubernetes_egress_seed=kubernetes_egress_seed(settings),
         kubernetes_protected_namespaces=kubernetes_protected_namespaces(settings),
+        first_run=first_run,
     )
     ctx = AppContext(
         uow_factory=factory,
@@ -422,6 +449,7 @@ def wire(settings: Settings) -> Wiring:
         credential_sources=credential_sources(settings),
         admin=admin,
         settings=settings,
+        first_run=first_run,
     )
     publisher: Publisher | None = None
     if docker is not None and github is not None:
