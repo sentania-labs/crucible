@@ -1160,7 +1160,7 @@ async def test_a_required_credential_with_no_declared_auth_files_fails_naming_th
 
 
 async def test_a_rotated_auth_file_is_written_back_and_the_copy_removed() -> None:
-    """12: on a clean exit, a valid, newer file is synced back and the copy removed."""
+    """12: a valid, newer file is synced back and the copy removed."""
     api, provider, launch, workspace = await codex_attempt()
     handle = await provider.launch(workspace, launch)
     claim = api.claims["ws-01attempt0000000000000000a"]
@@ -1177,6 +1177,26 @@ async def test_a_rotated_auth_file_is_written_back_and_the_copy_removed() -> Non
     )
     assert sync.removed and not api.secret_exists("cred-01attempt0000000000000000a")
     assert "credential/auth.json" not in claim
+
+
+async def test_a_failed_attempts_newer_auth_file_is_still_written_back() -> None:
+    """12, issue 56: a harness that refreshed its token before the task failed has
+    rotated the refresh token; the one in the harness Secret may already be revoked.
+    The newer, valid file is written back whatever the exit code."""
+    api, provider, launch, workspace = await codex_attempt()
+    api.script(launch.attempt_id, "crash")
+    handle = await provider.launch(workspace, launch)
+    api.claims["ws-01attempt0000000000000000a"]["credential/auth.json"] = _auth(
+        "2026-09-21T00:00:00Z"
+    )
+    observation = await run_to_exit(provider, handle)
+    assert observation.exit_code not in (None, 0)
+    outputs = await provider.collect(handle, workspace, launch)
+    assert outputs.credential_sync is not None
+    assert [(f.name, f.synced) for f in outputs.credential_sync.files] == [("auth.json", True)]
+    assert api.harness_secret("crucible-harness-codex")["auth.json"] == _auth(
+        "2026-09-21T00:00:00Z"
+    )
 
 
 async def test_an_older_auth_file_is_recorded_and_not_written_back() -> None:

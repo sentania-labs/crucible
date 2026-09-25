@@ -160,13 +160,23 @@ Crucible's own argv. Everything else the
 harness reads from its config directory (settings, hooks, MCP definitions,
 instruction files) is mounted read-only from a Crucible-owned template, so
 a worker cannot plant a hook or a server definition that a later worker
-inherits. On clean exit, Crucible validates each named auth file's JSON
-shape and syncs back only those files, choosing by the newest issued-at
-timestamp inside the token, never by exit order; a file that is not the
-expected shape, or not newer than the source as it stands, is recorded and
-not written. A file the adapter marks as state rather than a credential is
-seeded and never written back. Then the copy is removed
-at once.
+inherits. Whenever the attempt reaches collection, whatever its exit code,
+Crucible validates each named auth file's JSON shape and syncs back only those
+files, choosing by the newest issued-at timestamp inside the token, never by
+exit order; a file that is not the expected shape, or not newer than the source
+as it stands, is recorded and not written. A file the adapter marks as state
+rather than a credential is seeded and never written back. Then the copy is
+removed at once.
+
+The exit code is deliberately not a condition. A harness that refreshed its
+token before the task failed has rotated its refresh token, so the one in the
+source may already be revoked, and dropping the newer file would lock every
+later worker out (the refresh race below). Nor does a successful exit make a
+file more trustworthy: the shape and issued-at checks are what stand between a
+worker and the source, on every path. A worker the provider lost is never
+collected, and its copy is removed without a sync (16). (Amended 2026-09-25,
+issue 56: this paragraph said "on clean exit" while 26 and both providers sync
+whenever an attempt reaches collection.)
 
 The copy is removed on **every** path, not only the clean one: a start that
 failed after seeding, a worker the daemon lost, and a transport failure
