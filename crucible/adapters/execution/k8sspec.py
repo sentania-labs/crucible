@@ -62,6 +62,8 @@ ANNOTATION_EGRESS = "crucible.io/egress-hosts"
 
 ROLE_WORKER = "worker"
 ROLE_PREPARER = "preparer"
+# 26: the one writer of the shared reference cache; the preparer only reads it (#55).
+ROLE_CACHE_REFRESHER = "cache-refresher"
 ROLE_COLLECTOR = "collector"
 ROLE_BUNDLE = "bundle-verifier"
 ROLE_VERIFIER = "verifier"
@@ -842,6 +844,7 @@ __all__ = [
     "REPORT_MOUNT",
     "REPO_MOUNT",
     "ROLE_BUNDLE",
+    "ROLE_CACHE_REFRESHER",
     "ROLE_CANARY",
     "ROLE_CLEANER",
     "ROLE_COLLECTOR",

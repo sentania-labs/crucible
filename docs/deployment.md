@@ -176,9 +176,19 @@ prunes them.
 5. Watch the migration Job complete. `crucible serve` refuses to start against a schema
    that is not at head, so the api and supervisor wait for it rather than corrupting
    anything.
-6. Read the one-time first-run administrator token out of the migration Job's log. It is
-   printed once, in a framed block, and only its salted hash is stored (25). Store it
-   before the log rotates.
+6. Read the one-time first-run administrator token from the Secret the migration Job
+   wrote. It is never in the Job's log (ADR 0016); the log says only where it is:
+
+   ```sh
+   kubectl -n crucible get secret crucible-first-run-admin \
+     -o jsonpath='{.data.token}' | base64 -d
+   ```
+
+   Only the migrate Job's account can create that Secret and only the api's account can
+   delete it; reading it takes your own cluster permissions. The api deletes it the
+   first time you sign in at `/ui` with it (or when that principal is revoked), so
+   create your own administrator before you lose the session. Only the token's salted
+   hash is stored (25).
 
 ## Logging the harnesses in
 

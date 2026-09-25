@@ -123,9 +123,11 @@ make e2e-live HARNESS=claude_code \
 
 Administration (25) is one set of operations behind three entry points: the
 server-rendered `/ui`, `/v1/admin`, and `crucible admin`. They call the same
-services and own no separate state. On a fresh deployment, retrieve the
-one-time administrator token from `docker compose logs migrate`, then open
-`http://127.0.0.1:8080/ui`. Every mutation takes a reason, needs a live
+services and own no separate state. On a fresh deployment, read the
+one-time administrator token with `docker compose exec crucible cat
+/var/lib/crucible/credentials/first-run-admin-token` (it is never in a log,
+ADR 0016), then open `http://127.0.0.1:8080/ui`; the first sign-in removes
+the file. Every mutation takes a reason, needs a live
 supervisor, and leaves an event with the principal and a before/after summary,
 never a value:
 
@@ -166,7 +168,8 @@ build of this branch). Before the first tagged release the answer is
 `POSTGRES_PASSWORD` there. First use after `make up`:
 
 ```sh
-docker compose logs migrate     # copy the framed first-run administrator token
+# the first-run administrator token (never in a log; removed on first sign-in)
+docker compose exec crucible cat /var/lib/crucible/credentials/first-run-admin-token
 # Open http://127.0.0.1:8080/ui and create any additional principals there.
 docker compose exec crucible crucible admin --reason "onboarding" repository register \
   --name example-service --url https://github.com/example-org/example-service \
