@@ -383,6 +383,25 @@ async def test_list_images_resolves_a_few_tags_at_once_and_skips_failures() -> N
     assert 1 < registry.peak <= LIST_IMAGES_CONCURRENCY
 
 
+async def test_a_tagged_repository_entry_is_skipped_by_a_registry_404_not_a_parse_error() -> None:
+    """80: `probe_image` mistakenly landing in `image_repositories` builds
+    `<repo:tag>:<tag>` for every tag the registry lists under it. `parse_reference`
+    does not reject that shape; the registry still lists tags for it and only the
+    manifest read 404s, dropping the entry the same way an unavailable one does."""
+    registry = FakeRegistry()
+    registry.register("ghcr.io/o/worker:t00")
+    registry._tags["ghcr.io/o/worker:probe"] = ["t00"]
+    provider = KubernetesProvider(
+        KubernetesConfig(image_repositories=("ghcr.io/o/worker", "ghcr.io/o/worker:probe")),
+        FakeKubernetesApi(),  # type: ignore[arg-type]
+        registry,
+    )
+
+    images = await provider.list_images()
+
+    assert [i.reference for i in images] == ["ghcr.io/o/worker:t00"]
+
+
 def _alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)

@@ -315,8 +315,10 @@ class KubernetesConfig:
     # One exact, pullable worker image for the readiness canary (26). It is deliberately
     # not an entry of `image_repositories`: the listing would take it for a repository,
     # list the same tags a second time, and then build `<repo>:<probe tag>:<tag>` for
-    # each of them, which is a reference that does not parse and one suppressed registry
-    # round trip per tag on every `GET /admin/images`.
+    # each of them. `parse_reference` does not reject that shape, so it is a real
+    # manifest lookup the registry answers 404 to, not a caught parse error: one wasted
+    # round trip per tag on every `GET /admin/images`, and nothing worse only because
+    # the 404 happens to be what quietly drops the entry.
     probe_image: str = ""
     use_reference_cache: bool = True
     # 26, issue 93: the canary is a shell script with curl, not a role pod, so it asks
