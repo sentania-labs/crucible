@@ -19,6 +19,16 @@ from crucible.adapters.execution.k8sapi import (
 )
 
 
+@pytest.fixture(autouse=True)
+def private_tempdir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A temporary directory nothing else on the machine writes to, so the tests can
+    see that the client wrote nothing there."""
+    directory = tmp_path / "tmp"
+    directory.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(directory))
+    return directory
+
+
 def test_kind_inline_kubeconfig_material_is_held_in_memory(tmp_path: Path) -> None:
     material = {
         "ca": b"kind ca certificate\n",
