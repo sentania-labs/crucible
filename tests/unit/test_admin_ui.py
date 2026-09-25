@@ -978,7 +978,11 @@ def test_the_settings_page_shows_broad_egress_and_the_resolve_ttl(
     monkeypatch.delenv("CRUCIBLE_CONFIG", raising=False)
     monkeypatch.setenv("CRUCIBLE_KUBERNETES__RESOLVE_TTL_SECONDS", "120")
     rows = {
-        row[0]: row for row in _settings_rows(Settings(kubernetes={"resolve_ttl_seconds": 120}))
+        # A provider's settings are listed only while it is on (crucible#125).
+        row[0]: row
+        for row in _settings_rows(
+            Settings(kubernetes={"enabled": True, "resolve_ttl_seconds": 120})
+        )
     }
     assert rows["kubernetes.broad_egress"][1:3] == [False, "default"]
     assert "GitHub included" in rows["kubernetes.broad_egress"][3]
