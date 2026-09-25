@@ -669,6 +669,86 @@ async def test_an_adopted_attempt_records_its_node() -> None:
     assert document["node"] == "lab-node-1"
 
 
+def _record_deletes(api: FakeKubernetesApi) -> list[tuple[str, str, int | None]]:
+    """Every delete with the grace period it asked for; the fake itself keeps names."""
+    seen: list[tuple[str, str, int | None]] = []
+    real = api.delete
+
+    def delete(kind: str, name: str, **kwargs: Any) -> None:
+        seen.append((kind, name, kwargs.get("grace_period_seconds")))
+        real(kind, name, **kwargs)
+
+    api.delete = delete  # type: ignore[method-assign]
+    return seen
+
+
+async def test_an_adopted_attempt_drains_with_the_task_policys_grace_period() -> None:
+    """Issue 66: after a supervisor restart the adopted attempt has no policy in memory,
+    and a drain must still give the worker the policy's grace, not a 60 s default."""
+    policy = {
+        "images": {"allowlist": ["crucible-worker:*"]},
+        "resources": {"cpus": 2, "memory": "4GiB"},
+        "limits": {"grace_seconds": 45},
+    }
+    api, _registry, provider, launch, workspace = await prepared(policy=policy)
+    handle = await provider.launch(workspace, launch)
+    provider._launched.clear()
+    [adopted] = await provider.reconcile()
+    assert provider._launched[launch.attempt_id].limits.grace_seconds == 45
+    deletes = _record_deletes(api)
+    await provider.terminate(adopted, "drain")
+    assert deletes == [("pods", f"{handle.ref}-abc12", 45)]
+
+
+async def test_a_drain_on_a_handle_the_provider_never_saw_uses_the_pods_grace() -> None:
+    """Issue 66: a handle with no `_Launched` behind it (a terminate before any
+    reconcile) reads the grace period off the live Pod rather than guessing 60 s."""
+    api, _registry, provider, launch, workspace = await prepared()
+    handle = await provider.launch(workspace, launch)
+    provider._launched.clear()
+    deletes = _record_deletes(api)
+    await provider.terminate(handle, "drain")
+    assert deletes == [("pods", f"{handle.ref}-abc12", 30)]
+
+
+async def test_an_adopted_attempt_records_the_live_pods_limits() -> None:
+    """Issue 76: the hardening evidence of an adopted attempt is what its live Pod
+    carries (here, as an admission controller rewrote it), not the policy's intent."""
+    api, _registry, provider, launch, workspace = await prepared()
+    handle = await provider.launch(workspace, launch)
+    pod = api.objects[("pods", f"{handle.ref}-abc12")].body
+    container = pod["spec"]["containers"][0]
+    container["resources"] = {
+        "limits": {"cpu": "1500m", "memory": "3Gi", "ephemeral-storage": "1Gi"},
+        "requests": {"cpu": "750m", "memory": "3Gi"},
+    }
+    provider._launched.clear()
+    [adopted] = await provider.reconcile()
+    await run_to_exit(provider, adopted)
+    outputs = await provider.collect(adopted, workspace, launch)
+    evidence = next(a for a in outputs.artifacts if a.name == "report/kubernetes-launch.json")
+    document = json.loads(evidence.content)
+    assert document["limits_source"] == "pod"
+    assert document["limits"]["cpu"] == "1500m"
+    assert document["limits"]["memory"] == str(3 * 1024**3)
+    assert document["limits"]["cpu_request"] == "750m"
+    assert document["limits"]["ephemeral_storage"] == "1Gi"
+    assert document["limits"]["termination_grace_seconds"] == 30
+
+
+async def test_a_launched_attempt_records_limits_read_from_its_pod() -> None:
+    """Issue 76: without a restart too, the evidence is the Pod as the API server
+    stored it once the Pod has been seen."""
+    _api, _registry, provider, launch, workspace = await prepared()
+    handle = await provider.launch(workspace, launch)
+    await run_to_exit(provider, handle)
+    outputs = await provider.collect(handle, workspace, launch)
+    evidence = next(a for a in outputs.artifacts if a.name == "report/kubernetes-launch.json")
+    document = json.loads(evidence.content)
+    assert document["limits_source"] == "pod"
+    assert document["limits"] == provider._limits(launch).as_dict()
+
+
 async def test_reconcile_does_not_adopt_a_finished_job_with_no_pod() -> None:
     """A Job that already finished before this restart and had its Pod reaped is not a
     launch still in flight; the normal cleanup pass handles it, not reconcile."""

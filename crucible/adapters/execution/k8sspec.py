@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import base64
 import ipaddress
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -224,6 +225,103 @@ def limits_from_policy(
         grace_seconds=grace,
         cpu_request_fraction=float(resources.get("cpu_request_fraction") or 0.5),
         memory_request_fraction=float(resources.get("memory_request_fraction") or 1.0),
+    )
+
+
+# A Kubernetes resource quantity's suffixes (`resource.Quantity`): the binary ones, the
+# decimal ones, and `m`, which only ever means milli.
+_QUANTITY_SUFFIXES: dict[str, float] = {
+    "Ki": 1024.0,
+    "Mi": 1024.0**2,
+    "Gi": 1024.0**3,
+    "Ti": 1024.0**4,
+    "Pi": 1024.0**5,
+    "Ei": 1024.0**6,
+    "m": 1e-3,
+    "k": 1e3,
+    "M": 1e6,
+    "G": 1e9,
+    "T": 1e12,
+    "P": 1e15,
+    "E": 1e18,
+}
+
+
+def quantity(value: Any) -> float | None:
+    """A Kubernetes resource quantity (`2`, `500m`, `4Gi`, `1e3`) as a number, or None
+    when it is not one. The API server may return a quantity in a canonical form other
+    than the one Crucible sent, so a live Pod is read by value, not by string."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int | float):
+        return float(value)
+    text = str(value or "").strip()
+    if not text:
+        return None
+    factor = 1.0
+    for suffix in sorted(_QUANTITY_SUFFIXES, key=len, reverse=True):
+        if text.endswith(suffix) and text[: -len(suffix)]:
+            factor = _QUANTITY_SUFFIXES[suffix]
+            text = text[: -len(suffix)]
+            break
+    try:
+        number = float(text)
+    except ValueError:
+        return None
+    if number < 0 or not math.isfinite(number):
+        return None
+    return number * factor
+
+
+def limits_from_pod(pod: Mapping[str, Any], fallback: Limits) -> Limits:
+    """The limits a live Pod (or a Job's pod template) actually carries (issues 66, 76).
+
+    What the API server stored is the effective shape: admission may have defaulted or
+    rewritten what Crucible asked for, and an adopted attempt has no policy in memory at
+    all. Every field is read from `pod` where it is present and parses, and taken from
+    `fallback` only where it is not, so a partial or unfamiliar Pod never invents a
+    number."""
+    containers = [c for c in pod.get("containers") or [] if isinstance(c, Mapping)]
+    container: Mapping[str, Any] = next(
+        (c for c in containers if c.get("name") == CONTAINER_NAME),
+        containers[0] if containers else {},
+    )
+    resources = container.get("resources") or {}
+    limit = resources.get("limits") or {}
+    request = resources.get("requests") or {}
+    cpus = quantity(limit.get("cpu"))
+    memory = quantity(limit.get("memory"))
+    cpu_request = quantity(request.get("cpu"))
+    memory_request = quantity(request.get("memory"))
+    tmpfs: int | None = None
+    for volume in pod.get("volumes") or []:
+        if not isinstance(volume, Mapping) or volume.get("name") != "tmp":
+            continue
+        size = quantity((volume.get("emptyDir") or {}).get("sizeLimit"))
+        tmpfs = int(size) if size is not None else None
+    grace = pod.get("terminationGracePeriodSeconds")
+    effective_cpus = cpus if cpus else fallback.cpus
+    effective_memory = int(memory) if memory else fallback.memory_bytes
+    return Limits(
+        cpus=effective_cpus,
+        memory_bytes=effective_memory,
+        ephemeral_storage=str(limit.get("ephemeral-storage") or fallback.ephemeral_storage),
+        tmpfs_bytes=tmpfs if tmpfs is not None else fallback.tmpfs_bytes,
+        grace_seconds=(
+            int(grace)
+            if isinstance(grace, int) and not isinstance(grace, bool) and grace >= 0
+            else fallback.grace_seconds
+        ),
+        cpu_request_fraction=(
+            cpu_request / effective_cpus
+            if cpu_request is not None and cpus
+            else fallback.cpu_request_fraction
+        ),
+        memory_request_fraction=(
+            memory_request / effective_memory
+            if memory_request is not None and memory
+            else fallback.memory_request_fraction
+        ),
     )
 
 
@@ -774,10 +872,12 @@ __all__ = [
     "egress_policy",
     "job",
     "labels",
+    "limits_from_pod",
     "limits_from_policy",
     "memory_volume",
     "object_name",
     "pod_spec",
+    "quantity",
     "secret",
     "selector",
     "workspace_claim",

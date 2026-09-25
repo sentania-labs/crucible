@@ -422,6 +422,9 @@ class _Launched:
     job_name: str
     spec: LaunchSpec
     image_digest: str
+    # The limits the worker runs under. Policy-derived at launch, then replaced by what
+    # the live Pod carries once it is seen (issues 66, 76): an adopted attempt has no
+    # policy in memory, and admission may have rewritten what was asked for.
     limits: Limits
     network_policy: str | None = None
     credential: _CredentialCopy | None = None
@@ -432,6 +435,9 @@ class _Launched:
     # deleted it is never reported as lost (16).
     terminated: str | None = None
     exit_code: int | None = None
+    # Whether `limits` was read from the live Pod rather than derived from the policy or
+    # from the Job's template, so the evidence says which of the two it records.
+    limits_observed: bool = False
 
 
 # What an adopted attempt's `_Launched` carries before the supervisor hands the real
@@ -1168,6 +1174,8 @@ class KubernetesProvider:
         if launched is not None and not launched.pod_name:
             launched.pod_name = str((pod.get("metadata") or {}).get("name") or "")
             launched.node = str((pod.get("spec") or {}).get("nodeName") or "") or None
+        if launched is not None and not launched.limits_observed:
+            _observe_limits(launched, pod)
         terminated = _terminated_state(status)
         if terminated is not None:
             code = int(terminated.get("exitCode", -1))
@@ -1443,7 +1451,10 @@ class KubernetesProvider:
             "job": launched.job_name if launched else "",
             "pod": (launched.pod_name if launched else "") or "",
             "node": (launched.node if launched else "") or "",
-            "limits": self._limits(spec).as_dict(),
+            # What the live Pod carried when it was seen (issue 76), else what the policy
+            # asked for, and which of the two this is.
+            "limits": (launched.limits if launched else self._limits(spec)).as_dict(),
+            "limits_source": "pod" if launched and launched.limits_observed else "policy",
             "pod_pid_limit": probe.pid_limit if probe else None,
             "pod_pid_limit_source": probe.pid_limit_source if probe else "",
             "runtime_class": "standard",
@@ -1473,11 +1484,17 @@ class KubernetesProvider:
             pod = await self._pod_of(h.ref)
         except KubernetesApiError as exc:
             raise ProviderError(f"terminate could not read the Pod of {h.ref}: {exc}") from exc
-        grace = launched.limits.grace_seconds if launched else 60
         if launched is not None:
             launched.terminated = mode
         if pod is None:
             return
+        # The grace period is the one the Pod was created with, which is the task
+        # policy's (issue 66): an adopted attempt, or a handle the provider never
+        # launched, has no policy in memory, but the live Pod always carries it.
+        grace = k8sspec.limits_from_pod(
+            pod.get("spec") or {},
+            launched.limits if launched else k8sspec.limits_from_policy({}),
+        ).grace_seconds
         name = str((pod.get("metadata") or {}).get("name") or "")
         try:
             await self._call(
@@ -1607,25 +1624,22 @@ class KubernetesProvider:
                 # creation timestamp, not from now, so an attempt already past the
                 # window is caught on the first observation rather than given it again.
                 created = _age_seconds(str(metadata.get("creationTimestamp", "")))
-                # The Job's template is what the Pod is built from, and it is there
-                # whether or not a Pod exists yet. An empty image here would reach the
-                # helper Pods of collection, which the API server rejects (103).
+                # The live Pod is what the worker runs as (issues 66, 76); the Job's
+                # template is what it is built from, and is there whether or not a Pod
+                # exists yet. An empty image here would reach the helper Pods of
+                # collection, which the API server rejects (103).
                 template_spec = ((row.get("spec") or {}).get("template") or {}).get("spec") or {}
-                pod_spec = template_spec if template_spec.get("containers") else {}
-                if not pod_spec and pod is not None:
-                    pod_spec = pod.get("spec") or {}
+                live_spec = (pod or {}).get("spec") or {}
+                pod_spec = live_spec if live_spec.get("containers") else template_spec
                 containers = pod_spec.get("containers") or []
                 image = str((containers[0] if containers else {}).get("image", ""))
-                limits = replace(
-                    k8sspec.limits_from_policy({}),
-                    grace_seconds=int(pod_spec.get("terminationGracePeriodSeconds") or 60),
-                )
                 self._launched[attempt_id] = _Launched(
                     job_name=name,
                     spec=_ADOPTED_SPEC,
                     image_digest=image,
-                    limits=limits,
+                    limits=k8sspec.limits_from_pod(pod_spec, k8sspec.limits_from_policy({})),
                     launched_at=time.monotonic() - created,
+                    limits_observed=pod_spec is live_spec,
                 )
             launched = self._launched[attempt_id]
             if pod is not None and not launched.pod_name:
@@ -3648,6 +3662,14 @@ class KubernetesProvider:
 
 
 # ----- pure helpers -------------------------------------------------------
+
+
+def _observe_limits(launched: _Launched, pod: Mapping[str, Any]) -> None:
+    """Take the limits from the live Pod once it is seen (issues 66, 76)."""
+    spec = pod.get("spec") or {}
+    if spec.get("containers"):
+        launched.limits = k8sspec.limits_from_pod(spec, launched.limits)
+        launched.limits_observed = True
 
 
 def _seconds_until(timestamp: str) -> float:
