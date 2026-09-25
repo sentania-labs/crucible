@@ -414,7 +414,10 @@ def _readiness(
     monkeypatch.setattr(
         credentials_service,
         "state_view",
-        lambda _ctx, _uow, _name: {"state": credential_state, "last_launch_outcome": None},
+        lambda _ctx, _uow, _name, _secret=None: {
+            "state": credential_state,
+            "last_launch_outcome": None,
+        },
     )
     monkeypatch.setattr(status_service, "_enabled_models", lambda _uow: enabled_models or set())
     monkeypatch.setattr(status_service, "gateway_url", lambda _uow: (endpoint, "routing"))
@@ -606,14 +609,22 @@ async def test_gap_logic_reads_only_keys_from_real_status_document(
     supervisor = _supervisor_document(None, _status())
     status_module = cast(Any, status_service)
     monkeypatch.setattr(status_service, "list_images", list_images)
-    monkeypatch.setattr(status_service, "list_harnesses", lambda _ctx, _uow, _images: harnesses)
+
+    async def read_harnesses(_ctx: Any, _uow: Any, _images: Any) -> tuple[Any, dict[str, Any]]:
+        return harnesses, {}
+
+    async def read_stored(_ctx: Any) -> tuple[None, None]:
+        return None, None
+
+    monkeypatch.setattr(status_service, "read_harnesses", read_harnesses)
+    monkeypatch.setattr(status_module.github, "read_stored", read_stored)
     monkeypatch.setattr(status_service, "providers_status", provider_status)
     monkeypatch.setattr(
         status_service,
         "supervisor_view",
         lambda *_args: SimpleNamespace(model_dump=lambda **_kwargs: supervisor),
     )
-    monkeypatch.setattr(status_module.github, "status", lambda _ctx, _uow: {})
+    monkeypatch.setattr(status_module.github, "status", lambda _ctx, _uow, **_kwargs: {})
     monkeypatch.setattr(status_service, "workers", lambda _uow: [])
     monkeypatch.setattr(status_service, "tasks", lambda _uow: {})
     monkeypatch.setattr(status_service, "wakes", lambda _uow: {})
@@ -622,7 +633,9 @@ async def test_gap_logic_reads_only_keys_from_real_status_document(
     monkeypatch.setattr(status_module.audit, "tail", lambda _uow, **_kwargs: {"next_cursor": None})
     computed: dict[str, Any] = {}
 
-    def readiness(ctx: Any, uow: Any, document: dict[str, Any]) -> dict[str, Any]:
+    def readiness(
+        ctx: Any, uow: Any, document: dict[str, Any], secrets: Any = None
+    ) -> dict[str, Any]:
         result = _readiness(_strict_status(document), monkeypatch)
         computed["readiness"] = result
         return result
