@@ -18,7 +18,7 @@ import pytest
 
 from crucible.adapters.execution import k8sspec
 from crucible.adapters.execution import kubernetes as kubernetes_module
-from crucible.adapters.execution.k8sapi import ExecResult, KubernetesApiError
+from crucible.adapters.execution.k8sapi import ExecResult, KubernetesApiError, LogFrame
 from crucible.adapters.execution.k8sfake import FakeKubernetesApi
 from crucible.adapters.execution.kubernetes import (
     CollectionFailedError,
@@ -535,6 +535,35 @@ async def test_a_capped_log_read_resumes_with_the_line_it_cut(
     assert stored == [line.partition(" ")[2].encode() for line in lines]
     assert len(api.log_reads) > 2
     assert {r["limit_bytes"] for r in api.log_reads} == {400}
+
+
+async def test_a_short_truncated_log_response_resumes_with_the_whole_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue 76 follow-up: the kubelet can land short of `limitBytes` and still cut a
+    line in half. Detecting a capped read by the missing trailing newline, not by exact
+    byte equality against the limit, still resumes with the whole line."""
+    monkeypatch.setattr(kubernetes_module, "LOG_READ_LIMIT", 400)
+    lines = [_stamped(s, n, f"line {s}.{n} " + "x" * 20) for s in range(6) for n in range(3)]
+    api, provider, handle = await _worker_with_log(lines)
+    real = api.pod_log
+
+    def pod_log(*args: Any, **kwargs: Any) -> Any:
+        call_kwargs = dict(kwargs)
+        limit = call_kwargs.pop("limit_bytes", None)
+        frames = real(*args, **call_kwargs, limit_bytes=None)
+        payload = b"".join(f.payload for f in frames)
+        if limit is not None and len(payload) > limit:
+            # A real kubelet response can land a few bytes short of the exact
+            # limit and still cut a line in half.
+            payload = payload[: max(0, limit - 5)]
+        return [LogFrame("stdout", payload)] if payload else []
+
+    api.pod_log = pod_log  # type: ignore[method-assign]
+    api.log_reads.clear()
+    stored = await _drain_logs(provider, handle)
+    assert stored == [line.partition(" ")[2].encode() for line in lines]
+    assert len(api.log_reads) > 2
 
 
 async def test_a_second_fuller_than_one_read_is_read_again_larger(

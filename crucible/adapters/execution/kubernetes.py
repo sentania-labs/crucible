@@ -1463,11 +1463,18 @@ class KubernetesProvider:
                     return []
                 raise ProviderError(f"log pull failed: {exc}") from exc
             payload = b"".join(frame.payload for frame in frames)
-            capped = len(payload) >= limit
-            # A capped read can stop inside a line; that line is read whole next time.
-            whole = payload[: payload.rfind(b"\n") + 1] if capped else payload
+            # The kubelet can land short of `limitBytes` and still cut a line in half,
+            # so byte-count equality against `limit` alone cannot tell a whole trailing
+            # line from a cut one. A payload that does not end in a newline has an
+            # incomplete trailing line whatever its length; that line is read whole
+            # next time. A payload that fills the requested limit may still have more
+            # data past it even when it happens to end on a line boundary, so that
+            # alone is still reason to retry larger when nothing new came back.
+            truncated = len(payload) >= limit
+            incomplete = bool(payload) and not payload.endswith(b"\n")
+            whole = payload[: payload.rfind(b"\n") + 1] if incomplete else payload
             chunks = _chunks([LogFrame("stdout", whole)] if whole else [], since)
-            if chunks or not capped:
+            if chunks or not (truncated or incomplete):
                 return chunks
             if limit < LOG_READ_CEILING:
                 limit = min(limit * 4, LOG_READ_CEILING)
