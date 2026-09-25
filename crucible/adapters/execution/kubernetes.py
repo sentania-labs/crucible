@@ -2144,9 +2144,15 @@ class KubernetesProvider:
     def read_credential_files(self, harness: str) -> dict[str, bytes] | None:
         """The adapter's declared auth files the Secret holds, by auth file name. None
         when the Secret does not exist; a declared file it lacks is simply absent."""
+        return self.credential_files_in(harness, self.read_credential_secret(harness))
+
+    def credential_files_in(
+        self, harness: str, body: dict[str, Any] | None
+    ) -> dict[str, bytes] | None:
+        """`read_credential_files` of a Secret body already read, so a caller that needs
+        the body and the files reads the Secret once."""
         adapter = self.harnesses.require(harness)
         credential = adapter.credential_spec()
-        body = self.read_credential_secret(harness)
         if body is None:
             return None
         data = body.get("data") or {}

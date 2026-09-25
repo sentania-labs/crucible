@@ -370,7 +370,8 @@ def test_schema_names_every_kind_a_command_can_print(capsys: pytest.CaptureFixtu
         argv = [*words, *("x" for _ in shape["positionals"])]
         for flag, option in shape["options"].items():
             if option["required"]:
-                argv += [flag, (option["choices"] or ["x"])[0]]
+                default = "1" if option["type"] == "int" else "x"
+                argv += [flag, (option["choices"] or [default])[0]]
         if path == "admin routing set-local-endpoint":
             # A required mutually-exclusive group; walk() records its members but not
             # the group's own requiredness, so synthesize the missing choice here.

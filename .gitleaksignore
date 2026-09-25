@@ -1,0 +1,5 @@
+# One finding, fingerprinted exactly, that is not a secret: commit 10d9240 wrote a unit
+# test fixture whose body is the literal text "not-a-real-key" between PEM header lines.
+# The next commit assembles the header at run time instead, and history is never
+# rewritten, so the commit that carried it is named here (FDY-0117, 2026-09-25).
+10d9240aa23ed5c0163d480f3a087de5f41af0c8:tests/unit/test_first_run_units.py:crucible-private-key-header:20

@@ -32,6 +32,7 @@ from crucible.application.admin import (
     audit,
     bootstrap,
     credentials,
+    gateway,
     github,
     harnesses,
     images,
@@ -78,12 +79,13 @@ TOKEN_ENVS = (ADMIN_TOKEN_ENV, TOKEN_ENV)
 
 DESCRIPTION = """\
 The operator's console (25): harness gates, credentials and login, image promotion,
-tokens, repositories, routing, the bootstrap import, audit. Runs in process against the
-configured database by default; with --api-url URL (or --remote, which takes the URL
-from CRUCIBLE_URL or the client configuration file) it calls the running API with the
-token in CRUCIBLE_ADMIN_TOKEN, else CRUCIBLE_TOKEN. Every mutation takes --reason,
-placed before the verb: `crucible admin --reason TEXT harnesses disable codex`.
-Output is one JSON envelope (see `crucible --help`)."""
+tokens, repositories, routing, the local gateway, GitHub, the bootstrap import, audit.
+Runs in process against the configured database by default; with --api-url URL (or
+--remote, which takes the URL from CRUCIBLE_URL or the client configuration file) it
+calls the running API with the token in CRUCIBLE_ADMIN_TOKEN, else CRUCIBLE_TOKEN.
+Every mutation takes --reason, placed before the verb:
+`crucible admin --reason TEXT harnesses disable codex`. Output is one JSON envelope
+(see `crucible --help`)."""
 
 
 def build_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -203,6 +205,78 @@ def build_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     g_sub = g.add_subparsers(dest="github_command", required=True)
     g_sub.add_parser("status", help="the App's configuration and key")
     g_sub.add_parser("check", help="mint and discard a token per registered repository")
+    connect = g_sub.add_parser(
+        "connect",
+        help="an existing App's id and private key, checked with GitHub and then kept by "
+        "the service (ADR 0017)",
+    )
+    connect.add_argument("--app-id", type=int, required=True, help="the App's numeric id")
+    connect.add_argument(
+        "--private-key-file",
+        required=True,
+        help="the .pem GitHub gave you; read here, never placed in argv or a record",
+    )
+    connect.add_argument(
+        "--webhook-secret-file", default=None, help="the App's webhook secret, when one is used"
+    )
+    g_sub.add_parser(
+        "installations", help="the App's install link, installations and their repositories"
+    )
+    add_repo = g_sub.add_parser(
+        "add-repository",
+        help="register a repository an installation covers, with GitHub's default branch",
+    )
+    add_repo.add_argument("--installation-id", type=int, required=True)
+    add_repo.add_argument("--repository", required=True, help="OWNER/NAME")
+    add_repo.add_argument(
+        "--name", default=None, help="the registered name (default: the repository's own)"
+    )
+    add_repo.add_argument("--policy", default="default-software", help="the policy name")
+    add_repo.add_argument(
+        "--attest-external-review-all-prs",
+        action="store_true",
+        help="attest the external reviewer reviews every pull request (23)",
+    )
+    add_repo.add_argument("--attested-by", default=None, help="who attests")
+
+    gw = sub.add_parser(
+        "gateway", help="the local gateway: its URL, the Hermes key, a test, and its models"
+    )
+    gw_sub = gw.add_subparsers(dest="gateway_command", required=True)
+    gw_sub.add_parser("show", help="the gateway URL, whether a key is set, and the last test")
+    gw_set = gw_sub.add_parser(
+        "set", help="set the gateway URL (and the key with --key), then test both"
+    )
+    gw_set.add_argument(
+        "--endpoint-url", required=True, help="the gateway's base URL, ending in /v1"
+    )
+    gw_set.add_argument(
+        "--key",
+        action="store_true",
+        help="also read a new Hermes key from a hidden prompt or stdin, never argv",
+    )
+    gw_sub.add_parser("test", help="test the saved URL and key again")
+    gw_sub.add_parser("models", help="the models the key can see, beside the entries in force")
+    pick = gw_sub.add_parser(
+        "pick", help="enable or disable gateway models; writes a new routing policy version"
+    )
+    pick.add_argument("--enable", action="append", default=[], metavar="MODEL")
+    pick.add_argument("--disable", action="append", default=[], metavar="MODEL")
+    pick.add_argument(
+        "--thinking",
+        action="append",
+        default=[],
+        metavar="MODEL",
+        help="thinking on by default for this picked model (off for the others)",
+    )
+    pick.add_argument(
+        "--capability",
+        action="append",
+        default=[],
+        metavar="MODEL=CAPABILITY",
+        help="small, mid or frontier (a new model defaults to mid)",
+    )
+    pick.add_argument("--max-concurrency", type=int, default=None, help="the pool's limit")
 
     a = sub.add_parser("audit", help="the audit log")
     a_sub = a.add_subparsers(dest="audit_command", required=True)
@@ -361,6 +435,62 @@ def _read_api_key() -> str:
     )
 
 
+def _picks(args: argparse.Namespace) -> list[dict[str, Any]]:
+    """`gateway pick` flags as the model picks the service checks."""
+    capabilities: dict[str, str] = {}
+    for item in args.capability:
+        model, sep, value = item.partition("=")
+        if not sep or not model or not value:
+            raise UsageError(f"--capability takes MODEL=CAPABILITY, not {item!r}")
+        capabilities[model] = value
+    named = list(dict.fromkeys([*args.enable, *args.disable]))
+    stray = sorted((set(args.thinking) | set(capabilities)) - set(named))
+    if stray:
+        raise UsageError(f"{stray} must also be named with --enable or --disable")
+    if not named:
+        raise UsageError("name at least one model with --enable or --disable")
+    return [
+        {
+            "id": model,
+            "enabled": model in args.enable and model not in args.disable,
+            "enable_thinking": model in args.thinking,
+            "capability": capabilities.get(model),
+        }
+        for model in named
+    ]
+
+
+def _read_file(path: str, what: str) -> str:
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return handle.read()
+    except OSError as exc:
+        raise UsageError(f"cannot read the {what} from {path}: {exc.strerror}") from None
+
+
+def _connect_body(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "app_id": args.app_id,
+        "private_key": _read_file(args.private_key_file, "private key"),
+        "webhook_secret": (
+            _read_file(args.webhook_secret_file, "webhook secret")
+            if args.webhook_secret_file
+            else None
+        ),
+    }
+
+
+def _add_repository_body(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "installation_id": args.installation_id,
+        "repository": args.repository,
+        "name": args.name,
+        "policy_name": args.policy,
+        "attested_all_prs": args.attest_external_review_all_prs,
+        "attested_by": args.attested_by,
+    }
+
+
 # ----- remote mode -------------------------------------------------------------
 
 
@@ -415,7 +545,38 @@ def _remote(args: argparse.Namespace, remote: Api) -> Any:
     if command == "github":
         if args.github_command == "status":
             return remote.call("GET", "/v1/admin/github")
+        if args.github_command == "connect":
+            return remote.call("POST", "/v1/admin/github/app", {**reason, **_connect_body(args)})
+        if args.github_command == "installations":
+            return remote.call("GET", "/v1/admin/github/installations")
+        if args.github_command == "add-repository":
+            return remote.call(
+                "POST", "/v1/admin/github/repositories", {**reason, **_add_repository_body(args)}
+            )
         return remote.call("POST", "/v1/admin/github/check", reason)
+    if command == "gateway":
+        verb = args.gateway_command
+        if verb == "show":
+            return remote.call("GET", "/v1/admin/gateway")
+        if verb == "models":
+            return remote.call("GET", "/v1/admin/gateway/models")
+        if verb == "test":
+            return remote.call("POST", "/v1/admin/gateway/test", reason)
+        if verb == "pick":
+            return remote.call(
+                "POST",
+                "/v1/admin/gateway/models",
+                {**reason, "models": _picks(args), "max_concurrency": args.max_concurrency},
+            )
+        return remote.call(
+            "POST",
+            "/v1/admin/gateway",
+            {
+                **reason,
+                "endpoint_url": args.endpoint_url,
+                "api_key": _read_api_key() if args.key else None,
+            },
+        )
     if command == "audit":
         query = f"?limit={args.limit}" + (f"&cursor={args.cursor}" if args.cursor else "")
         return remote.call("GET", "/v1/admin/audit" + query)
@@ -619,11 +780,42 @@ def _local(args: argparse.Namespace, wiring: Wiring) -> Any:
         return {"items": asyncio.run(providers_admin.providers_status(admin))}
     if command == "github":
         with wiring.ctx.uow_factory() as uow:
-            if args.github_command == "status":
+            verb = args.github_command
+            if verb == "status":
                 return github.status(admin, uow)
-            result = github.check(admin, uow, principal=principal, reason=args.reason)
+            if verb == "installations":
+                return github.apps_view(admin, uow)
+            if verb == "connect":
+                body = _connect_body(args)
+                result = github.connect(
+                    admin,
+                    uow,
+                    principal=principal,
+                    app_id=body["app_id"],
+                    private_key=body["private_key"],
+                    webhook_secret=body["webhook_secret"],
+                    reason=args.reason,
+                )
+            elif verb == "add-repository":
+                body = _add_repository_body(args)
+                result = github.add_repository(
+                    admin,
+                    uow,
+                    principal=principal,
+                    installation_id=body["installation_id"],
+                    repository=body["repository"],
+                    name=body["name"],
+                    policy_name=body["policy_name"],
+                    attested_all_prs=body["attested_all_prs"],
+                    attested_by=body["attested_by"],
+                    reason=args.reason,
+                )
+            else:
+                result = github.check(admin, uow, principal=principal, reason=args.reason)
             uow.commit()
             return result
+    if command == "gateway":
+        return _local_gateway(args, wiring, admin)
     if command == "audit":
         with wiring.ctx.uow_factory() as uow:
             return audit.tail(uow, cursor=args.cursor, limit=args.limit)
@@ -693,6 +885,46 @@ def _local(args: argparse.Namespace, wiring: Wiring) -> Any:
     if command == "bootstrap":
         return _local_bootstrap(args, wiring, admin, principal)
     raise UsageError(f"unknown command: {command}")
+
+
+def _local_gateway(args: argparse.Namespace, wiring: Wiring, admin: AdminContext) -> Any:
+    principal = Principal(
+        id=CLI_PRINCIPAL, name=CLI_PRINCIPAL, role=Role.ADMIN, created_at=wiring.ctx.clock.now()
+    )
+    verb = args.gateway_command
+    with wiring.ctx.uow_factory() as uow:
+        if verb == "show":
+            return gateway.gateway_view(admin, uow)
+        if verb == "models":
+            return asyncio.run(gateway.models_view(admin, uow))
+        if verb == "test":
+            result = asyncio.run(
+                gateway.test_gateway(admin, uow, principal=principal, reason=args.reason)
+            )
+        elif verb == "pick":
+            result = asyncio.run(
+                gateway.save_models(
+                    admin,
+                    uow,
+                    principal=principal,
+                    models=_picks(args),
+                    max_concurrency=args.max_concurrency,
+                    reason=args.reason,
+                )
+            )
+        else:
+            result = asyncio.run(
+                gateway.save_gateway(
+                    admin,
+                    uow,
+                    principal=principal,
+                    endpoint_url=args.endpoint_url,
+                    api_key=_read_api_key() if args.key else None,
+                    reason=args.reason,
+                )
+            )
+        uow.commit()
+        return result
 
 
 def _local_credentials(
@@ -928,6 +1160,7 @@ def kind_of(args: argparse.Namespace) -> str:
         "kubernetes": "kubernetes_command",
         "limits": "limits_command",
         "bootstrap": "bootstrap_command",
+        "gateway": "gateway_command",
     }.get(command)
     sub = getattr(args, verb) if verb else None
     table: dict[tuple[str, str | None], str] = {
@@ -950,6 +1183,14 @@ def kind_of(args: argparse.Namespace) -> str:
         ("providers", "status"): "provider_list",
         ("github", "status"): "github_status",
         ("github", "check"): "github_check",
+        ("github", "connect"): "github_connected",
+        ("github", "installations"): "github_installations",
+        ("github", "add-repository"): "repository",
+        ("gateway", "show"): "gateway",
+        ("gateway", "set"): "gateway_test",
+        ("gateway", "test"): "gateway_test",
+        ("gateway", "models"): "gateway_models",
+        ("gateway", "pick"): "gateway_models_saved",
         ("audit", "tail"): "audit_page",
         ("routing", "exhaustion"): "exhaustion_list",
         ("routing", "clear-exhaustion"): "exhaustion_cleared",

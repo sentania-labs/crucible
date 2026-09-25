@@ -19,7 +19,7 @@ from crucible.domain.secrets import scan_text
 from crucible.ports.clock import Clock
 from crucible.ports.execution import ExecutionProvider
 from crucible.ports.first_run import FirstRunDelivery
-from crucible.ports.github import GitHubClient
+from crucible.ports.github import GitHubAppCredentials, GitHubAppDirectory, GitHubClient
 from crucible.ports.harness import CredentialSource, HarnessGate
 from crucible.ports.repository import UnitOfWork, UnitOfWorkFactory
 
@@ -45,6 +45,10 @@ class AdminContext:
     credential_sources: dict[str, CredentialSource] = field(default_factory=dict)
     github: GitHubClient | None = None
     github_app: GitHubAppInfo = field(default_factory=GitHubAppInfo)
+    # The App credential the service owns and what the App can see (ADR 0017,
+    # crucible#120). None where there is nowhere to keep one.
+    github_credentials: GitHubAppCredentials | None = None
+    github_apps: GitHubAppDirectory | None = None
     artifact_root: str = ""
     lease_ttl_seconds: int = 30
     credential_retention_hours: int = 24
