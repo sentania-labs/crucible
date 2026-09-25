@@ -164,10 +164,11 @@ async def test_the_writable_credential_init_container_carries_its_own_restricted
     workspace = await provider.prepare(launch)
     await provider.launch(workspace, launch)
     pod = pod_of(api, "worker-")
-    init = pod["initContainers"][0]
-    assert init["securityContext"]["allowPrivilegeEscalation"] is False
-    assert init["securityContext"]["readOnlyRootFilesystem"] is True
-    assert init["securityContext"]["capabilities"] == {"drop": ["ALL"]}
+    assert pod["initContainers"]
+    for init in pod["initContainers"]:
+        assert init["securityContext"]["allowPrivilegeEscalation"] is False
+        assert init["securityContext"]["readOnlyRootFilesystem"] is True
+        assert init["securityContext"]["capabilities"] == {"drop": ["ALL"]}
 
 
 @pytest.mark.parametrize("prefix", ROLE_PREFIXES)
