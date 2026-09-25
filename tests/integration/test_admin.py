@@ -2183,3 +2183,39 @@ def test_a_harness_test_reports_each_step_and_stops_at_the_first_failure(
     harnesses_view = {h["name"]: h for h in admin_client.get("/v1/admin/harnesses").json()["items"]}
     assert harnesses_view["script-harness"]["last_test"]["ok"] is True
     assert harnesses_view["codex"]["last_test"]["failed_step"] == "Model call"
+
+
+def test_rows_carry_their_own_actions_instead_of_typed_ids(
+    ctx: AppContext,
+    admin_client: TestClient,
+    live_supervisor: Supervisor,
+    tokens: dict[str, str],
+) -> None:
+    """crucible#127: where the system knows the value, the UI offers it. Revoke is on the
+    principal's row, Remove on the repository's, and no page asks for an ID to be typed."""
+    asyncio.run(live_supervisor.tick())
+    principals = admin_client.get("/v1/admin/tokens").json()["items"]
+    observer = next(item for item in principals if item["role"] == "observer")
+    with TestClient(create_app(ctx)) as browser:
+        csrf = ui_sign_in(browser, tokens["admin"])
+        pages = {path: browser.get(path).text for path in ("/ui/tokens", "/ui/repositories")}
+        pages["/ui/workers"] = browser.get("/ui/workers").text
+        pages["/ui/bootstrap"] = browser.get("/ui/bootstrap").text
+        for text in pages.values():
+            for typed in ("Principal ID", "Attempt ID", "Import ID", "Digest or reference"):
+                assert f">{typed}<" not in text
+        assert f'name="principal_id" value="{observer["id"]}"' in pages["/ui/tokens"]
+        assert 'name="name" value="example-service"' in pages["/ui/repositories"]
+        revoked = browser.post(
+            "/ui/actions/token-revoke",
+            data={
+                "csrf": csrf,
+                "principal_id": observer["id"],
+                "return_to": "/ui/tokens",
+            },
+            follow_redirects=False,
+        )
+        # The revoke asks for a reason (crucible#117): refused without one.
+        assert "reason" in unquote(revoked.headers["location"])
+        missing = browser.get("/ui/bootstrap/01ABCDEFGHJKMNPQRSTVWXYZ00", follow_redirects=False)
+        assert missing.status_code == 303 and "not%20found" in missing.headers["location"]

@@ -1303,6 +1303,7 @@ def repositories_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                 "Policy",
                 "Installation",
                 "External review",
+                "",
             ],
             "rows": [
                 [
@@ -1312,6 +1313,18 @@ def repositories_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                     item.policy_name,
                     item.installation_id,
                     item.external_review_attested,
+                    # The row's own removal, never a typed name (crucible#127); refused
+                    # while tasks reference it, and it asks for a reason (crucible#117).
+                    {
+                        "kind": "form",
+                        "action": "/ui/actions/repository-remove",
+                        "label": "Remove",
+                        "danger": True,
+                        "reason": True,
+                        "hidden": {"name": item.name},
+                    }
+                    if principal.role is Role.ADMIN
+                    else "",
                 ]
                 for item in items
             ],
@@ -1355,18 +1368,6 @@ def repositories_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                         ],
                     },
                 },
-                {
-                    "title": "Remove unreferenced registration",
-                    "form": {
-                        "action": "/ui/actions/repository-remove",
-                        "label": "Remove",
-                        "danger": True,
-                        "fields": [
-                            {"name": "name", "label": "Name", "required": True},
-                            {"name": "reason", "label": "Reason", "required": True},
-                        ],
-                    },
-                },
             ]
         )
     return _page(
@@ -1387,52 +1388,60 @@ def tokens_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
         return found
     principal, csrf = found
     items = tokens.list_principals(uow)
+    admin = principal.role is Role.ADMIN
+
+    def revoke(item: dict[str, Any]) -> Any:
+        # The row's own action, never a typed ID (crucible#127). Revoking is hard to
+        # reverse, so it asks for a reason (crucible#117).
+        if not admin or item["disabled_at"] is not None:
+            return ""
+        return {
+            "kind": "form",
+            "action": "/ui/actions/token-revoke",
+            "label": "Revoke",
+            "danger": True,
+            "reason": True,
+            "hidden": {"principal_id": item["id"]},
+        }
+
     sections: list[dict[str, Any]] = [
         {
             "title": "Principals",
-            "columns": ["ID", "Name", "Role", "Created", "Revoked"],
+            "columns": ["Name", "Role", "Created", "Revoked", ""],
             "rows": [
-                [item["id"], item["name"], item["role"], item["created_at"], item["disabled_at"]]
+                [
+                    item["name"],
+                    item["role"],
+                    item["created_at"],
+                    item["disabled_at"] or "no",
+                    revoke(item),
+                ]
                 for item in items
             ],
         }
     ]
-    if principal.role is Role.ADMIN:
-        sections.extend(
-            [
-                {
-                    "title": "Create token",
-                    "note": (
-                        "The token is shown on the next page once and is never stored in plaintext."
-                    ),
-                    "form": {
-                        "action": "/ui/actions/token-create",
-                        "label": "Create token",
-                        "fields": [
-                            {"name": "name", "label": "Principal name", "required": True},
-                            {
-                                "name": "role",
-                                "label": "Role",
-                                "kind": "select",
-                                "options": [(role.value, role.value) for role in Role],
-                            },
-                            {"name": "reason", "label": "Reason", "required": True},
-                        ],
-                    },
+    if admin:
+        sections.append(
+            {
+                "title": "Create token",
+                "note": (
+                    "The token is shown on the next page once and is never stored in plaintext."
+                ),
+                "form": {
+                    "action": "/ui/actions/token-create",
+                    "label": "Create token",
+                    "fields": [
+                        {"name": "name", "label": "Principal name", "required": True},
+                        {
+                            "name": "role",
+                            "label": "Role",
+                            "kind": "select",
+                            "options": [(role.value, role.value) for role in Role],
+                        },
+                        {"name": "reason", "label": "Reason"},
+                    ],
                 },
-                {
-                    "title": "Revoke token",
-                    "form": {
-                        "action": "/ui/actions/token-revoke",
-                        "label": "Revoke",
-                        "danger": True,
-                        "fields": [
-                            {"name": "principal_id", "label": "Principal ID", "required": True},
-                            {"name": "reason", "label": "Reason", "required": True},
-                        ],
-                    },
-                },
-            ]
+            }
         )
     return _page(
         request,
@@ -1440,7 +1449,7 @@ def tokens_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
         csrf,
         active="/ui/tokens",
         heading="Tokens",
-        intro="Principals share the same bearer credentials across API, CLI, and UI.",
+        intro="Who can sign in or call the API, and with which role.",
         sections=sections,
     )
 
@@ -1484,53 +1493,46 @@ def workers_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
         return found
     principal, csrf = found
     rows = status.workers(uow)
-    sections = [
-        {
-            "title": "Active attempts",
-            "columns": [
-                "Attempt",
-                "State",
-                "Task",
-                "External ID",
-                "Harness",
-                "Model",
-                "Image",
-                "Started",
-                "Heartbeat",
-            ],
-            "rows": [
-                [
-                    item.get("attempt_id"),
-                    item.get("state"),
-                    item.get("task_id"),
-                    item.get("external_id"),
-                    item.get("harness"),
-                    item.get("model"),
-                    item.get("image_digest"),
-                    item.get("started_at"),
-                    item.get("last_heartbeat"),
-                ]
-                for item in rows
-            ],
-        }
-    ]
     return _page(
         request,
         principal,
         csrf,
         active="/ui/workers",
         heading="Active workers",
-        intro="Current attempts. Select an attempt log below by entering its ID.",
+        intro="Attempts running now. Open a row's log to follow it.",
         sections=[
-            *sections,
             {
-                "title": "Live log tail",
-                "form": {
-                    "action": "/ui/actions/log-tail",
-                    "label": "Open log",
-                    "fields": [{"name": "attempt_id", "label": "Attempt ID", "required": True}],
-                },
-            },
+                "title": "Active attempts",
+                "empty": "No attempt is running.",
+                "columns": ["Task", "Harness", "Model", "State", "Started", "Heartbeat", ""],
+                "rows": [
+                    [
+                        item.get("external_id") or item.get("task_id"),
+                        item.get("harness"),
+                        item.get("model"),
+                        item.get("state"),
+                        item.get("started_at"),
+                        item.get("last_heartbeat"),
+                        # The row's own log, never a typed attempt ID (crucible#127).
+                        {
+                            "kind": "link",
+                            "href": f"/ui/workers/{quote(str(item.get('attempt_id')))}/logs",
+                            "label": "Log",
+                        },
+                    ]
+                    for item in rows
+                ],
+                "details": [
+                    {
+                        "title": "Identifiers",
+                        "columns": ["Attempt", "Task", "Image"],
+                        "rows": [
+                            [item.get("attempt_id"), item.get("task_id"), item.get("image_digest")]
+                            for item in rows
+                        ],
+                    }
+                ],
+            }
         ],
     )
 
@@ -1677,39 +1679,78 @@ def bootstrap_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
         return found
     principal, csrf = found
     items = bootstrap.list_imports(uow)
-    sections: list[dict[str, Any]] = [
-        _document_section("Imports", items),
-        {
-            "title": "Show import",
-            "form": {
-                "action": "/ui/actions/bootstrap-show",
-                "label": "Show",
-                "fields": [{"name": "import_id", "label": "Import ID", "required": True}],
-            },
-        },
-    ]
-    if principal.role is Role.ADMIN:
-        sections.append(
+    admin = principal.role is Role.ADMIN
+
+    def actions(item: dict[str, Any]) -> dict[str, Any]:
+        # The row's own actions, never a typed import ID (crucible#127).
+        entries: list[dict[str, Any]] = [
             {
-                "title": "Commit verified import",
-                "form": {
-                    "action": "/ui/actions/bootstrap-commit",
-                    "label": "Commit import",
-                    "fields": [
-                        {"name": "import_id", "label": "Import ID", "required": True},
-                        {"name": "reason", "label": "Reason", "required": True},
-                    ],
-                },
+                "kind": "link",
+                "href": f"/ui/bootstrap/{quote(item['import_id'])}",
+                "label": "Show",
             }
-        )
+        ]
+        if admin and item["state"] == "verified":
+            entries.append(
+                {
+                    "kind": "form",
+                    "action": "/ui/actions/bootstrap-commit",
+                    "label": "Commit",
+                    "danger": True,
+                    "reason": True,
+                    "hidden": {"import_id": item["import_id"]},
+                }
+            )
+        return {"kind": "actions", "items": entries}
+
     return _page(
         request,
         principal,
         csrf,
         active="/ui/bootstrap",
         heading="Bootstrap imports",
-        intro="Verified imports, manifests, and the explicit authoritative commit.",
-        sections=sections,
+        intro="Ledgers imported from Foundry, and the commit that makes one authoritative.",
+        sections=[
+            {
+                "title": "Imports",
+                "empty": "No ledger has been imported.",
+                "columns": ["Import", "State", "Tasks", "Verified", "Committed", ""],
+                "rows": [
+                    [
+                        item["import_id"],
+                        item["state"],
+                        (item.get("counts") or {}).get("tasks", 0),
+                        item["verified_at"],
+                        item["committed_at"] or "no",
+                        actions(item),
+                    ]
+                    for item in items
+                ],
+            }
+        ],
+    )
+
+
+@router.get("/bootstrap/{import_id}", response_class=HTMLResponse)
+def bootstrap_import_page(request: Request, import_id: str, ctx: Ctx, uow: UoW) -> Response:
+    found = _require(request, ctx, uow)
+    if isinstance(found, RedirectResponse):
+        return found
+    principal, csrf = found
+    try:
+        document = bootstrap.show(uow, import_id)
+    except ApplicationError as exc:
+        return RedirectResponse(
+            f"/ui/bootstrap?kind=bad&message={quote(exc.detail or exc.title)}", status_code=303
+        )
+    return _page(
+        request,
+        principal,
+        csrf,
+        active="/ui/bootstrap",
+        heading="Bootstrap manifest",
+        intro=import_id,
+        sections=[_document_section("Manifest", document)],
     )
 
 
@@ -1837,21 +1878,6 @@ async def action(request: Request, action: str, ctx: Ctx, uow: UoW) -> Response:
     form = await _form(request)
     try:
         _csrf(form, csrf)
-        if action == "log-tail":
-            return RedirectResponse(
-                f"/ui/workers/{quote(form.get('attempt_id', ''))}/logs", status_code=303
-            )
-        if action == "bootstrap-show":
-            document = bootstrap.show(uow, form.get("import_id", ""))
-            return _page(
-                request,
-                principal,
-                csrf,
-                active="/ui/bootstrap",
-                heading="Bootstrap manifest",
-                intro=form.get("import_id", ""),
-                sections=[_document_section("Manifest", document)],
-            )
         _admin(principal)
         if ctx.admin is None:
             raise ConflictError("the administrative surface is not configured")
