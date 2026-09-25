@@ -36,6 +36,8 @@ ADMIN_KINDS: frozenset[str] = frozenset(
         EventKind.POOL_EXHAUSTION_CLEARED.value,
         EventKind.LOCAL_ENDPOINT_UPDATED.value,
         EventKind.KUBERNETES_EGRESS_UPDATED.value,
+        EventKind.LOCAL_GATEWAY_UPDATED.value,
+        EventKind.GITHUB_APP_CONNECTED.value,
     }
 )
 
