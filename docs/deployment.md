@@ -245,7 +245,7 @@ The operator's own daily-use harness directories are never read, copied or refer
 
 Done means seen working, so all three:
 
-1. **The status page.** `/ui` System status, or `GET /v1/admin/status`. The `kubernetes`
+1. **The status page.** `/ui` Status, or `GET /v1/admin/status`. The `kubernetes`
    provider row must read `health: ok` with
 
    ```json

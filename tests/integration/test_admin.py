@@ -2155,7 +2155,7 @@ def test_a_harness_test_reports_each_step_and_stops_at_the_first_failure(
     probes_before = len(provider.probes)
     missing = admin_client.post("/v1/admin/harnesses/hermes/test", json={}).json()
     assert missing["failed_step"] == "Credential"
-    assert "no API key is set" in missing["steps"][2]["detail"]
+    assert "no API key is stored" in missing["steps"][2]["detail"]
     assert len(provider.probes) == probes_before
 
     # The fixture harness calls no model unless routed to a local endpoint; it passes.

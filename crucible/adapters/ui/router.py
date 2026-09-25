@@ -315,6 +315,10 @@ def _panel(value: Any, *, key: str = "") -> dict[str, Any]:
                 ],
                 "rows": [[row.get(path, "none") for path in column_keys] for row in flattened],
             }
+        if not any(isinstance(item, (dict, list)) for item in value):
+            # A plain list reads as a list, not a one-column table headed "Value"
+            # (crucible#115).
+            return {"kind": "values", "items": [_safe_value(key, item) for item in value]}
         rows = [
             [_panel(item, key=key)] if isinstance(item, (dict, list)) else [_safe_value(key, item)]
             for item in value
@@ -952,7 +956,7 @@ async def credentials_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
         )
         sections.append(
             {
-                "title": "Validate, probe, or remove",
+                "title": "Validate or probe" if secrets_held else "Validate, probe, or remove",
                 "form": {
                     "action": "/ui/actions/credential",
                     "label": "Run credential action",

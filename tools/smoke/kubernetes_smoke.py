@@ -532,7 +532,8 @@ def await_supervisor(base_url: str, token: str) -> None:
 
 
 def promote_worker_image(base_url: str, token: str) -> dict[str, Any]:
-    """25 and 13: the provider reports what the registry holds; promotion is an admin act."""
+    """25 and 13: the provider reports what the registry holds; promotion is an admin act,
+    and it is per harness (ADR 0016), so it names the script harness."""
     deadline = time.monotonic() + 120
     while True:
         listing = request("GET", f"{base_url}/v1/admin/images", token=token)
@@ -555,7 +556,10 @@ def promote_worker_image(base_url: str, token: str) -> dict[str, Any]:
         "POST",
         f"{base_url}/v1/admin/images/{digest}/promote",
         token=token,
-        body={"reason": "kind deployment smoke: the script harness image under test"},
+        body={
+            "harness": "script-harness",
+            "reason": "kind deployment smoke: the script harness image under test",
+        },
     )
     log(f"promoted {image.get('reference')} ({digest})")
     return dict(image)
@@ -629,8 +633,8 @@ def walk_status_ui(base_url: str) -> None:
             page = response.read().decode("utf-8", "replace")
     except urllib.error.URLError as exc:
         raise SmokeError(f"the first-run administrator sign-in failed: {exc}") from None
-    if "System status" not in page:
-        raise SmokeError("the first-run administrator sign-in did not render System status")
+    if "<h1>Status</h1>" not in page:
+        raise SmokeError("the first-run administrator sign-in did not render the Status page")
     if "kubernetes" not in page:
         raise SmokeError("the rendered status page does not name the kubernetes provider")
     log("the rendered /ui status page names the kubernetes provider")

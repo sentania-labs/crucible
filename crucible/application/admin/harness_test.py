@@ -127,15 +127,11 @@ async def _run(
         view = credentials.state_view(ctx, uow, harness)
         state = str(view.get("state"))
         if state == "absent":
-            what = "no API key is set" if harness == credentials.HERMES else "no credential"
             steps.failed(
                 CREDENTIAL,
-                f"{what} is stored for {harness}; "
-                + (
-                    "set the key on Credentials"
-                    if harness == credentials.HERMES
-                    else "log in on Credentials"
-                ),
+                f"no API key is stored for {harness}; set the key on Credentials"
+                if harness == credentials.HERMES
+                else f"no credential is stored for {harness}; log in on Credentials",
             )
             return
         steps.passed(CREDENTIAL, f"stored ({state})")
