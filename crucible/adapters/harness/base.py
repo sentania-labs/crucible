@@ -84,6 +84,21 @@ def classify_with_patterns(
     return base
 
 
+def with_in_flight(exit_class: ExitClass, in_flight: Sequence[str]) -> ExitClass:
+    """Issue 128: a clean exit while the harness's own tooling reported a command still
+    running is `incomplete`, never a completion. Any other class already says the run
+    did not finish cleanly, and a termination Crucible performed keeps its own class."""
+    if in_flight and exit_class in (ExitClass.COMPLETED, ExitClass.COMPLETED_WITHOUT_REPORT):
+        return ExitClass.INCOMPLETE
+    return exit_class
+
+
+def in_flight_summary(label: str, detail: str) -> str:
+    """One in-flight entry as the attempt_collected event records it: short, one line."""
+    text = " ".join(f"{label}: {detail}".split())
+    return text[:300]
+
+
 _RESET_KEYS = frozenset({"reset_at", "resetAt", "resets_at", "resetsAt", "reset_time"})
 
 
@@ -183,6 +198,7 @@ def parse_report_dir(
     *,
     metrics: ReportMetrics,
     transcript_lines: int,
+    in_flight: Sequence[str] = (),
 ) -> ParsedReport:
     """`report.yaml` against CompletionClaimV1, `blocked.md`, and `progress.jsonl` (07).
 
@@ -217,6 +233,7 @@ def parse_report_dir(
         metrics=metrics,
         transcript_lines=transcript_lines,
         transcript_name=TRANSCRIPT_NAME if transcript.is_file() else None,
+        in_flight=tuple(in_flight),
     )
 
 

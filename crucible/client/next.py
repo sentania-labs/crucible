@@ -406,6 +406,32 @@ def _labels_text(labels: Any) -> str:
     return ",".join(f"{k}={v}" for k, v in sorted(labels.items()))
 
 
+def command_timeout_actions(document: Any, prefix: Sequence[str]) -> list[dict[str, Any]]:
+    """One action: write new bounds, prefilled with the bounds in force, so the command
+    as offered changes nothing until a value in it is edited."""
+    if not isinstance(document, dict) or not isinstance(document.get("command_timeout_ms"), dict):
+        return []
+    bounds = document["command_timeout_ms"]
+    return [
+        action(
+            "set-command-timeout",
+            "write a new policy version with these per-command timeout bounds",
+            [
+                *prefix,
+                "--reason",
+                "{reason}",
+                "limits",
+                "set-command-timeout",
+                f"--min={bounds.get('min', '')}",
+                f"--max={bounds.get('max', '')}",
+                f"--default={bounds.get('default', '')}",
+            ],
+            needs=REASON,
+            roles=(ADMIN,),
+        )
+    ]
+
+
 def kubernetes_egress_actions(document: Any, prefix: Sequence[str]) -> list[dict[str, Any]]:
     """One action: replace the setting, prefilled with what is in force now, so the
     command as offered changes nothing until a value in it is edited."""

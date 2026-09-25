@@ -22,6 +22,7 @@ from crucible.application.admin import (
     tokens,
 )
 from crucible.application.admin import kubernetes as kubernetes_admin
+from crucible.application.admin import limits as limits_admin
 from crucible.application.admin import providers as providers_admin
 from crucible.application.admin import repositories as repositories_admin
 from crucible.application.admin import status as status_admin
@@ -62,6 +63,45 @@ def admin_clear_routing_exhaustion(
 ) -> dict[str, Any]:
     result = routing.clear_exhaustion(
         _admin(ctx), uow, principal=principal.name, pool=pool, reason=_reason(body)
+    )
+    uow.commit()
+    return result
+
+
+def _whole_milliseconds(body: dict[str, Any], name: str) -> int | None:
+    """A JSON integer, never a bool or a string: a limit read from truthiness or a
+    stringified number is a limit nobody set. Absent keeps the value in force."""
+    value = body.get(name)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise RequestValidationError(
+            [{"loc": ("body", name), "msg": f"{name} must be a JSON integer", "type": "int_type"}]
+        )
+    return value
+
+
+@router.get("/admin/limits/command-timeout")
+def admin_command_timeout(ctx: Ctx, uow: UoW, _principal: Admin) -> dict[str, Any]:
+    _admin(ctx)
+    return limits_admin.command_timeout_view(uow)
+
+
+@router.post("/admin/limits/command-timeout")
+def admin_save_command_timeout(
+    ctx: Ctx,
+    uow: UoW,
+    principal: Admin,
+    body: Annotated[dict[str, Any], Body()],
+) -> dict[str, Any]:
+    result = limits_admin.save_command_timeout(
+        _admin(ctx),
+        uow,
+        principal=principal,
+        minimum=_whole_milliseconds(body, "min"),
+        maximum=_whole_milliseconds(body, "max"),
+        default=_whole_milliseconds(body, "default"),
+        reason=_reason(body),
     )
     uow.commit()
     return result

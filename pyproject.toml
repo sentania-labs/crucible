@@ -94,6 +94,7 @@ markers = [
     "e2e_live: the live harness tier (07, 18): real harness images with the dedicated credentials, local only",
     "e2e_registry: the real crane against a stub registry that redirects its blobs (108)",
     "e2e_admin: the live administration tier (25): every operation through the API and the CLI, probes with the dedicated credentials, local only",
+    "e2e_command_timeout: each real harness in the worker image against a stub model, no network and no login (issue 128)",
 ]
 filterwarnings = ["error::DeprecationWarning:crucible.*"]
 

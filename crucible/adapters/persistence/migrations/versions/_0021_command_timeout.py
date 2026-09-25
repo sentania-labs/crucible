@@ -1,12 +1,11 @@
-"""crucible#119, #120, #121: the events of the first-run setup.
+"""crucible#128: the event an edit of the per-command timeout writes.
 
-`local_gateway_updated` records a save of the local gateway (its URL, whether a key was
-set) or of the models picked from it; `github_app_connected` records the GitHub App
-credential the service now owns (ADR 0017). The gateway URL itself is the
-`local.gateway` row of `provider_settings` (0020) until a model entry carries it, so no
-table changes here.
+`limits.command_timeout_ms` lives in the policy document, so no table changes; a save
+from the admin surface writes a new policy version and one `command_timeout_updated`
+audit event. Existing policy versions are left as they are: one without the field takes
+the default bounds (60 minutes, operator decision of 2026-09-25).
 
-Revision ID: 0021_first_run_setup
+Revision ID: 0021_command_timeout
 Revises: 0020_provider_settings
 """
 
@@ -19,13 +18,13 @@ from crucible.adapters.persistence.migrations.versions._0020_provider_settings i
     _event_kinds as _previous_event_kinds,
 )
 
-revision = "0021_first_run_setup"
+revision = "0021_command_timeout"
 down_revision = "0020_provider_settings"
 branch_labels = None
 depends_on = None
 
-EVENT_KINDS = ("local_gateway_updated", "github_app_connected")
-EVENT_ARCHIVE = "events_first_run_archive"
+EVENT_KINDS = ("command_timeout_updated",)
+EVENT_ARCHIVE = "events_128_archive"
 
 
 def _event_kinds() -> list[str]:
@@ -54,8 +53,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    # The audit trail outlives a rollback, as in 0017 and 0020: the events move to an
-    # archive table and come back on the next upgrade.
+    # The audit trail of an edit outlives a rollback, as 0020 keeps its own kinds.
     kinds = ", ".join(f"'{kind}'" for kind in EVENT_KINDS)
     op.execute(f"CREATE TABLE IF NOT EXISTS {EVENT_ARCHIVE} (LIKE events)")
     op.execute("ALTER TABLE events DISABLE TRIGGER trg_events_append_only")

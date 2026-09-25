@@ -185,6 +185,7 @@ class EventKind(StrEnum):
     # and the GitHub App credential the service now owns (ADR 0017)
     LOCAL_GATEWAY_UPDATED = "local_gateway_updated"
     GITHUB_APP_CONNECTED = "github_app_connected"
+    COMMAND_TIMEOUT_UPDATED = "command_timeout_updated"
     # the bootstrap ledger handoff (15, C6)
     BOOTSTRAP_IMPORT_VERIFIED = "bootstrap_import_verified"
     BOOTSTRAP_IMPORT_COMMITTED = "bootstrap_import_committed"

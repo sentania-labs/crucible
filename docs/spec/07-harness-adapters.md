@@ -25,7 +25,7 @@ dir, user, resource limits, network mode, expected exit semantics.
 `ExitClass` is the one enum used by contracts, policies, and 16:
 `completed`, `completed_without_report`, `blocked`, `environment`,
 `auth_failure`, `provider_error`, `quota_exhausted`, `timeout`, `killed`, `crashed`, `lost`,
-`unknown`. Which classes may retry is a policy decision (05b
+`incomplete`, `unknown`. Which classes may retry is a policy decision (05b
 `retry.eligible_classes`), narrowed by the contract's `retry_on`; a retry
 happens only when the class is in both. Gate failures are never a class and
 never retry.
@@ -229,3 +229,25 @@ The identity, report, and gate contracts do not change.
 Hermes is the local gateway front end. Other harness and local-server
 combinations remain disabled until their own compatibility and quality evidence
 exists.
+
+## Commands that outlive their timeout (issue 128)
+
+A headless harness runs each shell command under a timeout of its own, and some
+of them move a command that outlives it to the background. In a headless run the
+turn can then end, the process exits, the command dies with it, and the attempt
+looks finished. Every adapter launches its harness with the attempt's command
+timeout (05b `limits.command_timeout_ms`, set by the contract within the
+policy's bounds, capped at `timeout_seconds`), and reads the harness's own
+record of what was still running at exit. A clean exit (`completed` or
+`completed_without_report`) with anything in that record is classified
+`incomplete`, and the list is recorded on the
+`attempt_collected` event as `work_in_flight`. Each fact below was established on
+the pinned worker image on 2026-09-25, against a stub model server with no
+network and no login (`make e2e-command-timeout`).
+
+| Harness | What it does with a long command | What the launch sets | In-flight evidence |
+|---|---|---|---|
+| Claude Code 2.1.280 | Moves a Bash command past its timeout to the background (`sleep` excepted); `-p` then ends its turn and kills it at exit | `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`, so the command is ended at its timeout and reported to the model instead; `BASH_DEFAULT_TIMEOUT_MS` and `BASH_MAX_TIMEOUT_MS` to the command timeout | stream-json `task_started` (`is_backgrounded`) with no `completed` or `failed` end, or one ended by the exit after the final `result` |
+| Codex 0.156.0 | Unified exec returns after at most 30 s with a session the model must poll with `write_stdin`; a turn that ends instead leaves the command to die. The model catalog, not the `unified_exec` feature flag, picks this tool, so nothing at the launch makes a command block | `-c background_terminal_max_timeout=<command timeout>`, the longest single poll | a `command_execution` item `item.started` and never `item.completed` |
+| Hermes 0.19.0 | Never backgrounds a foreground command: kills it at `TERMINAL_TIMEOUT` and reports exit 124. A model may ask for `background=true`; under `-z` Hermes says it cannot deliver the completion and exits without waiting | `TERMINAL_TIMEOUT` and `TERMINAL_MAX_FOREGROUND_TIMEOUT`, in whole seconds | its process registry, `HERMES_HOME/processes.json`, copied into the report directory by the launch wrapper after Hermes exits (`CRUCIBLE_AFTER_EXIT`); any entry is a running command |
+| AGY 1.2.8 | `run_command` takes `Blocking` and `WaitMsBeforeAsync` from the model per call; past the wait a command continues in the background | no flag, variable or setting exists for it in `agy --help`, the binary, or the public CLI docs, so the `-p` prompt asks the model to run every command blocking for up to the command timeout and never to end its turn with one running: a mitigation nothing enforces. `--print-timeout` stays the attempt's timeout | none known; AGY cannot run without a Google login, so its exit behaviour was not observed and its attempts are classified by exit code and report alone |
