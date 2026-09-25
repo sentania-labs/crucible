@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import stat
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -128,6 +129,32 @@ def test_kubeconfig_refuses_a_credential_plugin(tmp_path: Path) -> None:
         "users": [{"name": "user", "user": {"exec": {"command": "unsafe-command"}}}],
     }
     path = tmp_path / "credential-plugin"
+    path.write_text(yaml.safe_dump(document), encoding="utf-8")
+
+    with pytest.raises(KubernetesApiError, match="needs a credential plugin"):
+        kubeconfig_access(str(path))
+
+
+def test_kubeconfig_credential_plugin_refusal_never_spawns_a_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """64: the security-relevant guarantee is not the error message, it is that
+    `unsafe-command` never runs. Patch every process-spawning entry point `subprocess`
+    offers so a future regression that ran the plugin before refusing it fails here."""
+
+    def _must_not_spawn(*args: object, **kwargs: object) -> None:
+        raise AssertionError("kubeconfig_access must never spawn a process")
+
+    for name in ("Popen", "run", "call", "check_call", "check_output"):
+        monkeypatch.setattr(subprocess, name, _must_not_spawn)
+
+    document = {
+        "current-context": "plugin",
+        "clusters": [{"name": "cluster", "cluster": {"server": "https://127.0.0.1:6443"}}],
+        "contexts": [{"name": "plugin", "context": {"cluster": "cluster", "user": "user"}}],
+        "users": [{"name": "user", "user": {"exec": {"command": "unsafe-command"}}}],
+    }
+    path = tmp_path / "credential-plugin-no-spawn"
     path.write_text(yaml.safe_dump(document), encoding="utf-8")
 
     with pytest.raises(KubernetesApiError, match="needs a credential plugin"):
