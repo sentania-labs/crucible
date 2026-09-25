@@ -17,7 +17,7 @@ from crucible.application.proxy_config import (
     worker_proxy_config,
 )
 from crucible.domain.endpoints import validate_endpoint
-from crucible.domain.entities import Principal
+from crucible.domain.entities import Policy, Principal
 from crucible.domain.events import EventKind
 from crucible.ports.repository import UnitOfWork
 
@@ -43,11 +43,16 @@ def list_exhaustions(ctx: AdminContext, uow: UnitOfWork) -> dict[str, Any]:
     }
 
 
-def _active_documents(uow: UnitOfWork) -> tuple[Any, Any]:
+def active_policy(uow: UnitOfWork) -> Policy:
+    """The newest unretired default-software version: the one the admin panels edit."""
     policies = [p for p in uow.policies.list_versions("default-software") if p.retired_at is None]
     if not policies:
         raise NotFoundError("no default-software policy is in force")
-    policy = max(policies, key=lambda item: item.version)
+    return max(policies, key=lambda item: item.version)
+
+
+def _active_documents(uow: UnitOfWork) -> tuple[Any, Any]:
+    policy = active_policy(uow)
     ref = (policy.document.get("routing") or {}).get("policy") or {}
     routing = uow.routing_policies.get(str(ref.get("name", "")), int(ref.get("version", 0)))
     if routing is None or routing.retired_at is not None:

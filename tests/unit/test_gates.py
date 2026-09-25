@@ -225,6 +225,24 @@ def test_exit_clean_fails_on_a_non_zero_code() -> None:
     assert outcome.result is GateResult.FAIL and "1" in outcome.detail
 
 
+@pytest.mark.parametrize("exit_class", ["incomplete", None, "unknown"])
+def test_exit_clean_fails_on_a_zero_code_without_a_completed_class(
+    exit_class: str | None,
+) -> None:
+    """Issue 128: a harness that exited 0 with work in flight is `incomplete`, and a
+    valid report beside it does not let the attempt pass exit_clean."""
+    evidence = _passing_evidence()
+    evidence[0] = _ev("exit_info", {"exit_code": 0, "exit_class": exit_class}, ident=1)
+    assert evaluate_gate(GateName.REPORT_PRESENT, _gi(evidence)).result is GateResult.PASS
+    outcome = evaluate_gate(GateName.EXIT_CLEAN, _gi(evidence))
+    assert outcome.result is GateResult.FAIL and repr(exit_class) in outcome.detail
+
+
+def test_exit_clean_passes_a_zero_code_that_completed() -> None:
+    outcome = evaluate_gate(GateName.EXIT_CLEAN, _gi(_passing_evidence()))
+    assert outcome.result is GateResult.PASS
+
+
 @pytest.mark.parametrize(
     ("patch", "reason"),
     [

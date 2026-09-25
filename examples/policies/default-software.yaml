@@ -12,6 +12,9 @@ limits:
     min: 300
     max: 14400
     default: 3600
+  # command_timeout_ms (issue 128) is absent from the seeded version, which takes the
+  # default bounds { min: 1000, max: 14400000, default: 3600000 }. A new version sets
+  # it here, or through `crucible admin limits set-command-timeout`.
   max_attempts:
     max: 3
     default: 2
