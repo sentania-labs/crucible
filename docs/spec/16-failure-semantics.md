@@ -14,7 +14,7 @@
 | `crashed` | non-zero exit not otherwise classified | no retry by default; wake |
 | `lost` | provider cannot find the worker | retry if attempts remain and policy allows `lost`; else `failed` |
 | `completed_without_report` | exit 0, no report | report gate fails; no retry; wake |
-| `incomplete` | the harness exited cleanly while its own tooling reported a command still running (07, issue 128) | attempt `failed`, never a completion, whatever the report claims; the running commands are on `attempt_collected` as `work_in_flight`; retried only when policy and contract both name it |
+| `incomplete` | the harness exited cleanly while its own tooling reported a command still running (07, issue 128) | attempt `failed`, never a completion, whatever the report claims; the running commands are on `attempt_collected` as `work_in_flight`; no retry, as for `crashed`. A worker that starts a server and leaves it running when it ends its turn is `incomplete` too: its own tooling reports the command still running |
 
 Retry is never a way to re-roll the worker's judgment. A class retries only
 when it is in both the policy's `retry.eligible_classes` and the contract's

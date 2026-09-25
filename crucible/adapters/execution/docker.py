@@ -156,7 +156,8 @@ WORKER_UID = 1000
 # CRUCIBLE_AFTER_EXIT names `path=name` pairs: state files the harness keeps outside the
 # report directory, copied into it once the harness has exited (issue 128), so the
 # adapter can read what the harness's own tooling said was still running. Only a regular
-# file is copied, never a link, and at most 1 MiB of it.
+# file is copied, never a link, and at most 1 MiB of it; the copy goes to a fresh file
+# renamed into place, so a link planted at the destination is replaced, not written through.
 LAUNCH_WRAPPER = r"""set -u
 for pair in ${CRUCIBLE_ENV_FROM_FILES:-}; do
   var=${pair%%=*}; file=${pair#*=}
@@ -188,7 +189,13 @@ for pair in ${CRUCIBLE_AFTER_EXIT:-}; do
   src=${pair%%=*}; name=${pair#*=}
   case "$name" in ""|.*|*/*) continue ;; esac
   if [ -f "$src" ] && [ ! -L "$src" ]; then
-    head -c 1048576 "$src" > "${CRUCIBLE_REPORT_DIR:-/crucible/report}/$name" 2>/dev/null || true
+    dir=${CRUCIBLE_REPORT_DIR:-/crucible/report}
+    tmp=$(mktemp "$dir/.after-exit.XXXXXX" 2>/dev/null) || continue
+    if head -c 1048576 -- "$src" > "$tmp" 2>/dev/null; then
+      mv -f -- "$tmp" "$dir/$name" 2>/dev/null || rm -f -- "$tmp"
+    else
+      rm -f -- "$tmp"
+    fi
   fi
 done
 exit "$status"

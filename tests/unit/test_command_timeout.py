@@ -173,19 +173,24 @@ def test_hermes_takes_the_launch_timeout_in_whole_seconds() -> None:
             endpoint_url="http://spark.example.internal:11434/v1",
         )
     )
-    assert launch.env["TERMINAL_TIMEOUT"] == "1234"
-    assert launch.env["TERMINAL_MAX_FOREGROUND_TIMEOUT"] == "1234"
+    # Rounded up: Hermes never gets less than the launch asked for.
+    assert launch.env["TERMINAL_TIMEOUT"] == "1235"
+    assert launch.env["TERMINAL_MAX_FOREGROUND_TIMEOUT"] == "1235"
     assert launch.env["CRUCIBLE_AFTER_EXIT"] == (
         f"/home/worker/.hermes/processes.json={PROCESSES_NAME}"
     )
 
 
-def test_agy_has_no_command_timeout_to_set() -> None:
-    # 1.2.8 offers none (the adapter's docstring cites the evidence); its print timeout
-    # stays the attempt's own.
-    launch = AgyAdapter().build_launch(context(command_timeout_ms=60_000, timeout_seconds=1200))
+def test_agy_has_no_command_timeout_to_set_so_the_prompt_asks_for_blocking() -> None:
+    # 1.2.8 offers no setting (the adapter's docstring cites the evidence); its print
+    # timeout stays the attempt's own, and the prompt carries the instruction instead.
+    launch = AgyAdapter().build_launch(context(command_timeout_ms=90_000, timeout_seconds=1200))
     assert launch.argv[launch.argv.index("--print-timeout") + 1] == "1200s"
     assert launch.env == {}
+    prompt = launch.argv[2]
+    assert prompt.startswith(base.POINTER_PROMPT)
+    assert "blocking" in prompt and "up to 2 minutes" in prompt
+    assert len(prompt) < 1024
 
 
 # ----- work in flight at exit ------------------------------------------------------
@@ -335,3 +340,27 @@ def test_the_wrapper_never_follows_a_link_or_writes_outside_the_report(tmp_path:
     assert completed.returncode == 0, completed.stderr
     assert sorted(p.name for p in report.iterdir()) == ["transcript.jsonl"]
     assert not (tmp_path / "escaped").exists()
+
+
+def test_the_wrapper_replaces_a_link_planted_at_the_destination(tmp_path: Path) -> None:
+    report = tmp_path / "report"
+    report.mkdir()
+    elsewhere = tmp_path / "elsewhere.json"
+    elsewhere.write_text("untouched", encoding="utf-8")
+    (report / "hermes-processes.json").symlink_to(elsewhere)
+    state = tmp_path / "processes.json"
+    state.write_text('[{"session_id": "p1"}]', encoding="utf-8")
+    completed = run_wrapper(
+        tmp_path,
+        "exit 0\n",
+        {
+            "CRUCIBLE_REPORT_DIR": str(report),
+            "CRUCIBLE_TRANSCRIPT": str(report / "transcript.jsonl"),
+            "CRUCIBLE_AFTER_EXIT": f"{state}=hermes-processes.json",
+        },
+    )
+    assert completed.returncode == 0, completed.stderr
+    copied = report / "hermes-processes.json"
+    assert not copied.is_symlink() and json.loads(copied.read_text()) == [{"session_id": "p1"}]
+    assert elsewhere.read_text() == "untouched"
+    assert sorted(p.name for p in report.iterdir()) == ["hermes-processes.json", "transcript.jsonl"]

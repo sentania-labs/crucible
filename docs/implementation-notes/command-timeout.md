@@ -63,6 +63,19 @@ settings are in 07; this note keeps the observations.
   either. AGY needs a Google login before any turn (its adapter's endpoints), so
   it was not run and its print-mode behaviour at exit is unknown.
 
+## Known limits
+
+- The stall limits still apply (05b): a silent command outlasting
+  `stall_fail_seconds` (1800 s in the seeded policy) is a stall before it reaches
+  the 60-minute default.
+- A worker that leaves a server or other long command running when it ends its
+  turn is `incomplete`, even with a valid report. That is the requirement read
+  literally; `incomplete` is not retried.
+- The transcript is evidence only when it is collected: a report directory file
+  over the policy's size cap is dropped at collection, and with it the Claude Code
+  or Codex record of what was running.
+- AGY has only a prompt instruction (07), not a setting, and no evidence is read.
+
 ## Why no generic process check
 
 A launch-wrapper check for any process alive after the harness exits was

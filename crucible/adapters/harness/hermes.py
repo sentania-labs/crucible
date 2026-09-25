@@ -147,7 +147,8 @@ class HermesAdapter:
         if ctx.endpoint != "local" or ctx.endpoint_url is None:
             raise ValueError("Hermes is supported only with a configured local endpoint")
         usage_path = f"{ctx.report_mount}/{USAGE_NAME}"
-        seconds = str(max(1, ctx.command_timeout // 1000))
+        # Whole seconds, rounded up; the launch value is already within the attempt.
+        seconds = str(max(1, -(-ctx.command_timeout // 1000)))
         spec = self.credential_spec()
         assert spec is not None
         return AdapterLaunch(

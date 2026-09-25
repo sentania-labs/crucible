@@ -19,7 +19,8 @@ switch for backgrounding. Its `run_command` tool takes `Blocking` and
 wait continues in the background ("Background command is still running after %ds",
 from the binary's strings, 2026-09-25); neither `agy --help` nor the public CLI docs
 name a setting that changes it. `--print-timeout` bounds the whole turn and is the
-attempt's own timeout. What print mode does with a background command at exit was not
+attempt's own timeout. The one mitigation is in the prompt: run commands blocking, for
+up to the launch's command timeout, and never end the turn with one running. What print mode does with a background command at exit was not
 observed: AGY cannot run without a Google login, so it was not reproduced. Its
 transcript format for background commands is unknown, so this adapter has no in-flight
 evidence to read and its attempts are classified by exit code and report alone.
@@ -51,6 +52,13 @@ from crucible.ports.harness import (
 )
 
 NAME = "agy"
+# Issue 128: AGY takes blocking and backgrounding from the model per command, and the
+# launch has no setting for either, so the prompt says it. A mitigation, not a guard:
+# nothing enforces it and AGY's exit with a command running is not detected.
+BLOCKING_NOTE = (
+    "Run every shell command blocking and wait for it to finish, up to {minutes} minutes; "
+    "never end your turn while a command you started is still running."
+)
 CONFIG_DIR = "/home/worker/.gemini"
 TOKEN_FILE = "antigravity-cli/antigravity-oauth-token"
 
@@ -144,7 +152,14 @@ class AgyAdapter:
         )
 
     def build_launch(self, ctx: LaunchContext) -> AdapterLaunch:
-        argv: list[str] = [AGY_BINARY, "-p", base.POINTER_PROMPT, "--model", ctx.model]
+        note = BLOCKING_NOTE.format(minutes=max(1, -(-ctx.command_timeout // 60_000)))
+        argv: list[str] = [
+            AGY_BINARY,
+            "-p",
+            f"{base.POINTER_PROMPT} {note}",
+            "--model",
+            ctx.model,
+        ]
         if ctx.effort:
             argv += ["--effort", ctx.effort]
         argv += [

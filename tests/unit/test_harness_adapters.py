@@ -100,7 +100,7 @@ def test_codex_launch_matches_07_with_s1_and_s6_flags() -> None:
 def test_agy_launch_matches_07_and_stays_under_the_argv_ceiling() -> None:
     launch = AgyAdapter().build_launch(context(effort="low", timeout_seconds=1200))
     argv = launch.argv
-    assert argv[:3] == ("/usr/local/bin/agy", "-p", POINTER)
+    assert argv[:2] == ("/usr/local/bin/agy", "-p") and argv[2].startswith(POINTER + " ")
     assert argv[argv.index("--model") + 1] == "model-x"
     assert argv[argv.index("--effort") + 1] == "low"
     assert "--dangerously-skip-permissions" in argv

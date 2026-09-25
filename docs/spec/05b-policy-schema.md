@@ -207,6 +207,12 @@ field existed takes the default bounds shown above (60 minutes). The admin API,
 CLI and UI edit it in place (25), which writes a new policy version with only
 this limit changed. How each harness is held to it is in 07.
 
+A command that writes nothing still counts against the stall limits (10): a
+worker with no log output and no workspace change for `stall_fail_seconds` is
+stalled, whatever its command timeout. The seeded policy's 1800 seconds is
+shorter than the 60-minute default, so a silent command of more than 30 minutes
+ends as a stall before its command timeout.
+
 ## Precedence with the task contract
 
 The contract may narrow but never widen: `timeout_seconds` within limits,
