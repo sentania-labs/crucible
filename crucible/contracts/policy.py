@@ -12,6 +12,7 @@ from typing import Any, Literal
 from pydantic import Field, field_validator, model_validator
 
 from crucible.contracts.common import StrictModel, check_major_version
+from crucible.domain.command_timeout import DEFAULT_COMMAND_TIMEOUT_BOUNDS
 from crucible.domain.endpoints import validate_endpoint
 from crucible.domain.exit_class import ExitClass
 from crucible.domain.gates import (
@@ -37,7 +38,7 @@ class Bounds(StrictModel):
     @model_validator(mode="after")
     def _ordered(self) -> Bounds:
         if not self.min <= self.default <= self.max:
-            raise ValueError("timeout_seconds must satisfy min <= default <= max")
+            raise ValueError("bounds must satisfy min <= default <= max")
         return self
 
 
@@ -54,6 +55,13 @@ class AttemptCap(StrictModel):
 
 class Limits(StrictModel):
     timeout_seconds: Bounds
+    # Issue 128: the per-command timeout every harness is launched with, in
+    # milliseconds. A contract may narrow it within these bounds; the launch never
+    # exceeds the attempt's own timeout_seconds. Absent on versions uploaded before it
+    # existed, which take the operator's default of 60 minutes.
+    command_timeout_ms: Bounds = Field(
+        default_factory=lambda: Bounds.model_validate(DEFAULT_COMMAND_TIMEOUT_BOUNDS)
+    )
     max_attempts: AttemptCap
     grace_seconds: int = Field(ge=0)
     stall_warn_seconds: int = Field(ge=1)

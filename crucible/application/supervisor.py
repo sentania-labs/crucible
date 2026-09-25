@@ -68,6 +68,7 @@ from crucible.contracts.completion_claim import parse_claim
 from crucible.contracts.evidence import ROLE_RUN_EVIDENCE, EvidenceKind, EvidenceSource
 from crucible.contracts.task_contract import TaskContractV1
 from crucible.contracts.wake import WakeReason
+from crucible.domain.command_timeout import effective_command_timeout_ms
 from crucible.domain.entities import (
     Attempt,
     AttemptMetrics,
@@ -1021,6 +1022,10 @@ class Supervisor:
             if route is not None:
                 endpoint = route.endpoint
                 endpoint_url = route.endpoint_url
+        # Issue 128: the policy default, narrowed by the contract, capped at the attempt.
+        command_timeout_ms = effective_command_timeout_ms(
+            execution.policy_snapshot, contract, execution.timeout_seconds
+        )
         spec = LaunchSpec(
             attempt_id=attempt.id,
             task_id=task.id,
@@ -1039,6 +1044,7 @@ class Supervisor:
             effort=execution.effort,
             endpoint=endpoint,
             endpoint_url=endpoint_url,
+            command_timeout_ms=command_timeout_ms,
         )
         adapter = self._harnesses.get(selected_harness) if self._harnesses else None
         if adapter is None:
@@ -1071,6 +1077,7 @@ class Supervisor:
                 credential_mounted=credential_mounted,
                 endpoint=endpoint,
                 endpoint_url=endpoint_url,
+                command_timeout_ms=command_timeout_ms,
             )
         )
         return replace(

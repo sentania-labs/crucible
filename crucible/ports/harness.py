@@ -16,6 +16,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
+from crucible.domain.command_timeout import DEFAULT_COMMAND_TIMEOUT_MS
 from crucible.domain.endpoints import validate_endpoint
 from crucible.domain.exit_class import ExitClass
 
@@ -254,9 +255,17 @@ class LaunchContext:
     credential_mounted: bool = False
     endpoint: Literal["subscription", "local"] = "subscription"
     endpoint_url: str | None = None
+    # Issue 128: the per-command timeout, from the launch spec. None: the default.
+    command_timeout_ms: int | None = None
 
     def __post_init__(self) -> None:
         validate_endpoint(self.endpoint, self.endpoint_url)
+
+    @property
+    def command_timeout(self) -> int:
+        """The per-command timeout in milliseconds, never above the attempt's timeout."""
+        requested = self.command_timeout_ms or DEFAULT_COMMAND_TIMEOUT_MS
+        return max(1, min(requested, max(int(self.timeout_seconds), 1) * 1000))
 
 
 @dataclass(frozen=True, slots=True)

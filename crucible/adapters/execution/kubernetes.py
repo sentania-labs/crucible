@@ -2755,6 +2755,7 @@ class KubernetesProvider:
             credential_mounted=credential_mounted,
             endpoint=spec.endpoint,
             endpoint_url=spec.endpoint_url,
+            command_timeout_ms=spec.command_timeout_ms,
         )
 
     # ----- the network policy (26) --------------------------------------

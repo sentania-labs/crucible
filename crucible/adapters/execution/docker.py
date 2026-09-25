@@ -784,6 +784,7 @@ class DockerProvider:
             credential_mounted=self._credential_copy(spec) is not None,
             endpoint=spec.endpoint,
             endpoint_url=spec.endpoint_url,
+            command_timeout_ms=spec.command_timeout_ms,
         )
 
     def _credential_source(self, harness: str) -> CredentialSource | None:
