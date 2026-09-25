@@ -41,6 +41,7 @@ from crucible.application.harnesses import HarnessRegistry
 from crucible.application.supervisor import Supervisor
 from crucible.domain.entities import ImagePromotion, Role
 from crucible.ports.execution import (
+    REPORT_MOUNT,
     CleanupPolicy,
     LaunchRefusedError,
     LaunchSpec,
@@ -66,6 +67,8 @@ from tests.e2e.conftest import (
 )
 from tests.e2e.policy import e2e_policy_document, e2e_routing_document
 from tests.e2e.repo import make_origin
+from tests.e2e.test_class_routing import _install_class_policy
+from tests.e2e.test_isolation import MUST_BE_REFUSED
 from tests.fixtures import contract_document
 
 pytestmark = [
@@ -519,6 +522,28 @@ async def test_rows_5_7_11_23_supervisor_restart_and_full_gate_lifecycle(
         assert timeout_row.termination_reason == "timeout"
         assert "attempt_timeout_drain" in event_kinds(client, timeout_task)
 
+        # Row 7: completion, timeout, cancellation and stall are proven below and
+        # elsewhere in this function; a plain worker failure (no timeout, no signal)
+        # is not, so it gets its own case rather than being implied by the others.
+        crash_origin = _origin("supervisor-crash", "crash")
+        register(ctx, "supervisor-crash", crash_origin)
+        crash_document = e2e_contract("E2E-KIND-CRASH", "supervisor-crash", image)
+        crash_document["execution_request"]["provider"] = "kubernetes"
+        crash_task = submit_and_start(client, crash_document)
+        assert (
+            await run_until(
+                successor, client, crash_task, {"pre_pr_gates_failed"}, max_ticks=60, pause=0.5
+            )
+            == "pre_pr_gates_failed"
+        )
+        crash_attempt = client.get(f"/v1/tasks/{crash_task}").json()["latest_attempt"]
+        with engine.begin() as connection:
+            crash_row = connection.execute(
+                text("SELECT exit_class FROM attempts WHERE id = :id"),
+                {"id": crash_attempt["id"]},
+            ).one()
+        assert crash_row.exit_class == "crashed"
+
         cancel_origin = _origin("supervisor-cancel", "hang")
         register(ctx, "supervisor-cancel", cancel_origin)
         cancel_document = e2e_contract("E2E-KIND-CANCEL", "supervisor-cancel", image)
@@ -532,6 +557,39 @@ async def test_rows_5_7_11_23_supervisor_restart_and_full_gate_lifecycle(
             await asyncio.sleep(0.25)
         else:
             raise AssertionError("the cancellation worker never reached running")
+        # Row 11: a kill proves the worker stops; it says nothing about what the
+        # collector does with the report a killed worker had partly written. Plant one
+        # before the cancel so a real Pod's file is what the collector reads back.
+        # `running` is recorded once the Job exists, before its Pod is scheduled or its
+        # worker container has started, so wait for the container itself.
+        cancel_pod_name = ""
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline and not cancel_pod_name:
+            for cancel_pod in api.list_objects(
+                "pods", label_selector=f"{k8sspec.LABEL_ATTEMPT}={cancel_attempt['id']}"
+            ):
+                statuses = (cancel_pod.get("status") or {}).get("containerStatuses") or []
+                if any(
+                    item.get("name") == k8sspec.CONTAINER_NAME
+                    and "running" in (item.get("state") or {})
+                    for item in statuses
+                ):
+                    cancel_pod_name = str(cancel_pod["metadata"]["name"])
+                    break
+            else:
+                await asyncio.sleep(0.25)
+        assert cancel_pod_name, "the cancellation worker's container never started"
+        exec_result = api.pod_exec(
+            cancel_pod_name,
+            [
+                "sh",
+                "-c",
+                f"printf '%s\\n' 'schema_version: 1.0' 'summary: interrupted' "
+                f"> {REPORT_MOUNT}/report.yaml",
+            ],
+            container=k8sspec.CONTAINER_NAME,
+        )
+        assert exec_result.exit_code == 0, exec_result
         cancelled = client.post(
             f"/v1/tasks/{cancel_task}/cancel",
             json={
@@ -545,9 +603,15 @@ async def test_rows_5_7_11_23_supervisor_restart_and_full_gate_lifecycle(
             await run_until(successor, client, cancel_task, {"cancelled"}, max_ticks=40, pause=0.5)
             == "cancelled"
         )
+        cancel_attempt_id = client.get(f"/v1/tasks/{cancel_task}").json()["latest_attempt"]["id"]
         assert client.get(f"/v1/tasks/{cancel_task}").json()["latest_attempt"]["exit_class"] in (
             "killed",
             "cancelled",
+        )
+        cancel_artifacts = client.get(f"/v1/attempts/{cancel_attempt_id}/artifacts").json()["items"]
+        partial = [item for item in cancel_artifacts if item["type"] == "partial_report"]
+        assert len(partial) == 1 and partial[0]["filename"] == "report/report.yaml", (
+            cancel_artifacts
         )
 
         with engine.begin() as connection:
@@ -671,8 +735,9 @@ async def test_network_policy_denies_every_kubernetes_destination_from_the_worke
             for key, value in metadata.items()
             if key in ("name", "namespace", "labels", "annotations")
         }
-        with contextlib.suppress(KubernetesApiError):
-            api.create("networkpolicies", restored)
+        # A suppressed failure here would leave every later case in the session
+        # running without the default-deny NetworkPolicy in place (74).
+        api.create("networkpolicies", restored)
     await asyncio.sleep(2)
     spec = _spec(
         2,
@@ -688,6 +753,28 @@ async def test_network_policy_denies_every_kubernetes_destination_from_the_worke
         assert f"{name}=denied" in body, body
         assert f"{name}=reached" not in body, body
     await provider.cleanup(workspace, CleanupPolicy.DELETE, spec)
+    # 73: the reachable control ran once, before the denial phase, with no proof any
+    # destination was still reachable once the policy came off again. A destination
+    # that went away between phases for reasons other than the policy would read as
+    # denied either way, so re-run the control with the same budget after.
+    default_deny = api.get("networkpolicies", "default-deny")
+    api.delete("networkpolicies", "default-deny")
+    try:
+        control = await _unrestricted_network_control(api, destinations)
+        for name in destinations:
+            assert f"{name}=reached" in control, control
+    finally:
+        restored = {key: value for key, value in default_deny.items() if key != "status"}
+        metadata = restored["metadata"]
+        restored["metadata"] = {
+            key: value
+            for key, value in metadata.items()
+            if key in ("name", "namespace", "labels", "annotations")
+        }
+        api.create("networkpolicies", restored)
+    # The same settle the first restore gets, so the next case does not launch before
+    # Calico enforces the deny again.
+    await asyncio.sleep(2)
 
 
 async def test_deleted_pod_is_lost_and_sigterm_ignoring_pod_dies_at_grace(
@@ -707,6 +794,43 @@ async def test_deleted_pod_is_lost_and_sigterm_ignoring_pod_dies_at_grace(
     await _pods_gone(api, lost_spec.attempt_id)
     assert (await provider.observe(lost_handle)).state is ObservationState.LOST
     await provider.cleanup(lost_ws, CleanupPolicy.DELETE, lost_spec)
+
+    # 71: spec 26 says a Pod "evicted or deleted out of band" is `lost`. This evicts
+    # through the Eviction API, which is what `kubectl drain` calls, rather than
+    # deleting. The supervisor's Role may not create `pods/eviction`, so the tier's
+    # cluster-admin kubeconfig (KUBECONFIG, set by e2e-kind.sh) makes the request, as
+    # an operator draining the node would.
+    evicted_spec = _spec(6, _origin("evicted"), command=("sh", "-c", "sleep 600"))
+    evicted_ws = await provider.prepare(evicted_spec)
+    evicted_handle = await provider.launch(evicted_ws, evicted_spec)
+    await _running(provider, evicted_handle)
+    assert (await provider.observe(evicted_handle)).state is ObservationState.RUNNING
+    evicted_pod = await provider._pod_of(evicted_handle.ref)
+    assert evicted_pod is not None
+    evicted_name = str(evicted_pod["metadata"]["name"])
+    eviction = {
+        "apiVersion": "policy/v1",
+        "kind": "Eviction",
+        "metadata": {"name": evicted_name, "namespace": "crucible-workers"},
+        "deleteOptions": {"gracePeriodSeconds": 0},
+    }
+    subprocess.run(
+        [
+            "kubectl",
+            "create",
+            "--raw",
+            f"/api/v1/namespaces/crucible-workers/pods/{evicted_name}/eviction",
+            "-f",
+            "-",
+        ],
+        input=json.dumps(eviction),
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    await _pods_gone(api, evicted_spec.attempt_id)
+    assert (await provider.observe(evicted_handle)).state is ObservationState.LOST
+    await provider.cleanup(evicted_ws, CleanupPolicy.DELETE, evicted_spec)
 
     stubborn = _spec(
         4,
@@ -1016,6 +1140,224 @@ async def test_probe_refuses_launches_without_default_deny(
         await provider._delete_attempt_objects(spec.attempt_id)
 
 
+async def test_row_23_a_harness_the_image_does_not_declare_is_refused(
+    api: KubernetesClient, registry: CraneRegistryClient
+) -> None:
+    """Readiness row 23: unsupported combinations are refused. The tier's image
+    carries only the script harness's label, so an attempt that asks it for codex is
+    an unsupported combination, and prepare refuses it before any Job exists."""
+    provider = _provider(api, registry, harnesses=application_harnesses())
+    launch = _spec(50, _origin("unsupported-harness"), harness="codex")
+    with pytest.raises(LaunchRefusedError, match="the image declares harness"):
+        await provider.prepare(launch)
+    assert not api.list_objects(
+        "persistentvolumeclaims", label_selector=f"{k8sspec.LABEL_ATTEMPT}={launch.attempt_id}"
+    )
+
+
+async def test_isolation_probes_are_refused_on_kubernetes(
+    engine: Engine,
+    migrated: str,
+    artifact_root: Path,
+    provider: KubernetesProvider,
+    registry: CraneRegistryClient,
+) -> None:
+    """72: `test_isolation.py`'s probes (S4, 18, 21) had no kind counterpart. The
+    worker image's `isolation` behavior is the one script both tiers launch, so this
+    re-runs it through the full app and Supervisor on the Kubernetes provider and
+    demands the same posture Docker proves: every probe reads `refused`, whichever
+    mechanism (no Docker socket to mount, a NetworkPolicy instead of an egress proxy,
+    no shared filesystem to push into) produced it."""
+    clock = SystemClock()
+    harnesses = application_harnesses()
+    ctx = AppContext(
+        uow_factory=SqlUnitOfWorkFactory(engine),
+        clock=clock,
+        providers=[provider],
+        database_url=migrated,
+        engine=engine,
+        artifact_store=DiskArtifactStore(artifact_root / "kind-isolation-store"),
+        harnesses=harnesses,
+    )
+    tokens: dict[str, str] = {}
+    with ctx.uow_factory() as uow:
+        for role in Role:
+            tokens[role.value] = mint_token(
+                uow, clock, name=f"kind-isolation-{role.value}", role=role
+            ).token
+        uow.commit()
+    app = create_app(ctx)
+    image = os.environ["CRUCIBLE_E2E_KIND_REGISTRY"]
+    resolved = await asyncio.to_thread(registry.resolve, image)
+    with TestClient(app, headers={"Authorization": f"Bearer {tokens['admin']}"}) as admin:
+        routing = e2e_routing_document()
+        assert admin.put(
+            f"/v1/routing/{routing['name']}/{routing['version']}", json=routing
+        ).status_code in (200, 201)
+        policy = e2e_policy_document()
+        policy["images"]["allowlist"] = ["localhost:*/*"]
+        policy["resources"] = {
+            "cpus": 1,
+            "memory": "256MiB",
+            "pids": 128,
+            "tmpfs_total": "256MiB",
+        }
+        assert admin.put(
+            f"/v1/policies/{policy['name']}/{policy['version']}", json=policy
+        ).status_code in (200, 201)
+        with ctx.uow_factory() as uow:
+            uow.image_promotions.put(
+                ImagePromotion(
+                    digest=resolved.digest,
+                    reference=resolved.reference,
+                    harnesses=dict(resolved.harnesses) or {"script-harness": "1.0.0"},
+                    state="default",
+                    updated_at=clock.now(),
+                    updated_by="e2e-kind",
+                    reason="kind isolation probe image",
+                )
+            )
+            uow.commit()
+
+    supervisor = Supervisor(
+        ctx.uow_factory,
+        {"kubernetes": provider},
+        clock,
+        holder="e2e-kind-isolation",
+        artifact_store=ctx.artifact_store,
+        lease_ttl_seconds=120,
+        grace_seconds=5,
+        harnesses=harnesses,
+    )
+    with TestClient(app, headers={"Authorization": f"Bearer {tokens['operator']}"}) as client:
+        origin = _origin("isolation", "isolation")
+        register(ctx, "isolation", origin)
+        document = e2e_contract("E2E-KIND-ISOLATION", "isolation", image)
+        document["execution_request"]["provider"] = "kubernetes"
+        task_id = submit_and_start(client, document)
+        await run_until(
+            supervisor,
+            client,
+            task_id,
+            {"awaiting_internal_review", "gates_passed", "pre_pr_gates_failed"},
+            max_ticks=90,
+            pause=0.5,
+        )
+        attempt_id = client.get(f"/v1/tasks/{task_id}").json()["latest_attempt"]["id"]
+        artifacts = client.get(f"/v1/attempts/{attempt_id}/artifacts").json()["items"]
+        probe_artifact = next(a for a in artifacts if a["filename"].endswith("isolation.tsv"))
+        body = client.get(f"/v1/artifacts/{probe_artifact['id']}/content").text
+        results = dict(line.split("\t", 1) for line in body.splitlines() if "\t" in line)
+        assert set(MUST_BE_REFUSED) <= set(results), sorted(results)
+        reached = sorted(name for name, outcome in results.items() if outcome != "refused")
+        assert reached == [], f"a worker on Kubernetes reached something it must not: {reached}"
+
+
+async def test_scripted_quota_reroutes_on_kubernetes(
+    engine: Engine,
+    migrated: str,
+    artifact_root: Path,
+    provider: KubernetesProvider,
+    registry: CraneRegistryClient,
+) -> None:
+    """72: `test_class_routing.py`'s reroute case had no kind counterpart. A real Pod
+    runs the scripted quota worker, which exhausts its quota and exits, and the attempt
+    reroutes to a successor that resumes from the remote work branch. Stops at the
+    reroute: the Docker case goes on to prove the checkpoint reaches a local file
+    origin through `DockerProvider.push_quota_checkpoint`, which the Kubernetes
+    provider does not have, so on this tier nothing pushes a local-origin checkpoint."""
+    clock = SystemClock()
+    harnesses = application_harnesses()
+    ctx = AppContext(
+        uow_factory=SqlUnitOfWorkFactory(engine),
+        clock=clock,
+        providers=[provider],
+        database_url=migrated,
+        engine=engine,
+        artifact_store=DiskArtifactStore(artifact_root / "kind-routing-store"),
+        harnesses=harnesses,
+    )
+    tokens: dict[str, str] = {}
+    with ctx.uow_factory() as uow:
+        for role in Role:
+            tokens[role.value] = mint_token(
+                uow, clock, name=f"kind-routing-{role.value}", role=role
+            ).token
+        uow.commit()
+    app = create_app(ctx)
+    image = os.environ["CRUCIBLE_E2E_KIND_REGISTRY"]
+    resolved = await asyncio.to_thread(registry.resolve, image)
+    with TestClient(app, headers={"Authorization": f"Bearer {tokens['admin']}"}) as admin:
+        routing = e2e_routing_document()
+        assert admin.put(
+            f"/v1/routing/{routing['name']}/{routing['version']}", json=routing
+        ).status_code in (200, 201)
+        policy = e2e_policy_document()
+        policy["images"]["allowlist"] = ["localhost:*/*"]
+        policy["resources"] = {
+            "cpus": 1,
+            "memory": "256MiB",
+            "pids": 128,
+            "tmpfs_total": "256MiB",
+        }
+        assert admin.put(
+            f"/v1/policies/{policy['name']}/{policy['version']}", json=policy
+        ).status_code in (200, 201)
+        with ctx.uow_factory() as uow:
+            uow.image_promotions.put(
+                ImagePromotion(
+                    digest=resolved.digest,
+                    reference=resolved.reference,
+                    harnesses=dict(resolved.harnesses) or {"script-harness": "1.0.0"},
+                    state="default",
+                    updated_at=clock.now(),
+                    updated_by="e2e-kind",
+                    reason="kind class routing first image",
+                )
+            )
+            uow.commit()
+        _install_class_policy(ctx)
+
+    supervisor = Supervisor(
+        ctx.uow_factory,
+        {"kubernetes": provider},
+        clock,
+        holder="e2e-kind-routing",
+        artifact_store=ctx.artifact_store,
+        lease_ttl_seconds=120,
+        grace_seconds=5,
+        harnesses=harnesses,
+    )
+    with TestClient(app, headers={"Authorization": f"Bearer {tokens['operator']}"}) as client:
+        origin = _origin("class-routing")
+        register(ctx, "class-routing", origin)
+        document = e2e_contract("E2E-KIND-C6B", "class-routing", image)
+        document["execution_request"]["provider"] = "kubernetes"
+        document["policy"] = {"name": "e2e-script", "version": 2}
+        document["scope"]["allowed_paths"].append("e2e-behavior")
+        for field in ("harness", "model", "pin_reason", "image"):
+            document["execution_request"].pop(field, None)
+        task_id = submit_and_start(client, document)
+
+        # A real Pod's schedule-pull-run-exit round trip spans several ticks on kind,
+        # unlike Docker's near-instant container start, so this polls rather than
+        # assuming one tick reaches the reroute the way the Docker case can.
+        for _ in range(120):
+            await supervisor.tick()
+            midway = client.get(f"/v1/tasks/{task_id}").json()
+            attempts = midway["executions"][0]["attempts"]
+            if len(attempts) >= 2 and attempts[0].get("exit_class") == "quota_exhausted":
+                break
+            await asyncio.sleep(0.5)
+        else:
+            raise AssertionError("the scripted quota attempt never rerouted")
+        assert midway["state"] == "scheduled", midway
+        first, second = attempts
+        assert first["exit_class"] == "quota_exhausted"
+        assert first["image"] == resolved.reference
+        assert second["resume_from_remote"] is True
+
+
 # ----- the login Job, the service-owned Secret and the probe (25, 26, ADR 0015) ----------
 
 # The stand-in harness's credential directory and its "model endpoint". The endpoint is
@@ -1249,9 +1591,16 @@ async def test_login_from_an_empty_secret_to_a_probe_and_an_attempt_through_the_
             assert report["probe"]["exit_class"] == "completed", report
             assert report["validated"] is True
             assert report["credential"]["state"] == "validated"
-            assert not api.list_objects(
-                "persistentvolumeclaims", label_selector=f"{k8sspec.LABEL_ADMIN}=probe"
-            )
+            # The probe's PVC delete is issued, not waited for, and the
+            # `kubernetes.io/pvc-protection` finalizer keeps it listed for a moment (110).
+            probe_pvc_selector = f"{k8sspec.LABEL_ADMIN}=probe"
+            for _ in range(60):
+                if not api.list_objects(
+                    "persistentvolumeclaims", label_selector=probe_pvc_selector
+                ):
+                    break
+                time.sleep(0.5)
+            assert not api.list_objects("persistentvolumeclaims", label_selector=probe_pvc_selector)
 
         with TestClient(app, headers={"Authorization": f"Bearer {tokens['operator']}"}) as client:
             register(ctx, "kind-login", _origin("kind-login"))

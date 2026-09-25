@@ -332,8 +332,10 @@ class KubernetesConfig:
     # One exact, pullable worker image for the readiness canary (26). It is deliberately
     # not an entry of `image_repositories`: the listing would take it for a repository,
     # list the same tags a second time, and then build `<repo>:<probe tag>:<tag>` for
-    # each of them, which is a reference that does not parse and one suppressed registry
-    # round trip per tag on every `GET /admin/images`.
+    # each of them. `parse_reference` does not reject that shape; `crane digest` does,
+    # locally, before any request, and the failure drops the entry the way an
+    # unavailable image is dropped. The cost is the second tag listing plus one failing
+    # crane process per tag on every `GET /admin/images`.
     probe_image: str = ""
     use_reference_cache: bool = True
     # 26, issue 93: the canary is a shell script with curl, not a role pod, so it asks
