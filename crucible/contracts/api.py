@@ -263,6 +263,8 @@ class HarnessView(Response):
     # 0016): reference, digest, and the version of this harness the image pins.
     default_image: dict[str, str] | None = None
     previous_image: dict[str, str] | None = None
+    # The last harness test (crucible#118): pass or fail, and each step in plain words.
+    last_test: dict[str, Any] | None = None
 
 
 class HarnessList(Response):

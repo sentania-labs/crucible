@@ -1420,6 +1420,8 @@ class DockerProvider:
             env_from_files=dict(request.env_from_files),
             stdin_files=tuple(request.stdin_files),
             stdin_text=request.stdin_text,
+            endpoint=request.endpoint,
+            endpoint_url=request.endpoint_url,
         )
         root = self._root(probe_id)
         await asyncio.to_thread(shutil.rmtree, root, True)

@@ -244,6 +244,11 @@ def kind_schemas() -> dict[str, dict[str, Any]]:
             {"harness": STR},
             {"login": ANY_OBJ, "shape": ANY_OBJ},
         ),
+        "harness_test": _obj(
+            "a harness test: each step of a task's path, pass or fail in plain words",
+            {"harness": STR, "ok": BOOL, "steps": {"type": "array", "items": ANY_OBJ}},
+            {"failed_step": NSTR},
+        ),
         "image_list": _obj(
             "worker images, and each harness's default, previous image and choices",
             {"items": {"type": "array", "items": _model(ImageView)}},

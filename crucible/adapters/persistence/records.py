@@ -837,6 +837,7 @@ class HarnessStates:
             last_launch_outcome=row.last_launch_outcome,
             last_auth_failure_at=_dt(row.last_auth_failure_at),
             last_validated_at=_dt(row.last_validated_at),
+            last_test=dict(row.last_test) if row.last_test is not None else None,
         )
 
     def get(self, name: str) -> HarnessState | None:
@@ -861,6 +862,7 @@ class HarnessStates:
         row.last_launch_outcome = state.last_launch_outcome
         row.last_auth_failure_at = state.last_auth_failure_at
         row.last_validated_at = state.last_validated_at
+        row.last_test = state.last_test
         row.updated_at = state.updated_at
         row.updated_by = state.updated_by
         self._s.flush()

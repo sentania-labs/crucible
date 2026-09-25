@@ -400,6 +400,11 @@ def _ensure_state(uow: UnitOfWork, clock: Clock, name: str) -> HarnessState:
     return state
 
 
+def harness_state(uow: UnitOfWork, clock: Clock, name: str) -> HarnessState:
+    """The harness's runtime row, or the defaults a fresh deployment's row starts from."""
+    return _ensure_state(uow, clock, name)
+
+
 def set_harness_enabled(
     uow: UnitOfWork,
     clock: Clock,

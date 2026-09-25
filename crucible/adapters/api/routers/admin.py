@@ -14,6 +14,7 @@ from crucible.application.admin import (
     audit,
     credentials,
     github,
+    harness_test,
     harnesses,
     images,
     login,
@@ -182,6 +183,23 @@ def admin_disable(
         harness=name,
         enabled=False,
         reason=_reason(body),
+    )
+    uow.commit()
+    return result
+
+
+@router.post("/admin/harnesses/{name}/test")
+async def admin_test_harness(
+    name: str,
+    ctx: Ctx,
+    uow: UoW,
+    principal: Admin,
+    body: Annotated[dict[str, Any] | None, Body()] = None,
+) -> dict[str, Any]:
+    """crucible#118: the path a real task takes, step by step, pass or fail in plain
+    words. A check, so no reason is asked for; one given is recorded."""
+    result = await harness_test.test_harness(
+        _admin(ctx), uow, principal=principal.name, harness=name, reason=_reason(body)
     )
     uow.commit()
     return result

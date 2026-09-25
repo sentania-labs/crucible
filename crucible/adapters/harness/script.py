@@ -9,6 +9,7 @@ port now so the registry has one shape for every harness (07).
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
@@ -35,6 +36,33 @@ QUOTA_PATTERNS = base.patterns("scripted_quota_exhausted")
 
 def _provider_quota_refusal(document: Mapping[str, Any]) -> bool:
     return document.get("error") == "scripted_quota_exhausted"
+
+
+def _probe_launch(ctx: LaunchContext) -> AdapterLaunch:
+    """A harness test of the fixture (crucible#118). Routed to a local endpoint, it makes
+    the one minimal model call a real harness would, from the worker Pod and through its
+    egress, and fails when the endpoint does not answer; otherwise there is nothing to
+    call and it exits 0."""
+    if ctx.endpoint != "local" or not ctx.endpoint_url:
+        return AdapterLaunch(argv=("sh", "-c", "exit 0"))
+    body = json.dumps(
+        {
+            "model": ctx.model,
+            "messages": [{"role": "user", "content": "Reply with OK."}],
+            "max_tokens": 1,
+        }
+    )
+    script = (
+        'curl -sS -f --max-time 60 -H "content-type: application/json" '
+        '--data "$CRUCIBLE_TEST_BODY" "$CRUCIBLE_TEST_ENDPOINT/chat/completions" >/dev/null'
+    )
+    return AdapterLaunch(
+        argv=("sh", "-c", script),
+        env={
+            "CRUCIBLE_TEST_ENDPOINT": ctx.endpoint_url.rstrip("/"),
+            "CRUCIBLE_TEST_BODY": body,
+        },
+    )
 
 
 class ScriptHarnessAdapter:
@@ -66,6 +94,8 @@ class ScriptHarnessAdapter:
         return None
 
     def build_launch(self, ctx: LaunchContext) -> AdapterLaunch:
+        if ctx.probe:
+            return _probe_launch(ctx)
         if ctx.model == "a-scripted-quota":
             script = (
                 "mkdir -p src; printf 'quota checkpoint\\n' > src/quota-checkpoint.txt; "

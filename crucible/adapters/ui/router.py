@@ -25,6 +25,7 @@ from crucible.application.admin import (
     bootstrap,
     credentials,
     github,
+    harness_test,
     harnesses,
     images,
     login,
@@ -171,7 +172,7 @@ REASON_REQUIRED_ACTIONS = frozenset(
         "/ui/actions/token-revoke",
     }
 )
-NO_REASON_ACTIONS = frozenset({"/ui/actions/github-check"})
+NO_REASON_ACTIONS = frozenset({"/ui/actions/github-check", "/ui/actions/harness-test"})
 
 
 def _reason_fields(sections: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -637,6 +638,34 @@ async def dashboard(request: Request, ctx: Ctx, uow: UoW) -> Response:
     )
 
 
+def _harness_status(item: dict[str, Any]) -> dict[str, Any]:
+    """The one word an operator acts on, most blocking first."""
+    if not item["enabled_by_configuration"]:
+        return {"kind": "status", "value": "off in configuration", "tone": "bad"}
+    if not item["enabled"]:
+        return {"kind": "status", "value": "disabled", "tone": "warn"}
+    if not item.get("default_image"):
+        return {"kind": "status", "value": "needs an image", "tone": "warn"}
+    if item["credential"]["state"] in ("absent", "invalid"):
+        return {"kind": "status", "value": "needs a credential", "tone": "warn"}
+    return {"kind": "status", "value": "ready", "tone": "ok"}
+
+
+def _test_cell(last: dict[str, Any] | None) -> dict[str, Any]:
+    if not last:
+        return {"kind": "note", "value": "not tested yet"}
+    tones = {"pass": "ok", "fail": "bad", "not run": "accent"}
+    return {
+        "kind": "steps",
+        "items": [
+            {**step, "tone": tones.get(str(step.get("result")), "accent")}
+            for step in last.get("steps", [])
+            if step.get("result") != "not run"
+        ],
+        "tested_at": last.get("tested_at"),
+    }
+
+
 @router.get("/harnesses", response_class=HTMLResponse)
 async def harness_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
     found = _require(request, ctx, uow)
@@ -646,66 +675,100 @@ async def harness_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
     assert ctx.admin is not None
     discovered = await harnesses.list_images(ctx.admin)
     items = harnesses.list_harnesses(ctx.admin, uow, [item for _, item in discovered])
-    rows = [
-        [
-            item["name"],
-            item["enabled_by_configuration"],
-            item["enabled_by_administrator"],
-            item["reason"],
-            item["credential"]["state"],
-            item.get("concurrency_in_use", 0),
-            item.get("images", []),
-        ]
-        for item in items
-    ]
+    admin = principal.role is Role.ADMIN
+    rows: list[list[Any]] = []
+    for item in items:
+        name = item["name"]
+        image = item.get("default_image")
+        last = item.get("last_test")
+        actions: list[dict[str, Any]] = []
+        if admin and item["enabled_by_configuration"]:
+            actions.append(
+                {
+                    "kind": "form",
+                    "action": "/ui/actions/harness-test",
+                    "label": "Test",
+                    "primary": True,
+                    "hidden": {"harness": name},
+                }
+            )
+            actions.append(
+                {
+                    "kind": "form",
+                    "action": "/ui/actions/harness",
+                    "label": "Disable" if item["enabled_by_administrator"] else "Enable",
+                    "danger": bool(item["enabled_by_administrator"]),
+                    "hidden": {
+                        "harness": name,
+                        "enabled": "false" if item["enabled_by_administrator"] else "true",
+                    },
+                }
+            )
+        rows.append(
+            [
+                name,
+                _harness_status(item),
+                (
+                    {
+                        "kind": "note",
+                        "value": image["reference"],
+                        "hint": f"{name} {image['version']}",
+                    }
+                    if image
+                    else {"kind": "link", "href": "/ui/images", "label": "Choose on Images"}
+                ),
+                item["credential"]["state"].replace("_", " "),
+                _test_cell(last),
+                {"kind": "actions", "items": actions} if actions else "",
+            ]
+        )
     sections: list[dict[str, Any]] = [
         {
-            "title": "Harness roster",
-            "columns": [
-                "Harness",
-                "Configured",
-                "Runtime",
-                "Reason",
-                "Credential",
-                "Concurrency",
-                "Images",
-            ],
+            "title": "Harnesses",
+            "note": (
+                "Test runs what a task runs: the harness's image, its credential, a worker "
+                "under the worker's egress, and one small model call. It takes up to a "
+                "couple of minutes."
+            ),
+            "columns": ["Harness", "Status", "Image", "Credential", "Last test", ""],
             "rows": rows,
+            "details": [
+                {
+                    "title": "Gates, versions and use",
+                    "columns": [
+                        "Harness",
+                        "Configuration gate",
+                        "Runtime gate",
+                        "Why",
+                        "Tested versions",
+                        "Running now",
+                    ],
+                    "rows": [
+                        [
+                            item["name"],
+                            "on" if item["enabled_by_configuration"] else "off",
+                            "on" if item["enabled_by_administrator"] else "off",
+                            item["reason"] or "none",
+                            item["supported_versions"],
+                            item.get("concurrency_in_use", 0),
+                        ]
+                        for item in items
+                    ],
+                    "note": (
+                        "The configuration gate is restart-bound (Settings); the runtime "
+                        "gate is the Enable and Disable buttons above."
+                    ),
+                }
+            ],
         }
     ]
-    if principal.role is Role.ADMIN:
-        sections.append(
-            {
-                "title": "Change runtime gate",
-                "note": "The configuration gate is restart-bound and is shown on Settings.",
-                "form": {
-                    "action": "/ui/actions/harness",
-                    "label": "Apply runtime gate",
-                    "fields": [
-                        {
-                            "name": "harness",
-                            "label": "Harness",
-                            "kind": "select",
-                            "options": [(item["name"], item["name"]) for item in items],
-                        },
-                        {
-                            "name": "enabled",
-                            "label": "State",
-                            "kind": "select",
-                            "options": [("true", "Enabled"), ("false", "Disabled")],
-                        },
-                        {"name": "reason", "label": "Reason", "required": True},
-                    ],
-                },
-            }
-        )
     return _page(
         request,
         principal,
         csrf,
         active="/ui/harnesses",
         heading="Harnesses",
-        intro="Installed images, compatibility, and both launch gates.",
+        intro="Whether each harness can run a task, and a test that proves it.",
         sections=sections,
     )
 
@@ -1853,6 +1916,19 @@ async def action(request: Request, action: str, ctx: Ctx, uow: UoW) -> Response:
                 digest=form.get("digest", ""),
                 reason=reason,
             )
+        elif action == "harness-test":
+            result = await harness_test.test_harness(
+                ctx.admin, uow, principal=principal.name, harness=form.get("harness", "")
+            )
+            uow.commit()
+            failed = result["failed_step"]
+            message = (
+                f"{result['harness']} passed every step."
+                if result["ok"]
+                else f"{result['harness']} failed at {failed}: "
+                + next(s["detail"] for s in result["steps"] if s["name"] == failed)
+            )
+            return _redirect(form, message, kind="ok" if result["ok"] else "bad")
         elif action == "image-rollback":
             images.rollback(
                 ctx.admin,

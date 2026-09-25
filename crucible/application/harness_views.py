@@ -78,6 +78,7 @@ def harness_list(
                     if default is not None
                     else None
                 ),
+                last_test=state.last_test if state is not None else None,
                 previous_image=(
                     {
                         "reference": default.previous_reference or "",

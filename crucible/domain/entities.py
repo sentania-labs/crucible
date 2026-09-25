@@ -455,6 +455,9 @@ class HarnessState:
     last_launch_outcome: str | None = None
     last_auth_failure_at: datetime | None = None
     last_validated_at: datetime | None = None
+    # The last harness test (crucible#118): when, pass or fail, and each step's result in
+    # plain words. Never output: the steps say what was checked and why it failed.
+    last_test: dict[str, Any] | None = None
 
 
 @dataclass(slots=True)

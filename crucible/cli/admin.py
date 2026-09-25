@@ -33,6 +33,7 @@ from crucible.application.admin import (
     bootstrap,
     credentials,
     github,
+    harness_test,
     harnesses,
     images,
     login,
@@ -156,6 +157,10 @@ def build_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     for verb in ("enable", "disable"):
         p = h_sub.add_parser(verb, help=f"{verb} a harness for new launches")
         p.add_argument("name", help="claude_code, codex, agy, hermes")
+    test = h_sub.add_parser(
+        "test", help="run the path a task takes: image, credential, worker, one model call"
+    )
+    test.add_argument("name", help="claude_code, codex, agy, hermes")
 
     c = sub.add_parser("credentials", help="status, set, validate, probe, login, rotate, remove")
     c_sub = c.add_subparsers(dest="credential_command", required=True)
@@ -386,6 +391,8 @@ def _remote(args: argparse.Namespace, remote: Api) -> Any:
     if command == "harnesses":
         if args.harness_command == "list":
             return remote.call("GET", "/v1/admin/harnesses")
+        if args.harness_command == "test":
+            return remote.call("POST", f"/v1/admin/harnesses/{args.name}/test", reason)
         return remote.call(
             "POST", f"/v1/admin/harnesses/{args.name}/{args.harness_command}", reason
         )
@@ -581,6 +588,14 @@ def _local(args: argparse.Namespace, wiring: Wiring) -> Any:
             if args.harness_command == "list":
                 found = asyncio.run(harnesses.list_images(admin))
                 return {"items": harnesses.list_harnesses(admin, uow, [i for _, i in found])}
+            if args.harness_command == "test":
+                tested = asyncio.run(
+                    harness_test.test_harness(
+                        admin, uow, principal=principal, harness=args.name, reason=args.reason
+                    )
+                )
+                uow.commit()
+                return tested
             result = harnesses.set_enabled(
                 admin,
                 uow,
@@ -909,6 +924,7 @@ def kind_of(args: argparse.Namespace) -> str:
         ("harnesses", "list"): "harness_list",
         ("harnesses", "enable"): "harness",
         ("harnesses", "disable"): "harness",
+        ("harnesses", "test"): "harness_test",
         ("credentials", "status"): "credential_state",
         ("credentials", "login"): "credential_login",
         ("images", "list"): "image_list",
@@ -975,6 +991,8 @@ def result_for(
         actions = nx.credential_actions(args.harness, state, prefix)
     elif kind == "harness_list":
         actions = nx.harness_actions(_items(document), prefix)
+    elif kind == "harness_test" and isinstance(document, dict):
+        state = "passed" if document.get("ok") else "failed"
     elif kind == "harness" and isinstance(document, dict):
         state = "enabled" if document.get("enabled") else "disabled"
         actions = nx.harness_actions(

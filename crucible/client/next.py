@@ -523,6 +523,15 @@ def harness_actions(items: Iterable[Any], prefix: Sequence[str]) -> list[dict[st
                 roles=(ADMIN,),
             )
         )
+        if on:
+            out.append(
+                action(
+                    f"test:{name}",
+                    f"test {name}: image, credential, worker, one model call",
+                    [*prefix, "harnesses", "test", name],
+                    roles=(ADMIN,),
+                )
+            )
     return out
 
 

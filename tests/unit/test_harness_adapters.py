@@ -292,3 +292,30 @@ def test_an_administrator_flag_refuses_with_its_reason() -> None:
         default_registry().resolve("agy", state=state)
     state.enabled = True
     assert default_registry().resolve("agy", state=state).name == "agy"
+
+
+def test_the_fixture_harness_makes_one_model_call_when_tested_behind_a_local_endpoint() -> None:
+    """crucible#118: the harness test's model call, from the worker and through its
+    egress, against the endpoint the routing policy names. Nothing to call otherwise."""
+    adapter = ScriptHarnessAdapter()
+
+    def context(**kwargs: Any) -> LaunchContext:
+        return LaunchContext(
+            attempt_id="probe",
+            model="stub-model",
+            effort=None,
+            timeout_seconds=60,
+            identity_mount="/crucible/identity",
+            report_mount="/crucible/report",
+            repo_mount="/crucible/repo",
+            probe=True,
+            **kwargs,
+        )
+
+    local = adapter.build_launch(
+        context(endpoint="local", endpoint_url="https://stub.example.invalid/v1")
+    )
+    assert local.argv[:2] == ("sh", "-c") and "chat/completions" in local.argv[2]
+    assert local.env["CRUCIBLE_TEST_ENDPOINT"] == "https://stub.example.invalid/v1"
+    assert '"model": "stub-model"' in local.env["CRUCIBLE_TEST_BODY"]
+    assert adapter.build_launch(context()).argv == ("sh", "-c", "exit 0")

@@ -1816,8 +1816,8 @@ def test_the_probe_refuses_rather_than_falling_back_to_a_retired_model(
     policy tables are not truncated between tests, and a superseding version with a
     disabled harness would be in force for every test that follows."""
     from crucible.application.admin.credentials import (  # noqa: PLC0415
-        _probe_model,
         adapter_for,
+        probe_route,
     )
     from crucible.domain.entities import Policy, RoutingPolicyRecord  # noqa: PLC0415
 
@@ -1859,7 +1859,7 @@ def test_the_probe_refuses_rather_than_falling_back_to_a_retired_model(
         assert "gpt-5.6-luna" not in detail
         # A harness the policy in force still enables takes its model from that policy.
         assert (
-            _probe_model(uow, adapter_for(admin_ctx, "claude_code"), "claude_code")
+            probe_route(uow, adapter_for(admin_ctx, "claude_code"), "claude_code")[0]
             == "claude-haiku-4-5"
         )
         uow.rollback()
@@ -2115,3 +2115,71 @@ def test_the_cli_remote_mode_sends_the_egress_document(monkeypatch: pytest.Monke
             },
         ),
     ]
+
+
+def test_a_harness_test_reports_each_step_and_stops_at_the_first_failure(
+    ctx: AppContext,
+    admin_client: TestClient,
+    live_supervisor: Supervisor,
+    config_file: Path,
+    provider: FakeProvider,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """crucible#118: one Test per harness runs the path a task takes and says, per step,
+    pass or fail in plain words. It asks for no reason (crucible#117)."""
+    asyncio.run(live_supervisor.tick())
+    untested = admin_client.post("/v1/admin/harnesses/hermes/test")
+    assert untested.status_code == 200, untested.text
+    result = untested.json()
+    assert result["ok"] is False and result["failed_step"] == "Worker image"
+    assert [s["result"] for s in result["steps"]] == [
+        "pass",
+        "fail",
+        "not run",
+        "not run",
+        "not run",
+        "not run",
+    ]
+    assert "choose one on Images" in result["steps"][1]["detail"]
+
+    with ctx.uow_factory() as uow:
+        promote_for_test(
+            uow,
+            digest="sha256:" + "a" * 64,
+            reference="ghcr.io/sentania-labs/crucible-worker:0.5.5",
+            harnesses={"hermes": "0.19.0", "script-harness": "1.0.0", "codex": "0.156.0"},
+            at=ctx.clock.now(),
+        )
+        uow.commit()
+    # Hermes has no key in this tier: the test stops at the credential, before a worker.
+    probes_before = len(provider.probes)
+    missing = admin_client.post("/v1/admin/harnesses/hermes/test", json={}).json()
+    assert missing["failed_step"] == "Credential"
+    assert "no API key is set" in missing["steps"][2]["detail"]
+    assert len(provider.probes) == probes_before
+
+    # The fixture harness calls no model unless routed to a local endpoint; it passes.
+    passed = run_cli(config_file, "harnesses", "test", "script-harness", capsys=capsys)
+    assert passed["ok"] is True, passed
+    assert [s["name"] for s in passed["steps"]] == [
+        "Harness enabled",
+        "Worker image",
+        "Credential",
+        "Model",
+        "Worker starts",
+        "Model call",
+    ]
+    assert passed["steps"][2]["detail"] == "this harness needs none"
+    through_api = admin_client.post("/v1/admin/harnesses/script-harness/test").json()
+    assert through_api["ok"] is True
+    assert provider.probe_requests[-1].harness == "script-harness"
+
+    # A model provider that refuses the credential fails the model call, named as such.
+    provider.probe_outcome = "auth_failure"
+    refused = admin_client.post("/v1/admin/harnesses/codex/test").json()
+    assert refused["failed_step"] == "Model call", refused
+    assert "refused the credential" in refused["steps"][-1]["detail"]
+
+    harnesses_view = {h["name"]: h for h in admin_client.get("/v1/admin/harnesses").json()["items"]}
+    assert harnesses_view["script-harness"]["last_test"]["ok"] is True
+    assert harnesses_view["codex"]["last_test"]["failed_step"] == "Model call"

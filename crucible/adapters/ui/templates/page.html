@@ -38,7 +38,7 @@
   {% elif cell is mapping and cell.kind == "link" %}<a href="{{ cell.href }}">{{ cell.label }}</a>
   {% elif cell is mapping and cell.kind == "status" %}<span class="lat-badge lat-badge--{{ cell.tone or 'accent' }}">{{ cell.value }}</span>{% if cell.hint %}<div class="admin-hint">{{ cell.hint }}</div>{% endif %}
   {% elif cell is mapping and cell.kind == "note" %}<div>{{ cell.value }}</div>{% if cell.hint %}<div class="admin-hint">{{ cell.hint }}</div>{% endif %}
-  {% elif cell is mapping and cell.kind == "steps" %}<ol class="admin-steps">{% for step in cell["items"] %}<li><span class="lat-badge lat-badge--{{ step.tone }}">{{ step.result }}</span> <b>{{ step.name }}</b>{% if step.detail %}: {{ step.detail }}{% endif %}</li>{% endfor %}</ol>
+  {% elif cell is mapping and cell.kind == "steps" %}<ol class="admin-steps">{% for step in cell["items"] %}<li><span class="lat-badge lat-badge--{{ step.tone }}">{{ step.result }}</span> <b>{{ step.name }}</b>{% if step.detail %}: {{ step.detail }}{% endif %}</li>{% endfor %}</ol>{% if cell.tested_at %}<div class="admin-hint">{{ cell.tested_at }}</div>{% endif %}
   {% elif cell is string and cell.startswith('/ui') %}<a href="{{ cell }}">Open</a>
   {% elif cell is mapping or (cell is sequence and cell is not string) %}{{ render_panel(panel_from_cell(cell)) }}
   {% else %}{{ safe_value(column, cell) }}{% endif %}

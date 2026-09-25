@@ -365,6 +365,11 @@ class ProbeRequest:
     identity_text: str = ""
     timeout_seconds: int = 120
     policy: dict[str, Any] = field(default_factory=dict)
+    # A model behind a local endpoint (13, S16): the worker's egress opens to it exactly
+    # as it does for an attempt routed there, so the harness test's model call takes the
+    # path a task's does (crucible#118).
+    endpoint: Literal["subscription", "local"] = "subscription"
+    endpoint_url: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
