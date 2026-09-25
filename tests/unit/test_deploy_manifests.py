@@ -180,24 +180,72 @@ def test_supervisor_role_verbs_are_exactly_what_26_records(
     assert seen == SUPERVISOR_ROLE_RULES
 
 
-def test_the_only_rolebinding_names_the_control_plane_account(
+def test_each_rolebinding_names_only_the_control_plane_account(
     rendered: dict[str, list[dict[str, Any]]],
 ) -> None:
-    """A second subject, or a Group subject, is how the supervisor's Role would reach
-    something other than Crucible."""
+    """A second subject, or a Group subject, is how a Role would reach something other
+    than Crucible. There are two bindings: the supervisor's Role in `crucible-workers`
+    (26) and the GitHub App Secret's Role in `crucible` (ADR 0016)."""
+    subjects = [{"kind": "ServiceAccount", "name": "crucible-supervisor", "namespace": "crucible"}]
     for target in ("base", "overlays/lab", "overlays/kind"):
-        bindings = _of_kind(rendered[target], "RoleBinding")
-        assert len(bindings) == 1, f"{target}: {len(bindings)} RoleBinding objects"
-        binding = bindings[0]
-        assert binding["metadata"]["namespace"] == "crucible-workers"
-        assert binding["roleRef"] == {
-            "apiGroup": "rbac.authorization.k8s.io",
-            "kind": "Role",
-            "name": "crucible-supervisor",
+        bindings = {
+            (b["metadata"]["namespace"], b["metadata"]["name"]): b
+            for b in _of_kind(rendered[target], "RoleBinding")
         }
-        assert binding["subjects"] == [
-            {"kind": "ServiceAccount", "name": "crucible-supervisor", "namespace": "crucible"}
-        ], target
+        assert set(bindings) == {
+            ("crucible-workers", "crucible-supervisor"),
+            ("crucible", "crucible-github-app"),
+        }, target
+        for (_namespace, name), binding in bindings.items():
+            assert binding["roleRef"] == {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "Role",
+                "name": name,
+            }
+            assert binding["subjects"] == subjects, target
+
+
+def test_the_control_plane_reaches_only_the_github_app_secret_in_its_own_namespace(
+    rendered: dict[str, list[dict[str, Any]]],
+) -> None:
+    """ADR 0016: `get` and `patch` name the one Secret; `create` cannot be narrowed by
+    name, and nothing lists, watches, replaces or deletes a Secret in `crucible`."""
+    role = _named(rendered["base"], "Role", "crucible-github-app")
+    assert role["metadata"]["namespace"] == "crucible"
+    assert role["rules"] == [
+        {
+            "apiGroups": [""],
+            "resources": ["secrets"],
+            "resourceNames": ["crucible-github-app"],
+            "verbs": ["get", "patch"],
+        },
+        {"apiGroups": [""], "resources": ["secrets"], "verbs": ["create"]},
+    ]
+    roles = {
+        (r["metadata"]["namespace"], r["metadata"]["name"])
+        for r in _of_kind(rendered["base"], "Role")
+    }
+    assert roles == {
+        ("crucible-workers", "crucible-supervisor"),
+        ("crucible", "crucible-github-app"),
+    }
+
+
+def test_gitops_delivers_no_github_app_secret(
+    rendered: dict[str, list[dict[str, Any]]],
+) -> None:
+    """ADR 0016: the service writes the App credential, so a copy GitOps also applied
+    would be a second writer. No rendered target carries one, and the mount that reads it
+    stays optional because a fresh deployment has none until the operator connects."""
+    for target in TARGETS:
+        for obj in rendered[target]:
+            if obj["kind"] in {"Secret", "SealedSecret", "ExternalSecret"}:
+                assert obj["metadata"]["name"] != "crucible-github-app", target
+    for name in ("crucible-api", "crucible-supervisor"):
+        deployment = _named(rendered["base"], "Deployment", name)
+        volumes = deployment["spec"]["template"]["spec"]["volumes"]
+        github = next(v for v in volumes if v["name"] == "github")
+        assert github["secret"]["optional"] is True
 
 
 def test_the_kind_tier_applies_the_deployed_rbac_files() -> None:

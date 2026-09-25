@@ -3,6 +3,7 @@ kind: Kustomization
 resources:
   - namespace.yaml
   - serviceaccounts.yaml
+  - github-app-rbac.yaml
   - configmap.yaml
   - artifacts-pvc.yaml
   - postgres.yaml

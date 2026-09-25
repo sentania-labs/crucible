@@ -160,6 +160,12 @@ spec:
         - name: artifacts
           persistentVolumeClaim:
             claimName: crucible-artifacts
+        # The GitHub App Secret the service owns (ADR 0016). Optional by design, not by
+        # accident (crucible#79): the service creates it when the operator connects the
+        # App, so a fresh deployment has none and must still start. The key is read
+        # through the API server, not from this mount; the mount carries the webhook
+        # secret to the webhook route, and a missing key is named on the GitHub page and
+        # at startup when `github.enabled` says one should be there.
         - name: github
           secret:
             secretName: crucible-github-app

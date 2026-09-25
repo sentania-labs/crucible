@@ -1,0 +1,44 @@
+# The one permission the control plane holds in its own namespace (ADR 0016): the GitHub
+# App credential Secret, which the service owns. Connect GitHub creates it the first time
+# it writes, labelled `app.kubernetes.io/managed-by: crucible`, and replaces its data with
+# one merge patch on each later write; the api and the supervisor read it through the API
+# server on each signature.
+#
+# `get` and `patch` name the one Secret. `create` cannot: the API server authorizes a
+# create before the object has a name, so RBAC ignores resourceNames on it. That is the
+# whole of the widening, and it is in `crucible`, where no worker ever runs. `list`,
+# `watch`, `update` and `delete` are absent: nothing here enumerates, replaces or removes
+# a Secret, and the database Secret stays out of reach.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: crucible-github-app
+  namespace: crucible
+  labels:
+    app.kubernetes.io/name: crucible
+    app.kubernetes.io/component: control-plane
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["crucible-github-app"]
+    verbs: ["get", "patch"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: crucible-github-app
+  namespace: crucible
+  labels:
+    app.kubernetes.io/name: crucible
+    app.kubernetes.io/component: control-plane
+subjects:
+  - kind: ServiceAccount
+    name: crucible-supervisor
+    namespace: crucible
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: crucible-github-app
