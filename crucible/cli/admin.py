@@ -196,7 +196,10 @@ def build_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
 
     i = sub.add_parser("images", help="list, promote, roll back: per harness (ADR 0016)")
     i_sub = i.add_subparsers(dest="image_command", required=True)
-    i_sub.add_parser("list", help="worker images, and each harness's default and choices")
+    i_sub.add_parser(
+        "list",
+        help="worker images, and each harness's default and choices (ci-* tags are not listed)",
+    )
     promote = i_sub.add_parser("promote", help="make an image one harness's default")
     promote.add_argument("digest", help="the image's digest or reference")
     promote.add_argument("--harness", required=True, help="the harness it becomes the default of")

@@ -1166,7 +1166,7 @@ async def images_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
         csrf,
         active="/ui/images",
         heading="Images",
-        intro="Which worker image each harness runs.",
+        intro="Which worker image each harness runs. CI proof tags (ci-*) are not listed.",
         sections=sections,
     )
 
