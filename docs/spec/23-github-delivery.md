@@ -7,7 +7,8 @@ delivery half of the task lifecycle (09).
 
 ## Authority model
 
-- Crucible holds a GitHub App private key (mounted, 12) and mints
+- Crucible holds a GitHub App private key (the credential it owns, 12, ADR
+  0016) and mints
   short-lived installation tokens scoped to one repository, on demand, for
   one publisher job at a time. Tokens live in memory and in the tmpfs of
   the publisher container, never elsewhere.
@@ -17,6 +18,11 @@ delivery half of the task lifecycle (09).
   Issues write. Repository
   registration (`PUT /repositories/{name}`) records the installation ID
   the App has for that repository; the key never appears in the record.
+  The GitHub page's repository picker fills it (25): it lists what each
+  installation covers, grouped by account, using a token scoped to
+  `metadata: read` that is discarded before the listing returns, and a pick
+  registers the repository with that installation ID and the default branch
+  GitHub reports.
 - **The push remote is derived from the repository's `owner/name`, not from
   its registered url.** The registered url is the fetch source: it is what
   the preparer and the collector clone, and those containers hold no GitHub

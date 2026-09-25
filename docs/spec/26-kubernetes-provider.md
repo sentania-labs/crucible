@@ -33,8 +33,11 @@ Deployment (one replica, lease-guarded exactly as today, fenced tokens in
 PostgreSQL), and PostgreSQL (operator-managed or external; the manifests
 carry a single-instance StatefulSet for the lab and a connection-string
 option for an external server). No Docker socket anywhere. The GitHub App
-key and webhook secret are a Secret mounted on the `crucible` pods only
-(12). Everything a worker needs lives in `crucible-workers` and is created
+key and webhook secret are the Secret `crucible-github-app` in `crucible`,
+which the service owns and reads through the API server (12, ADR 0016); it is
+mounted, optional, on the `crucible` pods only. The one permission the
+control plane holds in `crucible` is that Secret: `get` and `patch` by name,
+and `create`. Everything a worker needs lives in `crucible-workers` and is created
 per attempt by the supervisor through the Kubernetes API.
 
 The supervisor's ServiceAccount is bound to a Role in `crucible-workers`
@@ -421,7 +424,8 @@ service owns it (ADR 0015, the operator's decisions of 2026-09-23): it creates
 it when absent, labelled `app.kubernetes.io/managed-by: crucible` and
 `crucible.credential: <harness>`, and it is the only writer, from the login Job,
 the Hermes key entry and the sync-back. GitOps does not deliver it; the
-database, GitHub App and TLS Secrets stay with GitOps. Its name is
+database and TLS Secrets stay with GitOps, and the GitHub App Secret is the
+service's too (ADR 0016). Its name is
 `kubernetes.credential_secrets[<harness>]`, else `crucible-harness-<harness>`
 with `_` as `-`.
 Per attempt, the provider copies it into `cred-<attempt>`, taking only the
@@ -450,8 +454,8 @@ writes the harness Secret itself, only after they pass the shape check. Hermes
 declares optional read-only credential file `api-key`. When the Hermes Secret
 exists and holds it, the provider copies that file into the per-attempt
 credential Secret and never syncs it back; when it does not, the launch uses the
-adapter's explicit unauthenticated placeholder. The Routing page's key entry
-writes that Secret. (Made concrete 2026-09-24, FDY-0112.)
+adapter's explicit unauthenticated placeholder. The Local gateway page's key
+entry writes that Secret (crucible#119). (Made concrete 2026-09-24, FDY-0112.)
 
 The supervisor defers a launch while a login Job for its harness exists,
 because the login is about to replace the credential (12). A launch that raced

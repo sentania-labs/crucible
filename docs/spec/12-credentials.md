@@ -192,16 +192,22 @@ probe refuses while a login Job for the harness exists.
 
 ## GitHub App credentials
 
-Locally the App private key and webhook secret are files under a private
-credential directory mounted read-only into the `crucible` container only.
-In Kubernetes they are a Secret mounted on the `crucible` pods only,
-delivered through the GitOps repository as a SealedSecret (encrypted to
-the cluster's key, so only the ciphertext is committed) or as an
-ExternalSecret pointing at a secret store; Crucible reads a file path and
-does not care which. Rotation is a new App key (GitHub allows several per
-App), a new sealed manifest, and a revoke of the old key. Rebuilding a
-cluster re-seals and is a natural rotation point. Workers, collectors,
-verifiers, and publishers never mount that Secret. Crucible signs a JWT with the key in memory,
+The service owns the App credential (ADR 0016, crucible#120): the operator
+connects an existing App by its id and one of its private keys on the GitHub
+page (or `POST /v1/admin/github/app`, `crucible admin github connect`), the
+service checks them with GitHub's `GET /app` before it stores anything, and
+from then on it is the credential's only writer. In Kubernetes it is the
+Secret `crucible-github-app` in the `crucible` namespace, keys `app-id`,
+`app.pem` and `webhook.secret`, created and labelled by the service and read
+through the API server on each signature; it is also mounted, optional, on
+the `crucible` pods only, where the webhook route reads `webhook.secret`.
+GitOps does not deliver it. Locally the same three files sit beside
+`github.app.private_key_path` in a private directory of the `crucible`
+container, written mode 0600 by the same flow. A Secret or directory a
+deployment filled itself still works when `github.enabled` and
+`github.app.app_id` name it. Rotation is a new App key (GitHub allows several
+per App), a Connect GitHub with it, and a revoke of the old key in GitHub.
+Workers, collectors, verifiers, and publishers never mount that Secret. Crucible signs a JWT with the key in memory,
 exchanges it for an installation token scoped to the one repository the
 job needs, and hands that token to the publisher container as a file on
 tmpfs read by a git credential helper. The token is never in `env`, `ps`,
