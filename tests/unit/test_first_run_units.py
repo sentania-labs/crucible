@@ -12,6 +12,7 @@ import pytest
 from crucible.adapters.execution import k8sspec
 from crucible.adapters.execution.k8sapi import KubernetesApiError
 from crucible.adapters.execution.k8sfake import FakeKubernetesApi
+from crucible.adapters.github import credentials as credentials_module
 from crucible.adapters.github.credentials import DirectoryAppCredentials, SecretAppCredentials
 from crucible.application.admin.credentials import model_ids
 from crucible.application.admin.gateway import plain_outcome
@@ -117,6 +118,98 @@ def test_the_directory_store_writes_private_files_beside_the_key(tmp_path: Path)
     assert credential is not None and credential.app_id == 9
     assert store.describe()["service_owned"] is True
     assert not list(directory.glob(".*incoming"))
+
+
+OTHER_PEM = PEM.replace(b"not-a-real-key", b"another-fake-key")
+
+
+def _directory_store(tmp_path: Path) -> tuple[Path, DirectoryAppCredentials]:
+    directory = tmp_path / "github"
+    directory.mkdir(mode=0o700)
+    return directory, DirectoryAppCredentials(
+        str(directory / "app.pem"), webhook_secret_path=str(directory / "webhook.secret")
+    )
+
+
+def test_a_directory_replacement_switches_the_id_and_the_key_as_one(tmp_path: Path) -> None:
+    directory, store = _directory_store(tmp_path)
+    store.write(app_id=9, private_key=PEM, webhook_secret=None)
+    store.write(app_id=10, private_key=OTHER_PEM, webhook_secret=None)
+
+    credential = store.read()
+    assert credential is not None
+    assert (credential.app_id, credential.private_key) == (10, OTHER_PEM)
+    # The configured key path and the id file follow the version in force.
+    assert (directory / "app.pem").is_symlink()
+    assert (directory / "app.pem").read_bytes() == OTHER_PEM
+    assert (directory / "app-id").read_bytes() == b"10"
+    # The version in force and the one before it are kept, nothing older.
+    store.write(app_id=11, private_key=PEM, webhook_secret=None)
+    assert len(list((directory / ".versions").iterdir())) == 2
+
+
+def test_a_failure_between_the_two_writes_leaves_the_previous_pair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory, store = _directory_store(tmp_path)
+    store.write(app_id=9, private_key=PEM, webhook_secret=None)
+    in_force = list((directory / ".versions").iterdir())
+
+    real = credentials_module._write_private
+
+    def fail_on_the_key(target: Path, value: bytes) -> None:
+        if target.name == "app.pem":
+            raise GitHubAppStoreError(f"{target} could not be written (OSError)")
+        real(target, value)
+
+    monkeypatch.setattr(credentials_module, "_write_private", fail_on_the_key)
+    with pytest.raises(GitHubAppStoreError, match="could not be written"):
+        store.write(app_id=10, private_key=OTHER_PEM, webhook_secret=None)
+
+    credential = store.read()
+    assert credential is not None
+    assert (credential.app_id, credential.private_key) == (9, PEM)
+    assert (directory / "app-id").read_bytes() == b"9"
+    assert list((directory / ".versions").iterdir()) == in_force
+
+
+def test_a_reader_takes_both_files_from_the_version_it_resolved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A write that lands between a reader's two file reads does not mix the pair."""
+    _, store = _directory_store(tmp_path)
+    store.write(app_id=9, private_key=PEM, webhook_secret=None)
+    real_read = Path.read_bytes
+    switched: list[bool] = []
+
+    def read_then_switch(path: Path) -> bytes:
+        data = real_read(path)
+        if path.name == "app-id" and not switched:
+            switched.append(True)
+            store.write(app_id=10, private_key=OTHER_PEM, webhook_secret=None)
+        return data
+
+    monkeypatch.setattr(Path, "read_bytes", read_then_switch)
+    credential = store.read()
+    assert switched and credential is not None
+    assert (credential.app_id, credential.private_key) == (9, PEM)
+    monkeypatch.undo()
+    after = store.read()
+    assert after is not None and (after.app_id, after.private_key) == (10, OTHER_PEM)
+
+
+def test_files_placed_by_hand_are_read_until_the_first_write(tmp_path: Path) -> None:
+    directory, store = _directory_store(tmp_path)
+    (directory / "app.pem").write_bytes(PEM)
+    (directory / "app-id").write_bytes(b"9")
+    credential = store.read()
+    assert credential is not None and credential.app_id == 9
+
+    store.write(app_id=10, private_key=OTHER_PEM, webhook_secret=None)
+    credential = store.read()
+    assert credential is not None
+    assert (credential.app_id, credential.private_key) == (10, OTHER_PEM)
+    assert (directory / "app.pem").read_bytes() == OTHER_PEM
 
 
 def test_a_read_only_directory_is_refused_by_name(tmp_path: Path) -> None:

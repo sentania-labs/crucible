@@ -31,7 +31,12 @@ building an app/seevice."
    `app.kubernetes.io/managed-by: crucible` and `crucible.credential: github-app`, and
    replaces its data with one merge patch on each later write; a webhook secret is
    replaced only when one is given. With the Docker provider the same three files sit
-   beside `github.app.private_key_path`, written mode 0600 by the same flow. GitOps no
+   beside `github.app.private_key_path`, written mode 0600 by the same flow: each write
+   stages the id and the key in a new `.versions/<v>` directory and renames one
+   `.current` symlink onto it, the id file and the key path are links through `.current`,
+   and a reader resolves `.current` once and reads both from that version, so a failed
+   write leaves the previous pair in force and no reader pairs one App's id with
+   another's key (Codex review of PR 156, 2026-09-25). GitOps no
    longer delivers the Secret; the sealed placeholder is gone from `secret-shapes/sealed`.
 2. **Connect GitHub checks before it stores.** The operator enters an existing App's id
    and one of its private keys (the UI's GitHub page, `POST /v1/admin/github/app`, or

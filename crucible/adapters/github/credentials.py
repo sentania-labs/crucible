@@ -7,7 +7,7 @@ later write. It is read through the API server on each signature rather than fro
 mounted file, so a save is in force at once instead of after the kubelet's next sync;
 the mount stays for the webhook secret, which the webhook route reads as a file. With
 the Docker provider the credential is the files beside `github.app.private_key_path`,
-written mode 0600 by the same flow.
+written mode 0600 by the same flow into a versioned directory and switched as one pair.
 
 Keys and file names are the same in both: `app-id`, `app.pem`, `webhook.secret`. The App
 id is a public identifier; the other two are never returned, logged or audited.
@@ -18,6 +18,8 @@ from __future__ import annotations
 import base64
 import contextlib
 import os
+import shutil
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +31,8 @@ APP_ID = "app-id"
 PRIVATE_KEY = "app.pem"
 WEBHOOK_SECRET = "webhook.secret"
 CREDENTIAL_LABEL = "github-app"
+VERSIONS = ".versions"
+CURRENT = ".current"
 
 
 def _app_id(raw: bytes | None) -> int | None:
@@ -183,7 +187,16 @@ class SecretAppCredentials:
 
 
 class DirectoryAppCredentials:
-    """The App credential as files beside `github.app.private_key_path` (Docker)."""
+    """The App credential as files beside `github.app.private_key_path` (Docker).
+
+    The id and the key are one credential, so they change as one. Each write stages
+    both in a fresh `.versions/<v>` directory and then renames one `.current` symlink
+    onto it; `read` resolves that link once and reads both files from the version it
+    names, so a signer never pairs one App's id with another's key. A write that fails
+    before the rename leaves the previous pair in force and its stage removed. The id
+    file and the key path become links through `.current`, so anything that reads the
+    configured key path sees the version in force. Files placed there by hand, before
+    the service ever wrote, are read as they are until the first write."""
 
     def __init__(
         self,
@@ -197,16 +210,27 @@ class DirectoryAppCredentials:
         self.directory = self.key_path.parent
         self.webhook_path = Path(webhook_secret_path) if webhook_secret_path else None
         self.app_id_path = self.directory / APP_ID
+        self.versions = self.directory / VERSIONS
+        self.current = self.directory / CURRENT
         self._settings_app_id = settings_app_id
         self._settings_enabled = settings_enabled
 
+    def _version(self) -> Path | None:
+        """The version directory in force, resolved once, or None before the first write."""
+        try:
+            return self.directory / os.readlink(self.current)
+        except OSError:
+            return None
+
     def _files(self) -> dict[str, bytes]:
+        version = self._version()
+        pair = (
+            ((APP_ID, version / APP_ID), (PRIVATE_KEY, version / PRIVATE_KEY))
+            if version is not None
+            else ((APP_ID, self.app_id_path), (PRIVATE_KEY, self.key_path))
+        )
         out: dict[str, bytes] = {}
-        for name, path in (
-            (APP_ID, self.app_id_path),
-            (PRIVATE_KEY, self.key_path),
-            (WEBHOOK_SECRET, self.webhook_path),
-        ):
+        for name, path in (*pair, (WEBHOOK_SECRET, self.webhook_path)):
             if path is None:
                 continue
             with contextlib.suppress(OSError):
@@ -218,8 +242,8 @@ class DirectoryAppCredentials:
         return {
             "kind": "directory",
             "path": str(self.directory),
-            "exists": self.key_path.is_file(),
-            "service_owned": self.app_id_path.is_file(),
+            "exists": bool(files.get(PRIVATE_KEY)),
+            "service_owned": self.current.is_symlink() or self.app_id_path.is_file(),
             "writable": self.directory.is_dir() and os.access(self.directory, os.W_OK),
             "app_id_stored": _app_id(files.get(APP_ID)),
             "key_present": bool(files.get(PRIVATE_KEY)),
@@ -241,12 +265,57 @@ class DirectoryAppCredentials:
                 f"the GitHub App directory {self.directory} is missing or read-only here; "
                 "the service needs it writable to own the credential (ADR 0017)"
             )
-        writes = [(self.app_id_path, str(app_id).encode("ascii")), (self.key_path, private_key)]
+        previous = self._version()
+        try:
+            self.versions.mkdir(mode=0o700, exist_ok=True)
+            stage = Path(tempfile.mkdtemp(prefix="v-", dir=self.versions))
+        except OSError as exc:
+            raise GitHubAppStoreError(
+                f"{self.versions} could not be prepared ({type(exc).__name__})"
+            ) from None
+        try:
+            _write_private(stage / APP_ID, str(app_id).encode("ascii"))
+            _write_private(stage / PRIVATE_KEY, private_key)
+            _link(self.current, stage.relative_to(self.directory))
+        except BaseException:
+            shutil.rmtree(stage, ignore_errors=True)
+            raise
+        # The new pair is in force from here; what follows only tidies around it.
+        try:
+            _link(self.app_id_path, Path(CURRENT) / APP_ID)
+            _link(self.key_path, Path(CURRENT) / PRIVATE_KEY)
+        except GitHubAppStoreError as exc:
+            raise GitHubAppStoreError(
+                f"the new App credential is in force, but {exc}; "
+                f"{self.key_path} does not point at it yet"
+            ) from None
         if webhook_secret and self.webhook_path is not None:
-            writes.append((self.webhook_path, webhook_secret))
-        for path, value in writes:
-            _write_private(path, value)
+            _write_private(self.webhook_path, webhook_secret)
+        keep = {stage.name, previous.name if previous is not None else ""}
+        for old in self.versions.iterdir():
+            if old.name not in keep:
+                shutil.rmtree(old, ignore_errors=True)
         return {"store": "directory", "path": str(self.directory), "created": False}
+
+
+def _link(target: Path, points_to: Path) -> None:
+    """`target` made a symlink to `points_to` by one rename, so a reader finds the old
+    link (or file) or the new link and never neither. Left alone when already so."""
+    with contextlib.suppress(OSError):
+        if os.readlink(target) == str(points_to):
+            return
+    temporary = target.with_name(f".{target.name}.incoming")
+    try:
+        with contextlib.suppress(FileNotFoundError):
+            temporary.unlink()
+        os.symlink(points_to, temporary)
+        os.replace(temporary, target)
+    except OSError as exc:
+        with contextlib.suppress(OSError):
+            temporary.unlink()
+        raise GitHubAppStoreError(
+            f"{target} could not be switched ({type(exc).__name__})"
+        ) from None
 
 
 def _write_private(target: Path, value: bytes) -> None:
