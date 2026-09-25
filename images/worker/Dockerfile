@@ -149,13 +149,29 @@ COPY --chmod=0644 ca/sentania-lab-root.crt /usr/local/share/ca-certificates/sent
 RUN set -eu; \
     echo "${LAB_CA_SHA256}  /usr/local/share/ca-certificates/sentania-lab-root.crt" | sha256sum -c -; \
     update-ca-certificates
+# The lock alone decides what goes into the Hermes venv (FDY-0115). --require-hashes
+# checks the files the lock names, but without --no-deps pip still resolves each
+# package's own requirements: hermes-agent 0.19.0 asks for uvicorn[standard]<1, pip
+# treats the extra as a separate requirement, picks the newest uvicorn on the index,
+# and refuses it for having no hash. That broke the v0.5.4 release the day uvicorn
+# 0.54.0 appeared. --no-deps installs exactly the locked set; --only-binary :all:
+# keeps pip from building an sdist, whose build backend would come from the index
+# unhashed. Then pip check proves the set is consistent, and the installed
+# name==version list must equal the lock's, so a package the lock misses or one
+# nothing asked for fails the build here rather than surprising a launch.
 COPY --chmod=0644 worker/requirements.lock /tmp/requirements.lock
 COPY --from=fetch-hermes /fetch/hermes_agent-${HARNESS_HERMES_VERSION}-py3-none-any.whl /fetch/hermes_agent-${HARNESS_HERMES_VERSION}-py3-none-any.whl
 RUN set -eu; \
-    /opt/hermes/bin/pip install --no-cache-dir --require-hashes -r /tmp/requirements.lock; \
+    /opt/hermes/bin/pip install --no-cache-dir --no-deps --only-binary :all: --require-hashes -r /tmp/requirements.lock; \
     /opt/hermes/bin/pip install --no-cache-dir --no-deps --force-reinstall /fetch/hermes_agent-${HARNESS_HERMES_VERSION}-py3-none-any.whl; \
     test "$(/opt/hermes/bin/python -c 'import importlib.metadata; print(importlib.metadata.version("hermes-agent"))')" = "${HARNESS_HERMES_VERSION}"; \
-    rm -rf /root/.cache /tmp/requirements.lock /fetch
+    /opt/hermes/bin/pip check; \
+    normalize() { awk -F'==' '{ n = tolower($1); gsub(/[-_.]+/, "-", n); print n "==" $2 }' | LC_ALL=C sort; }; \
+    sed -n -E 's/^([A-Za-z0-9][A-Za-z0-9._-]*==[^ ;\\]+).*/\1/p' /tmp/requirements.lock | normalize > /tmp/locked; \
+    /opt/hermes/bin/pip list --format=freeze --exclude pip --exclude setuptools | normalize > /tmp/installed; \
+    test -s /tmp/locked; \
+    diff -u /tmp/locked /tmp/installed; \
+    rm -rf /root/.cache /tmp/requirements.lock /tmp/locked /tmp/installed /fetch
 COPY --chmod=0755 worker/crucible-hermes.py /usr/local/bin/crucible-hermes
 COPY --from=fetch-claude-code /fetch/claude /usr/local/bin/claude
 COPY --from=fetch-codex /fetch/codex /usr/local/bin/codex
