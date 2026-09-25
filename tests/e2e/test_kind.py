@@ -669,8 +669,9 @@ async def test_network_policy_denies_every_kubernetes_destination_from_the_worke
             for key, value in metadata.items()
             if key in ("name", "namespace", "labels", "annotations")
         }
-        with contextlib.suppress(KubernetesApiError):
-            api.create("networkpolicies", restored)
+        # A suppressed failure here would leave every later case in the session
+        # running without the default-deny NetworkPolicy in place (74).
+        api.create("networkpolicies", restored)
     await asyncio.sleep(2)
     spec = _spec(
         2,
