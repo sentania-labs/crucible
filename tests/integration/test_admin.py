@@ -38,7 +38,9 @@ from crucible.cli import admin as cli
 from crucible.client.config import ADMIN_TOKEN_ENV
 from crucible.client.http import Api
 from crucible.contracts.wake import WakeReason
-from crucible.domain.entities import ImagePromotion, Role
+from crucible.domain.entities import Attempt, Execution, ExecutionRole, ImagePromotion, Role
+from crucible.domain.ids import new_id
+from crucible.domain.lifecycle import AttemptState, ExecutionState, TaskState
 from crucible.ports.execution import ImageInfo
 from crucible.ports.harness import CredentialSource
 from tests.admin_cli import admin_main, envelope_data
@@ -1308,7 +1310,10 @@ def test_providers_github_audit_status_and_capabilities(
 
 
 def test_capabilities_show_an_orchestrator_its_own_work_only(
-    ctx: AppContext, tokens: dict[str, str], admin_ctx: AdminContext
+    ctx: AppContext,
+    tokens: dict[str, str],
+    admin_ctx: AdminContext,
+    live_supervisor: Supervisor,
 ) -> None:
     """crucible#40: one orchestrator cannot read another's tasks, attempts or wakes
     through /v1/capabilities; an operator still sees everything."""
@@ -1323,10 +1328,45 @@ def test_capabilities_show_an_orchestrator_its_own_work_only(
         own = mine.post("/v1/tasks", json=contract_document(external_id="EX-MINE"))
         foreign = theirs.post("/v1/tasks", json=contract_document(external_id="EX-THEIRS"))
         assert own.status_code == 201 and foreign.status_code == 201
+        asyncio.run(live_supervisor.tick())
+        assert live_supervisor.fenced_token is not None
         with ctx.uow_factory() as uow:
+            # Each task blocked, so it is listed with its external id, and each with one
+            # running attempt, so it is a worker (attempts are the supervisor's, 14).
+            uow.set_fenced_token(live_supervisor.fenced_token)
             for task_id in (own.json()["id"], foreign.json()["id"]):
                 task = uow.tasks.get(task_id)
                 assert task is not None
+                task.state = TaskState.BLOCKED
+                uow.tasks.save(task)
+                execution = Execution(
+                    id=new_id(),
+                    task_id=task.id,
+                    role=ExecutionRole.IMPLEMENT,
+                    contract_version=1,
+                    harness="script-harness",
+                    model="fake",
+                    effort=None,
+                    provider="fake",
+                    image="crucible-worker:fake-succeed",
+                    policy_snapshot={},
+                    state=ExecutionState.ACTIVE,
+                    max_attempts=1,
+                    retry_on=[],
+                    timeout_seconds=60,
+                    created_at=ctx.clock.now(),
+                )
+                uow.executions.add(execution)
+                uow.attempts.add(
+                    Attempt(
+                        id=new_id(),
+                        execution_id=execution.id,
+                        task_id=task.id,
+                        number=1,
+                        state=AttemptState.RUNNING,
+                        created_at=ctx.clock.now(),
+                    )
+                )
                 create_wake(
                     uow,
                     ctx.clock,
@@ -1341,17 +1381,22 @@ def test_capabilities_show_an_orchestrator_its_own_work_only(
         mine_view = mine.get("/v1/capabilities").json()
         theirs_view = theirs.get("/v1/capabilities").json()
 
-    assert mine_view["tasks"]["counts"] == {"submitted": 1}
-    assert theirs_view["tasks"]["counts"] == {"submitted": 1}
+    for view, own_id, foreign_id in (
+        (mine_view, "EX-MINE", "EX-THEIRS"),
+        (theirs_view, "EX-THEIRS", "EX-MINE"),
+    ):
+        assert view["tasks"]["counts"] == {"blocked": 1}
+        assert [t["external_id"] for t in view["tasks"]["lists"]["blocked"]] == [own_id]
+        assert [w["external_id"] for w in view["workers"]] == [own_id]
+        assert foreign_id not in json.dumps(view)
     assert mine_view["wakes"]["pending"] == {"orchestrator-principal": 1}
     assert mine_view["wakes"]["unacked"] == 1
     assert theirs_view["wakes"]["pending"] == {"other-orchestrator": 1}
-    assert "EX-THEIRS" not in json.dumps(mine_view)
-    assert "EX-MINE" not in json.dumps(theirs_view)
 
     with client(tokens["operator"]) as operator:
         everything = operator.get("/v1/capabilities").json()
-    assert everything["tasks"]["counts"] == {"submitted": 2}
+    assert everything["tasks"]["counts"] == {"blocked": 2}
+    assert sorted(w["external_id"] for w in everything["workers"]) == ["EX-MINE", "EX-THEIRS"]
     assert everything["wakes"]["pending"] == {
         "orchestrator-principal": 1,
         "other-orchestrator": 1,
