@@ -154,7 +154,7 @@ def _harness_steps(
         steps.append(
             _step(
                 "credential_unreadable",
-                f"{name}'s credential cannot be read: {view.get('detail') or 'no detail'}.",
+                f"The credential of {name} cannot be read: {view.get('detail') or 'no detail'}.",
                 credential_page,
             )
         )
@@ -162,7 +162,7 @@ def _harness_steps(
         steps.append(
             _step(
                 "credential_invalid",
-                f"{name}'s credential was refused at its last test or launch. "
+                f"The credential of {name} was refused at its last test or launch. "
                 + ("Set a new key on Local gateway." if hermes else "Log in again on Credentials."),
                 credential_page,
             )
@@ -171,7 +171,7 @@ def _harness_steps(
         steps.append(
             _step(
                 "endpoint_not_configured",
-                f"{name}'s gateway URL is not set. Set it on Local gateway.",
+                f"The gateway URL for {name} is not set. Set it on Local gateway.",
                 "/ui/gateway",
             )
         )
@@ -179,7 +179,7 @@ def _harness_steps(
         steps.append(
             _step(
                 "credential_not_verified",
-                f"{name}'s credential is set but not verified ("
+                f"The credential of {name} is set but not verified ("
                 f"{plain_outcome(view.get('last_launch_outcome'))}). "
                 + ("Test it on Local gateway." if hermes else "Validate it on Credentials."),
                 credential_page,
@@ -200,7 +200,7 @@ def _harness_steps(
         steps.append(
             _step(
                 "endpoint_unreachable",
-                f"Workers cannot reach {name}'s gateway: {unreachable}. "
+                f"Workers cannot reach the gateway of {name}: {unreachable}. "
                 "Check the Kubernetes egress selectors on Routing.",
                 "/ui/routing",
             )

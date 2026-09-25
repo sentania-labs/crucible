@@ -437,6 +437,20 @@ def smoke(stub_image: str) -> None:
                 raise SmokeError("Status never reached ready for Hermes")
             time.sleep(5)
         show("readiness", after)
+        provider = KS.provider_checks(base_url, admin)
+        checks = provider.get("checks") or {}
+        show(
+            "kubernetes provider, the workers' view of the gateway",
+            {
+                "health": provider.get("health"),
+                **{
+                    k: checks.get(k)
+                    for k in ("namespace_ready", "dns_resolves", "local_endpoint_reachable")
+                },
+            },
+        )
+        if checks.get("local_endpoint_reachable") is not True:
+            raise SmokeError("the readiness canary did not reach the gateway from the workers")
 
         opener = sign_in(base_url)
         status_page = page_text(opener, f"{base_url}/ui")
