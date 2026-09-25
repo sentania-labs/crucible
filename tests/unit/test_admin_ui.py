@@ -924,3 +924,44 @@ def test_settings_for_a_provider_that_is_off_are_not_listed() -> None:
     paths = [row[0] for row in ui_router._settings_rows(docker)]
     assert "credentials.codex.path" in paths
     assert not [p for p in paths if p.startswith("kubernetes.") and p != "kubernetes.enabled"]
+
+
+def test_once_a_harness_is_ready_the_others_gaps_leave_the_to_do_list() -> None:
+    """Review of the first-run integration: Status must not read "ready" above a list of
+    what stands before a task. Other harnesses' gaps stay under Details."""
+    from crucible.adapters.ui.router import _readiness_sections  # noqa: PLC0415
+
+    step = {"code": "credential_missing", "text": "codex has no credential.", "fix": "/ui/x"}
+    ready = {
+        "ready": True,
+        "ready_harnesses": ["hermes"],
+        "steps": [],
+        "harnesses": [
+            {"name": "hermes", "state": "ready", "note": "ready for a task", "steps": []},
+            {"name": "codex", "state": "not_ready", "note": "", "steps": [step]},
+        ],
+    }
+    sections, (_summary, detail) = _readiness_sections(ready)
+    assert sections == []
+    assert ["codex", "not ready", step["text"], step["fix"]] in detail["rows"]
+    none_ready = {
+        **ready,
+        "ready": False,
+        "ready_harnesses": [],
+        "harnesses": [ready["harnesses"][1]],
+    }
+    sections, _ = _readiness_sections(none_ready)
+    assert sections[0]["rows"] == [[step["text"], step["fix"]]]
+
+
+def test_the_harnesses_word_is_the_first_readiness_step() -> None:
+    """Review of the first-run integration: the Harnesses page and Status agree."""
+    from crucible.adapters.ui.router import _harness_status  # noqa: PLC0415
+
+    item = _harness("hermes")
+    gap = {"code": "endpoint_not_configured", "text": "The gateway URL is not set.", "fix": "/"}
+    assert _harness_status(item, {"steps": [gap]})["value"] == "needs the gateway"
+    assert _harness_status(item, {"steps": []})["value"] == "ready"
+    assert _harness_status(_harness("script-harness", default_image=None), None)["value"] == (
+        "needs an image"
+    )

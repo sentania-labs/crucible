@@ -124,8 +124,19 @@ async def _run(
     if adapter.credential_spec() is None:
         steps.passed(CREDENTIAL, "this harness needs none")
     else:
-        view = credentials.state_view(ctx, uow, harness)
+        # Read on a worker thread with a bounded wait, as every async page does, so a
+        # slow API server never holds the event loop.
+        secrets = await credentials.read_secrets(ctx, [harness])
+        view = credentials.state_view(ctx, uow, harness, secrets.get(harness))
         state = str(view.get("state"))
+        if state == "unreadable":
+            steps.failed(
+                CREDENTIAL,
+                f"the credential of {harness} cannot be read: {view.get('detail') or 'no detail'}",
+            )
+            return
+        # A refused credential ("invalid") goes on to the model call, which is the check
+        # that can clear it once the operator has fixed it.
         if state == "absent":
             steps.failed(
                 CREDENTIAL,

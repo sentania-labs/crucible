@@ -39,6 +39,7 @@ from crucible.application.admin import (
 from crucible.application.admin import kubernetes as kubernetes_admin
 from crucible.application.admin import limits as limits_admin
 from crucible.application.admin.context import guard_mutation
+from crucible.application.admin.providers import providers_status
 from crucible.application.auth import authenticate
 from crucible.application.errors import (
     ApplicationError,
@@ -358,6 +359,11 @@ def _panel(value: Any, *, key: str = "") -> dict[str, Any]:
     return {"kind": "value", "value": _safe_value(key, value)}
 
 
+def _without_migration(note: Any) -> str:
+    """A model note without the migration that wrote it (crucible#115)."""
+    return re.sub(r" \(\d{4}_[a-z0-9_]+\)", "", str(note))
+
+
 def _check_words(check: Any) -> str:
     """A repository's last connectivity check in one phrase."""
     if not isinstance(check, dict) or not check:
@@ -564,7 +570,10 @@ def _readiness_sections(readiness: dict[str, Any]) -> tuple[list[dict[str, Any]]
     todo = [[step["text"], step["fix"]] for step in readiness["steps"]]
     rows: list[list[Any]] = []
     for harness in readiness["harnesses"]:
-        todo.extend([step["text"], step["fix"]] for step in harness["steps"])
+        # A harness's own gaps are the to-do list only while none is ready; once one is,
+        # the others' gaps are not what stands before a task (they stay under Details).
+        if not readiness["ready_harnesses"]:
+            todo.extend([step["text"], step["fix"]] for step in harness["steps"])
         if harness["steps"]:
             rows.extend(
                 [harness["name"], "not ready", step["text"], step["fix"]]
@@ -836,16 +845,37 @@ async def dashboard(request: Request, ctx: Ctx, uow: UoW) -> Response:
     )
 
 
-def _harness_status(item: dict[str, Any]) -> dict[str, Any]:
-    """The one word an operator acts on, most blocking first."""
+# The first readiness step of a harness in one word (crucible#115, #123).
+STEP_WORDS = {
+    "disabled": "disabled",
+    "credential_missing": "needs a credential",
+    "credential_unreadable": "credential unreadable",
+    "credential_invalid": "credential refused",
+    "credential_not_verified": "credential not verified",
+    "endpoint_not_configured": "needs the gateway",
+    "no_enabled_model": "needs a model",
+    "endpoint_unreachable": "gateway unreachable",
+    "no_promoted_image": "needs an image",
+}
+
+
+def _harness_status(item: dict[str, Any], ready: dict[str, Any] | None) -> dict[str, Any]:
+    """The one word an operator acts on, most blocking first, from the same readiness
+    Status shows. A test fixture has no readiness entry and is judged on its image."""
     if not item["enabled_by_configuration"]:
         return {"kind": "status", "value": "off in configuration", "tone": "bad"}
-    if not item["enabled"]:
+    if ready is not None and ready["steps"]:
+        step = ready["steps"][0]
+        return {
+            "kind": "status",
+            "value": STEP_WORDS.get(step["code"], "not ready"),
+            "tone": "warn",
+            "hint": step["text"] if len(ready["steps"]) == 1 else None,
+        }
+    if ready is None and not item["enabled"]:
         return {"kind": "status", "value": "disabled", "tone": "warn"}
-    if not item.get("default_image"):
+    if ready is None and not item.get("default_image"):
         return {"kind": "status", "value": "needs an image", "tone": "warn"}
-    if item["credential"]["state"] in ("absent", "invalid"):
-        return {"kind": "status", "value": "needs a credential", "tone": "warn"}
     return {"kind": "status", "value": "ready", "tone": "ok"}
 
 
@@ -872,7 +902,15 @@ async def harness_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
     principal, csrf = found
     assert ctx.admin is not None
     discovered = await harnesses.list_images(ctx.admin)
-    items, _ = await harnesses.read_harnesses(ctx.admin, uow, [item for _, item in discovered])
+    items, secrets = await harnesses.read_harnesses(
+        ctx.admin, uow, [item for _, item in discovered]
+    )
+    ready_by_name = {
+        entry["name"]: entry
+        for entry in status.harness_readiness(
+            ctx.admin, uow, items, await providers_status(ctx.admin), secrets
+        )
+    }
     admin = principal.role is Role.ADMIN
     rows: list[list[Any]] = []
     for item in items:
@@ -904,7 +942,7 @@ async def harness_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
         rows.append(
             [
                 name,
-                _harness_status(item),
+                _harness_status(item, ready_by_name.get(name)),
                 (
                     {
                         "kind": "note",
@@ -1229,7 +1267,7 @@ async def gateway_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                     row["enabled"],
                     row["enable_thinking"],
                     row["capability"],
-                    row["note"],
+                    _without_migration(row["note"]),
                 ]
                 for row in offered["models"]
             ],
@@ -1303,7 +1341,7 @@ async def gateway_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                             "label": f"capability of {row['id']}",
                         },
                         # The note without the migration that wrote it (crucible#115).
-                        {"value": re.sub(r" \(\d{4}_[a-z0-9_]+\)", "", str(row["note"]))},
+                        {"value": _without_migration(row["note"])},
                     ]
                 )
             listing["form"] = {
@@ -1397,7 +1435,9 @@ def routing_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
         return found
     principal, csrf = found
     versions = list(uow.policies.list_versions("default-software"))
-    policy = max(versions, key=lambda item: item.version) if versions else None
+    # The version in force: the newest one not retired, as the timeout editor reads it.
+    live = [item for item in versions if item.retired_at is None]
+    policy = max(live, key=lambda item: item.version) if live else None
     routing_ref = ((policy.document.get("routing") or {}).get("policy") or {}) if policy else {}
     routing_record = (
         uow.routing_policies.get(
@@ -1864,7 +1904,6 @@ def github_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
     # the stored-credential document is behind Details.
     connection: dict[str, Any] = {
         "title": "Connection",
-        "note": "A repository the picker below cannot show is registered by hand on Repositories.",
         "columns": ["Part", "State"],
         "rows": [
             [
@@ -1895,6 +1934,17 @@ def github_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
         ],
         "details": [_document_section("Stored App and every repository", state)],
     }
+    if state["configured"]:
+        connection["rows"].append(
+            [
+                "A repository the picker cannot show",
+                {
+                    "kind": "link",
+                    "href": "/ui/repositories",
+                    "label": "Register it on Repositories",
+                },
+            ]
+        )
     if admin and state["configured"]:
         # A read-only check: no reason is asked for (crucible#117).
         connection["form"] = {

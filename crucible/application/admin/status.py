@@ -232,25 +232,25 @@ def _harness_steps(
     return steps
 
 
-def readiness(
+def harness_readiness(
     ctx: AdminContext,
     uow: UnitOfWork,
-    document: dict[str, Any],
+    items: list[dict[str, Any]],
+    providers: list[dict[str, Any]],
     secrets: dict[str, credentials.SecretRead] | None = None,
-) -> dict[str, Any]:
-    """crucible#123: the "before a task can run" list. Each real harness is `ready`,
-    `not_ready` with the steps that fix it, or `off` when its configuration gate is shut;
-    test fixtures are left out. The system is ready when the supervisor is healthy, a
-    repository is registered, and at least one harness is ready."""
+) -> list[dict[str, Any]]:
+    """Each real harness `ready`, `not_ready` with the steps that fix it, or `off` when its
+    configuration gate is shut; test fixtures are left out. The Harnesses page reads its
+    one word from this too, so it and Status never disagree about a harness."""
     endpoint, _source = gateway_url(uow)
     enabled_models = _enabled_models(uow)
     unreachable: str | None = None
-    for provider in document["providers"]:
+    for provider in providers:
         checks = provider.get("checks") or {}
         if checks.get("local_endpoint_reachable") is False:
             unreachable = str(checks.get("local_endpoint_detail") or "the connection failed")
     harnesses: list[dict[str, Any]] = []
-    for item in document["harnesses"]:
+    for item in items:
         name = str(item["name"])
         if is_test_fixture(ctx, name):
             continue
@@ -281,6 +281,19 @@ def readiness(
                 "steps": harness_steps,
             }
         )
+    return harnesses
+
+
+def readiness(
+    ctx: AdminContext,
+    uow: UnitOfWork,
+    document: dict[str, Any],
+    secrets: dict[str, credentials.SecretRead] | None = None,
+) -> dict[str, Any]:
+    """crucible#123: the "before a task can run" list. The system is ready when the
+    supervisor is healthy, a repository is registered, and at least one harness is
+    ready."""
+    harnesses = harness_readiness(ctx, uow, document["harnesses"], document["providers"], secrets)
     steps: list[dict[str, str]] = []
     supervisor = document["supervisor"]
     if not supervisor["healthy"]:
