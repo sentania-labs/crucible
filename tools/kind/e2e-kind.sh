@@ -44,8 +44,11 @@ cleanup() {
       cleanup_failed=1
     fi
   fi
-  docker run --rm -v "$scratch:/cleanup" \
-    busybox@sha256:9db7b59979c38555a39def84a31fb98b5296952f9e3afd4f6f11f05b07adfab0 \
+  # The cleanup helper is pulled the same way as the tier's other images (68); if no
+  # source answers, the original reference is tried anyway and its failure is what
+  # `cleanup_failed` catches.
+  busybox=$(crucible_kind_pull "$CRUCIBLE_BUSYBOX_IMAGE" 2>/dev/null) || busybox=$CRUCIBLE_BUSYBOX_IMAGE
+  docker run --rm -v "$scratch:/cleanup" "$busybox" \
     chmod -R a+rwX /cleanup >/dev/null 2>&1 || cleanup_failed=1
   rm -rf "$scratch" || cleanup_failed=1
   if [ -e "$scratch" ]; then
@@ -108,6 +111,7 @@ containerdConfigPatches:
   - |-
     [plugins."io.containerd.grpc.v1.cri".registry.mirrors."localhost:${registry_port}"]
       endpoint = ["http://${registry}:5000"]
+    ${CRUCIBLE_KIND_DOCKER_HUB_MIRROR_PATCH}
 EOF
 
 cluster_created=1
