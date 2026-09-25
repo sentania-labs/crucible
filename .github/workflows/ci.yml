@@ -177,13 +177,15 @@ jobs:
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
       # Pinned the same way as the manifests job (69): this tier's kubectl applies
       # Calico and drives the cluster, so a different kubectl behaving differently is
-      # exactly the kind of drift reproducibility here is supposed to rule out.
+      # exactly the kind of drift reproducibility here is supposed to rule out. Its
+      # minor version follows the kind node image (tools/kind/cluster.sh, 1.37), not
+      # the manifests job's, to stay inside kubectl's one-minor skew policy.
       - name: install kubectl
         run: |
           set -euo pipefail
           curl -fsSL --retry 4 -o "$RUNNER_TEMP/kubectl" \
-            https://dl.k8s.io/release/v1.31.6/bin/linux/amd64/kubectl
-          echo 'c46b2f5b0027e919299d1eca073ebf13a4c5c0528dd854fc71a5b93396c9fa9d  '"$RUNNER_TEMP/kubectl" | sha256sum -c -
+            https://dl.k8s.io/release/v1.37.1/bin/linux/amd64/kubectl
+          echo '65691ff77eb6fa44c908b77a1082c9f092c3b9733b5cefabec0d1104890e21a8  '"$RUNNER_TEMP/kubectl" | sha256sum -c -
           chmod 0755 "$RUNNER_TEMP/kubectl"
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
       - name: build the script-harness worker image
