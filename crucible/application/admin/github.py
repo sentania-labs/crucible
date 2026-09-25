@@ -184,6 +184,19 @@ def _install_url(app: dict[str, Any]) -> str | None:
     return None
 
 
+def _is_rsa(pem: bytes) -> bool:
+    """GitHub App keys are RSA and JWTs are RS256; any other key is refused plainly here
+    rather than failing later inside the signature."""
+    try:
+        from cryptography.hazmat.primitives import serialization  # noqa: PLC0415
+        from cryptography.hazmat.primitives.asymmetric import rsa  # noqa: PLC0415
+
+        key = serialization.load_pem_private_key(pem, password=None)
+    except Exception:
+        return False
+    return isinstance(key, rsa.RSAPrivateKey)
+
+
 def _normalized_pem(private_key: str) -> bytes:
     text = private_key.replace("\r\n", "\n").strip()
     if not text:
@@ -192,9 +205,9 @@ def _normalized_pem(private_key: str) -> bytes:
             errors=[{"path": "private_key", "message": "must not be empty"}],
         )
     pem = (text + "\n").encode("utf-8")
-    if fingerprint_of(pem) is None:
+    if not _is_rsa(pem):
         raise ContractValidationError(
-            "the private key is not a PEM private key",
+            "the private key is not an RSA private key in PEM form",
             errors=[
                 {
                     "path": "private_key",
@@ -258,15 +271,9 @@ def connect(
             f"GitHub says this key belongs to App {app.get('id')}, not App {app_id}"
         )
     before = status(ctx, uow)
-    try:
-        written = store.write(
-            app_id=app_id,
-            private_key=pem,
-            webhook_secret=secret.encode("utf-8") if secret else None,
-        )
-    except GitHubAppStoreError as exc:
-        raise ConflictError(str(exc)) from None
-    after = status(ctx, uow)
+    # The event first and the store last: the credential leaves the transaction, so a
+    # refusal of the event (or anything before it) must not leave a changed credential
+    # with no audit record behind it.
     admin_event(
         uow,
         ctx,
@@ -277,12 +284,21 @@ def connect(
         after={
             "app_id": app_id,
             "app_slug": app.get("slug"),
-            "key_fingerprint": after["key_fingerprint"],
+            "key_fingerprint": fingerprint_of(pem),
             "webhook_secret_set": bool(secret),
-            "stored_in": written,
+            "stored_in": (before.get("stored_in") or {}).get("name")
+            or (before.get("stored_in") or {}).get("path"),
         },
     )
-    return {**after, "app": app, "install_url": _install_url(app)}
+    try:
+        store.write(
+            app_id=app_id,
+            private_key=pem,
+            webhook_secret=secret.encode("utf-8") if secret else None,
+        )
+    except GitHubAppStoreError as exc:
+        raise ConflictError(str(exc)) from None
+    return {**status(ctx, uow), "app": app, "install_url": _install_url(app)}
 
 
 def apps_view(ctx: AdminContext, uow: UnitOfWork) -> dict[str, Any]:

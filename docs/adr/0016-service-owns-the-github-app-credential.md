@@ -81,7 +81,12 @@ building an app/seevice."
   Role `crucible-github-app` (`deploy/kubernetes/base/crucible/github-app-rbac.yaml`),
   `get` and `patch` on the one Secret by name, and `create` on Secrets, which RBAC cannot
   narrow by name. No `list`, `watch`, `update` or `delete`; the database Secret stays out
-  of reach.
+  of reach. The residual risk is the pair: a compromised control-plane process could,
+  before the first connect, create `crucible-github-app` itself as a service-account
+  token Secret for another account in `crucible` and then read it. The service refuses to
+  use or adopt a Secret of that name whose type is not `Opaque`, which keeps it from
+  mistaking one for the App credential; it cannot stop a process that is already
+  compromised. `crucible` holds no account with more than this one's permissions.
 - A deployment that sealed `crucible-github-app` before this change removes it from its
   GitOps repository without pruning it (Argo's prune would delete the key), or connects
   the App again from the GitHub page afterwards. On its first write the service takes the

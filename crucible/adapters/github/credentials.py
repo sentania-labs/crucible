@@ -85,7 +85,18 @@ class SecretAppCredentials:
             raise GitHubAppStoreError(
                 f"the Secret {self.name!r} in {self.namespace} is not readable ({exc.status})"
             ) from None
+        self._require_opaque(body)
         return body
+
+    def _require_opaque(self, body: dict[str, Any]) -> None:
+        """Only an Opaque Secret is the App credential. A Secret of another type under
+        this name (a service-account token, say) is refused, never read or adopted."""
+        kind = body.get("type") or "Opaque"
+        if kind != "Opaque":
+            raise GitHubAppStoreError(
+                f"the Secret {self.name!r} in {self.namespace} is of type {kind}, not Opaque; "
+                "it is not the App credential and the service will not use or adopt it"
+            )
 
     def _files(self, body: dict[str, Any] | None) -> dict[str, bytes] | None:
         if body is None:
@@ -154,6 +165,7 @@ class SecretAppCredentials:
                 ) from None
         try:
             current = self._client.get("secrets", self.name)
+            self._require_opaque(current)
             keep = {WEBHOOK_SECRET} if not webhook_secret else set()
             stale = {
                 k: None for k in (current.get("data") or {}) if k not in data and k not in keep
