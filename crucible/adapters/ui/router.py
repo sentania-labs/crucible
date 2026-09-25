@@ -161,6 +161,41 @@ NON_SECRET_FIELDS = {
 }
 
 
+# A reason is an audit note the operator may leave out (the operator's decision of
+# 2026-09-25, crucible#117). These forms' services require one, because what they do is
+# destructive or hard to reverse; a read-only check never asks for one.
+REASON_REQUIRED_ACTIONS = frozenset(
+    {
+        "/ui/actions/bootstrap-commit",
+        "/ui/actions/repository-remove",
+        "/ui/actions/token-revoke",
+    }
+)
+NO_REASON_ACTIONS = frozenset({"/ui/actions/github-check"})
+
+
+def _reason_fields(sections: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Every form's reason field, set by one rule rather than form by form: required
+    where the service requires one, optional elsewhere, absent on a read-only check."""
+    for section in sections:
+        form = section.get("form")
+        if not isinstance(form, dict):
+            continue
+        action = str(form.get("action", ""))
+        fields = []
+        for field in form.get("fields", []):
+            if field.get("name") != "reason":
+                fields.append(field)
+                continue
+            if action in NO_REASON_ACTIONS:
+                continue
+            required = action in REASON_REQUIRED_ACTIONS
+            label = field.get("reason_label") or ("Reason" if required else "Reason (optional)")
+            fields.append({**field, "label": label, "required": required})
+        form["fields"] = fields
+    return sections
+
+
 def _operator_label(key: str) -> str:
     """Turn an API key into an operator label while retaining the key separately."""
     if key in LABELS:
@@ -361,7 +396,7 @@ def _page(
     settings = getattr(request.app.state.ctx, "settings", None)
     if settings is not None:
         timezone = settings.service.render_timezone
-    sections = _localize(sections, timezone)
+    sections = _reason_fields(_localize(sections, timezone))
     context = _base(request, principal, csrf, title=heading, active=active)
     context.update(
         heading=heading,
@@ -752,7 +787,11 @@ async def credentials_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                                 ("remove", "Remove"),
                             ],
                         },
-                        {"name": "reason", "label": "Reason", "required": True},
+                        {
+                            "name": "reason",
+                            "label": "Reason",
+                            "reason_label": "Reason (required to remove)",
+                        },
                         {
                             "name": "new_path",
                             "label": "Prepared directory (rotate only)",

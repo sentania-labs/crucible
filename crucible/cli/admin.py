@@ -78,8 +78,10 @@ The operator's console (25): harness gates, credentials and login, image promoti
 tokens, repositories, routing, the bootstrap import, audit. Runs in process against the
 configured database by default; with --api-url URL (or --remote, which takes the URL
 from CRUCIBLE_URL or the client configuration file) it calls the running API with the
-token in CRUCIBLE_ADMIN_TOKEN, else CRUCIBLE_TOKEN. Every mutation takes --reason,
-placed before the verb: `crucible admin --reason TEXT harnesses disable codex`.
+token in CRUCIBLE_ADMIN_TOKEN, else CRUCIBLE_TOKEN. A mutation takes an optional
+--reason, recorded in the audit log, before or after the verb:
+`crucible admin harnesses disable codex --reason TEXT`. Revoking a token, removing a
+repository or a credential, and committing a bootstrap import require one.
 Output is one JSON envelope (see `crucible --help`)."""
 
 
@@ -101,7 +103,10 @@ def build_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help="remote mode with the base URL from CRUCIBLE_URL or the client configuration",
     )
     parser.add_argument(
-        "--reason", default=None, help="the reason recorded on a mutation (required on one)"
+        "--reason",
+        default=None,
+        help="a note recorded on a mutation; required to revoke a token, remove a "
+        "repository or a credential, or commit a bootstrap import",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -273,7 +278,23 @@ def build_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     b_sub.add_parser("list", help="every import")
     commit = b_sub.add_parser("commit", help="make a verified import authoritative")
     commit.add_argument("import_id")
+    _reason_after_the_verb(parser)
     return parser
+
+
+def _reason_after_the_verb(parser: argparse.ArgumentParser) -> None:
+    """Every verb also takes `--reason` after it, where a caller appends an optional flag
+    (`next`'s `optional`). SUPPRESS keeps a reason given before the verb when none
+    follows it."""
+    for item in parser._actions:
+        if isinstance(item, argparse._SubParsersAction):
+            for child in item.choices.values():
+                _reason_after_the_verb(child)
+            return
+    if "--reason" not in parser._option_string_actions:
+        parser.add_argument(
+            "--reason", default=argparse.SUPPRESS, help="a note recorded on a mutation"
+        )
 
 
 def _read_code() -> str:

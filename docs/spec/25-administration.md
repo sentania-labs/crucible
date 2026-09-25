@@ -11,7 +11,8 @@ without Foundry.
 
 - **Versioned admin API** under `/v1/admin`, admin role only, generated
   into the same OpenAPI document. Every mutation is an event with the
-  principal, before-and-after summary (never a value), and reason.
+  principal, before-and-after summary (never a value), and the reason when
+  the operator gave one.
 - **`crucible admin` CLI** (the `admin` group of the one `crucible`
   command; `crucible-admin` remains as a shim that prints one deprecation
   line on stderr and runs `crucible admin` with the same arguments) calls
@@ -96,15 +97,25 @@ resource.
 | show or update the local gateway | `GET`, `POST /admin/routing/local-endpoint` | `routing local-endpoint`, `routing set-local-endpoint` | edits endpoint URL, local model enablement, thinking preference, and pool concurrency by creating new immutable routing and delivery policy versions; atomically regenerates and reloads the proxy configuration |
 | show or update the Kubernetes egress selectors | `GET`, `POST /admin/kubernetes/egress` | `kubernetes egress`, `kubernetes set-egress` | 26: the `kubernetes.egress` setting, the cluster resolver's and an in-cluster local endpoint's namespace, pod labels and port. The settings file seeds it and a save wins over the file; the response says which (`source`). Refused naming the field when a selector is empty, malformed, or names the workers or Crucible namespace. A save states both halves (`dns` and `local_endpoint`); a missing one is refused rather than read as off. The supervisor reads a save back within 15 seconds without a restart, and the readiness canary runs again before a launch uses it (crucible#91) |
 
-Every mutation requires a non-empty `reason` string, records the principal,
-and is refused when the supervisor lease is not held by a live instance (so
-a stale instance cannot administer). One guard applies both rules, so no
-operation can carry only one of them, and they bind every state-changing row
-of the table above without exception: registering a repository and finishing
-a login are mutations too, and a login's completion writes
-`session_compatibility` and clears `last_validated_at`, which is exactly the
-kind of change the rules exist for. A reason is a string an operator wrote:
-an absent, blank, or non-string body value is not one.
+Every mutation records the principal and is refused when the supervisor
+lease is not held by a live instance (so a stale instance cannot
+administer). A reason is an audit note the operator may leave out; the event
+records who acted, when, and what changed whether or not one was given. It
+is required only where the operation is destructive or hard to reverse:
+revoking a token, removing a repository, removing a credential, and
+committing a bootstrap import. A read-only check (the GitHub connectivity
+check, a harness test) never asks for one. This is the operator's decision of
+2026-09-25 (crucible#117, "I shouldn't have to provide a reason for
+everything"); the API, the CLI and the UI apply the same rule, because they
+call the same guard. One guard applies the lease rule, the reason rule, and
+the secret-shape check below, so no operation can carry only one of them,
+and they bind every state-changing row of the table above without
+exception: registering a repository and finishing a login are mutations too,
+and a login's completion writes `session_compatibility` and clears
+`last_validated_at`, which is exactly the kind of change the rules exist
+for. Where a reason is required, it is a string an operator wrote: an
+absent, blank, or non-string body value is not one. The CLI takes `--reason`
+before or after the verb.
 
 A refusal is itself recorded, as an `admin_refused` event naming the
 operation and why it was refused, written through a unit of work of its own

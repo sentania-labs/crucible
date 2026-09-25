@@ -383,7 +383,8 @@ def test_an_unknown_owner_is_a_problem_and_the_default_owner_is_the_caller(
 def test_the_guard_applies_to_submit_and_commit(
     ctx: AppContext, tokens: dict[str, str], admin_ctx: AdminContext
 ) -> None:
-    """No live supervisor: 503 and nothing written. No reason: 422."""
+    """No live supervisor: 503 and nothing written. A reason is optional on the submit
+    and required on the commit (crucible#117)."""
     with TestClient(create_app(ctx), headers={"Authorization": f"Bearer {tokens['admin']}"}) as c:
         response = submit(c, synthetic_bundle())
         assert response.status_code == 503 and response.json()["type"].endswith(
@@ -391,6 +392,8 @@ def test_the_guard_applies_to_submit_and_commit(
         )
         assert c.get("/v1/import/bootstrap").json()["items"] == []
         response = c.post("/v1/import/bootstrap", json=synthetic_bundle())
+        assert response.status_code == 503, response.text
+        response = c.post("/v1/import/bootstrap/01ABCDEFGHJKMNPQRSTVWXYZ00/commit", json={})
         assert response.status_code == 422 and response.json()["errors"][0]["path"] == "reason"
     with TestClient(
         create_app(ctx), headers={"Authorization": f"Bearer {tokens['orchestrator']}"}

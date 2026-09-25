@@ -125,20 +125,21 @@ Administration (25) is one set of operations behind three entry points: the
 server-rendered `/ui`, `/v1/admin`, and `crucible admin`. They call the same
 services and own no separate state. On a fresh deployment, retrieve the
 one-time administrator token from `docker compose logs migrate`, then open
-`http://127.0.0.1:8080/ui`. Every mutation takes a reason, needs a live
-supervisor, and leaves an event with the principal and a before/after summary,
-never a value:
+`http://127.0.0.1:8080/ui`. Every mutation needs a live supervisor and leaves
+an event with the principal and a before/after summary, never a value. A
+reason is an optional audit note, required only to revoke a token, remove a
+repository or a credential, or commit a bootstrap import:
 
 ```sh
 crucible admin status                                        # the sanitized status document
 crucible admin harnesses list
-crucible admin --reason "refresh unverified" harnesses disable codex
+crucible admin harnesses disable codex --reason "refresh unverified"
 crucible admin credentials status --harness claude_code      # presence, permissions, expiry class
 crucible admin credentials validate --harness claude_code    # shape and expiry, no network
 crucible admin credentials probe --harness claude_code       # bounded run of the hardened image
-crucible admin --reason "..." credentials login --harness codex   # prints the URL and the code; token file mode 600
-crucible admin --reason "..." credentials rotate --harness agy --new-path /path/to/staged
-crucible admin --reason "..." credentials remove --harness codex
+crucible admin credentials login --harness codex                 # prints the URL and the code; token file mode 600
+crucible admin credentials rotate --harness agy --new-path /path/to/staged
+crucible admin credentials remove --harness codex --reason "..."
 crucible admin images list
 crucible admin --reason "..." images promote <digest>
 crucible admin providers status

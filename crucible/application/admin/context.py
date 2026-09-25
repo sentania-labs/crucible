@@ -1,6 +1,8 @@
-"""What every administrative service needs, and the two rules they all obey (25): a
-mutation requires a reason and a live supervisor lease, and it is an event with the
-principal and a before-and-after summary that never carries a value."""
+"""What every administrative service needs, and the rules they all obey (25): a mutation
+needs a live supervisor lease and is an event with the principal and a before-and-after
+summary that never carries a value. A reason is an optional audit note, required only
+for the destructive or hard-to-reverse operations (the operator's decision of
+2026-09-25, crucible#117)."""
 
 from __future__ import annotations
 
@@ -111,16 +113,21 @@ def require_reason(
     *,
     principal: str = "",
     operation: str = "",
+    required: bool = True,
 ) -> str:
-    """Every mutation requires a reason string (25), and the string is recorded, so it
-    may not be a credential."""
+    """The reason an operator gave, stripped; "" when none was given and none is
+    required. A destructive or hard-to-reverse operation requires one (25). Whatever is
+    given is recorded, so it may not be a credential."""
     if reason is None or not reason.strip():
+        if not required:
+            return ""
         if ctx is not None:
             record_refusal(
                 ctx, principal=principal, operation=operation, detail="no reason was given"
             )
         raise ContractValidationError(
-            "a reason is required", errors=[{"path": "reason", "message": "must not be empty"}]
+            f"a reason is required for {operation}" if operation else "a reason is required",
+            errors=[{"path": "reason", "message": "must not be empty"}],
         )
     cleaned = reason.strip()
     try:
@@ -149,12 +156,21 @@ def require_live_supervisor(
 
 
 def guard_mutation(
-    ctx: AdminContext, uow: UnitOfWork, reason: str | None, *, principal: str, operation: str
+    ctx: AdminContext,
+    uow: UnitOfWork,
+    reason: str | None,
+    *,
+    principal: str,
+    operation: str,
+    reason_required: bool = False,
 ) -> str:
-    """The two rules every mutation obeys (25), in one call so no operation can carry
-    only one of them: a reason that is a reason and not a credential, and a live
-    supervisor lease. Either refusal is recorded as `admin_refused`."""
-    cleaned = require_reason(reason, ctx, principal=principal, operation=operation)
+    """The rules every mutation obeys (25), in one call so no operation can skip one: a
+    reason that is not a credential, required when `reason_required` (bootstrap commit,
+    repository remove, token revoke, credential remove), and a live supervisor lease.
+    Either refusal is recorded as `admin_refused`."""
+    cleaned = require_reason(
+        reason, ctx, principal=principal, operation=operation, required=reason_required
+    )
     require_live_supervisor(ctx, uow, principal=principal, operation=operation)
     return cleaned
 

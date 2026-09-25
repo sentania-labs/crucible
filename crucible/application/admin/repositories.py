@@ -81,7 +81,12 @@ def remove(
     reason: str | None,
 ) -> dict[str, Any]:
     reason = guard_mutation(
-        ctx, uow, reason, principal=principal, operation=f"repositories remove {name}"
+        ctx,
+        uow,
+        reason,
+        principal=principal,
+        operation=f"repositories remove {name}",
+        reason_required=True,
     )
     before = _view(uow, name)
     if before is None:

@@ -472,7 +472,12 @@ def commit(
     handoff. Refused unless the import is `verified`, and refused while another import
     holds authority (ADR 0006: never more than one writable ledger)."""
     reason = guard_mutation(
-        ctx, uow, reason, principal=principal, operation=f"bootstrap commit {import_id}"
+        ctx,
+        uow,
+        reason,
+        principal=principal,
+        operation=f"bootstrap commit {import_id}",
+        reason_required=True,
     )
     record = uow.bootstrap_imports.get(import_id, for_update=True)
     if record is None:

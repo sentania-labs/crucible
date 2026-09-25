@@ -60,7 +60,9 @@ def revoke(
     principal_id: str,
     reason: str | None,
 ) -> dict[str, Any]:
-    reason = guard_mutation(ctx, uow, reason, principal=principal, operation="tokens revoke")
+    reason = guard_mutation(
+        ctx, uow, reason, principal=principal, operation="tokens revoke", reason_required=True
+    )
     target = uow.principals.get(principal_id)
     if target is None or target.disabled_at is not None:
         raise ConflictError("the principal does not exist or is already revoked")

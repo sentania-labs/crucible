@@ -606,13 +606,29 @@ def test_a_mutation_is_refused_without_a_live_supervisor(
     assert "supervisor-not-live" in capsys.readouterr().out
 
 
-def test_a_mutation_requires_a_reason(
+def test_a_reason_is_an_optional_note_except_on_a_destructive_mutation(
     admin_client: TestClient, live_supervisor: Supervisor
 ) -> None:
+    """crucible#117, the operator's decision of 2026-09-25: a reason is an audit note the
+    operator may leave out, and the event is recorded without one; revoking a token,
+    removing a repository or a credential, and committing a bootstrap import still
+    require one."""
     asyncio.run(live_supervisor.tick())
     response = admin_client.post("/v1/admin/harnesses/agy/disable", json={})
-    assert response.status_code == 422
-    assert response.json()["errors"][0]["path"] == "reason"
+    assert response.status_code == 200, response.text
+    assert response.json()["enabled"] is False
+    events = admin_client.get("/v1/admin/audit").json()["items"]
+    disabled = [e for e in events if e["kind"] == "harness_disabled"][-1]
+    assert disabled["payload"]["reason"] == ""
+    for method, path in (
+        ("POST", "/v1/admin/tokens/01ABCDEFGHJKMNPQRSTVWXYZ00/revoke"),
+        ("DELETE", "/v1/admin/repositories/anything"),
+        ("POST", "/v1/admin/credentials/codex/remove"),
+        ("POST", "/v1/import/bootstrap/01ABCDEFGHJKMNPQRSTVWXYZ00/commit"),
+    ):
+        refused = admin_client.request(method, path, json={"reason": "  "})
+        assert refused.status_code == 422, (path, refused.text)
+        assert refused.json()["errors"][0]["path"] == "reason"
 
 
 # ----- parity: every operation through both entry points ----------------------------
@@ -1130,14 +1146,8 @@ def test_providers_github_audit_status_and_capabilities(
     with pytest.raises(SystemExit):
         admin_main(["--config", str(config_file), "--reason", "x", "github", "check"])
 
-    # A registration under /admin is a mutation like any other: a reason, and a live lease.
-    assert (
-        admin_client.put(
-            "/v1/admin/repositories/second",
-            json={"url": "https://github.com/example-org/second", "attested_all_prs": True},
-        ).status_code
-        == 422
-    )
+    # A registration under /admin is a mutation like any other: a live lease, and the
+    # reason when one is given (crucible#117).
     registered = admin_client.put(
         "/v1/admin/repositories/second",
         json={
@@ -1379,22 +1389,20 @@ def test_registering_a_repository_takes_both_guards_on_both_entry_points(
         )
     assert "supervisor-not-live" in capsys.readouterr().out
     asyncio.run(live_supervisor.tick())
-    assert admin_client.put("/v1/admin/repositories/guarded", json=body).status_code == 422
-    with pytest.raises(SystemExit):
-        admin_main(
-            [
-                "--config",
-                str(config_file),
-                "repositories",
-                "register",
-                "--name",
-                "guarded-cli",
-                "--url",
-                "https://github.com/example-org/guarded-cli",
-                "--attest-external-review-all-prs",
-            ]
-        )
-    assert "reason" in capsys.readouterr().out
+    # A reason is an optional note on a registration (crucible#117); the guard is the lease.
+    assert admin_client.put("/v1/admin/repositories/guarded", json=body).status_code == 200
+    registered = run_cli(
+        config_file,
+        "repositories",
+        "register",
+        "--name",
+        "guarded-cli",
+        "--url",
+        "https://github.com/example-org/guarded-cli",
+        "--attest-external-review-all-prs",
+        capsys=capsys,
+    )
+    assert registered["repository"] == "guarded-cli"
 
 
 def test_finishing_a_login_takes_both_guards(
@@ -1409,9 +1417,11 @@ def test_finishing_a_login_takes_both_guards(
     )
     assert no_lease.status_code == 503, no_lease.text
     asyncio.run(live_supervisor.tick())
+    # The reason is an optional note (crucible#117): with the lease held, what refuses a
+    # finish with nothing to finish is the login state, not a missing reason.
     no_reason = admin_client.post("/v1/admin/credentials/codex/login/finish", json={})
-    assert no_reason.status_code == 422, no_reason.text
-    assert no_reason.json()["errors"][0]["path"] == "reason"
+    assert no_reason.status_code != 422, no_reason.text
+    assert no_reason.status_code != 503, no_reason.text
 
 
 def test_a_failed_swap_leaves_the_configured_directory_exactly_as_it_was(
@@ -1962,8 +1972,8 @@ def test_kubernetes_egress_through_api_cli_and_ui(
     )
     assert refused.status_code == 422
     assert "may never reach" in refused.text
-    no_reason = admin_client.post("/v1/admin/kubernetes/egress", json={"dns": {"namespace": ""}})
-    assert no_reason.status_code == 422
+    half = admin_client.post("/v1/admin/kubernetes/egress", json={"dns": {"namespace": ""}})
+    assert half.status_code == 422
     # Leaving `dns` out of an edit of the endpoint must not read as "no DNS selector".
     partial = admin_client.post(
         "/v1/admin/kubernetes/egress",

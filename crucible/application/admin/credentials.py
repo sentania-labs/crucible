@@ -1238,7 +1238,12 @@ def remove(
     """25: the harness becomes `absent`; the files are shredded; the harness is
     disabled with the reason so a launch is refused cleanly rather than failing auth."""
     reason = guard_mutation(
-        ctx, uow, reason, principal=principal, operation=f"credentials remove {harness}"
+        ctx,
+        uow,
+        reason,
+        principal=principal,
+        operation=f"credentials remove {harness}",
+        reason_required=True,
     )
     _refuse_for_secret(ctx, harness, "remove")
     spec_for(ctx, harness)

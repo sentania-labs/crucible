@@ -126,11 +126,13 @@ async def test_enabling_through_the_service_lets_the_same_harness_run(
     assert "harness_refused" not in kinds
 
 
-async def test_a_reason_is_required_to_change_the_flag(ctx: AppContext) -> None:
-    with ctx.uow_factory() as uow, pytest.raises(ValueError, match="reason is required"):
-        set_harness_enabled(
+async def test_a_reason_is_an_optional_note_on_the_flag(ctx: AppContext) -> None:
+    """crucible#117: flipping the flag without a reason records none."""
+    with ctx.uow_factory() as uow:
+        state = set_harness_enabled(
             uow, ctx.clock, principal_name="admin-principal", name="agy", enabled=False, reason="  "
         )
+    assert state.enabled is False and state.reason == ""
 
 
 async def test_get_harnesses_reports_flags_ranges_and_a_sanitized_credential_state(

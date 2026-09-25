@@ -36,6 +36,11 @@ MUTATOR_ROUTE = (ORCHESTRATOR, OPERATOR, ADMIN)
 PROBED_ORCHESTRATOR = ORCHESTRATOR
 
 REASON = {"reason": "why; recorded with the operation (never a secret)"}
+# An admin reason is an audit note the caller may add, except on the destructive
+# operations that still require one (25, crucible#117).
+OPTIONAL_REASON = [
+    {"flag": "--reason", "description": "a note recorded with the operation (never a secret)"}
+]
 
 # 09's cancellable states plus `running`, which cancels through `cancelling`.
 CANCELLABLE = frozenset(
@@ -389,14 +394,31 @@ def credential_actions(
     if harness in SET_KEY_HARNESSES and state in ("absent", "invalid"):
         verbs = ("set", *verbs)
     for verb in verbs:
-        command = [*prefix, "--reason", "{reason}", "credentials", verb, "--harness", harness]
-        needs: dict[str, Any] = dict(REASON)
+        required = verb == "remove"
+        command = [
+            *prefix,
+            *(["--reason", "{reason}"] if required else []),
+            "credentials",
+            verb,
+            "--harness",
+            harness,
+        ]
+        needs: dict[str, Any] = dict(REASON) if required else {}
         if verb == "rotate":
             command += ["--new-path", "{new_path}"]
             needs["new_path"] = "a prepared credential directory; left untouched"
         if verb == "login" and state != "absent":
             command.append("--replace")
-        out.append(action(verb, CREDENTIAL_WORDS[verb], command, needs=needs, roles=(ADMIN,)))
+        out.append(
+            action(
+                verb,
+                CREDENTIAL_WORDS[verb],
+                command,
+                needs=needs,
+                optional=None if required else OPTIONAL_REASON,
+                roles=(ADMIN,),
+            )
+        )
     return out
 
 
@@ -422,8 +444,6 @@ def kubernetes_egress_actions(document: Any, prefix: Sequence[str]) -> list[dict
             "replace the resolver's and the in-cluster local endpoint's selectors",
             [
                 *prefix,
-                "--reason",
-                "{reason}",
                 "kubernetes",
                 "set-egress",
                 f"--dns-namespace={dns.get('namespace', '')}",
@@ -432,7 +452,7 @@ def kubernetes_egress_actions(document: Any, prefix: Sequence[str]) -> list[dict
                 f"--endpoint-labels={_labels_text(endpoint.get('pod_labels'))}",
                 f"--endpoint-port={endpoint.get('port', 0)}",
             ],
-            needs=REASON,
+            optional=OPTIONAL_REASON,
             roles=(ADMIN,),
         )
     ]
@@ -461,8 +481,6 @@ def local_endpoint_actions(document: Any, prefix: Sequence[str]) -> list[dict[st
                 f"{verb} the {model_id} model on the local endpoint",
                 [
                     *prefix,
-                    "--reason",
-                    "{reason}",
                     "routing",
                     "set-local-endpoint",
                     "--endpoint-url",
@@ -470,8 +488,9 @@ def local_endpoint_actions(document: Any, prefix: Sequence[str]) -> list[dict[st
                     f"--model={model_id}",
                     f"--{verb}",
                 ],
-                needs={"endpoint_url": "the local endpoint's base URL", **REASON},
+                needs={"endpoint_url": "the local endpoint's base URL"},
                 optional=[
+                    *OPTIONAL_REASON,
                     {
                         "flag": "--enable-thinking",
                         "description": "turn on the model's thinking mode",
@@ -499,8 +518,8 @@ def harness_actions(items: Iterable[Any], prefix: Sequence[str]) -> list[dict[st
             action(
                 f"{verb}:{name}",
                 f"{verb} the {name} harness for new launches",
-                [*prefix, "--reason", "{reason}", "harnesses", verb, name],
-                needs=REASON,
+                [*prefix, "harnesses", verb, name],
+                optional=OPTIONAL_REASON,
                 roles=(ADMIN,),
             )
         )
@@ -512,8 +531,8 @@ def image_actions(items: Iterable[Any], prefix: Sequence[str]) -> list[dict[str,
         action(
             f"promote:{item['digest']}",
             f"promote {item.get('reference', item['digest'])}",
-            [*prefix, "--reason", "{reason}", "images", "promote", str(item["digest"])],
-            needs=REASON,
+            [*prefix, "images", "promote", str(item["digest"])],
+            optional=OPTIONAL_REASON,
             roles=(ADMIN,),
         )
         for item in items
@@ -530,8 +549,8 @@ def exhaustion_actions(items: Iterable[Any], prefix: Sequence[str]) -> list[dict
         action(
             f"clear-exhaustion:{item['pool']}",
             f"clear the exhaustion mark on pool {item['pool']}",
-            [*prefix, "--reason", "{reason}", "routing", "clear-exhaustion", str(item["pool"])],
-            needs=REASON,
+            [*prefix, "routing", "clear-exhaustion", str(item["pool"])],
+            optional=OPTIONAL_REASON,
             roles=(ADMIN,),
         )
         for item in items

@@ -713,3 +713,34 @@ def test_all_fifteen_sections_preserve_real_service_output_shapes() -> None:
             values = leaf if isinstance(leaf, list) else [leaf]
             for value in values:
                 assert str(value) in rendered, (title, value)
+
+
+def test_a_reason_is_asked_for_only_where_the_service_requires_one() -> None:
+    """crucible#117: one rule sets every form's reason field. Required on the
+    destructive forms, optional on the rest, and absent on a read-only check."""
+
+    def form(action: str) -> dict[str, Any]:
+        return {
+            "title": action,
+            "form": {
+                "action": action,
+                "fields": [
+                    {"name": "harness", "label": "Harness"},
+                    {"name": "reason", "label": "Reason", "required": True},
+                ],
+            },
+        }
+
+    sections = ui_router._reason_fields(
+        [
+            form("/ui/actions/token-revoke"),
+            form("/ui/actions/harness"),
+            form("/ui/actions/github-check"),
+        ]
+    )
+    reasons = [
+        [f for f in section["form"]["fields"] if f["name"] == "reason"] for section in sections
+    ]
+    assert reasons[0] == [{"name": "reason", "label": "Reason", "required": True}]
+    assert reasons[1] == [{"name": "reason", "label": "Reason (optional)", "required": False}]
+    assert reasons[2] == []
