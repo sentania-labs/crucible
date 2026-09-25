@@ -384,11 +384,12 @@ async def test_list_images_resolves_a_few_tags_at_once_and_skips_failures() -> N
     assert 1 < registry.peak <= LIST_IMAGES_CONCURRENCY
 
 
-async def test_a_tagged_repository_entry_is_skipped_by_a_registry_404_not_a_parse_error() -> None:
+async def test_a_tagged_repository_entry_is_skipped_when_its_references_fail_to_resolve() -> None:
     """80: `probe_image` mistakenly landing in `image_repositories` builds
     `<repo:tag>:<tag>` for every tag the registry lists under it. `parse_reference`
-    does not reject that shape; the registry still lists tags for it and only the
-    manifest read 404s, dropping the entry the same way an unavailable one does."""
+    does not reject that shape, so the skip is not a parse error in Crucible: resolving
+    the reference fails (the real crane refuses it locally), and the entry is dropped
+    the same way an unavailable one is."""
     parse_reference("ghcr.io/o/worker:probe:t00")  # does not raise: the skip is not here
     registry = FakeRegistry()
     registry.register("ghcr.io/o/worker:t00")
