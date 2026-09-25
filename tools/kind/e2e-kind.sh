@@ -115,7 +115,9 @@ containerdConfigPatches:
 EOF
 
 cluster_created=1
-kind create cluster --config "$scratch/kind.yaml" --kubeconfig "$kubeconfig" --wait 0s
+node_image=$(crucible_kind_pull "$CRUCIBLE_KIND_NODE_IMAGE")
+kind create cluster --config "$scratch/kind.yaml" --kubeconfig "$kubeconfig" --wait 0s \
+  --image "$node_image"
 
 node="${cluster}-control-plane"
 for address in 10.0.0.1 172.16.0.1 192.168.0.1 100.64.0.1 169.254.169.254; do

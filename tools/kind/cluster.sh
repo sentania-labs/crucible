@@ -22,6 +22,10 @@ CRUCIBLE_REGISTRY_IMAGE='registry@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b
 # cache of Docker Hub and needs no credential. Every Docker Hub image here is pinned by
 # digest, so whichever of the two serves it, the bytes are the same.
 CRUCIBLE_KIND_DOCKER_HUB_MIRROR=mirror.gcr.io
+# The node image kind v0.33.0 (the CI pin) uses by default, named here so it can be
+# pulled through the mirror like the rest and handed to `kind create cluster --image`.
+# shellcheck disable=SC2034 # used by the scripts that source this file
+CRUCIBLE_KIND_NODE_IMAGE='kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5'
 # shellcheck disable=SC2034 # used by the scripts that source this file
 CRUCIBLE_BUSYBOX_IMAGE='busybox@sha256:9db7b59979c38555a39def84a31fb98b5296952f9e3afd4f6f11f05b07adfab0'
 
@@ -38,7 +42,7 @@ CRUCIBLE_KIND_DOCKER_HUB_MIRROR_PATCH="[plugins.\"io.containerd.grpc.v1.cri\".re
 # Docker Hub second on each attempt; four attempts, doubling from two seconds, ride out
 # a short rate limit or a blip without masking a real outage.
 crucible_kind_pull() {
-  local image=$1 attempt delay=2 first candidate
+  local image=$1 attempt delay=2 first candidate error
   local -a candidates=("$image")
   first=${image%%/*}
   if [ "$first" = "$image" ]; then
@@ -48,11 +52,11 @@ crucible_kind_pull() {
   fi
   for attempt in 1 2 3 4; do
     for candidate in "${candidates[@]}"; do
-      if docker pull -q "$candidate" >/dev/null 2>&1; then
+      if error=$(docker pull -q "$candidate" 2>&1 >/dev/null); then
         printf '%s\n' "$candidate"
         return 0
       fi
-      echo "kind: pull of $candidate failed (attempt $attempt/4)" >&2
+      echo "kind: pull of $candidate failed (attempt $attempt/4): ${error##*$'\n'}" >&2
     done
     [ "$attempt" -eq 4 ] && break
     sleep "$delay"
@@ -137,8 +141,10 @@ crucible_kind_install_calico() {
     -e "s#quay.io/calico/kube-controllers:${CRUCIBLE_CALICO_VERSION}#quay.io/calico/kube-controllers:${CRUCIBLE_CALICO_VERSION}@${CRUCIBLE_CALICO_KUBE_CONTROLLERS_DIGEST}#g" \
     "$calico"
   # A new manifest that spells an image differently would slip past the rewrite above.
-  if grep -E '^[[:space:]]*image:' "$calico" | grep -v '@sha256:' >&2; then
-    echo "kind: the Calico manifest names an image not pinned by digest (67)" >&2
+  local images
+  images=$(grep -E 'image:' "$calico" || :)
+  if [ -z "$images" ] || grep -v '@sha256:' <<< "$images" >&2; then
+    echo "kind: the Calico manifest names no image, or one not pinned by digest (67)" >&2
     return 1
   fi
   KUBECONFIG="$kubeconfig" kubectl apply -f "$calico" >/dev/null
