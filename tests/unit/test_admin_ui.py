@@ -247,6 +247,39 @@ def test_all_document_sections_suppress_secret_shaped_values() -> None:
     assert "present" in rendered and "absent" in rendered
 
 
+def test_harness_version_maps_are_shown_whatever_the_harness_is_called() -> None:
+    """crucible#126: the audit of an image promotion lists every harness's version, and
+    `claude_code` is a harness name, not a login code. Redaction goes by what a field
+    holds, so a code, a token or a key under the same document stays hidden."""
+    marker = "LEAK-MARKER-126"
+    payload = {
+        "reason": "",
+        "harnesses": {
+            "agy": "1.2.8",
+            "claude_code": "2.1.280",
+            "codex": "0.156.0",
+            "hermes": "0.19.0",
+            "script-harness": "1.0.0",
+        },
+        "code": marker,
+        "user_code": marker,
+        "login_token": marker,
+        "error_code": 70,
+        "api_key_set": True,
+    }
+
+    rendered = _render_documents([_document_section("Audit", payload)])
+
+    for version in ("1.2.8", "2.1.280", "0.156.0", "0.19.0", "1.0.0"):
+        assert version in rendered
+    assert marker not in rendered
+    assert rendered.count("not displayed") == 3
+    assert "70" in rendered
+    assert _safe_value("harnesses.claude_code", "2.1.280") == "2.1.280"
+    assert _safe_value("claudeCode", "2.1.280") == "2.1.280"
+    assert _safe_value("device_code", "ABCD-EFGH") == "not displayed"
+
+
 def test_nested_lists_stay_readable_and_suppress_secrets_at_any_depth() -> None:
     marker = "ghp_" + "q" * 40
     document = {

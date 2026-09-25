@@ -39,6 +39,7 @@ from crucible.application.auth import authenticate
 from crucible.application.errors import ApplicationError, ConflictError, ForbiddenError
 from crucible.application.policies import put_policy, put_routing_policy
 from crucible.contracts.api import ExternalReviewAttestation, RepositoryRegistration
+from crucible.contracts.task_contract import HarnessName
 from crucible.domain.cluster_egress import format_labels, parse_labels
 from crucible.domain.entities import Principal, Role
 from crucible.domain.secrets import redact, scan_text
@@ -120,27 +121,43 @@ LABELS = {
     "webhook_secret_present": "Webhook secret",
 }
 
-SECRET_PARTS = {
+# A field is hidden when its own name says it holds a credential value (crucible#126).
+# The name is compared whole, or by a credential suffix, never as a substring: a harness
+# called `claude_code` is a harness, not a login code, and its version is not a secret.
+SECRET_NAMES = {
     "access_token",
+    "api_key",
+    "apikey",
+    "auth_code",
     "authorization",
+    "authorization_code",
+    "bearer",
+    "client_secret",
     "code",
+    "cookie",
     "credential_value",
     "device_code",
+    "id_token",
     "oauth_token",
+    "passwd",
     "password",
     "private_key",
     "refresh_token",
     "secret",
+    "session_token",
     "token",
+    "user_code",
 }
-NON_SECRET_TOKEN_FIELDS = {
-    "error_code",
-    "exit_code",
+SECRET_SUFFIXES = ("_api_key", "_password", "_private_key", "_secret", "_token")
+# Names that describe a credential without holding one: whether it is there, what it
+# fingerprints to, where it is kept, when it changed.
+DESCRIBES_SECRET_SUFFIXES = ("_at", "_fingerprint", "_path", "_present", "_set", "_source")
+NON_SECRET_FIELDS = {
     "fenced_token",
-    "http_code",
-    "status_code",
     "tokens_in",
     "tokens_out",
+    # Harness names key the version maps an image promotion records (crucible#126).
+    *(harness.value.replace("-", "_") for harness in HarnessName),
 }
 
 
@@ -157,20 +174,12 @@ def _operator_label(key: str) -> str:
 
 
 def _secret_field(key: str) -> bool:
+    """Whether a field's value is a credential, decided by what its name means."""
     separated = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", key).lower()
-    terminal = separated.rsplit(".", 1)[-1]
-    lowered = separated.replace(".", "_")
-    if lowered in NON_SECRET_TOKEN_FIELDS or terminal in NON_SECRET_TOKEN_FIELDS:
+    name = separated.rsplit(".", 1)[-1].replace("-", "_")
+    if name in NON_SECRET_FIELDS or name.endswith(DESCRIBES_SECRET_SUFFIXES):
         return False
-    if lowered.endswith("_present") or lowered.endswith("_fingerprint"):
-        return False
-    return any(
-        part == lowered
-        or lowered.startswith(f"{part}_")
-        or lowered.endswith(f"_{part}")
-        or f"_{part}_" in lowered
-        for part in SECRET_PARTS
-    )
+    return name in SECRET_NAMES or name.endswith(SECRET_SUFFIXES)
 
 
 def _safe_value(key: str, value: Any) -> Any:
