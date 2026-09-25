@@ -51,14 +51,14 @@ cluster is read.
 | `test_row_5_7_11_full_lifecycle_on_a_real_pod_and_pvc` | prepare, launch, observe, logs, collection, independent verification, bundle, digest resolution, cleanup | 5, 7, 23 |
 | `test_rows_5_7_11_23_supervisor_restart_and_full_gate_lifecycle` | the real API and Supervisor drive full gates, restart, plain worker failure, timeout, cancellation with the partial report collected, stall, detached completion, hardening verification IDs, and orphan cleanup through Kubernetes | 5, 7, 11, 23 |
 | `test_restart_adopts_the_job_and_resumes_logs` | a new provider adopts the live Job and resumes strictly after the stored log offset | 5 |
-| `test_deleted_pod_is_lost_and_sigterm_ignoring_pod_dies_at_grace` | out-of-band deletion and an `Evicted` status are both `lost`; kubelet kills a worker that ignores SIGTERM after the configured grace | 7, 11 |
+| `test_deleted_pod_is_lost_and_sigterm_ignoring_pod_dies_at_grace` | an out-of-band deletion and an eviction through the Eviction API (the `kubectl drain` path) are both `lost`; kubelet kills a worker that ignores SIGTERM after the configured grace | 7, 11 |
 | `test_row_12_concurrent_attempts_use_distinct_claims` | concurrent attempts on one repository have distinct PVCs and working trees | 12 |
-| `test_network_policy_denies_every_kubernetes_destination_from_the_worker` | each API server, DNS off port 53, other namespace, link-local, RFC 1918, and carrier-grade NAT endpoint is first reached without a selecting policy, then denied inside the policy-selected worker | 12 |
-| `test_per_attempt_secret_is_removed_under_every_cleanup_policy` | the attempt Secret is gone for `keep`, `delete`, and `keep_diff_only` | 12 |
-| `test_probe_refuses_launches_without_default_deny` | removing the enforcing default deny makes the real canary refuse readiness | 12 |
+| `test_network_policy_denies_every_kubernetes_destination_from_the_worker` | each API server, DNS off port 53, other namespace, link-local, RFC 1918, and carrier-grade NAT endpoint is first reached without a selecting policy, then denied inside the policy-selected worker | 16 |
+| `test_per_attempt_secret_is_removed_under_every_cleanup_policy` | the attempt Secret is gone for `keep`, `delete`, and `keep_diff_only` | 16 |
+| `test_probe_refuses_launches_without_default_deny` | removing the enforcing default deny makes the real canary refuse readiness | 16 |
 | `test_row_23_a_harness_the_image_does_not_declare_is_refused` | an attempt asking the tier's image for a harness its label does not declare is refused before any claim exists | 23 |
-| `test_isolation_probes_are_refused_on_kubernetes` | the Docker tier's isolation probes (`test_isolation.py`) all read `refused` from a real Pod driven by the API and Supervisor | Docker parity (72) |
-| `test_scripted_quota_reroutes_on_kubernetes` | the Docker tier's class-routing reroute (`test_class_routing.py`) continues from the checkpoint on the Kubernetes provider | Docker parity (72) |
+| `test_isolation_probes_are_refused_on_kubernetes` | the Docker tier's isolation probes (`test_isolation.py`) all read `refused` from a real Pod driven by the API and Supervisor | 16 |
+| `test_scripted_quota_reroutes_on_kubernetes` | the Docker tier's class-routing reroute (`test_class_routing.py`): a real Pod exhausts its quota and the attempt reroutes to a successor that resumes from the remote branch; checkpoint continuity stays Docker-only, because only the Docker provider pushes a checkpoint to a local file origin | Docker parity (72) |
 
 ## Provider defects exposed by the real cluster
 
