@@ -65,6 +65,8 @@ from tests.e2e.conftest import (
 )
 from tests.e2e.policy import e2e_policy_document, e2e_routing_document
 from tests.e2e.repo import make_origin
+from tests.e2e.test_class_routing import _install_class_policy
+from tests.e2e.test_isolation import MUST_BE_REFUSED
 from tests.fixtures import contract_document
 
 pytestmark = [
@@ -802,7 +804,7 @@ async def test_deleted_pod_is_lost_and_sigterm_ignoring_pod_dies_at_grace(
     )
     observed = await provider.observe(evicted_handle)
     assert observed.state is ObservationState.LOST
-    assert "Evicted" in observed.detail
+    assert observed.detail is not None and "Evicted" in observed.detail
     api.delete("pods", str(evicted_pod["metadata"]["name"]), grace_period_seconds=0)
     await _pods_gone(api, evicted_spec.attempt_id)
     await provider.cleanup(evicted_ws, CleanupPolicy.DELETE, evicted_spec)
@@ -928,6 +930,259 @@ async def test_row_23_a_harness_the_image_does_not_declare_is_refused(
     assert not api.list_objects(
         "persistentvolumeclaims", label_selector=f"{k8sspec.LABEL_ATTEMPT}={launch.attempt_id}"
     )
+
+
+async def test_isolation_probes_are_refused_on_kubernetes(
+    engine: Engine,
+    migrated: str,
+    artifact_root: Path,
+    provider: KubernetesProvider,
+    registry: CraneRegistryClient,
+) -> None:
+    """72: `test_isolation.py`'s probes (S4, 18, 21) had no kind counterpart. The
+    worker image's `isolation` behavior is the one script both tiers launch, so this
+    re-runs it through the full app and Supervisor on the Kubernetes provider and
+    demands the same posture Docker proves: every probe reads `refused`, whichever
+    mechanism (no Docker socket to mount, a NetworkPolicy instead of an egress proxy,
+    no shared filesystem to push into) produced it."""
+    clock = SystemClock()
+    harnesses = application_harnesses()
+    ctx = AppContext(
+        uow_factory=SqlUnitOfWorkFactory(engine),
+        clock=clock,
+        providers=[provider],
+        database_url=migrated,
+        engine=engine,
+        artifact_store=DiskArtifactStore(artifact_root / "kind-isolation-store"),
+        harnesses=harnesses,
+    )
+    tokens: dict[str, str] = {}
+    with ctx.uow_factory() as uow:
+        for role in Role:
+            tokens[role.value] = mint_token(
+                uow, clock, name=f"kind-isolation-{role.value}", role=role
+            ).token
+        uow.commit()
+    app = create_app(ctx)
+    image = os.environ["CRUCIBLE_E2E_KIND_REGISTRY"]
+    resolved = await asyncio.to_thread(registry.resolve, image)
+    with TestClient(app, headers={"Authorization": f"Bearer {tokens['admin']}"}) as admin:
+        routing = e2e_routing_document()
+        assert admin.put(
+            f"/v1/routing/{routing['name']}/{routing['version']}", json=routing
+        ).status_code in (200, 201)
+        policy = e2e_policy_document()
+        policy["images"]["allowlist"] = ["localhost:*/*"]
+        policy["resources"] = {
+            "cpus": 1,
+            "memory": "256MiB",
+            "pids": 128,
+            "tmpfs_total": "256MiB",
+        }
+        assert admin.put(
+            f"/v1/policies/{policy['name']}/{policy['version']}", json=policy
+        ).status_code in (200, 201)
+        with ctx.uow_factory() as uow:
+            uow.image_promotions.put(
+                ImagePromotion(
+                    digest=resolved.digest,
+                    reference=resolved.reference,
+                    harnesses=dict(resolved.harnesses) or {"script-harness": "1.0.0"},
+                    state="default",
+                    updated_at=clock.now(),
+                    updated_by="e2e-kind",
+                    reason="kind isolation probe image",
+                )
+            )
+            uow.commit()
+
+    supervisor = Supervisor(
+        ctx.uow_factory,
+        {"kubernetes": provider},
+        clock,
+        holder="e2e-kind-isolation",
+        artifact_store=ctx.artifact_store,
+        lease_ttl_seconds=120,
+        grace_seconds=5,
+        harnesses=harnesses,
+    )
+    with TestClient(app, headers={"Authorization": f"Bearer {tokens['operator']}"}) as client:
+        origin = _origin("isolation", "isolation")
+        register(ctx, "isolation", origin)
+        document = e2e_contract("E2E-KIND-ISOLATION", "isolation", image)
+        document["execution_request"]["provider"] = "kubernetes"
+        task_id = submit_and_start(client, document)
+        await run_until(
+            supervisor,
+            client,
+            task_id,
+            {"awaiting_internal_review", "gates_passed", "pre_pr_gates_failed"},
+            max_ticks=90,
+            pause=0.5,
+        )
+        attempt_id = client.get(f"/v1/tasks/{task_id}").json()["latest_attempt"]["id"]
+        artifacts = client.get(f"/v1/attempts/{attempt_id}/artifacts").json()["items"]
+        probe_artifact = next(a for a in artifacts if a["filename"].endswith("isolation.tsv"))
+        body = client.get(f"/v1/artifacts/{probe_artifact['id']}/content").text
+        results = dict(line.split("\t", 1) for line in body.splitlines() if "\t" in line)
+        assert set(MUST_BE_REFUSED) <= set(results), sorted(results)
+        reached = sorted(name for name, outcome in results.items() if outcome != "refused")
+        assert reached == [], f"a worker on Kubernetes reached something it must not: {reached}"
+
+
+async def test_scripted_quota_reroutes_on_kubernetes(
+    engine: Engine,
+    migrated: str,
+    artifact_root: Path,
+    provider: KubernetesProvider,
+    registry: CraneRegistryClient,
+) -> None:
+    """72: `test_class_routing.py`'s reroute case had no kind counterpart. The reroute
+    decision (a pool's soft limit exhausted before any worker launches) and the
+    checkpoint continuity it proves are both application-level, not Docker-specific;
+    only re-tagging the image the retried attempt resolves is provider-specific, done
+    here with the same crane the tier's registry already uses (108)."""
+    clock = SystemClock()
+    harnesses = application_harnesses()
+    ctx = AppContext(
+        uow_factory=SqlUnitOfWorkFactory(engine),
+        clock=clock,
+        providers=[provider],
+        database_url=migrated,
+        engine=engine,
+        artifact_store=DiskArtifactStore(artifact_root / "kind-routing-store"),
+        harnesses=harnesses,
+    )
+    tokens: dict[str, str] = {}
+    with ctx.uow_factory() as uow:
+        for role in Role:
+            tokens[role.value] = mint_token(
+                uow, clock, name=f"kind-routing-{role.value}", role=role
+            ).token
+        uow.commit()
+    app = create_app(ctx)
+    image = os.environ["CRUCIBLE_E2E_KIND_REGISTRY"]
+    resolved = await asyncio.to_thread(registry.resolve, image)
+    with TestClient(app, headers={"Authorization": f"Bearer {tokens['admin']}"}) as admin:
+        routing = e2e_routing_document()
+        assert admin.put(
+            f"/v1/routing/{routing['name']}/{routing['version']}", json=routing
+        ).status_code in (200, 201)
+        policy = e2e_policy_document()
+        policy["images"]["allowlist"] = ["localhost:*/*"]
+        policy["resources"] = {
+            "cpus": 1,
+            "memory": "256MiB",
+            "pids": 128,
+            "tmpfs_total": "256MiB",
+        }
+        assert admin.put(
+            f"/v1/policies/{policy['name']}/{policy['version']}", json=policy
+        ).status_code in (200, 201)
+        with ctx.uow_factory() as uow:
+            uow.image_promotions.put(
+                ImagePromotion(
+                    digest=resolved.digest,
+                    reference=resolved.reference,
+                    harnesses=dict(resolved.harnesses) or {"script-harness": "1.0.0"},
+                    state="default",
+                    updated_at=clock.now(),
+                    updated_by="e2e-kind",
+                    reason="kind class routing first image",
+                )
+            )
+            uow.commit()
+        _install_class_policy(ctx)
+
+    supervisor = Supervisor(
+        ctx.uow_factory,
+        {"kubernetes": provider},
+        clock,
+        holder="e2e-kind-routing",
+        artifact_store=ctx.artifact_store,
+        lease_ttl_seconds=120,
+        grace_seconds=5,
+        harnesses=harnesses,
+    )
+    with TestClient(app, headers={"Authorization": f"Bearer {tokens['operator']}"}) as client:
+        origin = _origin("class-routing")
+        register(ctx, "class-routing", origin)
+        document = e2e_contract("E2E-KIND-C6B", "class-routing", image)
+        document["execution_request"]["provider"] = "kubernetes"
+        document["policy"] = {"name": "e2e-script", "version": 2}
+        document["scope"]["allowed_paths"].append("e2e-behavior")
+        for field in ("harness", "model", "pin_reason", "image"):
+            document["execution_request"].pop(field, None)
+        task_id = submit_and_start(client, document)
+
+        # A real Pod's schedule-pull-run-exit round trip spans several ticks on kind,
+        # unlike Docker's near-instant container start, so this polls rather than
+        # assuming one tick reaches the reroute the way the Docker case can.
+        for _ in range(120):
+            await supervisor.tick()
+            midway = client.get(f"/v1/tasks/{task_id}").json()
+            attempts = midway["executions"][0]["attempts"]
+            if len(attempts) >= 2 and attempts[0].get("exit_class") == "quota_exhausted":
+                break
+            await asyncio.sleep(0.5)
+        else:
+            raise AssertionError("the scripted quota attempt never rerouted")
+        assert midway["state"] == "scheduled", midway
+        first, second = attempts
+        assert first["exit_class"] == "quota_exhausted"
+        assert first["image"] == resolved.reference
+        assert second["resume_from_remote"] is True
+
+        second_tag = f"{image.rsplit(':', 1)[1]}-reroute"
+        second_image = image.rsplit(":", 1)[0] + f":{second_tag}"
+        subprocess.run(["crane", "tag", image, second_tag], check=True)
+        with ctx.uow_factory() as uow:
+            uow.image_promotions.put(
+                ImagePromotion(
+                    digest=resolved.digest,
+                    reference=second_image,
+                    harnesses=dict(resolved.harnesses) or {"script-harness": "1.0.0"},
+                    state="default",
+                    updated_at=clock.now(),
+                    updated_by="e2e-kind",
+                    reason="kind class routing second image",
+                )
+            )
+            uow.commit()
+
+        await run_until(
+            supervisor,
+            client,
+            task_id,
+            {"awaiting_internal_review", "pre_pr_gates_failed", "gates_passed"},
+            max_ticks=90,
+            pause=0.5,
+        )
+        final = client.get(f"/v1/tasks/{task_id}").json()
+        attempts = final["executions"][0]["attempts"]
+        assert attempts[1]["state"] == "succeeded"
+        assert attempts[1]["image"] == second_image
+        events = client.get(f"/v1/tasks/{task_id}/events", params={"limit": 200}).json()["items"]
+        reroute = next(event for event in events if event["kind"] == "task_rerouted")
+        assert reroute["payload"]["wip_commit_sha"]
+        prepared = [event for event in events if event["kind"] == "workspace_prepared"]
+        assert prepared[-1]["payload"]["started_from"] == "origin/crucible/E2E-KIND-C6B"
+        # `origin` is the in-cluster remote URL a Pod resolves; the test process itself
+        # runs on the host, where the same bare repo sits under the cache root.
+        host_bare = Path(os.environ["CRUCIBLE_E2E_KIND_CACHE"]) / Path(origin).name
+        final_file = subprocess.run(
+            [
+                "git",
+                "--git-dir",
+                str(host_bare),
+                "show",
+                "crucible/E2E-KIND-C6B:src/quota-checkpoint.txt",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        assert final_file == "quota checkpoint\n"
 
 
 # ----- the login Job, the service-owned Secret and the probe (25, 26, ADR 0015) ----------
@@ -1172,9 +1427,7 @@ async def test_login_from_an_empty_secret_to_a_probe_and_an_attempt_through_the_
                 ):
                     break
                 time.sleep(0.5)
-            assert not api.list_objects(
-                "persistentvolumeclaims", label_selector=probe_pvc_selector
-            )
+            assert not api.list_objects("persistentvolumeclaims", label_selector=probe_pvc_selector)
 
         with TestClient(app, headers={"Authorization": f"Bearer {tokens['operator']}"}) as client:
             register(ctx, "kind-login", _origin("kind-login"))
