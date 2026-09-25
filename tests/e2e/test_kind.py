@@ -39,6 +39,7 @@ from crucible.application.harnesses import HarnessRegistry
 from crucible.application.supervisor import Supervisor
 from crucible.domain.entities import ImagePromotion, Role
 from crucible.ports.execution import (
+    REPORT_MOUNT,
     CleanupPolicy,
     LaunchRefusedError,
     LaunchSpec,
@@ -517,6 +518,28 @@ async def test_rows_5_7_11_23_supervisor_restart_and_full_gate_lifecycle(
         assert timeout_row.termination_reason == "timeout"
         assert "attempt_timeout_drain" in event_kinds(client, timeout_task)
 
+        # Row 7: completion, timeout, cancellation and stall are proven below and
+        # elsewhere in this function; a plain worker failure (no timeout, no signal)
+        # is not, so it gets its own case rather than being implied by the others.
+        crash_origin = _origin("supervisor-crash", "crash")
+        register(ctx, "supervisor-crash", crash_origin)
+        crash_document = e2e_contract("E2E-KIND-CRASH", "supervisor-crash", image)
+        crash_document["execution_request"]["provider"] = "kubernetes"
+        crash_task = submit_and_start(client, crash_document)
+        assert (
+            await run_until(
+                successor, client, crash_task, {"pre_pr_gates_failed"}, max_ticks=60, pause=0.5
+            )
+            == "pre_pr_gates_failed"
+        )
+        crash_attempt = client.get(f"/v1/tasks/{crash_task}").json()["latest_attempt"]
+        with engine.begin() as connection:
+            crash_row = connection.execute(
+                text("SELECT exit_class FROM attempts WHERE id = :id"),
+                {"id": crash_attempt["id"]},
+            ).one()
+        assert crash_row.exit_class == "crashed"
+
         cancel_origin = _origin("supervisor-cancel", "hang")
         register(ctx, "supervisor-cancel", cancel_origin)
         cancel_document = e2e_contract("E2E-KIND-CANCEL", "supervisor-cancel", image)
@@ -530,6 +553,25 @@ async def test_rows_5_7_11_23_supervisor_restart_and_full_gate_lifecycle(
             await asyncio.sleep(0.25)
         else:
             raise AssertionError("the cancellation worker never reached running")
+        # Row 11: a kill proves the worker stops; it says nothing about what the
+        # collector does with the report a killed worker had partly written. Plant one
+        # before the cancel so a real Pod's file is what the collector reads back.
+        cancel_pods = api.list_objects(
+            "pods", label_selector=f"{k8sspec.LABEL_ATTEMPT}={cancel_attempt['id']}"
+        )
+        assert cancel_pods, "the cancellation worker's Pod was not found"
+        cancel_pod_name = str(cancel_pods[0]["metadata"]["name"])
+        exec_result = api.pod_exec(
+            cancel_pod_name,
+            [
+                "sh",
+                "-c",
+                f"printf '%s\\n' 'schema_version: 1.0' 'summary: interrupted' "
+                f"> {REPORT_MOUNT}/report.yaml",
+            ],
+            container=k8sspec.CONTAINER_NAME,
+        )
+        assert exec_result.exit_code == 0, exec_result
         cancelled = client.post(
             f"/v1/tasks/{cancel_task}/cancel",
             json={
@@ -543,9 +585,15 @@ async def test_rows_5_7_11_23_supervisor_restart_and_full_gate_lifecycle(
             await run_until(successor, client, cancel_task, {"cancelled"}, max_ticks=40, pause=0.5)
             == "cancelled"
         )
+        cancel_attempt_id = client.get(f"/v1/tasks/{cancel_task}").json()["latest_attempt"]["id"]
         assert client.get(f"/v1/tasks/{cancel_task}").json()["latest_attempt"]["exit_class"] in (
             "killed",
             "cancelled",
+        )
+        cancel_artifacts = client.get(f"/v1/attempts/{cancel_attempt_id}/artifacts").json()["items"]
+        partial = [item for item in cancel_artifacts if item["type"] == "partial_report"]
+        assert len(partial) == 1 and partial[0]["filename"] == "report/report.yaml", (
+            cancel_artifacts
         )
 
         with engine.begin() as connection:
@@ -832,6 +880,21 @@ async def test_probe_refuses_launches_without_default_deny(
         }
         api.create("networkpolicies", restored)
         await provider.cleanup(workspace, CleanupPolicy.DELETE, spec)
+
+
+async def test_row_23_a_harness_the_image_does_not_declare_is_refused(
+    api: KubernetesClient, registry: CraneRegistryClient
+) -> None:
+    """Readiness row 23: unsupported combinations are refused. The tier's image
+    carries only the script harness's label, so an attempt that asks it for codex is
+    an unsupported combination, and prepare refuses it before any Job exists."""
+    provider = _provider(api, registry, harnesses=application_harnesses())
+    launch = _spec(50, _origin("unsupported-harness"), harness="codex")
+    with pytest.raises(LaunchRefusedError, match="declares harness"):
+        await provider.prepare(launch)
+    assert not api.list_objects(
+        "persistentvolumeclaims", label_selector=f"{k8sspec.LABEL_ATTEMPT}={launch.attempt_id}"
+    )
 
 
 # ----- the login Job, the service-owned Secret and the probe (25, 26, ADR 0015) ----------

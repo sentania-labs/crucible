@@ -32,7 +32,7 @@ Additional, from the operator's direction:
 | External review recorded only from allowlisted logins; feedback reaches Foundry, never a worker | integration: non-allowlisted activity satisfies nothing; disposition required before ready |
 | A required CI failure escalates with evidence and triggers no retry or correction | integration and e2e: forced failure lands in `ci_certification_failed` |
 | Docker authority arrangement recorded | S9 result and the arrangement in use named in the report |
-| Harness versions pinned, digests recorded, unsupported combinations refused | unit: refusal; live: `GET /harnesses` matches image labels; kind: `test_rows_5_7_11_23_supervisor_restart_and_full_gate_lifecycle` and `test_row_5_7_11_full_lifecycle_on_a_real_pod_and_pvc` resolve the disposable registry tag to a digest and verify its harness label; [kind CI run](https://github.com/sentania-labs/crucible/actions/runs/35692723709) |
+| Harness versions pinned, digests recorded, unsupported combinations refused | unit: refusal; live: `GET /harnesses` matches image labels; kind: `test_rows_5_7_11_23_supervisor_restart_and_full_gate_lifecycle` and `test_row_5_7_11_full_lifecycle_on_a_real_pod_and_pvc` resolve the disposable registry tag to a digest and verify its harness label, and `test_row_23_a_harness_the_image_does_not_declare_is_refused` refuses one; [kind CI run](https://github.com/sentania-labs/crucible/actions/runs/35692723709) |
 
 The readiness report is a document in Crucible's repo listing each row, the
 test names, the CI run URL, and the live-run artifact IDs.
