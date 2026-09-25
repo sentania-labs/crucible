@@ -32,7 +32,7 @@ building an app/seevice."
    replaces its data with one merge patch on each later write; a webhook secret is
    replaced only when one is given. With the Docker provider the same three files sit
    beside `github.app.private_key_path`, written mode 0600 by the same flow: each write
-   stages the id and the key in a new `.versions/<v>` directory and renames one
+   stages the id and the key, under a lock, in a new `.versions/<v>` directory and renames one
    `.current` symlink onto it, the id file and the key path are links through `.current`,
    and a reader resolves `.current` once and reads both from that version, so a failed
    write leaves the previous pair in force and no reader pairs one App's id with

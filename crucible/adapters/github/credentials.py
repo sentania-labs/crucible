@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import fcntl
 import os
 import shutil
 import tempfile
@@ -33,6 +34,7 @@ WEBHOOK_SECRET = "webhook.secret"
 CREDENTIAL_LABEL = "github-app"
 VERSIONS = ".versions"
 CURRENT = ".current"
+LOCK = ".lock"
 
 
 def _app_id(raw: bytes | None) -> int | None:
@@ -193,7 +195,8 @@ class DirectoryAppCredentials:
     both in a fresh `.versions/<v>` directory and then renames one `.current` symlink
     onto it; `read` resolves that link once and reads both files from the version it
     names, so a signer never pairs one App's id with another's key. A write that fails
-    before the rename leaves the previous pair in force and its stage removed. The id
+    before the rename leaves the previous pair in force and its stage removed. Writes
+    take a lock on `.lock`, so two saves never prune each other's version. The id
     file and the key path become links through `.current`, so anything that reads the
     configured key path sees the version in force. Files placed there by hand, before
     the service ever wrote, are read as they are until the first write."""
@@ -265,6 +268,26 @@ class DirectoryAppCredentials:
                 f"the GitHub App directory {self.directory} is missing or read-only here; "
                 "the service needs it writable to own the credential (ADR 0017)"
             )
+        try:
+            lock = os.open(self.directory / LOCK, os.O_WRONLY | os.O_CREAT, 0o600)
+        except OSError as exc:
+            raise GitHubAppStoreError(
+                f"{self.directory} could not be locked for the write ({type(exc).__name__})"
+            ) from None
+        try:
+            # One save at a time: two saves racing would each prune the other's version.
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            return self._write_locked(app_id, private_key, webhook_secret)
+        finally:
+            os.close(lock)
+
+    def _write_locked(
+        self, app_id: int, private_key: bytes, webhook_secret: bytes | None
+    ) -> dict[str, Any]:
+        # The webhook secret stands apart from the pair and goes first, so a failure
+        # after the switch below can only be the tidying that follows it.
+        if webhook_secret and self.webhook_path is not None:
+            _write_private(self.webhook_path, webhook_secret)
         previous = self._version()
         try:
             self.versions.mkdir(mode=0o700, exist_ok=True)
@@ -280,22 +303,23 @@ class DirectoryAppCredentials:
         except BaseException:
             shutil.rmtree(stage, ignore_errors=True)
             raise
-        # The new pair is in force from here; what follows only tidies around it.
+        # The new pair is in force from here, so nothing after this point is a refusal:
+        # the caller has recorded the change and must not roll that record back.
+        done: dict[str, Any] = {"store": "directory", "path": str(self.directory), "created": False}
         try:
             _link(self.app_id_path, Path(CURRENT) / APP_ID)
             _link(self.key_path, Path(CURRENT) / PRIVATE_KEY)
         except GitHubAppStoreError as exc:
-            raise GitHubAppStoreError(
-                f"the new App credential is in force, but {exc}; "
-                f"{self.key_path} does not point at it yet"
-            ) from None
-        if webhook_secret and self.webhook_path is not None:
-            _write_private(self.webhook_path, webhook_secret)
+            done["warning"] = (
+                f"the new App credential is in force, but {exc}; anything that reads "
+                f"{self.key_path} directly still sees the previous key"
+            )
         keep = {stage.name, previous.name if previous is not None else ""}
-        for old in self.versions.iterdir():
-            if old.name not in keep:
-                shutil.rmtree(old, ignore_errors=True)
-        return {"store": "directory", "path": str(self.directory), "created": False}
+        with contextlib.suppress(OSError):
+            for old in self.versions.iterdir():
+                if old.name not in keep:
+                    shutil.rmtree(old, ignore_errors=True)
+        return done
 
 
 def _link(target: Path, points_to: Path) -> None:

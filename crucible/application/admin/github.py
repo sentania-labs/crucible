@@ -89,14 +89,19 @@ async def read_stored(ctx: AdminContext, *, timeout: float = STORE_READ_TIMEOUT_
         return None, None
     try:
         return await asyncio.wait_for(asyncio.to_thread(_stored, ctx), timeout)
-    except TimeoutError:
+    except (TimeoutError, OSError) as exc:
+        detail = (
+            f"the App credential store did not answer within {timeout:g} seconds"
+            if isinstance(exc, TimeoutError)
+            else f"the App credential store could not be reached ({type(exc).__name__})"
+        )
         described = {
             "kind": "secret" if hasattr(store, "namespace") else "directory",
             "name": getattr(store, "name", None),
             "namespace": getattr(store, "namespace", None),
             "path": str(getattr(store, "directory", "")) or None,
             "exists": None,
-            "detail": f"the App credential store did not answer within {timeout:g} seconds",
+            "detail": detail,
         }
         return described, None
 
@@ -332,14 +337,17 @@ def connect(
         },
     )
     try:
-        store.write(
+        written = store.write(
             app_id=app_id,
             private_key=pem,
             webhook_secret=secret.encode("utf-8") if secret else None,
         )
     except GitHubAppStoreError as exc:
         raise ConflictError(str(exc)) from None
-    return {**status(ctx, uow), "app": app, "install_url": _install_url(app)}
+    done = {**status(ctx, uow), "app": app, "install_url": _install_url(app)}
+    if written.get("warning"):
+        done["warning"] = written["warning"]
+    return done
 
 
 def apps_view(ctx: AdminContext, uow: UnitOfWork) -> dict[str, Any]:

@@ -202,6 +202,12 @@ def read_secret(store: Any, harness: str) -> SecretRead:
         return SecretRead(store.read_credential_secret(harness))
     except ProviderError as exc:
         return SecretRead(None, str(exc))
+    except OSError as exc:  # refused, reset, TLS: the API server did not answer at all
+        return SecretRead(
+            None,
+            f"the credential Secret {store.credential_secret(harness)!r} could not be read: "
+            f"the API server could not be reached ({type(exc).__name__})",
+        )
 
 
 async def read_secrets(

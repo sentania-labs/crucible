@@ -3,6 +3,7 @@ throughout: booleans, enumerations, timestamps, hashes of non-secret metadata.""
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from crucible.application.admin import audit, bootstrap, credentials, github
@@ -316,8 +317,12 @@ def readiness(
 
 async def status(ctx: AdminContext, uow: UnitOfWork) -> dict[str, Any]:
     images = await list_images(ctx)
-    harnesses, secrets = await read_harnesses(ctx, uow, [i for _, i in images])
-    stored = await github.read_stored(ctx)
+    # The GitHub store is read while the harness Secrets are, not after them.
+    stored_read = asyncio.ensure_future(github.read_stored(ctx))
+    try:
+        harnesses, secrets = await read_harnesses(ctx, uow, [i for _, i in images])
+    finally:
+        stored = await stored_read
     credential_states = {h["name"]: h["credential"] for h in harnesses}
     supervisor = supervisor_view(
         uow, list(ctx.providers.values()), ctx.clock.now(), ctx.lease_ttl_seconds

@@ -198,6 +198,74 @@ def test_a_reader_takes_both_files_from_the_version_it_resolved(
     assert after is not None and (after.app_id, after.private_key) == (10, OTHER_PEM)
 
 
+def test_a_failure_after_the_switch_is_a_warning_not_a_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Once the pair is switched it is in force, and the caller has already recorded
+    it: tidying that fails afterwards is reported, never raised."""
+    directory, store = _directory_store(tmp_path)
+    store.write(app_id=9, private_key=PEM, webhook_secret=None)
+    real = credentials_module._link
+
+    def refuse_the_key_path(target: Path, points_to: Path) -> None:
+        if target.name == "app.pem":
+            raise GitHubAppStoreError(f"{target} could not be switched (OSError)")
+        real(target, points_to)
+
+    (directory / "app.pem").unlink()
+    (directory / "app.pem").write_bytes(PEM)  # a key path that is not a link any more
+    monkeypatch.setattr(credentials_module, "_link", refuse_the_key_path)
+    done = store.write(app_id=10, private_key=OTHER_PEM, webhook_secret=b"hook")
+
+    assert "in force" in done["warning"]
+    credential = store.read()
+    assert credential is not None
+    assert (credential.app_id, credential.private_key) == (10, OTHER_PEM)
+    assert (directory / "webhook.secret").read_bytes() == b"hook"
+
+
+def test_saves_at_the_same_time_never_lose_the_credential(tmp_path: Path) -> None:
+    import threading  # noqa: PLC0415
+
+    directory, store = _directory_store(tmp_path)
+    store.write(app_id=1, private_key=PEM, webhook_secret=None)
+    failures: list[BaseException] = []
+
+    def save(app_id: int) -> None:
+        try:
+            for _ in range(20):
+                store.write(app_id=app_id, private_key=PEM, webhook_secret=None)
+        except BaseException as exc:  # reported below
+            failures.append(exc)
+
+    threads = [threading.Thread(target=save, args=(n,)) for n in range(2, 6)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert failures == []
+    credential = store.read()
+    assert credential is not None and credential.app_id in range(2, 6)
+    assert (directory / "app.pem").read_bytes() == PEM
+    assert len(list((directory / ".versions").iterdir())) == 2
+
+
+def test_an_api_server_that_refuses_the_connection_is_an_unreadable_row() -> None:
+    from crucible.application.admin import credentials as credentials_admin  # noqa: PLC0415
+
+    class Refusing:
+        def credential_secret(self, harness: str) -> str:
+            return f"crucible-harness-{harness}"
+
+        def read_credential_secret(self, harness: str) -> None:
+            raise ConnectionRefusedError(111, "Connection refused")
+
+    read = credentials_admin.read_secret(Refusing(), "codex")
+    assert read.body is None and read.error is not None
+    assert "could not be reached (ConnectionRefusedError)" in read.error
+
+
 def test_files_placed_by_hand_are_read_until_the_first_write(tmp_path: Path) -> None:
     directory, store = _directory_store(tmp_path)
     (directory / "app.pem").write_bytes(PEM)
