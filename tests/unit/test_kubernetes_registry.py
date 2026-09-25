@@ -11,18 +11,26 @@ import base64
 import json
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from crucible.adapters.execution.k8sfake import FakeKubernetesApi, FakeRegistry
 from crucible.adapters.execution.k8sregistry import (
     CraneRegistryClient,
     RegistryAuth,
     RegistryError,
     auths_from_dockerconfigjson,
 )
+from crucible.adapters.execution.kubernetes import (
+    LIST_IMAGES_CONCURRENCY,
+    KubernetesConfig,
+    KubernetesProvider,
+)
+from crucible.ports.execution import ImageInfo
 
 DIGEST = "sha256:" + "a" * 64
 CONFIG = {
@@ -280,3 +288,74 @@ def test_pull_secret_entries_are_read_from_either_form() -> None:
         "docker.io": RegistryAuth("hub", "pw"),
         "ghcr.io": RegistryAuth("robot", "tok"),
     }
+
+
+# ----- plain HTTP ---------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "reference",
+    [
+        "10.1.2.3:5000/worker:1",
+        "172.20.0.1/worker:1",
+        "192.168.1.5:443/worker:1",
+        "registry.localhost:5000/worker:1",
+    ],
+)
+def test_a_registry_crane_would_read_over_plain_http_is_refused(stub: Path, reference: str) -> None:
+    client = _client(stub, auths={reference.split("/", maxsplit=1)[0]: RegistryAuth("u", "p")})
+    with pytest.raises(RegistryError, match="plain HTTP"):
+        client.resolve(reference)
+
+    # Refused before crane ran, so no credential was ever written for it.
+    assert not (stub.parent / "log.jsonl").exists()
+
+
+@pytest.mark.parametrize(
+    "reference", ["localhost:5000/worker:1", "127.0.0.1:5000/worker:1", "[::1]:5000/worker:1"]
+)
+def test_loopback_is_read_because_it_never_leaves_the_host(stub: Path, reference: str) -> None:
+    _client(stub).resolve(reference)
+
+    assert _calls(stub)[0]["argv"][0] == "digest"
+
+
+# ----- listing ------------------------------------------------------------
+
+
+class _SlowRegistry(FakeRegistry):
+    def __init__(self) -> None:
+        super().__init__()
+        self.lock = threading.Lock()
+        self.in_flight = 0
+        self.peak = 0
+
+    def resolve(self, reference: str) -> ImageInfo:
+        with self.lock:
+            self.in_flight += 1
+            self.peak = max(self.peak, self.in_flight)
+        try:
+            time.sleep(0.05)
+            return super().resolve(reference)
+        finally:
+            with self.lock:
+                self.in_flight -= 1
+
+
+async def test_list_images_resolves_a_few_tags_at_once_and_skips_failures() -> None:
+    registry = _SlowRegistry()
+    for n in range(20):
+        registry.register(f"ghcr.io/o/worker:t{n:02d}")
+    registry.unavailable.add("ghcr.io/o/worker:t03")
+    provider = KubernetesProvider(
+        KubernetesConfig(image_repositories=("ghcr.io/o/worker",)),
+        FakeKubernetesApi(),  # type: ignore[arg-type]
+        registry,
+    )
+
+    images = await provider.list_images()
+
+    assert [i.reference for i in images] == [
+        f"ghcr.io/o/worker:t{n:02d}" for n in range(20) if n != 3
+    ]
+    assert 1 < registry.peak <= LIST_IMAGES_CONCURRENCY

@@ -191,6 +191,8 @@ DEFAULT_IMAGE_ALLOWLIST: tuple[str, ...] = (
 # How much of one file the reader Pod will hand back. A worker owns its credential copy
 # and can leave anything at that path, so the read is bounded before it is parsed (12).
 CREDENTIAL_READ_LIMIT = 1024 * 1024
+# Tags resolved at once while listing images (108). Each is two crane processes.
+LIST_IMAGES_CONCURRENCY = 6
 # How much of a collected output tar is accepted. The tree is excluded from it, so this
 # is the diff, the bundle, the report copy and the verifier logs.
 OUTPUT_READ_LIMIT = 256 * 1024 * 1024
@@ -1690,19 +1692,27 @@ class KubernetesProvider:
         release publishes to (13, 25, 26). A cluster holds no image on Crucible's side,
         so there is nothing local to list."""
         await self._load_pull_auths()
+        # Each resolve is a registry round trip, and a repository carries dozens of tags,
+        # so a few run at once; one after another, a listing outlasts the 15 seconds the
+        # harness and image endpoints wait for it.
+        limit = asyncio.Semaphore(LIST_IMAGES_CONCURRENCY)
+
+        async def resolve(reference: str) -> ImageInfo | None:
+            async with limit:
+                try:
+                    info: ImageInfo = await self._call(self.registry.resolve, reference)
+                except RegistryError:
+                    return None
+            return replace(info, reference=reference) if info.harnesses else None
+
         images: list[ImageInfo] = []
         for repository in self.config.image_repositories:
             try:
                 tags = await self._call(self.registry.list_tags, repository)
             except RegistryError as exc:
                 raise ProviderError(f"image listing failed for {repository}: {exc}") from exc
-            for tag in tags:
-                try:
-                    info = await self._call(self.registry.resolve, f"{repository}:{tag}")
-                except RegistryError:
-                    continue
-                if info.harnesses:
-                    images.append(replace(info, reference=f"{repository}:{tag}"))
+            found = await asyncio.gather(*(resolve(f"{repository}:{tag}") for tag in tags))
+            images.extend(info for info in found if info is not None)
         return sorted(images, key=lambda i: i.reference)
 
     async def health(self) -> ProviderHealth:

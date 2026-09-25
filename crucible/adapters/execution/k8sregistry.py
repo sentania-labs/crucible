@@ -22,6 +22,7 @@ is never on a command line and never logged (12).
 from __future__ import annotations
 
 import base64
+import ipaddress
 import json
 import os
 import re
@@ -44,6 +45,12 @@ DEFAULT_TIMEOUT = 20.0
 # index's own; only the labels are read from this platform's image config.
 PLATFORM = "linux/amd64"
 DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+# crane falls back from HTTPS to plain HTTP for these, and would send the pull
+# credential in the clear to anyone on the path who can make HTTPS fail. Loopback
+# (localhost, 127.0.0.1, ::1) is the same fallback but never leaves the host.
+PLAIN_HTTP_NETWORKS = tuple(
+    ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+)
 
 
 class RegistryError(Exception):
@@ -179,6 +186,7 @@ class CraneRegistryClient:
     # ----- running crane ------------------------------------------------
 
     def _crane(self, registry: str, *args: str) -> str:
+        _refuse_plain_http(registry)
         # mkdtemp creates the directory 0700 and owned by this process's user.
         config_dir = tempfile.mkdtemp(prefix="crucible-crane-")
         try:
@@ -221,6 +229,25 @@ class CraneRegistryClient:
                 if secret:
                     text = text.replace(secret, "[redacted]")
         return text[:300]
+
+
+def _refuse_plain_http(registry: str) -> None:
+    """The registries crane would read over plain HTTP from another host (108).
+
+    The client this replaced spoke HTTPS only. A registry named by a private IP address,
+    or by a name under `.localhost`, is refused rather than read in the clear."""
+    host = registry.rsplit(":", 1)[0] if registry.count(":") == 1 else registry
+    try:
+        address = ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        address = None
+    if (address is not None and any(address in n for n in PLAIN_HTTP_NETWORKS)) or (
+        host.endswith(".localhost")
+    ):
+        raise RegistryError(
+            f"{registry} is a registry crane would read over plain HTTP; "
+            "name it by a host name it serves HTTPS on"
+        )
 
 
 def _write_docker_config(directory: str, registry: str, auth: RegistryAuth | None) -> None:
