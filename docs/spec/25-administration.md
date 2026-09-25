@@ -362,9 +362,15 @@ harness, model, image digest, start time and last heartbeat; task counts by
 state together with the id, external id and update time of every task in
 `blocked`, `pre_pr_gates_failed`, `publish_failed`,
 `ci_certification_failed` and `head_diverged`; and pending wakes as a count
-per principal with the oldest pending timestamp and the total unacked. That
-is what an orchestrator needs to say which of its tasks is stuck and why,
-and it is its own work: the ids, models and image digests are of tasks it
-submitted and attempts Crucible ran for them. Nothing in the response is a
+per principal with the oldest pending timestamp and the total unacked. For
+an orchestrator principal these three parts are filtered to its own work
+(crucible#40): the active attempts and the task counts and lists cover only
+tasks it submitted, and `wakes` counts only the wakes addressed to it, so
+`unacked` is its own total. One orchestrator cannot read another's task ids,
+external ids or wake counts here. An operator principal is exempt, as it is
+from task ownership (04), and sees every principal's. The `harnesses`,
+`providers` and `github` parts describe the service rather than any one
+principal's work and are the same for every caller. That is what an
+orchestrator needs to say which of its tasks is stuck and why. Nothing in the response is a
 credential, a token, a key, a path, or a file name, and the view is
 read-only.

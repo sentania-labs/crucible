@@ -29,16 +29,19 @@ from crucible.adapters.execution.docker import DockerConfig
 from crucible.adapters.execution.fake import FakeProvider
 from crucible.adapters.persistence.unit_of_work import SqlUnitOfWorkFactory, make_engine
 from crucible.application.admin.context import AdminContext
-from crucible.application.auth import authenticate
+from crucible.application.auth import authenticate, mint_token
 from crucible.application.errors import ApplicationError
 from crucible.application.supervisor import Supervisor
+from crucible.application.wakes import create_wake
 from crucible.cli import admin as cli
 from crucible.client.config import ADMIN_TOKEN_ENV
 from crucible.client.http import Api
+from crucible.contracts.wake import WakeReason
 from crucible.domain.entities import ImagePromotion, Role
 from crucible.ports.execution import ImageInfo
 from crucible.ports.harness import CredentialSource
 from tests.admin_cli import admin_main, envelope_data
+from tests.fixtures import contract_document
 
 pytestmark = pytest.mark.integration
 
@@ -1217,6 +1220,58 @@ def test_providers_github_audit_status_and_capabilities(
         create_app(ctx), headers={"Authorization": f"Bearer {tokens['observer']}"}
     ) as observer:
         assert observer.get("/v1/capabilities").status_code == 403
+
+
+def test_capabilities_show_an_orchestrator_its_own_work_only(
+    ctx: AppContext, tokens: dict[str, str], admin_ctx: AdminContext
+) -> None:
+    """crucible#40: one orchestrator cannot read another's tasks, attempts or wakes
+    through /v1/capabilities; an operator still sees everything."""
+    with ctx.uow_factory() as uow:
+        other = mint_token(uow, ctx.clock, name="other-orchestrator", role=Role.ORCHESTRATOR)
+        uow.commit()
+
+    def client(token: str) -> TestClient:
+        return TestClient(create_app(ctx), headers={"Authorization": f"Bearer {token}"})
+
+    with client(tokens["orchestrator"]) as mine, client(other.token) as theirs:
+        own = mine.post("/v1/tasks", json=contract_document(external_id="EX-MINE"))
+        foreign = theirs.post("/v1/tasks", json=contract_document(external_id="EX-THEIRS"))
+        assert own.status_code == 201 and foreign.status_code == 201
+        with ctx.uow_factory() as uow:
+            for task_id in (own.json()["id"], foreign.json()["id"]):
+                task = uow.tasks.get(task_id)
+                assert task is not None
+                create_wake(
+                    uow,
+                    ctx.clock,
+                    principal_id=task.principal_id,
+                    reason=WakeReason.BLOCKED,
+                    summary="blocked",
+                    task=task,
+                    raised_by="tests",
+                )
+            uow.commit()
+
+        mine_view = mine.get("/v1/capabilities").json()
+        theirs_view = theirs.get("/v1/capabilities").json()
+
+    assert mine_view["tasks"]["counts"] == {"submitted": 1}
+    assert theirs_view["tasks"]["counts"] == {"submitted": 1}
+    assert mine_view["wakes"]["pending"] == {"orchestrator-principal": 1}
+    assert mine_view["wakes"]["unacked"] == 1
+    assert theirs_view["wakes"]["pending"] == {"other-orchestrator": 1}
+    assert "EX-THEIRS" not in json.dumps(mine_view)
+    assert "EX-MINE" not in json.dumps(theirs_view)
+
+    with client(tokens["operator"]) as operator:
+        everything = operator.get("/v1/capabilities").json()
+    assert everything["tasks"]["counts"] == {"submitted": 2}
+    assert everything["wakes"]["pending"] == {
+        "orchestrator-principal": 1,
+        "other-orchestrator": 1,
+    }
+    assert everything["wakes"]["unacked"] == 2
 
 
 def test_the_cli_remote_mode_builds_the_same_calls(monkeypatch: pytest.MonkeyPatch) -> None:
