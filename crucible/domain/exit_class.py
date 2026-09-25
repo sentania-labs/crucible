@@ -11,6 +11,9 @@ EXIT_CODE_ENVIRONMENT = 70
 class ExitClass(StrEnum):
     COMPLETED = "completed"
     COMPLETED_WITHOUT_REPORT = "completed_without_report"
+    # The harness exited while its own tooling reported a command still running (issue
+    # 128): never a clean completion, whatever the exit code and the report say.
+    INCOMPLETE = "incomplete"
     BLOCKED = "blocked"
     ENVIRONMENT = "environment"
     AUTH_FAILURE = "auth_failure"
@@ -21,6 +24,13 @@ class ExitClass(StrEnum):
     CRASHED = "crashed"
     LOST = "lost"
     UNKNOWN = "unknown"
+
+
+# The classes that say the harness finished its turn cleanly. A zero exit code alone
+# is not enough: an `incomplete` attempt exits 0 too (issue 128).
+CLEAN_EXIT_CLASSES: frozenset[ExitClass] = frozenset(
+    {ExitClass.COMPLETED, ExitClass.COMPLETED_WITHOUT_REPORT}
+)
 
 
 def classify_exit(

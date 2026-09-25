@@ -35,9 +35,15 @@ from crucible.application.admin import (
     tokens,
 )
 from crucible.application.admin import kubernetes as kubernetes_admin
+from crucible.application.admin import limits as limits_admin
 from crucible.application.admin.context import guard_mutation
 from crucible.application.auth import authenticate
-from crucible.application.errors import ApplicationError, ConflictError, ForbiddenError
+from crucible.application.errors import (
+    ApplicationError,
+    ConflictError,
+    ContractValidationError,
+    ForbiddenError,
+)
 from crucible.application.first_run import discard_after_use
 from crucible.application.policies import put_policy, put_routing_policy
 from crucible.contracts.api import ExternalReviewAttestation, RepositoryRegistration
@@ -867,6 +873,7 @@ def routing_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
     exhaustion = routing.list_exhaustions(ctx.admin, uow)
     local = routing.local_endpoint_view(uow)
     egress = kubernetes_admin.egress_view(ctx.admin, uow)
+    command_timeout = limits_admin.command_timeout_view(uow)
     hermes: dict[str, Any] = {}
     if "hermes" in ctx.admin.harnesses.names():
         view = credentials.state_view(ctx.admin, uow, "hermes")
@@ -880,6 +887,7 @@ def routing_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
         _document_section("Local endpoint", local),
         *([_document_section("Hermes API key", hermes)] if hermes else []),
         _document_section("Kubernetes egress selectors", egress),
+        _document_section("Per-command timeout", command_timeout),
         _document_section("Active policy", policy.document if policy else {}),
         _document_section("Routing policy", routing_record.document if routing_record else {}),
         _document_section("Pool exhaustion", exhaustion),
@@ -961,6 +969,47 @@ def routing_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                     },
                 }
             )
+        bounds = command_timeout["command_timeout_ms"]
+        sections.append(
+            {
+                "title": "Edit per-command timeout",
+                "note": (
+                    "The timeout, in milliseconds, every harness runs a shell command under "
+                    "(issue 128). A task contract may narrow the default within min and max; "
+                    "a launch never exceeds the attempt's own timeout. Saving creates a new "
+                    "immutable delivery policy version; tasks whose contracts name that "
+                    "version launch with it."
+                ),
+                "form": {
+                    "action": "/ui/actions/command-timeout",
+                    "label": "Save command timeout",
+                    "fields": [
+                        {
+                            "name": "min",
+                            "label": "Minimum (ms)",
+                            "kind": "number",
+                            "value": bounds["min"],
+                            "required": True,
+                        },
+                        {
+                            "name": "default",
+                            "label": "Default (ms)",
+                            "kind": "number",
+                            "value": bounds["default"],
+                            "required": True,
+                        },
+                        {
+                            "name": "max",
+                            "label": "Maximum (ms)",
+                            "kind": "number",
+                            "value": bounds["max"],
+                            "required": True,
+                        },
+                        {"name": "reason", "label": "Reason", "required": True},
+                    ],
+                },
+            }
+        )
         dns = egress["document"].get("dns") or {}
         endpoint = egress["document"].get("local_endpoint") or {}
         sections.append(
@@ -1634,6 +1683,18 @@ def settings_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
     )
 
 
+def _milliseconds(form: dict[str, str], name: str) -> int | None:
+    raw = form.get(name, "").strip()
+    if not raw:
+        return None
+    if not raw.isdigit():
+        raise ContractValidationError(
+            f"{name} must be a whole number of milliseconds",
+            errors=[{"path": name, "message": "a whole number of milliseconds"}],
+        )
+    return int(raw)
+
+
 @router.post("/actions/{action}")
 async def action(request: Request, action: str, ctx: Ctx, uow: UoW) -> Response:
     found = _require(request, ctx, uow)
@@ -1781,6 +1842,16 @@ async def action(request: Request, action: str, ctx: Ctx, uow: UoW) -> Response:
                     }
                 ],
                 max_concurrency=int(form.get("max_concurrency", "0")),
+                reason=reason,
+            )
+        elif action == "command-timeout":
+            limits_admin.save_command_timeout(
+                ctx.admin,
+                uow,
+                principal=principal,
+                minimum=_milliseconds(form, "min"),
+                maximum=_milliseconds(form, "max"),
+                default=_milliseconds(form, "default"),
                 reason=reason,
             )
         elif action == "kubernetes-egress":

@@ -37,6 +37,7 @@ from crucible.application.wakes import create_wake
 from crucible.cli import admin as cli
 from crucible.client.config import ADMIN_TOKEN_ENV
 from crucible.client.http import Api
+from crucible.contracts.policy import PolicyV1
 from crucible.contracts.wake import WakeReason
 from crucible.domain.entities import Attempt, Execution, ExecutionRole, ImagePromotion, Role
 from crucible.domain.ids import new_id
@@ -2327,4 +2328,128 @@ def test_the_cli_remote_mode_sends_the_egress_document(monkeypatch: pytest.Monke
                 },
             },
         ),
+    ]
+
+
+def test_command_timeout_through_api_cli_and_ui(
+    ctx: AppContext,
+    tokens: dict[str, str],
+    admin_client: TestClient,
+    live_supervisor: Supervisor,
+    config_file: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """crucible#128: the per-command timeout is a policy limit with API, CLI and UI
+    parity. Each save writes a new policy version with only that limit changed, and one
+    audit event; a bound left out keeps its value."""
+    asyncio.run(live_supervisor.tick())
+    first = admin_client.get("/v1/admin/limits/command-timeout").json()
+    assert first["command_timeout_ms"] == {"min": 1000, "max": 14_400_000, "default": 3_600_000}
+    start = first["policy"]["version"]
+
+    saved = admin_client.post(
+        "/v1/admin/limits/command-timeout",
+        json={"reason": "api: long builds", "min": 60_000, "max": 7_200_000, "default": 5_400_000},
+    )
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["policy"]["version"] == start + 1
+    stored = admin_client.get(f"/v1/policies/default-software/{start + 1}").json()["document"]
+    assert stored["limits"]["command_timeout_ms"] == {
+        "min": 60_000,
+        "max": 7_200_000,
+        "default": 5_400_000,
+    }
+    previous = admin_client.get(f"/v1/policies/default-software/{start}").json()["document"]
+
+    # Only the limit changed: both versions, normalized, differ in nothing else.
+    def rest(document: dict[str, Any]) -> dict[str, Any]:
+        normal = PolicyV1.model_validate(document).model_dump(mode="json")
+        del normal["version"], normal["description"], normal["limits"]["command_timeout_ms"]
+        return normal
+
+    assert rest(stored) == rest(previous)
+
+    for body in (
+        {"reason": "api: inverted", "min": 5000, "max": 4000},
+        {"reason": "api: a string", "default": "600000"},
+        {"reason": "api: a bool", "default": True},
+        {"default": 600_000},
+    ):
+        refused = admin_client.post("/v1/admin/limits/command-timeout", json=body)
+        assert refused.status_code == 422, (body, refused.text)
+    assert admin_client.get("/v1/admin/limits/command-timeout").json()["policy"]["version"] == (
+        start + 1
+    )
+
+    cli_view = run_cli(config_file, "limits", "command-timeout", capsys=capsys)
+    assert cli_view["command_timeout_ms"]["default"] == 5_400_000
+    cli_saved = run_cli(
+        config_file,
+        "--reason",
+        "cli: shorter default",
+        "limits",
+        "set-command-timeout",
+        "--default=1800000",
+        capsys=capsys,
+    )
+    assert cli_saved["command_timeout_ms"] == {
+        "min": 60_000,
+        "max": 7_200_000,
+        "default": 1_800_000,
+    }
+    assert cli_saved["policy"]["version"] == start + 2
+
+    with TestClient(create_app(ctx)) as browser:
+        csrf = ui_sign_in(browser, tokens["admin"])
+        page = browser.get("/ui/routing")
+        assert page.status_code == 200
+        assert 'action="/ui/actions/command-timeout"' in page.text
+        assert 'value="1800000"' in page.text
+        ui_saved = browser.post(
+            "/ui/actions/command-timeout",
+            data={
+                "csrf": csrf,
+                "min": "60000",
+                "default": "3600000",
+                "max": "7200000",
+                "reason": "ui: back to an hour",
+                "return_to": "/ui/routing",
+            },
+            follow_redirects=False,
+        )
+        assert ui_saved.status_code == 303
+        assert "Completed" in unquote(ui_saved.headers.get("location", ""))
+    final = admin_client.get("/v1/admin/limits/command-timeout").json()
+    assert final["command_timeout_ms"]["default"] == 3_600_000
+    assert final["policy"]["version"] == start + 3
+    kinds = audit_kinds(admin_client)
+    assert ("command_timeout_updated", "admin-principal") in kinds
+    assert ("command_timeout_updated", "crucible-admin") in kinds
+    assert len([k for k in kinds if k[0] == "command_timeout_updated"]) == 3
+
+
+def test_the_cli_remote_mode_sends_the_command_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[str, str, Any]] = []
+
+    def fake_call(self: Any, method: str, path: str, body: Any = None, **_: Any) -> Any:
+        calls.append((method, path, body))
+        return {"policy": {}, "command_timeout_ms": {"min": 1, "max": 2, "default": 2}}
+
+    monkeypatch.setattr(Api, "call", fake_call)
+    monkeypatch.setenv(ADMIN_TOKEN_ENV, "cru_" + "0" * 26 + "." + "s" * 40)
+    admin_main(["--api-url", "http://127.0.0.1:1", "limits", "command-timeout"])
+    admin_main(
+        [
+            "--api-url",
+            "http://127.0.0.1:1",
+            "--reason",
+            "r",
+            "limits",
+            "set-command-timeout",
+            "--max=7200000",
+        ]
+    )
+    assert calls == [
+        ("GET", "/v1/admin/limits/command-timeout", None),
+        ("POST", "/v1/admin/limits/command-timeout", {"reason": "r", "max": 7_200_000}),
     ]

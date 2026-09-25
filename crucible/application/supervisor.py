@@ -68,6 +68,7 @@ from crucible.contracts.completion_claim import parse_claim
 from crucible.contracts.evidence import ROLE_RUN_EVIDENCE, EvidenceKind, EvidenceSource
 from crucible.contracts.task_contract import TaskContractV1
 from crucible.contracts.wake import WakeReason
+from crucible.domain.command_timeout import effective_command_timeout_ms
 from crucible.domain.entities import (
     Attempt,
     AttemptMetrics,
@@ -83,7 +84,7 @@ from crucible.domain.entities import (
     Task,
 )
 from crucible.domain.events import PRINCIPAL_CRUCIBLE, EventKind
-from crucible.domain.exit_class import ExitClass, classify_exit
+from crucible.domain.exit_class import CLEAN_EXIT_CLASSES, ExitClass, classify_exit
 from crucible.domain.gates import GateName, GateResult, evaluate_gate
 from crucible.domain.ids import new_id
 from crucible.domain.lifecycle import (
@@ -1025,6 +1026,10 @@ class Supervisor:
             if route is not None:
                 endpoint = route.endpoint
                 endpoint_url = route.endpoint_url
+        # Issue 128: the policy default, narrowed by the contract, capped at the attempt.
+        command_timeout_ms = effective_command_timeout_ms(
+            execution.policy_snapshot, contract, execution.timeout_seconds
+        )
         spec = LaunchSpec(
             attempt_id=attempt.id,
             task_id=task.id,
@@ -1043,6 +1048,7 @@ class Supervisor:
             effort=execution.effort,
             endpoint=endpoint,
             endpoint_url=endpoint_url,
+            command_timeout_ms=command_timeout_ms,
         )
         adapter = self._harnesses.get(selected_harness) if self._harnesses else None
         if adapter is None:
@@ -1075,6 +1081,7 @@ class Supervisor:
                 credential_mounted=credential_mounted,
                 endpoint=endpoint,
                 endpoint_url=endpoint_url,
+                command_timeout_ms=command_timeout_ms,
             )
         )
         return replace(
@@ -3015,6 +3022,12 @@ class Supervisor:
                     "report_parsed": claim_ok,
                     "partial_report_kept_unparsed": cancelled and report_present,
                     "blocked_present": outputs.blocked_md is not None,
+                    # Issue 128: what the harness said was still running at its exit.
+                    **(
+                        {"work_in_flight": [redact(item) for item in parsed.in_flight]}
+                        if parsed is not None and parsed.in_flight
+                        else {}
+                    ),
                 },
             )
             uow.leases.release_attempt_lease(attempt.id)
@@ -3163,7 +3176,13 @@ class Supervisor:
         assert task is not None and execution is not None
         recorded = False
         detail = "no review report was produced"
-        if outputs.report is not None:
+        clean = attempt.exit_code == 0 and attempt.exit_class in CLEAN_EXIT_CLASSES
+        if outputs.report is not None and not clean:
+            # Issue 128: a review that exited with work in flight (or any unclean exit)
+            # did not finish, so its report is not recorded as a review.
+            exit_class = attempt.exit_class.value if attempt.exit_class else "unknown"
+            detail = f"the review execution ended {exit_class}, not a clean completion"
+        elif outputs.report is not None:
             try:
                 record_review_report(
                     uow,
@@ -3192,7 +3211,7 @@ class Supervisor:
             payload={"role": "review", "review_recorded": recorded, "detail": detail},
         )
         self._record_wall_time(uow, attempt)
-        if recorded and attempt.exit_code == 0:
+        if recorded:
             move_attempt(
                 uow, self._clock, attempt, AttemptState.SUCCEEDED, EventKind.ATTEMPT_SUCCEEDED
             )

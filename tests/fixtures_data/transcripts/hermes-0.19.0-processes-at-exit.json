@@ -1,0 +1,22 @@
+[
+  {
+    "session_id": "proc_5104debafe7b",
+    "command": "python3 -c \"import time; time.sleep(8)\"; echo finished > /tmp/marker",
+    "pid": 41,
+    "pid_scope": "host",
+    "host_start_time": 34442700,
+    "cwd": "/tmp/repo",
+    "started_at": 1790365757.6257555,
+    "task_id": "default",
+    "session_key": "hermes-session",
+    "watcher_platform": "",
+    "watcher_chat_id": "",
+    "watcher_user_id": "",
+    "watcher_user_name": "",
+    "watcher_thread_id": "",
+    "watcher_message_id": "",
+    "watcher_interval": 0,
+    "notify_on_complete": false,
+    "watch_patterns": []
+  }
+]
