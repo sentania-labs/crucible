@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import functools
 import hashlib
 import ipaddress
 import json
@@ -38,6 +39,7 @@ import tempfile
 import time
 import weakref
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from io import BytesIO
@@ -191,8 +193,14 @@ DEFAULT_IMAGE_ALLOWLIST: tuple[str, ...] = (
 # How much of one file the reader Pod will hand back. A worker owns its credential copy
 # and can leave anything at that path, so the read is bounded before it is parsed (12).
 CREDENTIAL_READ_LIMIT = 1024 * 1024
-# Tags resolved at once while listing images (108). Each is two crane processes.
+# Tags resolved at once while listing images (108). Each is two crane processes. Also
+# the size of the registry's own thread pool, so registry work never holds more threads
+# than this, and never one of the pool every Kubernetes API call runs on.
 LIST_IMAGES_CONCURRENCY = 6
+# How long one listing may take, from its start to the last crane process it runs (108).
+# Below the 15 seconds the harness and image endpoints wait for it, so a slow registry
+# ends the listing, and every crane process in it, before an endpoint gives up.
+LIST_IMAGES_DEADLINE = 12.0
 # How much of a collected output tar is accepted. The tree is excluded from it, so this
 # is the diff, the bundle, the report copy and the verifier logs.
 OUTPUT_READ_LIMIT = 256 * 1024 * 1024
@@ -480,11 +488,26 @@ class KubernetesProvider:
         self._quota_concurrency: int | None = None
         self._pull_auths_loaded = False
         self._resolved: dict[str, tuple[float, tuple[str, ...]]] = {}
+        # Registry reads run crane and wait on another host; they get threads of their
+        # own so a slow registry cannot take the ones Kubernetes API calls need (108).
+        self._registry_pool = ThreadPoolExecutor(
+            max_workers=LIST_IMAGES_CONCURRENCY, thread_name_prefix="crucible-registry"
+        )
+        # The image listing in flight on each event loop, which every caller shares.
+        self._listings: weakref.WeakKeyDictionary[
+            asyncio.AbstractEventLoop, asyncio.Task[list[ImageInfo]]
+        ] = weakref.WeakKeyDictionary()
 
     # ----- helpers -----------------------------------------------------
 
     async def _call(self, fn: Any, *args: Any, **kwargs: Any) -> Any:
         return await asyncio.to_thread(fn, *args, **kwargs)
+
+    async def _registry_call(self, fn: Any, *args: Any, **kwargs: Any) -> Any:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._registry_pool, functools.partial(fn, *args, **kwargs)
+        )
 
     def _labels(self, spec: LaunchSpec, role: str) -> dict[str, str]:
         out = k8sspec.labels(spec, role)
@@ -518,7 +541,7 @@ class KubernetesProvider:
         if cached is None:
             await self._load_pull_auths()
             try:
-                cached = await self._call(self.registry.resolve, spec.image)
+                cached = await self._registry_call(self.registry.resolve, spec.image)
             except RegistryError as exc:
                 raise ProviderError(f"image {spec.image!r} is not available: {exc}") from exc
             self._images[spec.image] = cached
@@ -1690,8 +1713,24 @@ class KubernetesProvider:
     async def list_images(self) -> list[ImageInfo]:
         """The promoted worker images the cluster can pull, from the registry the
         release publishes to (13, 25, 26). A cluster holds no image on Crucible's side,
-        so there is nothing local to list."""
+        so there is nothing local to list.
+
+        One listing runs at a time and every caller waits on it, so a page polling the
+        harnesses while the registry is slow does not start one more each time (108).
+        A caller that gives up stops waiting; the listing ends at its own bound."""
+        loop = asyncio.get_running_loop()
+        listing = self._listings.get(loop)
+        if listing is None or listing.done():
+            listing = loop.create_task(self._list_images())
+            # Read the outcome even when every caller has gone, so a failure nobody
+            # waited for is not reported as never retrieved.
+            listing.add_done_callback(lambda t: t.cancelled() or t.exception())
+            self._listings[loop] = listing
+        return list(await asyncio.shield(listing))
+
+    async def _list_images(self) -> list[ImageInfo]:
         await self._load_pull_auths()
+        deadline = time.monotonic() + LIST_IMAGES_DEADLINE
         # Each resolve is a registry round trip, and a repository carries dozens of tags,
         # so a few run at once; one after another, a listing outlasts the 15 seconds the
         # harness and image endpoints wait for it.
@@ -1700,7 +1739,9 @@ class KubernetesProvider:
         async def resolve(reference: str) -> ImageInfo | None:
             async with limit:
                 try:
-                    info: ImageInfo = await self._call(self.registry.resolve, reference)
+                    info: ImageInfo = await self._registry_call(
+                        self.registry.resolve, reference, deadline=deadline
+                    )
                 except RegistryError:
                     return None
             return replace(info, reference=reference) if info.harnesses else None
@@ -1708,11 +1749,18 @@ class KubernetesProvider:
         images: list[ImageInfo] = []
         for repository in self.config.image_repositories:
             try:
-                tags = await self._call(self.registry.list_tags, repository)
+                tags = await self._registry_call(
+                    self.registry.list_tags, repository, deadline=deadline
+                )
             except RegistryError as exc:
                 raise ProviderError(f"image listing failed for {repository}: {exc}") from exc
             found = await asyncio.gather(*(resolve(f"{repository}:{tag}") for tag in tags))
             images.extend(info for info in found if info is not None)
+        if time.monotonic() >= deadline:
+            log.warning(
+                "image listing reached its bound; tags not resolved in time are left out",
+                extra={"bound_seconds": LIST_IMAGES_DEADLINE},
+            )
         return sorted(images, key=lambda i: i.reference)
 
     async def health(self) -> ProviderHealth:

@@ -13,6 +13,10 @@ from crucible.ports.execution import ImageInfo, ProviderError
 
 router = APIRouter()
 
+# How long a request waits for one provider's image listing. The Kubernetes provider
+# bounds its listing below this (LIST_IMAGES_DEADLINE), so it ends first (108).
+LISTING_WAIT = 15.0
+
 
 async def _images(ctx: Ctx) -> list[tuple[str, ImageInfo]]:
     """What every provider can see. A provider that cannot answer contributes nothing
@@ -20,7 +24,7 @@ async def _images(ctx: Ctx) -> list[tuple[str, ImageInfo]]:
     out: list[tuple[str, ImageInfo]] = []
     for provider in ctx.providers:
         try:
-            found = await asyncio.wait_for(provider.list_images(), timeout=15)
+            found = await asyncio.wait_for(provider.list_images(), timeout=LISTING_WAIT)
         except (ProviderError, TimeoutError, OSError):
             continue
         out.extend((provider.name, image) for image in found)

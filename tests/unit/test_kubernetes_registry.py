@@ -7,17 +7,22 @@ asks it to. The real binary is exercised by tests/e2e/test_registry.py and the k
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import os
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from crucible.adapters.api.routers import harnesses
+from crucible.adapters.execution import kubernetes
 from crucible.adapters.execution.k8sfake import FakeKubernetesApi, FakeRegistry
 from crucible.adapters.execution.k8sregistry import (
     CraneRegistryClient,
@@ -47,12 +52,13 @@ record = {{
     "file_mode": stat.S_IMODE(os.stat(path).st_mode),
     "config": json.load(open(path)),
     "docker_config": directory,
+    "pid": os.getpid(),
 }}
 with open(os.environ["STUB_LOG"], "a") as log:
     log.write(json.dumps(record) + "\\n")
 mode = os.environ.get("STUB_MODE", "ok")
 command = sys.argv[1]
-if mode == "sleep":
+if mode == "sleep" or (mode == "sleep-resolve" and command != "ls"):
     time.sleep(30)
 if mode == "fail" or (mode == "fail-config" and command == "config"):
     sys.stderr.write(os.environ["STUB_STDERR"])
@@ -271,6 +277,22 @@ def test_a_crane_call_is_bounded_by_the_timeout(
     assert time.monotonic() - started < 10
 
 
+def test_a_crane_call_ends_at_the_callers_deadline(
+    stub: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("STUB_MODE", "sleep")
+    started = time.monotonic()
+    with pytest.raises(RegistryError, match="did not answer"):
+        _client(stub, timeout=20).list_tags("ghcr.io/o/r", deadline=started + 0.5)
+
+    assert time.monotonic() - started < 10
+    # With the deadline already past, crane is not started at all.
+    calls = len(_calls(stub))
+    with pytest.raises(RegistryError, match="no time left"):
+        _client(stub).resolve("ghcr.io/o/r:1", deadline=time.monotonic())
+    assert len(_calls(stub)) == calls
+
+
 # ----- the pull Secret ------------------------------------------------------
 
 
@@ -330,7 +352,7 @@ class _SlowRegistry(FakeRegistry):
         self.in_flight = 0
         self.peak = 0
 
-    def resolve(self, reference: str) -> ImageInfo:
+    def resolve(self, reference: str, *, deadline: float | None = None) -> ImageInfo:
         with self.lock:
             self.in_flight += 1
             self.peak = max(self.peak, self.in_flight)
@@ -359,3 +381,129 @@ async def test_list_images_resolves_a_few_tags_at_once_and_skips_failures() -> N
         f"ghcr.io/o/worker:t{n:02d}" for n in range(20) if n != 3
     ]
     assert 1 < registry.peak <= LIST_IMAGES_CONCURRENCY
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _crane_provider(stub: Path) -> KubernetesProvider:
+    return KubernetesProvider(
+        KubernetesConfig(image_repositories=("ghcr.io/o/worker",)),
+        FakeKubernetesApi(),  # type: ignore[arg-type]
+        CraneRegistryClient(binary=str(stub)),
+    )
+
+
+def test_a_listing_is_bounded_below_the_endpoints_wait() -> None:
+    assert kubernetes.LIST_IMAGES_DEADLINE < harnesses.LISTING_WAIT
+
+
+async def test_a_slow_registry_ends_the_listing_and_its_crane_processes_first(
+    stub: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Tags list, then every resolve hangs. The same ordering as the real constants, at
+    # test scale: the listing's bound falls before the endpoint's wait.
+    monkeypatch.setenv("STUB_MODE", "sleep-resolve")
+    monkeypatch.setattr(kubernetes, "LIST_IMAGES_DEADLINE", 1.0)
+    monkeypatch.setattr(harnesses, "LISTING_WAIT", 5.0)
+    provider = _crane_provider(stub)
+
+    started = time.monotonic()
+    found = await harnesses._images(SimpleNamespace(providers=[provider]))  # type: ignore[arg-type]
+
+    assert found == []
+    assert time.monotonic() - started < 5.0
+    calls = _calls(stub)
+    assert [c["argv"][0] for c in calls].count("digest") == 2
+    assert not [c["pid"] for c in calls if _alive(c["pid"])]
+    assert not [c["docker_config"] for c in calls if Path(c["docker_config"]).exists()]
+
+
+async def test_a_caller_that_gives_up_leaves_no_crane_process_past_the_bound(
+    stub: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("STUB_MODE", "sleep-resolve")
+    monkeypatch.setattr(kubernetes, "LIST_IMAGES_DEADLINE", 1.0)
+    monkeypatch.setattr(harnesses, "LISTING_WAIT", 0.2)
+    provider = _crane_provider(stub)
+
+    started = time.monotonic()
+    assert await harnesses._images(SimpleNamespace(providers=[provider])) == []  # type: ignore[arg-type]
+    # The endpoint gave up; the shared listing goes on to its own bound and no further.
+    listing = provider._listings[asyncio.get_running_loop()]
+    await asyncio.wait_for(asyncio.shield(listing), timeout=5)
+
+    assert time.monotonic() - started < 5.0
+    calls = _calls(stub)
+    assert calls
+    assert not [c["pid"] for c in calls if _alive(c["pid"])]
+    assert not [c["docker_config"] for c in calls if Path(c["docker_config"]).exists()]
+
+
+class _StuckRegistry(FakeRegistry):
+    """Every resolve blocks until the test releases it; the calls are counted."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.release = threading.Event()
+        self.lock = threading.Lock()
+        self.in_flight = 0
+        self.listings = 0
+
+    def list_tags(self, repository: str, *, deadline: float | None = None) -> list[str]:
+        with self.lock:
+            self.listings += 1
+        return super().list_tags(repository)
+
+    def resolve(self, reference: str, *, deadline: float | None = None) -> ImageInfo:
+        with self.lock:
+            self.in_flight += 1
+        try:
+            self.release.wait(10)
+            return super().resolve(reference)
+        finally:
+            with self.lock:
+                self.in_flight -= 1
+
+
+async def test_stuck_registry_work_neither_starves_api_calls_nor_multiplies() -> None:
+    # A default pool of two threads: had registry work run there, the API call below
+    # would queue behind it.
+    loop = asyncio.get_running_loop()
+    default_pool = ThreadPoolExecutor(max_workers=2)
+    loop.set_default_executor(default_pool)
+    registry = _StuckRegistry()
+    for n in range(20):
+        registry.register(f"ghcr.io/o/worker:t{n:02d}")
+    provider = KubernetesProvider(
+        KubernetesConfig(image_repositories=("ghcr.io/o/worker",)),
+        FakeKubernetesApi(),  # type: ignore[arg-type]
+        registry,
+    )
+    try:
+        # A page polling the harnesses ten times while the registry is stuck.
+        callers = [asyncio.create_task(provider.list_images()) for _ in range(10)]
+        waited = time.monotonic() + 5
+        while registry.in_flight < LIST_IMAGES_CONCURRENCY and time.monotonic() < waited:
+            await asyncio.sleep(0.01)
+
+        started = time.monotonic()
+        assert await asyncio.wait_for(provider._call(lambda: "answered"), timeout=2) == "answered"
+        assert time.monotonic() - started < 1.0
+        assert registry.in_flight == LIST_IMAGES_CONCURRENCY
+        assert registry.listings == 1
+
+        registry.release.set()
+        results = await asyncio.gather(*callers)
+    finally:
+        registry.release.set()
+        default_pool.shutdown(wait=False)
+
+    assert registry.listings == 1
+    assert all(len(r) == 20 for r in results)
+    assert all(r == results[0] for r in results)

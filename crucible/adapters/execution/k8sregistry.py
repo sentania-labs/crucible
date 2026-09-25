@@ -29,6 +29,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -105,11 +106,14 @@ def parse_reference(reference: str) -> ImageReference:
 
 class RegistryClient(Protocol):
     """What the provider needs from a registry: what a reference resolves to, and which
-    tags a repository carries so `list_images` can report the promoted ones (25)."""
+    tags a repository carries so `list_images` can report the promoted ones (25).
 
-    def resolve(self, reference: str) -> ImageInfo: ...
+    `deadline` is a `time.monotonic()` value: no registry work outlives it, so a caller
+    that bounds a whole listing leaves nothing running once the bound has passed (108)."""
 
-    def list_tags(self, repository: str) -> list[str]: ...
+    def resolve(self, reference: str, *, deadline: float | None = None) -> ImageInfo: ...
+
+    def list_tags(self, repository: str, *, deadline: float | None = None) -> list[str]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,32 +165,37 @@ class CraneRegistryClient:
     timeout: float = DEFAULT_TIMEOUT
     binary: str = CRANE
 
-    def resolve(self, reference: str) -> ImageInfo:
+    def resolve(self, reference: str, *, deadline: float | None = None) -> ImageInfo:
         """The reference's own digest (an index's, when it is one) and the labels of
         its linux/amd64 image config. The config is read by that digest, so a tag that
         moves between the two calls cannot pair one image's digest with another's
         labels."""
         parsed = parse_reference(reference)
-        digest = self._crane(parsed.registry, "digest", parsed.canonical).strip()
+        digest = self._crane(parsed.registry, deadline, "digest", parsed.canonical).strip()
         if not DIGEST.fullmatch(digest):
             raise RegistryError(f"{reference!r} resolved to no digest")
         by_digest = f"{parsed.registry}/{parsed.repository}@{digest}"
-        raw = self._crane(parsed.registry, "config", "--platform", PLATFORM, by_digest)
+        raw = self._crane(parsed.registry, deadline, "config", "--platform", PLATFORM, by_digest)
         config = _document(raw, parsed.repository)
         labels = {
             str(k): str(v) for k, v in ((config.get("config") or {}).get("Labels") or {}).items()
         }
         return ImageInfo.from_labels(parsed.pinned(digest), digest, labels)
 
-    def list_tags(self, repository: str) -> list[str]:
+    def list_tags(self, repository: str, *, deadline: float | None = None) -> list[str]:
         parsed = parse_reference(repository)
-        out = self._crane(parsed.registry, "ls", f"{parsed.registry}/{parsed.repository}")
+        out = self._crane(parsed.registry, deadline, "ls", f"{parsed.registry}/{parsed.repository}")
         return [line.strip() for line in out.splitlines() if line.strip()]
 
     # ----- running crane ------------------------------------------------
 
-    def _crane(self, registry: str, *args: str) -> str:
+    def _crane(self, registry: str, deadline: float | None, *args: str) -> str:
         _refuse_plain_http(registry)
+        timeout = self.timeout
+        if deadline is not None:
+            timeout = min(timeout, deadline - time.monotonic())
+            if timeout <= 0:
+                raise RegistryError(f"{registry}: no time left in the listing's bound")
         # mkdtemp creates the directory 0700 and owned by this process's user.
         config_dir = tempfile.mkdtemp(prefix="crucible-crane-")
         try:
@@ -195,12 +204,13 @@ class CraneRegistryClient:
             # (SSL_CERT_FILE, the system store with the lab CA) and takes the same proxy.
             env = {**os.environ, "DOCKER_CONFIG": config_dir}
             try:
+                # On a timeout, run() kills crane and reaps it before raising.
                 done = subprocess.run(
                     [self.binary, *args],
                     env=env,
                     stdin=subprocess.DEVNULL,
                     capture_output=True,
-                    timeout=self.timeout,
+                    timeout=timeout,
                     check=False,
                 )
             except FileNotFoundError as exc:
@@ -209,7 +219,7 @@ class CraneRegistryClient:
                     "(the service image ships it)"
                 ) from exc
             except subprocess.TimeoutExpired:
-                raise RegistryError(f"{registry} did not answer within {self.timeout:g}s") from None
+                raise RegistryError(f"{registry} did not answer within {timeout:.3g}s") from None
         finally:
             shutil.rmtree(config_dir, ignore_errors=True)
         if done.returncode != 0:

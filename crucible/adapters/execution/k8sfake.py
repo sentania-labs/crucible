@@ -95,7 +95,7 @@ class FakeRegistry:
         self._tags.setdefault(repository, []).append(reference.rsplit(":", 1)[-1])
         return info
 
-    def resolve(self, reference: str) -> ImageInfo:
+    def resolve(self, reference: str, *, deadline: float | None = None) -> ImageInfo:
         if reference in self.unavailable:
             raise RegistryError(f"{reference} is not in the registry")
         info = self._images.get(reference)
@@ -103,7 +103,7 @@ class FakeRegistry:
             raise RegistryError(f"{reference} is not in the registry")
         return info
 
-    def list_tags(self, repository: str) -> list[str]:
+    def list_tags(self, repository: str, *, deadline: float | None = None) -> list[str]:
         return list(self._tags.get(repository, []))
 
 
