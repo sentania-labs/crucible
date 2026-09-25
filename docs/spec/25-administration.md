@@ -337,7 +337,7 @@ the migrate Job's account may create and only the api's account may delete;
 on Docker the file `first-run-admin-token`, mode 0600, in the credential
 root. Its stderr says only where the token is. A token it cannot write is
 never minted, and with neither place configured it mints nothing and says how
-to create an administrator with `crucible admin token create`. Only the salted
+to create an administrator with `crucible admin --reason ... token create`. Only the salted
 token hash is stored. The sign-in page names the place for the running
 deployment. The api removes the Secret or file when the first-run principal
 first signs in at `/ui`, or when it is revoked. Principal names starting

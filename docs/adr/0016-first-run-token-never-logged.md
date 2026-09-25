@@ -32,7 +32,8 @@ to `docker compose logs migrate`, which is wrong on Kubernetes.
    commits the principal, so a token it could not deliver is never minted and the Job
    fails with the reason; the next run tries again. With neither place configured (a
    host-mode developer database), it mints nothing and says how to create an
-   administrator with `crucible admin token create`.
+   administrator with `crucible admin --reason "<why>" token create`, which needs the
+   supervisor running like every administrative mutation.
 5. **Removed after first use.** The api deletes the Secret or file when the first-run
    principal first signs in at `/ui`, and when that principal is revoked. A removal that
    fails is logged, without the value, and never fails the sign-in or the revoke.
@@ -57,8 +58,11 @@ to `docker compose logs migrate`, which is wrong on Kubernetes.
 ## Consequences
 
 - The migrate Job now mounts a ServiceAccount token (it had none). Its account can
-  create Secrets in `crucible`, because Kubernetes cannot narrow `create` by name; it is
-  used by that Job alone, whose command is fixed in the image.
+  create Secrets in `crucible`, because Kubernetes cannot narrow `create` by name,
+  including a `service-account-token` Secret the token controller would fill (it cannot
+  read one back). It is used by that Job alone, whose command is fixed in the image. A
+  ValidatingAdmissionPolicy could narrow the create to the one name on clusters that
+  want it.
 - The api and supervisor share `crucible-supervisor`, so the supervisor can also delete
   that one Secret. That is the whole of the new grant to it.
 - An operator who uses the token only through the CLI and never signs in at `/ui` leaves
