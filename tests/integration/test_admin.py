@@ -28,16 +28,22 @@ from crucible.adapters.api.deps import AppContext
 from crucible.adapters.clock import SystemClock
 from crucible.adapters.execution.docker import DockerConfig
 from crucible.adapters.execution.fake import FakeProvider
+from crucible.adapters.first_run import FileDelivery
 from crucible.adapters.persistence.unit_of_work import SqlUnitOfWorkFactory, make_engine
 from crucible.application.admin.context import AdminContext
-from crucible.application.auth import authenticate
+from crucible.application.auth import authenticate, mint_token
 from crucible.application.errors import ApplicationError
 from crucible.application.routing import image_for_harness
 from crucible.application.supervisor import Supervisor
+from crucible.application.wakes import create_wake
 from crucible.cli import admin as cli
 from crucible.client.config import ADMIN_TOKEN_ENV
 from crucible.client.http import Api
-from crucible.domain.entities import Role
+from crucible.contracts.policy import PolicyV1
+from crucible.contracts.wake import WakeReason
+from crucible.domain.entities import Attempt, Execution, ExecutionRole, Role
+from crucible.domain.ids import new_id
+from crucible.domain.lifecycle import AttemptState, ExecutionState, TaskState
 from crucible.ports.execution import ImageInfo
 from crucible.ports.harness import CredentialSource
 from tests.admin_cli import admin_main, envelope_data
@@ -338,15 +344,24 @@ def test_ui_mutation_uses_the_same_harness_service_and_rejects_bad_csrf(
         assert state.enabled is False and state.reason == "ui parity test"
 
 
-def test_migrate_creates_and_prints_the_first_admin_once(
-    migrated: str, capsys: pytest.CaptureFixture[str]
+@pytest.mark.usefixtures("engine")
+def test_migrate_delivers_the_first_admin_token_and_never_prints_it(
+    migrated: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    cli.ensure_first_admin(migrated)
-    first = capsys.readouterr().err
-    assert "CRUCIBLE FIRST-RUN ADMIN TOKEN, SHOWN ONCE" in first
-    shown = next(line for line in first.splitlines() if line.startswith("cru_"))
-    cli.ensure_first_admin(migrated)
+    """crucible#122: the token goes to the delivery, mode 0600, and never to stdout or
+    stderr; the log names where it is."""
+    delivery = FileDelivery(tmp_path / "first-run-admin-token")
+    cli.ensure_first_admin(migrated, delivery)
+    first = capsys.readouterr()
+    shown = delivery.path.read_text(encoding="utf-8").strip()
+    assert shown.startswith("cru_")
+    assert shown not in first.out and shown not in first.err
+    assert "cru_" not in first.out + first.err
+    assert str(delivery.path) in first.err
+    assert os.stat(delivery.path).st_mode & 0o777 == 0o600
+    cli.ensure_first_admin(migrated, delivery)
     assert capsys.readouterr().err == ""
+    assert delivery.path.read_text(encoding="utf-8").strip() == shown
     engine = make_engine(migrated)
     try:
         with SqlUnitOfWorkFactory(engine)() as uow:
@@ -355,9 +370,11 @@ def test_migrate_creates_and_prints_the_first_admin_once(
             assert principal.name == "first-run-admin" and principal.role is Role.ADMIN
             uow.principals.disable(principal.id, SystemClock().now())
             uow.commit()
-        cli.ensure_first_admin(migrated)
-        recovery = capsys.readouterr().err
-        recovered_token = next(line for line in recovery.splitlines() if line.startswith("cru_"))
+        cli.ensure_first_admin(migrated, delivery)
+        recovery = capsys.readouterr()
+        assert "cru_" not in recovery.out + recovery.err
+        recovered_token = delivery.path.read_text(encoding="utf-8").strip()
+        assert recovered_token != shown
         with SqlUnitOfWorkFactory(engine)() as uow:
             recovered = authenticate(uow, recovered_token)
             assert recovered is not None
@@ -365,6 +382,79 @@ def test_migrate_creates_and_prints_the_first_admin_once(
             assert recovered.role is Role.ADMIN and recovered.disabled_at is None
     finally:
         engine.dispose()
+
+
+@pytest.mark.usefixtures("engine")
+def test_migrate_mints_nothing_it_cannot_deliver(
+    migrated: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class Refusing:
+        def where(self) -> str:
+            return "nowhere"
+
+        def deliver(self, token: str) -> None:
+            raise RuntimeError("403 on secrets: forbidden")
+
+        def discard(self) -> None:
+            raise AssertionError("never reached")
+
+    with pytest.raises(RuntimeError, match="forbidden"):
+        cli.ensure_first_admin(migrated, Refusing())
+    cli.ensure_first_admin(migrated, None)
+    printed = capsys.readouterr()
+    assert "cru_" not in printed.out + printed.err
+    assert "No first-run administrator was created" in printed.err
+    engine = make_engine(migrated)
+    try:
+        with SqlUnitOfWorkFactory(engine)() as uow:
+            assert not [p for p in uow.principals.list_all() if p.role is Role.ADMIN]
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.usefixtures("engine")
+def test_the_first_sign_in_removes_the_first_run_token(
+    ctx: AppContext, admin_ctx: AdminContext, migrated: str, tmp_path: Path
+) -> None:
+    delivery = FileDelivery(tmp_path / "first-run-admin-token")
+    cli.ensure_first_admin(migrated, delivery)
+    token = delivery.path.read_text(encoding="utf-8").strip()
+    ctx.first_run = delivery
+    with TestClient(create_app(ctx)) as browser:
+        page = browser.get("/ui/sign-in").text
+        # The page names this deployment's place, not `docker compose logs migrate`.
+        assert str(delivery.path) in page and "logs migrate" not in page
+        ui_sign_in(browser, token)
+    assert not delivery.path.exists()
+
+
+def test_a_revoke_removes_the_first_run_token_and_the_prefix_is_reserved(
+    ctx: AppContext,
+    tokens: dict[str, str],
+    admin_ctx: AdminContext,
+    admin_client: TestClient,
+    live_supervisor: Supervisor,
+    migrated: str,
+    tmp_path: Path,
+) -> None:
+    asyncio.run(live_supervisor.tick())
+    delivery = FileDelivery(tmp_path / "first-run-admin-token")
+    admin_ctx.first_run = delivery
+    with ctx.uow_factory() as uow:
+        minted = mint_token(uow, ctx.clock, name="first-run-admin", role=Role.ADMIN)
+        uow.commit()
+    delivery.deliver(minted.token)
+    reserved = admin_client.post(
+        "/v1/admin/tokens",
+        json={"name": "first-run-admin-2", "role": "admin", "reason": "x"},
+    )
+    assert reserved.status_code == 409, reserved.text
+    assert "reserved" in reserved.text
+    revoked = admin_client.post(
+        f"/v1/admin/tokens/{minted.principal.id}/revoke", json={"reason": "leaked"}
+    )
+    assert revoked.status_code == 200, revoked.text
+    assert not delivery.path.exists()
 
 
 def test_token_and_repository_mutations_have_ui_api_and_cli_parity(
@@ -791,11 +881,11 @@ def test_local_endpoint_and_hermes_key_are_saved_without_exposing_the_key(
 
     observed: list[tuple[str, str | None]] = []
 
-    def http_status(url: str, *, bearer: str | None, timeout: float) -> int:
+    def http_get(url: str, *, bearer: str | None, timeout: float) -> tuple[int, bytes]:
         observed.append((url, bearer))
-        return 200
+        return 200, b'{"data": [{"id": "coder"}]}'
 
-    monkeypatch.setattr(credentials_service, "_http_status", http_status)
+    monkeypatch.setattr(credentials_service, "_http_get", http_get)
     api_key = "vk_" + "q" * 40
     saved = admin_client.post(
         "/v1/admin/credentials/hermes/set",
@@ -836,45 +926,61 @@ def test_local_endpoint_and_hermes_key_are_saved_without_exposing_the_key(
 
     with TestClient(create_app(ctx)) as browser:
         csrf = ui_sign_in(browser, tokens["admin"])
+        # crucible#119: one place for the URL and the key, linked from Credentials and
+        # Routing; neither page carries a key form of its own any more.
         credentials_page = browser.get("/ui/credentials")
         assert credentials_page.status_code == 200
-        assert 'action="/ui/actions/credential-set"' in credentials_page.text
-        assert 'name="api_key"' in credentials_page.text
-        assert 'type="password"' in credentials_page.text
+        assert 'href="/ui/gateway"' in credentials_page.text
+        assert "credential-set" not in credentials_page.text
+        routing_page = browser.get("/ui/routing")
+        assert routing_page.status_code == 200
+        assert 'href="/ui/gateway"' in routing_page.text
+        assert "routing-local" not in routing_page.text
+        gateway_page = browser.get("/ui/gateway")
+        assert gateway_page.status_code == 200
+        assert 'action="/ui/actions/gateway-save"' in gateway_page.text
+        assert 'name="api_key"' in gateway_page.text
+        assert 'type="password"' in gateway_page.text
+        assert cli_key not in gateway_page.text
 
         ui_key = "vk_" + "u" * 40
         ui_saved = browser.post(
-            "/ui/actions/credential-set",
+            "/ui/actions/gateway-save",
             data={
                 "csrf": csrf,
+                "endpoint_url": endpoint,
                 "api_key": ui_key,
                 "reason": "rotate through browser form",
-                "return_to": "/ui/credentials",
+                "return_to": "/ui/gateway",
             },
             follow_redirects=False,
         )
         assert ui_saved.status_code == 303
         assert key_path.read_text(encoding="utf-8").strip() == ui_key
+        message = unquote(ui_saved.headers["location"])
+        assert f"Gateway {endpoint} reachable, key accepted, 1 model." in message
+        assert ui_key not in message
 
-        routing_page = browser.get("/ui/routing")
-        assert routing_page.status_code == 200
-        assert 'action="/ui/actions/routing-local"' in routing_page.text
-        assert 'name="enable_thinking"' in routing_page.text
-        ui_routing = browser.post(
-            "/ui/actions/routing-local",
+        # #121: the model is picked from the gateway's own list, not typed.
+        gateway_page = browser.get("/ui/gateway")
+        assert 'name="model.0.id" value="coder"' in gateway_page.text
+        assert 'name="model.0.enabled"' in gateway_page.text
+        ui_models = browser.post(
+            "/ui/actions/gateway-models",
             data={
                 "csrf": csrf,
-                "endpoint_url": endpoint,
-                "model_id": "coder",
-                "enabled": "true",
-                "enable_thinking": "true",
+                "model.0.id": "coder",
+                "model.0.enabled": "true",
+                "model.0.thinking": "true",
+                "model.0.capability": "mid",
                 "max_concurrency": "2",
                 "reason": "save through browser form",
-                "return_to": "/ui/routing",
+                "return_to": "/ui/gateway",
             },
             follow_redirects=False,
         )
-        assert ui_routing.status_code == 303
+        assert ui_models.status_code == 303, ui_models.text
+        assert "kind=ok" in ui_models.headers["location"]
         ui_view = admin_client.get("/v1/admin/routing/local-endpoint").json()
         assert ui_view["models"][0]["chat_template_kwargs"] == {"enable_thinking": True}
         assert ui_view["pool"]["max_concurrency"] == 2
@@ -1087,7 +1193,7 @@ def test_images_are_promoted_and_rolled_back_per_harness(
     provider: FakeProvider,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """crucible#116, ADR 0016, the operator's decision of 2026-09-25: each harness has its
+    """crucible#116, ADR 0018, the operator's decision of 2026-09-25: each harness has its
     own default image. Promoting one image for Hermes and another for AGY leaves each
     where it was put, a rollback moves only the harness it names, and a launch resolves
     the launching harness's own image."""
@@ -1239,8 +1345,13 @@ def test_providers_github_audit_status_and_capabilities(
         "retention",
         "bootstrap",
         "audit",
+        "readiness",
     }
     assert document["supervisor"]["healthy"] is True
+    # crucible#123: the to-do list is part of the one status document, so the API and
+    # the CLI read the same list the Status page shows, and the script harness (a test
+    # fixture) is never in it.
+    assert "script-harness" not in {h["name"] for h in document["readiness"]["harnesses"]}
     assert document["bootstrap"] == {"authoritative": None, "imports": []}
     assert {r["repository"] for r in document["github"]["repositories"]} >= {"second", "third"}
     local = run_cli(config_file, "status", capsys=capsys)
@@ -1274,6 +1385,153 @@ def test_providers_github_audit_status_and_capabilities(
         create_app(ctx), headers={"Authorization": f"Bearer {tokens['observer']}"}
     ) as observer:
         assert observer.get("/v1/capabilities").status_code == 403
+
+
+def test_capabilities_show_an_orchestrator_its_own_work_only(
+    ctx: AppContext,
+    tokens: dict[str, str],
+    admin_ctx: AdminContext,
+    live_supervisor: Supervisor,
+) -> None:
+    """crucible#40: one orchestrator cannot read another's tasks, attempts or wakes
+    through /v1/capabilities; an operator still sees everything."""
+    with ctx.uow_factory() as uow:
+        other = mint_token(uow, ctx.clock, name="other-orchestrator", role=Role.ORCHESTRATOR)
+        uow.commit()
+
+    def client(token: str) -> TestClient:
+        return TestClient(create_app(ctx), headers={"Authorization": f"Bearer {token}"})
+
+    with client(tokens["orchestrator"]) as mine, client(other.token) as theirs:
+        own = mine.post("/v1/tasks", json=contract_document(external_id="EX-MINE"))
+        foreign = theirs.post("/v1/tasks", json=contract_document(external_id="EX-THEIRS"))
+        assert own.status_code == 201 and foreign.status_code == 201
+        asyncio.run(live_supervisor.tick())
+        assert live_supervisor.fenced_token is not None
+        with ctx.uow_factory() as uow:
+            # Each task blocked, so it is listed with its external id, and each with one
+            # running attempt, so it is a worker (attempts are the supervisor's, 14).
+            uow.set_fenced_token(live_supervisor.fenced_token)
+            for task_id in (own.json()["id"], foreign.json()["id"]):
+                task = uow.tasks.get(task_id)
+                assert task is not None
+                task.state = TaskState.BLOCKED
+                uow.tasks.save(task)
+                execution = Execution(
+                    id=new_id(),
+                    task_id=task.id,
+                    role=ExecutionRole.IMPLEMENT,
+                    contract_version=1,
+                    harness="script-harness",
+                    model="fake",
+                    effort=None,
+                    provider="fake",
+                    image="crucible-worker:fake-succeed",
+                    policy_snapshot={},
+                    state=ExecutionState.ACTIVE,
+                    max_attempts=1,
+                    retry_on=[],
+                    timeout_seconds=60,
+                    created_at=ctx.clock.now(),
+                )
+                uow.executions.add(execution)
+                uow.attempts.add(
+                    Attempt(
+                        id=new_id(),
+                        execution_id=execution.id,
+                        task_id=task.id,
+                        number=1,
+                        state=AttemptState.RUNNING,
+                        created_at=ctx.clock.now(),
+                    )
+                )
+                create_wake(
+                    uow,
+                    ctx.clock,
+                    principal_id=task.principal_id,
+                    reason=WakeReason.BLOCKED,
+                    summary="blocked",
+                    task=task,
+                    raised_by="tests",
+                )
+            uow.commit()
+
+        mine_view = mine.get("/v1/capabilities").json()
+        theirs_view = theirs.get("/v1/capabilities").json()
+
+    for view, own_id, foreign_id in (
+        (mine_view, "EX-MINE", "EX-THEIRS"),
+        (theirs_view, "EX-THEIRS", "EX-MINE"),
+    ):
+        assert view["tasks"]["counts"] == {"blocked": 1}
+        assert [t["external_id"] for t in view["tasks"]["lists"]["blocked"]] == [own_id]
+        assert [w["external_id"] for w in view["workers"]] == [own_id]
+        assert foreign_id not in json.dumps(view)
+    assert mine_view["wakes"]["pending"] == {"orchestrator-principal": 1}
+    assert mine_view["wakes"]["unacked"] == 1
+    assert theirs_view["wakes"]["pending"] == {"other-orchestrator": 1}
+
+    with client(tokens["operator"]) as operator:
+        everything = operator.get("/v1/capabilities").json()
+    assert everything["tasks"]["counts"] == {"blocked": 2}
+    assert sorted(w["external_id"] for w in everything["workers"]) == ["EX-MINE", "EX-THEIRS"]
+    assert everything["wakes"]["pending"] == {
+        "orchestrator-principal": 1,
+        "other-orchestrator": 1,
+    }
+    assert everything["wakes"]["unacked"] == 2
+
+
+def test_capabilities_wakes_count_is_not_truncated_by_the_page_limit(
+    ctx: AppContext,
+    tokens: dict[str, str],
+    admin_ctx: AdminContext,
+) -> None:
+    """Codex round on #130 (crucible#116): an orchestrator with more unacknowledged
+    wakes than the status page limit (200) still gets its true count, not the page
+    size, and another orchestrator's wakes are never counted against it."""
+    with ctx.uow_factory() as uow:
+        other = mint_token(uow, ctx.clock, name="other-orchestrator", role=Role.ORCHESTRATOR)
+        mine = uow.principals.get_by_name("orchestrator-principal")
+        assert mine is not None
+        for _ in range(205):
+            create_wake(
+                uow,
+                ctx.clock,
+                principal_id=mine.id,
+                reason=WakeReason.BLOCKED,
+                summary="blocked",
+                raised_by="tests",
+            )
+        create_wake(
+            uow,
+            ctx.clock,
+            principal_id=other.principal.id,
+            reason=WakeReason.BLOCKED,
+            summary="blocked",
+            raised_by="tests",
+        )
+        uow.commit()
+
+    def client(token: str) -> TestClient:
+        return TestClient(create_app(ctx), headers={"Authorization": f"Bearer {token}"})
+
+    with client(tokens["orchestrator"]) as mine_client, client(other.token) as theirs_client:
+        mine_view = mine_client.get("/v1/capabilities").json()
+        theirs_view = theirs_client.get("/v1/capabilities").json()
+
+    assert mine_view["wakes"]["pending"] == {"orchestrator-principal": 205}
+    assert mine_view["wakes"]["unacked"] == 205
+    assert theirs_view["wakes"]["pending"] == {"other-orchestrator": 1}
+    assert theirs_view["wakes"]["unacked"] == 1
+
+    with client(tokens["operator"]) as operator:
+        everything = operator.get("/v1/capabilities").json()
+    assert everything["wakes"]["pending"] == {
+        "orchestrator-principal": 205,
+        "other-orchestrator": 1,
+    }
+    assert everything["wakes"]["unacked"] == 206
 
 
 def test_the_cli_remote_mode_builds_the_same_calls(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2268,3 +2526,129 @@ def test_a_task_for_a_provider_this_deployment_does_not_run_is_refused_at_submit
     assert response.status_code == 422, response.text
     paths = [error["path"] for error in response.json()["errors"]]
     assert "execution_request.provider" in paths
+
+
+def test_command_timeout_through_api_cli_and_ui(
+    ctx: AppContext,
+    tokens: dict[str, str],
+    admin_client: TestClient,
+    live_supervisor: Supervisor,
+    config_file: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """crucible#128: the per-command timeout is a policy limit with API, CLI and UI
+    parity. Each save writes a new policy version with only that limit changed, and one
+    audit event; a bound left out keeps its value."""
+    asyncio.run(live_supervisor.tick())
+    first = admin_client.get("/v1/admin/limits/command-timeout").json()
+    assert first["command_timeout_ms"] == {"min": 1000, "max": 14_400_000, "default": 3_600_000}
+    start = first["policy"]["version"]
+
+    saved = admin_client.post(
+        "/v1/admin/limits/command-timeout",
+        json={"reason": "api: long builds", "min": 60_000, "max": 7_200_000, "default": 5_400_000},
+    )
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["policy"]["version"] == start + 1
+    stored = admin_client.get(f"/v1/policies/default-software/{start + 1}").json()["document"]
+    assert stored["limits"]["command_timeout_ms"] == {
+        "min": 60_000,
+        "max": 7_200_000,
+        "default": 5_400_000,
+    }
+    previous = admin_client.get(f"/v1/policies/default-software/{start}").json()["document"]
+
+    # Only the limit changed: both versions, normalized, differ in nothing else.
+    def rest(document: dict[str, Any]) -> dict[str, Any]:
+        normal = PolicyV1.model_validate(document).model_dump(mode="json")
+        del normal["version"], normal["description"], normal["limits"]["command_timeout_ms"]
+        return normal
+
+    assert rest(stored) == rest(previous)
+
+    for body in (
+        {"reason": "api: inverted", "min": 5000, "max": 4000},
+        {"reason": "api: a string", "default": "600000"},
+        {"reason": "api: a bool", "default": True},
+        # A reason is an optional audit note here (crucible#117), so no body is refused
+        # for leaving it out; a secret-shaped one still is.
+        {"reason": "ghp_" + "a" * 36, "default": 600_000},
+    ):
+        refused = admin_client.post("/v1/admin/limits/command-timeout", json=body)
+        assert refused.status_code == 422, (body, refused.text)
+    assert admin_client.get("/v1/admin/limits/command-timeout").json()["policy"]["version"] == (
+        start + 1
+    )
+
+    cli_view = run_cli(config_file, "limits", "command-timeout", capsys=capsys)
+    assert cli_view["command_timeout_ms"]["default"] == 5_400_000
+    cli_saved = run_cli(
+        config_file,
+        "--reason",
+        "cli: shorter default",
+        "limits",
+        "set-command-timeout",
+        "--default=1800000",
+        capsys=capsys,
+    )
+    assert cli_saved["command_timeout_ms"] == {
+        "min": 60_000,
+        "max": 7_200_000,
+        "default": 1_800_000,
+    }
+    assert cli_saved["policy"]["version"] == start + 2
+
+    with TestClient(create_app(ctx)) as browser:
+        csrf = ui_sign_in(browser, tokens["admin"])
+        page = browser.get("/ui/routing")
+        assert page.status_code == 200
+        assert 'action="/ui/actions/command-timeout"' in page.text
+        assert 'value="1800000"' in page.text
+        ui_saved = browser.post(
+            "/ui/actions/command-timeout",
+            data={
+                "csrf": csrf,
+                "min": "60000",
+                "default": "3600000",
+                "max": "7200000",
+                "reason": "ui: back to an hour",
+                "return_to": "/ui/routing",
+            },
+            follow_redirects=False,
+        )
+        assert ui_saved.status_code == 303
+        assert "Completed" in unquote(ui_saved.headers.get("location", ""))
+    final = admin_client.get("/v1/admin/limits/command-timeout").json()
+    assert final["command_timeout_ms"]["default"] == 3_600_000
+    assert final["policy"]["version"] == start + 3
+    kinds = audit_kinds(admin_client)
+    assert ("command_timeout_updated", "admin-principal") in kinds
+    assert ("command_timeout_updated", "crucible-admin") in kinds
+    assert len([k for k in kinds if k[0] == "command_timeout_updated"]) == 3
+
+
+def test_the_cli_remote_mode_sends_the_command_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[str, str, Any]] = []
+
+    def fake_call(self: Any, method: str, path: str, body: Any = None, **_: Any) -> Any:
+        calls.append((method, path, body))
+        return {"policy": {}, "command_timeout_ms": {"min": 1, "max": 2, "default": 2}}
+
+    monkeypatch.setattr(Api, "call", fake_call)
+    monkeypatch.setenv(ADMIN_TOKEN_ENV, "cru_" + "0" * 26 + "." + "s" * 40)
+    admin_main(["--api-url", "http://127.0.0.1:1", "limits", "command-timeout"])
+    admin_main(
+        [
+            "--api-url",
+            "http://127.0.0.1:1",
+            "--reason",
+            "r",
+            "limits",
+            "set-command-timeout",
+            "--max=7200000",
+        ]
+    )
+    assert calls == [
+        ("GET", "/v1/admin/limits/command-timeout", None),
+        ("POST", "/v1/admin/limits/command-timeout", {"reason": "r", "max": 7_200_000}),
+    ]

@@ -32,6 +32,7 @@ from crucible.application.admin import (
     audit,
     bootstrap,
     credentials,
+    gateway,
     github,
     harness_test,
     harnesses,
@@ -40,6 +41,7 @@ from crucible.application.admin import (
     routing,
 )
 from crucible.application.admin import kubernetes as kubernetes_admin
+from crucible.application.admin import limits as limits_admin
 from crucible.application.admin import providers as providers_admin
 from crucible.application.admin import repositories as repositories_admin
 from crucible.application.admin import status as status_admin
@@ -50,10 +52,11 @@ from crucible.application.admin.context import AdminContext
 from crucible.application.admin.login import LoginRegistry
 from crucible.application.auth import mint_token
 from crucible.application.errors import ApplicationError
+from crucible.application.first_run import FIRST_RUN_PREFIX
 from crucible.application.queries import task_view
 from crucible.application.republish import republish_task
 from crucible.application.transitions import record_event
-from crucible.cli.wiring import Wiring, wire
+from crucible.cli.wiring import Wiring, first_run_delivery, wire
 from crucible.client import next as nx
 from crucible.client.config import ADMIN_TOKEN_ENV, TOKEN_ENV, require_remote, resolve
 from crucible.client.envelope import ClientError, Result, UsageError
@@ -69,6 +72,7 @@ from crucible.domain.entities import Principal, Role
 from crucible.domain.events import EventKind
 from crucible.domain.ids import new_id
 from crucible.logs import configure_logging
+from crucible.ports.first_run import FirstRunDelivery
 from crucible.settings import load_settings
 
 CLI_PRINCIPAL = "crucible-admin"
@@ -76,11 +80,11 @@ TOKEN_ENVS = (ADMIN_TOKEN_ENV, TOKEN_ENV)
 
 DESCRIPTION = """\
 The operator's console (25): harness gates, credentials and login, image promotion,
-tokens, repositories, routing, the bootstrap import, audit. Runs in process against the
-configured database by default; with --api-url URL (or --remote, which takes the URL
-from CRUCIBLE_URL or the client configuration file) it calls the running API with the
-token in CRUCIBLE_ADMIN_TOKEN, else CRUCIBLE_TOKEN. A mutation takes an optional
---reason, recorded in the audit log, before or after the verb:
+tokens, repositories, routing, the local gateway, GitHub, the bootstrap import, audit.
+Runs in process against the configured database by default; with --api-url URL (or
+--remote, which takes the URL from CRUCIBLE_URL or the client configuration file) it
+calls the running API with the token in CRUCIBLE_ADMIN_TOKEN, else CRUCIBLE_TOKEN. A
+mutation takes an optional --reason, recorded in the audit log, before or after the verb:
 `crucible admin harnesses disable codex --reason TEXT`. Revoking a token, removing a
 repository or a credential, and committing a bootstrap import require one.
 Output is one JSON envelope (see `crucible --help`)."""
@@ -194,7 +198,7 @@ def build_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     set_key = c_sub.add_parser("set", help="read an API key without placing it in argv")
     set_key.add_argument("--harness", default="hermes", choices=("hermes",))
 
-    i = sub.add_parser("images", help="list, promote, roll back: per harness (ADR 0016)")
+    i = sub.add_parser("images", help="list, promote, roll back: per harness (ADR 0018)")
     i_sub = i.add_subparsers(dest="image_command", required=True)
     i_sub.add_parser(
         "list",
@@ -214,6 +218,78 @@ def build_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     g_sub = g.add_subparsers(dest="github_command", required=True)
     g_sub.add_parser("status", help="the App's configuration and key")
     g_sub.add_parser("check", help="mint and discard a token per registered repository")
+    connect = g_sub.add_parser(
+        "connect",
+        help="an existing App's id and private key, checked with GitHub and then kept by "
+        "the service (ADR 0017)",
+    )
+    connect.add_argument("--app-id", type=int, required=True, help="the App's numeric id")
+    connect.add_argument(
+        "--private-key-file",
+        required=True,
+        help="the .pem GitHub gave you; read here, never placed in argv or a record",
+    )
+    connect.add_argument(
+        "--webhook-secret-file", default=None, help="the App's webhook secret, when one is used"
+    )
+    g_sub.add_parser(
+        "installations", help="the App's install link, installations and their repositories"
+    )
+    add_repo = g_sub.add_parser(
+        "add-repository",
+        help="register a repository an installation covers, with GitHub's default branch",
+    )
+    add_repo.add_argument("--installation-id", type=int, required=True)
+    add_repo.add_argument("--repository", required=True, help="OWNER/NAME")
+    add_repo.add_argument(
+        "--name", default=None, help="the registered name (default: the repository's own)"
+    )
+    add_repo.add_argument("--policy", default="default-software", help="the policy name")
+    add_repo.add_argument(
+        "--attest-external-review-all-prs",
+        action="store_true",
+        help="attest the external reviewer reviews every pull request (23)",
+    )
+    add_repo.add_argument("--attested-by", default=None, help="who attests")
+
+    gw = sub.add_parser(
+        "gateway", help="the local gateway: its URL, the Hermes key, a test, and its models"
+    )
+    gw_sub = gw.add_subparsers(dest="gateway_command", required=True)
+    gw_sub.add_parser("show", help="the gateway URL, whether a key is set, and the last test")
+    gw_set = gw_sub.add_parser(
+        "set", help="set the gateway URL (and the key with --key), then test both"
+    )
+    gw_set.add_argument(
+        "--endpoint-url", required=True, help="the gateway's base URL, ending in /v1"
+    )
+    gw_set.add_argument(
+        "--key",
+        action="store_true",
+        help="also read a new Hermes key from a hidden prompt or stdin, never argv",
+    )
+    gw_sub.add_parser("test", help="test the saved URL and key again")
+    gw_sub.add_parser("models", help="the models the key can see, beside the entries in force")
+    pick = gw_sub.add_parser(
+        "pick", help="enable or disable gateway models; writes a new routing policy version"
+    )
+    pick.add_argument("--enable", action="append", default=[], metavar="MODEL")
+    pick.add_argument("--disable", action="append", default=[], metavar="MODEL")
+    pick.add_argument(
+        "--thinking",
+        action="append",
+        default=[],
+        metavar="MODEL",
+        help="thinking on by default for this picked model (off for the others)",
+    )
+    pick.add_argument(
+        "--capability",
+        action="append",
+        default=[],
+        metavar="MODEL=CAPABILITY",
+        help="small, mid or frontier (a new model defaults to mid)",
+    )
+    pick.add_argument("--max-concurrency", type=int, default=None, help="the pool's limit")
 
     a = sub.add_parser("audit", help="the audit log")
     a_sub = a.add_subparsers(dest="audit_command", required=True)
@@ -235,6 +311,23 @@ def build_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     state.add_argument("--disable", action="store_true")
     local_set.add_argument("--enable-thinking", action="store_true")
     local_set.add_argument("--max-concurrency", type=int, default=4)
+
+    lim = sub.add_parser("limits", help="policy limits edited in place (issue 128)")
+    lim_sub = lim.add_subparsers(dest="limits_command", required=True)
+    lim_sub.add_parser(
+        "command-timeout", help="the per-command timeout bounds of the policy in force"
+    )
+    timeout_set = lim_sub.add_parser(
+        "set-command-timeout",
+        help="write a new policy version with these per-command timeout bounds",
+    )
+    timeout_set.add_argument("--min", type=int, help="milliseconds; omitted keeps the value")
+    timeout_set.add_argument("--max", type=int, help="milliseconds; omitted keeps the value")
+    timeout_set.add_argument(
+        "--default",
+        type=int,
+        help="milliseconds, which a contract may narrow; omitted keeps the value",
+    )
 
     kube = sub.add_parser(
         "kubernetes", help="the Kubernetes provider's cluster egress selectors (26, #91)"
@@ -371,6 +464,62 @@ def _read_api_key() -> str:
     )
 
 
+def _picks(args: argparse.Namespace) -> list[dict[str, Any]]:
+    """`gateway pick` flags as the model picks the service checks."""
+    capabilities: dict[str, str] = {}
+    for item in args.capability:
+        model, sep, value = item.partition("=")
+        if not sep or not model or not value:
+            raise UsageError(f"--capability takes MODEL=CAPABILITY, not {item!r}")
+        capabilities[model] = value
+    named = list(dict.fromkeys([*args.enable, *args.disable]))
+    stray = sorted((set(args.thinking) | set(capabilities)) - set(named))
+    if stray:
+        raise UsageError(f"{stray} must also be named with --enable or --disable")
+    if not named:
+        raise UsageError("name at least one model with --enable or --disable")
+    return [
+        {
+            "id": model,
+            "enabled": model in args.enable and model not in args.disable,
+            "enable_thinking": model in args.thinking,
+            "capability": capabilities.get(model),
+        }
+        for model in named
+    ]
+
+
+def _read_file(path: str, what: str) -> str:
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return handle.read()
+    except OSError as exc:
+        raise UsageError(f"cannot read the {what} from {path}: {exc.strerror}") from None
+
+
+def _connect_body(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "app_id": args.app_id,
+        "private_key": _read_file(args.private_key_file, "private key"),
+        "webhook_secret": (
+            _read_file(args.webhook_secret_file, "webhook secret")
+            if args.webhook_secret_file
+            else None
+        ),
+    }
+
+
+def _add_repository_body(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "installation_id": args.installation_id,
+        "repository": args.repository,
+        "name": args.name,
+        "policy_name": args.policy,
+        "attested_all_prs": args.attest_external_review_all_prs,
+        "attested_by": args.attested_by,
+    }
+
+
 # ----- remote mode -------------------------------------------------------------
 
 
@@ -433,7 +582,38 @@ def _remote(args: argparse.Namespace, remote: Api) -> Any:
     if command == "github":
         if args.github_command == "status":
             return remote.call("GET", "/v1/admin/github")
+        if args.github_command == "connect":
+            return remote.call("POST", "/v1/admin/github/app", {**reason, **_connect_body(args)})
+        if args.github_command == "installations":
+            return remote.call("GET", "/v1/admin/github/installations")
+        if args.github_command == "add-repository":
+            return remote.call(
+                "POST", "/v1/admin/github/repositories", {**reason, **_add_repository_body(args)}
+            )
         return remote.call("POST", "/v1/admin/github/check", reason)
+    if command == "gateway":
+        verb = args.gateway_command
+        if verb == "show":
+            return remote.call("GET", "/v1/admin/gateway")
+        if verb == "models":
+            return remote.call("GET", "/v1/admin/gateway/models")
+        if verb == "test":
+            return remote.call("POST", "/v1/admin/gateway/test", reason)
+        if verb == "pick":
+            return remote.call(
+                "POST",
+                "/v1/admin/gateway/models",
+                {**reason, "models": _picks(args), "max_concurrency": args.max_concurrency},
+            )
+        return remote.call(
+            "POST",
+            "/v1/admin/gateway",
+            {
+                **reason,
+                "endpoint_url": args.endpoint_url,
+                "api_key": _read_api_key() if args.key else None,
+            },
+        )
     if command == "audit":
         query = f"?limit={args.limit}" + (f"&cursor={args.cursor}" if args.cursor else "")
         return remote.call("GET", "/v1/admin/audit" + query)
@@ -458,6 +638,25 @@ def _remote(args: argparse.Namespace, remote: Api) -> Any:
                     }
                 ],
                 "max_concurrency": args.max_concurrency,
+            },
+        )
+    if command == "limits":
+        if args.limits_command == "command-timeout":
+            return remote.call("GET", "/v1/admin/limits/command-timeout")
+        return remote.call(
+            "POST",
+            "/v1/admin/limits/command-timeout",
+            {
+                **reason,
+                **{
+                    key: value
+                    for key, value in (
+                        ("min", args.min),
+                        ("max", args.max),
+                        ("default", args.default),
+                    )
+                    if value is not None
+                },
             },
         )
     if command == "kubernetes":
@@ -641,11 +840,42 @@ def _local(args: argparse.Namespace, wiring: Wiring) -> Any:
         return {"items": asyncio.run(providers_admin.providers_status(admin))}
     if command == "github":
         with wiring.ctx.uow_factory() as uow:
-            if args.github_command == "status":
+            verb = args.github_command
+            if verb == "status":
                 return github.status(admin, uow)
-            result = github.check(admin, uow, principal=principal, reason=args.reason)
+            if verb == "installations":
+                return github.apps_view(admin, uow)
+            if verb == "connect":
+                body = _connect_body(args)
+                result = github.connect(
+                    admin,
+                    uow,
+                    principal=principal,
+                    app_id=body["app_id"],
+                    private_key=body["private_key"],
+                    webhook_secret=body["webhook_secret"],
+                    reason=args.reason,
+                )
+            elif verb == "add-repository":
+                body = _add_repository_body(args)
+                result = github.add_repository(
+                    admin,
+                    uow,
+                    principal=principal,
+                    installation_id=body["installation_id"],
+                    repository=body["repository"],
+                    name=body["name"],
+                    policy_name=body["policy_name"],
+                    attested_all_prs=body["attested_all_prs"],
+                    attested_by=body["attested_by"],
+                    reason=args.reason,
+                )
+            else:
+                result = github.check(admin, uow, principal=principal, reason=args.reason)
             uow.commit()
             return result
+    if command == "gateway":
+        return _local_gateway(args, wiring, admin)
     if command == "audit":
         with wiring.ctx.uow_factory() as uow:
             return audit.tail(uow, cursor=args.cursor, limit=args.limit)
@@ -683,6 +913,26 @@ def _local(args: argparse.Namespace, wiring: Wiring) -> Any:
             )
             uow.commit()
             return result
+    if command == "limits":
+        with wiring.ctx.uow_factory() as uow:
+            if args.limits_command == "command-timeout":
+                return limits_admin.command_timeout_view(uow)
+            result = limits_admin.save_command_timeout(
+                admin,
+                uow,
+                principal=Principal(
+                    id=CLI_PRINCIPAL,
+                    name=CLI_PRINCIPAL,
+                    role=Role.ADMIN,
+                    created_at=wiring.ctx.clock.now(),
+                ),
+                minimum=args.min,
+                maximum=args.max,
+                default=args.default,
+                reason=args.reason,
+            )
+            uow.commit()
+            return result
     if command == "kubernetes":
         with wiring.ctx.uow_factory() as uow:
             if args.kubernetes_command == "egress":
@@ -695,6 +945,46 @@ def _local(args: argparse.Namespace, wiring: Wiring) -> Any:
     if command == "bootstrap":
         return _local_bootstrap(args, wiring, admin, principal)
     raise UsageError(f"unknown command: {command}")
+
+
+def _local_gateway(args: argparse.Namespace, wiring: Wiring, admin: AdminContext) -> Any:
+    principal = Principal(
+        id=CLI_PRINCIPAL, name=CLI_PRINCIPAL, role=Role.ADMIN, created_at=wiring.ctx.clock.now()
+    )
+    verb = args.gateway_command
+    with wiring.ctx.uow_factory() as uow:
+        if verb == "show":
+            return gateway.gateway_view(admin, uow)
+        if verb == "models":
+            return asyncio.run(gateway.models_view(admin, uow))
+        if verb == "test":
+            result = asyncio.run(
+                gateway.test_gateway(admin, uow, principal=principal, reason=args.reason)
+            )
+        elif verb == "pick":
+            result = asyncio.run(
+                gateway.save_models(
+                    admin,
+                    uow,
+                    principal=principal,
+                    models=_picks(args),
+                    max_concurrency=args.max_concurrency,
+                    reason=args.reason,
+                )
+            )
+        else:
+            result = asyncio.run(
+                gateway.save_gateway(
+                    admin,
+                    uow,
+                    principal=principal,
+                    endpoint_url=args.endpoint_url,
+                    api_key=_read_api_key() if args.key else None,
+                    reason=args.reason,
+                )
+            )
+        uow.commit()
+        return result
 
 
 def _local_credentials(
@@ -792,6 +1082,7 @@ def _token(args: argparse.Namespace, wiring: Wiring) -> Any:
                 reason=args.reason,
             )
             uow.commit()
+            tokens_admin.after_revoke(wiring.admin, result)
             return result
         if args.rotate:
             raise UsageError("token rotation is replaced by revoke and create")
@@ -812,12 +1103,15 @@ def _token(args: argparse.Namespace, wiring: Wiring) -> Any:
     }
 
 
-def ensure_first_admin(database_url: str) -> None:
+def ensure_first_admin(database_url: str, delivery: FirstRunDelivery | None) -> None:
     """Create the first browser principal only when no administrator exists.
 
-    The value is printed by the migration process once, on stderr, and only its salted
-    hash is committed; stdout carries the envelope alone. A rerun sees the principal and
-    emits nothing.
+    Its token never reaches stdout, stderr or a log (crucible#122, ADR 0016): it goes to
+    `delivery`, a Secret on Kubernetes or a mode 0600 file on Docker, before the
+    principal is committed, so a token that could not be handed over is never minted.
+    The log says only where to read it. Without a delivery nothing is minted and the log
+    says how to make an administrator instead. A rerun sees the principal and does
+    nothing.
     """
     engine = make_engine(database_url)
     try:
@@ -828,9 +1122,19 @@ def ensure_first_admin(database_url: str) -> None:
                 for item in uow.principals.list_all()
             ):
                 return
-            name = "first-run-admin"
+            if delivery is None:
+                print(
+                    "No first-run administrator was created: this deployment has no "
+                    "private place for its token (the Kubernetes provider's Secret or the "
+                    "Docker credential root). With the supervisor running, create one "
+                    'with `crucible admin --reason "<why>" token create --principal '
+                    "<name> --role admin`.",
+                    file=sys.stderr,
+                )
+                return
+            name = FIRST_RUN_PREFIX
             if uow.principals.get_by_name(name) is not None:
-                name = f"first-run-admin-{new_id()[-8:].lower()}"
+                name = f"{FIRST_RUN_PREFIX}-{new_id()[-8:].lower()}"
             minted = mint_token(
                 uow,
                 SystemClock(),
@@ -848,13 +1152,14 @@ def ensure_first_admin(database_url: str) -> None:
                     "first_run": True,
                 },
             )
+            delivery.deliver(minted.token)
             uow.commit()
         border = "=" * 72
         for line in (
             border,
-            "CRUCIBLE FIRST-RUN ADMIN TOKEN, SHOWN ONCE",
-            minted.token,
-            "Open /ui and sign in. Store this token before logs are rotated.",
+            f"CRUCIBLE FIRST-RUN ADMINISTRATOR {minted.principal.name!r} CREATED",
+            f"Its one-time token is in {delivery.where()}",
+            "Open /ui and sign in with it; that removes it from there.",
             border,
         ):
             print(line, file=sys.stderr)
@@ -913,7 +1218,9 @@ def kind_of(args: argparse.Namespace) -> str:
         "audit": "audit_command",
         "routing": "routing_command",
         "kubernetes": "kubernetes_command",
+        "limits": "limits_command",
         "bootstrap": "bootstrap_command",
+        "gateway": "gateway_command",
     }.get(command)
     sub = getattr(args, verb) if verb else None
     table: dict[tuple[str, str | None], str] = {
@@ -938,6 +1245,14 @@ def kind_of(args: argparse.Namespace) -> str:
         ("providers", "status"): "provider_list",
         ("github", "status"): "github_status",
         ("github", "check"): "github_check",
+        ("github", "connect"): "github_connected",
+        ("github", "installations"): "github_installations",
+        ("github", "add-repository"): "repository",
+        ("gateway", "show"): "gateway",
+        ("gateway", "set"): "gateway_test",
+        ("gateway", "test"): "gateway_test",
+        ("gateway", "models"): "gateway_models",
+        ("gateway", "pick"): "gateway_models_saved",
         ("audit", "tail"): "audit_page",
         ("routing", "exhaustion"): "exhaustion_list",
         ("routing", "clear-exhaustion"): "exhaustion_cleared",
@@ -945,6 +1260,8 @@ def kind_of(args: argparse.Namespace) -> str:
         ("routing", "set-local-endpoint"): "local_endpoint",
         ("kubernetes", "egress"): "kubernetes_egress",
         ("kubernetes", "set-egress"): "kubernetes_egress",
+        ("limits", "command-timeout"): "command_timeout",
+        ("limits", "set-command-timeout"): "command_timeout",
         ("bootstrap", "list"): "bootstrap_import_list",
     }
     key = ("repository" if command == "repositories" else command, sub)
@@ -1017,6 +1334,8 @@ def result_for(
         actions = nx.local_endpoint_actions(document, prefix)
     elif kind == "kubernetes_egress":
         actions = nx.kubernetes_egress_actions(document, prefix)
+    elif kind == "command_timeout":
+        actions = nx.command_timeout_actions(document, prefix)
     elif kind == "audit_page":
         actions = nx.audit_actions(document, prefix, args.limit, args.cursor)
     return Result(kind=kind, data=document, state=state, next=actions, role=role)
@@ -1050,7 +1369,7 @@ def run(args: argparse.Namespace, *, root_api_url: str | None, timezone: str | N
     try:
         if args.command == "migrate":
             upgrade(settings.database.url)
-            ensure_first_admin(settings.database.url)
+            ensure_first_admin(settings.database.url, first_run_delivery(settings))
             document: Any = {"migrated_to": head_revision(settings.database.url)}
         else:
             wiring = wire(settings)

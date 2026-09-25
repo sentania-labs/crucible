@@ -393,3 +393,35 @@ def test_a_verification_id_that_looks_like_a_command_stays_a_file_name(tmp_path:
     assert not Path("/tmp/crucible-pwned").exists()
     (exit_file,) = list(verify.glob("*.exit"))
     assert exit_file.read_text().strip() == "7"
+
+
+def test_a_kubernetes_preparer_reads_the_cache_and_never_refreshes_it() -> None:
+    """crucible#55: on Kubernetes the refresher Job is the cache's only writer."""
+    common = {
+        "url": "https://github.com/example-org/example-service",
+        "base_ref": "main",
+        "work_branch": "crucible/test",
+        "from_remote_branch": False,
+        "cache_name": "0123456789abcdef",
+        "author_name": "crucible-worker",
+        "author_email": "crucible-worker@users.noreply.github.com",
+        "origin_placeholder": workspace.ORIGIN_PLACEHOLDER,
+        "claude_md_wins": True,
+        "shims": workspace.SHIM_NAMES,
+        "exclude_entries": workspace.EXCLUDE_ENTRIES,
+        "identity_mount": IDENTITY_MOUNT,
+    }
+    docker = scripts.preparer_script(**common)  # type: ignore[arg-type]
+    kubernetes = scripts.preparer_script(**common, refresh_cache=False)  # type: ignore[arg-type]
+    cache = "/crucible/cache/0123456789abcdef.git"
+    assert "fetch --prune origin" in docker and "clone --mirror" in docker
+    assert "fetch --prune origin" not in kubernetes and "clone --mirror" not in kubernetes
+    assert f'rm -rf "{cache}"' not in kubernetes
+    assert f"--reference {cache} --dissociate" in kubernetes
+
+    refresh = scripts.cache_refresh_script(
+        url="https://github.com/example-org/example-service", cache_name="0123456789abcdef"
+    )
+    assert f'--git-dir "{cache}" fetch --prune origin' in refresh
+    assert f'clone --mirror -- "$CLONE_URL" "{cache}"' in refresh
+    assert "CLONE_URL='https://github.com/example-org/example-service'" in refresh

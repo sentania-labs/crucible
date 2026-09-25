@@ -1,4 +1,4 @@
-"""Image administration (13, 25, ADR 0016): list, promote, roll back.
+"""Image administration (13, 25, ADR 0018): list, promote, roll back.
 
 Promotion is per harness, the operator's decision of 2026-09-25 (crucible#116): each
 harness has its own default worker image, promoted and rolled back on its own. A worker
@@ -130,7 +130,7 @@ async def promote(
     digest: str,
     reason: str | None,
 ) -> dict[str, Any]:
-    """Make one image the default for one harness (13, ADR 0016). The image must carry
+    """Make one image the default for one harness (13, ADR 0018). The image must carry
     that harness at a version inside its adapter's tested range; the other harnesses it
     carries are neither checked nor moved. The image it replaces becomes the one a
     rollback returns to."""
@@ -203,7 +203,7 @@ async def promote(
 async def rollback(
     ctx: AdminContext, uow: UnitOfWork, *, principal: str, harness: str, reason: str | None
 ) -> dict[str, Any]:
-    """Return one harness to the image its last promotion replaced (ADR 0016). The two
+    """Return one harness to the image its last promotion replaced (ADR 0018). The two
     swap, so a second rollback undoes the first. Every other harness stays where it is."""
     reason = guard_mutation(
         ctx, uow, reason, principal=principal, operation=f"images rollback {harness}"

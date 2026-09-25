@@ -763,7 +763,7 @@ def start_login(
 
 
 def promoted_image(uow: UnitOfWork, harness: str) -> str:
-    """The harness's own default worker image (ADR 0016), which is what a launch of it
+    """The harness's own default worker image (ADR 0018), which is what a launch of it
     would use too, so a login runs it."""
     default = uow.harness_images.get(harness)
     if default is None:

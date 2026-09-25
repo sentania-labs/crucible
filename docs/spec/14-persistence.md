@@ -29,7 +29,7 @@
 | `repositories` | id, name UNIQUE, url, default_branch, installation_id, policy_name, registered_by, created_at |
 | `worker_images` | digest PK, reference, harness, harness_version, build_inputs_sha256, promotion_state, promoted_at, promoted_by |
 | `harnesses` | name PK, enabled (the administrator's flag, 25), reason, session_compatibility (unverified, verified, failed), mount_mode_observed, refresh_requires_rw, last_launch_at, last_launch_outcome, last_auth_failure_at, last_validated_at, updated_at, updated_by |
-| `harness_images` | harness PK, digest, reference, version (of this harness in the image), previous_digest, previous_reference, previous_version, reason, updated_at, updated_by (ADR 0016; replaced `image_promotions` in 0021) |
+| `harness_images` | harness PK, digest, reference, version (of this harness in the image), previous_digest, previous_reference, previous_version, reason, updated_at, updated_by (ADR 0018; replaced `image_promotions` in 0023) |
 | `review_reports` | id, task_id, head_sha, reviewer_kind, reviewer_attempt_id, reviewer_principal_id, document JSONB, artifact_id, created_at |
 | `pull_requests` | id, task_id UNIQUE, repository_id, number, url, base_ref, work_branch, state, head_sha, title, opened_at, merged_at, merge_sha, merged_by, closed_at, closed_by, last_polled_at, last_reactions_polled_at, reactions_observable, cancelled_at, body_sha256; UNIQUE (repository_id, number) |
 | `pull_request_heads` | id, pull_request_id, sha, pushed_by (crucible, other), observed_at |

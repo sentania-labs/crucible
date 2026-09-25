@@ -181,6 +181,11 @@ class EventKind(StrEnum):
     ADMIN_REFUSED = "admin_refused"
     LOCAL_ENDPOINT_UPDATED = "local_endpoint_updated"
     KUBERNETES_EGRESS_UPDATED = "kubernetes_egress_updated"
+    # the first-run setup (crucible#119, #120, #121): the gateway URL and its models,
+    # and the GitHub App credential the service now owns (ADR 0017)
+    LOCAL_GATEWAY_UPDATED = "local_gateway_updated"
+    GITHUB_APP_CONNECTED = "github_app_connected"
+    COMMAND_TIMEOUT_UPDATED = "command_timeout_updated"
     # the bootstrap ledger handoff (15, C6)
     BOOTSTRAP_IMPORT_VERIFIED = "bootstrap_import_verified"
     BOOTSTRAP_IMPORT_COMMITTED = "bootstrap_import_committed"

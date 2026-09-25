@@ -496,7 +496,7 @@ class ProviderSetting:
 
 @dataclass(slots=True)
 class HarnessImage:
-    """One harness's default worker image (13, ADR 0016): what its launches, probes,
+    """One harness's default worker image (13, ADR 0018): what its launches, probes,
     tests and logins run, and the one it replaced, which a rollback returns to.
 
     Promotion is per harness, the operator's decision of 2026-09-25 (crucible#116). A

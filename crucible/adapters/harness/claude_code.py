@@ -12,6 +12,15 @@ the state it expects, and `CLAUDE_CONFIG_DIR` points at the mounted copy so both
 one directory (S1). Neither file is written back: the token does not refresh, and the
 state file is state, not a credential. `settings.json` is a Crucible-owned template
 mounted read-only on top, so no hook, MCP server or plugin definition reaches a worker.
+
+Commands (issue 128): the CLI moves a Bash command that outlives its timeout to the
+background, and a headless run that ends its turn then kills it on exit (reproduced on
+2.1.280 against a stub model, 2026-09-25). The launch sets
+`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`, so a command past its timeout is ended and
+reported to the model instead, and both `BASH_DEFAULT_TIMEOUT_MS` and
+`BASH_MAX_TIMEOUT_MS` to the launch's command timeout. The stream-json transcript's
+`task_started`, `task_updated` and `task_notification` events are the CLI's own record
+of a backgrounded command; one still open at the final `result` is work in flight.
 """
 
 from __future__ import annotations
@@ -40,6 +49,9 @@ from crucible.ports.harness import (
 )
 
 NAME = "claude_code"
+# A backgrounded task that ended on its own; anything else at exit was still running.
+FINISHED_TASK_STATUSES = frozenset({"completed", "failed"})
+STOPPED_TASK_STATUSES = frozenset({"killed", "stopped"})
 CONFIG_DIR = "/home/worker/.claude"
 TOKEN_ENV = "CLAUDE_CODE_OAUTH_TOKEN"
 
@@ -151,9 +163,18 @@ class ClaudeCodeAdapter:
             ctx.model,
         )
         spec = self.credential_spec()
+        timeout = str(ctx.command_timeout)
+        env = {
+            # Issue 128: a command past its timeout is ended, never moved to the
+            # background where the headless exit would kill it unseen.
+            "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
+            "BASH_DEFAULT_TIMEOUT_MS": timeout,
+            "BASH_MAX_TIMEOUT_MS": timeout,
+            **(spec.env() if ctx.credential_mounted else {}),
+        }
         return AdapterLaunch(
             argv=argv,
-            env=spec.env() if ctx.credential_mounted else {},
+            env=env,
             env_from_files=spec.env_from_files() if ctx.credential_mounted else {},
             stdin_text=base.POINTER_PROMPT,
             transcript_path=f"{ctx.report_mount}/{base.TRANSCRIPT_NAME}",
@@ -161,15 +182,58 @@ class ClaudeCodeAdapter:
         )
 
     def parse_report(self, report_dir: Path, exit: ExitInfo) -> ParsedReport:
-        metrics, lines = _metrics(report_dir / base.TRANSCRIPT_NAME)
-        return base.parse_report_dir(report_dir, exit, metrics=metrics, transcript_lines=lines)
+        transcript = report_dir / base.TRANSCRIPT_NAME
+        metrics, lines = _metrics(transcript)
+        return base.parse_report_dir(
+            report_dir,
+            exit,
+            metrics=metrics,
+            transcript_lines=lines,
+            in_flight=in_flight(transcript),
+        )
 
     def classify_exit(
         self, exit: ExitInfo, stdout_tail: str, stderr_tail: str, report_dir: Path | None = None
     ) -> ExitClass:
-        return base.classify_with_patterns(
+        exit_class = base.classify_with_patterns(
             exit, stdout_tail, stderr_tail, auth=AUTH_PATTERNS, quota=QUOTA_PATTERNS
         )
+        pending = in_flight(report_dir / base.TRANSCRIPT_NAME) if report_dir else ()
+        return base.with_in_flight(exit_class, pending)
+
+
+def in_flight(transcript: Path) -> tuple[str, ...]:
+    """Backgrounded commands the CLI still had open when its final `result` arrived.
+
+    A task the CLI reports `completed` or `failed` ended on its own, whenever that was.
+    One it reports `killed` or `stopped` before the final result was ended during the
+    run (the model stopped it); the same status after the final result is the exit
+    killing it, which is the trap. A task with no end at all is in flight too."""
+    events = list(base.json_lines(transcript))
+    results = [i for i, event in enumerate(events) if event.get("type") == "result"]
+    last_result = results[-1] if results else len(events)
+    open_tasks: dict[str, str] = {}
+    for index, event in enumerate(events):
+        if event.get("type") != "system":
+            continue
+        subtype = event.get("subtype")
+        task_id = event.get("task_id")
+        if not isinstance(task_id, str):
+            continue
+        if subtype == "task_started" and event.get("is_backgrounded") is True:
+            open_tasks[task_id] = str(event.get("description") or task_id)
+        elif subtype in ("task_updated", "task_notification"):
+            patch = event.get("patch")
+            status = event.get("status") or (
+                patch.get("status") if isinstance(patch, dict) else None
+            )
+            stopped_in_run = status in STOPPED_TASK_STATUSES and index < last_result
+            if status in FINISHED_TASK_STATUSES or stopped_in_run:
+                open_tasks.pop(task_id, None)
+    return tuple(
+        base.in_flight_summary(f"background task {task_id}", description)
+        for task_id, description in open_tasks.items()
+    )
 
 
 def _metrics(transcript: Path) -> tuple[ReportMetrics, int]:

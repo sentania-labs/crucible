@@ -1078,13 +1078,13 @@ def test_0020_provider_settings_down_and_up_keeps_the_audit_trail(database_url: 
     engine.dispose()
 
 
-def test_0021_carries_each_harness_default_forward_and_back(database_url: str) -> None:
+def test_0023_carries_each_harness_default_forward_and_back(database_url: str) -> None:
     """crucible#116: promotion is per harness. Each harness's current default (the most
     recent `default` row that carries it) becomes its own default, and the most recent
     `retained` row that carries it becomes the image a rollback returns to."""
     migrate.upgrade(database_url)
     engine = make_engine(database_url)
-    migrate.downgrade(database_url, "0020_provider_settings")
+    migrate.downgrade(database_url, "0022_first_run_setup")
     insert = text(
         "INSERT INTO image_promotions (digest, reference, harnesses, state, reason, "
         "updated_at, updated_by) VALUES (:digest, :reference, CAST(:harnesses AS jsonb), "
@@ -1120,7 +1120,7 @@ def test_0021_carries_each_harness_default_forward_and_back(database_url: str) -
         "hermes": ("sha256:new", "0.19.0", "sha256:old", "0.19.0"),
     }
     assert "image_promotions" not in inspect(engine).get_table_names()
-    migrate.downgrade(database_url, "0020_provider_settings")
+    migrate.downgrade(database_url, "0022_first_run_setup")
     with engine.connect() as conn:
         back = {
             str(r.digest): (r.state, dict(r.harnesses))
@@ -1134,6 +1134,33 @@ def test_0021_carries_each_harness_default_forward_and_back(database_url: str) -
     with engine.begin() as conn:
         conn.execute(text("DELETE FROM image_promotions"))
     migrate.upgrade(database_url)
+
+
+def test_0021_command_timeout_down_and_up_keeps_the_audit_trail(database_url: str) -> None:
+    """crucible#128: a rollback archives the command timeout's audit events and the
+    next upgrade restores them."""
+    migrate.upgrade(database_url)
+    engine = make_engine(database_url)
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO events (seq, ts, kind, principal, verified, payload) "
+                "SELECT coalesce(max(seq), 0) + 1, now(), 'command_timeout_updated', "
+                "'tests', true, '{}'::jsonb FROM events"
+            )
+        )
+    migrate.downgrade(database_url, "0020_provider_settings")
+
+    def count() -> int:
+        with engine.connect() as conn:
+            value = conn.execute(
+                text("SELECT count(*) FROM events WHERE kind='command_timeout_updated'")
+            ).scalar()
+        return int(value or 0)
+
+    assert count() == 0
+    migrate.upgrade(database_url)
+    assert count() == 1
     ok, detail = migrate.is_current(engine, database_url)
     assert ok, detail
     engine.dispose()

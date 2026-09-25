@@ -33,8 +33,11 @@ Deployment (one replica, lease-guarded exactly as today, fenced tokens in
 PostgreSQL), and PostgreSQL (operator-managed or external; the manifests
 carry a single-instance StatefulSet for the lab and a connection-string
 option for an external server). No Docker socket anywhere. The GitHub App
-key and webhook secret are a Secret mounted on the `crucible` pods only
-(12). Everything a worker needs lives in `crucible-workers` and is created
+key and webhook secret are the Secret `crucible-github-app` in `crucible`,
+which the service owns and reads through the API server (12, ADR 0017); it is
+mounted, optional, on the `crucible` pods only. The control plane holds two
+grants in `crucible`: that Secret (`get` and `patch` by name, and `create`)
+and deleting the first-run administrator Secret (ADR 0016). Everything a worker needs lives in `crucible-workers` and is created
 per attempt by the supervisor through the Kubernetes API.
 
 The supervisor's ServiceAccount is bound to a Role in `crucible-workers`
@@ -93,13 +96,14 @@ Per attempt the provider creates, in `crucible-workers`, all labelled
 | PersistentVolumeClaim `ws-<attempt>` | the workspace: `repo/`, `report/`, `output/` | attempt, then per cleanup policy |
 | ConfigMap `identity-<attempt>` (or a projected volume from an object store above the ConfigMap size cap, 08) | the identity bundle, read-only | attempt |
 | Secret `cred-<attempt>` | the per-attempt copy of one harness credential directory, seeded from the harness's dedicated Secret in `crucible-workers`, `rw-narrow` where the adapter declares it (12) | attempt, deleted under every cleanup policy |
-| Job `prepare-<attempt>` | the preparer: clone into the PVC from the reference cache, branch, shims, author identity, `origin` placeholder (08) | until complete, then deleted |
+| Job `refresh-cache-<attempt>` | the reference cache's only writer: fetches the repository's bare mirror on the cache PVC (or clones it when absent), with git egress only and no workspace, identity bundle or credential | until complete, then deleted, before the preparer starts |
+| Job `prepare-<attempt>` | the preparer: clone into the PVC from the reference cache, mounted read-only, then branch, shims, author identity, `origin` placeholder (08) | until complete, then deleted |
 | Job `worker-<attempt>` | the worker, one Pod, `backoffLimit: 0`, `restartPolicy: Never` | until terminal, then deleted after `logs_drained` |
 | Job `collect-<attempt>` | the collector, no network, repo and report read-only, output read-write (08) | until complete |
 | Job `verify-bundle-<attempt>` | `git bundle verify`, no network | until complete |
 | Job `verifier-<attempt>` | re-runs `required_verification` on an independent clone from the bundle (10, 11) | until complete |
 | Job `publish-<attempt>` | pushes the sealed bundle with a token on an in-memory volume (23) | until complete |
-| Job `login-<harness>-<id>` (admin flow, 25) | the harness's own login in that harness's default worker image (ADR 0016), no workspace, no credential mounted, a memory-backed home; the service reads the auth files back over exec and writes the harness Secret (ADR 0015). Labelled `crucible.role=login`, `crucible.harness`, `crucible.login` and never `crucible.attempt` | until the service has read it back, cancelled, or timed out; its own deadline and a TTL remove it if the api died |
+| Job `login-<harness>-<id>` (admin flow, 25) | the harness's own login in that harness's default worker image (ADR 0018), no workspace, no credential mounted, a memory-backed home; the service reads the auth files back over exec and writes the harness Secret (ADR 0015). Labelled `crucible.role=login`, `crucible.harness`, `crucible.login` and never `crucible.attempt` | until the service has read it back, cancelled, or timed out; its own deadline and a TTL remove it if the api died |
 | NetworkPolicy `np-login-<id>` | the login Job's egress: the adapter's `login_endpoints` only | with its Job; the retention sweep removes one whose Job is gone |
 | ConfigMap `login-lock-<harness>` (admin flow, 25) | the harness's login lock across every api replica: created before the login Job, so exactly one replica gets it and the others are refused naming its holder. Carries the holder and an expiry (the login deadline, the read-back window and five minutes). Labelled `crucible.role=login-lock` and `crucible.harness`, never `crucible.attempt` | deleted by the api that took it, by uid, however the login ends; a lock past its expiry (its api died) is deleted by uid and replaced by the next login |
 | the probe's claim, ConfigMap, per-run Secret and Jobs (admin flow, 25) | the bounded credential probe: an attempt's objects for one prompt, labelled `crucible.admin=probe` | removed by the probe; neither swept nor adopted by the supervisor for two hours |
@@ -346,11 +350,17 @@ the namespace. A deployment therefore names one exact, pullable reference in
 
 ## Provider mechanics (08's interface)
 
-- `prepare`: create the PVC, ConfigMap, and per-attempt Secret; run the
-  preparer Job with the reference cache mounted read-write from a
-  cluster-side cache volume that Crucible refreshes with a short-lived
-  installation token (the token never enters the workspace); the Job
-  performs exactly what 08's Docker `prepare` performs. `prepare` returns
+- `prepare`: create the PVC, ConfigMap, and per-attempt Secret; when a
+  cluster-side reference cache volume is configured, run the refresher Job,
+  the only Pod that mounts that volume writable, to fetch the repository's
+  mirror on it; then run the preparer Job with the cache mounted read-only
+  (on the claim and on the mount). The cache is the one volume every attempt
+  shares, so a preparer that could write it could poison every later
+  checkout (crucible#55). In the supervisor a refresh waits for the
+  preparers cloning from that mirror to finish and holds new ones back until
+  it is done. A refresh that fails is logged and the preparer clones from the
+  remote without a reference. The preparer Job otherwise performs exactly
+  what 08's Docker `prepare` performs. `prepare` returns
   when the Job completes; a failed Job is a prepare failure with the Job's
   log excerpt as detail.
 - `launch`: resolve the worker image to a digest through the image registry
@@ -424,7 +434,8 @@ service owns it (ADR 0015, the operator's decisions of 2026-09-23): it creates
 it when absent, labelled `app.kubernetes.io/managed-by: crucible` and
 `crucible.credential: <harness>`, and it is the only writer, from the login Job,
 the Hermes key entry and the sync-back. GitOps does not deliver it; the
-database, GitHub App and TLS Secrets stay with GitOps. Its name is
+database and TLS Secrets stay with GitOps, and the GitHub App Secret is the
+service's too (ADR 0017). Its name is
 `kubernetes.credential_secrets[<harness>]`, else `crucible-harness-<harness>`
 with `_` as `-`.
 Per attempt, the provider copies it into `cred-<attempt>`, taking only the
@@ -453,8 +464,8 @@ writes the harness Secret itself, only after they pass the shape check. Hermes
 declares optional read-only credential file `api-key`. When the Hermes Secret
 exists and holds it, the provider copies that file into the per-attempt
 credential Secret and never syncs it back; when it does not, the launch uses the
-adapter's explicit unauthenticated placeholder. The Routing page's key entry
-writes that Secret. (Made concrete 2026-09-24, FDY-0112.)
+adapter's explicit unauthenticated placeholder. The Local gateway page's key
+entry writes that Secret (crucible#119). (Made concrete 2026-09-24, FDY-0112.)
 
 The supervisor defers a launch while a login Job for its harness exists,
 because the login is about to replace the credential (12). A launch that raced
@@ -496,7 +507,7 @@ next to what was allowed to run.
 
 `GET /providers` reports the Kubernetes provider with `isolation: pod`,
 `network_control: true`, `resource_limits: true`, `shared_disk: false`, the
-harnesses that have a default image (each harness its own, ADR 0016), and `max_concurrency` from the
+harnesses that have a default image (each harness its own, ADR 0018), and `max_concurrency` from the
 namespace's ResourceQuota. The admin status page (25) shows the namespace
 readiness probe, the CNI egress enforcement result, the pod PID limit, and
 the runtime class in use ("standard" in this version). Attempt evidence

@@ -2,7 +2,7 @@
 
 It runs the path a real task takes, in order, and stops at the first step that fails:
 the harness is enabled, it has a worker image of its own at a supported version (ADR
-0016), its credential is stored, and a worker Pod (or container) runs that image with
+0018), its credential is stored, and a worker Pod (or container) runs that image with
 the credential under the worker's egress and makes one minimal model call. Each step
 is reported in plain words, pass or fail, with the failing step's cause. The last result
 is kept on the harness's row for the Harnesses page.

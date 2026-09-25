@@ -99,7 +99,7 @@ launch outside the range is refused with a wake. `GET /v1/harnesses` reports
 installed and supported versions, both enable flags with their reasons, and a
 sanitized credential state; `GET /v1/images` lists every labelled image with the
 harnesses it is the default image of. Each harness has its own default image,
-promoted and rolled back on its own (ADR 0016).
+promoted and rolled back on its own (ADR 0018).
 
 A harness credential is a directory Crucible reads (`[credentials.<harness>]`,
 paths only), never the operator's own `~/.claude`, `~/.codex` or `~/.gemini`.
@@ -124,12 +124,14 @@ make e2e-live HARNESS=claude_code \
 
 Administration (25) is one set of operations behind three entry points: the
 server-rendered `/ui`, `/v1/admin`, and `crucible admin`. They call the same
-services and own no separate state. On a fresh deployment, retrieve the
-one-time administrator token from `docker compose logs migrate`, then open
-`http://127.0.0.1:8080/ui`. Every mutation needs a live supervisor and leaves
-an event with the principal and a before/after summary, never a value. A
-reason is an optional audit note, required only to revoke a token, remove a
-repository or a credential, or commit a bootstrap import:
+services and own no separate state. On a fresh deployment, read the
+one-time administrator token with `docker compose exec crucible cat
+/var/lib/crucible/credentials/first-run-admin-token` (it is never in a log,
+ADR 0016), then open `http://127.0.0.1:8080/ui`; the first sign-in removes
+the file. Every mutation needs a live supervisor and leaves an event with the
+principal and a before/after summary, never a value. A reason is an optional
+audit note, required only to revoke a token, remove a repository or a
+credential, or commit a bootstrap import:
 
 ```sh
 crucible admin status                                        # the sanitized status document
@@ -142,7 +144,7 @@ crucible admin credentials login --harness codex                 # prints the UR
 crucible admin credentials rotate --harness agy --new-path /path/to/staged
 crucible admin credentials remove --harness codex --reason "..."
 crucible admin images list
-crucible admin images promote <digest> --harness hermes   # per harness (ADR 0016)
+crucible admin images promote <digest> --harness hermes   # per harness (ADR 0018)
 crucible admin images rollback --harness hermes
 crucible admin providers status
 crucible admin github status
@@ -169,7 +171,8 @@ build of this branch). Before the first tagged release the answer is
 `POSTGRES_PASSWORD` there. First use after `make up`:
 
 ```sh
-docker compose logs migrate     # copy the framed first-run administrator token
+# the first-run administrator token (never in a log; removed on first sign-in)
+docker compose exec crucible cat /var/lib/crucible/credentials/first-run-admin-token
 # Open http://127.0.0.1:8080/ui and create any additional principals there.
 docker compose exec crucible crucible admin --reason "onboarding" repository register \
   --name example-service --url https://github.com/example-org/example-service \

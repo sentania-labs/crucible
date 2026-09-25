@@ -103,7 +103,7 @@ the lab overlay sets:
 | `CRUCIBLE_KUBERNETES__LOCAL_ENDPOINT_CIDRS` | `[]` | only an endpoint outside the cluster needs an address range |
 
 The pods to name are the ones the endpoint URL's connection lands on. If the local
-endpoint URL (Routing page) is LiteLLM's own Service name or LoadBalancer address, that
+endpoint URL (Local gateway page) is LiteLLM's own Service name or LoadBalancer address, that
 is the LiteLLM pods. If the URL goes through an ingress, it is the ingress controller's
 pods and their port, not LiteLLM's.
 
@@ -119,16 +119,23 @@ under the new values before any launch uses them.
 ### The Secrets
 
 `deploy/kubernetes/secret-shapes/README.md` is the authority on the shapes. GitOps
-delivers two Secrets:
+delivers one Secret:
 
 | Object | Namespace | Keys |
 |---|---|---|
 | `crucible-database` | `crucible` | `password`, and `url`, the whole DSN, which must carry the same password |
-| `crucible-github-app` | `crucible` | `app.pem`, `webhook.secret` |
+
+**The GitHub App Secret is not GitOps's either** (ADR 0017). Connect the App on the
+GitHub page with its App ID and one of its private keys; Crucible checks them with
+GitHub, then creates `crucible-github-app` in `crucible` (keys `app-id`, `app.pem`,
+`webhook.secret`) and is its only writer. Install the App from the link the page shows,
+then pick repositories there. A deployment that sealed `crucible-github-app` before this
+change takes it out of its GitOps repository without pruning it, or connects the App
+again afterwards.
 
 **The harness credential Secrets are not GitOps's.** Crucible creates and owns them
-(ADR 0015): the login flow below writes each one, the Hermes key entry on the Routing
-page writes Hermes's, and the supervisor writes a refreshed token back after an attempt.
+(ADR 0015): the login flow below writes each one, the Hermes key entry on the Local
+gateway page writes Hermes's, and the supervisor writes a refreshed token back after an attempt.
 A Secret written by both Crucible and GitOps drifts, and a sync would restore a token the
 harness has already rotated. They are:
 
@@ -154,7 +161,8 @@ repository. Nothing sealed, encrypted or plain belongs in Crucible's repository.
 ## What Crucible provides
 
 Everything else: both namespaces with their admission labels and the default deny, the
-supervisor's Role scoped to `crucible-workers` and nothing else, the worker
+supervisor's Role scoped to `crucible-workers`, the one Role in `crucible` for the GitHub
+App Secret the service owns (ADR 0017), the worker
 ServiceAccount with no permission at all, the ResourceQuota that is also the provider's
 concurrency bound, the reference cache claim, PostgreSQL for the lab, the migration Job,
 the api and supervisor Deployments, the Service, and the Ingress route without a host.
@@ -176,9 +184,19 @@ prunes them.
 5. Watch the migration Job complete. `crucible serve` refuses to start against a schema
    that is not at head, so the api and supervisor wait for it rather than corrupting
    anything.
-6. Read the one-time first-run administrator token out of the migration Job's log. It is
-   printed once, in a framed block, and only its salted hash is stored (25). Store it
-   before the log rotates.
+6. Read the one-time first-run administrator token from the Secret the migration Job
+   wrote. It is never in the Job's log (ADR 0016); the log says only where it is:
+
+   ```sh
+   kubectl -n crucible get secret crucible-first-run-admin \
+     -o jsonpath='{.data.token}' | base64 -d
+   ```
+
+   Only the migrate Job's account can create that Secret and only the api's account can
+   delete it; reading it takes your own cluster permissions. The api deletes it the
+   first time you sign in at `/ui` with it (or when that principal is revoked), so
+   create your own administrator before you lose the session. Only the token's salted
+   hash is stored (25).
 
 ## Logging the harnesses in
 
@@ -215,7 +233,7 @@ Once the api is reachable, sign in at `/ui` with that token and, for each harnes
 5. **Images**: choose each harness's worker image. The page has one row per harness,
    with a pulldown of the images that carry that harness at a supported version
    (releases and `latest`); pick one and Promote. Promotion is per harness (the
-   operator's decision of 2026-09-25, ADR 0016): each harness can run a different
+   operator's decision of 2026-09-25, ADR 0018): each harness can run a different
    image, and promoting one never moves another. A launch of a harness with no image is
    refused. The registry the page lists is `CRUCIBLE_KUBERNETES__IMAGE_REPOSITORIES`,
    which the base settings already set to `["ghcr.io/sentania-labs/crucible-worker"]`;

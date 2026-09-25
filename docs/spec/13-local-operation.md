@@ -209,7 +209,7 @@ Image promotion (a Crucible repository process, C8):
    and report parsing.
 6. The supported-version declaration is updated in the same PR.
 7. Merge and tag publish the image to GHCR with its digest.
-8. Promotion is per harness (ADR 0016, the operator's decision of
+8. Promotion is per harness (ADR 0018, the operator's decision of
    2026-09-25, crucible#116): `POST /admin/images/{digest}/promote` with a
    `harness` makes the image that harness's default, an explicit admin act
    recorded as an event. The image must carry that harness at a version

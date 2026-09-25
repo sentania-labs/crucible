@@ -100,6 +100,7 @@ three operator-only relaxations retain their existing role checks.
 | Policy fields | Disposition |
 |---|---|
 | `schema_version`, `name`, `version`, `description` | editable |
+| `limits.command_timeout_ms.min`, `.max`, `.default` (issue 128) | editable by upload, and in place on Routing ("Edit per-command timeout"), `crucible admin limits set-command-timeout`, and `POST /v1/admin/limits/command-timeout`, each writing a new version |
 | `limits.timeout_seconds.min`, `.max`, `.default`, `limits.max_attempts.max`, `.default`, `limits.grace_seconds`, `limits.stall_warn_seconds`, `limits.stall_fail_seconds`, `limits.auth_retry_delay_seconds`, `limits.escalation_stale_hours`, `limits.wake_retry_hours` | editable |
 | `retry.eligible_classes`, `retry.auth_failure_max` | editable |
 | `concurrency.per_provider`, `concurrency.per_harness.<harness>` | editable |

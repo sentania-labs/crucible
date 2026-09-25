@@ -65,7 +65,7 @@ CRUCIBLE_DEPLOY_PORT ?= 8080
 
 .PHONY: up dev down reset lint check-image-manifest scan scan-tree scan-history smoke test test-unit \
 	test-integration e2e e2e-github e2e-live e2e-admin e2e-image build proxy-config proxies preflight \
-	e2e-kind registry-check manifests deploy-kind release-images-classify release-images-pull release-images-verify \
+	e2e-kind e2e-command-timeout registry-check manifests deploy-kind first-run-kind release-images-classify release-images-pull release-images-verify \
 	deploy-local deploy-local-down images images-check release-notes
 
 up: preflight proxy-config ## normal mode: postgres, proxies, migrate, crucible
@@ -211,6 +211,17 @@ e2e-kind: check-image-manifest ## Kubernetes-provider e2e on a disposable kind c
 	CRUCIBLE_E2E_DOCKER_SOCKET="$(CRUCIBLE_DOCKER_SOCKET)" \
 	tools/kind/e2e-kind.sh
 
+# The command-timeout tier (issue 128): Claude Code, Codex and Hermes from the pinned
+# worker image, each driven by a stub model server on loopback under `--network none`,
+# with a scripted command longer than a small configured timeout. No login, no
+# credential, no network; it needs the worker image (`make images`). The trap is
+# reproduced without the launch setting, then the setting shown to end or wait out the
+# command, and each report directory classified by the adapter.
+e2e-command-timeout: check-image-manifest ## real harnesses against a stub model: the launch-set command timeout (128)
+	$(UV) sync --frozen --quiet
+	CRUCIBLE_E2E_COMMAND_TIMEOUT=1 CRUCIBLE_E2E_DOCKER="$(DOCKER)" \
+	$(UV) run pytest tests/e2e/test_command_timeout.py -q -m e2e_command_timeout
+
 # The registry adapter with the real crane the service image ships (108): a stub registry
 # that redirects its blobs to another host and demands a password, then an anonymous
 # resolve of the published worker image on GHCR. Needs the network, no Docker, no secret.
@@ -237,6 +248,15 @@ manifests: ## render deploy/kubernetes and validate every object; needs kubectl 
 #
 deploy-kind: check-image-manifest ## deploy the manifests on a disposable kind cluster and run one task
 	CRUCIBLE_E2E_DOCKER="$(DOCKER)" \
+	  UV="$(UV)" tools/kind/deploy-kind.sh
+
+# The first-run path on a disposable kind cluster (crucible#119, #120, #121, #123, #79):
+# the same deployment as deploy-kind, then gateway URL and key, a model picked from the
+# gateway, a stand-in GitHub App connected and a repository picked, and Status reading
+# ready for Hermes. Stand-ins only: no real model and no real GitHub API. Needs the
+# combined worker image images/manifest.env pins on the host daemon (`make images`).
+first-run-kind: check-image-manifest ## deploy on a disposable kind cluster and walk the first-run setup
+	CRUCIBLE_E2E_DOCKER="$(DOCKER)" CRUCIBLE_DEPLOY_KIND_FIRST_RUN=1 \
 	  UV="$(UV)" tools/kind/deploy-kind.sh
 
 # The live GitHub tier (23). Local only, never in CI: it mints a real installation token

@@ -38,7 +38,7 @@ import tarfile
 import tempfile
 import time
 import weakref
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -169,6 +169,7 @@ KILL_EXIT_CODE = 137
 # roles and that is the whole mapping.
 OBJECT_PREFIX: dict[str, str] = {
     k8sspec.ROLE_PREPARER: "prepare",
+    k8sspec.ROLE_CACHE_REFRESHER: "refresh-cache",
     k8sspec.ROLE_WORKER: "worker",
     k8sspec.ROLE_COLLECTOR: "collect",
     k8sspec.ROLE_BUNDLE: "verify-bundle",
@@ -321,8 +322,10 @@ class KubernetesConfig:
     # One exact, pullable worker image for the readiness canary (26). It is deliberately
     # not an entry of `image_repositories`: the listing would take it for a repository,
     # list the same tags a second time, and then build `<repo>:<probe tag>:<tag>` for
-    # each of them, which is a reference that does not parse and one suppressed registry
-    # round trip per tag on every `GET /admin/images`.
+    # each of them. `parse_reference` does not reject that shape; `crane digest` does,
+    # locally, before any request, and the failure drops the entry the way an
+    # unavailable image is dropped. The cost is the second tag listing plus one failing
+    # crane process per tag on every `GET /admin/images`.
     probe_image: str = ""
     use_reference_cache: bool = True
     # 26, issue 93: the canary is a shell script with curl, not a role pod, so it asks
@@ -449,6 +452,65 @@ _ADOPTED_SPEC = LaunchSpec(
 )
 
 
+# A refresh younger than this is fresh enough: a prepare that finds one skips its own and
+# only reads, so attempts of one repository started together clone side by side (#55).
+CACHE_REFRESH_INTERVAL_SECONDS = 60.0
+
+
+class _CacheGate:
+    """A readers-writer gate over one reference cache in this process.
+
+    The refresher writes the mirror (a fetch can prune refs and repack); a preparer
+    reads it through `--reference`. Many preparers may read at once. A refresh waits for
+    the readers already in to finish, and holds new ones back while it waits, so it is
+    never starved. Refreshes are coalesced: a prepare refreshes only when no refresh is
+    running or waiting and the last finished more than the interval ago. Only the
+    supervisor prepares checkouts, so one process is the whole population (26)."""
+
+    def __init__(self) -> None:
+        self._condition = asyncio.Condition()
+        self._readers = 0
+        self._writing = False
+        self._writers_waiting = 0
+        self._refreshed_at: float | None = None
+
+    def refresh_due(self, now: float, interval: float = CACHE_REFRESH_INTERVAL_SECONDS) -> bool:
+        if self._writing or self._writers_waiting:
+            return False
+        return self._refreshed_at is None or now - self._refreshed_at >= interval
+
+    @contextlib.asynccontextmanager
+    async def reading(self) -> AsyncIterator[None]:
+        async with self._condition:
+            await self._condition.wait_for(lambda: not self._writing and not self._writers_waiting)
+            self._readers += 1
+        try:
+            yield
+        finally:
+            async with self._condition:
+                self._readers -= 1
+                self._condition.notify_all()
+
+    @contextlib.asynccontextmanager
+    async def writing(self) -> AsyncIterator[None]:
+        # Counted before the first await, so a prepare that checks `refresh_due` right
+        # after this one sees the refresh coming and does not queue a second.
+        self._writers_waiting += 1
+        try:
+            async with self._condition:
+                await self._condition.wait_for(lambda: not self._writing and self._readers == 0)
+                self._writing = True
+        finally:
+            self._writers_waiting -= 1
+        try:
+            yield
+        finally:
+            async with self._condition:
+                self._writing = False
+                self._refreshed_at = time.monotonic()
+                self._condition.notify_all()
+
+
 class KubernetesProvider:
     """The provider of 08 on Jobs and Pods, as 26 specifies it."""
 
@@ -486,6 +548,11 @@ class KubernetesProvider:
         self._probe_locks: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock] = (
             weakref.WeakKeyDictionary()
         )
+        # One gate per reference cache (one per repository), per loop as above: a
+        # refresh writes the mirror only while no preparer is cloning from it (#55).
+        self._cache_gates: weakref.WeakKeyDictionary[
+            asyncio.AbstractEventLoop, dict[str, _CacheGate]
+        ] = weakref.WeakKeyDictionary()
         # The attempt ids of the administrative runs this process has in flight (25),
         # with what each one is; their objects carry `crucible.admin` (see `_labels`).
         self._admin_runs: dict[str, str] = {}
@@ -970,43 +1037,58 @@ class KubernetesProvider:
         cache_mounts: list[Mount] = []
         cache_volumes: list[dict[str, Any]] = []
         cache_name: str | None = None
+        gate: _CacheGate | None = None
         if self.config.use_reference_cache and self.config.cache_claim:
             cache_name = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
-            cache_mounts.append(Mount("cache", k8sspec.CACHE_MOUNT))
+            gate = self._cache_gate(cache_name)
+            if gate.refresh_due(time.monotonic()):
+                async with gate.writing():
+                    await self._refresh_cache(
+                        spec, url=url, cache_name=cache_name, image=resolved, limits=limits
+                    )
+            # 26: the preparer reads the cache and never writes it. It is the one volume
+            # every attempt shares, so an attempt's Pod that could write it could poison
+            # every later checkout (#55). Read-only on the claim and on the mount.
+            cache_mounts.append(Mount("cache", k8sspec.CACHE_MOUNT, read_only=True))
             cache_volumes.append(
                 {
                     "name": "cache",
-                    "persistentVolumeClaim": {"claimName": self.config.cache_claim},
+                    "persistentVolumeClaim": {
+                        "claimName": self.config.cache_claim,
+                        "readOnly": True,
+                    },
                 }
             )
         git_policy = spec.policy.get("git", {})
-        exit_code = await self._run_role_job(
-            spec,
-            role=k8sspec.ROLE_PREPARER,
-            image=resolved,
-            script=scripts.preparer_script(
-                url=url,
-                base_ref=base_ref,
-                work_branch=work_branch,
-                from_remote_branch=spec.role == "correct"
-                or bool(repository.get("resume_from_work_branch")),
-                cache_name=cache_name,
-                author_name=str(git_policy.get("author_name", "crucible-worker")),
-                author_email=str(
-                    git_policy.get("author_email", "crucible-worker@users.noreply.github.com")
+        async with gate.reading() if gate is not None else contextlib.nullcontext():
+            exit_code = await self._run_role_job(
+                spec,
+                role=k8sspec.ROLE_PREPARER,
+                image=resolved,
+                script=scripts.preparer_script(
+                    url=url,
+                    base_ref=base_ref,
+                    work_branch=work_branch,
+                    from_remote_branch=spec.role == "correct"
+                    or bool(repository.get("resume_from_work_branch")),
+                    cache_name=cache_name,
+                    author_name=str(git_policy.get("author_name", "crucible-worker")),
+                    author_email=str(
+                        git_policy.get("author_email", "crucible-worker@users.noreply.github.com")
+                    ),
+                    origin_placeholder=workspace.ORIGIN_PLACEHOLDER,
+                    claude_md_wins=adapter.capabilities().claude_md_wins,
+                    shims=workspace.SHIM_NAMES,
+                    exclude_entries=workspace.EXCLUDE_ENTRIES,
+                    identity_mount=IDENTITY_MOUNT,
+                    refresh_cache=False,
                 ),
-                origin_placeholder=workspace.ORIGIN_PLACEHOLDER,
-                claude_md_wins=adapter.capabilities().claude_md_wins,
-                shims=workspace.SHIM_NAMES,
-                exclude_entries=workspace.EXCLUDE_ENTRIES,
-                identity_mount=IDENTITY_MOUNT,
-            ),
-            mounts=[Mount("ws", WORK_MOUNT), *cache_mounts],
-            volumes=[self._claim_volume(spec.attempt_id), *cache_volumes],
-            limits=limits,
-            timeout=self.config.prepare_timeout_seconds,
-            plan=self._egress_plan(spec, k8sspec.ROLE_PREPARER),
-        )
+                mounts=[Mount("ws", WORK_MOUNT), *cache_mounts],
+                volumes=[self._claim_volume(spec.attempt_id), *cache_volumes],
+                limits=limits,
+                timeout=self.config.prepare_timeout_seconds,
+                plan=self._egress_plan(spec, k8sspec.ROLE_PREPARER),
+            )
         if exit_code != 0:
             raise ProviderError(
                 f"the preparer Job could not build the checkout (exit {exit_code}): "
@@ -1031,6 +1113,45 @@ class KubernetesProvider:
             .decode("utf-8", "replace")
             .strip(),
         )
+
+    def _cache_gate(self, cache_name: str) -> _CacheGate:
+        gates = self._cache_gates.setdefault(asyncio.get_running_loop(), {})
+        return gates.setdefault(cache_name, _CacheGate())
+
+    async def _refresh_cache(
+        self, spec: LaunchSpec, *, url: str, cache_name: str, image: str, limits: Limits
+    ) -> None:
+        """26: refresh the reference cache in a Job of its own, the only Pod that mounts
+        it writable (#55). It carries no workspace, no identity bundle and no
+        credential, only the cache and the git remote. A refresh that exits non-zero
+        is logged, and the preparer clones from the remote, or from the mirror as it
+        was: a stale or absent cache costs time, never correctness. A refresher whose
+        Pod cannot be confirmed gone fails the prepare instead (`_run_role_job` raises),
+        because that Pod may still hold the cache writable while a preparer reads it."""
+        code = await self._run_role_job(
+            spec,
+            role=k8sspec.ROLE_CACHE_REFRESHER,
+            image=image,
+            script=scripts.cache_refresh_script(url=url, cache_name=cache_name),
+            mounts=[Mount("cache", k8sspec.CACHE_MOUNT)],
+            volumes=[
+                {
+                    "name": "cache",
+                    "persistentVolumeClaim": {"claimName": self.config.cache_claim},
+                }
+            ],
+            limits=limits,
+            timeout=self.config.prepare_timeout_seconds,
+            plan=self._egress_plan(spec, k8sspec.ROLE_CACHE_REFRESHER),
+        )
+        if code != 0:
+            log.warning(
+                "the reference cache refresh failed; the preparer clones without it",
+                extra={
+                    "exit_code": code,
+                    "detail": self.last_error.get(k8sspec.ROLE_CACHE_REFRESHER, ""),
+                },
+            )
 
     def _check_endpoint_ready(self, probe: NamespaceProbe, spec: LaunchSpec) -> None:
         """The operator, 2026-09-23: "a down provider should only block that provider."
@@ -1969,9 +2090,15 @@ class KubernetesProvider:
     def read_credential_files(self, harness: str) -> dict[str, bytes] | None:
         """The adapter's declared auth files the Secret holds, by auth file name. None
         when the Secret does not exist; a declared file it lacks is simply absent."""
+        return self.credential_files_in(harness, self.read_credential_secret(harness))
+
+    def credential_files_in(
+        self, harness: str, body: dict[str, Any] | None
+    ) -> dict[str, bytes] | None:
+        """`read_credential_files` of a Secret body already read, so a caller that needs
+        the body and the files reads the Secret once."""
         adapter = self.harnesses.require(harness)
         credential = adapter.credential_spec()
-        body = self.read_credential_secret(harness)
         if body is None:
             return None
         data = body.get("data") or {}
@@ -2766,6 +2893,7 @@ class KubernetesProvider:
             credential_mounted=credential_mounted,
             endpoint=spec.endpoint,
             endpoint_url=spec.endpoint_url,
+            command_timeout_ms=spec.command_timeout_ms,
         )
 
     # ----- the network policy (26) --------------------------------------
@@ -2789,8 +2917,13 @@ class KubernetesProvider:
                 )
                 if host not in WORKER_DENIED_HOSTS
             )
-        elif role in (k8sspec.ROLE_PREPARER, k8sspec.ROLE_PUBLISHER):
-            # 26: the preparer and the publisher do the git traffic, and nothing else.
+        elif role in (
+            k8sspec.ROLE_PREPARER,
+            k8sspec.ROLE_CACHE_REFRESHER,
+            k8sspec.ROLE_PUBLISHER,
+        ):
+            # 26: the preparer, the cache refresher and the publisher do the git
+            # traffic, and nothing else.
             # GitHub is not reachable from a worker.
             wanted = ("api.github.com", "github.com")
         elif role == k8sspec.ROLE_LOGIN:

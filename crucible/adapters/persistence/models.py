@@ -704,7 +704,7 @@ class BootstrapImportRow(Base):
 
 
 class HarnessImageRow(Base):
-    """Each harness's default worker image and the one it replaced (ADR 0016)."""
+    """Each harness's default worker image and the one it replaced (ADR 0018)."""
 
     __tablename__ = "harness_images"
     harness: Mapped[str] = mapped_column(String(64), primary_key=True)

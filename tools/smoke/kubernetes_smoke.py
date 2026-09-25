@@ -24,6 +24,7 @@ the thing they are smoking runs.
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import http.cookiejar
 import json
@@ -533,7 +534,7 @@ def await_supervisor(base_url: str, token: str) -> None:
 
 def promote_worker_image(base_url: str, token: str) -> dict[str, Any]:
     """25 and 13: the provider reports what the registry holds; promotion is an admin act,
-    and it is per harness (ADR 0016), so it names the script harness."""
+    and it is per harness (ADR 0018), so it names the script harness."""
     deadline = time.monotonic() + 120
     while True:
         listing = request("GET", f"{base_url}/v1/admin/images", token=token)
@@ -598,20 +599,71 @@ def assert_status_page(base_url: str, token: str) -> dict[str, Any]:
     return provider
 
 
+FIRST_RUN_SECRET = "crucible-first-run-admin"
+TOKEN_PATTERN = re.compile(r"\bcru_[A-Z0-9]{26}\.[A-Za-z0-9_-]+\b")
+
+
+def first_run_token() -> str:
+    """The first-run administrator token, from the Secret the migrate Job wrote (ADR
+    0016), after proving the Job's log does not carry it (crucible#122). The token is
+    never printed by this process."""
+    logs = kubectl(["-n", NAMESPACE, "logs", "job/crucible-migrate"], redact=True, check=False)
+    if TOKEN_PATTERN.search(logs):
+        raise SmokeError("the migrate Job's log carries a token (crucible#122)")
+    if FIRST_RUN_SECRET not in logs:
+        raise SmokeError("the migrate Job's log does not say where the first-run token is")
+    encoded = kubectl(
+        [
+            "-n",
+            NAMESPACE,
+            "get",
+            "secret",
+            FIRST_RUN_SECRET,
+            "-o",
+            "jsonpath={.data.token}",
+        ],
+        redact=True,
+    )
+    try:
+        token = base64.b64decode(encoded.strip()).decode("ascii").strip()
+    except ValueError:
+        raise SmokeError(f"the Secret {FIRST_RUN_SECRET} holds no readable token") from None
+    if not TOKEN_PATTERN.fullmatch(token):
+        raise SmokeError(f"the Secret {FIRST_RUN_SECRET} does not hold a Crucible token")
+    log(f"the migrate Job's log has no token; the Secret {FIRST_RUN_SECRET} holds one")
+    return token
+
+
+def await_first_run_secret_gone(timeout: float = 30.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        found = kubectl(
+            [
+                "-n",
+                NAMESPACE,
+                "get",
+                "secret",
+                FIRST_RUN_SECRET,
+                "--ignore-not-found",
+                "-o",
+                "name",
+            ],
+            check=False,
+        )
+        if not found.strip():
+            log(f"the first sign-in removed the Secret {FIRST_RUN_SECRET}")
+            return
+        time.sleep(1)
+    raise SmokeError(f"the Secret {FIRST_RUN_SECRET} is still there after the first sign-in")
+
+
 def walk_status_ui(base_url: str) -> None:
     """The rendered page, not only the document behind it (25, operator rule 7).
 
-    The migration prints a one-time first-run administrator token in a framed block; on
-    a cluster that is exactly the migration Job's log. It is never printed by this
-    process.
+    Signs in with the first-run administrator token from its Secret, which the sign-in
+    then removes (ADR 0016). The token is never printed by this process.
     """
-    logs = kubectl(["-n", NAMESPACE, "logs", "job/crucible-migrate"], redact=True, check=False)
-    match = re.search(r"\bcru_[A-Z0-9]{26}\.[A-Za-z0-9_-]+\b", logs)
-    if match is None:
-        raise SmokeError(
-            "the migration log has no one-time token, so the required first-run UI walk "
-            "cannot authenticate"
-        )
+    token = first_run_token()
     jar = http.cookiejar.CookieJar()
     opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
     with opener.open(f"{base_url}/ui/sign-in", timeout=DEFAULT_TIMEOUT) as response:
@@ -619,9 +671,9 @@ def walk_status_ui(base_url: str) -> None:
     csrf = re.search(r'name="csrf" value="([a-f0-9]+)"', sign_in)
     if csrf is None:
         raise SmokeError("the first-run sign-in page has no pre-authentication CSRF nonce")
-    body = urllib.parse.urlencode(
-        {"csrf": csrf.group(1), "token": match.group(0), "next": "/ui"}
-    ).encode()
+    if FIRST_RUN_SECRET not in sign_in or "logs migrate" in sign_in:
+        raise SmokeError("the sign-in page does not name the first-run Secret")
+    body = urllib.parse.urlencode({"csrf": csrf.group(1), "token": token, "next": "/ui"}).encode()
     post = urllib.request.Request(
         f"{base_url}/ui/sign-in",
         data=body,
@@ -638,6 +690,7 @@ def walk_status_ui(base_url: str) -> None:
     if "kubernetes" not in page:
         raise SmokeError("the rendered status page does not name the kubernetes provider")
     log("the rendered /ui status page names the kubernetes provider")
+    await_first_run_secret_gone()
 
 
 def task_events(base_url: str, token: str, task_id: str) -> str:

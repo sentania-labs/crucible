@@ -15,18 +15,34 @@ registry_ref=""
 cluster_created=0
 registry_started=0
 tag_created=0
+# Set by crucible_kind_start_registry the moment it creates the `kind` network, so cleanup
+# sees it even when the registry's own `docker run` fails right after (77).
+CRUCIBLE_KIND_NETWORK_CREATED=0
 
 cleanup() {
   status=$?
   cleanup_failed=0
-  trap - EXIT HUP INT TERM
+  # A second interrupt during cleanup must not abort it partway: `trap -` would
+  # restore the default action (immediate termination), which is exactly what a
+  # second Ctrl-C during a slow `kind delete cluster` would do (77). Ignoring the
+  # signals here, not resetting them, is what lets cleanup run to completion.
+  trap '' EXIT HUP INT TERM
   if [ "$status" -ne 0 ]; then
     "$root/tools/kind/dump.sh" "$kubeconfig" "$scratch/canary.log" || cleanup_failed=1
   fi
+  # An inspect that errors can mean either "confirmed absent" or "the daemon
+  # can't answer" (for example it died mid-cleanup); those are not the same
+  # thing, and the busybox pull below no longer fails a green run on its own
+  # (77), so it can't be relied on as the daemon-health signal either. Check
+  # `docker info` explicitly whenever an inspect comes back negative, and
+  # only call the resource confirmed gone when the daemon is still reachable.
   if [ "$cluster_created" -eq 1 ]; then
     kind delete cluster --name "$cluster" >/dev/null 2>&1 || :
     if kind get clusters 2>/dev/null | grep -Fxq "$cluster"; then
       echo "e2e-kind cleanup: cluster $cluster remains" >&2
+      cleanup_failed=1
+    elif ! docker info >/dev/null 2>&1; then
+      echo "e2e-kind cleanup: docker daemon unreachable, cannot confirm cluster $cluster removed" >&2
       cleanup_failed=1
     fi
   fi
@@ -35,6 +51,9 @@ cleanup() {
     if docker inspect "$registry" >/dev/null 2>&1; then
       echo "e2e-kind cleanup: registry $registry remains" >&2
       cleanup_failed=1
+    elif ! docker info >/dev/null 2>&1; then
+      echo "e2e-kind cleanup: docker daemon unreachable, cannot confirm registry $registry removed" >&2
+      cleanup_failed=1
     fi
   fi
   if [ "$tag_created" -eq 1 ]; then
@@ -42,14 +61,28 @@ cleanup() {
     if docker image inspect "$registry_ref" >/dev/null 2>&1; then
       echo "e2e-kind cleanup: image tag $registry_ref remains" >&2
       cleanup_failed=1
+    elif ! docker info >/dev/null 2>&1; then
+      echo "e2e-kind cleanup: docker daemon unreachable, cannot confirm image tag $registry_ref removed" >&2
+      cleanup_failed=1
     fi
   fi
-  # The cleanup helper is pulled the same way as the tier's other images (68); if no
-  # source answers, the original reference is tried anyway and its failure is what
-  # `cleanup_failed` catches.
+  if [ "${CRUCIBLE_KIND_NETWORK_CREATED:-0}" -eq 1 ]; then
+    # The name is shared by every kind cluster on the host; `network rm` on one a
+    # concurrent run still holds fails harmlessly (Docker refuses while an endpoint is
+    # attached), so this only ever removes what became ours to remove.
+    docker network rm kind >/dev/null 2>&1 || :
+    if docker network inspect kind >/dev/null 2>&1; then
+      echo "e2e-kind cleanup: network kind remains (a concurrent kind cluster may hold it)" >&2
+    fi
+  fi
+  # The cleanup helper is pulled the same way as the tier's other images (68). If no
+  # source answers, the chmod does not run, which is not itself a leak: the scratch
+  # path's removal is checked on its own right after, so a root-owned file left behind
+  # still fails the run there, and an unreachable registry no longer fails an
+  # otherwise clean one (77).
   busybox=$(crucible_kind_pull "$CRUCIBLE_BUSYBOX_IMAGE" 2>/dev/null) || busybox=$CRUCIBLE_BUSYBOX_IMAGE
   docker run --rm -v "$scratch:/cleanup" "$busybox" \
-    chmod -R a+rwX /cleanup >/dev/null 2>&1 || cleanup_failed=1
+    chmod -R a+rwX /cleanup >/dev/null 2>&1 || :
   rm -rf "$scratch" || cleanup_failed=1
   if [ -e "$scratch" ]; then
     echo "e2e-kind cleanup: scratch path $scratch remains" >&2
@@ -61,6 +94,12 @@ cleanup() {
   exit "$status"
 }
 trap cleanup EXIT HUP INT TERM
+
+# The cleanup test sources this file up to here, with a stubbed docker on PATH, to
+# exercise `cleanup` against fake resource state without a real cluster or registry.
+if [ "${CRUCIBLE_KIND_TEST_HOOK:-0}" = "1" ]; then
+  return 0
+fi
 
 crucible_kind_docker_shim "$scratch"
 

@@ -1,4 +1,4 @@
-# ADR 0016: Each harness has its own default worker image
+# ADR 0018: Each harness has its own default worker image
 
 Status: accepted. The operator's decision of 2026-09-25 (crucible#116), made concrete
 by FDY-0120 on 2026-09-25.
@@ -28,7 +28,7 @@ have a different Image: Hermes 0.5.5, AGY 0.5.6, Claude 0.7.1".
 3. **Every path that picks an image reads the launching harness's own row**: a launch
    (routing's image for the selected harness), the credential probe, the harness test,
    and a login. Another harness's default never answers for this one.
-4. **Existing state carries forward** (migration 0021): each harness's current default,
+4. **Existing state carries forward** (migration 0023): each harness's current default,
    the most recent `default` promotion that carried it and so what a launch resolved to,
    becomes its own default; the most recent `retained` one that carried it becomes its
    previous image. `image_promotions` is dropped; the downgrade folds the rows back into

@@ -247,7 +247,7 @@ def promote_for_test(
     by: str = "tests",
     reason: str = "",
 ) -> None:
-    """Make one image the default of every harness named (ADR 0016: one row each)."""
+    """Make one image the default of every harness named (ADR 0018: one row each)."""
     from crucible.domain.entities import HarnessImage  # noqa: PLC0415
 
     for harness, version in harnesses.items():

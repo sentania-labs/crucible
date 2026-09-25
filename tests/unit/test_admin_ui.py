@@ -24,12 +24,12 @@ from crucible.adapters.ui.router import (
     _document_section,
     _localize,
     _panel,
-    _readiness_gaps,
     _safe_value,
     templates,
 )
 from crucible.application.admin import audit as audit_service
 from crucible.application.admin import bootstrap as bootstrap_service
+from crucible.application.admin import credentials as credentials_service
 from crucible.application.admin import github as github_service
 from crucible.application.admin import providers as providers_service
 from crucible.application.admin import routing as routing_service
@@ -434,10 +434,70 @@ def _status(**overrides: Any) -> SupervisorStatus:
     return SupervisorStatus(**values)
 
 
-def test_healthy_supervisor_adds_no_readiness_gap() -> None:
-    document = {"supervisor": _supervisor_document(_lease(), _status()), "harnesses": []}
+READINESS = status_service.readiness
 
-    assert _readiness_gaps(document, repository_registered=True) == []
+
+def _readiness(
+    document: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    repositories: list[Any] | None = None,
+    credential_state: str = "validated",
+    enabled_models: set[str] | None = None,
+    endpoint: str | None = "https://llm.example.invalid/v1",
+) -> dict[str, Any]:
+    """crucible#123's readiness over a status document, with the credential, routing
+    and gateway reads it makes replaced by fixed answers."""
+    monkeypatch.setattr(
+        credentials_service,
+        "state_view",
+        lambda _ctx, _uow, _name, _secret=None: {
+            "state": credential_state,
+            "last_launch_outcome": None,
+        },
+    )
+    monkeypatch.setattr(status_service, "_enabled_models", lambda _uow: enabled_models or set())
+    monkeypatch.setattr(status_service, "gateway_url", lambda _uow: (endpoint, "routing"))
+    ctx = SimpleNamespace(
+        harnesses=SimpleNamespace(
+            get=lambda name: SimpleNamespace(test_fixture=name == "script-harness")
+        )
+    )
+    uow = SimpleNamespace(
+        repositories=SimpleNamespace(list_all=lambda: repositories if repositories else [])
+    )
+    return READINESS(cast(Any, ctx), cast(Any, uow), document)
+
+
+def _harness(name: str, **overrides: Any) -> dict[str, Any]:
+    item: dict[str, Any] = {
+        "name": name,
+        "enabled": True,
+        "enabled_by_configuration": True,
+        "enabled_by_administrator": True,
+        "reason": "",
+        "credential": {"state": "validated"},
+        "images": [{"promotion_state": "default"}],
+        "default_image": {"reference": "w:1", "digest": "sha256:w", "version": "1"},
+    }
+    item.update(overrides)
+    return item
+
+
+def test_healthy_supervisor_adds_no_readiness_step(monkeypatch: pytest.MonkeyPatch) -> None:
+    document = {
+        "supervisor": _supervisor_document(_lease(), _status()),
+        "harnesses": [_harness("hermes")],
+        "providers": [],
+    }
+
+    readiness = _readiness(
+        document, monkeypatch, repositories=[object()], enabled_models={"hermes"}
+    )
+
+    assert readiness["steps"] == []
+    assert readiness["ready"] is True
+    assert readiness["ready_harnesses"] == ["hermes"]
 
 
 @pytest.mark.parametrize(
@@ -460,18 +520,95 @@ def test_healthy_supervisor_adds_no_readiness_gap() -> None:
         ),
     ],
 )
-def test_each_unhealthy_supervisor_shape_adds_one_cause_specific_gap(
-    lease: Lease | None, supervisor_status: SupervisorStatus, cause: str
+def test_each_unhealthy_supervisor_shape_adds_one_cause_specific_step(
+    lease: Lease | None,
+    supervisor_status: SupervisorStatus,
+    cause: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     document = {
         "supervisor": _supervisor_document(lease, supervisor_status),
-        "harnesses": [],
+        "harnesses": [_harness("hermes")],
+        "providers": [],
     }
 
-    gaps = _readiness_gaps(document, repository_registered=True)
+    readiness = _readiness(
+        document, monkeypatch, repositories=[object()], enabled_models={"hermes"}
+    )
 
-    assert len(gaps) == 1
-    assert cause in gaps[0][0]
+    assert [step["code"] for step in readiness["steps"]] == ["supervisor"]
+    assert cause in readiness["steps"][0]["text"]
+    assert readiness["ready"] is False
+
+
+def test_hermes_steps_name_the_real_blocker_and_the_page_that_fixes_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """crucible#123: the lab's state on 2026-09-25. A key is set but was never verified,
+    the gateway URL is not set, no local model is enabled; the script harness is a test
+    fixture and never a to-do."""
+    document = {
+        "supervisor": _supervisor_document(_lease(), _status()),
+        "harnesses": [
+            _harness("hermes"),
+            _harness(
+                "script-harness", images=[{"promotion_state": "candidate"}], default_image=None
+            ),
+            _harness("codex", enabled_by_configuration=False, reason="unverified"),
+        ],
+        "providers": [],
+    }
+
+    readiness = _readiness(
+        document, monkeypatch, credential_state="configured", endpoint=None, enabled_models=set()
+    )
+
+    names = [h["name"] for h in readiness["harnesses"]]
+    assert "script-harness" not in names
+    codex = next(h for h in readiness["harnesses"] if h["name"] == "codex")
+    assert codex["state"] == "off" and codex["steps"] == []
+    hermes = next(h for h in readiness["harnesses"] if h["name"] == "hermes")
+    codes = [step["code"] for step in hermes["steps"]]
+    assert codes == ["endpoint_not_configured", "credential_not_verified", "no_enabled_model"]
+    assert {step["fix"] for step in hermes["steps"]} == {"/ui/gateway"}
+    assert "The gateway URL for hermes is not set" in hermes["steps"][0]["text"]
+    assert [step["code"] for step in readiness["steps"]] == ["no_repository", "no_ready_harness"]
+    assert all("script-harness" not in step["text"] for step in readiness["steps"])
+
+
+def test_a_missing_credential_and_image_are_named_per_harness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    document = {
+        "supervisor": _supervisor_document(_lease(), _status()),
+        "harnesses": [
+            _harness(
+                "claude_code",
+                enabled_by_administrator=False,
+                images=[{"promotion_state": "candidate"}],
+                default_image=None,
+            )
+        ],
+        "providers": [
+            {"checks": {"local_endpoint_reachable": False, "local_endpoint_detail": "refused"}}
+        ],
+    }
+
+    readiness = _readiness(document, monkeypatch, credential_state="absent")
+
+    steps = readiness["harnesses"][0]["steps"]
+    assert [step["code"] for step in steps] == [
+        "disabled",
+        "credential_missing",
+        "no_enabled_model",
+        "no_promoted_image",
+    ]
+    assert [step["fix"] for step in steps] == [
+        "/ui/harnesses",
+        "/ui/credentials",
+        "/ui/routing",
+        "/ui/images",
+    ]
 
 
 class _StrictStatusDict(dict[str, Any]):
@@ -507,40 +644,44 @@ async def test_gap_logic_reads_only_keys_from_real_status_document(
         return {}
 
     harnesses = [
-        {
-            "name": "disabled",
-            "enabled": False,
-            "enabled_by_configuration": True,
-            "credential": {"state": "absent"},
-            "images": [],
-            "default_image": None,
-        },
-        {
-            "name": "unpromoted",
-            "enabled": True,
-            "enabled_by_configuration": True,
-            "credential": {"state": "valid"},
-            "images": [{"promotion_state": "candidate"}],
-            "default_image": None,
-        },
+        _harness("disabled", enabled=False, enabled_by_administrator=False),
+        _harness("unpromoted", images=[{"promotion_state": "candidate"}], default_image=None),
     ]
     supervisor = _supervisor_document(None, _status())
     status_module = cast(Any, status_service)
     monkeypatch.setattr(status_service, "list_images", list_images)
-    monkeypatch.setattr(status_service, "list_harnesses", lambda _ctx, _uow, _images: harnesses)
+
+    async def read_harnesses(_ctx: Any, _uow: Any, _images: Any) -> tuple[Any, dict[str, Any]]:
+        return harnesses, {}
+
+    async def read_stored(_ctx: Any) -> tuple[None, None]:
+        return None, None
+
+    monkeypatch.setattr(status_service, "read_harnesses", read_harnesses)
+    monkeypatch.setattr(status_module.github, "read_stored", read_stored)
     monkeypatch.setattr(status_service, "providers_status", provider_status)
     monkeypatch.setattr(
         status_service,
         "supervisor_view",
         lambda *_args: SimpleNamespace(model_dump=lambda **_kwargs: supervisor),
     )
-    monkeypatch.setattr(status_module.github, "status", lambda _ctx, _uow: {})
+    monkeypatch.setattr(status_module.github, "status", lambda _ctx, _uow, **_kwargs: {})
     monkeypatch.setattr(status_service, "workers", lambda _uow: [])
     monkeypatch.setattr(status_service, "tasks", lambda _uow: {})
     monkeypatch.setattr(status_service, "wakes", lambda _uow: {})
     monkeypatch.setattr(status_service, "retention", lambda _uow: {})
     monkeypatch.setattr(status_module.bootstrap, "status_part", lambda _uow: {})
     monkeypatch.setattr(status_module.audit, "tail", lambda _uow, **_kwargs: {"next_cursor": None})
+    computed: dict[str, Any] = {}
+
+    def readiness(
+        ctx: Any, uow: Any, document: dict[str, Any], secrets: Any = None
+    ) -> dict[str, Any]:
+        result = _readiness(_strict_status(document), monkeypatch)
+        computed["readiness"] = result
+        return result
+
+    monkeypatch.setattr(status_service, "readiness", readiness)
     document = await status_service.status(
         cast(
             Any,
@@ -551,9 +692,20 @@ async def test_gap_logic_reads_only_keys_from_real_status_document(
         cast(Any, SimpleNamespace()),
     )
 
-    gaps = _readiness_gaps(_strict_status(document), repository_registered=False)
-
-    assert len(gaps) == 5
+    steps = [
+        step["code"]
+        for part in (document["readiness"], *document["readiness"]["harnesses"])
+        for step in part["steps"]
+    ]
+    assert steps == [
+        "supervisor",
+        "no_repository",
+        "no_ready_harness",
+        "disabled",
+        "no_enabled_model",
+        "no_enabled_model",
+        "no_promoted_image",
+    ]
 
 
 def test_all_fifteen_sections_preserve_real_service_output_shapes() -> None:
@@ -575,6 +727,7 @@ def test_all_fifteen_sections_preserve_real_service_output_shapes() -> None:
         wakes=SimpleNamespace(
             list_for_principal=lambda *_args, **_kwargs: [wake],
             count_unacked=lambda: 1,
+            count_unacked_for_principal=lambda _principal_id: 1,
         ),
     )
     retention_action = RetentionAction(

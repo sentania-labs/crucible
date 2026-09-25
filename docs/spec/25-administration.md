@@ -67,10 +67,11 @@ resource.
 
 | Part | Fields |
 |---|---|
-| `harnesses[]` | name, both enablement gates with the reason each carries, adapter supported range, its default image and previous image (ADR 0016), images known (reference, harness version, digest, and whether it is this harness's default or previous image), credential status (below), concurrency limit and current use, last launch outcome (a probe records itself there as `probe:<exit class>`, or `probe:inconclusive:<cause>` when it decided nothing) |
+| `harnesses[]` | name, both enablement gates with the reason each carries, adapter supported range, its default image and previous image (ADR 0018), images known (reference, harness version, digest, and whether it is this harness's default or previous image), credential status (below), concurrency limit and current use, last launch outcome (a probe records itself there as `probe:<exit class>`, or `probe:inconclusive:<cause>` when it decided nothing) |
 | `credentials[harness]` | `state`: `absent`, `configured` (files present, shape unchecked), `invalid` (the shape check failed, or a probe observed the provider refusing the credential; never a probe that merely did not finish), `validated` (a conclusive probe ran the credential); `mount_mode` (`ro`, `rw-narrow`); `last_validated_at`; `last_auth_failure_at` and its exit class (set only by those two conclusive outcomes); `refresh_verified` (bool, from the compatibility test); `source_fingerprint` (sha256 of the file **names and sizes**, never contents); `session_compatibility`: `unverified`, `verified`, `failed` |
 | `providers[]` | name, capabilities, `health`: `ok`, `degraded`, `unavailable` with detail (daemon reachable, proxy reachable, network present, disk headroom) |
-| `github` | App id and slug (public), key present (bool), key fingerprint (sha256 of the public key), installations visible, per registered repository: installation covers it, last successful token mint, last API failure, webhook enabled |
+| `github` | App id (public), whether a credential is configured, key present (bool), key fingerprint (sha256 of the public key), where it is kept (`stored_in`: the Secret or directory, whether it exists and whether the service owns it), per registered repository: installation covers it, last check, webhook enabled. The App's slug, install link and installations are read live by the picker, not stored |
+| `readiness` | crucible#123: `ready`, `ready_harnesses`, the global `steps` (supervisor, no repository, no harness ready), and per real harness `ready`, `off` (configuration gate shut) or `not_ready` with its `steps`, each `{code, text, fix}` naming the page that fixes it. Read from the same state the other pages show (on Kubernetes the credential is the harness Secret's state). Test fixtures (the script harness) are left out |
 | `supervisor` | as `GET /supervisor` (lease, last tick, last error) |
 | `workers` | active attempts with task, harness, model, image digest, started_at, last heartbeat |
 | `tasks` | counts by state; lists for `blocked`, `pre_pr_gates_failed`, `publish_failed`, `ci_certification_failed`, `head_diverged` |
@@ -84,19 +85,24 @@ resource.
 |---|---|---|---|
 | list harnesses | `GET /admin/harnesses` | `harnesses list` | |
 | disable or enable a harness | `POST /admin/harnesses/{name}/disable` and `/enable` | `harnesses disable|enable` | flips the administrator's flag only; configuration retained; running attempts finish; new launches refused with a wake |
-| test a harness | `POST /admin/harnesses/{name}/test` | `harnesses test NAME` | crucible#118: the path a real task takes, in order, stopping at the first failure: the harness is enabled; it has its own worker image at a supported version (ADR 0016); its credential is stored; the routing policy in force names a model for it (a local model brings its endpoint URL); a worker runs that image with the credential under the worker's egress, the bounded probe below with every harness in a worker, Hermes included; and one minimal model call answers. Each step is reported pass, fail or not run, in plain words, with the failing step's cause and never the run's output. The last result is kept on the harness (`last_test` in `GET /admin/harnesses`) and shown on the Harnesses page. A check, not a change: no reason is asked for. The probe it runs is recorded as a probe is. The script harness (a test fixture, 18) routed to a local endpoint makes that one call itself, which is how the kind tier proves the path against a stub model server |
+| test a harness | `POST /admin/harnesses/{name}/test` | `harnesses test NAME` | crucible#118: the path a real task takes, in order, stopping at the first failure: the harness is enabled; it has its own worker image at a supported version (ADR 0018); its credential is stored; the routing policy in force names a model for it (a local model brings its endpoint URL); a worker runs that image with the credential under the worker's egress, the bounded probe below with every harness in a worker, Hermes included; and one minimal model call answers. Each step is reported pass, fail or not run, in plain words, with the failing step's cause and never the run's output. The last result is kept on the harness (`last_test` in `GET /admin/harnesses`) and shown on the Harnesses page. A check, not a change: no reason is asked for. The probe it runs is recorded as a probe is. The script harness (a test fixture, 18) routed to a local endpoint makes that one call itself, which is how the kind tier proves the path against a stub model server |
 | validate a credential | `POST /admin/credentials/{harness}/validate` | `credentials validate --harness` | shape check of the named auth files, then the bounded probe (below); returns state, timestamps, and the probe's `conclusive` and `cause`, never a verdict the run did not support |
-| set the Hermes API key | `POST /admin/credentials/hermes/set` | `credentials set --harness hermes` | reads the value from a password field (the Credentials and Routing pages) or stdin, atomically writes `api-key` mode 0600 (on Kubernetes, into the `crucible-harness-hermes` Secret the service owns, creating it when absent; ADR 0015), returns no value, and audits only `credential set`; immediately probes readiness without auth and models with auth. Every view reports only `key_set` |
+| set the Hermes API key | `POST /admin/credentials/hermes/set` | `credentials set --harness hermes` | reads the value from a password field (the Local gateway page, with the URL) or stdin, atomically writes `api-key` mode 0600 (on Kubernetes, into the `crucible-harness-hermes` Secret the service owns, creating it when absent; ADR 0015), returns no value, and audits only `credential set`; immediately probes readiness without auth and models with auth. Every view reports only `key_set` |
 | bounded auth probe | `POST /admin/credentials/{harness}/probe` | `credentials probe --harness` | launches the promoted worker image with the credential mounted, runs a one-line prompt with a 120 s timeout, records exit class, conclusiveness and cause, harness version, image digest, whether auth files changed (by hash), mount mode and duration, removes everything; never shows output beyond the exit class |
 | onboard a credential | `POST /admin/credentials/{harness}/login` (starts) | `credentials login --harness` | interactive flow below; the service runs the login in the promoted worker image (a container on Docker, a Job on Kubernetes) and the CLI retains its local-host mode. Refused while an attempt of that harness holds its credential (12) |
 | rotate or replace a credential source | `POST /admin/credentials/{harness}/rotate` | `credentials rotate --harness` | the operator's prepared directory is shape-checked, copied in, and left exactly as it was found; the swap is two renames; the previous directory is retained for `credential_retention_hours` then shredded; a failed swap rolls back; every step an event. Directory-held credentials only: where the credential is a Secret (Kubernetes, ADR 0015) it refuses and names the Secret, and a login with `replace` is the replacement |
 | remove a credential | `POST /admin/credentials/{harness}/remove` | `credentials remove --harness` | harness becomes `absent`; the directory is shredded at once rather than retained, because the operator said remove, and the harness is disabled with that reason. Directory-held credentials only, as rotate |
-| list images, promote, roll back | `GET /admin/images`, `POST /admin/images/{digest}/promote`, `POST /admin/images/rollback` | `images list`, `images promote DIGEST --harness`, `images rollback --harness` | 13, ADR 0016: promotion is per harness (the operator's decision of 2026-09-25). The list adds `defaults`, one row per harness with its current image, its previous image, and the images it may be promoted to: those that carry it at a version inside its adapter's range, release versions and `latest`, never a `ci-*` proof tag. A promotion names the harness and moves only that harness, refused when the image does not carry it inside the range; the image it replaces becomes the harness's previous image. Rollback swaps a harness's default and previous image and moves no other harness. Launches, the probe, the harness test and a login run the launching harness's own default |
+| list images, promote, roll back | `GET /admin/images`, `POST /admin/images/{digest}/promote`, `POST /admin/images/rollback` | `images list`, `images promote DIGEST --harness`, `images rollback --harness` | 13, ADR 0018: promotion is per harness (the operator's decision of 2026-09-25). The list adds `defaults`, one row per harness with its current image, its previous image, and the images it may be promoted to: those that carry it at a version inside its adapter's range, release versions and `latest`, never a `ci-*` proof tag. A promotion names the harness and moves only that harness, refused when the image does not carry it inside the range; the image it replaces becomes the harness's previous image. Rollback swaps a harness's default and previous image and moves no other harness. Launches, the probe, the harness test and a login run the launching harness's own default |
 | provider health | `GET /admin/providers` | `providers status` | |
 | GitHub health | `GET /admin/github`, `POST /admin/github/check` | `github status|check` | check mints a token per registered repository and discards it |
+| connect the GitHub App | `POST /admin/github/app` | `github connect --app-id --private-key-file` | ADR 0017: an existing App's id and one of its private keys, checked with `GET /app` before anything is stored; a refusal stores nothing. The service then owns the credential (the `crucible-github-app` Secret on Kubernetes, the files beside `github.app.private_key_path` with Docker). Returns the App's install link, never the key; audited as `github_app_connected` with the key's public fingerprint |
+| pick repositories | `GET /admin/github/installations`, `POST /admin/github/repositories` | `github installations`, `github add-repository` | crucible#120: each installation's repositories grouped by account, each marked with the name it is registered under; a pick registers it with the installation id, the clone URL and the default branch GitHub reports, refusing a repository the installation does not cover, one that is archived, or one that is private (listed and marked "private: not supported yet", since the preparation step clones without a credential). The free-text `register a repository` stays for anything the picker cannot show |
 | register a repository | `PUT /admin/repositories/{name}` | `repositories register` | 04; an administrative mutation like any other, guarded and audited here, with the previous registration as the before summary. 04's own `PUT /repositories/{name}` is a different, non-administrative surface |
 | audit | `GET /admin/audit?cursor=` | `audit tail` | admin events only; the cursor is the scan position and always moves forward, so a long stretch of non-administrative events cannot strand the pages behind it |
-| show or update the local gateway | `GET`, `POST /admin/routing/local-endpoint` | `routing local-endpoint`, `routing set-local-endpoint` | edits endpoint URL, local model enablement, thinking preference, and pool concurrency by creating new immutable routing and delivery policy versions; atomically regenerates and reloads the proxy configuration |
+| set and test the local gateway | `GET`, `POST /admin/gateway`, `POST /admin/gateway/test` | `gateway show`, `gateway set --endpoint-url [--key]`, `gateway test` | crucible#119: the gateway URL and the Hermes key in one step, then the Hermes probe (readiness, then `/models` with the key), reported in plain words naming the URL and the model count (`Gateway <url> reachable, key accepted, N models.`). A failed test still saves. The URL is the local model entries' `endpoint_url` once one exists and the `local.gateway` provider setting until then; a save writes both |
+| pick the gateway's models | `GET`, `POST /admin/gateway/models` | `gateway models`, `gateway pick --enable --disable --thinking --capability` | crucible#121: the models the key can see beside the local entries in force, one row each; a save asks the gateway again and creates or updates the local model entries (enabled, thinking, capability) in new routing and delivery policy versions. A model the gateway does not offer cannot be enabled (refused by name); an enabled entry the gateway no longer offers is disabled with that reason, not removed |
+| show or update the local endpoint entries | `GET`, `POST /admin/routing/local-endpoint` | `routing local-endpoint`, `routing set-local-endpoint` | edits the endpoint URL, enablement, thinking preference, and pool concurrency of local model entries that already exist, by creating new immutable routing and delivery policy versions; atomically regenerates and reloads the proxy configuration. The Local gateway page is the UI for it |
+| show or update the per-command timeout | `GET`, `POST /admin/limits/command-timeout` | `limits command-timeout`, `limits set-command-timeout` | 05b `limits.command_timeout_ms` of the policy in force: min, max and default in milliseconds. A save writes a new policy version with only that limit changed; a bound left out keeps its value, and one that is not a JSON integer, or bounds out of order, are refused. Tasks whose contracts name the new version launch with it (issue 128) |
 | show or update the Kubernetes egress selectors | `GET`, `POST /admin/kubernetes/egress` | `kubernetes egress`, `kubernetes set-egress` | 26: the `kubernetes.egress` setting, the cluster resolver's and an in-cluster local endpoint's namespace, pod labels and port. The settings file seeds it and a save wins over the file; the response says which (`source`). Refused naming the field when a selector is empty, malformed, or names the workers or Crucible namespace. A save states both halves (`dns` and `local_endpoint`); a missing one is refused rather than read as off. The supervisor reads a save back within 15 seconds without a restart, and the readiness canary runs again before a launch uses it (crucible#91) |
 
 Every mutation records the principal and is refused when the supervisor
@@ -169,8 +175,11 @@ exist. The 120 s bound stands; conclusiveness is what makes it safe.
 
 Hermes uses the same result model with a bounded HTTP probe rather than a model turn.
 It first calls `/health/readiness` without a bearer so endpoint reachability is distinct
-from authentication, then calls the configured `/v1/models` with the saved bearer. No
-response, log line, or event includes the bearer. The key-paste transaction emits only
+from authentication, then calls the configured `/v1/models` with the saved bearer. Its
+detail is a plain sentence that names the URL it used and what it proved, for example
+`Gateway https://llm.example/v1 reachable, key accepted, 3 models.`, and an unset URL is
+`endpoint_not_configured`, never a pass (crucible#119). No response, log line, or event
+includes the bearer. The key-paste transaction emits only
 the `credential_set` event even though it also updates the sanitized credential state.
 
 ## Harness enablement: two gates
@@ -327,6 +336,12 @@ any disable. Shredding is complete or it says so (12).
 
 ## Administrative interface
 
+The Status page's "Before a task can run" list is the status document's
+`readiness` part (crucible#123), so it can never disagree with the pages it
+links to. Where a field refers to something the system knows or can discover
+(the gateway's models, the App's installations and repositories), the page
+offers the valid values rather than a free-text field (crucible#121).
+
 The `/ui` interface consumes, without any other data source: harness status;
 credential onboarding and validation status (including an in-progress
 login's device URL); worker-image versions and promotion state; provider
@@ -341,11 +356,21 @@ storage, startup timing, and secret-bearing paths at process start. Runtime
 policy and state remain editable through the application services.
 
 A fresh migrated database with no administrator receives one
-`first-run-admin` principal. The migration process prints its token once in a
-clearly framed block on stderr (stdout carries the envelope alone, so a caller
-parsing it never holds the token). Only the salted token hash is stored. The sign-in page
-directs the operator to `docker compose logs migrate`; a later migration run
-finds the principal and prints no token.
+`first-run-admin` principal. Its token never reaches stdout, stderr or any
+log, because a log stream is shipped and retained by whatever collects it
+(crucible#122, ADR 0016). The migration writes it, before it commits the
+principal, to one private place: on Kubernetes the Secret
+`crucible-first-run-admin` (key `token`) in the service namespace, which only
+the migrate Job's account may create and only the api's account may delete;
+on Docker the file `first-run-admin-token`, mode 0600, in the credential
+root. Its stderr says only where the token is. A token it cannot write is
+never minted, and with neither place configured it mints nothing and says how
+to create an administrator with `crucible admin --reason ... token create`. Only the salted
+token hash is stored. The sign-in page names the place for the running
+deployment. The api removes the Secret or file when the first-run principal
+first signs in at `/ui`, or when it is revoked. Principal names starting
+`first-run-admin` are reserved for the migration, so `token create` refuses
+them. A later migration run finds an active administrator and does nothing.
 
 ## What Foundry may do
 
@@ -375,9 +400,15 @@ harness, model, image digest, start time and last heartbeat; task counts by
 state together with the id, external id and update time of every task in
 `blocked`, `pre_pr_gates_failed`, `publish_failed`,
 `ci_certification_failed` and `head_diverged`; and pending wakes as a count
-per principal with the oldest pending timestamp and the total unacked. That
-is what an orchestrator needs to say which of its tasks is stuck and why,
-and it is its own work: the ids, models and image digests are of tasks it
-submitted and attempts Crucible ran for them. Nothing in the response is a
+per principal with the oldest pending timestamp and the total unacked. For
+an orchestrator principal these three parts are filtered to its own work
+(crucible#40): the active attempts and the task counts and lists cover only
+tasks it submitted, and `wakes` counts only the wakes addressed to it, so
+`unacked` is its own total. One orchestrator cannot read another's task ids,
+external ids or wake counts here. An operator principal is exempt, as it is
+from task ownership (04), and sees every principal's. The `harnesses`,
+`providers` and `github` parts describe the service rather than any one
+principal's work and are the same for every caller. That is what an
+orchestrator needs to say which of its tasks is stuck and why. Nothing in the response is a
 credential, a token, a key, a path, or a file name, and the view is
 read-only.

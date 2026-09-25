@@ -68,6 +68,9 @@ def _probe_launch(ctx: LaunchContext) -> AdapterLaunch:
 class ScriptHarnessAdapter:
     name = NAME
     supported_versions = VersionRange("1.0.0", "2.0.0")
+    # The e2e tiers' harness, never a prerequisite for real work: the Status page's
+    # readiness list leaves it out (crucible#123).
+    test_fixture = True
 
     def quota_reset_at(self, stdout_tail: str, stderr_tail: str) -> datetime | None:
         return base.quota_reset_at(stdout_tail, stderr_tail, quota=QUOTA_PATTERNS)

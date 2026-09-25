@@ -335,3 +335,51 @@ def correction_document(
     }
     document.update(overrides)
     return document
+
+
+def put_seeded_policy_in_force(ctx: AppContext) -> None:
+    """Policies and routing policies are not truncated between tests, so the version in
+    force is whatever the last test left, and some tests write versions directly, past
+    validation. A test that writes routing versions of its own first puts in force a copy
+    of the newest `default-software` whose documents validate and whose routing policy
+    has the seeded shape of a fresh deployment: a Hermes local entry and no gateway URL
+    on any local entry."""
+    import copy  # noqa: PLC0415
+
+    from crucible.application.policies import put_policy  # noqa: PLC0415
+    from crucible.contracts.policy import parse_policy, parse_routing_policy  # noqa: PLC0415
+    from crucible.domain.entities import Principal  # noqa: PLC0415
+
+    def fresh(policy: Any, uow: Any) -> bool:
+        ref = (policy.document.get("routing") or {}).get("policy") or {}
+        routing = uow.routing_policies.get(str(ref.get("name", "")), int(ref.get("version", 0)))
+        if policy.retired_at is not None or routing is None or routing.retired_at is not None:
+            return False
+        try:
+            parse_policy(policy.document)
+            parse_routing_policy(routing.document)
+        except ValueError:
+            return False
+        local = [m for m in routing.document["models"] if m.get("endpoint") == "local"]
+        return any(m.get("harness") == "hermes" for m in local) and not any(
+            m.get("endpoint_url") for m in local
+        )
+
+    with ctx.uow_factory() as uow:
+        versions = sorted(uow.policies.list_versions("default-software"), key=lambda p: p.version)
+        chosen = next(p for p in reversed(versions) if fresh(p, uow))
+        version = versions[-1].version + 1
+        document = copy.deepcopy(chosen.document)
+        document["version"] = version
+        put_policy(
+            uow,
+            ctx.clock,
+            principal=Principal(
+                id="tests", name="tests", role=Role.ADMIN, created_at=ctx.clock.now()
+            ),
+            name="default-software",
+            version=version,
+            document=document,
+            reason="tests: a fresh deployment's policy in force",
+        )
+        uow.commit()

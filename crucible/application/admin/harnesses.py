@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
+from crucible.application.admin import credentials
 from crucible.application.admin.context import (
     AdminContext,
     guard_mutation,
@@ -44,11 +46,26 @@ def _concurrency(uow: UnitOfWork) -> dict[str, int]:
     return counts
 
 
-def list_harnesses(
+async def read_harnesses(
     ctx: AdminContext, uow: UnitOfWork, images: list[ImageInfo]
+) -> tuple[list[dict[str, Any]], dict[str, credentials.SecretRead]]:
+    """`list_harnesses` for an async handler: the harness Secrets are read first, once
+    each, on worker threads with a bounded wait, so a slow API server never holds the
+    event loop. The reads are returned too, for the rest of the same request."""
+    secrets = await credentials.read_secrets(ctx, ctx.harnesses.names())
+    return list_harnesses(ctx, uow, images, secrets=secrets), secrets
+
+
+def list_harnesses(
+    ctx: AdminContext,
+    uow: UnitOfWork,
+    images: list[ImageInfo],
+    *,
+    secrets: Mapping[str, credentials.SecretRead] | None = None,
 ) -> list[dict[str, Any]]:
     """25 status `harnesses[]`: the C5a view plus concurrency in use and the images
-    known for each harness."""
+    known for each harness. `secrets` are the harness Secrets already read; without
+    them each is read here, blocking, which only the CLI's local mode does."""
     views = harness_list(
         uow,
         ctx.harnesses,
@@ -59,8 +76,17 @@ def list_harnesses(
     in_use = _concurrency(uow)
     defaults = {d.harness: d for d in uow.harness_images.list_all()}
     out: list[dict[str, Any]] = []
+    # On Kubernetes the credential is the harness Secret, which the directory-based view
+    # cannot see; read the state the Credentials page reads, so no two pages disagree
+    # about the same credential (crucible#123).
+    secret_held = credentials.secret_store(ctx) is not None
     for view in views.items:
         entry = view.model_dump(mode="json")
+        if secret_held and entry["credential"].get("state") != "not_required":
+            held = credentials.state_view(ctx, uow, view.name, (secrets or {}).get(view.name))
+            for key in ("state", "mount_mode", "source_fingerprint", "files", "detail", "source"):
+                if key in held:
+                    entry["credential"][key] = held[key]
         entry["concurrency_in_use"] = in_use.get(view.name, 0)
         default = defaults.get(view.name)
         entry["images"] = [
@@ -68,7 +94,7 @@ def list_harnesses(
                 "reference": i.reference,
                 "harness_version": i.version_of(view.name),
                 "digest": i.digest,
-                # Relative to this harness: promotion is per harness (ADR 0016).
+                # Relative to this harness: promotion is per harness (ADR 0018).
                 "promotion_state": (
                     "default"
                     if default is not None and default.digest == i.digest

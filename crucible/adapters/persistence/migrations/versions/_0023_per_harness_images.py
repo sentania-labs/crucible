@@ -1,4 +1,4 @@
-"""crucible#116: promotion is per harness, the operator's decision of 2026-09-25 (ADR 0016).
+"""crucible#116: promotion is per harness, the operator's decision of 2026-09-25 (ADR 0018).
 
 `image_promotions` recorded one state per image (`default`, `retained`), so promoting an
 image switched every harness it carried (C11). `harness_images` records one row per
@@ -11,8 +11,8 @@ default, and the most recent other row that carries it, `default` or `retained`,
 its previous image.
 The downgrade folds the rows back into one row per image.
 
-Revision ID: 0021_per_harness_images
-Revises: 0020_provider_settings
+Revision ID: 0023_per_harness_images
+Revises: 0022_first_run_setup
 """
 
 from __future__ import annotations
@@ -24,8 +24,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects.postgresql import JSONB
 
-revision = "0021_per_harness_images"
-down_revision = "0020_provider_settings"
+revision = "0023_per_harness_images"
+down_revision = "0022_first_run_setup"
 branch_labels = None
 depends_on = None
 

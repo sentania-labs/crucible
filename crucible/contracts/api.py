@@ -260,7 +260,7 @@ class HarnessView(Response):
     capabilities: dict[str, Any]
     credential: HarnessCredentialView
     # The harness's own default worker image and the one a rollback returns to (13, ADR
-    # 0016): reference, digest, and the version of this harness the image pins.
+    # 0018): reference, digest, and the version of this harness the image pins.
     default_image: dict[str, str] | None = None
     previous_image: dict[str, str] | None = None
     # The last harness test (crucible#118): pass or fail, and each step in plain words.
@@ -273,7 +273,7 @@ class HarnessList(Response):
 
 class ImageView(Response):
     """13: a worker image the provider can see. `harnesses` is every harness the image
-    carries, name to pinned version. Promotion is per harness (ADR 0016):
+    carries, name to pinned version. Promotion is per harness (ADR 0018):
     `supported_for` names the harnesses whose version is inside the adapter's tested
     range, which is what promoting the image for that harness requires; `default_for`
     and `previous_for` name the harnesses it is the default, or the rollback image, of.

@@ -27,6 +27,7 @@ from crucible.application.routing import (
 from crucible.application.transitions import record_event
 from crucible.contracts.common import to_document
 from crucible.contracts.task_contract import TaskContractV1, contract_sha256
+from crucible.domain.command_timeout import policy_bounds
 from crucible.domain.entities import Event, Policy, Principal, Repository, Role, Task, TaskContract
 from crucible.domain.events import EventKind
 from crucible.domain.exit_class import ExitClass
@@ -179,6 +180,16 @@ def _check_against_registry(
                 f"outside the policy bounds {t_min}..{t_max}",
             )
         )
+    command_timeout = contract.execution_request.command_timeout_ms
+    if command_timeout is not None:
+        bounds = policy_bounds(doc)
+        if not bounds["min"] <= command_timeout <= bounds["max"]:
+            problems.append(
+                _problem(
+                    "execution_request.command_timeout_ms",
+                    f"outside the policy bounds {bounds['min']}..{bounds['max']}",
+                )
+            )
     eligible = set(doc.get("retry", {}).get("eligible_classes", []))
     for cls in contract.lifecycle.retry_on:
         if cls.value not in eligible:

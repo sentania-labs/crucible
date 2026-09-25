@@ -125,9 +125,19 @@ services:
     environment:
       CRUCIBLE_DATABASE__URL: postgresql+psycopg://crucible:${POSTGRES_PASSWORD}@postgres:5432/crucible
       CRUCIBLE_LOCAL_ENDPOINT_URL: "${CRUCIBLE_LOCAL_ENDPOINT_URL:-${CRUCIBLE_SPARK_ENDPOINT_URL:-}}"
+      # ADR 0016: the first-run administrator token is written to
+      # first-run-admin-token (mode 0600) in the credential root, never to this
+      # container's log. Read it with
+      # `docker compose exec crucible cat /var/lib/crucible/credentials/first-run-admin-token`;
+      # the service removes it on that administrator's first sign-in.
+      CRUCIBLE_DOCKER__CREDENTIAL_ROOT: /var/lib/crucible/credentials
+    volumes:
+      - crucible-credentials:/var/lib/crucible/credentials
     depends_on:
       postgres:
         condition: service_healthy
+      credential-init:
+        condition: service_completed_successfully
 
   credential-init:
     # Docker creates a fresh named volume as root. Give only the volume root to the

@@ -7,9 +7,9 @@ of the same UI.
 ## Operator decisions
 
 - 2026-09-25: "Each harness can have a different Image: Hermes 0.5.5, AGY 0.5.6, Claude
-  0.7.1". Promotion is per harness (ADR 0016). This replaces the C11 rule that promoting
+  0.7.1". Promotion is per harness (ADR 0018). This replaces the C11 rule that promoting
   the worker image switched all four harnesses; the C11 notes stay as the history of that
-  rule. Migration 0021 carries each harness's current default forward.
+  rule. Migration 0023 carries each harness's current default forward.
 - 2026-09-25: "I shouldn't have to provide a reason for everything." A reason is an
   optional audit note; bootstrap commit, repository remove, token revoke and credential
   remove still require one; read-only checks never ask (25, 04).
@@ -31,7 +31,7 @@ of the same UI.
   enabled, worker image, credential, model, worker starts, model call. The worker run is
   the bounded probe with every harness in a worker (Hermes included) and the model's
   local endpoint passed through, so its egress is the task's. The last result is kept on
-  the harness row (`harnesses.last_test`, migration 0022).
+  the harness row (`harnesses.last_test`, migration 0024).
 - **Test fixtures** (#124): `test_fixtures` (`CRUCIBLE_TEST_FIXTURES`), false by default,
   wires the fake provider and registers the script harness. The compose smoke (CI and
   release) and the kind overlay turn it on. It is a restart-bound setting like its peers,

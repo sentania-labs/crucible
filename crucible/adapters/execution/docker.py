@@ -153,6 +153,11 @@ WORKER_UID = 1000
 # and never placed in the create request. CRUCIBLE_STDIN_FILES and CRUCIBLE_PROMPT are
 # what the harness reads on stdin; CRUCIBLE_TRANSCRIPT is where its stdout is teed so
 # the stream becomes an artifact. With `pipefail`, the wrapper's exit is the harness's.
+# CRUCIBLE_AFTER_EXIT names `path=name` pairs: state files the harness keeps outside the
+# report directory, copied into it once the harness has exited (issue 128), so the
+# adapter can read what the harness's own tooling said was still running. Only a regular
+# file is copied, never a link, and at most 1 MiB of it; the copy goes to a fresh file
+# renamed into place, so a link planted at the destination is replaced, not written through.
 LAUNCH_WRAPPER = r"""set -u
 for pair in ${CRUCIBLE_ENV_FROM_FILES:-}; do
   var=${pair%%=*}; file=${pair#*=}
@@ -179,6 +184,22 @@ if [ -n "${CRUCIBLE_TRANSCRIPT:-}" ]; then
 else
   run "$@"
 fi
+status=$?
+for pair in ${CRUCIBLE_AFTER_EXIT:-}; do
+  src=${pair%%=*}; name=${pair#*=}
+  case "$name" in ""|.*|*/*) continue ;; esac
+  if [ -f "$src" ] && [ ! -L "$src" ]; then
+    dir=${CRUCIBLE_REPORT_DIR:-/crucible/report}
+    tmp=$(mktemp "$dir/.after-exit.XXXXXX" 2>/dev/null) || continue
+    # mktemp makes the file 0600; the collector reads it as the transcript is read.
+    if head -c 1048576 -- "$src" > "$tmp" 2>/dev/null && chmod 0644 -- "$tmp"; then
+      mv -f -- "$tmp" "$dir/$name" 2>/dev/null || rm -f -- "$tmp"
+    else
+      rm -f -- "$tmp"
+    fi
+  fi
+done
+exit "$status"
 """
 
 DEFAULT_IMAGE_ALLOWLIST: tuple[str, ...] = (
@@ -786,6 +807,7 @@ class DockerProvider:
             credential_mounted=self._credential_copy(spec) is not None,
             endpoint=spec.endpoint,
             endpoint_url=spec.endpoint_url,
+            command_timeout_ms=spec.command_timeout_ms,
         )
 
     def _credential_source(self, harness: str) -> CredentialSource | None:

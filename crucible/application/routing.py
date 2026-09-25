@@ -213,7 +213,7 @@ class Selection:
 
 
 def image_for_harness(uow: UnitOfWork, harness: str, provider: str) -> str | None:
-    """The harness's own default worker image (13, ADR 0016). Promotion is per harness,
+    """The harness's own default worker image (13, ADR 0018). Promotion is per harness,
     so another harness's default never answers for this one."""
     default = uow.harness_images.get(harness)
     if default is not None:

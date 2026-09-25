@@ -62,7 +62,15 @@ def test_claude_code_launch_matches_07() -> None:
         "model-x",
     )
     assert launch.stdin_text == POINTER and launch.stdin_files == ()
-    assert launch.env == {"CLAUDE_CONFIG_DIR": "/home/worker/.claude"}
+    assert launch.env == {
+        "CLAUDE_CONFIG_DIR": "/home/worker/.claude",
+        # Issue 128: no auto-backgrounding, and the Bash timeouts from the launch. With
+        # no value on the context, the default of 60 minutes is capped at the attempt's
+        # 900 seconds.
+        "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
+        "BASH_DEFAULT_TIMEOUT_MS": "900000",
+        "BASH_MAX_TIMEOUT_MS": "900000",
+    }
     # The one exception to file-only delivery (07): a name and a path, never a value.
     assert launch.env_from_files == {"CLAUDE_CODE_OAUTH_TOKEN": "/home/worker/.claude/oauth-token"}
     assert launch.transcript_path == "/crucible/report/transcript.jsonl"
@@ -92,7 +100,7 @@ def test_codex_launch_matches_07_with_s1_and_s6_flags() -> None:
 def test_agy_launch_matches_07_and_stays_under_the_argv_ceiling() -> None:
     launch = AgyAdapter().build_launch(context(effort="low", timeout_seconds=1200))
     argv = launch.argv
-    assert argv[:3] == ("/usr/local/bin/agy", "-p", POINTER)
+    assert argv[:2] == ("/usr/local/bin/agy", "-p") and argv[2].startswith(POINTER + " ")
     assert argv[argv.index("--model") + 1] == "model-x"
     assert argv[argv.index("--effort") + 1] == "low"
     assert "--dangerously-skip-permissions" in argv
@@ -138,6 +146,10 @@ def test_hermes_launch_matches_07_and_uses_the_optional_api_key() -> None:
         "OPENAI_BASE_URL": "http://spark.example.internal:11434/v1",
         "OPENAI_API_KEY": "local-no-auth",
         "CRUCIBLE_HERMES_USAGE": "/crucible/report/hermes-usage.json",
+        # Issue 128: whole seconds, from the launch's command timeout.
+        "TERMINAL_TIMEOUT": "900",
+        "TERMINAL_MAX_FOREGROUND_TIMEOUT": "900",
+        "CRUCIBLE_AFTER_EXIT": "/home/worker/.hermes/processes.json=hermes-processes.json",
     }
     assert launch.env_from_files == {"OPENAI_API_KEY": "/home/worker/.hermes-auth/api-key"}
     assert launch.stdin_files == () and launch.stdin_text == ""
@@ -206,7 +218,8 @@ def test_nothing_secret_shaped_in_any_launch(adapter: HarnessAdapter) -> None:
 def test_without_a_credential_mounted_no_config_env_is_set() -> None:
     for adapter in (ClaudeCodeAdapter(), CodexAdapter()):
         launch = adapter.build_launch(context(credential_mounted=False))
-        assert launch.env == {} and launch.env_from_files == {}
+        assert "CLAUDE_CONFIG_DIR" not in launch.env and "CODEX_HOME" not in launch.env
+        assert launch.env_from_files == {}
 
 
 # ----- credential specs (12) --------------------------------------------------

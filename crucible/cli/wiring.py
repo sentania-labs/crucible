@@ -32,8 +32,11 @@ from crucible.adapters.execution.kubernetes import (
     SettingsSource,
 )
 from crucible.adapters.execution.publisher import DockerPublisher, PublisherConfig
+from crucible.adapters.first_run import FILE_NAME, FileDelivery, SecretDelivery
 from crucible.adapters.github.appauth import AppAuthenticator, AppConfig
+from crucible.adapters.github.apps import RestGitHubApps
 from crucible.adapters.github.client import RestGitHubClient
+from crucible.adapters.github.credentials import DirectoryAppCredentials, SecretAppCredentials
 from crucible.adapters.github.transport import RestTransport
 from crucible.adapters.harness.registry import default_registry
 from crucible.adapters.notification.webhook import WebhookWakeDeliverer
@@ -55,7 +58,8 @@ from crucible.domain.cluster_egress import SETTING_NAME, parse_cluster_egress
 from crucible.domain.ids import new_id
 from crucible.ports.artifacts import ArtifactStore
 from crucible.ports.execution import ExecutionProvider
-from crucible.ports.github import GitHubClient
+from crucible.ports.first_run import FirstRunDelivery
+from crucible.ports.github import GitHubAppCredentials, GitHubClient
 from crucible.ports.harness import CredentialSource, HarnessGate, MountMode
 from crucible.ports.notification import WakeDeliverer
 from crucible.ports.publish import Publisher
@@ -283,22 +287,118 @@ def kubernetes_provider(
     )
 
 
-def github_client(settings: Settings) -> GitHubClient | None:
-    """The GitHub adapter, when the App is configured. The key is a path Crucible reads
-    to sign a JWT in memory; nothing about it is a configuration value (12)."""
+def first_run_delivery(settings: Settings) -> FirstRunDelivery | None:
+    """Where the first-run administrator token goes (ADR 0016, crucible#122).
+
+    On Kubernetes, the Secret in the service namespace; on Docker, a file in the
+    credential root. Anywhere else there is no private place Crucible knows of, and
+    None means the migration mints no token at all rather than print one."""
+    k = settings.kubernetes
+    if k.enabled:
+        try:
+            access = (
+                kubeconfig_access(k.kubeconfig, k.kubeconfig_context)
+                if k.kubeconfig
+                else in_cluster_access()
+            )
+        except (KubernetesApiError, OSError) as exc:
+            log.error("the first-run token Secret is unreachable: %s", exc)
+            return None
+        return SecretDelivery(KubernetesClient(access, k.namespace, timeout=k.api_timeout_seconds))
+    if settings.docker.credential_root:
+        return FileDelivery(Path(settings.docker.credential_root) / FILE_NAME)
+    return None
+
+
+def github_credentials(settings: Settings) -> GitHubAppCredentials | None:
+    """Where the App credential the service owns lives (ADR 0017): the Secret in the
+    service's own namespace on Kubernetes, the files beside `private_key_path` with
+    Docker, and nowhere when neither applies. The settings' App id and `enabled` still
+    count for a credential a deployment placed there itself."""
     g = settings.github
-    if not g.enabled or not g.app.app_id or not g.app.private_key_path:
-        return None
-    transport = RestTransport(g.api_base, timeout=g.api_timeout_seconds)
-    authenticator = AppAuthenticator(
-        AppConfig(
-            app_id=g.app.app_id,
-            private_key_path=g.app.private_key_path,
-            api_base=g.api_base,
-        ),
-        transport,
+    k = settings.kubernetes
+    if k.enabled and not settings.docker.enabled:
+        try:
+            access = (
+                kubeconfig_access(k.kubeconfig, k.kubeconfig_context)
+                if k.kubeconfig
+                else in_cluster_access()
+            )
+        except (KubernetesApiError, OSError, ValueError) as exc:
+            log.error("the GitHub App Secret cannot be reached: %s", exc)
+            return None
+        return SecretAppCredentials(
+            KubernetesClient(access, k.namespace, timeout=k.api_timeout_seconds),
+            name=g.app.secret_name,
+            settings_app_id=g.app.app_id,
+            settings_enabled=g.enabled,
+        )
+    if g.app.private_key_path:
+        return DirectoryAppCredentials(
+            g.app.private_key_path,
+            webhook_secret_path=g.app.webhook_secret_path,
+            settings_app_id=g.app.app_id,
+            settings_enabled=g.enabled,
+        )
+    return None
+
+
+def report_github_credential(settings: Settings, store: GitHubAppCredentials | None) -> None:
+    """crucible#79: a deployment that says GitHub is on but whose credential is missing
+    finds out at startup, with the store named, not at the first delivery. A store the
+    operator has not filled yet is not an error: Connect GitHub fills it."""
+    if store is None or not settings.github.enabled:
+        return
+    try:
+        described = store.describe()
+    except Exception as exc:  # a startup report never stops the process
+        log.error("the GitHub App credential could not be inspected: %s", exc)
+        return
+    where = (
+        f"the Secret {described.get('name')} in {described.get('namespace')}"
+        if described.get("kind") == "secret"
+        else f"{settings.github.app.private_key_path}"
     )
-    return RestGitHubClient(authenticator, transport, allow_issue_comments=g.allow_issue_comments)
+    if described.get("exists") is None:
+        log.error(
+            "github.enabled is true but %s cannot be read: %s", where, described.get("detail")
+        )
+    elif not described.get("key_present"):
+        log.error(
+            "github.enabled is true but %s holds no app.pem; connect the App on the GitHub "
+            "page or place the key there",
+            where,
+        )
+
+
+def github_client(
+    settings: Settings, credentials: GitHubAppCredentials | None = None
+) -> tuple[RestGitHubClient | None, RestGitHubApps | None]:
+    """The GitHub adapter and the App's own view, over one transport. The key is read
+    from the store on each signature, in memory; nothing about it is a configuration
+    value (12). With no store, the settings' file path is used when `github.enabled`
+    names a complete App, as before ADR 0017."""
+    g = settings.github
+    transport = RestTransport(g.api_base, timeout=g.api_timeout_seconds)
+    if credentials is None:
+        if not g.enabled or not g.app.app_id or not g.app.private_key_path:
+            return None, None
+        authenticator = AppAuthenticator(
+            AppConfig(
+                app_id=g.app.app_id,
+                private_key_path=g.app.private_key_path,
+                api_base=g.api_base,
+            ),
+            transport,
+        )
+    else:
+        authenticator = AppAuthenticator(
+            AppConfig(app_id=0, private_key_path="", api_base=g.api_base),
+            transport,
+            credentials=credentials,
+        )
+    client = RestGitHubClient(authenticator, transport, allow_issue_comments=g.allow_issue_comments)
+    return client, RestGitHubApps(authenticator, transport)
 
 
 def enabled_database_endpoint(routing_document: Mapping[str, object] | None) -> str | None:
@@ -381,7 +481,10 @@ def wire(settings: Settings) -> Wiring:
         settings.wake.secret,
         timeout_seconds=settings.wake.timeout_seconds,
     )
-    github = github_client(settings)
+    github_store = github_credentials(settings)
+    github, github_apps = github_client(settings, github_store)
+    report_github_credential(settings, github_store)
+    first_run = first_run_delivery(settings)
     admin = AdminContext(
         uow_factory=factory,
         clock=SystemClock(),
@@ -397,6 +500,8 @@ def wire(settings: Settings) -> Wiring:
             webhook_enabled=settings.github.webhook_enabled,
             api_base=settings.github.api_base,
         ),
+        github_credentials=github_store,
+        github_apps=github_apps,
         artifact_root=settings.service.artifact_root,
         lease_ttl_seconds=settings.supervisor.lease_ttl_seconds,
         credential_retention_hours=settings.admin.credential_retention_hours,
@@ -409,6 +514,7 @@ def wire(settings: Settings) -> Wiring:
         proxy_reload_timeout_seconds=settings.admin.proxy_reload_timeout_seconds,
         kubernetes_egress_seed=kubernetes_egress_seed(settings),
         kubernetes_protected_namespaces=kubernetes_protected_namespaces(settings),
+        first_run=first_run,
     )
     ctx = AppContext(
         uow_factory=factory,
@@ -425,6 +531,7 @@ def wire(settings: Settings) -> Wiring:
         credential_sources=credential_sources(settings),
         admin=admin,
         settings=settings,
+        first_run=first_run,
     )
     publisher: Publisher | None = None
     if docker is not None and github is not None:

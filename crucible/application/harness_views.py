@@ -99,7 +99,7 @@ def image_list(
     images: Sequence[tuple[str, ImageInfo]],
 ) -> ImageList:
     """Every labelled image, with the harnesses it is the default or the rollback image
-    of (13, ADR 0016). An image no harness has promoted is a `candidate`."""
+    of (13, ADR 0018). An image no harness has promoted is a `candidate`."""
     defaults = list(uow.harness_images.list_all())
     items: list[ImageView] = []
     for provider_name, image in images:

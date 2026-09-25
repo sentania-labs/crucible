@@ -13,6 +13,7 @@ from crucible.adapters.api.deps import Admin, Ctx, Orchestrator, UoW
 from crucible.application.admin import (
     audit,
     credentials,
+    gateway,
     github,
     harness_test,
     harnesses,
@@ -22,6 +23,7 @@ from crucible.application.admin import (
     tokens,
 )
 from crucible.application.admin import kubernetes as kubernetes_admin
+from crucible.application.admin import limits as limits_admin
 from crucible.application.admin import providers as providers_admin
 from crucible.application.admin import repositories as repositories_admin
 from crucible.application.admin import status as status_admin
@@ -62,6 +64,45 @@ def admin_clear_routing_exhaustion(
 ) -> dict[str, Any]:
     result = routing.clear_exhaustion(
         _admin(ctx), uow, principal=principal.name, pool=pool, reason=_reason(body)
+    )
+    uow.commit()
+    return result
+
+
+def _whole_milliseconds(body: dict[str, Any], name: str) -> int | None:
+    """A JSON integer, never a bool or a string: a limit read from truthiness or a
+    stringified number is a limit nobody set. Absent keeps the value in force."""
+    value = body.get(name)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise RequestValidationError(
+            [{"loc": ("body", name), "msg": f"{name} must be a JSON integer", "type": "int_type"}]
+        )
+    return value
+
+
+@router.get("/admin/limits/command-timeout")
+def admin_command_timeout(ctx: Ctx, uow: UoW, _principal: Admin) -> dict[str, Any]:
+    _admin(ctx)
+    return limits_admin.command_timeout_view(uow)
+
+
+@router.post("/admin/limits/command-timeout")
+def admin_save_command_timeout(
+    ctx: Ctx,
+    uow: UoW,
+    principal: Admin,
+    body: Annotated[dict[str, Any], Body()],
+) -> dict[str, Any]:
+    result = limits_admin.save_command_timeout(
+        _admin(ctx),
+        uow,
+        principal=principal,
+        minimum=_whole_milliseconds(body, "min"),
+        maximum=_whole_milliseconds(body, "max"),
+        default=_whole_milliseconds(body, "default"),
+        reason=_reason(body),
     )
     uow.commit()
     return result
@@ -114,6 +155,81 @@ def admin_save_local_endpoint(
     return result
 
 
+# ----- the local gateway (crucible#119, #121) ------------------------------------
+
+
+@router.get("/admin/gateway")
+def admin_gateway(ctx: Ctx, uow: UoW, _principal: Admin) -> dict[str, Any]:
+    return gateway.gateway_view(_admin(ctx), uow)
+
+
+@router.post("/admin/gateway")
+async def admin_save_gateway(
+    ctx: Ctx,
+    uow: UoW,
+    principal: Admin,
+    body: Annotated[dict[str, Any], Body()],
+) -> dict[str, Any]:
+    """The gateway URL and, when `api_key` is given, the Hermes key, in one step; then
+    both are tested. The answer never carries the key."""
+    api_key = body.get("api_key")
+    if api_key is not None and not isinstance(api_key, str):
+        raise ConflictError("api_key must be a string")
+    result = await gateway.save_gateway(
+        _admin(ctx),
+        uow,
+        principal=principal,
+        endpoint_url=str(body.get("endpoint_url", "")),
+        api_key=api_key,
+        reason=_reason(body),
+    )
+    uow.commit()
+    return result
+
+
+@router.post("/admin/gateway/test")
+async def admin_test_gateway(
+    ctx: Ctx, uow: UoW, principal: Admin, body: Annotated[dict[str, Any] | None, Body()] = None
+) -> dict[str, Any]:
+    """A check, so no reason is asked for; one given is recorded (crucible#117)."""
+    result = await gateway.test_gateway(_admin(ctx), uow, principal=principal, reason=_reason(body))
+    uow.commit()
+    return result
+
+
+@router.get("/admin/gateway/models")
+async def admin_gateway_models(ctx: Ctx, uow: UoW, _principal: Admin) -> dict[str, Any]:
+    return await gateway.models_view(_admin(ctx), uow)
+
+
+@router.post("/admin/gateway/models")
+async def admin_save_gateway_models(
+    ctx: Ctx,
+    uow: UoW,
+    principal: Admin,
+    body: Annotated[dict[str, Any], Body()],
+) -> dict[str, Any]:
+    """`models` is a list of `{id, enabled, enable_thinking, capability}`; a model the
+    gateway does not offer is refused by name."""
+    models = body.get("models")
+    if not isinstance(models, list) or not all(isinstance(item, dict) for item in models):
+        raise ConflictError("models must be a list of model picks")
+    _require_boolean_flags(models)
+    limit = body.get("max_concurrency")
+    if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int)):
+        raise ConflictError("max_concurrency must be a whole number")
+    result = await gateway.save_models(
+        _admin(ctx),
+        uow,
+        principal=principal,
+        models=models,
+        max_concurrency=limit,
+        reason=_reason(body),
+    )
+    uow.commit()
+    return result
+
+
 @router.get("/admin/kubernetes/egress")
 def admin_kubernetes_egress(ctx: Ctx, uow: UoW, _principal: Admin) -> dict[str, Any]:
     return kubernetes_admin.egress_view(_admin(ctx), uow)
@@ -145,10 +261,10 @@ async def admin_status(ctx: Ctx, uow: UoW, _principal: Admin) -> dict[str, Any]:
 
 
 @router.get("/capabilities")
-async def capabilities(ctx: Ctx, uow: UoW, _principal: Orchestrator) -> dict[str, Any]:
-    """25: what Foundry may read: harnesses, providers, github health, workers, tasks,
-    wakes. Read-only; it never calls a mutation."""
-    return await status_admin.capabilities(_admin(ctx), uow)
+async def capabilities(ctx: Ctx, uow: UoW, principal: Orchestrator) -> dict[str, Any]:
+    """25: what Foundry may read: harnesses, providers, github health, and its own
+    workers, tasks and wakes. Read-only; it never calls a mutation."""
+    return await status_admin.capabilities(_admin(ctx), uow, principal)
 
 
 # ----- harnesses ---------------------------------------------------------------
@@ -158,7 +274,8 @@ async def capabilities(ctx: Ctx, uow: UoW, _principal: Orchestrator) -> dict[str
 async def admin_harnesses(ctx: Ctx, uow: UoW, _principal: Admin) -> dict[str, Any]:
     admin = _admin(ctx)
     found = await harnesses.list_images(admin)
-    return {"items": harnesses.list_harnesses(admin, uow, [i for _, i in found])}
+    items, _ = await harnesses.read_harnesses(admin, uow, [i for _, i in found])
+    return {"items": items}
 
 
 @router.post("/admin/harnesses/{name}/enable")
@@ -369,7 +486,7 @@ def admin_remove(
 @router.get("/admin/images")
 async def admin_images(ctx: Ctx, uow: UoW, _principal: Admin) -> dict[str, Any]:
     """Every image a provider sees, and one row per harness: its default, the image a
-    rollback returns to, and the images it may be promoted to (ADR 0016)."""
+    rollback returns to, and the images it may be promoted to (ADR 0018)."""
     admin = _admin(ctx)
     return {
         "items": await images.list_all(admin, uow),
@@ -391,7 +508,7 @@ def _harness(body: dict[str, Any] | None) -> str:
 async def admin_promote(
     digest: str, ctx: Ctx, uow: UoW, principal: Admin, body: Annotated[dict[str, Any], Body()]
 ) -> dict[str, Any]:
-    """Make the image the default for the one harness the body names (ADR 0016)."""
+    """Make the image the default for the one harness the body names (ADR 0018)."""
     result = await images.promote(
         _admin(ctx),
         uow,
@@ -431,6 +548,64 @@ def admin_github_check(
     ctx: Ctx, uow: UoW, principal: Admin, body: Annotated[dict[str, Any], Body()]
 ) -> dict[str, Any]:
     result = github.check(_admin(ctx), uow, principal=principal.name, reason=_reason(body))
+    uow.commit()
+    return result
+
+
+@router.post("/admin/github/app")
+def admin_github_connect(
+    ctx: Ctx, uow: UoW, principal: Admin, body: Annotated[dict[str, Any], Body()]
+) -> dict[str, Any]:
+    """Connect GitHub (crucible#120, ADR 0017): an existing App's id and private key,
+    checked against GitHub before they are stored. The answer never carries the key."""
+    private_key = body.get("private_key")
+    webhook_secret = body.get("webhook_secret")
+    if not isinstance(private_key, str):
+        raise ConflictError("private_key must be a string (the .pem file's text)")
+    if webhook_secret is not None and not isinstance(webhook_secret, str):
+        raise ConflictError("webhook_secret must be a string")
+    app_id = body.get("app_id")
+    if isinstance(app_id, str) and app_id.strip().isdigit():
+        app_id = int(app_id)
+    result = github.connect(
+        _admin(ctx),
+        uow,
+        principal=principal.name,
+        app_id=app_id if isinstance(app_id, int) else 0,
+        private_key=private_key,
+        webhook_secret=webhook_secret,
+        reason=_reason(body),
+    )
+    uow.commit()
+    return result
+
+
+@router.get("/admin/github/installations")
+def admin_github_installations(ctx: Ctx, uow: UoW, _principal: Admin) -> dict[str, Any]:
+    return github.apps_view(_admin(ctx), uow)
+
+
+@router.post("/admin/github/repositories")
+def admin_github_add_repository(
+    ctx: Ctx, uow: UoW, principal: Admin, body: Annotated[dict[str, Any], Body()]
+) -> dict[str, Any]:
+    """Register a repository an installation covers, with the installation id and the
+    default branch GitHub reports."""
+    installation_id = body.get("installation_id")
+    if isinstance(installation_id, bool) or not isinstance(installation_id, int):
+        raise ConflictError("installation_id must be a number")
+    result = github.add_repository(
+        _admin(ctx),
+        uow,
+        principal=principal.name,
+        installation_id=installation_id,
+        repository=str(body.get("repository", "")),
+        name=body.get("name") if isinstance(body.get("name"), str) else None,
+        policy_name=str(body.get("policy_name") or "default-software"),
+        attested_all_prs=body.get("attested_all_prs") is True,
+        attested_by=body.get("attested_by") if isinstance(body.get("attested_by"), str) else None,
+        reason=_reason(body),
+    )
     uow.commit()
     return result
 
@@ -521,6 +696,7 @@ def admin_revoke_token(
         reason=_reason(body),
     )
     uow.commit()
+    tokens.after_revoke(_admin(ctx), result)
     return result
 
 

@@ -62,7 +62,12 @@ EGRESS_PROXY_IMAGE = (
 RUN_ID = uuid.uuid4().hex[:8]
 NET_WORKERS = f"crucible-e2e-workers-{RUN_ID}"
 NET_CONTROL = f"crucible-e2e-control-{RUN_ID}"
-WORKERS_SUBNET = "10.89.0.0/24"
+# 41: a fixed subnet collides when a second run creates its `internal: true` network on
+# the same rootless daemon at the same time. RUN_ID is already a random uuid4 prefix, so
+# its bits pick the subnet too; two concurrent runs share it only by the same odds they'd
+# share RUN_ID's own middle bytes.
+_run_bits = int(RUN_ID, 16)
+WORKERS_SUBNET = f"10.{100 + (_run_bits >> 8) % 100}.{_run_bits % 256}.0/24"
 # github.com for the script tier, plus every endpoint the real adapters declare (S6),
 # so the live tier's workers reach their model API through the same filtering proxy.
 EGRESS_ALLOWLIST = (

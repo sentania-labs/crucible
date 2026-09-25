@@ -23,7 +23,13 @@ from typing import Any
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
-from crucible.ports.github import GitHubError, InstallationToken
+from crucible.ports.github import (
+    AppCredential,
+    GitHubAppCredentials,
+    GitHubAppStoreError,
+    GitHubError,
+    InstallationToken,
+)
 
 log = logging.getLogger("crucible.github.auth")
 
@@ -49,13 +55,19 @@ def load_private_key(path: str) -> rsa.RSAPrivateKey:
     except OSError as exc:
         raise AppKeyError(f"the GitHub App private key at {path} could not be read: {exc}") from exc
     try:
-        key = serialization.load_pem_private_key(data, password=None)
-    except (ValueError, TypeError) as exc:
-        raise AppKeyError(f"the file at {path} is not a usable PEM private key") from exc
+        return parse_private_key(data, where=f"the file at {path}")
     finally:
         del data
+
+
+def parse_private_key(data: bytes, *, where: str = "the key") -> rsa.RSAPrivateKey:
+    """A PEM private key from bytes already in memory (the Secret, or a pasted key)."""
+    try:
+        key = serialization.load_pem_private_key(data, password=None)
+    except (ValueError, TypeError) as exc:
+        raise AppKeyError(f"{where} is not a usable PEM private key") from exc
     if not isinstance(key, rsa.RSAPrivateKey):
-        raise AppKeyError(f"the key at {path} is not an RSA private key; GitHub Apps sign RS256")
+        raise AppKeyError(f"{where} is not an RSA private key; GitHub Apps sign RS256")
     return key
 
 
@@ -111,20 +123,81 @@ class AppAuthenticator:
     discards its token when the job ends must not empty the cache for everyone else,
     which is exactly the bug a shared object produces."""
 
-    def __init__(self, config: AppConfig, transport: Any) -> None:
+    def __init__(
+        self,
+        config: AppConfig,
+        transport: Any,
+        *,
+        credentials: GitHubAppCredentials | None = None,
+    ) -> None:
         self._config = config
         self._transport = transport
+        # The service-owned store (ADR 0017), read on each signature so a Connect GitHub
+        # save is in force at once. Without one the key is the configured file.
+        self._credentials = credentials
         self._cache: dict[tuple[int, str, str], _CachedToken] = {}
 
     def _now(self) -> datetime:
         return datetime.now(UTC)
 
-    def app_jwt(self) -> str:
-        key = load_private_key(self._config.private_key_path)
+    def credential(self) -> AppCredential | None:
+        """The configured id and key, or None. Blocking."""
+        if self._credentials is None:
+            if not self._config.private_key_path or not self._config.app_id:
+                return None
+            try:
+                data = Path(self._config.private_key_path).read_bytes()
+            except OSError:
+                return None
+            return AppCredential(self._config.app_id, data)
         try:
-            return sign_jwt(self._config.app_id, key)
+            return self._credentials.read()
+        except GitHubAppStoreError:
+            return None
+
+    def configured(self) -> bool:
+        return self.credential() is not None
+
+    def app_jwt(self, credential: AppCredential | None = None) -> str:
+        """An App JWT signed with `credential`, or with the stored one."""
+        if credential is None and self._credentials is None:
+            key = load_private_key(self._config.private_key_path)
+            try:
+                return sign_jwt(self._config.app_id, key)
+            finally:
+                del key
+        if credential is None:
+            try:
+                credential = self._credentials.read() if self._credentials else None
+            except GitHubAppStoreError as exc:
+                raise AppKeyError(str(exc)) from None
+        if credential is None:
+            raise AppKeyError("no GitHub App is connected; connect one on the GitHub page")
+        key = parse_private_key(credential.private_key, where="the stored GitHub App key")
+        try:
+            return sign_jwt(credential.app_id, key)
         finally:
             del key
+
+    def unscoped_installation_token(self, installation_id: int) -> InstallationToken:
+        """A token for everything the installation covers, read-only, never cached: it
+        exists to list the installation's repositories for the picker (crucible#120) and
+        is discarded by the caller before it returns."""
+        path = f"/app/installations/{installation_id}/access_tokens"
+        status, payload, _ = self._transport.request(
+            "POST",
+            path,
+            body={"permissions": {"metadata": "read"}},
+            bearer=self.app_jwt(),
+        )
+        if status != 201 or not isinstance(payload, dict) or not payload.get("token"):
+            raise GitHubError(status, "could not mint an installation token", path=path)
+        return InstallationToken(
+            str(payload["token"]),
+            expires_at=_parse_expiry(payload.get("expires_at")),
+            repository="*",
+            permissions={"metadata": "read"},
+        )
 
     def installation_token(
         self, *, installation_id: int, repository: str, permissions: dict[str, str] | None = None

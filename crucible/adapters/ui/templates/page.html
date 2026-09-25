@@ -41,6 +41,7 @@
   {% elif cell is mapping and cell.kind == "note" %}<div>{{ safe_value("note", cell.value) }}</div>{% if cell.hint %}<div class="admin-hint">{{ safe_value("hint", cell.hint) }}</div>{% endif %}
   {% elif cell is mapping and cell.kind == "steps" %}<ol class="admin-steps">{% for step in cell["items"] %}<li><span class="lat-badge lat-badge--{{ step.tone }}">{{ step.result }}</span> <b>{{ step.name }}</b>{% if step.detail %}: {{ safe_value("detail", step.detail) }}{% endif %}</li>{% endfor %}</ol>{% if cell.tested_at %}<div class="admin-hint">{{ cell.tested_at }}</div>{% endif %}
   {% elif cell is string and cell.startswith('/ui') %}<a href="{{ cell }}">Open</a>
+  {% elif cell is mapping and cell.href is defined %}<a href="{{ cell.href }}"{% if not cell.href.startswith('/ui') %} rel="noopener noreferrer" target="_blank"{% endif %}>{{ cell.label }}</a>
   {% elif cell is mapping or (cell is sequence and cell is not string) %}{{ render_panel(panel_from_cell(cell)) }}
   {% else %}{{ safe_value(column, cell) }}{% endif %}
 {%- endmacro %}
@@ -69,12 +70,18 @@
     <form class="admin-form" method="post" action="{{ section.form.action }}">
       <input type="hidden" name="csrf" value="{{ csrf }}">
       <input type="hidden" name="return_to" value="{{ active }}">
-      <div class="admin-form-grid">{% for field in section.form.fields %}<label><span class="lat-label">{{ field.label }}</span>
+      <div class="admin-form-grid">{% for field in section.form.fields %}{% if field.kind == "grid" %}<div class="admin-form-wide">{% if field.label %}<span class="lat-label">{{ field.label }}</span>{% endif %}
+        <div class="admin-table-wrap lat-table-scroll"><table class="admin-table lat-table"><thead><tr>{% for column in field.columns %}<th>{{ column }}</th>{% endfor %}</tr></thead><tbody>
+        {% for row in field.rows %}<tr>{% for cell in row %}<td>{% if cell.kind == "checkbox" %}<input type="checkbox" name="{{ cell.name }}" value="true" aria-label="{{ cell.label or cell.name }}" {% if cell.value %}checked{% endif %}>
+          {% elif cell.kind == "select" %}<select class="lat-select" name="{{ cell.name }}" aria-label="{{ cell.label or cell.name }}">{% for value, label in cell.options %}<option value="{{ value }}" {% if value == cell.value %}selected{% endif %}>{{ label }}</option>{% endfor %}</select>
+          {% elif cell.kind == "hidden" %}<input type="hidden" name="{{ cell.name }}" value="{{ cell.value }}">{{ cell.label or cell.value }}
+          {% else %}{{ cell.value }}{% endif %}</td>{% endfor %}</tr>{% endfor %}
+        </tbody></table></div></div>{% elif field.kind == "hidden" %}<input type="hidden" name="{{ field.name }}" value="{{ field.value }}">{% else %}<label><span class="lat-label">{{ field.label }}</span>
         {% if field.kind == "textarea" %}<textarea class="lat-textarea" rows="{{ field.rows or 5 }}" name="{{ field.name }}" {% if field.required %}required{% endif %}>{{ field.value or "" }}</textarea>
-        {% elif field.kind == "select" %}<select class="lat-select" name="{{ field.name }}">{% for value, label in field.options %}<option value="{{ value }}" {% if value == field.value %}selected{% endif %}>{{ label }}</option>{% endfor %}</select>
+        {% elif field.kind == "select" %}<select class="lat-select" name="{{ field.name }}">{% for value, label in field.options %}<option value="{{ value }}" {% if field.value is defined and value == field.value %}selected{% endif %}>{{ label }}</option>{% endfor %}</select>
         {% elif field.kind == "checkbox" %}<input type="checkbox" name="{{ field.name }}" value="true" {% if field.value %}checked{% endif %}>
-        {% else %}<input class="lat-input" type="{{ field.kind or 'text' }}" name="{{ field.name }}" value="{{ field.value or '' }}" {% if field.required %}required{% endif %}>{% endif %}
-      </label>{% endfor %}</div>
+        {% else %}<input class="lat-input" type="{{ field.kind or 'text' }}" name="{{ field.name }}" value="{{ field.value or '' }}" {% if field.required %}required{% endif %}{% if field.placeholder %} placeholder="{{ field.placeholder }}"{% endif %}>{% endif %}
+      </label>{% endif %}{% endfor %}</div>
       <button class="lat-btn {% if section.form.danger %}lat-btn--danger{% else %}lat-btn--primary{% endif %}" type="submit">{{ section.form.label }}</button>
     </form>{% if section.form.collapsed %}</details>{% endif %}{% endif %}
   </section>

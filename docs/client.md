@@ -120,7 +120,8 @@ for an exhaustion mark, `clear-exhaustion` while it is active; for a verified
 bootstrap import, `commit`; for an audit page, the next page. The local
 model endpoint offers one `set-local-endpoint:<model_id>` per model, already
 set to flip its current enabled state. The Kubernetes egress selectors offer
-one `set-egress`, prefilled with the values in force. Their commands carry the
+one `set-egress`, prefilled with the values in force, and the per-command
+timeout one `set-command-timeout`, prefilled the same way. Their commands carry the
 `--api-url` or `--config` the command ran with.
 
 ## Principals
@@ -192,8 +193,9 @@ including a problem detail that echoed it. Redirects are refused, so the
 token never goes to another origin. The one secret an envelope carries on
 purpose is the new token `crucible admin token create` mints: it is that
 command's output, printed once and never stored in clear. The first-run
-administrator token that `crucible admin migrate` mints goes to stderr, never
-into the envelope.
+administrator token that `crucible admin migrate` mints is printed nowhere:
+it goes to a Secret on Kubernetes or a mode 0600 file on Docker, and stderr
+says only where (ADR 0016).
 
 ## Commands
 
@@ -241,8 +243,9 @@ test holds both old command trees to the new one. What did change:
   `--api-url` that redirects (http to https, say) must name the final URL;
 - the admin client's remote mode takes `CRUCIBLE_TOKEN` or `token_file` when
   `CRUCIBLE_ADMIN_TOKEN` is not set, where it used to stop;
-- `crucible admin migrate` prints the first-run administrator token on stderr,
-  where it used to share stdout with the result;
+- `crucible admin migrate` writes the first-run administrator token to a
+  Secret or a mode 0600 file and prints only where it is (ADR 0016), where it
+  used to share stdout with the result;
 - a login's "paste the code" prompt is on stderr, and the code is read from
   stdin;
 - a `--reason` outside printable ASCII is percent-encoded in the

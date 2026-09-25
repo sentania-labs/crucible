@@ -709,6 +709,16 @@ class Wakes:
             or 0
         )
 
+    def count_unacked_for_principal(self, principal_id: str) -> int:
+        return int(
+            self._s.scalar(
+                select(func.count())
+                .select_from(WakeRow)
+                .where(WakeRow.acked_at.is_(None), WakeRow.principal_id == principal_id)
+            )
+            or 0
+        )
+
 
 class AttemptMetricsRepo:
     def __init__(self, session: Session) -> None:
@@ -870,7 +880,7 @@ class HarnessStates:
 
 
 class HarnessImages:
-    """Each harness's default worker image (13, ADR 0016)."""
+    """Each harness's default worker image (13, ADR 0018)."""
 
     def __init__(self, session: Session) -> None:
         self._s = session

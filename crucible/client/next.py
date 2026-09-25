@@ -428,6 +428,30 @@ def _labels_text(labels: Any) -> str:
     return ",".join(f"{k}={v}" for k, v in sorted(labels.items()))
 
 
+def command_timeout_actions(document: Any, prefix: Sequence[str]) -> list[dict[str, Any]]:
+    """One action: write new bounds, prefilled with the bounds in force, so the command
+    as offered changes nothing until a value in it is edited."""
+    if not isinstance(document, dict) or not isinstance(document.get("command_timeout_ms"), dict):
+        return []
+    bounds = document["command_timeout_ms"]
+    return [
+        action(
+            "set-command-timeout",
+            "write a new policy version with these per-command timeout bounds",
+            [
+                *prefix,
+                "limits",
+                "set-command-timeout",
+                f"--min={bounds.get('min', '')}",
+                f"--max={bounds.get('max', '')}",
+                f"--default={bounds.get('default', '')}",
+            ],
+            optional=OPTIONAL_REASON,
+            roles=(ADMIN,),
+        )
+    ]
+
+
 def kubernetes_egress_actions(document: Any, prefix: Sequence[str]) -> list[dict[str, Any]]:
     """One action: replace the setting, prefilled with what is in force now, so the
     command as offered changes nothing until a value in it is edited."""
@@ -536,7 +560,7 @@ def harness_actions(items: Iterable[Any], prefix: Sequence[str]) -> list[dict[st
 
 
 def image_actions(document: Any, prefix: Sequence[str]) -> list[dict[str, Any]]:
-    """Per harness (ADR 0016): promote each offered image that is not its default, and
+    """Per harness (ADR 0018): promote each offered image that is not its default, and
     roll back while it has a previous image."""
     rows = document.get("defaults") if isinstance(document, dict) else None
     out: list[dict[str, Any]] = []

@@ -118,7 +118,7 @@ endpoint's existing role requirements.
 
 ### Administration
 
-`/v1/admin/*`, admin role, versioned with the rest: status, harnesses, credentials (validate, probe, login, rotate, remove), images, providers, github, repositories, audit. Every mutation there needs a live supervisor lease and takes an optional reason, recorded as an audit note; revoking a token, removing a repository or a credential, and committing a bootstrap import require one (the operator's decision of 2026-09-25, crucible#117). Repository registration through `PUT /v1/admin/repositories/{name}` is one of those mutations; the `PUT /repositories/{name}` above is the older non-administrative form and is unchanged. Detail in 25. `GET /v1/capabilities` gives orchestrator principals the sanitized read-only subset Foundry needs to report an unavailable capability.
+`/v1/admin/*`, admin role, versioned with the rest: status, harnesses, credentials (validate, probe, login, rotate, remove), images, providers, github, repositories, audit. Every mutation there needs a live supervisor lease and takes an optional reason, recorded as an audit note; revoking a token, removing a repository or a credential, and committing a bootstrap import require one (the operator's decision of 2026-09-25, crucible#117). Repository registration through `PUT /v1/admin/repositories/{name}` is one of those mutations; the `PUT /repositories/{name}` above is the older non-administrative form and is unchanged. Detail in 25. `GET /v1/capabilities` gives orchestrator principals the sanitized read-only subset Foundry needs to report an unavailable capability, with its workers, tasks and wakes filtered to the caller's own (an operator sees all).
 
 ### GitHub ingress
 

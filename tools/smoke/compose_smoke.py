@@ -247,18 +247,30 @@ def mint_token(principal: str) -> str:
         ) from None
 
 
+FIRST_RUN_FILE = "/var/lib/crucible/credentials/first-run-admin-token"
+TOKEN_PATTERN = re.compile(r"\bcru_[A-Z0-9]{26}\.[A-Za-z0-9_-]+\b")
+
+
 def walk_first_run_ui(base_url: str) -> None:
     """On a fresh compose database, sign in with the migration's one-time token.
 
-    Existing stacks may have replaced the migration container after the first run, so
-    absence of the framed token means this fresh-database assertion is not applicable.
+    The token is in a mode 0600 file in the credential root, never in the migration's
+    log (ADR 0016, crucible#122), and the first sign-in removes the file. A stack whose
+    first-run administrator already signed in has no file, so the walk does not apply.
     The token is never printed by this process.
     """
     logs = compose(["logs", "--no-color", "migrate"], redact=True)
-    match = re.search(r"\bcru_[A-Z0-9]{26}\.[A-Za-z0-9_-]+\b", logs)
-    if match is None:
-        log("first-run UI walk skipped: migration log has no one-time token")
+    if TOKEN_PATTERN.search(logs):
+        raise SmokeError("the migration log carries a token (crucible#122)")
+    token = compose(
+        ["exec", "-T", "crucible", "sh", "-c", f"cat {FIRST_RUN_FILE} 2>/dev/null || true"],
+        redact=True,
+    ).strip()
+    if not token:
+        log("first-run UI walk skipped: no first-run token file (already signed in)")
         return
+    if not TOKEN_PATTERN.fullmatch(token):
+        raise SmokeError("the first-run token file does not hold a Crucible token")
     jar = http.cookiejar.CookieJar()
     opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
     with opener.open(f"{base_url}/ui/sign-in", timeout=DEFAULT_TIMEOUT) as response:
@@ -266,9 +278,9 @@ def walk_first_run_ui(base_url: str) -> None:
     csrf = re.search(r'name="csrf" value="([a-f0-9]+)"', sign_in)
     if csrf is None:
         raise SmokeError("the first-run sign-in page has no pre-authentication CSRF nonce")
-    body = urllib.parse.urlencode(
-        {"csrf": csrf.group(1), "token": match.group(0), "next": "/ui"}
-    ).encode()
+    if FIRST_RUN_FILE not in sign_in or "logs migrate" in sign_in:
+        raise SmokeError("the sign-in page does not name the first-run token file")
+    body = urllib.parse.urlencode({"csrf": csrf.group(1), "token": token, "next": "/ui"}).encode()
     request_object = urllib.request.Request(
         f"{base_url}/ui/sign-in",
         data=body,
@@ -300,7 +312,12 @@ def walk_first_run_ui(base_url: str) -> None:
                     raise SmokeError(f"the first-run UI page {path} did not render")
     except urllib.error.URLError as exc:
         raise SmokeError(f"the first-run UI walk failed: {exc}") from None
-    log("first-run administrator sign-in and every UI page passed")
+    left = compose(
+        ["exec", "-T", "crucible", "sh", "-c", f"test -e {FIRST_RUN_FILE} && echo left || true"]
+    )
+    if left.strip():
+        raise SmokeError("the first sign-in did not remove the first-run token file")
+    log("first-run administrator sign-in and every UI page passed; the token file is gone")
 
 
 def register_repository() -> None:

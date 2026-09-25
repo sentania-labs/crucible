@@ -85,6 +85,9 @@ class LaunchSpec:
     effort: str | None = None
     endpoint: Literal["subscription", "local"] = "subscription"
     endpoint_url: str | None = None
+    # Issue 128: the per-command timeout the harness is launched with, resolved from the
+    # policy and the contract and capped at timeout_seconds. None: the default, capped.
+    command_timeout_ms: int | None = None
 
     def __post_init__(self) -> None:
         validate_endpoint(self.endpoint, self.endpoint_url)
