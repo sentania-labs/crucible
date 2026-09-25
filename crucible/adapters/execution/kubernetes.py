@@ -41,7 +41,7 @@ import weakref
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Literal
@@ -55,6 +55,7 @@ from crucible.adapters.execution.k8sapi import (
     ExecResult,
     KubernetesApiError,
     KubernetesClient,
+    LogFrame,
 )
 from crucible.adapters.execution.k8sregistry import (
     RegistryClient,
@@ -207,6 +208,14 @@ LIST_IMAGES_DEADLINE = 12.0
 # by requiring a release-version shape, keeps a future non-version tag (a hotfix build,
 # a manual pin) listable without a code change.
 LIST_IMAGES_SKIP_PREFIX = "ci-"
+# How much of a worker's log one observation poll reads (issue 63): the API's
+# `limitBytes`, so a poll never holds a whole long-running log in memory. A capped read
+# ends at its last complete line and the next poll resumes from there (10). `sinceTime`
+# is one-second granular, so a read that cannot get past its first second (more than
+# the cap logged inside it) is retried larger, up to the ceiling; past the ceiling the
+# rest of that second is skipped with a notice line, never read unbounded.
+LOG_READ_LIMIT = 4 * 1024 * 1024
+LOG_READ_CEILING = 64 * 1024 * 1024
 # How much of a collected output tar is accepted. The tree is excluded from it, so this
 # is the diff, the bundle, the report copy and the verifier logs.
 OUTPUT_READ_LIMIT = 256 * 1024 * 1024
@@ -1318,18 +1327,31 @@ class KubernetesProvider:
         if pod is None:
             return []
         name = str((pod.get("metadata") or {}).get("name") or "")
-        try:
-            frames = await self._call(
-                self.client.pod_log,
-                name,
-                container=k8sspec.CONTAINER_NAME,
-                since_time=since.timestamp,
-            )
-        except KubernetesApiError as exc:
-            if exc.status == 404:
-                return []
-            raise ProviderError(f"log pull failed: {exc}") from exc
-        return _chunks(frames, since)
+        limit = LOG_READ_LIMIT
+        while True:
+            try:
+                frames = await self._call(
+                    self.client.pod_log,
+                    name,
+                    container=k8sspec.CONTAINER_NAME,
+                    since_time=since.timestamp,
+                    limit_bytes=limit,
+                )
+            except KubernetesApiError as exc:
+                if exc.status == 404:
+                    return []
+                raise ProviderError(f"log pull failed: {exc}") from exc
+            payload = b"".join(frame.payload for frame in frames)
+            capped = len(payload) >= limit
+            # A capped read can stop inside a line; that line is read whole next time.
+            whole = payload[: payload.rfind(b"\n") + 1] if capped else payload
+            chunks = _chunks([LogFrame("stdout", whole)] if whole else [], since)
+            if chunks or not capped:
+                return chunks
+            if limit < LOG_READ_CEILING:
+                limit = min(limit * 4, LOG_READ_CEILING)
+                continue
+            return _skip_crowded_second(payload, limit)
 
     async def collect(
         self, h: Handle, ws: Workspace, spec: LaunchSpec | None = None
@@ -3662,6 +3684,37 @@ class KubernetesProvider:
 
 
 # ----- pure helpers -------------------------------------------------------
+
+
+def _skip_crowded_second(payload: bytes, limit: int) -> list[LogChunk]:
+    """More than `limit` bytes of log fall inside one second, so no read `sinceTime`
+    can express gets past it (issue 63). The resume moves to the start of the next
+    second with one notice line in the log saying so; the lines of that second beyond
+    the ceiling are not stored. The second is the latest one the capped read shows."""
+    latest: datetime | None = None
+    for raw in payload.split(b"\n"):
+        stamp = raw.partition(b" ")[0].decode("utf-8", "replace")
+        with contextlib.suppress(ValueError):
+            seen = parse_rfc3339(stamp)
+            latest = seen if latest is None or seen > latest else latest
+    if latest is None:
+        log.warning("a capped log read carried no timestamp; the next poll tries again")
+        return []
+    resume = latest.replace(microsecond=0) + timedelta(seconds=1)
+    notice = (
+        f"[crucible] log lines skipped: more than {limit} bytes of this log fall within "
+        "one second, more than one read takes; the log resumes at the next second"
+    ).encode()
+    return [
+        LogChunk(
+            stream="stdout",
+            content=notice + b"\n",
+            ts=resume,
+            line_sha256=hashlib.sha256(notice).hexdigest(),
+            occurrence=0,
+            lines=1,
+        )
+    ]
 
 
 def _observe_limits(launched: _Launched, pod: Mapping[str, Any]) -> None:

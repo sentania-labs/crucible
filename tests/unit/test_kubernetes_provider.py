@@ -476,6 +476,102 @@ async def test_logs_resume_strictly_after_the_stored_position() -> None:
     assert resumed == []
 
 
+def _stamped(second: int, nanos: int, text: str) -> str:
+    return f"2026-09-25T17:00:{second:02d}.{nanos:09d}Z {text}"
+
+
+async def _drain_logs(provider: KubernetesProvider, handle: Handle) -> list[bytes]:
+    """Poll as the supervisor does, carrying the resume position forward, until a poll
+    brings nothing new; every line stored, in order."""
+    offset = LogOffset()
+    stored: list[bytes] = []
+    for _ in range(50):
+        chunks = await provider.logs(handle, offset)
+        if not chunks:
+            return stored
+        for chunk in chunks:
+            stored.extend(chunk.content.splitlines())
+            offset = LogOffset(
+                index=offset.index + chunk.lines,
+                timestamp=chunk.ts.isoformat() if chunk.ts else None,
+                line_sha256=chunk.line_sha256,
+                occurrence=chunk.occurrence,
+            )
+    raise AssertionError("the log never stopped bringing new lines")
+
+
+async def _worker_with_log(lines: list[str]) -> tuple[FakeKubernetesApi, Any, Handle]:
+    api, _registry, provider, launch, workspace = await prepared()
+    handle = await provider.launch(workspace, launch)
+    await run_to_exit(provider, handle)
+    api.logs[f"{handle.ref}-abc12"] = lines
+    return api, provider, handle
+
+
+async def test_a_log_poll_asks_for_a_bounded_number_of_bytes() -> None:
+    """Issue 63: every observation poll passes `limitBytes`, so no poll reads the whole
+    log of a long-running worker into memory."""
+    api, provider, handle = await _worker_with_log([_stamped(0, 0, "hello")])
+    api.log_reads.clear()
+    await provider.logs(handle, LogOffset())
+    assert [r["limit_bytes"] for r in api.log_reads] == [kubernetes_module.LOG_READ_LIMIT]
+
+
+async def test_a_capped_log_read_resumes_with_the_line_it_cut(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue 63: a capped read can stop inside a line. Only whole lines are stored, and
+    the strict-after resume of 10 carries on from the last of them, so the log arrives
+    complete, in order and exactly once over several polls."""
+    # About 180 bytes a second against a 400-byte read: each poll gets past its first
+    # second and stops inside a later line.
+    monkeypatch.setattr(kubernetes_module, "LOG_READ_LIMIT", 400)
+    lines = [_stamped(s, n, f"line {s}.{n} " + "x" * 20) for s in range(6) for n in range(3)]
+    api, provider, handle = await _worker_with_log(lines)
+    api.log_reads.clear()
+    stored = await _drain_logs(provider, handle)
+    assert stored == [line.partition(" ")[2].encode() for line in lines]
+    assert len(api.log_reads) > 2
+    assert {r["limit_bytes"] for r in api.log_reads} == {400}
+
+
+async def test_a_second_fuller_than_one_read_is_read_again_larger(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`sinceTime` is one-second granular, so a read capped inside the first second it
+    returns cannot move on by resuming. It is read again larger, up to the ceiling."""
+    monkeypatch.setattr(kubernetes_module, "LOG_READ_LIMIT", 100)
+    monkeypatch.setattr(kubernetes_module, "LOG_READ_CEILING", 1600)
+    lines = [_stamped(0, n, f"burst {n} " + "y" * 30) for n in range(10)]
+    lines.append(_stamped(1, 0, "after"))
+    api, provider, handle = await _worker_with_log(lines)
+    api.log_reads.clear()
+    stored = await _drain_logs(provider, handle)
+    assert stored == [line.partition(" ")[2].encode() for line in lines]
+    assert max(r["limit_bytes"] for r in api.log_reads) == 1600
+
+
+async def test_a_second_fuller_than_the_ceiling_is_skipped_with_a_notice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Past the ceiling nothing `sinceTime` can say gets through the second, so the
+    resume moves to the next second and the log says what was skipped. The poll never
+    stalls and never reads unbounded."""
+    monkeypatch.setattr(kubernetes_module, "LOG_READ_LIMIT", 100)
+    monkeypatch.setattr(kubernetes_module, "LOG_READ_CEILING", 400)
+    lines = [_stamped(0, 0, "before")]
+    lines += [_stamped(1, n + 1, f"flood {n} " + "z" * 60) for n in range(20)]
+    lines += [_stamped(2, 5, "after the flood")]
+    api, provider, handle = await _worker_with_log(lines)
+    api.log_reads.clear()
+    stored = await _drain_logs(provider, handle)
+    assert stored[0] == b"before"
+    assert stored[-1] == b"after the flood"
+    notices = [line for line in stored if line.startswith(b"[crucible] log lines skipped")]
+    assert len(notices) == 1
+    assert all(r["limit_bytes"] <= 400 for r in api.log_reads)
+
+
 # ----- reconcile (10, 26) --------------------------------------------------
 
 

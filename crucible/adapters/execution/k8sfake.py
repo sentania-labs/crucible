@@ -24,6 +24,7 @@ import tarfile
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 
 from crucible.adapters.execution.fake import (
@@ -54,6 +55,7 @@ from crucible.adapters.execution.k8sspec import (
     ROLE_VERIFIER,
     ROLE_WORKER,
 )
+from crucible.domain.time import parse_rfc3339
 from crucible.ports.execution import ImageInfo
 
 _TAG = re.compile(r"^.*:.*fake-(?P<behavior>[a-z]+(?:-[a-z]+)*?)(?:-(?P<n>\d+))?$")
@@ -219,6 +221,8 @@ class FakeKubernetesApi:
     objects: dict[tuple[str, str], _Object] = field(default_factory=dict)
     claims: dict[str, dict[str, bytes]] = field(default_factory=dict)
     logs: dict[str, list[str]] = field(default_factory=dict)
+    # Every `pod_log` call's name, `sinceTime` and `limitBytes`, in order (issue 63).
+    log_reads: list[dict[str, Any]] = field(default_factory=list)
     workers: dict[str, _Worker] = field(default_factory=dict)
     scripts: dict[str, tuple[str, int]] = field(default_factory=dict)
     # Which tag each resolved digest came from, so a role can read the behaviour a test
@@ -420,7 +424,9 @@ class FakeKubernetesApi:
         since_time: str | None = None,
         timestamps: bool = True,
         timeout: float | None = None,
+        limit_bytes: int | None = None,
     ) -> list[LogFrame]:
+        self.log_reads.append({"name": name, "since_time": since_time, "limit_bytes": limit_bytes})
         lines = self.logs.get(name, [])
         if not timestamps:
             # Worker lines carry the API server's timestamp prefix in this fake. The
@@ -439,8 +445,14 @@ class FakeKubernetesApi:
             if not timestamps:
                 lines = [line.partition(" ")[2] for line in lines]
         if since_time:
-            lines = [line for line in lines if line[: len(since_time)] >= since_time]
+            # The API server passes `sinceTime` on to the kubelet at one-second
+            # granularity, and the bound is inclusive.
+            floor = parse_rfc3339(since_time).replace(microsecond=0)
+            lines = [line for line in lines if _line_time(line) >= floor]
         payload = ("\n".join(lines) + "\n").encode("utf-8") if lines else b""
+        if limit_bytes is not None:
+            # `limitBytes` stops the stream where it lands, mid-line included.
+            payload = payload[:limit_bytes]
         return [LogFrame("stdout", payload)] if payload else []
 
     def pod_exec(
@@ -861,6 +873,14 @@ def _running(node: str) -> dict[str, Any]:
         "hostIP": "10.10.0.1",
         "nodeName": node,
     }
+
+
+def _line_time(line: str) -> datetime:
+    stamp = line.partition(" ")[0]
+    try:
+        return parse_rfc3339(stamp)
+    except ValueError:
+        return datetime.min.replace(tzinfo=UTC)
 
 
 def _stamp(offset: int) -> str:
