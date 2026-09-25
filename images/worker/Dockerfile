@@ -156,9 +156,12 @@ RUN set -eu; \
 # and refuses it for having no hash. That broke the v0.5.4 release the day uvicorn
 # 0.54.0 appeared. --no-deps installs exactly the locked set; --only-binary :all:
 # keeps pip from building an sdist, whose build backend would come from the index
-# unhashed. Then pip check proves the set is consistent, and the installed
-# name==version list must equal the lock's, so a package the lock misses or one
-# nothing asked for fails the build here rather than surprising a launch.
+# unhashed. pip check then catches a missing or wrong-version requirement, but it
+# ignores the packages an extra pulls in (removing uvloop, there only for
+# uvicorn[standard], passes it), so the guard that matters is the last one: the
+# installed name==version list must equal the lock's. pip and setuptools are left out
+# of that comparison: they come with the venv from Debian's pinned python3-venv, not
+# from the index or the lock.
 COPY --chmod=0644 worker/requirements.lock /tmp/requirements.lock
 COPY --from=fetch-hermes /fetch/hermes_agent-${HARNESS_HERMES_VERSION}-py3-none-any.whl /fetch/hermes_agent-${HARNESS_HERMES_VERSION}-py3-none-any.whl
 RUN set -eu; \
