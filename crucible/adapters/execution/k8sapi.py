@@ -346,11 +346,21 @@ class KubernetesClient:
             if exc.status != 404:
                 raise
 
-    def patch(self, kind: str, name: str, body: Mapping[str, Any]) -> dict[str, Any]:
-        """A JSON merge patch on one object. The only mutation this client makes to an
-        object it did not create, and the only thing it patches is the harness
-        credential Secret's data on a validated sync-back (12)."""
+    def patch(
+        self, kind: str, name: str, body: Mapping[str, Any], *, subresource: str | None = None
+    ) -> dict[str, Any]:
+        """A JSON merge patch on one object, or one of its subresources.
+
+        `subresource` is a test seam (71): the API server registers `status` apart
+        from the object it belongs to, so proving `observe` reads a real Evicted
+        status means patching it there, not on the object's own endpoint, which
+        silently ignores a status change for a built-in type. Every other caller
+        omits it and patches the object as before, which is the only mutation this
+        client makes to an object it did not create otherwise: the harness credential
+        Secret's data on a validated sync-back (12)."""
         url = f"{self._base(kind)}/{quote(name, safe='')}"
+        if subresource:
+            url = f"{url}/{subresource}"
         headers = {**self._headers(), "Content-Type": "application/merge-patch+json"}
         conn = self._connect()
         try:

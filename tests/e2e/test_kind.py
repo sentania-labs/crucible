@@ -774,6 +774,39 @@ async def test_deleted_pod_is_lost_and_sigterm_ignoring_pod_dies_at_grace(
     assert (await provider.observe(lost_handle)).state is ObservationState.LOST
     await provider.cleanup(lost_ws, CleanupPolicy.DELETE, lost_spec)
 
+    # 71: spec 26 says a Pod "evicted or deleted out of band" is `lost`. An eviction
+    # never removes the Pod the way a delete does; the kubelet leaves it behind with
+    # `status.phase=Failed, status.reason=Evicted`, a different code path in `observe`
+    # (26) that an out-of-band delete never exercises. The eviction API itself just
+    # deletes the Pod on a real cluster, so the status subresource is patched directly
+    # to the shape a genuine node-pressure eviction leaves, which is the part `observe`
+    # actually reads.
+    evicted_spec = _spec(6, _origin("evicted"), command=("sh", "-c", "sleep 600"))
+    evicted_ws = await provider.prepare(evicted_spec)
+    evicted_handle = await provider.launch(evicted_ws, evicted_spec)
+    await _running(provider, evicted_handle)
+    assert (await provider.observe(evicted_handle)).state is ObservationState.RUNNING
+    evicted_pod = await provider._pod_of(evicted_handle.ref)
+    assert evicted_pod is not None
+    api.patch(
+        "pods",
+        str(evicted_pod["metadata"]["name"]),
+        {
+            "status": {
+                "phase": "Failed",
+                "reason": "Evicted",
+                "message": "kind e2e (71): synthetic node-pressure eviction",
+            }
+        },
+        subresource="status",
+    )
+    observed = await provider.observe(evicted_handle)
+    assert observed.state is ObservationState.LOST
+    assert "Evicted" in observed.detail
+    api.delete("pods", str(evicted_pod["metadata"]["name"]), grace_period_seconds=0)
+    await _pods_gone(api, evicted_spec.attempt_id)
+    await provider.cleanup(evicted_ws, CleanupPolicy.DELETE, evicted_spec)
+
     stubborn = _spec(
         4,
         _origin("stubborn"),
