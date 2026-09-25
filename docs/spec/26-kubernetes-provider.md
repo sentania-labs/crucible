@@ -355,7 +355,15 @@ the namespace. A deployment therefore names one exact, pullable reference in
   log excerpt as detail.
 - `launch`: resolve the worker image to a digest through the image registry
   (11, 25) and record it; refuse an unsupported harness version; create the
-  NetworkPolicy and the worker Job; return the Job name as the handle.
+  NetworkPolicy and the worker Job; return the Job name as the handle. The
+  registry is read with `crane` (go-containerregistry), which the service image
+  ships at a pinned version: `crane digest` for the reference's own digest (an
+  index's, when it is one) and `crane config --platform linux/amd64` by that
+  digest for the harness labels. The credential is the image pull Secret the
+  kubelet already uses, written for each call into a private `DOCKER_CONFIG`
+  directory that is removed when the call returns; each call is bounded by a
+  timeout, and crane trusts what the service trusts (`SSL_CERT_FILE`, the
+  system store with the lab CA). The operator's decision of 2026-09-24 (108).
 - `observe`: read the Job and its Pod.
 
   | Job | Pod | Result |

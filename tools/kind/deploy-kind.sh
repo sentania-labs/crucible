@@ -123,9 +123,10 @@ echo "deploy-kind: kind loads this local image and never pulls it, so the render
 echo "deploy-kind: reference and the image under test are both $release_image"
 docker build -t "$built_image" --build-arg "REVISION=$revision" "$root" >/dev/null
 
-# A registry the deployed provider can reach over HTTPS. k8sregistry.py speaks HTTPS
-# only and it is right to: resolving a tag to a digest is how the harness version refusal
-# happens before a kubelet pulls (07, 26), so it must not be a plaintext hop. The CA is
+# A registry the deployed provider can reach over HTTPS. The provider's crane speaks
+# HTTPS to a registry named by hostname, and that is right: resolving a tag to a digest is
+# how the harness version refusal happens before a kubelet pulls (07, 26), so it must not
+# be a plaintext hop. crane trusts this run's CA through SSL_CERT_FILE below. The CA is
 # generated per run, lives only in this scratch directory, and is trusted by exactly two
 # things: containerd on the throwaway node, and the two Crucible containers.
 mkdir -p "$certs"
@@ -253,9 +254,10 @@ data:
   # podPidsLimit: 512 on (95). This is lab-admin's attestation of that same number for
   # this disposable cluster, the same way a real deployment would state it.
   CRUCIBLE_KUBERNETES__POD_PID_LIMIT_OVERRIDE: "512"
-  # Python's default HTTPS context reads this, and the Kubernetes API client does not:
-  # it builds its own context from the ServiceAccount's ca.crt (k8sapi.py). So the only
-  # thing this changes is which registry the provider will trust.
+  # crane, which the provider runs to resolve a worker image, reads this, as does Python's
+  # default HTTPS context; the Kubernetes API client does not: it builds its own context
+  # from the ServiceAccount's ca.crt (k8sapi.py). So the only thing this changes is which
+  # registry the provider will trust.
   SSL_CERT_FILE: /etc/crucible-registry-ca/ca.crt
 EOF
 for component in api supervisor; do
