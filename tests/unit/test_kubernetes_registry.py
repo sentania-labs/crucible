@@ -365,6 +365,37 @@ class _SlowRegistry(FakeRegistry):
                 self.in_flight -= 1
 
 
+async def test_list_images_skips_ci_proof_tags_without_resolving_them() -> None:
+    """111: a ci-* tag is a CI proof push, never a promotable image, and about two
+    thirds of a worker repository's tags are one. Listing costs two crane calls per
+    tag resolved, so leaving them out of the resolve step, not just the result, is
+    the point."""
+    resolved: list[str] = []
+
+    class _CountingRegistry(FakeRegistry):
+        def resolve(self, reference: str, *, deadline: float | None = None) -> ImageInfo:
+            resolved.append(reference)
+            return super().resolve(reference)
+
+    registry = _CountingRegistry()
+    registry.register("ghcr.io/o/worker:1.0.0")
+    registry.register("ghcr.io/o/worker:latest")
+    registry.register("ghcr.io/o/worker:ci-0123abcd-20260916-aaaaaaaaaaaa")
+    provider = KubernetesProvider(
+        KubernetesConfig(image_repositories=("ghcr.io/o/worker",)),
+        FakeKubernetesApi(),  # type: ignore[arg-type]
+        registry,
+    )
+
+    images = await provider.list_images()
+
+    assert {i.reference for i in images} == {
+        "ghcr.io/o/worker:1.0.0",
+        "ghcr.io/o/worker:latest",
+    }
+    assert resolved == ["ghcr.io/o/worker:1.0.0", "ghcr.io/o/worker:latest"]
+
+
 async def test_list_images_resolves_a_few_tags_at_once_and_skips_failures() -> None:
     registry = _SlowRegistry()
     for n in range(20):

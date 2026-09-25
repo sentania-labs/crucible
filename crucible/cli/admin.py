@@ -186,7 +186,9 @@ def build_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
 
     i = sub.add_parser("images", help="list and promote")
     i_sub = i.add_subparsers(dest="image_command", required=True)
-    i_sub.add_parser("list", help="worker images and their promotion state")
+    i_sub.add_parser(
+        "list", help="worker images and their promotion state (ci-* tags are not listed)"
+    )
     promote = i_sub.add_parser("promote", help="promote a candidate image")
     promote.add_argument("digest", help="the image's digest or reference")
 

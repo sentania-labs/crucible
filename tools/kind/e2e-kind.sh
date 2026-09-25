@@ -60,12 +60,13 @@ cleanup() {
       echo "e2e-kind cleanup: network kind remains (a concurrent kind cluster may hold it)" >&2
     fi
   fi
-  # A pull failure here is not a leak: it only means the chmod below did not run, and
-  # the removal it was for is checked on its own right after (77). Treating the pull
-  # itself as fatal failed an otherwise clean run whenever it could not reach the
-  # registry.
-  docker run --rm -v "$scratch:/cleanup" \
-    busybox@sha256:9db7b59979c38555a39def84a31fb98b5296952f9e3afd4f6f11f05b07adfab0 \
+  # The cleanup helper is pulled the same way as the tier's other images (68). If no
+  # source answers, the chmod does not run, which is not itself a leak: the scratch
+  # path's removal is checked on its own right after, so a root-owned file left behind
+  # still fails the run there, and an unreachable registry no longer fails an
+  # otherwise clean one (77).
+  busybox=$(crucible_kind_pull "$CRUCIBLE_BUSYBOX_IMAGE" 2>/dev/null) || busybox=$CRUCIBLE_BUSYBOX_IMAGE
+  docker run --rm -v "$scratch:/cleanup" "$busybox" \
     chmod -R a+rwX /cleanup >/dev/null 2>&1 || :
   rm -rf "$scratch" || cleanup_failed=1
   if [ -e "$scratch" ]; then
@@ -128,10 +129,13 @@ containerdConfigPatches:
   - |-
     [plugins."io.containerd.grpc.v1.cri".registry.mirrors."localhost:${registry_port}"]
       endpoint = ["http://${registry}:5000"]
+    ${CRUCIBLE_KIND_DOCKER_HUB_MIRROR_PATCH}
 EOF
 
 cluster_created=1
-kind create cluster --config "$scratch/kind.yaml" --kubeconfig "$kubeconfig" --wait 0s
+node_image=$(crucible_kind_pull "$CRUCIBLE_KIND_NODE_IMAGE")
+kind create cluster --config "$scratch/kind.yaml" --kubeconfig "$kubeconfig" --wait 0s \
+  --image "$node_image"
 
 node="${cluster}-control-plane"
 for address in 10.0.0.1 172.16.0.1 192.168.0.1 100.64.0.1 169.254.169.254; do
