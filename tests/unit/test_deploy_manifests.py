@@ -29,6 +29,7 @@ from typing import Any
 import pytest
 import yaml
 
+from crucible.adapters.first_run import SECRET_NAME
 from crucible.settings import CredentialSettings, HarnessSettings, Settings
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -214,7 +215,7 @@ FIRST_RUN_GRANTS = {
             {
                 "apiGroups": [""],
                 "resources": ["secrets"],
-                "resourceNames": ["crucible-first-run-admin"],
+                "resourceNames": [SECRET_NAME],
                 "verbs": ["patch"],
             },
         ],
@@ -225,7 +226,7 @@ FIRST_RUN_GRANTS = {
             {
                 "apiGroups": [""],
                 "resources": ["secrets"],
-                "resourceNames": ["crucible-first-run-admin"],
+                "resourceNames": [SECRET_NAME],
                 "verbs": ["delete"],
             }
         ],

@@ -299,7 +299,7 @@ def first_run_delivery(settings: Settings) -> FirstRunDelivery | None:
                 if k.kubeconfig
                 else in_cluster_access()
             )
-        except KubernetesApiError as exc:
+        except (KubernetesApiError, OSError) as exc:
             log.error("the first-run token Secret is unreachable: %s", exc)
             return None
         return SecretDelivery(KubernetesClient(access, k.namespace, timeout=k.api_timeout_seconds))

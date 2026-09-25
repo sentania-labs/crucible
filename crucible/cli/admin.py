@@ -731,6 +731,7 @@ def _token(args: argparse.Namespace, wiring: Wiring) -> Any:
                 reason=args.reason,
             )
             uow.commit()
+            tokens_admin.after_revoke(wiring.admin, result)
             return result
         if args.rotate:
             raise UsageError("token rotation is replaced by revoke and create")
@@ -774,8 +775,9 @@ def ensure_first_admin(database_url: str, delivery: FirstRunDelivery | None) -> 
                 print(
                     "No first-run administrator was created: this deployment has no "
                     "private place for its token (the Kubernetes provider's Secret or the "
-                    "Docker credential root). Create one with `crucible admin token "
-                    "create --principal <name> --role admin`.",
+                    "Docker credential root). With the supervisor running, create one "
+                    'with `crucible admin --reason "<why>" token create --principal '
+                    "<name> --role admin`.",
                     file=sys.stderr,
                 )
                 return

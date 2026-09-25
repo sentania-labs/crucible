@@ -57,6 +57,13 @@ def create(
     return minted
 
 
+def after_revoke(ctx: AdminContext, result: dict[str, Any]) -> None:
+    """ADR 0016: once a revoke of the first-run principal is committed, its token has
+    nothing left to open and is not left lying in its Secret or file. Blocking: an
+    async caller runs it on a thread."""
+    discard_after_use(ctx.first_run, str(result.get("name", "")))
+
+
 def revoke(
     ctx: AdminContext,
     uow: UnitOfWork,
@@ -72,9 +79,6 @@ def revoke(
     if target.name == principal:
         raise ConflictError("an administrator cannot revoke the token in use")
     uow.principals.disable(principal_id, ctx.clock.now())
-    # ADR 0016: a revoked first-run principal's token has nothing left to open, and is
-    # not left lying in its Secret or file.
-    discard_after_use(ctx.first_run, target)
     admin_event(
         uow,
         ctx,

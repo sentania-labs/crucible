@@ -5,7 +5,6 @@ from __future__ import annotations
 import base64
 import logging
 import os
-from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -14,13 +13,8 @@ from crucible.adapters.execution.k8sapi import KubernetesApiError
 from crucible.adapters.execution.k8sfake import FakeKubernetesApi
 from crucible.adapters.first_run import SECRET_NAME, FileDelivery, SecretDelivery
 from crucible.application.first_run import discard_after_use, is_first_run
-from crucible.domain.entities import Principal, Role
 
 TOKEN = "cru_" + "0" * 26 + "." + "s" * 40
-
-
-def _principal(name: str) -> Principal:
-    return Principal(id="p1", name=name, role=Role.ADMIN, created_at=datetime.now(UTC))
 
 
 def test_the_secret_holds_the_token_and_names_only_where_it_is() -> None:
@@ -63,6 +57,7 @@ def test_the_file_is_private_and_replaced_atomically(tmp_path: Path) -> None:
     assert os.stat(delivery.path).st_mode & 0o777 == 0o600
     assert sorted(p.name for p in tmp_path.iterdir()) == ["first-run-admin-token"]
     assert "docker compose exec crucible cat" in delivery.where()
+    assert str(delivery.path) in delivery.where()
     delivery.discard()
     delivery.discard()
     assert not delivery.path.exists()
@@ -71,10 +66,10 @@ def test_the_file_is_private_and_replaced_atomically(tmp_path: Path) -> None:
 def test_only_the_first_run_principal_discards(tmp_path: Path) -> None:
     delivery = FileDelivery(tmp_path / "first-run-admin-token")
     delivery.deliver(TOKEN)
-    discard_after_use(delivery, _principal("operator-admin"))
+    discard_after_use(delivery, "operator-admin")
     assert delivery.path.exists()
-    discard_after_use(None, _principal("first-run-admin"))
-    discard_after_use(delivery, _principal("first-run-admin-1a2b3c4d"))
+    discard_after_use(None, "first-run-admin")
+    discard_after_use(delivery, "first-run-admin-1a2b3c4d")
     assert not delivery.path.exists()
     assert is_first_run("first-run-admin") and not is_first_run("admin-first-run-admin")
 
@@ -91,5 +86,5 @@ def test_a_failed_discard_is_logged_without_the_token(caplog: pytest.LogCaptureF
             raise KubernetesApiError(403, "forbidden")
 
     with caplog.at_level(logging.WARNING):
-        discard_after_use(Failing(), _principal("first-run-admin"))
+        discard_after_use(Failing(), "first-run-admin")
     assert "could not be removed" in caplog.text and "cru_" not in caplog.text

@@ -469,6 +469,7 @@ def admin_revoke_token(
         reason=_reason(body),
     )
     uow.commit()
+    tokens.after_revoke(_admin(ctx), result)
     return result
 
 

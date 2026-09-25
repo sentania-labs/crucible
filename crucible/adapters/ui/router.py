@@ -535,7 +535,7 @@ async def sign_in(request: Request, ctx: Ctx, uow: UoW) -> Response:
         )
     # ADR 0016: the first-run token has done its job once it has signed someone in;
     # it does not stay in its Secret or file for the next reader.
-    await asyncio.to_thread(discard_after_use, ctx.first_run, principal)
+    await asyncio.to_thread(discard_after_use, ctx.first_run, principal.name)
     csrf = os.urandom(24).hex()
     value = _serializer(ctx).dumps({"token": token, "csrf": csrf})
     target = form.get("next", "/ui")
@@ -1866,13 +1866,15 @@ async def action(request: Request, action: str, ctx: Ctx, uow: UoW) -> Response:
             response.headers["Cache-Control"] = "no-store"
             return response
         elif action == "token-revoke":
-            tokens.revoke(
+            revoked = tokens.revoke(
                 ctx.admin,
                 uow,
                 principal=principal.name,
                 principal_id=form.get("principal_id", ""),
                 reason=reason,
             )
+            uow.commit()
+            await asyncio.to_thread(tokens.after_revoke, ctx.admin, revoked)
         elif action == "github-check":
             github.check(ctx.admin, uow, principal=principal.name, reason=reason)
         elif action == "bootstrap-commit":

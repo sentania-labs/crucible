@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 
-from crucible.domain.entities import Principal
 from crucible.ports.first_run import FirstRunDelivery
 
 log = logging.getLogger(__name__)
@@ -18,11 +17,11 @@ def is_first_run(name: str) -> bool:
     return name.startswith(FIRST_RUN_PREFIX)
 
 
-def discard_after_use(delivery: FirstRunDelivery | None, principal: Principal) -> None:
+def discard_after_use(delivery: FirstRunDelivery | None, principal_name: str) -> None:
     """Remove the delivered token once the first-run principal has used or lost it.
-    Best effort: a failure is logged and never fails the sign-in or the revoke that
-    caused it, because the token the operator holds works either way."""
-    if delivery is None or not is_first_run(principal.name):
+    Called after the sign-in or the committed revoke. Best effort: a failure is logged
+    and never fails the sign-in or the revoke that caused it."""
+    if delivery is None or not is_first_run(principal_name):
         return
     try:
         delivery.discard()

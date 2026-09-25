@@ -68,7 +68,7 @@ class FileDelivery:
 
     def where(self) -> str:
         return (
-            f"the file {self.path} in the service container (mode 0600): "
+            f"the file {self.path} (mode 0600); under compose, read it with "
             f"docker compose exec crucible cat {self.path}"
         )
 
