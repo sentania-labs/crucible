@@ -337,3 +337,44 @@ def test_a_pod_missing_a_field_keeps_the_fallback_for_that_field_only() -> None:
     assert read.cpus == fallback.cpus
     assert read.grace_seconds == 30
     assert read.tmpfs_bytes == fallback.tmpfs_bytes
+
+
+def test_a_live_cpu_request_survives_a_missing_limit() -> None:
+    """A live Pod can carry a request with no limit, or a limit admission could not
+    parse. The request still says something about the attempt's actual usage, so it is
+    kept against the fallback limit instead of being discarded for the policy
+    default (issue 76 follow-up)."""
+    fallback = k8sspec.limits_from_policy({"resources": {"cpus": 2.0}})
+    read = k8sspec.limits_from_pod(
+        {
+            "containers": [
+                {
+                    "name": "crucible",
+                    "resources": {"requests": {"cpu": "500m"}},
+                }
+            ]
+        },
+        fallback,
+    )
+    assert read.cpus == fallback.cpus
+    assert read.cpu_request_fraction == pytest.approx(0.5 / 2.0)
+
+
+def test_a_live_memory_request_survives_an_unparsable_limit() -> None:
+    fallback = k8sspec.limits_from_policy({"resources": {"memory": "4GiB"}})
+    read = k8sspec.limits_from_pod(
+        {
+            "containers": [
+                {
+                    "name": "crucible",
+                    "resources": {
+                        "requests": {"memory": "1Gi"},
+                        "limits": {"memory": "not-a-quantity"},
+                    },
+                }
+            ]
+        },
+        fallback,
+    )
+    assert read.memory_bytes == fallback.memory_bytes
+    assert read.memory_request_fraction == pytest.approx(1024**3 / fallback.memory_bytes)

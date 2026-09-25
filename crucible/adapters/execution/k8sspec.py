@@ -282,7 +282,10 @@ def limits_from_pod(pod: Mapping[str, Any], fallback: Limits) -> Limits:
     rewritten what Crucible asked for, and an adopted attempt has no policy in memory at
     all. Every field is read from `pod` where it is present and parses, and taken from
     `fallback` only where it is not, so a partial or unfamiliar Pod never invents a
-    number."""
+    number. A request is kept against the effective limit (the Pod's own, or the
+    fallback's where the Pod's is missing or unparsable) rather than discarded for the
+    policy default fraction, so a live request still means something even without a
+    matching live limit."""
     containers = [c for c in pod.get("containers") or [] if isinstance(c, Mapping)]
     container: Mapping[str, Any] = next(
         (c for c in containers if c.get("name") == CONTAINER_NAME),
@@ -316,12 +319,12 @@ def limits_from_pod(pod: Mapping[str, Any], fallback: Limits) -> Limits:
         ),
         cpu_request_fraction=(
             cpu_request / effective_cpus
-            if cpu_request is not None and cpus
+            if cpu_request is not None and effective_cpus
             else fallback.cpu_request_fraction
         ),
         memory_request_fraction=(
             memory_request / effective_memory
-            if memory_request is not None and memory
+            if memory_request is not None and effective_memory
             else fallback.memory_request_fraction
         ),
     )
