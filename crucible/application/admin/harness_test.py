@@ -129,7 +129,7 @@ async def _run(
         if state == "absent":
             steps.failed(
                 CREDENTIAL,
-                f"no API key is stored for {harness}; set the key on Credentials"
+                f"no API key is stored for {harness}; set it with the gateway URL on Local gateway"
                 if harness == credentials.HERMES
                 else f"no credential is stored for {harness}; log in on Credentials",
             )
