@@ -2439,6 +2439,14 @@ def _setting_applies(path: str, settings: Any) -> bool:
     return not (parts[0] == "credentials" and secrets_held and parts[-1] in ("path", "source"))
 
 
+# 26 and issue 61: the one restart-bound setting that widens what a worker can reach. The
+# page intro already says every setting here is read at start (crucible#115).
+_BROAD_EGRESS_REASON = (
+    "On, a worker's egress is the public internet on 443 minus the denied ranges, GitHub "
+    "included, instead of the resolved allowlist."
+)
+
+
 def _settings_rows(settings: Any) -> list[list[Any]]:
     if settings is None or not hasattr(settings, "model_dump"):
         return []
@@ -2487,6 +2495,8 @@ def _settings_rows(settings: Any) -> list[list[Any]]:
             if path in sensitive
             else "Seeds the egress selectors; edit them on Routing, where a saved value wins."
             if path.split(".")[:2] in _EGRESS_SEEDS
+            else _BROAD_EGRESS_REASON
+            if path == "kubernetes.broad_egress"
             else ""
         )
         rows.append([path, shown, source, reason])

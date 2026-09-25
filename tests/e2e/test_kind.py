@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import json
 import os
@@ -20,6 +21,7 @@ from crucible.adapters.api.app import create_app
 from crucible.adapters.api.deps import AppContext
 from crucible.adapters.clock import SystemClock
 from crucible.adapters.execution import k8sspec
+from crucible.adapters.execution import kubernetes as kubernetes_module
 from crucible.adapters.execution.fake import FakeProvider
 from crucible.adapters.execution.k8sapi import (
     KubernetesApiError,
@@ -874,6 +876,202 @@ async def test_restart_adopts_the_job_and_resumes_logs(
     await successor.cleanup(workspace, CleanupPolicy.DELETE, spec)
 
 
+async def test_an_adopted_attempt_drains_with_its_policy_grace_and_reports_pod_limits(
+    provider: KubernetesProvider, api: KubernetesClient, registry: CraneRegistryClient
+) -> None:
+    """Issues 66 and 76 on a real API server: a fresh provider adopts a worker, reads
+    its limits off the live Pod (as the API server canonicalised them), and drains it
+    with the task policy's grace period rather than a 60 s default."""
+    spec = _spec(
+        50,
+        _origin("adopt-grace"),
+        command=("sh", "-c", "trap '' TERM; echo ready; while :; do sleep 1; done"),
+    )
+    spec = replace(spec, policy={**spec.policy, "limits": {"grace_seconds": 7}})
+    workspace = await provider.prepare(spec)
+    handle = await provider.launch(workspace, spec)
+    await _running(provider, handle)
+    successor = _provider(api, registry)
+    adopted = next(h for h in await successor.reconcile() if h.attempt_id == spec.attempt_id)
+    launched = successor._launched[spec.attempt_id]
+    pod = await successor._pod_of(adopted.ref)
+    assert pod is not None
+    print("live limits:", json.dumps(pod["spec"]["containers"][0]["resources"]))
+    assert launched.limits_source == "pod"
+    assert launched.limits.as_dict() == provider._limits(spec).as_dict()
+    assert launched.limits.grace_seconds == 7
+    await successor.terminate(adopted, "drain")
+    draining = api.get("pods", str(pod["metadata"]["name"]))
+    print("deletionGracePeriodSeconds:", draining["metadata"].get("deletionGracePeriodSeconds"))
+    assert draining["metadata"].get("deletionGracePeriodSeconds") == 7
+    assert (await _terminal(successor, adopted, timeout=30)).state is ObservationState.EXITED
+    await successor.cleanup(workspace, CleanupPolicy.DELETE, spec)
+
+
+def _pod_body(name: str, resources: dict[str, Any], *, pod_level: bool) -> dict[str, Any]:
+    container: dict[str, Any] = {
+        "name": "crucible",
+        "image": os.environ["CRUCIBLE_E2E_KIND_REGISTRY"],
+        "command": ["true"],
+        "securityContext": {
+            "allowPrivilegeEscalation": False,
+            "runAsNonRoot": True,
+            "runAsUser": 1000,
+            "capabilities": {"drop": ["ALL"]},
+            "seccompProfile": {"type": "RuntimeDefault"},
+        },
+    }
+    spec: dict[str, Any] = {"restartPolicy": "Never", "containers": [container]}
+    if pod_level:
+        spec["resources"] = resources
+    else:
+        container["resources"] = resources
+    return {"apiVersion": "v1", "kind": "Pod", "metadata": {"name": name}, "spec": spec}
+
+
+@pytest.mark.parametrize("pod_level", [False, True])
+async def test_the_pod_api_has_no_pid_limit_field(api: KubernetesClient, pod_level: bool) -> None:
+    """Issue 60: the Docker provider's `PidsLimit` has no Pod API equivalent. The API
+    server refuses `pids` as a container resource and as a pod-level resource, so the
+    per-pod limit cannot be set from the Pod and is the kubelet's `podPidsLimit`."""
+    name = f"crucible-pids-probe-{'pod' if pod_level else 'container'}"
+    resources = {
+        "limits": {"cpu": "100m", "memory": "64Mi", "pids": "64"},
+        "requests": {"cpu": "100m", "memory": "64Mi"},
+    }
+    try:
+        api.create("pods", _pod_body(name, resources, pod_level=pod_level))
+    except KubernetesApiError as exc:
+        refused = exc
+    else:
+        api.delete("pods", name, grace_period_seconds=0)
+        pytest.fail("the API server accepted a pids resource")
+    print(f"pids refused ({'pod' if pod_level else 'container'} level):", refused)
+    assert refused.status == 422
+    assert "pids" in str(refused)
+
+
+async def test_a_bounded_log_read_brings_every_line_once_through_the_real_api(
+    provider: KubernetesProvider,
+    api: KubernetesClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue 63 on a real kubelet: `limitBytes` is honoured (a read stops where it lands,
+    mid-line), and polling with a small cap still stores the whole log, in order, once.
+    A burst of more than the ceiling inside one second is skipped with a notice and the
+    lines after it still arrive."""
+    script = (
+        "i=1; while [ $i -le 40 ]; do echo bounded-$i-padding-padding-padding; "
+        "i=$((i+1)); sleep 0.05; done; "
+        "j=1; while [ $j -le 60 ]; do "
+        "echo burst-$j-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; "
+        "j=$((j+1)); done; sleep 2; echo after-the-burst"
+    )
+    spec = _spec(51, _origin("bounded-logs"), command=("sh", "-c", script))
+    workspace = await provider.prepare(spec)
+    handle = await provider.launch(workspace, spec)
+    await _terminal(provider, handle)
+    pod = await provider._pod_of(handle.ref)
+    assert pod is not None
+    pod_name = str(pod["metadata"]["name"])
+    raw = b"".join(
+        f.payload for f in api.pod_log(pod_name, container=k8sspec.CONTAINER_NAME, limit_bytes=100)
+    )
+    print("a 100-byte read:", raw)
+    assert len(raw) == 100
+
+    monkeypatch.setattr(kubernetes_module, "LOG_READ_LIMIT", 600)
+    monkeypatch.setattr(kubernetes_module, "LOG_READ_CEILING", 2400)
+    reads: list[int] = []
+    real_log = api.pod_log
+
+    def counted(name: str, **kwargs: Any) -> Any:
+        reads.append(int(kwargs.get("limit_bytes") or 0))
+        return real_log(name, **kwargs)
+
+    monkeypatch.setattr(api, "pod_log", counted)
+    offset = LogOffset()
+    stored: list[bytes] = []
+    for _ in range(200):
+        chunks = await provider.logs(handle, offset)
+        if not chunks:
+            break
+        for chunk in chunks:
+            stored.extend(chunk.content.splitlines())
+            offset = LogOffset(
+                index=offset.index + chunk.lines,
+                timestamp=chunk.ts.isoformat() if chunk.ts else None,
+                line_sha256=chunk.line_sha256,
+                occurrence=chunk.occurrence,
+            )
+    print("polls:", len(reads), "largest read:", max(reads), "lines stored:", len(stored))
+    assert reads and max(reads) <= 2400
+    bounded = [line for line in stored if line.startswith(b"bounded-")]
+    assert bounded == [f"bounded-{i}-padding-padding-padding".encode() for i in range(1, 41)]
+    assert any(line.startswith(b"[crucible] log lines skipped") for line in stored)
+    assert stored[-1] == b"after-the-burst"
+    await provider.cleanup(workspace, CleanupPolicy.DELETE, spec)
+
+
+class RotatingScriptAdapter(ScriptHarnessAdapter):
+    """A rw-narrow credential with an issued-at field, like the real three (12)."""
+
+    def credential_spec(self) -> CredentialSpec:
+        return CredentialSpec(
+            harness=self.name,
+            mount_target="/home/worker/.script-harness",
+            auth_files=(
+                AuthFile("auth.json", json=True, json_keys=("token",), issued_at=("issued",)),
+            ),
+            minimum_mode=MountMode.RW_NARROW,
+        )
+
+
+async def test_a_failed_attempts_rotated_token_is_written_back_on_a_real_cluster(
+    api: KubernetesClient, registry: CraneRegistryClient
+) -> None:
+    """Issue 56: the worker refreshes its token and then fails. The newer, valid file is
+    read back through the reader Pod and written into the harness Secret whatever the
+    exit code (12 as amended)."""
+    provider = _provider(api, registry, harnesses=HarnessRegistry((RotatingScriptAdapter(),)))
+    source = provider.credential_secret("script-harness")
+    with contextlib.suppress(KubernetesApiError):
+        api.delete("secrets", source)
+    seeded = {"token": "seeded-placeholder", "issued": "2026-09-20T00:00:00Z"}
+    rotated = {"token": "rotated-placeholder", "issued": "2026-09-25T00:00:00Z"}
+    api.create(
+        "secrets",
+        {
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {"name": source, "namespace": "crucible-workers"},
+            "type": "Opaque",
+            "stringData": {"auth.json": json.dumps(seeded)},
+        },
+    )
+    rotate = (
+        "printf '%s' '" + json.dumps(rotated) + "' > /home/worker/.script-harness/auth.json; "
+        "echo rotated; exit 3"
+    )
+    spec = _spec(52, _origin("rotate-then-fail"), command=("sh", "-c", rotate))
+    try:
+        workspace = await provider.prepare(spec)
+        handle = await provider.launch(workspace, spec)
+        observed = await _terminal(provider, handle)
+        assert observed.exit_code == 3, observed
+        outputs = await provider.collect(handle, workspace, spec)
+        sync = outputs.credential_sync
+        print("credential sync:", sync)
+        assert sync is not None
+        assert [(f.name, f.synced) for f in sync.files] == [("auth.json", True)], sync
+        stored = api.get("secrets", source)["data"]["auth.json"]
+        assert json.loads(base64.b64decode(stored)) == rotated
+        await provider.cleanup(workspace, CleanupPolicy.DELETE, spec)
+    finally:
+        with contextlib.suppress(KubernetesApiError):
+            api.delete("secrets", source)
+
+
 @pytest.mark.parametrize("policy", list(CleanupPolicy))
 async def test_per_attempt_secret_is_removed_under_every_cleanup_policy(
     api: KubernetesClient,
@@ -911,19 +1109,23 @@ async def test_per_attempt_secret_is_removed_under_every_cleanup_policy(
 async def test_probe_refuses_launches_without_default_deny(
     api: KubernetesClient, registry: CraneRegistryClient
 ) -> None:
-    """Readiness row 12: removing enforcement makes the canary fail closed."""
+    """Readiness row 12: removing enforcement makes the canary fail closed. Issue 59:
+    the refusal comes at prepare, before the claim, the identity ConfigMap, the
+    per-attempt credential Secret or the preparer Job (which has GitHub egress) exist."""
     spec = _spec(20, _origin("probe-refusal"))
     provider = _provider(api, registry)
-    workspace = await provider.prepare(spec)
     default_deny = api.get("networkpolicies", "default-deny")
     api.delete("networkpolicies", "default-deny")
     try:
+        with pytest.raises(LaunchRefusedError, match="namespace is not ready"):
+            await provider.prepare(spec)
         probe = await provider.ensure_ready()
         assert probe.passed is False
         assert probe.egress_enforced is False
         assert "reached the API server" in probe.detail
-        with pytest.raises(LaunchRefusedError, match="namespace is not ready"):
-            await provider.launch(workspace, spec)
+        selector = f"{k8sspec.LABEL_ATTEMPT}={spec.attempt_id}"
+        for kind in ("persistentvolumeclaims", "configmaps", "secrets", "jobs", "pods"):
+            assert not api.list_objects(kind, label_selector=selector), kind
     finally:
         restored = {key: value for key, value in default_deny.items() if key not in ("status",)}
         metadata = restored["metadata"]
@@ -933,7 +1135,7 @@ async def test_probe_refuses_launches_without_default_deny(
             if key in ("name", "namespace", "labels", "annotations")
         }
         api.create("networkpolicies", restored)
-        await provider.cleanup(workspace, CleanupPolicy.DELETE, spec)
+        await provider._delete_attempt_objects(spec.attempt_id)
 
 
 async def test_row_23_a_harness_the_image_does_not_declare_is_refused(

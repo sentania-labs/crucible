@@ -25,6 +25,7 @@ from crucible.adapters.ui.router import (
     _localize,
     _panel,
     _safe_value,
+    _settings_rows,
     templates,
 )
 from crucible.application.admin import audit as audit_service
@@ -45,6 +46,7 @@ from crucible.domain.entities import (
 )
 from crucible.domain.events import EventKind
 from crucible.domain.lifecycle import TaskState
+from crucible.settings import Settings
 
 
 def request(path: str) -> Request:
@@ -966,3 +968,20 @@ def test_the_harnesses_word_is_the_first_readiness_step() -> None:
     assert _harness_status(_harness("script-harness", default_image=None), None)["value"] == (
         "needs an image"
     )
+
+
+def test_the_settings_page_shows_broad_egress_and_the_resolve_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue 61: the two egress settings appear beside every other Kubernetes setting,
+    with their source, and broad egress says what turning it on gives a worker."""
+    monkeypatch.delenv("CRUCIBLE_CONFIG", raising=False)
+    monkeypatch.setenv("CRUCIBLE_KUBERNETES__RESOLVE_TTL_SECONDS", "120")
+    rows = {
+        row[0]: row for row in _settings_rows(Settings(kubernetes={"resolve_ttl_seconds": 120}))
+    }
+    assert rows["kubernetes.broad_egress"][1:3] == [False, "default"]
+    assert "GitHub included" in rows["kubernetes.broad_egress"][3]
+    assert rows["kubernetes.resolve_ttl_seconds"][1:3] == [120.0, "environment"]
+    # Every setting here is read at start, which the page intro says once (crucible#115).
+    assert rows["kubernetes.resolve_ttl_seconds"][3] == ""

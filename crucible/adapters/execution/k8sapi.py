@@ -410,8 +410,12 @@ class KubernetesClient:
         since_time: str | None = None,
         timestamps: bool = True,
         timeout: float | None = None,
+        limit_bytes: int | None = None,
     ) -> list[LogFrame]:
         """`pods/log` with timestamps and an RFC 3339 `sinceTime` bound (26).
+
+        `limit_bytes` is the API's `limitBytes` (issue 63): the kubelet stops after that
+        many bytes of output, which may be in the middle of a line.
 
         Kubernetes merges stdout and stderr into one stream and does not say which a
         line came from, so every line is reported on stdout. The resume position (10)
@@ -423,6 +427,8 @@ class KubernetesClient:
             params["container"] = container
         if since_time:
             params["sinceTime"] = since_time
+        if limit_bytes is not None:
+            params["limitBytes"] = str(limit_bytes)
         path = f"{self._base('pods')}/{quote(name, safe='')}/log"
         try:
             with self._request("GET", path, params=params, timeout=timeout) as response:

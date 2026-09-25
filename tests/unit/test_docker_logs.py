@@ -6,6 +6,7 @@ import hashlib
 
 from crucible.adapters.execution.docker import _since_param
 from crucible.adapters.execution.dockerapi import LogFrame, demultiplex
+from crucible.adapters.execution.logstream import RESUME_AT_BOUNDARY
 from crucible.adapters.execution.logstream import chunks as _chunks
 from crucible.ports.execution import LogOffset
 
@@ -205,3 +206,18 @@ def test_a_body_that_is_not_framed_is_kept_rather_than_dropped() -> None:
 def test_a_truncated_final_frame_keeps_what_arrived() -> None:
     raw = bytes([1, 0, 0, 0]) + (99).to_bytes(4, "big") + b"short"
     assert [(f.stream, f.payload) for f in demultiplex(raw)] == [("stdout", b"short")]
+
+
+def test_a_position_at_a_boundary_keeps_the_line_stamped_at_that_instant() -> None:
+    """Issue 63: a position a provider moved past lines it could not read names no line,
+    so the resume keeps everything at or after it instead of taking the first line at
+    that instant for one already stored."""
+    raw = (
+        b"2026-09-25T17:00:01.000000000Z inside the skipped second's next instant\n"
+        b"2026-09-25T17:00:01.500000000Z later\n"
+    )
+    offset = LogOffset(
+        timestamp="2026-09-25T17:00:01+00:00", line_sha256=RESUME_AT_BOUNDARY, occurrence=0
+    )
+    [chunk] = _chunks([LogFrame("stdout", raw)], offset)
+    assert chunk.content == b"inside the skipped second's next instant\nlater\n"

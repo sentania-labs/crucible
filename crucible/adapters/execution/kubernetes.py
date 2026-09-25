@@ -41,7 +41,7 @@ import weakref
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Literal
@@ -55,6 +55,7 @@ from crucible.adapters.execution.k8sapi import (
     ExecResult,
     KubernetesApiError,
     KubernetesClient,
+    LogFrame,
 )
 from crucible.adapters.execution.k8sregistry import (
     RegistryClient,
@@ -69,6 +70,7 @@ from crucible.adapters.execution.k8sspec import (
     PodRequest,
     SpecError,
 )
+from crucible.adapters.execution.logstream import RESUME_AT_BOUNDARY
 from crucible.adapters.execution.logstream import chunks as _chunks
 from crucible.adapters.harness.registry import default_registry
 from crucible.application.harnesses import (
@@ -208,6 +210,14 @@ LIST_IMAGES_DEADLINE = 12.0
 # by requiring a release-version shape, keeps a future non-version tag (a hotfix build,
 # a manual pin) listable without a code change.
 LIST_IMAGES_SKIP_PREFIX = "ci-"
+# How much of a worker's log one observation poll reads (issue 63): the API's
+# `limitBytes`, so a poll never holds a whole long-running log in memory. A capped read
+# ends at its last complete line and the next poll resumes from there (10). `sinceTime`
+# is one-second granular, so a read that cannot get past its first second (more than
+# the cap logged inside it) is retried larger, up to the ceiling; past the ceiling the
+# rest of that second is skipped with a notice line, never read unbounded.
+LOG_READ_LIMIT = 4 * 1024 * 1024
+LOG_READ_CEILING = 64 * 1024 * 1024
 # How much of a collected output tar is accepted. The tree is excluded from it, so this
 # is the diff, the bundle, the report copy and the verifier logs.
 OUTPUT_READ_LIMIT = 256 * 1024 * 1024
@@ -425,6 +435,9 @@ class _Launched:
     job_name: str
     spec: LaunchSpec
     image_digest: str
+    # The limits the worker runs under. Policy-derived at launch, then replaced by what
+    # the live Pod carries once it is seen (issues 66, 76): an adopted attempt has no
+    # policy in memory, and admission may have rewritten what was asked for.
     limits: Limits
     network_policy: str | None = None
     credential: _CredentialCopy | None = None
@@ -435,6 +448,10 @@ class _Launched:
     # deleted it is never reported as lost (16).
     terminated: str | None = None
     exit_code: int | None = None
+    # Where `limits` came from, so the evidence says what it records: `policy` at
+    # launch, `template` for an attempt adopted before its Pod existed, `pod` once the
+    # live Pod has been read.
+    limits_source: Literal["policy", "template", "pod"] = "policy"
 
 
 # What an adopted attempt's `_Launched` carries before the supervisor hands the real
@@ -968,6 +985,11 @@ class KubernetesProvider:
         work_branch = str(repository.get("work_branch") or f"crucible/{spec.external_id}")
         resolved = await self._resolve_image(spec)
         limits = self._limits(spec)
+        # 26, issue 59: the preparer is a Pod with GitHub egress and the per-attempt
+        # Secret is a credential copy, so neither is made in a namespace whose egress
+        # enforcement and PID limit are unproven. The image is resolved first because
+        # the canary runs the image an attempt resolved when no probe image is named.
+        await self._require_ready(spec)
 
         # 26: the PVC, the ConfigMap and the per-attempt Secret, then the preparer Job.
         await self._delete_attempt_objects(spec.attempt_id)
@@ -1170,17 +1192,20 @@ class KubernetesProvider:
             f"({probe.local_endpoint_detail or probe.detail})"
         )
 
-    async def launch(self, ws: Workspace, spec: LaunchSpec) -> Handle:
+    async def _require_ready(self, spec: LaunchSpec) -> None:
+        """26: a namespace whose egress enforcement or pod PID limit is not proven runs
+        no Pod of an attempt and holds no copy of its credential. This is a refusal, not
+        a retry: the next attempt would meet the same cluster."""
         probe = await self.ensure_ready()
-        gated_under = self.config
         if not probe.passed:
-            # 26: a namespace whose egress enforcement or pod PID limit is not proven
-            # does not run a worker. This is a refusal, not a retry: the next attempt
-            # would meet the same cluster.
             raise HarnessRefusedError(
                 f"refusing to launch: the workers namespace is not ready ({probe.detail})"
             )
         self._check_endpoint_ready(probe, spec)
+
+    async def launch(self, ws: Workspace, spec: LaunchSpec) -> Handle:
+        await self._require_ready(spec)
+        gated_under = self.config
         resolved = await self._resolve_image(spec)
         limits = self._limits(spec)
         copy = self._credential_copy(spec)
@@ -1283,6 +1308,8 @@ class KubernetesProvider:
         if launched is not None and not launched.pod_name:
             launched.pod_name = str((pod.get("metadata") or {}).get("name") or "")
             launched.node = str((pod.get("spec") or {}).get("nodeName") or "") or None
+        if launched is not None and launched.limits_source != "pod":
+            _observe_limits(launched, pod)
         terminated = _terminated_state(status)
         if terminated is not None:
             code = int(terminated.get("exitCode", -1))
@@ -1425,18 +1452,41 @@ class KubernetesProvider:
         if pod is None:
             return []
         name = str((pod.get("metadata") or {}).get("name") or "")
-        try:
-            frames = await self._call(
-                self.client.pod_log,
-                name,
-                container=k8sspec.CONTAINER_NAME,
-                since_time=since.timestamp,
-            )
-        except KubernetesApiError as exc:
-            if exc.status == 404:
-                return []
-            raise ProviderError(f"log pull failed: {exc}") from exc
-        return _chunks(frames, since)
+        limit = LOG_READ_LIMIT
+        while True:
+            try:
+                frames = await self._call(
+                    self.client.pod_log,
+                    name,
+                    container=k8sspec.CONTAINER_NAME,
+                    since_time=since.timestamp,
+                    limit_bytes=limit,
+                )
+            except KubernetesApiError as exc:
+                if exc.status == 404:
+                    return []
+                raise ProviderError(f"log pull failed: {exc}") from exc
+            payload = b"".join(frame.payload for frame in frames)
+            # The kubelet can land short of `limitBytes` and still cut a line in half,
+            # so byte-count equality against `limit` alone cannot tell a whole trailing
+            # line from a cut one: a payload that does not end in a newline has an
+            # incomplete trailing line whatever its length, and that line is read whole
+            # next time. Filling the requested limit is still the only signal that a
+            # larger read might find more data; a short response with an unfinished
+            # last line, with nothing else new, is left for the next regular poll
+            # instead of being retried larger, since a worker still writing that line
+            # would otherwise be forced through the ceiling and skipped as if it were a
+            # crowded second.
+            truncated = len(payload) >= limit
+            incomplete = bool(payload) and not payload.endswith(b"\n")
+            whole = payload[: payload.rfind(b"\n") + 1] if incomplete else payload
+            chunks = _chunks([LogFrame("stdout", whole)] if whole else [], since)
+            if chunks or not truncated:
+                return chunks
+            if limit < LOG_READ_CEILING:
+                limit = min(limit * 4, LOG_READ_CEILING)
+                continue
+            return _skip_crowded_second(payload, limit, since)
 
     async def collect(
         self, h: Handle, ws: Workspace, spec: LaunchSpec | None = None
@@ -1558,7 +1608,10 @@ class KubernetesProvider:
             "job": launched.job_name if launched else "",
             "pod": (launched.pod_name if launched else "") or "",
             "node": (launched.node if launched else "") or "",
-            "limits": self._limits(spec).as_dict(),
+            # What the live Pod carried when it was seen (issue 76), else what the policy
+            # asked for, and which of the two this is.
+            "limits": (launched.limits if launched else self._limits(spec)).as_dict(),
+            "limits_source": launched.limits_source if launched else "policy",
             "pod_pid_limit": probe.pid_limit if probe else None,
             "pod_pid_limit_source": probe.pid_limit_source if probe else "",
             "runtime_class": "standard",
@@ -1588,11 +1641,17 @@ class KubernetesProvider:
             pod = await self._pod_of(h.ref)
         except KubernetesApiError as exc:
             raise ProviderError(f"terminate could not read the Pod of {h.ref}: {exc}") from exc
-        grace = launched.limits.grace_seconds if launched else 60
         if launched is not None:
             launched.terminated = mode
         if pod is None:
             return
+        # The grace period is the one the Pod was created with, which is the task
+        # policy's (issue 66): an adopted attempt, or a handle the provider never
+        # launched, has no policy in memory, but the live Pod always carries it.
+        grace = k8sspec.limits_from_pod(
+            pod.get("spec") or {},
+            launched.limits if launched else k8sspec.limits_from_policy({}),
+        ).grace_seconds
         name = str((pod.get("metadata") or {}).get("name") or "")
         try:
             await self._call(
@@ -1722,25 +1781,22 @@ class KubernetesProvider:
                 # creation timestamp, not from now, so an attempt already past the
                 # window is caught on the first observation rather than given it again.
                 created = _age_seconds(str(metadata.get("creationTimestamp", "")))
-                # The Job's template is what the Pod is built from, and it is there
-                # whether or not a Pod exists yet. An empty image here would reach the
-                # helper Pods of collection, which the API server rejects (103).
+                # The live Pod is what the worker runs as (issues 66, 76); the Job's
+                # template is what it is built from, and is there whether or not a Pod
+                # exists yet. An empty image here would reach the helper Pods of
+                # collection, which the API server rejects (103).
                 template_spec = ((row.get("spec") or {}).get("template") or {}).get("spec") or {}
-                pod_spec = template_spec if template_spec.get("containers") else {}
-                if not pod_spec and pod is not None:
-                    pod_spec = pod.get("spec") or {}
+                live_spec = (pod or {}).get("spec") or {}
+                pod_spec = live_spec if live_spec.get("containers") else template_spec
                 containers = pod_spec.get("containers") or []
                 image = str((containers[0] if containers else {}).get("image", ""))
-                limits = replace(
-                    k8sspec.limits_from_policy({}),
-                    grace_seconds=int(pod_spec.get("terminationGracePeriodSeconds") or 60),
-                )
                 self._launched[attempt_id] = _Launched(
                     job_name=name,
                     spec=_ADOPTED_SPEC,
                     image_digest=image,
-                    limits=limits,
+                    limits=k8sspec.limits_from_pod(pod_spec, k8sspec.limits_from_policy({})),
                     launched_at=time.monotonic() - created,
+                    limits_source="pod" if pod_spec is live_spec else "template",
                 )
             launched = self._launched[attempt_id]
             if pod is not None and not launched.pod_name:
@@ -1968,6 +2024,8 @@ class KubernetesProvider:
         try:
             resolved = await self._resolve_image(spec)
             limits = self._limits(spec)
+            # Issue 59: nothing is created, and no credential copied, before the gate.
+            await self._require_ready(spec)
             await self._create(
                 "persistentvolumeclaims",
                 k8sspec.workspace_claim(
@@ -3775,6 +3833,62 @@ class KubernetesProvider:
 
 
 # ----- pure helpers -------------------------------------------------------
+
+
+def _latest_stamp(lines: bytes) -> datetime | None:
+    latest: datetime | None = None
+    for raw in lines.split(b"\n"):
+        stamp = raw.partition(b" ")[0].decode("utf-8", "replace")
+        with contextlib.suppress(ValueError):
+            seen = parse_rfc3339(stamp)
+            latest = seen if latest is None or seen > latest else latest
+    return latest
+
+
+def _skip_crowded_second(payload: bytes, limit: int, since: LogOffset) -> list[LogChunk]:
+    """More than `limit` bytes of log fall inside one second, so no read `sinceTime`
+    can express gets past it (issue 63). The resume moves to the start of the next
+    second with one notice line in the log saying so; the lines of that second beyond
+    the ceiling are not stored.
+
+    The crowded second is the latest one among the read's whole lines, all of which
+    were already stored; the line the cap cut belongs to a second that may be perfectly
+    readable. Only a read with no whole line at all (one line longer than the ceiling)
+    takes the cut line's second, and a read with no readable stamp the stored
+    position's, so every skip moves the position forward."""
+    whole, _, cut = payload.rpartition(b"\n")
+    latest = _latest_stamp(whole) or _latest_stamp(cut)
+    if latest is None and since.timestamp:
+        with contextlib.suppress(ValueError):
+            latest = parse_rfc3339(since.timestamp)
+    if latest is None:
+        log.warning("a capped log read carried no timestamp; the next poll tries again")
+        return []
+    resume = latest.replace(microsecond=0) + timedelta(seconds=1)
+    notice = (
+        f"[crucible] log lines skipped: more than {limit} bytes of this log fall within "
+        "one second, more than one read takes; the log resumes at the next second"
+    ).encode()
+    return [
+        LogChunk(
+            stream="stdout",
+            content=notice + b"\n",
+            ts=resume,
+            # The notice is not a line of the log: the next read keeps everything at or
+            # after `resume`, including a line stamped in its first microsecond.
+            line_sha256=RESUME_AT_BOUNDARY,
+            occurrence=0,
+            lines=1,
+        )
+    ]
+
+
+def _observe_limits(launched: _Launched, pod: Mapping[str, Any]) -> None:
+    """Take the limits from the live Pod once it is seen (issues 66, 76)."""
+    spec = pod.get("spec") or {}
+    if spec.get("containers"):
+        launched.limits = k8sspec.limits_from_pod(spec, launched.limits)
+        launched.limits_source = "pod"
 
 
 def _seconds_until(timestamp: str) -> float:

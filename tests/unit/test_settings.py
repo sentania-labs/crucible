@@ -163,3 +163,33 @@ def test_test_fixtures_are_off_unless_turned_on(monkeypatch: pytest.MonkeyPatch)
     assert load_settings().test_fixtures is False
     monkeypatch.setenv("CRUCIBLE_TEST_FIXTURES", "true")
     assert load_settings().test_fixtures is True
+
+
+def test_broad_egress_and_the_resolve_ttl_reach_the_provider() -> None:
+    """Issue 61: both are deployment settings, not provider-only fields."""
+    config = kubernetes_config(Settings())
+    assert config.broad_egress is False
+    assert config.resolve_ttl_seconds == 300.0
+    config = kubernetes_config(
+        Settings(kubernetes={"broad_egress": True, "resolve_ttl_seconds": 45})
+    )
+    assert config.broad_egress is True
+    assert config.resolve_ttl_seconds == 45.0
+
+
+def test_broad_egress_and_the_resolve_ttl_come_from_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cluster deployment sets every Kubernetes setting as an environment variable."""
+    monkeypatch.delenv("CRUCIBLE_CONFIG", raising=False)
+    monkeypatch.setenv("CRUCIBLE_KUBERNETES__BROAD_EGRESS", "true")
+    monkeypatch.setenv("CRUCIBLE_KUBERNETES__RESOLVE_TTL_SECONDS", "120")
+    settings = load_settings()
+    assert settings.kubernetes.broad_egress is True
+    assert settings.kubernetes.resolve_ttl_seconds == 120.0
+
+
+@pytest.mark.parametrize("value", [0, -5])
+def test_a_non_positive_resolve_ttl_is_refused(value: float) -> None:
+    with pytest.raises(ValidationError, match="greater than 0"):
+        Settings(kubernetes={"resolve_ttl_seconds": value})

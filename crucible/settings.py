@@ -148,6 +148,15 @@ class KubernetesSettings(BaseModel):
     # Private ranges a named local endpoint may resolve into. Literal IP endpoint URLs
     # are still refused. Keep this narrower than the cluster service and pod ranges.
     local_endpoint_cidrs: list[str] = Field(default_factory=list)
+    # 26: a plain `networking.k8s.io/v1` CNI has no FQDN rule, so each allowlisted name
+    # is resolved here and the NetworkPolicy carries its addresses. `broad_egress` swaps
+    # that for the broad rule (the public internet on 443, minus every denied range),
+    # for a CNI that enforces names some other way (issue 61). Off by default: the broad
+    # rule lets a worker reach GitHub, which 26 says a worker never does.
+    broad_egress: bool = False
+    # How long a resolved allowlist address stays in a policy before the name is looked
+    # up again (issue 61). `gt=0`: zero would resolve every name on every policy write.
+    resolve_ttl_seconds: float = Field(default=300.0, gt=0)
     # The worker image repositories `GET /admin/images` reports the promoted tags of.
     # Bare repositories: the provider appends each tag the registry lists.
     image_repositories: list[str] = Field(default_factory=list)
