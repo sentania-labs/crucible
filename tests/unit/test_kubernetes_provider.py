@@ -540,7 +540,7 @@ async def test_a_capped_log_read_resumes_with_the_line_it_cut(
 async def test_a_short_truncated_log_response_resumes_with_the_whole_line(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Issue 76 follow-up: the kubelet can land short of `limitBytes` and still cut a
+    """Issue 63 follow-up: the kubelet can land short of `limitBytes` and still cut a
     line in half. Detecting a capped read by the missing trailing newline, not by exact
     byte equality against the limit, still resumes with the whole line."""
     monkeypatch.setattr(kubernetes_module, "LOG_READ_LIMIT", 400)
@@ -564,6 +564,31 @@ async def test_a_short_truncated_log_response_resumes_with_the_whole_line(
     stored = await _drain_logs(provider, handle)
     assert stored == [line.partition(" ")[2].encode() for line in lines]
     assert len(api.log_reads) > 2
+
+
+async def test_an_unfinished_line_well_under_the_limit_waits_for_the_next_poll() -> None:
+    """Issue 63 follow-up: a worker partway through writing a line, with nothing else
+    new and a response nowhere near `limitBytes`, is not a capped read. It is left for
+    the next regular poll instead of being forced through a growth retry to the
+    ceiling, which would wrongly report it as a skipped crowded second."""
+    api, provider, handle = await _worker_with_log([])
+
+    def pod_log(name: str, **kwargs: Any) -> Any:
+        api.log_reads.append(
+            {
+                "name": name,
+                "since_time": kwargs.get("since_time"),
+                "limit_bytes": kwargs.get("limit_bytes"),
+            }
+        )
+        payload = _stamped(0, 0, "still writing").encode()[:20]
+        return [LogFrame("stdout", payload)] if payload else []
+
+    api.pod_log = pod_log  # type: ignore[method-assign]
+    api.log_reads.clear()
+    chunks = await provider.logs(handle, LogOffset())
+    assert chunks == []
+    assert len(api.log_reads) == 1
 
 
 async def test_a_second_fuller_than_one_read_is_read_again_larger(
