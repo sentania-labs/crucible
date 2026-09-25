@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from crucible.application.admin import credentials
 from crucible.application.admin.context import (
     AdminContext,
     guard_mutation,
@@ -59,8 +60,17 @@ def list_harnesses(
     in_use = _concurrency(uow)
     promotions = {p.digest: p.state for p in uow.image_promotions.list_all()}
     out: list[dict[str, Any]] = []
+    # On Kubernetes the credential is the harness Secret, which the directory-based view
+    # cannot see; read the state the Credentials page reads, so no two pages disagree
+    # about the same credential (crucible#123).
+    secret_held = credentials.secret_store(ctx) is not None
     for view in views.items:
         entry = view.model_dump(mode="json")
+        if secret_held and entry["credential"].get("state") != "not_required":
+            held = credentials.state_view(ctx, uow, view.name)
+            for key in ("state", "mount_mode", "source_fingerprint", "files", "detail", "source"):
+                if key in held:
+                    entry["credential"][key] = held[key]
         entry["concurrency_in_use"] = in_use.get(view.name, 0)
         entry["images"] = [
             {
