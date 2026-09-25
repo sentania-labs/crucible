@@ -151,6 +151,22 @@ jobs:
       - name: run the kind tier
         run: make e2e-kind
 
+  # The registry adapter through the real crane the service image ships (108): a stub
+  # registry that redirects its blobs to another host, then an anonymous resolve of the
+  # published worker image on GHCR, asserting its digest and harness labels. It needs the
+  # internet and neither a Docker daemon nor the lab, and the repository is public, so it
+  # is GitHub-hosted (github-ci skill rule 4). No secret: the package is public.
+  registry:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: astral-sh/setup-uv@eb1897b8dc4b5d5bfe39a428a8f2304605e0983c # v7.0.0
+        with:
+          enable-cache: true
+      - name: resolve through the pinned crane
+        run: make registry-check
+
   # The deployment manifests (C9). `kubectl kustomize` and `kubeconform` need neither a
   # Docker daemon nor lab access, and the repository is public, so hosted minutes are
   # free: GitHub-hosted under the github-ci skill's rule 4. It is deliberately not the

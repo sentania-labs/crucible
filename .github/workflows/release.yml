@@ -133,6 +133,19 @@ jobs:
           echo "image label: $LABEL"
           [ "$LABEL" = "${VERSION}" ]
 
+      # The candidate's own crane resolves the published worker image on GHCR (108): the
+      # same adapter the Kubernetes provider runs, inside the image about to be
+      # published, so a service image that cannot resolve a worker image never ships.
+      # Anonymous: the package is public and no credential is passed in.
+      - name: the image resolves the published worker image through its crane
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD/tools/registry:/check:ro" --entrypoint python \
+            "${IMAGE}:${VERSION}" /check/check_published.py \
+            --reference "${WORKER_REGISTRY}:latest" \
+            --expect-harness claude_code --expect-harness codex \
+            --expect-harness agy --expect-harness hermes
+
       # Gate 3, part one. Boot the exact image that is about to be published,
       # the way an operator boots it, and prove the running containers are that
       # image. Part two drives a task through it.
