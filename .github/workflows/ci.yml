@@ -12,6 +12,21 @@ name: ci
 on:
   push:
     branches: ["**"]
+  # Manual escape hatch for 114: a branch push restores main's BuildKit cache in the
+  # images job, so a change to a fetch or install step is only proven fresh from that
+  # layer on. Dispatching this workflow with no_cache=true builds the images job from
+  # scratch on that branch, the same way main and the release always do:
+  #   gh workflow run ci.yml --ref <branch> -f no_cache=true
+  # GitHub only offers the dispatch once this trigger is on the default branch; the
+  # run then uses the branch's own copy of this file. It shares the branch's
+  # concurrency group, so a later push to the branch cancels it (and it cancels an
+  # in-flight push run, which it repeats in full).
+  workflow_dispatch:
+    inputs:
+      no_cache:
+        description: "images job: build from scratch (NO_CACHE=1) instead of restoring main's layer cache"
+        type: boolean
+        default: false
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -103,14 +118,28 @@ jobs:
   # proof that upstream still serves those bytes. That proof is every push to main, which
   # builds from scratch (NO_CACHE=1, nothing restored) before exporting the cache, and
   # the release, which builds from scratch again and pushes nothing unless the digests
-  # match.
+  # match. A branch can force the same from-scratch proof early with workflow_dispatch
+  # (114), for a change that touches a fetch or install step and should not wait for
+  # main to find out a network step no longer reproduces.
   images:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: decide whether this run builds from scratch
+        id: no_cache
+        env:
+          DISPATCH_NO_CACHE: ${{ github.event_name == 'workflow_dispatch' && inputs.no_cache }}
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if [ "$REF" = "refs/heads/main" ] || [ "$DISPATCH_NO_CACHE" = "true" ]; then
+            echo "value=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=" >> "$GITHUB_OUTPUT"
+          fi
       - name: restore the BuildKit layer cache
-        if: github.ref != 'refs/heads/main'
+        if: steps.no_cache.outputs.value != '1'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/buildkit-cache
@@ -118,7 +147,7 @@ jobs:
           restore-keys: worker-images-
       - name: build both images and compare with images/manifest.env
         env:
-          NO_CACHE: ${{ github.ref == 'refs/heads/main' && '1' || '' }}
+          NO_CACHE: ${{ steps.no_cache.outputs.value }}
         run: make images-check CACHE_DIR="$RUNNER_TEMP/buildkit-cache" NO_CACHE="$NO_CACHE"
       - name: keep the layer cache for branches
         if: github.ref == 'refs/heads/main'
@@ -145,6 +174,97 @@ jobs:
             https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64
           echo 'aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d  '"$RUNNER_TEMP/kind" | sha256sum -c -
           chmod 0755 "$RUNNER_TEMP/kind"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      - name: build the script-harness worker image
+        run: make e2e-image
+      - run: make e2e
+      - name: what the daemon was left holding, on failure
+        if: failure()
+        run: |
+          docker ps -a --filter label=crucible.attempt
+          docker network ls
+
+  # The worker images (13, C11): the worker image carrying Claude Code, Codex, AGY and
+  # Hermes, and the script-harness image, built from the pinned inputs with the same
+  # script as `make images`. The job fails when any tag, harness version or OCI digest
+  # differs from images/manifest.env: reproducibility is the contract, and this is where
+  # it is proved on a machine the author does not control. GitHub-hosted, because it
+  # needs a Docker daemon and buildx (github-ci skill).
+  #
+  # Branch pushes import the BuildKit layer cache the last push to
+  # main exported, so the job takes minutes. The digest is always computed from what the
+  # build output, but a network step (apt, pip, ADD <url>) is cached on its instruction
+  # text, not on the bytes it would fetch today, so a branch's pass is not on its own
+  # proof that upstream still serves those bytes. That proof is every push to main, which
+  # builds from scratch (NO_CACHE=1, nothing restored) before exporting the cache, and
+  # the release, which builds from scratch again and pushes nothing unless the digests
+  # match. A branch can force the same from-scratch proof early with workflow_dispatch
+  # (114), for a change that touches a fetch or install step and should not wait for
+  # main to find out a network step no longer reproduces.
+  images:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: decide whether this run builds from scratch
+        id: no_cache
+        env:
+          DISPATCH_NO_CACHE: ${{ github.event_name == 'workflow_dispatch' && inputs.no_cache }}
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if [ "$REF" = "refs/heads/main" ] || [ "$DISPATCH_NO_CACHE" = "true" ]; then
+            echo "value=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=" >> "$GITHUB_OUTPUT"
+          fi
+      - name: restore the BuildKit layer cache
+        if: steps.no_cache.outputs.value != '1'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/buildkit-cache
+          key: worker-images-${{ hashFiles('images/**') }}
+          restore-keys: worker-images-
+      - name: build both images and compare with images/manifest.env
+        env:
+          NO_CACHE: ${{ steps.no_cache.outputs.value }}
+        run: make images-check CACHE_DIR="$RUNNER_TEMP/buildkit-cache" NO_CACHE="$NO_CACHE"
+      - name: keep the layer cache for branches
+        if: github.ref == 'refs/heads/main'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/buildkit-cache
+          key: worker-images-${{ hashFiles('images/**') }}
+
+  # A real API server, kubelet, enforcing CNI and PVC on the runner's Docker daemon.
+  # This belongs beside the Docker tier on GitHub-hosted infrastructure: it needs a
+  # daemon but no lab access (github-ci skill).
+  e2e-kind:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: astral-sh/setup-uv@eb1897b8dc4b5d5bfe39a428a8f2304605e0983c # v7.0.0
+        with:
+          enable-cache: true
+      - name: install kind
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 4 -o "$RUNNER_TEMP/kind" \
+            https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64
+          echo 'aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d  '"$RUNNER_TEMP/kind" | sha256sum -c -
+          chmod 0755 "$RUNNER_TEMP/kind"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      # Pinned the same way as the manifests job (69): this tier's kubectl applies
+      # Calico and drives the cluster, so a different kubectl behaving differently is
+      # exactly the kind of drift reproducibility here is supposed to rule out.
+      - name: install kubectl
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 4 -o "$RUNNER_TEMP/kubectl" \
+            https://dl.k8s.io/release/v1.31.6/bin/linux/amd64/kubectl
+          echo 'c46b2f5b0027e919299d1eca073ebf13a4c5c0528dd854fc71a5b93396c9fa9d  '"$RUNNER_TEMP/kubectl" | sha256sum -c -
+          chmod 0755 "$RUNNER_TEMP/kubectl"
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
       - name: build the script-harness worker image
         run: make e2e-image
