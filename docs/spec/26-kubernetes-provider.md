@@ -355,7 +355,23 @@ the namespace. A deployment therefore names one exact, pullable reference in
   log excerpt as detail.
 - `launch`: resolve the worker image to a digest through the image registry
   (11, 25) and record it; refuse an unsupported harness version; create the
-  NetworkPolicy and the worker Job; return the Job name as the handle.
+  NetworkPolicy and the worker Job; return the Job name as the handle. The
+  registry is read with `crane` (go-containerregistry), which the service image
+  ships at a pinned version: `crane digest` for the reference's own digest (an
+  index's, when it is one) and `crane config --platform linux/amd64` by that
+  digest for the harness labels. The credential is the image pull Secret the
+  kubelet already uses, written for each call into a private `DOCKER_CONFIG`
+  directory that is removed when the call returns; each call is bounded by a
+  timeout, and crane trusts what the service trusts (`SSL_CERT_FILE`, the
+  system store with the lab CA). A registry named by a private (RFC 1918) IP
+  address or a `.localhost` name is refused, because crane would fall back to
+  plain HTTP for it; name the registry by a host name it serves HTTPS on. The
+  operator's decision of 2026-09-24 (108). Registry reads run on a thread pool of
+  their own (six threads), so a slow registry cannot hold the threads Kubernetes
+  API calls run on. The image listing (25) runs one at a time and every caller
+  shares it, and it is bounded at 12 seconds, below the 15 seconds the harness and
+  image endpoints wait: past the bound no crane process is started and any still
+  running is killed, and tags not resolved in time are left out of that listing.
 - `observe`: read the Job and its Pod.
 
   | Job | Pod | Result |

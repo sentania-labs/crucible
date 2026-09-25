@@ -61,6 +61,12 @@ trap cleanup EXIT HUP INT TERM
 
 crucible_kind_docker_shim "$scratch"
 
+# The provider resolves the tier's registry tag with the same crane the service image
+# ships (108), fetched and checked against the Dockerfile's pin.
+crane_bin=$("$root/tools/crane/fetch.sh")
+PATH="$(dirname "$crane_bin"):$PATH"
+export PATH
+
 mkdir -p "$cache"
 chmod 0777 "$cache"
 

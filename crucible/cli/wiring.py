@@ -25,7 +25,7 @@ from crucible.adapters.execution.k8sapi import (
     in_cluster_access,
     kubeconfig_access,
 )
-from crucible.adapters.execution.k8sregistry import HttpRegistryClient
+from crucible.adapters.execution.k8sregistry import CraneRegistryClient
 from crucible.adapters.execution.kubernetes import (
     KubernetesConfig,
     KubernetesProvider,
@@ -277,7 +277,7 @@ def kubernetes_provider(
     return KubernetesProvider(
         kubernetes_config(settings, local_endpoint_url=local_endpoint_url),
         client,
-        HttpRegistryClient(),
+        CraneRegistryClient(),
         harnesses=registry,
         settings_source=kubernetes_settings_source(factory) if factory is not None else None,
     )

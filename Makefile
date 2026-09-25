@@ -65,7 +65,7 @@ CRUCIBLE_DEPLOY_PORT ?= 8080
 
 .PHONY: up dev down reset lint check-image-manifest scan scan-tree scan-history smoke test test-unit \
 	test-integration e2e e2e-github e2e-live e2e-admin e2e-image build proxy-config proxies preflight \
-	e2e-kind manifests deploy-kind release-images-classify release-images-pull release-images-verify \
+	e2e-kind registry-check manifests deploy-kind release-images-classify release-images-pull release-images-verify \
 	deploy-local deploy-local-down images images-check release-notes
 
 up: preflight proxy-config ## normal mode: postgres, proxies, migrate, crucible
@@ -127,9 +127,9 @@ reset: ## DESTRUCTIVE: down plus postgres, artifact, and credential volumes
 
 lint: check-image-manifest
 	$(UV) sync --frozen --quiet
-	$(UV) run ruff format --check crucible tests tools/release tools/smoke
-	$(UV) run ruff check crucible tests tools/release tools/smoke
-	$(UV) run mypy crucible tests tools/release tools/smoke
+	$(UV) run ruff format --check crucible tests tools/release tools/smoke tools/registry
+	$(UV) run ruff check crucible tests tools/release tools/smoke tools/registry
+	$(UV) run mypy crucible tests tools/release tools/smoke tools/registry
 	$(UV) run lint-imports
 
 check-image-manifest: ## fail when a declared worker-image tag is stale
@@ -210,6 +210,16 @@ e2e-kind: check-image-manifest ## Kubernetes-provider e2e on a disposable kind c
 	CRUCIBLE_E2E_DOCKER="$(DOCKER)" \
 	CRUCIBLE_E2E_DOCKER_SOCKET="$(CRUCIBLE_DOCKER_SOCKET)" \
 	tools/kind/e2e-kind.sh
+
+# The registry adapter with the real crane the service image ships (108): a stub registry
+# that redirects its blobs to another host and demands a password, then an anonymous
+# resolve of the published worker image on GHCR. Needs the network, no Docker, no secret.
+REGISTRY_CHECK_REFERENCE ?= ghcr.io/sentania-labs/crucible-worker:latest
+registry-check: ## resolve through the real crane: a redirecting stub registry, then the published worker image
+	$(UV) sync --frozen --quiet
+	@crane=$$(tools/crane/fetch.sh) && export PATH="$$(dirname "$$crane"):$$PATH" \
+	  && CRUCIBLE_E2E_REGISTRY=1 $(UV) run pytest tests/e2e/test_registry.py -q -m e2e_registry \
+	  && $(UV) run python tools/registry/check_published.py --reference "$(REGISTRY_CHECK_REFERENCE)"
 
 # CRUCIBLE_CLUSTER_CPU_BUDGET and CRUCIBLE_CLUSTER_MEMORY_BUDGET_GI (issue 93): the
 # cluster's CPU and memory ceiling the render-time resource check refuses to exceed.

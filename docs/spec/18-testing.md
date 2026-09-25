@@ -94,6 +94,20 @@ two concurrent claims; real registry digest and harness-label resolution; and
 every cleanup policy. Every denied NetworkPolicy endpoint has a reachable
 control before the selected policy proves it blocked.
 
+## The registry adapter (`make registry-check`, 108)
+
+The Kubernetes provider's registry adapter runs the real `crane` binary, at the
+version the service image ships (`tools/crane/fetch.sh` reads the Dockerfile's
+pin). Unit tests run it against a stub `crane` (argument shape, the private
+credential directory and its removal on every path, error mapping, timeout).
+`make registry-check` runs the real binary twice: against a stub registry that
+demands a password and answers every blob GET with a 307 to another host, as
+GHCR does, and against the published worker image on GHCR, anonymously,
+asserting a digest and a version label for every harness. CI runs it on every
+branch push; the release runs the GHCR half inside the service image it is
+about to publish. The kind tier resolves its own registry through the same
+real binary.
+
 ## Live harness tests (subscription required, not in CI by default)
 
 `make e2e-live HARNESS=<name>` runs a trivial task through the real harness
