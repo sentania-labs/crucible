@@ -23,7 +23,9 @@ of the same UI.
   `image_promotions`; launches, probes, logins and the harness test read the launching
   harness's own row.
 - **Reasons** (#117): one guard decides, `guard_mutation(..., reason_required=)`; the UI
-  marks each form's reason required, optional, or absent from one table; the CLI takes
+  marks each form's reason required, optional, or absent from one table, and each row
+  action names its own mode (enable, disable, promote, roll back and pool clear carry an
+  optional note; the destructive row actions a required one); the CLI takes
   `--reason` before or after the verb; `next` lists it under `optional` where it may be
   left out.
 - **Harness test** (#118): `POST /v1/admin/harnesses/{name}/test`, `crucible admin
