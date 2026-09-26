@@ -15,6 +15,7 @@ import os
 import re
 import time
 from collections.abc import Iterator
+from datetime import timedelta
 from importlib import import_module
 from pathlib import Path
 from typing import Any
@@ -41,7 +42,7 @@ from crucible.client.config import ADMIN_TOKEN_ENV
 from crucible.client.http import Api
 from crucible.contracts.policy import PolicyV1
 from crucible.contracts.wake import WakeReason
-from crucible.domain.entities import Attempt, Execution, ExecutionRole, Role
+from crucible.domain.entities import Attempt, Execution, ExecutionRole, PoolExhaustion, Role
 from crucible.domain.ids import new_id
 from crucible.domain.lifecycle import AttemptState, ExecutionState, TaskState
 from crucible.ports.execution import ImageInfo
@@ -1242,6 +1243,137 @@ def test_a_promoted_image_no_provider_lists_any_more_is_not_ready(
     assert "no longer in the registry" in missing[0]["text"]
     provider.images = [image]
     assert image_steps() == []
+
+
+def test_row_actions_offer_an_optional_reason_and_destructive_ones_require_it(
+    ctx: AppContext,
+    tokens: dict[str, str],
+    admin_client: TestClient,
+    live_supervisor: Supervisor,
+    provider: FakeProvider,
+) -> None:
+    """Codex on PR 164 (crucible#117): enable, disable, promote, roll back and pool clear
+    carry an optional note on their row; revoke keeps a required one. A note typed on a
+    row reaches the audit record, and leaving it out is accepted."""
+    asyncio.run(live_supervisor.tick())
+    first = ImageInfo(
+        "ghcr.io/sentania-labs/crucible-worker:0.5.5", "sha256:" + "b" * 64, WORKER_HARNESSES
+    )
+    second = ImageInfo(
+        "ghcr.io/sentania-labs/crucible-worker:0.5.6", "sha256:" + "c" * 64, WORKER_HARNESSES
+    )
+    provider.images = [first, second]
+    for image in (first, second):
+        promoted = admin_client.post(
+            f"/v1/admin/images/{image.digest}/promote", json={"harness": "hermes"}
+        )
+        assert promoted.status_code == 200, promoted.text
+    submitted = admin_client.post(
+        "/v1/tasks",
+        json=contract_document(external_id="ROW-REASON"),
+        headers={"Authorization": f"Bearer {tokens['orchestrator']}"},
+    )
+    assert submitted.status_code == 201, submitted.text
+    task_id = submitted.json()["id"]
+    assert live_supervisor.fenced_token is not None
+    with ctx.uow_factory() as uow:
+        # A mark names the attempt that hit the limit; attempts are the supervisor's (14).
+        uow.set_fenced_token(live_supervisor.fenced_token)
+        execution = Execution(
+            id=new_id(),
+            task_id=task_id,
+            role=ExecutionRole.IMPLEMENT,
+            contract_version=1,
+            harness="script-harness",
+            model="fake",
+            effort=None,
+            provider="fake",
+            image="crucible-worker:fake-succeed",
+            policy_snapshot={},
+            state=ExecutionState.ACTIVE,
+            max_attempts=1,
+            retry_on=[],
+            timeout_seconds=60,
+            created_at=ctx.clock.now(),
+        )
+        attempt = Attempt(
+            id=new_id(),
+            execution_id=execution.id,
+            task_id=task_id,
+            number=1,
+            state=AttemptState.FAILED,
+            created_at=ctx.clock.now(),
+        )
+        uow.executions.add(execution)
+        uow.attempts.add(attempt)
+        uow.pool_exhaustions.put(
+            PoolExhaustion(
+                pool="primary",
+                exhausted_at=ctx.clock.now(),
+                reset_at=ctx.clock.now() + timedelta(hours=5),
+                task_id=task_id,
+                attempt_id=attempt.id,
+                reason="soft limit reached",
+            )
+        )
+        uow.commit()
+
+    def reason_inputs(page: str, action: str) -> list[str]:
+        """The reason input of each row form posting to `action`, or "" for none."""
+        forms = re.findall(
+            rf'<form class="admin-row-form" method="post" action="{action}">(.*?)</form>',
+            page,
+            re.S,
+        )
+        assert forms, action
+        found = [re.search(r'<input class="lat-input" name="reason"[^>]*>', f) for f in forms]
+        return [match.group(0) if match else "" for match in found]
+
+    with TestClient(create_app(ctx)) as browser:
+        csrf = ui_sign_in(browser, tokens["admin"])
+        pages = {
+            path: browser.get(path).text
+            for path in ("/ui/harnesses", "/ui/images", "/ui/routing", "/ui/tokens")
+        }
+        for path, action in (
+            ("/ui/harnesses", "/ui/actions/harness"),
+            ("/ui/images", "/ui/actions/image-promote"),
+            ("/ui/images", "/ui/actions/image-rollback"),
+            ("/ui/routing", "/ui/actions/routing-clear"),
+        ):
+            for found in reason_inputs(pages[path], action):
+                assert 'placeholder="Reason (optional)"' in found, (path, action)
+                assert "required" not in found, (path, action)
+        for found in reason_inputs(pages["/ui/tokens"], "/ui/actions/token-revoke"):
+            assert 'placeholder="Reason (required)"' in found and found.endswith("required>")
+        # The Test action is a read-only check and asks for no reason at all.
+        assert reason_inputs(pages["/ui/harnesses"], "/ui/actions/harness-test")[0] == ""
+
+        noted = browser.post(
+            "/ui/actions/image-rollback",
+            data={
+                "csrf": csrf,
+                "harness": "hermes",
+                "reason": "0.5.6 regressed the gateway call",
+                "return_to": "/ui/images",
+            },
+            follow_redirects=False,
+        )
+        assert noted.status_code == 303 and "kind=ok" in noted.headers["location"]
+        bare = browser.post(
+            "/ui/actions/routing-clear",
+            data={"csrf": csrf, "pool": "primary", "reason": "", "return_to": "/ui/routing"},
+            follow_redirects=False,
+        )
+        assert bare.status_code == 303 and "kind=ok" in bare.headers["location"]
+    events = admin_client.get("/v1/admin/audit", params={"limit": 200}).json()["items"]
+    rollback = next(
+        e for e in events if e["kind"] == "image_promoted" and e["payload"].get("rollback")
+    )
+    assert rollback["payload"]["reason"] == "0.5.6 regressed the gateway call"
+    with ctx.uow_factory() as uow:
+        mark = uow.pool_exhaustions.get("primary")
+        assert mark is not None and mark.cleared_at is not None
 
 
 def test_images_are_promoted_and_rolled_back_per_harness(

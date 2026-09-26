@@ -208,6 +208,9 @@ REASON_REQUIRED_ACTIONS = frozenset(
 NO_REASON_ACTIONS = frozenset(
     {"/ui/actions/github-check", "/ui/actions/harness-test", "/ui/actions/gateway-test"}
 )
+# A row action names its reason mode itself, since one action path can serve both a
+# check and a removal (credential validate and remove): `True` is required (destructive),
+# "optional" is an audit note the operator may leave out, absent asks for none.
 
 
 def _reason_fields(sections: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -934,6 +937,7 @@ async def harness_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                     "kind": "form",
                     "action": "/ui/actions/harness",
                     "label": "Disable" if item["enabled_by_administrator"] else "Enable",
+                    "reason": "optional",
                     "hidden": {
                         "harness": name,
                         "enabled": "false" if item["enabled_by_administrator"] else "true",
@@ -1165,6 +1169,7 @@ def _image_rows(rows: list[dict[str, Any]], *, admin: bool) -> list[list[Any]]:
                     "action": "/ui/actions/image-promote",
                     "label": "Promote",
                     "primary": True,
+                    "reason": "optional",
                     "hidden": {"harness": harness},
                     "select": {
                         "name": "digest",
@@ -1183,6 +1188,7 @@ def _image_rows(rows: list[dict[str, Any]], *, admin: bool) -> list[list[Any]]:
                     "kind": "form",
                     "action": "/ui/actions/image-rollback",
                     "label": f"Roll back to {previous['reference']}",
+                    "reason": "optional",
                     "hidden": {"harness": harness},
                 }
             )
@@ -1539,6 +1545,7 @@ def routing_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                         "kind": "form",
                         "action": "/ui/actions/routing-clear",
                         "label": "Clear",
+                        "reason": "optional",
                         "hidden": {"pool": item["pool"]},
                     }
                     if admin

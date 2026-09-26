@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -930,6 +931,43 @@ def test_a_reason_is_asked_for_only_where_the_service_requires_one() -> None:
     assert reasons[0] == [{"name": "reason", "label": "Reason", "required": True}]
     assert reasons[1] == [{"name": "reason", "label": "Reason (optional)", "required": False}]
     assert reasons[2] == []
+
+
+def test_a_row_action_renders_its_reason_as_optional_required_or_absent() -> None:
+    """Codex on PR 164 (crucible#117): a row action's own reason mode decides its input."""
+
+    def row(label: str, **mode: Any) -> dict[str, Any]:
+        return {"kind": "form", "action": f"/ui/actions/{label}", "label": label, **mode}
+
+    rendered = templates.get_template("page.html").render(
+        **base_context("/ui/images"),
+        heading="Images",
+        intro="Fixture",
+        sections=[
+            {
+                "title": "Rows",
+                "columns": ["Actions"],
+                "rows": [
+                    [
+                        {
+                            "kind": "actions",
+                            "items": [
+                                row("note", reason="optional"),
+                                row("remove", reason=True, danger=True),
+                                row("check"),
+                            ],
+                        }
+                    ]
+                ],
+            }
+        ],
+        badge=None,
+    )
+    forms = dict(re.findall(r'action="/ui/actions/(\w+)">(.*?)</form>', rendered, re.S))
+    assert '<input class="lat-input" name="reason" placeholder="Reason (optional)"' in forms["note"]
+    assert "required" not in forms["note"]
+    assert 'placeholder="Reason (required)" aria-label="Reason" required>' in forms["remove"]
+    assert 'name="reason"' not in forms["check"]
 
 
 def test_settings_for_a_provider_that_is_off_are_not_listed() -> None:

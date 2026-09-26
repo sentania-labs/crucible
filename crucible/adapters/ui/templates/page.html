@@ -28,7 +28,7 @@
     <input type="hidden" name="return_to" value="{{ item.return_to or active }}">
     {% for name, value in (item.hidden or {}).items() %}<input type="hidden" name="{{ name }}" value="{{ value }}">{% endfor %}
     {% if item.select %}<select class="lat-select" name="{{ item.select.name }}" aria-label="{{ item.select.label or item.select.name }}">{% for value, label in item.select.options %}<option value="{{ value }}" {% if value == item.select.selected %}selected{% endif %}>{{ safe_value("option", label) }}</option>{% endfor %}</select>{% endif %}
-    {% if item.reason %}<input class="lat-input" name="reason" placeholder="Reason (required)" aria-label="Reason" required>{% endif %}
+    {% if item.reason == "optional" %}<input class="lat-input" name="reason" placeholder="Reason (optional)" aria-label="Reason (optional)">{% elif item.reason %}<input class="lat-input" name="reason" placeholder="Reason (required)" aria-label="Reason" required>{% endif %}
     <button class="lat-btn {% if item.danger %}lat-btn--danger{% elif item.primary %}lat-btn--primary{% else %}lat-btn--ghost{% endif %}" type="submit">{{ item.label }}</button>
   </form>
 {%- endmacro %}
