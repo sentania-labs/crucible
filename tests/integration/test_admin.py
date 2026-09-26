@@ -316,16 +316,20 @@ def test_the_settings_page_shows_broad_egress_and_the_resolve_ttl(
     other Kubernetes setting, with where each value came from."""
     monkeypatch.delenv("CRUCIBLE_CONFIG", raising=False)
     monkeypatch.setenv("CRUCIBLE_KUBERNETES__RESOLVE_TTL_SECONDS", "120")
-    ctx.settings = Settings()
+    # A provider's settings are listed only while it is on (crucible#125).
+    ctx.settings = Settings(kubernetes={"enabled": True})
     with TestClient(create_app(ctx)) as browser:
         ui_sign_in(browser, tokens["observer"])
         page = browser.get("/ui/settings")
     assert page.status_code == 200, page.text
     text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", page.text))
-    assert re.search(r"kubernetes\.broad_egress no default", text), text
-    assert "GitHub included" in text
-    assert re.search(r"kubernetes\.resolve_ttl_seconds 120\.0 environment", text), text
-    assert re.search(r"kubernetes\.launch_timeout_seconds 300 default", text), text
+    # What this deployment set leads, with where it came from; the defaults it left alone
+    # are behind a click, without a source column (crucible#115).
+    lead, _, defaults = text.partition("Defaults left unchanged")
+    assert re.search(r"kubernetes\.resolve_ttl_seconds 120\.0 environment", lead), text
+    assert re.search(r"kubernetes\.broad_egress no On, a worker", defaults), text
+    assert "GitHub included" in defaults
+    assert re.search(r"kubernetes\.launch_timeout_seconds 300 ", defaults), text
 
 
 def test_ui_mutation_uses_the_same_harness_service_and_rejects_bad_csrf(
