@@ -236,7 +236,8 @@ def _harness_steps(
             _step(
                 "promoted_image_missing",
                 f"The promoted image for {name} ({default.get('reference') or 'no reference'}) "
-                "is no longer in the registry. Promote another on Images.",
+                "is no longer in the registry, or the registry did not answer. "
+                "Promote another on Images.",
                 "/ui/images",
             )
         )

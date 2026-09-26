@@ -632,8 +632,8 @@ def test_a_promoted_image_no_provider_lists_is_named_not_ready(
     assert hermes["state"] == "not_ready"
     assert [step["code"] for step in hermes["steps"]] == ["promoted_image_missing"]
     assert hermes["steps"][0]["text"] == (
-        "The promoted image for hermes (w:1) is no longer in the registry. "
-        "Promote another on Images."
+        "The promoted image for hermes (w:1) is no longer in the registry, or the "
+        "registry did not answer. Promote another on Images."
     )
     assert hermes["steps"][0]["fix"] == "/ui/images"
     assert readiness["ready"] is False
