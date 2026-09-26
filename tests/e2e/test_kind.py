@@ -1167,7 +1167,7 @@ async def test_isolation_probes_are_refused_on_kubernetes(
     mechanism (no Docker socket to mount, a NetworkPolicy instead of an egress proxy,
     no shared filesystem to push into) produced it."""
     clock = SystemClock()
-    harnesses = application_harnesses()
+    harnesses = application_harnesses(test_fixtures=True)
     ctx = AppContext(
         uow_factory=SqlUnitOfWorkFactory(engine),
         clock=clock,
@@ -1263,7 +1263,7 @@ async def test_scripted_quota_reroutes_on_kubernetes(
     origin through `DockerProvider.push_quota_checkpoint`, which the Kubernetes
     provider does not have, so on this tier nothing pushes a local-origin checkpoint."""
     clock = SystemClock()
-    harnesses = application_harnesses()
+    harnesses = application_harnesses(test_fixtures=True)
     ctx = AppContext(
         uow_factory=SqlUnitOfWorkFactory(engine),
         clock=clock,
