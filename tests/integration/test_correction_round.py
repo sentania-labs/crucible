@@ -4,12 +4,14 @@ One test per finding, named so the disposition is traceable to what proves it.""
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import text
 
+from crucible.adapters.api.app import create_app
 from crucible.adapters.api.deps import AppContext
 from crucible.adapters.execution.fake import FakeProvider
 from crucible.application.supervisor import Supervisor
@@ -99,6 +101,56 @@ async def test_orchestrator_cannot_add_a_pin_by_amendment_or_correction(
     refused = client.post(f"/v1/tasks/{correction_task_id}/corrections", json=correction)
     assert refused.status_code == 403
     assert "only an operator may" in refused.json()["detail"]
+
+
+async def test_amendment_and_correction_refuse_a_provider_this_deployment_does_not_run(
+    ctx: AppContext, tokens: dict[str, str], client: TestClient, supervisor: Supervisor
+) -> None:
+    """crucible#124: every path that stores a contract version refuses an unwired
+    provider, not only submit. Each task is created while the fake provider is wired, then
+    amended or corrected through a deployment that runs no provider (test fixtures off)."""
+    amend_task_id = submit_and_start(
+        client, "crucible-worker:fake-succeed", external_id="UNWIRED-AMEND", start=False
+    )
+    correction_task_id = submit_and_start(
+        client, "crucible-worker:fake-no-report", external_id="UNWIRED-CORRECTION"
+    )
+    assert await run_to_settled(supervisor, client, correction_task_id) == "pre_pr_gates_failed"
+    amendment = contract_of(client, amend_task_id)
+    correction = correction_document(
+        client, correction_task_id, image="crucible-worker:fake-succeed"
+    )
+
+    production = dataclasses.replace(ctx, providers=[])
+    with TestClient(
+        create_app(production), headers={"Authorization": f"Bearer {tokens['orchestrator']}"}
+    ) as unwired:
+        amended = unwired.post(
+            f"/v1/tasks/{amend_task_id}/amend",
+            json={"contract": amendment, "reason": "same contract, fixtures now off"},
+        )
+        corrected = unwired.post(f"/v1/tasks/{correction_task_id}/corrections", json=correction)
+
+    for response in (amended, corrected):
+        assert response.status_code == 422, response.text
+        assert "execution_request.provider" in [e["path"] for e in response.json()["errors"]]
+    assert contract_of(client, amend_task_id) == amendment
+    view = client.get(f"/v1/tasks/{correction_task_id}").json()
+    assert (view["state"], view["contract_version"]) == ("pre_pr_gates_failed", 1)
+
+    # The same versions through the deployment that wires the fake provider are accepted,
+    # so the refusal above is the provider check and nothing else.
+    assert (
+        client.post(
+            f"/v1/tasks/{amend_task_id}/amend",
+            json={"contract": amendment, "reason": "fixtures on"},
+        ).status_code
+        == 200
+    )
+    assert (
+        client.post(f"/v1/tasks/{correction_task_id}/corrections", json=correction).status_code
+        == 200
+    )
 
 
 # ----- 1: a decision on a blocked task must create new work --------------------

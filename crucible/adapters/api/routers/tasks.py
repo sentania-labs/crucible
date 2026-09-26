@@ -269,6 +269,7 @@ async def corrections(
             harness_gates=ctx.harness_gates,
             credential_sources=ctx.credential_sources,
             secret_providers=ctx.secret_providers,
+            wired_providers=frozenset(provider.name for provider in ctx.providers),
         )
         return 200, task_view(uow, task.id).model_dump(mode="json")
 
@@ -306,6 +307,7 @@ async def amend(
             harness_gates=ctx.harness_gates,
             credential_sources=ctx.credential_sources,
             secret_providers=ctx.secret_providers,
+            wired_providers=frozenset(provider.name for provider in ctx.providers),
         )
         return 200, task_view(uow, task.id).model_dump(mode="json")
 

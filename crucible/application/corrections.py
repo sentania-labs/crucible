@@ -20,6 +20,7 @@ from crucible.application.submit_task import (
     eligible_harness_names,
     parse_contract,
     require_operator_for_pin,
+    unwired_provider_problems,
     validate_against_registry,
 )
 from crucible.application.task_access import require_task_principal
@@ -92,6 +93,7 @@ def attach_correction(
     harness_gates: dict[str, HarnessGate] | None = None,
     credential_sources: dict[str, CredentialSource] | None = None,
     secret_providers: Collection[str] = (),
+    wired_providers: Collection[str] | None = None,
 ) -> Task:
     task = uow.tasks.get(task_id, for_update=True)
     if task is None:
@@ -135,6 +137,7 @@ def attach_correction(
     problems: list[dict[str, Any]] = validate_against_registry(
         uow, clock, contract, eligible_harnesses=eligible, harnesses=harnesses
     )
+    problems.extend(unwired_provider_problems(contract, wired_providers))
     problems.extend(correction_narrows(previous, contract))
     if task.state is TaskState.AWAITING_ACCEPTANCE:
         # The current verdict only. A needs_more_work that a later accept superseded is
@@ -211,6 +214,7 @@ def amend_task(
     harness_gates: dict[str, HarnessGate] | None = None,
     credential_sources: dict[str, CredentialSource] | None = None,
     secret_providers: Collection[str] = (),
+    wired_providers: Collection[str] | None = None,
 ) -> Task:
     task = uow.tasks.get(task_id, for_update=True)
     if task is None:
@@ -241,6 +245,7 @@ def amend_task(
     problems: list[dict[str, Any]] = validate_against_registry(
         uow, clock, contract, eligible_harnesses=eligible, harnesses=harnesses
     )
+    problems.extend(unwired_provider_problems(contract, wired_providers))
     if contract.external_identity_fields() != previous.external_identity_fields():
         problems.append(
             {
