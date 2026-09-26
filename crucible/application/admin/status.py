@@ -220,12 +220,23 @@ def _harness_steps(
                 "/ui/routing",
             )
         )
-    # Promotion is per harness (ADR 0018): the harness's own default, not the image list.
-    if not item.get("default_image"):
+    # Promotion is per harness (ADR 0018): the harness's own default, which must also be
+    # an image a provider lists now. A row alone can name an image deleted since.
+    default = item.get("default_image")
+    if not default:
         steps.append(
             _step(
                 "no_promoted_image",
                 f"{name} has no promoted worker image. Promote one on Images.",
+                "/ui/images",
+            )
+        )
+    elif not any(i.get("promotion_state") == "default" for i in item.get("images") or []):
+        steps.append(
+            _step(
+                "promoted_image_missing",
+                f"The promoted image for {name} ({default.get('reference') or 'no reference'}) "
+                "is no longer in the registry. Promote another on Images.",
                 "/ui/images",
             )
         )

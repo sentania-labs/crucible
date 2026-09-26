@@ -1212,6 +1212,38 @@ def test_login_through_api_and_cli_against_the_fake_cli(
     assert ("credential_login_finished", "crucible-admin") in kinds
 
 
+def test_a_promoted_image_no_provider_lists_any_more_is_not_ready(
+    admin_client: TestClient, live_supervisor: Supervisor, provider: FakeProvider
+) -> None:
+    """Codex on PR 164: the default image is a database row, so an image deleted from
+    every provider after promotion still has one. Readiness names the missing image
+    rather than reading the harness ready, and a fresh listing clears the step."""
+    asyncio.run(live_supervisor.tick())
+    image = ImageInfo(
+        "ghcr.io/sentania-labs/crucible-worker:0.5.5", "sha256:" + "a" * 64, WORKER_HARNESSES
+    )
+    provider.images = [image]
+    promoted = admin_client.post(
+        f"/v1/admin/images/{image.digest}/promote", json={"harness": "hermes"}
+    )
+    assert promoted.status_code == 200, promoted.text
+
+    def image_steps() -> list[dict[str, Any]]:
+        readiness = admin_client.get("/v1/admin/status").json()["readiness"]
+        hermes = next(h for h in readiness["harnesses"] if h["name"] == "hermes")
+        return [s for s in hermes["steps"] if "image" in s["code"]]
+
+    assert image_steps() == []
+    provider.images = []
+    missing = image_steps()
+    assert [s["code"] for s in missing] == ["promoted_image_missing"]
+    assert missing[0]["fix"] == "/ui/images"
+    assert image.reference in missing[0]["text"]
+    assert "no longer in the registry" in missing[0]["text"]
+    provider.images = [image]
+    assert image_steps() == []
+
+
 def test_images_are_promoted_and_rolled_back_per_harness(
     ctx: AppContext,
     admin_client: TestClient,

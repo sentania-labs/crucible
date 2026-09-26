@@ -856,6 +856,7 @@ STEP_WORDS = {
     "no_enabled_model": "needs a model",
     "endpoint_unreachable": "gateway unreachable",
     "no_promoted_image": "needs an image",
+    "promoted_image_missing": "image no longer listed",
 }
 
 

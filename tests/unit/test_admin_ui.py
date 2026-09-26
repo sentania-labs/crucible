@@ -613,6 +613,31 @@ def test_a_missing_credential_and_image_are_named_per_harness(
     ]
 
 
+def test_a_promoted_image_no_provider_lists_is_named_not_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex on PR 164: the harness has a default row, but no listed image is it."""
+    document = {
+        "supervisor": _supervisor_document(_lease(), _status()),
+        "harnesses": [_harness("hermes", images=[{"promotion_state": "candidate"}])],
+        "providers": [],
+    }
+
+    readiness = _readiness(
+        document, monkeypatch, repositories=[object()], enabled_models={"hermes"}
+    )
+
+    hermes = readiness["harnesses"][0]
+    assert hermes["state"] == "not_ready"
+    assert [step["code"] for step in hermes["steps"]] == ["promoted_image_missing"]
+    assert hermes["steps"][0]["text"] == (
+        "The promoted image for hermes (w:1) is no longer in the registry. "
+        "Promote another on Images."
+    )
+    assert hermes["steps"][0]["fix"] == "/ui/images"
+    assert readiness["ready"] is False
+
+
 class _StrictStatusDict(dict[str, Any]):
     """Make optional access to an undefined status field fail like indexed access."""
 

@@ -63,7 +63,9 @@ timeout (#151) and security (#130). The branch merged main rather than rebasing:
 - **Status:** the readiness list #156 computes is the to-do list, one row per missing
   step with its fix page. The per-harness readiness table moved behind Details with a
   one-line Harnesses row in the Service table. `no_promoted_image` reads the harness's own
-  default (the `harness_images` row), not the image list.
+  default (the `harness_images` row), not the image list; `promoted_image_missing`
+  names a default that no provider lists any more, so a deleted image does not read
+  ready.
 - **Routing:** one "In force" table (delivery and routing policy versions, the gateway,
   the per-command timeout in hours or minutes, the Kubernetes egress in plain words); the
   documents behind Details; exhausted pools listed with a Clear button on each row,
