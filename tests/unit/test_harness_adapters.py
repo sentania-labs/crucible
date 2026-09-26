@@ -195,7 +195,7 @@ def test_script_harness_is_a_plain_argv() -> None:
     assert ScriptHarnessAdapter().credential_spec() is None
 
 
-@pytest.mark.parametrize("adapter", default_adapters(), ids=lambda a: a.name)
+@pytest.mark.parametrize("adapter", default_adapters(test_fixtures=True), ids=lambda a: a.name)
 def test_nothing_secret_shaped_in_any_launch(adapter: HarnessAdapter) -> None:
     """12: argv and env carry names, paths and flags; the scanner finds nothing."""
     ctx = (
@@ -266,8 +266,10 @@ def test_configuration_may_raise_the_mount_mode_and_never_lower_it() -> None:
 # ----- the registry (07, 25) ----------------------------------------------------
 
 
-def test_the_registry_knows_the_five_harnesses() -> None:
-    registry = default_registry()
+def test_the_registry_knows_the_four_harnesses_and_the_fixture_only_when_asked() -> None:
+    """crucible#124: the script harness is a test fixture, off unless a tier enables it."""
+    assert default_registry().names() == ("claude_code", "codex", "agy", "hermes")
+    registry = default_registry(test_fixtures=True)
     assert registry.names() == ("claude_code", "codex", "agy", "hermes", "script-harness")
     # C11: 0.154, 0.155 and 0.156 keep every flag the launch uses (codex exec --help of
     # 0.156.0; their changelogs remove only `codex mcp-server`, which is not used).
@@ -303,3 +305,30 @@ def test_an_administrator_flag_refuses_with_its_reason() -> None:
         default_registry().resolve("agy", state=state)
     state.enabled = True
     assert default_registry().resolve("agy", state=state).name == "agy"
+
+
+def test_the_fixture_harness_makes_one_model_call_when_tested_behind_a_local_endpoint() -> None:
+    """crucible#118: the harness test's model call, from the worker and through its
+    egress, against the endpoint the routing policy names. Nothing to call otherwise."""
+    adapter = ScriptHarnessAdapter()
+
+    def context(**kwargs: Any) -> LaunchContext:
+        return LaunchContext(
+            attempt_id="probe",
+            model="stub-model",
+            effort=None,
+            timeout_seconds=60,
+            identity_mount="/crucible/identity",
+            report_mount="/crucible/report",
+            repo_mount="/crucible/repo",
+            probe=True,
+            **kwargs,
+        )
+
+    local = adapter.build_launch(
+        context(endpoint="local", endpoint_url="https://stub.example.invalid/v1")
+    )
+    assert local.argv[:2] == ("sh", "-c") and "chat/completions" in local.argv[2]
+    assert local.env["CRUCIBLE_TEST_ENDPOINT"] == "https://stub.example.invalid/v1"
+    assert '"model": "stub-model"' in local.env["CRUCIBLE_TEST_BODY"]
+    assert adapter.build_launch(context()).argv == ("sh", "-c", "exit 0")

@@ -11,7 +11,7 @@ from crucible.adapters.harness.registry import default_registry
 from crucible.application.harnesses import check_image_version as _check
 from crucible.application.harnesses import egress_allowlist
 
-REGISTRY = default_registry()
+REGISTRY = default_registry(test_fixtures=True)
 MANIFEST = Path(__file__).parents[2] / "images" / "manifest.env"
 # The worker image (C11) is named for the day of its pinned inputs; the e2e image keeps
 # its harness and version in the tag.

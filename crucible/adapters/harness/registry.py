@@ -1,4 +1,5 @@
-"""The four adapters as one registry (07)."""
+"""The adapters as one registry (07): the four real harnesses, and the script harness
+only when test fixtures are on (crucible#124)."""
 
 from __future__ import annotations
 
@@ -11,15 +12,17 @@ from crucible.application.harnesses import HarnessRegistry
 from crucible.ports.harness import HarnessAdapter
 
 
-def default_adapters() -> tuple[HarnessAdapter, ...]:
-    return (
+def default_adapters(*, test_fixtures: bool = False) -> tuple[HarnessAdapter, ...]:
+    """The script harness reports completion without doing any work, so it is a test
+    fixture: registered only when `test_fixtures` is on (18, crucible#124)."""
+    real: tuple[HarnessAdapter, ...] = (
         ClaudeCodeAdapter(),
         CodexAdapter(),
         AgyAdapter(),
         HermesAdapter(),
-        ScriptHarnessAdapter(),
     )
+    return (*real, ScriptHarnessAdapter()) if test_fixtures else real
 
 
-def default_registry() -> HarnessRegistry:
-    return HarnessRegistry(default_adapters())
+def default_registry(*, test_fixtures: bool = False) -> HarnessRegistry:
+    return HarnessRegistry(default_adapters(test_fixtures=test_fixtures))

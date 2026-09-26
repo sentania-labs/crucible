@@ -97,8 +97,9 @@ the e2e script harness as the fourth adapter. Each adapter declares the version
 range it was tested with; the image label carries the installed version, and a
 launch outside the range is refused with a wake. `GET /v1/harnesses` reports
 installed and supported versions, both enable flags with their reasons, and a
-sanitized credential state; `GET /v1/images` lists every labelled image with its
-promotion state.
+sanitized credential state; `GET /v1/images` lists every labelled image with the
+harnesses it is the default image of. Each harness has its own default image,
+promoted and rolled back on its own (ADR 0018).
 
 A harness credential is a directory Crucible reads (`[credentials.<harness>]`,
 paths only), never the operator's own `~/.claude`, `~/.codex` or `~/.gemini`.
@@ -127,22 +128,24 @@ services and own no separate state. On a fresh deployment, read the
 one-time administrator token with `docker compose exec crucible cat
 /var/lib/crucible/credentials/first-run-admin-token` (it is never in a log,
 ADR 0016), then open `http://127.0.0.1:8080/ui`; the first sign-in removes
-the file. Every mutation takes a reason, needs a live
-supervisor, and leaves an event with the principal and a before/after summary,
-never a value:
+the file. Every mutation needs a live supervisor and leaves an event with the
+principal and a before/after summary, never a value. A reason is an optional
+audit note, required only to revoke a token, remove a repository or a
+credential, or commit a bootstrap import:
 
 ```sh
 crucible admin status                                        # the sanitized status document
 crucible admin harnesses list
-crucible admin --reason "refresh unverified" harnesses disable codex
+crucible admin harnesses disable codex --reason "refresh unverified"
 crucible admin credentials status --harness claude_code      # presence, permissions, expiry class
 crucible admin credentials validate --harness claude_code    # shape and expiry, no network
 crucible admin credentials probe --harness claude_code       # bounded run of the hardened image
-crucible admin --reason "..." credentials login --harness codex   # prints the URL and the code; token file mode 600
-crucible admin --reason "..." credentials rotate --harness agy --new-path /path/to/staged
-crucible admin --reason "..." credentials remove --harness codex
+crucible admin credentials login --harness codex                 # prints the URL and the code; token file mode 600
+crucible admin credentials rotate --harness agy --new-path /path/to/staged
+crucible admin credentials remove --harness codex --reason "..."
 crucible admin images list
-crucible admin --reason "..." images promote <digest>
+crucible admin images promote <digest> --harness hermes   # per harness (ADR 0018)
+crucible admin images rollback --harness hermes
 crucible admin providers status
 crucible admin github status
 crucible admin github check                                  # mints and discards a token per registered repository

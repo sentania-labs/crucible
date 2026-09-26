@@ -19,8 +19,8 @@ from crucible.adapters.persistence.models import (
     EscalationRow,
     EvidenceRow,
     GateResultRow,
+    HarnessImageRow,
     HarnessStateRow,
-    ImagePromotionRow,
     PolicyRow,
     ProviderSettingRow,
     ReviewDispositionRow,
@@ -41,8 +41,8 @@ from crucible.domain.entities import (
     EscalationState,
     EvidenceRecord,
     GateResultRecord,
+    HarnessImage,
     HarnessState,
-    ImagePromotion,
     Policy,
     ProviderSetting,
     ReviewDisposition,
@@ -847,6 +847,7 @@ class HarnessStates:
             last_launch_outcome=row.last_launch_outcome,
             last_auth_failure_at=_dt(row.last_auth_failure_at),
             last_validated_at=_dt(row.last_validated_at),
+            last_test=dict(row.last_test) if row.last_test is not None else None,
         )
 
     def get(self, name: str) -> HarnessState | None:
@@ -871,47 +872,56 @@ class HarnessStates:
         row.last_launch_outcome = state.last_launch_outcome
         row.last_auth_failure_at = state.last_auth_failure_at
         row.last_validated_at = state.last_validated_at
+        row.last_test = state.last_test
         row.updated_at = state.updated_at
         row.updated_by = state.updated_by
         self._s.flush()
         return self._to_entity(row)
 
 
-class ImagePromotions:
+class HarnessImages:
+    """Each harness's default worker image (13, ADR 0018)."""
+
     def __init__(self, session: Session) -> None:
         self._s = session
 
     @staticmethod
-    def _to_entity(row: ImagePromotionRow) -> ImagePromotion:
-        return ImagePromotion(
+    def _to_entity(row: HarnessImageRow) -> HarnessImage:
+        return HarnessImage(
+            harness=row.harness,
             digest=row.digest,
             reference=row.reference,
-            harnesses={str(k): str(v) for k, v in (row.harnesses or {}).items()},
-            state=row.state,
+            version=row.version,
             updated_at=ensure_utc(row.updated_at),
             updated_by=row.updated_by,
             reason=row.reason,
+            previous_digest=row.previous_digest,
+            previous_reference=row.previous_reference,
+            previous_version=row.previous_version,
         )
 
-    def get(self, digest: str) -> ImagePromotion | None:
-        row = self._s.get(ImagePromotionRow, digest)
+    def get(self, harness: str) -> HarnessImage | None:
+        row = self._s.get(HarnessImageRow, harness)
         return self._to_entity(row) if row else None
 
-    def list_all(self) -> Sequence[ImagePromotion]:
-        rows = self._s.scalars(select(ImagePromotionRow).order_by(ImagePromotionRow.digest)).all()
+    def list_all(self) -> Sequence[HarnessImage]:
+        rows = self._s.scalars(select(HarnessImageRow).order_by(HarnessImageRow.harness)).all()
         return [self._to_entity(r) for r in rows]
 
-    def put(self, promotion: ImagePromotion) -> ImagePromotion:
-        row = self._s.get(ImagePromotionRow, promotion.digest)
+    def put(self, image: HarnessImage) -> HarnessImage:
+        row = self._s.get(HarnessImageRow, image.harness)
         if row is None:
-            row = ImagePromotionRow(digest=promotion.digest)
+            row = HarnessImageRow(harness=image.harness)
             self._s.add(row)
-        row.reference = promotion.reference
-        row.harnesses = dict(promotion.harnesses)
-        row.state = promotion.state
-        row.reason = promotion.reason
-        row.updated_at = promotion.updated_at
-        row.updated_by = promotion.updated_by
+        row.digest = image.digest
+        row.reference = image.reference
+        row.version = image.version
+        row.previous_digest = image.previous_digest
+        row.previous_reference = image.previous_reference
+        row.previous_version = image.previous_version
+        row.reason = image.reason
+        row.updated_at = image.updated_at
+        row.updated_by = image.updated_by
         self._s.flush()
         return self._to_entity(row)
 

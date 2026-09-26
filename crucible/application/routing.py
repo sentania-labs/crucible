@@ -213,19 +213,11 @@ class Selection:
 
 
 def image_for_harness(uow: UnitOfWork, harness: str, provider: str) -> str | None:
-    """The promoted image that carries the harness (13). Since C11 one worker image
-    carries all four real harnesses, so one promotion normally answers for all four; if
-    a narrower image was promoted after it, the more recent promotion wins for the
-    harnesses it carries."""
-    defaults = [
-        item
-        for item in uow.image_promotions.list_all()
-        if item.carries(harness) and item.state == "default"
-    ]
-    if defaults:
-        return sorted(defaults, key=lambda item: (item.updated_at, item.digest), reverse=True)[
-            0
-        ].reference
+    """The harness's own default worker image (13, ADR 0018). Promotion is per harness,
+    so another harness's default never answers for this one."""
+    default = uow.harness_images.get(harness)
+    if default is not None:
+        return default.reference
     # The fake provider is an in-process test double and has no image manifest.
     if provider == "fake":
         return "crucible-worker:fake-succeed"
@@ -295,25 +287,14 @@ def select_model(
             reasons.append("selected harness has no default image")
             image = ""
         elif provider != "fake":
-            promotion = next(
-                (
-                    item
-                    for item in uow.image_promotions.list_all()
-                    if item.carries(entry.harness)
-                    and item.reference == image
-                    and item.state == "default"
-                ),
-                None,
-            )
-            if promotion is None:
+            default = uow.harness_images.get(entry.harness)
+            if default is None or default.reference != image:
                 reasons.append("derived image is unknown or retired")
             elif harnesses is not None:
                 adapter = harnesses.get(entry.harness)
                 if adapter is None:
                     reasons.append("derived image names an unknown harness")
-                elif not adapter.supported_versions.supports(
-                    promotion.harnesses.get(entry.harness, "")
-                ):
+                elif not adapter.supported_versions.supports(default.version):
                     reasons.append(
                         "derived image harness version is outside the adapter supported range"
                     )

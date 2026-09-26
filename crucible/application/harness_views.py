@@ -31,6 +31,7 @@ def harness_list(
     if registry is None:
         return HarnessList(items=[])
     states: dict[str, HarnessState] = {s.name: s for s in uow.harnesses.list_all()}
+    defaults = {d.harness: d for d in uow.harness_images.list_all()}
     items: list[HarnessView] = []
     for adapter in registry:
         state = states.get(adapter.name)
@@ -40,6 +41,7 @@ def harness_list(
             {version for i in images if (version := i.version_of(adapter.name)) is not None}
         )
         credential = credential_state(adapter.credential_spec(), sources.get(adapter.name), state)
+        default = defaults.get(adapter.name)
         reasons = [
             r for r in (gate.reason if not gate.enabled else "", state.reason if state else "") if r
         ]
@@ -67,6 +69,25 @@ def harness_list(
                     last_launch_at=state.last_launch_at if state else None,
                     last_launch_outcome=state.last_launch_outcome if state else None,
                 ),
+                default_image=(
+                    {
+                        "reference": default.reference,
+                        "digest": default.digest,
+                        "version": default.version,
+                    }
+                    if default is not None
+                    else None
+                ),
+                last_test=state.last_test if state is not None else None,
+                previous_image=(
+                    {
+                        "reference": default.previous_reference or "",
+                        "digest": default.previous_digest,
+                        "version": default.previous_version or "",
+                    }
+                    if default is not None and default.previous_digest
+                    else None
+                ),
             )
         )
     return HarnessList(items=items)
@@ -77,25 +98,32 @@ def image_list(
     registry: HarnessRegistry | None,
     images: Sequence[tuple[str, ImageInfo]],
 ) -> ImageList:
-    """Every labelled image, with the promotion state the table records (13). An image
-    no admin act has touched is a `candidate`."""
-    promotions = {p.digest: p for p in uow.image_promotions.list_all()}
+    """Every labelled image, with the harnesses it is the default or the rollback image
+    of (13, ADR 0018). An image no harness has promoted is a `candidate`."""
+    defaults = list(uow.harness_images.list_all())
     items: list[ImageView] = []
     for provider_name, image in images:
-        supported = bool(image.harnesses) and all(
-            (adapter := registry.get(harness) if registry else None) is not None
-            and adapter.supported_versions.supports(version)
+        supported_for = sorted(
+            harness
             for harness, version in image.harnesses.items()
+            if (adapter := registry.get(harness) if registry else None) is not None
+            and adapter.supported_versions.supports(version)
         )
-        promotion = promotions.get(image.digest)
+        default_for = sorted(d.harness for d in defaults if d.digest == image.digest)
+        previous_for = sorted(d.harness for d in defaults if d.previous_digest == image.digest)
         items.append(
             ImageView(
                 reference=image.reference,
                 digest=image.digest,
                 harnesses=dict(image.harnesses),
-                supported=supported,
-                promotion_state=promotion.state if promotion else "candidate",
+                supported=bool(image.harnesses) and len(supported_for) == len(image.harnesses),
+                promotion_state=(
+                    "default" if default_for else "retained" if previous_for else "candidate"
+                ),
                 provider=provider_name,
+                supported_for=supported_for,
+                default_for=default_for,
+                previous_for=previous_for,
             )
         )
     return ImageList(items=items)

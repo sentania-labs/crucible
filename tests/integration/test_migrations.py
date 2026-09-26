@@ -709,7 +709,7 @@ def test_0018_keeps_a_promotion_across_down_and_up(database_url: str) -> None:
                 "'tests')"
             )
         )
-    migrate.upgrade(database_url)
+    migrate.upgrade(database_url, "0020_provider_settings")
     with engine.connect() as conn:
         harnesses = conn.execute(
             text("SELECT harnesses FROM image_promotions WHERE digest='sha256:c5'")
@@ -733,9 +733,10 @@ def test_0018_keeps_a_promotion_across_down_and_up(database_url: str) -> None:
             ).all()
         }
     assert rows == {"sha256:c5": "codex 0.153.4", "sha256:c11": "agy 1.2.8"}
-    migrate.upgrade(database_url)
+    migrate.upgrade(database_url, "0020_provider_settings")
     with engine.begin() as conn:
         conn.execute(text("DELETE FROM image_promotions"))
+    migrate.upgrade(database_url)
     engine.dispose()
 
 
@@ -1075,6 +1076,64 @@ def test_0020_provider_settings_down_and_up_keeps_the_audit_trail(database_url: 
     ok, detail = migrate.is_current(engine, database_url)
     assert ok, detail
     engine.dispose()
+
+
+def test_0023_carries_each_harness_default_forward_and_back(database_url: str) -> None:
+    """crucible#116: promotion is per harness. Each harness's current default (the most
+    recent `default` row that carries it) becomes its own default, and the most recent
+    `retained` row that carries it becomes the image a rollback returns to."""
+    migrate.upgrade(database_url)
+    engine = make_engine(database_url)
+    migrate.downgrade(database_url, "0022_first_run_setup")
+    insert = text(
+        "INSERT INTO image_promotions (digest, reference, harnesses, state, reason, "
+        "updated_at, updated_by) VALUES (:digest, :reference, CAST(:harnesses AS jsonb), "
+        ":state, '', now() - make_interval(mins => :age), 'tests')"
+    )
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM image_promotions"))
+        for digest, reference, harnesses, state, age in (
+            ("sha256:old", "w:0.5.4", {"hermes": "0.19.0", "agy": "1.2.7"}, "retained", 30),
+            ("sha256:new", "w:0.5.5", {"hermes": "0.19.0", "agy": "1.2.8"}, "default", 20),
+            ("sha256:agy", "w:agy", {"agy": "1.2.9"}, "default", 10),
+        ):
+            conn.execute(
+                insert,
+                {
+                    "digest": digest,
+                    "reference": reference,
+                    "harnesses": json.dumps(harnesses),
+                    "state": state,
+                    "age": age,
+                },
+            )
+    migrate.upgrade(database_url)
+    with engine.connect() as conn:
+        rows = {
+            str(r.harness): (r.digest, r.version, r.previous_digest, r.previous_version)
+            for r in conn.execute(text("SELECT * FROM harness_images"))
+        }
+    # agy's default replaced the combined image it was promoted over, which stayed the
+    # default for hermes; hermes's replaced the retained one.
+    assert rows == {
+        "agy": ("sha256:agy", "1.2.9", "sha256:new", "1.2.8"),
+        "hermes": ("sha256:new", "0.19.0", "sha256:old", "0.19.0"),
+    }
+    assert "image_promotions" not in inspect(engine).get_table_names()
+    migrate.downgrade(database_url, "0022_first_run_setup")
+    with engine.connect() as conn:
+        back = {
+            str(r.digest): (r.state, dict(r.harnesses))
+            for r in conn.execute(text("SELECT * FROM image_promotions"))
+        }
+    assert back == {
+        "sha256:agy": ("default", {"agy": "1.2.9"}),
+        "sha256:new": ("default", {"hermes": "0.19.0"}),
+        "sha256:old": ("retained", {"hermes": "0.19.0"}),
+    }
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM image_promotions"))
+    migrate.upgrade(database_url)
 
 
 def test_0021_command_timeout_down_and_up_keeps_the_audit_trail(database_url: str) -> None:

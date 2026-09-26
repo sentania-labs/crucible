@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -249,6 +250,43 @@ def test_all_document_sections_suppress_secret_shaped_values() -> None:
     assert "present" in rendered and "absent" in rendered
 
 
+def test_harness_version_maps_are_shown_whatever_the_harness_is_called() -> None:
+    """crucible#126: the audit of an image promotion lists every harness's version, and
+    `claude_code` is a harness name, not a login code. Redaction goes by what a field
+    holds, so a code, a token or a key under the same document stays hidden."""
+    marker = "LEAK-MARKER-126"
+    payload = {
+        "reason": "",
+        "harnesses": {
+            "agy": "1.2.8",
+            "claude_code": "2.1.280",
+            "codex": "0.156.0",
+            "hermes": "0.19.0",
+            "script-harness": "1.0.0",
+        },
+        "code": marker,
+        "user_code": marker,
+        "login_token": marker,
+        "error_code": 70,
+        "api_key_set": True,
+    }
+
+    rendered = _render_documents([_document_section("Audit", payload)])
+
+    for version in ("1.2.8", "2.1.280", "0.156.0", "0.19.0", "1.0.0"):
+        assert version in rendered
+    assert marker not in rendered
+    assert rendered.count("not displayed") == 3
+    assert "70" in rendered
+    assert _safe_value("harnesses.claude_code", "2.1.280") == "2.1.280"
+    assert _safe_value("claudeCode", "2.1.280") == "2.1.280"
+    assert _safe_value("device_code", "ABCD-EFGH") == "not displayed"
+    for name in ("secret_key", "token_value", "password_hash", "verification_code"):
+        assert _safe_value(name, "x") == "not displayed", name
+    for name in ("exit_code", "error_code", "tokens_in", "api_key_set", "private_key_path"):
+        assert _safe_value(name, "x") == "x", name
+
+
 def test_nested_lists_stay_readable_and_suppress_secrets_at_any_depth() -> None:
     marker = "ghp_" + "q" * 40
     document = {
@@ -443,6 +481,7 @@ def _harness(name: str, **overrides: Any) -> dict[str, Any]:
         "reason": "",
         "credential": {"state": "validated"},
         "images": [{"promotion_state": "default"}],
+        "default_image": {"reference": "w:1", "digest": "sha256:w", "version": "1"},
     }
     item.update(overrides)
     return item
@@ -515,7 +554,9 @@ def test_hermes_steps_name_the_real_blocker_and_the_page_that_fixes_it(
         "supervisor": _supervisor_document(_lease(), _status()),
         "harnesses": [
             _harness("hermes"),
-            _harness("script-harness", images=[{"promotion_state": "candidate"}]),
+            _harness(
+                "script-harness", images=[{"promotion_state": "candidate"}], default_image=None
+            ),
             _harness("codex", enabled_by_configuration=False, reason="unverified"),
         ],
         "providers": [],
@@ -548,6 +589,7 @@ def test_a_missing_credential_and_image_are_named_per_harness(
                 "claude_code",
                 enabled_by_administrator=False,
                 images=[{"promotion_state": "candidate"}],
+                default_image=None,
             )
         ],
         "providers": [
@@ -570,6 +612,31 @@ def test_a_missing_credential_and_image_are_named_per_harness(
         "/ui/routing",
         "/ui/images",
     ]
+
+
+def test_a_promoted_image_no_provider_lists_is_named_not_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex on PR 164: the harness has a default row, but no listed image is it."""
+    document = {
+        "supervisor": _supervisor_document(_lease(), _status()),
+        "harnesses": [_harness("hermes", images=[{"promotion_state": "candidate"}])],
+        "providers": [],
+    }
+
+    readiness = _readiness(
+        document, monkeypatch, repositories=[object()], enabled_models={"hermes"}
+    )
+
+    hermes = readiness["harnesses"][0]
+    assert hermes["state"] == "not_ready"
+    assert [step["code"] for step in hermes["steps"]] == ["promoted_image_missing"]
+    assert hermes["steps"][0]["text"] == (
+        "The promoted image for hermes (w:1) is no longer in the registry, or the "
+        "registry did not answer. Promote another on Images."
+    )
+    assert hermes["steps"][0]["fix"] == "/ui/images"
+    assert readiness["ready"] is False
 
 
 class _StrictStatusDict(dict[str, Any]):
@@ -606,7 +673,7 @@ async def test_gap_logic_reads_only_keys_from_real_status_document(
 
     harnesses = [
         _harness("disabled", enabled=False, enabled_by_administrator=False),
-        _harness("unpromoted", images=[{"promotion_state": "candidate"}]),
+        _harness("unpromoted", images=[{"promotion_state": "candidate"}], default_image=None),
     ]
     supervisor = _supervisor_document(None, _status())
     status_module = cast(Any, status_service)
@@ -835,6 +902,137 @@ def test_all_fifteen_sections_preserve_real_service_output_shapes() -> None:
                 assert str(value) in rendered, (title, value)
 
 
+def test_a_reason_is_asked_for_only_where_the_service_requires_one() -> None:
+    """crucible#117: one rule sets every form's reason field. Required on the
+    destructive forms, optional on the rest, and absent on a read-only check."""
+
+    def form(action: str) -> dict[str, Any]:
+        return {
+            "title": action,
+            "form": {
+                "action": action,
+                "fields": [
+                    {"name": "harness", "label": "Harness"},
+                    {"name": "reason", "label": "Reason", "required": True},
+                ],
+            },
+        }
+
+    sections = ui_router._reason_fields(
+        [
+            form("/ui/actions/token-revoke"),
+            form("/ui/actions/harness"),
+            form("/ui/actions/github-check"),
+        ]
+    )
+    reasons = [
+        [f for f in section["form"]["fields"] if f["name"] == "reason"] for section in sections
+    ]
+    assert reasons[0] == [{"name": "reason", "label": "Reason", "required": True}]
+    assert reasons[1] == [{"name": "reason", "label": "Reason (optional)", "required": False}]
+    assert reasons[2] == []
+
+
+def test_a_row_action_renders_its_reason_as_optional_required_or_absent() -> None:
+    """Codex on PR 164 (crucible#117): a row action's own reason mode decides its input."""
+
+    def row(label: str, **mode: Any) -> dict[str, Any]:
+        return {"kind": "form", "action": f"/ui/actions/{label}", "label": label, **mode}
+
+    rendered = templates.get_template("page.html").render(
+        **base_context("/ui/images"),
+        heading="Images",
+        intro="Fixture",
+        sections=[
+            {
+                "title": "Rows",
+                "columns": ["Actions"],
+                "rows": [
+                    [
+                        {
+                            "kind": "actions",
+                            "items": [
+                                row("note", reason="optional"),
+                                row("remove", reason=True, danger=True),
+                                row("check"),
+                            ],
+                        }
+                    ]
+                ],
+            }
+        ],
+        badge=None,
+    )
+    forms = dict(re.findall(r'action="/ui/actions/(\w+)">(.*?)</form>', rendered, re.S))
+    assert '<input class="lat-input" name="reason" placeholder="Reason (optional)"' in forms["note"]
+    assert "required" not in forms["note"]
+    assert 'placeholder="Reason (required)" aria-label="Reason" required>' in forms["remove"]
+    assert 'name="reason"' not in forms["check"]
+
+
+def test_settings_for_a_provider_that_is_off_are_not_listed() -> None:
+    """crucible#125: a Kubernetes deployment does not list the Docker provider's
+    settings, nor the credential directory settings its service-owned Secrets replace;
+    each provider's own `enabled` row stays so the page still says it is off."""
+    from crucible.settings import CredentialSettings, Settings  # noqa: PLC0415
+
+    kubernetes = Settings(kubernetes={"enabled": True}, docker={"enabled": False})
+    kubernetes.credentials = {"codex": CredentialSettings(path="/x")}
+    paths = [row[0] for row in ui_router._settings_rows(kubernetes)]
+    assert "docker.enabled" in paths
+    assert not [p for p in paths if p.startswith("docker.") and p != "docker.enabled"]
+    assert any(p.startswith("kubernetes.") and p != "kubernetes.enabled" for p in paths)
+    assert "credentials.codex.path" not in paths
+    assert "credentials.codex.mount_mode" in paths
+    docker = Settings(kubernetes={"enabled": False}, docker={"enabled": True})
+    docker.credentials = {"codex": CredentialSettings(path="/x")}
+    paths = [row[0] for row in ui_router._settings_rows(docker)]
+    assert "credentials.codex.path" in paths
+    assert not [p for p in paths if p.startswith("kubernetes.") and p != "kubernetes.enabled"]
+
+
+def test_once_a_harness_is_ready_the_others_gaps_leave_the_to_do_list() -> None:
+    """Review of the first-run integration: Status must not read "ready" above a list of
+    what stands before a task. Other harnesses' gaps stay under Details."""
+    from crucible.adapters.ui.router import _readiness_sections  # noqa: PLC0415
+
+    step = {"code": "credential_missing", "text": "codex has no credential.", "fix": "/ui/x"}
+    codex = {"name": "codex", "state": "not_ready", "note": "", "steps": [step]}
+    ready: dict[str, Any] = {
+        "ready": True,
+        "ready_harnesses": ["hermes"],
+        "steps": [],
+        "harnesses": [
+            {"name": "hermes", "state": "ready", "note": "ready for a task", "steps": []},
+            codex,
+        ],
+    }
+    sections, (_summary, detail) = _readiness_sections(ready)
+    assert sections == []
+    assert ["codex", "not ready", step["text"], step["fix"]] in detail["rows"]
+    none_ready = {
+        **ready,
+        "ready": False,
+        "ready_harnesses": [],
+        "harnesses": [codex],
+    }
+    sections, _ = _readiness_sections(none_ready)
+    assert sections[0]["rows"] == [[step["text"], step["fix"]]]
+
+
+def test_the_harnesses_word_is_the_first_readiness_step() -> None:
+    """Review of the first-run integration: the Harnesses page and Status agree."""
+    from crucible.adapters.ui.router import _harness_status  # noqa: PLC0415
+
+    item = _harness("hermes")
+    gap = {"code": "endpoint_not_configured", "text": "The gateway URL is not set.", "fix": "/"}
+    assert _harness_status(item, {"steps": [gap]})["value"] == "needs the gateway"
+    assert _harness_status(item, {"steps": []})["value"] == "ready"
+    assert _harness_status(_harness("script-harness", default_image=None), None)["value"] == (
+        "needs an image"
+    )
+
+
 def test_the_settings_page_shows_broad_egress_and_the_resolve_ttl(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -843,9 +1041,14 @@ def test_the_settings_page_shows_broad_egress_and_the_resolve_ttl(
     monkeypatch.delenv("CRUCIBLE_CONFIG", raising=False)
     monkeypatch.setenv("CRUCIBLE_KUBERNETES__RESOLVE_TTL_SECONDS", "120")
     rows = {
-        row[0]: row for row in _settings_rows(Settings(kubernetes={"resolve_ttl_seconds": 120}))
+        # A provider's settings are listed only while it is on (crucible#125).
+        row[0]: row
+        for row in _settings_rows(
+            Settings(kubernetes={"enabled": True, "resolve_ttl_seconds": 120})
+        )
     }
     assert rows["kubernetes.broad_egress"][1:3] == [False, "default"]
     assert "GitHub included" in rows["kubernetes.broad_egress"][3]
     assert rows["kubernetes.resolve_ttl_seconds"][1:3] == [120.0, "environment"]
-    assert rows["kubernetes.resolve_ttl_seconds"][3] == "Read at process start; restart required."
+    # Every setting here is read at start, which the page intro says once (crucible#115).
+    assert rows["kubernetes.resolve_ttl_seconds"][3] == ""

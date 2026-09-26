@@ -32,10 +32,10 @@ from crucible.application.auth import mint_token
 from crucible.application.repositories import register_repository
 from crucible.application.supervisor import Supervisor
 from crucible.contracts.api import ExternalReviewAttestation, RepositoryRegistration
-from crucible.domain.entities import ImagePromotion, Role
+from crucible.domain.entities import Role
 from crucible.ports.execution import ObservationState
 from tests.e2e.policy import e2e_policy_document, e2e_routing_document
-from tests.fixtures import REPOSITORY_URL, FakeClock, contract_document
+from tests.fixtures import REPOSITORY_URL, FakeClock, contract_document, promote_for_test
 from tests.integration.conftest import event_kinds, run_to_settled
 
 pytestmark = pytest.mark.integration
@@ -62,7 +62,7 @@ def k8s_provider(k8s_api: FakeKubernetesApi) -> KubernetesProvider:
         ),
         k8s_api,  # type: ignore[arg-type]
         registry,
-        harnesses=default_registry(),
+        harnesses=default_registry(test_fixtures=True),
         resolver=lambda host: list(HOSTS.get(host, ["203.0.113.1/32"])),
     )
 
@@ -82,7 +82,7 @@ def k8s_ctx(
         database_url=migrated,
         engine=engine,
         artifact_store=DiskArtifactStore(tmp_path / "artifacts"),
-        harnesses=default_registry(),
+        harnesses=default_registry(test_fixtures=True),
     )
 
 
@@ -98,16 +98,14 @@ def k8s_client(k8s_ctx: AppContext) -> Iterator[TestClient]:
             ).token
             for role in Role
         }
-        uow.image_promotions.put(
-            ImagePromotion(
-                digest="sha256:" + "c" * 64,
-                reference=IMAGE,
-                harnesses={"script-harness": "1.0.0"},
-                state="default",
-                updated_at=k8s_ctx.clock.now(),
-                updated_by="tests",
-                reason="the C8a integration tier's script harness image",
-            )
+        promote_for_test(
+            uow,
+            digest="sha256:" + "c" * 64,
+            reference=IMAGE,
+            harnesses={"script-harness": "1.0.0"},
+            at=k8s_ctx.clock.now(),
+            by="tests",
+            reason="the C8a integration tier's script harness image",
         )
         uow.commit()
     with TestClient(app, headers={"Authorization": f"Bearer {tokens['admin']}"}) as admin:

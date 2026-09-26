@@ -18,7 +18,7 @@
     <form method="post" action="/ui/sign-out"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="lat-btn lat-btn--ghost">Sign out</button></form>{% endif %}
   </header>
   {% if principal %}<nav class="admin-nav" aria-label="Administration">
-    {% for href, label in nav %}<a href="{{ href }}" {% if active == href %}aria-current="page"{% endif %}>{{ label }}</a>{% endfor %}
+    {% for href, label in nav %}{% if href %}<a href="{{ href }}" {% if active == href %}aria-current="page"{% endif %}>{{ label }}</a>{% else %}<span class="admin-nav-group">{{ label }}</span>{% endif %}{% endfor %}
   </nav>{% endif %}
   <main class="admin-main">
     {% if message %}<div class="lat-banner lat-banner--{{ message_kind }} admin-flash">{{ message }}</div>{% endif %}

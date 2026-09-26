@@ -235,3 +235,30 @@ def synthetic_bundle(**overrides: Any) -> dict[str, Any]:
     bundle = bootstrap_bundle(tasks, events)
     bundle.update(overrides)
     return bundle
+
+
+def promote_for_test(
+    uow: Any,
+    *,
+    digest: str,
+    reference: str,
+    harnesses: dict[str, str],
+    at: datetime,
+    by: str = "tests",
+    reason: str = "",
+) -> None:
+    """Make one image the default of every harness named (ADR 0018: one row each)."""
+    from crucible.domain.entities import HarnessImage  # noqa: PLC0415
+
+    for harness, version in harnesses.items():
+        uow.harness_images.put(
+            HarnessImage(
+                harness=harness,
+                digest=digest,
+                reference=reference,
+                version=version,
+                updated_at=at,
+                updated_by=by,
+                reason=reason,
+            )
+        )

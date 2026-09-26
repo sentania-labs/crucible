@@ -255,6 +255,8 @@ class LaunchContext:
     credential_mounted: bool = False
     endpoint: Literal["subscription", "local"] = "subscription"
     endpoint_url: str | None = None
+    # A bounded probe or harness test (25, crucible#118): one prompt, no task, no report.
+    probe: bool = False
     # Issue 128: the per-command timeout, from the launch spec. None: the default.
     command_timeout_ms: int | None = None
 

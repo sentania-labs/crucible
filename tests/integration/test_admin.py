@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import dataclasses
 import json
 import os
 import re
 import time
 from collections.abc import Iterator
+from datetime import timedelta
 from importlib import import_module
 from pathlib import Path
 from typing import Any
@@ -32,6 +34,7 @@ from crucible.adapters.persistence.unit_of_work import SqlUnitOfWorkFactory, mak
 from crucible.application.admin.context import AdminContext
 from crucible.application.auth import authenticate, mint_token
 from crucible.application.errors import ApplicationError
+from crucible.application.routing import image_for_harness
 from crucible.application.supervisor import Supervisor
 from crucible.application.wakes import create_wake
 from crucible.cli import admin as cli
@@ -39,14 +42,14 @@ from crucible.client.config import ADMIN_TOKEN_ENV
 from crucible.client.http import Api
 from crucible.contracts.policy import PolicyV1
 from crucible.contracts.wake import WakeReason
-from crucible.domain.entities import Attempt, Execution, ExecutionRole, ImagePromotion, Role
+from crucible.domain.entities import Attempt, Execution, ExecutionRole, PoolExhaustion, Role
 from crucible.domain.ids import new_id
 from crucible.domain.lifecycle import AttemptState, ExecutionState, TaskState
 from crucible.ports.execution import ImageInfo
 from crucible.ports.harness import CredentialSource
 from crucible.settings import Settings
 from tests.admin_cli import admin_main, envelope_data
-from tests.fixtures import contract_document
+from tests.fixtures import contract_document, promote_for_test
 
 pytestmark = pytest.mark.integration
 
@@ -196,6 +199,8 @@ def config_file(migrated: str, credential_root: Path, tmp_path: Path) -> Path:
     credential directories, the fake logins."""
     logins = fake_login_cli(tmp_path)
     lines = [
+        # The fake provider and the script harness are test fixtures (crucible#124).
+        "test_fixtures = true",
         "[database]",
         f'url = "{migrated}"',
         "[supervisor]",
@@ -312,16 +317,20 @@ def test_the_settings_page_shows_broad_egress_and_the_resolve_ttl(
     other Kubernetes setting, with where each value came from."""
     monkeypatch.delenv("CRUCIBLE_CONFIG", raising=False)
     monkeypatch.setenv("CRUCIBLE_KUBERNETES__RESOLVE_TTL_SECONDS", "120")
-    ctx.settings = Settings()
+    # A provider's settings are listed only while it is on (crucible#125).
+    ctx.settings = Settings(kubernetes={"enabled": True})
     with TestClient(create_app(ctx)) as browser:
         ui_sign_in(browser, tokens["observer"])
         page = browser.get("/ui/settings")
     assert page.status_code == 200, page.text
     text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", page.text))
-    assert re.search(r"kubernetes\.broad_egress no default", text), text
-    assert "GitHub included" in text
-    assert re.search(r"kubernetes\.resolve_ttl_seconds 120\.0 environment", text), text
-    assert re.search(r"kubernetes\.launch_timeout_seconds 300 default", text), text
+    # What this deployment set leads, with where it came from; the defaults it left alone
+    # are behind a click, without a source column (crucible#115).
+    lead, _, defaults = text.partition("Defaults left unchanged")
+    assert re.search(r"kubernetes\.resolve_ttl_seconds 120\.0 environment", lead), text
+    assert re.search(r"kubernetes\.broad_egress no On, a worker", defaults), text
+    assert "GitHub included" in defaults
+    assert re.search(r"kubernetes\.launch_timeout_seconds 300 ", defaults), text
 
 
 def test_ui_mutation_uses_the_same_harness_service_and_rejects_bad_csrf(
@@ -631,6 +640,7 @@ def test_every_remaining_ui_mutation_dispatches_to_the_shared_application_servic
         (ui.login, "cancel_login", stub("login-cancel")),
         (ui.login, "finish_login", stub("login-finish")),
         (ui.images, "promote", async_stub("image-promote")),
+        (ui.images, "rollback", async_stub("image-rollback")),
         (ui.routing, "clear_exhaustion", stub("routing-clear")),
         (ui.repositories, "register", stub("repository-register")),
         (ui.repositories, "remove", stub("repository-remove")),
@@ -655,7 +665,8 @@ def test_every_remaining_ui_mutation_dispatches_to_the_shared_application_servic
         ("login-code", {"harness": "codex", "code": "fixture-code"}),
         ("login-cancel", {"harness": "codex"}),
         ("login-finish", {"harness": "codex"}),
-        ("image-promote", {"digest": "sha256:" + "a" * 64}),
+        ("image-promote", {"harness": "hermes", "digest": "sha256:" + "a" * 64}),
+        ("image-rollback", {"harness": "hermes"}),
         ("routing-clear", {"pool": "primary"}),
         (
             "routing-upload",
@@ -697,6 +708,7 @@ def test_every_remaining_ui_mutation_dispatches_to_the_shared_application_servic
         "login-cancel",
         "login-finish",
         "image-promote",
+        "image-rollback",
         "routing-clear",
         "routing-upload",
         "policy-upload",
@@ -720,13 +732,29 @@ def test_a_mutation_is_refused_without_a_live_supervisor(
     assert "supervisor-not-live" in capsys.readouterr().out
 
 
-def test_a_mutation_requires_a_reason(
+def test_a_reason_is_an_optional_note_except_on_a_destructive_mutation(
     admin_client: TestClient, live_supervisor: Supervisor
 ) -> None:
+    """crucible#117, the operator's decision of 2026-09-25: a reason is an audit note the
+    operator may leave out, and the event is recorded without one; revoking a token,
+    removing a repository or a credential, and committing a bootstrap import still
+    require one."""
     asyncio.run(live_supervisor.tick())
     response = admin_client.post("/v1/admin/harnesses/agy/disable", json={})
-    assert response.status_code == 422
-    assert response.json()["errors"][0]["path"] == "reason"
+    assert response.status_code == 200, response.text
+    assert response.json()["enabled"] is False
+    events = admin_client.get("/v1/admin/audit").json()["items"]
+    disabled = [e for e in events if e["kind"] == "harness_disabled"][-1]
+    assert disabled["payload"]["reason"] == ""
+    for method, path in (
+        ("POST", "/v1/admin/tokens/01ABCDEFGHJKMNPQRSTVWXYZ00/revoke"),
+        ("DELETE", "/v1/admin/repositories/anything"),
+        ("POST", "/v1/admin/credentials/codex/remove"),
+        ("POST", "/v1/import/bootstrap/01ABCDEFGHJKMNPQRSTVWXYZ00/commit"),
+    ):
+        refused = admin_client.request(method, path, json={"reason": "  "})
+        assert refused.status_code == 422, (path, refused.text)
+        assert refused.json()["errors"][0]["path"] == "reason"
 
 
 # ----- parity: every operation through both entry points ----------------------------
@@ -1185,58 +1213,260 @@ def test_login_through_api_and_cli_against_the_fake_cli(
     assert ("credential_login_finished", "crucible-admin") in kinds
 
 
-def test_images_list_and_promote_through_api_and_cli(
+def test_a_promoted_image_no_provider_lists_any_more_is_not_ready(
+    admin_client: TestClient, live_supervisor: Supervisor, provider: FakeProvider
+) -> None:
+    """Codex on PR 164: the default image is a database row, so an image deleted from
+    every provider after promotion still has one. Readiness names the missing image
+    rather than reading the harness ready, and a fresh listing clears the step."""
+    asyncio.run(live_supervisor.tick())
+    image = ImageInfo(
+        "ghcr.io/sentania-labs/crucible-worker:0.5.5", "sha256:" + "a" * 64, WORKER_HARNESSES
+    )
+    provider.images = [image]
+    promoted = admin_client.post(
+        f"/v1/admin/images/{image.digest}/promote", json={"harness": "hermes"}
+    )
+    assert promoted.status_code == 200, promoted.text
+
+    def image_steps() -> list[dict[str, Any]]:
+        readiness = admin_client.get("/v1/admin/status").json()["readiness"]
+        hermes = next(h for h in readiness["harnesses"] if h["name"] == "hermes")
+        return [s for s in hermes["steps"] if "image" in s["code"]]
+
+    assert image_steps() == []
+    provider.images = []
+    missing = image_steps()
+    assert [s["code"] for s in missing] == ["promoted_image_missing"]
+    assert missing[0]["fix"] == "/ui/images"
+    assert image.reference in missing[0]["text"]
+    assert "no longer in the registry" in missing[0]["text"]
+    provider.images = [image]
+    assert image_steps() == []
+
+
+def test_row_actions_offer_an_optional_reason_and_destructive_ones_require_it(
+    ctx: AppContext,
+    tokens: dict[str, str],
+    admin_client: TestClient,
+    live_supervisor: Supervisor,
+    provider: FakeProvider,
+) -> None:
+    """Codex on PR 164 (crucible#117): enable, disable, promote, roll back and pool clear
+    carry an optional note on their row; revoke keeps a required one. A note typed on a
+    row reaches the audit record, and leaving it out is accepted."""
+    asyncio.run(live_supervisor.tick())
+    first = ImageInfo(
+        "ghcr.io/sentania-labs/crucible-worker:0.5.5", "sha256:" + "b" * 64, WORKER_HARNESSES
+    )
+    second = ImageInfo(
+        "ghcr.io/sentania-labs/crucible-worker:0.5.6", "sha256:" + "c" * 64, WORKER_HARNESSES
+    )
+    provider.images = [first, second]
+    for image in (first, second):
+        promoted = admin_client.post(
+            f"/v1/admin/images/{image.digest}/promote", json={"harness": "hermes"}
+        )
+        assert promoted.status_code == 200, promoted.text
+    submitted = admin_client.post(
+        "/v1/tasks",
+        json=contract_document(external_id="ROW-REASON"),
+        headers={"Authorization": f"Bearer {tokens['orchestrator']}"},
+    )
+    assert submitted.status_code == 201, submitted.text
+    task_id = submitted.json()["id"]
+    assert live_supervisor.fenced_token is not None
+    with ctx.uow_factory() as uow:
+        # A mark names the attempt that hit the limit; attempts are the supervisor's (14).
+        uow.set_fenced_token(live_supervisor.fenced_token)
+        execution = Execution(
+            id=new_id(),
+            task_id=task_id,
+            role=ExecutionRole.IMPLEMENT,
+            contract_version=1,
+            harness="script-harness",
+            model="fake",
+            effort=None,
+            provider="fake",
+            image="crucible-worker:fake-succeed",
+            policy_snapshot={},
+            state=ExecutionState.ACTIVE,
+            max_attempts=1,
+            retry_on=[],
+            timeout_seconds=60,
+            created_at=ctx.clock.now(),
+        )
+        attempt = Attempt(
+            id=new_id(),
+            execution_id=execution.id,
+            task_id=task_id,
+            number=1,
+            state=AttemptState.FAILED,
+            created_at=ctx.clock.now(),
+        )
+        uow.executions.add(execution)
+        uow.attempts.add(attempt)
+        uow.pool_exhaustions.put(
+            PoolExhaustion(
+                pool="primary",
+                exhausted_at=ctx.clock.now(),
+                reset_at=ctx.clock.now() + timedelta(hours=5),
+                task_id=task_id,
+                attempt_id=attempt.id,
+                reason="soft limit reached",
+            )
+        )
+        uow.commit()
+
+    def reason_inputs(page: str, action: str) -> list[str]:
+        """The reason input of each row form posting to `action`, or "" for none."""
+        forms = re.findall(
+            rf'<form class="admin-row-form" method="post" action="{action}">(.*?)</form>',
+            page,
+            re.S,
+        )
+        assert forms, action
+        found = [re.search(r'<input class="lat-input" name="reason"[^>]*>', f) for f in forms]
+        return [match.group(0) if match else "" for match in found]
+
+    with TestClient(create_app(ctx)) as browser:
+        csrf = ui_sign_in(browser, tokens["admin"])
+        pages = {
+            path: browser.get(path).text
+            for path in ("/ui/harnesses", "/ui/images", "/ui/routing", "/ui/tokens")
+        }
+        for path, action in (
+            ("/ui/harnesses", "/ui/actions/harness"),
+            ("/ui/images", "/ui/actions/image-promote"),
+            ("/ui/images", "/ui/actions/image-rollback"),
+            ("/ui/routing", "/ui/actions/routing-clear"),
+        ):
+            for found in reason_inputs(pages[path], action):
+                assert 'placeholder="Reason (optional)"' in found, (path, action)
+                assert "required" not in found, (path, action)
+        for found in reason_inputs(pages["/ui/tokens"], "/ui/actions/token-revoke"):
+            assert 'placeholder="Reason (required)"' in found and found.endswith("required>")
+        # The Test action is a read-only check and asks for no reason at all.
+        assert reason_inputs(pages["/ui/harnesses"], "/ui/actions/harness-test")[0] == ""
+
+        noted = browser.post(
+            "/ui/actions/image-rollback",
+            data={
+                "csrf": csrf,
+                "harness": "hermes",
+                "reason": "0.5.6 regressed the gateway call",
+                "return_to": "/ui/images",
+            },
+            follow_redirects=False,
+        )
+        assert noted.status_code == 303 and "kind=ok" in noted.headers["location"]
+        bare = browser.post(
+            "/ui/actions/routing-clear",
+            data={"csrf": csrf, "pool": "primary", "reason": "", "return_to": "/ui/routing"},
+            follow_redirects=False,
+        )
+        assert bare.status_code == 303 and "kind=ok" in bare.headers["location"]
+    events = admin_client.get("/v1/admin/audit", params={"limit": 200}).json()["items"]
+    rollback = next(
+        e for e in events if e["kind"] == "image_promoted" and e["payload"].get("rollback")
+    )
+    assert rollback["payload"]["reason"] == "0.5.6 regressed the gateway call"
+    with ctx.uow_factory() as uow:
+        mark = uow.pool_exhaustions.get("primary")
+        assert mark is not None and mark.cleared_at is not None
+
+
+def test_images_are_promoted_and_rolled_back_per_harness(
+    ctx: AppContext,
     admin_client: TestClient,
     live_supervisor: Supervisor,
     config_file: Path,
     provider: FakeProvider,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    """crucible#116, ADR 0018, the operator's decision of 2026-09-25: each harness has its
+    own default image. Promoting one image for Hermes and another for AGY leaves each
+    where it was put, a rollback moves only the harness it names, and a launch resolves
+    the launching harness's own image."""
     asyncio.run(live_supervisor.tick())
-    # The fake provider lists what a test hands it (08); the CLI's own provider lists
-    # nothing, so the promotion is exercised through the API and its refusal through
-    # both.
-    # One worker image carries all four harnesses (C11): the listing shows each version
-    # and promoting it switches all four.
-    image = ImageInfo(
-        reference="crucible-worker:20260916-aaaaaaaaaaaa",
+    first = ImageInfo(
+        reference="ghcr.io/sentania-labs/crucible-worker:0.5.5",
         digest="sha256:" + "d" * 64,
         harnesses=WORKER_HARNESSES,
     )
-    provider.images = [image]
-    listed = admin_client.get("/v1/admin/images").json()["items"]
-    assert listed[0]["promotion_state"] == "candidate" and listed[0]["supported"] is True
-    assert listed[0]["harnesses"] == WORKER_HARNESSES
-    promoted = admin_client.post(
-        f"/v1/admin/images/{image.digest}/promote", json={"reason": "canary passed"}
+    second = ImageInfo(
+        "ghcr.io/sentania-labs/crucible-worker:0.5.6", "sha256:" + "e" * 64, WORKER_HARNESSES
+    )
+    proof = ImageInfo(
+        "ghcr.io/sentania-labs/crucible-worker:ci-35000000000",
+        "sha256:" + "f" * 64,
+        WORKER_HARNESSES,
+    )
+    provider.images = [first, second, proof]
+    listed = admin_client.get("/v1/admin/images").json()
+    assert {i["promotion_state"] for i in listed["items"]} == {"candidate"}
+    hermes_row = next(row for row in listed["defaults"] if row["harness"] == "hermes")
+    assert hermes_row["current"] is None
+    # A CI proof tag is never offered (crucible#111).
+    assert [c["reference"] for c in hermes_row["choices"]] == [first.reference, second.reference]
+
+    for harness in ("hermes", "agy"):
+        promoted = admin_client.post(
+            f"/v1/admin/images/{first.digest}/promote", json={"harness": harness}
+        )
+        assert promoted.status_code == 200, promoted.text
+    moved = admin_client.post(
+        f"/v1/admin/images/{second.digest}/promote", json={"harness": "agy", "reason": "canary"}
     ).json()
-    assert promoted["promotion_state"] == "default"
-    assert promoted["harnesses"] == WORKER_HARNESSES
-    provider.images = [
-        image,
-        ImageInfo("crucible-worker:20260917-bbbbbbbbbbbb", "sha256:" + "e" * 64, WORKER_HARNESSES),
-    ]
-    again = admin_client.post(
-        "/v1/admin/images/sha256:" + "e" * 64 + "/promote", json={"reason": "next canary"}
-    ).json()
-    assert again["retained"] == [image.digest]
+    assert moved["harness"] == "agy" and moved["digest"] == second.digest
+    assert moved["previous"]["digest"] == first.digest
+    rows = {r["harness"]: r for r in admin_client.get("/v1/admin/images").json()["defaults"]}
+    assert rows["hermes"]["current"]["digest"] == first.digest
+    assert rows["agy"]["current"]["digest"] == second.digest
+    assert rows["claude_code"]["current"] is None
+    with ctx.uow_factory() as uow:
+        assert image_for_harness(uow, "hermes", "kubernetes") == first.reference
+        assert image_for_harness(uow, "agy", "kubernetes") == second.reference
+        assert image_for_harness(uow, "codex", "kubernetes") is None
+
+    # A rollback moves only the harness it names, and a second one undoes the first.
+    back = admin_client.post("/v1/admin/images/rollback", json={"harness": "agy"}).json()
+    assert back["digest"] == first.digest and back["previous"]["digest"] == second.digest
+    rows = {r["harness"]: r for r in admin_client.get("/v1/admin/images").json()["defaults"]}
+    assert rows["agy"]["current"]["digest"] == first.digest
+    assert rows["hermes"]["current"]["digest"] == first.digest
+    assert rows["hermes"]["previous"] is None
+    refused = admin_client.post("/v1/admin/images/rollback", json={"harness": "hermes"})
+    assert refused.status_code == 409, refused.text
+    ci = admin_client.post(f"/v1/admin/images/{proof.digest}/promote", json={"harness": "agy"})
+    assert ci.status_code == 409 and "CI proof tag" in ci.json()["detail"]
+    unnamed = admin_client.post(f"/v1/admin/images/{first.digest}/promote", json={})
+    assert unnamed.status_code == 422 and unnamed.json()["errors"][0]["path"] == "harness"
     states = {
-        i["digest"]: i["promotion_state"]
+        i["digest"]: (i["promotion_state"], i["default_for"], i["previous_for"])
         for i in admin_client.get("/v1/admin/images").json()["items"]
     }
-    assert states[image.digest] == "retained" and states["sha256:" + "e" * 64] == "default"
-    # Rollback is promoting the previous digest, and it rolls back all four together.
-    back = admin_client.post(
-        f"/v1/admin/images/{image.digest}/promote", json={"reason": "roll back"}
-    ).json()
-    assert back["promotion_state"] == "default" and back["retained"] == ["sha256:" + "e" * 64]
-    assert run_cli(config_file, "images", "list", capsys=capsys)["items"] == []
+    assert states[first.digest] == ("default", ["agy", "hermes"], [])
+    assert states[second.digest] == ("retained", [], ["agy"])
+
+    # A previous image no provider lists any more is not a rollback target.
+    provider.images = [first, proof]
+    gone = admin_client.post("/v1/admin/images/rollback", json={"harness": "agy"})
+    assert gone.status_code == 409 and "any more" in gone.json()["detail"], gone.text
+    provider.images = [first, second, proof]
     with pytest.raises(SystemExit):
         admin_main(
-            ["--config", str(config_file), "--reason", "x", "images", "promote", "sha256:nope"]
+            ["--config", str(config_file), "images", "promote", "sha256:nope", "--harness", "agy"]
         )
     assert "not-found" in capsys.readouterr().out
-    assert ("image_promoted", "admin-principal") in audit_kinds(admin_client)
+    events = admin_client.get("/v1/admin/audit", params={"limit": 200}).json()["items"]
+    promotions = [e["payload"] for e in events if e["kind"] == "image_promoted"]
+    assert [(p["harness"], p["rollback"]) for p in promotions] == [
+        ("hermes", False),
+        ("agy", False),
+        ("agy", False),
+        ("agy", True),
+    ]
 
 
 def test_providers_github_audit_status_and_capabilities(
@@ -1260,14 +1490,8 @@ def test_providers_github_audit_status_and_capabilities(
     with pytest.raises(SystemExit):
         admin_main(["--config", str(config_file), "--reason", "x", "github", "check"])
 
-    # A registration under /admin is a mutation like any other: a reason, and a live lease.
-    assert (
-        admin_client.put(
-            "/v1/admin/repositories/second",
-            json={"url": "https://github.com/example-org/second", "attested_all_prs": True},
-        ).status_code
-        == 422
-    )
+    # A registration under /admin is a mutation like any other: a live lease, and the
+    # reason when one is given (crucible#117).
     registered = admin_client.put(
         "/v1/admin/repositories/second",
         json={
@@ -1661,22 +1885,20 @@ def test_registering_a_repository_takes_both_guards_on_both_entry_points(
         )
     assert "supervisor-not-live" in capsys.readouterr().out
     asyncio.run(live_supervisor.tick())
-    assert admin_client.put("/v1/admin/repositories/guarded", json=body).status_code == 422
-    with pytest.raises(SystemExit):
-        admin_main(
-            [
-                "--config",
-                str(config_file),
-                "repositories",
-                "register",
-                "--name",
-                "guarded-cli",
-                "--url",
-                "https://github.com/example-org/guarded-cli",
-                "--attest-external-review-all-prs",
-            ]
-        )
-    assert "reason" in capsys.readouterr().out
+    # A reason is an optional note on a registration (crucible#117); the guard is the lease.
+    assert admin_client.put("/v1/admin/repositories/guarded", json=body).status_code == 200
+    registered = run_cli(
+        config_file,
+        "repositories",
+        "register",
+        "--name",
+        "guarded-cli",
+        "--url",
+        "https://github.com/example-org/guarded-cli",
+        "--attest-external-review-all-prs",
+        capsys=capsys,
+    )
+    assert registered["repository"] == "guarded-cli"
 
 
 def test_finishing_a_login_takes_both_guards(
@@ -1691,9 +1913,11 @@ def test_finishing_a_login_takes_both_guards(
     )
     assert no_lease.status_code == 503, no_lease.text
     asyncio.run(live_supervisor.tick())
+    # The reason is an optional note (crucible#117): with the lease held, what refuses a
+    # finish with nothing to finish is the login state, not a missing reason.
     no_reason = admin_client.post("/v1/admin/credentials/codex/login/finish", json={})
-    assert no_reason.status_code == 422, no_reason.text
-    assert no_reason.json()["errors"][0]["path"] == "reason"
+    assert no_reason.status_code == 409, no_reason.text
+    assert "reason" not in no_reason.json()["detail"]
 
 
 def test_a_failed_swap_leaves_the_configured_directory_exactly_as_it_was(
@@ -1947,8 +2171,8 @@ def test_container_login_checks_promotion_before_retiring_a_credential(
             return object()
 
     with admin_ctx.uow_factory() as uow:
-        monkeypatch.setattr(uow.image_promotions, "list_all", lambda: [])
-        with pytest.raises(ApplicationError, match="no promoted worker image"):
+        monkeypatch.setattr(uow.harness_images, "get", lambda _harness: None)
+        with pytest.raises(ApplicationError, match="no worker image is promoted"):
             start_login(
                 admin_ctx,
                 uow,
@@ -1994,16 +2218,14 @@ def test_container_login_restores_a_credential_when_replacement_mkdir_fails(
 
     monkeypatch.setattr(Path, "mkdir", fail_replacement_mkdir)
     with admin_ctx.uow_factory() as uow:
-        uow.image_promotions.put(
-            ImagePromotion(
-                digest="sha256:" + "b" * 64,
-                reference="crucible-worker:codex-fixture",
-                harnesses={"codex": "fixture"},
-                state="default",
-                updated_at=admin_ctx.clock.now(),
-                updated_by="tests",
-                reason="mkdir rollback test",
-            )
+        promote_for_test(
+            uow,
+            digest="sha256:" + "b" * 64,
+            reference="crucible-worker:codex-fixture",
+            harnesses={"codex": "fixture"},
+            at=admin_ctx.clock.now(),
+            by="tests",
+            reason="mkdir rollback test",
         )
         uow.commit()
     with admin_ctx.uow_factory() as uow:
@@ -2051,8 +2273,8 @@ def test_the_probe_refuses_rather_than_falling_back_to_a_retired_model(
     policy tables are not truncated between tests, and a superseding version with a
     disabled harness would be in force for every test that follows."""
     from crucible.application.admin.credentials import (  # noqa: PLC0415
-        _probe_model,
         adapter_for,
+        probe_route,
     )
     from crucible.domain.entities import Policy, RoutingPolicyRecord  # noqa: PLC0415
 
@@ -2094,7 +2316,7 @@ def test_the_probe_refuses_rather_than_falling_back_to_a_retired_model(
         assert "gpt-5.6-luna" not in detail
         # A harness the policy in force still enables takes its model from that policy.
         assert (
-            _probe_model(uow, adapter_for(admin_ctx, "claude_code"), "claude_code")
+            probe_route(uow, adapter_for(admin_ctx, "claude_code"), "claude_code")[0]
             == "claude-haiku-4-5"
         )
         uow.rollback()
@@ -2244,8 +2466,8 @@ def test_kubernetes_egress_through_api_cli_and_ui(
     )
     assert refused.status_code == 422
     assert "may never reach" in refused.text
-    no_reason = admin_client.post("/v1/admin/kubernetes/egress", json={"dns": {"namespace": ""}})
-    assert no_reason.status_code == 422
+    half = admin_client.post("/v1/admin/kubernetes/egress", json={"dns": {"namespace": ""}})
+    assert half.status_code == 422
     # Leaving `dns` out of an edit of the endpoint must not read as "no DNS selector".
     partial = admin_client.post(
         "/v1/admin/kubernetes/egress",
@@ -2352,6 +2574,169 @@ def test_the_cli_remote_mode_sends_the_egress_document(monkeypatch: pytest.Monke
     ]
 
 
+def test_a_harness_test_reports_each_step_and_stops_at_the_first_failure(
+    ctx: AppContext,
+    admin_client: TestClient,
+    live_supervisor: Supervisor,
+    config_file: Path,
+    provider: FakeProvider,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """crucible#118: one Test per harness runs the path a task takes and says, per step,
+    pass or fail in plain words. It asks for no reason (crucible#117)."""
+    asyncio.run(live_supervisor.tick())
+    untested = admin_client.post("/v1/admin/harnesses/hermes/test")
+    assert untested.status_code == 200, untested.text
+    result = untested.json()
+    assert result["ok"] is False and result["failed_step"] == "Worker image"
+    assert [s["result"] for s in result["steps"]] == [
+        "pass",
+        "fail",
+        "not run",
+        "not run",
+        "not run",
+        "not run",
+    ]
+    assert "choose one on Images" in result["steps"][1]["detail"]
+
+    with ctx.uow_factory() as uow:
+        promote_for_test(
+            uow,
+            digest="sha256:" + "a" * 64,
+            reference="ghcr.io/sentania-labs/crucible-worker:0.5.5",
+            harnesses={"hermes": "0.19.0", "script-harness": "1.0.0", "codex": "0.156.0"},
+            at=ctx.clock.now(),
+        )
+        uow.commit()
+    # Hermes has no key in this tier: the test stops at the credential, before a worker.
+    probes_before = len(provider.probes)
+    missing = admin_client.post("/v1/admin/harnesses/hermes/test", json={}).json()
+    assert missing["failed_step"] == "Credential"
+    assert "no API key is stored" in missing["steps"][2]["detail"]
+    assert "Local gateway" in missing["steps"][2]["detail"]
+    assert len(provider.probes) == probes_before
+
+    # The fixture harness calls no model unless routed to a local endpoint; it passes.
+    passed = run_cli(config_file, "harnesses", "test", "script-harness", capsys=capsys)
+    assert passed["ok"] is True, passed
+    assert [s["name"] for s in passed["steps"]] == [
+        "Harness enabled",
+        "Worker image",
+        "Credential",
+        "Model",
+        "Worker starts",
+        "Model call",
+    ]
+    assert passed["steps"][2]["detail"] == "this harness needs none"
+    through_api = admin_client.post("/v1/admin/harnesses/script-harness/test").json()
+    assert through_api["ok"] is True
+    assert provider.probe_requests[-1].harness == "script-harness"
+
+    # A model provider that refuses the credential fails the model call, named as such.
+    provider.probe_outcome = "auth_failure"
+    refused = admin_client.post("/v1/admin/harnesses/codex/test").json()
+    assert refused["failed_step"] == "Model call", refused
+    assert "refused the credential" in refused["steps"][-1]["detail"]
+
+    harnesses_view = {h["name"]: h for h in admin_client.get("/v1/admin/harnesses").json()["items"]}
+    assert harnesses_view["script-harness"]["last_test"]["ok"] is True
+    assert harnesses_view["codex"]["last_test"]["failed_step"] == "Model call"
+
+
+def test_rows_carry_their_own_actions_instead_of_typed_ids(
+    ctx: AppContext,
+    admin_client: TestClient,
+    live_supervisor: Supervisor,
+    tokens: dict[str, str],
+) -> None:
+    """crucible#127: where the system knows the value, the UI offers it. Revoke is on the
+    principal's row, Remove on the repository's, and no page asks for an ID to be typed."""
+    asyncio.run(live_supervisor.tick())
+    principals = admin_client.get("/v1/admin/tokens").json()["items"]
+    observer = next(item for item in principals if item["role"] == "observer")
+    with TestClient(create_app(ctx)) as browser:
+        csrf = ui_sign_in(browser, tokens["admin"])
+        pages = {path: browser.get(path).text for path in ("/ui/tokens", "/ui/repositories")}
+        pages["/ui/workers"] = browser.get("/ui/workers").text
+        pages["/ui/bootstrap"] = browser.get("/ui/bootstrap").text
+        for text in pages.values():
+            for typed in ("Principal ID", "Attempt ID", "Import ID", "Digest or reference"):
+                assert f">{typed}<" not in text
+        assert f'name="principal_id" value="{observer["id"]}"' in pages["/ui/tokens"]
+        assert 'name="name" value="example-service"' in pages["/ui/repositories"]
+        revoked = browser.post(
+            "/ui/actions/token-revoke",
+            data={
+                "csrf": csrf,
+                "principal_id": observer["id"],
+                "return_to": "/ui/tokens",
+            },
+            follow_redirects=False,
+        )
+        # The revoke asks for a reason (crucible#117): refused without one.
+        assert "reason" in unquote(revoked.headers["location"])
+        missing = browser.get("/ui/bootstrap/01ABCDEFGHJKMNPQRSTVWXYZ00", follow_redirects=False)
+        assert missing.status_code == 303 and "not%20found" in missing.headers["location"]
+
+
+def test_pages_lead_with_what_the_operator_acts_on(
+    ctx: AppContext,
+    admin_client: TestClient,
+    live_supervisor: Supervisor,
+    tokens: dict[str, str],
+) -> None:
+    """crucible#115: plain labels first, internals behind a details view, one provider
+    table, and navigation entries with nothing behind them left out."""
+    asyncio.run(live_supervisor.tick())
+    with TestClient(create_app(ctx)) as browser:
+        ui_sign_in(browser, tokens["admin"])
+        status_page = browser.get("/ui").text
+        settings_page = browser.get("/ui/settings").text
+        routing_page = browser.get("/ui/routing").text
+        github_page = browser.get("/ui/github").text
+        credentials_page = browser.get("/ui/credentials").text
+    # The pages first-run setup added (crucible#150): Routing leads with what is in force
+    # in plain words, its documents behind Details, and a pool is cleared from its row.
+    lead, _, details = routing_page.partition("<details")
+    assert "In force" in lead and "1 hour by default" in lead
+    assert "Delivery policy document" not in lead and "Delivery policy document" in details
+    assert 'name="pool"' not in routing_page and "issue 128" not in routing_page
+    lead, _, details = github_page.partition("<details")
+    assert "Connection" in lead and "Stored App and every repository" in details
+    assert "API base" not in lead
+    # Hermes has no key stored in this tier: nothing to validate, probe or remove, only the
+    # page that sets it.
+    assert 'name="harness" value="hermes"' not in credentials_page
+    assert 'href="/ui/gateway">Local gateway' in credentials_page
+    assert "/ui/credentials/codex/login" in credentials_page
+    lead, _, details = status_page.partition("<details")
+    assert "Provider: fake" in lead and "Supervisor" in lead
+    assert "Fenced token" not in lead and "Fenced token" in details
+    assert lead.count("CHECKS") == 0
+    nav = status_page[status_page.index("admin-nav") : status_page.index("</nav>")]
+    assert 'href="/ui/bootstrap"' not in nav and 'href="/ui/retention"' not in nav
+    assert "Set up" in nav and "Work" in nav and "Admin" in nav
+    lead, _, defaults = settings_page.partition("<details")
+    assert "Defaults left unchanged" in defaults
+    assert "restart required" not in settings_page
+
+
+def test_a_task_for_a_provider_this_deployment_does_not_run_is_refused_at_submit(
+    ctx: AppContext, tokens: dict[str, str], live_supervisor: Supervisor
+) -> None:
+    """crucible#124: with test fixtures off the fake provider is not wired, and a
+    contract naming it is refused when it is submitted, not left to fail at launch."""
+    asyncio.run(live_supervisor.tick())
+    production = dataclasses.replace(ctx, providers=[])
+    with TestClient(
+        create_app(production), headers={"Authorization": f"Bearer {tokens['orchestrator']}"}
+    ) as client:
+        response = client.post("/v1/tasks", json=contract_document(external_id="UNWIRED-1"))
+    assert response.status_code == 422, response.text
+    paths = [error["path"] for error in response.json()["errors"]]
+    assert "execution_request.provider" in paths
+
+
 def test_command_timeout_through_api_cli_and_ui(
     ctx: AppContext,
     tokens: dict[str, str],
@@ -2394,7 +2779,9 @@ def test_command_timeout_through_api_cli_and_ui(
         {"reason": "api: inverted", "min": 5000, "max": 4000},
         {"reason": "api: a string", "default": "600000"},
         {"reason": "api: a bool", "default": True},
-        {"default": 600_000},
+        # A reason is an optional audit note here (crucible#117), so no body is refused
+        # for leaving it out; a secret-shaped one still is.
+        {"reason": "ghp_" + "a" * 36, "default": 600_000},
     ):
         refused = admin_client.post("/v1/admin/limits/command-timeout", json=body)
         assert refused.status_code == 422, (body, refused.text)

@@ -625,3 +625,15 @@ def test_the_audit_cursor_advances_across_a_gap_of_non_admin_events() -> None:
             raise AssertionError("the admin event past the gap was never reached")
     finally:
         audit_module.PAGE_SIZE, audit_module.MAX_PAGES = original_page, original_max
+
+
+def test_the_images_page_offers_releases_and_latest_never_a_ci_proof_tag() -> None:
+    """crucible#116 and #111: a `ci-*` tag proves a build and is never a candidate."""
+    from crucible.application.admin.images import offered_tag  # noqa: PLC0415
+
+    assert offered_tag("ghcr.io/sentania-labs/crucible-worker:0.5.5")
+    assert offered_tag("ghcr.io/sentania-labs/crucible-worker:latest")
+    assert offered_tag("ghcr.io/sentania-labs/crucible-worker")
+    assert offered_tag("registry:5000/crucible-worker@sha256:" + "a" * 64)
+    assert not offered_tag("ghcr.io/sentania-labs/crucible-worker:ci-35000000000")
+    assert not offered_tag("registry:5000/crucible-worker:ci-abc")

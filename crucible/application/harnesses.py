@@ -400,6 +400,11 @@ def _ensure_state(uow: UnitOfWork, clock: Clock, name: str) -> HarnessState:
     return state
 
 
+def harness_state(uow: UnitOfWork, clock: Clock, name: str) -> HarnessState:
+    """The harness's runtime row, or the defaults a fresh deployment's row starts from."""
+    return _ensure_state(uow, clock, name)
+
+
 def set_harness_enabled(
     uow: UnitOfWork,
     clock: Clock,
@@ -412,9 +417,7 @@ def set_harness_enabled(
 ) -> HarnessState:
     """Enable or disable a harness (25): configuration retained, running attempts finish,
     new launches refused with a wake. Every change is an event with the principal, the
-    reason, and a before-and-after summary that carries no value."""
-    if not reason.strip():
-        raise ValueError("a reason is required to enable or disable a harness")
+    reason when one was given, and a before-and-after summary that carries no value."""
     state = _ensure_state(uow, clock, name)
     before = _summary(state)
     state.enabled = enabled

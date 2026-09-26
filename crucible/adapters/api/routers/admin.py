@@ -15,6 +15,7 @@ from crucible.application.admin import (
     credentials,
     gateway,
     github,
+    harness_test,
     harnesses,
     images,
     login,
@@ -27,7 +28,7 @@ from crucible.application.admin import providers as providers_admin
 from crucible.application.admin import repositories as repositories_admin
 from crucible.application.admin import status as status_admin
 from crucible.application.admin.context import AdminContext
-from crucible.application.errors import ConflictError
+from crucible.application.errors import ConflictError, ContractValidationError
 from crucible.contracts.api import ExternalReviewAttestation, RepositoryRegistration
 
 router = APIRouter()
@@ -188,8 +189,9 @@ async def admin_save_gateway(
 
 @router.post("/admin/gateway/test")
 async def admin_test_gateway(
-    ctx: Ctx, uow: UoW, principal: Admin, body: Annotated[dict[str, Any], Body()]
+    ctx: Ctx, uow: UoW, principal: Admin, body: Annotated[dict[str, Any] | None, Body()] = None
 ) -> dict[str, Any]:
+    """A check, so no reason is asked for; one given is recorded (crucible#117)."""
     result = await gateway.test_gateway(_admin(ctx), uow, principal=principal, reason=_reason(body))
     uow.commit()
     return result
@@ -298,6 +300,23 @@ def admin_disable(
         harness=name,
         enabled=False,
         reason=_reason(body),
+    )
+    uow.commit()
+    return result
+
+
+@router.post("/admin/harnesses/{name}/test")
+async def admin_test_harness(
+    name: str,
+    ctx: Ctx,
+    uow: UoW,
+    principal: Admin,
+    body: Annotated[dict[str, Any] | None, Body()] = None,
+) -> dict[str, Any]:
+    """crucible#118: the path a real task takes, step by step, pass or fail in plain
+    words. A check, so no reason is asked for; one given is recorded."""
+    result = await harness_test.test_harness(
+        _admin(ctx), uow, principal=principal.name, harness=name, reason=_reason(body)
     )
     uow.commit()
     return result
@@ -466,15 +485,49 @@ def admin_remove(
 
 @router.get("/admin/images")
 async def admin_images(ctx: Ctx, uow: UoW, _principal: Admin) -> dict[str, Any]:
-    return {"items": await images.list_all(_admin(ctx), uow)}
+    """Every image a provider sees, and one row per harness: its default, the image a
+    rollback returns to, and the images it may be promoted to (ADR 0018)."""
+    admin = _admin(ctx)
+    return {
+        "items": await images.list_all(admin, uow),
+        "defaults": await images.defaults(admin, uow),
+    }
+
+
+def _harness(body: dict[str, Any] | None) -> str:
+    value = (body or {}).get("harness")
+    if not isinstance(value, str) or not value:
+        raise ContractValidationError(
+            "promotion is per harness: name the harness",
+            errors=[{"path": "harness", "message": "must name a harness"}],
+        )
+    return value
 
 
 @router.post("/admin/images/{digest:path}/promote")
 async def admin_promote(
     digest: str, ctx: Ctx, uow: UoW, principal: Admin, body: Annotated[dict[str, Any], Body()]
 ) -> dict[str, Any]:
+    """Make the image the default for the one harness the body names (ADR 0018)."""
     result = await images.promote(
-        _admin(ctx), uow, principal=principal.name, digest=digest, reason=_reason(body)
+        _admin(ctx),
+        uow,
+        principal=principal.name,
+        harness=_harness(body),
+        digest=digest,
+        reason=_reason(body),
+    )
+    uow.commit()
+    return result
+
+
+@router.post("/admin/images/rollback")
+async def admin_rollback(
+    ctx: Ctx, uow: UoW, principal: Admin, body: Annotated[dict[str, Any], Body()]
+) -> dict[str, Any]:
+    """Return the harness the body names to the image its last promotion replaced."""
+    result = await images.rollback(
+        _admin(ctx), uow, principal=principal.name, harness=_harness(body), reason=_reason(body)
     )
     uow.commit()
     return result
@@ -492,8 +545,9 @@ def admin_github(ctx: Ctx, uow: UoW, _principal: Admin) -> dict[str, Any]:
 
 @router.post("/admin/github/check")
 def admin_github_check(
-    ctx: Ctx, uow: UoW, principal: Admin, body: Annotated[dict[str, Any], Body()]
+    ctx: Ctx, uow: UoW, principal: Admin, body: Annotated[dict[str, Any] | None, Body()] = None
 ) -> dict[str, Any]:
+    """A check, so no reason is asked for; one given is recorded (crucible#117)."""
     result = github.check(_admin(ctx), uow, principal=principal.name, reason=_reason(body))
     uow.commit()
     return result

@@ -42,9 +42,9 @@ from crucible.application.admin.login import (
 )
 from crucible.application.errors import ConflictError
 from crucible.application.supervisor import Supervisor
-from crucible.domain.entities import ImagePromotion
 from crucible.domain.lifecycle import AttemptState
 from crucible.domain.secrets import scan_text
+from tests.fixtures import promote_for_test
 from tests.integration.conftest import put_seeded_policy_in_force
 from tests.integration.test_admin import ui_sign_in
 from tests.integration.test_harness_registry import _submit_pinned
@@ -88,7 +88,7 @@ def k8s_provider(k8s_api: FakeKubernetesApi) -> KubernetesProvider:
         ),
         k8s_api,  # type: ignore[arg-type]
         registry,
-        harnesses=default_registry(),
+        harnesses=default_registry(test_fixtures=True),
         resolver=lambda host: list(HOSTS.get(host, ["203.0.113.1/32"])),
     )
 
@@ -112,16 +112,14 @@ def admin_ctx(
     )
     ctx.admin = admin
     with ctx.uow_factory() as uow:
-        uow.image_promotions.put(
-            ImagePromotion(
-                digest="sha256:" + "d" * 64,
-                reference=WORKER,
-                harnesses={k.rsplit(".", 2)[-2]: v for k, v in LABELS.items() if "version" in k},
-                state="default",
-                updated_at=ctx.clock.now(),
-                updated_by="tests",
-                reason="the worker image the login and the probe run",
-            )
+        promote_for_test(
+            uow,
+            digest="sha256:" + "d" * 64,
+            reference=WORKER,
+            harnesses={k.rsplit(".", 2)[-2]: v for k, v in LABELS.items() if "version" in k},
+            at=ctx.clock.now(),
+            by="tests",
+            reason="the worker image the login and the probe run",
         )
         uow.commit()
     return admin
@@ -246,6 +244,24 @@ def test_rotate_and_remove_say_the_credential_is_a_secret(admin: TestClient) -> 
         response = admin.post(f"/v1/admin/credentials/codex/{verb}", json={"reason": "r", **body})
         assert response.status_code == 409, response.text
         assert "crucible-harness-codex" in response.json()["detail"]
+
+
+def test_the_credentials_page_offers_only_what_applies_to_a_secret(
+    admin: TestClient, ctx: AppContext, tokens: dict[str, str]
+) -> None:
+    """crucible#125: rotate and remove move and shred directories, which a Secret-held
+    credential has none of, so the page does not offer them or their prepared directory;
+    and Hermes, which takes a key, has no login page link."""
+    with TestClient(create_app(ctx)) as browser:
+        ui_sign_in(browser, tokens["admin"])
+        page = browser.get("/ui/credentials").text
+    assert "Rotate from prepared server directory" not in page
+    assert "Prepared directory" not in page
+    assert 'value="remove"' not in page
+    # Nothing is stored yet, so each row offers only the way to set its credential up.
+    assert 'value="validate"' not in page
+    assert "/ui/credentials/hermes/login" not in page
+    assert "/ui/credentials/codex/login" in page
 
 
 def test_the_hermes_key_is_set_from_the_gateway_page_and_never_shown(

@@ -34,6 +34,7 @@ from crucible.application.admin import (
     credentials,
     gateway,
     github,
+    harness_test,
     harnesses,
     images,
     login,
@@ -82,10 +83,11 @@ The operator's console (25): harness gates, credentials and login, image promoti
 tokens, repositories, routing, the local gateway, GitHub, the bootstrap import, audit.
 Runs in process against the configured database by default; with --api-url URL (or
 --remote, which takes the URL from CRUCIBLE_URL or the client configuration file) it
-calls the running API with the token in CRUCIBLE_ADMIN_TOKEN, else CRUCIBLE_TOKEN.
-Every mutation takes --reason, placed before the verb:
-`crucible admin --reason TEXT harnesses disable codex`. Output is one JSON envelope
-(see `crucible --help`)."""
+calls the running API with the token in CRUCIBLE_ADMIN_TOKEN, else CRUCIBLE_TOKEN. A
+mutation takes an optional --reason, recorded in the audit log, before or after the verb:
+`crucible admin harnesses disable codex --reason TEXT`. Revoking a token, removing a
+repository or a credential, and committing a bootstrap import require one.
+Output is one JSON envelope (see `crucible --help`)."""
 
 
 def build_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -106,7 +108,10 @@ def build_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help="remote mode with the base URL from CRUCIBLE_URL or the client configuration",
     )
     parser.add_argument(
-        "--reason", default=None, help="the reason recorded on a mutation (required on one)"
+        "--reason",
+        default=None,
+        help="a note recorded on a mutation; required to revoke a token, remove a "
+        "repository or a credential, or commit a bootstrap import",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -156,6 +161,10 @@ def build_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     for verb in ("enable", "disable"):
         p = h_sub.add_parser(verb, help=f"{verb} a harness for new launches")
         p.add_argument("name", help="claude_code, codex, agy, hermes")
+    test = h_sub.add_parser(
+        "test", help="run the path a task takes: image, credential, worker, one model call"
+    )
+    test.add_argument("name", help="claude_code, codex, agy, hermes")
 
     c = sub.add_parser("credentials", help="status, set, validate, probe, login, rotate, remove")
     c_sub = c.add_subparsers(dest="credential_command", required=True)
@@ -189,13 +198,17 @@ def build_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     set_key = c_sub.add_parser("set", help="read an API key without placing it in argv")
     set_key.add_argument("--harness", default="hermes", choices=("hermes",))
 
-    i = sub.add_parser("images", help="list and promote")
+    i = sub.add_parser("images", help="list, promote, roll back: per harness (ADR 0018)")
     i_sub = i.add_subparsers(dest="image_command", required=True)
     i_sub.add_parser(
-        "list", help="worker images and their promotion state (ci-* tags are not listed)"
+        "list",
+        help="worker images, and each harness's default and choices (ci-* tags are not listed)",
     )
-    promote = i_sub.add_parser("promote", help="promote a candidate image")
+    promote = i_sub.add_parser("promote", help="make an image one harness's default")
     promote.add_argument("digest", help="the image's digest or reference")
+    promote.add_argument("--harness", required=True, help="the harness it becomes the default of")
+    back = i_sub.add_parser("rollback", help="return a harness to its previous image")
+    back.add_argument("--harness", required=True)
 
     pr = sub.add_parser("providers", help="execution providers")
     pr_sub = pr.add_subparsers(dest="provider_command", required=True)
@@ -369,7 +382,23 @@ def build_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     b_sub.add_parser("list", help="every import")
     commit = b_sub.add_parser("commit", help="make a verified import authoritative")
     commit.add_argument("import_id")
+    _reason_after_the_verb(parser)
     return parser
+
+
+def _reason_after_the_verb(parser: argparse.ArgumentParser) -> None:
+    """Every verb also takes `--reason` after it, where a caller appends an optional flag
+    (`next`'s `optional`). SUPPRESS keeps a reason given before the verb when none
+    follows it."""
+    for item in parser._actions:
+        if isinstance(item, argparse._SubParsersAction):
+            for child in item.choices.values():
+                _reason_after_the_verb(child)
+            return
+    if "--reason" not in parser._option_string_actions:
+        parser.add_argument(
+            "--reason", default=argparse.SUPPRESS, help="a note recorded on a mutation"
+        )
 
 
 def _read_code() -> str:
@@ -514,6 +543,8 @@ def _remote(args: argparse.Namespace, remote: Api) -> Any:
     if command == "harnesses":
         if args.harness_command == "list":
             return remote.call("GET", "/v1/admin/harnesses")
+        if args.harness_command == "test":
+            return remote.call("POST", f"/v1/admin/harnesses/{args.name}/test", reason)
         return remote.call(
             "POST", f"/v1/admin/harnesses/{args.name}/{args.harness_command}", reason
         )
@@ -539,7 +570,13 @@ def _remote(args: argparse.Namespace, remote: Api) -> Any:
     if command == "images":
         if args.image_command == "list":
             return remote.call("GET", "/v1/admin/images")
-        return remote.call("POST", f"/v1/admin/images/{args.digest}/promote", reason)
+        if args.image_command == "rollback":
+            return remote.call(
+                "POST", "/v1/admin/images/rollback", {**reason, "harness": args.harness}
+            )
+        return remote.call(
+            "POST", f"/v1/admin/images/{args.digest}/promote", {**reason, "harness": args.harness}
+        )
     if command == "providers":
         return remote.call("GET", "/v1/admin/providers")
     if command == "github":
@@ -753,6 +790,14 @@ def _local(args: argparse.Namespace, wiring: Wiring) -> Any:
             if args.harness_command == "list":
                 found = asyncio.run(harnesses.list_images(admin))
                 return {"items": harnesses.list_harnesses(admin, uow, [i for _, i in found])}
+            if args.harness_command == "test":
+                tested = asyncio.run(
+                    harness_test.test_harness(
+                        admin, uow, principal=principal, harness=args.name, reason=args.reason
+                    )
+                )
+                uow.commit()
+                return tested
             result = harnesses.set_enabled(
                 admin,
                 uow,
@@ -768,12 +813,27 @@ def _local(args: argparse.Namespace, wiring: Wiring) -> Any:
     if command == "images":
         with wiring.ctx.uow_factory() as uow:
             if args.image_command == "list":
-                return {"items": asyncio.run(images.list_all(admin, uow))}
-            result = asyncio.run(
-                images.promote(
-                    admin, uow, principal=principal, digest=args.digest, reason=args.reason
+                return {
+                    "items": asyncio.run(images.list_all(admin, uow)),
+                    "defaults": asyncio.run(images.defaults(admin, uow)),
+                }
+            if args.image_command == "rollback":
+                result = asyncio.run(
+                    images.rollback(
+                        admin, uow, principal=principal, harness=args.harness, reason=args.reason
+                    )
                 )
-            )
+            else:
+                result = asyncio.run(
+                    images.promote(
+                        admin,
+                        uow,
+                        principal=principal,
+                        harness=args.harness,
+                        digest=args.digest,
+                        reason=args.reason,
+                    )
+                )
             uow.commit()
             return result
     if command == "providers":
@@ -1176,10 +1236,12 @@ def kind_of(args: argparse.Namespace) -> str:
         ("harnesses", "list"): "harness_list",
         ("harnesses", "enable"): "harness",
         ("harnesses", "disable"): "harness",
+        ("harnesses", "test"): "harness_test",
         ("credentials", "status"): "credential_state",
         ("credentials", "login"): "credential_login",
         ("images", "list"): "image_list",
         ("images", "promote"): "image_promotion",
+        ("images", "rollback"): "image_promotion",
         ("providers", "status"): "provider_list",
         ("github", "status"): "github_status",
         ("github", "check"): "github_check",
@@ -1251,6 +1313,8 @@ def result_for(
         actions = nx.credential_actions(args.harness, state, prefix)
     elif kind == "harness_list":
         actions = nx.harness_actions(_items(document), prefix)
+    elif kind == "harness_test" and isinstance(document, dict):
+        state = "passed" if document.get("ok") else "failed"
     elif kind == "harness" and isinstance(document, dict):
         state = "enabled" if document.get("enabled") else "disabled"
         actions = nx.harness_actions(
@@ -1258,7 +1322,7 @@ def result_for(
             prefix,
         )
     elif kind == "image_list":
-        actions = nx.image_actions(_items(document), prefix)
+        actions = nx.image_actions(document, prefix)
     elif kind == "exhaustion_list":
         actions = nx.exhaustion_actions(_items(document), prefix)
     elif kind == "token_list":

@@ -131,8 +131,13 @@ ADMIN_CALLS: list[tuple[list[str], tuple[str, str, Any]]] = [
     ),
     (["images", "list"], ("GET", "/v1/admin/images", None)),
     (
-        ["--reason", "r", "images", "promote", "sha256:abc"],
-        ("POST", "/v1/admin/images/sha256:abc/promote", {"reason": "r"}),
+        # Promotion is per harness (ADR 0018): the harness is named.
+        ["--reason", "r", "images", "promote", "sha256:abc", "--harness", "hermes"],
+        ("POST", "/v1/admin/images/sha256:abc/promote", {"reason": "r", "harness": "hermes"}),
+    ),
+    (
+        ["images", "rollback", "--harness", "agy"],
+        ("POST", "/v1/admin/images/rollback", {"reason": "", "harness": "agy"}),
     ),
     (["providers", "status"], ("GET", "/v1/admin/providers", None)),
     (["github", "status"], ("GET", "/v1/admin/github", None)),

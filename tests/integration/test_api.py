@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import dataclasses
+from types import SimpleNamespace
+
 import pytest
 from fastapi.testclient import TestClient
 
 from crucible.adapters.api.app import create_app
 from crucible.adapters.api.deps import AppContext
 from crucible.application.auth import mint_token
-from crucible.domain.entities import ImagePromotion, Role
-from tests.fixtures import FakeClock, contract_document
+from crucible.domain.entities import Role
+from tests.fixtures import FakeClock, contract_document, promote_for_test
 
 pytestmark = pytest.mark.integration
 
@@ -211,26 +214,25 @@ def test_only_registered_providers_are_accepted(
         }
     )
     with ctx.uow_factory() as uow:
-        uow.image_promotions.put(
-            ImagePromotion(
-                digest="sha256:integration-codex",
-                reference="crucible-worker:codex-integration",
-                harnesses={"codex": "0.156.0"},
-                state="default",
-                updated_at=clock.now(),
-                updated_by="tests",
-                reason="provider registry integration fixture",
-            )
+        promote_for_test(
+            uow,
+            digest="sha256:integration-codex",
+            reference="crucible-worker:codex-integration",
+            harnesses={"codex": "0.156.0"},
+            at=clock.now(),
+            by="tests",
+            reason="provider registry integration fixture",
         )
         uow.commit()
-    assert (
-        client.post(
-            "/v1/tasks",
-            json=doc,
-            headers={"Authorization": f"Bearer {tokens['operator']}"},
-        ).status_code
-        == 201
-    )
+    operator = {"Authorization": f"Bearer {tokens['operator']}"}
+    # A registered provider this deployment does not run is refused (crucible#124).
+    unwired = client.post("/v1/tasks", json=doc, headers=operator)
+    assert unwired.status_code == 422, unwired.text
+    assert "not a provider this deployment runs" in unwired.text
+    # Wired, the same contract is accepted: the registry rule is only about the name.
+    wired = dataclasses.replace(ctx, providers=[*ctx.providers, SimpleNamespace(name="docker")])
+    with TestClient(create_app(wired)) as docker_client:
+        assert docker_client.post("/v1/tasks", json=doc, headers=operator).status_code == 201
 
 
 def test_protected_branch_and_pattern(client: TestClient) -> None:

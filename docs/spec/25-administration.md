@@ -11,7 +11,8 @@ without Foundry.
 
 - **Versioned admin API** under `/v1/admin`, admin role only, generated
   into the same OpenAPI document. Every mutation is an event with the
-  principal, before-and-after summary (never a value), and reason.
+  principal, before-and-after summary (never a value), and the reason when
+  the operator gave one.
 - **`crucible admin` CLI** (the `admin` group of the one `crucible`
   command; `crucible-admin` remains as a shim that prints one deprecation
   line on stderr and runs `crucible admin` with the same arguments) calls
@@ -41,8 +42,9 @@ without Foundry.
   usage. `next` lists the admin verbs valid from the record's state: for a
   credential, what 25's operations accept from its state (`login` only in
   local mode, because only there can the harness's own CLI run); for a
-  harness, the enable flag's other value; for an image, `promote` while it
-  is a supported candidate; for a pool, `clear-exhaustion` while its mark
+  harness, the enable flag's other value; for each harness on the image
+  list, `promote` for each image offered for it that is not its default and
+  `rollback` while it has a previous image; for a pool, `clear-exhaustion` while its mark
   is active; for a verified import, `commit`. Each names its argv,
   including the `--api-url` or `--config` the command ran with, and what
   the caller must supply. Logs, and the interactive parts of a login, go to
@@ -65,7 +67,7 @@ resource.
 
 | Part | Fields |
 |---|---|
-| `harnesses[]` | name, both enablement gates with the reason each carries, adapter supported range, images known (reference, harness version, digest, promotion state), credential status (below), concurrency limit and current use, last launch outcome (a probe records itself there as `probe:<exit class>`, or `probe:inconclusive:<cause>` when it decided nothing) |
+| `harnesses[]` | name, both enablement gates with the reason each carries, adapter supported range, its default image and previous image (ADR 0018), images known (reference, harness version, digest, and whether it is this harness's default or previous image), credential status (below), concurrency limit and current use, last launch outcome (a probe records itself there as `probe:<exit class>`, or `probe:inconclusive:<cause>` when it decided nothing) |
 | `credentials[harness]` | `state`: `absent`, `configured` (files present, shape unchecked), `invalid` (the shape check failed, or a probe observed the provider refusing the credential; never a probe that merely did not finish), `validated` (a conclusive probe ran the credential); `mount_mode` (`ro`, `rw-narrow`); `last_validated_at`; `last_auth_failure_at` and its exit class (set only by those two conclusive outcomes); `refresh_verified` (bool, from the compatibility test); `source_fingerprint` (sha256 of the file **names and sizes**, never contents); `session_compatibility`: `unverified`, `verified`, `failed` |
 | `providers[]` | name, capabilities, `health`: `ok`, `degraded`, `unavailable` with detail (daemon reachable, proxy reachable, network present, disk headroom) |
 | `github` | App id (public), whether a credential is configured, key present (bool), key fingerprint (sha256 of the public key), where it is kept (`stored_in`: the Secret or directory, whether it exists and whether the service owns it), per registered repository: installation covers it, last check, webhook enabled. The App's slug, install link and installations are read live by the picker, not stored |
@@ -83,13 +85,14 @@ resource.
 |---|---|---|---|
 | list harnesses | `GET /admin/harnesses` | `harnesses list` | |
 | disable or enable a harness | `POST /admin/harnesses/{name}/disable` and `/enable` | `harnesses disable|enable` | flips the administrator's flag only; configuration retained; running attempts finish; new launches refused with a wake |
+| test a harness | `POST /admin/harnesses/{name}/test` | `harnesses test NAME` | crucible#118: the path a real task takes, in order, stopping at the first failure: the harness is enabled; it has its own worker image at a supported version (ADR 0018); its credential is stored; the routing policy in force names a model for it (a local model brings its endpoint URL); a worker runs that image with the credential under the worker's egress, the bounded probe below with every harness in a worker, Hermes included; and one minimal model call answers. Each step is reported pass, fail or not run, in plain words, with the failing step's cause and never the run's output. The last result is kept on the harness (`last_test` in `GET /admin/harnesses`) and shown on the Harnesses page. A check, not a change: no reason is asked for. The probe it runs is recorded as a probe is. The script harness (a test fixture, 18) routed to a local endpoint makes that one call itself, which is how the kind tier proves the path against a stub model server |
 | validate a credential | `POST /admin/credentials/{harness}/validate` | `credentials validate --harness` | shape check of the named auth files, then the bounded probe (below); returns state, timestamps, and the probe's `conclusive` and `cause`, never a verdict the run did not support |
 | set the Hermes API key | `POST /admin/credentials/hermes/set` | `credentials set --harness hermes` | reads the value from a password field (the Local gateway page, with the URL) or stdin, atomically writes `api-key` mode 0600 (on Kubernetes, into the `crucible-harness-hermes` Secret the service owns, creating it when absent; ADR 0015), returns no value, and audits only `credential set`; immediately probes readiness without auth and models with auth. Every view reports only `key_set` |
 | bounded auth probe | `POST /admin/credentials/{harness}/probe` | `credentials probe --harness` | launches the promoted worker image with the credential mounted, runs a one-line prompt with a 120 s timeout, records exit class, conclusiveness and cause, harness version, image digest, whether auth files changed (by hash), mount mode and duration, removes everything; never shows output beyond the exit class |
 | onboard a credential | `POST /admin/credentials/{harness}/login` (starts) | `credentials login --harness` | interactive flow below; the service runs the login in the promoted worker image (a container on Docker, a Job on Kubernetes) and the CLI retains its local-host mode. Refused while an attempt of that harness holds its credential (12) |
 | rotate or replace a credential source | `POST /admin/credentials/{harness}/rotate` | `credentials rotate --harness` | the operator's prepared directory is shape-checked, copied in, and left exactly as it was found; the swap is two renames; the previous directory is retained for `credential_retention_hours` then shredded; a failed swap rolls back; every step an event. Directory-held credentials only: where the credential is a Secret (Kubernetes, ADR 0015) it refuses and names the Secret, and a login with `replace` is the replacement |
 | remove a credential | `POST /admin/credentials/{harness}/remove` | `credentials remove --harness` | harness becomes `absent`; the directory is shredded at once rather than retained, because the operator said remove, and the harness is disabled with that reason. Directory-held credentials only, as rotate |
-| list images and promote | `GET /admin/images`, `POST /admin/images/{digest}/promote` | `images list|promote` | 13; each image lists every harness it carries with its version (`harnesses`), and the one worker image carries all four (C11), so one promotion makes it the default for all four, refused whole if any of them is outside its adapter's range. A previous default the promoted image fully covers becomes `retained`. Rollback is promoting the previous digest, which rolls all four harnesses back together. The probe and the live tiers run the promoted image |
+| list images, promote, roll back | `GET /admin/images`, `POST /admin/images/{digest}/promote`, `POST /admin/images/rollback` | `images list`, `images promote DIGEST --harness`, `images rollback --harness` | 13, ADR 0018: promotion is per harness (the operator's decision of 2026-09-25). The list adds `defaults`, one row per harness with its current image, its previous image, and the images it may be promoted to: those that carry it at a version inside its adapter's range, release versions and `latest`, never a `ci-*` proof tag. A promotion names the harness and moves only that harness, refused when the image does not carry it inside the range; the image it replaces becomes the harness's previous image. Rollback swaps a harness's default and previous image and moves no other harness. Launches, the probe, the harness test and a login run the launching harness's own default |
 | provider health | `GET /admin/providers` | `providers status` | |
 | GitHub health | `GET /admin/github`, `POST /admin/github/check` | `github status|check` | check mints a token per registered repository and discards it |
 | connect the GitHub App | `POST /admin/github/app` | `github connect --app-id --private-key-file` | ADR 0017: an existing App's id and one of its private keys, checked with `GET /app` before anything is stored; a refusal stores nothing. The service then owns the credential (the `crucible-github-app` Secret on Kubernetes, the files beside `github.app.private_key_path` with Docker). Returns the App's install link, never the key; audited as `github_app_connected` with the key's public fingerprint |
@@ -102,15 +105,25 @@ resource.
 | show or update the per-command timeout | `GET`, `POST /admin/limits/command-timeout` | `limits command-timeout`, `limits set-command-timeout` | 05b `limits.command_timeout_ms` of the policy in force: min, max and default in milliseconds. A save writes a new policy version with only that limit changed; a bound left out keeps its value, and one that is not a JSON integer, or bounds out of order, are refused. Tasks whose contracts name the new version launch with it (issue 128) |
 | show or update the Kubernetes egress selectors | `GET`, `POST /admin/kubernetes/egress` | `kubernetes egress`, `kubernetes set-egress` | 26: the `kubernetes.egress` setting, the cluster resolver's and an in-cluster local endpoint's namespace, pod labels and port. The settings file seeds it and a save wins over the file; the response says which (`source`). Refused naming the field when a selector is empty, malformed, or names the workers or Crucible namespace. A save states both halves (`dns` and `local_endpoint`); a missing one is refused rather than read as off. The supervisor reads a save back within 15 seconds without a restart, and the readiness canary runs again before a launch uses it (crucible#91) |
 
-Every mutation requires a non-empty `reason` string, records the principal,
-and is refused when the supervisor lease is not held by a live instance (so
-a stale instance cannot administer). One guard applies both rules, so no
-operation can carry only one of them, and they bind every state-changing row
-of the table above without exception: registering a repository and finishing
-a login are mutations too, and a login's completion writes
-`session_compatibility` and clears `last_validated_at`, which is exactly the
-kind of change the rules exist for. A reason is a string an operator wrote:
-an absent, blank, or non-string body value is not one.
+Every mutation records the principal and is refused when the supervisor
+lease is not held by a live instance (so a stale instance cannot
+administer). A reason is an audit note the operator may leave out; the event
+records who acted, when, and what changed whether or not one was given. It
+is required only where the operation is destructive or hard to reverse:
+revoking a token, removing a repository, removing a credential, and
+committing a bootstrap import. A read-only check (the GitHub connectivity
+check, a harness test, a gateway test) never asks for one. This is the operator's decision of
+2026-09-25 (crucible#117, "I shouldn't have to provide a reason for
+everything"); the API, the CLI and the UI apply the same rule, because they
+call the same guard. One guard applies the lease rule, the reason rule, and
+the secret-shape check below, so no operation can carry only one of them,
+and they bind every state-changing row of the table above without
+exception: registering a repository and finishing a login are mutations too,
+and a login's completion writes `session_compatibility` and clears
+`last_validated_at`, which is exactly the kind of change the rules exist
+for. Where a reason is required, it is a string an operator wrote: an
+absent, blank, or non-string body value is not one. The CLI takes `--reason`
+before or after the verb.
 
 A refusal is itself recorded, as an `admin_refused` event naming the
 operation and why it was refused, written through a unit of work of its own

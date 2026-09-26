@@ -171,6 +171,9 @@ services:
       CRUCIBLE_SERVICE__BIND: 0.0.0.0:8080
       CRUCIBLE_SERVICE__RENDER_TIMEZONE: America/Chicago
       CRUCIBLE_SUPERVISOR__HOLDER: crucible-compose
+      # The fake provider and the script harness are test fixtures (crucible#124): off
+      # unless the environment turns them on, as CI's compose smoke does.
+      CRUCIBLE_TEST_FIXTURES: "${CRUCIBLE_TEST_FIXTURES:-false}"
       # The Docker provider (08, 13). S9 Test E: the service runs as uid 1000 and the
       # artifact root is a named volume it shares with every container it creates, so
       # workspaces, identity renders, report dirs and collector output have one owner

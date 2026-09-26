@@ -252,9 +252,10 @@ def egress_and_image(base_url: str, token: str) -> None:
         "POST",
         f"{base_url}/v1/admin/images/{image['digest']}/promote",
         token=token,
-        body={"reason": "first-run kind proof: the combined worker image"},
+        # Promotion is per harness (ADR 0018): this names Hermes, the harness under proof.
+        body={"harness": "hermes", "reason": "first-run kind proof: the Hermes worker image"},
     )
-    log(f"promoted {image['reference']} ({image['digest']}), carrying {image['harnesses']}")
+    log(f"promoted {image['reference']} ({image['digest']}) for hermes")
 
 
 def github(base_url: str, token: str, private_key: str) -> None:
@@ -478,7 +479,7 @@ def smoke(stub_image: str) -> None:
 
         opener = sign_in(base_url)
         status_page = page_text(opener, f"{base_url}/ui")
-        match = re.search(r"System status (.{0,120})", status_page)
+        match = re.search(r"Status ((?:Ready for a task|Crucible cannot).{0,120})", status_page)
         log(f"rendered /ui: {match.group(0) if match else status_page[:200]}")
         if "Ready for a task on hermes" not in status_page or " ready " not in status_page:
             raise SmokeError("the rendered Status page does not read ready for Hermes")

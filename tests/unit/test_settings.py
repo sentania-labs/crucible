@@ -156,6 +156,15 @@ def test_a_positive_pod_pid_limit_override_is_accepted() -> None:
     assert settings.kubernetes.pod_pid_limit_override == 512
 
 
+def test_test_fixtures_are_off_unless_turned_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    """crucible#124: a production deployment never gets the fake provider or the script
+    harness; a test tier turns them on through the environment."""
+    monkeypatch.delenv("CRUCIBLE_TEST_FIXTURES", raising=False)
+    assert load_settings().test_fixtures is False
+    monkeypatch.setenv("CRUCIBLE_TEST_FIXTURES", "true")
+    assert load_settings().test_fixtures is True
+
+
 def test_broad_egress_and_the_resolve_ttl_reach_the_provider() -> None:
     """Issue 61: both are deployment settings, not provider-only fields."""
     config = kubernetes_config(Settings())

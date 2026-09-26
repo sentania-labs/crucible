@@ -259,6 +259,12 @@ class HarnessView(Response):
     installed_versions: list[str]
     capabilities: dict[str, Any]
     credential: HarnessCredentialView
+    # The harness's own default worker image and the one a rollback returns to (13, ADR
+    # 0018): reference, digest, and the version of this harness the image pins.
+    default_image: dict[str, str] | None = None
+    previous_image: dict[str, str] | None = None
+    # The last harness test (crucible#118): pass or fail, and each step in plain words.
+    last_test: dict[str, Any] | None = None
 
 
 class HarnessList(Response):
@@ -266,10 +272,13 @@ class HarnessList(Response):
 
 
 class ImageView(Response):
-    """13: a worker image the provider can see, with its promotion state. `harnesses`
-    is every harness the image carries, name to pinned version: all four real harnesses
-    for the worker image (C11). `supported` is true when every one of them is inside
-    its adapter's tested range, which is what promotion requires."""
+    """13: a worker image the provider can see. `harnesses` is every harness the image
+    carries, name to pinned version. Promotion is per harness (ADR 0018):
+    `supported_for` names the harnesses whose version is inside the adapter's tested
+    range, which is what promoting the image for that harness requires; `default_for`
+    and `previous_for` name the harnesses it is the default, or the rollback image, of.
+    `supported` is true when every harness it carries is supported, and
+    `promotion_state` summarises the three lists: `default`, `retained`, `candidate`."""
 
     reference: str
     digest: str
@@ -277,6 +286,9 @@ class ImageView(Response):
     supported: bool
     promotion_state: str
     provider: str
+    supported_for: list[str] = Field(default_factory=list)
+    default_for: list[str] = Field(default_factory=list)
+    previous_for: list[str] = Field(default_factory=list)
 
 
 class ImageList(Response):

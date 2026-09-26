@@ -2,6 +2,8 @@
 # What differs is the storage class, the sizes a one-node cluster can honour, and the
 # worker-side timeouts: the disposable registry and the local-path provisioner are slower
 # than a lab cluster on the first pull, and a task that is still pulling is not a stall.
+# The kind tier drives the script harness, a test fixture a real deployment never shows or
+# routes to (crucible#124), so this overlay turns the fixtures on.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -13,3 +15,4 @@ data:
   CRUCIBLE_KUBERNETES__MAX_CONCURRENCY: "1"
   CRUCIBLE_SUPERVISOR__TICK_SECONDS: "2"
   CRUCIBLE_SUPERVISOR__HOLDER: crucible-kind
+  CRUCIBLE_TEST_FIXTURES: "true"

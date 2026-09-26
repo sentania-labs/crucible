@@ -74,7 +74,7 @@ def list_harnesses(
         images=images,
     )
     in_use = _concurrency(uow)
-    promotions = {p.digest: p.state for p in uow.image_promotions.list_all()}
+    defaults = {d.harness: d for d in uow.harness_images.list_all()}
     out: list[dict[str, Any]] = []
     # On Kubernetes the credential is the harness Secret, which the directory-based view
     # cannot see; read the state the Credentials page reads, so no two pages disagree
@@ -88,12 +88,20 @@ def list_harnesses(
                 if key in held:
                     entry["credential"][key] = held[key]
         entry["concurrency_in_use"] = in_use.get(view.name, 0)
+        default = defaults.get(view.name)
         entry["images"] = [
             {
                 "reference": i.reference,
                 "harness_version": i.version_of(view.name),
                 "digest": i.digest,
-                "promotion_state": promotions.get(i.digest, "candidate"),
+                # Relative to this harness: promotion is per harness (ADR 0018).
+                "promotion_state": (
+                    "default"
+                    if default is not None and default.digest == i.digest
+                    else "retained"
+                    if default is not None and default.previous_digest == i.digest
+                    else "candidate"
+                ),
             }
             for i in images
             if i.carries(view.name)

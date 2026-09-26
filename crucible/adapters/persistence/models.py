@@ -672,6 +672,7 @@ class HarnessStateRow(Base):
     last_launch_outcome: Mapped[str | None] = mapped_column(String(48), nullable=True)
     last_auth_failure_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
     last_validated_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
+    last_test: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(TZ)
     updated_by: Mapped[str] = mapped_column(String(160))
 
@@ -702,13 +703,17 @@ class BootstrapImportRow(Base):
     committed_by: Mapped[str | None] = mapped_column(String(160), nullable=True)
 
 
-class ImagePromotionRow(Base):
-    __tablename__ = "image_promotions"
-    digest: Mapped[str] = mapped_column(String(160), primary_key=True)
+class HarnessImageRow(Base):
+    """Each harness's default worker image and the one it replaced (ADR 0018)."""
+
+    __tablename__ = "harness_images"
+    harness: Mapped[str] = mapped_column(String(64), primary_key=True)
+    digest: Mapped[str] = mapped_column(String(160))
     reference: Mapped[str] = mapped_column(Text)
-    # Harness name to pinned version, every harness the image carries (C11).
-    harnesses: Mapped[dict[str, str]] = mapped_column(JSONB)
-    state: Mapped[str] = mapped_column(String(16))
+    version: Mapped[str] = mapped_column(String(64))
+    previous_digest: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    previous_reference: Mapped[str | None] = mapped_column(Text, nullable=True)
+    previous_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
     reason: Mapped[str] = mapped_column(Text)
     updated_at: Mapped[datetime] = mapped_column(TZ)
     updated_by: Mapped[str] = mapped_column(String(160))

@@ -316,6 +316,23 @@ def eligible_harness_names(
     return eligible
 
 
+def unwired_provider_problems(
+    contract: TaskContractV1, wired_providers: Collection[str] | None
+) -> list[Problem]:
+    """A provider this deployment does not run, the fake one above all when test fixtures
+    are off (crucible#124), is refused on every contract version, submitted, amended or
+    corrected, rather than left to fail at launch."""
+    provider = contract.execution_request.provider.value
+    if wired_providers is None or provider in wired_providers:
+        return []
+    return [
+        _problem(
+            "execution_request.provider",
+            f"{provider!r} is not a provider this deployment runs",
+        )
+    ]
+
+
 def submit_task(
     uow: UnitOfWork,
     clock: Clock,
@@ -326,6 +343,7 @@ def submit_task(
     harness_gates: Mapping[str, HarnessGate] | None = None,
     credential_sources: Mapping[str, CredentialSource] | None = None,
     secret_providers: Collection[str] = (),
+    wired_providers: Collection[str] | None = None,
 ) -> tuple[Task, TaskContract]:
     contract = parse_contract(body)
     require_operator_for_pin(principal, contract)
@@ -348,6 +366,7 @@ def submit_task(
             harnesses.resolve(name, gates=harness_gates, state=uow.harnesses.get(name))
         except HarnessUnavailableError as exc:
             problems.append(_problem("execution_request.harness", exc.reason))
+    problems.extend(unwired_provider_problems(contract, wired_providers))
     if contract.correction is not None:
         problems.append(
             _problem("correction", "must be null on submit; corrections use /corrections")

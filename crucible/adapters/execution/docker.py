@@ -320,7 +320,9 @@ class DockerProvider:
     ) -> None:
         self.config = config
         self.client = client or DockerClient(config.endpoint, timeout=config.api_timeout_seconds)
-        self.harnesses = harnesses or default_registry()
+        # `wire` always passes the deployment's registry; one built without it is a test's,
+        # which may launch the script harness (crucible#124).
+        self.harnesses = harnesses or default_registry(test_fixtures=True)
         self._launched: dict[str, _Launched] = {}
         self._images: dict[str, _ResolvedImage] = {}
         # The last failing output of each throwaway role, so an environment failure can
@@ -1440,6 +1442,8 @@ class DockerProvider:
             env_from_files=dict(request.env_from_files),
             stdin_files=tuple(request.stdin_files),
             stdin_text=request.stdin_text,
+            endpoint=request.endpoint,
+            endpoint_url=request.endpoint_url,
         )
         root = self._root(probe_id)
         await asyncio.to_thread(shutil.rmtree, root, True)

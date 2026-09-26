@@ -150,6 +150,8 @@ jobs:
       - name: boot the built image and prove it is the candidate
         env:
           CRUCIBLE_IMAGE: ghcr.io/sentania-labs/crucible:${{ env.VERSION }}
+          # The smoke drives the fake provider, a test fixture off by default (crucible#124).
+          CRUCIBLE_TEST_FIXTURES: "true"
         run: |
           set -euo pipefail
           cp .env.example .env

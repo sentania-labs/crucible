@@ -7,7 +7,7 @@ from typing import Any
 from crucible.application.routing import select_model
 from crucible.application.supervisor import Supervisor
 from crucible.contracts.policy import RoutingPolicyV1
-from crucible.domain.entities import AttemptMetrics, ImagePromotion, PoolExhaustion
+from crucible.domain.entities import AttemptMetrics, HarnessImage, PoolExhaustion
 
 NOW = datetime(2026, 9, 20, 12, 0, tzinfo=UTC)
 
@@ -54,6 +54,9 @@ class _Images:
     def list_all(self) -> list[Any]:
         return self.rows
 
+    def get(self, harness: str) -> Any:
+        return next((row for row in self.rows if row.harness == harness), None)
+
 
 def _uow(
     rows: list[AttemptMetrics] | None = None,
@@ -63,7 +66,7 @@ def _uow(
     return SimpleNamespace(
         attempt_metrics=_Metrics(rows or []),
         pool_exhaustions=_Marks(marks or []),
-        image_promotions=_Images(images),
+        harness_images=_Images(images),
     )
 
 
@@ -236,19 +239,19 @@ def test_operator_pin_is_exact_and_does_not_fall_through() -> None:
 def test_image_allowlist_excludes_one_candidate_and_selects_the_next() -> None:
     routing = _routing([_model("first"), _model("second", harness="agy")])
     images = [
-        ImagePromotion(
+        HarnessImage(
+            harness="codex",
             digest="sha256:first",
             reference="workers/codex:1",
-            harnesses={"codex": "0.156.0"},
-            state="default",
+            version="0.156.0",
             updated_at=NOW,
             updated_by="tests",
         ),
-        ImagePromotion(
+        HarnessImage(
+            harness="agy",
             digest="sha256:second",
             reference="workers/agy:1",
-            harnesses={"agy": "1.2.1"},
-            state="default",
+            version="1.2.1",
             updated_at=NOW,
             updated_by="tests",
         ),

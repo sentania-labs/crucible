@@ -40,11 +40,11 @@ from crucible.application.proxy_config import worker_proxy_config
 from crucible.application.repositories import register_repository
 from crucible.application.supervisor import Supervisor
 from crucible.contracts.api import ExternalReviewAttestation, RepositoryRegistration
-from crucible.domain.entities import ImagePromotion, Role
+from crucible.domain.entities import Role
 from tests.e2e import daemon
 from tests.e2e.policy import e2e_policy_document, e2e_routing_document
 from tests.e2e.repo import make_origin
-from tests.fixtures import contract_document
+from tests.fixtures import contract_document, promote_for_test
 
 pytestmark = pytest.mark.e2e
 
@@ -345,7 +345,7 @@ def ctx(engine: Engine, migrated: str, artifact_root: Path, provider: DockerProv
         database_url=migrated,
         engine=engine,
         artifact_store=DiskArtifactStore(artifact_root / "store"),
-        harnesses=default_registry(),
+        harnesses=default_registry(test_fixtures=True),
     )
 
 
@@ -382,16 +382,14 @@ def client(
             item for item in asyncio.run(provider.list_images()) if item.reference == worker_image
         )
         with ctx.uow_factory() as uow:
-            uow.image_promotions.put(
-                ImagePromotion(
-                    digest=worker.digest,
-                    reference=worker.reference,
-                    harnesses=dict(worker.harnesses) or {"script-harness": "1.0.0"},
-                    state="default",
-                    updated_at=ctx.clock.now(),
-                    updated_by="e2e",
-                    reason="e2e script harness image",
-                )
+            promote_for_test(
+                uow,
+                digest=worker.digest,
+                reference=worker.reference,
+                harnesses=dict(worker.harnesses) or {"script-harness": "1.0.0"},
+                at=ctx.clock.now(),
+                by="e2e",
+                reason="e2e script harness image",
             )
             uow.commit()
     # The live variants add an explicit model pin, which is an operator-only action.

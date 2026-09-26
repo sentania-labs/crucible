@@ -289,8 +289,8 @@ def walk_first_run_ui(base_url: str) -> None:
     )
     try:
         with opener.open(request_object, timeout=DEFAULT_TIMEOUT) as response:
-            if response.status != 200 or b"System status" not in response.read():
-                raise SmokeError("first-run administrator sign-in did not render System status")
+            if response.status != 200 or b"<h1>Status</h1>" not in response.read():
+                raise SmokeError("first-run administrator sign-in did not render the Status page")
         for path in (
             "/ui/harnesses",
             "/ui/credentials",

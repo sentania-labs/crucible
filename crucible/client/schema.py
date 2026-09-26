@@ -244,8 +244,21 @@ def kind_schemas() -> dict[str, dict[str, Any]]:
             {"harness": STR},
             {"login": ANY_OBJ, "shape": ANY_OBJ},
         ),
-        "image_list": _items("worker images and their promotion state", _model(ImageView)),
-        "image_promotion": _obj("the promoted image", {}, {"promotion_state": STR}),
+        "harness_test": _obj(
+            "a harness test: each step of a task's path, pass or fail in plain words",
+            {"harness": STR, "ok": BOOL, "steps": {"type": "array", "items": ANY_OBJ}},
+            {"failed_step": NSTR},
+        ),
+        "image_list": _obj(
+            "worker images, and each harness's default, previous image and choices",
+            {"items": {"type": "array", "items": _model(ImageView)}},
+            {"defaults": {"type": "array", "items": ANY_OBJ}},
+        ),
+        "image_promotion": _obj(
+            "one harness's default image after a promotion or rollback",
+            {"harness": STR},
+            {"promotion_state": STR},
+        ),
         "provider_list": _items("execution providers and their health", ANY_OBJ),
         "github_status": _obj("the GitHub App's health", {"configured": BOOL}),
         "github_check": _obj("the per-repository token check", {}),

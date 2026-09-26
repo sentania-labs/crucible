@@ -255,6 +255,9 @@ jobs:
       - name: classify release candidate and supporting images
         run: make release-images-classify
       - name: make up from a clean clone
+        # The smoke drives the fake provider, a test fixture off by default (crucible#124).
+        env:
+          CRUCIBLE_TEST_FIXTURES: "true"
         run: make up
       # tools/smoke/compose_smoke.py is the only definition of this smoke; the
       # release workflow runs the same file against the image it is about to

@@ -7,6 +7,18 @@ daemon and requires an explicit `make e2e-image` to repair drift. CI runs on
 GitHub-hosted runners because the integration and end-to-end tiers need a
 Docker daemon.
 
+## Test fixtures are off in production
+
+The fake provider (08) runs nothing and the script harness reports completion
+without doing work, so neither is wired unless the restart-bound setting
+`test_fixtures` (`CRUCIBLE_TEST_FIXTURES`) is true. It defaults to false, and a
+deployment that leaves it there never lists, offers, or routes to either: they are
+absent from the harness registry, every administration page, and the providers
+(crucible#124, 2026-09-25). The integration tier builds its own registry with
+them; the compose smoke (CI and release) sets the variable for its boot, and the
+kind overlay sets it for the kind tiers. A developer running `make dev` sets it in
+their own environment.
+
 ## Unit (no I/O, milliseconds)
 
 - Every state machine transition table: allowed, disallowed, side effects.

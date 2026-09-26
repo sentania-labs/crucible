@@ -1,6 +1,7 @@
 # ADR 0011: Harness versions are pinned per image, recorded per attempt, and promoted explicitly
 
-Status: accepted, operator decision 16, 2026-09-16.
+Status: accepted, operator decision 16, 2026-09-16. Promotion and rollback are per
+harness since ADR 0018 (2026-09-25).
 
 ## Context
 

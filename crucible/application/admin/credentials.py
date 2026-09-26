@@ -27,7 +27,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlsplit, urlunsplit
 
 from crucible.application.admin.context import (
@@ -644,9 +644,10 @@ async def validate(
 
 
 def _probe_provider(ctx: AdminContext) -> ExecutionProvider:
-    """Where the probe runs: where the credentials are. Docker when it is wired, then
-    Kubernetes (the fake provider is always wired and runs behaviours, not credentials,
-    so it is only ever the answer when nothing else is)."""
+    """Where the probe and the harness test run: where the credentials are. Docker when
+    it is wired, then Kubernetes (the fake provider, wired only with test fixtures on,
+    runs behaviours, not credentials, so it is only ever the answer when nothing else
+    is)."""
     for name in ("docker", "kubernetes"):
         provider = ctx.providers.get(name)
         if provider is not None:
@@ -659,16 +660,11 @@ def _probe_provider(ctx: AdminContext) -> ExecutionProvider:
 async def probe_image(
     ctx: AdminContext, uow: UnitOfWork, provider: ExecutionProvider, harness: str
 ) -> str:
-    """The image the probe runs: the promoted default that carries the harness (the one
-    worker image, C11), else the one labelled image the provider has for it, else a
-    refusal naming the ambiguity (13)."""
-    promoted = sorted(
-        (p for p in uow.image_promotions.list_all() if p.carries(harness) and p.state == "default"),
-        key=lambda p: (p.updated_at, p.digest),
-        reverse=True,
-    )
-    if promoted:
-        return promoted[0].reference
+    """The image the probe runs: the harness's own default (ADR 0018), else the one
+    labelled image the provider has for it, else a refusal naming the ambiguity (13)."""
+    default = uow.harness_images.get(harness)
+    if default is not None:
+        return default.reference
     if provider.name == "fake":
         # The fake provider runs behaviours, not images (08).
         return "crucible-worker:fake-probe"
@@ -679,8 +675,8 @@ async def probe_image(
     if not references:
         raise CredentialAdminError(f"the provider has no image labelled for harness {harness!r}")
     raise CredentialAdminError(
-        f"{len(references)} images are labelled for {harness!r} and none is promoted; "
-        "promote one (images promote) so the probe knows which to run"
+        f"{len(references)} images are labelled for {harness!r} and none is promoted for "
+        "it; promote one (images promote --harness) so the probe knows which to run"
     )
 
 
@@ -734,8 +730,12 @@ async def _probe_async(
     principal: str,
     reason: str,
     audit_event: bool = True,
+    in_worker: bool = False,
 ) -> ProbeRecord:
-    if harness == HERMES:
+    """The bounded probe. `in_worker` runs every harness in a worker, Hermes too, the
+    way a task runs it (the harness test, crucible#118); without it Hermes is checked
+    from the service with two HTTP requests, the cheap check it has always been."""
+    if harness == HERMES and not in_worker:
         return await _hermes_probe_async(
             ctx,
             uow,
@@ -745,25 +745,29 @@ async def _probe_async(
             audit_event=audit_event,
         )
     adapter = adapter_for(ctx, harness)
-    spec = spec_for(ctx, harness)
+    spec = adapter.credential_spec()
     source = (
         ctx.credential_sources.get(harness)
-        if secret_store(ctx) is not None
+        if secret_store(ctx) is not None or spec is None
         else source_for(ctx, harness)
     )
     provider = _probe_provider(ctx)
     image = await probe_image(ctx, uow, provider, harness)
-    mode = effective_mount_mode(spec, source)
+    mode = effective_mount_mode(spec, source) if spec is not None else MountMode.RO
+    model, endpoint, endpoint_url = probe_route(uow, adapter, harness)
     launch = adapter.build_launch(
         LaunchContext(
             attempt_id="probe",
-            model=_probe_model(uow, adapter, harness),
+            model=model,
             effort=None,
             timeout_seconds=ctx.probe_timeout_seconds,
             identity_mount=IDENTITY_MOUNT,
             report_mount=REPORT_MOUNT,
             repo_mount=REPO_MOUNT,
-            credential_mounted=True,
+            credential_mounted=spec is not None,
+            endpoint=endpoint,
+            endpoint_url=endpoint_url,
+            probe=True,
         )
     )
     request = ProbeRequest(
@@ -781,6 +785,8 @@ async def _probe_async(
             "network": {"mode": "egress-proxy", "egress_allowlist": []},
             "images": {"allowlist": [image]},
         },
+        endpoint=endpoint,
+        endpoint_url=endpoint_url,
     )
     started = time.monotonic()
     try:
@@ -1057,31 +1063,49 @@ def _routing_document(uow: UnitOfWork) -> tuple[dict[str, Any] | None, str]:
     return record.document, f"{name} version {version}"
 
 
-def _probe_model(uow: UnitOfWork, adapter: HarnessAdapter, harness: str) -> str:
-    """The cheapest enabled model the routing policy in force names for the harness, so a
-    probe never runs on a frontier model and never on a model the operator retired. A
-    harness without a model flag (the script harness) needs none. Otherwise a routing
-    policy without an enabled model for the harness is a refusal: the CLIs reject an
-    unknown model name, so guessing one would only produce a crash that says nothing
-    about the credential (AGY did exactly that, C5b live run), and reaching past the
-    policy in force to an older one would run a model the operator disabled.
-    """
-    if not adapter.capabilities().model_flag:
-        return "none"
+def probe_route(
+    uow: UnitOfWork, adapter: HarnessAdapter, harness: str
+) -> tuple[str, Literal["subscription", "local"], str | None]:
+    """The model a probe or harness test runs, and where it is served: the cheapest
+    enabled model the routing policy in force names for the harness, so a probe never
+    runs on a frontier model and never on a model the operator retired. A model behind
+    a local endpoint brings its URL, so the worker reaches it as a task would.
+
+    A harness without a model flag (the script harness) needs a model only when the
+    policy routes it to a local endpoint, which is then the model it calls; otherwise
+    none. For every other harness a routing policy without an enabled model for it is a
+    refusal: the CLIs reject an unknown model name, so guessing one would only produce
+    a crash that says nothing about the credential (AGY did exactly that, C5b live
+    run), and reaching past the policy in force to an older one would run a model the
+    operator disabled."""
+    needs_model = adapter.capabilities().model_flag
     document, where = _routing_document(uow)
     if document is None:
+        if not needs_model:
+            return "none", "subscription", None
         raise CredentialAdminError(
             f"the probe needs the routing policy the policy in force names, and {where}; "
             "put a policy in force that names a stored routing policy"
         )
     order = {"small": 0, "mid": 1, "frontier": 2}
-    best: tuple[int, str] | None = None
+    # A subscription model before a local one: a local endpoint does not read the
+    # harness's own login, so a probe routed there would call a credential validated
+    # without using it. Hermes has only local models, which read its key; the script
+    # harness has no credential, and a local model is what gives it a model to call.
+    local_first = not needs_model
+    best: tuple[tuple[int, int], dict[str, Any]] | None = None
     for model in document.get("models", []):
         if model.get("harness") == harness and model.get("enabled"):
-            rank = order.get(str(model.get("capability")), 3)
+            is_local = model.get("endpoint") == "local"
+            rank = (
+                0 if is_local == local_first else 1,
+                order.get(str(model.get("capability")), 3),
+            )
             if best is None or rank < best[0]:
-                best = (rank, str(model["id"]))
+                best = (rank, model)
     if best is None:
+        if not needs_model:
+            return "none", "subscription", None
         raise CredentialAdminError(
             f"routing policy {where}, which the policy in force names, has no enabled "
             f"model for harness {harness!r}; the probe needs one (enable a model for it, "
@@ -1089,7 +1113,22 @@ def _probe_model(uow: UnitOfWork, adapter: HarnessAdapter, harness: str) -> str:
             "does not fall back to an older routing policy, because that would run a "
             "model the operator disabled or removed"
         )
-    return best[1]
+    model = best[1]
+    if model.get("endpoint") == "local" and model.get("endpoint_url"):
+        return str(model["id"]), "local", str(model["endpoint_url"])
+    if not needs_model:
+        return "none", "subscription", None
+    return str(model["id"]), "subscription", None
+
+
+async def worker_probe(
+    ctx: AdminContext, uow: UnitOfWork, *, harness: str, principal: str, reason: str
+) -> ProbeRecord:
+    """The bounded probe in a worker for every harness, Hermes included: the harness
+    test's run (crucible#118). The caller has applied the guard."""
+    return await _probe_async(
+        ctx, uow, harness=harness, principal=principal, reason=reason, in_worker=True
+    )
 
 
 async def probe(
@@ -1373,7 +1412,12 @@ def remove(
     """25: the harness becomes `absent`; the files are shredded; the harness is
     disabled with the reason so a launch is refused cleanly rather than failing auth."""
     reason = guard_mutation(
-        ctx, uow, reason, principal=principal, operation=f"credentials remove {harness}"
+        ctx,
+        uow,
+        reason,
+        principal=principal,
+        operation=f"credentials remove {harness}",
+        reason_required=True,
     )
     _refuse_for_secret(ctx, harness, "remove")
     spec_for(ctx, harness)

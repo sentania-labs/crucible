@@ -553,7 +553,9 @@ class KubernetesProvider:
         self.resolve = resolver or _resolve_host
         self.client = client
         self.registry = registry
-        self.harnesses = harnesses or default_registry()
+        # `wire` always passes the deployment's registry; one built without it is a test's,
+        # which may launch the script harness (crucible#124).
+        self.harnesses = harnesses or default_registry(test_fixtures=True)
         self._launched: dict[str, _Launched] = {}
         self._images: dict[str, ImageInfo] = {}
         self.last_error: dict[str, str] = {}
@@ -1999,6 +2001,8 @@ class KubernetesProvider:
             env_from_files=dict(request.env_from_files),
             stdin_files=tuple(request.stdin_files),
             stdin_text=request.stdin_text,
+            endpoint=request.endpoint,
+            endpoint_url=request.endpoint_url,
         )
         root = f"k8s://{self.config.namespace}/{k8sspec.object_name('ws', probe_id)}"
         ws = Workspace(
