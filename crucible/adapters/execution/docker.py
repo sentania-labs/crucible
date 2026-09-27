@@ -77,6 +77,7 @@ from crucible.application.harnesses import (
 from crucible.contracts.completion_claim import CompletionClaimV1
 from crucible.domain.exit_class import ExitClass
 from crucible.domain.ids import new_id
+from crucible.domain.secrets import redact
 from crucible.domain.time import parse_rfc3339
 from crucible.ports.execution import (
     HARNESSES_LABEL,
@@ -110,6 +111,7 @@ from crucible.ports.execution import (
     WorkspaceState,
     image_harnesses,
 )
+from crucible.ports.github import InstallationToken
 from crucible.ports.harness import (
     AuthFile,
     CredentialSource,
@@ -244,6 +246,11 @@ class DockerConfig:
     # The configured credential directory per harness (12). A harness without one falls
     # back to `<credential_root>/<harness>` when that directory exists.
     credentials: Mapping[str, CredentialSource] = field(default_factory=dict)
+    # The one host a private repository's checkout token is answered for (ADR 0019),
+    # the same `github.credential_host` the publisher's helper uses (23).
+    credential_host: str = "github.com"
+    # The preparer's token tmpfs, which holds one installation token and nothing else.
+    token_tmpfs_bytes: int = 64 * 1024
 
 
 # The launch was refused by the adapter's version range or a missing credential (07,
@@ -465,11 +472,15 @@ class DockerProvider:
         credential = adapter.credential_spec() if adapter is not None else None
         return source is not None and (credential is None or credential.held_by(source.path))
 
-    async def prepare(self, spec: LaunchSpec) -> Workspace:
+    async def prepare(
+        self, spec: LaunchSpec, checkout_token: InstallationToken | None = None
+    ) -> Workspace:
         repository = spec.contract.get("repository", {})
         url = spec.repository_url or str(repository.get("url", ""))
         if not url:
             raise ProviderError("the contract names no repository url")
+        if checkout_token is not None:
+            workspace.require_checkout_url(url, self.config.credential_host)
         base_ref = str(repository.get("base_ref", "main"))
         work_branch = str(repository.get("work_branch") or f"crucible/{spec.external_id}")
         root = self._root(spec.attempt_id)
@@ -499,6 +510,10 @@ class DockerProvider:
             network, env = self._network_and_env(spec)
 
         git_policy = spec.policy.get("git", {})
+        # ADR 0019: a private repository's token goes to this one container on stdin,
+        # onto its own tmpfs, as the publisher's does; the worker is a different
+        # container that never has either.
+        private = checkout_token is not None and local is None
         exit_code = await self._run_throwaway(
             spec,
             role=ROLE_PREPARER,
@@ -519,16 +534,19 @@ class DockerProvider:
                 shims=workspace.SHIM_NAMES,
                 exclude_entries=workspace.EXCLUDE_ENTRIES,
                 identity_mount=IDENTITY_MOUNT,
+                checkout_token="stdin" if private else None,
+                credential_host=self.config.credential_host,
             ),
             mounts=mounts,
             network=network,
             timeout=self.config.collector_timeout_seconds,
             env=env,
+            secret_stdin=checkout_token if private else None,
         )
         if exit_code != 0:
             raise ProviderError(
                 f"the preparer container could not build the checkout (exit {exit_code}): "
-                f"{self.last_error.get(ROLE_PREPARER, '')}"
+                f"{redact(self.last_error.get(ROLE_PREPARER, ''))}"
             )
         try:
             return await asyncio.to_thread(self._finish_prepare, spec, paths, work_branch)
@@ -1173,8 +1191,13 @@ class DockerProvider:
         timeout: int,
         env: Mapping[str, str] | None = None,
         image: str | None = None,
+        secret_stdin: InstallationToken | None = None,
     ) -> int:
-        """Run one hardened, single-purpose container to completion and remove it."""
+        """Run one hardened, single-purpose container to completion and remove it.
+
+        `secret_stdin` is a token the container reads from its stdin onto a tmpfs of its
+        own (ADR 0019, S10): never `Env`, `Cmd`, a bind source or the writable layer,
+        and gone with the container, which the `finally` below removes on every path."""
         launched = self._launched.get(spec.attempt_id)
         image = image or (launched.image_digest if launched else spec.image)
         host_config = self._hardened(spec, network=network)
@@ -1189,12 +1212,28 @@ class DockerProvider:
             "Tty": False,
             "HostConfig": host_config,
         }
+        if secret_stdin is not None:
+            host_config["Tmpfs"] = {
+                **host_config["Tmpfs"],
+                scripts.TOKEN_MOUNT: (
+                    f"rw,nosuid,nodev,noexec,size={self.config.token_tmpfs_bytes},"
+                    "mode=0700,uid=1000,gid=1000"
+                ),
+            }
+            # `docker run -i`: stdin stays open until the attach closes it.
+            body.update({"OpenStdin": True, "StdinOnce": True, "AttachStdin": True})
         check_create(body, self._create_policy(spec, resolved=str(image)))
         name = f"crucible-{role}-{spec.attempt_id}"
         container_id = ""
         try:
             container_id = await self._call(self.client.create_container, name, body)
             await self._call(self.client.start_container, container_id)
+            if secret_stdin is not None:
+                await self._call(
+                    self.client.write_stdin,
+                    container_id,
+                    secret_stdin.reveal().encode("utf-8"),
+                )
             code = int(
                 await self._call(self.client.wait_container, container_id, timeout=float(timeout))
             )

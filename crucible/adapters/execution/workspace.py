@@ -12,6 +12,10 @@ a read-only identity bundle, and an empty report directory.
 
 from __future__ import annotations
 
+from urllib.parse import urlsplit
+
+from crucible.ports.execution import ProviderError
+
 # The origin URL a worker sees. It resolves nowhere, so a push cannot even start (S4).
 ORIGIN_PLACEHOLDER = "crucible-no-remote://this-checkout-cannot-push"
 SHIM_NAMES: tuple[str, ...] = ("AGENTS.md",)
@@ -24,3 +28,17 @@ EXCLUDE_ENTRIES: tuple[str, ...] = (
 
 class WorkspaceError(Exception):
     """Preparation failed. The attempt is an `environment` failure (16)."""
+
+
+def require_checkout_url(url: str, credential_host: str) -> None:
+    """ADR 0019: a checkout token is only ever handed to git for an https URL on the one
+    configured credential host, because the helper answers for nothing else and a clone
+    from anywhere else would fail later with a less useful message. Refuses otherwise."""
+    parts = urlsplit(url)
+    host = parts.netloc.rpartition("@")[2].lower()
+    if parts.scheme != "https" or host != credential_host.lower():
+        raise ProviderError(
+            f"refusing to prepare: {url} is registered as private, and a private "
+            f"repository is cloned with the GitHub App's token only over https from "
+            f"{credential_host} (github.credential_host)"
+        )
