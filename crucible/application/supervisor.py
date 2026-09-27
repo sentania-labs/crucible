@@ -117,6 +117,7 @@ from crucible.ports.execution import (
 )
 from crucible.ports.github import GitHubClient
 from crucible.ports.harness import (
+    CommandTracker,
     CredentialSource,
     ExitInfo,
     HarnessGate,
@@ -148,6 +149,11 @@ RETENTION_BATCH = 200
 # bounds one pull at 4 MiB drains 1 GiB of backlog in this many; past that the log is
 # still arriving faster than it is read, and the attempt moves on with what was stored.
 FINAL_DRAIN_PULLS = 256
+# Issue 152: while the harness reports a command in flight, a `command_running` activity
+# signal is written whenever the newest activity is at least this old. The stall clock
+# therefore resumes from within this window of the command's end.
+COMMAND_RUNNING_REFRESH_SECONDS = 60
+COMMAND_LOG_PAGE = 500
 
 
 def worker_stall_action(
@@ -167,6 +173,15 @@ def worker_stall_action(
     if quiet >= warn_seconds and (warned_at is None or warned_at < quiet_baseline):
         return "warn"
     return None
+
+
+def command_activity_due(*, now: datetime, last_activity: datetime | None) -> bool:
+    """Issue 152: whether a command in flight writes a fresh activity signal now. Once a
+    minute is enough to keep both stall clocks from advancing while it runs."""
+    return (
+        last_activity is None
+        or (now - last_activity).total_seconds() >= COMMAND_RUNNING_REFRESH_SECONDS
+    )
 
 
 def workspace_fingerprint(workspace: Workspace) -> tuple[int, int, int]:
@@ -206,6 +221,14 @@ class TickResult:
     pull_requests_polled: int = 0
     duration_ms: int = 0
     counts: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class _CommandWatch:
+    """One attempt's live-log tracker (issue 152) and the last log chunk it was fed."""
+
+    tracker: CommandTracker | None
+    after_id: int = 0
 
 
 @dataclass(slots=True)
@@ -285,6 +308,8 @@ class Supervisor:
         # The harnesses a login is running for, read once per launch pass (12, 25).
         self._logins_now: frozenset[str] = frozenset()
         self._workspace_fingerprints: dict[str, tuple[int, int, int]] = {}
+        # Rebuilt from the stored log after a restart or takeover, so nothing is lost.
+        self._command_watches: dict[str, _CommandWatch] = {}
         # The delivery half (23). With no GitHub client configured it is inert, which is
         # what every tier below the live one runs with.
         self.delivery = DeliveryCoordinator(
@@ -1524,6 +1549,7 @@ class Supervisor:
             await self._discard(provider, ws, spec)
             self._workspaces.pop(attempt.id, None)
             self._workspace_fingerprints.pop(attempt.id, None)
+            self._command_watches.pop(attempt.id, None)
             return False
         try:
             handle = await provider.launch(ws, spec)
@@ -2128,6 +2154,7 @@ class Supervisor:
             await self._db(partial(self._mark_cleaned, attempt.id, choice))
             self._workspaces.pop(attempt.id, None)
             self._workspace_fingerprints.pop(attempt.id, None)
+            self._command_watches.pop(attempt.id, None)
             self._handles.pop(attempt.id, None)
             cleaned += 1
         return cleaned
@@ -2319,6 +2346,9 @@ class Supervisor:
             changed = await self._db(partial(self._workspace_changed, attempt))
             if changed:
                 await self._db(partial(self._record_workspace_activity, attempt.id))
+            running = await self._db(partial(self._running_commands, attempt))
+            if running:
+                await self._db(partial(self._record_command_running, attempt.id, running))
             stall = await self._db(partial(self._stall_action, attempt.id))
             if stall == "fail":
                 await provider.terminate(handle, "drain")
@@ -2369,6 +2399,7 @@ class Supervisor:
         self._handles.pop(attempt.id, None)
         self._workspaces.pop(attempt.id, None)
         self._workspace_fingerprints.pop(attempt.id, None)
+        self._command_watches.pop(attempt.id, None)
         return True
 
     def _pending_quota_checkpoints(self) -> list[str]:
@@ -2731,6 +2762,55 @@ class Supervisor:
                     ts=self._clock.now(),
                     signal="fs_changed",
                     detail={},
+                )
+            )
+            uow.commit()
+
+    def _running_commands(self, attempt: Attempt) -> tuple[str, ...]:
+        """Issue 152: what the harness's live log says it has in flight, feeding the
+        attempt's tracker every stored chunk it has not yet seen."""
+        watch = self._command_watches.get(attempt.id)
+        with self._uow_factory() as uow:
+            if watch is None:
+                execution = uow.executions.get(attempt.execution_id)
+                harness = attempt.selected_harness or (execution.harness if execution else None)
+                adapter = (
+                    self._harnesses.get(harness)
+                    if self._harnesses is not None and harness is not None
+                    else None
+                )
+                watch = _CommandWatch(adapter.command_tracker() if adapter is not None else None)
+                self._command_watches[attempt.id] = watch
+            if watch.tracker is None:
+                return ()
+            while True:
+                chunks = uow.logs.list_for_attempt(
+                    attempt.id, after_id=watch.after_id, limit=COMMAND_LOG_PAGE
+                )
+                for chunk in chunks:
+                    watch.tracker.feed(chunk.stream, chunk.content.decode("utf-8", "replace"))
+                    watch.after_id = chunk.id or watch.after_id
+                if len(chunks) < COMMAND_LOG_PAGE:
+                    return watch.tracker.running
+
+    def _record_command_running(self, attempt_id: str, running: tuple[str, ...]) -> None:
+        """A command in flight is activity (issue 152, the operator's decision of
+        2026-09-27), so neither stall limit counts it; its command timeout does."""
+        with self._fenced() as uow:
+            attempt = uow.attempts.get(attempt_id)
+            if attempt is None or attempt.state is not AttemptState.RUNNING:
+                return
+            now = self._clock.now()
+            latest = uow.heartbeats.latest_activity(attempt.id)
+            if not command_activity_due(now=now, last_activity=latest.ts if latest else None):
+                return
+            uow.heartbeats.append(
+                Heartbeat(
+                    id=None,
+                    attempt_id=attempt.id,
+                    ts=now,
+                    signal="command_running",
+                    detail={"commands": list(running[:5]), "count": len(running)},
                 )
             )
             uow.commit()

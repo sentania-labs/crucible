@@ -24,7 +24,8 @@ up to the launch's command timeout, and never end the turn with one running. Wha
 mode does with a background command at exit was not observed: AGY cannot run without a
 Google login, so it was not reproduced. Its transcript format for background commands
 is unknown, so this adapter has no in-flight evidence to read and its attempts are
-classified by exit code and report alone.
+classified by exit code and report alone. For the same reason it has no live command
+tracker (issue 152): a silent AGY command counts against the stall limits.
 """
 
 from __future__ import annotations
@@ -40,6 +41,7 @@ from crucible.ports.harness import (
     AGY_BINARY,
     AdapterLaunch,
     AuthFile,
+    CommandTracker,
     CredentialSpec,
     ExitInfo,
     HarnessCapabilities,
@@ -103,6 +105,10 @@ class AgyAdapter:
 
     def provider_quota_exhausted(self, stdout_tail: str, stderr_tail: str) -> bool:
         return self.provider_quota_event(stdout_tail, stderr_tail) is not None
+
+    def command_tracker(self) -> CommandTracker | None:
+        # Issue 152: no live evidence of a running command; the stall clock runs as ever.
+        return None
 
     def capabilities(self) -> HarnessCapabilities:
         return HarnessCapabilities(

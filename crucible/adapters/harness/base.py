@@ -99,6 +99,53 @@ def in_flight_summary(label: str, detail: str) -> str:
     return text[:300]
 
 
+# The longest partial line a live tracker holds. A longer one is dropped whole and the
+# tracker resumes at the next newline; json_lines reads a transcript under the same cap.
+LIVE_LINE_LIMIT = 32 * 1024 * 1024
+
+
+class LineTracker:
+    """Issue 152: the shared half of a CommandTracker. It splits the live log into whole
+    lines, one partial line per stream, and hands each to `line`. Kubernetes merges the
+    two streams, so a tracker reads both and relies on what the line says."""
+
+    def __init__(self) -> None:
+        self._partial: dict[str, str] = {}
+        self._dropping: set[str] = set()
+
+    def feed(self, stream: str, text: str) -> None:
+        pending = self._partial.pop(stream, "") + text
+        *lines, rest = pending.split("\n")
+        for raw in lines:
+            if stream in self._dropping:
+                self._dropping.discard(stream)
+                continue
+            self.line(raw.strip())
+        if len(rest) > LIVE_LINE_LIMIT:
+            self._dropping.add(stream)
+            rest = ""
+        if rest:
+            self._partial[stream] = rest
+
+    def line(self, text: str) -> None:
+        raise NotImplementedError
+
+    @property
+    def running(self) -> tuple[str, ...]:
+        raise NotImplementedError
+
+
+def json_object(text: str) -> dict[str, Any] | None:
+    """One transcript line as an object, or None: the stream is the harness's own."""
+    if not text.startswith("{"):
+        return None
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 _RESET_KEYS = frozenset({"reset_at", "resetAt", "resets_at", "resetsAt", "reset_time"})
 
 

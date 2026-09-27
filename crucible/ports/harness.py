@@ -357,6 +357,19 @@ class HarnessUnavailableError(Exception):
         self.reason = reason
 
 
+class CommandTracker(Protocol):
+    """Issue 152: whether the harness has a command running, read from its live log.
+
+    The supervisor feeds every stored log chunk in order, from the attempt's first; a
+    tracker keeps its own partial lines. While `running` is non-empty the stall clock
+    does not advance (05b, 10)."""
+
+    def feed(self, stream: str, text: str) -> None: ...
+
+    @property
+    def running(self) -> tuple[str, ...]: ...
+
+
 class HarnessAdapter(Protocol):
     name: str
     supported_versions: VersionRange
@@ -385,4 +398,9 @@ class HarnessAdapter(Protocol):
 
     def provider_quota_exhausted(self, stdout_tail: str, stderr_tail: str) -> bool:
         """True only for the harness's authoritative provider-refusal event."""
+        ...
+
+    def command_tracker(self) -> CommandTracker | None:
+        """A fresh tracker for one attempt, or None where the harness gives no live
+        evidence of a running command (AGY): its stall clock runs as for any worker."""
         ...

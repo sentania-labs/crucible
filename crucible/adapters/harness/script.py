@@ -19,6 +19,7 @@ from crucible.adapters.harness import base
 from crucible.domain.exit_class import ExitClass
 from crucible.ports.harness import (
     AdapterLaunch,
+    CommandTracker,
     CredentialSpec,
     ExitInfo,
     HarnessCapabilities,
@@ -82,6 +83,9 @@ class ScriptHarnessAdapter:
 
     def provider_quota_exhausted(self, stdout_tail: str, stderr_tail: str) -> bool:
         return self.provider_quota_event(stdout_tail, stderr_tail) is not None
+
+    def command_tracker(self) -> CommandTracker | None:
+        return None
 
     def capabilities(self) -> HarnessCapabilities:
         return HarnessCapabilities(

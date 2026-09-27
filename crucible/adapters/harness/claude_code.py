@@ -201,6 +201,9 @@ class ClaudeCodeAdapter:
         pending = in_flight(report_dir / base.TRANSCRIPT_NAME) if report_dir else ()
         return base.with_in_flight(exit_class, pending)
 
+    def command_tracker(self) -> CommandTracker:
+        return CommandTracker()
+
 
 def in_flight(transcript: Path) -> tuple[str, ...]:
     """Backgrounded commands the CLI still had open when its final `result` arrived.
@@ -234,6 +237,74 @@ def in_flight(transcript: Path) -> tuple[str, ...]:
         base.in_flight_summary(f"background task {task_id}", description)
         for task_id, description in open_tasks.items()
     )
+
+
+class CommandTracker(base.LineTracker):
+    """Issue 152: tool calls the stream-json log has started and not answered.
+
+    An `assistant` event carries each `tool_use` block before the tool runs, and the
+    `user` event carrying its `tool_result` comes when it ends. A later assistant
+    message from the same agent also closes them, since the model is only called again
+    once every result is back; that keeps a result line too long to read from holding
+    the clock forever. A backgrounded task is running until the CLI reports its end."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        # tool_use id -> (agent it belongs to, the message that asked, summary)
+        self._tools: dict[str, tuple[str | None, str | None, str]] = {}
+        self._tasks: dict[str, str] = {}
+
+    def line(self, text: str) -> None:
+        event = base.json_object(text)
+        if event is None:
+            return
+        kind = event.get("type")
+        message = event.get("message")
+        blocks = message.get("content") if isinstance(message, dict) else None
+        if kind == "assistant" and isinstance(message, dict):
+            agent = event.get("parent_tool_use_id")
+            message_id = message.get("id")
+            for open_id, (owner, asked_in, _) in list(self._tools.items()):
+                if owner == agent and asked_in != message_id:
+                    del self._tools[open_id]
+            for block in blocks if isinstance(blocks, list) else ():
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    tool_id = block.get("id")
+                    if isinstance(tool_id, str):
+                        self._tools[tool_id] = (agent, message_id, _tool_summary(block))
+        elif kind == "user":
+            for block in blocks if isinstance(blocks, list) else ():
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    self._tools.pop(str(block.get("tool_use_id")), None)
+        elif kind == "system":
+            task_id = event.get("task_id")
+            if not isinstance(task_id, str):
+                return
+            subtype = event.get("subtype")
+            if subtype == "task_started" and event.get("is_backgrounded") is True:
+                self._tasks[task_id] = base.in_flight_summary(
+                    f"background task {task_id}", str(event.get("description") or task_id)
+                )
+            elif subtype in ("task_updated", "task_notification"):
+                patch = event.get("patch")
+                status = event.get("status") or (
+                    patch.get("status") if isinstance(patch, dict) else None
+                )
+                if status in FINISHED_TASK_STATUSES or status in STOPPED_TASK_STATUSES:
+                    self._tasks.pop(task_id, None)
+
+    @property
+    def running(self) -> tuple[str, ...]:
+        return tuple(summary for _, _, summary in self._tools.values()) + tuple(
+            self._tasks.values()
+        )
+
+
+def _tool_summary(block: dict[str, Any]) -> str:
+    name = str(block.get("name") or "tool")
+    arguments = block.get("input")
+    detail = arguments.get("command") if isinstance(arguments, dict) else None
+    return base.in_flight_summary(f"tool {name}", str(detail or block.get("id")))
 
 
 def _metrics(transcript: Path) -> tuple[ReportMetrics, int]:
