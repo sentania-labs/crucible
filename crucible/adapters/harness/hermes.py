@@ -6,13 +6,14 @@ that outlives `TERMINAL_TIMEOUT` (default 180 seconds) is killed and the model i
 (default 600 seconds). The launch sets both to the launch's command timeout. A model can
 still start a command with `background=true`; under `-z` Hermes says it cannot deliver
 the completion and exits without waiting (reproduced on 0.19.0 against a stub model,
-2026-09-25). Its own process registry, `processes.json` in HERMES_HOME, lists every
-background command still running; the launch wrapper copies it into the report
-directory after Hermes exits, and a non-empty list is work in flight.
+2026-09-25). Such a process dies with the sandbox and is not unfinished work (issue
+153), and a foreground command never outlives Hermes, so Hermes's exit is classified on
+its usage record, exit code and report alone.
 
-During the run (issue 152) the wrapper also counts the registry's entries and writes the
-count to stderr when it changes, the only live evidence there is: `-z` sends Hermes's
-own output to /dev/null, and a foreground command never enters the registry.
+During the run (issue 152) the launch wrapper counts the entries of Hermes's own process
+registry, `processes.json` in HERMES_HOME, and writes the count to stderr when it
+changes, the only live evidence there is: `-z` sends Hermes's own output to /dev/null,
+and a foreground command never enters the registry.
 """
 
 from __future__ import annotations
@@ -47,9 +48,8 @@ NAME = "hermes"
 HERMES_HOME = "/home/worker/.hermes"
 AUTH_DIR = "/home/worker/.hermes-auth"
 USAGE_NAME = "hermes-usage.json"
-# Hermes's process registry checkpoint, and the name its after-exit copy takes.
+# Hermes's process registry checkpoint, counted by the launch wrapper (issue 152).
 PROCESSES_FILE = f"{HERMES_HOME}/processes.json"
-PROCESSES_NAME = "hermes-processes.json"
 # What the launch wrapper writes to stderr when the registry's count changes (07).
 RUNNING_LINE = re.compile(r"crucible-launch: commands running: (\d+)")
 
@@ -195,8 +195,7 @@ class HermesAdapter:
                 # Issue 128: Hermes reads both in whole seconds.
                 "TERMINAL_TIMEOUT": seconds,
                 "TERMINAL_MAX_FOREGROUND_TIMEOUT": seconds,
-                "CRUCIBLE_AFTER_EXIT": f"{PROCESSES_FILE}={PROCESSES_NAME}",
-                # Issue 152: the same registry, counted while Hermes runs.
+                # Issue 152: the process registry, counted while Hermes runs.
                 "CRUCIBLE_IN_FLIGHT_FILE": PROCESSES_FILE,
             },
             env_from_files=spec.env_from_files() if ctx.credential_mounted else {},
@@ -225,7 +224,6 @@ class HermesAdapter:
             transcript_lines=parsed.transcript_lines,
             transcript_name=parsed.transcript_name,
             run_evidence_error=error,
-            in_flight=in_flight(report_dir),
         )
 
     def classify_exit(
@@ -243,18 +241,6 @@ class HermesAdapter:
             return ExitClass.KILLED
         if exit.oom_killed:
             return ExitClass.ENVIRONMENT
-        return base.with_in_flight(
-            self._classify(exit, stdout_tail, stderr_tail, report_dir),
-            in_flight(report_dir) if report_dir is not None else (),
-        )
-
-    def _classify(
-        self,
-        exit: ExitInfo,
-        stdout_tail: str,
-        stderr_tail: str,
-        report_dir: Path | None,
-    ) -> ExitClass:
         usage, _ = _usage(report_dir)
         tails = (stdout_tail[-base.TAIL_LIMIT :], stderr_tail[-base.TAIL_LIMIT :])
         quota = base.first_match(tails, QUOTA_PATTERNS) is not None
@@ -308,23 +294,3 @@ class CommandTracker(base.LineTracker):
                 base.in_flight_summary("process registry", f"{self._count} running"),
             ),
         )
-
-
-def in_flight(report_dir: Path) -> tuple[str, ...]:
-    """Background commands Hermes's own registry still listed as running at exit."""
-    text = base.read_text(report_dir / PROCESSES_NAME, 1024 * 1024)
-    if text is None:
-        return ()
-    try:
-        entries = json.loads(text)
-    except ValueError:
-        return (base.in_flight_summary("process registry", "unparsable processes.json"),)
-    if not isinstance(entries, list):
-        return ()
-    return tuple(
-        base.in_flight_summary(
-            f"background process {entry.get('session_id', '?')}", str(entry.get("command", ""))
-        )
-        for entry in entries
-        if isinstance(entry, dict)
-    )

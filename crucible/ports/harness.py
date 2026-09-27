@@ -342,9 +342,10 @@ class ParsedReport:
     transcript_lines: int = 0
     transcript_name: str | None = None
     run_evidence_error: str | None = None
-    # Issue 128: what the harness's own tooling (its transcript, or a state file the
-    # launch wrapper copied after exit) said was still running when the harness exited.
-    # Non-empty makes a clean exit `incomplete`.
+    # Issue 128: a command the harness's own transcript shows it was waiting on and cut
+    # off at exit (Claude Code's auto-background). A background process the worker chose
+    # to leave running is not listed (issue 153). Non-empty makes a clean exit
+    # `incomplete`.
     in_flight: tuple[str, ...] = ()
 
 

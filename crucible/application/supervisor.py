@@ -3231,7 +3231,8 @@ class Supervisor:
                     "report_parsed": claim_ok,
                     "partial_report_kept_unparsed": cancelled and report_present,
                     "blocked_present": outputs.blocked_md is not None,
-                    # Issue 128: what the harness said was still running at its exit.
+                    # Issue 128: commands the harness was waiting on and cut off at its
+                    # exit. A background process left running is not listed (153).
                     **(
                         {"work_in_flight": [redact(item) for item in parsed.in_flight]}
                         if parsed is not None and parsed.in_flight

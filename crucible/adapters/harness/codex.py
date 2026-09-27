@@ -22,8 +22,12 @@ instead leaves the command to die with the process (reproduced on 0.156.0 agains
 stub model, 2026-09-25). Turning the `unified_exec` feature off does not change the
 tool, so nothing at the launch can make a command block. The launch sets
 `background_terminal_max_timeout`, the longest single poll, to the launch's command
-timeout so one poll can wait out a long build. A `command_execution` item the JSON
-stream started and never completed is work in flight.
+timeout so one poll can wait out a long build. A session the model leaves open when it
+ends its turn is a background process that dies with the sandbox, not unfinished work
+(issue 153): Codex exits only once the turn is over, so it never exits while a command
+it was waiting on is still running, and its exit is classified on the exit code and
+the report alone. While the run lasts, an open `command_execution` item still counts as
+activity for the stall clock (issue 152).
 """
 
 from __future__ import annotations
@@ -182,40 +186,17 @@ class CodexAdapter:
             exit,
             metrics=metrics,
             transcript_lines=lines,
-            in_flight=in_flight(transcript),
         )
 
     def classify_exit(
         self, exit: ExitInfo, stdout_tail: str, stderr_tail: str, report_dir: Path | None = None
     ) -> ExitClass:
-        exit_class = base.classify_with_patterns(
+        return base.classify_with_patterns(
             exit, stdout_tail, stderr_tail, auth=AUTH_PATTERNS, quota=QUOTA_PATTERNS
         )
-        pending = in_flight(report_dir / base.TRANSCRIPT_NAME) if report_dir else ()
-        return base.with_in_flight(exit_class, pending)
 
     def command_tracker(self) -> CommandTracker:
         return CommandTracker()
-
-
-def in_flight(transcript: Path) -> tuple[str, ...]:
-    """`command_execution` items the stream started and never completed."""
-    started: dict[str, str] = {}
-    for event in base.json_lines(transcript):
-        item = event.get("item")
-        if not isinstance(item, dict) or item.get("type") != "command_execution":
-            continue
-        item_id = item.get("id")
-        if not isinstance(item_id, str):
-            continue
-        if event.get("type") == "item.started":
-            started[item_id] = str(item.get("command") or item_id)
-        elif event.get("type") == "item.completed":
-            started.pop(item_id, None)
-    return tuple(
-        base.in_flight_summary(f"command {item_id}", command)
-        for item_id, command in started.items()
-    )
 
 
 class CommandTracker(base.LineTracker):

@@ -63,7 +63,8 @@ settings are in 07; this note keeps the observations.
   "notify_on_complete / watch_patterns are not available in this session", Hermes
   exited 0 two seconds in with `completed: true`, and its `processes.json` still
   listed the command. The registry rewrites that file whenever a process ends
-  (`_move_to_finished`), so an entry at exit is a command still running.
+  (`_move_to_finished`), so an entry at exit is a command still running. Since issue
+  153 that entry is a background process, not unfinished work, and is not read at exit.
 - **AGY.** `agy --help` has `--print-timeout` and nothing for commands. The
   binary's strings show `run_command` taking `Blocking` and `WaitMsBeforeAsync`
   from the model, and "Background command is still running after %ds". The
@@ -77,12 +78,11 @@ settings are in 07; this note keeps the observations.
   evidence of it (issue 152, below): AGY, and a Hermes foreground command. There a
   command outlasting `stall_fail_seconds` (1800 s in the seeded policy) is a stall
   before it reaches the 60-minute default.
-- A worker that leaves a server or other long command running when it ends its
-  turn is `incomplete`, even with a valid report. That is the requirement read
-  literally; `incomplete` is not retried.
+- A worker that leaves a server or other background process running when it ends its
+  turn is not `incomplete` (issue 153, below). Only Claude Code's auto-background is.
 - The transcript is evidence only when it is collected: a report directory file
   over the policy's size cap is dropped at collection, and with it the Claude Code
-  or Codex record of what was running.
+  record of a call it cut off.
 - AGY has only a prompt instruction (07), not a setting, and no evidence is read.
 
 ## Why no generic process check
@@ -92,6 +92,39 @@ considered and not built: a build that leaves a daemon behind (a Gradle daemon,
 a git fsmonitor) would mark every such attempt incomplete. The requirement is
 what the harness's own tooling reports, so the evidence is per harness.
 
+## A background process left running is not unfinished work (issue 153, FDY-0125)
+
+The operator, 2026-09-27: a process a worker leaves running dies with the sandbox when
+the attempt ends, and recording it helps no one ("How will keeping a naughty list be
+actionable or help us improve?"). Unfinished work is caught independently by the pre-PR
+gates (verification ran, run evidence present) and by CI on the PR. Foundry issued the
+work the same day on the operator's "Go for 2/4".
+
+`incomplete` now means only that the harness ended while a command it was waiting on
+was still running, shown by its own transcript. Per harness:
+
+- **Claude Code** keeps it for a task the CLI moved to the background on its own. A task
+  whose `tool_use` asked for `run_in_background` is the model's own background process
+  and does not count. Observed on 2026-09-27 (pinned image, stub model, `--network
+  none`): without `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS`, a model-requested 20 s command
+  was answered "Command running in background with ID", recorded as `task_started`
+  (`is_backgrounded: true`, with its `tool_use_id`) exactly as an auto-backgrounded one
+  is, and killed at exit; the only difference in the transcript is the key on the
+  `tool_use` input. With the launch setting, the same request was refused ("An
+  unexpected parameter `run_in_background` was provided") and no task started.
+- **Codex** has no such case. Unified exec always hands a long command back to the model
+  as a session within 30 s, and Codex exits only once the model ends its turn, so an
+  item still open at exit is a session the model chose not to poll.
+- **Hermes** has none either. A foreground command is killed at `TERMINAL_TIMEOUT` and
+  reported, and its registry lists only `background=true` processes. The launch
+  wrapper's after-exit copy of `processes.json` (`CRUCIBLE_AFTER_EXIT`) is removed; the
+  live count for the stall clock (issue 152) is unchanged.
+- **AGY** is unchanged: no evidence is read.
+
+The stall clock is unchanged: a command a harness reports in flight, a Hermes background
+process counted by the wrapper included, still counts as activity, bounded by the
+command timeout plus one minute.
+
 ## A command in flight pauses the stall clock (issue 152, FDY-0123)
 
 The operator, 2026-09-27: "a running command counts as activity. While a harness
@@ -99,8 +132,8 @@ reports a command in flight, the stall clock pauses, so the stall limit applies 
 worker doing nothing and the command timeout applies to a command running long."
 Foundry issued the work the same day on the operator's "apply your recommendation".
 
-The evidence is the one this note already reads at exit, read from the live log
-instead: each adapter's `command_tracker()` is fed every stored log chunk in order,
+The evidence is the one this note read at exit before issue 153, read from the live
+log instead: each adapter's `command_tracker()` is fed every stored log chunk in order,
 and while it reports a command the supervisor writes a `command_running` activity
 heartbeat whenever the newest activity is older than a minute (or half the shorter
 stall limit, when that is less). Both stall clocks (warn and fail) read activity, so
