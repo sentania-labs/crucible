@@ -1,20 +1,22 @@
 """Issue 128 through the supervisor: the launch carries the resolved per-command
 timeout, submission holds a contract's value to the policy's bounds, and a harness
-that exits with work still in flight is recorded `incomplete`, not completed."""
+that exits with a command it was waiting on cut off is recorded `incomplete`, not
+completed. Issue 153: a background process the worker chose to leave running is not."""
 
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 
+from crucible.adapters.api.app import create_app
 from crucible.adapters.api.deps import AppContext
 from crucible.adapters.execution.fake import FakeProvider
 from crucible.adapters.harness.base import TRANSCRIPT_NAME
-from crucible.adapters.harness.hermes import PROCESSES_NAME
 from crucible.ports.execution import CollectedOutputs, Handle, LaunchSpec, Workspace
 from crucible.ports.github import InstallationToken
 from tests.fixtures import contract_document
@@ -22,25 +24,85 @@ from tests.integration.conftest import make_supervisor, run_to_settled, submit_a
 
 pytestmark = pytest.mark.integration
 
-# What each harness's own tooling leaves behind when it exits with a command running:
-# a Claude Code background task that never ended, a Codex command item never completed
-# (both are transcript lines), and a Hermes process registry that still lists one. The
-# fake provider picks the harness, so the report carries all three.
-IN_FLIGHT_TRANSCRIPT = [
-    {"type": "system", "subtype": "task_started", "task_id": "b1", "is_backgrounded": True},
+# The trap (issue 128): Claude Code moved a Bash call to the background on its own and
+# the exit killed it after the final result.
+CUT_OFF_TRANSCRIPT: list[dict[str, Any]] = [
+    {
+        "type": "assistant",
+        "message": {
+            "id": "m1",
+            "content": [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {}}],
+        },
+    },
+    {
+        "type": "system",
+        "subtype": "task_started",
+        "task_id": "b1",
+        "tool_use_id": "t1",
+        "is_backgrounded": True,
+    },
+    {"type": "result", "subtype": "success"},
+    {"type": "system", "subtype": "task_updated", "task_id": "b1", "patch": {"status": "killed"}},
+]
+# Issue 153: what a worker leaves running on purpose. A Claude Code task the model asked
+# for with `run_in_background`, and a Codex unified-exec session never completed (both
+# transcript lines, so either harness reads its own).
+BACKGROUND_TRANSCRIPT: list[dict[str, Any]] = [
+    {
+        "type": "assistant",
+        "message": {
+            "id": "m1",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "t1",
+                    "name": "Bash",
+                    "input": {"command": "make serve", "run_in_background": True},
+                }
+            ],
+        },
+    },
+    {
+        "type": "system",
+        "subtype": "task_started",
+        "task_id": "b1",
+        "tool_use_id": "t1",
+        "is_backgrounded": True,
+    },
     {"type": "item.started", "item": {"id": "item_1", "type": "command_execution"}},
     {"type": "result", "subtype": "success"},
 ]
+# The default route picks Claude Code. A contract that names another harness pins it,
+# which only an operator may submit.
+PINNED_CODEX = {
+    "harness": "codex",
+    "model": "gpt-5.6-luna",
+    "pin_reason": "the transcript under test is Codex's",
+}
+
+
+@pytest.fixture
+def operator(ctx: AppContext, tokens: dict[str, str]) -> Iterator[TestClient]:
+    with TestClient(
+        create_app(ctx), headers={"Authorization": f"Bearer {tokens['operator']}"}
+    ) as c:
+        yield c
 
 
 class InFlightProvider(FakeProvider):
     """A fake whose workspaces are real directories, so the adapter reads the report."""
 
-    def __init__(self, root: Path, only_image: str | None = None) -> None:
+    def __init__(
+        self,
+        root: Path,
+        only_image: str | None = None,
+        transcript: list[dict[str, Any]] = CUT_OFF_TRANSCRIPT,
+    ) -> None:
         super().__init__()
         self.root = root
-        # When set, only attempts launched from this image leave work in flight.
+        # When set, only attempts launched from this image leave the transcript.
         self.only_image = only_image
+        self.transcript = transcript
 
     async def prepare(
         self, spec: LaunchSpec, checkout_token: InstallationToken | None = None
@@ -64,11 +126,8 @@ class InFlightProvider(FakeProvider):
         report = Path(ws.checkout_path).parent / "output" / "report"
         report.mkdir(parents=True, exist_ok=True)
         (report / TRANSCRIPT_NAME).write_text(
-            "\n".join(json.dumps(line) for line in IN_FLIGHT_TRANSCRIPT) + "\n",
+            "\n".join(json.dumps(line) for line in self.transcript) + "\n",
             encoding="utf-8",
-        )
-        (report / PROCESSES_NAME).write_text(
-            json.dumps([{"session_id": "proc_1", "command": "make test"}]), encoding="utf-8"
         )
         return await super().collect(h, ws, spec)
 
@@ -113,7 +172,7 @@ def test_submission_holds_the_command_timeout_to_the_policy_bounds(client: TestC
     assert "must not exceed timeout_seconds" in over.text
 
 
-async def test_a_harness_that_exits_with_work_in_flight_is_incomplete(
+async def test_a_harness_that_exits_with_a_command_cut_off_is_incomplete(
     client: TestClient, ctx: AppContext, tmp_path: Path
 ) -> None:
     provider = InFlightProvider(tmp_path)
@@ -122,10 +181,8 @@ async def test_a_harness_that_exits_with_work_in_flight_is_incomplete(
     await run_to_settled(supervisor, client, task_id)
     (attempt,) = _attempts(client, task_id)
     view = client.get(f"/v1/tasks/{task_id}").json()
-    harness = view["executions"][0]["harness"]
-    if harness == "agy":
-        pytest.skip("AGY leaves no in-flight evidence to read (its adapter says why)")
-    assert attempt["exit_class"] == "incomplete", harness
+    assert view["executions"][0]["harness"] == "claude_code"
+    assert attempt["exit_class"] == "incomplete"
     assert attempt["state"] == "failed"
     events = client.get(f"/v1/tasks/{task_id}/events").json()["items"]
     collected = next(e for e in events if e["kind"] == "attempt_collected")
@@ -135,18 +192,48 @@ async def test_a_harness_that_exits_with_work_in_flight_is_incomplete(
     assert all(g["result"] != "pass" for g in gates if g["gate"] == "exit_clean")
 
 
-async def test_a_review_that_exits_with_work_in_flight_is_not_recorded(
-    client: TestClient, ctx: AppContext, tmp_path: Path
+@pytest.mark.parametrize("request_overrides", [{}, PINNED_CODEX], ids=["claude_code", "codex"])
+async def test_a_background_process_left_running_is_a_completion(
+    operator: TestClient, ctx: AppContext, tmp_path: Path, request_overrides: dict[str, str]
 ) -> None:
-    """A review worker that exits 0 with a valid ReviewReportV1 but a command still
-    running did not finish: no review is recorded and the attempt fails."""
+    """Issue 153: a process the worker left running dies with the sandbox. The attempt
+    completes and the collection records no warning about it."""
+    client = operator
+    provider = InFlightProvider(tmp_path, transcript=BACKGROUND_TRANSCRIPT)
+    supervisor = make_supervisor(ctx, provider)
+    request = {**contract_document()["execution_request"], **request_overrides}
+    task_id = submit_and_start(
+        client, "crucible-worker:fake-succeed", "EX-0153A", execution_request=request
+    )
+    await run_to_settled(supervisor, client, task_id)
+    (attempt,) = _attempts(client, task_id)
+    view = client.get(f"/v1/tasks/{task_id}").json()
+    assert view["executions"][0]["harness"] == request_overrides.get("harness", "claude_code")
+    assert attempt["exit_class"] == "completed"
+    events = client.get(f"/v1/tasks/{task_id}/events").json()["items"]
+    collected = next(e for e in events if e["kind"] == "attempt_collected")
+    assert "work_in_flight" not in collected["payload"]
+    gates = client.get(f"/v1/attempts/{attempt['id']}/gates").json()["items"]
+    assert [g["result"] for g in gates if g["gate"] == "exit_clean"] == ["pass"]
+
+
+async def test_a_review_that_exits_with_a_command_cut_off_is_not_recorded(
+    operator: TestClient, ctx: AppContext, tmp_path: Path
+) -> None:
+    """A review worker that exits 0 with a valid ReviewReportV1 but a command it was
+    waiting on cut off did not finish: no review is recorded and the attempt fails. The
+    author runs on Codex so the Claude Code reviewer is a different harness."""
+    client = operator
     provider = InFlightProvider(tmp_path, only_image="crucible-worker:fake-review")
     supervisor = make_supervisor(ctx, provider)
-    task_id = submit_and_start(client, "crucible-worker:fake-succeed", "EX-0128E")
+    request = {**contract_document()["execution_request"], **PINNED_CODEX}
+    task_id = submit_and_start(
+        client, "crucible-worker:fake-succeed", "EX-0128E", execution_request=request
+    )
     assert await run_to_settled(supervisor, client, task_id) == "awaiting_internal_review"
     review = {
-        "harness": "codex",
-        "model": "gpt-5.6-luna",
+        "harness": "claude_code",
+        "model": "claude-sonnet-5",
         "provider": "fake",
         "image": "crucible-worker:fake-review",
         "timeout_seconds": 600,

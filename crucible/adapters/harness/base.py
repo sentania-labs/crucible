@@ -85,8 +85,8 @@ def classify_with_patterns(
 
 
 def with_in_flight(exit_class: ExitClass, in_flight: Sequence[str]) -> ExitClass:
-    """Issue 128: a clean exit while the harness's own tooling reported a command still
-    running is `incomplete`, never a completion. Any other class already says the run
+    """Issue 128: a clean exit while the harness's own transcript shows a command it was
+    waiting on cut off is `incomplete`, never a completion. Any other class already says the run
     did not finish cleanly, and a termination Crucible performed keeps its own class."""
     if in_flight and exit_class in (ExitClass.COMPLETED, ExitClass.COMPLETED_WITHOUT_REPORT):
         return ExitClass.INCOMPLETE

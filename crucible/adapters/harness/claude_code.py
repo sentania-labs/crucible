@@ -20,7 +20,10 @@ background, and a headless run that ends its turn then kills it on exit (reprodu
 reported to the model instead, and both `BASH_DEFAULT_TIMEOUT_MS` and
 `BASH_MAX_TIMEOUT_MS` to the launch's command timeout. The stream-json transcript's
 `task_started`, `task_updated` and `task_notification` events are the CLI's own record
-of a backgrounded command; one still open at the final `result` is work in flight.
+of a backgrounded command; one the CLI backgrounded on its own and still open at the
+final `result` is a blocking call cut off, and makes a clean exit `incomplete`. One the
+model asked for with `run_in_background` is a background process the model chose to
+leave, and dies with the sandbox; it is not unfinished work (issue 153).
 """
 
 from __future__ import annotations
@@ -206,15 +209,19 @@ class ClaudeCodeAdapter:
 
 
 def in_flight(transcript: Path) -> tuple[str, ...]:
-    """Backgrounded commands the CLI still had open when its final `result` arrived.
+    """Commands the CLI moved to the background on its own and still had open when its
+    final `result` arrived: the auto-background trap (issue 128).
 
     A task the CLI reports `completed` or `failed` ended on its own, whenever that was.
     One it reports `killed` or `stopped` before the final result was ended during the
     run (the model stopped it); the same status after the final result is the exit
-    killing it, which is the trap. A task with no end at all is in flight too."""
+    killing it, which is the trap. A task with no end at all is in flight too. A task
+    whose `tool_use` asked for `run_in_background` is the model's own background
+    process, never counted (issue 153)."""
     events = list(base.json_lines(transcript))
     results = [i for i, event in enumerate(events) if event.get("type") == "result"]
     last_result = results[-1] if results else len(events)
+    chosen = _background_requests(events)
     open_tasks: dict[str, str] = {}
     for index, event in enumerate(events):
         if event.get("type") != "system":
@@ -224,7 +231,8 @@ def in_flight(transcript: Path) -> tuple[str, ...]:
         if not isinstance(task_id, str):
             continue
         if subtype == "task_started" and event.get("is_backgrounded") is True:
-            open_tasks[task_id] = str(event.get("description") or task_id)
+            if event.get("tool_use_id") not in chosen:
+                open_tasks[task_id] = str(event.get("description") or task_id)
         elif subtype in ("task_updated", "task_notification"):
             patch = event.get("patch")
             status = event.get("status") or (
@@ -237,6 +245,27 @@ def in_flight(transcript: Path) -> tuple[str, ...]:
         base.in_flight_summary(f"background task {task_id}", description)
         for task_id, description in open_tasks.items()
     )
+
+
+def _background_requests(events: list[dict[str, Any]]) -> frozenset[str]:
+    """The `tool_use` ids whose input asked for `run_in_background`: the model chose to
+    background them. Observed on 2.1.280 (2026-09-27, stub model): the CLI's own
+    backgrounding leaves the input as the model sent it, without the key, and under
+    `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` the key is refused as an unexpected
+    parameter, so no task starts."""
+    chosen: set[str] = set()
+    for event in events:
+        message = event.get("message")
+        blocks = message.get("content") if isinstance(message, dict) else None
+        if event.get("type") != "assistant" or not isinstance(blocks, list):
+            continue
+        for block in blocks:
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            arguments = block.get("input")
+            if isinstance(arguments, dict) and arguments.get("run_in_background") is True:
+                chosen.add(str(block.get("id")))
+    return frozenset(chosen)
 
 
 class CommandTracker(base.LineTracker):

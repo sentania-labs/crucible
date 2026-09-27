@@ -8,7 +8,8 @@ Each harness is launched with the adapter's own argv and environment, through th
 provider's launch wrapper, and its report directory is classified by the adapter, so
 what is proven is the launch Crucible actually sends and the class it would record.
 For each: the trap reproduced without the setting, then the setting making the harness
-end or wait for the command instead of exiting with it running. AGY cannot run without a
+end or wait for the command instead of exiting with it running. A background process the
+model chose to leave running is a completion (issue 153). AGY cannot run without a
 Google login and is not in this tier (its adapter documents what is and is not known).
 
     make e2e-command-timeout
@@ -215,6 +216,33 @@ def test_claude_code_trap_without_the_setting_is_classified_incomplete(tmp_path:
     assert run.classify(ClaudeCodeAdapter()) is ExitClass.INCOMPLETE
 
 
+def test_claude_code_background_the_model_asked_for_is_a_completion(tmp_path: Path) -> None:
+    """Issue 153: without the setting, the model's own `run_in_background` starts the
+    task and the exit kills it, as in the trap; it is not a call the CLI was waiting on."""
+    run = run_harness(
+        tmp_path,
+        claude(60_000),
+        command=long_command(20),
+        extra_env={**CLAUDE_ENV, "STUB_BACKGROUND": "1"},
+        drop_env=("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS",),
+    )
+    assert run.exit_code == 0 and not run.marker and run.elapsed < 15
+    assert "Command running in background" in run.tool_outputs()
+    assert run.classify(ClaudeCodeAdapter()) is ExitClass.COMPLETED
+
+
+def test_claude_code_refuses_a_background_request_under_the_setting(tmp_path: Path) -> None:
+    run = run_harness(
+        tmp_path,
+        claude(60_000),
+        command=long_command(20),
+        extra_env={**CLAUDE_ENV, "STUB_BACKGROUND": "1"},
+    )
+    assert run.exit_code == 0 and not run.marker
+    assert "unexpected parameter `run_in_background`" in run.tool_outputs()
+    assert run.classify(ClaudeCodeAdapter()) is ExitClass.COMPLETED
+
+
 def test_claude_code_ends_a_command_at_the_launch_timeout_instead(tmp_path: Path) -> None:
     run = run_harness(tmp_path, claude(3000), command=long_command(40), extra_env=CLAUDE_ENV)
     assert run.exit_code == 0 and not run.marker and run.elapsed < 35
@@ -245,7 +273,9 @@ def codex(timeout_ms: int) -> AdapterLaunch:
     return CodexAdapter().build_launch(context(timeout_ms))
 
 
-def test_codex_trap_a_session_left_running_is_classified_incomplete(tmp_path: Path) -> None:
+def test_codex_session_left_running_is_a_completion(tmp_path: Path) -> None:
+    """Issue 153: the model ended its turn on an open unified-exec session. The command
+    dies with the sandbox; Codex was not waiting on it, so the exit is clean."""
     run = run_harness(
         tmp_path,
         codex(60_000),
@@ -255,7 +285,7 @@ def test_codex_trap_a_session_left_running_is_classified_incomplete(tmp_path: Pa
     )
     assert run.exit_code == 0 and not run.marker and run.elapsed < 35
     assert "Process running with session ID" in run.tool_outputs()
-    assert run.classify(CodexAdapter()) is ExitClass.INCOMPLETE
+    assert run.classify(CodexAdapter()) is ExitClass.COMPLETED
 
 
 def test_codex_polls_a_long_command_to_its_end_within_the_launch_window(tmp_path: Path) -> None:
@@ -288,9 +318,9 @@ def hermes(timeout_ms: int) -> AdapterLaunch:
     )
 
 
-def test_hermes_trap_a_background_process_left_running_is_classified_incomplete(
-    tmp_path: Path,
-) -> None:
+def test_hermes_background_process_left_running_is_a_completion(tmp_path: Path) -> None:
+    """Issue 153: a model-requested `background=true` process is still in Hermes's
+    registry at exit; it dies with the sandbox and nothing is copied out or recorded."""
     run = run_harness(
         tmp_path,
         hermes(60_000),
@@ -299,8 +329,10 @@ def test_hermes_trap_a_background_process_left_running_is_classified_incomplete(
     )
     assert run.exit_code == 0 and not run.marker
     assert "notify_unsupported" in run.tool_outputs()
-    assert (run.report / "hermes-processes.json").exists()
-    assert run.classify(HermesAdapter()) is ExitClass.INCOMPLETE
+    assert sorted(p.name for p in run.report.iterdir() if p.name.startswith("hermes-")) == [
+        "hermes-usage.json"
+    ]
+    assert run.classify(HermesAdapter()) is ExitClass.COMPLETED
 
 
 def test_hermes_ends_a_command_at_the_launch_timeout(tmp_path: Path) -> None:

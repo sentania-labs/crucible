@@ -149,7 +149,6 @@ def test_hermes_launch_matches_07_and_uses_the_optional_api_key() -> None:
         # Issue 128: whole seconds, from the launch's command timeout.
         "TERMINAL_TIMEOUT": "900",
         "TERMINAL_MAX_FOREGROUND_TIMEOUT": "900",
-        "CRUCIBLE_AFTER_EXIT": "/home/worker/.hermes/processes.json=hermes-processes.json",
         "CRUCIBLE_IN_FLIGHT_FILE": "/home/worker/.hermes/processes.json",
     }
     assert launch.env_from_files == {"OPENAI_API_KEY": "/home/worker/.hermes-auth/api-key"}
