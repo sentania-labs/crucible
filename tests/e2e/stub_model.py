@@ -142,6 +142,10 @@ class Handler(BaseHTTPRequestHandler):
         tool = _shell_tool(body)
         call = tool is not None and not _has_tool_result(body)
         _log({"at": time.time(), "path": path, "call": call, "tool": tool, "body": body})
+        if not call and _has_tool_result(body):
+            # A model slow to answer after a tool result (`STUB_REPLY_DELAY` seconds), so
+            # the harness is still running while what the tool started goes on (152).
+            time.sleep(float(os.environ.get("STUB_REPLY_DELAY") or 0))
         if path.endswith("/messages/count_tokens"):
             self._json(200, {"input_tokens": 1})
         elif path.endswith("/messages"):
