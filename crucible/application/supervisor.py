@@ -2847,7 +2847,12 @@ class Supervisor:
     def _running_commands(self, attempt: Attempt) -> tuple[str, ...]:
         """Issue 152: what the harness's live log says it has in flight, feeding the
         attempt's tracker every stored chunk it has not yet seen, less any command
-        reported for longer than its command timeout allows."""
+        reported for longer than its command timeout allows.
+
+        On a restart or a takeover, `watch` is new and this replays the whole stored
+        log at once. A command already running when the replay starts gets its
+        `first_seen` from the chunk where the tracker first reports it, not from now,
+        so its age survives the restart instead of resetting on every takeover."""
         with self._uow_factory() as uow:
             watch = self._command_watch(uow, attempt)
             tracker = watch.tracker
@@ -2861,7 +2866,11 @@ class Supervisor:
                     # Past this chunk before feeding it: a chunk that upsets the tracker
                     # is not read again on every later tick.
                     watch.after_id = chunk.id or watch.after_id
+                    before = {key for key, _ in tracker.running}
                     tracker.feed(chunk.stream, chunk.content.decode("utf-8", "replace"))
+                    for key, _ in tracker.running:
+                        if key not in before:
+                            watch.first_seen.setdefault(key, chunk.ts)
                 if len(chunks) < COMMAND_LOG_PAGE:
                     break
         return commands_counted(

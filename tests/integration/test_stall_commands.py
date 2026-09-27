@@ -248,6 +248,35 @@ async def test_a_restarted_supervisor_rebuilds_the_command_from_the_stored_log(
     assert len(renewed) >= STALL_FAIL // 120
 
 
+async def test_a_restart_mid_command_keeps_the_original_age_and_stops_pausing_at_the_original_bound(
+    operator: TestClient,
+    supervisor: Supervisor,
+    provider: FakeProvider,
+    clock: FakeClock,
+    ctx: AppContext,
+) -> None:
+    """Issue 152 correction: a restart or a takeover must not reset a running command's
+    age, or a command near its command timeout gets another full timeout, and repeated
+    takeovers would extend it indefinitely."""
+    client = operator
+    task_id = start(client, "codex", "EX-0152-RESTART-OVERRUN", command_timeout_ms=600_000)
+    await supervisor.tick()
+    attempt_id = client.get(f"/v1/tasks/{task_id}").json()["latest_attempt"]["id"]
+    worker = provider.worker(attempt_id)
+    assert worker is not None
+    worker.logs.append(SCRIPTS["codex"][0])
+    elapsed_before_restart = 300
+    await advance(supervisor, clock, elapsed_before_restart)
+    # A fresh process mid-command: nothing in memory, only the stored log. If the
+    # restart reset the command's age to now, the overrun bound below (measured from
+    # the command's original start) would never arrive on this schedule.
+    restarted = make_supervisor(ctx, provider)
+    remaining_to_command_timeout = 600 - elapsed_before_restart
+    await advance(restarted, clock, remaining_to_command_timeout + 60 + STALL_FAIL + 2 * TICK)
+    assert worker.drains == 1
+    assert client.get(f"/v1/attempts/{attempt_id}").json()["termination_reason"] == "stall"
+
+
 async def test_a_command_reported_past_its_command_timeout_stops_pausing_the_clock(
     operator: TestClient,
     supervisor: Supervisor,
