@@ -102,10 +102,16 @@ Foundry issued the work the same day on the operator's "apply your recommendatio
 The evidence is the one this note already reads at exit, read from the live log
 instead: each adapter's `command_tracker()` is fed every stored log chunk in order,
 and while it reports a command the supervisor writes a `command_running` activity
-heartbeat, at most once a minute and only when no other activity is newer. Both stall
-clocks (warn and fail) read activity, so both pause; when the command ends they run
-again from within a minute of its end. The tracker is rebuilt from the stored log
-after a supervisor restart or takeover.
+heartbeat whenever the newest activity is older than a minute (or half the shorter
+stall limit, when that is less). Both stall clocks (warn and fail) read activity, so
+both pause; when the command ends they run again from within that window of its end.
+A command still reported a minute past its command timeout stops counting: a Codex
+session and a Hermes background process are not ended by the harness's own timeout,
+and the operator's rule is that the command timeout bounds a command. The tracker is
+rebuilt from the stored log after a supervisor restart or takeover.
+
+The non-author review round (2026-09-27) raised the short-limit renewal and the
+command-timeout bound; both were adopted as described above.
 
 What was seen on 2026-09-27, pinned image `crucible-worker:20260916-d39e5748bf08`,
 stub model, `--network none`, the log read every half second while a 15 s silent
@@ -141,4 +147,9 @@ Known limits of this change:
 - A Claude Code `tool_result` line longer than 32 MiB is dropped by the tracker; the
   call it answers stays open until the model's next message, which closes it.
 - The first observation after a supervisor restart reads the attempt's whole stored
-  log once, 500 chunks at a time.
+  log once, 500 chunks at a time. A command's age is counted from when this
+  supervisor first saw it, so after a restart a command can hold the stall clock for
+  up to one more command timeout.
+- Hermes's count is one entry: when it changes, its age starts again.
+- The pause can be no finer than the supervisor's tick (5 seconds): a stall limit
+  shorter than two ticks can still pass during a command.

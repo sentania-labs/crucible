@@ -213,9 +213,12 @@ command in flight, the stall clock pauses, so the stall limit applies to a worke
 doing nothing and the command timeout applies to a command running long."). While
 the harness's own live output reports a command running, neither
 `stall_warn_seconds` nor `stall_fail_seconds` advances (10); the command timeout
-bounds each command, and `timeout_seconds` still bounds the whole attempt. When the
-command ends, both clocks run again from within a minute of its end, so a worker
-that then does nothing stalls as before. What each harness reports while it runs is
+bounds each command, and `timeout_seconds` still bounds the whole attempt. A command
+the harness still reports a minute past its command timeout no longer counts, since
+some harnesses do not end every command at that timeout themselves (a Codex session,
+a Hermes background process). When the command ends, both clocks run again from
+within a minute of its end (half the shorter stall limit, when that is less), so a
+worker that then does nothing stalls as before. What each harness reports while it runs is
 in 07. Where it reports nothing, the stall limits count a silent command as they
 count any silence: AGY gives no live evidence at all, and a Hermes foreground
 command (its usual kind) is not in the registry the evidence comes from, so for

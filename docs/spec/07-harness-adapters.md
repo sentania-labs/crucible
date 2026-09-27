@@ -257,7 +257,9 @@ network and no login (`make e2e-command-timeout`).
 The same evidence, read from the live log while the attempt runs, pauses the
 stall clock (05b, 10): each adapter gives the supervisor a tracker that it feeds
 every stored log chunk in order, and while the tracker reports a command running
-the supervisor writes a `command_running` activity signal. The log is the one
+the supervisor writes a `command_running` activity signal. A command still reported
+a minute past the launch's command timeout stops counting, whatever keeps the
+harness reporting it. The log is the one
 source that reaches the supervisor on Docker and Kubernetes alike (Kubernetes
 merges the two streams, so a tracker reads both). Each fact below was observed
 on the pinned worker image on 2026-09-27 against the stub model, with the log
