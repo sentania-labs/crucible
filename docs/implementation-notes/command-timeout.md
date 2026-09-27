@@ -73,9 +73,10 @@ settings are in 07; this note keeps the observations.
 
 ## Known limits
 
-- The stall limits still apply (05b): a silent command outlasting
-  `stall_fail_seconds` (1800 s in the seeded policy) is a stall before it reaches
-  the 60-minute default.
+- The stall limits apply to a silent command only where the harness gives no live
+  evidence of it (issue 152, below): AGY, and a Hermes foreground command. There a
+  command outlasting `stall_fail_seconds` (1800 s in the seeded policy) is a stall
+  before it reaches the 60-minute default.
 - A worker that leaves a server or other long command running when it ends its
   turn is `incomplete`, even with a valid report. That is the requirement read
   literally; `incomplete` is not retried.
@@ -90,3 +91,65 @@ A launch-wrapper check for any process alive after the harness exits was
 considered and not built: a build that leaves a daemon behind (a Gradle daemon,
 a git fsmonitor) would mark every such attempt incomplete. The requirement is
 what the harness's own tooling reports, so the evidence is per harness.
+
+## A command in flight pauses the stall clock (issue 152, FDY-0123)
+
+The operator, 2026-09-27: "a running command counts as activity. While a harness
+reports a command in flight, the stall clock pauses, so the stall limit applies to a
+worker doing nothing and the command timeout applies to a command running long."
+Foundry issued the work the same day on the operator's "apply your recommendation".
+
+The evidence is the one this note already reads at exit, read from the live log
+instead: each adapter's `command_tracker()` is fed every stored log chunk in order,
+and while it reports a command the supervisor writes a `command_running` activity
+heartbeat whenever the newest activity is older than a minute (or half the shorter
+stall limit, when that is less). Both stall clocks (warn and fail) read activity, so
+both pause; when the command ends they run again from within that window of its end.
+A command still reported a minute past its command timeout stops counting: a Codex
+session and a Hermes background process are not ended by the harness's own timeout,
+and the operator's rule is that the command timeout bounds a command. The tracker is
+rebuilt from the stored log after a supervisor restart or takeover.
+
+The non-author review round (2026-09-27) raised the short-limit renewal and the
+command-timeout bound; both were adopted as described above.
+
+What was seen on 2026-09-27, pinned image `crucible-worker:20260916-d39e5748bf08`,
+stub model, `--network none`, the log read every half second while a 15 s silent
+command ran:
+
+- **Claude Code** wrote the `assistant` event with the `tool_use` block before the
+  command started and the `user` event with its `tool_result` when it ended; the
+  tracker reported `tool Bash: python3 -c ...` for at least 10 of the 15 seconds and
+  nothing after.
+- **Codex** wrote `item.started` for the `command_execution` item when the command
+  started and `item.completed` only after the model's `write_stdin` polls saw it end,
+  so the item is open across the polls.
+- **Hermes** under `-z` wrote nothing to stdout or stderr while it worked: its
+  one-shot mode sends both to `/dev/null` (`hermes_cli/oneshot.py` in the image), and a
+  foreground command is run directly, never through the process registry
+  (`tools/terminal_tool.py`: only `background=true` calls `process_registry.spawn_*`).
+  The launch wrapper therefore counts the registry's `"session_id"` entries every 10
+  seconds while Hermes runs and writes `crucible-launch: commands running: <n>` to
+  stderr on each change. With a background command and a model slow to answer
+  afterwards, the count `1` reached the log during the run. A 12 s foreground command
+  produced no evidence at all, which is the limit 05b states.
+- **AGY** was not run (no Google login) and has no tracker.
+
+Known limits of this change:
+
+- A Hermes foreground command, the usual kind, is still counted as silence; so is any
+  AGY command. Hermes ends a foreground command at `TERMINAL_TIMEOUT` (the launch's
+  command timeout), so an operator who wants long silent Hermes commands to survive
+  needs a `stall_fail_seconds` above the command timeout.
+- The evidence is the harness's own stream, which the worker's process writes. A
+  worker could keep its own stall clock paused by writing such lines, as it could
+  already by writing any output; `timeout_seconds` still ends the attempt.
+- A Claude Code `tool_result` line longer than 32 MiB is dropped by the tracker; the
+  call it answers stays open until the model's next message, which closes it.
+- The first observation after a supervisor restart reads the attempt's whole stored
+  log once, 500 chunks at a time. A command's age is counted from when this
+  supervisor first saw it, so after a restart a command can hold the stall clock for
+  up to one more command timeout.
+- Hermes's count is one entry: when it changes, its age starts again.
+- The pause can be no finer than the supervisor's tick (5 seconds): a stall limit
+  shorter than two ticks can still pass during a command.

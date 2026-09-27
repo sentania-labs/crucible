@@ -91,7 +91,12 @@ old supervisor from corrupting state after a takeover.
 ## Heartbeats
 
 `heartbeats`: `attempt_id`, `ts`, `signal` (container_running, log_advanced,
-fs_changed, progress_line), `detail`. The supervisor derives worker state:
+fs_changed, command_running, progress_line), `detail`. `command_running` is
+written while the harness's live log reports a command in flight (07, issue 152),
+whenever the newest activity is older than a minute, or than half the shorter
+stall limit when that is less; a command reported more than a minute past its
+command timeout no longer counts. Its `detail` names up to five commands and their
+`count`. The supervisor derives worker state:
 any signal within `stall_warn_seconds` is `alive`; none within
 `stall_fail_seconds` is `stalled`. Defaults: 300 s warn, 1800 s fail,
 overridable per policy. A worker that emits progress lines but changes

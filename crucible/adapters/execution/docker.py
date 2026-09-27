@@ -160,6 +160,11 @@ WORKER_UID = 1000
 # adapter can read what the harness's own tooling said was still running. Only a regular
 # file is copied, never a link, and at most 1 MiB of it; the copy goes to a fresh file
 # renamed into place, so a link planted at the destination is replaced, not written through.
+# CRUCIBLE_IN_FLIGHT_FILE names a harness state file listing its running commands, one
+# `"session_id"` per command (Hermes's process registry, issue 152). While the harness
+# runs, the wrapper counts them every 10 seconds and writes the count to stderr whenever
+# it changes, so the supervisor can see a command in flight during the run. Only the
+# count leaves the file.
 LAUNCH_WRAPPER = r"""set -u
 for pair in ${CRUCIBLE_ENV_FROM_FILES:-}; do
   var=${pair%%=*}; file=${pair#*=}
@@ -181,12 +186,33 @@ run() {
     "$@" </dev/null
   fi
 }
+watch_in_flight() {
+  shown=0
+  while :; do
+    count=0
+    if [ -f "$CRUCIBLE_IN_FLIGHT_FILE" ] && [ ! -L "$CRUCIBLE_IN_FLIGHT_FILE" ]; then
+      count=$(grep -o '"session_id"' -- "$CRUCIBLE_IN_FLIGHT_FILE" 2>/dev/null | wc -l)
+    fi
+    count=$((count + 0))
+    if [ "$count" != "$shown" ]; then
+      printf 'crucible-launch: commands running: %s\n' "$count" >&2
+      shown=$count
+    fi
+    sleep 10 >/dev/null 2>&1
+  done
+}
+watcher=
+if [ -n "${CRUCIBLE_IN_FLIGHT_FILE:-}" ]; then
+  watch_in_flight </dev/null >/dev/null &
+  watcher=$!
+fi
 if [ -n "${CRUCIBLE_TRANSCRIPT:-}" ]; then
   run "$@" | tee "$CRUCIBLE_TRANSCRIPT"
 else
   run "$@"
 fi
 status=$?
+if [ -n "$watcher" ]; then kill "$watcher" 2>/dev/null; wait "$watcher" 2>/dev/null; fi
 for pair in ${CRUCIBLE_AFTER_EXIT:-}; do
   src=${pair%%=*}; name=${pair#*=}
   case "$name" in ""|.*|*/*) continue ;; esac

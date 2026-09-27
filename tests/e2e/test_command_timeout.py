@@ -21,6 +21,7 @@ import os
 import shlex
 import subprocess
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -91,6 +92,7 @@ def run_harness(
     extra_argv: tuple[str, ...] = (),
     drop_env: tuple[str, ...] = (),
     linger: int = 0,
+    during: Callable[[Path], None] | None = None,
 ) -> Run:
     """One harness run in the worker image, through Crucible's launch wrapper."""
     report = tmp_path / "report"
@@ -156,7 +158,13 @@ def run_harness(
         *extra_argv,
     ]
     started = time.monotonic()
-    completed = subprocess.run(argv, capture_output=True, text=True, timeout=600, check=False)
+    process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    while during is not None and process.poll() is None and time.monotonic() - started < 600:
+        # Issue 152: what the supervisor would see of the log while the harness runs.
+        during(report)
+        time.sleep(0.5)
+    _, stderr = process.communicate(timeout=600)
+    completed = subprocess.CompletedProcess(argv, process.returncode, "", stderr)
     elapsed = time.monotonic() - started - linger
     log = report / "stub-model.jsonl"
     entries = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
@@ -306,3 +314,80 @@ def test_hermes_waits_for_a_command_within_the_launch_timeout(tmp_path: Path) ->
     run = run_harness(tmp_path, hermes(60_000), command=long_command(8), extra_env={})
     assert run.exit_code == 0 and run.marker and run.elapsed >= 8
     assert run.classify(HermesAdapter()) is ExitClass.COMPLETED
+
+
+# ----- Issue 152: the command in flight, seen while it runs -----------------------------
+
+
+@dataclass
+class LiveLog:
+    """What a supervisor's tracker would say at each look at the log during the run."""
+
+    adapter: ClaudeCodeAdapter | CodexAdapter | HermesAdapter
+    samples: list[tuple[str, ...]]
+
+    def look(self, report: Path) -> None:
+        tracker = self.adapter.command_tracker()
+        for stream in ("stdout", "stderr"):
+            path = report / f"{stream}.txt"
+            if path.exists():
+                tracker.feed(stream, path.read_text(encoding="utf-8", errors="replace"))
+        self.samples.append(tuple(summary for _, summary in tracker.running))
+
+    def seconds_in_flight(self) -> float:
+        return 0.5 * sum(1 for running in self.samples if running)
+
+    def after(self, run: Run) -> tuple[str, ...]:
+        self.look(run.report)
+        return self.samples[-1]
+
+
+def test_claude_code_reports_its_command_in_flight_while_it_runs(tmp_path: Path) -> None:
+    live = LiveLog(ClaudeCodeAdapter(), [])
+    run = run_harness(
+        tmp_path, claude(60_000), command=long_command(15), extra_env=CLAUDE_ENV, during=live.look
+    )
+    assert run.exit_code == 0 and run.marker
+    assert live.seconds_in_flight() >= 10
+    assert any(r.startswith("tool Bash: python3 -c") for s in live.samples for r in s)
+    assert live.after(run) == ()
+
+
+def test_codex_reports_its_command_in_flight_while_it_runs(tmp_path: Path) -> None:
+    live = LiveLog(CodexAdapter(), [])
+    run = run_harness(
+        tmp_path,
+        codex(60_000),
+        command=long_command(15),
+        extra_env={**CODEX_ENV, "STUB_POLL": "1"},
+        extra_argv=CODEX_PROVIDER,
+        during=live.look,
+    )
+    assert run.exit_code == 0 and run.marker
+    assert live.seconds_in_flight() >= 10
+    assert live.after(run) == ()
+
+
+def test_hermes_background_command_is_seen_through_the_wrappers_count(tmp_path: Path) -> None:
+    live = LiveLog(HermesAdapter(), [])
+    run = run_harness(
+        tmp_path,
+        hermes(60_000),
+        command=long_command(40),
+        extra_env={"STUB_BACKGROUND": "1", "STUB_REPLY_DELAY": "15"},
+        during=live.look,
+    )
+    assert run.exit_code == 0 and not run.marker
+    assert ("process registry: 1 running",) in live.samples
+    assert "crucible-launch: commands running: 1" in (run.report / "stderr.txt").read_text()
+
+
+def test_hermes_foreground_command_leaves_no_live_evidence(tmp_path: Path) -> None:
+    """The limit 05b states: under `-z` Hermes writes nothing while it works, and a
+    foreground command is not in its registry, so its stall clock keeps running."""
+    live = LiveLog(HermesAdapter(), [])
+    run = run_harness(
+        tmp_path, hermes(60_000), command=long_command(12), extra_env={}, during=live.look
+    )
+    assert run.exit_code == 0 and run.marker and run.elapsed >= 12
+    assert live.samples and not any(live.samples)

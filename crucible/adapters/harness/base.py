@@ -99,6 +99,66 @@ def in_flight_summary(label: str, detail: str) -> str:
     return text[:300]
 
 
+# The longest partial line a live tracker holds. A longer one is dropped whole and the
+# tracker resumes at the next newline; json_lines reads a transcript under the same cap.
+LIVE_LINE_LIMIT = 32 * 1024 * 1024
+
+
+class LineTracker:
+    """Issue 152: the shared half of a CommandTracker. It splits the live log into whole
+    lines, one partial line per stream, and hands each to `line`. Kubernetes merges the
+    two streams, so a tracker reads both and relies on what the line says."""
+
+    def __init__(self) -> None:
+        # Each stream's partial line as its pieces, joined once when the line ends.
+        self._partial: dict[str, list[str]] = {}
+        self._held: dict[str, int] = {}
+        self._dropping: set[str] = set()
+
+    def feed(self, stream: str, text: str) -> None:
+        pieces = self._partial.setdefault(stream, [])
+        start = 0
+        while (end := text.find("\n", start)) >= 0:
+            pieces.append(text[start:end])
+            whole = "".join(pieces)
+            pieces.clear()
+            self._held[stream] = 0
+            start = end + 1
+            if stream in self._dropping:
+                self._dropping.discard(stream)
+                continue
+            self.line(whole.strip())
+        rest = text[start:]
+        if not rest:
+            return
+        held = self._held.get(stream, 0) + len(rest)
+        if held > LIVE_LINE_LIMIT:
+            pieces.clear()
+            held = 0
+            self._dropping.add(stream)
+        else:
+            pieces.append(rest)
+        self._held[stream] = held
+
+    def line(self, text: str) -> None:
+        raise NotImplementedError
+
+    @property
+    def running(self) -> tuple[tuple[str, str], ...]:
+        raise NotImplementedError
+
+
+def json_object(text: str) -> dict[str, Any] | None:
+    """One transcript line as an object, or None: the stream is the harness's own."""
+    if not text.startswith("{"):
+        return None
+    try:
+        parsed = json.loads(text)
+    except (ValueError, RecursionError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 _RESET_KEYS = frozenset({"reset_at", "resetAt", "resets_at", "resetsAt", "reset_time"})
 
 

@@ -9,11 +9,16 @@ the completion and exits without waiting (reproduced on 0.19.0 against a stub mo
 2026-09-25). Its own process registry, `processes.json` in HERMES_HOME, lists every
 background command still running; the launch wrapper copies it into the report
 directory after Hermes exits, and a non-empty list is work in flight.
+
+During the run (issue 152) the wrapper also counts the registry's entries and writes the
+count to stderr when it changes, the only live evidence there is: `-z` sends Hermes's
+own output to /dev/null, and a foreground command never enters the registry.
 """
 
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
@@ -45,6 +50,8 @@ USAGE_NAME = "hermes-usage.json"
 # Hermes's process registry checkpoint, and the name its after-exit copy takes.
 PROCESSES_FILE = f"{HERMES_HOME}/processes.json"
 PROCESSES_NAME = "hermes-processes.json"
+# What the launch wrapper writes to stderr when the registry's count changes (07).
+RUNNING_LINE = re.compile(r"crucible-launch: commands running: (\d+)")
 
 PROVIDER_PATTERNS = base.patterns(
     "connection refused",
@@ -123,6 +130,9 @@ class HermesAdapter:
     def provider_quota_exhausted(self, stdout_tail: str, stderr_tail: str) -> bool:
         return False
 
+    def command_tracker(self) -> CommandTracker:
+        return CommandTracker()
+
     def capabilities(self) -> HarnessCapabilities:
         return HarnessCapabilities(
             prompt_on_stdin=False,
@@ -186,6 +196,8 @@ class HermesAdapter:
                 "TERMINAL_TIMEOUT": seconds,
                 "TERMINAL_MAX_FOREGROUND_TIMEOUT": seconds,
                 "CRUCIBLE_AFTER_EXIT": f"{PROCESSES_FILE}={PROCESSES_NAME}",
+                # Issue 152: the same registry, counted while Hermes runs.
+                "CRUCIBLE_IN_FLIGHT_FILE": PROCESSES_FILE,
             },
             env_from_files=spec.env_from_files() if ctx.credential_mounted else {},
             transcript_path=f"{ctx.report_mount}/{base.TRANSCRIPT_NAME}",
@@ -267,6 +279,34 @@ class HermesAdapter:
             exit_code=exit.exit_code,
             report_present=exit.report_present,
             blocked_present=False,
+        )
+
+
+class CommandTracker(base.LineTracker):
+    """Issue 152: the launch wrapper's count of the commands in Hermes's process
+    registry, written whenever it changes. Under `-z` Hermes itself writes nothing while
+    it works, and a foreground command is not in the registry, so only a background
+    command is seen."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._count = 0
+
+    def line(self, text: str) -> None:
+        match = RUNNING_LINE.fullmatch(text)
+        if match is not None:
+            self._count = int(match.group(1))
+
+    @property
+    def running(self) -> tuple[tuple[str, str], ...]:
+        if not self._count:
+            return ()
+        # One conceptual entry: the registry's count, not one id per process.
+        return (
+            (
+                "process registry",
+                base.in_flight_summary("process registry", f"{self._count} running"),
+            ),
         )
 
 

@@ -194,6 +194,9 @@ class CodexAdapter:
         pending = in_flight(report_dir / base.TRANSCRIPT_NAME) if report_dir else ()
         return base.with_in_flight(exit_class, pending)
 
+    def command_tracker(self) -> CommandTracker:
+        return CommandTracker()
+
 
 def in_flight(transcript: Path) -> tuple[str, ...]:
     """`command_execution` items the stream started and never completed."""
@@ -213,6 +216,34 @@ def in_flight(transcript: Path) -> tuple[str, ...]:
         base.in_flight_summary(f"command {item_id}", command)
         for item_id, command in started.items()
     )
+
+
+class CommandTracker(base.LineTracker):
+    """Issue 152: `command_execution` items the live `--json` log started and has not
+    completed. Only commands count: other items (a todo list) stay open for a turn."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._started: dict[str, str] = {}
+
+    def line(self, text: str) -> None:
+        event = base.json_object(text) or {}
+        item = event.get("item")
+        if not isinstance(item, dict) or item.get("type") != "command_execution":
+            return
+        item_id = item.get("id")
+        if not isinstance(item_id, str):
+            return
+        if event.get("type") == "item.started":
+            self._started[item_id] = base.in_flight_summary(
+                f"command {item_id}", str(item.get("command") or item_id)
+            )
+        elif event.get("type") == "item.completed":
+            self._started.pop(item_id, None)
+
+    @property
+    def running(self) -> tuple[tuple[str, str], ...]:
+        return tuple(self._started.items())
 
 
 def _toml_string(value: str) -> str:

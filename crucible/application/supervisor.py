@@ -16,7 +16,7 @@ import copy
 import logging
 import stat
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
@@ -123,6 +123,7 @@ from crucible.ports.execution import (
 )
 from crucible.ports.github import GitHubClient
 from crucible.ports.harness import (
+    CommandTracker,
     CredentialSource,
     ExitInfo,
     HarnessGate,
@@ -154,6 +155,15 @@ RETENTION_BATCH = 200
 # bounds one pull at 4 MiB drains 1 GiB of backlog in this many; past that the log is
 # still arriving faster than it is read, and the attempt moves on with what was stored.
 FINAL_DRAIN_PULLS = 256
+# Issue 152: while the harness reports a command in flight, a `command_running` activity
+# signal is written whenever the newest activity is at least this old, or half the
+# policy's shorter stall limit when that is less. The stall clock therefore resumes from
+# within this window of the command's end.
+COMMAND_RUNNING_REFRESH_SECONDS = 60
+COMMAND_LOG_PAGE = 500
+# A command still reported this long past its command timeout no longer counts: the
+# command timeout, not the stall limit, bounds a command, and it bounds it here too.
+COMMAND_OVERRUN_SECONDS = 60
 
 
 def worker_stall_action(
@@ -173,6 +183,45 @@ def worker_stall_action(
     if quiet >= warn_seconds and (warned_at is None or warned_at < quiet_baseline):
         return "warn"
     return None
+
+
+def command_refresh_seconds(warn_seconds: int, fail_seconds: int) -> int:
+    """How often a command in flight renews activity: once a minute, or more often when
+    a stall limit is short, so neither limit can pass between two renewals."""
+    return max(1, min(COMMAND_RUNNING_REFRESH_SECONDS, warn_seconds // 2, fail_seconds // 2))
+
+
+def command_activity_due(
+    *, now: datetime, last_activity: datetime | None, refresh_seconds: int
+) -> bool:
+    """Issue 152: whether a command in flight writes a fresh activity signal now."""
+    return last_activity is None or (now - last_activity).total_seconds() >= refresh_seconds
+
+
+def commands_counted(
+    running: Sequence[tuple[str, str]],
+    first_seen: dict[str, datetime],
+    *,
+    now: datetime,
+    command_timeout_seconds: float,
+) -> tuple[str, ...]:
+    """The commands in flight that still count as activity, updating when each was first
+    seen. `running` is `(key, summary)`: `key` is the harness's own unique id for the
+    command, so a repeat of the same command, or two different commands whose summaries
+    truncate to the same text, never inherit each other's age. One reported past its
+    command timeout (and a minute's margin) has outlived what the timeout allows it,
+    whatever keeps the harness reporting it: a Hermes background process or a Codex
+    session is not ended by the harness's own timeout."""
+    keys = {key for key, _ in running}
+    for gone in set(first_seen) - keys:
+        del first_seen[gone]
+    limit = command_timeout_seconds + COMMAND_OVERRUN_SECONDS
+    counted = []
+    for key, summary in running:
+        seen = first_seen.setdefault(key, now)
+        if (now - seen).total_seconds() < limit:
+            counted.append(summary)
+    return tuple(counted)
 
 
 def workspace_fingerprint(workspace: Workspace) -> tuple[int, int, int]:
@@ -212,6 +261,18 @@ class TickResult:
     pull_requests_polled: int = 0
     duration_ms: int = 0
     counts: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class _CommandWatch:
+    """One attempt's live-log tracker (issue 152), the last log chunk it was fed, and
+    what bounds the commands it reports."""
+
+    tracker: CommandTracker | None
+    refresh_seconds: int = COMMAND_RUNNING_REFRESH_SECONDS
+    command_timeout_seconds: float = 0.0
+    after_id: int = 0
+    first_seen: dict[str, datetime] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -293,6 +354,8 @@ class Supervisor:
         # The harnesses a login is running for, read once per launch pass (12, 25).
         self._logins_now: frozenset[str] = frozenset()
         self._workspace_fingerprints: dict[str, tuple[int, int, int]] = {}
+        # Rebuilt from the stored log after a restart or takeover, so nothing is lost.
+        self._command_watches: dict[str, _CommandWatch] = {}
         # ADR 0019: a private repository's checkout token is minted through this client.
         self._github = github
         # The delivery half (23). With no GitHub client configured it is inert, which is
@@ -1542,6 +1605,7 @@ class Supervisor:
             await self._discard(provider, ws, spec)
             self._workspaces.pop(attempt.id, None)
             self._workspace_fingerprints.pop(attempt.id, None)
+            self._command_watches.pop(attempt.id, None)
             return False
         try:
             handle = await provider.launch(ws, spec)
@@ -2159,6 +2223,7 @@ class Supervisor:
             await self._db(partial(self._mark_cleaned, attempt.id, choice))
             self._workspaces.pop(attempt.id, None)
             self._workspace_fingerprints.pop(attempt.id, None)
+            self._command_watches.pop(attempt.id, None)
             self._handles.pop(attempt.id, None)
             cleaned += 1
         return cleaned
@@ -2350,6 +2415,7 @@ class Supervisor:
             changed = await self._db(partial(self._workspace_changed, attempt))
             if changed:
                 await self._db(partial(self._record_workspace_activity, attempt.id))
+            await self._note_running_commands(attempt)
             stall = await self._db(partial(self._stall_action, attempt.id))
             if stall == "fail":
                 await provider.terminate(handle, "drain")
@@ -2400,6 +2466,7 @@ class Supervisor:
         self._handles.pop(attempt.id, None)
         self._workspaces.pop(attempt.id, None)
         self._workspace_fingerprints.pop(attempt.id, None)
+        self._command_watches.pop(attempt.id, None)
         return True
 
     def _pending_quota_checkpoints(self) -> list[str]:
@@ -2762,6 +2829,117 @@ class Supervisor:
                     ts=self._clock.now(),
                     signal="fs_changed",
                     detail={},
+                )
+            )
+            uow.commit()
+
+    async def _note_running_commands(self, attempt: Attempt) -> None:
+        """Issue 152. Best effort: whatever a harness's stream does to its tracker, the
+        stall check and the lease renewal after this still run."""
+        try:
+            running = await self._db(partial(self._running_commands, attempt))
+            if running:
+                await self._db(partial(self._record_command_running, attempt.id, running))
+        except LeaseLostError:
+            raise
+        except Exception:
+            log.exception("reading the commands in flight failed; the stall clock runs")
+
+    def _command_watch(self, uow: UnitOfWork, attempt: Attempt) -> _CommandWatch:
+        watch = self._command_watches.get(attempt.id)
+        if watch is not None:
+            return watch
+        execution = uow.executions.get(attempt.execution_id)
+        harness = attempt.selected_harness or (execution.harness if execution else None)
+        adapter = (
+            self._harnesses.get(harness)
+            if self._harnesses is not None and harness is not None
+            else None
+        )
+        watch = _CommandWatch(adapter.command_tracker() if adapter is not None else None)
+        if execution is not None:
+            limits = (execution.policy_snapshot or {}).get("limits", {})
+            watch.refresh_seconds = command_refresh_seconds(
+                int(limits.get("stall_warn_seconds", 300)),
+                int(limits.get("stall_fail_seconds", 1800)),
+            )
+            stored = uow.contracts.get(attempt.task_id, execution.contract_version)
+            watch.command_timeout_seconds = (
+                effective_command_timeout_ms(
+                    execution.policy_snapshot,
+                    stored.document if stored is not None else None,
+                    execution.timeout_seconds,
+                )
+                / 1000
+            )
+        self._command_watches[attempt.id] = watch
+        return watch
+
+    def _running_commands(self, attempt: Attempt) -> tuple[str, ...]:
+        """Issue 152: what the harness's live log says it has in flight, feeding the
+        attempt's tracker every stored chunk it has not yet seen, less any command
+        reported for longer than its command timeout allows.
+
+        On a restart or a takeover, `watch` is new and this replays the whole stored
+        log at once. A command already running when the replay starts gets its
+        `first_seen` from the chunk where the tracker first reports it, not from now,
+        so its age survives the restart instead of resetting on every takeover."""
+        with self._uow_factory() as uow:
+            watch = self._command_watch(uow, attempt)
+            tracker = watch.tracker
+            if tracker is None:
+                return ()
+            while True:
+                chunks = uow.logs.list_for_attempt(
+                    attempt.id, after_id=watch.after_id, limit=COMMAND_LOG_PAGE
+                )
+                for chunk in chunks:
+                    # Past this chunk before feeding it: a chunk that upsets the tracker
+                    # is not read again on every later tick.
+                    watch.after_id = chunk.id or watch.after_id
+                    before = {key for key, _ in tracker.running}
+                    tracker.feed(chunk.stream, chunk.content.decode("utf-8", "replace"))
+                    after = {key for key, _ in tracker.running}
+                    # A key gone within this same chunk (Hermes reuses one fixed key
+                    # for its whole registry) must drop its age here: the cleanup in
+                    # commands_counted only sees the batch's final state, so a command
+                    # that ended and a same-keyed one that started would otherwise
+                    # share the first command's first_seen.
+                    for gone in before - after:
+                        watch.first_seen.pop(gone, None)
+                    for key in after - before:
+                        watch.first_seen.setdefault(key, chunk.ts)
+                if len(chunks) < COMMAND_LOG_PAGE:
+                    break
+        return commands_counted(
+            tracker.running,
+            watch.first_seen,
+            now=self._clock.now(),
+            command_timeout_seconds=watch.command_timeout_seconds,
+        )
+
+    def _record_command_running(self, attempt_id: str, running: tuple[str, ...]) -> None:
+        """A command in flight is activity (issue 152, the operator's decision of
+        2026-09-27), so neither stall limit counts it; its command timeout does."""
+        with self._fenced() as uow:
+            attempt = uow.attempts.get(attempt_id)
+            if attempt is None or attempt.state is not AttemptState.RUNNING:
+                return
+            now = self._clock.now()
+            latest = uow.heartbeats.latest_activity(attempt.id)
+            watch = self._command_watches.get(attempt.id)
+            refresh = watch.refresh_seconds if watch else COMMAND_RUNNING_REFRESH_SECONDS
+            if not command_activity_due(
+                now=now, last_activity=latest.ts if latest else None, refresh_seconds=refresh
+            ):
+                return
+            uow.heartbeats.append(
+                Heartbeat(
+                    id=None,
+                    attempt_id=attempt.id,
+                    ts=now,
+                    signal="command_running",
+                    detail={"commands": list(running[:5]), "count": len(running)},
                 )
             )
             uow.commit()

@@ -251,3 +251,23 @@ network and no login (`make e2e-command-timeout`).
 | Codex 0.156.0 | Unified exec returns after at most 30 s with a session the model must poll with `write_stdin`; a turn that ends instead leaves the command to die. The model catalog, not the `unified_exec` feature flag, picks this tool, so nothing at the launch makes a command block | `-c background_terminal_max_timeout=<command timeout>`, the longest single poll | a `command_execution` item `item.started` and never `item.completed` |
 | Hermes 0.19.0 | Never backgrounds a foreground command: kills it at `TERMINAL_TIMEOUT` and reports exit 124. A model may ask for `background=true`; under `-z` Hermes says it cannot deliver the completion and exits without waiting | `TERMINAL_TIMEOUT` and `TERMINAL_MAX_FOREGROUND_TIMEOUT`, in whole seconds | its process registry, `HERMES_HOME/processes.json`, copied into the report directory by the launch wrapper after Hermes exits (`CRUCIBLE_AFTER_EXIT`); any entry is a running command |
 | AGY 1.2.8 | `run_command` takes `Blocking` and `WaitMsBeforeAsync` from the model per call; past the wait a command continues in the background | no flag, variable or setting exists for it in `agy --help`, the binary, or the public CLI docs, so the `-p` prompt asks the model to run every command blocking for up to the command timeout and never to end its turn with one running: a mitigation nothing enforces. `--print-timeout` stays the attempt's timeout | none known; AGY cannot run without a Google login, so its exit behaviour was not observed and its attempts are classified by exit code and report alone |
+
+### A command in flight during the run (issue 152)
+
+The same evidence, read from the live log while the attempt runs, pauses the
+stall clock (05b, 10): each adapter gives the supervisor a tracker that it feeds
+every stored log chunk in order, and while the tracker reports a command running
+the supervisor writes a `command_running` activity signal. A command still reported
+a minute past the launch's command timeout stops counting, whatever keeps the
+harness reporting it. The log is the one
+source that reaches the supervisor on Docker and Kubernetes alike (Kubernetes
+merges the two streams, so a tracker reads both). Each fact below was observed
+on the pinned worker image on 2026-09-27 against the stub model, with the log
+read every half second while a silent command ran (`make e2e-command-timeout`).
+
+| Harness | In flight while it runs |
+|---|---|
+| Claude Code | a stream-json `assistant` event's `tool_use` block, from before the tool runs until the `user` event carrying its `tool_result`; also a backgrounded task until the CLI reports its end. A later message from the same agent closes its earlier calls, since the model is only asked again once every result is back |
+| Codex | a `command_execution` item from `item.started` to `item.completed`, polls included. Other items do not count: a todo list stays open for the whole turn |
+| Hermes | under `-z` Hermes writes nothing while it works, so the launch wrapper reads its process registry (`CRUCIBLE_IN_FLIGHT_FILE`, the same `processes.json`) every 10 seconds and writes `crucible-launch: commands running: <n>` to stderr whenever the count changes; only the count leaves the file. The registry lists background commands only: a foreground command, which Hermes ends at `TERMINAL_TIMEOUT`, gives no live evidence, and the stall limits count it as silence |
+| AGY | none: no tracker, and the stall clock runs as for any silent worker |

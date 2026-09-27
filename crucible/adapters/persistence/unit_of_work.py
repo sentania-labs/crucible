@@ -1081,7 +1081,13 @@ class Heartbeats:
 
     # Progress lines are unverified and may keep a worker out of the quiet state,
     # but they do not prove useful work for the fail threshold (10).
-    _ACTIVITY_SIGNALS = ("container_running", "log_advanced", "fs_changed")
+    _ACTIVITY_SIGNALS = (
+        "container_running",
+        "log_advanced",
+        "fs_changed",
+        # Issue 152: the harness reports a command in flight.
+        "command_running",
+    )
 
     def __init__(self, session: Session) -> None:
         self._s = session
