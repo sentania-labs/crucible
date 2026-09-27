@@ -16,6 +16,14 @@
 | `completed_without_report` | exit 0, no report | report gate fails; no retry; wake |
 | `incomplete` | the harness exited cleanly while its own tooling reported a command still running (07, issue 128) | attempt `failed`, never a completion, whatever the report claims; the running commands are on `attempt_collected` as `work_in_flight`; no retry, as for `crashed`. A worker that starts a server and leaves it running when it ends its turn is `incomplete` too: its own tooling reports the command still running |
 
+A stall is `timeout` with reason `stall`: no activity (10) for the policy's
+`stall_fail_seconds`. A command the harness reports in flight is activity (05b,
+issue 152), so a long silent build or test run is bounded by its command timeout
+and the attempt's `timeout_seconds`, not by the stall limit; a worker with
+nothing in flight and nothing written still stalls out. For AGY, and for a
+Hermes foreground command, no in-flight evidence exists during the run (07), and
+the stall limit counts their silent commands as before.
+
 Retry is never a way to re-roll the worker's judgment. A class retries only
 when it is in both the policy's `retry.eligible_classes` and the contract's
 `retry_on`. Each retry is a new attempt with the same contract version and a

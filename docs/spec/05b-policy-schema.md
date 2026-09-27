@@ -207,11 +207,20 @@ field existed takes the default bounds shown above (60 minutes). The admin API,
 CLI and UI edit it in place (25), which writes a new policy version with only
 this limit changed. How each harness is held to it is in 07.
 
-A command that writes nothing still counts against the stall limits (10): a
-worker with no log output and no workspace change for `stall_fail_seconds` is
-stalled, whatever its command timeout. The seeded policy's 1800 seconds is
-shorter than the 60-minute default, so a silent command of more than 30 minutes
-ends as a stall before its command timeout.
+A command in flight counts as activity (issue 152; the operator's decision of
+2026-09-27: "a running command counts as activity. While a harness reports a
+command in flight, the stall clock pauses, so the stall limit applies to a worker
+doing nothing and the command timeout applies to a command running long."). While
+the harness's own live output reports a command running, neither
+`stall_warn_seconds` nor `stall_fail_seconds` advances (10); the command timeout
+bounds each command, and `timeout_seconds` still bounds the whole attempt. When the
+command ends, both clocks run again from within a minute of its end, so a worker
+that then does nothing stalls as before. What each harness reports while it runs is
+in 07. Where it reports nothing, the stall limits count a silent command as they
+count any silence: AGY gives no live evidence at all, and a Hermes foreground
+command (its usual kind) is not in the registry the evidence comes from, so for
+either a silent command longer than `stall_fail_seconds` (1800 seconds in the
+seeded policy) ends as a stall before its command timeout.
 
 ## Precedence with the task contract
 
