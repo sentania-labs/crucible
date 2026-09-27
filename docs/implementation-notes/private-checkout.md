@@ -67,9 +67,28 @@ surface the registration is (API, CLI, UI).
   `/crucible`, `/home/worker` and `/tmp`, its environment, the token path) found nothing.
   The cluster, its registry and the run's images were removed afterwards.
 
+## Review round (2026-09-27)
+
+One non-author review round found no blockers. Fixed from it: the Kubernetes Secret is
+created inside the step's `try`, a stale one is removed first, and a Secret that cannot be
+deleted now fails the prepare instead of sitting beside a worker; the URL check compares
+the host exactly as the helper does; `"private"` on the admin route is parsed by the model,
+as on 04's route; a 404 from the mint now reads as an unknown installation; tests for a
+failed prepare (supervisor), a cancelled prepare and an undeletable Secret (Kubernetes),
+the `discard` and `cleanup` retries, and a failed stdin write (Docker). Corrected in ADR
+0019: on Kubernetes the token file stays mounted read-only until the preparer Pod ends;
+the Docker preparer's egress is the attempt's proxy allowlist, not git only; and the
+shared reference cache lets any preparer read a private repository's mirror.
+
 ## Limits
 
 - The Docker provider's side is proved with a stub daemon and by running the rendered
   script on the host; the Docker end-to-end tier was not run (FDY-0124's standing rules:
   its fixed subnet collides with concurrent workers).
 - No live GitHub run: the live tier (`make e2e-github`) needs the operator's App key.
+- The reference cache is shared: a private repository's mirror is readable by the
+  preparer and refresher of any other repository's attempt (never by a worker).
+- Re-registering a private repository through the form or the CLI without the private
+  flag makes it public again; its next prepare then fails with git's own error.
+- A mint in flight when the supervisor is cancelled is not revoked; it expires within the
+  hour.

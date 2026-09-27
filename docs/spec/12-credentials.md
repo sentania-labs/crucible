@@ -231,8 +231,9 @@ returns, whichever way. The Docker provider hands it to the preparer
 container on stdin, onto that container's tmpfs, exactly as the publisher's;
 on Kubernetes it is a per-attempt Secret `checkout-<attempt>` mounted
 read-only into the cache refresher and the preparer Jobs only, and deleted
-before `launch` renders a worker (`discard` and `cleanup` retry a failed
-deletion). The worker's container or Pod never has it, and the checkout it
+before `prepare` returns: a deletion that fails fails the prepare, so no
+worker is launched beside it, and `discard`, `cleanup` and the retention
+sweep retry it. The worker's container or Pod never has it, and the checkout it
 receives holds no token and no helper. Registration of a private repository
 mints and revokes one token first, so an App that cannot read the repository
 is refused there, not at the first task.

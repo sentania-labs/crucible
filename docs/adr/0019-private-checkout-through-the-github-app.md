@@ -40,22 +40,28 @@ terms.
    publisher's is delivered. On Kubernetes it is a per-attempt Secret
    `checkout-<attempt>`, mounted read-only (mode 0400) at the same path into the cache
    refresher Job and the preparer Job only, and deleted as soon as the preparer's Pod is
-   gone, on every path, before `launch` renders a worker. The token is never in `Env`,
-   `Cmd`, a log, an event payload, a database row, or any path inside the workspace.
+   gone, on every path. A Secret that cannot be deleted fails the prepare, so no worker is
+   ever launched beside one; it then holds a token that is revoked a moment later, and the
+   retention sweep removes it. The token is never in `Env`, `Cmd`, a log, an event
+   payload, a database row, or any path inside the workspace.
 4. **The helper answers for one host.** The preparer's git is given the same helper as the
    publisher's: it answers `get` only for `https` on `github.credential_host` (default
    `github.com`) and ignores `store` and `erase`. A private repository whose registered
    URL is not https on that host is refused at prepare. `GIT_TRACE*` and
    `GIT_CURL_VERBOSE` are unset first, because they print the Authorization header.
-5. **The token is gone before the checkout is positioned.** The script removes the token
-   file and the helper and resets its git configuration right after the clone (and the
-   cache refresh), and again from an `EXIT` trap, so a failing step leaves neither behind.
-   The checkout's `.git/config` never held it: git keeps the clean URL, which is then
-   replaced by the placeholder, and the checkout's own `credential.helper` is empty.
+5. **git stops using the token once it has cloned.** Right after the clone (and the cache
+   refresh) the script removes the helper and resets its git configuration, and again
+   from an `EXIT` trap, so a failing step leaves no helper behind. With the Docker
+   provider it removes the token file too. On Kubernetes the file is a read-only Secret
+   volume the script cannot remove: it stays mounted, readable only by this Pod, while the
+   Pod runs the rest of Crucible's own script (branch, shims, sealing), and goes when the
+   Pod does. The checkout's `.git/config` never held it: git keeps the clean URL, which is
+   then replaced by the placeholder, and the checkout's own `credential.helper` is empty.
 6. **Refusals are plain and early.** Registration of a private repository mints the token
    once and revokes it, so an App that is not connected, a missing installation id, an
-   installation that cannot see the repository (HTTP 404) or cannot read its contents
-   (HTTP 422) is refused when the operator registers it, in those words. The same checks
+   installation id GitHub does not know for the App (HTTP 404), or an installation that is
+   not on the repository or cannot read its contents (HTTP 422) is refused when the
+   operator registers it, in those words. The same checks
    at prepare end the attempt as an `environment` failure whose detail says why, so an App
    disconnected after registration never leaves a task waiting silently.
 
@@ -72,26 +78,38 @@ bounds that step (`collector_timeout_seconds` with Docker, `prepare_timeout_seco
 Kubernetes). Then the token is revoked at GitHub, so even a copy that escaped stops
 working; if revocation fails, GitHub expires it within the hour. The in-memory object is
 emptied either way. On Kubernetes the Secret exists only for that step; if its deletion
-failed, the attempt's `discard` or `cleanup` deletes it again.
+fails, the prepare fails with it, and `discard`, `cleanup` and the retention sweep delete
+it again.
 
 **Blast radius if the preparer is compromised.** The preparer runs Crucible's own script
 from the worker image, on a checkout it has just cloned, with hooks off and no command the
 repository defines, so the realistic compromise is a hostile worker image or a git
-vulnerability triggered by the remote. Such a preparer could read that one private
-repository until the step ends and the token is revoked, which is no more than the worker
-that follows is given anyway (the checkout itself). It cannot write to the repository or
-reach any other. Its egress is the git remote only (26: `github.com` and `api.github.com`,
-plus the configured credential host when that is not GitHub; the Docker preparer uses the
-workers' proxy), so it has nowhere else to send the token. The reference cache is the one
-thing shared across attempts: a private repository's mirror now lives there, readable by
-later preparers and refreshers (never by a worker, which never mounts the cache), and on
-Kubernetes only the refresher writes it (#55).
+vulnerability triggered by the remote. With the token, such a preparer could read that
+one private repository until the step ends and the token is revoked, which is no more
+than the worker that follows is given anyway (the checkout itself); it cannot write to
+the repository or reach another through the token. On Kubernetes its egress is the git
+remote only (26: `github.com` and `api.github.com`, plus the configured credential host
+when that is not GitHub). The Docker preparer is not as narrow: it runs on the workers'
+network with the attempt's own proxy allowlist (the harness's endpoints, the policy's
+registries, the contract's `egress_extra`), so a hostile preparer image there could send
+the token to any of those hosts before it is revoked.
+
+The reference cache widens this. It is the one volume shared across attempts, and a
+private repository's mirror now lives there, keyed by its URL. Every preparer and
+refresher mounts the whole cache (on Docker read-write, as before this change; on
+Kubernetes only the refresher writes it, #55), so a hostile preparer image running for
+any other repository's attempt can read a private repository's mirror without any
+token, and on Docker could rewrite it. A worker never mounts the cache. Narrowing each
+preparer to its own repository's mirror is a follow-up; until then the protection is
+the same as for the harness credentials: the worker images are the operator's promoted
+ones (ADR 0018), and the preparer runs only Crucible's script from them.
 
 **Why the worker never sees it.** The worker is a different container or Pod. With
 Docker, the token's tmpfs belongs to the preparer container and disappears when that
 container is removed, before the worker is created, and the worker's create request has
 no such mount and no open stdin. On Kubernetes the Secret is mounted into two Jobs by
-name, is deleted before `launch`, and the worker's Pod spec never references it; the
+name, is deleted before `prepare` returns (a prepare whose deletion failed launches no
+worker), and the worker's Pod spec never references it; the
 worker's ServiceAccount token is not mounted, so it cannot read Secrets through the API.
 The checkout the worker gets holds no token, no helper and no URL that could carry one,
 and its `origin` resolves nowhere, as before.

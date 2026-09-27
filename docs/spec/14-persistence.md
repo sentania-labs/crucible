@@ -26,7 +26,7 @@
 | `supervisor_status` | singleton: holder, last_tick_at, last_success_at, last_error, consecutive_failures, tick_ms, counts JSONB |
 | `idempotency_keys` | (principal_id, key) PK, request_sha256, response JSONB, created_at |
 | `bootstrap_imports` | id, source_sha256, manifest JSONB, verified_at, committed_at, state |
-| `repositories` | id, name UNIQUE, url, default_branch, installation_id, policy_name, registered_by, created_at |
+| `repositories` | id, name UNIQUE, url, default_branch, installation_id, policy_name, registered_by, created_at, private (ADR 0019, 0025) |
 | `worker_images` | digest PK, reference, harness, harness_version, build_inputs_sha256, promotion_state, promoted_at, promoted_by |
 | `harnesses` | name PK, enabled (the administrator's flag, 25), reason, session_compatibility (unverified, verified, failed), mount_mode_observed, refresh_requires_rw, last_launch_at, last_launch_outcome, last_auth_failure_at, last_validated_at, updated_at, updated_by |
 | `harness_images` | harness PK, digest, reference, version (of this harness in the image), previous_digest, previous_reference, previous_version, reason, updated_at, updated_by (ADR 0018; replaced `image_promotions` in 0023) |
