@@ -30,6 +30,7 @@ def _view(uow: UnitOfWork, name: str) -> dict[str, Any] | None:
         "policy_name": existing.policy_name,
         "installation_id": existing.installation_id,
         "external_review_attested": existing.external_review_attested,
+        "private": existing.private,
     }
 
 
@@ -60,6 +61,7 @@ def register(
         registration=registration,
         reason=reason,
         before=before,
+        github=ctx.github,
     )
     return {
         "repository": repo.name,
@@ -69,6 +71,7 @@ def register(
         "policy_name": repo.policy_name,
         "installation_id": repo.installation_id,
         "external_review_attested": repo.external_review_attested,
+        "private": repo.private,
     }
 
 

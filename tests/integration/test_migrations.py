@@ -605,8 +605,11 @@ def test_0019_downgrade_keeps_the_version_a_task_was_submitted_against(
             routing = load_routing(uow, policy.document)
             assert routing is not None and routing.version == routing_version
             assert routing.model("claude-opus-5-5") is not None
-        assert client.get(f"/v1/tasks/{task_id}").status_code == 200
         migrate.upgrade(migrated)
+        # Through the API only once the schema matches the code again: this code reads
+        # columns later revisions add (0025's `repositories.private`), and running it
+        # against a downgraded schema is the drift readiness refuses, not a rollback.
+        assert client.get(f"/v1/tasks/{task_id}").status_code == 200
         with engine.connect() as conn:
             again, _, routing_again, _ = _active(conn)
         assert again > version and routing_again > routing_version

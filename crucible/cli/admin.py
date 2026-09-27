@@ -152,6 +152,11 @@ def build_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
             help="attest the external reviewer reviews every pull request (23)",
         )
         register.add_argument("--attested-by", default=None, help="who attests")
+        register.add_argument(
+            "--private",
+            action="store_true",
+            help="clone with the GitHub App's read-only token; needs --installation-id (ADR 0019)",
+        )
         remove = repo_sub.add_parser("remove", help="remove a registered repository")
         remove.add_argument("name")
 
@@ -691,6 +696,7 @@ def _remote(args: argparse.Namespace, remote: Api) -> Any:
                 "installation_id": args.installation_id,
                 "attested_all_prs": args.attest_external_review_all_prs,
                 "attested_by": args.attested_by,
+                "private": args.private,
             },
         )
     raise UsageError(f"{command} is CLI-only and runs in local mode; drop --api-url")
@@ -1192,6 +1198,7 @@ def _register(args: argparse.Namespace, wiring: Wiring, admin: AdminContext) -> 
                     attested_all_prs=args.attest_external_review_all_prs,
                     attested_by=args.attested_by,
                 ),
+                private=args.private,
             ),
             reason=args.reason,
         )

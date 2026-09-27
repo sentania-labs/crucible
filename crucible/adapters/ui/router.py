@@ -1740,6 +1740,7 @@ def repositories_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                 "Default branch",
                 "Policy",
                 "Installation",
+                "Private",
                 "External review",
                 "",
             ],
@@ -1750,6 +1751,7 @@ def repositories_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                     item.default_branch,
                     item.policy_name,
                     item.installation_id,
+                    item.private,
                     item.external_review_attested,
                     # The row's own removal, never a typed name (crucible#127); refused
                     # while tasks reference it, and it asks for a reason (crucible#117).
@@ -1775,7 +1777,10 @@ def repositories_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                     "title": "Register or update",
                     "note": (
                         "For a repository the GitHub page's picker cannot show. The picker "
-                        "fills the installation ID and default branch from GitHub."
+                        "fills the installation ID, the default branch and whether it is "
+                        "private from GitHub. A private repository is cloned with a "
+                        "read-only token from the GitHub App, so it needs the App connected "
+                        "and the installation ID that covers it."
                     ),
                     "form": {
                         "action": "/ui/actions/repository-register",
@@ -1799,6 +1804,11 @@ def repositories_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                                 "name": "installation_id",
                                 "label": "GitHub installation ID",
                                 "kind": "number",
+                            },
+                            {
+                                "name": "private",
+                                "label": "Private (clone with the GitHub App's read-only token)",
+                                "kind": "checkbox",
                             },
                             {
                                 "name": "attested_all_prs",
@@ -2037,8 +2047,8 @@ def github_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                     [
                         repo["full_name"],
                         repo["default_branch"],
-                        repo.get("unsupported") or repo["private"],
-                        repo["archived"],
+                        repo["private"],
+                        repo.get("unsupported") or repo["archived"],
                         repo["registered_as"] or "not registered",
                     ]
                     for repo in repositories
@@ -2859,6 +2869,7 @@ async def action(request: Request, action: str, ctx: Ctx, uow: UoW) -> Response:
                         attested_all_prs=form.get("attested_all_prs") == "true",
                         attested_by=form.get("attested_by") or None,
                     ),
+                    private=form.get("private") == "true",
                 ),
                 reason=reason,
             )

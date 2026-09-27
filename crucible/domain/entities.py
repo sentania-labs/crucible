@@ -53,6 +53,9 @@ class Repository:
     external_review_attested: bool = False
     attested_by: str | None = None
     attested_at: datetime | None = None
+    # ADR 0019: cloned with a read-only GitHub App installation token rather than with no
+    # credential. The picker takes it from GitHub; the registration form states it.
+    private: bool = False
 
 
 @dataclass(slots=True)

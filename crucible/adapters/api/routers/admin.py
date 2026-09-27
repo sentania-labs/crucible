@@ -627,6 +627,7 @@ def admin_register_repository(
             attested_all_prs=bool(body.get("attested_all_prs", False)),
             attested_by=body.get("attested_by"),
         ),
+        private=body.get("private") is True,
     )
     result = repositories_admin.register(
         _admin(ctx),
