@@ -1119,7 +1119,7 @@ class KubernetesProvider:
                     return
                 log.warning("checkout token secret removal failed", extra={"error": str(exc)})
         # The token is repository-scoped, read-only, revoked by the supervisor and at most
-        # an hour from expiry; the attempt's label sweep removes the Secret next.
+        # an hour from expiry; `discard` and `cleanup` try the deletion again.
 
     def _checkout_token_mounts(self, token: str | None) -> tuple[list[Mount], list[dict[str, Any]]]:
         if token is None:
@@ -1804,6 +1804,9 @@ class KubernetesProvider:
         when one was seeded. Nothing else of the workspace is touched."""
         self._seeded.pop(ws.attempt_id, None)
         await self._delete_credential_secret(ws.attempt_id)
+        # ADR 0019: prepare deletes the checkout token Secret itself; a deletion that
+        # failed there is retried here.
+        await self._delete_checkout_secret(ws.attempt_id)
         launched = self._launched.get(ws.attempt_id)
         spec = spec or (launched.spec if launched else None)
         if spec is None:
@@ -1826,6 +1829,7 @@ class KubernetesProvider:
         spec = spec or (launched.spec if launched else None)
         await self._delete_by_label(("jobs", "networkpolicies", "pods"), attempt_id=ws.attempt_id)
         await self._delete_credential_secret(ws.attempt_id)
+        await self._delete_checkout_secret(ws.attempt_id)
         if policy is CleanupPolicy.DELETE:
             await self._delete_by_label(
                 ("persistentvolumeclaims", "configmaps"), attempt_id=ws.attempt_id
