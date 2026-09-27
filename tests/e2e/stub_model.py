@@ -75,7 +75,11 @@ def _shell_tool(body: dict[str, Any]) -> str | None:
 
 def _arguments(tool: str) -> dict[str, Any]:
     if tool == "Bash":
-        return {"command": COMMAND, "description": "the scripted command"}
+        arguments: dict[str, Any] = {"command": COMMAND, "description": "the scripted command"}
+        if os.environ.get("STUB_BACKGROUND") == "1":
+            # Claude Code's own background mode, as a model that chooses it asks for it.
+            arguments["run_in_background"] = True
+        return arguments
     if tool in ("shell", "local_shell"):
         return {"command": ["bash", "-lc", COMMAND]}
     if tool == "exec_command":
