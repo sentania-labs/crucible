@@ -301,10 +301,14 @@ def test_hermes_background_process_still_running_at_exit_is_a_completion(
     tmp_path: Path,
 ) -> None:
     """Issue 153: the launch wrapper's last count said a background process was running
-    when Hermes exited; that does not change the class, and nothing is recorded."""
+    when Hermes exited; that does not change the class, and nothing is recorded. A
+    registry copy under the name the removed after-exit copy used is ignored too."""
     directory = report_dir(tmp_path)
     (directory / USAGE_NAME).write_text(
         json.dumps({"completed": True, "failed": False}), encoding="utf-8"
+    )
+    (directory / "hermes-processes.json").write_text(
+        json.dumps([{"session_id": "proc_1", "command": "make serve"}]), encoding="utf-8"
     )
     adapter = HermesAdapter()
     stderr = "crucible-launch: commands running: 1\n"

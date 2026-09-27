@@ -96,13 +96,13 @@ class InFlightProvider(FakeProvider):
         self,
         root: Path,
         only_image: str | None = None,
-        transcript: list[dict[str, Any]] = CUT_OFF_TRANSCRIPT,
+        transcript: list[dict[str, Any]] | None = None,
     ) -> None:
         super().__init__()
         self.root = root
         # When set, only attempts launched from this image leave the transcript.
         self.only_image = only_image
-        self.transcript = transcript
+        self.transcript = list(CUT_OFF_TRANSCRIPT if transcript is None else transcript)
 
     async def prepare(
         self, spec: LaunchSpec, checkout_token: InstallationToken | None = None

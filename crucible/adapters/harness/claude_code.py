@@ -262,9 +262,12 @@ def _background_requests(events: list[dict[str, Any]]) -> frozenset[str]:
         for block in blocks:
             if not isinstance(block, dict) or block.get("type") != "tool_use":
                 continue
+            tool_id = block.get("id")
             arguments = block.get("input")
-            if isinstance(arguments, dict) and arguments.get("run_in_background") is True:
-                chosen.add(str(block.get("id")))
+            if not isinstance(tool_id, str) or not isinstance(arguments, dict):
+                continue
+            if arguments.get("run_in_background") is True:
+                chosen.add(tool_id)
     return frozenset(chosen)
 
 
