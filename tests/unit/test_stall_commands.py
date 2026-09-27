@@ -42,7 +42,7 @@ FAIL = 1800
 
 
 def running_now(live: CommandTracker) -> tuple[str, ...]:
-    return live.running
+    return tuple(summary for _, summary in live.running)
 
 
 def lines(name: str) -> list[str]:
@@ -79,7 +79,7 @@ def stall_timeline(
     refresh = command_refresh_seconds(warn, fail)
     for second in range(tick, end + 1, tick):
         now = START + timedelta(seconds=second)
-        reported = ("tool Bash: make e2e",) if second < command_until else ()
+        reported = (("toolu_1", "tool Bash: make e2e"),) if second < command_until else ()
         counted = commands_counted(
             reported, first_seen, now=now, command_timeout_seconds=command_timeout
         )
@@ -143,14 +143,43 @@ def test_a_command_signal_is_written_at_most_once_per_refresh() -> None:
 
 def test_each_command_is_bounded_from_when_it_was_first_seen() -> None:
     first_seen: dict[str, datetime] = {}
-    assert commands_counted(("a",), first_seen, now=START, command_timeout_seconds=100) == ("a",)
-    later = START + timedelta(seconds=170)
-    assert commands_counted(("a", "b"), first_seen, now=later, command_timeout_seconds=100) == (
-        "b",
+    assert commands_counted((("a", "a"),), first_seen, now=START, command_timeout_seconds=100) == (
+        "a",
     )
-    # A command that ends is forgotten; the same entry again is a new command.
+    later = START + timedelta(seconds=170)
+    assert commands_counted(
+        (("a", "a"), ("b", "b")), first_seen, now=later, command_timeout_seconds=100
+    ) == ("b",)
+    # A command that ends is forgotten; the same key again is a new command.
     assert commands_counted((), first_seen, now=later, command_timeout_seconds=100) == ()
-    assert commands_counted(("a",), first_seen, now=later, command_timeout_seconds=100) == ("a",)
+    assert commands_counted((("a", "a"),), first_seen, now=later, command_timeout_seconds=100) == (
+        "a",
+    )
+
+
+def test_a_repeat_of_the_same_command_gets_its_own_age() -> None:
+    """Issue 152 correction: two invocations with the same summary (a repeat, or two
+    different commands truncated to the same 300 characters) do not share an age when
+    they carry different harness ids."""
+    first_seen: dict[str, datetime] = {}
+    commands_counted(
+        (("toolu_1", "tool Bash: make test"),), first_seen, now=START, command_timeout_seconds=100
+    )
+    # commands_counted allows the command timeout plus a minute's overrun margin (160 s
+    # total here), so toolu_1 is still counted at 150 s.
+    later = START + timedelta(seconds=150)
+    both = (("toolu_1", "tool Bash: make test"), ("toolu_2", "tool Bash: make test"))
+    assert commands_counted(both, first_seen, now=later, command_timeout_seconds=100) == (
+        "tool Bash: make test",
+        "tool Bash: make test",
+    )
+    past_timeout = START + timedelta(seconds=165)
+    # toolu_1 has outlived its command timeout (and the margin) from when it started;
+    # toolu_2, seen only from `later`, has not, even though the two entries share an
+    # identical summary.
+    assert commands_counted(both, first_seen, now=past_timeout, command_timeout_seconds=100) == (
+        "tool Bash: make test",
+    )
 
 
 # ----- Claude Code ---------------------------------------------------------------------

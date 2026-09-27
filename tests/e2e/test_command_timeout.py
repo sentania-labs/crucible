@@ -332,7 +332,7 @@ class LiveLog:
             path = report / f"{stream}.txt"
             if path.exists():
                 tracker.feed(stream, path.read_text(encoding="utf-8", errors="replace"))
-        self.samples.append(tracker.running)
+        self.samples.append(tuple(summary for _, summary in tracker.running))
 
     def seconds_in_flight(self) -> float:
         return 0.5 * sum(1 for running in self.samples if running)

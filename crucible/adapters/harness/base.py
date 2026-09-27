@@ -144,7 +144,7 @@ class LineTracker:
         raise NotImplementedError
 
     @property
-    def running(self) -> tuple[str, ...]:
+    def running(self) -> tuple[tuple[str, str], ...]:
         raise NotImplementedError
 
 

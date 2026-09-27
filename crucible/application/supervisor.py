@@ -193,24 +193,28 @@ def command_activity_due(
 
 
 def commands_counted(
-    running: Sequence[str],
+    running: Sequence[tuple[str, str]],
     first_seen: dict[str, datetime],
     *,
     now: datetime,
     command_timeout_seconds: float,
 ) -> tuple[str, ...]:
     """The commands in flight that still count as activity, updating when each was first
-    seen. One reported past its command timeout (and a minute's margin) has outlived
-    what the timeout allows it, whatever keeps the harness reporting it: a Hermes
-    background process or a Codex session is not ended by the harness's own timeout."""
-    for gone in set(first_seen) - set(running):
+    seen. `running` is `(key, summary)`: `key` is the harness's own unique id for the
+    command, so a repeat of the same command, or two different commands whose summaries
+    truncate to the same text, never inherit each other's age. One reported past its
+    command timeout (and a minute's margin) has outlived what the timeout allows it,
+    whatever keeps the harness reporting it: a Hermes background process or a Codex
+    session is not ended by the harness's own timeout."""
+    keys = {key for key, _ in running}
+    for gone in set(first_seen) - keys:
         del first_seen[gone]
     limit = command_timeout_seconds + COMMAND_OVERRUN_SECONDS
     counted = []
-    for entry in running:
-        seen = first_seen.setdefault(entry, now)
+    for key, summary in running:
+        seen = first_seen.setdefault(key, now)
         if (now - seen).total_seconds() < limit:
-            counted.append(entry)
+            counted.append(summary)
     return tuple(counted)
 
 

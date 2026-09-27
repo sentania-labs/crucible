@@ -242,8 +242,8 @@ class CommandTracker(base.LineTracker):
             self._started.pop(item_id, None)
 
     @property
-    def running(self) -> tuple[str, ...]:
-        return tuple(self._started.values())
+    def running(self) -> tuple[tuple[str, str], ...]:
+        return tuple(self._started.items())
 
 
 def _toml_string(value: str) -> str:

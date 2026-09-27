@@ -294,10 +294,10 @@ class CommandTracker(base.LineTracker):
                     self._tasks.pop(task_id, None)
 
     @property
-    def running(self) -> tuple[str, ...]:
-        return tuple(summary for _, _, summary in self._tools.values()) + tuple(
-            self._tasks.values()
-        )
+    def running(self) -> tuple[tuple[str, str], ...]:
+        return tuple(
+            (tool_id, summary) for tool_id, (_, _, summary) in self._tools.items()
+        ) + tuple(self._tasks.items())
 
 
 def _tool_summary(block: dict[str, Any]) -> str:

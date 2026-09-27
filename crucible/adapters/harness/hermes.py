@@ -298,10 +298,16 @@ class CommandTracker(base.LineTracker):
             self._count = int(match.group(1))
 
     @property
-    def running(self) -> tuple[str, ...]:
+    def running(self) -> tuple[tuple[str, str], ...]:
         if not self._count:
             return ()
-        return (base.in_flight_summary("process registry", f"{self._count} running"),)
+        # One conceptual entry: the registry's count, not one id per process.
+        return (
+            (
+                "process registry",
+                base.in_flight_summary("process registry", f"{self._count} running"),
+            ),
+        )
 
 
 def in_flight(report_dir: Path) -> tuple[str, ...]:
