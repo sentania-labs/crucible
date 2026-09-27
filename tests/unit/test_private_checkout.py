@@ -527,3 +527,95 @@ async def test_kubernetes_refuses_a_private_url_off_the_credential_host() -> Non
     with pytest.raises(ProviderError, match=r"over https from github\.com"):
         await provider.prepare(launch, checkout_token=_token())
     assert not kf.created(api, "secrets")
+
+
+# ----- the failure paths the review asked for ---------------------------------------
+
+
+class StdinRefusedClient(PreparingClient):
+    def write_stdin(self, container_id: str, payload: bytes) -> None:
+        raise OSError("the attach connection was reset")
+
+
+async def test_docker_removes_the_preparer_when_the_token_cannot_be_written(
+    tmp_path: Path,
+) -> None:
+    client = StdinRefusedClient(tmp_path)
+    provider = DockerProvider(docker_config(tmp_path), client=client)  # type: ignore[arg-type]
+    launch = replace(docker_spec(), repository_url="https://github.com/octo-lab/secret")
+    with pytest.raises(ProviderError, match="preparer container could not build"):
+        await provider.prepare(launch, checkout_token=_token())
+    assert client.created and client.removed == ["container-1"]
+    assert client.killed == ["container-1"]
+
+
+async def test_kubernetes_deletes_the_token_secret_when_prepare_is_cancelled() -> None:
+    import asyncio  # noqa: PLC0415
+
+    api, _registry, provider = kf.build(config=_k8s_config())
+
+    async def cancelled(*_: Any, **__: Any) -> Any:
+        assert api.secret_exists(SECRET_NAME), "the Secret should exist while the step runs"
+        raise asyncio.CancelledError
+
+    provider._run_preparer = cancelled  # type: ignore[method-assign]
+    with pytest.raises(asyncio.CancelledError):
+        await provider.prepare(kf.spec(), checkout_token=_token())
+    assert not api.secret_exists(SECRET_NAME)
+
+
+async def test_kubernetes_launches_no_worker_beside_a_secret_it_could_not_delete() -> None:
+    from crucible.adapters.execution.k8sapi import KubernetesApiError  # noqa: PLC0415
+
+    api, _registry, provider = kf.build(config=_k8s_config())
+    original = api.delete
+    created: list[bool] = []
+
+    def refuse_once_made(kind: str, name: str, **kw: Any) -> None:
+        if kind == "secrets" and name == SECRET_NAME and api.secret_exists(name):
+            created.append(True)
+            raise KubernetesApiError(500, "etcd is unhappy")
+        original(kind, name, **kw)
+
+    api.delete = refuse_once_made  # type: ignore[method-assign]
+    with pytest.raises(ProviderError, match="no worker is launched beside it"):
+        await provider.prepare(kf.spec(), checkout_token=_token())
+    assert created, "the deletion was never attempted"
+    assert not kf.created(api, "jobs", "worker-")
+
+
+async def test_kubernetes_discard_and_cleanup_remove_a_leftover_token_secret() -> None:
+    from crucible.ports.execution import CleanupPolicy  # noqa: PLC0415
+
+    for finish in ("discard", "cleanup"):
+        api, _registry, provider = kf.build(config=_k8s_config())
+        launch = kf.spec()
+        ws = await provider.prepare(launch)
+        api.create(
+            "secrets",
+            k8sspec.secret(
+                name=SECRET_NAME,
+                namespace="crucible-workers",
+                object_labels=k8sspec.labels(launch, k8sspec.ROLE_PREPARER),
+                data={"token": b"revoked"},
+            ),
+        )
+        assert api.secret_exists(SECRET_NAME)
+        if finish == "discard":
+            await provider.discard(ws, launch)
+        else:
+            await provider.cleanup(ws, CleanupPolicy.DELETE, launch)
+        assert not api.secret_exists(SECRET_NAME), finish
+
+
+@pytest.mark.parametrize(
+    "url",
+    ["https://GitHub.com/octo-lab/secret", "https://github.com:443/octo-lab/secret"],
+)
+def test_the_url_check_matches_what_the_helper_is_given(url: str) -> None:
+    """git gives the helper the host as the URL writes it, port included, so the check
+    compares exactly: a spelling the helper would not answer is refused up front."""
+    with pytest.raises(ProviderError, match="over https from github"):
+        workspace.require_checkout_url(url, "github.com")
+    workspace.require_checkout_url("https://github.com/octo-lab/secret", "github.com")
+    workspace.require_checkout_url("https://x-access-token@github.com/o/r", "github.com")

@@ -42,9 +42,8 @@ def _refusal(repository: Repository, slug: str, exc: Exception) -> CheckoutRefus
     if isinstance(exc, GitHubError):
         if exc.status == 404:
             detail = (
-                f"installation {installation} cannot see {slug} (HTTP 404); install the "
-                "GitHub App on that repository, or register it under the installation "
-                "that covers it"
+                f"GitHub has no installation {installation} for this App (HTTP 404); "
+                "register the repository under the installation that covers it"
             )
         elif exc.status == 422:
             detail = (

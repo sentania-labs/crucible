@@ -176,7 +176,7 @@ def test_registration_mints_a_scoped_read_only_token_once_and_revokes_it(
     ("installation_id", "connected", "reason"),
     [
         (9, True, "installation 9 cannot read octo-lab/secret's contents (HTTP 422)"),
-        (404, True, "installation 404 cannot see octo-lab/secret (HTTP 404)"),
+        (404, True, "GitHub has no installation 404 for this App (HTTP 404)"),
         (None, True, "names no GitHub App installation"),
         (7, False, "no GitHub App is connected"),
     ],
@@ -504,3 +504,24 @@ def test_the_preparer_clones_a_remote_that_demands_the_token(
             revoked = _prepare_locally(tmp_path, url, host, value, cert, "revoked")
             assert revoked.returncode != 0
             assert not (tmp_path / "revoked" / "work" / "repo" / "README.md").exists()
+
+
+async def test_the_token_is_revoked_and_emptied_when_prepare_fails(
+    ctx: AppContext,
+    client: TestClient,
+    provider: FakeProvider,
+    stubs: Any,
+    app_key: tuple[str, str],
+    tmp_path: Path,
+) -> None:
+    github = _github(stubs, app_key, tmp_path)
+    _make_private(ctx, github)
+    supervisor = make_supervisor(ctx, provider, github=github)
+    task_id = submit_and_start(client, "crucible-worker:fake-prepare-fails")
+    for _ in range(3):
+        await supervisor.tick()
+    task = client.get(f"/v1/tasks/{task_id}").json()
+    attempt_id = task["executions"][0]["attempts"][0]["id"]
+    seen = provider.checkout_tokens[attempt_id]
+    assert seen.had_value and seen.token.reveal() == ""
+    assert stubs.stubs.tokens == {}, "a failed prepare left its token live at GitHub"

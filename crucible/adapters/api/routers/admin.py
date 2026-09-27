@@ -627,7 +627,8 @@ def admin_register_repository(
             attested_all_prs=bool(body.get("attested_all_prs", False)),
             attested_by=body.get("attested_by"),
         ),
-        private=body.get("private") is True,
+        # Parsed by the model, as PUT /v1/repositories parses it.
+        private=body.get("private", False),
     )
     result = repositories_admin.register(
         _admin(ctx),

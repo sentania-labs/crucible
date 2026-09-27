@@ -88,10 +88,12 @@ def _checkout_credential(source: str, credential_host: str) -> str:
     container's stdin, and this puts it on the container's own tmpfs, as the publisher
     does) or `file` (the Kubernetes provider mounts it from a per-attempt Secret). The
     helper answers only for https on `credential_host`. `drop_checkout_token` removes
-    the token and the helper and resets the git configuration to the safe.directory
-    exception alone; it runs once the network steps are done and again on exit, so no
-    path out of the script leaves either behind. `GIT_TRACE*` and `GIT_CURL_VERBOSE`
-    print the Authorization header, so they are unset rather than trusted (S10)."""
+    the helper and resets the git configuration to the safe.directory exception alone,
+    and removes the token file when it is on the container's tmpfs (a Secret volume is
+    read-only and goes with the Pod); it runs once the network steps are done and again
+    on exit, so no path out of the script leaves the helper behind. `GIT_TRACE*` and
+    `GIT_CURL_VERBOSE` print the Authorization header, so they are unset rather than
+    trusted (S10)."""
     if source not in ("stdin", "file"):
         raise ValueError(f"unknown token source {source!r}")
     receive = ""
@@ -232,8 +234,10 @@ def preparer_script(
     A private repository's clone and cache refresh use a read-only installation token
     (ADR 0019): `checkout_token` names where it is (`stdin` with the Docker provider,
     `file` on Kubernetes) and None means a public repository and no credential at all.
-    The token and its helper are gone before the checkout is positioned, and again on
-    every exit, so nothing after the network steps can read it.
+    git stops using it once it has cloned: the helper and its configuration go before
+    the checkout is positioned, and again on every exit. From a tmpfs (`stdin`) the
+    token file goes with them; a Secret volume (`file`) is read-only and goes with the
+    Pod.
     """
     cache_dir = f"{CACHE_MOUNT}/{cache_name}.git" if cache_name else ""
     refresh = ""

@@ -33,10 +33,14 @@ class WorkspaceError(Exception):
 def require_checkout_url(url: str, credential_host: str) -> None:
     """ADR 0019: a checkout token is only ever handed to git for an https URL on the one
     configured credential host, because the helper answers for nothing else and a clone
-    from anywhere else would fail later with a less useful message. Refuses otherwise."""
+    from anywhere else would fail later with a less useful message. Refuses otherwise.
+
+    The comparison is the helper's own: git hands the helper the URL's host exactly as
+    written, with the port when the URL names one, so `GitHub.com` or `github.com:443`
+    would get no answer from a helper bound to `github.com`, and is refused here."""
     parts = urlsplit(url)
-    host = parts.netloc.rpartition("@")[2].lower()
-    if parts.scheme != "https" or host != credential_host.lower():
+    host = parts.netloc.rpartition("@")[2]
+    if parts.scheme != "https" or host != credential_host:
         raise ProviderError(
             f"refusing to prepare: {url} is registered as private, and a private "
             f"repository is cloned with the GitHub App's token only over https from "

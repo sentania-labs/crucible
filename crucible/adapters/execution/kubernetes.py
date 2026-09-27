@@ -1084,17 +1084,25 @@ class KubernetesProvider:
                 token=None,
             )
         name = k8sspec.object_name("checkout", spec.attempt_id)
-        await self._create(
-            "secrets",
-            k8sspec.secret(
-                name=name,
-                namespace=self.config.namespace,
-                object_labels=self._labels(spec, k8sspec.ROLE_PREPARER),
-                data={CHECKOUT_TOKEN_KEY: checkout_token.reveal().encode("utf-8")},
-            ),
-        )
         try:
-            return await self._run_preparer(
+            # A Secret of this name can only be a leftover of an earlier try of this
+            # attempt, holding a token already revoked; the create must not keep it.
+            if not await self._delete_checkout_secret(spec.attempt_id):
+                raise ProviderError(
+                    f"the checkout token Secret {name!r} left by an earlier try could not "
+                    "be removed"
+                )
+            await self._call(
+                self.client.create,
+                "secrets",
+                k8sspec.secret(
+                    name=name,
+                    namespace=self.config.namespace,
+                    object_labels=self._labels(spec, k8sspec.ROLE_PREPARER),
+                    data={CHECKOUT_TOKEN_KEY: checkout_token.reveal().encode("utf-8")},
+                ),
+            )
+            workspace_ready = await self._run_preparer(
                 spec,
                 url=url,
                 base_ref=base_ref,
@@ -1104,22 +1112,39 @@ class KubernetesProvider:
                 identity_sha=identity_sha,
                 token=name,
             )
-        finally:
+        except BaseException:
+            # The failure that got here is the one reported; a deletion that fails as
+            # well is logged, and the retention sweep removes the object later.
             await self._delete_checkout_secret(spec.attempt_id)
+            raise
+        if not await self._delete_checkout_secret(spec.attempt_id):
+            # The worker is never launched beside it. The token in it is revoked when
+            # this returns, and `discard`, `cleanup` and the retention sweep retry.
+            raise ProviderError(
+                f"the checkout token Secret {name!r} could not be deleted after the "
+                "preparation step, so no worker is launched beside it"
+            )
+        return workspace_ready
 
-    async def _delete_checkout_secret(self, attempt_id: str) -> None:
-        """Remove the checkout token Secret; a missing one is already the goal."""
+    async def _delete_checkout_secret(self, attempt_id: str) -> bool:
+        """Remove the checkout token Secret; a missing one is already the goal. True
+        when it is gone. Never raises: it runs on failure paths whose own error is the
+        one to report."""
         name = k8sspec.object_name("checkout", attempt_id)
         for _ in range(2):
             try:
                 await self._call(self.client.delete, "secrets", name)
-                return
+                return True
             except KubernetesApiError as exc:
                 if exc.status == 404:
-                    return
+                    return True
                 log.warning("checkout token secret removal failed", extra={"error": str(exc)})
-        # The token is repository-scoped, read-only, revoked by the supervisor and at most
-        # an hour from expiry; `discard` and `cleanup` try the deletion again.
+            except Exception as exc:
+                log.warning(
+                    "checkout token secret removal failed",
+                    extra={"error": type(exc).__name__},
+                )
+        return False
 
     def _checkout_token_mounts(self, token: str | None) -> tuple[list[Mount], list[dict[str, Any]]]:
         if token is None:
