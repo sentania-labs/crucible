@@ -20,7 +20,7 @@ from crucible.adapters.execution.fake import FakeProvider
 from crucible.application.supervisor import Supervisor
 from crucible.ports.execution import LogChunk
 from tests.fixtures import FakeClock, contract_document
-from tests.integration.conftest import event_kinds
+from tests.integration.conftest import event_kinds, make_supervisor
 
 pytestmark = pytest.mark.integration
 
@@ -109,9 +109,15 @@ def local_endpoint_policy(client: TestClient, admin: TestClient) -> int:
 
 
 def start(
-    client: TestClient, harness: str, external_id: str, policy_version: int | None = None
+    client: TestClient,
+    harness: str,
+    external_id: str,
+    policy_version: int | None = None,
+    command_timeout_ms: int | None = None,
 ) -> str:
     doc = contract_document(external_id=external_id)
+    if command_timeout_ms is not None:
+        doc["execution_request"]["command_timeout_ms"] = command_timeout_ms
     if policy_version is not None:
         doc["policy"] = {"name": "default-software", "version": policy_version}
     doc["repository"]["work_branch"] = f"crucible/{external_id}"
@@ -211,5 +217,55 @@ async def test_a_worker_with_nothing_in_flight_and_no_output_still_stalls(
     assert worker.drains == 0
     assert event_kinds(client, task_id).count("worker_quiet") == 1
     await advance(supervisor, clock, TICK)
+    assert worker.drains == 1
+    assert client.get(f"/v1/attempts/{attempt_id}").json()["termination_reason"] == "stall"
+
+
+async def test_a_restarted_supervisor_rebuilds_the_command_from_the_stored_log(
+    operator: TestClient,
+    supervisor: Supervisor,
+    provider: FakeProvider,
+    clock: FakeClock,
+    ctx: AppContext,
+) -> None:
+    client = operator
+    task_id = start(client, "codex", "EX-0152-RESTART")
+    await supervisor.tick()
+    attempt_id = client.get(f"/v1/tasks/{task_id}").json()["latest_attempt"]["id"]
+    worker = provider.worker(attempt_id)
+    assert worker is not None
+    worker.logs.append(SCRIPTS["codex"][0])
+    await advance(supervisor, clock, STALL_FAIL // 2)
+    # A fresh process: nothing in memory, only the stored log.
+    restarted = make_supervisor(ctx, provider)
+    restarted_at = clock.now()
+    await advance(restarted, clock, STALL_FAIL)
+    assert worker.drains == 0
+    assert "worker_quiet" not in event_kinds(client, task_id)
+    with ctx.uow_factory() as uow:
+        heartbeats = uow.heartbeats.list_for_attempt(attempt_id, limit=10_000)
+    renewed = [h for h in heartbeats if h.signal == "command_running" and h.ts > restarted_at]
+    assert len(renewed) >= STALL_FAIL // 120
+
+
+async def test_a_command_reported_past_its_command_timeout_stops_pausing_the_clock(
+    operator: TestClient,
+    supervisor: Supervisor,
+    provider: FakeProvider,
+    clock: FakeClock,
+) -> None:
+    """A Codex session or a Hermes background process is not ended by the harness's own
+    timeout; the command timeout still bounds how long it holds the stall clock."""
+    client = operator
+    task_id = start(client, "codex", "EX-0152-OVERRUN", command_timeout_ms=600_000)
+    await supervisor.tick()
+    attempt_id = client.get(f"/v1/tasks/{task_id}").json()["latest_attempt"]["id"]
+    worker = provider.worker(attempt_id)
+    assert worker is not None
+    worker.logs.append(SCRIPTS["codex"][0])
+    await advance(supervisor, clock, 600)
+    assert "worker_quiet" not in event_kinds(client, task_id)
+    # Never completed: past 600 s and the minute's margin, the silence counts again.
+    await advance(supervisor, clock, 60 + STALL_FAIL + 2 * TICK)
     assert worker.drains == 1
     assert client.get(f"/v1/attempts/{attempt_id}").json()["termination_reason"] == "stall"

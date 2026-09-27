@@ -110,22 +110,35 @@ class LineTracker:
     two streams, so a tracker reads both and relies on what the line says."""
 
     def __init__(self) -> None:
-        self._partial: dict[str, str] = {}
+        # Each stream's partial line as its pieces, joined once when the line ends.
+        self._partial: dict[str, list[str]] = {}
+        self._held: dict[str, int] = {}
         self._dropping: set[str] = set()
 
     def feed(self, stream: str, text: str) -> None:
-        pending = self._partial.pop(stream, "") + text
-        *lines, rest = pending.split("\n")
-        for raw in lines:
+        pieces = self._partial.setdefault(stream, [])
+        start = 0
+        while (end := text.find("\n", start)) >= 0:
+            pieces.append(text[start:end])
+            whole = "".join(pieces)
+            pieces.clear()
+            self._held[stream] = 0
+            start = end + 1
             if stream in self._dropping:
                 self._dropping.discard(stream)
                 continue
-            self.line(raw.strip())
-        if len(rest) > LIVE_LINE_LIMIT:
+            self.line(whole.strip())
+        rest = text[start:]
+        if not rest:
+            return
+        held = self._held.get(stream, 0) + len(rest)
+        if held > LIVE_LINE_LIMIT:
+            pieces.clear()
+            held = 0
             self._dropping.add(stream)
-            rest = ""
-        if rest:
-            self._partial[stream] = rest
+        else:
+            pieces.append(rest)
+        self._held[stream] = held
 
     def line(self, text: str) -> None:
         raise NotImplementedError
@@ -141,7 +154,7 @@ def json_object(text: str) -> dict[str, Any] | None:
         return None
     try:
         parsed = json.loads(text)
-    except ValueError:
+    except (ValueError, RecursionError):
         return None
     return parsed if isinstance(parsed, dict) else None
 

@@ -26,7 +26,12 @@ from crucible.adapters.harness.claude_code import ClaudeCodeAdapter
 from crucible.adapters.harness.codex import CodexAdapter
 from crucible.adapters.harness.hermes import HermesAdapter
 from crucible.adapters.harness.script import ScriptHarnessAdapter
-from crucible.application.supervisor import command_activity_due, worker_stall_action
+from crucible.application.supervisor import (
+    command_activity_due,
+    command_refresh_seconds,
+    commands_counted,
+    worker_stall_action,
+)
 from crucible.ports.harness import CommandTracker
 from tests.unit.test_command_timeout import context
 
@@ -53,24 +58,41 @@ def tracker(adapter: ClaudeCodeAdapter | CodexAdapter | HermesAdapter) -> Comman
 # ----- the stall clock with a command in flight ---------------------------------------
 
 
-def stall_timeline(*, command_until: int, end: int, tick: int = 5) -> tuple[int | None, int | None]:
+def stall_timeline(
+    *,
+    command_until: int,
+    end: int,
+    tick: int = 5,
+    warn: int = WARN,
+    fail: int = FAIL,
+    command_timeout: int = 3600,
+) -> tuple[int | None, int | None]:
     """Walk the supervisor's per-tick rule from START: the worker writes nothing after
-    its first line, a command is in flight until `command_until` seconds, and each tick
-    writes a command_running signal when one is due. Returns when the first warning and
-    the stall came, in seconds, or None."""
+    its first line, the harness reports a command in flight until `command_until`
+    seconds, and each tick writes a command_running signal when one is due and the
+    command still counts. Returns when the first warning and the stall came, in
+    seconds, or None."""
     activity = START
     warned_at: datetime | None = None
     first_warn: int | None = None
+    first_seen: dict[str, datetime] = {}
+    refresh = command_refresh_seconds(warn, fail)
     for second in range(tick, end + 1, tick):
         now = START + timedelta(seconds=second)
-        if second < command_until and command_activity_due(now=now, last_activity=activity):
+        reported = ("tool Bash: make e2e",) if second < command_until else ()
+        counted = commands_counted(
+            reported, first_seen, now=now, command_timeout_seconds=command_timeout
+        )
+        if counted and command_activity_due(
+            now=now, last_activity=activity, refresh_seconds=refresh
+        ):
             activity = now
         action = worker_stall_action(
             now=now,
             last_activity=activity,
             last_signal=activity,
-            warn_seconds=WARN,
-            fail_seconds=FAIL,
+            warn_seconds=warn,
+            fail_seconds=fail,
             warned_at=warned_at,
         )
         if action == "fail":
@@ -96,10 +118,39 @@ def test_a_worker_with_no_command_in_flight_and_no_output_still_stalls() -> None
     assert stall_timeline(command_until=0, end=6000) == (WARN, FAIL)
 
 
-def test_a_command_signal_is_written_at_most_once_a_minute() -> None:
-    assert command_activity_due(now=START, last_activity=None)
-    assert not command_activity_due(now=START + timedelta(seconds=59), last_activity=START)
-    assert command_activity_due(now=START + timedelta(seconds=60), last_activity=START)
+def test_short_stall_limits_are_renewed_often_enough() -> None:
+    assert command_refresh_seconds(30, 45) == 15
+    assert command_refresh_seconds(1, 1) == 1
+    assert stall_timeline(command_until=600, end=600, warn=30, fail=45) == (None, None)
+
+
+def test_a_command_reported_past_its_command_timeout_no_longer_counts() -> None:
+    """A Hermes background process or a Codex session is not ended by the harness's
+    own timeout; the stall clock runs again once the command timeout (and a minute)
+    has passed, so the command timeout bounds it here too."""
+    warned, stalled = stall_timeline(command_until=99_999, end=9000, command_timeout=1200)
+    assert warned is not None and 1200 + 60 <= warned <= 1200 + 60 + WARN
+    assert stalled is not None and 1200 + 60 <= stalled <= 1200 + 60 + FAIL
+
+
+def test_a_command_signal_is_written_at_most_once_per_refresh() -> None:
+    assert command_activity_due(now=START, last_activity=None, refresh_seconds=60)
+    later = START + timedelta(seconds=59)
+    assert not command_activity_due(now=later, last_activity=START, refresh_seconds=60)
+    later = START + timedelta(seconds=60)
+    assert command_activity_due(now=later, last_activity=START, refresh_seconds=60)
+
+
+def test_each_command_is_bounded_from_when_it_was_first_seen() -> None:
+    first_seen: dict[str, datetime] = {}
+    assert commands_counted(("a",), first_seen, now=START, command_timeout_seconds=100) == ("a",)
+    later = START + timedelta(seconds=170)
+    assert commands_counted(("a", "b"), first_seen, now=later, command_timeout_seconds=100) == (
+        "b",
+    )
+    # A command that ends is forgotten; the same entry again is a new command.
+    assert commands_counted((), first_seen, now=later, command_timeout_seconds=100) == ()
+    assert commands_counted(("a",), first_seen, now=later, command_timeout_seconds=100) == ("a",)
 
 
 # ----- Claude Code ---------------------------------------------------------------------
@@ -175,6 +226,13 @@ def test_a_line_too_long_to_hold_is_dropped_and_reading_resumes(
     assert running_now(live) == ()
     monkeypatch.setattr(base, "LIVE_LINE_LIMIT", 1024)
     live.feed("stdout", assistant("m", tool("t", "ls"))[60:] + "\n")
+    assert len(running_now(live)) == 1
+
+
+def test_a_line_nested_too_deep_to_parse_is_skipped() -> None:
+    live = tracker(ClaudeCodeAdapter())
+    live.feed("stdout", "{" + '"a":[' * 200_000 + "\n")
+    live.feed("stdout", assistant("m", tool("t", "ls")) + "\n")
     assert len(running_now(live)) == 1
 
 
