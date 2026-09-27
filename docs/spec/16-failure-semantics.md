@@ -14,7 +14,7 @@
 | `crashed` | non-zero exit not otherwise classified | no retry by default; wake |
 | `lost` | provider cannot find the worker | retry if attempts remain and policy allows `lost`; else `failed` |
 | `completed_without_report` | exit 0, no report | report gate fails; no retry; wake |
-| `incomplete` | the harness exited cleanly while its own tooling reported a command still running (07, issue 128) | attempt `failed`, never a completion, whatever the report claims; the running commands are on `attempt_collected` as `work_in_flight`; no retry, as for `crashed`. A worker that starts a server and leaves it running when it ends its turn is `incomplete` too: its own tooling reports the command still running |
+| `incomplete` | the harness exited cleanly while its own transcript shows a command it was waiting on cut off by the exit (07, issue 128): today only Claude Code's auto-background, a Bash call the CLI moved to the background on its own | attempt `failed`, never a completion, whatever the report claims; the cut-off commands are on `attempt_collected` as `work_in_flight`; no retry, as for `crashed`. A background process the worker chose to leave running (a server, a Codex session it did not poll, a Hermes `background=true` process) is not `incomplete` and is not recorded: it dies with the sandbox, and unfinished work is caught by the pre-PR gates and CI (issue 153) |
 
 A stall is `timeout` with reason `stall`: no activity (10) for the policy's
 `stall_fail_seconds`. A command the harness reports in flight is activity (05b,
