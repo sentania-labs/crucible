@@ -190,6 +190,15 @@ class GitHubClient(Protocol):
         self, *, installation_id: int, repository: str, permissions: dict[str, str] | None = None
     ) -> InstallationToken: ...
 
+    def checkout_token(self, *, installation_id: int, repository: str) -> InstallationToken:
+        """ADR 0019: a fresh token for one private repository's preparation step, scoped
+        to that repository with `contents: read` only, never cached."""
+        ...
+
+    def revoke_token(self, token: InstallationToken) -> bool:
+        """End a token before it expires. True when GitHub says it is gone."""
+        ...
+
     def remote_head(self, token: InstallationToken, *, repository: str, ref: str) -> str | None:
         """The SHA at `refs/heads/<ref>`, or None when the ref does not exist."""
         ...
