@@ -133,6 +133,20 @@ then pick repositories there. A deployment that sealed `crucible-github-app` bef
 change takes it out of its GitOps repository without pruning it, or connects the App
 again afterwards.
 
+**Private repositories need the App and nothing else** (ADR 0019). The picker registers a
+private repository as private; the Repositories form and `crucible admin repository
+register --private` do the same for one it cannot show, with the installation ID that
+covers it. Registration asks GitHub for a read-only token for that repository and revokes
+it at once, so a missing App, a wrong installation, or an App without Contents read is
+refused there, in those words. Each preparation then gets its own read-only token,
+revoked when the step ends; on this cluster it is a short-lived Secret `checkout-<attempt>`
+in `crucible-workers`, mounted into the cache refresher and the preparer Jobs only. No
+extra RBAC is needed: the service already creates and deletes Secrets there for the
+harness credential copies. The token is answered only for https on
+`CRUCIBLE_GITHUB__CREDENTIAL_HOST` (default `github.com`); a GitHub Enterprise Server
+deployment sets that to its host, and the preparer of a private repository may then reach
+it. Public repositories clone with no credential, as before.
+
 **The harness credential Secrets are not GitOps's.** Crucible creates and owns them
 (ADR 0015): the login flow below writes each one, the Hermes key entry on the Local
 gateway page writes Hermes's, and the supervisor writes a refreshed token back after an attempt.

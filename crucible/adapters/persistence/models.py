@@ -54,6 +54,7 @@ class RepositoryRow(Base):
     external_review_attested: Mapped[bool] = mapped_column(Boolean, default=False)
     attested_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
     attested_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
+    private: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 class PolicyRow(Base):

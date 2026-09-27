@@ -6,6 +6,10 @@ all pull requests there. The setting lives inside the reviewer's own product and
 absent from every GitHub surface S12 checked, so the operator attests to it and the
 attestation is an event with the attesting principal and the time. A registration without
 it is accepted only when the repository's policy asks for no external review round.
+
+A private repository (ADR 0019) is registered only when the GitHub App can mint it a
+read-only checkout token: the check mints one and revokes it at once, so the refusal
+comes here, in words the operator can act on, and not at the first task's preparation.
 """
 
 from __future__ import annotations
@@ -13,7 +17,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from crucible.application.errors import ContractValidationError, NotFoundError
+from crucible.application.checkout import CheckoutRefusedError, check_private_checkout
+from crucible.application.errors import ConflictError, ContractValidationError, NotFoundError
 from crucible.application.transitions import record_event
 from crucible.contracts.api import RepositoryRegistration
 from crucible.domain.entities import Repository
@@ -21,7 +26,13 @@ from crucible.domain.events import EventKind
 from crucible.domain.external_review import required_rounds
 from crucible.domain.ids import new_id
 from crucible.ports.clock import Clock
+from crucible.ports.github import GitHubClient
 from crucible.ports.repository import UnitOfWork
+
+
+class PrivateCheckoutRefusedError(ConflictError):
+    slug = "private-checkout"
+    title = "Private repository refused"
 
 
 def register_repository(
@@ -33,6 +44,7 @@ def register_repository(
     registration: RepositoryRegistration,
     reason: str | None = None,
     before: Mapping[str, Any] | None = None,
+    github: GitHubClient | None = None,
 ) -> Repository:
     versions = list(uow.policies.list_versions(registration.policy_name))
     policy = max(versions, key=lambda p: p.version) if versions else None
@@ -59,21 +71,25 @@ def register_repository(
     now = clock.now()
     existing = uow.repositories.get_by_name(name)
     attested_by = attestation.attested_by or principal_name
-    repository = uow.repositories.upsert(
-        Repository(
-            id=existing.id if existing else new_id(),
-            name=name,
-            url=registration.url,
-            default_branch=registration.default_branch,
-            policy_name=registration.policy_name,
-            installation_id=registration.installation_id,
-            registered_by=principal_name,
-            created_at=existing.created_at if existing else now,
-            external_review_attested=attestation.attested_all_prs,
-            attested_by=attested_by if attestation.attested_all_prs else None,
-            attested_at=now if attestation.attested_all_prs else None,
-        )
+    candidate = Repository(
+        id=existing.id if existing else new_id(),
+        name=name,
+        url=registration.url,
+        default_branch=registration.default_branch,
+        policy_name=registration.policy_name,
+        installation_id=registration.installation_id,
+        registered_by=principal_name,
+        created_at=existing.created_at if existing else now,
+        external_review_attested=attestation.attested_all_prs,
+        attested_by=attested_by if attestation.attested_all_prs else None,
+        attested_at=now if attestation.attested_all_prs else None,
+        private=registration.private,
     )
+    try:
+        check_private_checkout(github, candidate)
+    except CheckoutRefusedError as exc:
+        raise PrivateCheckoutRefusedError(f"refusing to register: {exc}") from None
+    repository = uow.repositories.upsert(candidate)
     record_event(
         uow,
         clock,
@@ -88,6 +104,7 @@ def register_repository(
             # discovery calls off the token-minting hot path (S10 follow-up 5).
             "installation_id": repository.installation_id,
             "external_review_attested": repository.external_review_attested,
+            "private": repository.private,
             # The administrative path (25) supplies both; 04's own path supplies neither.
             **({"reason": reason} if reason else {}),
             **({"before": dict(before)} if before is not None else {}),

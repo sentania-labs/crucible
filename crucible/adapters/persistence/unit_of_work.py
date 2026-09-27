@@ -239,6 +239,7 @@ class Repositories:
             external_review_attested=row.external_review_attested,
             attested_by=row.attested_by,
             attested_at=ensure_utc(row.attested_at) if row.attested_at else None,
+            private=row.private,
         )
 
     def get_by_name(self, name: str) -> Repository | None:
@@ -284,6 +285,7 @@ class Repositories:
         row.external_review_attested = repository.external_review_attested
         row.attested_by = repository.attested_by
         row.attested_at = repository.attested_at
+        row.private = repository.private
         self._s.flush()
         return self._to_entity(row)
 

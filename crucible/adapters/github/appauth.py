@@ -38,6 +38,9 @@ JWT_BACKDATE_SECONDS = 60
 # Re-mint before the hour is out, and well before: a publisher that outlives ten minutes
 # is treated as failed (S10), so a token with two minutes left is no use to anyone.
 TOKEN_REFRESH_MARGIN_SECONDS = 300
+# ADR 0019: what a private repository's checkout token may do. Read the repository's
+# contents, which is a clone and a fetch, and nothing else; GitHub adds metadata read.
+CHECKOUT_PERMISSIONS: dict[str, str] = {"contents": "read"}
 
 
 class AppKeyError(Exception):
@@ -212,6 +215,51 @@ class AppAuthenticator:
             if remaining > TOKEN_REFRESH_MARGIN_SECONDS:
                 return cached.issue(repository)
             self._cache.pop(cache_key, None)
+        entry = self._mint(installation_id, short, permissions)
+        self._cache[cache_key] = entry
+        token = entry.issue(repository)
+        log.info(
+            "installation token minted",
+            extra={
+                "repository": repository,
+                "installation_id": installation_id,
+                "expires_at": entry.expires_at.isoformat(),
+                "permissions": sorted(token.permissions),
+            },
+        )
+        return token
+
+    def checkout_token(self, *, installation_id: int, repository: str) -> InstallationToken:
+        """ADR 0019: a private repository's checkout token. Scoped to the one repository,
+        `contents: read` and nothing more, and minted fresh for each preparation step:
+        never cached, because the caller discards it and revokes it when the step ends
+        and a cached copy would outlive both."""
+        short = repository.rsplit("/", maxsplit=1)[-1]
+        entry = self._mint(installation_id, short, CHECKOUT_PERMISSIONS)
+        log.info(
+            "checkout token minted",
+            extra={
+                "repository": repository,
+                "installation_id": installation_id,
+                "expires_at": entry.expires_at.isoformat(),
+                "permissions": sorted(entry.permissions),
+            },
+        )
+        return entry.issue(repository)
+
+    def revoke(self, token: InstallationToken) -> bool:
+        """`DELETE /installation/token`: end a token before its hour is out. The token
+        authenticates its own revocation, so nothing else is signed. True when GitHub
+        says it is gone."""
+        value = token.reveal()
+        if not value:
+            return False
+        status, _, _ = self._transport.request("DELETE", "/installation/token", bearer=value)
+        return bool(status == 204)
+
+    def _mint(
+        self, installation_id: int, short: str, permissions: dict[str, str] | None
+    ) -> _CachedToken:
         body: dict[str, Any] = {"repositories": [short]}
         if permissions:
             body["permissions"] = dict(permissions)
@@ -230,24 +278,11 @@ class AppAuthenticator:
         value = str(payload.get("token", ""))
         if not value:
             raise GitHubError(status, "the mint response carried no token")
-        expires = _parse_expiry(payload.get("expires_at"))
-        entry = _CachedToken(
+        return _CachedToken(
             value=value,
-            expires_at=expires,
+            expires_at=_parse_expiry(payload.get("expires_at")),
             permissions={str(k): str(v) for k, v in (payload.get("permissions") or {}).items()},
         )
-        self._cache[cache_key] = entry
-        token = entry.issue(repository)
-        log.info(
-            "installation token minted",
-            extra={
-                "repository": repository,
-                "installation_id": installation_id,
-                "expires_at": expires.isoformat(),
-                "permissions": sorted(token.permissions),
-            },
-        )
-        return token
 
     def discard_all(self) -> None:
         self._cache.clear()

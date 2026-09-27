@@ -82,6 +82,7 @@ from crucible.contracts.completion_claim import CompletionClaimV1
 from crucible.domain.cluster_egress import ClusterEgress, parse_cluster_egress
 from crucible.domain.exit_class import ExitClass
 from crucible.domain.ids import new_id
+from crucible.domain.secrets import redact
 from crucible.domain.time import parse_rfc3339
 from crucible.ports.execution import (
     IDENTITY_MOUNT,
@@ -113,6 +114,7 @@ from crucible.ports.execution import (
     Workspace,
     WorkspaceState,
 )
+from crucible.ports.github import InstallationToken
 from crucible.ports.harness import AuthFile, CredentialSpec, ExitInfo, LaunchContext, MountMode
 
 log = logging.getLogger("crucible.provider.kubernetes")
@@ -169,6 +171,9 @@ KILL_EXIT_CODE = 137
 # 26's object table names the Jobs; `crucible.role` keeps the Docker provider's role
 # names, so one label means the same thing on both providers. The two differ for three
 # roles and that is the whole mapping.
+# The key the checkout token Secret keeps a private repository's token under (ADR 0019).
+CHECKOUT_TOKEN_KEY = "token"
+
 OBJECT_PREFIX: dict[str, str] = {
     k8sspec.ROLE_PREPARER: "prepare",
     k8sspec.ROLE_CACHE_REFRESHER: "refresh-cache",
@@ -349,6 +354,11 @@ class KubernetesConfig:
     # gate could not read at all; a canary that positively read no limit still fails
     # regardless of this value.
     pod_pid_limit_override: int | None = None
+    # The one host a private repository's checkout token is answered for (ADR 0019),
+    # the same `github.credential_host` the publisher's helper uses (23). When it is not
+    # github.com, the preparer and the cache refresher of a private repository may also
+    # reach it.
+    credential_host: str = "github.com"
 
     def credential_secret_name(self, harness: str) -> str:
         # A Secret name is a DNS subdomain, which has no underscore: claude_code's
@@ -972,7 +982,9 @@ class KubernetesProvider:
             ) from exc
         return _has_declared_auth_file(credential, source)
 
-    async def prepare(self, spec: LaunchSpec) -> Workspace:
+    async def prepare(
+        self, spec: LaunchSpec, checkout_token: InstallationToken | None = None
+    ) -> Workspace:
         # 26: the preparer renders its own egress policy (the DNS selector included),
         # and the supervisor calls prepare() before launch(). Refresh here too, or a
         # stale seed's policy is rendered and launch()'s own refresh is never reached.
@@ -981,6 +993,8 @@ class KubernetesProvider:
         url = spec.repository_url or str(repository.get("url", ""))
         if not url:
             raise ProviderError("the contract names no repository url")
+        if checkout_token is not None:
+            workspace.require_checkout_url(url, self.config.credential_host)
         base_ref = str(repository.get("base_ref", "main"))
         work_branch = str(repository.get("work_branch") or f"crucible/{spec.external_id}")
         resolved = await self._resolve_image(spec)
@@ -1029,6 +1043,7 @@ class KubernetesProvider:
                 resolved=resolved,
                 limits=limits,
                 identity_sha=identity_sha,
+                checkout_token=checkout_token,
             )
         except BaseException:
             # 12: the copy is removed on *every* path, not only the clean one. Every
@@ -1051,8 +1066,128 @@ class KubernetesProvider:
         resolved: str,
         limits: Limits,
         identity_sha: str,
+        checkout_token: InstallationToken | None = None,
+    ) -> Workspace:
+        """ADR 0019: a private repository's token is a per-attempt Secret mounted into
+        the cache refresher and the preparer, the two Pods that talk to the remote, and
+        into no other Pod. It is deleted as soon as the preparer's Pod is gone, on every
+        path, before `launch` ever renders a worker."""
+        if checkout_token is None:
+            return await self._run_preparer(
+                spec,
+                url=url,
+                base_ref=base_ref,
+                work_branch=work_branch,
+                resolved=resolved,
+                limits=limits,
+                identity_sha=identity_sha,
+                token=None,
+            )
+        name = k8sspec.object_name("checkout", spec.attempt_id)
+        try:
+            # A Secret of this name can only be a leftover of an earlier try of this
+            # attempt, holding a token already revoked; the create must not keep it.
+            if not await self._delete_checkout_secret(spec.attempt_id):
+                raise ProviderError(
+                    f"the checkout token Secret {name!r} left by an earlier try could not "
+                    "be removed"
+                )
+            await self._call(
+                self.client.create,
+                "secrets",
+                k8sspec.secret(
+                    name=name,
+                    namespace=self.config.namespace,
+                    object_labels=self._labels(spec, k8sspec.ROLE_PREPARER),
+                    data={CHECKOUT_TOKEN_KEY: checkout_token.reveal().encode("utf-8")},
+                ),
+            )
+            workspace_ready = await self._run_preparer(
+                spec,
+                url=url,
+                base_ref=base_ref,
+                work_branch=work_branch,
+                resolved=resolved,
+                limits=limits,
+                identity_sha=identity_sha,
+                token=name,
+            )
+        except BaseException:
+            # The failure that got here is the one reported; a deletion that fails as
+            # well is logged, and the retention sweep removes the object later.
+            await self._delete_checkout_secret(spec.attempt_id)
+            raise
+        if not await self._delete_checkout_secret(spec.attempt_id):
+            # The worker is never launched beside it. The token in it is revoked when
+            # this returns, and `discard`, `cleanup` and the retention sweep retry.
+            raise ProviderError(
+                f"the checkout token Secret {name!r} could not be deleted after the "
+                "preparation step, so no worker is launched beside it"
+            )
+        return workspace_ready
+
+    async def _delete_checkout_secret(self, attempt_id: str) -> bool:
+        """Remove the checkout token Secret; a missing one is already the goal. True
+        when it is gone. Never raises: it runs on failure paths whose own error is the
+        one to report."""
+        name = k8sspec.object_name("checkout", attempt_id)
+        for _ in range(2):
+            try:
+                await self._call(self.client.delete, "secrets", name)
+                return True
+            except KubernetesApiError as exc:
+                if exc.status == 404:
+                    return True
+                log.warning("checkout token secret removal failed", extra={"error": str(exc)})
+            except Exception as exc:
+                log.warning(
+                    "checkout token secret removal failed",
+                    extra={"error": type(exc).__name__},
+                )
+        return False
+
+    def _checkout_token_mounts(self, token: str | None) -> tuple[list[Mount], list[dict[str, Any]]]:
+        if token is None:
+            return [], []
+        volume = {
+            "name": "checkout-token",
+            "secret": {
+                "secretName": token,
+                "defaultMode": 0o400,
+                "items": [{"key": CHECKOUT_TOKEN_KEY, "path": "token", "mode": 0o400}],
+                "optional": False,
+            },
+        }
+        return [Mount("checkout-token", scripts.TOKEN_MOUNT, read_only=True)], [volume]
+
+    def _checkout_plan(self, spec: LaunchSpec, role: str, private: bool) -> EgressPlan:
+        """The git roles' egress, plus the credential host when a private repository's
+        token is answered for a host that is not github.com (ADR 0019)."""
+        plan = self._egress_plan(spec, role)
+        if not private or not (plan.hosts or plan.endpoints or plan.broad):
+            return plan
+        host, _, port = self.config.credential_host.lower().partition(":")
+        if host in plan.hosts and port in ("", "443"):
+            return plan
+        destination = f"{host}:{port or '443'}"
+        if destination in plan.endpoints:
+            return plan
+        return replace(plan, endpoints=(*plan.endpoints, destination))
+
+    async def _run_preparer(
+        self,
+        spec: LaunchSpec,
+        *,
+        url: str,
+        base_ref: str,
+        work_branch: str,
+        resolved: str,
+        limits: Limits,
+        identity_sha: str,
+        token: str | None,
     ) -> Workspace:
         repository = spec.contract.get("repository", {})
+        token_mounts, token_volumes = self._checkout_token_mounts(token)
         # The shim rule is the adapter's (06): Claude Code reads AGENTS.md only where the
         # project has no CLAUDE.md of its own, and the preparer needs to be told which.
         adapter = self.harnesses.require(spec.harness)
@@ -1066,7 +1201,12 @@ class KubernetesProvider:
             if gate.refresh_due(time.monotonic()):
                 async with gate.writing():
                     await self._refresh_cache(
-                        spec, url=url, cache_name=cache_name, image=resolved, limits=limits
+                        spec,
+                        url=url,
+                        cache_name=cache_name,
+                        image=resolved,
+                        limits=limits,
+                        token=token,
                     )
             # 26: the preparer reads the cache and never writes it. It is the one volume
             # every attempt shares, so an attempt's Pod that could write it could poison
@@ -1104,17 +1244,19 @@ class KubernetesProvider:
                     exclude_entries=workspace.EXCLUDE_ENTRIES,
                     identity_mount=IDENTITY_MOUNT,
                     refresh_cache=False,
+                    checkout_token="file" if token else None,
+                    credential_host=self.config.credential_host,
                 ),
-                mounts=[Mount("ws", WORK_MOUNT), *cache_mounts],
-                volumes=[self._claim_volume(spec.attempt_id), *cache_volumes],
+                mounts=[Mount("ws", WORK_MOUNT), *cache_mounts, *token_mounts],
+                volumes=[self._claim_volume(spec.attempt_id), *cache_volumes, *token_volumes],
                 limits=limits,
                 timeout=self.config.prepare_timeout_seconds,
-                plan=self._egress_plan(spec, k8sspec.ROLE_PREPARER),
+                plan=self._checkout_plan(spec, k8sspec.ROLE_PREPARER, token is not None),
             )
         if exit_code != 0:
             raise ProviderError(
                 f"the preparer Job could not build the checkout (exit {exit_code}): "
-                f"{self.last_error.get(k8sspec.ROLE_PREPARER, '')}"
+                f"{redact(self.last_error.get(k8sspec.ROLE_PREPARER, ''))}"
             )
         prepared = await self._read_files(
             spec, ["output/prepared-head.txt", "output/started-from.txt"], limits
@@ -1141,7 +1283,14 @@ class KubernetesProvider:
         return gates.setdefault(cache_name, _CacheGate())
 
     async def _refresh_cache(
-        self, spec: LaunchSpec, *, url: str, cache_name: str, image: str, limits: Limits
+        self,
+        spec: LaunchSpec,
+        *,
+        url: str,
+        cache_name: str,
+        image: str,
+        limits: Limits,
+        token: str | None = None,
     ) -> None:
         """26: refresh the reference cache in a Job of its own, the only Pod that mounts
         it writable (#55). It carries no workspace, no identity bundle and no
@@ -1149,29 +1298,39 @@ class KubernetesProvider:
         is logged, and the preparer clones from the remote, or from the mirror as it
         was: a stale or absent cache costs time, never correctness. A refresher whose
         Pod cannot be confirmed gone fails the prepare instead (`_run_role_job` raises),
-        because that Pod may still hold the cache writable while a preparer reads it."""
+        because that Pod may still hold the cache writable while a preparer reads it.
+
+        A private repository's refresher also mounts the checkout token Secret (ADR
+        0019), and fetches with it; a public one's carries no credential at all."""
+        token_mounts, token_volumes = self._checkout_token_mounts(token)
         code = await self._run_role_job(
             spec,
             role=k8sspec.ROLE_CACHE_REFRESHER,
             image=image,
-            script=scripts.cache_refresh_script(url=url, cache_name=cache_name),
-            mounts=[Mount("cache", k8sspec.CACHE_MOUNT)],
+            script=scripts.cache_refresh_script(
+                url=url,
+                cache_name=cache_name,
+                checkout_token="file" if token else None,
+                credential_host=self.config.credential_host,
+            ),
+            mounts=[Mount("cache", k8sspec.CACHE_MOUNT), *token_mounts],
             volumes=[
                 {
                     "name": "cache",
                     "persistentVolumeClaim": {"claimName": self.config.cache_claim},
-                }
+                },
+                *token_volumes,
             ],
             limits=limits,
             timeout=self.config.prepare_timeout_seconds,
-            plan=self._egress_plan(spec, k8sspec.ROLE_CACHE_REFRESHER),
+            plan=self._checkout_plan(spec, k8sspec.ROLE_CACHE_REFRESHER, token is not None),
         )
         if code != 0:
             log.warning(
                 "the reference cache refresh failed; the preparer clones without it",
                 extra={
                     "exit_code": code,
-                    "detail": self.last_error.get(k8sspec.ROLE_CACHE_REFRESHER, ""),
+                    "detail": redact(self.last_error.get(k8sspec.ROLE_CACHE_REFRESHER, "")),
                 },
             )
 
@@ -1670,6 +1829,9 @@ class KubernetesProvider:
         when one was seeded. Nothing else of the workspace is touched."""
         self._seeded.pop(ws.attempt_id, None)
         await self._delete_credential_secret(ws.attempt_id)
+        # ADR 0019: prepare deletes the checkout token Secret itself; a deletion that
+        # failed there is retried here.
+        await self._delete_checkout_secret(ws.attempt_id)
         launched = self._launched.get(ws.attempt_id)
         spec = spec or (launched.spec if launched else None)
         if spec is None:
@@ -1692,6 +1854,7 @@ class KubernetesProvider:
         spec = spec or (launched.spec if launched else None)
         await self._delete_by_label(("jobs", "networkpolicies", "pods"), attempt_id=ws.attempt_id)
         await self._delete_credential_secret(ws.attempt_id)
+        await self._delete_checkout_secret(ws.attempt_id)
         if policy is CleanupPolicy.DELETE:
             await self._delete_by_label(
                 ("persistentvolumeclaims", "configmaps"), attempt_id=ws.attempt_id

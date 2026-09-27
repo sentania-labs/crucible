@@ -67,6 +67,12 @@ class RestGitHubClient:
             installation_id=installation_id, repository=repository, permissions=permissions
         )
 
+    def checkout_token(self, *, installation_id: int, repository: str) -> InstallationToken:
+        return self._auth.checkout_token(installation_id=installation_id, repository=repository)
+
+    def revoke_token(self, token: InstallationToken) -> bool:
+        return self._auth.revoke(token)
+
     # ----- reads --------------------------------------------------------
 
     def remote_head(self, token: InstallationToken, *, repository: str, ref: str) -> str | None:

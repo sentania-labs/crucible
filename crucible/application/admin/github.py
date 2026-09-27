@@ -8,9 +8,10 @@ then owns the credential (the `crucible-github-app` Secret on Kubernetes, the fi
 beside `github.app.private_key_path` with Docker). The App's install link comes from its
 own `html_url`. The repository picker lists what each installation covers, grouped by
 account, and registers a pick with the installation id and the default branch GitHub
-reports. A private repository is listed but not registered: the preparation step clones
-without a credential (`scripts.preparer_script`), so its first task could only fail.
-Private checkout is a separate operator decision."""
+reports. A private repository is registered as private (ADR 0019): its preparation step
+clones with a read-only installation token, and registration first proves the App can
+mint one for it. An archived repository is listed but not registered, because it cannot
+take a pull request."""
 
 from __future__ import annotations
 
@@ -37,14 +38,15 @@ class GitHubConnectError(ConflictError):
     title = "GitHub App refused"
 
 
-PRIVATE_NOT_SUPPORTED = "private: not supported yet"
+ARCHIVED_NOT_SUPPORTED = "archived: cannot take a pull request"
 
 
 def unsupported(repository: dict[str, Any]) -> str | None:
     """Why the picker cannot register this repository, in the words the page, the API
-    and the CLI all show, or None when it can."""
-    if repository.get("private"):
-        return PRIVATE_NOT_SUPPORTED
+    and the CLI all show, or None when it can. A private repository can be registered
+    (ADR 0019); an archived one cannot."""
+    if repository.get("archived"):
+        return ARCHIVED_NOT_SUPPORTED
     return None
 
 
@@ -441,11 +443,6 @@ def add_repository(
         )
     if found.get("archived"):
         raise GitHubConnectError(f"{found['full_name']} is archived and cannot take a pull request")
-    if unsupported(found):
-        raise GitHubConnectError(
-            f"{found['full_name']} is {PRIVATE_NOT_SUPPORTED}: the preparation step clones "
-            "without a credential, so a task on it would fail before it started"
-        )
     url = str(found.get("html_url") or f"https://github.com/{found['full_name']}")
     chosen = (name or "").strip() or str(found["full_name"]).rsplit("/", 1)[-1]
     existing = uow.repositories.get_by_name(chosen)
@@ -467,6 +464,8 @@ def add_repository(
             external_review=ExternalReviewAttestation(
                 attested_all_prs=attested_all_prs, attested_by=attested_by
             ),
+            # GitHub's own answer, read at the moment of the pick (ADR 0019).
+            private=found.get("private") is True,
         ),
         reason=reason,
     )

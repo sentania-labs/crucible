@@ -9,6 +9,7 @@ from enum import StrEnum
 from typing import Any, Literal, Protocol
 
 from crucible.domain.endpoints import validate_endpoint
+from crucible.ports.github import InstallationToken
 
 # Where the workspace appears inside every Crucible-created container (06, 08).
 REPO_MOUNT = "/crucible/repo"
@@ -423,7 +424,13 @@ class ExecutionProvider(Protocol):
 
     async def credential_available(self, harness: str) -> bool: ...
 
-    async def prepare(self, spec: LaunchSpec) -> Workspace: ...
+    async def prepare(
+        self, spec: LaunchSpec, checkout_token: InstallationToken | None = None
+    ) -> Workspace:
+        """Build the checkout. `checkout_token` is a private repository's read-only
+        installation token (ADR 0019): the provider hands it to the preparation step
+        alone, never to the worker, and the caller discards it once this returns."""
+        ...
 
     async def launch(self, ws: Workspace, spec: LaunchSpec) -> Handle: ...
 
