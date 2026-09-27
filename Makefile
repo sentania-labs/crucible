@@ -253,8 +253,10 @@ deploy-kind: check-image-manifest ## deploy the manifests on a disposable kind c
 # The first-run path on a disposable kind cluster (crucible#119, #120, #121, #123, #79):
 # the same deployment as deploy-kind, then gateway URL and key, a model picked from the
 # gateway, a stand-in GitHub App connected and a repository picked, and Status reading
-# ready for Hermes. Stand-ins only: no real model and no real GitHub API. Needs the
-# combined worker image images/manifest.env pins on the host daemon (`make images`).
+# ready for Hermes; then a private repository picked and prepared from a git stand-in
+# that demands the read-only checkout token, with the worker shown unable to read it
+# (crucible#157, ADR 0019). Stand-ins only: no real model and no real GitHub API. Needs
+# the combined worker image images/manifest.env pins on the host daemon (`make images`).
 first-run-kind: check-image-manifest ## deploy on a disposable kind cluster and walk the first-run setup
 	CRUCIBLE_E2E_DOCKER="$(DOCKER)" CRUCIBLE_DEPLOY_KIND_FIRST_RUN=1 \
 	  UV="$(UV)" tools/kind/deploy-kind.sh

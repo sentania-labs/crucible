@@ -13,6 +13,10 @@
 # instead of the task smoke (crucible#119, #120, #121, #123, #79): it also pushes the
 # combined worker image images/manifest.env pins, points the GitHub API at the stand-ins
 # tools/smoke/first_run_smoke.py deploys, and walks gateway, models, GitHub and Status.
+# It then prepares a private repository (crucible#157, ADR 0019) from a git stand-in
+# served over HTTPS with a certificate from this run's CA: the script-harness image it
+# pushes is the pinned one plus that CA in its trust store, and the credential host is
+# the stand-in's, so the preparer verifies it and hands it the token as it would GitHub.
 set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -168,7 +172,23 @@ crucible_kind_await_registry "https://127.0.0.1:${registry_port}" "$certs/ca.crt
 # what the certificate is for.
 push_ref="127.0.0.1:${registry_port}/crucible-worker:${run_id}"
 worker_ref="${registry_host}:5000/crucible-worker:${run_id}"
-docker tag "$worker_image" "$push_ref"
+if [ "$first_run" = 1 ]; then
+  # The pinned image with one more trusted CA, this run's, and nothing else changed: the
+  # preparer clones the private repository from the git stand-in over HTTPS and must be
+  # able to verify it. The tag is this run's and is removed with it.
+  mkdir -p "$scratch/trust"
+  cp "$certs/ca.crt" "$scratch/trust/ca.crt"
+  cat > "$scratch/trust/Dockerfile" <<EOF
+FROM $worker_image
+USER root
+COPY ca.crt /usr/local/share/ca-certificates/crucible-deploy-kind.crt
+RUN cat /usr/local/share/ca-certificates/crucible-deploy-kind.crt >> /etc/ssl/certs/ca-certificates.crt
+USER 1000:1000
+EOF
+  docker build -q -t "$push_ref" "$scratch/trust" >/dev/null
+else
+  docker tag "$worker_image" "$push_ref"
+fi
 docker push "$push_ref" >/dev/null
 echo "deploy-kind: the worker image is $worker_ref"
 if [ "$first_run" = 1 ]; then
@@ -284,9 +304,14 @@ data:
 EOF
 if [ "$first_run" = 1 ]; then
   # The stand-in GitHub API tools/smoke/first_run_smoke.py deploys. The real GitHub API
-  # is never called on this cluster.
+  # is never called on this cluster. The private repository's git stand-in is the one
+  # host the checkout token is answered for, and it is a Pod: its address is inside this
+  # cluster's pod range, which 26 denies unless a deployment names it, so the run names
+  # kind's pod subnet (the podSubnet above) for the endpoints it resolves.
   cat >> "$overlay/settings.yaml" <<EOF
   CRUCIBLE_GITHUB__API_BASE: http://crucible-stubs.crucible-stubs.svc.cluster.local:8080
+  CRUCIBLE_GITHUB__CREDENTIAL_HOST: crucible-git.crucible-stubs.svc.cluster.local:8443
+  CRUCIBLE_KUBERNETES__LOCAL_ENDPOINT_CIDRS: '["10.244.0.0/16"]'
 EOF
 fi
 for component in api supervisor; do
@@ -340,6 +365,8 @@ kubectl -n crucible-workers get sa,role,rolebinding,networkpolicy,resourcequota,
 
 if [ "$first_run" = 1 ]; then
   CRUCIBLE_DEPLOY_KIND_STUB_IMAGE="$release_image" \
+    CRUCIBLE_DEPLOY_KIND_GIT_IMAGE="${registry_host}:5000/crucible-worker:combined-${run_id}" \
+    CRUCIBLE_DEPLOY_KIND_CA_DIR="$certs" \
     "${UV:-uv}" run --frozen python "$root/tools/smoke/first_run_smoke.py"
 else
   CRUCIBLE_DEPLOY_KIND_WORKER_IMAGE="$worker_ref" python3 "$root/tools/smoke/kubernetes_smoke.py"

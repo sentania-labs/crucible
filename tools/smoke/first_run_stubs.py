@@ -76,6 +76,10 @@ class Stubs:
         # Never the token.
         self.mints: list[dict[str, Any]] = []
         self.revoked: int = 0
+        # Every token this stand-in minted, revoked or not, so a proof can look for one
+        # where it must not be (`GET /_stub/minted`). These are the stand-in's own values
+        # and grant nothing outside it.
+        self.history: list[dict[str, Any]] = []
         self.seen: list[str] = []
         self.lock = threading.Lock()
         pem = str(config.get("public_key_pem") or "")
@@ -181,11 +185,18 @@ class _Handler(BaseHTTPRequestHandler):
                 gone = stubs.tokens.pop(self._bearer(), None)
                 if gone is not None:
                     stubs.revoked += 1
+                    for entry in stubs.history:
+                        if entry["token"] == self._bearer():
+                            entry["revoked"] = True
             if gone is None:
                 self._send(401, {"message": "Bad credentials"})
                 return
             self.send_response(204)
             self.end_headers()
+            return
+        if method == "GET" and path == "/_stub/minted":
+            with stubs.lock:
+                self._send(200, list(stubs.history))
             return
         if method == "GET" and path == "/_stub/git-access":
             repository = (parse_qs(split.query).get("repository") or [""])[0]
@@ -299,6 +310,14 @@ class _Handler(BaseHTTPRequestHandler):
                         "installation": installation_id,
                         "repositories": names,
                         "permissions": permissions,
+                    }
+                )
+                stubs.history.append(
+                    {
+                        "token": token,
+                        "repositories": names,
+                        "permissions": permissions,
+                        "revoked": False,
                     }
                 )
             expires = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3600))

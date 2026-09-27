@@ -15,16 +15,26 @@ services (tools/smoke/first_run_stubs.py, run as a Pod in `crucible-stubs`):
    creates `crucible-github-app` in `crucible`, and the mounted copy appears in the api
    Pod readable by its user (the #79 fsGroup question);
 6. a repository is picked from the stand-in installation;
-7. Status reaches "ready" for Hermes, in the document and on the rendered page.
+7. Status reaches "ready" for Hermes, in the document and on the rendered page;
+8. a private repository is picked (crucible#157, ADR 0019) from a git stand-in that
+   answers a clone only with a read-only token the GitHub stand-in minted for it, and a
+   script-harness task on it is prepared: the refresher and the preparer clone with the
+   token, the token Secret is gone before the worker runs, the worker's Pod never
+   references it, nothing the worker can read holds it, and GitHub was asked to revoke
+   it.
 
 Nothing here calls the real GitHub API or a real model. The throwaway key is generated
-in memory, sent once in a request body, and never written to disk or printed.
+in memory, sent once in a request body, and never written to disk or printed. The git
+stand-in's certificate is signed by the run's own CA (`CRUCIBLE_DEPLOY_KIND_CA_DIR`),
+which deploy-kind.sh also adds to the script-harness image it pushes for this run, so
+the preparer verifies the stand-in the way it verifies GitHub.
 """
 
 from __future__ import annotations
 
 import argparse
 import base64
+import datetime as dt
 import http.cookiejar
 import importlib.util
 import json
@@ -32,14 +42,17 @@ import os
 import re
 import secrets
 import sys
+import tempfile
 import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
 
-from cryptography.hazmat.primitives import serialization
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import NameOID
 
 HERE = Path(__file__).resolve().parent
 STUB_NAMESPACE = "crucible-stubs"
@@ -49,6 +62,11 @@ APP_SLUG = "crucible-kind"
 MODELS = ["kind-fast", "kind-large"]
 REPOSITORY = "octo-lab/widgets"
 PRIVATE_REPOSITORY = "octo-lab/secret-plans"
+# The git stand-in: a headless Service, so the name resolves to the Pod's own address,
+# which is what a NetworkPolicy's address rule can match (26, crucible#91).
+GIT_HOST = f"crucible-git.{STUB_NAMESPACE}.svc.cluster.local"
+GIT_PORT = 8443
+PRIVATE_URL = f"https://{GIT_HOST}:{GIT_PORT}/{PRIVATE_REPOSITORY}"
 
 
 def _smoke_module() -> Any:
@@ -91,9 +109,87 @@ def app_key() -> tuple[str, str]:
     return private, public
 
 
-def deploy_stubs(image: str, config: dict[str, Any]) -> None:
+def git_tls(ca_dir: Path) -> tuple[str, str]:
+    """A one-day serving certificate for the git stand-in, signed by the run's CA."""
+    ca_key = serialization.load_pem_private_key((ca_dir / "ca.key").read_bytes(), password=None)
+    ca_cert = x509.load_pem_x509_certificate((ca_dir / "ca.crt").read_bytes())
+    assert isinstance(ca_key, rsa.RSAPrivateKey)
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    now = dt.datetime.now(dt.UTC)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, GIT_HOST)]))
+        .issuer_name(ca_cert.subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - dt.timedelta(minutes=5))
+        .not_valid_after(now + dt.timedelta(days=1))
+        .add_extension(x509.SubjectAlternativeName([x509.DNSName(GIT_HOST)]), critical=False)
+        .sign(ca_key, hashes.SHA256())
+    )
+    return (
+        cert.public_bytes(serialization.Encoding.PEM).decode(),
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption(),
+        ).decode(),
+    )
+
+
+def git_container(git_image: str) -> dict[str, Any]:
+    """The git stand-in, from the worker image (git and Python), beside the GitHub half
+    it asks whether a token may clone."""
+    return {
+        "name": "git",
+        "image": git_image,
+        "imagePullPolicy": "IfNotPresent",
+        "command": [
+            "python3",
+            "/stubs/first_run_stubs.py",
+            "--config",
+            "/stubs/config.json",
+            "--git-root",
+            "/srv/git",
+            "--port",
+            str(GIT_PORT),
+            "--tls-cert",
+            "/tls/tls.crt",
+            "--tls-key",
+            "/tls/tls.key",
+            "--auth-url",
+            "http://127.0.0.1:8080",
+        ],
+        "ports": [{"containerPort": GIT_PORT}],
+        "readinessProbe": {"tcpSocket": {"port": GIT_PORT}, "periodSeconds": 2},
+        "securityContext": {
+            "allowPrivilegeEscalation": False,
+            "readOnlyRootFilesystem": True,
+            "capabilities": {"drop": ["ALL"]},
+        },
+        "volumeMounts": [
+            {"name": "stubs", "mountPath": "/stubs"},
+            {"name": "tls", "mountPath": "/tls", "readOnly": True},
+            {"name": "git", "mountPath": "/srv/git"},
+            {"name": "tmp", "mountPath": "/tmp"},
+        ],
+        "resources": {
+            "requests": {"cpu": "20m", "memory": "64Mi"},
+            "limits": {"cpu": "500m", "memory": "256Mi"},
+        },
+    }
+
+
+def deploy_stubs(
+    image: str,
+    config: dict[str, Any],
+    *,
+    git_image: str | None = None,
+    tls: tuple[str, str] | None = None,
+) -> None:
     """The stand-ins as one Pod behind one Service, in their own namespace so the workers'
-    egress selector can name them (a selector may not name `crucible`)."""
+    egress selector can name them (a selector may not name `crucible`). With `git_image`
+    the Pod also runs the git stand-in, behind a headless Service of its own."""
     script = (HERE / "first_run_stubs.py").read_text(encoding="utf-8")
     objects = [
         {"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": STUB_NAMESPACE}},
@@ -164,12 +260,46 @@ def deploy_stubs(image: str, config: dict[str, Any]) -> None:
             },
         },
     ]
-    manifest = Path(os.environ.get("TMPDIR", "/tmp")) / f"crucible-stubs-{os.getpid()}.json"
-    manifest.write_text(json.dumps({"apiVersion": "v1", "kind": "List", "items": objects}))
-    try:
+    if git_image and tls:
+        deployment: Any = next(o for o in objects if o["kind"] == "Deployment")
+        pod = deployment["spec"]["template"]["spec"]
+        pod["containers"].append(git_container(git_image))
+        pod["volumes"].extend(
+            [
+                {"name": "tls", "secret": {"secretName": "crucible-git-tls"}},
+                {"name": "git", "emptyDir": {}},
+                {"name": "tmp", "emptyDir": {"medium": "Memory", "sizeLimit": "64Mi"}},
+            ]
+        )
+        objects.insert(
+            1,
+            {
+                "apiVersion": "v1",
+                "kind": "Secret",
+                "type": "kubernetes.io/tls",
+                "metadata": {"name": "crucible-git-tls", "namespace": STUB_NAMESPACE},
+                "stringData": {"tls.crt": tls[0], "tls.key": tls[1]},
+            },
+        )
+        objects.append(
+            {
+                "apiVersion": "v1",
+                "kind": "Service",
+                "metadata": {"name": "crucible-git", "namespace": STUB_NAMESPACE},
+                "spec": {
+                    "clusterIP": "None",
+                    "selector": {"app": "crucible-stubs"},
+                    "ports": [{"port": GIT_PORT, "targetPort": GIT_PORT}],
+                },
+            }
+        )
+    # The manifest may carry the git stand-in's throwaway key: a private file in a
+    # private directory, removed as soon as kubectl has read it.
+    with tempfile.TemporaryDirectory(prefix="crucible-stubs-") as scratch:
+        manifest = Path(scratch) / "stubs.json"
+        manifest.write_text(json.dumps({"apiVersion": "v1", "kind": "List", "items": objects}))
+        manifest.chmod(0o600)
         kubectl(["apply", "-f", str(manifest)])
-    finally:
-        manifest.unlink(missing_ok=True)
     kubectl(
         ["-n", STUB_NAMESPACE, "rollout", "status", "deployment/crucible-stubs", "--timeout=180s"]
     )
@@ -349,29 +479,238 @@ def github(base_url: str, token: str, private_key: str) -> None:
         or registered["installation_id"] != installation["id"]
     ):
         raise SmokeError("the registration did not take GitHub's default branch and installation")
-    # Checkout carries no credential, so a private repository is listed, marked and refused.
+    # ADR 0019: the private repository is offered like any other; step 8 registers it.
     private = next(
         (r for r in installation["repositories"] if r["full_name"] == PRIVATE_REPOSITORY), None
     )
-    if private is None or private.get("unsupported") != "private: not supported yet":
-        raise SmokeError(f"the picker did not mark {PRIVATE_REPOSITORY} as unsupported: {private}")
-    try:
-        request(
-            "POST",
-            f"{base_url}/v1/admin/github/repositories",
-            token=token,
-            body={
-                "reason": "first-run kind proof",
-                "installation_id": installation["id"],
-                "repository": PRIVATE_REPOSITORY,
-            },
-        )
-    except SmokeError as exc:
-        if "HTTP 409" not in str(exc) or "private: not supported yet" not in str(exc):
-            raise
-        show("private repository refused", str(exc).splitlines()[-1])
+    if private is None or private.get("private") is not True or private.get("unsupported"):
+        raise SmokeError(f"the picker does not offer {PRIVATE_REPOSITORY} as private: {private}")
+
+
+def stub_json(path: str) -> Any:
+    """A GET on the GitHub stand-in from inside its own Pod: the smoke's port forward
+    reaches Crucible only."""
+    code = (
+        "import json, urllib.request; "
+        f"print(urllib.request.urlopen('http://127.0.0.1:8080{path}', timeout=10).read().decode())"
+    )
+    out = kubectl(
+        [
+            "-n",
+            STUB_NAMESPACE,
+            "exec",
+            "deployment/crucible-stubs",
+            "-c",
+            "stubs",
+            "--",
+            "python",
+            "-c",
+            code,
+        ]
+    )
+    return json.loads(out)
+
+
+def scoped_mints() -> list[dict[str, Any]]:
+    return [m for m in stub_json("/_stub/minted") if m.get("repositories")]
+
+
+def private_checkout(base_url: str, admin: str) -> None:
+    step("8. a private repository, prepared with a read-only token the worker never sees (#157)")
+    request("PUT", f"{base_url}/v1/routing/{KS.ROUTING}/1", token=admin, body=KS.routing_document())
+    request(
+        "PUT",
+        f"{base_url}/v1/policies/{KS.POLICY}/1",
+        token=admin,
+        body=KS.policy_document(KS.shipped_policy(base_url, admin)),
+    )
+    KS.promote_worker_image(base_url, admin)
+    # Only repository-scoped mints: the picker's own listing mints metadata-only tokens.
+    before = len(scoped_mints())
+    registered = request(
+        "POST",
+        f"{base_url}/v1/admin/github/repositories",
+        token=admin,
+        body={
+            "reason": "first-run kind proof: a private repository (ADR 0019)",
+            "installation_id": 77,
+            "repository": PRIVATE_REPOSITORY,
+            "policy_name": KS.POLICY,
+            "attested_all_prs": True,
+        },
+    )
+    show("registered", registered)
+    if registered.get("private") is not True or registered.get("url") != PRIVATE_URL:
+        raise SmokeError("the private repository did not register as private at its git URL")
+    check = scoped_mints()[before:]
+    show(
+        "registration's token (scope only)",
+        [{k: m[k] for k in ("repositories", "permissions", "revoked")} for m in check],
+    )
+    if [(m["repositories"], m["permissions"], m["revoked"]) for m in check] != [
+        (["secret-plans"], {"contents": "read"}, True)
+    ]:
+        raise SmokeError("registration did not mint one read-only token and revoke it")
+
+    operator = KS.mint_token(f"first-run-operator-{int(time.time())}", "operator")
+    external_id = f"FIRST-RUN-PRIVATE-{int(time.time())}"
+    contract = KS.task_contract(external_id)
+    contract["title"] = "First-run kind proof: a private repository"
+    contract["project"] = "secret-plans"
+    contract["repository"].update({"name": "secret-plans", "base_ref": "main"})
+    contract["execution_request"]["rationale"] = "first-run kind proof, private checkout"
+    task = request("POST", f"{base_url}/v1/tasks", token=operator, body=contract)
+    task_id = str(task["id"])
+    request(
+        "POST",
+        f"{base_url}/v1/tasks/{task_id}/start",
+        token=operator,
+        body={"provider": "kubernetes", "policy_version": 1},
+    )
+    log(f"submitted and started task {task_id} on {PRIVATE_REPOSITORY}")
+
+    # The repository's `e2e-behavior` is `hang`: the worker runs until it is cancelled,
+    # which leaves time to look inside it.
+    deadline = time.monotonic() + 600
+    attempt_id = ""
+    worker: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        view = request("GET", f"{base_url}/v1/tasks/{task_id}", token=operator)
+        if view["state"] in KS.DEAD_END_STATES:
+            trail = KS.task_events(base_url, operator, task_id)
+            raise SmokeError(f"the private task reached {view['state']}:\n{trail}")
+        attempt_id = str((view.get("latest_attempt") or {}).get("id") or "")
+        if attempt_id:
+            pods = json.loads(
+                kubectl(
+                    [
+                        "-n",
+                        KS.WORKERS_NAMESPACE,
+                        "get",
+                        "pods",
+                        "-l",
+                        f"crucible.attempt={attempt_id},crucible.role=worker",
+                        "-o",
+                        "json",
+                    ]
+                )
+            )["items"]
+            running = [p for p in pods if (p.get("status") or {}).get("phase") == "Running"]
+            if running:
+                worker = running[0]
+                break
+        time.sleep(3)
     else:
-        raise SmokeError(f"{PRIVATE_REPOSITORY} was registered although it is private")
+        raise SmokeError(
+            "the private task's worker never ran:\n" + KS.task_events(base_url, operator, task_id)
+        )
+    log(f"attempt {attempt_id}: the worker Pod {worker['metadata']['name']} is running")
+
+    events = KS.task_events(base_url, operator, task_id)
+    git_log = kubectl(["-n", STUB_NAMESPACE, "logs", "deployment/crucible-stubs", "-c", "git"])
+    served = [line for line in git_log.splitlines() if "secret-plans" in line]
+    log("git stand-in, what it answered for the private repository:")
+    for line in served:
+        log(f"  {line}")
+    if not any(" 401 " in f" {line} " for line in served):
+        raise SmokeError("the git stand-in never refused an anonymous request")
+    if not any("200 POST git-upload-pack" in line for line in served):
+        raise SmokeError("the git stand-in never served the clone with a scoped token")
+
+    minted = stub_json("/_stub/minted")
+    prepared = scoped_mints()[before + 1 :]
+    show(
+        "prepare's token (scope only)",
+        [{k: m[k] for k in ("repositories", "permissions", "revoked")} for m in prepared],
+    )
+    if not prepared or any(
+        (m["repositories"], m["permissions"]) != (["secret-plans"], {"contents": "read"})
+        for m in prepared
+    ):
+        raise SmokeError("prepare did not use a token scoped to the one repository, read-only")
+    if not all(m["revoked"] for m in prepared):
+        raise SmokeError("a prepare's token was not revoked when the step ended")
+
+    secret_name = f"checkout-{attempt_id.lower()}"
+    leftover = kubectl(
+        [
+            "-n",
+            KS.WORKERS_NAMESPACE,
+            "get",
+            "secret",
+            secret_name,
+            "--ignore-not-found",
+            "-o",
+            "name",
+        ]
+    ).strip()
+    if leftover:
+        raise SmokeError(f"{secret_name} still exists while the worker runs")
+    log(f"{secret_name} is gone while the worker runs")
+    worker_spec = json.dumps(worker["spec"])
+    if "checkout-" in worker_spec or "/run/crucible-token" in worker_spec:
+        raise SmokeError("the worker Pod references the checkout token")
+    log("the worker Pod spec names no checkout Secret and no token mount")
+
+    tokens = [m["token"] for m in minted]
+    probe = (
+        'found=""; test -e /run/crucible-token && found="$found mount"; '
+        'for t in "$@"; do '
+        'grep -rqsF "$t" /crucible /home/worker /tmp 2>/dev/null && found="$found file"; '
+        'tr "\\0" "\\n" < /proc/1/environ | grep -qF "$t" && found="$found env"; '
+        'env | grep -qF "$t" && found="$found env"; '
+        'done; echo "found:${found:- nothing}"'
+    )
+    seen = kubectl(
+        [
+            "-n",
+            KS.WORKERS_NAMESPACE,
+            "exec",
+            worker["metadata"]["name"],
+            "--",
+            "sh",
+            "-c",
+            probe,
+            "probe",
+            *tokens,
+        ],
+        redact=True,
+    ).strip()
+    log(f"inside the worker, a search for every token the stand-in minted: {seen}")
+    if seen != "found: nothing":
+        raise SmokeError(f"the worker can read a checkout token: {seen}")
+    readme = kubectl(
+        [
+            "-n",
+            KS.WORKERS_NAMESPACE,
+            "exec",
+            worker["metadata"]["name"],
+            "--",
+            "cat",
+            "/crucible/repo/README.md",
+        ]
+    ).strip()
+    log(f"the worker's checkout of the private repository reads: {readme!r}")
+
+    request(
+        "POST",
+        f"{base_url}/v1/tasks/{task_id}/cancel",
+        token=operator,
+        body={
+            "reason": "first-run kind proof: the private checkout is proved",
+            "verbatim": "cancel the private checkout proof task",
+            "decided_by": "first-run-kind-proof",
+        },
+    )
+    deadline = time.monotonic() + 240
+    while time.monotonic() < deadline:
+        state = request("GET", f"{base_url}/v1/tasks/{task_id}", token=operator)["state"]
+        if state == "cancelled":
+            break
+        time.sleep(3)
+    else:
+        raise SmokeError(f"the private task did not cancel:\n{events}")
+    log("the private task is cancelled")
 
 
 def sign_in(base_url: str) -> Any:
@@ -405,7 +744,7 @@ def page_text(opener: Any, url: str) -> str:
     return re.sub(r"\s+", " ", text)
 
 
-def smoke(stub_image: str) -> None:
+def smoke(stub_image: str, git_image: str, ca_dir: Path) -> None:
     if not os.environ.get("KUBECONFIG"):
         raise SmokeError("KUBECONFIG must name the disposable cluster's kubeconfig")
     key = "vk_" + secrets.token_urlsafe(24)
@@ -426,11 +765,24 @@ def smoke(stub_image: str) -> None:
                     "repositories": [
                         {"full_name": REPOSITORY, "default_branch": "trunk"},
                         {"full_name": "octo-lab/gadgets", "default_branch": "main"},
-                        {"full_name": PRIVATE_REPOSITORY, "private": True},
+                        {
+                            "full_name": PRIVATE_REPOSITORY,
+                            "private": True,
+                            "default_branch": "main",
+                            "url": PRIVATE_URL,
+                            "git": {
+                                "files": {
+                                    "README.md": "The secret plans, readable with a token.\n",
+                                    "e2e-behavior": "hang\n",
+                                }
+                            },
+                        },
                     ],
                 }
             ],
         },
+        git_image=git_image,
+        tls=git_tls(ca_dir),
     )
     with KS.PortForward() as base_url:
         admin = KS.mint_token(f"first-run-{int(time.time())}", "admin")
@@ -498,6 +850,7 @@ def smoke(stub_image: str) -> None:
             if wanted not in github_page:
                 raise SmokeError(f"the rendered GitHub page lacks {wanted!r}")
         log("rendered /ui, /ui/gateway and /ui/github read as expected")
+        private_checkout(base_url, admin)
         log("\nfirst-run kind proof passed")
 
 
@@ -508,12 +861,26 @@ def main(argv: list[str] | None = None) -> int:
         default=os.environ.get("CRUCIBLE_DEPLOY_KIND_STUB_IMAGE"),
         help="an image with python and cryptography the cluster has (the service image)",
     )
+    parser.add_argument(
+        "--git-image",
+        default=os.environ.get("CRUCIBLE_DEPLOY_KIND_GIT_IMAGE"),
+        help="an image with git and python3 the cluster can pull (the combined worker image)",
+    )
+    parser.add_argument(
+        "--ca-dir",
+        default=os.environ.get("CRUCIBLE_DEPLOY_KIND_CA_DIR"),
+        help="the run's CA (ca.crt, ca.key), which signs the git stand-in's certificate",
+    )
     args = parser.parse_args(argv)
-    if not args.stub_image:
-        print("set --stub-image or CRUCIBLE_DEPLOY_KIND_STUB_IMAGE", file=sys.stderr)
+    if not args.stub_image or not args.git_image or not args.ca_dir:
+        print(
+            "set --stub-image, --git-image and --ca-dir (or CRUCIBLE_DEPLOY_KIND_STUB_IMAGE, "
+            "CRUCIBLE_DEPLOY_KIND_GIT_IMAGE and CRUCIBLE_DEPLOY_KIND_CA_DIR)",
+            file=sys.stderr,
+        )
         return 2
     try:
-        smoke(args.stub_image)
+        smoke(args.stub_image, args.git_image, Path(args.ca_dir))
     except SmokeError as exc:
         print(f"first-run kind proof failed: {exc}", file=sys.stderr, flush=True)
         return 1
