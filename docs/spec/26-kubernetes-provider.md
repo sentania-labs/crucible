@@ -96,7 +96,8 @@ Per attempt the provider creates, in `crucible-workers`, all labelled
 | PersistentVolumeClaim `ws-<attempt>` | the workspace: `repo/`, `report/`, `output/` | attempt, then per cleanup policy |
 | ConfigMap `identity-<attempt>` (or a projected volume from an object store above the ConfigMap size cap, 08) | the identity bundle, read-only | attempt |
 | Secret `cred-<attempt>` | the per-attempt copy of one harness credential directory, seeded from the harness's dedicated Secret in `crucible-workers`, `rw-narrow` where the adapter declares it (12) | attempt, deleted under every cleanup policy |
-| Job `refresh-cache-<attempt>` | the reference cache's only writer: fetches the repository's bare mirror on the cache PVC (or clones it when absent), with git egress only and no workspace, identity bundle or credential | until complete, then deleted, before the preparer starts |
+| Secret `checkout-<attempt>` | a private repository's read-only installation token (ADR 0019), key `token`, mounted mode 0400 at `/run/crucible-token` into the refresher and the preparer Jobs and nothing else | created just before the refresher, deleted once the preparer's Pod is gone, on every path; `discard` and `cleanup` retry a failed deletion |
+| Job `refresh-cache-<attempt>` | the reference cache's only writer: fetches the repository's bare mirror on the cache PVC (or clones it when absent), with git egress only and no workspace or identity bundle; for a private repository it also mounts `checkout-<attempt>` and fetches with it | until complete, then deleted, before the preparer starts |
 | Job `prepare-<attempt>` | the preparer: clone into the PVC from the reference cache, mounted read-only, then branch, shims, author identity, `origin` placeholder (08) | until complete, then deleted |
 | Job `worker-<attempt>` | the worker, one Pod, `backoffLimit: 0`, `restartPolicy: Never` | until terminal, then deleted after `logs_drained` |
 | Job `collect-<attempt>` | the collector, no network, repo and report read-only, output read-write (08) | until complete |
@@ -248,7 +249,10 @@ supports them:
   `endpoint_url` hostname and port over HTTP or HTTPS. GitHub is not
   reachable from a worker; the preparer and the publisher do the git
   traffic.
-- preparer and publisher: `github.com` and `api.github.com` only.
+- preparer and publisher: `github.com` and `api.github.com` only. For a
+  private repository whose `github.credential_host` is not `github.com`
+  (GitHub Enterprise Server, ADR 0019), the preparer and the refresher may
+  also reach that host and port, resolved like any other allowlisted name.
 - collector, bundle verifier, verifier: no egress at all (the verifier
   gets the registries only when `required_verification` needs them and the
   policy says so).
@@ -388,7 +392,11 @@ the namespace. A deployment therefore names one exact, pullable reference in
   checkout (crucible#55). In the supervisor a refresh waits for the
   preparers cloning from that mirror to finish and holds new ones back until
   it is done. A refresh that fails is logged and the preparer clones from the
-  remote without a reference. The preparer Job otherwise performs exactly
+  remote without a reference. For a private repository (ADR 0019) the
+  supervisor passes a read-only installation token to `prepare`, which
+  writes it to the per-attempt Secret `checkout-<attempt>`, mounts that
+  Secret into the refresher and the preparer and no other Pod, and deletes
+  it before returning, on every path. The preparer Job otherwise performs exactly
   what 08's Docker `prepare` performs. `prepare` returns
   when the Job completes; a failed Job is a prepare failure with the Job's
   log excerpt as detail.

@@ -65,6 +65,8 @@ building an app/seevice."
    repository is listed and marked "private: not supported yet", and a pick of one is
    refused with those words: the preparation step clones without a credential, so its
    first task could only fail. Private checkout is a separate operator decision.
+   (Amended by ADR 0019, 2026-09-27: the operator decided to support private
+   repositories, and the picker now registers them as private.)
 
 ## Alternatives considered
 
