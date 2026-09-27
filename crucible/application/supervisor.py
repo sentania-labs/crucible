@@ -2868,9 +2868,16 @@ class Supervisor:
                     watch.after_id = chunk.id or watch.after_id
                     before = {key for key, _ in tracker.running}
                     tracker.feed(chunk.stream, chunk.content.decode("utf-8", "replace"))
-                    for key, _ in tracker.running:
-                        if key not in before:
-                            watch.first_seen.setdefault(key, chunk.ts)
+                    after = {key for key, _ in tracker.running}
+                    # A key gone within this same chunk (Hermes reuses one fixed key
+                    # for its whole registry) must drop its age here: the cleanup in
+                    # commands_counted only sees the batch's final state, so a command
+                    # that ended and a same-keyed one that started would otherwise
+                    # share the first command's first_seen.
+                    for gone in before - after:
+                        watch.first_seen.pop(gone, None)
+                    for key in after - before:
+                        watch.first_seen.setdefault(key, chunk.ts)
                 if len(chunks) < COMMAND_LOG_PAGE:
                     break
         return commands_counted(

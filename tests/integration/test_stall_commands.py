@@ -89,23 +89,23 @@ def operator(ctx: AppContext, tokens: dict[str, str]) -> Iterator[TestClient]:
         yield c
 
 
-def local_endpoint_policy(client: TestClient, admin: TestClient) -> int:
+def local_endpoint_policy(client: TestClient, admin: TestClient, version: int = 152) -> int:
     """Hermes serves only a local endpoint, which the seeded routing leaves unset; the
     same setup as the local pool cap test, one version on."""
     routing = client.get("/v1/routing/default-routing/4").json()["document"]
-    routing["version"] = 152
+    routing["version"] = version
     hermes = next(model for model in routing["models"] if model["harness"] == "hermes")
     hermes.update(
         {"endpoint_url": "http://192.0.2.41:11434/v1", "enabled": True, "disabled_reason": None}
     )
-    assert admin.put("/v1/routing/default-routing/152", json=routing).status_code == 200
+    assert admin.put(f"/v1/routing/default-routing/{version}", json=routing).status_code == 200
     policy = client.get("/v1/policies/default-software/4").json()["document"]
-    policy["version"] = 152
-    policy["routing"]["policy"]["version"] = 152
-    assert admin.put("/v1/policies/default-software/152", json=policy).status_code == 200
+    policy["version"] = version
+    policy["routing"]["policy"]["version"] = version
+    assert admin.put(f"/v1/policies/default-software/{version}", json=policy).status_code == 200
     limits = policy["limits"]
     assert (limits["stall_warn_seconds"], limits["stall_fail_seconds"]) == (STALL_WARN, STALL_FAIL)
-    return 152
+    return version
 
 
 def start(
@@ -219,6 +219,45 @@ async def test_a_worker_with_nothing_in_flight_and_no_output_still_stalls(
     await advance(supervisor, clock, TICK)
     assert worker.drains == 1
     assert client.get(f"/v1/attempts/{attempt_id}").json()["termination_reason"] == "stall"
+
+
+async def test_a_command_ending_and_a_new_one_starting_in_one_replay_gets_its_own_age(
+    operator: TestClient,
+    supervisor: Supervisor,
+    provider: FakeProvider,
+    clock: FakeClock,
+    ctx: AppContext,
+    tokens: dict[str, str],
+) -> None:
+    """Issue 152 correction (review round 2): Hermes tracks its whole registry under one
+    fixed key, so a command ending and a new one starting inside the log a restart
+    replays in one batch must not let the new command inherit the ended one's age."""
+    client = operator
+    admin_headers = {"Authorization": f"Bearer {tokens['admin']}"}
+    with TestClient(create_app(ctx), headers=admin_headers) as admin:
+        policy_version = local_endpoint_policy(client, admin, version=153)
+    task_id = start(
+        client, "hermes", "EX-0152-HERMES-BATCH", policy_version, command_timeout_ms=120_000
+    )
+    await supervisor.tick()
+    attempt_id = client.get(f"/v1/tasks/{task_id}").json()["latest_attempt"]["id"]
+    worker = provider.worker(attempt_id)
+    assert worker is not None
+    started, ended = SCRIPTS["hermes"]
+    worker.logs.append(started)
+    await advance(supervisor, clock, TICK)
+    # Nothing observes the log again until the restart: the first command ends and a
+    # second starts while the old supervisor's watch is discarded.
+    clock.advance(200)
+    worker.logs.append(ended)
+    worker.logs.append(started)
+    restarted = make_supervisor(ctx, provider)
+    await advance(restarted, clock, TICK)
+    # If the second command inherited the first one's age, it would already be past its
+    # command timeout and margin (180 s) here, so the clock would run again from now.
+    await advance(restarted, clock, STALL_WARN + TICK)
+    assert "worker_quiet" not in event_kinds(client, task_id)
+    assert worker.drains == 0
 
 
 async def test_a_restarted_supervisor_rebuilds_the_command_from_the_stored_log(
