@@ -169,6 +169,7 @@ def docker_config(
         max_concurrency=d.max_concurrency,
         extra_image_allowlist=tuple(d.extra_image_allowlist),
         credentials=credential_sources(settings),
+        credential_host=settings.github.credential_host,
     )
 
 
@@ -258,6 +259,7 @@ def kubernetes_config(
         image_repositories=tuple(k.image_repositories),
         probe_image=k.probe_image,
         use_reference_cache=k.use_reference_cache,
+        credential_host=settings.github.credential_host,
         canary_cpu_millicores=k.canary_cpu_millicores,
         canary_memory=k.canary_memory,
         pod_pid_limit_override=k.pod_pid_limit_override,

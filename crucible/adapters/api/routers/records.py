@@ -161,6 +161,7 @@ def _repo_view(repo: Repository) -> RepositoryView:
         external_review_attested=repo.external_review_attested,
         attested_by=repo.attested_by,
         attested_at=repo.attested_at,
+        private=repo.private,
     )
 
 
@@ -177,7 +178,12 @@ def put_repository(
     name: str, body: RepositoryRegistration, ctx: Ctx, uow: UoW, principal: Admin
 ) -> RepositoryView:
     repo = register_repository(
-        uow, ctx.clock, principal_name=principal.name, name=name, registration=body
+        uow,
+        ctx.clock,
+        principal_name=principal.name,
+        name=name,
+        registration=body,
+        github=ctx.admin.github if ctx.admin is not None else None,
     )
     uow.commit()
     return _repo_view(repo)

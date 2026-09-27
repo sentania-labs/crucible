@@ -310,6 +310,10 @@ class RepositoryRegistration(StrictModel):
     policy_name: str = Field(min_length=1)
     installation_id: int | None = None
     external_review: ExternalReviewAttestation = Field(default_factory=ExternalReviewAttestation)
+    # ADR 0019: clone with a read-only GitHub App installation token. Needs the App
+    # connected and `installation_id` naming an installation that can read the
+    # repository; registration refuses it otherwise.
+    private: bool = False
 
 
 class RepositoryView(Response):
@@ -324,6 +328,7 @@ class RepositoryView(Response):
     external_review_attested: bool = False
     attested_by: str | None = None
     attested_at: Rfc3339 | None = None
+    private: bool = False
 
 
 # ----- C2: review, acceptance, corrections, decisions, wakes, policies, artifacts ----

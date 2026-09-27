@@ -224,6 +224,20 @@ tmpfs read by a git credential helper. The token is never in `env`, `ps`,
 a log, an event payload, or a database row. Its expiry and the job ID are
 recorded; its value is not.
 
+A private repository's preparation step gets one too (ADR 0019): minted
+fresh, never cached, scoped to that repository with `contents: read`, and
+revoked (`DELETE /installation/token`) and emptied as soon as `prepare`
+returns, whichever way. The Docker provider hands it to the preparer
+container on stdin, onto that container's tmpfs, exactly as the publisher's;
+on Kubernetes it is a per-attempt Secret `checkout-<attempt>` mounted
+read-only into the cache refresher and the preparer Jobs only, and deleted
+before `prepare` returns: a deletion that fails fails the prepare, so no
+worker is launched beside it, and `discard`, `cleanup` and the retention
+sweep retry it. The worker's container or Pod never has it, and the checkout it
+receives holds no token and no helper. Registration of a private repository
+mints and revokes one token first, so an App that cannot read the repository
+is refused there, not at the first task.
+
 ## Logs and artifacts
 
 Provider log capture passes through a redaction filter with the same

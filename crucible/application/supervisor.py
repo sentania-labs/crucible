@@ -27,6 +27,11 @@ from typing import Any, ClassVar, Literal, TypeVar
 
 import yaml
 
+from crucible.application.checkout import (
+    CheckoutRefusedError,
+    checkout_token_for,
+    release_checkout_token,
+)
 from crucible.application.decisions import (
     DEFAULT_ESCALATION_STALE_HOURS,
     open_escalation,
@@ -80,6 +85,7 @@ from crucible.domain.entities import (
     LogChunkRecord,
     PoolExhaustion,
     PullRequestState,
+    Repository,
     RetentionAction,
     Task,
 )
@@ -221,6 +227,8 @@ class _Pending:
     task: Task
     contract: dict[str, Any]
     repository_url: str = ""
+    # The registered repository, for a private one's checkout token (ADR 0019).
+    repository: Repository | None = None
 
 
 def _secret_holds(provider: Any, harness: str, credential: Any) -> bool:
@@ -285,6 +293,8 @@ class Supervisor:
         # The harnesses a login is running for, read once per launch pass (12, 25).
         self._logins_now: frozenset[str] = frozenset()
         self._workspace_fingerprints: dict[str, tuple[int, int, int]] = {}
+        # ADR 0019: a private repository's checkout token is minted through this client.
+        self._github = github
         # The delivery half (23). With no GitHub client configured it is inert, which is
         # what every tier below the live one runs with.
         self.delivery = DeliveryCoordinator(
@@ -980,6 +990,7 @@ class Supervisor:
                         task,
                         stored.document,
                         repository.url if repository else "",
+                        repository,
                     )
                 )
         return out
@@ -1509,7 +1520,14 @@ class Supervisor:
             spec = await self._build_spec(
                 attempt, execution, task, item.contract, item.repository_url
             )
-            ws = await provider.prepare(spec)
+            ws = await self._prepare(provider, spec, item.repository)
+        except CheckoutRefusedError as exc:
+            await self._db(
+                partial(
+                    self._environment_failure, attempt.id, "prepare", f"refusing to prepare: {exc}"
+                )
+            )
+            return False
         except LaunchRefusedError as exc:
             await self._db(partial(self._refuse_launch, attempt.id, "prepare", str(exc)))
             return False
@@ -1540,6 +1558,19 @@ class Supervisor:
         await self._db(partial(self._mark_running, attempt.id, handle))
         log.info("attempt launched", extra={"handle": handle.ref, "provider": provider.name})
         return True
+
+    async def _prepare(
+        self, provider: ExecutionProvider, spec: LaunchSpec, repository: Repository | None
+    ) -> Workspace:
+        """08, ADR 0019: build the checkout. A private repository's read-only checkout
+        token is minted here, handed to the provider for the preparation step alone,
+        and revoked and emptied the moment `prepare` returns or raises: the worker that
+        launches next never had it, and nothing in this process keeps it."""
+        token = await checkout_token_for(self._github, repository)
+        try:
+            return await provider.prepare(spec, checkout_token=token)
+        finally:
+            await release_checkout_token(self._github, token)
 
     async def _discard(
         self, provider: ExecutionProvider, ws: Workspace | None, spec: LaunchSpec | None

@@ -336,13 +336,13 @@ async def test_two_supervisors_interleaved_between_selection_and_reservation_lau
     original_prepare = provider.prepare
     prepare_calls = 0
 
-    async def pause_first_prepare(spec: Any) -> Any:
+    async def pause_first_prepare(spec: Any, checkout_token: Any = None) -> Any:
         nonlocal prepare_calls
         prepare_calls += 1
         if prepare_calls == 1:
             entered.set()
             await release.wait()
-        return await original_prepare(spec)
+        return await original_prepare(spec, checkout_token)
 
     provider.prepare = pause_first_prepare  # type: ignore[method-assign]
     first_tick = asyncio.create_task(supervisor.tick())
@@ -680,8 +680,8 @@ async def test_reservation_race_reroutes_and_discards_prepared_workspace(
         uow.commit()
     original_prepare = provider.prepare
 
-    async def exhaust_after_prepare(spec: Any) -> Any:
-        workspace = await original_prepare(spec)
+    async def exhaust_after_prepare(spec: Any, checkout_token: Any = None) -> Any:
+        workspace = await original_prepare(spec, checkout_token)
         with ctx.uow_factory() as uow:
             uow.pool_exhaustions.put(
                 PoolExhaustion(

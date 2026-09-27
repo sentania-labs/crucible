@@ -11,7 +11,9 @@ delivery half of the task lifecycle (09).
   0017) and mints
   short-lived installation tokens scoped to one repository, on demand, for
   one publisher job at a time. Tokens live in memory and in the tmpfs of
-  the publisher container, never elsewhere.
+  the publisher container, never elsewhere. A private repository's
+  preparation step also gets one, read-only (`contents: read`), for the
+  length of that step only (ADR 0019, 12).
 - App permissions: Metadata read, Contents read/write, Pull requests
   read/write, Checks read, Actions read, Issues read (for
   `GET /issues/{n}/reactions` only, S12 rerun). Nothing else, and no
@@ -21,16 +23,19 @@ delivery half of the task lifecycle (09).
   The GitHub page's repository picker fills it (25): it lists what each
   installation covers, grouped by account, using a token scoped to
   `metadata: read` that is discarded before the listing returns, and a pick
-  registers the repository with that installation ID and the default branch
-  GitHub reports. A private repository is listed but refused ("private: not
-  supported yet"): the preparer clones without a credential.
+  registers the repository with that installation ID, the default branch
+  GitHub reports, and whether GitHub says it is private. A private
+  repository (ADR 0019) is registered only after the App has minted it a
+  read-only checkout token, which is revoked at once; an archived one is
+  listed and refused.
 - **The push remote is derived from the repository's `owner/name`, not from
   its registered url.** The registered url is the fetch source: it is what
-  the preparer and the collector clone, and those containers hold no GitHub
-  credential. Keeping the two separate lets a deployment point the fetch at
-  a local mirror of a private repository, which a worker could not clone
-  otherwise, while the publisher still pushes to GitHub with the App token.
-  In an ordinary deployment the two resolve to the same GitHub repository.
+  the preparer and the collector clone. The collector never holds a GitHub
+  credential; the preparer holds one only for a repository registered as
+  private, read-only and for that one step (ADR 0019). Keeping the two
+  separate still lets a deployment point the fetch at a local mirror, while
+  the publisher pushes to GitHub with the App token. In an ordinary
+  deployment the two resolve to the same GitHub repository.
 - Workers receive no GitHub credential. The worker's checkout has its
   `origin` URL replaced with a placeholder; a `git push` inside a worker
   fails with no credential and is a recorded prohibition, not a gate.

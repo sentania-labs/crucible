@@ -16,6 +16,7 @@ from crucible.adapters.execution.fake import FakeProvider
 from crucible.adapters.harness.base import TRANSCRIPT_NAME
 from crucible.adapters.harness.hermes import PROCESSES_NAME
 from crucible.ports.execution import CollectedOutputs, Handle, LaunchSpec, Workspace
+from crucible.ports.github import InstallationToken
 from tests.fixtures import contract_document
 from tests.integration.conftest import make_supervisor, run_to_settled, submit_and_start
 
@@ -41,7 +42,9 @@ class InFlightProvider(FakeProvider):
         # When set, only attempts launched from this image leave work in flight.
         self.only_image = only_image
 
-    async def prepare(self, spec: LaunchSpec) -> Workspace:
+    async def prepare(
+        self, spec: LaunchSpec, checkout_token: InstallationToken | None = None
+    ) -> Workspace:
         base = self.root / spec.attempt_id
         (base / "repo").mkdir(parents=True)
         ws = Workspace(

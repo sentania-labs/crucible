@@ -48,14 +48,22 @@ It is a test fixture: wired only when `test_fixtures` is on (18).
   and under rootless Docker the checkout must be created by the
   container uid that will own it) which performs `git clone --reference
   <cache> --dissociate` into `<artifact_root>/workspaces/<attempt>/repo`
-  (the cache is a bare repository Crucible refreshes with a short-lived
-  installation token that never reaches the workspace; nothing shared is
-  mounted into a worker); for a `correct` execution, or a retry of a task
+  (the cache is a bare repository the same preparer refreshes first; nothing
+  shared is mounted into a worker). A public repository is cloned and
+  refreshed with no credential at all. A private one (ADR 0019) uses a
+  read-only installation token scoped to that repository, which the
+  supervisor mints just before `prepare` and revokes as soon as it returns:
+  the provider writes it to the preparer container's stdin, the script puts
+  it on a tmpfs of that container's own (`/run/crucible-token`, as the
+  publisher's is, 23), and git reads it through a helper that answers only
+  for https on `github.credential_host`; the token and the helper are removed
+  right after the clone and again on every exit, so nothing after the network
+  steps, and no other container, can read it; for a `correct` execution, or a retry of a task
   whose branch Crucible already pushed, check out the remote `work_branch`
   head, else create `work_branch` from `base_ref`; record which happened
   as an event; replace the `origin` URL with a placeholder so no push can
   succeed; write shims and `.git/info/exclude`; install the author
-  identity from policy (no credential helper); render the identity bundle to
+  identity from policy (an empty credential helper, whatever the clone used); render the identity bundle to
   `<artifact_root>/workspaces/<attempt>/identity`; create the empty report
   directory at `<artifact_root>/workspaces/<attempt>/report`.
 - `launch`: resolve the image tag to a digest and record it on the

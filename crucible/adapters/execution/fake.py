@@ -58,8 +58,22 @@ from crucible.ports.execution import (
     Workspace,
     WorkspaceState,
 )
+from crucible.ports.github import InstallationToken
 
 PROVIDER_NAME = "fake"
+
+
+@dataclass(frozen=True, slots=True)
+class CheckoutTokenSeen:
+    """A checkout token as `prepare` received it (ADR 0019). `token` is the object
+    itself, so a test can check it was discarded once `prepare` returned."""
+
+    repository: str
+    permissions: dict[str, str]
+    had_value: bool
+    token: InstallationToken
+
+
 _TAG = re.compile(r"^.*:fake-(?P<behavior>[a-z]+(?:-[a-z]+)*)(?:-(?P<n>\d+))?$")
 
 Behavior = Literal[
@@ -303,6 +317,8 @@ class FakeProvider:
         self._review_heads: dict[str, str] = {}
         self.cleaned: list[str] = []
         self.cleanup_policies: dict[str, CleanupPolicy] = {}
+        # The checkout token each private repository's prepare received (ADR 0019).
+        self.checkout_tokens: dict[str, CheckoutTokenSeen] = {}
 
     # test controls
     def script(self, external_id: str, behavior: str, *, after: int = 1) -> None:
@@ -342,8 +358,19 @@ class FakeProvider:
     async def credential_available(self, harness: str) -> bool:
         return False
 
-    async def prepare(self, spec: LaunchSpec) -> Workspace:
+    async def prepare(
+        self, spec: LaunchSpec, checkout_token: InstallationToken | None = None
+    ) -> Workspace:
         behavior, _ = self._behavior_for(spec)
+        if checkout_token is not None:
+            # What a test needs to see about the token: which repository and which
+            # permissions it was minted for, and that its value was there to hand over.
+            self.checkout_tokens[spec.attempt_id] = CheckoutTokenSeen(
+                repository=checkout_token.repository,
+                permissions=dict(checkout_token.permissions),
+                had_value=bool(checkout_token.reveal()),
+                token=checkout_token,
+            )
         if behavior == "prepare-fails":
             raise ProviderError("fake prepare failure")
         root = f"fake:///workspaces/{spec.attempt_id}"
