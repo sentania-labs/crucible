@@ -41,6 +41,82 @@ __all__ = [
 
 CACHE_MOUNT = "/crucible/cache"
 ORIGIN_MOUNT = "/crucible/origin"
+# Where a GitHub installation token lives inside the one container that uses it: the
+# publisher's (23, S10) and a private repository's preparer and cache refresher (ADR
+# 0019). A tmpfs with the Docker provider, a Secret volume on Kubernetes; never a path
+# inside the workspace.
+TOKEN_MOUNT = "/run/crucible-token"
+
+# git's credential helper protocol: git writes `protocol=`, `host=` and friends on
+# stdin and reads `username=` and `password=` back. The helper answers only for
+# https on the one configured host, because a helper that answers unconditionally hands
+# the token to whatever remote git was pointed at (S10). `store` and `erase` are ignored.
+#
+# The helper is run through `sh` rather than executed: a Docker tmpfs is mounted
+# `noexec` unless `exec` is asked for, and `/tmp` keeps `noexec`. git runs a helper
+# value beginning with `!` through the shell, which is what this uses. It reads the
+# token from `$CRUCIBLE_TOKEN_FILE` when git asks, so the value is never in an
+# environment variable, an argument, or the helper's own text.
+_CRED_HELPER_SCRIPT = r"""
+cat > /tmp/cred-helper.sh <<'HELPER'
+#!/bin/sh
+[ "${1:-}" = "get" ] || exit 0
+protocol= host=
+while IFS='=' read -r key value; do
+  [ -z "$key" ] && break
+  case "$key" in
+    protocol) protocol=$value ;;
+    host) host=$value ;;
+  esac
+done
+[ "$protocol" = "https" ] || exit 0
+[ "$host" = "$CRUCIBLE_CREDENTIAL_HOST" ] || exit 0
+printf 'username=x-access-token\n'
+printf 'password=%s\n' "$(cat "$CRUCIBLE_TOKEN_FILE")"
+HELPER
+chmod 0600 /tmp/cred-helper.sh
+"""
+
+# The safe.directory exception every preparer and refresher needs (see the preparer).
+_SAFE_GITCONFIG = "printf '[safe]\\n\\tdirectory = *\\n' > /tmp/gitconfig"
+
+
+def _checkout_credential(source: str, credential_host: str) -> str:
+    """ADR 0019: give git a read-only installation token for one clone, then take it back.
+
+    `source` is where the token is: `stdin` (the Docker provider writes it to the
+    container's stdin, and this puts it on the container's own tmpfs, as the publisher
+    does) or `file` (the Kubernetes provider mounts it from a per-attempt Secret). The
+    helper answers only for https on `credential_host`. `drop_checkout_token` removes
+    the token and the helper and resets the git configuration to the safe.directory
+    exception alone; it runs once the network steps are done and again on exit, so no
+    path out of the script leaves either behind. `GIT_TRACE*` and `GIT_CURL_VERBOSE`
+    print the Authorization header, so they are unset rather than trusted (S10)."""
+    if source not in ("stdin", "file"):
+        raise ValueError(f"unknown token source {source!r}")
+    receive = ""
+    if source == "stdin":
+        receive = """umask 077
+cat > "$CRUCIBLE_TOKEN_FILE"
+umask 022
+"""
+    return f"""unset GIT_TRACE GIT_TRACE_CURL GIT_CURL_VERBOSE GIT_TRACE_PACKET GIT_TRACE2 || true
+export CRUCIBLE_TOKEN_FILE={_quote(TOKEN_MOUNT + "/token")}
+export CRUCIBLE_CREDENTIAL_HOST={_quote(credential_host)}
+drop_checkout_token() {{
+  {'rm -f "$CRUCIBLE_TOKEN_FILE"' if source == "stdin" else ":"}
+  rm -f /tmp/cred-helper.sh
+  {_SAFE_GITCONFIG}
+}}
+trap drop_checkout_token EXIT
+{receive}if [ ! -s "$CRUCIBLE_TOKEN_FILE" ]; then
+  echo "no checkout token arrived for this private repository" >&2
+  exit 3
+fi
+{_CRED_HELPER_SCRIPT.strip()}
+printf '[credential]\\n\\thelper = "!sh /tmp/cred-helper.sh"\\n' >> /tmp/gitconfig
+"""
+
 
 GIT = (
     "git -c core.fsmonitor= -c diff.external= -c core.pager=cat "
@@ -98,18 +174,31 @@ fi
 """
 
 
-def cache_refresh_script(*, url: str, cache_name: str) -> str:
+def cache_refresh_script(
+    *,
+    url: str,
+    cache_name: str,
+    checkout_token: str | None = None,
+    credential_host: str = "github.com",
+) -> str:
     """26: the one writer of the reference cache on Kubernetes, run on its own before a
     preparer that mounts the cache read-only (crucible#55). A refresh that fails leaves
     no mirror rather than a half-fetched one, and the preparer then clones from the
-    remote directly; so this script exits 0 either way."""
+    remote directly; so this script exits 0 either way.
+
+    `checkout_token` names where a private repository's read-only token is (ADR 0019),
+    `file` on Kubernetes; None for a public repository, which fetches with no
+    credential at all."""
     cache_dir = f"{CACHE_MOUNT}/{cache_name}.git"
+    credential = ""
+    if checkout_token is not None:
+        credential = _checkout_credential(checkout_token, credential_host)
     return f"""set -eu
 {GIT_ENV}
-printf '[safe]\n\tdirectory = *\n' > /tmp/gitconfig
+printf '[safe]\\n\\tdirectory = *\\n' > /tmp/gitconfig
 export GIT_CONFIG_GLOBAL=/tmp/gitconfig
 CLONE_URL={_quote(url)}
-{_cache_refresh(cache_dir)}"""
+{credential}{_cache_refresh(cache_dir)}"""
 
 
 def preparer_script(
@@ -127,6 +216,8 @@ def preparer_script(
     exclude_entries: tuple[str, ...],
     identity_mount: str,
     refresh_cache: bool = True,
+    checkout_token: str | None = None,
+    credential_host: str = "github.com",
 ) -> str:
     """Clone, position, and seal the checkout (08).
 
@@ -137,6 +228,12 @@ def preparer_script(
     else keeps it fresh (the Kubernetes provider's refresher Job, 26). The origin URL
     is replaced with a placeholder before the worker sees it, and no credential helper
     is configured, so a push cannot start.
+
+    A private repository's clone and cache refresh use a read-only installation token
+    (ADR 0019): `checkout_token` names where it is (`stdin` with the Docker provider,
+    `file` on Kubernetes) and None means a public repository and no credential at all.
+    The token and its helper are gone before the checkout is positioned, and again on
+    every exit, so nothing after the network steps can read it.
     """
     cache_dir = f"{CACHE_MOUNT}/{cache_name}.git" if cache_name else ""
     refresh = ""
@@ -148,6 +245,11 @@ if [ -d "{cache_dir}" ]; then
 fi
 """
     resume = "1" if from_remote_branch else "0"
+    credential = drop = ""
+    if checkout_token is not None:
+        credential = _checkout_credential(checkout_token, credential_host)
+        # The last network step is the clone: from here on git reads only the checkout.
+        drop = "drop_checkout_token\n"
     # Bound as literals, referenced quoted, and never concatenated into a command.
     bindings = "\n".join(
         (
@@ -182,11 +284,11 @@ OUT={WORK_MOUNT}/output
 REPO={WORK_MOUNT}/repo
 mkdir -p "$OUT"
 rm -rf "$REPO"
-REFERENCE=""
+{credential}REFERENCE=""
 {refresh}
 # shellcheck disable=SC2086
 {GIT} clone --no-hardlinks --no-checkout $REFERENCE -- "$CLONE_URL" "$REPO"
-cd "$REPO"
+{drop}cd "$REPO"
 STARTED=""
 if [ "{resume}" = "1" ] \
   && {GIT} rev-parse --verify --quiet "refs/remotes/origin/$WORK_BRANCH" >/dev/null; then
@@ -436,38 +538,15 @@ def _quote(value: str) -> str:
 # ----- the publisher (23, S10) -------------------------------------------
 
 BUNDLE_MOUNT = "/crucible/bundle"
-TOKEN_MOUNT = "/run/crucible-token"
 PUBLISH_MOUNT = "/crucible/publish"
 
-# git's credential helper protocol: git writes `protocol=`, `host=` and friends on
-# stdin and reads `username=` and `password=` back. The helper answers only for
-# https on the one configured host, because a helper that answers unconditionally hands
-# the token to whatever remote git was pointed at (S10). `store` and `erase` are ignored.
-#
-# The helper is run through `sh` rather than executed: a Docker tmpfs is mounted
-# `noexec` unless `exec` is asked for, and the publisher's `/tmp` keeps `noexec`. git
-# runs a helper value beginning with `!` through the shell, which is what this uses. The
-# value has spaces, so it lives in a git config file in the container's own tmpfs rather
-# than on a command line, which is the same shape the preparer uses (C3).
-_CRED_HELPER = r"""
-cat > /tmp/cred-helper.sh <<'HELPER'
-#!/bin/sh
-[ "${1:-}" = "get" ] || exit 0
-protocol= host=
-while IFS='=' read -r key value; do
-  [ -z "$key" ] && break
-  case "$key" in
-    protocol) protocol=$value ;;
-    host) host=$value ;;
-  esac
-done
-[ "$protocol" = "https" ] || exit 0
-[ "$host" = "$CRUCIBLE_CREDENTIAL_HOST" ] || exit 0
-printf 'username=x-access-token\n'
-printf 'password=%s\n' "$(cat "$CRUCIBLE_TOKEN_FILE")"
-HELPER
-chmod 0600 /tmp/cred-helper.sh
-{
+# The publisher's git configuration: the helper above, no hooks, no pager, and the
+# policy's author. The value of `helper` has spaces, so it lives in a git config file in
+# the container's own tmpfs rather than on a command line, which is the same shape the
+# preparer uses (C3).
+_CRED_HELPER = (
+    _CRED_HELPER_SCRIPT
+    + r"""{
   printf '[credential]\n\thelper = "!sh /tmp/cred-helper.sh"\n'
   printf '[core]\n\thooksPath = /dev/null\n\tpager = cat\n'
   printf '[user]\n\tname = %s\n\temail = %s\n' \
@@ -476,6 +555,7 @@ chmod 0600 /tmp/cred-helper.sh
 chmod 0600 /tmp/gitconfig
 export GIT_CONFIG_GLOBAL=/tmp/gitconfig
 """
+)
 
 
 def publisher_script(
