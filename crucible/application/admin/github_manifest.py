@@ -34,7 +34,11 @@ from crucible.application.admin.context import (
     record_refusal,
 )
 from crucible.application.admin.github import GitHubConnectError, is_rsa, keep, web_base
-from crucible.application.errors import ConflictError, ContractValidationError
+from crucible.application.errors import (
+    ApplicationError,
+    ConflictError,
+    ContractValidationError,
+)
 from crucible.domain.entities import GitHubManifestState, ProviderSetting
 from crucible.domain.events import EventKind
 from crucible.ports.github import GitHubError
@@ -60,6 +64,9 @@ MAX_NAME = 34
 LOGIN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}")
 CODE = re.compile(r"[A-Za-z0-9_-]{1,128}")
 OPERATION = "github create-app"
+# The browser that pressed Create keeps a nonce in a cookie named for its start; the
+# return must carry it, so a state read from anywhere else finishes nothing.
+BINDING_COOKIE_PREFIX = "crucible_github_start_"
 
 
 class GitHubManifestStateError(ConflictError):
@@ -75,6 +82,11 @@ def default_app_name() -> str:
 
 def _hash(state: str) -> str:
     return hashlib.sha256(state.encode("utf-8")).hexdigest()
+
+
+def binding_cookie(state: str) -> str:
+    """The name of the cookie that ties a start to the browser that made it."""
+    return BINDING_COOKIE_PREFIX + _hash(state)[:16]
 
 
 def normalize_external_url(value: str, *, path: str = "url") -> str:
@@ -235,10 +247,12 @@ def start(
     now = ctx.clock.now()
     uow.github_manifest_states.prune(now - timedelta(days=1))
     state = secrets.token_urlsafe(32)
+    nonce = secrets.token_urlsafe(32)
     expires = now + STATE_TTL
     uow.github_manifest_states.add(
         GitHubManifestState(
             state_hash=_hash(state),
+            browser_hash=_hash(nonce),
             principal=principal,
             app_name=name,
             organization=org,
@@ -266,6 +280,8 @@ def start(
         "target_url": manifest_target_url(web_base(ctx.github_app.api_base), state, org),
         "manifest": manifest,
         "state": state,
+        # For the starting browser's cookie (`binding_cookie(state)`), never shown.
+        "browser_nonce": nonce,
         "expires_at": expires.isoformat(),
         "account": org or "your personal account",
     }
@@ -276,14 +292,21 @@ def _refuse(ctx: AdminContext, principal: str, detail: str) -> GitHubManifestSta
     return GitHubManifestStateError(detail)
 
 
-def _consume(ctx: AdminContext, *, principal: str, state: str) -> GitHubManifestState:
+def _consume(
+    ctx: AdminContext, *, principal: str, state: str, browser_nonce: str | None
+) -> GitHubManifestState:
     """Spend the state in a transaction of its own, committed before GitHub is asked,
-    so a second return with it is refused whatever happens to the first."""
+    so a second return with it is refused whatever happens to the first. Only the
+    starter's own return spends it: another administrator's, or one from a browser that
+    does not hold the start's cookie, is refused and leaves it unspent."""
     now = ctx.clock.now()
     found = None
+    browser_hash = _hash(browser_nonce or "")
     if state and len(state) <= 128:
         with ctx.uow_factory() as own:
-            found = own.github_manifest_states.consume(_hash(state), now)
+            found = own.github_manifest_states.consume(
+                _hash(state), now, principal=principal, browser_hash=browser_hash
+            )
             own.commit()
     if found is None:
         raise _refuse(
@@ -302,6 +325,13 @@ def _consume(ctx: AdminContext, *, principal: str, state: str) -> GitHubManifest
         raise _refuse(
             ctx, principal, "this Create GitHub App start belongs to another administrator"
         )
+    if not browser_nonce or found.browser_hash != browser_hash:
+        raise _refuse(
+            ctx,
+            principal,
+            "this Create GitHub App start was made in another browser; finish it there, or "
+            "start again here",
+        )
     return found
 
 
@@ -312,13 +342,15 @@ def complete(
     principal: str,
     code: str,
     state: str,
+    browser_nonce: str | None,
     reason: str | None = None,
 ) -> dict[str, Any]:
-    """Check the state, exchange the code once, keep what GitHub hands back. The answer
-    is the GitHub status with the new App and its install link, never a secret."""
+    """Check the state and the browser, exchange the code once, keep what GitHub hands
+    back. The answer is the GitHub status with the new App and its install link, never a
+    secret."""
     reason = guard_mutation(ctx, uow, reason, principal=principal, operation=OPERATION)
     _require_store(ctx)
-    started = _consume(ctx, principal=principal, state=state)
+    started = _consume(ctx, principal=principal, state=state, browser_nonce=browser_nonce)
     if not CODE.fullmatch(code or ""):
         raise _refuse(ctx, principal, "GitHub returned no usable code")
     assert ctx.github_apps is not None
@@ -330,8 +362,16 @@ def complete(
             f"GitHub did not hand over the new App ({cause}); the code is good once and for "
             "an hour, so start Create GitHub App again"
         ) from None
+    # From here GitHub has made an App whose code is spent: a refusal names it, so the
+    # operator can delete it on GitHub rather than leave it behind.
+    stranded = (
+        f"; GitHub made the App {made.slug or made.app_id}, which Crucible could not keep: "
+        "delete it in GitHub's App settings and start again"
+    )
     if not is_rsa(made.private_key):
-        raise GitHubConnectError("GitHub handed over a key that is not an RSA private key")
+        raise GitHubConnectError(
+            "GitHub handed over a key that is not an RSA private key" + stranded
+        )
     app = {
         "id": made.app_id,
         "slug": made.slug,
@@ -339,22 +379,25 @@ def complete(
         "owner": made.owner,
         "html_url": made.html_url,
     }
-    done = keep(
-        ctx,
-        uow,
-        principal=principal,
-        reason=reason,
-        app=app,
-        private_key=made.private_key,
-        webhook_secret=made.webhook_secret,
-        via="manifest" + (f" for {started.organization}" if started.organization else ""),
-    )
-    return done
+    try:
+        return keep(
+            ctx,
+            uow,
+            principal=principal,
+            reason=reason,
+            app=app,
+            private_key=made.private_key,
+            webhook_secret=made.webhook_secret,
+            via="manifest" + (f" for {started.organization}" if started.organization else ""),
+        )
+    except ApplicationError as exc:
+        raise GitHubConnectError(exc.detail + stranded) from None
 
 
 __all__ = [
     "PERMISSIONS",
     "SETTING_NAME",
+    "binding_cookie",
     "build_manifest",
     "complete",
     "default_app_name",

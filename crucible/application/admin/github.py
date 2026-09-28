@@ -235,10 +235,12 @@ def web_base(api_base: str) -> str:
     parts = urlsplit(api_base.rstrip("/"))
     host = parts.netloc
     path = parts.path
+    # GitHub Enterprise Server first: its API is `/api/v3` on the web host itself, even
+    # when that host's name happens to start with `api.`.
+    if path.endswith("/api/v3"):
+        return f"{parts.scheme}://{host}{path[: -len('/api/v3')]}".rstrip("/")
     if host.startswith("api."):
         return f"{parts.scheme}://{host[len('api.') :]}"
-    if path.endswith("/api/v3"):
-        path = path[: -len("/api/v3")]
     return f"{parts.scheme}://{host}{path}".rstrip("/")
 
 

@@ -738,6 +738,7 @@ class ProviderSettingRow(Base):
 class GitHubManifestStateRow(Base):
     __tablename__ = "github_manifest_states"
     state_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    browser_hash: Mapped[str] = mapped_column(String(64))
     principal: Mapped[str] = mapped_column(String(160))
     app_name: Mapped[str] = mapped_column(String(64))
     organization: Mapped[str | None] = mapped_column(String(64), nullable=True)

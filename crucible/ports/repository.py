@@ -533,10 +533,13 @@ class GitHubManifestStateRepository(Protocol):
 
     def add(self, state: GitHubManifestState) -> None: ...
 
-    def consume(self, state_hash: str, now: datetime) -> GitHubManifestState | None:
+    def consume(
+        self, state_hash: str, now: datetime, *, principal: str, browser_hash: str
+    ) -> GitHubManifestState | None:
         """The start as it was before this call, and marked used from now on when it
-        was unused. None when there is no such start. Locks the row, so two returns
-        with the same state cannot both find it unused."""
+        was unused and `principal` and `browser_hash` are its own: a return that is not
+        the starter's cannot spend it. None when there is no such start. Locks the row,
+        so two returns with the same state cannot both find it unused."""
         ...
 
     def prune(self, before: datetime) -> int:

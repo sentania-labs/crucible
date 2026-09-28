@@ -971,6 +971,7 @@ class GitHubManifestStates:
     def _to_entity(row: GitHubManifestStateRow) -> GitHubManifestState:
         return GitHubManifestState(
             state_hash=row.state_hash,
+            browser_hash=row.browser_hash,
             principal=row.principal,
             app_name=row.app_name,
             organization=row.organization,
@@ -984,6 +985,7 @@ class GitHubManifestStates:
         self._s.add(
             GitHubManifestStateRow(
                 state_hash=state.state_hash,
+                browser_hash=state.browser_hash,
                 principal=state.principal,
                 app_name=state.app_name,
                 organization=state.organization,
@@ -995,12 +997,18 @@ class GitHubManifestStates:
         )
         self._s.flush()
 
-    def consume(self, state_hash: str, now: datetime) -> GitHubManifestState | None:
+    def consume(
+        self, state_hash: str, now: datetime, *, principal: str, browser_hash: str
+    ) -> GitHubManifestState | None:
         row = self._s.get(GitHubManifestStateRow, state_hash, with_for_update=True)
         if row is None:
             return None
         before = self._to_entity(row)
-        if row.consumed_at is None:
+        if (
+            row.consumed_at is None
+            and row.principal == principal
+            and row.browser_hash == browser_hash
+        ):
             row.consumed_at = now
             self._s.flush()
         return before

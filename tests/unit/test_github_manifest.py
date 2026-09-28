@@ -57,6 +57,7 @@ def test_the_default_name_is_hades_and_a_short_suffix() -> None:
         ("https://api.github.com", "https://github.com"),
         ("https://api.github.com/", "https://github.com"),
         ("https://ghe.example.internal/api/v3", "https://ghe.example.internal"),
+        ("https://api.corp.example/api/v3", "https://api.corp.example"),
         (
             "http://crucible-stubs.ns.svc.cluster.local:8080",
             "http://crucible-stubs.ns.svc.cluster.local:8080",
@@ -181,3 +182,10 @@ def test_a_spent_code_is_githubs_404() -> None:
     with pytest.raises(GitHubError) as caught:
         apps.convert_manifest("spent")
     assert caught.value.status == 404
+
+
+def test_a_manifest_code_never_reaches_a_log_or_an_error() -> None:
+    from crucible.adapters.github.transport import _loggable  # noqa: PLC0415
+
+    assert _loggable("/app-manifests/mc_live/conversions") == "/app-manifests/[code]/conversions"
+    assert _loggable("/app/installations") == "/app/installations"

@@ -1,7 +1,8 @@
 """crucible#168: the one-click GitHub App (the manifest flow, ADR 0017 as amended).
 
 `github_manifest_states` holds one row per start of the flow: the sha256 of the `state`
-value GitHub carries back (never the value), who started it, the App name and account it
+value GitHub carries back (never the value), the sha256 of the nonce the starting
+browser keeps in a cookie, who started it, the App name and account it
 asked for, the external URL the redirect uses, when it expires and when it was used. A
 state is good once. Two event kinds: `github_app_manifest_started` records a start, and
 `github_external_url_updated` a save of the `github.external_url` setting (a row of
@@ -44,6 +45,7 @@ def upgrade() -> None:
     op.create_table(
         "github_manifest_states",
         sa.Column("state_hash", sa.String(64), primary_key=True),
+        sa.Column("browser_hash", sa.String(64), nullable=False),
         sa.Column("principal", sa.String(160), nullable=False),
         sa.Column("app_name", sa.String(64), nullable=False),
         sa.Column("organization", sa.String(64), nullable=True),

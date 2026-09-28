@@ -715,6 +715,9 @@ def test_github_app_is_created_with_one_click_and_installed(
         # Create: the page the browser posts to GitHub, the manifest filled in.
         started = _create(browser, csrf, app_name="Hades-test", organization="", reason="")
         assert started.status_code == 200 and started.headers["cache-control"] == "no-store"
+        binding = started.headers["set-cookie"]
+        assert binding.startswith("crucible_github_start_") and "samesite=lax" in binding.lower()
+        assert "path=/ui/github" in binding.lower() and "httponly" in binding.lower()
         responses.append(started.text)
         target, manifest = _manifest_form(started.text)
         assert target.startswith(f"{stubs.url}/settings/apps/new?state=")
@@ -821,6 +824,20 @@ def test_github_app_is_created_with_one_click_and_installed(
             ui_sign_in(second, other)
             theirs = second.get(mine_callback, follow_redirects=False)
             assert "belongs to another administrator" in _flash(theirs)
+        # The same administrator in a browser that did not press Create: the start is
+        # tied to the browser's cookie, so a state read from anywhere else finishes
+        # nothing. Neither refusal spends the start.
+        with TestClient(create_app(ctx)) as elsewhere:
+            ui_sign_in(elsewhere, tokens["admin"])
+            other_browser = elsewhere.get(mine_callback, follow_redirects=False)
+            assert "made in another browser" in _flash(other_browser)
+        with ctx.uow_factory() as uow:
+            unspent = uow.session.execute(  # type: ignore[attr-defined]
+                sqlalchemy.text(
+                    "SELECT consumed_at FROM github_manifest_states WHERE app_name = 'Hades-mine'"
+                )
+            ).scalar_one()
+            assert unspent is None
         assert len(stubs.stubs.conversions) == 1
 
         # Install: the button opens the App's own page; GitHub sends the browser back to

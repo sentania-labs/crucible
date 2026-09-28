@@ -2239,21 +2239,25 @@ def github_callback(request: Request, ctx: Ctx, uow: UoW) -> Response:
         _admin(principal)
         if ctx.admin is None:
             raise ConflictError("the administrative surface is not configured")
+        state = request.query_params.get("state", "")
         done = github_manifest.complete(
             ctx.admin,
             uow,
             principal=principal.name,
             code=request.query_params.get("code", ""),
-            state=request.query_params.get("state", ""),
+            state=state,
+            browser_nonce=request.cookies.get(github_manifest.binding_cookie(state)),
         )
         uow.commit()
     except ApplicationError as exc:
         return _to_github_page(exc.detail, "bad")
     app = done.get("app") or {}
-    return _to_github_page(
+    response = _to_github_page(
         f"Created the GitHub App {app.get('slug') or app.get('name')} (App {app.get('id')}) "
         "and connected it. Next: install it."
     )
+    response.delete_cookie(github_manifest.binding_cookie(state), path="/ui/github")
+    return response
 
 
 @router.get("/github/installed", response_class=HTMLResponse)
@@ -2893,6 +2897,17 @@ async def action(request: Request, action: str, ctx: Ctx, uow: UoW) -> Response:
             )
             response.headers["Cache-Control"] = "no-store"
             response.headers["Referrer-Policy"] = "no-referrer"
+            # Ties the start to this browser (crucible#168). Lax, because GitHub's
+            # redirect back is a cross-site navigation, which a Lax cookie comes with.
+            response.set_cookie(
+                github_manifest.binding_cookie(started["state"]),
+                started["browser_nonce"],
+                max_age=int(github_manifest.STATE_TTL.total_seconds()),
+                httponly=True,
+                samesite="lax",
+                secure=_browser_url(request).startswith("https://"),
+                path="/ui/github",
+            )
             return response
         elif action == "github-external-url":
             saved = github_manifest.save_external_url(
