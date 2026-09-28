@@ -4,7 +4,10 @@ SET LOCAL and the database rejects a stale one.
 
 Tick order: lease, provider reconcile (orphans and adoption), materialize scheduled
 tasks, launch pending attempts, observe running attempts (timeouts, exits, loss),
-sweep cancellations, write the liveness row. Running the tick twice with nothing
+sweep cancellations, write the liveness row. A launch's slow half (build the spec,
+prepare the checkout, start the worker) runs as a task of its own that the tick starts
+and polls, so a prepare that takes minutes never holds back the lease or any other
+attempt (hades #190). Running the tick twice with nothing
 happening in between changes nothing the second time except lease expiry times and
 the liveness row; that property is tested.
 """
@@ -113,6 +116,7 @@ from crucible.ports.execution import (
     CollectedOutputs,
     ExecutionProvider,
     Handle,
+    LaunchCancelledError,
     LaunchRefusedError,
     LaunchSpec,
     LogChunk,
@@ -322,6 +326,7 @@ class Supervisor:
         attempt_lease_ttl_seconds: int = 60,
         checkout_lease_ttl_seconds: int = 21600,
         grace_seconds: int = 60,
+        launch_wait_seconds: float | None = None,
         harnesses: HarnessRegistry | None = None,
         harness_gates: Mapping[str, HarnessGate] | None = None,
         credential_sources: Mapping[str, CredentialSource] | None = None,
@@ -348,6 +353,18 @@ class Supervisor:
         # attempt died without a supervisor to release it.
         self.checkout_lease_ttl_seconds = checkout_lease_ttl_seconds
         self.grace_seconds = grace_seconds
+        # hades #190: how long a tick waits for the launches in flight before it moves
+        # on and leaves them running. Well inside the lease, so a slow prepare can never
+        # keep the tick from renewing it; long enough that a quick launch still ends
+        # in the tick that started it.
+        self.launch_wait_seconds = (
+            launch_wait_seconds
+            if launch_wait_seconds is not None
+            else min(5.0, lease_ttl_seconds / 3)
+        )
+        # The launches in flight, by attempt id. An attempt in here is this process's
+        # to finish; nothing else in the tick touches it until its task is done.
+        self._launches: dict[str, asyncio.Task[bool]] = {}
         self.fenced_token: int | None = None
         self._handles: dict[str, Handle] = {}
         self._workspaces: dict[str, Workspace] = {}
@@ -502,8 +519,19 @@ class Supervisor:
         self.fenced_token = None
 
     async def stop(self) -> None:
-        """Release the lease cleanly (a crash simply lets it expire)."""
+        """Release the lease cleanly (a crash simply lets it expire). A launch still in
+        flight is cancelled first, so its provider removes what it made; the attempt
+        stays in preparing or launching for the next supervisor to reconcile."""
+        await self._abandon_launches()
         await self._db(self._release_step)
+
+    async def _abandon_launches(self) -> None:
+        launches = list(self._launches.values())
+        self._launches.clear()
+        for launch in launches:
+            launch.cancel()
+        if launches:
+            await asyncio.gather(*launches, return_exceptions=True)
 
     # ----- tick -----------------------------------------------------------
 
@@ -540,6 +568,7 @@ class Supervisor:
             result.counts = await self._db(partial(self._status_step, started))
         except LeaseLostError:
             result.held = False
+            await self._abandon_launches()
         except Exception as exc:
             # The liveness row must say the tick failed, or readiness lies (19).
             summary = f"{type(exc).__name__}: {str(exc).splitlines()[0] if str(exc) else ''}"
@@ -1059,19 +1088,173 @@ class Supervisor:
         return out
 
     async def _launch_pending(self) -> int:
-        launched = 0
+        """Start each pending attempt's launch, then wait a bounded time for the
+        launches in flight (hades #190). What finishes in that window is counted now;
+        what does not keeps running and is counted by the tick that sees it end."""
+        launched = self._harvest_launches()
         for item in await self._db(self._list_pending):
+            if item.attempt.id in self._launches:
+                continue
             with log_context(
                 task_id=item.task.id, execution_id=item.execution.id, attempt_id=item.attempt.id
             ):
                 try:
-                    if await self._launch_one(item):
-                        launched += 1
+                    begun = await self._begin_launch(item)
                 except LeaseLostError:
                     raise
                 except Exception:
                     log.exception("launch step failed; continuing with the next attempt")
+                    continue
+            if begun is not None:
+                self._launches[item.attempt.id] = asyncio.create_task(
+                    self._finish_launch(*begun), name=f"launch-{item.attempt.id}"
+                )
+        if self._launches:
+            await asyncio.wait(list(self._launches.values()), timeout=self.launch_wait_seconds)
+        return launched + self._harvest_launches()
+
+    def _harvest_launches(self) -> int:
+        """Collect the launches that ended; a lost lease in any of them is the tick's."""
+        launched = 0
+        lease_lost = False
+        for attempt_id, launch in list(self._launches.items()):
+            if not launch.done():
+                continue
+            del self._launches[attempt_id]
+            if launch.cancelled():
+                continue
+            error = launch.exception()
+            if error is not None and not isinstance(error, Exception):
+                # What ends the process (a crash, an exit) ends it here too.
+                raise error
+            if isinstance(error, LeaseLostError):
+                lease_lost = True
+            elif error is not None:
+                with log_context(attempt_id=attempt_id):
+                    log.error(
+                        "launch step failed; continuing with the next attempt",
+                        exc_info=(type(error), error, error.__traceback__),
+                    )
+            elif launch.result():
+                launched += 1
+        if lease_lost:
+            raise LeaseLostError("the lease was lost during a launch")
         return launched
+
+    async def _begin_launch(self, item: _Pending) -> tuple[_Pending, ExecutionProvider] | None:
+        """The quick half of a launch, in the tick itself: route, gate, take the
+        checkout, and move the attempt to preparing. Each step is a short database
+        transaction, and they run one attempt after another, so the per-harness cap and
+        the checkout lease see every launch this tick has already begun."""
+        attempt, execution, task = item.attempt, item.execution, item.task
+        review = execution.role is ExecutionRole.REVIEW
+        # Read per attempt, not per pass: a login started while this pass runs holds
+        # back the next launch of its harness rather than racing it (12).
+        self._logins_now = await self._logins_in_progress()
+        if not review:
+            selection = await self._db(partial(self._preview_route, item))
+            if selection is None or selection.selected is None or selection.image is None:
+                await self._db(partial(self._route_pending, item))
+                return None
+            execution = replace(
+                execution,
+                model=selection.selected.id,
+                harness=selection.selected.harness,
+                image=selection.image,
+            )
+        refusal = await self._db(partial(self._harness_gate, execution)) if review else None
+        if refusal is not None:
+            # The same path an environment failure at prepare takes: the attempt and the
+            # execution become active first, so the refusal can end them.
+            if await self._db(partial(self._mark_preparing, attempt.id)):
+                await self._db(partial(self._refuse_launch, attempt.id, "registry", refusal))
+            return None
+        provider = self._provider(execution.provider)
+        key = self.checkout_key(item.contract, task.external_id, item.repository_url)
+        # 10 first, then 05b: an attempt whose checkout another attempt holds waits on
+        # the lease and says so; only a launch that could take the checkout is held back
+        # by the per-harness cap.
+        if review or await self._db(partial(self._checkout_lease_free, attempt.id, key)):
+            busy = await self._db(partial(self._harness_busy, execution))
+            if busy is not None:
+                await self._db(partial(self._defer_launch, attempt.id, busy))
+                return None
+        if not review and not await self._db(partial(self._take_checkout_lease, attempt.id, key)):
+            # A second attempt on the same repository and branch waits; it is not a
+            # failure, and nothing of the holder's checkout is disturbed (10).
+            return None
+        if not review:
+            routed = await self._db(partial(self._route_pending, item))
+            if routed is None:
+                await self._db(partial(self._release_attempt_checkout, attempt.id))
+                return None
+            item = routed
+            refusal = await self._db(partial(self._harness_gate, item.execution))
+            if refusal is not None:
+                await self._db(partial(self._refuse_launch, item.attempt.id, "registry", refusal))
+                return None
+        elif not await self._db(partial(self._mark_preparing, attempt.id)):
+            return None
+        return item, provider
+
+    async def _finish_launch(self, item: _Pending, provider: ExecutionProvider) -> bool:
+        """The slow half, as a task of its own (hades #190): build the spec, prepare
+        the checkout, and start the worker. A cancel is honoured before each step and
+        while the prepare runs, and a cancelled task never gets a worker (hades #189)."""
+        attempt, execution, task = item.attempt, item.execution, item.task
+        with log_context(task_id=task.id, execution_id=execution.id, attempt_id=attempt.id):
+            if await self._db(partial(self._settle_if_cancelled, attempt.id, "spec")):
+                return False
+            try:
+                spec = await self._build_spec(
+                    attempt, execution, task, item.contract, item.repository_url
+                )
+                ws = await self._prepare(provider, spec, item.repository)
+            except LaunchCancelledError as exc:
+                log.info("launch stopped for a cancel", extra={"detail": str(exc)})
+                await self._db(partial(self._settle_if_cancelled, attempt.id, "prepare"))
+                return False
+            except CheckoutRefusedError as exc:
+                await self._db(
+                    partial(
+                        self._environment_failure,
+                        attempt.id,
+                        "prepare",
+                        f"refusing to prepare: {exc}",
+                    )
+                )
+                return False
+            except LaunchRefusedError as exc:
+                await self._db(partial(self._refuse_launch, attempt.id, "prepare", str(exc)))
+                return False
+            except ProviderError as exc:
+                detail = str(exc)
+                await self._db(partial(self._environment_failure, attempt.id, "prepare", detail))
+                return False
+            self._workspaces[attempt.id] = ws
+            self._workspace_fingerprints[attempt.id] = workspace_fingerprint(ws)
+            await self._db(partial(self._record_prepared, attempt.id, ws))
+            if not await self._db(partial(self._mark_launching, attempt.id, ws)):
+                await self._discard(provider, ws, spec)
+                self._workspaces.pop(attempt.id, None)
+                self._workspace_fingerprints.pop(attempt.id, None)
+                self._command_watches.pop(attempt.id, None)
+                return False
+            try:
+                handle = await provider.launch(ws, spec)
+            except LaunchRefusedError as exc:
+                await self._discard(provider, ws, spec)
+                await self._db(partial(self._refuse_launch, attempt.id, "launch", str(exc)))
+                return False
+            except ProviderError as exc:
+                detail = str(exc)
+                await self._discard(provider, ws, spec)
+                await self._db(partial(self._environment_failure, attempt.id, "launch", detail))
+                return False
+            self._handles[attempt.id] = handle
+            await self._db(partial(self._mark_running, attempt.id, handle))
+            log.info("attempt launched", extra={"handle": handle.ref, "provider": provider.name})
+            return True
 
     async def _build_spec(
         self,
@@ -1528,113 +1711,68 @@ class Supervisor:
             move_task(uow, self._clock, task, TaskState.RUNNING, EventKind.TASK_RUNNING)
         self._task_reported(uow, task, attempt, ExitClass.ENVIRONMENT, {})
 
-    async def _launch_one(self, item: _Pending) -> bool:
-        attempt, execution, task = item.attempt, item.execution, item.task
-        review = execution.role is ExecutionRole.REVIEW
-        # Read per attempt, not per pass: a login started while this pass runs holds
-        # back the next launch of its harness rather than racing it (12).
-        self._logins_now = await self._logins_in_progress()
-        if not review:
-            selection = await self._db(partial(self._preview_route, item))
-            if selection is None or selection.selected is None or selection.image is None:
-                await self._db(partial(self._route_pending, item))
-                return False
-            execution = replace(
-                execution,
-                model=selection.selected.id,
-                harness=selection.selected.harness,
-                image=selection.image,
-            )
-        refusal = await self._db(partial(self._harness_gate, execution)) if review else None
-        if refusal is not None:
-            # The same path an environment failure at prepare takes: the attempt and the
-            # execution become active first, so the refusal can end them.
-            if await self._db(partial(self._mark_preparing, attempt.id)):
-                await self._db(partial(self._refuse_launch, attempt.id, "registry", refusal))
-            return False
-        provider = self._provider(execution.provider)
-        key = self.checkout_key(item.contract, task.external_id, item.repository_url)
-        # 10 first, then 05b: an attempt whose checkout another attempt holds waits on
-        # the lease and says so; only a launch that could take the checkout is held back
-        # by the per-harness cap.
-        if review or await self._db(partial(self._checkout_lease_free, attempt.id, key)):
-            busy = await self._db(partial(self._harness_busy, execution))
-            if busy is not None:
-                await self._db(partial(self._defer_launch, attempt.id, busy))
-                return False
-        if not review and not await self._db(partial(self._take_checkout_lease, attempt.id, key)):
-            # A second attempt on the same repository and branch waits; it is not a
-            # failure, and nothing of the holder's checkout is disturbed (10).
-            return False
-        if not review:
-            routed = await self._db(partial(self._route_pending, item))
-            if routed is None:
-                await self._db(partial(self._release_attempt_checkout, attempt.id))
-                return False
-            item = routed
-            attempt, execution, task = item.attempt, item.execution, item.task
-            refusal = await self._db(partial(self._harness_gate, execution))
-            if refusal is not None:
-                await self._db(partial(self._refuse_launch, attempt.id, "registry", refusal))
-                return False
-        elif not await self._db(partial(self._mark_preparing, attempt.id)):
-            return False
-        try:
-            spec = await self._build_spec(
-                attempt, execution, task, item.contract, item.repository_url
-            )
-            ws = await self._prepare(provider, spec, item.repository)
-        except CheckoutRefusedError as exc:
-            await self._db(
-                partial(
-                    self._environment_failure, attempt.id, "prepare", f"refusing to prepare: {exc}"
-                )
-            )
-            return False
-        except LaunchRefusedError as exc:
-            await self._db(partial(self._refuse_launch, attempt.id, "prepare", str(exc)))
-            return False
-        except ProviderError as exc:
-            detail = str(exc)
-            await self._db(partial(self._environment_failure, attempt.id, "prepare", detail))
-            return False
-        self._workspaces[attempt.id] = ws
-        self._workspace_fingerprints[attempt.id] = workspace_fingerprint(ws)
-        await self._db(partial(self._record_prepared, attempt.id, ws))
-        if not await self._db(partial(self._mark_launching, attempt.id, ws)):
-            await self._discard(provider, ws, spec)
-            self._workspaces.pop(attempt.id, None)
-            self._workspace_fingerprints.pop(attempt.id, None)
-            self._command_watches.pop(attempt.id, None)
-            return False
-        try:
-            handle = await provider.launch(ws, spec)
-        except LaunchRefusedError as exc:
-            await self._discard(provider, ws, spec)
-            await self._db(partial(self._refuse_launch, attempt.id, "launch", str(exc)))
-            return False
-        except ProviderError as exc:
-            detail = str(exc)
-            await self._discard(provider, ws, spec)
-            await self._db(partial(self._environment_failure, attempt.id, "launch", detail))
-            return False
-        self._handles[attempt.id] = handle
-        await self._db(partial(self._mark_running, attempt.id, handle))
-        log.info("attempt launched", extra={"handle": handle.ref, "provider": provider.name})
-        return True
-
     async def _prepare(
         self, provider: ExecutionProvider, spec: LaunchSpec, repository: Repository | None
     ) -> Workspace:
         """08, ADR 0019: build the checkout. A private repository's read-only checkout
         token is minted here, handed to the provider for the preparation step alone,
         and revoked and emptied the moment `prepare` returns or raises: the worker that
-        launches next never had it, and nothing in this process keeps it."""
+        launches next never had it, and nothing in this process keeps it. The provider
+        asks whether the task was cancelled before each of its steps (hades #189)."""
+
+        async def cancelled() -> bool:
+            return await self._db(partial(self._task_cancelled, spec.task_id))
+
         token = await checkout_token_for(self._github, repository)
         try:
-            return await provider.prepare(spec, checkout_token=token)
+            return await provider.prepare(spec, checkout_token=token, cancelled=cancelled)
         finally:
             await release_checkout_token(self._github, token)
+
+    def _task_cancelled(self, task_id: str) -> bool:
+        with self._uow_factory() as uow:
+            task = uow.tasks.get(task_id)
+            return task is None or task.state in (TaskState.CANCELLING, TaskState.CANCELLED)
+
+    def _settle_if_cancelled(self, attempt_id: str, stage: str) -> bool:
+        """hades #189: when the attempt's task was cancelled, end the attempt here, before
+        any worker exists, and let the task become cancelled. True when it did."""
+        with self._fenced() as uow:
+            attempt = uow.attempts.get(attempt_id, for_update=True)
+            assert attempt is not None
+            task = uow.tasks.get(attempt.task_id, for_update=True)
+            assert task is not None
+            if task.state not in (TaskState.CANCELLING, TaskState.CANCELLED):
+                return False
+            if attempt.state in (AttemptState.PREPARING, AttemptState.LAUNCHING):
+                self._end_cancelled_launch(uow, attempt, task, stage)
+            uow.commit()
+            return True
+
+    def _end_cancelled_launch(
+        self, uow: UnitOfWork, attempt: Attempt, task: Task, stage: str
+    ) -> None:
+        attempt.exit_class = ExitClass.KILLED
+        attempt.termination_reason = TERMINATION_CANCEL
+        attempt.ended_at = self._clock.now()
+        move_attempt(
+            uow,
+            self._clock,
+            attempt,
+            AttemptState.COLLECTED,
+            EventKind.ATTEMPT_COLLECTED,
+            payload={"reason": "task cancelled during launch", "stage": stage},
+        )
+        move_attempt(
+            uow,
+            self._clock,
+            attempt,
+            AttemptState.FAILED,
+            EventKind.ATTEMPT_FAILED,
+            payload={"exit_class": ExitClass.KILLED.value, "stage": stage},
+        )
+        self._release_checkout_leases(uow, attempt)
+        self._finish_cancelling(uow, task)
 
     async def _discard(
         self, provider: ExecutionProvider, ws: Workspace | None, spec: LaunchSpec | None
@@ -1703,6 +1841,13 @@ class Supervisor:
             assert attempt is not None
             execution = uow.executions.get(attempt.execution_id)
             assert execution is not None
+            current = uow.tasks.get(attempt.task_id, for_update=True)
+            assert current is not None
+            if current.state in (TaskState.CANCELLING, TaskState.CANCELLED):
+                # hades #189: the last look before a worker starts.
+                self._end_cancelled_launch(uow, attempt, current, "launch")
+                uow.commit()
+                return False
             reservation = reserve(
                 uow,
                 execution.policy_snapshot or {},
@@ -2366,6 +2511,9 @@ class Supervisor:
     async def _observe_attempts(self) -> tuple[int, int]:
         observed = finished = 0
         for attempt in await self._db(self._list_live):
+            if attempt.id in self._launches:
+                # Its launch is still running here; it is not stranded (hades #190).
+                continue
             with log_context(
                 task_id=attempt.task_id, execution_id=attempt.execution_id, attempt_id=attempt.id
             ):

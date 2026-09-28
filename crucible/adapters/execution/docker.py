@@ -88,6 +88,7 @@ from crucible.ports.execution import (
     REPORT_MOUNT,
     VERIFY_MOUNT,
     WORK_MOUNT,
+    CancelCheck,
     CleanupPolicy,
     CollectedOutputs,
     CredentialFileSync,
@@ -95,6 +96,7 @@ from crucible.ports.execution import (
     Handle,
     ImageInfo,
     IsolationLevel,
+    LaunchCancelledError,
     LaunchRefusedError,
     LaunchSpec,
     LogChunk,
@@ -480,8 +482,15 @@ class DockerProvider:
         return source is not None and (credential is None or credential.held_by(source.path))
 
     async def prepare(
-        self, spec: LaunchSpec, checkout_token: InstallationToken | None = None
+        self,
+        spec: LaunchSpec,
+        checkout_token: InstallationToken | None = None,
+        cancelled: CancelCheck | None = None,
     ) -> Workspace:
+        # hades #189: the preparer container refreshes the cache and clones in one step,
+        # so a cancel is honoured before it starts.
+        if cancelled is not None and await cancelled():
+            raise LaunchCancelledError("the task was cancelled before the preparer started")
         repository = spec.contract.get("repository", {})
         url = spec.repository_url or str(repository.get("url", ""))
         if not url:

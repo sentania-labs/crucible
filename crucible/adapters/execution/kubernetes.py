@@ -91,6 +91,7 @@ from crucible.ports.execution import (
     REPORT_MOUNT,
     VERIFY_MOUNT,
     WORK_MOUNT,
+    CancelCheck,
     CleanupPolicy,
     CollectedArtifact,
     CollectedOutputs,
@@ -99,6 +100,7 @@ from crucible.ports.execution import (
     Handle,
     ImageInfo,
     IsolationLevel,
+    LaunchCancelledError,
     LaunchRefusedError,
     LaunchSpec,
     LogChunk,
@@ -983,8 +985,12 @@ class KubernetesProvider:
         return _has_declared_auth_file(credential, source)
 
     async def prepare(
-        self, spec: LaunchSpec, checkout_token: InstallationToken | None = None
+        self,
+        spec: LaunchSpec,
+        checkout_token: InstallationToken | None = None,
+        cancelled: CancelCheck | None = None,
     ) -> Workspace:
+        await _stop_if_cancelled(cancelled, "before the prepare")
         # 26: the preparer renders its own egress policy (the DNS selector included),
         # and the supervisor calls prepare() before launch(). Refresh here too, or a
         # stale seed's policy is rendered and launch()'s own refresh is never reached.
@@ -1044,6 +1050,7 @@ class KubernetesProvider:
                 limits=limits,
                 identity_sha=identity_sha,
                 checkout_token=checkout_token,
+                cancelled=cancelled,
             )
         except BaseException:
             # 12: the copy is removed on *every* path, not only the clean one. Every
@@ -1067,6 +1074,7 @@ class KubernetesProvider:
         limits: Limits,
         identity_sha: str,
         checkout_token: InstallationToken | None = None,
+        cancelled: CancelCheck | None = None,
     ) -> Workspace:
         """ADR 0019: a private repository's token is a per-attempt Secret mounted into
         the cache refresher and the preparer, the two Pods that talk to the remote, and
@@ -1082,6 +1090,7 @@ class KubernetesProvider:
                 limits=limits,
                 identity_sha=identity_sha,
                 token=None,
+                cancelled=cancelled,
             )
         name = k8sspec.object_name("checkout", spec.attempt_id)
         try:
@@ -1111,6 +1120,7 @@ class KubernetesProvider:
                 limits=limits,
                 identity_sha=identity_sha,
                 token=name,
+                cancelled=cancelled,
             )
         except BaseException:
             # The failure that got here is the one reported; a deletion that fails as
@@ -1185,6 +1195,7 @@ class KubernetesProvider:
         limits: Limits,
         identity_sha: str,
         token: str | None,
+        cancelled: CancelCheck | None = None,
     ) -> Workspace:
         repository = spec.contract.get("repository", {})
         token_mounts, token_volumes = self._checkout_token_mounts(token)
@@ -1199,6 +1210,8 @@ class KubernetesProvider:
             cache_name = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
             gate = self._cache_gate(cache_name)
             if gate.refresh_due(time.monotonic()):
+                # hades #189: a cancel is honoured before each step and while it runs.
+                await _stop_if_cancelled(cancelled, "before the cache refresh")
                 async with gate.writing():
                     await self._refresh_cache(
                         spec,
@@ -1207,6 +1220,7 @@ class KubernetesProvider:
                         image=resolved,
                         limits=limits,
                         token=token,
+                        cancelled=cancelled,
                     )
             # 26: the preparer reads the cache and never writes it. It is the one volume
             # every attempt shares, so an attempt's Pod that could write it could poison
@@ -1222,6 +1236,7 @@ class KubernetesProvider:
                 }
             )
         git_policy = spec.policy.get("git", {})
+        await _stop_if_cancelled(cancelled, "before the preparer")
         async with gate.reading() if gate is not None else contextlib.nullcontext():
             exit_code = await self._run_role_job(
                 spec,
@@ -1252,6 +1267,7 @@ class KubernetesProvider:
                 limits=limits,
                 timeout=self.config.prepare_timeout_seconds,
                 plan=self._checkout_plan(spec, k8sspec.ROLE_PREPARER, token is not None),
+                cancelled=cancelled,
             )
         if exit_code != 0:
             raise ProviderError(
@@ -1291,6 +1307,7 @@ class KubernetesProvider:
         image: str,
         limits: Limits,
         token: str | None = None,
+        cancelled: CancelCheck | None = None,
     ) -> None:
         """26: refresh the reference cache in a Job of its own, the only Pod that mounts
         it writable (#55). It carries no workspace, no identity bundle and no
@@ -1324,6 +1341,7 @@ class KubernetesProvider:
             limits=limits,
             timeout=self.config.prepare_timeout_seconds,
             plan=self._checkout_plan(spec, k8sspec.ROLE_CACHE_REFRESHER, token is not None),
+            cancelled=cancelled,
         )
         if code != 0:
             log.warning(
@@ -3589,8 +3607,11 @@ class KubernetesProvider:
         timeout: int,
         plan: EgressPlan,
         env: Mapping[str, str] | None = None,
+        cancelled: CancelCheck | None = None,
     ) -> int:
-        """Run one single-purpose Job to completion and delete it."""
+        """Run one single-purpose Job to completion and delete it. With `cancelled`, a
+        cancel ends the wait (hades #189): the Job and its policy are deleted on the way
+        out, as on every other path."""
         name = k8sspec.object_name(OBJECT_PREFIX.get(role, role), spec.attempt_id)
         policy_name: str | None = None
         with contextlib.suppress(KubernetesApiError):
@@ -3623,7 +3644,7 @@ class KubernetesProvider:
             self.last_error[role] = str(exc)
             return JOB_API_ERROR
         try:
-            code = await self._await_job(name, timeout=timeout)
+            code = await self._await_job(name, timeout=timeout, cancelled=cancelled)
             if code is None:
                 self.last_error[role] = f"the {role} Job did not finish within {timeout}s"
                 return JOB_TIMED_OUT
@@ -3802,10 +3823,14 @@ class KubernetesProvider:
 
     # ----- waiting -------------------------------------------------------
 
-    async def _await_job(self, name: str, *, timeout: int) -> int | None:
-        """Wait for a Job's Pod to terminate and return the container's exit code."""
+    async def _await_job(
+        self, name: str, *, timeout: int, cancelled: CancelCheck | None = None
+    ) -> int | None:
+        """Wait for a Job's Pod to terminate and return the container's exit code. A
+        cancel raises LaunchCancelledError (hades #189)."""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
+            await _stop_if_cancelled(cancelled, f"while {name} ran")
             try:
                 pod = await self._pod_of(name)
             except KubernetesApiError:
@@ -4008,6 +4033,11 @@ class KubernetesProvider:
 
 
 # ----- pure helpers -------------------------------------------------------
+
+
+async def _stop_if_cancelled(cancelled: CancelCheck | None, where: str) -> None:
+    if cancelled is not None and await cancelled():
+        raise LaunchCancelledError(f"the task was cancelled {where}")
 
 
 def _latest_stamp(lines: bytes) -> datetime | None:

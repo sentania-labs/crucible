@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
@@ -417,6 +417,17 @@ class LaunchRefusedError(ProviderError):
     The supervisor turns this into a wake, not a retry."""
 
 
+class LaunchCancelledError(ProviderError):
+    """The task was cancelled while its attempt was being prepared (hades #189). The
+    provider stopped at the step it was on, removed what that step made, and started
+    nothing further; the supervisor settles the attempt as cancelled, not as a failure."""
+
+
+# Asked by `prepare` before each of its steps and while it waits on one; True means the
+# task was cancelled and the prepare stops with LaunchCancelledError (hades #189).
+CancelCheck = Callable[[], Awaitable[bool]]
+
+
 class ExecutionProvider(Protocol):
     name: str
 
@@ -425,11 +436,16 @@ class ExecutionProvider(Protocol):
     async def credential_available(self, harness: str) -> bool: ...
 
     async def prepare(
-        self, spec: LaunchSpec, checkout_token: InstallationToken | None = None
+        self,
+        spec: LaunchSpec,
+        checkout_token: InstallationToken | None = None,
+        cancelled: CancelCheck | None = None,
     ) -> Workspace:
         """Build the checkout. `checkout_token` is a private repository's read-only
         installation token (ADR 0019): the provider hands it to the preparation step
-        alone, never to the worker, and the caller discards it once this returns."""
+        alone, never to the worker, and the caller discards it once this returns.
+        `cancelled` is asked before each step (a cache refresh, the checkout) and while
+        one runs; when it answers True the prepare raises LaunchCancelledError."""
         ...
 
     async def launch(self, ws: Workspace, spec: LaunchSpec) -> Handle: ...

@@ -105,7 +105,10 @@ class InFlightProvider(FakeProvider):
         self.transcript = list(CUT_OFF_TRANSCRIPT if transcript is None else transcript)
 
     async def prepare(
-        self, spec: LaunchSpec, checkout_token: InstallationToken | None = None
+        self,
+        spec: LaunchSpec,
+        checkout_token: InstallationToken | None = None,
+        cancelled: Any = None,
     ) -> Workspace:
         base = self.root / spec.attempt_id
         (base / "repo").mkdir(parents=True)

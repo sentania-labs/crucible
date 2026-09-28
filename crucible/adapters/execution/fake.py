@@ -29,6 +29,8 @@ the image tag. Handles survive as long as the provider instance does, which is h
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import hashlib
 import posixpath
 import re
@@ -38,12 +40,14 @@ from typing import Any, Literal
 
 from crucible.ports.execution import (
     BranchBundle,
+    CancelCheck,
     CleanupPolicy,
     CollectedArtifact,
     CollectedOutputs,
     Handle,
     ImageInfo,
     IsolationLevel,
+    LaunchCancelledError,
     LaunchSpec,
     LogChunk,
     LogOffset,
@@ -319,12 +323,27 @@ class FakeProvider:
         self.cleanup_policies: dict[str, CleanupPolicy] = {}
         # The checkout token each private repository's prepare received (ADR 0019).
         self.checkout_tokens: dict[str, CheckoutTokenSeen] = {}
+        # hades #189, #190: prepares a test holds open, by external id, until it
+        # releases them; and the attempts whose prepare stopped for a cancel.
+        self._prepare_holds: dict[str, asyncio.Event] = {}
+        self.prepare_cancelled: list[str] = []
+        self.prepares_started: list[str] = []
 
     # test controls
     def script(self, external_id: str, behavior: str, *, after: int = 1) -> None:
         if behavior not in BEHAVIORS:
             raise ValueError(f"unknown fake behavior {behavior!r}")
         self._scripts[external_id] = (behavior, after)
+
+    def hold_prepare(self, external_id: str) -> None:
+        """Hold the next prepare of this task open, as a refresher that cannot connect
+        would, until `release_prepare` or a cancel ends it."""
+        self._prepare_holds[external_id] = asyncio.Event()
+
+    def release_prepare(self, external_id: str) -> None:
+        hold = self._prepare_holds.pop(external_id, None)
+        if hold is not None:
+            hold.set()
 
     def set_report(self, external_id: str, report: dict[str, Any]) -> None:
         self._reports[external_id] = report
@@ -359,9 +378,22 @@ class FakeProvider:
         return False
 
     async def prepare(
-        self, spec: LaunchSpec, checkout_token: InstallationToken | None = None
+        self,
+        spec: LaunchSpec,
+        checkout_token: InstallationToken | None = None,
+        cancelled: CancelCheck | None = None,
     ) -> Workspace:
         behavior, _ = self._behavior_for(spec)
+        self.prepares_started.append(spec.attempt_id)
+        hold = self._prepare_holds.get(spec.external_id)
+        while True:
+            if cancelled is not None and await cancelled():
+                self.prepare_cancelled.append(spec.attempt_id)
+                raise LaunchCancelledError("the task was cancelled during prepare")
+            if hold is None or hold.is_set():
+                break
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(hold.wait(), timeout=0.02)
         if checkout_token is not None:
             # What a test needs to see about the token: which repository and which
             # permissions it was minted for, and that its value was there to hand over.
