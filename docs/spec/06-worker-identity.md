@@ -49,7 +49,12 @@ are reproducible.
    lines as milestones pass; capture each verification command's output to a log file there;
    write `blocked.md` and exit 75 to escalate; exit 0 only after
    `report.yaml` exists. Every path inside the report resolves against this
-   directory.
+   directory. It lists the contract's acceptance criteria and says that
+   `acceptance_mapping` has one entry per criterion, keyed by the criterion's
+   id and never by a verification id, with a one-line example; and that
+   `refs.head_sha` is `git rev-parse HEAD` after the final commit, which
+   Crucible only notes, because it reads the head from the collected branch
+   (hades #187).
 8. **Exit codes.** 0 done with report, 75 blocked, 70 cannot proceed (bad
    environment), anything else is failure.
 9. **Prohibitions.** No pushing at all (the checkout has no remote

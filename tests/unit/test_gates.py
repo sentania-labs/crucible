@@ -248,7 +248,7 @@ def test_exit_clean_passes_a_zero_code_that_completed() -> None:
     [
         ({"commits": 0}, "no commit"),
         ({"bundle_verified": False}, "bundle verify"),
-        ({"head_sha": "b" * 40}, "does not equal"),
+        ({"head_sha": ""}, "names no head"),
     ],
 )
 def test_commits_present_failures(patch: dict[str, Any], reason: str) -> None:
@@ -329,13 +329,17 @@ def test_no_injected_files_needs_the_commit_list() -> None:
     assert evaluate_gate(GateName.NO_INJECTED_FILES, _gi(evidence)).result is GateResult.FAIL
 
 
-def test_commits_present_fails_when_the_report_claims_no_head() -> None:
+def test_commits_present_takes_the_head_from_the_bundle_not_the_report() -> None:
+    """hades #187: HT-0002 reported a head it did not end on. The collected bundle is the
+    head; a report that names another one, or none, is noted and does not fail."""
     evidence = _passing_evidence()
-    payload = dict(evidence[2].payload)
-    payload["claimed_head_sha"] = None
-    evidence[2] = _ev("bundle_head", payload, ident=3)
-    outcome = evaluate_gate(GateName.COMMITS_PRESENT, _gi(evidence))
-    assert outcome.result is GateResult.FAIL and "claims no head_sha" in outcome.detail
+    for claimed, note in ((None, "named no head_sha"), ("9" * 40, "is not the collected head")):
+        payload = dict(evidence[2].payload)
+        payload["claimed_head_sha"] = claimed
+        evidence[2] = _ev("bundle_head", payload, ident=3)
+        outcome = evaluate_gate(GateName.COMMITS_PRESENT, _gi(evidence))
+        assert outcome.result is GateResult.PASS, outcome.detail
+        assert HEAD in outcome.detail and note in outcome.detail
 
 
 @pytest.mark.parametrize(

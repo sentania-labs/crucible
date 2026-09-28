@@ -112,3 +112,19 @@ def test_the_worker_is_told_the_report_format_version(tmp_path: Path) -> None:
     assert version["examples"] == ["1.0"]
     assert version["pattern"] == r"^1\.[0-9]+$"
     assert "1.0" in version["description"]
+
+
+def test_identity_md_says_how_to_fill_acceptance_mapping_and_head_sha(tmp_path: Path) -> None:
+    """hades #187: HT-0002 keyed `acceptance_mapping` by the verification ids and copied
+    a head it did not end on. The bundle names the criterion ids to map and says where
+    `refs.head_sha` comes from."""
+    text, _, _ = build(tmp_path)
+    criteria = [str(c["id"]) for c in contract_document()["acceptance_criteria"]]
+    section = text[text.index("## 7. Reporting protocol") : text.index("## 8. Exit codes")]
+    assert "`acceptance_mapping` has one entry for each acceptance criterion" in section
+    assert "verification ids in section 6 are not\nacceptance criteria" in section
+    for criterion in criteria:
+        assert f"- `{criterion}`: " in section
+    assert f"{{id: {criteria[0]}, status: met, evidence:" in section
+    assert "`refs.head_sha` is the output of `git rev-parse HEAD`" in section
+    assert "Crucible reads the head from the collected branch" in section

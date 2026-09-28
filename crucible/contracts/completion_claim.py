@@ -12,7 +12,12 @@ from crucible.contracts.common import StrictModel, check_major_version
 
 class ClaimRefs(StrictModel):
     branch: str = Field(min_length=1)
-    head_sha: str = Field(min_length=1)
+    # hades #187: Crucible takes the head from the collected branch; this is a note.
+    head_sha: str = Field(
+        min_length=1,
+        description="`git rev-parse HEAD` after the final commit. Crucible reads the "
+        "head from the collected branch itself; a different value is only noted.",
+    )
     commits: int = Field(ge=0)
 
 
@@ -49,7 +54,10 @@ class CompletionClaimV1(StrictModel):
     changed_files: list[str]
     refs: ClaimRefs
     checks: list[ClaimCheck]
-    acceptance_mapping: list[AcceptanceMapping]
+    acceptance_mapping: list[AcceptanceMapping] = Field(
+        description="One entry per contract acceptance criterion, keyed by its id "
+        "(AC1, AC2, ...), never by a verification id (V1, ...)."
+    )
     run_evidence: list[str]
     proposed_pull_request: ProposedPullRequest
     limitations: list[str]
