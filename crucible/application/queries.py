@@ -421,6 +421,10 @@ def attempt_view(uow: UnitOfWork, attempt_id: str) -> AttemptView:
     )
 
 
+# `release_supervisor` marks a released lease by expiring it at the epoch.
+RELEASED_LEASE_YEAR = 1970
+
+
 def supervisor_health(uow: UnitOfWork, now: datetime, lease_ttl_seconds: int) -> tuple[bool, str]:
     """Supervisor is healthy only when the lease is held and the last tick inside the lease
     window succeeded. A held lease next to failing ticks is not healthy (10, 19)."""
@@ -429,6 +433,9 @@ def supervisor_health(uow: UnitOfWork, now: datetime, lease_ttl_seconds: int) ->
     if lease is None:
         return False, "no supervisor lease"
     if lease.expires_at <= now:
+        if lease.expires_at.year == RELEASED_LEASE_YEAR:
+            # A clean stop writes the epoch; "expired in 1970" would read as nonsense.
+            return False, f"{lease.holder} released the lease and no supervisor holds it"
         return False, f"lease held by {lease.holder} expired {lease.expires_at.isoformat()}"
     window_start = now - timedelta(seconds=lease_ttl_seconds)
     last_ok = status.last_success_at
