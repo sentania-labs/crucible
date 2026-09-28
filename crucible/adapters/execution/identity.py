@@ -109,9 +109,10 @@ Run each of these and capture its output to a log file under `{REPORT_MOUNT}`:
 
 The report directory is `{REPORT_MOUNT}`, mounted writable and outside the
 checkout. Write `report.yaml` there matching `CompletionClaimV1`
-(`report-schema.json` in this bundle). Write `progress.jsonl` lines as
-milestones pass. Capture each verification command's output to a log file
-there. Write `blocked.md` and exit 75 to escalate. Exit 0 only after
+(`report-schema.json` in this bundle), with `schema_version: "1.0"`: the
+version of the document format, not the schema's name. Write
+`progress.jsonl` lines as milestones pass. Capture each verification
+command's output to a log file there. Write `blocked.md` and exit 75 to escalate. Exit 0 only after
 `report.yaml` exists. Every path inside the report resolves against this
 directory.
 

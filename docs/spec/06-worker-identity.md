@@ -44,7 +44,8 @@ are reproducible.
    instruction to capture each command's output to `report/`.
 7. **Reporting protocol.** The report directory is `/crucible/report`,
    mounted writable and outside the checkout. Write `report.yaml` there
-   matching `CompletionClaimV1`; write `progress.jsonl` lines as milestones
+   matching `CompletionClaimV1`, with `schema_version: "1.0"` (the format
+   version, not the schema's name, hades #181); write `progress.jsonl` lines as milestones
    pass; capture each verification command's output to a log file there;
    write `blocked.md` and exit 75 to escalate; exit 0 only after
    `report.yaml` exists. Every path inside the report resolves against this
