@@ -31,7 +31,9 @@ metadata:
 spec:
   hard:
     count/jobs.batch: "15"
-    persistentvolumeclaims: "12"
+    # The tier's earlier cases keep their claims (their cleanup policy keeps the diff),
+    # and the hades #189, #190 and #191 cases at the end of the file need five more.
+    persistentvolumeclaims: "24"
     requests.cpu: "6"
     requests.memory: 8Gi
 ---
