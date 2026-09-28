@@ -76,6 +76,9 @@ from tests.fixtures import contract_document, promote_for_test
 
 pytestmark = [
     pytest.mark.e2e,
+    # A kind case waits on pods, image pulls and the supervisor's own timeouts; the
+    # cluster's first case also pays for the session fixtures (issue 192).
+    pytest.mark.timeout(900),
     pytest.mark.skipif(not os.environ.get("CRUCIBLE_E2E_KIND"), reason="needs make e2e-kind"),
 ]
 

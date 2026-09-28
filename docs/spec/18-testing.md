@@ -7,6 +7,18 @@ daemon and requires an explicit `make e2e-image` to repair drift. CI runs on
 GitHub-hosted runners because the integration and end-to-end tiers need a
 Docker daemon.
 
+## Every test has a time limit
+
+`pytest-timeout` gives every test 120 seconds by default, set in the pytest
+configuration in `pyproject.toml`, so it holds for `make test`, `make e2e`,
+`make e2e-kind` and CI alike (issue 192). A test that runs past its limit fails
+on its own, with its name and the stack of every thread, and the run goes on to
+the next test; `faulthandler_timeout` dumps every thread again if a hang cannot
+be interrupted. A module whose cases legitimately need longer sets its own
+`pytest.mark.timeout`: the kind tier and the local-only live tiers do.
+`tests/unit/test_test_time_limit.py` runs a deliberately hanging fixture and
+proves it fails within the limit and names itself.
+
 ## Test fixtures are off in production
 
 The fake provider (08) runs nothing and the script harness reports completion
