@@ -14,6 +14,16 @@ installation's repositories. A mint that names repositories the installation doe
 cover is refused (HTTP 422), as GitHub refuses it; each mint's requested repositories
 and permissions are recorded, and `DELETE /installation/token` revokes a token (ADR 0019).
 
+The GitHub half also stands in for github.com's side of the App manifest flow
+(crucible#168): `POST /settings/apps/new` (or `/organizations/<org>/settings/apps/new`)
+takes the manifest a browser posts and shows a confirm page, whose button redirects the
+browser to the manifest's `redirect_url` with a one-time code and the state it was given;
+`POST /app-manifests/<code>/conversions` exchanges that code once for a new App (an id,
+a fresh RSA key, a webhook secret), after which the App JWT checks use the new App; and
+`/apps/<slug>/installations/new` installs it (adds the configuration's `manifest.install`
+installation) and redirects to the manifest's `setup_url`. `GET /_stub/manifests` shows
+the manifests posted and the conversions made, never a key.
+
 `--git-root` runs the third stand-in instead (crucible#157): a git remote over HTTPS that
 serves each repository the configuration gives a `git` block, and answers a clone only
 with Basic credentials `x-access-token:<token>` for a token the GitHub half minted,
@@ -29,6 +39,10 @@ environment variable:
      "installations": [{"id": 7, "account": "octo-lab", "type": "Organization",
                         "repositories": [{"full_name": "octo-lab/widgets",
                                           "default_branch": "trunk"}]}]}
+
+The manifest flow reads `"manifest": {"app_id": 5151, "owner": "stub-owner",
+"install": {<an installation, as above>}}`; `app_id` and `public_key_pem` may then be left
+out, since the conversion makes them.
 
 A repository may also carry `"url"` (the `html_url` the picker registers, in place of
 `https://github.com/<full_name>`) and `"git": {"files": {"README.md": "..."}}` (what the
@@ -52,6 +66,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -81,6 +96,12 @@ class Stubs:
         # and grant nothing outside it.
         self.history: list[dict[str, Any]] = []
         self.seen: list[str] = []
+        # The manifest flow (crucible#168): what each browser posted, the starts waiting
+        # for their confirm button, the codes not yet exchanged, and each exchange made.
+        self.manifests: list[dict[str, Any]] = []
+        self.pending: dict[str, dict[str, Any]] = {}
+        self.codes: dict[str, dict[str, Any]] = {}
+        self.conversions: list[dict[str, Any]] = []
         self.lock = threading.Lock()
         pem = str(config.get("public_key_pem") or "")
         self.public_key = serialization.load_pem_public_key(pem.encode()) if pem else None
@@ -155,6 +176,32 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _html(self, status: int, title: str, body: str) -> None:
+        page = (
+            f"<!doctype html><html><head><meta charset='utf-8'><title>{escape(title)}</title>"
+            "</head><body style='font-family:sans-serif;max-width:40em;margin:3em auto'>"
+            f"<p style='color:#666'>GitHub stand-in</p><h1>{escape(title)}</h1>{body}"
+            "</body></html>"
+        ).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(page)))
+        self.end_headers()
+        self.wfile.write(page)
+
+    def _redirect(self, location: str) -> None:
+        self.send_response(302)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _form(self) -> dict[str, str]:
+        raw = getattr(self, "body", b"") or b""
+        return {k: v[0] for k, v in parse_qs(raw.decode("utf-8", "replace")).items()}
+
+    def _origin(self) -> str:
+        return f"http://{self.headers.get('Host', '127.0.0.1')}"
+
     def _bearer(self) -> str:
         value = self.headers.get("Authorization", "")
         return value[len("Bearer ") :] if value.startswith("Bearer ") else ""
@@ -211,6 +258,8 @@ class _Handler(BaseHTTPRequestHandler):
             models = [{"id": m, "object": "model"} for m in config.get("models") or []]
             self._send(200, {"object": "list", "data": models})
             return
+        if self._manifest_flow(method, path, split.query):
+            return
         if path == "/app" or path.startswith("/app/"):
             if not stubs.jwt_ok(self._bearer()):
                 self._send(401, {"message": "A JSON web token could not be decoded"})
@@ -241,6 +290,161 @@ class _Handler(BaseHTTPRequestHandler):
             return
         self._send(404, {"message": "Not Found"})
 
+    def _manifest_flow(self, method: str, path: str, query: str) -> bool:
+        """github.com's half of the manifest flow, and the conversion; True when it
+        answered."""
+        stubs = self.server.stubs
+        parts = path.split("/")
+        if method == "GET" and path == "/_stub/manifests":
+            with stubs.lock:
+                self._send(
+                    200, {"manifests": list(stubs.manifests), "conversions": stubs.conversions}
+                )
+            return True
+        organization = None
+        if (
+            len(parts) == 6
+            and parts[1] == "organizations"
+            and parts[3:]
+            == [
+                "settings",
+                "apps",
+                "new",
+            ]
+        ):
+            organization = parts[2]
+        if method == "POST" and (path == "/settings/apps/new" or organization):
+            state = (parse_qs(query).get("state") or [""])[0]
+            try:
+                manifest = json.loads(self._form().get("manifest") or "")
+            except ValueError:
+                manifest = None
+            if not isinstance(manifest, dict) or not manifest.get("redirect_url"):
+                self._html(422, "Invalid manifest", "<p>The manifest could not be read.</p>")
+                return True
+            owner = organization or str(
+                (stubs.config.get("manifest") or {}).get("owner") or "stub-owner"
+            )
+            pending = secrets.token_urlsafe(12)
+            with stubs.lock:
+                stubs.manifests.append(
+                    {"manifest": manifest, "organization": organization, "state": state}
+                )
+                stubs.pending[pending] = {"manifest": manifest, "owner": owner, "state": state}
+            permissions = ", ".join(
+                f"{k} {v}" for k, v in (manifest.get("default_permissions") or {}).items()
+            )
+            hook = manifest.get("hook_attributes") or {}
+            self._html(
+                200,
+                f"Create GitHub App for {owner}",
+                f"<p>Name: <b>{escape(str(manifest.get('name')))}</b></p>"
+                f"<p>Permissions: {escape(permissions)}</p>"
+                f"<p>Webhook active: {escape(str(hook.get('active')))}</p>"
+                "<form method='post' action='/_stub/apps/confirm'>"
+                f"<input type='hidden' name='pending' value='{escape(pending)}'>"
+                f"<button type='submit'>Create GitHub App for {escape(owner)}</button></form>",
+            )
+            return True
+        if method == "POST" and path == "/_stub/apps/confirm":
+            with stubs.lock:
+                started = stubs.pending.pop(self._form().get("pending", ""), None)
+            if started is None:
+                self._html(404, "Not found", "<p>No such App creation.</p>")
+                return True
+            code = "mc_" + secrets.token_urlsafe(16)
+            with stubs.lock:
+                stubs.codes[code] = started
+            redirect = str(started["manifest"]["redirect_url"])
+            separator = "&" if "?" in redirect else "?"
+            self._redirect(
+                f"{redirect}{separator}{urlencode({'code': code, 'state': started['state']})}"
+            )
+            return True
+        if (
+            method == "POST"
+            and len(parts) == 4
+            and parts[1] == "app-manifests"
+            and parts[3] == "conversions"
+        ):
+            with stubs.lock:
+                started = stubs.codes.pop(parts[2], None)
+            if started is None:
+                self._send(404, {"message": "Not Found"})
+                return True
+            self._convert(started)
+            return True
+        if len(parts) == 5 and parts[1] == "apps" and parts[3] == "installations":
+            self._install(method, parts[2], parts[4])
+            return True
+        return False
+
+    def _convert(self, started: dict[str, Any]) -> None:
+        """A new App: its id, a fresh key the App JWT checks now verify against, and a
+        webhook secret. The key goes into the answer and nowhere else."""
+        from cryptography.hazmat.primitives import serialization  # noqa: PLC0415
+        from cryptography.hazmat.primitives.asymmetric import rsa  # noqa: PLC0415
+
+        stubs = self.server.stubs
+        manifest = started["manifest"]
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        pem = key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption(),
+        ).decode()
+        app_id = int((stubs.config.get("manifest") or {}).get("app_id") or 5151)
+        slug = "-".join(
+            "".join(c.lower() if c.isalnum() else " " for c in str(manifest["name"])).split()
+        )
+        with stubs.lock:
+            stubs.public_key = key.public_key()
+            stubs.config["app_id"] = app_id
+            stubs.config["app_slug"] = slug
+            stubs.config["app_html_url"] = f"{self._origin()}/apps/{slug}"
+            stubs.config["setup_url"] = manifest.get("setup_url")
+            stubs.conversions.append({"app_id": app_id, "slug": slug, "owner": started["owner"]})
+        self._send(
+            201,
+            {
+                "id": app_id,
+                "slug": slug,
+                "name": manifest["name"],
+                "owner": {"login": started["owner"]},
+                "html_url": f"{self._origin()}/apps/{slug}",
+                "client_id": "Iv1.stub" + secrets.token_hex(4),
+                "client_secret": secrets.token_hex(20),
+                "webhook_secret": secrets.token_hex(20),
+                "pem": pem,
+                "permissions": manifest.get("default_permissions") or {},
+                "events": manifest.get("default_events") or [],
+            },
+        )
+
+    def _install(self, method: str, slug: str, action: str) -> None:
+        stubs = self.server.stubs
+        if slug != stubs.config.get("app_slug") or action != "new":
+            self._html(404, "Not found", "<p>No such App.</p>")
+            return
+        install = dict((stubs.config.get("manifest") or {}).get("install") or {})
+        if method == "GET":
+            names = ", ".join(str(r["full_name"]) for r in install.get("repositories") or [])
+            self._html(
+                200,
+                f"Install {slug}",
+                f"<p>On <b>{escape(str(install.get('account')))}</b>, for: {escape(names)}</p>"
+                f"<form method='post' action='/apps/{escape(slug)}/installations/new'>"
+                "<button type='submit'>Install</button></form>",
+            )
+            return
+        with stubs.lock:
+            installations = stubs.config.setdefault("installations", [])
+            if install and not any(int(i["id"]) == int(install["id"]) for i in installations):
+                installations.append(install)
+        setup = str(stubs.config.get("setup_url") or "")
+        query = urlencode({"installation_id": install.get("id"), "setup_action": "install"})
+        self._redirect(f"{setup}{'&' if '?' in setup else '?'}{query}")
+
     def _app(self, method: str, path: str) -> None:
         stubs = self.server.stubs
         config = stubs.config
@@ -253,7 +457,7 @@ class _Handler(BaseHTTPRequestHandler):
                     "slug": slug,
                     "name": slug,
                     "owner": {"login": "stub-owner"},
-                    "html_url": f"https://github.com/apps/{slug}",
+                    "html_url": config.get("app_html_url") or f"https://github.com/apps/{slug}",
                 },
             )
             return

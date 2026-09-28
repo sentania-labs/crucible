@@ -10,17 +10,23 @@ real cluster (docs/implementation-notes/first-run.md)."""
 from __future__ import annotations
 
 import asyncio
+import base64
 import copy
+import hashlib
+import html
 import importlib.util
 import json
 import re
 import sys
+import urllib.parse
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
 
+import httpx
 import pytest
+import sqlalchemy
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
@@ -37,8 +43,10 @@ from crucible.adapters.github.client import RestGitHubClient
 from crucible.adapters.github.credentials import SecretAppCredentials
 from crucible.adapters.github.transport import RestTransport
 from crucible.application.admin.context import AdminContext
+from crucible.application.auth import mint_token
 from crucible.application.supervisor import Supervisor
 from crucible.cli import admin as cli
+from crucible.domain.entities import Role
 from tests.admin_cli import admin_main
 from tests.integration.conftest import put_seeded_policy_in_force
 from tests.integration.test_admin import (
@@ -571,6 +579,9 @@ def test_the_cli_remote_mode_builds_the_first_run_calls(
     admin_main([*base, "gateway", "pick", "--enable", "a", "--disable", "b", "--thinking", "a"])
     admin_main([*base, "github", "connect", "--app-id", "5", "--private-key-file", str(pem)])
     admin_main(["--api-url", "http://127.0.0.1:1", "github", "installations"])
+    admin_main(["--api-url", "http://127.0.0.1:1", "github", "external-url"])
+    admin_main([*base, "github", "set-external-url", "--url", "https://hades.example"])
+    admin_main([*base, "github", "set-external-url", "--url", ""])
     admin_main([*base, "github", "add-repository", "--installation-id", "7", "--repository", "o/r"])
     expected: list[tuple[str, str, Any]] = [
         (
@@ -598,6 +609,9 @@ def test_the_cli_remote_mode_builds_the_first_run_calls(
             {"reason": "r", "app_id": 5, "private_key": "PEM-TEXT\n", "webhook_secret": None},
         ),
         ("GET", "/v1/admin/github/installations", None),
+        ("GET", "/v1/admin/github/external-url", None),
+        ("POST", "/v1/admin/github/external-url", {"reason": "r", "url": "https://hades.example"}),
+        ("POST", "/v1/admin/github/external-url", {"reason": "r", "url": None}),
         (
             "POST",
             "/v1/admin/github/repositories",
@@ -615,3 +629,284 @@ def test_the_cli_remote_mode_builds_the_first_run_calls(
     assert calls == expected
     assert json.dumps(calls).count("PEM-TEXT") == 1
     assert re.search(r"cru_", json.dumps(calls)) is None
+
+
+# ----- the one-click App: GitHub's manifest flow (crucible#168) -------------------------
+
+HADES = "http://hades.test"
+MANIFEST_APP_ID = 5151
+
+
+def _manifest_form(page: str) -> tuple[str, dict[str, Any]]:
+    action = re.search(r'id="github-manifest"[^>]*action="([^"]+)"', page)
+    manifest = re.search(r'name="manifest" value="([^"]+)"', page)
+    assert action is not None and manifest is not None, page
+    return html.unescape(action.group(1)), json.loads(html.unescape(manifest.group(1)))
+
+
+def _create(browser: TestClient, csrf: str, **fields: str) -> TestClient | Any:
+    return browser.post(
+        "/ui/actions/github-create-app",
+        data={"csrf": csrf, "return_to": "/ui/github", **fields},
+        headers={"Origin": HADES},
+        follow_redirects=False,
+    )
+
+
+def _on_github(target: str, manifest: dict[str, Any]) -> str:
+    """What the operator's browser does on github.com: post the manifest, press Create
+    on the confirm page, and follow the redirect back. Returns the path and query it is
+    sent back to on Crucible."""
+    with httpx.Client(follow_redirects=False, timeout=10) as web:
+        confirm = web.post(target, data={"manifest": json.dumps(manifest)})
+        assert confirm.status_code == 200, confirm.text
+        pending = re.search(r"name='pending' value='([^']+)'", confirm.text)
+        assert pending is not None
+        back = web.post(
+            urllib.parse.urljoin(target, "/_stub/apps/confirm"),
+            data={"pending": pending.group(1)},
+        )
+    assert back.status_code == 302
+    location = back.headers["location"]
+    assert location.startswith(f"{HADES}/ui/github/callback?"), location
+    return location[len(HADES) :]
+
+
+def _flash(response: Any) -> str:
+    assert response.status_code == 303, response.text
+    return unquote(response.headers["location"])
+
+
+def test_github_app_is_created_with_one_click_and_installed(
+    admin: TestClient,
+    live: Supervisor,
+    stubs: Any,
+    k8s_api: FakeKubernetesApi,
+    ctx: AppContext,
+    tokens: dict[str, str],
+) -> None:
+    asyncio.run(live.tick())
+    stubs.stubs.config["installations"] = []
+    stubs.stubs.config["manifest"] = {
+        "app_id": MANIFEST_APP_ID,
+        "owner": "sentania",
+        "install": {
+            "id": 31,
+            "account": "octo-lab",
+            "type": "Organization",
+            "repositories": [
+                {"full_name": "octo-lab/widgets", "default_branch": "trunk"},
+                {"full_name": "octo-lab/secret", "private": True},
+            ],
+        },
+    }
+    responses: list[str] = []
+    with TestClient(create_app(ctx)) as browser:
+        csrf = ui_sign_in(browser, tokens["admin"])
+        page = browser.get("/ui/github").text
+        # One button, the existing-App form behind a secondary link.
+        assert "Create GitHub App" in page and 'value="Hades-' in page
+        assert 'href="/ui/github?existing=1"' in page and 'name="private_key"' not in page
+        existing = browser.get("/ui/github?existing=1").text
+        assert (
+            'name="private_key"' in existing and 'action="/ui/actions/github-connect"' in existing
+        )
+
+        # Create: the page the browser posts to GitHub, the manifest filled in.
+        started = _create(browser, csrf, app_name="Hades-test", organization="", reason="")
+        assert started.status_code == 200 and started.headers["cache-control"] == "no-store"
+        responses.append(started.text)
+        target, manifest = _manifest_form(started.text)
+        assert target.startswith(f"{stubs.url}/settings/apps/new?state=")
+        assert manifest == {
+            "name": "Hades-test",
+            "url": HADES,
+            "description": "Crucible delivery: opens and follows pull requests.",
+            "public": False,
+            "redirect_url": f"{HADES}/ui/github/callback",
+            "setup_url": f"{HADES}/ui/github/installed",
+            "setup_on_update": True,
+            "hook_attributes": {"url": f"{HADES}/v1/github/webhook", "active": False},
+            "default_permissions": {
+                "metadata": "read",
+                "contents": "write",
+                "pull_requests": "write",
+                "checks": "read",
+                "actions": "read",
+                "issues": "read",
+            },
+            "default_events": [],
+        }
+        with ctx.uow_factory() as uow:
+            stored = uow.session.execute(  # type: ignore[attr-defined]
+                sqlalchemy.text("SELECT state_hash FROM github_manifest_states")
+            ).scalars()
+            state = urllib.parse.parse_qs(urllib.parse.urlsplit(target).query)["state"][0]
+            assert list(stored) == [hashlib.sha256(state.encode()).hexdigest()]
+
+        # An organization's page, when one is named; a login that is not one is refused.
+        org = _create(browser, csrf, app_name="Hades-org", organization="octo-lab")
+        assert _manifest_form(org.text)[0].startswith(
+            f"{stubs.url}/organizations/octo-lab/settings/apps/new?state="
+        )
+        bad_org = _create(browser, csrf, app_name="x", organization="-no-")
+        assert "is not a GitHub organization login" in _flash(bad_org)
+
+        callback = _on_github(target, manifest)
+        assert stubs.stubs.manifests[0]["manifest"] == manifest
+
+        # GitHub's redirect is cross-site, so the Strict session cookie is not sent: the
+        # first arrival reloads itself from Crucible's own site; still no session, and
+        # it goes to sign-in and back. Nothing is exchanged on the way.
+        with TestClient(create_app(ctx)) as cross_site:
+            hop = cross_site.get(callback, follow_redirects=False)
+            assert hop.status_code == 200 and 'http-equiv="refresh"' in hop.text
+            assert hop.headers["referrer-policy"] == "no-referrer"
+            again = re.search(r'url=([^"]+)"', hop.text)
+            assert again is not None and "hop=1" in html.unescape(again.group(1))
+            signed_out = cross_site.get(html.unescape(again.group(1)), follow_redirects=False)
+            assert signed_out.status_code == 303
+            assert _flash(signed_out).startswith("/ui/sign-in?next=/ui/github/callback?code=")
+        assert stubs.stubs.conversions == []
+
+        # The signed-in browser: the state checks out, the code is exchanged once, and
+        # the new App's credential is in the Secret the service owns.
+        done = browser.get(callback, follow_redirects=False)
+        message = _flash(done)
+        responses.append(message)
+        assert "kind=ok" in message and f"(App {MANIFEST_APP_ID})" in message
+        assert "Created the GitHub App hades-test" in message
+        conversions = [s for s in stubs.stubs.seen if s.startswith("POST /app-manifests/")]
+        assert len(conversions) == 1 and len(stubs.stubs.conversions) == 1
+        secret = k8s_api.objects[("secrets", "crucible-github-app")].body
+        assert secret["metadata"]["labels"][k8sspec.LABEL_MANAGED_BY] == "crucible"
+        assert set(secret["data"]) == {"app-id", "app.pem", "webhook.secret"}
+        assert base64.b64decode(secret["data"]["app-id"]).decode() == str(MANIFEST_APP_ID)
+        pem = base64.b64decode(secret["data"]["app.pem"]).decode()
+        hook = base64.b64decode(secret["data"]["webhook.secret"]).decode()
+        assert "PRIVATE KEY" in pem and hook
+
+        # Used once: the same return is refused without asking GitHub again.
+        replay = browser.get(callback, follow_redirects=False)
+        assert "kind=bad" in _flash(replay) and "used already" in _flash(replay)
+        wrong = browser.get(
+            "/ui/github/callback?code=mc_x&state=" + "w" * 43, follow_redirects=False
+        )
+        assert "matches no start" in _flash(wrong)
+        assert len(stubs.stubs.conversions) == 1
+
+        # Expired: a start older than its 15 minutes is refused, and GitHub is not asked.
+        late = _create(browser, csrf, app_name="Hades-late")
+        late_target, late_manifest = _manifest_form(late.text)
+        late_callback = _on_github(late_target, late_manifest)
+        with ctx.uow_factory() as uow:
+            uow.session.execute(  # type: ignore[attr-defined]
+                sqlalchemy.text(
+                    "UPDATE github_manifest_states SET expires_at = created_at "
+                    "- interval '1 second' WHERE app_name = 'Hades-late'"
+                )
+            )
+            uow.commit()
+        expired = browser.get(late_callback, follow_redirects=False)
+        assert "expired after 15 minutes" in _flash(expired)
+        assert len(stubs.stubs.conversions) == 1
+
+        # Another administrator's start is not this one's to finish.
+        mine = _create(browser, csrf, app_name="Hades-mine")
+        mine_callback = _on_github(*_manifest_form(mine.text))
+        with ctx.uow_factory() as uow:
+            other = mint_token(uow, ctx.clock, name="second-admin", role=Role.ADMIN).token
+            uow.commit()
+        with TestClient(create_app(ctx)) as second:
+            ui_sign_in(second, other)
+            theirs = second.get(mine_callback, follow_redirects=False)
+            assert "belongs to another administrator" in _flash(theirs)
+        assert len(stubs.stubs.conversions) == 1
+
+        # Install: the button opens the App's own page; GitHub sends the browser back to
+        # the repository picker, which lists what the installation covers.
+        page = browser.get("/ui/github").text
+        responses.append(page)
+        install = f"{stubs.url}/apps/hades-test/installations/new"
+        assert f'class="lat-btn lat-btn--primary" href="{install}"' in page
+        assert "Install on GitHub" in page and "connected, App 5151" in page
+        with httpx.Client(follow_redirects=False, timeout=10) as web:
+            assert web.get(install).status_code == 200
+            installed = web.post(install)
+        assert installed.status_code == 302
+        setup = installed.headers["location"]
+        assert setup.startswith(f"{HADES}/ui/github/installed?installation_id=31")
+        landed = browser.get(setup[len(HADES) :], follow_redirects=False)
+        assert _flash(landed).startswith("/ui/github?kind=ok&message=Installed on GitHub")
+        picker = browser.get("/ui/github").text
+        responses.append(picker)
+        assert "octo-lab (Organization), installation 31" in picker
+        assert '<option value="octo-lab/widgets"' in picker
+
+    # The key and the webhook secret are never in an answer, a page or the audit.
+    audit_response = admin.get("/v1/admin/audit", params={"limit": 200})
+    status_response = admin.get("/v1/admin/github")
+    assert audit_response.status_code == 200 and status_response.status_code == 200
+    audit, status = audit_response.text, status_response.text
+    for text in [*responses, audit, status]:
+        assert "PRIVATE KEY" not in text
+        assert pem.strip().splitlines()[1] not in text and hook not in text
+    events = [e for e in admin.get("/v1/admin/audit", params={"limit": 200}).json()["items"]]
+    kinds = [e["kind"] for e in events]
+    assert kinds.count("github_app_manifest_started") == 4
+    connected = [e for e in events if e["kind"] == "github_app_connected"]
+    assert len(connected) == 1
+    after = connected[0]["payload"]["after"]
+    assert after["via"] == "manifest" and after["app_id"] == MANIFEST_APP_ID
+    assert after["key_fingerprint"].startswith("sha256:") and after["webhook_secret_set"] is True
+    refusals = [e["payload"]["detail"] for e in events if e["kind"] == "admin_refused"]
+    assert any("used already" in d for d in refusals)
+
+
+def test_the_return_address_setting_overrides_the_browsers(
+    admin: TestClient,
+    live: Supervisor,
+    stubs: Any,
+    ctx: AppContext,
+    tokens: dict[str, str],
+    config_file: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    asyncio.run(live.tick())
+    assert admin.get("/v1/admin/github/external-url").json()["source"] == "browser"
+    bad = admin.post("/v1/admin/github/external-url", json={"url": "ftp://x", "reason": "r"})
+    assert bad.status_code == 422
+    saved = admin.post(
+        "/v1/admin/github/external-url",
+        json={"url": "https://hades.apps.example.internal/", "reason": "behind the ingress"},
+    )
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["url"] == "https://hades.apps.example.internal"
+    with TestClient(create_app(ctx)) as browser:
+        csrf = ui_sign_in(browser, tokens["admin"])
+        page = browser.get("/ui/github").text
+        assert "https://hades.apps.example.internal (saved)" in page
+        _, manifest = _manifest_form(_create(browser, csrf, app_name="Hades-x").text)
+        assert manifest["redirect_url"] == "https://hades.apps.example.internal/ui/github/callback"
+        cleared = browser.post(
+            "/ui/actions/github-external-url",
+            data={"csrf": csrf, "return_to": "/ui/github", "external_url": ""},
+            follow_redirects=False,
+        )
+        assert "Cleared" in _flash(cleared)
+    assert admin.get("/v1/admin/github/external-url").json()["url"] is None
+    # The CLI's local mode, through the same service.
+    cli_saved = run_cli(
+        config_file,
+        "--reason",
+        "cli",
+        "github",
+        "set-external-url",
+        "--url",
+        "https://cli.example.internal",
+        capsys=capsys,
+    )
+    assert cli_saved["url"] == "https://cli.example.internal"
+    assert run_cli(config_file, "github", "external-url", capsys=capsys)["source"] == "database"
+    audit = admin.get("/v1/admin/audit", params={"limit": 200}).text
+    assert audit.count("github_external_url_updated") == 3
