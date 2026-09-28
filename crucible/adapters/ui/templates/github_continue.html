@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="admin-title"><div><h1>Continue on GitHub</h1><p>GitHub shows the App it is about to create for {{ account }}, filled in. Press Create GitHub App there; GitHub then sends your browser back here.</p></div><span class="lat-badge lat-badge--accent">step 1 of 2</span></div>
+<section class="lat-card">
+  <h2>{{ app_name }}</h2>
+  <p class="lat-hint">Permissions: {{ permissions }}. No webhook: Crucible polls GitHub, so GitHub never has to reach it. This start is good for 15 minutes and once.</p>
+  <form id="github-manifest" class="admin-form" method="post" action="{{ target_url }}">
+    <input type="hidden" name="manifest" value="{{ manifest }}">
+    <button class="lat-btn lat-btn--primary" type="submit">Continue to GitHub</button>
+  </form>
+  <details class="admin-details"><summary>The manifest GitHub receives</summary><pre class="lat-code admin-output">{{ manifest_pretty }}</pre></details>
+  <p><a href="/ui/github">Back to the GitHub page</a></p>
+</section>
+<script>document.getElementById("github-manifest").submit();</script>
+{% endblock %}

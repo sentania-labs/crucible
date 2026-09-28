@@ -34,6 +34,8 @@ var/
 # Generated review surfaces and scratch
 .lavish/
 *.html
+# The UI's own templates are source, not scratch.
+!crucible/adapters/ui/templates/*.html
 tmp/
 
 # Crucible local state

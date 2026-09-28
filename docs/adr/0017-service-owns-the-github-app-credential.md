@@ -2,7 +2,9 @@
 
 Status: accepted. The operator's feedback of 2026-09-25 (quoted below), made concrete by
 FDY-0117 the same day. Extends ADR 0015's ownership model from the harness credentials to
-the GitHub App credential.
+the GitHub App credential. Amended 2026-09-27 (crucible#168): the App manifest flow needs
+no public DNS, and it is now the only way the App is connected; see "Amendment: the
+one-click App" below.
 
 ## Context
 
@@ -27,7 +29,7 @@ building an app/seevice."
 1. **The service is the single writer of the GitHub App credential.** On Kubernetes it is
    the Secret `crucible-github-app` in the service's own namespace (`crucible`, named by
    `github.app.secret_name`), keys `app-id`, `app.pem` and `webhook.secret`. The service
-   creates it the first time Connect GitHub writes it, labels it
+   creates it the first time Create GitHub App writes it, labels it
    `app.kubernetes.io/managed-by: crucible` and `crucible.credential: github-app`, and
    replaces its data with one merge patch on each later write; a webhook secret is
    replaced only when one is given. With the Docker provider the same three files sit
@@ -44,6 +46,9 @@ building an app/seevice."
    and calls `GET /app`; a refusal, or an answer naming another App, stores nothing. The
    answer carries the App's install link, built from the `html_url` GitHub returned. The
    key is never returned, logged or audited; its public-key fingerprint is.
+   (Superseded by the amendment below, 2026-09-27: the operator removed this path, and
+   Create GitHub App is the only way to connect an App. The route, the CLI verb and the
+   form are gone.)
 3. **The key is read through the API server, on each signature.** Both the api and the
    supervisor read the Secret when they sign a JWT, so a connect is in force at once
    rather than after the kubelet's next projection of the mount. The mount stays, still
@@ -74,10 +79,9 @@ building an app/seevice."
   same reason as in ADR 0015: it is hand-sealing with extra steps, and the operator asked
   to connect the App from the UI.
 - **The App manifest flow** (GitHub creates a new App from a manifest and redirects back
-  with its credentials). It needs a public callback URL, which on this lab is a public
-  DNS record, and those are the operator's alone (operator rule 10). Entering an existing
-  App's id and key covers the need without one; the manifest flow can follow if a
-  deployment has a public route.
+  with its credentials). Rejected at first on the belief that it needs a public callback
+  URL, which on this lab would be a public DNS record. That was wrong, and the flow is
+  adopted by the amendment below.
 - **Put the Secret in `crucible-workers`, where the Role already grants Secret verbs.**
   Rejected: that is the namespace untrusted worker code runs in, and 12 keeps the App key
   on the `crucible` pods only. A narrow Role in `crucible` is the smaller blast radius.
@@ -102,12 +106,81 @@ building an app/seevice."
   first-run Secret, and cannot read any. Both Roles grant `create` on Secrets in
   `crucible`, to different accounts; neither can read the other's Secret.
 - A deployment that sealed `crucible-github-app` before this change removes it from its
-  GitOps repository without pruning it (Argo's prune would delete the key), or connects
+  GitOps repository without pruning it (Argo's prune would delete the key), or creates
   the App again from the GitHub page afterwards. On its first write the service takes the
   Secret over: it sets its labels and replaces its data.
-- Rotation is a new App key in GitHub and a Connect GitHub with it, then revoking the old
-  key in GitHub. Connect GitHub replaces the id and the key together, so the two can
-  never disagree.
+- Rotation is Replace the App on the GitHub page: a new App, created and installed the
+  same way, each registered repository registered again with the new installation (a
+  registration carries its installation id, and a new App's installations are new),
+  then the old App deleted on GitHub (amended 2026-09-27; it was a new key for the same
+  App through the paste form of decision 2, which is removed). The store replaces the id
+  and the key together, so the two can never disagree.
 - With the Docker provider the connect flow needs the directory beside
   `github.app.private_key_path` writable by the service; compose mounts it read-only
   today, and the flow refuses there and names the directory.
+
+## Amendment: the one-click App (2026-09-27, crucible#168)
+
+The operator, 2026-09-27, on the GitHub page asking for an existing App's ID and `.pem`:
+"What am i supposed to do here? Should an app install be like 'Click the button' install
+the app? That's what happened for chronicle." And on this dispatch: "let's do a single
+dispatch to get the github app working like it works on chronicle 'click here to install
+the app'".
+
+**Correction.** The manifest flow needs no public DNS record. GitHub's `redirect_url` and
+`setup_url` redirect the operator's own browser, so any address the operator's browser
+reaches (the internal hostname of the UI) works; the code exchange is an outbound call
+from the service to GitHub. Only a webhook needs an address GitHub itself can reach, and
+Crucible polls (23), so the manifest turns the webhook off.
+
+**Decision.**
+
+1. The GitHub page's first action is Create GitHub App, for the operator's personal
+   account or an organization they name. The manifest carries the name (default `Hades-`
+   and six hex characters, editable, since App names are unique on GitHub), spec 23's
+   permissions exactly, no events, `hook_attributes.active: false`, `public: false`, and
+   `redirect_url` (`/ui/github/callback`) and `setup_url` (`/ui/github/installed`) on the
+   external URL. It is the only way to connect an App: entering an existing App's id and
+   key (decision 2) is removed (see "Correction" below).
+2. The external URL is the `Origin` of the operator's form post, unless the
+   `github.external_url` setting (a `provider_settings` row, on the GitHub page, the admin
+   API and the CLI) overrides it.
+3. A start is a row of `github_manifest_states` (migration 0026): the sha256 of a random
+   `state`, the sha256 of a second random value the starting browser keeps in an
+   HttpOnly, `SameSite=Lax` cookie scoped to `/ui/github` (Lax, because GitHub's redirect
+   back is a cross-site navigation), the administrator who started it, and an expiry 15
+   minutes later. On return the row is spent in its own transaction before GitHub is
+   asked, so a state is good once, and only by its own administrator in its own browser;
+   a missing, spent, expired, another administrator's or another browser's return is
+   refused, recorded as `admin_refused`, and GitHub is not asked. A refusal of the last
+   two leaves the start unspent, so it cannot be used to cancel someone else's. The code is exchanged once
+   (`POST /app-manifests/{code}/conversions`, unauthenticated: the code is the
+   credential). The App ID, key and webhook secret go straight to the store of decision
+   1; GitHub's OAuth client secret is dropped where the answer is read, because Crucible
+   signs as the App and never as a user. Audited as `github_app_manifest_started` and
+   `github_app_connected` (`via: manifest`, the key's public fingerprint, never the key);
+   the access log blanks `code` and `state` in the callback's query and in sign-in's
+   percent-encoded `next`, and the transport never puts the code in a log line or an
+   error. A refusal after the exchange names the App GitHub made, so the operator can
+   delete it there.
+4. The UI session cookie is `SameSite=Strict`, so it does not come with GitHub's
+   cross-site redirect. The callback and the install return answer a cookieless arrival
+   with a page that reloads the same URL from Crucible's own site (with
+   `Referrer-Policy: no-referrer`), which the cookie does come with; a second cookieless
+   arrival goes to sign-in and back. The cookie stays Strict.
+5. The flow is the UI's alone: GitHub requires a browser to post the manifest and
+   receives the operator's confirmation there, so there is no admin API or CLI verb for
+   it. The setting of decision 2 has all three.
+
+**Consequences.** A deployment whose UI is reached through a proxy that rewrites the
+host should set `github.external_url`. With the Docker provider the webhook secret is kept
+only where `github.app.webhook_secret_path` names a file, as before; the webhook is off
+either way.
+
+**Correction (2026-09-27, the same review).** The operator: "why even have the past your
+own app - it's a complicated duplicate". Decision 2 is removed rather than kept behind a
+link: no form, no `POST /v1/admin/github/app`, no `crucible admin github connect`. Replace
+the App offers only "Create a new App instead". The audited store path Create uses
+(`github.keep`) is unchanged, and decision 4 still counts a credential a deployment
+placed itself. "Connect GitHub" elsewhere in this record and in the code names the step
+that stores the App, which Create GitHub App now performs.

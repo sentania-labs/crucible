@@ -15,6 +15,7 @@ from crucible.application.admin import (
     credentials,
     gateway,
     github,
+    github_manifest,
     harness_test,
     harnesses,
     images,
@@ -553,29 +554,23 @@ def admin_github_check(
     return result
 
 
-@router.post("/admin/github/app")
-def admin_github_connect(
+@router.get("/admin/github/external-url")
+def admin_github_external_url(ctx: Ctx, uow: UoW, _principal: Admin) -> dict[str, Any]:
+    """The `github.external_url` setting (crucible#168): where GitHub sends the browser
+    back in the Create GitHub App flow. None: the address the browser used."""
+    return github_manifest.external_url_view(_admin(ctx), uow)
+
+
+@router.post("/admin/github/external-url")
+def admin_github_save_external_url(
     ctx: Ctx, uow: UoW, principal: Admin, body: Annotated[dict[str, Any], Body()]
 ) -> dict[str, Any]:
-    """Connect GitHub (crucible#120, ADR 0017): an existing App's id and private key,
-    checked against GitHub before they are stored. The answer never carries the key."""
-    private_key = body.get("private_key")
-    webhook_secret = body.get("webhook_secret")
-    if not isinstance(private_key, str):
-        raise ConflictError("private_key must be a string (the .pem file's text)")
-    if webhook_secret is not None and not isinstance(webhook_secret, str):
-        raise ConflictError("webhook_secret must be a string")
-    app_id = body.get("app_id")
-    if isinstance(app_id, str) and app_id.strip().isdigit():
-        app_id = int(app_id)
-    result = github.connect(
-        _admin(ctx),
-        uow,
-        principal=principal.name,
-        app_id=app_id if isinstance(app_id, int) else 0,
-        private_key=private_key,
-        webhook_secret=webhook_secret,
-        reason=_reason(body),
+    """Save the override; an empty or null `url` clears it."""
+    url = body.get("url")
+    if url is not None and not isinstance(url, str):
+        raise ConflictError("url must be a string or null")
+    result = github_manifest.save_external_url(
+        _admin(ctx), uow, principal=principal.name, url=url, reason=_reason(body)
     )
     uow.commit()
     return result

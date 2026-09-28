@@ -47,6 +47,7 @@
 {%- endmacro %}
 {% macro render_section_body(section) -%}
     {% if section.note %}<p class="lat-hint">{{ section.note }}</p>{% endif %}
+    {% if section.button %}<p><a class="lat-btn lat-btn--primary" href="{{ section.button.href }}"{% if not section.button.href.startswith('/ui') %} rel="noopener noreferrer"{% endif %}>{{ section.button.label }}</a></p>{% endif %}
     {% if section.rows is defined %}
       {% if section.rows %}<div class="admin-table-wrap lat-table-scroll"><table class="admin-table lat-table"><thead><tr>{% for column in section.columns %}<th>{{ column }}</th>{% endfor %}</tr></thead><tbody>
       {% for row in section.rows %}<tr>{% for cell in row %}<td>{{ render_cell(cell, section.columns[loop.index0]) }}</td>{% endfor %}</tr>{% endfor %}

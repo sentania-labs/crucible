@@ -84,14 +84,17 @@ class RestTransport:
                 delay = _rate_limit_delay(headers)
                 log.warning(
                     "github rate limit reached; waiting",
-                    extra={"path": path, "seconds": delay},
+                    extra={"path": _loggable(path), "seconds": delay},
                 )
                 self.waits += 1
                 self._sleep(delay)
                 continue
             return status, payload, headers
         raise GitHubError(
-            429, "rate limited twice in a row", path=path, response_class="rate_limited"
+            429,
+            "rate limited twice in a row",
+            path=_loggable(path),
+            response_class="rate_limited",
         )
 
     def _once(
@@ -115,9 +118,12 @@ class RestTransport:
             "Accept": accept,
             "X-GitHub-Api-Version": API_VERSION,
             "User-Agent": USER_AGENT,
-            "Authorization": f"Bearer {bearer}",
             "Accept-Encoding": "gzip",
         }
+        # The one unauthenticated call is the manifest conversion (crucible#168): the
+        # code in its path is the credential, so an empty bearer sends no header.
+        if bearer:
+            headers["Authorization"] = f"Bearer {bearer}"
         if payload is not None:
             headers["Content-Type"] = "application/json"
         conn = self._connect(self.host, self.port, self.timeout)
@@ -131,7 +137,10 @@ class RestTransport:
             status = int(response.status)
         except OSError as exc:
             raise GitHubError(
-                0, f"{type(exc).__name__}: {exc}", path=path, response_class="transport"
+                0,
+                f"{type(exc).__name__}: {exc}",
+                path=_loggable(path),
+                response_class="transport",
             ) from exc
         finally:
             conn.close()
@@ -173,6 +182,14 @@ class RestTransport:
                 break
             page += 1
         return out
+
+
+def _loggable(path: str) -> str:
+    """The path as a log line or an error may carry it: a manifest code is a one-time
+    credential for a new App's key (crucible#168), so it is left out."""
+    if path.startswith("/app-manifests/"):
+        return "/app-manifests/[code]/conversions"
+    return path
 
 
 def _is_rate_limited(status: int, headers: Mapping[str, str]) -> bool:

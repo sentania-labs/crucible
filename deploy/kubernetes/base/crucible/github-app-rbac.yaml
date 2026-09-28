@@ -1,6 +1,6 @@
 # The control plane's grant on the GitHub App credential Secret in its own namespace (ADR
 # 0017), which the service owns; its other grant here is deleting the first-run Secret
-# (first-run-rbac.yaml, ADR 0016). Connect GitHub creates it the first time
+# (first-run-rbac.yaml, ADR 0016). Create GitHub App creates it the first time
 # it writes, labelled `app.kubernetes.io/managed-by: crucible`, and replaces its data with
 # one merge patch on each later write; the api and the supervisor read it through the API
 # server on each signature.

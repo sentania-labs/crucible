@@ -27,6 +27,7 @@ from crucible.domain.entities import (
     ExternalReviewCycle,
     GateResultRecord,
     GitHubDelivery,
+    GitHubManifestState,
     HarnessImage,
     HarnessState,
     Heartbeat,
@@ -526,6 +527,26 @@ class ProviderSettingRepository(Protocol):
     def put(self, setting: ProviderSetting) -> ProviderSetting: ...
 
 
+class GitHubManifestStateRepository(Protocol):
+    """The starts of the GitHub App manifest flow (crucible#168), by the sha256 of their
+    `state` value."""
+
+    def add(self, state: GitHubManifestState) -> None: ...
+
+    def consume(
+        self, state_hash: str, now: datetime, *, principal: str, browser_hash: str
+    ) -> GitHubManifestState | None:
+        """The start as it was before this call, and marked used from now on when it
+        was unused and `principal` and `browser_hash` are its own: a return that is not
+        the starter's cannot spend it. None when there is no such start. Locks the row,
+        so two returns with the same state cannot both find it unused."""
+        ...
+
+    def prune(self, before: datetime) -> int:
+        """Delete every start that expired before `before`; how many went."""
+        ...
+
+
 class BootstrapImportRepository(Protocol):
     """The imports of 15, newest first when listed."""
 
@@ -604,6 +625,7 @@ class UnitOfWork(Protocol):
     harness_images: HarnessImageRepository
     bootstrap_imports: BootstrapImportRepository
     provider_settings: ProviderSettingRepository
+    github_manifest_states: GitHubManifestStateRepository
 
     def __enter__(self) -> UnitOfWork: ...
 

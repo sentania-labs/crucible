@@ -295,6 +295,22 @@ class AppCredential:
     private_key: bytes = field(repr=False)
 
 
+@dataclass(frozen=True, slots=True)
+class ManifestConversion:
+    """What GitHub hands back once for a manifest code (crucible#168): the new App's
+    public identity, its first private key and its webhook secret, if it made one.
+    `repr` never shows either secret. GitHub's OAuth client secret is not kept: Crucible
+    signs as the App and never as a user, so it is dropped where the answer is read."""
+
+    app_id: int
+    slug: str
+    name: str
+    owner: str | None
+    html_url: str
+    private_key: bytes = field(repr=False)
+    webhook_secret: bytes | None = field(default=None, repr=False)
+
+
 class GitHubAppCredentials(Protocol):
     """Where the App credential lives and the one writer of it (ADR 0017).
 
@@ -335,4 +351,9 @@ class GitHubAppDirectory(Protocol):
 
     def installation_repositories(self, installation_id: int) -> list[dict[str, Any]]:
         """`GET /installation/repositories` under that installation."""
+        ...
+
+    def convert_manifest(self, code: str) -> ManifestConversion:
+        """`POST /app-manifests/{code}/conversions`, unauthenticated: the code GitHub
+        redirected the operator's browser back with, good once, for the App it made."""
         ...

@@ -27,6 +27,7 @@ from crucible.application.admin import (
     credentials,
     gateway,
     github,
+    github_manifest,
     harness_test,
     harnesses,
     images,
@@ -1908,8 +1909,8 @@ def tokens_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
 
 @router.get("/github", response_class=HTMLResponse)
 def github_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
-    """crucible#120: connect an existing App by its id and key, install it from its own
-    link, then pick repositories from what each installation covers."""
+    """crucible#120, #168: create the App with one click, install it from its own link,
+    then pick repositories from what each installation covers."""
     found = _require(request, ctx, uow)
     if isinstance(found, RedirectResponse):
         return found
@@ -1971,57 +1972,24 @@ def github_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
             "fields": [{"name": "reason", "label": "Reason"}],
         }
     sections: list[dict[str, Any]] = [connection]
-    if admin:
-        sections.append(
-            {
-                "title": "Connect a GitHub App" if not state["configured"] else "Replace the App",
-                "note": (
-                    "An existing App's numeric ID and one of its private keys (the whole "
-                    ".pem file). GitHub is asked about them before anything is stored; the "
-                    "service then keeps them (on Kubernetes the Secret crucible-github-app "
-                    "in its own namespace, which it alone writes). The key is never shown or "
-                    "audited; its public fingerprint is."
-                ),
-                "form": {
-                    "action": "/ui/actions/github-connect",
-                    "label": "Check and connect",
-                    "collapsed": "Connect a different App" if state["configured"] else None,
-                    "fields": [
-                        {
-                            "name": "app_id",
-                            "label": "App ID",
-                            "kind": "number",
-                            "value": state["app_id"] or "",
-                            "required": True,
-                        },
-                        {
-                            "name": "private_key",
-                            "label": "Private key (.pem)",
-                            "kind": "textarea",
-                            "rows": 6,
-                            "required": True,
-                        },
-                        {
-                            "name": "webhook_secret",
-                            "label": "Webhook secret (optional)",
-                            "kind": "password",
-                        },
-                        {"name": "reason", "label": "Reason", "required": True},
-                    ],
-                },
-            }
-        )
     if picker is not None:
         if picker["error"]:
             sections.append({"title": "Installations", "note": picker["error"]})
         if picker["install_url"]:
+            installed = bool(picker["installations"])
             sections.append(
                 {
-                    "title": "Install the App",
+                    "title": "Install the App" if not installed else "Install it somewhere else",
                     "note": (
-                        "Install it on each account or organization whose repositories "
-                        "Crucible should deliver to, then come back here."
+                        "GitHub asks which account or organization, and which of its "
+                        "repositories, the App may see, then sends you back here to pick "
+                        "them."
+                        if not installed
+                        else "To deliver to another account or organization, or to more of "
+                        "its repositories, install or configure the App there; GitHub sends "
+                        "you back here."
                     ),
+                    "button": {"href": picker["install_url"], "label": "Install on GitHub"},
                     "columns": ["App", "Install link"],
                     "rows": [
                         [
@@ -2090,17 +2058,169 @@ def github_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                     ],
                 }
             sections.append(section)
+    if admin:
+        sections.append(_github_create_section(configured=state["configured"]))
+        sections.append(_github_external_url_section(ctx, uow))
     return _page(
         request,
         principal,
         csrf,
         active="/ui/github",
         heading="GitHub",
-        intro="Connect the App, install it, and pick the repositories Crucible delivers to.",
+        intro="Create the App, install it, and pick the repositories Crucible delivers to.",
         sections=sections,
         badge="connected" if state["configured"] else "not connected",
         badge_kind="ok" if state["configured"] else "warn",
     )
+
+
+def _github_create_section(*, configured: bool) -> dict[str, Any]:
+    """crucible#168: Create GitHub App, GitHub's manifest flow, the only way to connect
+    an App (the operator, 2026-09-27)."""
+    return {
+        "title": "Create the GitHub App" if not configured else "Replace the App",
+        "note": (
+            "One button: GitHub opens its own create-an-App page with everything filled in "
+            "(the name, the permissions Crucible needs, no webhook). Confirm there, and "
+            "GitHub sends your browser back here; Crucible keeps the App's key itself and "
+            "never shows it. Then install the App and pick repositories."
+            if not configured
+            else "Create a new App to replace the connected one. The connected App keeps "
+            "working until the new one is stored. A new App has new installations: install "
+            "it, then register each repository again on Repositories with the new "
+            "installation, or its deliveries fail."
+        ),
+        "form": {
+            "action": "/ui/actions/github-create-app",
+            "label": "Create GitHub App",
+            "collapsed": "Create a new App instead" if configured else None,
+            "fields": [
+                {
+                    "name": "app_name",
+                    "label": "App name (unique on GitHub; edit it if you like)",
+                    "value": github_manifest.default_app_name(),
+                    "required": True,
+                },
+                {
+                    "name": "organization",
+                    "label": "Organization (empty: your personal account)",
+                    "placeholder": "for example octo-lab",
+                },
+                {"name": "reason", "label": "Reason"},
+            ],
+        },
+    }
+
+
+def _github_external_url_section(ctx: Any, uow: UnitOfWork) -> dict[str, Any]:
+    """The `github.external_url` setting (crucible#168): where GitHub sends the browser
+    back. Empty uses the address the browser used for this page."""
+    view = github_manifest.external_url_view(ctx.admin, uow)
+    return {
+        "title": "Return address",
+        "note": (
+            f"GitHub sends your browser back to {view['url']} (saved)."
+            if view["url"]
+            else "GitHub sends your browser back to the address you are using for this page. "
+            "Only your browser needs to reach it; no public DNS record is needed."
+        ),
+        "form": {
+            "action": "/ui/actions/github-external-url",
+            "label": "Save return address",
+            "collapsed": "Change the return address",
+            "fields": [
+                {
+                    "name": "external_url",
+                    "label": "Crucible's address as your browser reaches it (empty: this page's)",
+                    "value": view["url"] or "",
+                    "placeholder": "https://hades.example.internal",
+                },
+                {"name": "reason", "label": "Reason"},
+            ],
+        },
+    }
+
+
+def _browser_url(request: Request) -> str:
+    """The origin the operator's browser used: a form post's `Origin`, else the URL
+    this request arrived on."""
+    origin = request.headers.get("origin")
+    if origin and origin != "null":
+        return origin
+    return str(request.base_url).rstrip("/")
+
+
+def _github_return(request: Request, ctx: Any, uow: UnitOfWork) -> Response | None:
+    """GitHub's redirect is cross-site, so the Strict session cookie does not come with
+    it. The first arrival without a session gets a page that reloads this same URL from
+    Crucible's own site, which the cookie does come with; a second arrival without one
+    is not signed in, and goes to sign-in and back."""
+    if _session(request, ctx, uow) is not None:
+        return None
+    params = [(k, v) for k, v in request.query_params.multi_items() if k != "hop"]
+    query = "&".join(f"{quote(k)}={quote(v)}" for k, v in params)
+    here = request.url.path + (f"?{query}" if query else "")
+    if request.query_params.get("hop") == "1":
+        return RedirectResponse(f"/ui/sign-in?next={quote(here)}", status_code=303)
+    target = here + ("&" if query else "?") + "hop=1"
+    response = templates.TemplateResponse(
+        request=request, name="github_return.html", context={"target": target}
+    )
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    return response
+
+
+def _to_github_page(message: str, kind: str = "ok") -> RedirectResponse:
+    return RedirectResponse(
+        f"/ui/github?kind={quote(kind)}&message={quote(message)}", status_code=303
+    )
+
+
+@router.get("/github/callback", response_class=HTMLResponse)
+def github_callback(request: Request, ctx: Ctx, uow: UoW) -> Response:
+    """Where GitHub sends the browser once it has created the App (crucible#168)."""
+    bounced = _github_return(request, ctx, uow)
+    if bounced is not None:
+        return bounced
+    found = _session(request, ctx, uow)
+    assert found is not None
+    principal, _ = found
+    try:
+        _admin(principal)
+        if ctx.admin is None:
+            raise ConflictError("the administrative surface is not configured")
+        state = request.query_params.get("state", "")
+        done = github_manifest.complete(
+            ctx.admin,
+            uow,
+            principal=principal.name,
+            code=request.query_params.get("code", ""),
+            state=state,
+            browser_nonce=request.cookies.get(github_manifest.binding_cookie(state)),
+        )
+        uow.commit()
+    except ApplicationError as exc:
+        return _to_github_page(exc.detail, "bad")
+    app = done.get("app") or {}
+    response = _to_github_page(
+        f"Created the GitHub App {app.get('slug') or app.get('name')} (App {app.get('id')}) "
+        "and connected it. Next: install it."
+    )
+    response.delete_cookie(
+        github_manifest.binding_cookie(state),
+        path=github_manifest.binding_cookie_path(done["external_url"]),
+    )
+    return response
+
+
+@router.get("/github/installed", response_class=HTMLResponse)
+def github_installed(request: Request, ctx: Ctx, uow: UoW) -> Response:
+    """Where GitHub sends the browser after an install (the manifest's `setup_url`)."""
+    bounced = _github_return(request, ctx, uow)
+    if bounced is not None:
+        return bounced
+    return _to_github_page("Installed on GitHub. Pick the repositories below.")
 
 
 @router.get("/workers", response_class=HTMLResponse)
@@ -2684,22 +2804,62 @@ async def action(request: Request, action: str, ctx: Ctx, uow: UoW) -> Response:
                 f"Enabled: {enabled}."
                 + (f" Disabled as no longer offered: {', '.join(dropped)}." if dropped else ""),
             )
-        elif action == "github-connect":
-            connected = github.connect(
+        elif action == "github-create-app":
+            started = github_manifest.start(
                 ctx.admin,
                 uow,
                 principal=principal.name,
-                app_id=int(form.get("app_id") or "0"),
-                private_key=form.get("private_key", ""),
-                webhook_secret=form.get("webhook_secret") or None,
+                app_name=form.get("app_name"),
+                organization=form.get("organization"),
+                browser_url=_browser_url(request),
+                reason=reason,
+            )
+            uow.commit()
+            context = _base(
+                request, principal, csrf, title="Continue on GitHub", active="/ui/github"
+            )
+            context.update(
+                target_url=started["target_url"],
+                manifest=json.dumps(started["manifest"], separators=(",", ":")),
+                manifest_pretty=json.dumps(started["manifest"], indent=2),
+                app_name=started["manifest"]["name"],
+                account=started["account"],
+                permissions=", ".join(
+                    f"{name.replace('_', ' ')} {level}"
+                    for name, level in started["manifest"]["default_permissions"].items()
+                ),
+            )
+            response = templates.TemplateResponse(
+                request=request, name="github_continue.html", context=context
+            )
+            response.headers["Cache-Control"] = "no-store"
+            response.headers["Referrer-Policy"] = "no-referrer"
+            # Ties the start to this browser (crucible#168). Lax, because GitHub's
+            # redirect back is a cross-site navigation, which a Lax cookie comes with.
+            response.set_cookie(
+                github_manifest.binding_cookie(started["state"]),
+                started["browser_nonce"],
+                max_age=int(github_manifest.STATE_TTL.total_seconds()),
+                httponly=True,
+                samesite="lax",
+                secure=_browser_url(request).startswith("https://"),
+                path=github_manifest.binding_cookie_path(started["manifest"]["url"]),
+            )
+            return response
+        elif action == "github-external-url":
+            saved = github_manifest.save_external_url(
+                ctx.admin,
+                uow,
+                principal=principal.name,
+                url=form.get("external_url"),
                 reason=reason,
             )
             uow.commit()
             return _redirect(
                 form,
-                f"Connected App {connected['app_id']}"
-                + (f" ({connected['app'].get('slug')})" if connected["app"].get("slug") else "")
-                + ". Install it from the link below, then pick repositories.",
+                f"Saved: GitHub sends the browser back to {saved['url']}."
+                if saved["url"]
+                else "Cleared: GitHub sends the browser back to the address you use.",
             )
         elif action == "github-add-repository":
             added = github.add_repository(
