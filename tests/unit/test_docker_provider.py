@@ -7,7 +7,11 @@ tier's job.
 
 from __future__ import annotations
 
+import asyncio
 import socket
+import threading
+import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +26,13 @@ from crucible.adapters.execution.docker import (
 )
 from crucible.adapters.execution.dockerapi import DockerApiError, LogFrame
 from crucible.application.admin.login import FLOWS, LoginSession
-from crucible.ports.execution import Handle, LaunchSpec, ProviderError, Workspace
+from crucible.ports.execution import (
+    Handle,
+    LaunchCancelledError,
+    LaunchSpec,
+    ProviderError,
+    Workspace,
+)
 from tests.fixtures import contract_document
 
 IMAGE = "crucible-worker:script-harness-1.0.0-abc"
@@ -284,6 +294,75 @@ async def test_a_hung_verifier_fails_verification_ran_with_the_reason(tmp_path: 
     assert all(not run.ran for run in runs)
     assert all("did not finish within" in run.detail for run in runs)
     assert all(not run.ok for run in runs)
+
+
+# ----- a cancel while the preparer runs (hades #189) --------------------------
+
+
+class CloningClient(StubClient):
+    """A preparer that clones until it is force-removed, as one against a git host
+    that never answers would: the daemon's wait returns only when the container goes."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = threading.Event()
+        self.gone = threading.Event()
+        self.forced: list[bool] = []
+
+    def start_container(self, container_id: str) -> None:
+        self.started.set()
+
+    def wait_container(self, container_id: str, *, timeout: float) -> int:
+        if not self.gone.wait(timeout):
+            raise TimeoutError("timed out")
+        return 137
+
+    def remove_container(self, container_id: str, *, force: bool = True) -> None:
+        self.forced.append(force)
+        super().remove_container(container_id, force=force)
+        self.gone.set()
+
+
+async def test_a_cancel_during_the_preparer_removes_it_within_one_poll(tmp_path: Path) -> None:
+    """hades #189 (Codex on PR 202): the preparer runs for up to the collector timeout
+    while the attempt is preparing, which the cancel sweep leaves alone. Its wait asks
+    the cancel on every poll, and a cancel force-removes the container."""
+    client = CloningClient()
+    docker = DockerProvider(
+        replace(config(tmp_path), collector_timeout_seconds=30),
+        client=client,  # type: ignore[arg-type]
+    )
+    docker.cancel_poll_seconds = 0.05
+    cancelled_at: list[float] = []
+
+    async def cancelled() -> bool:
+        if client.started.is_set() and not cancelled_at:
+            await asyncio.sleep(0.3)  # the clone is well under way
+            cancelled_at.append(time.monotonic())
+        return bool(cancelled_at)
+
+    with pytest.raises(LaunchCancelledError, match="while the preparer ran"):
+        await docker.prepare(spec(), cancelled=cancelled)
+    settled = time.monotonic() - cancelled_at[0]
+
+    assert settled < docker.cancel_poll_seconds + 0.5, settled
+    assert client.created and client.created[0]["name"].startswith("crucible-preparer-")
+    assert client.removed == ["container-1"] and client.forced == [True]
+    assert client.gone.is_set(), "the daemon's wait ended with the container"
+
+
+async def test_a_cancel_before_the_worker_is_created_creates_nothing(tmp_path: Path) -> None:
+    """hades #189: the launch's last look is after the image resolution it awaits."""
+    client = StubClient()
+    docker = provider(tmp_path, client)
+    launch = spec()
+
+    async def cancelled() -> bool:
+        return True
+
+    with pytest.raises(LaunchCancelledError, match="before the worker was created"):
+        await docker.launch(workspace_for(tmp_path, launch.attempt_id), launch, cancelled)
+    assert client.created == []
 
 
 async def test_the_sentinels_are_outside_any_real_exit_code() -> None:
