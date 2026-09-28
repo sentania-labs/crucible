@@ -464,10 +464,10 @@ def github(base_url: str, token: str, jar: http.cookiejar.CookieJar) -> None:
     web = ui_opener()
     _, _, page = browse(browser, "GET", f"{base_url}/ui/github")
     csrf = re.search(r'name="csrf" value="([a-f0-9]+)"', page)
-    if csrf is None or "Create GitHub App" not in page or "/ui/github?existing=1" not in page:
+    if csrf is None or "Create GitHub App" not in page:
         raise SmokeError("the GitHub page offers no Create GitHub App button")
-    if 'name="private_key"' in page:
-        raise SmokeError("the existing-App form is not behind its secondary link")
+    if 'name="private_key"' in page or "existing=1" in page:
+        raise SmokeError("the GitHub page still offers to paste an existing App's id and key")
     status, _, started = browse(
         browser,
         "POST",

@@ -404,52 +404,30 @@ def test_github_is_connected_installed_and_a_repository_picked(
     picker = admin.get("/v1/admin/github/installations").json()
     assert picker["connected"] is False and "No GitHub App is connected" in picker["error"]
 
-    # A key that is not RSA is refused plainly, before GitHub is asked.
-    from cryptography.hazmat.primitives.asymmetric import ec  # noqa: PLC0415
-
-    ec_pem = (
-        ec.generate_private_key(ec.SECP256R1())
-        .private_bytes(
-            serialization.Encoding.PEM,
-            serialization.PrivateFormat.PKCS8,
-            serialization.NoEncryption(),
-        )
-        .decode()
-    )
-    not_rsa = admin.post(
-        "/v1/admin/github/app",
-        json={"reason": "connect", "app_id": APP_ID, "private_key": ec_pem},
-    )
-    assert not_rsa.status_code == 422 and "not an RSA private key" in not_rsa.text
-
-    # A key that is not the App's is refused by GitHub, and nothing is stored.
-    other, _ = _rsa_pem()
-    refused = admin.post(
-        "/v1/admin/github/app",
-        json={"reason": "connect", "app_id": APP_ID, "private_key": other},
-    )
-    assert refused.status_code == 409
-    assert f"GitHub refused the key for App {APP_ID} (HTTP 401)" in refused.json()["detail"]
-    assert ("secrets", "crucible-github-app") not in k8s_api.objects
-
-    connected = admin.post(
+    # Create GitHub App is the only way to connect an App (the operator, 2026-09-27):
+    # pasting an existing App's id and key is gone from the API (the UI and the CLI are
+    # checked in the tests below).
+    gone = admin.post(
         "/v1/admin/github/app",
         json={"reason": "connect", "app_id": APP_ID, "private_key": app_key[0]},
     )
-    assert connected.status_code == 200, connected.text
-    body = connected.json()
+    assert gone.status_code in (404, 405)
+    assert ("secrets", "crucible-github-app") not in k8s_api.objects
+
+    # The one-click flow is tested below; here the credential it would store is put in the
+    # service's own store, and the picker is what is under test.
+    assert ctx.admin is not None and ctx.admin.github_credentials is not None
+    ctx.admin.github_credentials.write(
+        app_id=APP_ID, private_key=app_key[0].encode(), webhook_secret=None
+    )
+    body = admin.get("/v1/admin/github").json()
     assert body["configured"] is True and body["app_id"] == APP_ID
-    assert body["install_url"] == "https://github.com/apps/crucible-test/installations/new"
     assert body["stored_in"]["kind"] == "secret" and body["stored_in"]["service_owned"] is True
-    assert "PRIVATE KEY" not in connected.text
-    secret = k8s_api.objects[("secrets", "crucible-github-app")].body
-    assert secret["metadata"]["labels"][k8sspec.LABEL_MANAGED_BY] == "crucible"
-    assert set(secret["data"]) == {"app-id", "app.pem"}
-    audit = admin.get("/v1/admin/audit", params={"limit": 200}).text
-    assert "github_app_connected" in audit and "PRIVATE KEY" not in audit
+    assert "PRIVATE KEY" not in json.dumps(body)
 
     # #120: the picker, grouped by account, and a pick registers with GitHub's facts.
     picker = admin.get("/v1/admin/github/installations").json()
+    assert picker["install_url"] == "https://github.com/apps/crucible-test/installations/new"
     assert [i["account"] for i in picker["installations"]] == ["octo-lab", "someone"]
     widgets = picker["installations"][0]["repositories"][-1]
     assert widgets["full_name"] == "octo-lab/widgets" and widgets["registered_as"] is None
@@ -555,9 +533,7 @@ def test_github_is_connected_installed_and_a_repository_picked(
     assert {"widgets", "gadgets"} <= names
 
 
-def test_the_cli_remote_mode_builds_the_first_run_calls(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_the_cli_remote_mode_builds_the_first_run_calls(monkeypatch: pytest.MonkeyPatch) -> None:
     from crucible.client.config import ADMIN_TOKEN_ENV  # noqa: PLC0415
     from crucible.client.http import Api  # noqa: PLC0415
 
@@ -570,14 +546,15 @@ def test_the_cli_remote_mode_builds_the_first_run_calls(
     monkeypatch.setattr(Api, "call", fake_call)
     monkeypatch.setattr(cli, "_read_api_key", lambda: GATEWAY_KEY)
     monkeypatch.setenv(ADMIN_TOKEN_ENV, "cru_" + "0" * 26 + "." + "s" * 40)
-    pem = tmp_path / "app.pem"
-    pem.write_text("PEM-TEXT\n", encoding="utf-8")
     base = ["--api-url", "http://127.0.0.1:1", "--reason", "r"]
     admin_main([*base, "gateway", "set", "--endpoint-url", "http://gw/v1", "--key"])
     admin_main([*base, "gateway", "test"])
     admin_main(["--api-url", "http://127.0.0.1:1", "gateway", "models"])
     admin_main([*base, "gateway", "pick", "--enable", "a", "--disable", "b", "--thinking", "a"])
-    admin_main([*base, "github", "connect", "--app-id", "5", "--private-key-file", str(pem)])
+    # `github connect` (an existing App's id and key) is gone; Create GitHub App on the
+    # GitHub page is the only way to connect one (the operator, 2026-09-27).
+    with pytest.raises(SystemExit):
+        admin_main([*base, "github", "connect", "--app-id", "5", "--private-key-file", "x"])
     admin_main(["--api-url", "http://127.0.0.1:1", "github", "installations"])
     admin_main(["--api-url", "http://127.0.0.1:1", "github", "external-url"])
     admin_main([*base, "github", "set-external-url", "--url", "https://hades.example"])
@@ -603,11 +580,6 @@ def test_the_cli_remote_mode_builds_the_first_run_calls(
                 "max_concurrency": None,
             },
         ),
-        (
-            "POST",
-            "/v1/admin/github/app",
-            {"reason": "r", "app_id": 5, "private_key": "PEM-TEXT\n", "webhook_secret": None},
-        ),
         ("GET", "/v1/admin/github/installations", None),
         ("GET", "/v1/admin/github/external-url", None),
         ("POST", "/v1/admin/github/external-url", {"reason": "r", "url": "https://hades.example"}),
@@ -627,7 +599,6 @@ def test_the_cli_remote_mode_builds_the_first_run_calls(
         ),
     ]
     assert calls == expected
-    assert json.dumps(calls).count("PEM-TEXT") == 1
     assert re.search(r"cru_", json.dumps(calls)) is None
 
 
@@ -704,13 +675,18 @@ def test_github_app_is_created_with_one_click_and_installed(
     with TestClient(create_app(ctx)) as browser:
         csrf = ui_sign_in(browser, tokens["admin"])
         page = browser.get("/ui/github").text
-        # One button, the existing-App form behind a secondary link.
+        # One button, and no way to paste an existing App's id and key (the operator,
+        # 2026-09-27): not on the page, not by the old link, not by the old action.
         assert "Create GitHub App" in page and 'value="Hades-' in page
-        assert 'href="/ui/github?existing=1"' in page and 'name="private_key"' not in page
-        existing = browser.get("/ui/github?existing=1").text
-        assert (
-            'name="private_key"' in existing and 'action="/ui/actions/github-connect"' in existing
+        for text in (page, browser.get("/ui/github?existing=1").text):
+            assert 'name="private_key"' not in text and "existing=1" not in text
+            assert "github-connect" not in text and "Already have a GitHub App" not in text
+        pasted = browser.post(
+            "/ui/actions/github-connect",
+            data={"csrf": csrf, "return_to": "/ui/github", "app_id": "5", "private_key": "x"},
+            follow_redirects=False,
         )
+        assert "unknown UI action 'github-connect'" in _flash(pasted)
 
         # Create: the page the browser posts to GitHub, the manifest filled in.
         started = _create(browser, csrf, app_name="Hades-test", organization="", reason="")
@@ -847,6 +823,9 @@ def test_github_app_is_created_with_one_click_and_installed(
         install = f"{stubs.url}/apps/hades-test/installations/new"
         assert f'class="lat-btn lat-btn--primary" href="{install}"' in page
         assert "Install on GitHub" in page and "connected, App 5151" in page
+        # Replace the App offers only a new App.
+        assert "Replace the App" in page and "Create a new App instead" in page
+        assert 'name="private_key"' not in page and "existing=1" not in page
         with httpx.Client(follow_redirects=False, timeout=10) as web:
             assert web.get(install).status_code == 200
             installed = web.post(install)
