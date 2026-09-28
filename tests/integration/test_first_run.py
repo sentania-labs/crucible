@@ -863,6 +863,67 @@ def test_github_app_is_created_with_one_click_and_installed(
     assert any("used already" in d for d in refusals)
 
 
+def test_the_binding_cookie_is_scoped_to_a_reverse_proxy_path_prefix(
+    admin: TestClient,
+    live: Supervisor,
+    stubs: Any,
+    k8s_api: FakeKubernetesApi,
+    ctx: AppContext,
+    tokens: dict[str, str],
+) -> None:
+    """Codex correction on crucible#168, 2026-09-28: `github.external_url` with a path
+    prefix (a deployment behind a reverse proxy) means GitHub returns the browser to
+    `<prefix>/ui/github/callback`. The binding cookie must be scoped under that prefix, or
+    the browser withholds it and the callback is refused. A real proxy strips the prefix
+    before the request reaches Crucible, so the request that lands here is still
+    `/ui/github/callback`; only the cookie the browser carries with it is prefix-scoped."""
+    asyncio.run(live.tick())
+    stubs.stubs.config["installations"] = []
+    app_id = MANIFEST_APP_ID + 1
+    stubs.stubs.config["manifest"] = {
+        "app_id": app_id,
+        "owner": "sentania",
+        "install": {"id": 41, "account": "octo-lab", "type": "Organization", "repositories": []},
+    }
+    prefixed = f"{HADES}/crucible"
+    saved = admin.post(
+        "/v1/admin/github/external-url", json={"url": prefixed, "reason": "behind the ingress"}
+    )
+    assert saved.status_code == 200, saved.text
+    with TestClient(create_app(ctx)) as browser:
+        csrf = ui_sign_in(browser, tokens["admin"])
+        started = _create(browser, csrf, app_name="Hades-prefixed", organization="")
+        binding = started.headers["set-cookie"]
+        assert "path=/crucible/ui/github" in binding.lower()
+        cookie_name, cookie_value = binding.split(";", 1)[0].split("=", 1)
+        target, manifest = _manifest_form(started.text)
+        assert manifest["redirect_url"] == f"{prefixed}/ui/github/callback"
+
+        with httpx.Client(follow_redirects=False, timeout=10) as web:
+            confirm = web.post(target, data={"manifest": json.dumps(manifest)})
+            assert confirm.status_code == 200, confirm.text
+            pending = re.search(r"name='pending' value='([^']+)'", confirm.text)
+            assert pending is not None
+            back = web.post(
+                urllib.parse.urljoin(target, "/_stub/apps/confirm"),
+                data={"pending": pending.group(1)},
+            )
+        assert back.status_code == 302
+        location = back.headers["location"]
+        assert location.startswith(f"{prefixed}/ui/github/callback?"), location
+        # What a reverse proxy hands Crucible once it strips the `/crucible` prefix; the
+        # browser's cookie (kept out of the jar above, since its path does not match this
+        # unprefixed request) travels with the request regardless of the strip.
+        stripped = location[len(prefixed) :]
+        browser.cookies.set(cookie_name, cookie_value)
+        done = browser.get(stripped, follow_redirects=False)
+        message = _flash(done)
+        assert "kind=ok" in message and f"(App {app_id})" in message
+        cleared = done.headers["set-cookie"]
+        assert "path=/crucible/ui/github" in cleared.lower()
+    admin.post("/v1/admin/github/external-url", json={"url": None, "reason": "cleanup"})
+
+
 def test_the_return_address_setting_overrides_the_browsers(
     admin: TestClient,
     live: Supervisor,

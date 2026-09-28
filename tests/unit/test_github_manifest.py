@@ -16,6 +16,7 @@ from crucible.adapters.github.transport import RestTransport
 from crucible.application.admin.github import _github_refusal, _install_url, web_base
 from crucible.application.admin.github_manifest import (
     PERMISSIONS,
+    binding_cookie_path,
     build_manifest,
     default_app_name,
     manifest_target_url,
@@ -109,6 +110,22 @@ def test_an_external_url_is_an_origin_and_an_optional_prefix(value: str, expecte
 def test_an_external_url_that_is_not_one_is_refused(value: str) -> None:
     with pytest.raises(ContractValidationError):
         normalize_external_url(value)
+
+
+@pytest.mark.parametrize(
+    ("external_url", "path"),
+    [
+        ("https://hades.apps.int.example", "/ui/github"),
+        ("https://lab.example/crucible", "/crucible/ui/github"),
+        ("https://lab.example/crucible/hades", "/crucible/hades/ui/github"),
+    ],
+)
+def test_the_binding_cookie_is_scoped_under_the_external_urls_prefix(
+    external_url: str, path: str
+) -> None:
+    """A deployment behind a reverse-proxy path prefix (crucible#168 Codex correction) gets
+    the callback at that prefix in the browser's address bar, so the cookie must cover it."""
+    assert binding_cookie_path(external_url) == path
 
 
 class _Connection:

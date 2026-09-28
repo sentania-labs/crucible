@@ -89,6 +89,17 @@ def binding_cookie(state: str) -> str:
     return BINDING_COOKIE_PREFIX + _hash(state)[:16]
 
 
+def binding_cookie_path(external_url: str) -> str:
+    """Where the binding cookie is scoped: `/ui/github`, under whatever path prefix
+    `external_url` carries. GitHub returns the browser to `external_url` plus
+    `CALLBACK_PATH`, and a deployment behind a reverse proxy path (for example
+    `https://host/crucible`) serves that at `/crucible/ui/github/callback` in the
+    browser's own address bar, so the cookie must be scoped there too, or the browser
+    never sends it back."""
+    prefix = urlsplit(external_url).path.rstrip("/")
+    return f"{prefix}/ui/github"
+
+
 def normalize_external_url(value: str, *, path: str = "url") -> str:
     """An http(s) origin, and an optional path prefix, with no trailing slash. No
     credentials, query or fragment: it is where GitHub sends the operator's browser."""
@@ -380,7 +391,7 @@ def complete(
         "html_url": made.html_url,
     }
     try:
-        return keep(
+        done = keep(
             ctx,
             uow,
             principal=principal,
@@ -392,12 +403,15 @@ def complete(
         )
     except ApplicationError as exc:
         raise GitHubConnectError(exc.detail + stranded) from None
+    done["external_url"] = started.external_url
+    return done
 
 
 __all__ = [
     "PERMISSIONS",
     "SETTING_NAME",
     "binding_cookie",
+    "binding_cookie_path",
     "build_manifest",
     "complete",
     "default_app_name",

@@ -2207,7 +2207,10 @@ def github_callback(request: Request, ctx: Ctx, uow: UoW) -> Response:
         f"Created the GitHub App {app.get('slug') or app.get('name')} (App {app.get('id')}) "
         "and connected it. Next: install it."
     )
-    response.delete_cookie(github_manifest.binding_cookie(state), path="/ui/github")
+    response.delete_cookie(
+        github_manifest.binding_cookie(state),
+        path=github_manifest.binding_cookie_path(done["external_url"]),
+    )
     return response
 
 
@@ -2840,7 +2843,7 @@ async def action(request: Request, action: str, ctx: Ctx, uow: UoW) -> Response:
                 httponly=True,
                 samesite="lax",
                 secure=_browser_url(request).startswith("https://"),
-                path="/ui/github",
+                path=github_manifest.binding_cookie_path(started["manifest"]["url"]),
             )
             return response
         elif action == "github-external-url":
