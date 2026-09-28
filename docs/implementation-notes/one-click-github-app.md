@@ -41,6 +41,18 @@ and corrects its earlier claim that the manifest flow needs a public DNS record.
 The flow has no admin API or CLI verb: GitHub needs the operator's browser to post the
 manifest and to confirm. The one new tunable, the external URL, has all three surfaces.
 
+## Review round (2026-09-27)
+
+One non-author review round. Fixed from it: the two new templates were ignored by the
+repository's `*.html` rule and never committed (now tracked, and the UI's templates are
+excepted from the rule); a return that had to sign in first carried the code and state
+percent-encoded into the access log (the redaction now matches both forms) and a
+rate-limited conversion would have logged the code (the transport masks it); a start is
+now bound to the browser that made it, and a return that is not its own leaves it
+unspent; GitHub Enterprise's web address is right for a host named `api.*`; a refusal
+after the exchange names the App GitHub made so it can be deleted. Kept: a commit
+failure after the credential write is the ordering Connect GitHub already had.
+
 ## Evidence
 
 - Unit (`tests/unit/test_github_manifest.py`): the manifest's permissions, events, webhook
@@ -60,7 +72,8 @@ manifest and to confirm. The one new tunable, the external URL, has all three su
   `test_the_return_address_setting_overrides_the_browsers` covers the setting on the API,
   the UI and the CLI's local mode; the remote CLI calls are in
   `test_the_cli_remote_mode_builds_the_first_run_calls`.
-- Kind (`make first-run-kind`, finished 2026-09-27 at 10:53 PM): step 5 pressed Create
+- Kind (`make first-run-kind`, 2026-09-27, 11:16 PM to 11:20 PM, after the review
+  round's fixes; an earlier run before them, finished at 10:53 PM, passed too): step 5 pressed Create
   GitHub App on the rendered page, posted the manifest to the stand-in through a second
   port forward, followed its redirect back, saw the cookieless reload page with nothing
   exchanged, finished the callback signed in (one conversion, `crucible-github-app`
@@ -68,11 +81,11 @@ manifest and to confirm. The one new tunable, the external URL, has all three su
   refused a second return with the same state, and pressed Install on GitHub, landing on
   the picker. Steps 6 to 8 then ran on the App the flow created, the private checkout
   included.
-- A real browser (headless Chrome, 2026-09-27 around 10:55 PM), Crucible on `localhost`
+- A real browser (headless Chrome, 2026-09-27 around 11:22 PM, after the fixes), Crucible on `localhost`
   and the stand-in on `127.0.0.1` so the redirect is cross-site: Create opened the
   stand-in's page filled in; its button came back through the reload page (the access log
-  shows the callback answered 200, then 303 on the same-site reload) signed in and
-  connected; Install came back to the picker the same way. This is the only proof that a
+  shows the callback answered 200, then 303 on the same-site reload, with `code` and
+  `state` blanked) signed in and connected, the start's cookie having come with it; Install came back to the picker the same way. This is the only proof that a
   real browser withholds the Strict session cookie and sends the Lax start cookie on
   GitHub's redirect: the integration tier's and the kind proof's HTTP clients ignore
   `SameSite`, so they prove the reload page and the checks, not the browser's cookie
