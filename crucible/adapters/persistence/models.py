@@ -730,3 +730,18 @@ class ProviderSettingRow(Base):
     reason: Mapped[str] = mapped_column(Text)
     updated_at: Mapped[datetime] = mapped_column(TZ)
     updated_by: Mapped[str] = mapped_column(String(160))
+
+
+# ----- the GitHub App manifest flow (crucible#168) ------------------------------------
+
+
+class GitHubManifestStateRow(Base):
+    __tablename__ = "github_manifest_states"
+    state_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    principal: Mapped[str] = mapped_column(String(160))
+    app_name: Mapped[str] = mapped_column(String(64))
+    organization: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    external_url: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(TZ)
+    expires_at: Mapped[datetime] = mapped_column(TZ)
+    consumed_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)

@@ -7,7 +7,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from datetime import datetime
 
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session
 
 from crucible.adapters.persistence.models import (
@@ -19,6 +19,7 @@ from crucible.adapters.persistence.models import (
     EscalationRow,
     EvidenceRow,
     GateResultRow,
+    GitHubManifestStateRow,
     HarnessImageRow,
     HarnessStateRow,
     PolicyRow,
@@ -41,6 +42,7 @@ from crucible.domain.entities import (
     EscalationState,
     EvidenceRecord,
     GateResultRecord,
+    GitHubManifestState,
     HarnessImage,
     HarnessState,
     Policy,
@@ -957,6 +959,57 @@ class ProviderSettings:
         stored = self.get(setting.name)
         assert stored is not None
         return stored
+
+
+class GitHubManifestStates:
+    """The starts of the GitHub App manifest flow (crucible#168)."""
+
+    def __init__(self, session: Session) -> None:
+        self._s = session
+
+    @staticmethod
+    def _to_entity(row: GitHubManifestStateRow) -> GitHubManifestState:
+        return GitHubManifestState(
+            state_hash=row.state_hash,
+            principal=row.principal,
+            app_name=row.app_name,
+            organization=row.organization,
+            external_url=row.external_url,
+            created_at=ensure_utc(row.created_at),
+            expires_at=ensure_utc(row.expires_at),
+            consumed_at=_dt(row.consumed_at),
+        )
+
+    def add(self, state: GitHubManifestState) -> None:
+        self._s.add(
+            GitHubManifestStateRow(
+                state_hash=state.state_hash,
+                principal=state.principal,
+                app_name=state.app_name,
+                organization=state.organization,
+                external_url=state.external_url,
+                created_at=state.created_at,
+                expires_at=state.expires_at,
+                consumed_at=state.consumed_at,
+            )
+        )
+        self._s.flush()
+
+    def consume(self, state_hash: str, now: datetime) -> GitHubManifestState | None:
+        row = self._s.get(GitHubManifestStateRow, state_hash, with_for_update=True)
+        if row is None:
+            return None
+        before = self._to_entity(row)
+        if row.consumed_at is None:
+            row.consumed_at = now
+            self._s.flush()
+        return before
+
+    def prune(self, before: datetime) -> int:
+        result = self._s.execute(
+            delete(GitHubManifestStateRow).where(GitHubManifestStateRow.expires_at < before)
+        )
+        return int(getattr(result, "rowcount", 0) or 0)
 
 
 class BootstrapImports:

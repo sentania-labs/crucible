@@ -51,6 +51,7 @@ from crucible.adapters.persistence.records import (
     Escalations,
     Evidences,
     GateResults,
+    GitHubManifestStates,
     HarnessImages,
     HarnessStates,
     Policies,
@@ -103,6 +104,7 @@ from crucible.ports.repository import (
     FencedTokenRejectedError,
     GateResultRepository,
     GitHubDeliveryRepository,
+    GitHubManifestStateRepository,
     HarnessImageRepository,
     HarnessStateRepository,
     HeartbeatRepository,
@@ -1338,6 +1340,7 @@ class SqlUnitOfWork:
     harness_images: HarnessImageRepository
     bootstrap_imports: BootstrapImportRepository
     provider_settings: ProviderSettingRepository
+    github_manifest_states: GitHubManifestStateRepository
 
     def __init__(self, session_factory: sessionmaker[Session]) -> None:
         self._factory = session_factory
@@ -1392,6 +1395,7 @@ class SqlUnitOfWork:
         self.harness_images = HarnessImages(s)
         self.bootstrap_imports = BootstrapImports(s)
         self.provider_settings = ProviderSettings(s)
+        self.github_manifest_states = GitHubManifestStates(s)
         return self
 
     def __exit__(

@@ -185,6 +185,10 @@ class EventKind(StrEnum):
     # and the GitHub App credential the service now owns (ADR 0017)
     LOCAL_GATEWAY_UPDATED = "local_gateway_updated"
     GITHUB_APP_CONNECTED = "github_app_connected"
+    # the one-click App (crucible#168): a start of the manifest flow and the saved
+    # external URL its redirect uses
+    GITHUB_APP_MANIFEST_STARTED = "github_app_manifest_started"
+    GITHUB_EXTERNAL_URL_UPDATED = "github_external_url_updated"
     COMMAND_TIMEOUT_UPDATED = "command_timeout_updated"
     # the bootstrap ledger handoff (15, C6)
     BOOTSTRAP_IMPORT_VERIFIED = "bootstrap_import_verified"

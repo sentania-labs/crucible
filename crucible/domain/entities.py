@@ -483,6 +483,23 @@ class BootstrapImport:
 
 
 @dataclass(slots=True)
+class GitHubManifestState:
+    """One start of the GitHub App manifest flow (crucible#168, ADR 0017 as amended).
+
+    The `state` value GitHub carries back is never stored, only its sha256; it is good
+    once, for the principal who started the flow, until `expires_at`."""
+
+    state_hash: str
+    principal: str
+    app_name: str
+    organization: str | None
+    external_url: str
+    created_at: datetime
+    expires_at: datetime
+    consumed_at: datetime | None = None
+
+
+@dataclass(slots=True)
 class ProviderSetting:
     """One provider setting an administrator edits at runtime, as a document (25).
 
