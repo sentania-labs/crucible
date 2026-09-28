@@ -2,7 +2,7 @@
 # CLIs, Claude Code, Codex, AGY and Hermes, each at its pinned version. The operator
 # chose one image over one per harness on 2026-09-22 at 3:09 PM (C11): one digest
 # to build, publish, promote and roll back. Debian slim by digest, uid 1000 worker,
-# git, curl, jq, the lab root CA, the Python runtime Hermes needs, the four CLIs,
+# git, curl, jq, make, the lab root CA, the Python runtime Hermes needs, the four CLIs,
 # nothing else. Shared pins mirror images/pins.env; build with images/build.sh.
 #
 # Every harness pin is an `ARG HARNESS_<NAME>_VERSION` here. build.sh reads those
@@ -98,6 +98,7 @@ ARG DEBIAN_SNAPSHOT=20260916T000000Z
 ARG GIT_VERSION=1:2.39.5-0+deb12u3
 ARG CURL_VERSION=7.88.1-10+deb12u15
 ARG JQ_VERSION=1.6-2.1+deb12u2
+ARG MAKE_VERSION=4.3-4.1
 ARG CA_CERTIFICATES_VERSION=20250419~deb12u1
 ARG LAB_CA_SHA256=567f110bb80bb2179b44995c78c7a49a4149085a59f6acb73cf37c6503a0481a
 ARG PYTHON3_VERSION=3.11.2-1+b1
@@ -123,6 +124,7 @@ RUN set -eu; \
         "git=${GIT_VERSION}" \
         "curl=${CURL_VERSION}" \
         "jq=${JQ_VERSION}" \
+        "make=${MAKE_VERSION}" \
         "ca-certificates=${CA_CERTIFICATES_VERSION}" \
         "python3=${PYTHON3_VERSION}" \
         "python3-venv=${PYTHON3_VENV_VERSION}"; \

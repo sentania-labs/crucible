@@ -36,7 +36,14 @@ class ProposedPullRequest(StrictModel):
 
 
 class CompletionClaimV1(StrictModel):
-    schema_version: str
+    # The format version, "1.0". A worker handed only the schema's name wrote
+    # "CompletionClaimV1" here (HT-0001, hades #181), so the JSON schema in the identity
+    # bundle names the value; the validator below still decides.
+    schema_version: str = Field(
+        description='The report format version, "1.0". Not the schema name.',
+        examples=["1.0"],
+        json_schema_extra={"pattern": r"^1\.[0-9]+$"},
+    )
     task_external_id: str = Field(min_length=1)
     summary: str = Field(min_length=1)
     changed_files: list[str]

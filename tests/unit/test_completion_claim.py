@@ -47,3 +47,16 @@ def test_unknown_field_rejected() -> None:
 def test_non_mapping() -> None:
     claim, errors = parse_claim("not yaml mapping")
     assert claim is None and errors[0]["msg"] == "report is not a mapping"
+
+
+def test_the_schema_name_is_not_a_version() -> None:
+    """HT-0001 (hades #181): a report otherwise complete, with the schema's name where
+    the format version goes, is one problem, and the validator stays strict about it."""
+    doc = default_report(_spec())
+    doc["schema_version"] = "CompletionClaimV1"
+    claim, errors = parse_claim(doc)
+    assert claim is None
+    assert [e["loc"] for e in errors] == [["schema_version"]]
+    doc["schema_version"] = "1.0"
+    claim, errors = parse_claim(doc)
+    assert errors == [] and claim is not None

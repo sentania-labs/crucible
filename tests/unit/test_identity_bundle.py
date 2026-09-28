@@ -98,3 +98,17 @@ def test_the_bundle_is_read_only(tmp_path: Path) -> None:
     for path in directory.rglob("*"):
         if path.is_file():
             assert path.stat().st_mode & 0o222 == 0, path
+
+
+def test_the_worker_is_told_the_report_format_version(tmp_path: Path) -> None:
+    """hades #181: HT-0001's worker, told only "matching CompletionClaimV1", wrote
+    schema_version: CompletionClaimV1 and the report did not parse. The prompt and
+    the schema it points at both name the value."""
+    text, _, directory = build(tmp_path)
+    assert 'with `schema_version: "1.0"`' in text
+    assert "not the schema's name" in text
+    schema = json.loads((directory / "report-schema.json").read_text())
+    version = schema["properties"]["schema_version"]
+    assert version["examples"] == ["1.0"]
+    assert version["pattern"] == r"^1\.[0-9]+$"
+    assert "1.0" in version["description"]
