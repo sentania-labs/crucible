@@ -2086,7 +2086,9 @@ def _github_create_section(*, configured: bool) -> dict[str, Any]:
             "never shows it. Then install the App and pick repositories."
             if not configured
             else "Create a new App to replace the connected one. The connected App keeps "
-            "working until the new one is stored."
+            "working until the new one is stored. A new App has new installations: install "
+            "it, then register each repository again on Repositories with the new "
+            "installation, or its deliveries fail."
         ),
         "form": {
             "action": "/ui/actions/github-create-app",
