@@ -31,7 +31,9 @@ metadata:
 spec:
   hard:
     count/jobs.batch: "15"
-    persistentvolumeclaims: "12"
+    # The tier's earlier cases keep their claims (their cleanup policy keeps the diff),
+    # and the hades #189, #190 and #191 cases at the end of the file need five more.
+    persistentvolumeclaims: "24"
     requests.cpu: "6"
     requests.memory: 8Gi
 ---
@@ -147,6 +149,15 @@ spec:
       volumeMounts:
         - name: www
           mountPath: /www
+        # hades #191: the tier's bare repositories, served read-only as a dumb-HTTP git
+        # host at http://github.com:443/git/<name>.git (tools/kind/e2e-kind.sh).
+        - name: git
+          mountPath: /www/git
+          readOnly: true
   volumes:
     - name: www
       emptyDir: {}
+    - name: git
+      hostPath:
+        path: /crucible-kind-cache
+        type: Directory

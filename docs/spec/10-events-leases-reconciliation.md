@@ -136,6 +136,21 @@ Runs at supervisor start and every `reconcile_interval` (default 60 s):
 9. Apply retention: each deletion an event and a `RetentionAction`.
 10. Write the supervisor liveness row (`last_tick`, duration, counts).
 
+A launch has a quick half and a slow half. The quick half (route, gate, take
+the checkout lease, move the attempt to `preparing`) runs in the tick, one
+attempt after another. The slow half (build the spec, prepare the checkout,
+which on Kubernetes is the cache refresher and the preparer Jobs, and start
+the worker) runs as a task of its own that the tick starts and then waits on
+for at most a third of the lease TTL, capped at 5 seconds. A launch that has
+not ended by then keeps running, the tick goes on to every other step, and a
+later tick counts it when it ends without waiting on it again. A supervisor
+that loses its lease, or finds it was renewed under a new fenced token,
+cancels the launches it still has running. The attempt is left alone by the
+stranded-launch rule while this process is still launching it; after a
+restart it is stranded as before. So a prepare that takes minutes never
+keeps the supervisor from renewing its lease or serving another attempt
+(hades #190, 2026-09-28).
+
 Reconciliation is idempotent; running it twice changes nothing the second
 time except lease expiry times and the liveness row. That property is
 tested. The liveness row records the last successful tick, the last tick

@@ -164,14 +164,28 @@ copy_report() {
 """
 
 
+# hades #191: how long the refresh waits for the remote to answer before it leaves the
+# mirror as it is. A failed refresh costs time, never correctness, so it should cost
+# seconds: an unanswered connect otherwise waits out the kernel's SYN retries, about 135
+# seconds, once for the fetch and once more for the clone.
+CACHE_REFRESH_CONNECT_SECONDS = 20
+
+
 def _cache_refresh(cache_dir: str) -> str:
-    """Fetch into the bare mirror, or clone it when it is absent or will not fetch."""
+    """Fetch into the bare mirror, or clone it when it is absent or will not fetch; and
+    neither when the remote does not answer a ref listing within
+    CACHE_REFRESH_CONNECT_SECONDS."""
     return f"""
-if [ -d "{cache_dir}" ]; then
-  {GIT} --git-dir "{cache_dir}" fetch --prune origin || rm -rf "{cache_dir}"
-fi
-if [ ! -d "{cache_dir}" ]; then
-  {GIT} clone --mirror -- "$CLONE_URL" "{cache_dir}" || true
+if timeout {CACHE_REFRESH_CONNECT_SECONDS} {GIT} ls-remote -- "$CLONE_URL" HEAD >/dev/null; then
+  if [ -d "{cache_dir}" ]; then
+    {GIT} --git-dir "{cache_dir}" fetch --prune origin || rm -rf "{cache_dir}"
+  fi
+  if [ ! -d "{cache_dir}" ]; then
+    {GIT} clone --mirror -- "$CLONE_URL" "{cache_dir}" || true
+  fi
+else
+  echo "crucible: the remote did not answer within {CACHE_REFRESH_CONNECT_SECONDS}s;" \
+    "the reference cache is left as it is" >&2
 fi
 """
 

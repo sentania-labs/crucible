@@ -573,3 +573,144 @@ def test_an_empty_dns_namespace_leaves_the_address_rule_alone() -> None:
             "ports": [{"protocol": "UDP", "port": 53}, {"protocol": "TCP", "port": 53}],
         }
     ]
+
+
+# ----- hades #191: the git roles reach the git host --------------------------------
+
+GIT_ROLES = frozenset({k8sspec.ROLE_CACHE_REFRESHER, k8sspec.ROLE_PREPARER})
+
+
+def _selects(policy: dict[str, Any], labels: dict[str, str]) -> bool:
+    wanted = policy["spec"]["podSelector"].get("matchLabels", {})
+    return all(labels.get(key) == value for key, value in wanted.items())
+
+
+def _allows(policy: dict[str, Any], cidr: str, port: int) -> bool:
+    for rule in policy["spec"]["egress"]:
+        ports = {p["port"] for p in rule.get("ports", []) if p.get("protocol") == "TCP"}
+        if port not in ports:
+            continue
+        for peer in rule.get("to", []):
+            block = peer.get("ipBlock")
+            if block and ipaddress.ip_address(cidr.partition("/")[0]) in ipaddress.ip_network(
+                block["cidr"]
+            ):
+                return True
+    return False
+
+
+@pytest.mark.parametrize("private", [False, True])
+async def test_every_git_role_pod_is_selected_by_a_policy_that_allows_the_git_host(
+    private: bool,
+) -> None:
+    """hades #191: the refresher timed out on github.com while the preparer reached it.
+    Every Pod of a git role is selected by a policy that permits the git host's
+    addresses on 443, and the Pod resolves the host to exactly those addresses."""
+    from datetime import UTC, datetime, timedelta  # noqa: PLC0415
+
+    from crucible.ports.github import InstallationToken  # noqa: PLC0415
+
+    api, _registry, provider = build(
+        config=KubernetesConfig(
+            poll_interval_seconds=0,
+            launch_timeout_seconds=5,
+            storage_class="lab-ssd",
+            cache_claim="crucible-reference-cache",
+        )
+    )
+    token = (
+        InstallationToken(
+            "ghs_" + "Q" * 36,
+            expires_at=datetime.now(UTC) + timedelta(hours=1),
+            repository="acme/example",
+            permissions={"contents": "read"},
+        )
+        if private
+        else None
+    )
+    await provider.prepare(spec(), checkout_token=token)
+    policies = [row["body"] for row in api.created if row["kind"] == "networkpolicies"]
+    git_addresses = fake_resolver("github.com")
+    assert git_addresses
+    seen: set[str] = set()
+    for row in api.created:
+        if row["kind"] != "jobs":
+            continue
+        template = row["body"]["spec"]["template"]
+        labels = template["metadata"]["labels"]
+        role = labels[k8sspec.LABEL_ROLE]
+        if role not in GIT_ROLES:
+            continue
+        seen.add(role)
+        selecting = [p for p in policies if _selects(p, labels)]
+        assert selecting, f"no NetworkPolicy selects the {role} Pod ({labels})"
+        for cidr in git_addresses:
+            assert any(_allows(p, cidr, 443) for p in selecting), (
+                f"no policy selecting the {role} Pod allows {cidr}:443"
+            )
+        pinned = {
+            alias["ip"]
+            for alias in template["spec"].get("hostAliases", [])
+            if "github.com" in alias["hostnames"]
+        }
+        assert pinned == {str(ipaddress.ip_network(c).network_address) for c in git_addresses}
+    assert seen == GIT_ROLES
+
+
+async def test_a_pod_resolves_its_hosts_to_the_addresses_its_policy_was_written_with() -> None:
+    """hades #191: github.com answers one address with a 60 second TTL, and the provider
+    keeps a resolved address for `resolve_ttl_seconds`. The Pod's own lookup could
+    return an address the policy never named; `hostAliases` takes that lookup away."""
+    answers = {"github.com": ["140.82.112.3/32"], "api.github.com": ["140.82.112.6/32"]}
+
+    def rotating(host: str) -> list[str]:
+        return list(answers.get(host, []))
+
+    api, _registry, provider = build(
+        config=KubernetesConfig(
+            poll_interval_seconds=0,
+            launch_timeout_seconds=5,
+            storage_class="lab-ssd",
+            cache_claim="crucible-reference-cache",
+        ),
+        resolver=rotating,
+    )
+    await provider.prepare(spec())
+    answers["github.com"] = ["140.82.114.4/32"]
+    # Within the resolve TTL the provider keeps the first answer for the next attempt.
+    await provider.prepare(spec(attempt_id="01ATTEMPT0000000000000000B"))
+    for row in api.created:
+        if row["kind"] != "jobs":
+            continue
+        pod = row["body"]["spec"]["template"]["spec"]
+        aliases = {a["ip"]: a["hostnames"] for a in pod.get("hostAliases", [])}
+        assert aliases == {"140.82.112.3": ["github.com"], "140.82.112.6": ["api.github.com"]}
+
+
+def test_host_aliases_pin_nothing_under_the_broad_rule() -> None:
+    plan = EgressPlan(
+        hosts=("github.com",),
+        broad=True,
+        host_addresses=(("github.com", ("140.82.112.3/32",)),),
+    )
+    assert k8sspec.host_aliases(plan) == []
+    assert k8sspec.host_aliases(replace(plan, broad=False)) == [
+        {"ip": "140.82.112.3", "hostnames": ["github.com"]}
+    ]
+
+
+def test_host_aliases_carry_only_names_the_api_server_accepts() -> None:
+    """A hostAliases hostname must be a lowercase DNS-1123 name, or the Job is refused;
+    the policy's allowlist is not held to that, so the alias is normalised or left out."""
+    plan = EgressPlan(
+        hosts=("Registry.NPMjs.org", "pypi.org.", "bad_name.example"),
+        host_addresses=(
+            ("Registry.NPMjs.org", ("104.16.1.34/32",)),
+            ("pypi.org.", ("151.101.0.223/32",)),
+            ("bad_name.example", ("203.0.113.9/32",)),
+        ),
+    )
+    assert k8sspec.host_aliases(plan) == [
+        {"ip": "104.16.1.34", "hostnames": ["registry.npmjs.org"]},
+        {"ip": "151.101.0.223", "hostnames": ["pypi.org"]},
+    ]

@@ -50,6 +50,7 @@ from crucible.application.errors import (
 )
 from crucible.application.first_run import discard_after_use
 from crucible.application.policies import put_policy, put_routing_policy
+from crucible.application.queries import supervisor_health
 from crucible.contracts.api import ExternalReviewAttestation, RepositoryRegistration
 from crucible.contracts.task_contract import HarnessName
 from crucible.domain.cluster_egress import format_labels, parse_labels
@@ -451,7 +452,24 @@ def _base(
         "csrf": csrf,
         "message": request.query_params.get("message"),
         "message_kind": request.query_params.get("kind", "info"),
+        "supervisor_warning": _supervisor_warning(request) if principal is not None else None,
     }
+
+
+def _supervisor_warning(request: Request) -> str | None:
+    """hades #190: readiness no longer reflects the supervisor, so every signed-in page
+    says when it is not healthy. None when it is, or when there is nothing to ask."""
+    try:
+        ctx = request.app.state.ctx
+        with ctx.uow_factory() as uow:
+            healthy, detail = supervisor_health(uow, ctx.clock.now(), ctx.lease_ttl_seconds)
+    except (AttributeError, KeyError):
+        return None
+    if healthy:
+        return None
+    settings = getattr(ctx, "settings", None)
+    timezone = settings.service.render_timezone if settings is not None else "America/Chicago"
+    return str(_localize(str(detail), timezone))
 
 
 def _page(

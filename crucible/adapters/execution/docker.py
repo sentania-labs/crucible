@@ -88,6 +88,7 @@ from crucible.ports.execution import (
     REPORT_MOUNT,
     VERIFY_MOUNT,
     WORK_MOUNT,
+    CancelCheck,
     CleanupPolicy,
     CollectedOutputs,
     CredentialFileSync,
@@ -95,6 +96,7 @@ from crucible.ports.execution import (
     Handle,
     ImageInfo,
     IsolationLevel,
+    LaunchCancelledError,
     LaunchRefusedError,
     LaunchSpec,
     LogChunk,
@@ -325,6 +327,9 @@ class DockerProvider:
     """The provider of 08 against a rootless daemon behind the socket proxy (13, S9)."""
 
     name = PROVIDER_NAME
+    # hades #189: how often a throwaway container's wait asks whether the task was
+    # cancelled. Not a setting: it bounds how long a cancel waits, nothing else.
+    cancel_poll_seconds = 2.0
 
     def __init__(
         self,
@@ -480,8 +485,15 @@ class DockerProvider:
         return source is not None and (credential is None or credential.held_by(source.path))
 
     async def prepare(
-        self, spec: LaunchSpec, checkout_token: InstallationToken | None = None
+        self,
+        spec: LaunchSpec,
+        checkout_token: InstallationToken | None = None,
+        cancelled: CancelCheck | None = None,
     ) -> Workspace:
+        # hades #189: the preparer container refreshes the cache and clones in one step,
+        # so a cancel is honoured before it starts and on every poll while it runs.
+        if cancelled is not None and await cancelled():
+            raise LaunchCancelledError("the task was cancelled before the preparer started")
         repository = spec.contract.get("repository", {})
         url = spec.repository_url or str(repository.get("url", ""))
         if not url:
@@ -549,6 +561,7 @@ class DockerProvider:
             timeout=self.config.collector_timeout_seconds,
             env=env,
             secret_stdin=checkout_token if private else None,
+            cancelled=cancelled,
         )
         if exit_code != 0:
             raise ProviderError(
@@ -678,7 +691,9 @@ class DockerProvider:
             for p in (spec.policy.get("images", {}).get("allowlist") or DEFAULT_IMAGE_ALLOWLIST)
         ] + list(self.config.extra_image_allowlist)
 
-    async def launch(self, ws: Workspace, spec: LaunchSpec) -> Handle:
+    async def launch(
+        self, ws: Workspace, spec: LaunchSpec, cancelled: CancelCheck | None = None
+    ) -> Handle:
         await self._ensure_network()
         resolved = await self._resolve_image(spec)
         network, env = self._network_and_env(spec)
@@ -687,6 +702,10 @@ class DockerProvider:
             check_create(body, self._create_policy(spec, resolved=resolved))
         except CreateRequestRefusedError as exc:
             raise ProviderError(f"create-request policy refused the worker: {exc}") from exc
+        # hades #189: the network and the image resolution above can take a while; a
+        # cancel that landed during them creates nothing.
+        if cancelled is not None and await cancelled():
+            raise LaunchCancelledError("the task was cancelled before the worker was created")
         name = f"crucible-{spec.attempt_id}"
         copy = self._credential_copy(spec)
         container_id = ""
@@ -1199,12 +1218,16 @@ class DockerProvider:
         env: Mapping[str, str] | None = None,
         image: str | None = None,
         secret_stdin: InstallationToken | None = None,
+        cancelled: CancelCheck | None = None,
     ) -> int:
         """Run one hardened, single-purpose container to completion and remove it.
 
         `secret_stdin` is a token the container reads from its stdin onto a tmpfs of its
         own (ADR 0019, S10): never `Env`, `Cmd`, a bind source or the writable layer,
-        and gone with the container, which the `finally` below removes on every path."""
+        and gone with the container, which the `finally` below removes on every path.
+
+        With `cancelled`, the wait asks it every `cancel_poll_seconds`; a cancel raises
+        LaunchCancelledError and the `finally` force-removes the container (hades #189)."""
         launched = self._launched.get(spec.attempt_id)
         image = image or (launched.image_digest if launched else spec.image)
         host_config = self._hardened(spec, network=network)
@@ -1233,6 +1256,8 @@ class DockerProvider:
         name = f"crucible-{role}-{spec.attempt_id}"
         container_id = ""
         try:
+            if cancelled is not None and await cancelled():
+                raise LaunchCancelledError(f"the task was cancelled before the {role} started")
             container_id = await self._call(self.client.create_container, name, body)
             await self._call(self.client.start_container, container_id)
             if secret_stdin is not None:
@@ -1241,8 +1266,8 @@ class DockerProvider:
                     container_id,
                     secret_stdin.reveal().encode("utf-8"),
                 )
-            code = int(
-                await self._call(self.client.wait_container, container_id, timeout=float(timeout))
+            code = await self._wait_throwaway(
+                container_id, role=role, timeout=timeout, cancelled=cancelled
             )
             if code != 0:
                 # A throwaway container that failed is an environment failure, and its
@@ -1274,6 +1299,26 @@ class DockerProvider:
             if container_id:
                 with contextlib.suppress(Exception):
                     await self._call(self.client.remove_container, container_id, force=True)
+
+    async def _wait_throwaway(
+        self, container_id: str, *, role: str, timeout: int, cancelled: CancelCheck | None
+    ) -> int:
+        """The container's exit code. The daemon's wait blocks a thread, so it runs as a
+        task of its own and the cancel is asked beside it; a cancelled wait's thread
+        returns once the caller's `finally` has force-removed the container."""
+        waiting = asyncio.ensure_future(
+            self._call(self.client.wait_container, container_id, timeout=float(timeout))
+        )
+        # Retrieved here so an abandoned wait never logs an unretrieved exception.
+        waiting.add_done_callback(lambda t: t.cancelled() or t.exception())
+        poll = self.cancel_poll_seconds if cancelled is not None else None
+        while True:
+            done, _ = await asyncio.wait({waiting}, timeout=poll)
+            if done:
+                return int(waiting.result())
+            assert cancelled is not None
+            if await cancelled():
+                raise LaunchCancelledError(f"the task was cancelled while the {role} ran")
 
     async def _tail_of(self, container_id: str, limit: int = 4000) -> str:
         """What a failed throwaway container said, for the event that records it."""

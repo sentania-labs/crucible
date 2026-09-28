@@ -116,6 +116,25 @@ partial report, kept as an artifact but never parsed as a claim). The
 checkout is kept per cleanup policy so partial work is recoverable by a
 person. An open PR is never closed by Crucible on cancel.
 
+A cancel that arrives while an attempt is being launched stops the launch
+at the step it is on: the launch asks whether the task was cancelled before
+the spec is built, before the cache refresh, before the preparer, while the
+refresher or preparer Job (Kubernetes) or the preparer container (Docker,
+every 2 seconds) runs, in the transaction that would move the attempt to
+`launching`, just before the provider creates the worker, and in the
+transaction that would record the worker `running`. A cancelled launch
+removes what its step made and ends the attempt `killed` with its `stage`
+recorded on `attempt_collected`. A cancel that lands after the provider
+created the worker settles the attempt in that last transaction, so it is
+never `running`, and the launch then kills the worker it started; anything
+of it the kill leaves is removed by provider retention. A supervisor that
+finds such a worker after a restart or a lease change settles the attempt the
+same way instead of adopting it. The cancel sweep
+acts only on `pending` and `running` attempts, so it never acts on an
+attempt whose launch is in flight. The task reaches `cancelled` as soon as
+the launch reaches its next check, which on the kind tier was seconds after
+the cancel (hades #189, 2026-09-28).
+
 ## Cleanup policy (per policy document, 05b)
 
 | Setting | Options | Default |

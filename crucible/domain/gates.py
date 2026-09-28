@@ -90,6 +90,7 @@ DEFERRED_MARKER = "deferred:c3-verifier"
 COLLECTOR_MARKER = "incomplete:collector"
 
 WORKER_SOURCE = "worker"
+_HEX = re.compile(r"[0-9a-f]{7,64}")
 
 # Shims and identity paths a worker must never leave behind (11).
 INJECTED_PREFIXES: tuple[str, ...] = (".crucible/", "crucible/identity/", ".crucible-shims/")
@@ -270,18 +271,19 @@ def commits_present(gi: GateInput) -> GateOutcome:
     if not bundle.payload.get("bundle_verified"):
         return GateOutcome(GateResult.FAIL, "git bundle verify failed on the collected branch", ids)
     collected = str(bundle.payload.get("head_sha") or "")
+    if not collected:
+        return GateOutcome(GateResult.FAIL, "the collected bundle names no head", ids)
+    detail = f"{commits} commit(s), bundle verified at {collected}"
+    # hades #187: the head is the collected bundle's, never a hash the worker copied. A
+    # report whose `refs.head_sha` differs is noted here and does not fail the gate.
     claimed = str(bundle.payload.get("claimed_head_sha") or "")
     if not claimed:
-        return GateOutcome(
-            GateResult.FAIL, "the report claims no head_sha to compare the bundle head to", ids
-        )
-    if collected != claimed:
-        return GateOutcome(
-            GateResult.FAIL,
-            "the bundle head does not equal the head_sha the report claims",
-            ids,
-        )
-    return GateOutcome(GateResult.PASS, f"{commits} commit(s), bundle verified at {collected}", ids)
+        detail += "; the report named no head_sha"
+    elif claimed != collected:
+        # Worker-written: echoed only when it is a hash, never as free text.
+        named = claimed[:12] if _HEX.fullmatch(claimed) else "another value"
+        detail += f"; the report named {named}, which is not the collected head"
+    return GateOutcome(GateResult.PASS, detail, ids)
 
 
 def scope_contained(gi: GateInput) -> GateOutcome:

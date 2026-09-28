@@ -52,6 +52,11 @@ def render_identity_md(
         )
         or "- none"
     )
+    criteria = contract.get("acceptance_criteria", [])
+    criteria_lines = (
+        "\n".join(f"- `{c.get('id')}`: {c.get('text', '')}" for c in criteria) or "- none"
+    )
+    first_criterion = str(criteria[0].get("id")) if criteria else "AC1"
     return f"""# Worker identity
 
 ## 1. Role
@@ -115,6 +120,18 @@ the version of the document format, not the schema's name. Write
 command's output to a log file there. Write `blocked.md` and exit 75 to escalate. Exit 0 only after
 `report.yaml` exists. Every path inside the report resolves against this
 directory.
+
+`acceptance_mapping` has one entry for each acceptance criterion below, keyed
+by that criterion's own `id`. The verification ids in section 6 are not
+acceptance criteria and never go here. `status` is one of `met`, `not_met`,
+`not_exercised` or `partial`. For example:
+`- {{id: {first_criterion}, status: met, evidence: "v2-make-test.log: the new case passes"}}`
+
+{criteria_lines}
+
+`refs.head_sha` is the output of `git rev-parse HEAD` run after your final
+commit; write it last. Crucible reads the head from the collected branch
+itself and records a different value as a note, never as the head.
 
 ## 8. Exit codes
 

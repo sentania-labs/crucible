@@ -97,7 +97,7 @@ Per attempt the provider creates, in `crucible-workers`, all labelled
 | ConfigMap `identity-<attempt>` (or a projected volume from an object store above the ConfigMap size cap, 08) | the identity bundle, read-only | attempt |
 | Secret `cred-<attempt>` | the per-attempt copy of one harness credential directory, seeded from the harness's dedicated Secret in `crucible-workers`, `rw-narrow` where the adapter declares it (12) | attempt, deleted under every cleanup policy |
 | Secret `checkout-<attempt>` | a private repository's read-only installation token (ADR 0019), key `token`, mounted mode 0400 at `/run/crucible-token` into the refresher and the preparer Jobs and nothing else | created just before the refresher, deleted once the preparer's Pod is gone, on every path; a deletion that fails fails the prepare, and `discard`, `cleanup` and the retention sweep retry it |
-| Job `refresh-cache-<attempt>` | the reference cache's only writer: fetches the repository's bare mirror on the cache PVC (or clones it when absent), with git egress only and no workspace or identity bundle; for a private repository it also mounts `checkout-<attempt>` and fetches with it | until complete, then deleted, before the preparer starts |
+| Job `refresh-cache-<attempt>` | the reference cache's only writer: fetches the repository's bare mirror on the cache PVC (or clones it when absent), with git egress only and no workspace or identity bundle; for a private repository it also mounts `checkout-<attempt>` and fetches with it. It gives the remote 20 seconds to answer a ref listing and otherwise leaves the mirror as it is, so a refresh that cannot connect costs seconds, not the kernel's two-minute connect timeout (hades #191) | until complete, then deleted, before the preparer starts |
 | Job `prepare-<attempt>` | the preparer: clone into the PVC from the reference cache, mounted read-only, then branch, shims, author identity, `origin` placeholder (08) | until complete, then deleted |
 | Job `worker-<attempt>` | the worker, one Pod, `backoffLimit: 0`, `restartPolicy: Never` | until terminal, then deleted after `logs_drained` |
 | Job `collect-<attempt>` | the collector, no network, repo and report read-only, output read-write (08) | until complete |
@@ -275,7 +275,13 @@ any denied range outside that declaration, is refused. General allowlist hostnam
 resolve into a denied range remain refused. IPv6 never
 appears in a rule and is therefore denied entirely.
 A resolved address stays in a policy for `kubernetes.resolve_ttl_seconds`
-(default 300) before its name is looked up again. `kubernetes.broad_egress`
+(default 300) before its name is looked up again. Every Pod whose policy names
+resolved addresses carries the same addresses as `hostAliases`, so it connects
+to exactly what its policy permits: a name like github.com answers one address
+with a 60 second TTL, and a different one to a different resolver, so a Pod that
+looked the name up again could get an address its policy never named and time
+out against the default deny (hades #191, 2026-09-28). The broad rule pins
+nothing. `kubernetes.broad_egress`
 (default false) replaces the resolved addresses with the broad rule, the
 public internet on 443 minus every denied range, for a CNI that enforces names
 some other way; that rule lets a worker reach GitHub, so a deployment turns it

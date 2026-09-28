@@ -118,6 +118,10 @@ spec:
                 secretKeyRef:
                   name: crucible-database
                   key: url
+          # `/v1/ready` is this process's readiness: the database answers and the schema
+          # is at head. The supervisor's health is reported in the same response and on
+          # `/v1/supervisor` and does not fail it, so a supervisor in trouble never takes
+          # the API and the admin UI out of the Service (hades #190).
           readinessProbe:
             httpGet:
               path: /v1/ready

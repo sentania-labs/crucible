@@ -162,6 +162,17 @@ node="${cluster}-control-plane"
 for address in 10.0.0.1 172.16.0.1 192.168.0.1 100.64.0.1 169.254.169.254; do
   docker exec "$node" ip address add "$address/32" dev lo
 done
+# hades #189, #190, #191: a stand-in github.com on public-shaped documentation addresses
+# (RFC 5737), which no rule of 26 denies. range-http serves the tier's bare repositories
+# over plain HTTP on 443 at every node address, so 198.51.100.10 and 198.51.100.20 both
+# answer as the git host; cluster DNS says github.com is .20 (the CoreDNS patch below),
+# which is the pod-side lookup a policy written for .10 does not permit. 198.51.100.30
+# is a blackhole route: a git host that never answers, for a prepare that hangs. A route,
+# not a filter rule, so no CNI chain can accept the packet before it is dropped.
+for address in 198.51.100.10 198.51.100.20; do
+  docker exec "$node" ip address add "$address/32" dev lo
+done
+docker exec "$node" ip route add blackhole 198.51.100.30/32
 
 crucible_kind_install_calico "$scratch" "$kubeconfig"
 
@@ -185,6 +196,19 @@ KUBECONFIG="$supervisor_kubeconfig" kubectl config set-credentials crucible-supe
 KUBECONFIG="$supervisor_kubeconfig" kubectl config set-context crucible-supervisor \
   --cluster=kind --user=crucible-supervisor --namespace=crucible-workers >/dev/null
 KUBECONFIG="$supervisor_kubeconfig" kubectl config use-context crucible-supervisor >/dev/null
+corefile=$(KUBECONFIG="$kubeconfig" kubectl -n kube-system get configmap coredns -o jsonpath='{.data.Corefile}')
+corefile=$(printf '%s\n' "$corefile" | awk '
+  { print }
+  /^[[:space:]]*ready[[:space:]]*$/ && !done {
+    print "    hosts {"
+    print "       198.51.100.20 github.com api.github.com"
+    print "       fallthrough"
+    print "    }"
+    done = 1
+  }')
+KUBECONFIG="$kubeconfig" kubectl -n kube-system create configmap coredns \
+  --from-literal=Corefile="$corefile" --dry-run=client -o yaml \
+  | KUBECONFIG="$kubeconfig" kubectl apply -f - >/dev/null
 KUBECONFIG="$kubeconfig" kubectl -n kube-system patch deployment coredns --type=json -p='[
   {"op":"add","path":"/spec/template/spec/volumes/-","value":{"name":"wrong-port-www","emptyDir":{}}},
   {"op":"add","path":"/spec/template/spec/containers/-","value":{"name":"wrong-port-http","image":"busybox@sha256:9db7b59979c38555a39def84a31fb98b5296952f9e3afd4f6f11f05b07adfab0","command":["sh","-c","mkdir -p /www; echo dns-wrong-port > /www/index.html; exec httpd -f -p 18080 -h /www"],"securityContext":{"allowPrivilegeEscalation":false,"readOnlyRootFilesystem":true,"runAsNonRoot":true,"runAsUser":1000,"capabilities":{"drop":["ALL"]}},"volumeMounts":[{"name":"wrong-port-www","mountPath":"/www"}]}}
