@@ -44,13 +44,13 @@ replaces its data.
 
 ## The GitHub App Secret is Crucible's
 
-The operator connects an existing App on the GitHub page: its App ID and one of its
-private keys. Crucible asks GitHub whether they belong together, and only then creates
-`crucible-github-app` in `crucible`, labelled `app.kubernetes.io/managed-by: crucible`,
-and replaces its data on each later connect. The control plane's Role in `crucible`
+The operator presses Create GitHub App on the GitHub page. GitHub makes the App and its
+key and hands them to Crucible once, which then creates `crucible-github-app` in
+`crucible`, labelled `app.kubernetes.io/managed-by: crucible`, and replaces its data when
+the App is replaced. The control plane's Role in `crucible`
 (`../base/crucible/github-app-rbac.yaml`) allows exactly that: `get` and `patch` on this
 one Secret and `create`. A deployment that sealed it before this change removes it from
-its GitOps repository without pruning it, as above, or connects the App again.
+its GitOps repository without pruning it, as above, or creates the App again.
 
 ## `sealed/`
 

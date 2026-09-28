@@ -205,11 +205,9 @@ probe refuses while a login Job for the harness exists.
 The service owns the App credential (ADR 0017, crucible#120, #168): the
 operator creates the App with one click on the GitHub page (GitHub's manifest
 flow: GitHub makes the App and its key and hands them to the service once, for
-a single-use code), or connects an existing App by its id and one of its
-private keys (the same page behind a link, `POST /v1/admin/github/app`,
-`crucible admin github connect`), which the service checks with GitHub's
-`GET /app` before it stores anything. From then on it is the credential's only
-writer. In Kubernetes it is the
+a single-use code). That is the only way to connect an App; there is no form,
+API route or CLI verb that takes an existing App's id and key (the operator,
+2026-09-27). From then on the service is the credential's only writer. In Kubernetes it is the
 Secret `crucible-github-app` in the `crucible` namespace, keys `app-id`,
 `app.pem` and `webhook.secret`, created and labelled by the service and read
 through the API server on each signature; it is also mounted, optional, on
@@ -218,8 +216,8 @@ GitOps does not deliver it. Locally the same three files sit beside
 `github.app.private_key_path` in a private directory of the `crucible`
 container, written mode 0600 by the same flow. A Secret or directory a
 deployment filled itself still works when `github.enabled` and
-`github.app.app_id` name it. Rotation is a new App key (GitHub allows several
-per App), a Connect GitHub with it, and a revoke of the old key in GitHub.
+`github.app.app_id` name it. Rotation is Replace the App on the GitHub page (a
+new App, created the same way, installed, and the old App deleted on GitHub).
 Workers, collectors, verifiers, and publishers never mount that Secret. Crucible signs a JWT with the key in memory,
 exchanges it for an installation token scoped to the one repository the
 job needs, and hands that token to the publisher container as a file on

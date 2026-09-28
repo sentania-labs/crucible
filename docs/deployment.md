@@ -133,10 +133,9 @@ and is its only writer (crucible#168). No public DNS record is needed: every red
 of your own browser, so the internal hostname you use for the UI is enough, and the App
 has no webhook (Crucible polls). If Crucible sees a different address than your browser
 uses, set it under Return address (`crucible admin github set-external-url`). Then press
-Install on GitHub; GitHub sends you back to the repository picker. An App you already
-have connects with its App ID and one of its private keys, behind the link under the
-Create button. A deployment that sealed `crucible-github-app` before this
-change takes it out of its GitOps repository without pruning it, or connects the App
+Install on GitHub; GitHub sends you back to the repository picker. Create is the only
+way to connect an App; to change Apps, use Replace the App on the same page. A deployment that sealed `crucible-github-app` before this
+change takes it out of its GitOps repository without pruning it, or creates the App
 again afterwards.
 
 **Private repositories need the App and nothing else** (ADR 0019). The picker registers a

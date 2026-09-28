@@ -12,8 +12,8 @@ and corrects its earlier claim that the manifest flow needs a public DNS record.
 ## What changed
 
 - The GitHub page leads with Create GitHub App: an App name (default `Hades-` and six hex
-  characters) and an optional organization. The existing-App form (App ID and `.pem`) is
-  behind the link "Already have a GitHub App?" (`/ui/github?existing=1`).
+  characters) and an optional organization. It is the only way to connect an App (see
+  "Correction: the paste path is removed" below).
 - Create records a start (`github_manifest_states`, migration 0026: the state's sha256,
   the sha256 of a nonce the browser keeps in a `SameSite=Lax` cookie named for the start,
   the administrator, 15 minutes) and returns a page that posts the manifest to GitHub's
@@ -22,7 +22,7 @@ and corrects its earlier claim that the manifest flow needs a public DNS record.
   GitHub Enterprise Server, the origin itself for the stand-in), so no new setting.
 - `/ui/github/callback` spends the state, exchanges the code once
   (`RestGitHubApps.convert_manifest`, the transport's one unauthenticated call), and keeps
-  the App through the same audited path as Connect GitHub (`github.keep`). It lands on
+  the App through the audited store path (`github.keep`). It lands on
   the GitHub page, where Install on GitHub now sits right under the connection.
   `/ui/github/installed` is the manifest's `setup_url`: GitHub sends the browser there
   after an install, and it lands on the picker.
@@ -90,3 +90,14 @@ failure after the credential write is the ordering Connect GitHub already had.
   GitHub's redirect: the integration tier's and the kind proof's HTTP clients ignore
   `SameSite`, so they prove the reload page and the checks, not the browser's cookie
   rules.
+
+## Correction: the paste path is removed
+
+The operator, 2026-09-27, on the review of this change: "why even have the past your own
+app - it's a complicated duplicate". Create GitHub App is the only way to connect an App.
+Removed: the "Already have a GitHub App?" link and its form (before connect and under
+Replace the App, which now offers only "Create a new App instead"), the UI action
+`github-connect`, `POST /v1/admin/github/app`, `crucible admin github connect`, the
+client schema's `github_connected`, and `github.connect` with its key check. `github.keep`,
+the audited store path, stays: Create uses it. A Secret or directory a deployment filled
+itself still counts under ADR 0017's decision 4.

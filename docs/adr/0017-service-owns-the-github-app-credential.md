@@ -3,8 +3,8 @@
 Status: accepted. The operator's feedback of 2026-09-25 (quoted below), made concrete by
 FDY-0117 the same day. Extends ADR 0015's ownership model from the harness credentials to
 the GitHub App credential. Amended 2026-09-27 (crucible#168): the App manifest flow needs
-no public DNS, and it is now how the App is connected; see "Amendment: the one-click App"
-below.
+no public DNS, and it is now the only way the App is connected; see "Amendment: the
+one-click App" below.
 
 ## Context
 
@@ -46,6 +46,9 @@ building an app/seevice."
    and calls `GET /app`; a refusal, or an answer naming another App, stores nothing. The
    answer carries the App's install link, built from the `html_url` GitHub returned. The
    key is never returned, logged or audited; its public-key fingerprint is.
+   (Superseded by the amendment below, 2026-09-27: the operator removed this path, and
+   Create GitHub App is the only way to connect an App. The route, the CLI verb and the
+   form are gone.)
 3. **The key is read through the API server, on each signature.** Both the api and the
    supervisor read the Secret when they sign a JWT, so a connect is in force at once
    rather than after the kubelet's next projection of the mount. The mount stays, still
@@ -106,9 +109,10 @@ building an app/seevice."
   GitOps repository without pruning it (Argo's prune would delete the key), or connects
   the App again from the GitHub page afterwards. On its first write the service takes the
   Secret over: it sets its labels and replaces its data.
-- Rotation is a new App key in GitHub and a Connect GitHub with it, then revoking the old
-  key in GitHub. Connect GitHub replaces the id and the key together, so the two can
-  never disagree.
+- Rotation is Replace the App on the GitHub page: a new App, created and installed the
+  same way, then the old App deleted on GitHub (amended 2026-09-27; it was a new key for
+  the same App through Connect GitHub, which is removed). The store replaces the id and
+  the key together, so the two can never disagree.
 - With the Docker provider the connect flow needs the directory beside
   `github.app.private_key_path` writable by the service; compose mounts it read-only
   today, and the flow refuses there and names the directory.
@@ -134,7 +138,8 @@ Crucible polls (23), so the manifest turns the webhook off.
    and six hex characters, editable, since App names are unique on GitHub), spec 23's
    permissions exactly, no events, `hook_attributes.active: false`, `public: false`, and
    `redirect_url` (`/ui/github/callback`) and `setup_url` (`/ui/github/installed`) on the
-   external URL. Entering an existing App's id and key (decision 2) stays, behind a link.
+   external URL. It is the only way to connect an App: entering an existing App's id and
+   key (decision 2) is removed (see "Correction" below).
 2. The external URL is the `Origin` of the operator's form post, unless the
    `github.external_url` setting (a `provider_settings` row, on the GitHub page, the admin
    API and the CLI) overrides it.
@@ -169,3 +174,10 @@ Crucible polls (23), so the manifest turns the webhook off.
 host should set `github.external_url`. With the Docker provider the webhook secret is kept
 only where `github.app.webhook_secret_path` names a file, as before; the webhook is off
 either way.
+
+**Correction (2026-09-27, the same review).** The operator: "why even have the past your
+own app - it's a complicated duplicate". Decision 2 is removed rather than kept behind a
+link: no form, no `POST /v1/admin/github/app`, no `crucible admin github connect`. Replace
+the App offers only "Create a new App instead". The audited store path Create uses
+(`github.keep`) is unchanged, and decision 4 still counts a credential a deployment
+placed itself.
