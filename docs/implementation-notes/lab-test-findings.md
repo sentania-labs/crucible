@@ -28,6 +28,13 @@ with the issue's recommendation.
   provider asks it before the cache refresh, before the preparer and on every poll of
   either Job, and the supervisor asks once more in the transaction that would move the
   attempt to `launching`.
+- **Cancel during launch, after Codex's review of PR 202 (2026-09-28).** The Docker
+  preparer's wait asks the check every 2 seconds (a class constant, not a setting) and
+  force-removes the container on a cancel. `launch` takes the same check and asks it
+  just before it creates the worker. The transaction that would record the worker
+  `running` asks it too: on a cancel it settles the attempt `killed` at stage `launch`
+  instead, and the launch kills the worker it started. The cancel sweep never acts on
+  a `preparing` or `launching` attempt, so only the launch settles it.
 - **Readiness (#190).** `/v1/ready` is decided by the database and the migrations; its
   `supervisor` check stays in the response as information. Every signed-in admin page
   carries a red banner while the supervisor is not healthy.

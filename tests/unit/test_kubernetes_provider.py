@@ -31,6 +31,7 @@ from crucible.ports.execution import (
     CleanupPolicy,
     ExecutionProvider,
     Handle,
+    LaunchCancelledError,
     LaunchRefusedError,
     LogOffset,
     ObservationState,
@@ -330,6 +331,23 @@ async def test_the_resolved_digest_is_the_handle_and_the_recorded_image() -> Non
     assert handle.ref == "worker-01attempt0000000000000000a"
     assert handle.image_digest == registry.resolve(IMAGE).reference
     assert "@sha256:" in handle.image_digest
+
+
+async def test_a_cancel_before_the_worker_job_is_created_creates_nothing() -> None:
+    """hades #189: the launch's last look comes after the readiness gate and the image
+    resolution it awaits; a cancel there creates no worker Job and no worker policy."""
+    api, _registry, provider, launch, workspace = await prepared()
+
+    async def cancelled() -> bool:
+        return True
+
+    before = len(api.created)
+    with pytest.raises(LaunchCancelledError, match="before the worker was created"):
+        await provider.launch(workspace, launch, cancelled)
+    assert api.created[before:] == []
+    # The same launch with no cancel creates the worker's policy and Job.
+    await provider.launch(workspace, launch)
+    assert {row["kind"] for row in api.created[before:]} >= {"jobs", "networkpolicies"}
 
 
 # ----- observe (26) --------------------------------------------------------

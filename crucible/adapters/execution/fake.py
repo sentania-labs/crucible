@@ -328,6 +328,9 @@ class FakeProvider:
         self._prepare_holds: dict[str, asyncio.Event] = {}
         self.prepare_cancelled: list[str] = []
         self.prepares_started: list[str] = []
+        # hades #189: launches a test holds open, and those that stopped for a cancel.
+        self._launch_holds: dict[tuple[str, str], asyncio.Event] = {}
+        self.launch_cancelled: list[str] = []
 
     # test controls
     def script(self, external_id: str, behavior: str, *, after: int = 1) -> None:
@@ -344,6 +347,14 @@ class FakeProvider:
         hold = self._prepare_holds.pop(external_id, None)
         if hold is not None:
             hold.set()
+
+    def hold_launch(self, external_id: str, where: Literal["before", "after"]) -> asyncio.Event:
+        """Hold the next launch of this task open until the returned event is set:
+        `before` the launch's cancel look (a slow readiness gate or image resolution),
+        or `after` the worker was created (a slow Pod start)."""
+        hold = asyncio.Event()
+        self._launch_holds[(external_id, where)] = hold
+        return hold
 
     def set_report(self, external_id: str, report: dict[str, Any]) -> None:
         self._reports[external_id] = report
@@ -419,8 +430,14 @@ class FakeProvider:
         """Tell a review worker which head it is reviewing (the supervisor passes it)."""
         self._review_heads[attempt_id] = head_sha
 
-    async def launch(self, ws: Workspace, spec: LaunchSpec) -> Handle:
+    async def launch(
+        self, ws: Workspace, spec: LaunchSpec, cancelled: CancelCheck | None = None
+    ) -> Handle:
         behavior, after = self._behavior_for(spec)
+        await self._held(self._launch_holds.pop((spec.external_id, "before"), None))
+        if cancelled is not None and await cancelled():
+            self.launch_cancelled.append(spec.attempt_id)
+            raise LaunchCancelledError("the task was cancelled before the worker was created")
         # The image tag decides, for a review execution as for any other: a review that
         # crashes or vanishes is exactly what the review failure paths have to survive.
         review_head = spec.env.get("CRUCIBLE_REVIEW_HEAD_SHA")
@@ -429,7 +446,15 @@ class FakeProvider:
         worker = _Worker(spec=spec, behavior=behavior, remaining=after)
         worker.logs.append(LogChunk("stdout", f"fake worker {behavior} start\n".encode()))
         self._workers[spec.attempt_id] = worker
+        # A worker that exists while its launch still waits, as on a Pod that is slow
+        # to be scheduled: a cancel now is the supervisor's to act on.
+        await self._held(self._launch_holds.pop((spec.external_id, "after"), None))
         return Handle(provider=self.name, ref=f"fake-{spec.attempt_id}", attempt_id=spec.attempt_id)
+
+    @staticmethod
+    async def _held(hold: asyncio.Event | None) -> None:
+        if hold is not None:
+            await hold.wait()
 
     async def observe(self, h: Handle) -> Observation:
         worker = self._workers.get(h.attempt_id)

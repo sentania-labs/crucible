@@ -119,12 +119,19 @@ person. An open PR is never closed by Crucible on cancel.
 A cancel that arrives while an attempt is being launched stops the launch
 at the step it is on: the launch asks whether the task was cancelled before
 the spec is built, before the cache refresh, before the preparer, while the
-refresher or preparer Job runs, and once more in the transaction that would
-move the attempt to `launching`. A cancelled launch removes what its step
-made, starts no worker, and ends the attempt `killed` with its `stage`
-recorded on `attempt_collected`; the task reaches `cancelled` as soon as the
-launch reaches its next check, which on the kind tier was seconds after the
-cancel (hades #189, 2026-09-28).
+refresher or preparer Job (Kubernetes) or the preparer container (Docker,
+every 2 seconds) runs, in the transaction that would move the attempt to
+`launching`, just before the provider creates the worker, and in the
+transaction that would record the worker `running`. A cancelled launch
+removes what its step made and ends the attempt `killed` with its `stage`
+recorded on `attempt_collected`. A cancel that lands after the provider
+created the worker settles the attempt in that last transaction, so it is
+never `running`, and the launch then kills the worker it started; anything
+of it the kill leaves is removed by provider retention. The cancel sweep
+acts only on `pending` and `running` attempts, so it never acts on an
+attempt whose launch is in flight. The task reaches `cancelled` as soon as
+the launch reaches its next check, which on the kind tier was seconds after
+the cancel (hades #189, 2026-09-28).
 
 ## Cleanup policy (per policy document, 05b)
 

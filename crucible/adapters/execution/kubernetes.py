@@ -1380,7 +1380,9 @@ class KubernetesProvider:
             )
         self._check_endpoint_ready(probe, spec)
 
-    async def launch(self, ws: Workspace, spec: LaunchSpec) -> Handle:
+    async def launch(
+        self, ws: Workspace, spec: LaunchSpec, cancelled: CancelCheck | None = None
+    ) -> Handle:
         await self._require_ready(spec)
         gated_under = self.config
         resolved = await self._resolve_image(spec)
@@ -1418,6 +1420,9 @@ class KubernetesProvider:
                     )
                 self._check_endpoint_ready(probe, spec)
                 plan = self._egress_plan(spec, k8sspec.ROLE_WORKER)
+            # hades #189: the readiness gate and the image resolution above can take a
+            # while; a cancel that landed during them creates nothing.
+            await _stop_if_cancelled(cancelled, "before the worker was created")
             policy_name, plan = await self._apply_policy(spec, k8sspec.ROLE_WORKER, plan)
             body = k8sspec.job(
                 name=job_name,

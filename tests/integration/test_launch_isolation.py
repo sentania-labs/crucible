@@ -8,6 +8,7 @@ open by the fake provider the way that refresher was.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any
 
@@ -151,6 +152,81 @@ async def test_a_cancel_after_the_prepare_starts_no_worker(
     assert attempt["state"] == "failed" and attempt["exit_class"] == "killed"
     assert provider.worker(str(attempt["id"])) is None
     assert _collected(client, task_id)["stage"] == "launch"
+    assert attempt["id"] in provider.discarded
+    await supervisor.stop()
+
+
+async def _finish_launches(supervisor: Any) -> None:
+    launches = list(supervisor._launches.values())
+    if launches:
+        await asyncio.wait(launches, timeout=5)
+
+
+async def test_a_cancel_during_a_slow_launch_never_records_the_worker_running(
+    ctx: AppContext, client: TestClient, provider: FakeProvider
+) -> None:
+    """hades #189 (Codex on PR 202): the provider has created the worker and is still
+    waiting on it when the cancel lands. The transaction that would record it running
+    settles the attempt killed at stage launch instead, and the launch stops the worker.
+    Until then the sweep leaves the launching attempt to its launch."""
+    supervisor = make_supervisor(ctx, provider, launch_wait_seconds=0.2)
+    task_id = _submit(client, "HT-CANCEL-START")
+    hold = provider.hold_launch("HT-CANCEL-START", "after")
+    await supervisor.tick()
+    attempt = _attempt(client, task_id)
+    assert attempt["state"] == "launching"
+    worker = provider.worker(str(attempt["id"]))
+    assert worker is not None, "the worker exists while its launch still waits"
+
+    response = client.post(f"/v1/tasks/{task_id}/cancel", json=CANCEL)
+    assert response.status_code == 200 and response.json()["state"] == "cancelling"
+    await supervisor.tick()
+    # The sweep did not act on it: no drain, no terminating, still the launch's.
+    assert _attempt(client, task_id)["state"] == "launching"
+    assert worker.drains == 0 and worker.kills == 0
+
+    hold.set()
+    await _finish_launches(supervisor)
+    await supervisor.tick()
+
+    assert client.get(f"/v1/tasks/{task_id}").json()["state"] == "cancelled"
+    attempt = _attempt(client, task_id)
+    assert attempt["state"] == "failed" and attempt["exit_class"] == "killed"
+    assert attempt["started_at"] is None
+    collected = _collected(client, task_id)
+    assert collected["reason"] == "task cancelled during launch"
+    assert collected["stage"] == "launch"
+    kinds = event_kinds(client, task_id)
+    assert "attempt_running" not in kinds and "attempt_terminating" not in kinds
+    assert worker.kills == 1 and worker.drains == 0 and worker.exit_code == 137
+    assert attempt["id"] in provider.discarded
+    assert attempt["id"] not in supervisor._handles
+    await supervisor.stop()
+
+
+async def test_a_cancel_during_the_launch_gate_creates_no_worker(
+    ctx: AppContext, client: TestClient, provider: FakeProvider
+) -> None:
+    """hades #189: a cancel that lands while `launch` awaits its readiness gate or image
+    resolution is seen by the launch's own look, and no worker is created."""
+    supervisor = make_supervisor(ctx, provider, launch_wait_seconds=0.2)
+    task_id = _submit(client, "HT-CANCEL-GATE")
+    hold = provider.hold_launch("HT-CANCEL-GATE", "before")
+    await supervisor.tick()
+    assert _attempt(client, task_id)["state"] == "launching"
+
+    response = client.post(f"/v1/tasks/{task_id}/cancel", json=CANCEL)
+    assert response.status_code == 200, response.text
+    hold.set()
+    await _finish_launches(supervisor)
+
+    assert client.get(f"/v1/tasks/{task_id}").json()["state"] == "cancelled"
+    attempt = _attempt(client, task_id)
+    assert attempt["state"] == "failed" and attempt["exit_class"] == "killed"
+    assert provider.worker(str(attempt["id"])) is None
+    assert provider.launch_cancelled == [attempt["id"]]
+    assert _collected(client, task_id)["stage"] == "launch"
+    assert "attempt_running" not in event_kinds(client, task_id)
     assert attempt["id"] in provider.discarded
     await supervisor.stop()
 

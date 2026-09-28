@@ -418,15 +418,16 @@ class LaunchRefusedError(ProviderError):
 
 
 class LaunchCancelledError(ProviderError):
-    """The task was cancelled while its attempt was being prepared (hades #189). The
-    provider stopped at the step it was on, removed that step's Job, policy and
-    per-attempt Secrets, and started nothing further; the supervisor settles the
+    """The task was cancelled while its attempt was being prepared or launched (hades
+    #189). The provider stopped at the step it was on, removed that step's Job or
+    container and policy, and started nothing further; the supervisor settles the
     attempt as cancelled, not as a failure. The workspace claim and anything an earlier
     step left go with the attempt's other objects in retention."""
 
 
-# Asked by `prepare` before each of its steps and while it waits on one; True means the
-# task was cancelled and the prepare stops with LaunchCancelledError (hades #189).
+# Asked by `prepare` before each of its steps and while it waits on one, and by
+# `launch` just before it creates the worker; True means the task was cancelled and the
+# call stops with LaunchCancelledError (hades #189).
 CancelCheck = Callable[[], Awaitable[bool]]
 
 
@@ -450,7 +451,13 @@ class ExecutionProvider(Protocol):
         one runs; when it answers True the prepare raises LaunchCancelledError."""
         ...
 
-    async def launch(self, ws: Workspace, spec: LaunchSpec) -> Handle: ...
+    async def launch(
+        self, ws: Workspace, spec: LaunchSpec, cancelled: CancelCheck | None = None
+    ) -> Handle:
+        """Start the worker. `cancelled` is asked once more just before the worker is
+        created; when it answers True no worker is created and the launch raises
+        LaunchCancelledError. A cancel after that is the supervisor's to act on."""
+        ...
 
     async def observe(self, h: Handle) -> Observation: ...
 

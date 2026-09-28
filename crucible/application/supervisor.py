@@ -112,6 +112,7 @@ from crucible.ports.execution import (
     IDENTITY_MOUNT,
     REPO_MOUNT,
     REPORT_MOUNT,
+    CancelCheck,
     CleanupPolicy,
     CollectedOutputs,
     ExecutionProvider,
@@ -1212,8 +1213,11 @@ class Supervisor:
 
     async def _finish_launch(self, item: _Pending, provider: ExecutionProvider) -> bool:
         """The slow half, as a task of its own (hades #190): build the spec, prepare
-        the checkout, and start the worker. A cancel is honoured before each step and
-        while the prepare runs, and a cancelled task never gets a worker (hades #189)."""
+        the checkout, and start the worker. A cancel is honoured before each step, while
+        the prepare runs, just before the worker is created, and in the transaction that
+        would record it running; a cancelled task never has a running worker (hades
+        #189). Until that transaction the attempt is this task's alone: the cancel sweep
+        acts only on pending and running attempts, and observe skips it."""
         attempt, execution, task = item.attempt, item.execution, item.task
         with log_context(task_id=task.id, execution_id=execution.id, attempt_id=attempt.id):
             if await self._db(partial(self._settle_if_cancelled, attempt.id, "spec")):
@@ -1254,7 +1258,12 @@ class Supervisor:
                 self._command_watches.pop(attempt.id, None)
                 return False
             try:
-                handle = await provider.launch(ws, spec)
+                handle = await provider.launch(ws, spec, cancelled=self._cancel_check(task.id))
+            except LaunchCancelledError as exc:
+                log.info("launch stopped for a cancel", extra={"detail": str(exc)})
+                await self._discard(provider, ws, spec)
+                await self._db(partial(self._settle_if_cancelled, attempt.id, "launch"))
+                return False
             except LaunchRefusedError as exc:
                 await self._discard(provider, ws, spec)
                 await self._db(partial(self._refuse_launch, attempt.id, "launch", str(exc)))
@@ -1265,9 +1274,28 @@ class Supervisor:
                 await self._db(partial(self._environment_failure, attempt.id, "launch", detail))
                 return False
             self._handles[attempt.id] = handle
-            await self._db(partial(self._mark_running, attempt.id, handle))
+            if not await self._db(partial(self._mark_running, attempt.id, handle)):
+                # The cancel landed while the provider was starting the worker. The
+                # attempt is already settled; the worker it started is stopped here, and
+                # anything of it that survives goes with provider retention.
+                await self._stop_cancelled_worker(provider, handle, ws, spec)
+                return False
             log.info("attempt launched", extra={"handle": handle.ref, "provider": provider.name})
             return True
+
+    async def _stop_cancelled_worker(
+        self, provider: ExecutionProvider, handle: Handle, ws: Workspace, spec: LaunchSpec
+    ) -> None:
+        log.info("worker stopped for a cancel during launch", extra={"handle": handle.ref})
+        try:
+            await provider.terminate(handle, "kill")
+        except ProviderError:
+            log.exception("terminate of a cancelled launch failed; retention removes it")
+        await self._discard(provider, ws, spec)
+        self._handles.pop(handle.attempt_id, None)
+        self._workspaces.pop(handle.attempt_id, None)
+        self._workspace_fingerprints.pop(handle.attempt_id, None)
+        self._command_watches.pop(handle.attempt_id, None)
 
     async def _build_spec(
         self,
@@ -1733,14 +1761,19 @@ class Supervisor:
         launches next never had it, and nothing in this process keeps it. The provider
         asks whether the task was cancelled before each of its steps (hades #189)."""
 
-        async def cancelled() -> bool:
-            return await self._db(partial(self._task_cancelled, spec.task_id))
-
         token = await checkout_token_for(self._github, repository)
         try:
-            return await provider.prepare(spec, checkout_token=token, cancelled=cancelled)
+            return await provider.prepare(
+                spec, checkout_token=token, cancelled=self._cancel_check(spec.task_id)
+            )
         finally:
             await release_checkout_token(self._github, token)
+
+    def _cancel_check(self, task_id: str) -> CancelCheck:
+        async def cancelled() -> bool:
+            return await self._db(partial(self._task_cancelled, task_id))
+
+        return cancelled
 
     def _task_cancelled(self, task_id: str) -> bool:
         with self._uow_factory() as uow:
@@ -1969,12 +2002,22 @@ class Supervisor:
             )
         )
 
-    def _mark_running(self, attempt_id: str, handle: Handle) -> None:
+    def _mark_running(self, attempt_id: str, handle: Handle) -> bool:
+        """Record the worker running, unless the task was cancelled while it started
+        (hades #189): then the attempt ends killed at stage launch in this same
+        transaction, it is never running, and False tells the caller to stop the worker."""
         with self._fenced() as uow:
             attempt = uow.attempts.get(attempt_id, for_update=True)
             assert attempt is not None
             execution = uow.executions.get(attempt.execution_id)
             assert execution is not None
+            task = uow.tasks.get(attempt.task_id, for_update=True)
+            assert task is not None
+            if task.state in (TaskState.CANCELLING, TaskState.CANCELLED):
+                if attempt.state is AttemptState.LAUNCHING:
+                    self._end_cancelled_launch(uow, attempt, task, "launch")
+                uow.commit()
+                return False
             now = self._clock.now()
             if handle.image_digest and attempt.image_digest != handle.image_digest:
                 # 13: every attempt records the image digest it ran, resolved at launch.
@@ -2014,6 +2057,7 @@ class Supervisor:
                 )
             )
             uow.commit()
+            return True
 
     def _environment_failure(self, attempt_id: str, stage: str, detail: str) -> None:
         with self._fenced() as uow:
