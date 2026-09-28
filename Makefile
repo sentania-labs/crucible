@@ -66,7 +66,7 @@ CRUCIBLE_DEPLOY_PORT ?= 8080
 .PHONY: up dev down reset lint check-image-manifest scan scan-tree scan-history smoke test test-unit \
 	test-integration e2e e2e-github e2e-live e2e-admin e2e-image build proxy-config proxies preflight \
 	e2e-kind e2e-command-timeout registry-check manifests deploy-kind first-run-kind release-images-classify release-images-pull release-images-verify \
-	deploy-local deploy-local-down images images-check release-notes
+	deploy-local deploy-local-down images images-check images-policy-check release-notes
 
 up: preflight proxy-config ## normal mode: postgres, proxies, migrate, crucible
 	@test -f .env || cp .env.example .env
@@ -127,9 +127,9 @@ reset: ## DESTRUCTIVE: down plus postgres, artifact, and credential volumes
 
 lint: check-image-manifest
 	$(UV) sync --frozen --quiet
-	$(UV) run ruff format --check crucible tests tools/release tools/smoke tools/registry
-	$(UV) run ruff check crucible tests tools/release tools/smoke tools/registry
-	$(UV) run mypy crucible tests tools/release tools/smoke tools/registry
+	$(UV) run ruff format --check crucible tests tools/release tools/smoke tools/registry tools/images
+	$(UV) run ruff check crucible tests tools/release tools/smoke tools/registry tools/images
+	$(UV) run mypy crucible tests tools/release tools/smoke tools/registry tools/images
 	$(UV) run lint-imports
 
 check-image-manifest: ## fail when a declared worker-image tag is stale
@@ -152,6 +152,14 @@ images: ## FDY-0072: build both images from a staged copy the daemon's user can 
 
 images-check: ## build both images and fail if any tag, harness version or OCI digest differs from images/manifest.env
 	DOCKER="$(DOCKER)" CACHE_DIR="$(CACHE_DIR)" NO_CACHE="$(NO_CACHE)" tools/images/images.sh check
+
+# hades #181: every program a shipped policy's required checks run (default-software's
+# `make lint`, `make test`, `make scan`) must resolve in the worker image, so a policy
+# and the image cannot disagree again. Probes the WORKER tag images/manifest.env
+# declares, which `make images` or `make images-check` leaves in the daemon.
+images-policy-check: ## fail when the worker image lacks a program a shipped policy requires
+	$(UV) sync --frozen --quiet
+	DOCKER="$(DOCKER)" $(UV) run python tools/images/policy_commands.py
 
 # Reads the registry through DOCKER, so log it in first: reading a manifest back is
 # still an authenticated registry call.
