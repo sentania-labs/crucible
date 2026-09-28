@@ -373,6 +373,7 @@ class PodRequest:
     working_dir: str = "/tmp"
     service_account: str = "crucible-worker"
     image_pull_secret: str | None = None
+    host_aliases: Sequence[Mapping[str, Any]] = ()
 
 
 def pod_spec(request: PodRequest) -> dict[str, Any]:
@@ -439,6 +440,8 @@ def pod_spec(request: PodRequest) -> dict[str, Any]:
         spec["initContainers"] = [dict(c) for c in request.init_containers]
     if request.image_pull_secret:
         spec["imagePullSecrets"] = [{"name": request.image_pull_secret}]
+    if request.host_aliases:
+        spec["hostAliases"] = [dict(a) for a in request.host_aliases]
     return spec
 
 
@@ -677,10 +680,41 @@ class EgressPlan:
     # a name resolves to is exactly what a translating CNI never matches.
     endpoint_selector: PeerSelector | None = None
     endpoint_ports: tuple[int, ...] = ()
+    # Each allowlisted name with the addresses it resolved to when the policy was
+    # written. The Pod is told these same addresses (`host_aliases`), so what it
+    # connects to is what the policy permits even when the name's answer has since
+    # changed (hades #191).
+    host_addresses: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
     @property
     def empty(self) -> bool:
         return not self.hosts and not self.endpoints and self.endpoint_selector is None
+
+
+def host_aliases(plan: EgressPlan) -> list[dict[str, Any]]:
+    """The Pod's `hostAliases` for a resolved plan: each allowlisted name pinned to the
+    addresses its policy rule permits (hades #191).
+
+    A policy names addresses, and a Pod resolves the name again when it connects. For a
+    name whose answer changes (github.com hands out one address with a 60 second TTL,
+    and a different one to different resolvers) the two drift apart, and every
+    connection times out against the default deny. Writing the policy's own addresses
+    into the Pod's hosts file takes the second lookup away. The broad rule permits any
+    public address, so it pins nothing."""
+    if plan.broad:
+        return []
+    by_address: dict[str, list[str]] = {}
+    for host, addresses in plan.host_addresses:
+        for cidr in addresses:
+            network = ipaddress.ip_network(cidr, strict=False)
+            if network.version != 4 or network.num_addresses != 1:
+                continue
+            names = by_address.setdefault(str(network.network_address), [])
+            if host not in names:
+                names.append(host)
+    return [
+        {"ip": address, "hostnames": sorted(names)} for address, names in sorted(by_address.items())
+    ]
 
 
 def _endpoint_rule(endpoint: str) -> dict[str, Any]:
@@ -876,6 +910,7 @@ __all__ = [
     "config_map",
     "denied_by",
     "egress_policy",
+    "host_aliases",
     "job",
     "labels",
     "limits_from_pod",

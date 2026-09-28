@@ -425,3 +425,63 @@ def test_a_kubernetes_preparer_reads_the_cache_and_never_refreshes_it() -> None:
     assert f'--git-dir "{cache}" fetch --prune origin' in refresh
     assert f'clone --mirror -- "$CLONE_URL" "{cache}"' in refresh
     assert "CLONE_URL='https://github.com/example-org/example-service'" in refresh
+
+
+def _refresh_in(tmp_path: Path, url: str) -> tuple[str, Path]:
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    script = scripts.cache_refresh_script(url=url, cache_name="0123456789abcdef")
+    return script.replace(scripts.CACHE_MOUNT, str(cache)), cache / "0123456789abcdef.git"
+
+
+def test_a_refresh_whose_remote_does_not_answer_costs_seconds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """hades #191: an unanswered connect waited out the kernel's SYN retries twice, about
+    270 seconds. The refresh gives the remote CACHE_REFRESH_CONNECT_SECONDS to answer a
+    ref listing and otherwise leaves the mirror as it is, without fetch or clone."""
+    import time  # noqa: PLC0415
+
+    monkeypatch.setattr(scripts, "CACHE_REFRESH_CONNECT_SECONDS", 1)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    calls = tmp_path / "calls"
+    stub = bin_dir / "git"
+    stub.write_text(
+        "#!/bin/sh\n"
+        'case "$*" in\n'
+        "  *ls-remote*) exec sleep 30 ;;\n"
+        f'  *) echo "$*" >> {calls} ;;\n'
+        "esac\n"
+    )
+    stub.chmod(0o755)
+    script, mirror = _refresh_in(tmp_path, "https://github.com/example-org/example-service")
+    started = time.monotonic()
+    result = subprocess.run(
+        ["sh", "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={"PATH": f"{bin_dir}:/usr/bin:/bin"},
+    )
+    assert result.returncode == 0, result.stderr
+    assert time.monotonic() - started < 10
+    assert "did not answer within 1s" in result.stderr
+    assert not calls.exists() and not mirror.exists()
+
+
+def test_a_refresh_whose_remote_answers_builds_the_mirror(tmp_path: Path) -> None:
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=origin, check=True)
+    (origin / "a.txt").write_text("a\n")
+    subprocess.run(["git", "add", "."], cwd=origin, check=True)
+    subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@example.test", "commit", "-qm", "a"],
+        cwd=origin,
+        check=True,
+    )
+    script, mirror = _refresh_in(tmp_path, str(origin))
+    result = subprocess.run(["sh", "-c", script], capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stderr
+    assert (mirror / "HEAD").is_file()

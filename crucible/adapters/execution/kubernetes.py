@@ -1400,7 +1400,7 @@ class KubernetesProvider:
                     )
                 self._check_endpoint_ready(probe, spec)
                 plan = self._egress_plan(spec, k8sspec.ROLE_WORKER)
-            policy_name = await self._apply_policy(spec, k8sspec.ROLE_WORKER, plan)
+            policy_name, plan = await self._apply_policy(spec, k8sspec.ROLE_WORKER, plan)
             body = k8sspec.job(
                 name=job_name,
                 namespace=self.config.namespace,
@@ -1413,6 +1413,7 @@ class KubernetesProvider:
                     copy=copy,
                     identity_paths=identity_paths,
                     credential_keys=credential_keys,
+                    host_aliases=k8sspec.host_aliases(plan),
                 ),
                 active_deadline_seconds=max(60, spec.timeout_seconds + limits.grace_seconds),
             )
@@ -2641,6 +2642,7 @@ class KubernetesProvider:
                         volumes=volumes,
                         service_account=self.config.service_account,
                         image_pull_secret=self.config.image_pull_secret,
+                        host_aliases=k8sspec.host_aliases(plan),
                     )
                 ),
                 active_deadline_seconds=timeout + LOGIN_READBACK_SECONDS,
@@ -2902,6 +2904,7 @@ class KubernetesProvider:
         copy: _CredentialCopy | None,
         identity_paths: Mapping[str, str],
         credential_keys: Sequence[str],
+        host_aliases: Sequence[Mapping[str, Any]] = (),
     ) -> dict[str, Any]:
         if copy is None and spec.env_from_files:
             spec = replace(spec, env_from_files={})
@@ -2954,6 +2957,7 @@ class KubernetesProvider:
                 working_dir=REPO_MOUNT,
                 service_account=self.config.service_account,
                 image_pull_secret=self.config.image_pull_secret,
+                host_aliases=host_aliases,
             )
         )
 
@@ -3231,7 +3235,9 @@ class KubernetesProvider:
             pod_selector=pod_selector,
         )
 
-    async def _apply_policy(self, spec: LaunchSpec, role: str, plan: EgressPlan) -> str | None:
+    async def _apply_policy(
+        self, spec: LaunchSpec, role: str, plan: EgressPlan
+    ) -> tuple[str | None, EgressPlan]:
         """One NetworkPolicy per attempt per role that needs egress.
 
         26 asks for "one policy per attempt selecting that attempt's pods, with the
@@ -3239,14 +3245,17 @@ class KubernetesProvider:
         object per attempt would have to carry the union of every role's destinations,
         which would hand the worker GitHub and the collector the model endpoints. The
         selector therefore carries the role as well, and a role with no egress gets no
-        policy at all: the namespace's default deny is already the answer for it."""
+        policy at all: the namespace's default deny is already the answer for it.
+
+        Returns the policy's name and the resolved plan, whose addresses the role's Pod
+        is pinned to (`k8sspec.host_aliases`, hades #191)."""
         if plan.empty:
-            return None
+            return None, plan
         plan = await self._resolve_plan(plan)
         name = k8sspec.object_name(f"np-{role}", spec.attempt_id)
         body = self._policy_body(name, self._labels(spec, role), spec.attempt_id, role, plan)
         await self._create("networkpolicies", body)
-        return name
+        return name, plan
 
     async def _resolve_plan(self, plan: EgressPlan) -> EgressPlan:
         """Turn the allowlist's names into the addresses a CIDR-only CNI can enforce.
@@ -3302,6 +3311,7 @@ class KubernetesProvider:
         if self.config.broad_egress or not plan.hosts:
             return replace(plan, broad=self.config.broad_egress)
         cidrs: list[str] = []
+        by_host: list[tuple[str, tuple[str, ...]]] = []
         unresolved: list[str] = []
         forbidden: list[str] = []
         now = time.monotonic()
@@ -3324,6 +3334,7 @@ class KubernetesProvider:
                 if denied is not None:
                     forbidden.append(f"{host} -> {address} inside {denied}")
             cidrs.extend(addresses)
+            by_host.append((host, tuple(addresses)))
         if unresolved:
             raise ProviderError(
                 "the egress allowlist names hosts that do not resolve to an address, so "
@@ -3334,7 +3345,7 @@ class KubernetesProvider:
                 "the egress allowlist resolves into ranges this namespace denies, so no "
                 f"NetworkPolicy may permit it: {sorted(forbidden)}"
             )
-        return replace(plan, cidrs=tuple(dict.fromkeys(cidrs)))
+        return replace(plan, cidrs=tuple(dict.fromkeys(cidrs)), host_addresses=tuple(by_host))
 
     # ----- credentials (12) ---------------------------------------------
 
@@ -3585,7 +3596,7 @@ class KubernetesProvider:
         with contextlib.suppress(KubernetesApiError):
             await self._call(self.client.delete, "jobs", name)
         try:
-            policy_name = await self._apply_policy(spec, role, plan)
+            policy_name, resolved_plan = await self._apply_policy(spec, role, plan)
             body = k8sspec.job(
                 name=name,
                 namespace=self.config.namespace,
@@ -3601,6 +3612,7 @@ class KubernetesProvider:
                         volumes=[*k8sspec.base_volumes(limits), *volumes],
                         service_account=self.config.service_account,
                         image_pull_secret=self.config.image_pull_secret,
+                        host_aliases=k8sspec.host_aliases(resolved_plan),
                     )
                 ),
                 active_deadline_seconds=timeout,
