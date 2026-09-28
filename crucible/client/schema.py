@@ -262,12 +262,6 @@ def kind_schemas() -> dict[str, dict[str, Any]]:
         "provider_list": _items("execution providers and their health", ANY_OBJ),
         "github_status": _obj("the GitHub App's health", {"configured": BOOL}),
         "github_check": _obj("the per-repository token check", {}),
-        "github_connected": _obj(
-            "the connected GitHub App: its id, key fingerprint, where the service keeps it, "
-            "and its install link; never the key",
-            {"configured": BOOL},
-            {"app": ANY_OBJ, "install_url": NSTR, "stored_in": ANY_OBJ},
-        ),
         "github_installations": _obj(
             "the repository picker: the App, its install link, and each installation's "
             "repositories grouped by account",

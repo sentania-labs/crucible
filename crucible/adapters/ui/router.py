@@ -1909,9 +1909,8 @@ def tokens_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
 
 @router.get("/github", response_class=HTMLResponse)
 def github_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
-    """crucible#120, #168: create the App with one click (or connect an existing one by
-    its id and key), install it from its own link, then pick repositories from what each
-    installation covers."""
+    """crucible#120, #168: create the App with one click, install it from its own link,
+    then pick repositories from what each installation covers."""
     found = _require(request, ctx, uow)
     if isinstance(found, RedirectResponse):
         return found
@@ -2059,52 +2058,8 @@ def github_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                     ],
                 }
             sections.append(section)
-    existing = request.query_params.get("existing") == "1"
-    if admin and not existing:
-        sections.append(_github_create_section(configured=state["configured"]))
-    if admin and existing:
-        # Right under the connection: the operator asked for it by its link.
-        sections.insert(
-            1,
-            {
-                "title": "Connect an existing GitHub App",
-                "note": (
-                    "For an App you already have: its numeric ID and one of its private keys "
-                    "(the whole .pem file). GitHub is asked about them before anything is "
-                    "stored; the service then keeps them (on Kubernetes the Secret "
-                    "crucible-github-app in its own namespace, which it alone writes). The "
-                    "key is never shown or audited; its public fingerprint is."
-                ),
-                "form": {
-                    "action": "/ui/actions/github-connect",
-                    "label": "Check and connect",
-                    "fields": [
-                        {
-                            "name": "app_id",
-                            "label": "App ID",
-                            "kind": "number",
-                            "value": state["app_id"] or "",
-                            "required": True,
-                        },
-                        {
-                            "name": "private_key",
-                            "label": "Private key (.pem)",
-                            "kind": "textarea",
-                            "rows": 6,
-                            "required": True,
-                        },
-                        {
-                            "name": "webhook_secret",
-                            "label": "Webhook secret (optional)",
-                            "kind": "password",
-                        },
-                        {"name": "reason", "label": "Reason", "required": True},
-                    ],
-                },
-                "links": [{"href": "/ui/github", "label": "Create a new App instead"}],
-            },
-        )
     if admin:
+        sections.append(_github_create_section(configured=state["configured"]))
         sections.append(_github_external_url_section(ctx, uow))
     return _page(
         request,
@@ -2120,8 +2075,8 @@ def github_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
 
 
 def _github_create_section(*, configured: bool) -> dict[str, Any]:
-    """crucible#168: Create GitHub App, GitHub's manifest flow. The existing-App form is
-    behind a secondary link."""
+    """crucible#168: Create GitHub App, GitHub's manifest flow, the only way to connect
+    an App (the operator, 2026-09-27)."""
     return {
         "title": "Create the GitHub App" if not configured else "Replace the App",
         "note": (
@@ -2152,12 +2107,6 @@ def _github_create_section(*, configured: bool) -> dict[str, Any]:
                 {"name": "reason", "label": "Reason"},
             ],
         },
-        "links": [
-            {
-                "href": "/ui/github?existing=1",
-                "label": "Already have a GitHub App? Connect it with its App ID and key",
-            }
-        ],
     }
 
 
@@ -2849,23 +2798,6 @@ async def action(request: Request, action: str, ctx: Ctx, uow: UoW) -> Response:
                 f"Saved routing policy version {saved['routing_policy']['version']}. "
                 f"Enabled: {enabled}."
                 + (f" Disabled as no longer offered: {', '.join(dropped)}." if dropped else ""),
-            )
-        elif action == "github-connect":
-            connected = github.connect(
-                ctx.admin,
-                uow,
-                principal=principal.name,
-                app_id=int(form.get("app_id") or "0"),
-                private_key=form.get("private_key", ""),
-                webhook_secret=form.get("webhook_secret") or None,
-                reason=reason,
-            )
-            uow.commit()
-            return _redirect(
-                form,
-                f"Connected App {connected['app_id']}"
-                + (f" ({connected['app'].get('slug')})" if connected["app"].get("slug") else "")
-                + ". Install it from the link below, then pick repositories.",
             )
         elif action == "github-create-app":
             started = github_manifest.start(

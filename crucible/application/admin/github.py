@@ -3,8 +3,7 @@ public-key fingerprint, and per registered repository whether an installation co
 and what the last check found. `check` mints a token per repository and discards it.
 
 Connect GitHub (crucible#120, ADR 0017): the operator creates the App with one click
-(`github_manifest`, crucible#168) or enters an existing App's id and private key, which
-the service checks against `GET /app` before it stores anything; either way it then owns
+(`github_manifest`, crucible#168), the only way to connect one; the service then owns
 the credential (the `crucible-github-app` Secret on Kubernetes, the files
 beside `github.app.private_key_path` with Docker). The App's install link comes from its
 own `html_url`. The repository picker lists what each installation covers, grouped by
@@ -28,7 +27,7 @@ from crucible.application.admin.context import (
     guard_mutation,
 )
 from crucible.application.admin.repositories import register as register_repository
-from crucible.application.errors import ConflictError, ContractValidationError
+from crucible.application.errors import ConflictError
 from crucible.contracts.api import ExternalReviewAttestation, RepositoryRegistration
 from crucible.domain.events import EventKind
 from crucible.ports.github import AppCredential, GitHubAppStoreError, GitHubError
@@ -268,33 +267,11 @@ def is_rsa(pem: bytes) -> bool:
     return isinstance(key, rsa.RSAPrivateKey)
 
 
-def _normalized_pem(private_key: str) -> bytes:
-    text = private_key.replace("\r\n", "\n").strip()
-    if not text:
-        raise ContractValidationError(
-            "a private key is required",
-            errors=[{"path": "private_key", "message": "must not be empty"}],
-        )
-    pem = (text + "\n").encode("utf-8")
-    if not is_rsa(pem):
-        raise ContractValidationError(
-            "the private key is not an RSA private key in PEM form",
-            errors=[
-                {
-                    "path": "private_key",
-                    "message": "paste the whole .pem file GitHub gave you, BEGIN and END lines "
-                    "included",
-                }
-            ],
-        )
-    return pem
-
-
 def _github_refusal(exc: Exception, app_id: int, api_base: str) -> GitHubConnectError:
     if isinstance(exc, GitHubError) and exc.status in (401, 403):
         return GitHubConnectError(
-            f"GitHub refused the key for App {app_id} (HTTP {exc.status}); check the App ID "
-            "and that the key is one of that App's private keys"
+            f"GitHub refused the stored key for App {app_id} (HTTP {exc.status}); if the "
+            "App or its key was deleted on GitHub, create a new App on the GitHub page"
         )
     if isinstance(exc, GitHubError) and exc.status == 404:
         return GitHubConnectError(f"GitHub has no App {app_id} for this key (HTTP 404)")
@@ -304,52 +281,6 @@ def _github_refusal(exc: Exception, app_id: int, api_base: str) -> GitHubConnect
         )
     return GitHubConnectError(
         f"the GitHub API at {api_base} could not be reached ({type(exc).__name__})"
-    )
-
-
-def connect(
-    ctx: AdminContext,
-    uow: UnitOfWork,
-    *,
-    principal: str,
-    app_id: int,
-    private_key: str,
-    webhook_secret: str | None,
-    reason: str | None,
-) -> dict[str, Any]:
-    """Check the id and key against `GET /app`, then store them. Nothing is stored when
-    GitHub refuses them. The answer carries the App's install link, never the key."""
-    reason = guard_mutation(ctx, uow, reason, principal=principal, operation="github connect")
-    store = ctx.github_credentials
-    if store is None or ctx.github_apps is None:
-        raise ConflictError(
-            "this deployment has nowhere to keep a GitHub App credential: run on the "
-            "Kubernetes provider, or set github.app.private_key_path (ADR 0017)"
-        )
-    if isinstance(app_id, bool) or not isinstance(app_id, int) or app_id < 1:
-        raise ContractValidationError(
-            "the App ID must be a positive number",
-            errors=[{"path": "app_id", "message": "must be a positive integer"}],
-        )
-    pem = _normalized_pem(private_key)
-    secret = (webhook_secret or "").strip()
-    try:
-        app = ctx.github_apps.app(AppCredential(app_id, pem))
-    except (GitHubError, OSError) as exc:
-        raise _github_refusal(exc, app_id, ctx.github_app.api_base) from None
-    if app.get("id") not in (app_id, str(app_id)):
-        raise GitHubConnectError(
-            f"GitHub says this key belongs to App {app.get('id')}, not App {app_id}"
-        )
-    return keep(
-        ctx,
-        uow,
-        principal=principal,
-        reason=reason,
-        app={**app, "id": app_id},
-        private_key=pem,
-        webhook_secret=secret.encode("utf-8") if secret else None,
-        via="existing App",
     )
 
 
@@ -364,9 +295,9 @@ def keep(
     webhook_secret: bytes | None,
     via: str,
 ) -> dict[str, Any]:
-    """Audit, then store, an App credential GitHub has vouched for: an existing App's
-    key it accepted, or a new App's key it just made (crucible#168). The audit carries
-    the key's public fingerprint and never the key."""
+    """Audit, then store, an App credential GitHub has vouched for: a new App's key it
+    just made (crucible#168). The audit carries the key's public fingerprint and never
+    the key."""
     store = ctx.github_credentials
     assert store is not None
     app_id = int(app["id"])

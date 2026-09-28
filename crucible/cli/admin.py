@@ -224,20 +224,6 @@ def build_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     g_sub = g.add_subparsers(dest="github_command", required=True)
     g_sub.add_parser("status", help="the App's configuration and key")
     g_sub.add_parser("check", help="mint and discard a token per registered repository")
-    connect = g_sub.add_parser(
-        "connect",
-        help="an existing App's id and private key, checked with GitHub and then kept by "
-        "the service (ADR 0017)",
-    )
-    connect.add_argument("--app-id", type=int, required=True, help="the App's numeric id")
-    connect.add_argument(
-        "--private-key-file",
-        required=True,
-        help="the .pem GitHub gave you; read here, never placed in argv or a record",
-    )
-    connect.add_argument(
-        "--webhook-secret-file", default=None, help="the App's webhook secret, when one is used"
-    )
     g_sub.add_parser(
         "external-url",
         help="where GitHub sends the browser back when creating the App (crucible#168)",
@@ -504,26 +490,6 @@ def _picks(args: argparse.Namespace) -> list[dict[str, Any]]:
     ]
 
 
-def _read_file(path: str, what: str) -> str:
-    try:
-        with open(path, encoding="utf-8") as handle:
-            return handle.read()
-    except OSError as exc:
-        raise UsageError(f"cannot read the {what} from {path}: {exc.strerror}") from None
-
-
-def _connect_body(args: argparse.Namespace) -> dict[str, Any]:
-    return {
-        "app_id": args.app_id,
-        "private_key": _read_file(args.private_key_file, "private key"),
-        "webhook_secret": (
-            _read_file(args.webhook_secret_file, "webhook secret")
-            if args.webhook_secret_file
-            else None
-        ),
-    }
-
-
 def _add_repository_body(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "installation_id": args.installation_id,
@@ -597,8 +563,6 @@ def _remote(args: argparse.Namespace, remote: Api) -> Any:
     if command == "github":
         if args.github_command == "status":
             return remote.call("GET", "/v1/admin/github")
-        if args.github_command == "connect":
-            return remote.call("POST", "/v1/admin/github/app", {**reason, **_connect_body(args)})
         if args.github_command == "installations":
             return remote.call("GET", "/v1/admin/github/installations")
         if args.github_command == "external-url":
@@ -875,18 +839,7 @@ def _local(args: argparse.Namespace, wiring: Wiring) -> Any:
                 )
                 uow.commit()
                 return result
-            if verb == "connect":
-                body = _connect_body(args)
-                result = github.connect(
-                    admin,
-                    uow,
-                    principal=principal,
-                    app_id=body["app_id"],
-                    private_key=body["private_key"],
-                    webhook_secret=body["webhook_secret"],
-                    reason=args.reason,
-                )
-            elif verb == "add-repository":
+            if verb == "add-repository":
                 body = _add_repository_body(args)
                 result = github.add_repository(
                     admin,
@@ -1276,7 +1229,6 @@ def kind_of(args: argparse.Namespace) -> str:
         ("providers", "status"): "provider_list",
         ("github", "status"): "github_status",
         ("github", "check"): "github_check",
-        ("github", "connect"): "github_connected",
         ("github", "installations"): "github_installations",
         ("github", "external-url"): "github_external_url",
         ("github", "set-external-url"): "github_external_url",

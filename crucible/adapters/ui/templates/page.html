@@ -85,7 +85,6 @@
       </label>{% endif %}{% endfor %}</div>
       <button class="lat-btn {% if section.form.danger %}lat-btn--danger{% else %}lat-btn--primary{% endif %}" type="submit">{{ section.form.label }}</button>
     </form>{% if section.form.collapsed %}</details>{% endif %}{% endif %}
-    {% if section.links %}<p class="lat-hint">{% for link in section.links %}<a href="{{ link.href }}">{{ link.label }}</a>{% if not loop.last %} | {% endif %}{% endfor %}</p>{% endif %}
   </section>
   {% endfor %}
 </div>
