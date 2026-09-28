@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from itertools import pairwise
 
 import pytest
@@ -26,6 +27,8 @@ from tests.e2e.conftest import (
 
 pytestmark = pytest.mark.e2e
 
+# How long a wait for a launch or a settled task may take, by the clock.
+WAIT_SECONDS = 240
 DONE = {"awaiting_internal_review", "gates_passed", "awaiting_acceptance", "pre_pr_gates_failed"}
 
 
@@ -38,8 +41,13 @@ async def _attempt_id(client: TestClient, task_id: str) -> str:
 async def _wait_running(
     supervisor: Supervisor, client: TestClient, task_id: str, *, ticks: int = 40
 ) -> dict[str, object]:
-    for _ in range(ticks):
+    # At least `ticks` ticks and at least WAIT_SECONDS: a launch runs beside the tick
+    # (hades #190), so a count of ticks alone is no budget.
+    started = time.monotonic()
+    done = 0
+    while done < ticks or time.monotonic() - started < WAIT_SECONDS:
         await supervisor.tick()
+        done += 1
         attempt = client.get(f"/v1/tasks/{task_id}").json().get("latest_attempt")
         if attempt and attempt["state"] == "running":
             return dict(attempt)
@@ -98,7 +106,8 @@ async def test_a_worker_removed_out_of_band_is_lost(
     document["lifecycle"] = {"max_attempts": 1, "retry_on": [], "cleanup": "policy"}
     task_id = submit_and_start(client, document)
 
-    for _ in range(40):
+    deadline = time.monotonic() + WAIT_SECONDS
+    while time.monotonic() < deadline:
         await supervisor.tick()
         attempt = client.get(f"/v1/tasks/{task_id}").json().get("latest_attempt")
         if attempt and attempt["state"] == "running":
@@ -167,7 +176,8 @@ async def test_a_restart_re_attaches_and_resumes_the_log_offset(
     task_id = submit_and_start(client, e2e_contract("E2E-0012", "restart", worker_image))
 
     # First supervisor: launch, then stand down mid-run.
-    for _ in range(40):
+    deadline = time.monotonic() + WAIT_SECONDS
+    while time.monotonic() < deadline:
         await supervisor.tick()
         attempt = client.get(f"/v1/tasks/{task_id}").json().get("latest_attempt")
         if attempt and attempt["state"] == "running":
@@ -226,7 +236,8 @@ async def test_the_run_completes_with_no_client_attached(
     task_id = submit_and_start(client, e2e_contract("E2E-0013", "disconnect", worker_image))
     client.close()
 
-    for _ in range(60):
+    deadline = time.monotonic() + WAIT_SECONDS
+    while time.monotonic() < deadline:
         await supervisor.tick()
         with ctx.uow_factory() as uow:
             task = uow.tasks.get(task_id)
@@ -258,7 +269,8 @@ async def test_a_second_attempt_on_the_same_branch_waits_for_the_checkout_lease(
     second_document["repository"]["work_branch"] = "crucible/E2E-0014"
     second = submit_and_start(client, second_document)
 
-    for _ in range(20):
+    deadline = time.monotonic() + WAIT_SECONDS
+    while time.monotonic() < deadline:
         await supervisor.tick()
         view = client.get(f"/v1/tasks/{first}").json()
         if view.get("latest_attempt") and view["latest_attempt"]["state"] == "running":

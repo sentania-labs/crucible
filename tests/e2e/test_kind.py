@@ -80,6 +80,8 @@ pytestmark = [
 ]
 
 ATTEMPT_PREFIX = "01KIND00000000000000000"
+# How long a supervisor-driven test waits for a launch to reach a running worker.
+LAUNCH_DEADLINE_SECONDS = 240
 
 
 class RecordingKubernetesClient(KubernetesClient):
@@ -428,7 +430,10 @@ async def test_rows_5_7_11_23_supervisor_restart_and_full_gate_lifecycle(
             grace_seconds=5,
             harnesses=harnesses,
         )
-        for _ in range(60):
+        # By the clock, not by ticks: a launch runs beside the tick (hades #190), so a
+        # tick no longer lasts as long as the launch it starts.
+        deadline = time.monotonic() + LAUNCH_DEADLINE_SECONDS
+        while time.monotonic() < deadline:
             await first.tick()
             attempt = client.get(f"/v1/tasks/{task_id}").json().get("latest_attempt")
             if attempt and attempt["state"] == "running":
@@ -555,7 +560,8 @@ async def test_rows_5_7_11_23_supervisor_restart_and_full_gate_lifecycle(
         cancel_document = e2e_contract("E2E-KIND-CANCEL", "supervisor-cancel", image)
         cancel_document["execution_request"]["provider"] = "kubernetes"
         cancel_task = submit_and_start(client, cancel_document)
-        for _ in range(60):
+        deadline = time.monotonic() + LAUNCH_DEADLINE_SECONDS
+        while time.monotonic() < deadline:
             await successor.tick()
             cancel_attempt = client.get(f"/v1/tasks/{cancel_task}").json().get("latest_attempt")
             if cancel_attempt and cancel_attempt["state"] == "running":

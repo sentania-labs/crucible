@@ -508,10 +508,17 @@ async def run_until(
     *,
     max_ticks: int = 40,
     pause: float = 0.5,
+    min_seconds: float = 240.0,
 ) -> str:
+    """Tick until the task reaches one of `states`: at least `max_ticks` ticks and at
+    least `min_seconds`. A launch runs beside the tick (hades #190), so a tick no longer
+    lasts as long as the launch it starts and a count of ticks alone is no budget."""
     state = ""
-    for _ in range(max_ticks):
+    ticks = 0
+    started = time.monotonic()
+    while ticks < max_ticks or time.monotonic() - started < min_seconds:
         await supervisor.tick()
+        ticks += 1
         state = str(client.get(f"/v1/tasks/{task_id}").json()["state"])
         if state in states:
             return state
