@@ -19,6 +19,7 @@ import asyncio
 import hashlib
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from crucible.application.admin.context import (
     AdminContext,
@@ -225,14 +226,33 @@ def check(
 # ----- Connect GitHub and the repository picker (crucible#120, ADR 0017) -------------
 
 
-def _install_url(app: dict[str, Any]) -> str | None:
+def web_base(api_base: str) -> str:
+    """GitHub's web origin for its API base: `https://github.com` for api.github.com, the
+    host without `/api/v3` for GitHub Enterprise Server, and the API's own origin
+    otherwise (the stand-in serves both halves). The manifest form and the install page
+    are web pages, not API calls (crucible#168)."""
+    parts = urlsplit(api_base.rstrip("/"))
+    host = parts.netloc
+    path = parts.path
+    if host.startswith("api."):
+        return f"{parts.scheme}://{host[len('api.') :]}"
+    if path.endswith("/api/v3"):
+        path = path[: -len("/api/v3")]
+    return f"{parts.scheme}://{host}{path}".rstrip("/")
+
+
+def _install_url(app: dict[str, Any], api_base: str = "https://api.github.com") -> str | None:
+    """The App's install page, from the `html_url` GitHub gave, only when that is an
+    HTTPS page or on GitHub's own web origin for this API."""
     html_url = app.get("html_url")
-    if isinstance(html_url, str) and html_url.startswith("https://"):
+    if not isinstance(html_url, str):
+        return None
+    if html_url.startswith("https://") or html_url.startswith(web_base(api_base) + "/"):
         return html_url.rstrip("/") + "/installations/new"
     return None
 
 
-def _is_rsa(pem: bytes) -> bool:
+def is_rsa(pem: bytes) -> bool:
     """GitHub App keys are RSA and JWTs are RS256; any other key is refused plainly here
     rather than failing later inside the signature."""
     try:
@@ -253,7 +273,7 @@ def _normalized_pem(private_key: str) -> bytes:
             errors=[{"path": "private_key", "message": "must not be empty"}],
         )
     pem = (text + "\n").encode("utf-8")
-    if not _is_rsa(pem):
+    if not is_rsa(pem):
         raise ContractValidationError(
             "the private key is not an RSA private key in PEM form",
             errors=[
@@ -318,6 +338,35 @@ def connect(
         raise GitHubConnectError(
             f"GitHub says this key belongs to App {app.get('id')}, not App {app_id}"
         )
+    return keep(
+        ctx,
+        uow,
+        principal=principal,
+        reason=reason,
+        app={**app, "id": app_id},
+        private_key=pem,
+        webhook_secret=secret.encode("utf-8") if secret else None,
+        via="existing App",
+    )
+
+
+def keep(
+    ctx: AdminContext,
+    uow: UnitOfWork,
+    *,
+    principal: str,
+    reason: str,
+    app: dict[str, Any],
+    private_key: bytes,
+    webhook_secret: bytes | None,
+    via: str,
+) -> dict[str, Any]:
+    """Audit, then store, an App credential GitHub has vouched for: an existing App's
+    key it accepted, or a new App's key it just made (crucible#168). The audit carries
+    the key's public fingerprint and never the key."""
+    store = ctx.github_credentials
+    assert store is not None
+    app_id = int(app["id"])
     before = status(ctx, uow)
     # The event first and the store last: the credential leaves the transaction, so a
     # refusal of the event (or anything before it) must not leave a changed credential
@@ -332,21 +381,23 @@ def connect(
         after={
             "app_id": app_id,
             "app_slug": app.get("slug"),
-            "key_fingerprint": fingerprint_of(pem),
-            "webhook_secret_set": bool(secret),
+            "app_owner": app.get("owner"),
+            "via": via,
+            "key_fingerprint": fingerprint_of(private_key),
+            "webhook_secret_set": webhook_secret is not None,
             "stored_in": (before.get("stored_in") or {}).get("name")
             or (before.get("stored_in") or {}).get("path"),
         },
     )
     try:
-        written = store.write(
-            app_id=app_id,
-            private_key=pem,
-            webhook_secret=secret.encode("utf-8") if secret else None,
-        )
+        written = store.write(app_id=app_id, private_key=private_key, webhook_secret=webhook_secret)
     except GitHubAppStoreError as exc:
         raise ConflictError(str(exc)) from None
-    done = {**status(ctx, uow), "app": app, "install_url": _install_url(app)}
+    done = {
+        **status(ctx, uow),
+        "app": app,
+        "install_url": _install_url(app, ctx.github_app.api_base),
+    }
     if written.get("warning"):
         done["warning"] = written["warning"]
     return done
@@ -368,7 +419,7 @@ def apps_view(ctx: AdminContext, uow: UnitOfWork) -> dict[str, Any]:
         "installations": [],
     }
     if not connected:
-        view["error"] = "No GitHub App is connected. Enter its App ID and private key first."
+        view["error"] = "No GitHub App is connected. Create one on the GitHub page first."
         return view
     assert ctx.github_apps is not None
     try:
@@ -378,7 +429,7 @@ def apps_view(ctx: AdminContext, uow: UnitOfWork) -> dict[str, Any]:
         view["error"] = _github_refusal(exc, _app_id(ctx), ctx.github_app.api_base).detail
         return view
     view["app"] = app
-    view["install_url"] = _install_url(app)
+    view["install_url"] = _install_url(app, ctx.github_app.api_base)
     registered = {
         repo.url.rstrip("/").removesuffix(".git").lower(): repo.name for repo in _registered(uow)
     }

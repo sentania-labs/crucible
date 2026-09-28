@@ -274,6 +274,12 @@ def kind_schemas() -> dict[str, dict[str, Any]]:
             {"connected": BOOL, "installations": {"type": "array"}},
             {"app": ANY_OBJ, "install_url": NSTR, "error": NSTR},
         ),
+        "github_external_url": _obj(
+            "the github.external_url setting: where GitHub sends the browser back when "
+            "creating the App; null means the address the browser used (crucible#168)",
+            {"setting": STR, "source": STR},
+            {"url": NSTR, "updated_at": NSTR, "updated_by": NSTR, "reason": NSTR},
+        ),
         "gateway": _obj(
             "the local gateway: its URL and where it comes from, whether a key is set, the "
             "last test in plain words, and the local model entries in force",

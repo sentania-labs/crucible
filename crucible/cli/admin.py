@@ -34,6 +34,7 @@ from crucible.application.admin import (
     credentials,
     gateway,
     github,
+    github_manifest,
     harness_test,
     harnesses,
     images,
@@ -237,6 +238,15 @@ def build_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     connect.add_argument(
         "--webhook-secret-file", default=None, help="the App's webhook secret, when one is used"
     )
+    g_sub.add_parser(
+        "external-url",
+        help="where GitHub sends the browser back when creating the App (crucible#168)",
+    )
+    set_url = g_sub.add_parser(
+        "set-external-url",
+        help="override that address; an empty --url clears it (the browser's address is used)",
+    )
+    set_url.add_argument("--url", required=True, help="e.g. https://hades.example.internal")
     g_sub.add_parser(
         "installations", help="the App's install link, installations and their repositories"
     )
@@ -591,6 +601,12 @@ def _remote(args: argparse.Namespace, remote: Api) -> Any:
             return remote.call("POST", "/v1/admin/github/app", {**reason, **_connect_body(args)})
         if args.github_command == "installations":
             return remote.call("GET", "/v1/admin/github/installations")
+        if args.github_command == "external-url":
+            return remote.call("GET", "/v1/admin/github/external-url")
+        if args.github_command == "set-external-url":
+            return remote.call(
+                "POST", "/v1/admin/github/external-url", {**reason, "url": args.url or None}
+            )
         if args.github_command == "add-repository":
             return remote.call(
                 "POST", "/v1/admin/github/repositories", {**reason, **_add_repository_body(args)}
@@ -851,6 +867,14 @@ def _local(args: argparse.Namespace, wiring: Wiring) -> Any:
                 return github.status(admin, uow)
             if verb == "installations":
                 return github.apps_view(admin, uow)
+            if verb == "external-url":
+                return github_manifest.external_url_view(admin, uow)
+            if verb == "set-external-url":
+                result = github_manifest.save_external_url(
+                    admin, uow, principal=principal, url=args.url or None, reason=args.reason
+                )
+                uow.commit()
+                return result
             if verb == "connect":
                 body = _connect_body(args)
                 result = github.connect(
@@ -1254,6 +1278,8 @@ def kind_of(args: argparse.Namespace) -> str:
         ("github", "check"): "github_check",
         ("github", "connect"): "github_connected",
         ("github", "installations"): "github_installations",
+        ("github", "external-url"): "github_external_url",
+        ("github", "set-external-url"): "github_external_url",
         ("github", "add-repository"): "repository",
         ("gateway", "show"): "gateway",
         ("gateway", "set"): "gateway_test",

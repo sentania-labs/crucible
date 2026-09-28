@@ -15,6 +15,7 @@ from crucible.application.admin import (
     credentials,
     gateway,
     github,
+    github_manifest,
     harness_test,
     harnesses,
     images,
@@ -576,6 +577,28 @@ def admin_github_connect(
         private_key=private_key,
         webhook_secret=webhook_secret,
         reason=_reason(body),
+    )
+    uow.commit()
+    return result
+
+
+@router.get("/admin/github/external-url")
+def admin_github_external_url(ctx: Ctx, uow: UoW, _principal: Admin) -> dict[str, Any]:
+    """The `github.external_url` setting (crucible#168): where GitHub sends the browser
+    back in the Create GitHub App flow. None: the address the browser used."""
+    return github_manifest.external_url_view(_admin(ctx), uow)
+
+
+@router.post("/admin/github/external-url")
+def admin_github_save_external_url(
+    ctx: Ctx, uow: UoW, principal: Admin, body: Annotated[dict[str, Any], Body()]
+) -> dict[str, Any]:
+    """Save the override; an empty or null `url` clears it."""
+    url = body.get("url")
+    if url is not None and not isinstance(url, str):
+        raise ConflictError("url must be a string or null")
+    result = github_manifest.save_external_url(
+        _admin(ctx), uow, principal=principal.name, url=url, reason=_reason(body)
     )
     uow.commit()
     return result
