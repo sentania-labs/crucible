@@ -11,7 +11,7 @@ them (ADR 0015, ADR 0017).
 | Object | Namespace | Keys | Read by |
 |---|---|---|---|
 | `crucible-database` | `crucible` | `password`, `url` | the PostgreSQL StatefulSet (`password`) and the api, supervisor and migration Job (`url`) |
-| `crucible-github-app` | `crucible` | `app-id`, `app.pem`, `webhook.secret` | written only by Crucible (Connect GitHub on the GitHub page); read by the api and supervisor through the API server, and mounted on those pods only for the webhook secret (12). **Never delivered by GitOps.** |
+| `crucible-github-app` | `crucible` | `app-id`, `app.pem`, `webhook.secret` | written only by Crucible (Create GitHub App on the GitHub page); read by the api and supervisor through the API server, and mounted on those pods only for the webhook secret (12). **Never delivered by GitOps.** |
 | `crucible-harness-<harness>` | `crucible-workers` | one per auth file the adapter declares | written only by Crucible (the login, the Hermes key, the sync-back); copied per attempt into `cred-<attempt>` (12, 26). **Never delivered by GitOps.** |
 | an image pull secret | both | `.dockerconfigjson` | the kubelet, when the packages are private |
 

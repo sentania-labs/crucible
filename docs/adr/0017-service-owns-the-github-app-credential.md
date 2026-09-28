@@ -29,7 +29,7 @@ building an app/seevice."
 1. **The service is the single writer of the GitHub App credential.** On Kubernetes it is
    the Secret `crucible-github-app` in the service's own namespace (`crucible`, named by
    `github.app.secret_name`), keys `app-id`, `app.pem` and `webhook.secret`. The service
-   creates it the first time Connect GitHub writes it, labels it
+   creates it the first time Create GitHub App writes it, labels it
    `app.kubernetes.io/managed-by: crucible` and `crucible.credential: github-app`, and
    replaces its data with one merge patch on each later write; a webhook secret is
    replaced only when one is given. With the Docker provider the same three files sit
@@ -106,13 +106,15 @@ building an app/seevice."
   first-run Secret, and cannot read any. Both Roles grant `create` on Secrets in
   `crucible`, to different accounts; neither can read the other's Secret.
 - A deployment that sealed `crucible-github-app` before this change removes it from its
-  GitOps repository without pruning it (Argo's prune would delete the key), or connects
+  GitOps repository without pruning it (Argo's prune would delete the key), or creates
   the App again from the GitHub page afterwards. On its first write the service takes the
   Secret over: it sets its labels and replaces its data.
 - Rotation is Replace the App on the GitHub page: a new App, created and installed the
-  same way, then the old App deleted on GitHub (amended 2026-09-27; it was a new key for
-  the same App through Connect GitHub, which is removed). The store replaces the id and
-  the key together, so the two can never disagree.
+  same way, each registered repository registered again with the new installation (a
+  registration carries its installation id, and a new App's installations are new),
+  then the old App deleted on GitHub (amended 2026-09-27; it was a new key for the same
+  App through the paste form of decision 2, which is removed). The store replaces the id
+  and the key together, so the two can never disagree.
 - With the Docker provider the connect flow needs the directory beside
   `github.app.private_key_path` writable by the service; compose mounts it read-only
   today, and the flow refuses there and names the directory.
@@ -180,4 +182,5 @@ own app - it's a complicated duplicate". Decision 2 is removed rather than kept 
 link: no form, no `POST /v1/admin/github/app`, no `crucible admin github connect`. Replace
 the App offers only "Create a new App instead". The audited store path Create uses
 (`github.keep`) is unchanged, and decision 4 still counts a credential a deployment
-placed itself.
+placed itself. "Connect GitHub" elsewhere in this record and in the code names the step
+that stores the App, which Create GitHub App now performs.

@@ -207,8 +207,8 @@ operator creates the App with one click on the GitHub page (GitHub's manifest
 flow: GitHub makes the App and its key and hands them to the service once, for
 a single-use code). That is the only way to connect an App; there is no form,
 API route or CLI verb that takes an existing App's id and key (the operator,
-2026-09-27). From then on the service is the credential's only writer. In Kubernetes it is the
-Secret `crucible-github-app` in the `crucible` namespace, keys `app-id`,
+2026-09-27). From then on the service is the credential's only writer. In
+Kubernetes it is the Secret `crucible-github-app` in the `crucible` namespace, keys `app-id`,
 `app.pem` and `webhook.secret`, created and labelled by the service and read
 through the API server on each signature; it is also mounted, optional, on
 the `crucible` pods only, where the webhook route reads `webhook.secret`.
@@ -217,7 +217,8 @@ GitOps does not deliver it. Locally the same three files sit beside
 container, written mode 0600 by the same flow. A Secret or directory a
 deployment filled itself still works when `github.enabled` and
 `github.app.app_id` name it. Rotation is Replace the App on the GitHub page (a
-new App, created the same way, installed, and the old App deleted on GitHub).
+new App, created the same way and installed, each repository registered again
+with its new installation, and the old App deleted on GitHub).
 Workers, collectors, verifiers, and publishers never mount that Secret. Crucible signs a JWT with the key in memory,
 exchanges it for an installation token scoped to the one repository the
 job needs, and hands that token to the publisher container as a file on
