@@ -21,6 +21,7 @@
     {% for href, label in nav %}{% if href %}<a href="{{ href }}" {% if active == href %}aria-current="page"{% endif %}>{{ label }}</a>{% else %}<span class="admin-nav-group">{{ label }}</span>{% endif %}{% endfor %}
   </nav>{% endif %}
   <main class="admin-main">
+    {% if supervisor_warning %}<div class="lat-banner lat-banner--bad admin-flash" role="alert"><b>The supervisor is not healthy.</b> No task is launched, observed or cancelled until it recovers; the API and this page still work. {{ supervisor_warning }}. <a href="/ui">Status</a></div>{% endif %}
     {% if message %}<div class="lat-banner lat-banner--{{ message_kind }} admin-flash">{{ message }}</div>{% endif %}
     {% block content %}{% endblock %}
   </main>

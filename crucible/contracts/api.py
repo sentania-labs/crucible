@@ -210,6 +210,8 @@ class ReadyCheck(BaseModel):
 
 
 class ReadyView(Response):
+    # hades #190: the database and the migrations decide `ready`; the supervisor's
+    # check is reported and does not.
     ready: bool
     database: ReadyCheck
     migrations: ReadyCheck

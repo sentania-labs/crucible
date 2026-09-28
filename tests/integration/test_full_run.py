@@ -99,7 +99,10 @@ async def test_submit_start_run_to_reported(client: TestClient, supervisor: Supe
     assert sup["tick_ms"] is not None
     assert sup["providers"][0]["name"] == "fake"
     await supervisor.stop()
-    assert client.get("/v1/ready").status_code == 503
+    # hades #190: a stopped supervisor is reported, and the API stays ready.
+    ready = client.get("/v1/ready")
+    assert ready.status_code == 200 and ready.json()["supervisor"]["ok"] is False
+    assert client.get("/v1/supervisor").json()["healthy"] is False
 
 
 async def test_task_view_before_first_tick(client: TestClient) -> None:

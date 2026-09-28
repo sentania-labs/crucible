@@ -60,7 +60,10 @@ is a follow-up phase, not a fix.
 Compose owns lifecycle: `restart: unless-stopped` on all four. Closing any
 Foundry session touches none of them. Foundry detects Crucible down by
 `GET /ready` failing and runs the configured start command (`docker compose
--f <path> up -d`), recorded as an event once the API is reachable.
+-f <path> up -d`), recorded as an event once the API is reachable. `/ready`
+fails when the API cannot serve (database or schema); a supervisor in trouble
+shows in the same response's `supervisor` check and on `GET /supervisor`,
+and does not fail it (hades #190).
 
 ## Two modes
 

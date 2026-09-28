@@ -96,7 +96,7 @@ endpoint's existing role requirements.
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/health` | Liveness (process up). No auth. |
-| GET | `/ready` | Readiness, no auth (compose healthchecks and Foundry's probe need it). True only when all hold: database reachable; migrations at head **and** the live schema matches the ORM metadata (schema drift is not-ready, naming the first difference); the supervisor lease is held and the holder's last tick within the lease window succeeded. A supervisor whose ticks are failing makes the service not-ready with the last error summary, even though the lease is renewed. |
+| GET | `/ready` | Readiness of this API process, no auth (compose healthchecks, the Kubernetes readiness probe and Foundry's probe need it). True only when both hold: database reachable; migrations at head **and** the live schema matches the ORM metadata (schema drift is not-ready, naming the first difference). The response also carries a `supervisor` check (the lease is held and the holder's last tick within the lease window succeeded, or the last error summary), which is reported and does not decide readiness: a supervisor in trouble must not take the API and the admin UI offline. `/supervisor` and a red banner on every admin UI page are where supervisor health shows (hades #190, 2026-09-28). |
 | GET | `/supervisor` | Lease holder, last tick, tick duration, queue depths, provider status, GitHub observation status (last poll, webhook deliveries pending). |
 | POST | `/supervisor/reconcile` | Force a reconciliation pass now. Admin. |
 | GET | `/wakes` | Pending wakes for the caller's principal; `?since=`. |

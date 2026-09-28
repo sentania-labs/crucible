@@ -38,6 +38,10 @@ def health() -> HealthView:
 
 @router.get("/ready", response_model=ReadyView, responses={503: {"model": ReadyView}})
 def ready(ctx: Ctx, response: Response) -> ReadyView:
+    """Whether this API process can serve: the database answers and its schema is at
+    head. The supervisor's health is reported beside it and does not decide it (hades
+    #190): a supervisor in trouble must not take the operator's only window into the
+    system offline. `/v1/supervisor` and the admin UI's banner are where it shows."""
     database = ReadyCheck(ok=False, detail="not checked")
     migrations = ReadyCheck(ok=False, detail="not checked")
     supervisor = ReadyCheck(ok=False, detail="not checked")
@@ -53,7 +57,7 @@ def ready(ctx: Ctx, response: Response) -> ReadyView:
     except Exception as exc:  # the readiness probe must never raise
         database = ReadyCheck(ok=False, detail=type(exc).__name__)
     view = ReadyView(
-        ready=database.ok and migrations.ok and supervisor.ok,
+        ready=database.ok and migrations.ok,
         database=database,
         migrations=migrations,
         supervisor=supervisor,
