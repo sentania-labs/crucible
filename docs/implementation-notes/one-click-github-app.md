@@ -15,6 +15,7 @@ and corrects its earlier claim that the manifest flow needs a public DNS record.
   characters) and an optional organization. The existing-App form (App ID and `.pem`) is
   behind the link "Already have a GitHub App?" (`/ui/github?existing=1`).
 - Create records a start (`github_manifest_states`, migration 0026: the state's sha256,
+  the sha256 of a nonce the browser keeps in a `SameSite=Lax` cookie named for the start,
   the administrator, 15 minutes) and returns a page that posts the manifest to GitHub's
   create page on its own (a Continue button if scripts are off). GitHub's web origin is
   derived from `github.api_base` (`https://github.com` for api.github.com, the host for
@@ -30,7 +31,9 @@ and corrects its earlier claim that the manifest flow needs a public DNS record.
 - `github.external_url` (a `provider_settings` row): Return address on the GitHub page,
   `GET`/`POST /v1/admin/github/external-url`, `crucible admin github external-url` and
   `set-external-url --url`. Empty means the browser's own `Origin`.
-- The access log blanks `code` and `state` query values (`crucible/logs.py`).
+- The access log blanks `code` and `state` query values, plain or percent-encoded
+  (`crucible/logs.py`), and the transport logs a manifest conversion's path without its
+  code.
 - The stand-in (`tools/smoke/first_run_stubs.py`) serves github.com's half: the create
   page and its confirm button, the one-time conversion (a fresh RSA key per App), and the
   install page that redirects to `setup_url`.
@@ -51,8 +54,8 @@ manifest and to confirm. The one new tunable, the external URL, has all three su
   manifest, the state stored only as its hash, the organization target, a refused login),
   the cookieless return (reload page, then sign-in, nothing exchanged), the signed-in
   return (one conversion; the Secret holds `app-id`, `app.pem`, `webhook.secret`), a
-  reused, a wrong, an expired and another administrator's state (each refused, GitHub
-  not asked again), Install and the return to the picker, and then checks that no page,
+  reused, a wrong, an expired, another administrator's and another browser's return (each
+  refused, GitHub not asked again, the last two leaving the start unspent), Install and the return to the picker, and then checks that no page,
   answer or audit entry carries the key or the webhook secret.
   `test_the_return_address_setting_overrides_the_browsers` covers the setting on the API,
   the UI and the CLI's local mode; the remote CLI calls are in
@@ -69,4 +72,8 @@ manifest and to confirm. The one new tunable, the external URL, has all three su
   and the stand-in on `127.0.0.1` so the redirect is cross-site: Create opened the
   stand-in's page filled in; its button came back through the reload page (the access log
   shows the callback answered 200, then 303 on the same-site reload) signed in and
-  connected; Install came back to the picker the same way.
+  connected; Install came back to the picker the same way. This is the only proof that a
+  real browser withholds the Strict session cookie and sends the Lax start cookie on
+  GitHub's redirect: the integration tier's and the kind proof's HTTP clients ignore
+  `SameSite`, so they prove the reload page and the checks, not the browser's cookie
+  rules.

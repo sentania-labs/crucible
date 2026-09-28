@@ -139,16 +139,23 @@ Crucible polls (23), so the manifest turns the webhook off.
    `github.external_url` setting (a `provider_settings` row, on the GitHub page, the admin
    API and the CLI) overrides it.
 3. A start is a row of `github_manifest_states` (migration 0026): the sha256 of a random
-   `state`, the administrator who started it, and an expiry 15 minutes later. On return
-   the row is spent in its own transaction before GitHub is asked, so a state is good
-   once; a missing, spent, expired or another administrator's state is refused,
-   recorded as `admin_refused`, and GitHub is not asked. The code is exchanged once
+   `state`, the sha256 of a second random value the starting browser keeps in an
+   HttpOnly, `SameSite=Lax` cookie scoped to `/ui/github` (Lax, because GitHub's redirect
+   back is a cross-site navigation), the administrator who started it, and an expiry 15
+   minutes later. On return the row is spent in its own transaction before GitHub is
+   asked, so a state is good once, and only by its own administrator in its own browser;
+   a missing, spent, expired, another administrator's or another browser's return is
+   refused, recorded as `admin_refused`, and GitHub is not asked. A refusal of the last
+   two leaves the start unspent, so it cannot be used to cancel someone else's. The code is exchanged once
    (`POST /app-manifests/{code}/conversions`, unauthenticated: the code is the
    credential). The App ID, key and webhook secret go straight to the store of decision
    1; GitHub's OAuth client secret is dropped where the answer is read, because Crucible
    signs as the App and never as a user. Audited as `github_app_manifest_started` and
    `github_app_connected` (`via: manifest`, the key's public fingerprint, never the key);
-   the access log blanks the callback's `code` and `state`.
+   the access log blanks `code` and `state` in the callback's query and in sign-in's
+   percent-encoded `next`, and the transport never puts the code in a log line or an
+   error. A refusal after the exchange names the App GitHub made, so the operator can
+   delete it there.
 4. The UI session cookie is `SameSite=Strict`, so it does not come with GitHub's
    cross-site redirect. The callback and the install return answer a cookieless arrival
    with a page that reloads the same URL from Crucible's own site (with
