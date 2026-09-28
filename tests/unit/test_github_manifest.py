@@ -13,7 +13,7 @@ import pytest
 
 from crucible.adapters.github.apps import RestGitHubApps
 from crucible.adapters.github.transport import RestTransport
-from crucible.application.admin.github import _install_url, web_base
+from crucible.application.admin.github import _github_refusal, _install_url, web_base
 from crucible.application.admin.github_manifest import (
     PERMISSIONS,
     build_manifest,
@@ -189,3 +189,15 @@ def test_a_manifest_code_never_reaches_a_log_or_an_error() -> None:
 
     assert _loggable("/app-manifests/mc_live/conversions") == "/app-manifests/[code]/conversions"
     assert _loggable("/app/installations") == "/app/installations"
+
+
+def test_a_refused_stored_key_points_at_create_not_at_pasting_one() -> None:
+    """With the paste path gone (the operator, 2026-09-27), a refused key's remedy is a new
+    App from the GitHub page."""
+    from crucible.ports.github import GitHubError  # noqa: PLC0415
+
+    detail = _github_refusal(
+        GitHubError(401, "Bad credentials"), 5, "https://api.github.com"
+    ).detail
+    assert detail.startswith("GitHub refused the stored key for App 5 (HTTP 401)")
+    assert "create a new App on the GitHub page" in detail and "App ID" not in detail

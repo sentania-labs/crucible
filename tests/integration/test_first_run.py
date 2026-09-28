@@ -411,7 +411,7 @@ def test_github_is_connected_installed_and_a_repository_picked(
         "/v1/admin/github/app",
         json={"reason": "connect", "app_id": APP_ID, "private_key": app_key[0]},
     )
-    assert gone.status_code in (404, 405)
+    assert gone.status_code == 404
     assert ("secrets", "crucible-github-app") not in k8s_api.objects
 
     # The one-click flow is tested below; here the credential it would store is put in the
@@ -533,7 +533,9 @@ def test_github_is_connected_installed_and_a_repository_picked(
     assert {"widgets", "gadgets"} <= names
 
 
-def test_the_cli_remote_mode_builds_the_first_run_calls(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_the_cli_remote_mode_builds_the_first_run_calls(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
     from crucible.client.config import ADMIN_TOKEN_ENV  # noqa: PLC0415
     from crucible.client.http import Api  # noqa: PLC0415
 
@@ -553,8 +555,10 @@ def test_the_cli_remote_mode_builds_the_first_run_calls(monkeypatch: pytest.Monk
     admin_main([*base, "gateway", "pick", "--enable", "a", "--disable", "b", "--thinking", "a"])
     # `github connect` (an existing App's id and key) is gone; Create GitHub App on the
     # GitHub page is the only way to connect one (the operator, 2026-09-27).
-    with pytest.raises(SystemExit):
+    with pytest.raises(SystemExit) as refused:
         admin_main([*base, "github", "connect", "--app-id", "5", "--private-key-file", "x"])
+    assert refused.value.code == 2
+    assert "invalid choice: 'connect'" in capsys.readouterr().out
     admin_main(["--api-url", "http://127.0.0.1:1", "github", "installations"])
     admin_main(["--api-url", "http://127.0.0.1:1", "github", "external-url"])
     admin_main([*base, "github", "set-external-url", "--url", "https://hades.example"])
