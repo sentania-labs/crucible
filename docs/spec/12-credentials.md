@@ -202,11 +202,14 @@ probe refuses while a login Job for the harness exists.
 
 ## GitHub App credentials
 
-The service owns the App credential (ADR 0017, crucible#120): the operator
-connects an existing App by its id and one of its private keys on the GitHub
-page (or `POST /v1/admin/github/app`, `crucible admin github connect`), the
-service checks them with GitHub's `GET /app` before it stores anything, and
-from then on it is the credential's only writer. In Kubernetes it is the
+The service owns the App credential (ADR 0017, crucible#120, #168): the
+operator creates the App with one click on the GitHub page (GitHub's manifest
+flow: GitHub makes the App and its key and hands them to the service once, for
+a single-use code), or connects an existing App by its id and one of its
+private keys (the same page behind a link, `POST /v1/admin/github/app`,
+`crucible admin github connect`), which the service checks with GitHub's
+`GET /app` before it stores anything. From then on it is the credential's only
+writer. In Kubernetes it is the
 Secret `crucible-github-app` in the `crucible` namespace, keys `app-id`,
 `app.pem` and `webhook.secret`, created and labelled by the service and read
 through the API server on each signature; it is also mounted, optional, on

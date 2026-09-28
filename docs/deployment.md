@@ -125,11 +125,17 @@ delivers one Secret:
 |---|---|---|
 | `crucible-database` | `crucible` | `password`, and `url`, the whole DSN, which must carry the same password |
 
-**The GitHub App Secret is not GitOps's either** (ADR 0017). Connect the App on the
-GitHub page with its App ID and one of its private keys; Crucible checks them with
-GitHub, then creates `crucible-github-app` in `crucible` (keys `app-id`, `app.pem`,
-`webhook.secret`) and is its only writer. Install the App from the link the page shows,
-then pick repositories there. A deployment that sealed `crucible-github-app` before this
+**The GitHub App Secret is not GitOps's either** (ADR 0017). On the GitHub page press
+Create GitHub App (for your account, or name an organization): GitHub opens its own
+create page filled in, you confirm, and GitHub sends your browser back to Crucible, which
+creates `crucible-github-app` in `crucible` (keys `app-id`, `app.pem`, `webhook.secret`)
+and is its only writer (crucible#168). No public DNS record is needed: every redirect is
+of your own browser, so the internal hostname you use for the UI is enough, and the App
+has no webhook (Crucible polls). If Crucible sees a different address than your browser
+uses, set it under Return address (`crucible admin github set-external-url`). Then press
+Install on GitHub; GitHub sends you back to the repository picker. An App you already
+have connects with its App ID and one of its private keys, behind the link under the
+Create button. A deployment that sealed `crucible-github-app` before this
 change takes it out of its GitOps repository without pruning it, or connects the App
 again afterwards.
 

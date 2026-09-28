@@ -2,9 +2,10 @@
 public-key fingerprint, and per registered repository whether an installation covers it
 and what the last check found. `check` mints a token per repository and discards it.
 
-Connect GitHub (crucible#120, ADR 0017): the operator enters an existing App's id and
-private key, the service checks them against `GET /app` before it stores anything, and
-then owns the credential (the `crucible-github-app` Secret on Kubernetes, the files
+Connect GitHub (crucible#120, ADR 0017): the operator creates the App with one click
+(`github_manifest`, crucible#168) or enters an existing App's id and private key, which
+the service checks against `GET /app` before it stores anything; either way it then owns
+the credential (the `crucible-github-app` Secret on Kubernetes, the files
 beside `github.app.private_key_path` with Docker). The App's install link comes from its
 own `html_url`. The repository picker lists what each installation covers, grouped by
 account, and registers a pick with the installation id and the default branch GitHub
