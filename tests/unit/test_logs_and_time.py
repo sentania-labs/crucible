@@ -72,3 +72,22 @@ def test_the_access_log_blanks_a_manifest_returns_code_and_state() -> None:
     line = JsonFormatter().format(record)
     assert "mc_live" not in line and "s3cr3t" not in line
     assert "code=[redacted]&state=[redacted]&hop=1" in line
+    # A return that must sign in first carries them percent-encoded in `next`.
+    encoded = logging.LogRecord(
+        "uvicorn.access",
+        logging.INFO,
+        "",
+        0,
+        '%s - "%s %s HTTP/%s" %d',
+        (
+            "127.0.0.1:5",
+            "GET",
+            "/ui/sign-in?next=/ui/github/callback%3Fcode%3Dmc_live%26state%3Ds3cr3t",
+            "1.1",
+            200,
+        ),
+        None,
+    )
+    OneTimeQueryFilter().filter(encoded)
+    line = JsonFormatter().format(encoded)
+    assert "mc_live" not in line and "s3cr3t" not in line

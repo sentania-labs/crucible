@@ -50,8 +50,9 @@ class JsonFormatter(logging.Formatter):
 
 
 # A GitHub App manifest return carries a one-time code and state in its query string
-# (crucible#168); the access log records the path without their values.
-_ONE_TIME_QUERY = re.compile(r"([?&](?:code|state)=)[^&\s]*")
+# (crucible#168), and a return that must sign in first carries them again, percent-encoded,
+# in sign-in's `next`; the access log records the path without their values.
+_ONE_TIME_QUERY = re.compile(r"((?:[?&]|%3F|%26)(?:code|state)(?:=|%3D))[^&%\s]*", re.IGNORECASE)
 
 
 class OneTimeQueryFilter(logging.Filter):
