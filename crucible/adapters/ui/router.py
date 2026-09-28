@@ -1973,51 +1973,6 @@ def github_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
             "fields": [{"name": "reason", "label": "Reason"}],
         }
     sections: list[dict[str, Any]] = [connection]
-    existing = request.query_params.get("existing") == "1"
-    if admin and not existing:
-        sections.append(_github_create_section(configured=state["configured"]))
-    if admin and existing:
-        sections.append(
-            {
-                "title": "Connect an existing GitHub App",
-                "note": (
-                    "For an App you already have: its numeric ID and one of its private keys "
-                    "(the whole .pem file). GitHub is asked about them before anything is "
-                    "stored; the service then keeps them (on Kubernetes the Secret "
-                    "crucible-github-app in its own namespace, which it alone writes). The "
-                    "key is never shown or audited; its public fingerprint is."
-                ),
-                "form": {
-                    "action": "/ui/actions/github-connect",
-                    "label": "Check and connect",
-                    "fields": [
-                        {
-                            "name": "app_id",
-                            "label": "App ID",
-                            "kind": "number",
-                            "value": state["app_id"] or "",
-                            "required": True,
-                        },
-                        {
-                            "name": "private_key",
-                            "label": "Private key (.pem)",
-                            "kind": "textarea",
-                            "rows": 6,
-                            "required": True,
-                        },
-                        {
-                            "name": "webhook_secret",
-                            "label": "Webhook secret (optional)",
-                            "kind": "password",
-                        },
-                        {"name": "reason", "label": "Reason", "required": True},
-                    ],
-                },
-                "links": [{"href": "/ui/github", "label": "Create a new App instead"}],
-            }
-        )
-    if admin:
-        sections.append(_github_external_url_section(ctx, uow))
     if picker is not None:
         if picker["error"]:
             sections.append({"title": "Installations", "note": picker["error"]})
@@ -2104,6 +2059,53 @@ def github_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                     ],
                 }
             sections.append(section)
+    existing = request.query_params.get("existing") == "1"
+    if admin and not existing:
+        sections.append(_github_create_section(configured=state["configured"]))
+    if admin and existing:
+        # Right under the connection: the operator asked for it by its link.
+        sections.insert(
+            1,
+            {
+                "title": "Connect an existing GitHub App",
+                "note": (
+                    "For an App you already have: its numeric ID and one of its private keys "
+                    "(the whole .pem file). GitHub is asked about them before anything is "
+                    "stored; the service then keeps them (on Kubernetes the Secret "
+                    "crucible-github-app in its own namespace, which it alone writes). The "
+                    "key is never shown or audited; its public fingerprint is."
+                ),
+                "form": {
+                    "action": "/ui/actions/github-connect",
+                    "label": "Check and connect",
+                    "fields": [
+                        {
+                            "name": "app_id",
+                            "label": "App ID",
+                            "kind": "number",
+                            "value": state["app_id"] or "",
+                            "required": True,
+                        },
+                        {
+                            "name": "private_key",
+                            "label": "Private key (.pem)",
+                            "kind": "textarea",
+                            "rows": 6,
+                            "required": True,
+                        },
+                        {
+                            "name": "webhook_secret",
+                            "label": "Webhook secret (optional)",
+                            "kind": "password",
+                        },
+                        {"name": "reason", "label": "Reason", "required": True},
+                    ],
+                },
+                "links": [{"href": "/ui/github", "label": "Create a new App instead"}],
+            },
+        )
+    if admin:
+        sections.append(_github_external_url_section(ctx, uow))
     return _page(
         request,
         principal,
