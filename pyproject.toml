@@ -38,6 +38,7 @@ dev = [
     "mypy>=1.17",
     "pytest>=8.4",
     "pytest-asyncio>=1.1",
+    "pytest-timeout>=2.4",
     "ruff>=0.12",
     "testcontainers[postgres]>=4.10",
     "types-pyyaml>=6.0",
@@ -97,6 +98,15 @@ markers = [
     "e2e_command_timeout: each real harness in the worker image against a stub model, no network and no login (issue 128)",
 ]
 filterwarnings = ["error::DeprecationWarning:crucible.*"]
+# Every test has a time limit (issue 192): a hang fails that one test in two minutes,
+# with its name and the stack of every thread, instead of running until an outer
+# timeout kills the whole run with no word of where. The signal method fails the test
+# and lets the run go on. faulthandler_timeout is the backstop for a hang the signal
+# cannot interrupt: it dumps every thread's stack, still inside the named test. A test
+# that legitimately needs longer (the kind tier) sets `pytest.mark.timeout` itself.
+timeout = 120
+timeout_method = "signal"
+faulthandler_timeout = 180
 
 [tool.importlinter]
 root_package = "crucible"
