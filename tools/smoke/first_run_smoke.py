@@ -11,9 +11,12 @@ services (tools/smoke/first_run_stubs.py, run as a Pod in `crucible-stubs`):
 3. a model is picked from the gateway's own list, which writes a routing version;
 4. the Kubernetes egress selectors name the in-cluster gateway, and the combined worker
    image is promoted;
-5. the GitHub App is connected with a throwaway key made for this run; the service
-   creates `crucible-github-app` in `crucible`, and the mounted copy appears in the api
-   Pod readable by its user (the #79 fsGroup question);
+5. the GitHub App is created with one click (crucible#168): the GitHub page's Create
+   GitHub App posts the manifest to the GitHub stand-in, whose confirm button redirects
+   the browser back with a code; the service checks the state, exchanges the code once,
+   and creates `crucible-github-app` in `crucible`, and the mounted copy appears in the
+   api Pod readable by its user (the #79 fsGroup question); the page's Install button
+   installs the App and GitHub sends the browser back to the picker;
 6. a repository is picked from the stand-in installation;
 7. Status reaches "ready" for Hermes, in the document and on the rendered page;
 8. a private repository is picked (crucible#157, ADR 0019) from a git stand-in that
@@ -23,8 +26,10 @@ services (tools/smoke/first_run_stubs.py, run as a Pod in `crucible-stubs`):
    references it, nothing the worker can read holds it, and GitHub was asked to revoke
    it.
 
-Nothing here calls the real GitHub API or a real model. The throwaway key is generated
-in memory, sent once in a request body, and never written to disk or printed. The git
+Nothing here calls the real GitHub API or a real model. The App's key is made by the
+GitHub stand-in in its own Pod and handed to the service once, in the conversion's
+answer; this proof never sees it. The browser's side of the flow runs over a second
+port forward, to the stand-in, with the stand-in's in-cluster URL rewritten to it. The git
 stand-in's certificate is signed by the run's own CA (`CRUCIBLE_DEPLOY_KIND_CA_DIR`),
 which deploy-kind.sh also adds to the script-harness image it pushes for this run, so
 the preparer verifies the stand-in the way it verifies GitHub.
@@ -34,16 +39,20 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import datetime as dt
+import html
 import http.cookiejar
 import importlib.util
 import json
 import os
 import re
 import secrets
+import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -58,7 +67,8 @@ HERE = Path(__file__).resolve().parent
 STUB_NAMESPACE = "crucible-stubs"
 STUB_URL = f"http://crucible-stubs.{STUB_NAMESPACE}.svc.cluster.local:8080"
 APP_ID = 4242
-APP_SLUG = "crucible-kind"
+APP_NAME = "Hades-kind"
+APP_SLUG = "hades-kind"
 MODELS = ["kind-fast", "kind-large"]
 REPOSITORY = "octo-lab/widgets"
 PRIVATE_REPOSITORY = "octo-lab/secret-plans"
@@ -92,21 +102,6 @@ def step(title: str) -> None:
 
 def show(label: str, value: Any) -> None:
     log(f"{label}: {json.dumps(value, indent=2, sort_keys=True)}")
-
-
-def app_key() -> tuple[str, str]:
-    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    private = key.private_bytes(
-        serialization.Encoding.PEM,
-        serialization.PrivateFormat.TraditionalOpenSSL,
-        serialization.NoEncryption(),
-    ).decode()
-    public = (
-        key.public_key()
-        .public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
-        .decode()
-    )
-    return private, public
 
 
 def git_tls(ca_dir: Path) -> tuple[str, str]:
@@ -388,42 +383,193 @@ def egress_and_image(base_url: str, token: str) -> None:
     log(f"promoted {image['reference']} ({image['digest']}) for hermes")
 
 
-def github(base_url: str, token: str, private_key: str) -> None:
-    step("5. connect the GitHub App; the service creates its own Secret (#120, #79)")
+class StubForward:
+    """`kubectl port-forward` to the GitHub stand-in: the browser's half of the manifest
+    flow talks to github.com, which here is the stand-in's Service."""
+
+    def __init__(self) -> None:
+        self.port = KS.free_port()
+        self.process: subprocess.Popen[bytes] | None = None
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.port}"
+
+    def browser(self, url: str) -> str:
+        """An in-cluster stand-in URL as the browser reaches it."""
+        if not url.startswith(STUB_URL):
+            raise SmokeError(f"{url!r} is not on the GitHub stand-in")
+        return self.url + url[len(STUB_URL) :]
+
+    def __enter__(self) -> StubForward:
+        self.process = subprocess.Popen(
+            [
+                "kubectl",
+                "-n",
+                STUB_NAMESPACE,
+                "port-forward",
+                "service/crucible-stubs",
+                f"{self.port}:8080",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            try:
+                with urllib.request.urlopen(f"{self.url}/health/readiness", timeout=5):
+                    return self
+            except OSError:
+                time.sleep(1)
+        raise SmokeError("the GitHub stand-in's port forward never answered")
+
+    def __exit__(self, *_: object) -> None:
+        if self.process is not None:
+            self.process.terminate()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                self.process.wait(timeout=10)
+
+
+class _Stay(urllib.request.HTTPRedirectHandler):
+    """Report a redirect instead of following it, as a test of where it points."""
+
+    def redirect_request(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+
+def browse(
+    opener: Any, method: str, url: str, form: dict[str, str] | None = None, **headers: str
+) -> tuple[int, str, str]:
+    """One browser request, redirects not followed: (status, Location, body)."""
+    data = urllib.parse.urlencode(form).encode() if form is not None else None
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    if data is not None:
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    try:
+        with opener.open(req, timeout=180) as response:
+            return response.status, "", response.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.headers.get("Location", ""), exc.read().decode("utf-8", "replace")
+
+
+def ui_opener(jar: http.cookiejar.CookieJar | None = None) -> Any:
+    return urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar), _Stay())
+
+
+def github(base_url: str, token: str, jar: http.cookiejar.CookieJar) -> None:
+    step("5. create the GitHub App with one click; the service keeps its key (#168, #79)")
     before = request("GET", f"{base_url}/v1/admin/github", token=token)
     show("before", {k: before[k] for k in ("configured", "key_present", "stored_in")})
-    connected = request(
+    browser = ui_opener(jar)
+    web = ui_opener()
+    _, _, page = browse(browser, "GET", f"{base_url}/ui/github")
+    csrf = re.search(r'name="csrf" value="([a-f0-9]+)"', page)
+    if csrf is None or "Create GitHub App" not in page or "/ui/github?existing=1" not in page:
+        raise SmokeError("the GitHub page offers no Create GitHub App button")
+    if 'name="private_key"' in page:
+        raise SmokeError("the existing-App form is not behind its secondary link")
+    status, _, started = browse(
+        browser,
         "POST",
-        f"{base_url}/v1/admin/github/app",
-        token=token,
-        body={"reason": "first-run kind proof", "app_id": APP_ID, "private_key": private_key},
+        f"{base_url}/ui/actions/github-create-app",
+        {"csrf": csrf.group(1), "return_to": "/ui/github", "app_name": APP_NAME},
+        Origin=base_url,
     )
-    show(
-        "connected",
-        {
-            k: connected[k]
-            for k in ("configured", "app_id", "key_fingerprint", "stored_in", "install_url")
-        },
-    )
-    if connected["install_url"] != f"https://github.com/apps/{APP_SLUG}/installations/new":
-        raise SmokeError(f"the install link is {connected['install_url']!r}")
-    if "PRIVATE KEY" in json.dumps(connected):
-        raise SmokeError("the connect answer carried the key")
-    secret = json.loads(
-        kubectl(
-            ["-n", "crucible", "get", "secret", "crucible-github-app", "-o", "json"], redact=True
+    action = re.search(r'id="github-manifest"[^>]*action="([^"]+)"', started)
+    posted = re.search(r'name="manifest" value="([^"]+)"', started)
+    if status != 200 or action is None or posted is None:
+        raise SmokeError(f"Create GitHub App answered {status} without the GitHub form")
+    target = html.unescape(action.group(1))
+    manifest = json.loads(html.unescape(posted.group(1)))
+    show("manifest", manifest)
+    wanted = {
+        "metadata": "read",
+        "contents": "write",
+        "pull_requests": "write",
+        "checks": "read",
+        "actions": "read",
+        "issues": "read",
+    }
+    if (
+        manifest["default_permissions"] != wanted
+        or manifest["default_events"] != []
+        or manifest["hook_attributes"]["active"] is not False
+        or manifest["redirect_url"] != f"{base_url}/ui/github/callback"
+        or manifest["public"] is not False
+    ):
+        raise SmokeError("the manifest is not the one spec 23 and #168 describe")
+    if not target.startswith(f"{STUB_URL}/settings/apps/new?state="):
+        raise SmokeError(f"the manifest goes to {target!r}")
+
+    with StubForward() as stub:
+        # github.com's side: the confirm page, and its redirect back to Crucible.
+        status, _, confirm = browse(
+            web, "POST", stub.browser(target), {"manifest": json.dumps(manifest)}
         )
-    )
-    labels = secret["metadata"].get("labels") or {}
-    show(
-        "the Secret (keys and labels only)",
-        {"keys": sorted(secret.get("data") or {}), "labels": labels},
-    )
-    if labels.get("app.kubernetes.io/managed-by") != "crucible":
-        raise SmokeError("crucible-github-app is not labelled as the service's own")
-    stored_id = base64.b64decode(secret["data"]["app-id"]).decode()
-    if stored_id != str(APP_ID):
-        raise SmokeError(f"the Secret holds App id {stored_id}")
+        pending = re.search(r"name='pending' value='([^']+)'", confirm)
+        if status != 200 or pending is None:
+            raise SmokeError(f"the stand-in's create page answered {status}")
+        status, back, _ = browse(
+            web, "POST", f"{stub.url}/_stub/apps/confirm", {"pending": pending.group(1)}
+        )
+        if status != 302 or not back.startswith(f"{base_url}/ui/github/callback?code="):
+            raise SmokeError(f"GitHub's redirect back is {status} to {back!r}")
+        log(f"GitHub sent the browser back to {back.split('?')[0]}?code=...&state=...")
+
+        # The redirect is cross-site, so the Strict session cookie does not come with it:
+        # the first arrival reloads itself from Crucible's own site.
+        status, _, hop = browse(ui_opener(), "GET", back)
+        if status != 200 or 'http-equiv="refresh"' not in hop:
+            raise SmokeError(f"a cookieless return answered {status} without the reload page")
+        if stub_json("/_stub/manifests")["conversions"]:
+            raise SmokeError("the code was exchanged for a browser that is not signed in")
+
+        status, landed, _ = browse(browser, "GET", back)
+        landed = urllib.parse.unquote(landed)
+        log(f"the callback: HTTP {status}, then {landed}")
+        if status != 303 or "kind=ok" not in landed or f"(App {APP_ID})" not in landed:
+            raise SmokeError(f"the callback did not connect the App: {landed!r}")
+        status, again, _ = browse(browser, "GET", back)
+        if "used already" not in urllib.parse.unquote(again):
+            raise SmokeError(f"a second return with the same state was not refused: {again!r}")
+        conversions = stub_json("/_stub/manifests")["conversions"]
+        show("the stand-in's conversions (never a key)", conversions)
+        if len(conversions) != 1:
+            raise SmokeError(f"the code was exchanged {len(conversions)} times")
+
+        secret = json.loads(
+            kubectl(
+                ["-n", "crucible", "get", "secret", "crucible-github-app", "-o", "json"],
+                redact=True,
+            )
+        )
+        labels = secret["metadata"].get("labels") or {}
+        show(
+            "the Secret (keys and labels only)",
+            {"keys": sorted(secret.get("data") or {}), "labels": labels},
+        )
+        if labels.get("app.kubernetes.io/managed-by") != "crucible":
+            raise SmokeError("crucible-github-app is not labelled as the service's own")
+        stored_id = base64.b64decode(secret["data"]["app-id"]).decode()
+        if stored_id != str(APP_ID) or "app.pem" not in secret["data"]:
+            raise SmokeError(f"the Secret holds App id {stored_id}")
+
+        # Install: the page's button opens the App's page; GitHub sends the browser back
+        # to the picker.
+        _, _, page = browse(browser, "GET", f"{base_url}/ui/github")
+        install = f"{STUB_URL}/apps/{APP_SLUG}/installations/new"
+        if f'href="{install}"' not in page or "Install on GitHub" not in page:
+            raise SmokeError("the GitHub page has no Install button for the new App")
+        status, setup, _ = browse(web, "POST", stub.browser(install))
+        if status != 302 or not setup.startswith(f"{base_url}/ui/github/installed?"):
+            raise SmokeError(f"the install sent the browser to {setup!r}")
+        status, landed, _ = browse(browser, "GET", setup)
+        if "Installed on GitHub" not in urllib.parse.unquote(landed):
+            raise SmokeError(f"the install's return landed on {landed!r}")
+        log("installed; GitHub sent the browser back to the repository picker")
+    audit = json.dumps(request("GET", f"{base_url}/v1/admin/audit?limit=200", token=token))
+    if "PRIVATE KEY" in audit or "github_app_manifest_started" not in audit:
+        raise SmokeError("the audit lacks the start, or carries a key")
 
     # #79: the mounted copy, as the api's own user sees it. The kubelet projects a new
     # Secret into an optional volume on its next sync, so this waits for it.
@@ -713,12 +859,11 @@ def private_checkout(base_url: str, admin: str) -> None:
     log("the private task is cancelled")
 
 
-def sign_in(base_url: str) -> Any:
+def sign_in(base_url: str, jar: http.cookiejar.CookieJar) -> Any:
     """The first-run administrator from the Secret the migrate Job wrote (ADR 0016), as the
     operator would; never printed. The deploy smoke's helper also proves the Job's log
     does not carry it, and the Secret is gone once the token has signed in."""
     first_run = KS.first_run_token()
-    jar = http.cookiejar.CookieJar()
     opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
     with opener.open(f"{base_url}/ui/sign-in", timeout=60) as response:
         page = response.read().decode()
@@ -748,17 +893,16 @@ def smoke(stub_image: str, git_image: str, ca_dir: Path) -> None:
     if not os.environ.get("KUBECONFIG"):
         raise SmokeError("KUBECONFIG must name the disposable cluster's kubeconfig")
     key = "vk_" + secrets.token_urlsafe(24)
-    private_key, public_key = app_key()
     deploy_stubs(
         stub_image,
         {
             "gateway_key": key,
             "models": MODELS,
-            "app_id": APP_ID,
-            "app_slug": APP_SLUG,
-            "public_key_pem": public_key,
-            "installations": [
-                {
+            "installations": [],
+            "manifest": {
+                "app_id": APP_ID,
+                "owner": "sentania",
+                "install": {
                     "id": 77,
                     "account": "octo-lab",
                     "type": "Organization",
@@ -778,8 +922,8 @@ def smoke(stub_image: str, git_image: str, ca_dir: Path) -> None:
                             },
                         },
                     ],
-                }
-            ],
+                },
+            },
         },
         git_image=git_image,
         tls=git_tls(ca_dir),
@@ -801,7 +945,10 @@ def smoke(stub_image: str, git_image: str, ca_dir: Path) -> None:
 
         gateway(base_url, admin, key)
         egress_and_image(base_url, admin)
-        github(base_url, admin, private_key)
+        # The operator signs in to the UI now: the App is created from the GitHub page.
+        jar = http.cookiejar.CookieJar()
+        opener = sign_in(base_url, jar)
+        github(base_url, admin, jar)
 
         step("7. Status reaches ready for Hermes (#123)")
         deadline = time.monotonic() + 240
@@ -829,7 +976,6 @@ def smoke(stub_image: str, git_image: str, ca_dir: Path) -> None:
         if checks.get("local_endpoint_reachable") is not True:
             raise SmokeError("the readiness canary did not reach the gateway from the workers")
 
-        opener = sign_in(base_url)
         status_page = page_text(opener, f"{base_url}/ui")
         match = re.search(r"Status ((?:Ready for a task|Crucible cannot).{0,120})", status_page)
         log(f"rendered /ui: {match.group(0) if match else status_page[:200]}")
@@ -844,7 +990,7 @@ def smoke(stub_image: str, git_image: str, ca_dir: Path) -> None:
         github_page = page_text(opener, f"{base_url}/ui/github")
         for wanted in (
             "connected",
-            f"https://github.com/apps/{APP_SLUG}/installations/new",
+            f"{STUB_URL}/apps/{APP_SLUG}/installations/new",
             REPOSITORY,
         ):
             if wanted not in github_page:

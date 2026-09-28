@@ -580,7 +580,9 @@ def seed_repositories(config: dict[str, Any], root: Path) -> list[str]:
     """A bare repository per configured repository with a `git` block, holding one
     commit of its files on its default branch. Returns the full names served."""
     served: list[str] = []
-    for installation in config.get("installations") or []:
+    # An installation the manifest flow will add (crucible#168) is served from the start.
+    pending = (config.get("manifest") or {}).get("install")
+    for installation in [*(config.get("installations") or []), *([pending] if pending else [])]:
         for repo in installation.get("repositories") or []:
             if "git" not in repo:
                 continue
