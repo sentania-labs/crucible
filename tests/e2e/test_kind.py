@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import hashlib
 import json
 import os
+import re
 import subprocess
 import time
 from dataclasses import replace
@@ -47,6 +49,7 @@ from crucible.ports.execution import (
     LaunchSpec,
     LogOffset,
     ObservationState,
+    ProviderError,
 )
 from crucible.ports.harness import (
     AdapterLaunch,
@@ -127,29 +130,34 @@ def _provider(
     registry: CraneRegistryClient,
     *,
     harnesses: HarnessRegistry | None = None,
+    resolver: Any = None,
+    **overrides: Any,
 ) -> KubernetesProvider:
+    settings: dict[str, Any] = {
+        "storage_class": "standard",
+        "workspace_size": "64Mi",
+        "cache_claim": "crucible-reference-cache",
+        "poll_interval_seconds": 0.25,
+        "launch_timeout_seconds": 45,
+        "prepare_timeout_seconds": 90,
+        "collector_timeout_seconds": 90,
+        "verifier_timeout_seconds": 90,
+        "cluster_dns_ip": os.environ["CRUCIBLE_E2E_KIND_DNS_IP"],
+        "broad_egress": True,
+        "image_repositories": (os.environ["CRUCIBLE_E2E_KIND_REGISTRY"],),
+        # kind's containerd gives every container a private cgroup namespace, so the
+        # canary cannot see the pod-level cgroup `tools/kind/e2e-kind.sh` configures
+        # `podPidsLimit: 512` on (95); this is lab-admin's attestation of that same
+        # number for this disposable cluster, the same way a real deployment would.
+        "pod_pid_limit_override": 512,
+    }
+    settings.update(overrides)
     return KubernetesProvider(
-        KubernetesConfig(
-            storage_class="standard",
-            workspace_size="64Mi",
-            cache_claim="crucible-reference-cache",
-            poll_interval_seconds=0.25,
-            launch_timeout_seconds=45,
-            prepare_timeout_seconds=90,
-            collector_timeout_seconds=90,
-            verifier_timeout_seconds=90,
-            cluster_dns_ip=os.environ["CRUCIBLE_E2E_KIND_DNS_IP"],
-            broad_egress=True,
-            image_repositories=(os.environ["CRUCIBLE_E2E_KIND_REGISTRY"],),
-            # kind's containerd gives every container a private cgroup namespace, so the
-            # canary cannot see the pod-level cgroup `tools/kind/e2e-kind.sh` configures
-            # `podPidsLimit: 512` on (95); this is lab-admin's attestation of that same
-            # number for this disposable cluster, the same way a real deployment would.
-            pod_pid_limit_override=512,
-        ),
+        KubernetesConfig(**settings),
         api,
         registry,
         harnesses=harnesses,
+        resolver=resolver,
     )
 
 
@@ -1625,3 +1633,379 @@ async def test_login_from_an_empty_secret_to_a_probe_and_an_attempt_through_the_
     finally:
         with contextlib.suppress(KubernetesApiError):
             api.delete("secrets", secret)
+
+
+# ----- hades #189, #190, #191: a git host that answers, and one that never does -----
+
+# tools/kind/e2e-kind.sh puts these on the node: .10 and .20 are range-http serving the
+# tier's bare repositories as github.com; cluster DNS answers github.com with .20; .30
+# drops every packet.
+GIT_HOST_POLICY = "198.51.100.10"
+GIT_HOST_DNS = "198.51.100.20"
+GIT_HOST_SILENT = "198.51.100.30"
+
+
+class CreateRecordingClient(RecordingKubernetesClient):
+    """Keep every object the provider created, with when, for a test to read after the
+    provider has deleted it."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.made: list[tuple[float, str, dict[str, Any]]] = []
+
+    def create(self, kind: str, body: Any, **kwargs: Any) -> Any:
+        self.made.append((time.monotonic(), kind, json.loads(json.dumps(body))))
+        return super().create(kind, body, **kwargs)
+
+
+def _recording_client() -> CreateRecordingClient:
+    return CreateRecordingClient(
+        kubeconfig_access(os.environ["CRUCIBLE_E2E_KIND_KUBECONFIG"]),
+        "crucible-workers",
+        timeout=15,
+    )
+
+
+def _git_host(address: str) -> Any:
+    def resolve(host: str) -> list[str]:
+        return [f"{address}/32"] if host in ("github.com", "api.github.com") else []
+
+    return resolve
+
+
+def _stand_in_repository(name: str) -> tuple[str, Path]:
+    """A bare repository range-http serves as http://github.com:443/git/<name>.git."""
+    bare = Path(make_origin(Path(os.environ["CRUCIBLE_E2E_KIND_CACHE"]), name))
+    subprocess.run(["git", "--git-dir", str(bare), "update-server-info"], check=True)
+    for path in bare.rglob("*"):
+        path.chmod(0o777 if path.is_dir() else 0o666)
+    return f"http://github.com:443/git/{bare.name}", bare
+
+
+def _jobs(client: CreateRecordingClient, attempt_id: str) -> list[tuple[float, dict[str, Any]]]:
+    return [
+        (at, body)
+        for at, kind, body in client.made
+        if kind == "jobs" and body["metadata"]["labels"].get(k8sspec.LABEL_ATTEMPT) == attempt_id
+    ]
+
+
+def _selects(policy: dict[str, Any], labels: dict[str, str]) -> bool:
+    wanted = policy["spec"]["podSelector"].get("matchLabels", {})
+    return all(labels.get(key) == value for key, value in wanted.items())
+
+
+def _permits(policy: dict[str, Any], address: str) -> bool:
+    return any(
+        any(peer.get("ipBlock", {}).get("cidr") == f"{address}/32" for peer in rule.get("to", []))
+        and any(port.get("port") == 443 for port in rule.get("ports", []))
+        for rule in policy["spec"]["egress"]
+    )
+
+
+async def test_hades_191_git_pods_reach_the_address_their_policy_permits(
+    registry: CraneRegistryClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """hades #191 on Calico, with the provider's real NetworkPolicies enforced.
+
+    The lab's refresher timed out on github.com while the preparer reached it. The
+    refresher's Pod is selected by its policy, and the policy permits the address the
+    provider resolved; what the policy cannot permit is the address the Pod looks up for
+    itself when that answer has changed. Reproduced first without `hostAliases`, then
+    shown fixed with them, and the refresh that cannot connect costs its 20 second cap."""
+    client = _recording_client()
+    url, bare = _stand_in_repository("hades-191")
+    # Written by the refresher's uid; the tier's cleanup removes it with the scratch.
+    mirror = bare.parent / f"{hashlib.sha256(url.encode()).hexdigest()[:16]}.git"
+
+    broken = _provider(
+        client,
+        registry,
+        resolver=_git_host(GIT_HOST_POLICY),
+        broad_egress=False,
+        prepare_timeout_seconds=45,
+    )
+    lab = _spec(61, url)
+    with monkeypatch.context() as patched:
+        patched.setattr(k8sspec, "host_aliases", lambda plan: [])
+        with pytest.raises(ProviderError, match="preparer Job could not build"):
+            await broken.prepare(lab)
+    await broken._delete_attempt_objects(lab.attempt_id)
+    jobs = _jobs(client, lab.attempt_id)
+    refresher = next(body for _, body in jobs if body["metadata"]["name"].startswith("refresh"))
+    labels = refresher["spec"]["template"]["metadata"]["labels"]
+    policies = [body for _, kind, body in client.made if kind == "networkpolicies"]
+    selecting = [p for p in policies if _selects(p, labels)]
+    # The issue's first suspicion, ruled out: the refresher is selected, and permitted.
+    assert [p["metadata"]["name"] for p in selecting] == [
+        k8sspec.object_name("np-cache-refresher", lab.attempt_id)
+    ]
+    assert _permits(selecting[0], GIT_HOST_POLICY)
+    assert "hostAliases" not in refresher["spec"]["template"]["spec"]
+    assert not mirror.exists(), "the refresher reached the git host it resolved for itself"
+    # The refresh that could not connect cost its cap, not two kernel connect timeouts.
+    started = {body["metadata"]["name"].split("-")[0]: at for at, body in jobs}
+    refresh_seconds = started["prepare"] - started["refresh"]
+    print(
+        f"hades-191: without hostAliases the refresher (labels {labels}) was selected by "
+        f"{selecting[0]['metadata']['name']} permitting {GIT_HOST_POLICY}:443, resolved "
+        f"github.com to {GIT_HOST_DNS} itself, and gave up after {refresh_seconds:.1f}s"
+    )
+    assert 20 <= refresh_seconds < 60, refresh_seconds
+
+    fixed = _provider(client, registry, resolver=_git_host(GIT_HOST_POLICY), broad_egress=False)
+    spec = _spec(62, url)
+    workspace = await fixed.prepare(spec)
+    try:
+        assert (mirror / "HEAD").is_file(), "the refresher did not build the mirror"
+        print(f"hades-191: with hostAliases the refresher built {mirror.name}")
+        for _, body in _jobs(client, spec.attempt_id):
+            assert body["spec"]["template"]["spec"]["hostAliases"] == [
+                {"ip": GIT_HOST_POLICY, "hostnames": ["api.github.com", "github.com"]}
+            ]
+    finally:
+        await fixed.cleanup(workspace, CleanupPolicy.DELETE, spec)
+
+
+def _kind_app(
+    engine: Engine,
+    migrated: str,
+    artifact_root: Path,
+    provider: KubernetesProvider,
+    registry: CraneRegistryClient,
+) -> tuple[AppContext, dict[str, str], Any, Any]:
+    """The API on the tier's database, the e2e policy at version 21 with two
+    script-harness workers allowed at once, and the tier's image promoted."""
+    clock = SystemClock()
+    harnesses = application_harnesses(test_fixtures=True)
+    ctx = AppContext(
+        uow_factory=SqlUnitOfWorkFactory(engine),
+        clock=clock,
+        providers=[provider],
+        database_url=migrated,
+        engine=engine,
+        artifact_store=DiskArtifactStore(artifact_root / "kind-store"),
+        harnesses=harnesses,
+        lease_ttl_seconds=15,
+    )
+    tokens: dict[str, str] = {}
+    with ctx.uow_factory() as uow:
+        for role in Role:
+            tokens[role.value] = mint_token(uow, clock, name=f"kind-{role.value}", role=role).token
+        uow.commit()
+    app = create_app(ctx)
+    resolved = registry.resolve(os.environ["CRUCIBLE_E2E_KIND_REGISTRY"])
+    with TestClient(app, headers={"Authorization": f"Bearer {tokens['admin']}"}) as admin:
+        routing = e2e_routing_document()
+        assert admin.put(
+            f"/v1/routing/{routing['name']}/{routing['version']}", json=routing
+        ).status_code in (200, 201)
+        policy = e2e_policy_document(version=21)
+        policy["images"]["allowlist"] = ["localhost:*/*"]
+        policy["resources"] = {"cpus": 1, "memory": "256MiB", "pids": 128, "tmpfs_total": "256MiB"}
+        policy["concurrency"]["per_harness"]["script-harness"] = 2
+        response = admin.put(f"/v1/policies/{policy['name']}/{policy['version']}", json=policy)
+        assert response.status_code in (200, 201), response.text
+    with ctx.uow_factory() as uow:
+        promote_for_test(
+            uow,
+            digest=resolved.digest,
+            reference=resolved.reference,
+            harnesses=dict(resolved.harnesses) or {"script-harness": "1.0.0"},
+            at=clock.now(),
+            by="e2e-kind",
+            reason="kind script harness image",
+        )
+        uow.commit()
+    return ctx, tokens, app, harnesses
+
+
+def _kind_task(client: TestClient, ctx: AppContext, name: str, url: str) -> str:
+    register(ctx, name, url)
+    document = e2e_contract(f"E2E-{name.upper()}", name, os.environ["CRUCIBLE_E2E_KIND_REGISTRY"])
+    document["execution_request"]["provider"] = "kubernetes"
+    document["policy"]["version"] = 21
+    return submit_and_start(client, document)
+
+
+def _worker_objects(api: KubernetesClient, attempt_id: str) -> list[str]:
+    selector = f"{k8sspec.LABEL_ATTEMPT}={attempt_id},{k8sspec.LABEL_ROLE}={k8sspec.ROLE_WORKER}"
+    return [
+        f"{kind}/{item['metadata']['name']}"
+        for kind in ("jobs", "pods")
+        for item in api.list_objects(kind, label_selector=selector)
+    ]
+
+
+async def _preparer_running(api: KubernetesClient, attempt_id: str, supervisor: Any) -> None:
+    selector = f"{k8sspec.LABEL_ATTEMPT}={attempt_id},{k8sspec.LABEL_ROLE}={k8sspec.ROLE_PREPARER}"
+    for _ in range(120):
+        await supervisor.tick()
+        if api.list_objects("pods", label_selector=selector):
+            return
+        await asyncio.sleep(0.5)
+    raise AssertionError("the preparer Pod never appeared")
+
+
+def _slow_provider(api: KubernetesClient, registry: CraneRegistryClient) -> KubernetesProvider:
+    """A git host that drops every packet: the refresher gives up at its 20 second cap
+    and the preparer hangs until its deadline unless something ends it. A task on the
+    tier's own file:// origin prepares as usual beside it."""
+    return _provider(
+        api,
+        registry,
+        resolver=_git_host(GIT_HOST_SILENT),
+        broad_egress=False,
+        prepare_timeout_seconds=600,
+    )
+
+
+async def test_hades_189_a_cancel_during_a_hanging_prepare_starts_no_worker(
+    engine: Engine,
+    migrated: str,
+    artifact_root: Path,
+    api: KubernetesClient,
+    registry: CraneRegistryClient,
+) -> None:
+    provider = _slow_provider(api, registry)
+    ctx, tokens, app, harnesses = _kind_app(engine, migrated, artifact_root, provider, registry)
+    supervisor = Supervisor(
+        ctx.uow_factory,
+        {"kubernetes": provider},
+        ctx.clock,
+        holder="e2e-kind-189",
+        artifact_store=ctx.artifact_store,
+        lease_ttl_seconds=15,
+        grace_seconds=5,
+        harnesses=harnesses,
+    )
+    with TestClient(app, headers={"Authorization": f"Bearer {tokens['operator']}"}) as client:
+        task_id = _kind_task(client, ctx, "hades-189", "http://github.com:443/git/never.git")
+        attempt_id = ""
+        for _ in range(20):
+            attempt = client.get(f"/v1/tasks/{task_id}").json().get("latest_attempt")
+            if attempt:
+                attempt_id = str(attempt["id"])
+                break
+            await supervisor.tick()
+        assert attempt_id
+        await _preparer_running(api, attempt_id, supervisor)
+        assert client.get(f"/v1/attempts/{attempt_id}").json()["state"] == "preparing"
+
+        cancel = client.post(
+            f"/v1/tasks/{task_id}/cancel",
+            json={"reason": "hades #189 proof", "verbatim": "cancel it", "decided_by": "tests"},
+        )
+        assert cancel.status_code == 200 and cancel.json()["state"] == "cancelling"
+        cancelled_at = time.monotonic()
+        state = ""
+        ticks = 0
+        while time.monotonic() - cancelled_at < 60:
+            assert _worker_objects(api, attempt_id) == []
+            await supervisor.tick()
+            ticks += 1
+            state = client.get(f"/v1/tasks/{task_id}").json()["state"]
+            if state == "cancelled":
+                break
+            await asyncio.sleep(0.5)
+        elapsed = time.monotonic() - cancelled_at
+        assert state == "cancelled", state
+        print(f"hades-189: cancelled {elapsed:.1f}s after the cancel, in {ticks} tick(s)")
+        assert elapsed < 30
+        attempt = client.get(f"/v1/attempts/{attempt_id}").json()
+        assert attempt["state"] == "failed" and attempt["exit_class"] == "killed"
+        events = client.get(f"/v1/tasks/{task_id}/events", params={"limit": 200}).json()
+        collected = next(e for e in events["items"] if e["kind"] == "attempt_collected")
+        assert collected["payload"]["stage"] == "prepare"
+        assert "attempt_running" not in [e["kind"] for e in events["items"]]
+        # Nothing of the launch is left running, and no worker ever existed.
+        await _pods_gone(api, attempt_id, timeout=30)
+        assert _worker_objects(api, attempt_id) == []
+    await supervisor.stop()
+
+
+async def test_hades_190_a_hanging_prepare_leaves_the_lease_readiness_and_other_tasks(
+    engine: Engine,
+    migrated: str,
+    artifact_root: Path,
+    api: KubernetesClient,
+    registry: CraneRegistryClient,
+) -> None:
+    """A prepare hanging past the lease TTL (15 s here): every tick still renews the
+    lease, `/v1/ready` stays 200, and another task launches. Then the supervisor stops,
+    and the API stays ready while the admin UI says the supervisor is not healthy."""
+    provider = _slow_provider(api, registry)
+    ctx, tokens, app, harnesses = _kind_app(engine, migrated, artifact_root, provider, registry)
+    supervisor = Supervisor(
+        ctx.uow_factory,
+        {"kubernetes": provider},
+        ctx.clock,
+        holder="e2e-kind-190",
+        artifact_store=ctx.artifact_store,
+        lease_ttl_seconds=15,
+        grace_seconds=5,
+        harnesses=harnesses,
+    )
+    with TestClient(app, headers={"Authorization": f"Bearer {tokens['operator']}"}) as client:
+        slow = _kind_task(client, ctx, "hades-190-slow", "http://github.com:443/git/never.git")
+        await supervisor.tick()
+        slow_attempt = str(client.get(f"/v1/tasks/{slow}").json()["latest_attempt"]["id"])
+        await _preparer_running(api, slow_attempt, supervisor)
+        # The other worker runs through the whole window, so every tick is the launch
+        # and observation path; a collect is its own step and comes after (see below).
+        other = _kind_task(client, ctx, "hades-190-other", _origin("hades-190-other", "hang"))
+
+        hang_started = time.monotonic()
+        longest_tick = 0.0
+        other_launched = False
+        while time.monotonic() - hang_started < 50:
+            before = time.monotonic()
+            result = await supervisor.tick()
+            longest_tick = max(longest_tick, time.monotonic() - before)
+            assert result.held, "the lease was lost while a prepare hung"
+            ready = client.get("/v1/ready")
+            assert ready.status_code == 200, ready.text
+            sup = client.get("/v1/supervisor").json()
+            assert sup["healthy"] is True, sup
+            other_attempt = client.get(f"/v1/tasks/{other}").json().get("latest_attempt")
+            other_launched = other_launched or bool(other_attempt and other_attempt["started_at"])
+            await asyncio.sleep(1)
+        print(f"hades-190: longest tick {longest_tick:.1f}s while the prepare hung for 50s")
+        assert longest_tick < 15
+        assert other_launched, "the other task never launched beside the hanging prepare"
+        assert client.get(f"/v1/attempts/{slow_attempt}").json()["state"] == "preparing"
+        other_view = client.get(f"/v1/tasks/{other}").json()["latest_attempt"]
+        assert other_view["state"] == "running", other_view
+        for task in (slow, other):
+            response = client.post(
+                f"/v1/tasks/{task}/cancel",
+                json={"reason": "hades #190 proof done", "verbatim": "stop", "decided_by": "tests"},
+            )
+            assert response.status_code == 200
+        for task in (slow, other):
+            assert (
+                await run_until(supervisor, client, task, {"cancelled"}, max_ticks=120)
+                == "cancelled"
+            )
+
+        # The supervisor stops; past the lease the API is still ready and says why the
+        # supervisor is not healthy, and the admin UI shows it on every page.
+        await supervisor.stop()
+        await asyncio.sleep(16)
+        ready = client.get("/v1/ready")
+        assert ready.status_code == 200 and ready.json()["supervisor"]["ok"] is False
+    with TestClient(app) as browser:
+        form = browser.get("/ui/sign-in")
+        nonce = re.search(r'name="csrf" value="([a-f0-9]+)"', form.text)
+        assert nonce is not None
+        signed_in = browser.post(
+            "/ui/sign-in",
+            data={"csrf": nonce.group(1), "token": tokens["admin"], "next": "/ui/tasks"},
+            follow_redirects=False,
+        )
+        assert signed_in.status_code == 303
+        page = browser.get("/ui/tasks")
+        assert page.status_code == 200
+        assert "The supervisor is not healthy." in page.text
+        assert "e2e-kind-190 released the lease and no supervisor holds it" in page.text
+        print("hades-190: UI banner:", re.search(r'role="alert">(.*?)</div>', page.text).group(1))  # type: ignore[union-attr]
