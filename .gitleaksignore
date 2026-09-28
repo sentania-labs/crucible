@@ -3,3 +3,7 @@
 # The next commit assembles the header at run time instead, and history is never
 # rewritten, so the commit that carried it is named here (FDY-0117, 2026-09-25).
 10d9240aa23ed5c0163d480f3a087de5f41af0c8:tests/unit/test_first_run_units.py:crucible-private-key-header:20
+# The same again (FDY-0127, 2026-09-27): commit 5ea531a wrote a unit test's conversion
+# answer whose body is "MIIfake" between PEM header lines; the next commits assemble the
+# header at run time.
+5ea531a3f273e45c475842235bee1242d94c10c2:tests/unit/test_github_manifest.py:crucible-private-key-header:151
