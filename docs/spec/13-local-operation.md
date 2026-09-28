@@ -90,8 +90,8 @@ cheaper and easier in the long run." Before C11 there was one image per
 harness; now `images/worker/Dockerfile` builds a single image with Claude
 Code, Codex, AGY and Hermes, each CLI at its own pinned version and each
 downloaded by URL and verified against a sha256 computed when the pin was
-taken. It is Debian slim, non-root `worker` (uid 1000), git, curl, jq, the
-lab root CA, the Python runtime and hash-locked virtual environment Hermes
+taken. It is Debian slim, non-root `worker` (uid 1000), git, curl, jq,
+make (every shipped policy requires `make` checks, hades #181), the lab root CA, the Python runtime and hash-locked virtual environment Hermes
 needs, the four CLIs, and nothing else. No `gh`: workers have no GitHub
 credential to use it with. Where a CLI needs a companion binary to work at
 all, as Codex does for the 5.6 model family, the companion ships from the

@@ -59,7 +59,7 @@ case "${NO_CACHE:-0}" in 0|"") ;; *) no_cache="--no-cache" ;; esac
 # shellcheck disable=SC1091
 . "$here/pins.env"
 : "${BASE_IMAGE:?}" "${DEBIAN_SNAPSHOT:?}" "${GIT_VERSION:?}" "${CURL_VERSION:?}" \
-  "${JQ_VERSION:?}" "${CA_CERTIFICATES_VERSION:?}" "${LAB_CA_SHA256:?}" \
+  "${JQ_VERSION:?}" "${MAKE_VERSION:?}" "${CA_CERTIFICATES_VERSION:?}" "${LAB_CA_SHA256:?}" \
   "${SOURCE_DATE_EPOCH:?}" "${BUILDKIT_IMAGE:?}"
 
 # rewrite-timestamp only clamps a file newer than SOURCE_DATE_EPOCH. A context file at
@@ -173,6 +173,7 @@ for image in "${images[@]}"; do
         --build-arg "GIT_VERSION=$GIT_VERSION" \
         --build-arg "CURL_VERSION=$CURL_VERSION" \
         --build-arg "JQ_VERSION=$JQ_VERSION" \
+        --build-arg "MAKE_VERSION=$MAKE_VERSION" \
         --build-arg "CA_CERTIFICATES_VERSION=$CA_CERTIFICATES_VERSION" \
         --build-arg "LAB_CA_SHA256=$LAB_CA_SHA256" \
         --build-arg "PYTHON3_VERSION=$PYTHON3_VERSION" \
