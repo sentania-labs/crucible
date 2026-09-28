@@ -53,3 +53,22 @@ def test_context_nesting() -> None:
         entry = json.loads(formatter.format(record))
     assert entry["task_id"] == "t1" and entry["execution_id"] == "e1"
     assert datetime.fromisoformat(entry["ts"]).tzinfo == UTC
+
+
+def test_the_access_log_blanks_a_manifest_returns_code_and_state() -> None:
+    """crucible#168: the callback's one-time code and state never reach a log line."""
+    from crucible.logs import OneTimeQueryFilter  # noqa: PLC0415
+
+    record = logging.LogRecord(
+        "uvicorn.access",
+        logging.INFO,
+        "",
+        0,
+        '%s - "%s %s HTTP/%s" %d',
+        ("127.0.0.1:5", "GET", "/ui/github/callback?code=mc_live&state=s3cr3t&hop=1", "1.1", 303),
+        None,
+    )
+    assert OneTimeQueryFilter().filter(record) is True
+    line = JsonFormatter().format(record)
+    assert "mc_live" not in line and "s3cr3t" not in line
+    assert "code=[redacted]&state=[redacted]&hop=1" in line
