@@ -1253,15 +1253,14 @@ class Supervisor:
             await self._db(partial(self._record_prepared, attempt.id, ws))
             if not await self._db(partial(self._mark_launching, attempt.id, ws)):
                 await self._discard(provider, ws, spec)
-                self._workspaces.pop(attempt.id, None)
-                self._workspace_fingerprints.pop(attempt.id, None)
-                self._command_watches.pop(attempt.id, None)
+                self._forget_workspace(attempt.id)
                 return False
             try:
                 handle = await provider.launch(ws, spec, cancelled=self._cancel_check(task.id))
             except LaunchCancelledError as exc:
                 log.info("launch stopped for a cancel", extra={"detail": str(exc)})
                 await self._discard(provider, ws, spec)
+                self._forget_workspace(attempt.id)
                 await self._db(partial(self._settle_if_cancelled, attempt.id, "launch"))
                 return False
             except LaunchRefusedError as exc:
@@ -1289,13 +1288,17 @@ class Supervisor:
         log.info("worker stopped for a cancel during launch", extra={"handle": handle.ref})
         try:
             await provider.terminate(handle, "kill")
-        except ProviderError:
+        except Exception:  # the discard below still runs; retention removes the worker
             log.exception("terminate of a cancelled launch failed; retention removes it")
-        await self._discard(provider, ws, spec)
-        self._handles.pop(handle.attempt_id, None)
-        self._workspaces.pop(handle.attempt_id, None)
-        self._workspace_fingerprints.pop(handle.attempt_id, None)
-        self._command_watches.pop(handle.attempt_id, None)
+        finally:
+            await self._discard(provider, ws, spec)
+            self._handles.pop(handle.attempt_id, None)
+            self._forget_workspace(handle.attempt_id)
+
+    def _forget_workspace(self, attempt_id: str) -> None:
+        self._workspaces.pop(attempt_id, None)
+        self._workspace_fingerprints.pop(attempt_id, None)
+        self._command_watches.pop(attempt_id, None)
 
     async def _build_spec(
         self,
@@ -1770,8 +1773,16 @@ class Supervisor:
             await release_checkout_token(self._github, token)
 
     def _cancel_check(self, task_id: str) -> CancelCheck:
+        """What a provider asks while it prepares or launches. A look that fails is not
+        a cancel: the provider asks again on its next poll, and a long clone is not
+        failed by one database blip."""
+
         async def cancelled() -> bool:
-            return await self._db(partial(self._task_cancelled, task_id))
+            try:
+                return await self._db(partial(self._task_cancelled, task_id))
+            except Exception:
+                log.warning("could not read whether the task was cancelled", exc_info=True)
+                return False
 
         return cancelled
 
@@ -2890,9 +2901,16 @@ class Supervisor:
         if handle is not None:
             observation = await provider.observe(handle)
             if observation.state is not ObservationState.LOST:
-                self._handles[attempt.id] = handle
-                await self._db(partial(self._adopt, attempt.id, handle))
-                return False
+                if await self._db(partial(self._adopt, attempt.id, handle)):
+                    self._handles[attempt.id] = handle
+                    return False
+                # hades #189: its task was cancelled while the launch that started this
+                # worker was in flight; the attempt is settled, and the worker goes.
+                try:
+                    await provider.terminate(handle, "kill")
+                except Exception:
+                    log.exception("terminate of a cancelled launch failed; retention removes it")
+                return True
         await self._db(
             partial(
                 self._environment_failure,
@@ -2903,12 +2921,21 @@ class Supervisor:
         )
         return True
 
-    def _adopt(self, attempt_id: str, handle: Handle) -> None:
+    def _adopt(self, attempt_id: str, handle: Handle) -> bool:
+        """Adopt a stranded attempt's worker as running. False when its task was
+        cancelled meanwhile: the attempt ends killed at stage launch instead, never
+        running, and the caller stops the worker (hades #189)."""
         with self._fenced() as uow:
             attempt = uow.attempts.get(attempt_id, for_update=True)
             assert attempt is not None
             if attempt.state not in (AttemptState.PREPARING, AttemptState.LAUNCHING):
-                return
+                return True
+            task = uow.tasks.get(attempt.task_id, for_update=True)
+            assert task is not None
+            if task.state in (TaskState.CANCELLING, TaskState.CANCELLED):
+                self._end_cancelled_launch(uow, attempt, task, "launch")
+                uow.commit()
+                return False
             execution = uow.executions.get(attempt.execution_id)
             assert execution is not None
             now = self._clock.now()
@@ -2932,6 +2959,7 @@ class Supervisor:
                 attempt.id, self.holder, self.fenced_token, now, self.attempt_lease_ttl_seconds
             )
             uow.commit()
+            return True
 
     def _renew_attempt_lease(self, attempt_id: str) -> None:
         with self._fenced() as uow:

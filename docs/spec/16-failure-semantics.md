@@ -127,7 +127,9 @@ removes what its step made and ends the attempt `killed` with its `stage`
 recorded on `attempt_collected`. A cancel that lands after the provider
 created the worker settles the attempt in that last transaction, so it is
 never `running`, and the launch then kills the worker it started; anything
-of it the kill leaves is removed by provider retention. The cancel sweep
+of it the kill leaves is removed by provider retention. A supervisor that
+finds such a worker after a restart or a lease change settles the attempt the
+same way instead of adopting it. The cancel sweep
 acts only on `pending` and `running` attempts, so it never acts on an
 attempt whose launch is in flight. The task reaches `cancelled` as soon as
 the launch reaches its next check, which on the kind tier was seconds after

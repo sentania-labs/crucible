@@ -204,6 +204,39 @@ async def test_a_cancel_during_a_slow_launch_never_records_the_worker_running(
     await supervisor.stop()
 
 
+async def test_a_successor_does_not_adopt_a_worker_whose_task_was_cancelled(
+    ctx: AppContext, client: TestClient, provider: FakeProvider, clock: FakeClock
+) -> None:
+    """Review of the Codex round: the cancel lands after the worker was created, and the
+    supervisor stops before its launch records anything. The successor finds the worker
+    of a stranded attempt; it settles the attempt killed and stops the worker rather
+    than adopting it as running."""
+    first = make_supervisor(ctx, provider, launch_wait_seconds=0.2)
+    task_id = _submit(client, "HT-CANCEL-ADOPT")
+    provider.script("HT-CANCEL-ADOPT", "hang")
+    provider.hold_launch("HT-CANCEL-ADOPT", "after")
+    await first.tick()
+    attempt_id = str(_attempt(client, task_id)["id"])
+    worker = provider.worker(attempt_id)
+    assert worker is not None
+    response = client.post(f"/v1/tasks/{task_id}/cancel", json=CANCEL)
+    assert response.status_code == 200, response.text
+    await first.stop()
+
+    clock.advance(31)
+    successor = make_supervisor(ctx, provider, holder="sup-b", launch_wait_seconds=0.2)
+    await successor.tick()
+
+    assert client.get(f"/v1/tasks/{task_id}").json()["state"] == "cancelled"
+    attempt = client.get(f"/v1/attempts/{attempt_id}").json()
+    assert attempt["state"] == "failed" and attempt["exit_class"] == "killed"
+    assert _collected(client, task_id)["stage"] == "launch"
+    kinds = event_kinds(client, task_id)
+    assert "attempt_adopted" not in kinds and "attempt_running" not in kinds
+    assert worker.kills == 1 and worker.exit_code == 137
+    await successor.stop()
+
+
 async def test_a_cancel_during_the_launch_gate_creates_no_worker(
     ctx: AppContext, client: TestClient, provider: FakeProvider
 ) -> None:

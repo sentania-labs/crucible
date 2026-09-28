@@ -33,8 +33,9 @@ with the issue's recommendation.
   force-removes the container on a cancel. `launch` takes the same check and asks it
   just before it creates the worker. The transaction that would record the worker
   `running` asks it too: on a cancel it settles the attempt `killed` at stage `launch`
-  instead, and the launch kills the worker it started. The cancel sweep never acts on
-  a `preparing` or `launching` attempt, so only the launch settles it.
+  instead, and the launch kills the worker it started. A successor that finds the
+  worker of a stranded attempt whose task was cancelled does the same rather than
+  adopting it. The cancel sweep never acts on a `preparing` or `launching` attempt.
 - **Readiness (#190).** `/v1/ready` is decided by the database and the migrations; its
   `supervisor` check stays in the response as information. Every signed-in admin page
   carries a red banner while the supervisor is not healthy.

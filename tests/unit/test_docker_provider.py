@@ -307,15 +307,19 @@ class CloningClient(StubClient):
         super().__init__()
         self.started = threading.Event()
         self.gone = threading.Event()
+        self.returned = threading.Event()
         self.forced: list[bool] = []
 
     def start_container(self, container_id: str) -> None:
         self.started.set()
 
     def wait_container(self, container_id: str, *, timeout: float) -> int:
-        if not self.gone.wait(timeout):
-            raise TimeoutError("timed out")
-        return 137
+        try:
+            if not self.gone.wait(timeout):
+                raise TimeoutError("timed out")
+            return 137
+        finally:
+            self.returned.set()
 
     def remove_container(self, container_id: str, *, force: bool = True) -> None:
         self.forced.append(force)
@@ -332,23 +336,32 @@ async def test_a_cancel_during_the_preparer_removes_it_within_one_poll(tmp_path:
         replace(config(tmp_path), collector_timeout_seconds=30),
         client=client,  # type: ignore[arg-type]
     )
-    docker.cancel_poll_seconds = 0.05
-    cancelled_at: list[float] = []
+    docker.cancel_poll_seconds = 0.2
+    flag = asyncio.Event()
+    asked: list[float] = []
 
     async def cancelled() -> bool:
-        if client.started.is_set() and not cancelled_at:
-            await asyncio.sleep(0.3)  # the clone is well under way
-            cancelled_at.append(time.monotonic())
-        return bool(cancelled_at)
+        asked.append(time.monotonic())
+        return flag.is_set()
 
+    async def cancel_mid_clone() -> float:
+        await asyncio.to_thread(client.started.wait, 5)
+        await asyncio.sleep(0.5)  # the clone is well under way
+        flag.set()
+        return time.monotonic()
+
+    cancelling = asyncio.create_task(cancel_mid_clone())
     with pytest.raises(LaunchCancelledError, match="while the preparer ran"):
         await docker.prepare(spec(), cancelled=cancelled)
-    settled = time.monotonic() - cancelled_at[0]
+    settled = time.monotonic() - await cancelling
 
-    assert settled < docker.cancel_poll_seconds + 0.5, settled
+    # Asked on every poll while the clone ran, and noticed within one poll of the cancel.
+    assert len(asked) >= 3, asked
+    assert settled <= docker.cancel_poll_seconds + 0.15, settled
     assert client.created and client.created[0]["name"].startswith("crucible-preparer-")
     assert client.removed == ["container-1"] and client.forced == [True]
-    assert client.gone.is_set(), "the daemon's wait ended with the container"
+    # The daemon's wait, abandoned in its thread, ended once the container was gone.
+    assert await asyncio.to_thread(client.returned.wait, 5)
 
 
 async def test_a_cancel_before_the_worker_is_created_creates_nothing(tmp_path: Path) -> None:
