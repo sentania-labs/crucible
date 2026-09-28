@@ -153,11 +153,11 @@ images: ## FDY-0072: build both images from a staged copy the daemon's user can 
 images-check: ## build both images and fail if any tag, harness version or OCI digest differs from images/manifest.env
 	DOCKER="$(DOCKER)" CACHE_DIR="$(CACHE_DIR)" NO_CACHE="$(NO_CACHE)" tools/images/images.sh check
 
-# hades #181: every program a shipped policy's required checks run (default-software's
-# `make lint`, `make test`, `make scan`) must resolve in the worker image, so a policy
-# and the image cannot disagree again. Probes the WORKER tag images/manifest.env
+# hades #181: the program each shipped policy's required check starts with (`make`, for
+# default-software's `make lint`, `make test`, `make scan`) must resolve in the worker
+# image, so a policy and the image cannot disagree about it again. Probes the WORKER tag images/manifest.env
 # declares, which `make images` or `make images-check` leaves in the daemon.
-images-policy-check: ## fail when the worker image lacks a program a shipped policy requires
+images-policy-check: ## fail when the worker image lacks the program a shipped policy's required check starts with
 	$(UV) sync --frozen --quiet
 	DOCKER="$(DOCKER)" $(UV) run python tools/images/policy_commands.py
 

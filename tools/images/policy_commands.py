@@ -1,4 +1,4 @@
-"""Prove the worker image carries every program the shipped policies require (hades #181).
+"""Prove the worker image carries the program each shipped policy's checks start with (#181).
 
 A policy's `repository.required_checks` are commands every task contract must carry as
 required verification, and the worker runs them inside the worker image. The image and
@@ -11,6 +11,12 @@ document the migrations seed. The program of a check is its first word after any
 leading `NAME=value` assignments. Each program must resolve, inside the image as its
 own user and PATH, to an absolute path of an executable file: a shell builtin or a
 function does not count.
+
+What this does not prove: that the check succeeds. `make lint` runs whatever the target
+repository's Makefile says, and the tools those recipes call are the repository's
+business, not the policy's. A wrapper such as `env make lint` or `sh -c '...'` would be
+satisfied by the wrapper alone, and a check that runs a script from the checkout
+(`./scripts/check`) would be reported missing; no shipped policy uses either form.
 
     python tools/images/policy_commands.py              # the WORKER image in images/manifest.env
     python tools/images/policy_commands.py --image crucible-worker:<tag>
@@ -146,7 +152,7 @@ def main(argv: list[str]) -> int:
             file=sys.stderr,
         )
         return 1
-    print(f"policy_commands.py: {image} carries every program the shipped policies require")
+    print(f"policy_commands.py: {image} carries the program every shipped policy check starts with")
     return 0
 
 

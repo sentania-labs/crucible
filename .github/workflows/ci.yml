@@ -149,12 +149,12 @@ jobs:
         env:
           NO_CACHE: ${{ steps.no_cache.outputs.value }}
         run: make images-check CACHE_DIR="$RUNNER_TEMP/buildkit-cache" NO_CACHE="$NO_CACHE"
-      # hades #181: the image just built must carry every program the shipped policies
-      # require their tasks to run (default-software's make lint, make test, make scan).
+      # hades #181: the image just built must carry the program each shipped policy's
+      # required check starts with (make, for default-software's make lint, test, scan).
       - uses: astral-sh/setup-uv@eb1897b8dc4b5d5bfe39a428a8f2304605e0983c # v7.0.0
         with:
           enable-cache: true
-      - name: the worker image carries every program the shipped policies require
+      - name: the worker image carries the programs the shipped policies' checks start with
         run: make images-policy-check
       - name: keep the layer cache for branches
         if: github.ref == 'refs/heads/main'

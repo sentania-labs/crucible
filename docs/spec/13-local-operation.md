@@ -91,7 +91,8 @@ harness; now `images/worker/Dockerfile` builds a single image with Claude
 Code, Codex, AGY and Hermes, each CLI at its own pinned version and each
 downloaded by URL and verified against a sha256 computed when the pin was
 taken. It is Debian slim, non-root `worker` (uid 1000), git, curl, jq,
-make (every shipped policy requires `make` checks, hades #181), the lab root CA, the Python runtime and hash-locked virtual environment Hermes
+make (the shipped policy's required checks start with it, hades #181), the
+lab root CA, the Python runtime and hash-locked virtual environment Hermes
 needs, the four CLIs, and nothing else. No `gh`: workers have no GitHub
 credential to use it with. Where a CLI needs a companion binary to work at
 all, as Codex does for the 5.6 model family, the companion ships from the
@@ -165,9 +166,11 @@ Rules:
   copy them.
 - CI's `images` job runs the same script as `make images-check`: it builds
   both images from the pinned inputs on a fresh runner and fails if any tag,
-  harness version or OCI digest differs from `images/manifest.env`. Pull
-  requests import a BuildKit layer cache; every push to main builds from
-  scratch before exporting it.
+  harness version or OCI digest differs from `images/manifest.env`. It then
+  runs `make images-policy-check`, which fails when the program a shipped
+  policy's required check starts with (`make` for default-software) does not
+  resolve in the worker image (hades #181). Pull requests import a BuildKit
+  layer cache; every push to main builds from scratch before exporting it.
 - The release publishes both to `ghcr.io/sentania-labs/crucible-worker`
   with `docker push`, the way the service image and every ScarGuard service
   are pushed (the operator's decision, 2026-09-23; 24): it builds from

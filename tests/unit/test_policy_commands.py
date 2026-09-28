@@ -1,4 +1,4 @@
-"""The worker image must carry every program the shipped policies require (hades #181).
+"""The worker image must carry the program each shipped policy's checks start with (#181).
 
 These tests cover the collection and the in-image probe without an image: the probe
 script runs under a stand-in `docker` that executes it on the host with a PATH the test
