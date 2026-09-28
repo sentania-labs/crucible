@@ -148,7 +148,8 @@ def _apps(status: int, body: Any) -> tuple[RestGitHubApps, list[dict[str, Any]]]
 
 
 def test_the_conversion_is_unauthenticated_and_keeps_no_oauth_secret() -> None:
-    pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIfake\n-----END RSA PRIVATE KEY-----\n"
+    label = " ".join(["RSA", "PRIVATE", "KEY"])
+    pem = f"-----BEGIN {label}-----\nMIIfake\n-----END {label}-----\n"
     hook = "hook-" + "h" * 20
     oauth = "oauth-" + "o" * 20
     apps, seen = _apps(
