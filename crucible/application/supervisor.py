@@ -520,8 +520,11 @@ class Supervisor:
 
     async def stop(self) -> None:
         """Release the lease cleanly (a crash simply lets it expire). A launch still in
-        flight is cancelled first, so its provider removes what it made; the attempt
-        stays in preparing or launching for the next supervisor to reconcile."""
+        flight is cancelled first: the step it was on removes its Job, policy and
+        per-attempt Secrets on the way out, and the attempt stays in preparing or
+        launching for the next supervisor to reconcile, as after a crash (10). What a
+        finished step left (the workspace claim, the identity ConfigMap) goes with
+        the attempt's other objects in the provider's retention sweep."""
         await self._abandon_launches()
         await self._db(self._release_step)
 
@@ -537,8 +540,13 @@ class Supervisor:
 
     async def tick(self) -> TickResult:
         started = time.monotonic()
+        token_before = self.fenced_token
         held = await self._db(self._lease_step)
         result = TickResult(held=held)
+        if not held or self.fenced_token != token_before:
+            # A launch begun under a lease this process no longer holds is not its to
+            # finish: the next holder reconciles the attempt (hades #190 review).
+            await self._abandon_launches()
         if not held:
             return result
         try:
@@ -1092,6 +1100,7 @@ class Supervisor:
         launches in flight (hades #190). What finishes in that window is counted now;
         what does not keeps running and is counted by the tick that sees it end."""
         launched = self._harvest_launches()
+        started: list[asyncio.Task[bool]] = []
         for item in await self._db(self._list_pending):
             if item.attempt.id in self._launches:
                 continue
@@ -1106,11 +1115,15 @@ class Supervisor:
                     log.exception("launch step failed; continuing with the next attempt")
                     continue
             if begun is not None:
-                self._launches[item.attempt.id] = asyncio.create_task(
+                launch = asyncio.create_task(
                     self._finish_launch(*begun), name=f"launch-{item.attempt.id}"
                 )
-        if self._launches:
-            await asyncio.wait(list(self._launches.values()), timeout=self.launch_wait_seconds)
+                self._launches[item.attempt.id] = launch
+                started.append(launch)
+        # Only this tick's launches are waited on: one begun earlier that is still
+        # running is a slow one, and waiting on it again would slow every tick.
+        if started:
+            await asyncio.wait(started, timeout=self.launch_wait_seconds)
         return launched + self._harvest_launches()
 
     def _harvest_launches(self) -> int:
@@ -1841,6 +1854,9 @@ class Supervisor:
             assert attempt is not None
             execution = uow.executions.get(attempt.execution_id)
             assert execution is not None
+            if attempt.state is not AttemptState.PREPARING:
+                # Another supervisor already ended it (a stranded launch, 10).
+                return False
             current = uow.tasks.get(attempt.task_id, for_update=True)
             assert current is not None
             if current.state in (TaskState.CANCELLING, TaskState.CANCELLED):

@@ -419,8 +419,10 @@ class LaunchRefusedError(ProviderError):
 
 class LaunchCancelledError(ProviderError):
     """The task was cancelled while its attempt was being prepared (hades #189). The
-    provider stopped at the step it was on, removed what that step made, and started
-    nothing further; the supervisor settles the attempt as cancelled, not as a failure."""
+    provider stopped at the step it was on, removed that step's Job, policy and
+    per-attempt Secrets, and started nothing further; the supervisor settles the
+    attempt as cancelled, not as a failure. The workspace claim and anything an earlier
+    step left go with the attempt's other objects in retention."""
 
 
 # Asked by `prepare` before each of its steps and while it waits on one; True means the

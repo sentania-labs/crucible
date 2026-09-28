@@ -697,3 +697,20 @@ def test_host_aliases_pin_nothing_under_the_broad_rule() -> None:
     assert k8sspec.host_aliases(replace(plan, broad=False)) == [
         {"ip": "140.82.112.3", "hostnames": ["github.com"]}
     ]
+
+
+def test_host_aliases_carry_only_names_the_api_server_accepts() -> None:
+    """A hostAliases hostname must be a lowercase DNS-1123 name, or the Job is refused;
+    the policy's allowlist is not held to that, so the alias is normalised or left out."""
+    plan = EgressPlan(
+        hosts=("Registry.NPMjs.org", "pypi.org.", "bad_name.example"),
+        host_addresses=(
+            ("Registry.NPMjs.org", ("104.16.1.34/32",)),
+            ("pypi.org.", ("151.101.0.223/32",)),
+            ("bad_name.example", ("203.0.113.9/32",)),
+        ),
+    )
+    assert k8sspec.host_aliases(plan) == [
+        {"ip": "104.16.1.34", "hostnames": ["registry.npmjs.org"]},
+        {"ip": "151.101.0.223", "hostnames": ["pypi.org"]},
+    ]

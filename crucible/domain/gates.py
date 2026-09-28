@@ -90,6 +90,7 @@ DEFERRED_MARKER = "deferred:c3-verifier"
 COLLECTOR_MARKER = "incomplete:collector"
 
 WORKER_SOURCE = "worker"
+_HEX = re.compile(r"[0-9a-f]{7,64}")
 
 # Shims and identity paths a worker must never leave behind (11).
 INJECTED_PREFIXES: tuple[str, ...] = (".crucible/", "crucible/identity/", ".crucible-shims/")
@@ -279,7 +280,9 @@ def commits_present(gi: GateInput) -> GateOutcome:
     if not claimed:
         detail += "; the report named no head_sha"
     elif claimed != collected:
-        detail += f"; the report named {claimed[:12]}, which is not the collected head"
+        # Worker-written: echoed only when it is a hash, never as free text.
+        named = claimed[:12] if _HEX.fullmatch(claimed) else "another value"
+        detail += f"; the report named {named}, which is not the collected head"
     return GateOutcome(GateResult.PASS, detail, ids)
 
 

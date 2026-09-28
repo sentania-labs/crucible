@@ -172,3 +172,29 @@ async def test_stopping_the_supervisor_ends_a_launch_in_flight(
     assert await run_to_settled(successor, client, task_id) == "awaiting_internal_review"
     assert "task_retry_scheduled" in event_kinds(client, task_id)
     await successor.stop()
+
+
+async def test_a_supervisor_that_lost_its_lease_abandons_its_launches(
+    ctx: AppContext, client: TestClient, provider: FakeProvider, clock: FakeClock
+) -> None:
+    """Review of hades #190: the usual lease loss is a renewal that fails at the top of
+    a tick. The launch begun under the old lease is cancelled then, so it neither keeps
+    preparing for an attempt the new holder owns nor fails a later tick of its own."""
+    first = make_supervisor(ctx, provider, launch_wait_seconds=0.2)
+    task_id = _submit(client, "HT-LEASE")
+    provider.hold_prepare("HT-LEASE")
+    await first.tick()
+    stranded = str(_attempt(client, task_id)["id"])
+    assert first._launches, "the prepare should still be held"
+
+    clock.advance(31)
+    successor = make_supervisor(ctx, provider, holder="sup-b", launch_wait_seconds=0.2)
+    assert (await successor.tick()).held
+    assert client.get(f"/v1/attempts/{stranded}").json()["state"] == "failed"
+    result = await first.tick()
+    assert result.held is False
+    assert not first._launches
+    provider.release_prepare("HT-LEASE")
+    assert provider.worker(stranded) is None
+    assert await run_to_settled(successor, client, task_id) == "awaiting_internal_review"
+    await successor.stop()

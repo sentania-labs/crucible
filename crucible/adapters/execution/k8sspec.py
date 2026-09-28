@@ -16,6 +16,7 @@ from __future__ import annotations
 import base64
 import ipaddress
 import math
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -691,6 +692,9 @@ class EgressPlan:
         return not self.hosts and not self.endpoints and self.endpoint_selector is None
 
 
+_DNS_1123_SUBDOMAIN = re.compile(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*")
+
+
 def host_aliases(plan: EgressPlan) -> list[dict[str, Any]]:
     """The Pod's `hostAliases` for a resolved plan: each allowlisted name pinned to the
     addresses its policy rule permits (hades #191).
@@ -704,7 +708,13 @@ def host_aliases(plan: EgressPlan) -> list[dict[str, Any]]:
     if plan.broad:
         return []
     by_address: dict[str, list[str]] = {}
-    for host, addresses in plan.host_addresses:
+    for written, addresses in plan.host_addresses:
+        # The API server takes only a lowercase DNS-1123 name here; a name the policy
+        # wrote otherwise (`Registry.NPMjs.org`, `pypi.org.`) is pinned in that form,
+        # and one that still does not fit is left to the Pod's own lookup.
+        host = written.lower().rstrip(".")
+        if len(host) > 253 or not _DNS_1123_SUBDOMAIN.fullmatch(host):
+            continue
         for cidr in addresses:
             network = ipaddress.ip_network(cidr, strict=False)
             if network.version != 4 or network.num_addresses != 1:

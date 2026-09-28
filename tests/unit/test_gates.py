@@ -333,7 +333,11 @@ def test_commits_present_takes_the_head_from_the_bundle_not_the_report() -> None
     """hades #187: HT-0002 reported a head it did not end on. The collected bundle is the
     head; a report that names another one, or none, is noted and does not fail."""
     evidence = _passing_evidence()
-    for claimed, note in ((None, "named no head_sha"), ("9" * 40, "is not the collected head")):
+    for claimed, note in (
+        (None, "named no head_sha"),
+        ("9" * 40, "named 999999999999, which is not the collected head"),
+        ("not a hash at all", "named another value, which is not the collected head"),
+    ):
         payload = dict(evidence[2].payload)
         payload["claimed_head_sha"] = claimed
         evidence[2] = _ev("bundle_head", payload, ident=3)

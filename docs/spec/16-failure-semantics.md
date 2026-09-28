@@ -122,8 +122,9 @@ the spec is built, before the cache refresh, before the preparer, while the
 refresher or preparer Job runs, and once more in the transaction that would
 move the attempt to `launching`. A cancelled launch removes what its step
 made, starts no worker, and ends the attempt `killed` with its `stage`
-recorded on `attempt_collected`; the task reaches `cancelled` in the same
-tick (hades #189, 2026-09-28).
+recorded on `attempt_collected`; the task reaches `cancelled` as soon as the
+launch reaches its next check, which on the kind tier was seconds after the
+cancel (hades #189, 2026-09-28).
 
 ## Cleanup policy (per policy document, 05b)
 
