@@ -115,9 +115,12 @@ class RestTransport:
             "Accept": accept,
             "X-GitHub-Api-Version": API_VERSION,
             "User-Agent": USER_AGENT,
-            "Authorization": f"Bearer {bearer}",
             "Accept-Encoding": "gzip",
         }
+        # The one unauthenticated call is the manifest conversion (crucible#168): the
+        # code in its path is the credential, so an empty bearer sends no header.
+        if bearer:
+            headers["Authorization"] = f"Bearer {bearer}"
         if payload is not None:
             headers["Content-Type"] = "application/json"
         conn = self._connect(self.host, self.port, self.timeout)

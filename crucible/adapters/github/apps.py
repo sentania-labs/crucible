@@ -9,7 +9,7 @@ from typing import Any
 
 from crucible.adapters.github.appauth import AppAuthenticator
 from crucible.adapters.github.transport import MAX_PAGES, PER_PAGE, RestTransport
-from crucible.ports.github import AppCredential, GitHubError
+from crucible.ports.github import AppCredential, GitHubError, ManifestConversion
 
 
 class RestGitHubApps:
@@ -84,3 +84,31 @@ class RestGitHubApps:
             for repo in repositories
             if repo.get("full_name")
         ]
+
+    def convert_manifest(self, code: str) -> ManifestConversion:
+        status, payload, _ = self._http.request(
+            "POST", f"/app-manifests/{code}/conversions", bearer=""
+        )
+        path = "/app-manifests/{code}/conversions"
+        if status >= 400:
+            message = payload.get("message") if isinstance(payload, dict) else None
+            raise GitHubError(status, str(message or "request failed"), path=path)
+        if not isinstance(payload, dict):
+            raise GitHubError(status, "the conversion answered no App", path=path)
+        pem = payload.get("pem")
+        app_id = payload.get("id")
+        if not isinstance(pem, str) or not pem.strip() or not isinstance(app_id, int):
+            raise GitHubError(status, "the conversion answered no App id and key", path=path)
+        owner = payload.get("owner") or {}
+        webhook_secret = payload.get("webhook_secret")
+        return ManifestConversion(
+            app_id=app_id,
+            slug=str(payload.get("slug") or ""),
+            name=str(payload.get("name") or payload.get("slug") or ""),
+            owner=owner.get("login") if isinstance(owner, dict) else None,
+            html_url=str(payload.get("html_url") or ""),
+            private_key=pem.encode("utf-8"),
+            webhook_secret=webhook_secret.encode("utf-8")
+            if isinstance(webhook_secret, str) and webhook_secret
+            else None,
+        )
