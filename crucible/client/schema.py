@@ -332,6 +332,12 @@ def kind_schemas() -> dict[str, dict[str, Any]]:
             {"policy": ANY_OBJ, "command_timeout_ms": ANY_OBJ},
             {"timeout_seconds": ANY_OBJ},
         ),
+        "routing_preference": _obj(
+            "the pool order routing tries first per tier, and when a model is demoted "
+            "for failing blocking gates and probed again (ADR 0028)",
+            {"tiers": ANY_OBJ, "rotation": ANY_OBJ, "pools": {"type": "array"}},
+            {"policy": ANY_OBJ, "routing_policy": ANY_OBJ, "local_pools": {"type": "array"}},
+        ),
         "bootstrap_import": bootstrap,
         "bootstrap_import_list": _items("bootstrap imports", ANY_OBJ),
         # this command
