@@ -323,6 +323,9 @@ class GateResultRecord:
     detail: str
     evidence_ids: list[int]
     evaluated_at: datetime
+    # ADR 0024: whether a failure here stops the task, and findings for the reviewer.
+    blocking: bool = True
+    findings: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)

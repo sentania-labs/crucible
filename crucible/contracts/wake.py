@@ -62,6 +62,9 @@ class WakeV1(StrictModel):
     attempt_id: str | None = None
     pull_request: dict[str, Any] | None = None
     summary: str
+    # ADR 0024: failed advisory gates and advisory findings, each with its detail, that
+    # the reviewer is asked to weigh. Empty when there are none.
+    for_reviewer: list[dict[str, str]] = Field(default_factory=list)
     links: dict[str, str] = Field(default_factory=dict)
     created_at: Rfc3339
 

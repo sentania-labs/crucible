@@ -361,6 +361,11 @@ class GateResultRow(Base):
     detail: Mapped[str] = mapped_column(Text)
     evidence_ids: Mapped[list[Any]] = mapped_column(ARRAY(BigInteger))
     evaluated_at: Mapped[datetime] = mapped_column(TZ)
+    # ADR 0024 (0028): the gate's class when it was evaluated, and advisory findings.
+    blocking: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"))
+    findings: Mapped[list[Any]] = mapped_column(
+        JSONB, default=list, server_default=text("'[]'::jsonb")
+    )
 
 
 class AcceptanceResultRow(Base):

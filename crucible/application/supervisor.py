@@ -72,7 +72,12 @@ from crucible.application.wakes import (
     retry_hours_from_policy,
     wake_body,
 )
-from crucible.contracts.completion_claim import CompletedClaim, complete_claim, parse_claim
+from crucible.contracts.completion_claim import (
+    CompletedClaim,
+    complete_claim,
+    load_report,
+    parse_claim,
+)
 from crucible.contracts.evidence import ROLE_RUN_EVIDENCE, EvidenceKind, EvidenceSource
 from crucible.contracts.task_contract import TaskContractV1
 from crucible.contracts.wake import WakeReason
@@ -3401,9 +3406,15 @@ class Supervisor:
                     content=partial_report.encode("utf-8"),
                     content_type="application/yaml",
                 )
+            unparsed_errors: list[dict[str, Any]] | None = None
             if outputs.report is None and outputs.report_raw is not None and not cancelled:
                 # The file exists and is not a YAML mapping (a bare colon in a value is
-                # the usual cause). The adapter's errors say so; nothing of it is stored.
+                # the usual cause). Its errors name the problem and position, never the
+                # text; nothing of the file is stored. The report is present, so the
+                # gate that reads it is for the reviewer, not a stop (ADR 0024).
+                unparsed_errors = load_report(outputs.report_raw)[1] or [
+                    {"loc": [], "msg": "report is not a mapping", "type": "shape"}
+                ]
                 record_event(
                     uow,
                     self._clock,
@@ -3412,15 +3423,7 @@ class Supervisor:
                     task_id=attempt.task_id,
                     execution_id=attempt.execution_id,
                     attempt_id=attempt.id,
-                    payload={
-                        "errors": (
-                            parsed.errors
-                            if parsed is not None and parsed.errors
-                            else [
-                                {"loc": [], "msg": "report.yaml is not a mapping", "type": "yaml"}
-                            ]
-                        )
-                    },
+                    payload={"errors": unparsed_errors},
                 )
             completed: CompletedClaim | None = None
             if outputs.report is not None and not cancelled:
@@ -3505,6 +3508,7 @@ class Supervisor:
                 parse_errors=errors,
                 parsed_report=parsed,
                 completed=completed,
+                unparsed_errors=unparsed_errors,
             )
             if head:
                 task.head_sha = head
