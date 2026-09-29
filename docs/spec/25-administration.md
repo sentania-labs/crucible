@@ -426,6 +426,12 @@ first signs in at `/ui`, or when it is revoked. Principal names starting
 `first-run-admin` are reserved for the migration, so `token create` refuses
 them. A later migration run finds an active administrator and does nothing.
 
+A principal is renamed with `POST /admin/tokens/{principal_id}/rename`
+(`crucible admin token rename ID NAME`, or the Rename form on the Tokens page),
+reason required (ADR 0029). Its tasks and token follow it by id; events keep the
+name they were written with. A taken or reserved name is refused, and the
+first-run principal keeps its name.
+
 ## What Foundry may do
 
 Read `/v1/admin/status` parts that its role permits (orchestrator role

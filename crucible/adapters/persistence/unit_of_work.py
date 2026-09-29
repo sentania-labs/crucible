@@ -222,6 +222,14 @@ class Principals:
         self._s.flush()
         return True
 
+    def rename(self, principal_id: str, name: str) -> bool:
+        row = self._s.get(PrincipalRow, principal_id)
+        if row is None:
+            return False
+        row.name = name
+        self._s.flush()
+        return True
+
 
 class Repositories:
     def __init__(self, session: Session) -> None:
@@ -368,6 +376,11 @@ class Tasks:
                 resume_at=task.resume_at,
                 quota_wait_started_at=task.quota_wait_started_at,
             )
+        )
+
+    def reassign(self, task_id: str, principal_id: str) -> None:
+        self._s.execute(
+            update(TaskRow).where(TaskRow.id == task_id).values(principal_id=principal_id)
         )
 
     def list_by_state(self, state: TaskState, *, for_update: bool = False) -> Sequence[Task]:

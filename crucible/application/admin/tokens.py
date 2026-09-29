@@ -12,6 +12,9 @@ from crucible.domain.entities import Role
 from crucible.domain.events import EventKind
 from crucible.ports.repository import UnitOfWork
 
+# The width of principals.name.
+NAME_MAX = 128
+
 
 def list_principals(uow: UnitOfWork) -> list[dict[str, Any]]:
     return [
@@ -55,6 +58,52 @@ def create(
         after={"name": minted.principal.name, "role": minted.principal.role.value},
     )
     return minted
+
+
+def rename(
+    ctx: AdminContext,
+    uow: UnitOfWork,
+    *,
+    principal: str,
+    principal_id: str,
+    name: str,
+    reason: str | None,
+) -> dict[str, Any]:
+    """Change a principal's name. Tasks, tokens and grants hold the principal's id, so
+    they all follow it; events keep the name they were written with, because they are
+    history (the operator's decision of 2026-09-29 that the orchestrator's account is
+    named `hades`)."""
+    reason = guard_mutation(
+        ctx, uow, reason, principal=principal, operation="tokens rename", reason_required=True
+    )
+    target = uow.principals.get(principal_id)
+    if target is None:
+        raise ConflictError("the principal does not exist")
+    new = name.strip()
+    if not new or new != name or len(new) > NAME_MAX:
+        raise ConflictError(
+            f"a principal name is 1 to {NAME_MAX} characters with no surrounding spaces"
+        )
+    if new == target.name:
+        raise ConflictError(f"the principal is already named {new!r}")
+    if new == "crucible" or new.startswith("worker:") or is_first_run(new):
+        raise ConflictError(f"principal name {new!r} is reserved")
+    if is_first_run(target.name):
+        # The first-run token is delivered and discarded by this name (ADR 0016).
+        raise ConflictError("the first-run principal keeps its name")
+    if uow.principals.get_by_name(new) is not None:
+        raise ConflictError(f"a principal named {new!r} already exists")
+    uow.principals.rename(target.id, new)
+    admin_event(
+        uow,
+        ctx,
+        EventKind.PRINCIPAL_RENAMED,
+        principal=principal,
+        reason=reason,
+        before={"id": target.id, "name": target.name, "role": target.role.value},
+        after={"id": target.id, "name": new, "role": target.role.value},
+    )
+    return {"id": target.id, "name": new, "previous_name": target.name}
 
 
 def after_revoke(ctx: AdminContext, result: dict[str, Any]) -> None:

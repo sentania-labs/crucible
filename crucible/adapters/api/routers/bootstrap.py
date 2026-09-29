@@ -89,3 +89,24 @@ def commit_bootstrap_import(
     )
     uow.commit()
     return report
+
+
+@router.post("/import/bootstrap/{import_id}/discard")
+def discard_bootstrap_import(
+    import_id: str,
+    ctx: Ctx,
+    uow: UoW,
+    principal: Admin,
+    body: Annotated[dict[str, Any], Body()],
+) -> dict[str, Any]:
+    """ADR 0029: withdraw a verified import. Its tasks are retired, never deleted, and
+    their external ids are free for a fresh import. 409 unless the import is `verified`."""
+    report = bootstrap.discard(
+        _admin(ctx),
+        uow,
+        principal=principal.name,
+        import_id=import_id,
+        reason=_reason(body.get("reason")),
+    )
+    uow.commit()
+    return report

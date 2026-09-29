@@ -197,9 +197,12 @@ class EventKind(StrEnum):
     BOOTSTRAP_TASK_IMPORTED = "bootstrap_task_imported"
     BOOTSTRAP_EVENT_IMPORTED = "bootstrap_event_imported"
     BOOTSTRAP_HANDOFF = "bootstrap_handoff"
+    # a verified import withdrawn before it was committed (ADR 0029)
+    BOOTSTRAP_IMPORT_DISCARDED = "bootstrap_import_discarded"
     # principals and configuration
     PRINCIPAL_CREATED = "principal_created"
     PRINCIPAL_REVOKED = "principal_revoked"
+    PRINCIPAL_RENAMED = "principal_renamed"
     REPOSITORY_REGISTERED = "repository_registered"
     REPOSITORY_REMOVED = "repository_removed"
     REPOSITORY_ATTESTATION_RECORDED = "repository_attestation_recorded"

@@ -216,8 +216,10 @@ NON_SECRET_FIELDS = {
 REASON_REQUIRED_ACTIONS = frozenset(
     {
         "/ui/actions/bootstrap-commit",
+        "/ui/actions/bootstrap-discard",
         "/ui/actions/repository-remove",
         "/ui/actions/token-revoke",
+        "/ui/actions/token-rename",
     }
 )
 NO_REASON_ACTIONS = frozenset(
@@ -2206,6 +2208,33 @@ def tokens_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
     if admin:
         sections.append(
             {
+                "title": "Rename principal",
+                "note": (
+                    "Its tasks and token follow it; past events keep the name they were "
+                    "written with."
+                ),
+                "form": {
+                    "action": "/ui/actions/token-rename",
+                    "label": "Rename",
+                    "fields": [
+                        {
+                            "name": "principal_id",
+                            "label": "Principal",
+                            "kind": "select",
+                            "options": [
+                                (item["id"], item["name"])
+                                for item in items
+                                if item["disabled_at"] is None
+                            ],
+                        },
+                        {"name": "name", "label": "New name", "required": True},
+                        {"name": "reason", "label": "Reason", "required": True},
+                    ],
+                },
+            }
+        )
+        sections.append(
+            {
                 "title": "Create token",
                 "note": (
                     "The token is shown on the next page once and is never stored in plaintext."
@@ -3133,6 +3162,18 @@ def bootstrap_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                     "hidden": {"import_id": item["import_id"]},
                 }
             )
+            # ADR 0029: an import that will not be committed is withdrawn, so a fresh
+            # export of the same ledger can be imported.
+            entries.append(
+                {
+                    "kind": "form",
+                    "action": "/ui/actions/bootstrap-discard",
+                    "label": "Discard",
+                    "danger": True,
+                    "reason": True,
+                    "hidden": {"import_id": item["import_id"]},
+                }
+            )
         return {"kind": "actions", "items": entries}
 
     return _page(
@@ -3141,7 +3182,10 @@ def bootstrap_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
         csrf,
         active="/ui/bootstrap",
         heading="Bootstrap imports",
-        intro="Ledgers imported from Foundry, and the commit that makes one authoritative.",
+        intro=(
+            "Ledgers imported from Foundry, the commit that makes one authoritative, and the "
+            "discard that withdraws one that will not be committed."
+        ),
         sections=[
             {
                 "title": "Imports",
@@ -3825,6 +3869,23 @@ async def action(request: Request, action: str, ctx: Ctx, uow: UoW) -> Response:
                 uow,
                 principal=principal.name,
                 import_id=form.get("import_id", ""),
+                reason=reason,
+            )
+        elif action == "bootstrap-discard":
+            bootstrap.discard(
+                ctx.admin,
+                uow,
+                principal=principal.name,
+                import_id=form.get("import_id", ""),
+                reason=reason,
+            )
+        elif action == "token-rename":
+            tokens.rename(
+                ctx.admin,
+                uow,
+                principal=principal.name,
+                principal_id=form.get("principal_id", ""),
+                name=form.get("name", ""),
                 reason=reason,
             )
         else:

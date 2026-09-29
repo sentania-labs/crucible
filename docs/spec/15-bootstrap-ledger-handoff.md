@@ -83,6 +83,21 @@ can carry on from Crucible's state alone. The client it uses is `crucible`
 valid from its state for Foundry's principal, so a session resumes from the
 envelope rather than from a procedure of its own.
 
+## Discarding a verified import, and native tasks (ADR 0029)
+
+A `verified` import that will not be committed (a newer export of the same ledger
+exists) is withdrawn with `POST /v1/import/bootstrap/{id}/discard` and a reason. Nothing
+is deleted, because events are append-only: the import's tasks move to a disabled
+principal of their own, `discarded-import-<import id>`, the open ones are cancelled and
+their synthetic runs ended, and the import's state becomes `discarded`. The owner's
+external ids are then free, and the same or a fresher bundle imports afresh. An
+`authoritative` import is never discarded.
+
+A bundle task whose external id is already one of the owner's own tasks (one Hades ran
+through the API, not one an import wrote) is skipped with its events. The report lists
+it under `skipped_existing`, and `counts` are what was written, with `skipped_tasks` and
+`skipped_events`. A task another import wrote still refuses the bundle.
+
 ## `source.migrated`
 
 The export carries `source.migrated` as informational metadata: whether
