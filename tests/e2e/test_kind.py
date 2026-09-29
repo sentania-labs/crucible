@@ -1375,7 +1375,9 @@ async def test_scripted_quota_reroutes_on_kubernetes(
             await asyncio.sleep(0.5)
         else:
             raise AssertionError("the scripted quota attempt never rerouted")
-        assert midway["state"] == "scheduled", midway
+        # The reroute schedules the successor; since collection runs beside the tick
+        # (lab findings of 2026-09-29) the tick after it may already have launched it.
+        assert midway["state"] in ("scheduled", "running"), midway
         first, second = attempts
         assert first["exit_class"] == "quota_exhausted"
         assert first["image"] == resolved.reference
