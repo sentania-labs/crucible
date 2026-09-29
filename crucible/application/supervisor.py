@@ -3345,7 +3345,9 @@ class Supervisor:
             )
             if provider_quota is not None:
                 self._mark_pool_exhausted(uow, attempt, execution, provider_quota.reset_at)
-            if attempt.exit_class is ExitClass.PROVIDER_ERROR:
+            # A collection failure makes this exit `environment` below, whatever the
+            # harness said, so it is not a gateway failure and marks nothing.
+            if attempt.exit_class is ExitClass.PROVIDER_ERROR and collection_error is None:
                 self._mark_local_endpoint_down(uow, attempt, execution)
             parsed: ParsedReport | None = None
             if adapter is not None and report_dir is not None and report_dir.is_dir():
@@ -3917,7 +3919,15 @@ class Supervisor:
         ]
         if not earlier:
             return
-        latest = max(earlier, key=lambda row: (row.created_at or since, row.attempt_id))
+
+        # The attempt that finished last, not the one launched last: attempts on one pool
+        # run side by side and finish out of launch order.
+        def finished(row: AttemptMetrics) -> tuple[datetime, str]:
+            earlier_attempt = uow.attempts.get(row.attempt_id)
+            ended = earlier_attempt.ended_at if earlier_attempt is not None else None
+            return (ended or row.created_at or since, row.attempt_id)
+
+        latest = max(earlier, key=finished)
         if latest.exit_class != ExitClass.PROVIDER_ERROR.value:
             return
         self._mark_pool_exhausted(

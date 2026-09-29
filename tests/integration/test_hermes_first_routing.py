@@ -6,16 +6,19 @@ through a probe. Gate failures here are real ones the fake worker causes."""
 from __future__ import annotations
 
 import copy
+from datetime import timedelta
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 
 from crucible.adapters.api.deps import AppContext
+from crucible.adapters.execution.fake import FakeProvider
 from crucible.application.harnesses import set_harness_enabled
 from crucible.application.supervisor import Supervisor
 from crucible.domain.entities import Policy, RoutingPolicyRecord
 from crucible.domain.exit_class import ExitClass
+from crucible.ports.execution import ProviderError
 from tests.fixtures import FakeClock, contract_document
 from tests.integration.conftest import run_to_settled
 
@@ -240,3 +243,95 @@ async def test_a_local_endpoint_failure_moves_work_to_the_fallbacks(
     with ctx.uow_factory() as uow:
         assert uow.pool_exhaustions.get("anthropic-sub") is None
         assert uow.pool_exhaustions.get("google-sub") is None
+
+
+def _hermes_exit(ctx: AppContext, monkeypatch: pytest.MonkeyPatch, outcome: dict[str, Any]) -> None:
+    """Hermes classifies every exit as `outcome["class"]`, or as it would, when None."""
+    assert ctx.harnesses is not None
+    adapter = ctx.harnesses.get("hermes")
+    assert adapter is not None
+    real = adapter.classify_exit
+
+    def classify(*args: Any, **kwargs: Any) -> ExitClass:
+        return outcome["class"] or real(*args, **kwargs)
+
+    monkeypatch.setattr(adapter, "classify_exit", classify)
+
+
+def _attempt_id(client: TestClient, task_id: str) -> str:
+    return str(client.get(f"/v1/tasks/{task_id}").json()["executions"][0]["attempts"][0]["id"])
+
+
+async def test_a_collection_failure_is_not_a_gateway_failure(
+    client: TestClient,
+    ctx: AppContext,
+    clock: FakeClock,
+    supervisor: Supervisor,
+    provider: FakeProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex on #235: an exit whose outputs could not be collected is `environment`, so
+    after one real gateway failure it does not take the local pool out of routing."""
+    _install(ctx, clock, {"quality_feedback": True, "quality_window": 20})
+    _hermes_exit(ctx, monkeypatch, {"class": ExitClass.PROVIDER_ERROR})
+    task, model = await _route(client, supervisor, "HF-COLL-1", "standard", SUCCEED)
+    assert model == "coder"
+    await run_to_settled(supervisor, client, task)
+
+    async def refuse(*_a: Any, **_k: Any) -> Any:
+        raise ProviderError("the cluster did not answer the collection")
+
+    monkeypatch.setattr(provider, "collect", refuse)
+    task, model = await _route(client, supervisor, "HF-COLL-2", "standard", SUCCEED)
+    assert model == "coder"
+    await run_to_settled(supervisor, client, task)
+    with ctx.uow_factory() as uow:
+        assert uow.pool_exhaustions.get("lab-local") is None
+
+
+async def test_the_previous_failure_is_the_one_that_finished_last(
+    client: TestClient,
+    ctx: AppContext,
+    clock: FakeClock,
+    supervisor: Supervisor,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex on #235: attempts on one pool finish out of launch order. A gateway failure,
+    then a success that finished after it, then another failure is not two in a row, even
+    when the first failure was launched after the success."""
+    from sqlalchemy import update  # noqa: PLC0415
+
+    from crucible.adapters.persistence.models import AttemptMetricsRow  # noqa: PLC0415
+
+    _install(ctx, clock, {"quality_feedback": True, "quality_window": 20})
+    outcome: dict[str, Any] = {"class": ExitClass.PROVIDER_ERROR}
+    _hermes_exit(ctx, monkeypatch, outcome)
+    failed, model = await _route(client, supervisor, "HF-ORDER-1", "standard", SUCCEED)
+    assert model == "coder"
+    await run_to_settled(supervisor, client, failed)
+    outcome["class"] = None
+    clock.advance(60)
+    succeeded, model = await _route(client, supervisor, "HF-ORDER-2", "standard", SUCCEED)
+    assert model == "coder"
+    await run_to_settled(supervisor, client, succeeded)
+    # The failure was launched after the success, and finished before it.
+    with ctx.uow_factory() as uow:
+        # attempt_metrics is fenced to the supervisor (14).
+        assert supervisor.fenced_token is not None
+        uow.set_fenced_token(supervisor.fenced_token)
+        launched = uow.attempt_metrics.get(_attempt_id(client, succeeded))
+        assert launched is not None and launched.created_at is not None
+        uow.session.execute(  # type: ignore[attr-defined]
+            update(AttemptMetricsRow)
+            .where(AttemptMetricsRow.attempt_id == _attempt_id(client, failed))
+            .values(created_at=launched.created_at + timedelta(seconds=1))
+        )
+        uow.commit()
+
+    outcome["class"] = ExitClass.PROVIDER_ERROR
+    clock.advance(60)
+    task, model = await _route(client, supervisor, "HF-ORDER-3", "standard", SUCCEED)
+    assert model == "coder"
+    await run_to_settled(supervisor, client, task)
+    with ctx.uow_factory() as uow:
+        assert uow.pool_exhaustions.get("lab-local") is None

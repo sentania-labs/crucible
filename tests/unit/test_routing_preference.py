@@ -321,3 +321,13 @@ def test_only_blocking_gate_failures_count() -> None:
 def test_rotation_limits(rotation: dict[str, Any]) -> None:
     with pytest.raises(ValidationError):
         _routing(rotation={"strategy": "w", "quality_feedback": True, **rotation})
+
+
+@pytest.mark.parametrize(("window", "sample"), [(1, 2), (3, 3), (4, 4), (20, 5)])
+def test_a_version_from_before_adr_0028_still_loads(window: int, sample: int) -> None:
+    """A stored version may carry a quality window below five and no minimum sample; it
+    is immutable, so its default must fit the window it has."""
+    routing = _routing(
+        rotation={"strategy": "w", "quality_feedback": True, "quality_window": window}
+    )
+    assert routing.rotation.demote_min_sample == sample

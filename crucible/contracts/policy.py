@@ -447,6 +447,12 @@ class Rotation(StrictModel):
 
     @model_validator(mode="after")
     def _sample_fits_window(self) -> Rotation:
+        if "demote_min_sample" not in self.model_fields_set:
+            # A version written before ADR 0028 has no minimum sample, and its window may be
+            # as small as 1. Its default fits that window, so the immutable document still
+            # loads; a window of 1 cannot hold two failures, so it never demotes.
+            self.demote_min_sample = max(2, min(5, self.quality_window))
+            return self
         # A minimum sample the window cannot hold would switch demotion off unseen.
         if self.demote_min_sample > self.quality_window:
             raise ValueError(
