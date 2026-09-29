@@ -8,7 +8,7 @@ import json
 import os
 import re
 import tomllib
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlsplit, urlunsplit
@@ -1156,11 +1156,22 @@ def login_page(request: Request, harness: str, ctx: Ctx, uow: UoW) -> Response:
     if isinstance(found, RedirectResponse):
         return found
     principal, csrf = found
-    document = (
+    document: dict[str, Any] = (
         {"harness": harness, "state": "not_required", "output_tail": []}
         if harness == "hermes"
-        else login.login_status(ctx.logins, harness)
+        else login.login_status(ctx.logins, harness, ctx.admin)
     )
+    ends = document.get("code_wait_ends_at")
+    if ends:
+        # hades #173: a CLI that gives up on its own (AGY, 60 seconds) says when, in the
+        # operator's zone.
+        settings = getattr(ctx, "settings", None)
+        zone = settings.service.render_timezone if settings is not None else "America/Chicago"
+        moment = datetime.fromisoformat(str(ends))
+        document["code_wait_local"] = _localize(moment, zone)
+        document["code_wait_seconds_left"] = max(
+            0, round((moment - datetime.now(UTC)).total_seconds())
+        )
     context = _base(request, principal, csrf, title=f"{harness} login", active="/ui/credentials")
     context.update(harness=harness, login=document)
     return templates.TemplateResponse(request=request, name="login.html", context=context)
