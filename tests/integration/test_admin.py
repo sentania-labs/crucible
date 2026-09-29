@@ -50,7 +50,7 @@ from crucible.ports.execution import ImageInfo
 from crucible.ports.harness import CredentialSource, HarnessGate
 from crucible.settings import Settings
 from tests.admin_cli import admin_main, envelope_data
-from tests.fixtures import contract_document, promote_for_test
+from tests.fixtures import FakeClock, contract_document, promote_for_test
 
 pytestmark = pytest.mark.integration
 
@@ -3098,3 +3098,22 @@ def test_the_cli_remote_mode_sends_the_command_timeout(monkeypatch: pytest.Monke
         ("GET", "/v1/admin/limits/command-timeout", None),
         ("POST", "/v1/admin/limits/command-timeout", {"reason": "r", "max": 7_200_000}),
     ]
+
+
+def test_recently_updated_reads_the_newest_tasks_only(
+    client: TestClient, ctx: AppContext, clock: FakeClock
+) -> None:
+    """hades PR 238 review: the Tasks page reads its rows with one bounded query, newest
+    update first, instead of every task of the last 14 days."""
+    since = clock.now()
+    ids = []
+    for n in range(3):
+        clock.advance(60)
+        response = client.post("/v1/tasks", json=contract_document(external_id=f"EX-RU{n}"))
+        assert response.status_code == 201, response.text
+        ids.append(response.json()["id"])
+    with ctx.uow_factory() as uow:
+        newest = [t.id for t in uow.tasks.recently_updated(since=since, limit=2)]
+        later = [t.id for t in uow.tasks.recently_updated(since=clock.now(), limit=50)]
+    assert newest == [ids[2], ids[1]]
+    assert later == [ids[2]]

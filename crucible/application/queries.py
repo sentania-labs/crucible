@@ -742,8 +742,19 @@ def delivery_view(uow: UnitOfWork, task_id: str, events: list[Any]) -> DeliveryV
     """The task's paper trail (hades FDY-0143): what Crucible pushed, the pull request,
     and the merge. The latest `branch_pushed` event is what Crucible itself pushed; a
     pull request's own branch and head stand in for a task published before that event
-    carried them."""
-    pushed = next((e for e in reversed(events) if e.kind == "branch_pushed"), None)
+    carried them. A republish that resumes after the push records the same head again,
+    so the time is the first event for that head: when Crucible actually pushed it."""
+    latest = next((e for e in reversed(events) if e.kind == "branch_pushed"), None)
+    pushed = (
+        next(
+            e
+            for e in events
+            if e.kind == "branch_pushed"
+            and e.payload.get("head_sha") == latest.payload.get("head_sha")
+        )
+        if latest is not None
+        else None
+    )
     payload = pushed.payload if pushed is not None else {}
     pull_request = uow.pull_requests.get_for_task(task_id)
     return DeliveryView(

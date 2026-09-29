@@ -402,6 +402,15 @@ class Tasks:
             stmt = stmt.where(TaskRow.id > after_id)
         return [self._to_entity(r) for r in self._s.scalars(stmt).all()]
 
+    def recently_updated(self, *, since: datetime, limit: int) -> Sequence[Task]:
+        stmt = (
+            select(TaskRow)
+            .where(TaskRow.updated_at >= since)
+            .order_by(TaskRow.updated_at.desc(), TaskRow.id.desc())
+            .limit(limit)
+        )
+        return [self._to_entity(r) for r in self._s.scalars(stmt).all()]
+
 
 class Contracts:
     def __init__(self, session: Session) -> None:

@@ -56,7 +56,7 @@ from crucible.application.queries import supervisor_health, task_view
 from crucible.contracts.api import ExternalReviewAttestation, RepositoryRegistration
 from crucible.contracts.task_contract import HarnessName
 from crucible.domain.cluster_egress import format_labels, parse_labels
-from crucible.domain.entities import Principal, Role, Task
+from crucible.domain.entities import Principal, Role
 from crucible.domain.gates import ALWAYS_BLOCKING_GATES, PRE_PR_GATES
 from crucible.domain.secrets import redact, scan_text
 from crucible.ports.repository import UnitOfWork
@@ -2439,11 +2439,12 @@ def tasks_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
         ]
         for item in document.get("publishing_waiting", [])
     ]
-    recent = sorted(
-        _tasks_updated_since(uow, ctx.clock.now() - timedelta(days=RECENT_TASK_DAYS)),
-        key=lambda task: task.updated_at,
-        reverse=True,
-    )[:RECENT_TASK_ROWS]
+    # One bounded query, newest first: the page shows RECENT_TASK_ROWS and reads no more.
+    recent = list(
+        uow.tasks.recently_updated(
+            since=ctx.clock.now() - timedelta(days=RECENT_TASK_DAYS), limit=RECENT_TASK_ROWS
+        )
+    )
     return _page(
         request,
         principal,
@@ -2516,29 +2517,6 @@ def tasks_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
 
 RECENT_TASK_DAYS = 14
 RECENT_TASK_ROWS = 50
-
-
-def _tasks_updated_since(uow: UnitOfWork, since: datetime) -> list[Task]:
-    """Every task updated since `since`. The search pages by id, not by update time, so
-    each page is read: a first page alone could leave out the newest updates."""
-    found: list[Task] = []
-    after: str | None = None
-    while True:
-        page = list(
-            uow.tasks.search(
-                state=None,
-                project=None,
-                repository_id=None,
-                external_id=None,
-                updated_since=since,
-                after_id=after,
-                limit=500,
-            )
-        )
-        found.extend(page)
-        if len(page) < 500:
-            return found
-        after = page[-1].id
 
 
 def _task_link(task_id: str, external_id: str | None) -> dict[str, str]:
