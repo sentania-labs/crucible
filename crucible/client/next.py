@@ -452,6 +452,27 @@ def command_timeout_actions(document: Any, prefix: Sequence[str]) -> list[dict[s
     ]
 
 
+def gate_classes_actions(document: Any, prefix: Sequence[str]) -> list[dict[str, Any]]:
+    """One action: write the advisory set, prefilled with the set in force, so the
+    command as offered changes nothing until a gate is added or removed (ADR 0024)."""
+    if not isinstance(document, dict) or not isinstance(document.get("advisory"), list):
+        return []
+    return [
+        action(
+            "set-advisory",
+            "write a new policy version whose advisory gates are exactly these",
+            [
+                *prefix,
+                "gates",
+                "set-advisory",
+                *(f"--gate={gate}" for gate in document["advisory"]),
+            ],
+            optional=OPTIONAL_REASON,
+            roles=(ADMIN,),
+        )
+    ]
+
+
 def kubernetes_egress_actions(document: Any, prefix: Sequence[str]) -> list[dict[str, Any]]:
     """One action: replace the setting, prefilled with what is in force now, so the
     command as offered changes nothing until a value in it is edited."""

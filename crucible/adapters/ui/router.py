@@ -37,6 +37,7 @@ from crucible.application.admin import (
     status,
     tokens,
 )
+from crucible.application.admin import gate_classes as gate_classes_admin
 from crucible.application.admin import kubernetes as kubernetes_admin
 from crucible.application.admin import limits as limits_admin
 from crucible.application.admin.context import guard_mutation
@@ -55,6 +56,7 @@ from crucible.contracts.api import ExternalReviewAttestation, RepositoryRegistra
 from crucible.contracts.task_contract import HarnessName
 from crucible.domain.cluster_egress import format_labels, parse_labels
 from crucible.domain.entities import Principal, Role
+from crucible.domain.gates import ALWAYS_BLOCKING_GATES, PRE_PR_GATES
 from crucible.domain.secrets import redact, scan_text
 from crucible.ports.repository import UnitOfWork
 
@@ -1514,6 +1516,7 @@ def routing_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
     egress = kubernetes_admin.egress_view(ctx.admin, uow)
     gateway_endpoint, _source = routing.gateway_url(uow)
     command_timeout = limits_admin.command_timeout_view(uow)
+    classes = gate_classes_admin.gate_classes_view(uow)
     admin = principal.role is Role.ADMIN
     bounds = command_timeout["command_timeout_ms"]
     dns = egress["document"].get("dns") or {}
@@ -1556,6 +1559,19 @@ def routing_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
             "",
         ],
         [
+            "Advisory gates",
+            {
+                "kind": "note",
+                "value": ", ".join(classes["advisory"]) or "none: every gate blocks",
+                "hint": (
+                    "a failure goes to the reviewer instead of stopping the task"
+                    + ("; the default set" if classes["default"] else "")
+                    + ". A prohibited path always blocks."
+                ),
+            },
+            "",
+        ],
+        [
             "Kubernetes worker egress",
             {
                 "kind": "note",
@@ -1579,6 +1595,7 @@ def routing_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                 _document_section("Local endpoint", local),
                 _document_section("Kubernetes egress selectors", egress),
                 _document_section("Per-command timeout", command_timeout),
+                _document_section("Gate classes", classes),
                 _document_section("Delivery policy document", policy.document if policy else {}),
                 _document_section(
                     "Routing policy document", routing_record.document if routing_record else {}
@@ -1650,6 +1667,34 @@ def routing_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                         },
                         {"name": "reason", "label": "Reason", "required": True},
                     ],
+                },
+            }
+        )
+        sections.append(
+            {
+                "title": "Edit advisory gates",
+                "note": (
+                    "Ticked gates are advisory: a failure is recorded and listed for the "
+                    "reviewer, and the task goes on to its internal review. Unticked gates "
+                    "block. internal_review_recorded always blocks, and a path matching a "
+                    "contract's prohibited_paths stops the task even when scope_contained is "
+                    "advisory. Making a gate outside the default set advisory is recorded "
+                    "as an operator decision. Saving writes a new delivery policy version."
+                ),
+                "form": {
+                    "action": "/ui/actions/gate-classes",
+                    "label": "Save advisory gates",
+                    "collapsed": "Change which gates are advisory",
+                    "fields": [
+                        {
+                            "name": f"advisory_{gate}",
+                            "label": gate,
+                            "kind": "checkbox",
+                            "value": gate in classes["advisory"],
+                        }
+                        for gate in sorted(PRE_PR_GATES - ALWAYS_BLOCKING_GATES)
+                    ]
+                    + [{"name": "reason", "label": "Reason", "required": True}],
                 },
             }
         )
@@ -2349,6 +2394,26 @@ def worker_logs(request: Request, attempt_id: str, ctx: Ctx, uow: UoW) -> Respon
     )
 
 
+def _gate_steps(gates: list[dict[str, Any]]) -> dict[str, Any]:
+    tones = {"pass": "ok", "fail": "bad", "error": "bad", "skipped": "accent"}
+    return {
+        "kind": "steps",
+        "items": [
+            {
+                "name": f"{g['gate']} ({g['classification']})",
+                "result": g["result"],
+                "detail": g["detail"] if g["result"] in ("fail", "error") else "",
+                "tone": (
+                    "warn"
+                    if g["classification"] == "advisory" and g["result"] in ("fail", "error")
+                    else tones.get(g["result"], "accent")
+                ),
+            }
+            for g in gates
+        ],
+    }
+
+
 @router.get("/tasks", response_class=HTMLResponse)
 def tasks_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
     found = _require(request, ctx, uow)
@@ -2382,6 +2447,32 @@ def tasks_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                 "empty": "No task needs attention.",
                 "columns": ["Task", "Why", "Since"],
                 "rows": attention,
+            },
+            {
+                # ADR 0024: every pre-PR gate marked blocking or advisory, and what the
+                # reviewer is asked to weigh.
+                "title": "Gates by task",
+                "note": (
+                    "A failed blocking gate stops the task. A failed advisory gate does "
+                    "not: it is listed for the reviewer, who decides."
+                ),
+                "empty": "No task is waiting on its gates.",
+                "columns": ["Task", "State", "Gates", "For the reviewer"],
+                "rows": [
+                    [
+                        item["external_id"] or item["id"],
+                        _state_words(item["state"]),
+                        _gate_steps(item["gates"]),
+                        {
+                            "kind": "note",
+                            "value": "; ".join(
+                                f"{r['gate']}: {r['detail']}" for r in item["for_reviewer"]
+                            )
+                            or "nothing",
+                        },
+                    ]
+                    for item in document.get("gates", [])
+                ],
             },
             {
                 "title": "Tasks by state",
@@ -3022,6 +3113,18 @@ async def action(request: Request, action: str, ctx: Ctx, uow: UoW) -> Response:
         elif action == "routing-clear":
             routing.clear_exhaustion(
                 ctx.admin, uow, principal=principal.name, pool=form.get("pool", ""), reason=reason
+            )
+        elif action == "gate-classes":
+            gate_classes_admin.save_gate_classes(
+                ctx.admin,
+                uow,
+                principal=principal,
+                advisory=[
+                    key.removeprefix("advisory_")
+                    for key, value in form.items()
+                    if key.startswith("advisory_") and value == "true"
+                ],
+                reason=reason,
             )
         elif action == "command-timeout":
             limits_admin.save_command_timeout(

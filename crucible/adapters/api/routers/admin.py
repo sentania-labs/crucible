@@ -23,6 +23,7 @@ from crucible.application.admin import (
     routing,
     tokens,
 )
+from crucible.application.admin import gate_classes as gate_classes_admin
 from crucible.application.admin import kubernetes as kubernetes_admin
 from crucible.application.admin import limits as limits_admin
 from crucible.application.admin import providers as providers_admin
@@ -104,6 +105,38 @@ def admin_save_command_timeout(
         maximum=_whole_milliseconds(body, "max"),
         default=_whole_milliseconds(body, "default"),
         reason=_reason(body),
+    )
+    uow.commit()
+    return result
+
+
+@router.get("/admin/gates/advisory")
+def admin_gate_classes(ctx: Ctx, uow: UoW, _principal: Admin) -> dict[str, Any]:
+    _admin(ctx)
+    return gate_classes_admin.gate_classes_view(uow)
+
+
+@router.post("/admin/gates/advisory")
+def admin_save_gate_classes(
+    ctx: Ctx,
+    uow: UoW,
+    principal: Admin,
+    body: Annotated[dict[str, Any], Body()],
+) -> dict[str, Any]:
+    """ADR 0024: `advisory` is the whole advisory set, a list of pre-PR gate names."""
+    advisory = body.get("advisory")
+    if not isinstance(advisory, list) or not all(isinstance(g, str) for g in advisory):
+        raise RequestValidationError(
+            [
+                {
+                    "loc": ("body", "advisory"),
+                    "msg": "advisory must be a JSON list of gate names",
+                    "type": "list_type",
+                }
+            ]
+        )
+    result = gate_classes_admin.save_gate_classes(
+        _admin(ctx), uow, principal=principal, advisory=advisory, reason=_reason(body)
     )
     uow.commit()
     return result
