@@ -1,16 +1,18 @@
-"""PostgreSQL in a container (testcontainers) or CRUCIBLE_TEST_DATABASE_URL; migrated once,
-truncated between tests. The supervisor, API client, and fake provider share one database."""
+"""PostgreSQL in a container (testcontainers) or CRUCIBLE_TEST_DATABASE_URL, one database per
+test process (issue 195); migrated once per process, truncated between tests. The supervisor,
+API client, and fake provider of one test share that database."""
 
 from __future__ import annotations
 
 import os
 from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import Engine, text
+from sqlalchemy import Engine, make_url, text
 
 from crucible.adapters.api.app import create_app
 from crucible.adapters.api.deps import AppContext
@@ -43,40 +45,110 @@ TRUNCATE = (
     "acceptance_results, gate_results, review_reports, evidence, artifacts, "
     "provider_settings, harness_images, github_manifest_states, "
     "bootstrap_imports, idempotency_keys, supervisor_status, completion_claims, leases, events, "
-    "attempts, executions, task_contracts, tasks, repositories, principals RESTART IDENTITY CASCADE"
+    "heartbeats, log_chunks, retention_actions, "
+    "attempts, executions, task_contracts, tasks, repositories, principals, "
+    "policies, routing_policies, harnesses RESTART IDENTITY CASCADE"
 )
+
+# The rows the migrations seed. Tests add versions and switch harnesses, so each test
+# starts from a copy taken once per process right after migrating, not from whatever
+# the test before it left (issue 195).
+SEEDED_TABLES = ("policies", "routing_policies", "harnesses")
+SEED_SCHEMA = "crucible_test_seed"
+
+
+def snapshot_seeds(engine: Engine) -> None:
+    with engine.begin() as conn:
+        conn.execute(text(f"DROP SCHEMA IF EXISTS {SEED_SCHEMA} CASCADE"))
+        conn.execute(text(f"CREATE SCHEMA {SEED_SCHEMA}"))
+        for table in SEEDED_TABLES:
+            conn.execute(text(f"CREATE TABLE {SEED_SCHEMA}.{table} AS TABLE public.{table}"))
+
+
+def reset(engine: Engine) -> None:
+    """Every table empty, then the migrations' seeded rows back as they were."""
+    with engine.begin() as conn:
+        conn.execute(text(TRUNCATE))
+        for table in SEEDED_TABLES:
+            columns = ", ".join(
+                f'"{c}"'
+                for c in conn.execute(
+                    text(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_schema = :schema AND table_name = :table "
+                        "ORDER BY ordinal_position"
+                    ),
+                    {"schema": SEED_SCHEMA, "table": table},
+                ).scalars()
+            )
+            conn.execute(
+                text(
+                    f"INSERT INTO public.{table} ({columns}) "
+                    f"SELECT {columns} FROM {SEED_SCHEMA}.{table}"
+                )
+            )
+
+
+def worker_database_name(worker_id: str) -> str:
+    """The database one test process owns (issue 195): `crucible_test_gw0` for an
+    xdist worker, `crucible_test_master` for a serial run."""
+    return f"crucible_test_{worker_id}"
+
+
+@contextmanager
+def own_database(server_url: str, name: str) -> Iterator[str]:
+    """A fresh database on the server, for this process alone, dropped afterwards."""
+    admin = make_engine(server_url).execution_options(isolation_level="AUTOCOMMIT")
+    try:
+        with admin.connect() as conn:
+            conn.execute(text(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)'))
+            conn.execute(text(f'CREATE DATABASE "{name}"'))
+        yield make_url(server_url).set(database=name).render_as_string(hide_password=False)
+        with admin.connect() as conn:
+            conn.execute(text(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)'))
+    finally:
+        admin.dispose()
 
 
 @pytest.fixture(scope="session")
-def database_url() -> Iterator[str]:
+def database_url(worker_id: str) -> Iterator[str]:
+    # Session scope is per process, so each xdist worker (and a serial run) gets its own
+    # database, named from the worker id, on CRUCIBLE_TEST_DATABASE_URL's server or on
+    # a container of its own. No test can see another process's rows (issue 195).
+    name = worker_database_name(worker_id)
     url = os.environ.get("CRUCIBLE_TEST_DATABASE_URL")
     if url:
-        yield url
+        with own_database(url, name) as own:
+            yield own
         return
     from testcontainers.postgres import PostgresContainer  # noqa: PLC0415
 
-    with PostgresContainer(POSTGRES_IMAGE, driver="psycopg") as pg:
-        yield pg.get_connection_url()
+    with (
+        PostgresContainer(POSTGRES_IMAGE, driver="psycopg") as pg,
+        own_database(pg.get_connection_url(), name) as own,
+    ):
+        yield own
 
 
 @pytest.fixture(scope="session")
 def migrated(database_url: str) -> str:
     migrate.downgrade(database_url, "base")
     migrate.upgrade(database_url)
+    engine = make_engine(database_url)
+    snapshot_seeds(engine)
+    engine.dispose()
     return database_url
 
 
 @pytest.fixture
 def engine(migrated: str) -> Iterator[Engine]:
     eng = make_engine(migrated)
-    with eng.begin() as conn:
-        conn.execute(text(TRUNCATE))
+    reset(eng)
     yield eng
-    # Truncated on the way out as well: a downgrade archives task-bound events and the
+    # Reset on the way out as well: a downgrade archives task-bound events and the
     # upgrade puts them back by foreign key, so rows the last test left would break the
     # migration tests that follow it in the run (C6).
-    with eng.begin() as conn:
-        conn.execute(text(TRUNCATE))
+    reset(eng)
     eng.dispose()
 
 

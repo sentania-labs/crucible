@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from typing import Any
 
 import pytest
@@ -12,9 +13,28 @@ from crucible.adapters.persistence.unit_of_work import SqlUnitOfWorkFactory, mak
 from crucible.application.routing import load_routing
 from crucible.contracts.policy import RoutingPolicyV1
 from tests.fixtures import contract_document
-from tests.integration.conftest import submit_and_start
+from tests.integration.conftest import reset, submit_and_start
 
 pytestmark = pytest.mark.integration
+
+
+@pytest.fixture(autouse=True)
+def at_clean_head(migrated: str) -> Iterator[None]:
+    """Most tests here take the database straight, not through the `engine` fixture, and
+    leave rows and revisions behind that break the next one's downgrade. Each starts and
+    ends at head with every table reset, so none depends on the one before it (issue 195)."""
+
+    def clean() -> None:
+        migrate.upgrade(migrated)
+        engine = make_engine(migrated)
+        try:
+            reset(engine)
+        finally:
+            engine.dispose()
+
+    clean()
+    yield
+    clean()
 
 
 def test_up_down_up_from_empty(database_url: str) -> None:
