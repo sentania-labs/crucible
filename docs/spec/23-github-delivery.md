@@ -189,7 +189,15 @@ Polling is the complete observation path; webhooks only shorten latency.
   and the base branch's required checks. Reactions are polled because
   GitHub delivers no webhook event for them; the configured reviewer
   signals "reviewed, no findings" with a thumbs-up, so the reaction poll
-  is part of every cycle, not an extra.
+  is part of every cycle, not an extra. A comment's reactions are fetched
+  only when the comment's own `reactions.total_count` says it has some.
+  Every list is read past its first page, the check-run, check-suite, and
+  workflow-run lists included. A rate-limit refusal is never waited out
+  inside the supervisor's tick: it is recorded (`github_rate_limited`)
+  and delivery resumes on the first tick after GitHub's `retry-after` (or
+  rate-limit reset); a publication it interrupts stays in `publishing`
+  rather than failing. A CI decision or an operator waiver recorded since
+  the last poll makes the pull request due at once.
 - **Webhooks** (optional accelerator, off by default on a workstation;
   Q13): `POST /v1/github/webhook` accepts `pull_request`,
   `pull_request_review`, `pull_request_review_comment`, `issue_comment`,
@@ -295,7 +303,11 @@ as a round. It is recognized by the marker the provider puts at the top of
 it, and a comment carrying that marker is not a round even under a policy
 that has deliberately added `comment` to `accepted_signals`. A comment is
 not an accepted signal by default at all (05b). The review object, its
-comments, and the provider's no-findings result do count. Installation tokens are
+comments, and the provider's no-findings result do count. Because the
+summary is an issue comment, its edit is recorded and is not feedback: it
+never steps a task back out of certification or `ready_for_merge`. Only an
+edit to an inline review comment is feedback that needs a disposition.
+Installation tokens are
 about 390 characters with dots, not the short `ghs_` form, and the
 redaction patterns cover both.
 
@@ -392,21 +404,38 @@ cycle opens on that head.
   `wait_timeout_hours` wakes Foundry with `ci_certification_overdue`. A
   repository that intentionally has no CI needs
   `ci_certification.allow_no_ci: true`, an operator-recorded policy
-  decision, which makes the gate `skipped` rather than passed. On green
-  the task moves to `ready_for_merge` and wakes Foundry.
+  decision, which makes the gate `skipped` rather than passed. For one
+  task, the operator's `accept_no_ci` decision (ADR 0025) does the same
+  when nothing at all has run on the accepted head; a check that does run
+  is still certified. On green the task moves to `ready_for_merge` and
+  wakes Foundry.
 - Failed: any required check concluded `failure`, `cancelled`,
   `timed_out`, or `action_required`. Crucible captures the check name,
   workflow, job, head SHA, and the available log excerpt (through the
   Actions read permission), writes a `CICertification` row with state
   `failed`, moves the task to `ci_certification_failed`, and wakes Foundry.
-  No automatic retry. No automatic worker correction.
+  No automatic retry. No automatic worker correction. The excerpt is the
+  tail of the failed job's own log: a check run from Actions is a job, so
+  its log is `GET /actions/jobs/{id}/logs`, and a failed workflow run is
+  resolved to its first failed job. GitHub answers with a redirect to a
+  signed URL on another host, which Crucible follows without sending the
+  token. It is fetched once per failed run, not on every poll.
 - Foundry's `POST /tasks/{id}/ci-decision` records the cause from the enum
   `false_pre_pr_evidence`, `wrong_sha_checked`, `correction_without_checks`,
   `environment_drift`, `flaky_test`, `crucible_verification_defect`,
   `ci_infrastructure`, `other`, and the action: `rerun` (Crucible records the
   intent and wakes the operator to re-run it on GitHub, because re-running
   needs Actions write, which the App does not hold; 22), `correct` (a
-  correction follows), `reject`, `cancel`.
+  correction follows), `reject`, `cancel`. After `rerun` the failure the
+  decision was about is stale: a required check that concluded before the
+  decision is not counted again, the certification reads `pending` with a
+  detail that says so, and the task waits for a result that concluded
+  after the decision. A failure that concluded after it is a new failure.
+- A task in `ci_certification_failed` that observes a green (or skipped)
+  certification on its accepted head goes back to
+  `awaiting_ci_certification` and on to `ready_for_merge`: someone re-ran
+  the check, with or without a decision, and the failure no longer
+  describes the head.
 - A head that changes while awaiting certification is a divergence
   (above), not a new certification: the task leaves the certification
   path until Foundry decides.
@@ -418,8 +447,13 @@ cycle opens on that head.
 Merging is the operator's act on GitHub. Crucible observes
 `pull_request.closed` with `merged: true`, records the merge SHA, the
 merger login, and time, moves the task to `merged`, and wakes Foundry
-(informational). A PR closed without merge moves the task to `rejected`
-with the closer recorded. The closer is not on the PR itself: `GET
+(informational). It does so from any delivery state, not only
+`ready_for_merge`: a person can merge before review or CI is done, and a
+merged pull request is never polled again, so the task would otherwise wait
+for ever. The wake says which state the task was in. A PR closed without
+merge moves the task to `rejected` from any delivery state, `head_diverged`
+included, with the closer recorded, and wakes Foundry with
+`pull_request_closed`. The closer is not on the PR itself: `GET
 /pulls/{n}` carries `merged_by` and no closer, so Crucible reads the actor
 from the issue events timeline (`GET /issues/{n}/events`, the last `closed`
 entry). That second call is **best effort**: a repository whose timeline
