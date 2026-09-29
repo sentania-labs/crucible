@@ -228,9 +228,13 @@ Once the api is reachable, sign in at `/ui` with that token and, for each harnes
    the harness's own CLI as a Job in `crucible-workers` from the promoted worker image,
    with a memory-backed home, no workspace, no credential mounted, and a NetworkPolicy
    for that harness's login endpoints only (never its model API). The page shows the
-   device or browser URL and the device code read from the Pod log; paste the code back
-   where the harness asks for one (Claude Code, AGY). The code has a window (Codex
-   fifteen minutes, AGY sixty seconds). When the CLI exits the service reads the auth
+   device or browser URL and the device code read from the Pod log, the harness's own
+   prompt, and the steps for that harness; paste the code back where the harness asks
+   for one (Claude Code, AGY). The code has a window (Codex fifteen minutes, AGY sixty
+   seconds, and the page shows the local time AGY stops waiting). For AGY, Google's
+   redirect after sign-in lands on an address the browser cannot load: copy the `code`
+   value from that address bar (or the whole address) and paste it. A login that ended,
+   including AGY running out of time, starts again from the same page (hades #173). When the CLI exits the service reads the auth
    files off the Pod, never through its log, checks their shape, writes the harness
    Secret, and deletes the Job. A login that is cancelled, times out, or whose files fail
    the shape check leaves the Secret as it was; files that pass are stored even when the
@@ -247,9 +251,14 @@ Once the api is reachable, sign in at `/ui` with that token and, for each harnes
 3. The harness stays `session_compatibility: unverified` until the daily-session
    compatibility test passes for it (21, S1b). A harness is not enabled for normal
    workers before that.
-4. **Harnesses**: flip the administrator's runtime gate. Both gates have to say yes: the
-   configuration gate is the `CRUCIBLE_HARNESSES__*` entries in the settings ConfigMap
-   and changing one is an edit and a restart; the runtime gate is this page.
+4. **Harnesses**: enable the harness. The `CRUCIBLE_HARNESSES__*` entries in the
+   settings ConfigMap are only where each harness starts (Codex ships off, "unverified:
+   Crucible-side refresh not yet observed"). Enable and Disable on this page (or
+   `crucible admin harnesses enable|disable NAME`, or the admin API) are the
+   administrator's decision: stored by the service, audited, and in force for new tasks
+   at once, with no ConfigMap edit and no restart. An unverified harness can be enabled;
+   the page keeps its reason as a warning, and **Test** is how you prove it works (hades
+   #174).
 5. **Images**: choose each harness's worker image. The page has one row per harness,
    with a pulldown of the images that carry that harness at a supported version
    (releases and `latest`); pick one and Promote. Promotion is per harness (the
