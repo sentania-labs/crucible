@@ -12,11 +12,16 @@ leading `NAME=value` assignments. Each program must resolve, inside the image as
 own user and PATH, to an absolute path of an executable file: a shell builtin or a
 function does not count.
 
+A policy may also name, in `repository.required_programs`, the programs its checks
+call beyond their first word (hades #184: `uv` and `gitleaks` behind `make lint` and
+`make scan`); each of those must resolve the same way.
+
 What this does not prove: that the check succeeds. `make lint` runs whatever the target
 repository's Makefile says, and the tools those recipes call are the repository's
-business, not the policy's. A wrapper such as `env make lint` or `sh -c '...'` would be
-satisfied by the wrapper alone, and a check that runs a script from the checkout
-(`./scripts/check`) would be reported missing; no shipped policy uses either form.
+business, not the policy's, unless the policy declares them. A wrapper such as
+`env make lint` or `sh -c '...'` would be satisfied by the wrapper alone, and a check
+that runs a script from the checkout (`./scripts/check`) would be reported missing; no
+shipped policy uses either form.
 
     python tools/images/policy_commands.py              # the WORKER image in images/manifest.env
     python tools/images/policy_commands.py --image crucible-worker:<tag>
@@ -83,12 +88,15 @@ def program_of(check: str) -> str:
 
 
 def required_programs(policies: Iterable[tuple[str, Mapping[str, Any]]]) -> dict[str, list[str]]:
-    """Program -> the `label: check` entries that require it."""
+    """Program -> the `label: check` entries that require it, and the `label:
+    required_programs` entries that declare it (hades #184)."""
     programs: dict[str, list[str]] = {}
     for label, document in policies:
         repository = document.get("repository") or {}
         for check in repository.get("required_checks") or []:
             programs.setdefault(program_of(str(check)), []).append(f"{label}: {check}")
+        for program in repository.get("required_programs") or []:
+            programs.setdefault(str(program), []).append(f"{label}: required_programs")
     return programs
 
 
