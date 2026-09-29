@@ -99,12 +99,20 @@ async def test_the_login_role_gets_login_endpoints_and_never_the_model_api() -> 
     _api, provider = login_provider()
     for harness, model_api in (
         ("codex", "api.openai.com"),
-        ("claude_code", "api.anthropic.com"),
         ("agy", "daily-cloudcode-pa.googleapis.com"),
     ):
         plan = provider._egress_plan(spec(harness=harness), k8sspec.ROLE_LOGIN)
         assert plan.hosts, harness
         assert model_api not in plan.hosts, harness
+
+
+async def test_a_claude_code_login_reaches_the_roles_call_after_the_token_exchange() -> None:
+    """The lab, 2026-09-29: `setup-token` exchanges the code at platform.claude.com and
+    then calls api.anthropic.com/api/oauth/claude_cli/roles before printing the token.
+    With only the first host allowed, a real code hung silently after the paste."""
+    _api, provider = login_provider()
+    plan = provider._egress_plan(spec(harness="claude_code"), k8sspec.ROLE_LOGIN)
+    assert set(plan.hosts) == {"platform.claude.com", "api.anthropic.com"}
 
 
 async def test_a_codex_login_policy_names_auth_openai_and_not_the_model_address() -> None:

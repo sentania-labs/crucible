@@ -91,9 +91,11 @@ never retry.
   account MCP connectors are wanted). Confirmed by a task completed
   through the filtering proxy, so the list is no longer provisional.
 - Login endpoints (the Kubernetes login Job's whole egress, 26):
-  `platform.claude.com`, where `setup-token` exchanges the pasted code. Read
-  from the pinned binary's strings on 2026-09-24, not yet observed on a live
-  login.
+  `platform.claude.com`, where `setup-token` exchanges the pasted code, and
+  `api.anthropic.com`, which it calls for the account's roles
+  (`/api/oauth/claude_cli/roles`) before printing the token. Observed on a live
+  lab login on 2026-09-29: with only the first host allowed, the login hung
+  silently after the paste.
 - Shim: one-line untracked `AGENTS.md` pointing at the identity file when the
   checkout has no `AGENTS.md`. Claude Code alone suppresses that shim when the
   checkout has its own `CLAUDE.md`, because it reads that file when it wins

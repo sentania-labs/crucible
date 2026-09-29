@@ -126,12 +126,13 @@ class ClaudeCodeAdapter:
             endpoints=("api.anthropic.com",),
             shim="AGENTS.md",
             claude_md_wins=True,
-            # `setup-token` exchanges the pasted code at platform.claude.com/v1/oauth/token;
-            # the browser, not the CLI, visits claude.ai. Read from the pinned 2.1.280
-            # binary's strings on 2026-09-24, not observed on a live login (FDY-0112).
-            # A setup-token session is inference-only, so the CLI has no profile call to
-            # make on api.anthropic.com, which is the model endpoint and stays denied.
-            login_endpoints=("platform.claude.com",),
+            # `setup-token` exchanges the pasted code at platform.claude.com/v1/oauth/token,
+            # then asks api.anthropic.com/api/oauth/claude_cli/roles about the account
+            # before it prints the token. Observed on the lab on 2026-09-29: with only
+            # platform.claude.com allowed, a real code hung silently after the exchange.
+            # The browser, not the CLI, visits claude.ai. api.anthropic.com is also the
+            # model endpoint, but a login Pod runs only `setup-token`, never a model.
+            login_endpoints=("api.anthropic.com", "platform.claude.com"),
         )
 
     def credential_spec(self) -> CredentialSpec:
