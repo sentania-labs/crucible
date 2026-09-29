@@ -96,7 +96,9 @@ downloaded by URL and verified against a sha256 computed when the pin was
 taken. It is Debian slim, non-root `worker` (uid 1000), git, curl, jq,
 make (the shipped policy's required checks start with it, hades #181), the
 lab root CA, the Python runtime and hash-locked virtual environment Hermes
-needs, the four CLIs, and nothing else. No `gh`: workers have no GitHub
+needs, the four CLIs, `crucible-report` (the worker's report checker, a
+standard-library script that borrows the Hermes environment's PyYAML for its
+own process, hades #215), and nothing else. No `gh`: workers have no GitHub
 credential to use it with. Where a CLI needs a companion binary to work at
 all, as Codex does for the 5.6 model family, the companion ships from the
 same pinned release, fetched and verified the same way, with its mtime set
