@@ -167,7 +167,8 @@ def test_agy_flow_pastes_the_code_and_a_missing_code_fails_cleanly(tmp_path: Pat
         tmp_path,
         "fake-agy",
         'echo "Please visit https://accounts.google.com/o/oauth2/auth?x=1"\n'
-        'printf "Enter the authorization code: "\n'
+        # AGY's own prompt, as captured (tests/fixtures_data/logins/agy.raw).
+        'echo "Or, paste the authorization code here and press Enter:"\n'
         "read -t 2 -r code || { echo timeout; exit 1; }\n"
         'echo "HOME=$HOME"\n'
         "exit 0\n",
