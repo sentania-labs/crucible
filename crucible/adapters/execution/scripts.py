@@ -458,21 +458,22 @@ def policy_git(policy: Mapping[str, Any], name: str) -> str:
 
 
 # FDY-0140: what the leftover commit never takes, as git pathspecs.
-_LEFTOVER_EXCLUDES = " ".join(
-    f"':(exclude,glob){pattern}'"
-    for pattern in (
-        "**/__pycache__/**",
-        "**/*.pyc",
-        "**/node_modules/**",
-        "**/.venv/**",
-        "**/.pytest_cache/**",
-        "**/.mypy_cache/**",
-        "**/.ruff_cache/**",
-        "**/.tox/**",
-        "**/*.egg-info/**",
-        "**/.coverage",
-    )
+_LEFTOVER_EXCLUDED = (
+    "**/__pycache__/**",
+    "**/*.pyc",
+    "**/node_modules/**",
+    "**/.venv/**",
+    "**/.pytest_cache/**",
+    "**/.mypy_cache/**",
+    "**/.ruff_cache/**",
+    "**/.tox/**",
+    "**/*.egg-info/**",
+    "**/.coverage",
 )
+_LEFTOVER_EXCLUDES = " ".join(f"':(exclude,glob){pattern}'" for pattern in _LEFTOVER_EXCLUDED)
+# The same paths as positive pathspecs, to unstage what the worker already added: an
+# exclusion only stops `git add` from adding, it does not take an entry out of the index.
+_LEFTOVER_EXCLUDED_PATHS = " ".join(f"':(glob){pattern}'" for pattern in _LEFTOVER_EXCLUDED)
 
 
 def collector_script(
@@ -584,6 +585,8 @@ EOF
   # commit is for the worker's edits, not what running its checks left behind.
   if ! checkpoint_git add -A -- . {_LEFTOVER_EXCLUDES}; then
     refuse_checkpoint "checkpoint refused: the working tree could not be staged"
+  elif ! checkpoint_git reset -q -- {_LEFTOVER_EXCLUDED_PATHS}; then
+    refuse_checkpoint "checkpoint refused: build output could not be unstaged"
   elif checkpoint_git diff --cached --quiet; then
     :
   elif checkpoint_git commit -q -m "$SUBJECT" -m "$TRAILER: $TRAILER_VALUE"; then

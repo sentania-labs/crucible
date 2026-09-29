@@ -474,6 +474,26 @@ def test_build_output_is_never_swept_into_the_leftover_commit(tmp_path: Path) ->
     ), changed
 
 
+def test_build_output_the_worker_already_staged_stays_out_of_the_leftover_commit(
+    tmp_path: Path,
+) -> None:
+    """A worker that ran `git add` on build output and then exited without committing:
+    the exclusions still hold, because an entry already in the index is unstaged."""
+    repo, output, report = _work_repo(tmp_path)
+    (repo / "tracked.txt").write_text("edited\n", encoding="utf-8")
+    for junk in ("node_modules/x/index.js", ".venv/bin/tool", ".coverage"):
+        (repo / junk).parent.mkdir(parents=True, exist_ok=True)
+        (repo / junk).write_text("junk\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A", "-f", "."], cwd=repo, check=True)
+    result = _collect(repo, output, report, attempt_id="01ATTEMPT")
+    assert result.returncode == 0, result.stderr
+    changed = set((output / "changed.txt").read_text().split())
+    assert "tracked.txt" in changed
+    assert not any(
+        "node_modules" in path or ".venv" in path or path == ".coverage" for path in changed
+    ), changed
+
+
 @pytest.mark.parametrize("breakage", ["missing", "directory"])
 def test_a_broken_git_config_skips_the_leftover_commit_and_still_collects(
     tmp_path: Path, breakage: str
