@@ -140,8 +140,12 @@ def sanitize(text: str) -> str:
 
 
 def validate_title(proposed: str) -> str:
-    """23: length, no secret patterns, no closing keywords. Raises rather than edits,
-    because a silently rewritten title is a claim Crucible did not make."""
+    """23: no secret patterns, no closing keywords, no mentions, one line. Raises rather
+    than edits for those, because a silently rewritten title is a claim Crucible did not
+    make. Length is the exception: a title over the limit is shortened at a word
+    boundary and marked with "...", keeping the claim's own words, because refusing a
+    whole publication over a few characters stops finished work on form alone
+    (operator, 2026-09-29)."""
     title = " ".join(proposed.split())
     if not title:
         raise TitleRefusedError("the claim proposes an empty pull request title")
@@ -152,9 +156,7 @@ def validate_title(proposed: str) -> str:
     if hit is not None:
         raise TitleRefusedError(f"the proposed title matches the {hit} secret pattern")
     if len(title) > MAX_TITLE_LENGTH:
-        raise TitleRefusedError(
-            f"the proposed title is {len(title)} characters; the limit is {MAX_TITLE_LENGTH}"
-        )
+        title = shorten_title(title)
     if _CLOSING_RE.search(title):
         raise TitleRefusedError(
             "the proposed title carries a closing keyword; only deliverables[].closes "
@@ -168,6 +170,15 @@ def validate_title(proposed: str) -> str:
     if "\n" in proposed or "\r" in proposed:
         raise TitleRefusedError("a pull request title is one line")
     return title
+
+
+def shorten_title(title: str) -> str:
+    """The title cut to MAX_TITLE_LENGTH: at the last word boundary that leaves room for
+    "...", or mid-word when the first word alone is too long."""
+    room = MAX_TITLE_LENGTH - len("...")
+    cut = title[: room + 1].rsplit(" ", 1)[0] if " " in title[: room + 1] else ""
+    kept = cut if cut else title[:room]
+    return kept.rstrip(" ,;:-") + "..."
 
 
 def authorized_closes(closes: Sequence[str]) -> list[str]:
