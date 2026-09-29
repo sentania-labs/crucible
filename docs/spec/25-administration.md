@@ -67,11 +67,11 @@ resource.
 
 | Part | Fields |
 |---|---|
-| `harnesses[]` | name, both enablement gates with the reason each carries, adapter supported range, its default image and previous image (ADR 0018), images known (reference, harness version, digest, and whether it is this harness's default or previous image), credential status (below), concurrency limit and current use, last launch outcome (a probe records itself there as `probe:<exit class>`, or `probe:inconclusive:<cause>` when it decided nothing) |
+| `harnesses[]` | name, whether it is enabled, the configuration default and the administrator's decision with the reason each carries and the configuration's `warning` (hades #174), adapter supported range, its default image and previous image (ADR 0018), images known (reference, harness version, digest, and whether it is this harness's default or previous image), credential status (below), concurrency limit and current use, last launch outcome (a probe records itself there as `probe:<exit class>`, or `probe:inconclusive:<cause>` when it decided nothing) |
 | `credentials[harness]` | `state`: `absent`, `configured` (files present, shape unchecked), `invalid` (the shape check failed, or a probe observed the provider refusing the credential; never a probe that merely did not finish), `validated` (a conclusive probe ran the credential); `mount_mode` (`ro`, `rw-narrow`); `last_validated_at`; `last_auth_failure_at` and its exit class (set only by those two conclusive outcomes); `refresh_verified` (bool, from the compatibility test); `source_fingerprint` (sha256 of the file **names and sizes**, never contents); `session_compatibility`: `unverified`, `verified`, `failed` |
 | `providers[]` | name, capabilities, `health`: `ok`, `degraded`, `unavailable` with detail (daemon reachable, proxy reachable, network present, disk headroom) |
 | `github` | App id (public), whether a credential is configured, key present (bool), key fingerprint (sha256 of the public key), where it is kept (`stored_in`: the Secret or directory, whether it exists and whether the service owns it), per registered repository: installation covers it, last check, webhook enabled. The App's slug, install link and installations are read live by the picker, not stored |
-| `readiness` | crucible#123: `ready`, `ready_harnesses`, the global `steps` (supervisor, no repository, no harness ready), and per real harness `ready`, `off` (configuration gate shut) or `not_ready` with its `steps`, each `{code, text, fix}` naming the page that fixes it. Read from the same state the other pages show (on Kubernetes the credential is the harness Secret's state). Test fixtures (the script harness) are left out |
+| `readiness` | crucible#123: `ready`, `ready_harnesses`, the global `steps` (supervisor, no repository, no harness ready), and per real harness `ready`, `off` (the configuration default keeps it off and no administrator has decided, hades #174) or `not_ready` with its `steps`, each `{code, text, fix}` naming the page that fixes it. Read from the same state the other pages show (on Kubernetes the credential is the harness Secret's state). Test fixtures (the script harness) are left out |
 | `supervisor` | as `GET /supervisor` (lease, last tick, last error) |
 | `workers` | active attempts with task, harness, model, image digest, started_at, last heartbeat |
 | `tasks` | counts by state; lists for `blocked`, `pre_pr_gates_failed`, `publish_failed`, `ci_certification_failed`, `head_diverged` |
@@ -84,7 +84,7 @@ resource.
 | Operation | API | CLI | Notes |
 |---|---|---|---|
 | list harnesses | `GET /admin/harnesses` | `harnesses list` | |
-| disable or enable a harness | `POST /admin/harnesses/{name}/disable` and `/enable` | `harnesses disable|enable` | flips the administrator's flag only; configuration retained; running attempts finish; new launches refused with a wake |
+| disable or enable a harness | `POST /admin/harnesses/{name}/disable` and `/enable` | `harnesses disable|enable` | the administrator's decision, stored and audited, which replaces the configuration default from then on with no restart (hades #174); configuration retained; an unverified harness can be enabled and the answer carries the configuration's reason as `warning`; running attempts finish; new launches of a disabled harness refused with a wake |
 | test a harness | `POST /admin/harnesses/{name}/test` | `harnesses test NAME` | crucible#118: the path a real task takes, in order, stopping at the first failure: the harness is enabled; it has its own worker image at a supported version (ADR 0018); its credential is stored; the routing policy in force names a model for it (a local model brings its endpoint URL); a worker runs that image with the credential under the worker's egress, the bounded probe below with every harness in a worker, Hermes included; and one minimal model call answers. Each step is reported pass, fail or not run, in plain words, with the failing step's cause and never the run's output. The last result is kept on the harness (`last_test` in `GET /admin/harnesses`) and shown on the Harnesses page. A check, not a change: no reason is asked for. The probe it runs is recorded as a probe is. The script harness (a test fixture, 18) routed to a local endpoint makes that one call itself, which is how the kind tier proves the path against a stub model server |
 | validate a credential | `POST /admin/credentials/{harness}/validate` | `credentials validate --harness` | shape check of the named auth files, then the bounded probe (below); returns state, timestamps, and the probe's `conclusive` and `cause`, never a verdict the run did not support |
 | set the Hermes API key | `POST /admin/credentials/hermes/set` | `credentials set --harness hermes` | reads the value from a password field (the Local gateway page, with the URL) or stdin, atomically writes `api-key` mode 0600 (on Kubernetes, into the `crucible-harness-hermes` Secret the service owns, creating it when absent; ADR 0015), returns no value, and audits only `credential set`; immediately probes readiness without auth and models with auth. Every view reports only `key_set` |
@@ -183,22 +183,38 @@ detail is a plain sentence that names the URL it used and what it proved, for ex
 includes the bearer. The key-paste transaction emits only
 the `credential_set` event even though it also updates the sanitized credential state.
 
-## Harness enablement: two gates
+## Harness enablement: a configured default, then the administrator's decision
 
-A harness is available for a launch only when **both** gates say so, and
-each carries its own reason string:
+Enabling a harness is an administrator's decision the service stores (hades
+#174, ADR 0021). Two things feed it, each with its own reason string:
 
-1. **Configuration**, the operator's static gate: a `[harnesses.<name>]`
-   section exists in Crucible's configuration. Changing it is an operator
-   edit and a restart.
-2. **The administrator's flag**, the runtime gate: the harness's row, which
-   `harnesses enable` and `harnesses disable` flip through the admin
-   surface without touching configuration.
+1. **Configuration**, the starting value: the `[harnesses.<name>]` section
+   (`CRUCIBLE_HARNESSES__<NAME>__ENABLED` and `__REASON`). A harness whose
+   dedicated session is unverified ships off here with the reason (S1b).
+2. **The administrator's decision**: the harness's row, which `harnesses
+   enable` and `harnesses disable` set through the admin API, the CLI and the
+   Harnesses page. The row records that an administrator decided
+   (`enabled_decided`, migration 0027).
 
-Either gate saying no refuses the launch, and the refusal names which gate
-and the reason it carries. `GET /admin/harnesses` reports both gates and
-both reasons, so "disabled" is never ambiguous about who disabled it. A
-refusal is terminal for that attempt: it ends as `environment` with a
+Until an administrator has decided, both have to say yes. Migration 0027
+records a disable as a decision only when a principal made it (the row's
+`updated_by`); a row a migration seeded off (Codex, 0008) starts undecided
+with its runtime flag on, so the configuration default governs it. With the
+shipped configuration an upgrade changes no harness's availability. Once one has, the stored decision alone
+decides: enabling a harness the configuration keeps off is one action, it
+takes effect for routing at once with no restart (the row is read on every
+submit and launch), and changing the configuration afterwards changes
+nothing for that harness. The configuration's reason stays visible as a
+`warning` (in `GET /admin/harnesses`, in the enable and disable answers, on
+the Harnesses page, and in the `harness_enabled` or `harness_disabled` event
+as `configuration_warning`), never a lock; the harness test (crucible#118) is
+how the operator proves an unverified harness works. A refusal names what
+refused and the reason it carries: `off by the configuration default` for an
+undecided harness the configuration keeps off, `disabled by an administrator`
+otherwise. `GET /admin/harnesses` reports `enabled` (the outcome),
+`enabled_by_configuration`, `enabled_by_administrator`,
+`decided_by_administrator`, `reason` and `warning`, so "disabled" is never
+ambiguous about who disabled it. A refusal is terminal for that attempt: it ends as `environment` with a
 `harness_refused` event and a `harness_unavailable` wake, and the retry
 rule skips it, because the same refusal would come back (16). A harness
 disabled at the time a contract is submitted is a contract problem then
@@ -223,9 +239,12 @@ disabled at the time a contract is submitted is a contract problem then
    NetworkPolicy for the adapter's `login_endpoints` only, which never include
    its model API (crucible#58). The Job needs the namespace readiness probe to
    have passed, as a worker does. A driver in the Pod runs the CLI under a
-   pseudo-terminal 4096 columns wide, so nothing wraps, and filters its output
-   line by line before it reaches the Pod log: terminal control codes are
-   stripped, the token Claude Code prints once
+   pseudo-terminal 4096 columns wide, so nothing wraps, and renders its output
+   line by line, as a terminal would show it, before it reaches the Pod log:
+   every trailing carriage return goes and then only what follows the last
+   one is kept, a cursor-column move is a space (Claude Code's Ink separates
+   words with them), terminal control codes are stripped and an OSC 8
+   hyperlink leaves its visible URL (hades #173); the token Claude Code prints once
    is written to `oauth-token` mode 0600 and replaced by
    `[captured to oauth-token]`, and a pasted code is masked where the terminal
    echoes it. The service reads that log for the URL, the device code and the
@@ -292,6 +311,26 @@ code lasts fifteen minutes, AGY's sixty seconds, and Claude Code's
 `setup-token` takes the pasted code and prints the long-lived token, which
 the driver captures into the credential file mode 0600 and never displays.
 The CLI's own output is not echoed.
+
+Each harness's paste prompt is recognised from what its CLI actually prints,
+captured from the pinned worker image (tests/fixtures_data/logins, hades
+#173): Claude Code's `Paste code here if prompted >`, and AGY's `Or, paste the
+authorization code here and press Enter:`. Codex's device flow asks for
+nothing; the page shows its URL and one-time code and the CLI finishes on its
+own once the operator has entered the code. Whatever a CLI's prompt, one that
+has printed its sign-in URL and then nothing for five seconds is waiting, and
+the page shows the code box. The Docker, local and Kubernetes paths render
+the CLI's output by the same rules. A pasted code is ended with a carriage
+return, which is what the Enter key sends: Claude Code reads raw and submits
+only on one. The Login page lists what the operator does for that harness;
+for AGY that after sign-in the browser ends on an address that does not
+load (on the lab on 2026-09-27 a localhost one), and that the code is the
+`code` value in that address bar (the whole address may be pasted, and a percent-encoded code is
+decoded). AGY stops waiting sixty seconds after printing its link and exits
+("authentication timed out"); the page shows the local time it stops, the
+login then ends with that said plainly, and **Start a new login** runs a fresh
+one, since a code from the old link no longer works. A login that has ended,
+either way, can be started again from its page.
 
 A login and an attempt of the same harness never overlap (12). The login
 refuses to start while an attempt of the harness is between `preparing` and

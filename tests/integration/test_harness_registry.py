@@ -13,11 +13,13 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import Engine, text
 
+from crucible.adapters.api.app import create_app
 from crucible.adapters.api.deps import AppContext
 from crucible.adapters.execution.fake import FakeProvider
+from crucible.application.admin.context import AdminContext
 from crucible.application.harnesses import set_harness_enabled
 from crucible.application.supervisor import Supervisor
-from crucible.ports.harness import CredentialSource
+from crucible.ports.harness import CredentialSource, HarnessGate
 from tests.fixtures import contract_document
 from tests.integration.conftest import (
     event_kinds,
@@ -482,3 +484,96 @@ async def test_progress_lines_become_unverified_worker_events(
     assert "read identity" in progress[0]["payload"]["line"]
     assert token not in progress[1]["payload"]["line"]
     assert "[redacted:anthropic_oauth_token]" in progress[1]["payload"]["line"]
+
+
+# ----- hades #174: the configuration is the starting value, the admin decides -------------
+
+UNVERIFIED = "unverified: Crucible-side refresh not yet observed (S1b step 5)"
+
+
+async def test_an_administrators_enable_replaces_the_configuration_default_without_a_restart(
+    ctx: AppContext, provider: FakeProvider, tokens: dict[str, str]
+) -> None:
+    """Codex ships off in configuration. On a deployment upgraded with that default (its
+    row undecided), a task naming it is refused; one enable through the admin API, on
+    the same running service and supervisor, lets the next task route and run; the
+    decision is audited with the configuration's warning; a disable refuses again."""
+    gates = {"codex": HarnessGate(enabled=False, reason=UNVERIFIED)}
+    ctx.harness_gates = gates
+    assert ctx.harnesses is not None
+    ctx.admin = AdminContext(
+        uow_factory=ctx.uow_factory,
+        clock=ctx.clock,
+        providers={"fake": provider},
+        harnesses=ctx.harnesses,
+        harness_gates=gates,
+    )
+    with ctx.uow_factory() as uow:
+        # What an upgraded deployment has: a row nobody decided (0027).
+        state = uow.harnesses.get("codex")
+        assert state is not None
+        state.enabled_decided = False
+        uow.harnesses.put(state)
+        uow.commit()
+    supervisor = make_supervisor(ctx, provider, harness_gates=gates)
+    await supervisor.tick()
+    admin_headers = {"Authorization": f"Bearer {tokens['admin']}"}
+    operator_headers = {"Authorization": f"Bearer {tokens['operator']}"}
+    orchestrator = {"Authorization": f"Bearer {tokens['orchestrator']}"}
+    with TestClient(create_app(ctx), headers=orchestrator) as client:
+        listed = client.get("/v1/admin/harnesses", headers=admin_headers).json()["items"]
+        codex = next(h for h in listed if h["name"] == "codex")
+        assert codex["enabled"] is False and codex["decided_by_administrator"] is False
+        assert codex["warning"] == UNVERIFIED
+
+        refused = client.post(
+            "/v1/tasks",
+            json=_pinned_document("EX-174-BEFORE", "crucible-worker:fake-succeed"),
+            headers=operator_headers,
+        )
+        assert refused.status_code == 422, refused.text
+        assert "configuration default" in refused.text
+
+        enabled = client.post(
+            "/v1/admin/harnesses/codex/enable",
+            json={"reason": "operator: try codex anyway"},
+            headers=admin_headers,
+        )
+        assert enabled.status_code == 200, enabled.text
+        body = enabled.json()
+        assert body["enabled"] is True and body["decided_by_administrator"] is True
+        assert body["warning"] == UNVERIFIED
+
+        listed = client.get("/v1/admin/harnesses", headers=admin_headers).json()["items"]
+        codex = next(h for h in listed if h["name"] == "codex")
+        assert codex["enabled"] is True and codex["enabled_by_configuration"] is False
+        assert codex["warning"] == UNVERIFIED
+
+        task_id = _submit_pinned(client, tokens, "crucible-worker:fake-succeed", "EX-174-AFTER")
+        assert await run_to_settled(supervisor, client, task_id) == "awaiting_internal_review"
+        assert "harness_refused" not in event_kinds(client, task_id)
+
+        audit = client.get("/v1/admin/audit", params={"limit": 200}, headers=admin_headers)
+        decision = next(
+            e
+            for e in audit.json()["items"]
+            if e["kind"] == "harness_enabled" and e["principal"] == "admin-principal"
+        )
+        assert decision["payload"]["harness"] == "codex"
+        assert decision["payload"]["reason"] == "operator: try codex anyway"
+        assert decision["payload"]["configuration_warning"] == UNVERIFIED
+        assert decision["payload"]["before"]["enabled_decided"] is False
+        assert decision["payload"]["after"]["enabled_decided"] is True
+
+        disabled = client.post(
+            "/v1/admin/harnesses/codex/disable",
+            json={"reason": "operator: back off"},
+            headers=admin_headers,
+        )
+        assert disabled.status_code == 200 and disabled.json()["enabled"] is False
+        again = client.post(
+            "/v1/tasks",
+            json=_pinned_document("EX-174-DISABLED", "crucible-worker:fake-succeed"),
+            headers=operator_headers,
+        )
+        assert again.status_code == 422 and "disabled by an administrator" in again.text

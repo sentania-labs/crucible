@@ -881,7 +881,7 @@ class FakeKubernetesApi:
     def _login_exec(
         self, name: str, run: _LoginRun, script: str, stdin: bytes | None
     ) -> ExecResult:
-        if "/tmp/crucible-login/in" in script:
+        if "CRUCIBLE_LOGIN_CONTROL" in script and '/in"' in script:
             if stdin is None:
                 return ExecResult(b"", b"no code on stdin\n", 3)
             run.codes.append(stdin)

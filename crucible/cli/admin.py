@@ -1303,8 +1303,7 @@ def result_for(
     elif kind == "harness" and isinstance(document, dict):
         state = "enabled" if document.get("enabled") else "disabled"
         actions = nx.harness_actions(
-            [{"name": args.name, "enabled_by_administrator": args.harness_command == "enable"}],
-            prefix,
+            [{"name": args.name, "enabled": document.get("enabled")}], prefix
         )
     elif kind == "image_list":
         actions = nx.image_actions(document, prefix)

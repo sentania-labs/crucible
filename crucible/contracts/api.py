@@ -254,6 +254,10 @@ class HarnessView(Response):
 
     name: str
     enabled: bool
+    # The configuration entry is the starting value only (hades #174): once an
+    # administrator has enabled or disabled the harness, `decided_by_administrator` is
+    # true and `enabled_by_administrator` alone decides `enabled`; until then `enabled`
+    # needs both.
     enabled_by_configuration: bool
     enabled_by_administrator: bool
     reason: str
@@ -267,6 +271,10 @@ class HarnessView(Response):
     previous_image: dict[str, str] | None = None
     # The last harness test (crucible#118): pass or fail, and each step in plain words.
     last_test: dict[str, Any] | None = None
+    decided_by_administrator: bool = False
+    # Why the configuration keeps the harness off (an unverified session), shown as a
+    # warning whatever the administrator decided; empty when the configuration has it on.
+    warning: str = ""
 
 
 class HarnessList(Response):

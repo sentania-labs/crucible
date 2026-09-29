@@ -31,7 +31,8 @@ step 6, the operator's own session answering and refreshing normally
 afterwards, was confirmed at 06:32 CDT. Codex's step 5 is still pending:
 its auth file was unchanged on every C5a run, the token still valid from
 the login, so no Crucible-side refresh has been observed and Codex ships
-disabled in both gates (25) until one is.
+off in its configuration default (25), with that reason as a warning an
+administrator can enable it past (hades #174), until one is.
 
 Spike results go in `docs/spikes/S<n>.md` with commands, output excerpts,
 and the decision. Credentials used during spikes are the operator's own

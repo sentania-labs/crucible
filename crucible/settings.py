@@ -219,10 +219,11 @@ class CredentialSettings(BaseModel):
 
 
 class HarnessSettings(BaseModel):
-    """The operator's configuration gate for a harness (25). A harness whose dedicated
-    session compatibility is unverified ships disabled with the reason recorded (S1b);
-    the runtime enable flag an administrator flips lives in the database beside it, and
-    a launch needs both."""
+    """Where a harness starts (25, ADR 0021). A harness whose dedicated session
+    compatibility is unverified ships off with the reason recorded (S1b). Until an
+    administrator enables or disables it through the service, a launch needs this and
+    the runtime flag both; once one has, the stored decision alone decides and this
+    reason stays a warning (hades #174)."""
 
     enabled: bool = True
     reason: str = ""

@@ -224,9 +224,10 @@ class CredentialSpec:
 
 @dataclass(frozen=True, slots=True)
 class HarnessGate:
-    """The operator's configuration gate for one harness (25): a harness ships disabled
-    until its dedicated credential session and daily-session compatibility are verified
-    (S1b), and the reason travels with the flag."""
+    """The operator's configuration default for one harness (25, ADR 0021): a harness
+    ships off until its dedicated credential session and daily-session compatibility
+    are verified (S1b), and the reason travels with the flag. An administrator's stored
+    decision replaces it (hades #174)."""
 
     enabled: bool = True
     reason: str = ""

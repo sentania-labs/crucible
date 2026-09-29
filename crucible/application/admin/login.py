@@ -30,9 +30,11 @@ import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from crucible.application.admin.context import (
     AdminContext,
@@ -61,14 +63,50 @@ from crucible.ports.repository import UnitOfWork
 URL_RE = re.compile(r"https?://[^\s'\"<>]+")
 # A device or one-time code the CLI shows for the operator to enter elsewhere.
 CODE_RE = re.compile(r"\b([A-Z0-9]{4,5}-[A-Z0-9]{4,6})\b")
-# The CLI is ready for the code when it has printed a prompt: a line that ends in a
-# prompt character with no newline after it. Matching the words alone flipped the session
-# to `waiting_for_code` on informational text ("visit the URL and enter the code"), before
-# the CLI was reading, and the pasted code went nowhere.
+# The generic prompt, for a flow that declares none of its own (a test's stand-in): a
+# line that ends in a prompt character. Matching the words alone flipped the session to
+# `waiting_for_code` on informational text ("visit the URL and enter the code"), before
+# the CLI was reading, and the pasted code went nowhere. The three real harnesses each
+# declare the prompt their CLI actually prints (hades #173), read from a capture of it.
 PASTE_RE = re.compile(
-    r"(?:(?:paste|enter)[^\n]{0,40}(?:code|token)[^\n]{0,20}|code|token)\s*[:>?]\s*$",
+    r"(?:(?:paste|enter)[^\n]{0,40}(?:code|token)[^\n]{0,40}|code|token)\s*[:>?]\s*$",
     re.IGNORECASE,
 )
+# The key a terminal sends for Enter. Claude Code reads its input raw, and only a
+# carriage return submits there; a newline is taken as more of the code (hades #173). A
+# CLI that reads a line in the terminal's normal mode gets a newline from it, as it
+# would from a keyboard.
+ENTER = "\r"
+# A CLI that has printed its sign-in URL and then nothing for this long is waiting for
+# the operator, whatever its prompt says (hades #173).
+QUIET_PROMPT_SECONDS = 5.0
+# The service sees a prompt a little after the CLI printed it (the driver's one-second
+# read, the log poll), so the deadline it shows for a CLI that gives up on its own is
+# this much early rather than late (hades #173).
+CODE_WAIT_MARGIN_SECONDS = 5
+
+# What a terminal would show for one line of a CLI's output (hades #173). Ink (Claude
+# Code) ends every line `\r\r\n` through the pty and separates words with cursor-column
+# moves instead of spaces; an OSC 8 hyperlink carries the URL twice, once as the link
+# and once as its visible text. The same rules as the login Pod's driver.
+_CURSOR_MOVE_RE = re.compile(r"\x1b\[[0-9]*[GC]")
+_OSC_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+_CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_ESCAPE_RE = re.compile(r"\x1b[()]?[A-Za-z0-9=>]")
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+
+
+def render_line(raw: str) -> str:
+    """One line as a terminal would show it: every trailing carriage return dropped,
+    then only what was drawn after the last one kept; a cursor-column move is a space;
+    control sequences go, and an OSC 8 hyperlink leaves its visible text."""
+    line = raw.rstrip("\r")
+    line = line.rsplit("\r", 1)[-1]
+    line = _CURSOR_MOVE_RE.sub(" ", line)
+    line = _CSI_RE.sub("", line)
+    line = _OSC_RE.sub("", line)
+    line = _ESCAPE_RE.sub("", line)
+    return _CONTROL_RE.sub("", line)
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,6 +130,21 @@ class LoginFlow:
     token_pattern: str
     token_file: str
     window: str
+    # The prompt this CLI prints when it reads the pasted code, as captured from the CLI
+    # itself (tests/fixtures_data/logins), matched on the rendered line. Empty: the
+    # generic PASTE_RE.
+    prompt_pattern: str = ""
+    # How long the CLI itself waits for the code once it has asked, when it gives up on
+    # its own (AGY: 60 seconds); 0 when it does not.
+    code_wait_seconds: int = 0
+    # The line the CLI prints when that wait ran out, and what the operator is told.
+    timed_out_pattern: str = ""
+    timed_out_message: str = ""
+    # The code is copied out of a redirect's address bar (AGY): a pasted address yields
+    # its `code` parameter, and a percent-encoded code is decoded.
+    code_from_redirect: bool = False
+    # What the operator does, in order, shown on the login page.
+    guidance: tuple[str, ...] = ()
 
 
 FLOWS: dict[str, LoginFlow] = {
@@ -109,6 +162,15 @@ FLOWS: dict[str, LoginFlow] = {
             "Claude Code: approve in the browser and paste the code; the long-lived token "
             "is shown by the CLI once and is captured to oauth-token, never displayed"
         ),
+        prompt_pattern=r"^\s*Paste code here if prompted\s*>\s*$",
+        guidance=(
+            "Open the sign-in link and sign in with the Claude account the token is for, "
+            "then approve.",
+            "The page that follows shows a code. Copy all of it, paste it into the "
+            "Authorization code box below and submit.",
+            "Claude Code then prints a long-lived token once. Crucible writes it to "
+            "oauth-token and never shows it.",
+        ),
     ),
     "codex": LoginFlow(
         harness="codex",
@@ -121,6 +183,13 @@ FLOWS: dict[str, LoginFlow] = {
         token_pattern="",
         token_file="",
         window="Codex: the device code expires in 15 minutes; enter it at the URL shown",
+        guidance=(
+            "Open the sign-in link and sign in with the ChatGPT account Codex is to use.",
+            "Enter the one-time code shown below when the page asks for it. It expires "
+            "15 minutes after Codex printed it.",
+            "There is nothing to paste back: Codex notices the sign-in on its own and "
+            "the login finishes by itself.",
+        ),
     ),
     "agy": LoginFlow(
         harness="agy",
@@ -136,8 +205,46 @@ FLOWS: dict[str, LoginFlow] = {
             "AGY: the CLI waits 60 seconds for the pasted code; have the browser signed "
             "in before starting"
         ),
+        prompt_pattern=r"^\s*Or, paste the authorization code here and press Enter:\s*$",
+        code_wait_seconds=60,
+        timed_out_pattern=r"authentication timed out",
+        timed_out_message=(
+            "AGY stopped waiting for the code after its own 60 seconds, so this login "
+            "ended. Start the login again; sign in to Google in this browser first so "
+            "the code is ready within the minute"
+        ),
+        code_from_redirect=True,
+        guidance=(
+            "AGY waits only 60 seconds for the code, counted from when it printed the "
+            "link. Sign in to Google in this browser before starting, so the sign-in "
+            "is one click.",
+            "Open the sign-in link and choose the Google account AGY is to use.",
+            "After you sign in, the browser ends on an address that does not load (on "
+            "the lab, 2026-09-27, it was a localhost address this browser cannot "
+            "reach). That is expected. Copy the whole address from the address bar, or "
+            "just the value after code= up to the next &, paste it into the "
+            "Authorization code box below and submit.",
+            "If the 60 seconds run out, the login ends and says so. Start it again: it "
+            "prints a new link, and a code from the old one no longer works.",
+        ),
     ),
 }
+
+
+def normalize_code(flow: LoginFlow | None, pasted: str) -> str:
+    """The code the CLI reads, from what the operator pasted. For a flow whose code is
+    copied from a redirect's address bar (AGY), a whole address yields its `code`
+    parameter, and a percent-encoded code (`4%2F0A...` as the address bar shows it) is
+    decoded: the CLI refuses the encoded form as a malformed code."""
+    code = pasted.strip()
+    if flow is None or not flow.code_from_redirect:
+        return code
+    if "code=" in code:
+        query = urlsplit(code).query if "://" in code else code.split("?", 1)[-1]
+        found = parse_qs(query).get("code")
+        if found:
+            return found[0].strip()
+    return unquote(code) if "%" in code else code
 
 
 # A session in one of these states has its outcome decided: nothing the operator sends
@@ -166,7 +273,18 @@ class LoginSession:
     credential_written: bool | None = None
     error: str | None = None
     cancel_requested: bool = False
+    # What the operator does, from the flow, and when the CLI stops waiting for the code
+    # (epoch seconds) for a CLI that gives up on its own.
+    guidance: tuple[str, ...] = ()
+    code_wait_ends_at: float | None = None
+    codes_submitted: int = 0
+    # When the CLI last printed a line (monotonic), for QUIET_PROMPT_SECONDS.
+    last_output_at: float = field(default_factory=time.monotonic)
     _code_from_operator: str | None = None
+    # The codes the operator pasted, masked wherever the CLI echoes one back: the
+    # Kubernetes driver masks in the Pod, and this is the same for the Docker and local
+    # logins, which read the CLI's terminal directly.
+    _pasted: list[str] = field(default_factory=list)
     _wake: threading.Event = field(default_factory=threading.Event)
     _guard: threading.Lock = field(default_factory=threading.Lock)
 
@@ -183,6 +301,12 @@ class LoginSession:
             "credential_written": self.credential_written,
             "error": self.error,
             "cancel_requested": self.cancel_requested,
+            "guidance": list(self.guidance),
+            "code_wait_ends_at": (
+                datetime.fromtimestamp(self.code_wait_ends_at, UTC).isoformat()
+                if self.code_wait_ends_at is not None
+                else None
+            ),
         }
 
     def submit_code(self, code: str) -> None:
@@ -197,8 +321,28 @@ class LoginSession:
             if self.state != "waiting_for_code":
                 return False
             self._code_from_operator = code
+            self.codes_submitted += 1
+            if code.strip():
+                self._pasted.append(code.strip())
         self._wake.set()
         return True
+
+    def notice_waiting(self, flow: LoginFlow, now: float | None = None) -> None:
+        """hades #173: a CLI that printed its sign-in URL and then went quiet is waiting
+        for the operator, so the code box is shown even when its prompt was not
+        recognised. Only before the first code: after one, the CLI's own prompt says
+        whether it wants another."""
+        if not flow.pastes_code or self.url is None or self.codes_submitted or self.error:
+            return
+        moment = time.monotonic() if now is None else now
+        with self._guard:
+            if self.state != "waiting_for_operator":
+                return
+            if moment - self.last_output_at < QUIET_PROMPT_SECONDS:
+                return
+            self.state = "waiting_for_code"
+            if self.prompt is None:
+                self.prompt = "The CLI has shown the sign-in link and is waiting for input."
 
     def request_cancel(self) -> str | None:
         """Mark the login cancelled and return the state it was cancelled in, or None
@@ -305,10 +449,11 @@ def run_login(
             elif process.poll() is not None:
                 buffer = _consume(buffer + "\n", flow, token_re, target, session, emit)
                 break
+            session.notice_waiting(flow)
             if session.state == "waiting_for_code":
                 code = session.wait_for_code(0.25)
-                if code is not None:
-                    os.write(master, (code.strip() + "\n").encode("utf-8"))
+                if code is not None and session.error is None:
+                    os.write(master, (code.strip() + ENTER).encode("utf-8"))
                     session.state = "waiting_for_operator"
         process.wait(timeout=5)
     finally:
@@ -330,15 +475,25 @@ def _consume(
     session: LoginSession,
     emit: Callable[[str], None] | None,
 ) -> str:
-    """Handle every complete line in the buffer; keep the partial tail (a prompt)."""
+    """Handle every complete line in the buffer; keep the partial tail (a prompt).
+
+    Each line is rendered as a terminal would show it first (`render_line`): the Docker
+    and local logins read the CLI's raw terminal output, and the Kubernetes driver's
+    already rendered lines come through unchanged."""
     lines = buffer.split("\n")
     tail = lines.pop()
     for raw in lines:
-        _line(raw.rstrip("\r"), flow, token_re, target, session, emit)
-    if tail and PASTE_RE.search(tail):
-        _line(tail.rstrip("\r"), flow, token_re, target, session, emit)
-        return ""
+        _line(render_line(raw), flow, token_re, target, session, emit)
+    if tail:
+        shown = render_line(tail)
+        if _prompt_re(flow).search(shown):
+            _line(shown, flow, token_re, target, session, emit)
+            return ""
     return tail
+
+
+def _prompt_re(flow: LoginFlow) -> re.Pattern[str]:
+    return re.compile(flow.prompt_pattern, re.IGNORECASE) if flow.prompt_pattern else PASTE_RE
 
 
 def _line(
@@ -356,8 +511,11 @@ def _line(
             _write_token(target / flow.token_file, match.group(1))
             session.token_written = True
             shown = line.replace(match.group(1), "[captured to " + flow.token_file + "]")
+    for pasted in session._pasted:
+        shown = shown.replace(pasted, "[pasted code]")
     shown = redact(shown)
     session.lines.append(shown)
+    session.last_output_at = time.monotonic()
     if emit is not None:
         emit(shown)
     url = URL_RE.search(shown)
@@ -366,8 +524,20 @@ def _line(
     code = CODE_RE.search(shown)
     if code and session.code is None and not flow.pastes_code:
         session.code = code.group(1)
-    if flow.pastes_code and PASTE_RE.search(shown):
+    if flow.timed_out_pattern and re.search(flow.timed_out_pattern, shown, re.IGNORECASE):
+        session.error = session.error or flow.timed_out_message or shown.strip()
+        # The CLI has stopped reading: no code box, and a code is refused rather than
+        # handed to a CLI on its way out.
+        with session._guard:
+            if session.state == "waiting_for_code":
+                session.state = "waiting_for_operator"
+        return
+    if flow.pastes_code and _prompt_re(flow).search(shown):
         session.prompt = shown.strip()
+        if flow.code_wait_seconds and session.code_wait_ends_at is None:
+            session.code_wait_ends_at = (
+                time.time() + flow.code_wait_seconds - CODE_WAIT_MARGIN_SECONDS
+            )
         session.state = "waiting_for_code"
 
 
@@ -475,7 +645,7 @@ class LoginRegistry:
             lock = self._take_lock(job, harness, holder, ctx.login_timeout_seconds)
             if lock is not None:
                 accept = partial(_accept_while_locked, job, lock, accept)
-        session = LoginSession(harness=harness, started_at=time.time())
+        session = LoginSession(harness=harness, started_at=time.time(), guidance=flow.guidance)
         self._sessions[harness] = session
         if job is not None:
             assert image is not None and accept is not None
@@ -1030,10 +1200,18 @@ def _restore_retired(
     return restored
 
 
-def login_status(registry: LoginRegistry, harness: str) -> dict[str, Any]:
+def login_status(
+    registry: LoginRegistry, harness: str, ctx: AdminContext | None = None
+) -> dict[str, Any]:
+    """The login's state; before any has run, what the operator will do in it."""
     session = registry.get(harness)
     if session is None:
-        return {"harness": harness, "state": "none"}
+        flow = (flows_for(ctx) if ctx is not None else FLOWS).get(harness)
+        return {
+            "harness": harness,
+            "state": "none",
+            "guidance": list(flow.guidance) if flow is not None else [],
+        }
     return session.as_dict()
 
 
@@ -1050,6 +1228,10 @@ def submit_code(
     session = registry.get(harness)
     if session is None or session.state != "waiting_for_code":
         raise ConflictError(_not_waiting(harness, session))
+    flows = flows_for(ctx) if ctx is not None else FLOWS
+    code = normalize_code(flows.get(harness), code)
+    if not code:
+        raise ConflictError("the code is empty; paste the code the sign-in page showed")
     audited_reason: str | None = None
     if ctx is not None and uow is not None:
         audited_reason = guard_mutation(

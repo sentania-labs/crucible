@@ -286,10 +286,31 @@ def test_an_unknown_name_is_refused() -> None:
 
 def test_a_configuration_gate_refuses_with_its_reason() -> None:
     gates = {"codex": HarnessGate(enabled=False, reason="unverified (S1b)")}
-    with pytest.raises(HarnessUnavailableError, match="disabled in configuration: unverified"):
+    with pytest.raises(HarnessUnavailableError, match="configuration default: unverified"):
         default_registry().resolve("codex", gates=gates)
     # Another harness is unaffected by a gate that does not name it.
     assert default_registry().resolve("claude_code", gates=gates).name == "claude_code"
+
+
+def test_an_administrators_decision_replaces_the_configuration_default() -> None:
+    """hades #174: the configuration is the starting value. A row nobody decided keeps
+    the old rule (both must say yes); an administrator's enable or disable decides."""
+    gates = {"codex": HarnessGate(enabled=False, reason="unverified (S1b)")}
+    state = HarnessState(
+        name="codex",
+        enabled=True,
+        reason="",
+        session_compatibility="unverified",
+        updated_at=FakeClock().now(),
+        updated_by="crucible",
+    )
+    with pytest.raises(HarnessUnavailableError, match="configuration default"):
+        default_registry().resolve("codex", gates=gates, state=state)
+    state.enabled_decided = True
+    assert default_registry().resolve("codex", gates=gates, state=state).name == "codex"
+    state.enabled = False
+    with pytest.raises(HarnessUnavailableError, match="disabled by an administrator"):
+        default_registry().resolve("codex", gates={}, state=state)
 
 
 def test_an_administrator_flag_refuses_with_its_reason() -> None:

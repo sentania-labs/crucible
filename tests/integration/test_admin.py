@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import dataclasses
+import html
 import json
 import os
 import re
@@ -46,7 +47,7 @@ from crucible.domain.entities import Attempt, Execution, ExecutionRole, PoolExha
 from crucible.domain.ids import new_id
 from crucible.domain.lifecycle import AttemptState, ExecutionState, TaskState
 from crucible.ports.execution import ImageInfo
-from crucible.ports.harness import CredentialSource
+from crucible.ports.harness import CredentialSource, HarnessGate
 from crucible.settings import Settings
 from tests.admin_cli import admin_main, envelope_data
 from tests.fixtures import contract_document, promote_for_test
@@ -788,6 +789,70 @@ def test_harnesses_list_enable_disable_through_api_and_cli(
     kinds = audit_kinds(admin_client)
     assert ("harness_disabled", "admin-principal") in kinds
     assert ("harness_enabled", "crucible-admin") in kinds
+
+
+def test_an_unverified_harness_is_enabled_in_one_action_from_the_page_or_the_cli(
+    ctx: AppContext,
+    tokens: dict[str, str],
+    admin_ctx: AdminContext,
+    live_supervisor: Supervisor,
+    config_file: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """hades #174: the configuration keeps codex off (unverified) as its starting value.
+    The Harnesses page offers Enable with the reason as a warning, the page's Enable
+    decides, and the CLI does the same with the warning in its answer."""
+    asyncio.run(live_supervisor.tick())
+    unverified = "unverified: Crucible-side refresh not yet observed (S1b step 5)"
+    gates = {"codex": HarnessGate(enabled=False, reason=unverified)}
+    ctx.harness_gates = gates
+    admin_ctx.harness_gates = gates
+    with ctx.uow_factory() as uow:
+        state = uow.harnesses.get("codex")
+        assert state is not None
+        state.enabled_decided = False
+        uow.harnesses.put(state)
+        uow.commit()
+    with TestClient(create_app(ctx)) as browser:
+        csrf = ui_sign_in(browser, tokens["admin"])
+        page = browser.get("/ui/harnesses").text
+        flat = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html.unescape(page)))
+        assert "off by default" in flat and unverified in flat, flat
+        assert 'name="enabled" value="true"' in page
+        changed = browser.post(
+            "/ui/actions/harness",
+            data={
+                "csrf": csrf,
+                "harness": "codex",
+                "enabled": "true",
+                "reason": "",
+                "return_to": "/ui/harnesses",
+            },
+            follow_redirects=False,
+        )
+        assert changed.status_code == 303, changed.text
+        page = browser.get("/ui/harnesses").text
+        flat = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html.unescape(page)))
+        assert "off by default" not in flat
+        assert f"codex off enabled none {unverified}" in flat, flat
+    with ctx.uow_factory() as uow:
+        state = uow.harnesses.get("codex")
+        assert state is not None and state.enabled and state.enabled_decided
+
+    gated = tmp_path / "gated.toml"
+    gated.write_text(
+        config_file.read_text() + f'\n[harnesses.codex]\nenabled = false\nreason = "{unverified}"\n'
+    )
+    off = run_cli(gated, "--reason", "cli: hold", "harnesses", "disable", "codex", capsys=capsys)
+    assert off["enabled"] is False and off["warning"] == unverified
+    on = run_cli(gated, "--reason", "cli: try it", "harnesses", "enable", "codex", capsys=capsys)
+    assert on["enabled"] is True and on["decided_by_administrator"] is True
+    assert on["warning"] == unverified
+    listed = run_cli(gated, "harnesses", "list", capsys=capsys)["items"]
+    codex = next(h for h in listed if h["name"] == "codex")
+    assert codex["enabled"] is True and codex["enabled_by_configuration"] is False
+    assert codex["warning"] == unverified
 
 
 def test_credentials_validate_and_probe_through_api_and_cli(

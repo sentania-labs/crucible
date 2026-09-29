@@ -536,7 +536,8 @@ def harness_actions(items: Iterable[Any], prefix: Sequence[str]) -> list[dict[st
         if not isinstance(item, dict):
             continue
         name = str(item.get("name") or item.get("harness"))
-        on = item.get("enabled_by_administrator", item.get("enabled"))
+        # The harness's availability, the administrator's decision included (hades #174).
+        on = item.get("enabled", item.get("enabled_by_administrator"))
         verb = "disable" if on else "enable"
         out.append(
             action(
