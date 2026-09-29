@@ -37,7 +37,7 @@ $docker volume create "$volume" >/dev/null
 # What the Pod's securityContext and emptyDir volumes are (crucible/adapters/execution/
 # k8sspec.py, pod_spec and memory_volume): an fsGroup emptyDir is root:1000, mode 2777.
 pod=(
-    --rm --user 1000:1000 --read-only --cap-drop ALL
+    --rm --pull never --user 1000:1000 --read-only --cap-drop ALL
     --security-opt no-new-privileges
     --tmpfs "/tmp:rw,exec,size=2g,uid=0,gid=1000,mode=2777"
     --tmpfs "/home/worker:rw,exec,size=2g,uid=0,gid=1000,mode=2777"
@@ -49,7 +49,7 @@ in_repo=(-w /work/repo)
 
 # The claim as the kubelet hands it over: group 1000, setgid. Only this step is root,
 # as the kubelet is.
-$docker run --rm --user 0:0 -v "$volume:/work" --entrypoint sh "$image" \
+$docker run --rm --pull never --user 0:0 -v "$volume:/work" --entrypoint sh "$image" \
     -c 'chown 0:1000 /work && chmod 2770 /work'
 
 # The checkout, made by the worker uid inside the setgid claim, as the preparer does.
@@ -58,7 +58,11 @@ git -C "$repo_root" ls-files -z --cached --others --exclude-standard \
     | $docker run -i "${pod[@]}" -w /work --entrypoint sh "$image" \
         -c 'mkdir repo && tar -C repo --no-same-permissions -xf -'
 
-$docker run "${pod[@]}" "${in_repo[@]}" --entrypoint uv "$image" sync --frozen --quiet
+if ! $docker run "${pod[@]}" "${in_repo[@]}" --entrypoint uv "$image" sync --frozen --quiet
+then
+    echo "unit tier setup (uv sync, the only networked step) failed inside $image" >&2
+    exit 1
+fi
 
 if ! $docker run "${pod[@]}" "${in_repo[@]}" --network none -e UV_OFFLINE=1 --entrypoint make "$image" \
     test-unit; then
