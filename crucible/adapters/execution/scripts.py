@@ -586,6 +586,8 @@ def publisher_script(
     author_email: str,
     commit_trailer: str,
     credential_host: str = "github.com",
+    token_source: str = "stdin",
+    bundle_sha256: str = "",
 ) -> str:
     """Fetch the base from the remote and the branch from the bundle, then push (23).
 
@@ -602,7 +604,19 @@ def publisher_script(
     curl runs at all, because the API calls stay on Crucible's side.
 
     `GIT_TRACE*` and `GIT_CURL_VERBOSE` print the Authorization header, so the script
-    unsets them rather than trusting the environment it inherited (S10 risks)."""
+    unsets them rather than trusting the environment it inherited (S10 risks).
+
+    `token_source` is `stdin` for the Docker provider, as above, or `file` for the
+    Kubernetes provider, which mounts the token from a per-push Secret at the same path
+    (a Secret volume is memory-backed and read-only, so the script neither writes nor
+    removes it; the Secret's deletion is the removal). `bundle_sha256` is the seal the
+    collector recorded: the bundle is hashed here, inside the container, before any
+    remote is contacted, and a bundle that no longer matches is refused (exit 7)."""
+    if token_source not in ("stdin", "file"):
+        raise ValueError(f"unknown token source {token_source!r}")
+    receive = 'cat > "$TOKDIR/token"\n' if token_source == "stdin" else ""
+    secure = 'chmod 0600 "$TOKDIR/token"\n' if token_source == "stdin" else ""
+    drop = 'rm -f "$TOKDIR/token"' if token_source == "stdin" else ":"
     return f"""set -eu
 umask 077
 TOKDIR={_quote(TOKEN_MOUNT)}
@@ -613,17 +627,20 @@ BASE_REF={_quote(base_ref)}
 EXPECTED={_quote(expected_head)}
 CLONE_URL={_quote(clone_url)}
 TRAILER={_quote(commit_trailer)}
+SEAL={_quote(bundle_sha256)}
+drop_token() {{ {drop}; }}
 mkdir -p "$OUT"
-cat > "$TOKDIR/token"
-if [ ! -s "$TOKDIR/token" ]; then
-  echo "no token arrived on stdin" > "$OUT/error.txt"; echo no-token > "$OUT/step.txt"; exit 3
+# A retried publication of the same attempt writes into the same directory; nothing a
+# previous run left may be read back as this run's outcome.
+find "$OUT" -mindepth 1 -maxdepth 1 -exec rm -rf {{}} + 2>/dev/null || true
+{receive}if [ ! -s "$TOKDIR/token" ]; then
+  echo "no token arrived for this push" > "$OUT/error.txt"; echo no-token > "$OUT/step.txt"; exit 3
 fi
-chmod 0600 "$TOKDIR/token"
-# Back to the ordinary mask before anything is written to the output directory: what
+{secure}# Back to the ordinary mask before anything is written to the output directory: what
 # lands there is Crucible's own record of the run, and under the rootless daemon this
 # container's uid is not the one that reads it back (S9 Test E).
 umask 022
-stat -c '%a' "$TOKDIR/token" > "$OUT/token-mode.txt"
+stat -L -c '%a' "$TOKDIR/token" > "$OUT/token-mode.txt"
 unset GIT_TRACE GIT_TRACE_CURL GIT_CURL_VERBOSE GIT_TRACE_PACKET GIT_TRACE2 || true
 export GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0
 export HOME=/home/worker LC_ALL=C
@@ -634,6 +651,17 @@ export CRUCIBLE_AUTHOR_EMAIL={_quote(author_email)}
 {_CRED_HELPER}
 cd /home/worker
 rm -rf publish && mkdir publish && cd publish
+echo bundle-seal > "$OUT/step.txt"
+if [ ! -f "$BUNDLE" ]; then
+  echo "no branch bundle where the collector left it" > "$OUT/error.txt"; drop_token; exit 7
+fi
+if [ -n "$SEAL" ]; then
+  ACTUAL=$(sha256sum "$BUNDLE" | cut -d' ' -f1)
+  if [ "$ACTUAL" != "$SEAL" ]; then
+    echo "the branch bundle no longer matches its sealed sha256" > "$OUT/error.txt"
+    drop_token; exit 7
+  fi
+fi
 echo init > "$OUT/step.txt"
 git init --quiet -b "$BASE_REF" >> "$OUT/publisher.log" 2>&1
 git remote add origin "$CLONE_URL"
@@ -687,7 +715,7 @@ if [ -s "$OUT/author-problems.txt" ] || [ -s "$OUT/trailer-problems.txt" ]; then
     "$AUTHORS" "$TRAILERS" > "$OUT/error.txt"
   echo commit-policy > "$OUT/step.txt"
   echo refused > "$OUT/push.txt"
-  rm -f "$TOKDIR/token"
+  drop_token
   chmod 0644 "$OUT"/* 2>/dev/null || true
   exit 6
 fi
@@ -701,11 +729,11 @@ else
   echo failed > "$OUT/push.txt"
   cp "$OUT/push.err" "$OUT/error.txt" 2>/dev/null || true
   echo push > "$OUT/step.txt"
-  rm -f "$TOKDIR/token"
+  drop_token
   exit 5
 fi
 echo done > "$OUT/step.txt"
-rm -f "$TOKDIR/token"
+drop_token
 chmod 0644 "$OUT"/* 2>/dev/null || true
 exit 0
 """

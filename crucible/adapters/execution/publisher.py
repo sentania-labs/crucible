@@ -19,7 +19,7 @@ import contextlib
 import hashlib
 import logging
 import shutil
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from http.client import HTTPException
 from pathlib import Path
@@ -51,6 +51,9 @@ ROLE_PUBLISHER = "publisher"
 # The script's own exit for "every commit was checked and at least one failed policy".
 # Distinct from a failed push, because nothing was attempted against the remote.
 COMMIT_POLICY_REFUSED = 6
+# The script's exit for "the bundle is missing or no longer matches its seal", checked
+# inside the container before any remote is contacted.
+BUNDLE_SEAL_REFUSED = 7
 # S10: a token is valid for an hour whatever the container does, so a publisher that
 # outlives ten minutes is treated as failed rather than left to hold one.
 MAX_PUBLISHER_SECONDS = 600
@@ -114,6 +117,7 @@ class DockerPublisher:
             author_email=request.author_email,
             commit_trailer=request.commit_trailer,
             credential_host=self.config.credential_host,
+            bundle_sha256=request.bundle_sha256,
         )
         env = {
             "HOME": "/home/worker",
@@ -250,29 +254,9 @@ class DockerPublisher:
         }
 
     def _read_outcome(self, root: Path, exit_code: int) -> PublishOutcome:
-        step = _read(root / "step.txt") or "unknown"
-        head = _read(root / "bundle-head.txt")
-        detail = redact(_read(root / "error.txt"))
-        pushed = _read(root / "push.txt") == "ok" and exit_code == 0
-        authors = tuple(_lines(root / "author-problems.txt"))
-        trailers = tuple(_lines(root / "trailer-problems.txt"))
-        if exit_code == COMMIT_POLICY_REFUSED and not detail:
-            detail = (
-                f"commit policy refused the push: {len(authors)} author problem(s), "
-                f"{len(trailers)} trailer problem(s); nothing was pushed"
-            )
-        return PublishOutcome(
-            pushed=pushed,
-            head_sha=head,
-            step=step,
-            detail=detail,
-            exit_code=exit_code,
-            remote_head_before=_read(root / "remote-head-before.txt"),
-            # Crucible's own container output, redacted before it is recorded: git can
-            # be made to print a header and a remote can answer with anything (12).
-            log_tail=redact(_read(root / "publisher.log", limit=8000)[-8000:]),
-            trailer_problems=trailers,
-            author_problems=authors,
+        return outcome_from_files(
+            {name: _read(root / name, limit=limit) for name, limit in OUTCOME_FILES.items()},
+            exit_code,
         )
 
     async def cleanup(self, attempt_ids: Sequence[str]) -> int:
@@ -310,14 +294,63 @@ def request_spec(request: PublishRequest) -> LaunchSpec:
     )
 
 
+# What the publisher script leaves in its output directory, and how much of each file is
+# read. Both providers read these same files and turn them into an outcome with the same
+# function, so the rules for what a publication did cannot drift between them (23).
+OUTCOME_FILES: dict[str, int] = {
+    "step.txt": 4000,
+    "bundle-head.txt": 4000,
+    "error.txt": 4000,
+    "push.txt": 4000,
+    "author-problems.txt": 4000,
+    "trailer-problems.txt": 4000,
+    "remote-head-before.txt": 4000,
+    "publisher.log": 8000,
+}
+
+
+def outcome_from_files(files: Mapping[str, str], exit_code: int) -> PublishOutcome:
+    """The outcome of one publisher run, from the text of its output files.
+
+    A file that is absent is the empty string. Each text is cut to the length in
+    `OUTCOME_FILES` here, whatever the caller read, so a provider that read more (the
+    Kubernetes reader takes whole files) records exactly what the Docker one does."""
+
+    def text(name: str) -> str:
+        return (files.get(name) or "")[: OUTCOME_FILES.get(name, 4000)].strip()
+
+    def lines(name: str) -> list[str]:
+        return [line for line in text(name).splitlines() if line.strip()]
+
+    step = text("step.txt") or "unknown"
+    head = text("bundle-head.txt")
+    detail = redact(text("error.txt"))
+    pushed = text("push.txt") == "ok" and exit_code == 0
+    authors = tuple(lines("author-problems.txt"))
+    trailers = tuple(lines("trailer-problems.txt"))
+    if exit_code == COMMIT_POLICY_REFUSED and not detail:
+        detail = (
+            f"commit policy refused the push: {len(authors)} author problem(s), "
+            f"{len(trailers)} trailer problem(s); nothing was pushed"
+        )
+    return PublishOutcome(
+        pushed=pushed,
+        head_sha=head,
+        step=step,
+        detail=detail,
+        exit_code=exit_code,
+        remote_head_before=text("remote-head-before.txt"),
+        # Crucible's own container output, redacted before it is recorded: git can be
+        # made to print a header and a remote can answer with anything (12).
+        log_tail=redact(text("publisher.log")[-8000:]),
+        trailer_problems=trailers,
+        author_problems=authors,
+    )
+
+
 def _read(path: Path, *, limit: int = 4000) -> str:
     try:
         with path.open("rb") as handle:
             return handle.read(limit).decode("utf-8", "replace").strip()
     except OSError:
         return ""
-
-
-def _lines(path: Path) -> list[str]:
-    text = _read(path)
-    return [line for line in text.splitlines() if line.strip()]

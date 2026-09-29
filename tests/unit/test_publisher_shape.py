@@ -147,7 +147,8 @@ def test_the_script_refuses_the_push_when_commit_policy_fails() -> None:
     assert f"exit {COMMIT_POLICY_REFUSED}" in script
     # And the token goes before the script does, on that path as on every other.
     tail = script[refusal:push]
-    assert 'rm -f "$TOKDIR/token"' in tail
+    assert "drop_token" in tail
+    assert 'drop_token() { rm -f "$TOKDIR/token"; }' in script
 
 
 def test_a_commit_policy_refusal_maps_to_an_outcome_that_did_not_push(
