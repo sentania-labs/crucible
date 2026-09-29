@@ -137,6 +137,11 @@ def build_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     create.add_argument("--rotate", action="store_true", help="refused: revoke and create")
     revoke = token_sub.add_parser("revoke", help="disable a principal token")
     revoke.add_argument("principal_id", help="an id from `token list`")
+    rename = token_sub.add_parser(
+        "rename", help="rename a principal; its tasks and token follow it (ADR 0029)"
+    )
+    rename.add_argument("principal_id", help="an id from `token list`")
+    rename.add_argument("name", help="the new name")
 
     for name in ("repository", "repositories"):
         repo = sub.add_parser(name, help="repository registry")
@@ -436,7 +441,8 @@ def build_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     )
 
     b = sub.add_parser(
-        "bootstrap", help="the bootstrap ledger handoff (15): submit, show, list, commit"
+        "bootstrap",
+        help="the bootstrap ledger handoff (15): submit, show, list, commit, discard",
     )
     b_sub = b.add_subparsers(dest="bootstrap_command", required=True)
     submit = b_sub.add_parser(
@@ -454,6 +460,10 @@ def build_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     b_sub.add_parser("list", help="every import")
     commit = b_sub.add_parser("commit", help="make a verified import authoritative")
     commit.add_argument("import_id")
+    discard = b_sub.add_parser(
+        "discard", help="withdraw a verified import that will not be committed (ADR 0029)"
+    )
+    discard.add_argument("import_id")
     _reason_after_the_verb(parser)
     return parser
 
@@ -613,6 +623,12 @@ def _remote(args: argparse.Namespace, remote: Api) -> Any:
             return remote.call("GET", "/v1/admin/tokens")
         if args.token_command == "revoke":
             return remote.call("POST", f"/v1/admin/tokens/{args.principal_id}/revoke", reason)
+        if args.token_command == "rename":
+            return remote.call(
+                "POST",
+                f"/v1/admin/tokens/{args.principal_id}/rename",
+                {**reason, "name": args.name},
+            )
         if args.rotate:
             raise UsageError("remote token rotation is not supported; revoke and create")
         return remote.call(
@@ -788,6 +804,8 @@ def _remote(args: argparse.Namespace, remote: Api) -> Any:
             return remote.call("GET", f"/v1/import/bootstrap/{args.import_id}")
         if verb == "list":
             return remote.call("GET", "/v1/import/bootstrap")
+        if verb == "discard":
+            return remote.call("POST", f"/v1/import/bootstrap/{args.import_id}/discard", reason)
         return remote.call("POST", f"/v1/import/bootstrap/{args.import_id}/commit", reason)
     if command in ("repository", "repositories"):
         if args.repo_command == "list":
@@ -1242,6 +1260,12 @@ def _local_bootstrap(
             return bootstrap.show(uow, args.import_id)
         if verb == "list":
             return {"items": bootstrap.list_imports(uow)}
+        if verb == "discard":
+            discarded = bootstrap.discard(
+                admin, uow, principal=principal, import_id=args.import_id, reason=args.reason
+            )
+            uow.commit()
+            return discarded
         result = bootstrap.commit(
             admin, uow, principal=principal, import_id=args.import_id, reason=args.reason
         )
@@ -1266,6 +1290,17 @@ def _token(args: argparse.Namespace, wiring: Wiring) -> Any:
             uow.commit()
             tokens_admin.after_revoke(wiring.admin, result)
             return result
+        if args.token_command == "rename":
+            renamed = tokens_admin.rename(
+                wiring.admin,
+                uow,
+                principal=CLI_PRINCIPAL,
+                principal_id=args.principal_id,
+                name=args.name,
+                reason=args.reason,
+            )
+            uow.commit()
+            return renamed
         if args.rotate:
             raise UsageError("token rotation is replaced by revoke and create")
         minted = tokens_admin.create(
@@ -1414,6 +1449,7 @@ def kind_of(args: argparse.Namespace) -> str:
         ("token", "list"): "token_list",
         ("token", "create"): "token_created",
         ("token", "revoke"): "token_revoked",
+        ("token", "rename"): "token_renamed",
         ("repository", "list"): "repository_list",
         ("repository", "register"): "repository",
         ("repository", "remove"): "repository_removed",

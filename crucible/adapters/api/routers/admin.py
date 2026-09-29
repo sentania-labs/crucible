@@ -860,6 +860,32 @@ def admin_revoke_token(
     return result
 
 
+@router.post("/admin/tokens/{principal_id}/rename")
+def admin_rename_principal(
+    principal_id: str,
+    ctx: Ctx,
+    uow: UoW,
+    principal: Admin,
+    body: Annotated[dict[str, Any], Body()],
+) -> dict[str, Any]:
+    """ADR 0029: rename a principal. Its tasks and token follow it by id."""
+    name = body.get("name")
+    if not isinstance(name, str):
+        raise RequestValidationError(
+            [{"loc": ("body", "name"), "msg": "name must be a string", "type": "value_error"}]
+        )
+    result = tokens.rename(
+        _admin(ctx),
+        uow,
+        principal=principal.name,
+        principal_id=principal_id,
+        name=name,
+        reason=_reason(body),
+    )
+    uow.commit()
+    return result
+
+
 @router.get("/admin/audit")
 def admin_audit(
     uow: UoW,

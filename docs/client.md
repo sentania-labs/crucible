@@ -237,7 +237,8 @@ each.
 `crucible admin --help` and each verb's `--help` list the admin verbs and
 their arguments. An admin `--reason` goes before or after the verb and is an
 optional audit note, except where the operation requires one (token revoke,
-repository remove, credential remove, bootstrap commit); `next` lists it under
+token rename, repository remove, credential remove, bootstrap commit, bootstrap
+discard); `next` lists it under
 `optional` where it may be left out and under `needs` where it may not.
 
 ## From the old clients

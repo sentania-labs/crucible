@@ -1,7 +1,12 @@
 """The bootstrap ledger handoff (15): submit a `BootstrapExportV1` bundle, which is
 validated in full and written in one transaction under a `bootstrap_imports` row in
 state `verified`; show and list imports; commit one, which makes it authoritative and
-records the handoff on every imported task.
+records the handoff on every imported task; or discard a verified one (ADR 0029).
+
+A bundle task whose external id is already a native task of the owner (one Hades ran
+itself, not one an import wrote) is skipped, with its events, and named in the report:
+the native task is the record, the ledger's copy of it is not. A task an import wrote
+still refuses the bundle, because two imports never share a task.
 
 Both entry points (the API under `/v1/import/bootstrap` and `crucible admin bootstrap`)
 call these functions. Submit and commit are administrative mutations (25): a reason and
@@ -18,6 +23,7 @@ whole import rolls back, which is the fence doing its job.
 from __future__ import annotations
 
 import json
+import secrets
 from typing import Any
 
 from crucible.application.admin.context import (
@@ -48,16 +54,27 @@ from crucible.domain.entities import (
     ExecutionRole,
     Principal,
     Repository,
+    Role,
     Task,
 )
 from crucible.domain.events import EventKind
 from crucible.domain.ids import new_id
-from crucible.domain.lifecycle import AttemptState, ExecutionState
+from crucible.domain.lifecycle import (
+    EXECUTION_TERMINAL,
+    TASK_TERMINAL,
+    AttemptState,
+    ExecutionState,
+    TaskState,
+)
 from crucible.domain.secrets import scan_text
 from crucible.ports.repository import UnitOfWork
 
 STATE_VERIFIED = "verified"
 STATE_AUTHORITATIVE = "authoritative"
+STATE_DISCARDED = "discarded"
+# The disabled principal a discarded import's tasks are retired under, one per import so
+# two discards of overlapping ledgers never collide (ADR 0029).
+DISCARDED_PRINCIPAL_PREFIX = "discarded-import-"
 # Where an imported task lands when its `repository` names nothing registered (or
 # nothing at all). A registration is an operator act (04); the import never invents one
 # with a URL, so the sentinel carries none and the report names every task on it.
@@ -302,6 +319,17 @@ def _write_task(
     return entry
 
 
+def _imported_task_ids(uow: UnitOfWork) -> set[str]:
+    """The tasks an import wrote and still owns: every import's but a discarded one's,
+    whose tasks were retired under a principal of their own."""
+    return {
+        str(entry["task_id"])
+        for record in uow.bootstrap_imports.list_all()
+        if record.state != STATE_DISCARDED
+        for entry in record.manifest.get("tasks", [])
+    }
+
+
 def submit(
     ctx: AdminContext,
     uow: UnitOfWork,
@@ -322,16 +350,31 @@ def submit(
             return dict(existing.manifest), False
         _scan(validated, problems)
     owner_principal = _resolve_owner(uow, principal=principal, owner=owner, problems=problems)
+    skipped: list[dict[str, Any]] = []
     if validated is not None and owner_principal is not None:
+        imported = _imported_task_ids(uow)
         for index, task in enumerate(validated.tasks):
-            if uow.tasks.get_by_external_id(owner_principal.id, task.external_id) is not None:
+            existing_task = uow.tasks.get_by_external_id(owner_principal.id, task.external_id)
+            if existing_task is None:
+                continue
+            if existing_task.id in imported:
                 problems.append(
                     problem(
                         f"tasks[{index}].id",
                         f"{task.external_id!r} already exists for principal "
-                        f"{owner_principal.name!r}",
+                        f"{owner_principal.name!r}, written by another import",
                     )
                 )
+                continue
+            skipped.append(
+                {
+                    "external_id": task.external_id,
+                    "task_id": existing_task.id,
+                    "state": existing_task.state.value,
+                    "source_state": task.source_state,
+                    "detail": "a native task of this principal; the ledger's copy is not imported",
+                }
+            )
     if problems or validated is None or owner_principal is None:
         record_refusal(
             ctx,
@@ -345,7 +388,10 @@ def submit(
         )
 
     import_id = new_id()
-    if any(t.unsupervised for t in validated.tasks):
+    skipped_ids = {entry["external_id"] for entry in skipped}
+    tasks = [t for t in validated.tasks if t.external_id not in skipped_ids]
+    events = [e for e in validated.events if e.external_id not in skipped_ids]
+    if any(t.unsupervised for t in tasks):
         lease = uow.leases.get_supervisor()
         if lease is None:
             raise SupervisorNotLiveError("refused: no supervisor lease to write the attempt under")
@@ -356,7 +402,7 @@ def submit(
     matched: dict[str, int] = {}
     on_sentinel: list[str] = []
     by_task_id: dict[str, str] = {}
-    for task in validated.tasks:
+    for task in tasks:
         repository = uow.repositories.get_by_name(task.repository) if task.repository else None
         uses_sentinel = repository is None
         if repository is None:
@@ -380,7 +426,7 @@ def submit(
         by_task_id[task.external_id] = entry["task_id"]
     first_seq: int | None = None
     last_seq: int | None = None
-    for event in validated.events:
+    for event in events:
         written = uow.events.append(
             Event(
                 seq=None,
@@ -417,21 +463,22 @@ def submit(
         "committed_at": None,
         "policy": {"name": policy[0], "version": policy[1]},
         "counts": {
-            "tasks": len(validated.tasks),
-            "events": len(validated.events),
-            "executions": sum(1 for t in validated.tasks if t.unsupervised),
-            "attempts": sum(1 for t in validated.tasks if t.unsupervised),
+            "tasks": len(tasks),
+            "events": len(events),
+            "executions": sum(1 for t in tasks if t.unsupervised),
+            "attempts": sum(1 for t in tasks if t.unsupervised),
             "handoff_events": 0,
+            "skipped_tasks": len(skipped),
+            "skipped_events": len(validated.events) - len(events),
         },
         "state_map": validated.state_map,
         "repositories": {"matched": matched, "sentinel": on_sentinel},
         "tasks": entries,
+        "skipped_existing": skipped,
         "events": {"first_seq": first_seq, "last_seq": last_seq},
         "uncarried": {
             "tasks": [
-                {"external_id": t.external_id, **entry}
-                for t in validated.tasks
-                for entry in t.uncarried
+                {"external_id": t.external_id, **entry} for t in tasks for entry in t.uncarried
             ],
             "events": list(EVENT_FIELD_MAP),
         },
@@ -543,6 +590,126 @@ def commit(
         reason=reason,
         before={"import": import_id, "state": STATE_VERIFIED},
         after={"import": import_id, "state": STATE_AUTHORITATIVE, "handoff_events": handoffs},
+        content_sha256=record.content_sha256,
+    )
+    return manifest
+
+
+def discard(
+    ctx: AdminContext, uow: UnitOfWork, *, principal: str, import_id: str, reason: str | None
+) -> dict[str, Any]:
+    """ADR 0029: withdraw a `verified` import that will never be committed, so a fresh
+    export of the same ledger can be imported. Events are append-only (10), so nothing is
+    deleted: the import's tasks are retired under a disabled principal of their own, a
+    task still open is cancelled, its synthetic execution and attempt end, and each task
+    records why. The owner's external ids are free again. Refused for any import that is
+    not `verified`; an authoritative ledger is never withdrawn."""
+    reason = guard_mutation(
+        ctx,
+        uow,
+        reason,
+        principal=principal,
+        operation=f"bootstrap discard {import_id}",
+        reason_required=True,
+    )
+    record = uow.bootstrap_imports.get(import_id, for_update=True)
+    if record is None:
+        raise NotFoundError(f"bootstrap import {import_id} not found")
+    if record.state != STATE_VERIFIED:
+        record_refusal(
+            ctx,
+            principal=principal,
+            operation=f"bootstrap discard {import_id}",
+            detail=f"the import is {record.state}, not {STATE_VERIFIED}",
+        )
+        raise ConflictError(
+            f"bootstrap import {import_id} is {record.state}; only a {STATE_VERIFIED} import "
+            "can be discarded"
+        )
+    entries = list(record.manifest.get("tasks", []))
+    if any(entry.get("attempt_id") for entry in entries):
+        # The synthetic executions and attempts are fenced to the supervisor (14), as
+        # when the import wrote them.
+        lease = uow.leases.get_supervisor()
+        if lease is None:
+            raise SupervisorNotLiveError(
+                "refused: no supervisor lease to end the import's synthetic attempts under"
+            )
+        uow.set_fenced_token(lease.fenced_token)
+    now = ctx.clock.now()
+    retired = Principal(
+        id=new_id(),
+        name=f"{DISCARDED_PRINCIPAL_PREFIX}{import_id.lower()}",
+        role=Role.OBSERVER,
+        created_at=now,
+        disabled_at=now,
+    )
+    # No token is ever issued for it: the hash is of a secret nobody holds.
+    uow.principals.add(retired, secrets.token_bytes(16), secrets.token_bytes(32))
+    cancelled = 0
+    for entry in entries:
+        task = uow.tasks.get(str(entry["task_id"]), for_update=True)
+        if task is None:
+            continue
+        before = task.state
+        if task.state not in TASK_TERMINAL:
+            task.state = TaskState.CANCELLED
+            task.updated_at = now
+            task.closed_at = now
+            uow.tasks.save(task)
+            cancelled += 1
+        uow.tasks.reassign(task.id, retired.id)
+        if entry.get("execution_id"):
+            execution = uow.executions.get(str(entry["execution_id"]), for_update=True)
+            if execution is not None and execution.state not in EXECUTION_TERMINAL:
+                execution.state = ExecutionState.CANCELLED
+                execution.ended_at = now
+                uow.executions.save(execution)
+        if entry.get("attempt_id"):
+            attempt = uow.attempts.get(str(entry["attempt_id"]), for_update=True)
+            if attempt is not None and attempt.state is AttemptState.RUNNING:
+                attempt.state = AttemptState.FAILED
+                attempt.ended_at = now
+                # A code, as every termination reason is; the event names the import.
+                attempt.termination_reason = "bootstrap_import_discarded"
+                uow.attempts.save(attempt)
+        record_event(
+            uow,
+            ctx.clock,
+            EventKind.BOOTSTRAP_IMPORT_DISCARDED,
+            principal=principal,
+            task_id=task.id,
+            payload={
+                "import_id": import_id,
+                "external_id": entry["external_id"],
+                "reason": reason,
+                "before": {"state": before.value, "principal": record.manifest.get("principal")},
+                "after": {"state": task.state.value, "principal": retired.name},
+            },
+        )
+    manifest = dict(record.manifest)
+    manifest["state"] = STATE_DISCARDED
+    manifest["discarded_at"] = now.isoformat()
+    manifest["discarded_by"] = principal
+    manifest["discard_reason"] = reason
+    manifest["retired_under"] = retired.name
+    record.state = STATE_DISCARDED
+    record.manifest = manifest
+    uow.bootstrap_imports.save(record)
+    admin_event(
+        uow,
+        ctx,
+        EventKind.BOOTSTRAP_IMPORT_DISCARDED,
+        principal=principal,
+        reason=reason,
+        before={"import": import_id, "state": STATE_VERIFIED},
+        after={
+            "import": import_id,
+            "state": STATE_DISCARDED,
+            "tasks_retired": len(entries),
+            "tasks_cancelled": cancelled,
+            "retired_under": retired.name,
+        },
         content_sha256=record.content_sha256,
     )
     return manifest

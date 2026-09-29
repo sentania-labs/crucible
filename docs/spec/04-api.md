@@ -132,6 +132,7 @@ endpoint's existing role requirements.
 |---|---|---|
 | POST | `/import/bootstrap` | Accept a `BootstrapExportV1` bundle; returns a verification report. Admin. Detail in 15. |
 | POST | `/import/bootstrap/{id}/commit` | Make the imported records authoritative after verification. |
+| POST | `/import/bootstrap/{id}/discard` | Withdraw a verified import: its tasks are retired, never deleted (ADR 0029). Admin. |
 
 ## The client
 

@@ -1079,6 +1079,8 @@ class BootstrapImports:
         row = self._s.scalars(
             select(BootstrapImportRow)
             .where(BootstrapImportRow.content_sha256 == content_sha256)
+            # A discarded import is withdrawn: the same bundle imports afresh (ADR 0029).
+            .where(BootstrapImportRow.state != "discarded")
             .order_by(BootstrapImportRow.id.desc())
             .limit(1)
         ).first()

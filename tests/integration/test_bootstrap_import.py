@@ -145,7 +145,10 @@ def test_import_writes_every_record_and_reports_it(
         "executions": 2,
         "attempts": 2,
         "handoff_events": 0,
+        "skipped_tasks": 0,
+        "skipped_events": 0,
     }
+    assert report["skipped_existing"] == []
     assert report["state_map"] == {
         state: {"target": STATE_MAP[state].value, "count": 1} for state in STATE_MAP
     }
@@ -296,6 +299,83 @@ def test_the_same_bundle_twice_is_one_import(admin_client: TestClient, engine: E
     assert submit(admin_client, raw).json()["state"] == "authoritative"
 
 
+def test_discard_retires_a_verified_import_and_frees_its_external_ids(
+    admin_client: TestClient, engine: Engine
+) -> None:
+    """ADR 0029: nothing is deleted, events being append-only. The tasks move to a
+    disabled principal of their own, the open ones are cancelled, the synthetic runs end,
+    and the same ledger imports afresh."""
+    raw = synthetic_bundle()
+    first = submit(admin_client, raw).json()
+    import_id = first["import_id"]
+    refused = admin_client.post(f"/v1/import/bootstrap/{import_id}/discard", json={})
+    assert refused.status_code == 422 and refused.json()["errors"][0]["path"] == "reason"
+    before = counts(engine)
+    response = admin_client.post(
+        f"/v1/import/bootstrap/{import_id}/discard", json={"reason": "a fresher export"}
+    )
+    assert response.status_code == 200, response.text
+    discarded = response.json()
+    assert discarded["state"] == "discarded"
+    assert discarded["discard_reason"] == "a fresher export"
+    retired = discarded["retired_under"]
+    assert retired == f"discarded-import-{import_id.lower()}"
+    after = counts(engine)
+    # Nothing removed: the same rows, plus one event per task and the audit event.
+    assert {k: after[k] - before[k] for k in ("tasks", "executions", "attempts")} == {
+        "tasks": 0,
+        "executions": 0,
+        "attempts": 0,
+    }
+    assert after["events"] - before["events"] == 8 + 1
+    for entry in first["tasks"]:
+        view = admin_client.get(f"/v1/tasks/{entry['task_id']}").json()
+        assert view["principal"] == retired
+        assert view["state"] in ("closed", "cancelled")
+        kinds = [
+            e["kind"]
+            for e in admin_client.get(f"/v1/tasks/{entry['task_id']}/events").json()["items"]
+        ]
+        assert kinds[-1] == "bootstrap_import_discarded"
+        if entry["unsupervised"]:
+            assert view["executions"][0]["state"] == "cancelled"
+            attempt = admin_client.get(f"/v1/attempts/{entry['attempt_id']}").json()
+            assert attempt["state"] == "failed"
+    tokens_list = {p["name"]: p for p in admin_client.get("/v1/admin/tokens").json()["items"]}
+    assert tokens_list[retired]["disabled_at"] is not None
+    assert tokens_list[retired]["role"] == "observer"
+    # A discarded import is never committed, discarded twice, or replayed.
+    commit = admin_client.post(f"/v1/import/bootstrap/{import_id}/commit", json={"reason": "x"})
+    assert commit.status_code == 409
+    again = admin_client.post(f"/v1/import/bootstrap/{import_id}/discard", json={"reason": "x"})
+    assert again.status_code == 409 and "discarded" in again.json()["detail"]
+    fresh = submit(admin_client, raw)
+    assert fresh.status_code == 201, fresh.text
+    assert fresh.json()["import_id"] != import_id
+    assert fresh.json()["counts"]["tasks"] == 8
+    states = {
+        i["import_id"]: i["state"] for i in admin_client.get("/v1/import/bootstrap").json()["items"]
+    }
+    assert states == {import_id: "discarded", fresh.json()["import_id"]: "verified"}
+    audit = [
+        e["kind"]
+        for e in admin_client.get("/v1/admin/audit", params={"limit": 200}).json()["items"]
+    ]
+    assert "bootstrap_import_discarded" in audit
+
+
+def test_an_authoritative_import_is_never_discarded(admin_client: TestClient) -> None:
+    report = submit(admin_client, synthetic_bundle()).json()
+    import_id = report["import_id"]
+    admin_client.post(f"/v1/import/bootstrap/{import_id}/commit", json={"reason": "go"})
+    refused = admin_client.post(
+        f"/v1/import/bootstrap/{import_id}/discard", json={"reason": "change of mind"}
+    )
+    assert refused.status_code == 409
+    assert "authoritative" in refused.json()["detail"]
+    assert admin_client.get("/v1/admin/status").json()["bootstrap"]["authoritative"] == import_id
+
+
 def test_a_bundle_that_fails_validation_stores_nothing_and_returns_every_problem(
     admin_client: TestClient, engine: Engine
 ) -> None:
@@ -329,16 +409,48 @@ def test_a_bundle_that_fails_validation_stores_nothing_and_returns_every_problem
     assert admin_client.get("/v1/import/bootstrap").json()["items"] == []
 
 
-def test_an_external_id_the_owner_already_has_is_a_problem(
-    admin_client: TestClient, client: TestClient
+def test_a_native_task_the_owner_already_has_is_skipped_with_its_events(
+    admin_client: TestClient, client: TestClient, engine: Engine
 ) -> None:
+    """ADR 0029: a task Hades ran itself is the record; the ledger's copy of it is not
+    imported, and the report names it. The lab had FDY-0137 and FDY-0144 this way."""
     from tests.integration.conftest import submit_and_start  # noqa: PLC0415
 
-    submit_and_start(client, "crucible-worker:fake-succeed", external_id="SYN-0003", start=False)
-    response = submit(admin_client, synthetic_bundle())
-    assert response.status_code == 422
-    assert [e["path"] for e in response.json()["errors"]] == ["tasks[2].id"]
-    assert OWNER in response.json()["errors"][0]["message"]
+    native = submit_and_start(
+        client, "crucible-worker:fake-succeed", external_id="SYN-0003", start=False
+    )
+    raw = synthetic_bundle()
+    skipped_events = sum(1 for e in raw["events"] if e["task"] == "SYN-0003")
+    before = counts(engine)
+    response = submit(admin_client, raw)
+    assert response.status_code == 201, response.text
+    report = response.json()
+    assert [s["external_id"] for s in report["skipped_existing"]] == ["SYN-0003"]
+    assert report["skipped_existing"][0]["task_id"] == native
+    assert report["counts"]["tasks"] == 7
+    assert report["counts"]["skipped_tasks"] == 1
+    assert report["counts"]["events"] == 15 - skipped_events
+    assert report["counts"]["skipped_events"] == skipped_events
+    assert "SYN-0003" not in {t["external_id"] for t in report["tasks"]}
+    assert counts(engine)["tasks"] - before["tasks"] == 7
+    # The native task is untouched: none of the ledger's events landed on it.
+    events = admin_client.get(f"/v1/tasks/{native}/events").json()["items"]
+    assert not [e for e in events if e["kind"].startswith("bootstrap_")]
+
+
+def test_a_task_another_import_wrote_still_refuses_the_bundle(admin_client: TestClient) -> None:
+    """Two imports never share a task: the second one is refused, as before ADR 0029."""
+    from tests.fixtures import bootstrap_content_sha256  # noqa: PLC0415
+
+    assert submit(admin_client, synthetic_bundle()).status_code == 201
+    other = synthetic_bundle()
+    other["events"][0]["detail"] = "a different export of the same ledger"
+    other["content_sha256"] = bootstrap_content_sha256(other["tasks"], other["events"])
+    response = submit(admin_client, other)
+    assert response.status_code == 422, response.text
+    messages = [e["message"] for e in response.json()["errors"]]
+    assert len(messages) == 8
+    assert all("written by another import" in m for m in messages)
 
 
 def test_a_secret_shaped_value_is_refused_by_path_and_never_stored(
@@ -613,11 +725,15 @@ def test_the_cli_remote_mode_builds_the_bootstrap_calls(
     admin_main([*base, "bootstrap", "show", "imp-1"])
     admin_main([*base, "bootstrap", "list"])
     admin_main([*base, "--reason", "r", "bootstrap", "commit", "imp-1"])
+    admin_main([*base, "--reason", "r", "bootstrap", "discard", "imp-1"])
+    admin_main([*base, "--reason", "r", "token", "rename", "p-1", "hades"])
     assert calls == [
         ("POST", f"/v1/import/bootstrap?reason=r&owner={OWNER}", raw),
         ("GET", "/v1/import/bootstrap/imp-1", None),
         ("GET", "/v1/import/bootstrap", None),
         ("POST", "/v1/import/bootstrap/imp-1/commit", {"reason": "r"}),
+        ("POST", "/v1/import/bootstrap/imp-1/discard", {"reason": "r"}),
+        ("POST", "/v1/admin/tokens/p-1/rename", {"reason": "r", "name": "hades"}),
     ]
 
 
@@ -681,3 +797,32 @@ def test_events_keep_their_order_and_original_seq_across_tasks(admin_client: Tes
     assert rows[1]["ts"] == "2026-01-05T16:00:00.000000+00:00"
     assert rows[2]["payload"]["detail"] is None and rows[2]["payload"]["who"] == "foundry"
     assert report["events"] == {"first_seq": rows[0]["seq"], "last_seq": rows[2]["seq"]}
+
+
+def test_the_bootstrap_page_discards_a_verified_import(
+    ctx: AppContext, tokens: dict[str, str], admin_client: TestClient
+) -> None:
+    """Every tunable has a UI: Discard sits beside Commit on a verified import."""
+    from tests.integration.test_admin import ui_sign_in  # noqa: PLC0415
+
+    import_id = submit(admin_client, synthetic_bundle()).json()["import_id"]
+    with TestClient(create_app(ctx)) as browser:
+        csrf = ui_sign_in(browser, tokens["admin"])
+        page = browser.get("/ui/bootstrap")
+        assert "/ui/actions/bootstrap-discard" in page.text
+        done = browser.post(
+            "/ui/actions/bootstrap-discard",
+            data={
+                "csrf": csrf,
+                "import_id": import_id,
+                "reason": "a fresher export",
+                "return_to": "/ui/bootstrap",
+            },
+            follow_redirects=False,
+        )
+        assert done.status_code == 303
+        assert "kind=bad" not in done.headers["location"]
+    states = {
+        i["import_id"]: i["state"] for i in admin_client.get("/v1/import/bootstrap").json()["items"]
+    }
+    assert states == {import_id: "discarded"}

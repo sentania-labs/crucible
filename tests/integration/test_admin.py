@@ -3302,3 +3302,94 @@ def test_hermes_run_limits_have_api_cli_and_ui_controls(
         if e["kind"] == "local_gateway_updated" and e["payload"].get("change") == "hermes_limits"
     ]
     assert len(changes) == 3
+
+
+def test_a_principal_rename_keeps_its_tasks_and_token_through_api_cli_and_ui(
+    ctx: AppContext,
+    tokens: dict[str, str],
+    admin_ctx: AdminContext,
+    admin_client: TestClient,
+    live_supervisor: Supervisor,
+    client: TestClient,
+    config_file: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """ADR 0029: the orchestrator's account is renamed `hades`. Tasks and the token hold
+    the principal's id, so they follow it; events keep the name they were written with."""
+    from tests.integration.conftest import submit_and_start  # noqa: PLC0415
+
+    asyncio.run(live_supervisor.tick())
+    task_id = submit_and_start(
+        client, "crucible-worker:fake-succeed", external_id="REN-0001", start=False
+    )
+    ids = {p["name"]: p["id"] for p in admin_client.get("/v1/admin/tokens").json()["items"]}
+    orchestrator = ids["orchestrator-principal"]
+    no_reason = admin_client.post(f"/v1/admin/tokens/{orchestrator}/rename", json={"name": "x"})
+    assert no_reason.status_code == 422, no_reason.text
+    renamed = admin_client.post(
+        f"/v1/admin/tokens/{orchestrator}/rename",
+        json={"name": "hades", "reason": "the principal agent's identity"},
+    )
+    assert renamed.status_code == 200, renamed.text
+    assert renamed.json() == {
+        "id": orchestrator,
+        "name": "hades",
+        "previous_name": "orchestrator-principal",
+    }
+    # The same token still works, and its task now reads as the renamed principal's.
+    view = client.get(f"/v1/tasks/{task_id}")
+    assert view.status_code == 200 and view.json()["principal"] == "hades"
+    events = client.get(f"/v1/tasks/{task_id}/events").json()["items"]
+    assert events[0]["principal"] == "orchestrator-principal"
+    audit = admin_client.get("/v1/admin/audit", params={"limit": 200}).json()["items"]
+    event = next(e for e in audit if e["kind"] == "principal_renamed")
+    assert event["payload"]["before"]["name"] == "orchestrator-principal"
+    assert event["payload"]["after"]["name"] == "hades"
+    # Refusals: a taken name, a reserved one, the same name, an unknown principal.
+    for body in (
+        {"name": "admin-principal"},
+        {"name": "crucible"},
+        {"name": "worker:x"},
+        {"name": "first-run-admin-9"},
+        {"name": "hades"},
+        {"name": " padded "},
+    ):
+        refused = admin_client.post(
+            f"/v1/admin/tokens/{orchestrator}/rename", json={**body, "reason": "x"}
+        )
+        assert refused.status_code == 409, (body, refused.text)
+    unknown = admin_client.post(
+        "/v1/admin/tokens/01ABCDEFGHJKMNPQRSTVWXYZ00/rename", json={"name": "y", "reason": "x"}
+    )
+    assert unknown.status_code == 409
+    # CLI and UI reach the same operation.
+    cli_renamed = run_cli(
+        config_file,
+        "--reason",
+        "parity",
+        "token",
+        "rename",
+        orchestrator,
+        "hades-cli",
+        capsys=capsys,
+    )
+    assert cli_renamed["name"] == "hades-cli" and cli_renamed["previous_name"] == "hades"
+    with TestClient(create_app(ctx)) as browser:
+        csrf = ui_sign_in(browser, tokens["admin"])
+        page = browser.get("/ui/tokens")
+        assert "Rename principal" in page.text
+        ui_renamed = browser.post(
+            "/ui/actions/token-rename",
+            data={
+                "csrf": csrf,
+                "principal_id": orchestrator,
+                "name": "hades",
+                "reason": "parity",
+                "return_to": "/ui/tokens",
+            },
+            follow_redirects=False,
+        )
+        assert ui_renamed.status_code == 303
+        assert "kind=bad" not in ui_renamed.headers["location"]
+    names = {p["id"]: p["name"] for p in admin_client.get("/v1/admin/tokens").json()["items"]}
+    assert names[orchestrator] == "hades"

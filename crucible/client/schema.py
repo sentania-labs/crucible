@@ -218,6 +218,10 @@ def kind_schemas() -> dict[str, dict[str, Any]]:
             {"principal": STR, "role": STR, "token": STR},
         ),
         "token_revoked": _obj("the revoked principal", {"id": STR, "name": STR, "revoked": BOOL}),
+        "token_renamed": _obj(
+            "the renamed principal (ADR 0029)",
+            {"id": STR, "name": STR, "previous_name": STR},
+        ),
         "repository_list": _items("registered repositories", ANY_OBJ),
         "repository": _obj("a registered repository", {}),
         "repository_removed": _obj("the removed repository", {}),
