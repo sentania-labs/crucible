@@ -1816,6 +1816,8 @@ class KubernetesProvider:
             copy_rejections=outputs.copy_rejections,
             credential_sync=credential_sync,
             checkpoint_refusal=outputs.checkpoint_refusal,
+            leftover_committed=outputs.leftover_committed,
+            leftover_note=outputs.leftover_note,
         )
 
     def _launch_evidence(self, spec: LaunchSpec, observation: Observation) -> CollectedArtifact:

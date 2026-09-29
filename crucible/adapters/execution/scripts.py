@@ -393,6 +393,24 @@ def policy_git(policy: Mapping[str, Any], name: str) -> str:
     return str(value) if value else _GIT_DEFAULTS[name]
 
 
+# FDY-0140: what the leftover commit never takes, as git pathspecs.
+_LEFTOVER_EXCLUDES = " ".join(
+    f"':(exclude,glob){pattern}'"
+    for pattern in (
+        "**/__pycache__/**",
+        "**/*.pyc",
+        "**/node_modules/**",
+        "**/.venv/**",
+        "**/.pytest_cache/**",
+        "**/.mypy_cache/**",
+        "**/.ruff_cache/**",
+        "**/.tox/**",
+        "**/*.egg-info/**",
+        "**/.coverage",
+    )
+)
+
+
 def collector_script(
     *,
     base_ref: str,
@@ -434,7 +452,7 @@ refuse_checkpoint() {{
     printf '%s\n' "$1" >&2
     exit 4
   fi
-  printf 'uncommitted work was not committed: %s\n' "$1" >&2
+  printf 'uncommitted work was not committed: %s\n' "$1" | tee "$OUT/leftover-refusal.txt" >&2
   LEFTOVER=0
 }}
 if [ -n "$COMMIT_ATTEMPT" ]; then
@@ -443,6 +461,8 @@ if [ -n "$COMMIT_ATTEMPT" ]; then
     refuse_checkpoint "checkpoint refused: repository .git is not a real directory"
   elif [ -e "$REPO/.git/commondir" ] || [ -L "$REPO/.git/commondir" ]; then
     refuse_checkpoint "checkpoint refused: repository .git contains a commondir redirect"
+  elif [ ! -f "$REPO/.git/config" ] || [ -L "$REPO/.git/config" ]; then
+    refuse_checkpoint "checkpoint refused: repository .git/config is not a regular file"
   fi
 fi
 if [ "$LEFTOVER" = "1" ]; then
@@ -458,7 +478,8 @@ if [ "$LEFTOVER" = "1" ]; then
     cp "$ORIGINAL_CONFIG" "$REPO/.git/config"
     rm -rf "$ORIGINAL_CONFIG" "$EMPTY_HOOKS"
   }}
-  trap restore_worker_git_config EXIT HUP INT TERM
+  trap restore_worker_git_config EXIT
+  trap 'restore_worker_git_config; trap - EXIT; exit 4' HUP INT TERM
   rm -f "$REPO/.git/config"
   mkdir -p "$EMPTY_HOOKS"
   cat > "$REPO/.git/config" <<EOF
@@ -484,7 +505,9 @@ EOF
       GIT_COMMITTER_NAME={_quote(author_name)} GIT_COMMITTER_EMAIL={_quote(author_email)} \\
       {CHECKPOINT_GIT} -C "$REPO" "$@"
   }}
-  if ! checkpoint_git add -A; then
+  # Build output and caches a repository forgot to ignore are never swept in: the
+  # commit is for the worker's edits, not what running its checks left behind.
+  if ! checkpoint_git add -A -- . {_LEFTOVER_EXCLUDES}; then
     refuse_checkpoint "checkpoint refused: the working tree could not be staged"
   elif checkpoint_git diff --cached --quiet; then
     :

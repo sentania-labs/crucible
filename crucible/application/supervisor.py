@@ -3546,6 +3546,14 @@ class Supervisor:
                         if parsed is not None and parsed.in_flight
                         else {}
                     ),
+                    # FDY-0140: Crucible committed what the worker left uncommitted, or
+                    # could not, and why. The commit itself is in the collected branch.
+                    **({"uncommitted_work_committed": True} if outputs.leftover_committed else {}),
+                    **(
+                        {"uncommitted_work_note": redact(outputs.leftover_note)[:500]}
+                        if outputs.leftover_note
+                        else {}
+                    ),
                 },
             )
             uow.leases.release_attempt_lease(attempt.id)

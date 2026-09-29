@@ -17,7 +17,9 @@ from types import SimpleNamespace
 import pytest
 
 from crucible.adapters.execution import scripts, workspace
-from crucible.ports.execution import IDENTITY_MOUNT, OUTPUT_MOUNT, REPORT_MOUNT
+from crucible.adapters.execution.collected import read_outputs
+from crucible.ports.execution import IDENTITY_MOUNT, OUTPUT_MOUNT, REPORT_MOUNT, LaunchSpec
+from tests.fixtures import contract_document
 
 HOSTILE_REFS = [
     "crucible/$(touch /tmp/crucible-pwned)",
@@ -451,6 +453,122 @@ def test_a_redirected_git_dir_skips_the_leftover_commit_without_a_refusal(
     assert not (output / "checkpoint-refusal.txt").exists()
     assert not (output / "leftover-committed.txt").exists()
     assert result.returncode != 4
+
+
+def test_build_output_is_never_swept_into_the_leftover_commit(tmp_path: Path) -> None:
+    """Caches and build output a repository forgot to ignore stay out of the commit;
+    the worker's edit beside them goes in."""
+    repo, output, report = _work_repo(tmp_path)
+    (repo / "tracked.txt").write_text("edited\n", encoding="utf-8")
+    for junk in ("src/__pycache__/mod.cpython-312.pyc", "node_modules/x/index.js", ".coverage"):
+        (repo / junk).parent.mkdir(parents=True, exist_ok=True)
+        (repo / junk).write_text("junk\n", encoding="utf-8")
+    result = _collect(repo, output, report, attempt_id="01ATTEMPT")
+    assert result.returncode == 0, result.stderr
+    changed = set((output / "changed.txt").read_text().split())
+    assert "tracked.txt" in changed
+    assert not any(
+        "__pycache__" in path or "node_modules" in path or path == ".coverage" for path in changed
+    ), changed
+
+
+@pytest.mark.parametrize("breakage", ["missing", "directory"])
+def test_a_broken_git_config_skips_the_leftover_commit_and_still_collects(
+    tmp_path: Path, breakage: str
+) -> None:
+    """A worker that removed or replaced `.git/config` loses only the leftover commit,
+    with a note the collection keeps; what it committed is still collected."""
+    repo, output, report = _work_repo(tmp_path)
+    (repo / "tracked.txt").write_text("edited\n", encoding="utf-8")
+    (repo / ".git" / "config").unlink()
+    if breakage == "directory":
+        (repo / ".git" / "config").mkdir()
+    result = _collect(repo, output, report, attempt_id="01ATTEMPT")
+    assert "config is not a regular file" in (output / "leftover-refusal.txt").read_text()
+    assert not (output / "checkpoint-refusal.txt").exists()
+    if breakage == "missing":
+        assert result.returncode == 0, result.stderr
+        assert (output / "collector.ok").is_file()
+        assert (output / "commits.txt").read_text().strip() == "1"
+    else:
+        # No git command can read a repository whose config is a directory, so the
+        # collection itself fails, as it did before the leftover commit existed.
+        assert result.returncode != 0
+
+
+def test_the_leftover_commit_and_its_note_are_read_back(tmp_path: Path) -> None:
+    """FDY-0140: what the collector did with uncommitted work reaches the supervisor,
+    which records it on `attempt_collected`."""
+    repo, output, report = _work_repo(tmp_path)
+    (repo / "tracked.txt").write_text("edited\n", encoding="utf-8")
+    assert _collect(repo, output, report, attempt_id="01ATTEMPT").returncode == 0
+    spec = LaunchSpec(
+        attempt_id="01ATTEMPT",
+        task_id="01TASK",
+        external_id="EX-0001",
+        role="implement",
+        harness="script-harness",
+        model="none",
+        image="crucible-worker:test",
+        timeout_seconds=600,
+        contract=contract_document(),
+    )
+    outputs = read_outputs(
+        output,
+        tmp_path / "verify",
+        spec=spec,
+        bundle_verified=True,
+        collector_exit=0,
+        verifications=(),
+        tail_bytes=1024,
+    )
+    assert outputs.leftover_committed is True and outputs.leftover_note is None
+    (output / "leftover-committed.txt").unlink()
+    (output / "leftover-refusal.txt").write_text("uncommitted work was not committed: x\n")
+    again = read_outputs(
+        output,
+        tmp_path / "verify",
+        spec=spec,
+        bundle_verified=True,
+        collector_exit=0,
+        verifications=(),
+        tail_bytes=1024,
+    )
+    assert again.leftover_committed is False
+    assert again.leftover_note == "uncommitted work was not committed: x"
+
+
+def test_the_activity_walk_fingerprints_the_worker_trees_and_sees_a_change(
+    tmp_path: Path,
+) -> None:
+    """FDY-0140: what the Kubernetes provider runs in a live worker. A missing home is
+    still a whole walk; a change anywhere in the trees changes the answer."""
+    repo, report, home = tmp_path / "repo", tmp_path / "report", tmp_path / "home"
+    for path in (repo, report, home):
+        path.mkdir()
+    (home / "state.db").write_bytes(b"turn 1")
+    script = scripts.ACTIVITY_SCRIPT.replace(scripts.REPO_MOUNT, str(repo)).replace(
+        REPORT_MOUNT, str(report)
+    )
+
+    def ask(home_dir: Path) -> tuple[int, int, int] | None:
+        result = subprocess.run(
+            ["sh", "-c", script],
+            capture_output=True,
+            check=False,
+            env={"HOME": str(home_dir), "PATH": "/usr/bin:/bin"},
+        )
+        assert result.returncode == 0, result.stderr
+        return scripts.parse_activity(result.stdout)
+
+    first = ask(home)
+    assert first is not None and first[1] == 4
+    assert ask(home) == first
+    (home / "state.db").write_bytes(b"turn 2, longer")
+    assert ask(home) != first
+    assert ask(tmp_path / "absent") is not None
+    assert scripts.parse_activity(b"incomplete\n") is None
+    assert scripts.parse_activity(b"") is None
 
 
 def test_a_verification_id_cannot_collide_with_another() -> None:

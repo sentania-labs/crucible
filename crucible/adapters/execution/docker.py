@@ -1142,6 +1142,8 @@ class DockerProvider:
             copy_rejections=outputs.copy_rejections,
             credential_sync=credential_sync,
             checkpoint_refusal=outputs.checkpoint_refusal,
+            leftover_committed=outputs.leftover_committed,
+            leftover_note=outputs.leftover_note,
         )
 
     async def push_quota_checkpoint(

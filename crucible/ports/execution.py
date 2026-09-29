@@ -273,6 +273,10 @@ class CollectedOutputs:
     # A quota checkpoint collector can refuse worker-controlled Git metadata before it
     # runs Git. This survives collection so the unsafe-checkpoint wake names the cause.
     checkpoint_refusal: str | None = None
+    # FDY-0140: the collector committed what the worker left uncommitted, or wrote why
+    # it did not.
+    leftover_committed: bool = False
+    leftover_note: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -2696,3 +2696,6 @@ async def test_fdy_0140_a_silent_worker_is_not_stalled_and_uncommitted_edits_are
         assert bundle["commits"] == 1 and bundle["bundle_verified"] is True, bundle
         assert any("left uncommitted" in message for message in bundle["commit_messages"]), bundle
         assert "src/e2e_change.txt" in bundle["commit_paths"], bundle
+        events = client.get(f"/v1/tasks/{uncommitted}/events", params={"limit": 200}).json()
+        collected = [e for e in events["items"] if e["kind"] == "attempt_collected"]
+        assert collected[-1]["payload"].get("uncommitted_work_committed") is True, collected
