@@ -23,6 +23,7 @@ import json
 import sys
 import time
 import urllib.parse
+from collections.abc import Mapping
 from typing import Any
 
 from crucible.adapters.clock import SystemClock
@@ -270,6 +271,19 @@ def build_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help="also read a new Hermes key from a hidden prompt or stdin, never argv",
     )
     gw_sub.add_parser("test", help="test the saved URL and key again")
+    limits = gw_sub.add_parser(
+        "limits",
+        help="show the Hermes run limits, or set them with --max-turns and --context-length",
+    )
+    limits.add_argument(
+        "--max-turns", type=int, default=None, help="model turns one Hermes run may take"
+    )
+    limits.add_argument(
+        "--context-length",
+        type=int,
+        default=None,
+        help="the context window Hermes is told, in tokens; 0 lets Hermes find it",
+    )
     gw_sub.add_parser("models", help="the models the key can see, beside the entries in force")
     pick = gw_sub.add_parser(
         "pick", help="enable or disable gateway models; writes a new routing policy version"
@@ -584,6 +598,15 @@ def _remote(args: argparse.Namespace, remote: Api) -> Any:
             return remote.call("GET", "/v1/admin/gateway/models")
         if verb == "test":
             return remote.call("POST", "/v1/admin/gateway/test", reason)
+        if verb == "limits":
+            current = remote.call("GET", "/v1/admin/gateway/hermes-limits")
+            if args.max_turns is None and args.context_length is None:
+                return current
+            return remote.call(
+                "POST",
+                "/v1/admin/gateway/hermes-limits",
+                {**reason, **_limits(args, current)},
+            )
         if verb == "pick":
             return remote.call(
                 "POST",
@@ -930,6 +953,18 @@ def _local(args: argparse.Namespace, wiring: Wiring) -> Any:
     raise UsageError(f"unknown command: {command}")
 
 
+def _limits(args: argparse.Namespace, current: Mapping[str, Any]) -> dict[str, int]:
+    """`gateway limits` flags over the limits in force: a flag not given keeps its value."""
+    return {
+        "max_turns": args.max_turns if args.max_turns is not None else int(current["max_turns"]),
+        "context_length": (
+            args.context_length
+            if args.context_length is not None
+            else int(current["context_length"])
+        ),
+    }
+
+
 def _local_gateway(args: argparse.Namespace, wiring: Wiring, admin: AdminContext) -> Any:
     principal = Principal(
         id=CLI_PRINCIPAL, name=CLI_PRINCIPAL, role=Role.ADMIN, created_at=wiring.ctx.clock.now()
@@ -940,9 +975,19 @@ def _local_gateway(args: argparse.Namespace, wiring: Wiring, admin: AdminContext
             return gateway.gateway_view(admin, uow)
         if verb == "models":
             return asyncio.run(gateway.models_view(admin, uow))
+        if verb == "limits" and args.max_turns is None and args.context_length is None:
+            return gateway.hermes_limits_view(uow)
         if verb == "test":
             result = asyncio.run(
                 gateway.test_gateway(admin, uow, principal=principal, reason=args.reason)
+            )
+        elif verb == "limits":
+            result = gateway.save_hermes_limits(
+                admin,
+                uow,
+                principal=principal,
+                reason=args.reason,
+                **_limits(args, gateway.hermes_limits_view(uow)),
             )
         elif verb == "pick":
             result = asyncio.run(

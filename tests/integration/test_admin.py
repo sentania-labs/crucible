@@ -2926,3 +2926,79 @@ def test_the_cli_remote_mode_sends_the_command_timeout(monkeypatch: pytest.Monke
         ("GET", "/v1/admin/limits/command-timeout", None),
         ("POST", "/v1/admin/limits/command-timeout", {"reason": "r", "max": 7_200_000}),
     ]
+
+
+def test_hermes_run_limits_have_api_cli_and_ui_controls(
+    ctx: AppContext,
+    tokens: dict[str, str],
+    admin_client: TestClient,
+    live_supervisor: Supervisor,
+    config_file: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """FDY-0140: every tunable has a UI. The turn and context limits are shown and set
+    from the admin API, `crucible-admin gateway limits` and the Local gateway page, and
+    each change is audited."""
+    asyncio.run(live_supervisor.tick())
+    shown = admin_client.get("/v1/admin/gateway/hermes-limits").json()
+    assert (shown["max_turns"], shown["context_length"], shown["saved"]) == (300, 131072, False)
+
+    saved = admin_client.post(
+        "/v1/admin/gateway/hermes-limits",
+        json={"reason": "api: longer tasks", "max_turns": 500, "context_length": 0},
+    )
+    assert saved.status_code == 200, saved.text
+    assert (saved.json()["max_turns"], saved.json()["context_length"]) == (500, 0)
+    for body in (
+        {"max_turns": 5, "context_length": 0},
+        {"max_turns": 300, "context_length": 1000},
+        {"max_turns": "many", "context_length": 0},
+    ):
+        refused = admin_client.post("/v1/admin/gateway/hermes-limits", json=body)
+        assert refused.status_code in (409, 422), (body, refused.text)
+    assert admin_client.get("/v1/admin/gateway/hermes-limits").json()["max_turns"] == 500
+
+    local = run_cli(config_file, "gateway", "limits", capsys=capsys)
+    assert (local["max_turns"], local["context_length"]) == (500, 0)
+    changed = run_cli(
+        config_file,
+        "--reason",
+        "cli: bigger window",
+        "gateway",
+        "limits",
+        "--context-length",
+        "200000",
+        capsys=capsys,
+    )
+    # A flag not given keeps its value.
+    assert (changed["max_turns"], changed["context_length"]) == (500, 200000)
+
+    with TestClient(create_app(ctx)) as browser:
+        csrf = ui_sign_in(browser, tokens["admin"])
+        page = browser.get("/ui/gateway")
+        assert page.status_code == 200
+        assert "Hermes run limits" in page.text
+        assert 'action="/ui/actions/hermes-limits"' in page.text
+        assert 'name="max_turns"' in page.text and 'name="context_length"' in page.text
+        response = browser.post(
+            "/ui/actions/hermes-limits",
+            data={
+                "csrf": csrf,
+                "max_turns": "250",
+                "context_length": "131072",
+                "reason": "ui: back to normal",
+                "return_to": "/ui/gateway",
+            },
+            follow_redirects=False,
+        )
+        assert response.status_code == 303, response.text
+        assert "kind=ok" in unquote(response.headers["location"])
+    final = admin_client.get("/v1/admin/gateway/hermes-limits").json()
+    assert (final["max_turns"], final["context_length"], final["saved"]) == (250, 131072, True)
+    events = admin_client.get("/v1/admin/audit", params={"limit": 200}).json()["items"]
+    changes = [
+        e["payload"]["after"]
+        for e in events
+        if e["kind"] == "local_gateway_updated" and e["payload"].get("change") == "hermes_limits"
+    ]
+    assert len(changes) == 3
