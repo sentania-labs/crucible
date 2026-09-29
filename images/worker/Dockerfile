@@ -127,7 +127,7 @@ RUN set -eu; \
     chmod 0755 /fetch/bin/uv /fetch/bin/gitleaks; \
     touch -h -d "@${SOURCE_DATE_EPOCH}" /fetch/bin/uv /fetch/bin/gitleaks; \
     tar -xzf /fetch/cpython.tar.gz -C /fetch/opt --no-same-owner; \
-    test "$(/fetch/opt/python/bin/python3.12 -c 'import platform; print(platform.python_version())')" = "${CPYTHON_VERSION}"; \
+    test "$(/fetch/opt/python/bin/python3.12 -B -c 'import platform; print(platform.python_version())')" = "${CPYTHON_VERSION}"; \
     test "$(/fetch/bin/uv --version | cut -d' ' -f2)" = "${UV_VERSION}"; \
     test "$(/fetch/bin/gitleaks version)" = "${GITLEAKS_VERSION}"
 

@@ -74,3 +74,9 @@ image, a per-project image, or the repository.
   declares them and adds them to the image, or waits for a per-project image; that
   choice is still per project, as #184 put it.
 - Postgres-backed tests do not run in a worker until the sidecar half of #85 lands.
+- Accepted risk: pypi.org and files.pythonhosted.org are served from a CDN's shared
+  addresses, so the per-address rules that admit them admit anything else that CDN
+  serves on those addresses, and code in the worker or the verifier could reach such a
+  service by naming it in TLS. default-software has always allowed the same two names;
+  this policy does not widen it. A pull-through index inside the cluster is what would
+  close it, and is not built.

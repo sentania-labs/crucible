@@ -376,20 +376,26 @@ The policy names a routing policy version. Upload it naming the one the default-
 in force names, so it routes to the same models (the gateway's Hermes models included):
 
 ```sh
-# The admin token is read from a file and never typed on a command line.
+# The admin token is read from a file into curl's header file on a pipe (printf is a
+# shell builtin), so it is never in any process's argument list.
 TOKEN_FILE=/path/to/admin-token
-routing=$(curl -fsS -H "Authorization: Bearer $(cat "$TOKEN_FILE")" \
+auth() { printf 'Authorization: Bearer %s\n' "$(cat "$TOKEN_FILE")"; }
+routing=$(curl -fsS -H @<(auth) \
   "$CRUCIBLE_URL/v1/routing/usage?policy=default-software" | jq -c .routing_policy)
 uv run python -c 'import json, sys, yaml
 document = yaml.safe_load(open("examples/policies/hades-self-hosting.yaml"))
 document["routing"] = {"policy": json.loads(sys.argv[1])}
 print(json.dumps(document))' "$routing" > /tmp/hades-self-hosting.json
-curl -fsS -X PUT -H "Authorization: Bearer $(cat "$TOKEN_FILE")" \
+curl -fsS -X PUT -H @<(auth) \
   -H 'Content-Type: application/json' --data @/tmp/hades-self-hosting.json \
   "$CRUCIBLE_URL/v1/policies/hades-self-hosting/1"
 ```
 
-Contracts then name `{"name": "hades-self-hosting", "version": 1}`. A version is
+Contracts then name `{"name": "hades-self-hosting", "version": 1}`, and their
+`required_verification` lists `make lint`, `make test-unit` and `make scan`. A contract
+that lacks `make test-unit` is refused at submission; one that also lists `make test` is
+accepted and then fails `verification_ran`, because the verifier has no Docker and no
+Postgres for the integration tier. A version is
 immutable once a task references it, and the admin UI's routing pages only ever write new
 default-software versions: after the operator changes routing there, upload the next
 version of this policy the same way (bump `version` in the document and the path).

@@ -16,11 +16,11 @@
 # routing.policy must name the routing policy the default-software in force names, or
 # this policy routes against an older model roster. Read it and fill it in at upload:
 #
-#   curl -fsS -H "Authorization: Bearer $(cat <admin token file>)" \
-#     "$CRUCIBLE_URL/v1/routing/usage?policy=default-software" | jq .routing_policy
+#   GET /v1/routing/usage?policy=default-software, its `routing_policy`
 #
 # then PUT /v1/policies/hades-self-hosting/<version> (admin) with this document as JSON.
-# docs/deployment.md has the whole procedure. A new routing version later needs a new
+# docs/deployment.md has the whole procedure, with the admin token kept off every
+# command line. A new routing version later needs a new
 # version of this policy too.
 schema_version: '1.0'
 name: hades-self-hosting

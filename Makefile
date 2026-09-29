@@ -155,9 +155,11 @@ images-check: ## build both images and fail if any tag, harness version or OCI d
 
 # hades #181: the program each shipped policy's required check starts with (`make`, for
 # default-software's `make lint`, `make test`, `make scan`) must resolve in the worker
-# image, so a policy and the image cannot disagree about it again. Probes the WORKER tag images/manifest.env
+# image, so a policy and the image cannot disagree about it again; so must every program
+# a shipped policy declares in `repository.required_programs` (hades #184, `uv` and
+# `gitleaks` for hades-self-hosting). Probes the WORKER tag images/manifest.env
 # declares, which `make images` or `make images-check` leaves in the daemon.
-images-policy-check: ## fail when the worker image lacks the program a shipped policy's required check starts with
+images-policy-check: ## fail when the worker image lacks a program a shipped policy's checks start with or declare
 	$(UV) sync --frozen --quiet
 	DOCKER="$(DOCKER)" $(UV) run python tools/images/policy_commands.py
 
@@ -181,7 +183,7 @@ scan-tree: ## every tracked file as it is in the working tree (caches and .venv 
 # left to fail inside gitleaks' git log.
 scan-history: ## commits in SCAN_RANGE (default origin/main..HEAD)
 	@test -n "$${SCAN_RANGE:-}" || git rev-parse --verify --quiet origin/main >/dev/null \
-	  || { echo "scan-history: no origin/main in this clone; set SCAN_RANGE"; exit 2; }
+	  || { echo "scan-history: no origin/main in this clone; set SCAN_RANGE" >&2; exit 2; }
 	gitleaks detect --redact --no-banner --source . --log-opts="$${SCAN_RANGE:-origin/main..HEAD}"
 
 smoke: ## drive one task end to end through a running stack; `make up` first

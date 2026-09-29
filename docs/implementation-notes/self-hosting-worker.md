@@ -5,8 +5,8 @@
 The operator, 2026-09-28, on FDY-0131: every task against this repository failed
 `verification_ran`, because the worker image lacked what `make lint`, `make test` and
 `make scan` call here. Deliver the toolchain in the worker image, a way to the locked
-dependencies without open internet, and a policy for this repository whose required
-checks are `make lint`, `make test-unit` and `make scan`. The integration and e2e tiers
+dependencies without opening worker egress beyond named hosts, and a policy for this
+repository whose required checks are `make lint`, `make test-unit` and `make scan`. The integration and e2e tiers
 need Postgres and Docker, and branch CI remains the full proof of record (the operator's
 decision, 2026-09-28). ADR 0020 records the choices.
 
