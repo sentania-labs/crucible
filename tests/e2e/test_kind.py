@@ -6,6 +6,7 @@ import asyncio
 import base64
 import contextlib
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -30,8 +31,12 @@ from crucible.adapters.execution.k8sapi import (
     KubernetesClient,
     kubeconfig_access,
 )
+from crucible.adapters.execution.k8spublisher import KubernetesPublisher
 from crucible.adapters.execution.k8sregistry import CraneRegistryClient
 from crucible.adapters.execution.kubernetes import KubernetesConfig, KubernetesProvider
+from crucible.adapters.github.appauth import AppAuthenticator, AppConfig
+from crucible.adapters.github.client import RestGitHubClient
+from crucible.adapters.github.transport import RestTransport
 from crucible.adapters.harness.registry import default_registry as application_harnesses
 from crucible.adapters.harness.script import ScriptHarnessAdapter
 from crucible.adapters.persistence.unit_of_work import SqlUnitOfWorkFactory
@@ -39,8 +44,11 @@ from crucible.adapters.storage.disk import DiskArtifactStore
 from crucible.application.admin.context import AdminContext
 from crucible.application.admin.login import LoginFlow
 from crucible.application.auth import mint_token
+from crucible.application.delivery_tick import DeliveryConfig
 from crucible.application.harnesses import HarnessRegistry
+from crucible.application.repositories import register_repository
 from crucible.application.supervisor import Supervisor
+from crucible.contracts.api import ExternalReviewAttestation, RepositoryRegistration
 from crucible.domain.entities import Role
 from crucible.ports.execution import (
     REPORT_MOUNT,
@@ -73,6 +81,7 @@ from tests.e2e.repo import make_origin
 from tests.e2e.test_class_routing import _install_class_policy
 from tests.e2e.test_isolation import MUST_BE_REFUSED
 from tests.fixtures import contract_document, promote_for_test
+from tests.integration.fake_github import FakeGitHubServer
 
 pytestmark = [
     pytest.mark.e2e,
@@ -2018,3 +2027,394 @@ async def test_hades_190_a_hanging_prepare_leaves_the_lease_readiness_and_other_
         assert "The supervisor is not healthy." in page.text
         assert "e2e-kind-190 released the lease and no supervisor holds it" in page.text
         print("hades-190: UI banner:", re.search(r'role="alert">(.*?)</div>', page.text).group(1))  # type: ignore[union-attr]
+
+
+# ----- FDY-0133: the Kubernetes publisher ---------------------------------
+
+# A smart-HTTP git host on port 443 of its own Pod: the tier's range-http serves the
+# bare repositories read-only over dumb HTTP, which nothing can push to. The worker image
+# carries git (with `git-http-backend`) and perl and no web server, so this is the
+# smallest server that turns one into the other: one fork per connection, the request
+# handed to `git-http-backend` as CGI, the answer passed back, the connection closed.
+# Every request line and status goes to `push-host.log` beside the repositories, never a
+# header: the publisher's helper answers only for https, so no credential ever crosses
+# this plain-HTTP stand-in.
+GIT_PUSH_HOST_SERVER = r"""
+use strict; use warnings; use IO::Socket::INET; use IPC::Open2;
+$SIG{CHLD} = 'IGNORE';
+my $srv = IO::Socket::INET->new(LocalAddr => '0.0.0.0', LocalPort => 443, Listen => 32,
+  ReuseAddr => 1) or die "listen: $!";
+open(my $log, '>>', '/srv/git/push-host.log') or die "log: $!";
+select((select($log), $| = 1)[0]);
+while (1) {
+  my $c = $srv->accept or next;
+  my $pid = fork;
+  if (!defined $pid || $pid) { close $c; next; }
+  $SIG{CHLD} = 'DEFAULT';
+  binmode $c;
+  my $line = <$c> // ''; $line =~ s/\r?\n\z//;
+  my ($method, $uri) = split / /, $line;
+  my %h;
+  while (my $l = <$c>) {
+    $l =~ s/\r?\n\z//; last if $l eq '';
+    my ($k, $v) = split /:\s*/, $l, 2; $h{lc $k} = $v // '';
+  }
+  print $c "HTTP/1.1 100 Continue\r\n\r\n" if ($h{expect} // '') =~ /100-continue/i;
+  my ($path, $query) = split /\?/, ($uri // '/'), 2;
+  $path =~ s{^/git}{};
+  my $body = '';
+  if (defined $h{'content-length'}) {
+    my $want = $h{'content-length'};
+    while (length($body) < $want) {
+      my $got = read($c, my $buf, $want - length($body)); last unless $got; $body .= $buf;
+    }
+  } elsif (($h{'transfer-encoding'} // '') =~ /chunked/i) {
+    while (1) {
+      my $size = <$c> // '0'; $size =~ s/\r?\n\z//; my $n = hex $size;
+      if ($n == 0) { <$c>; last; }
+      my $chunk = ''; while (length($chunk) < $n) {
+        my $got = read($c, my $buf, $n - length($chunk)); last unless $got; $chunk .= $buf;
+      }
+      $body .= $chunk; <$c>;
+    }
+  }
+  $ENV{GIT_PROJECT_ROOT} = '/srv/git'; $ENV{GIT_HTTP_EXPORT_ALL} = '1';
+  $ENV{GIT_CONFIG_COUNT} = '1'; $ENV{GIT_CONFIG_KEY_0} = 'safe.directory';
+  $ENV{GIT_CONFIG_VALUE_0} = '*'; $ENV{HOME} = '/tmp';
+  $ENV{PATH_INFO} = $path; $ENV{REQUEST_METHOD} = $method // 'GET';
+  $ENV{QUERY_STRING} = $query // ''; $ENV{CONTENT_TYPE} = $h{'content-type'} // '';
+  $ENV{CONTENT_LENGTH} = length $body; $ENV{REMOTE_ADDR} = $c->peerhost // '';
+  $ENV{HTTP_CONTENT_ENCODING} = $h{'content-encoding'} // '';
+  $ENV{GIT_HTTP_MAX_REQUEST_BUFFER} = '100M';
+  my $cgi = open2(my $out, my $in, '/usr/lib/git-core/git-http-backend');
+  binmode $in; binmode $out; print $in $body; close $in;
+  my $status = '200 OK'; my @headers;
+  while (my $l = <$out>) {
+    $l =~ s/\r?\n\z//; last if $l eq '';
+    if ($l =~ /^Status:\s*(.*)/i) { $status = $1 } else { push @headers, $l }
+  }
+  my $rest = do { local $/; <$out> } // '';
+  waitpid $cgi, 0;
+  print $c "HTTP/1.1 $status\r\n", map("$_\r\n", @headers), "Connection: close\r\n\r\n", $rest;
+  print $log "$method $uri $status\n";
+  close $c; exit 0;
+}
+"""
+GIT_PUSH_HOST_NAMESPACE = "crucible-kind-git"
+
+
+def _admin_kubectl(*args: str, stdin: str | None = None) -> str:
+    """kubectl as the tier's cluster administrator (the KUBECONFIG e2e-kind.sh exports),
+    for the stand-in's own namespace; the provider never uses this account."""
+    return subprocess.run(
+        ["kubectl", *args], input=stdin, check=True, capture_output=True, text=True
+    ).stdout
+
+
+@contextlib.contextmanager
+def _git_push_host() -> Any:
+    """The pushable github.com: a Pod serving the tier's bare repositories (the same
+    host directory range-http serves) over smart HTTP on 443, and its Pod address."""
+    namespace = {
+        "apiVersion": "v1",
+        "kind": "Namespace",
+        "metadata": {"name": GIT_PUSH_HOST_NAMESPACE},
+    }
+    pod = {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": "git-push-host",
+            "namespace": GIT_PUSH_HOST_NAMESPACE,
+            "labels": {"app": "git-push-host"},
+        },
+        "spec": {
+            "automountServiceAccountToken": False,
+            "securityContext": {
+                "runAsUser": 1000,
+                "runAsGroup": 1000,
+                "runAsNonRoot": True,
+                # Port 443 without a capability: a namespaced, safe sysctl.
+                "sysctls": [{"name": "net.ipv4.ip_unprivileged_port_start", "value": "0"}],
+            },
+            "containers": [
+                {
+                    "name": "git",
+                    "image": os.environ["CRUCIBLE_E2E_KIND_REGISTRY"],
+                    "command": ["perl", "-e", GIT_PUSH_HOST_SERVER],
+                    "securityContext": {
+                        "allowPrivilegeEscalation": False,
+                        "capabilities": {"drop": ["ALL"]},
+                    },
+                    "readinessProbe": {"tcpSocket": {"port": 443}, "periodSeconds": 1},
+                    "volumeMounts": [{"name": "git", "mountPath": "/srv/git"}],
+                }
+            ],
+            "volumes": [
+                {"name": "git", "hostPath": {"path": "/crucible-kind-cache", "type": "Directory"}}
+            ],
+        },
+    }
+    try:
+        _admin_kubectl("apply", "-f", "-", stdin=json.dumps(namespace))
+        _admin_kubectl("apply", "-f", "-", stdin=json.dumps(pod))
+        _admin_kubectl(
+            "-n",
+            GIT_PUSH_HOST_NAMESPACE,
+            "wait",
+            "--for=condition=Ready",
+            "pod/git-push-host",
+            "--timeout=120s",
+        )
+        address = _admin_kubectl(
+            "-n",
+            GIT_PUSH_HOST_NAMESPACE,
+            "get",
+            "pod",
+            "git-push-host",
+            "-o",
+            "jsonpath={.status.podIP}",
+        ).strip()
+        assert address, "the git push host has no Pod address"
+        yield address
+    finally:
+        with contextlib.suppress(subprocess.CalledProcessError):
+            _admin_kubectl(
+                "delete", "namespace", GIT_PUSH_HOST_NAMESPACE, "--wait=true", "--timeout=120s"
+            )
+
+
+def _denied_except(address: str) -> tuple[str, ...]:
+    """26's denied ranges with one hole: the stand-in git host's own Pod address. Every
+    other address in 10.0.0.0/8, and every other denied range, stays denied, and the
+    publisher's policy still names that one /32 on 443 and nothing else."""
+    hole = ipaddress.ip_network(f"{address}/32")
+    out: list[str] = []
+    for cidr in k8sspec.DEFAULT_DENIED_CIDRS:
+        network = ipaddress.ip_network(cidr)
+        if hole.subnet_of(network):  # type: ignore[arg-type]
+            out.extend(str(n) for n in network.address_exclude(hole))  # type: ignore[arg-type]
+        else:
+            out.append(cidr)
+    return tuple(out)
+
+
+def _branch_head(bare: Path, branch: str) -> str | None:
+    result = subprocess.run(
+        [
+            "git",
+            "-c",
+            "safe.directory=*",
+            "--git-dir",
+            str(bare),
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            f"refs/heads/{branch}",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result.stdout.strip() or None
+
+
+def _app_key(directory: Path) -> str:
+    from cryptography.hazmat.primitives import serialization  # noqa: PLC0415
+    from cryptography.hazmat.primitives.asymmetric import rsa  # noqa: PLC0415
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    path = directory / "fdy-0133-app.pem"
+    path.write_bytes(
+        key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+    )
+    path.chmod(0o600)
+    return str(path)
+
+
+async def test_fdy_0133_a_task_in_publishing_is_pushed_by_the_kubernetes_publisher(
+    engine: Engine,
+    migrated: str,
+    artifact_root: Path,
+    registry: CraneRegistryClient,
+) -> None:
+    """A task accepted on the Kubernetes provider is pushed by the Kubernetes publisher:
+    a real Job under Calico with its own NetworkPolicy, the token from a per-push Secret,
+    the bundle off the attempt's claim, to a real git remote, and a stand-in GitHub API
+    that reads the branch head from that remote. The branch lands at the accepted head,
+    the pull request opens, and the Job, its Pod, its policy and the Secret are gone."""
+    name = "fdy-0133"
+    url, bare = _stand_in_repository(name)
+    subprocess.run(
+        ["git", "--git-dir", str(bare), "config", "http.receivepack", "true"], check=True
+    )
+    full_name = f"git/{name}"
+    with _git_push_host() as host, FakeGitHubServer() as github:
+        github.state.add_repository(full_name)
+        github.state.ref_source = lambda _repo, branch: _branch_head(bare, branch)
+        transport = RestTransport(github.url, timeout=10.0, sleep=lambda _: None)
+        github_client = RestGitHubClient(
+            AppAuthenticator(
+                AppConfig(
+                    app_id=4969317, private_key_path=_app_key(artifact_root), api_base=github.url
+                ),
+                transport,
+            ),
+            transport,
+        )
+        client_api = _recording_client()
+        provider = _provider(
+            client_api,
+            registry,
+            resolver=_git_host(host),
+            broad_egress=False,
+            denied_cidrs=_denied_except(host),
+        )
+        ctx, tokens, app, harnesses = _kind_app(engine, migrated, artifact_root, provider, registry)
+        with ctx.uow_factory() as uow:
+            register_repository(
+                uow,
+                ctx.clock,
+                principal_name="tests",
+                name=name,
+                registration=RepositoryRegistration(
+                    url=url,
+                    default_branch="main",
+                    policy_name="e2e-script",
+                    installation_id=1,
+                    external_review=ExternalReviewAttestation(
+                        attested_all_prs=True, attested_by="tests"
+                    ),
+                ),
+            )
+            uow.commit()
+        supervisor = Supervisor(
+            ctx.uow_factory,
+            {"kubernetes": provider},
+            ctx.clock,
+            holder="e2e-kind-fdy-0133",
+            artifact_store=ctx.artifact_store,
+            lease_ttl_seconds=120,
+            grace_seconds=5,
+            harnesses=harnesses,
+            github=github_client,
+            publisher=KubernetesPublisher(provider),
+            delivery_config=DeliveryConfig(
+                poll_interval_seconds=0, reactions_poll_interval_seconds=0
+            ),
+        )
+        with TestClient(
+            app, headers={"Authorization": f"Bearer {tokens['orchestrator']}"}
+        ) as client:
+            document = e2e_contract("E2E-FDY-0133", name, os.environ["CRUCIBLE_E2E_KIND_REGISTRY"])
+            document["execution_request"]["provider"] = "kubernetes"
+            document["policy"]["version"] = 21
+            document["deliverables"] = [
+                {"kind": "pull_request", "target": "main", "draft": False, "closes": []}
+            ]
+            task_id = submit_and_start(client, document)
+            state = await run_until(
+                supervisor,
+                client,
+                task_id,
+                {"awaiting_internal_review", "pre_pr_gates_failed"},
+                max_ticks=90,
+                pause=0.5,
+            )
+            assert state == "awaiting_internal_review", gate_results(client, task_id)
+            upload_review(client, task_id)
+            assert (
+                await run_until(supervisor, client, task_id, {"awaiting_acceptance"})
+                == "awaiting_acceptance"
+            )
+            accepted = client.post(
+                f"/v1/tasks/{task_id}/accept",
+                json={"verdict": "accepted", "reasoning": "FDY-0133 kind proof."},
+            )
+            assert accepted.status_code == 200, accepted.text
+            assert accepted.json()["state"] == "publishing"
+            head = str(client.get(f"/v1/tasks/{task_id}").json()["head_sha"])
+            branch = "crucible/E2E-FDY-0133"
+            assert _branch_head(bare, branch) is None
+
+            started = time.monotonic()
+            state = await run_until(
+                supervisor,
+                client,
+                task_id,
+                {
+                    "awaiting_external_review",
+                    "awaiting_ci_certification",
+                    "ready_for_merge",
+                    "publish_failed",
+                },
+                max_ticks=10,
+                pause=0.5,
+                min_seconds=0,
+            )
+            events = client.get(f"/v1/tasks/{task_id}/events", params={"limit": 200}).json()
+            finished = [e for e in events["items"] if e["kind"] == "publisher_finished"]
+            assert state != "publish_failed", json.dumps(finished, indent=2)
+            kinds = [e["kind"] for e in events["items"]]
+            for kind in (
+                "publish_started",
+                "publisher_finished",
+                "branch_pushed",
+                "publish_completed",
+            ):
+                assert kind in kinds, kind
+            # The branch is on the remote at the accepted head, and the PR carries it.
+            assert _branch_head(bare, branch) == head
+            [pull] = github.state.repositories[full_name].pulls.values()
+            assert (pull.head_branch, pull.head_sha, pull.base_ref) == (branch, head, "main")
+            attempt_id = str(client.get(f"/v1/tasks/{task_id}").json()["latest_attempt"]["id"])
+            print(
+                f"fdy-0133: {branch} pushed to {url} at {head} in "
+                f"{time.monotonic() - started:.1f}s; PR #{pull.number}; task {state}"
+            )
+
+        # What the provider sent: one Secret carrying a token the App minted, one Job
+        # that reads it only from a Secret volume, one policy selecting that Job's Pod.
+        made = [
+            (kind, body)
+            for _, kind, body in client_api.made
+            if body["metadata"]["labels"].get(k8sspec.LABEL_ROLE) == k8sspec.ROLE_PUBLISHER
+        ]
+        secrets = [body for kind, body in made if kind == "secrets"]
+        jobs = [body for kind, body in made if kind == "jobs"]
+        policies = [body for kind, body in made if kind == "networkpolicies"]
+        assert [s["metadata"]["name"] for s in secrets] == [f"publish-token-{attempt_id.lower()}"]
+        value = base64.b64decode(secrets[0]["data"]["token"]).decode()
+        assert value in github.state.tokens
+        assert len(jobs) == 1 and len(policies) == 1
+        for body in (*jobs, *policies):
+            assert value not in json.dumps(body)
+        pod_spec = jobs[0]["spec"]["template"]["spec"]
+        assert {v["name"]: v.get("secret", {}).get("secretName") for v in pod_spec["volumes"]}[
+            "publish-token"
+        ] == secrets[0]["metadata"]["name"]
+        assert pod_spec["hostAliases"] == [
+            {"ip": host, "hostnames": ["api.github.com", "github.com"]}
+        ]
+        assert _selects(policies[0], jobs[0]["spec"]["template"]["metadata"]["labels"])
+        assert _permits(policies[0], host)
+        # And nothing of the push is left in the namespace.
+        selector = (
+            f"{k8sspec.LABEL_ATTEMPT}={attempt_id},{k8sspec.LABEL_ROLE}={k8sspec.ROLE_PUBLISHER}"
+        )
+        leftovers = [
+            f"{kind}/{item['metadata']['name']}"
+            for kind in ("jobs", "pods", "secrets", "networkpolicies")
+            for item in client_api.list_objects(kind, label_selector=selector)
+        ]
+        assert leftovers == [], leftovers
+        with pytest.raises(KubernetesApiError) as gone:
+            client_api.get("secrets", secrets[0]["metadata"]["name"])
+        assert gone.value.status == 404
+        log = (bare.parent / "push-host.log").read_text(encoding="utf-8")
+        assert f"POST /git/{name}.git/git-receive-pack 200 OK" in log, log
+        await supervisor.stop()
