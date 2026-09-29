@@ -11,6 +11,7 @@ import ipaddress
 import json
 import os
 import re
+import socket
 import subprocess
 import time
 from dataclasses import replace
@@ -2614,3 +2615,211 @@ async def test_fdy_0133_a_task_in_publishing_is_pushed_by_the_kubernetes_publish
         log = (bare.parent / "push-host.log").read_text(encoding="utf-8")
         assert f"POST /git/{name}.git/git-receive-pack 200 OK" in log, log
         await supervisor.stop()
+
+
+# ----- the lab keeps running (lab findings of 2026-09-29) --------------------
+
+
+class OutageKubernetesClient(RecordingKubernetesClient):
+    """The real API, except that the next `outages` creates of a role's Job go to an
+    API server address that refuses the connection: the real transport failure a
+    restarting API server produces, through the real `_request` path."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.outages: dict[str, int] = {}
+        self.refused: list[str] = []
+
+    def create(self, kind: str, body: Any, **kwargs: Any) -> Any:
+        role = str(((body.get("metadata") or {}).get("labels") or {}).get(k8sspec.LABEL_ROLE, ""))
+        if kind == "jobs" and self.outages.get(role, 0) > 0:
+            self.outages[role] -= 1
+            self.refused.append(role)
+            with socket.socket() as probe:
+                probe.bind(("127.0.0.1", 0))
+                closed = int(probe.getsockname()[1])
+            down = KubernetesClient(
+                replace(self.access, server=f"https://127.0.0.1:{closed}"), self.namespace
+            )
+            return down.create(kind, body)
+        return super().create(kind, body, **kwargs)
+
+
+def _claim_exists(api: KubernetesClient, attempt_id: str) -> bool:
+    try:
+        row = api.get("persistentvolumeclaims", k8sspec.object_name("ws", attempt_id))
+    except KubernetesApiError as exc:
+        if exc.status == 404:
+            return False
+        raise
+    return not (row.get("metadata") or {}).get("deletionTimestamp")
+
+
+async def test_lab_findings_a_long_collect_blocks_no_launch_and_the_sweep_frees_claims(
+    engine: Engine,
+    migrated: str,
+    artifact_root: Path,
+    api: KubernetesClient,
+    registry: CraneRegistryClient,
+) -> None:
+    """A collection whose verifier runs 45 seconds, three times the lease: every tick
+    still renews the lease and another task launches beside it. Then the claims: both
+    attempts keep theirs (keep_diff_only) while their tasks wait on review; cancelling
+    one task frees its claim on the next tick, and the other task's claim, which a
+    publication still needs, stays."""
+    provider = _provider(api, registry)
+    ctx, tokens, app, harnesses = _kind_app(engine, migrated, artifact_root, provider, registry)
+    supervisor = Supervisor(
+        ctx.uow_factory,
+        {"kubernetes": provider},
+        ctx.clock,
+        holder="e2e-kind-lab",
+        artifact_store=ctx.artifact_store,
+        lease_ttl_seconds=15,
+        grace_seconds=5,
+        harnesses=harnesses,
+    )
+    with TestClient(app, headers={"Authorization": f"Bearer {tokens['operator']}"}) as client:
+        name = "lab-slow-collect"
+        register(ctx, name, _origin(name))
+        document = e2e_contract(
+            f"E2E-{name.upper()}", name, os.environ["CRUCIBLE_E2E_KIND_REGISTRY"]
+        )
+        document["execution_request"]["provider"] = "kubernetes"
+        document["policy"]["version"] = 21
+        document["required_verification"].append(
+            {"id": "V5", "command": "sleep 45", "expect_exit": 0}
+        )
+        slow = submit_and_start(client, document)
+        deadline = time.monotonic() + LAUNCH_DEADLINE_SECONDS + 120
+        while time.monotonic() < deadline and not supervisor._collects:
+            await supervisor.tick()
+            await asyncio.sleep(0.5)
+        assert supervisor._collects, "the slow task never reached its collection"
+        slow_attempt = str(client.get(f"/v1/tasks/{slow}").json()["latest_attempt"]["id"])
+
+        other = _kind_task(client, ctx, "lab-other", _origin("lab-other"))
+        collect_started = time.monotonic()
+        longest_tick = 0.0
+        other_launched_during_collect = False
+        while slow_attempt in supervisor._collects and time.monotonic() - collect_started < 150:
+            before = time.monotonic()
+            result = await supervisor.tick()
+            longest_tick = max(longest_tick, time.monotonic() - before)
+            assert result.held, "the lease was lost while a collection ran"
+            assert client.get("/v1/supervisor").json()["healthy"] is True
+            other_attempt = client.get(f"/v1/tasks/{other}").json().get("latest_attempt")
+            started = bool(other_attempt and other_attempt["started_at"])
+            if started and slow_attempt in supervisor._collects:
+                other_launched_during_collect = True
+            await asyncio.sleep(1)
+        collect_seconds = time.monotonic() - collect_started
+        print(
+            f"lab findings: collection ran {collect_seconds:.0f}s, longest tick "
+            f"{longest_tick:.1f}s, other task launched during it: "
+            f"{other_launched_during_collect}"
+        )
+        assert collect_seconds > 15, "the collection was not longer than the lease"
+        assert longest_tick < 15
+        assert other_launched_during_collect
+
+        review = {"awaiting_internal_review", "pre_pr_gates_failed"}
+        for task in (slow, other):
+            state = await run_until(supervisor, client, task, review, max_ticks=120)
+            assert state == "awaiting_internal_review", gate_results(client, task)
+        other_attempt_id = str(client.get(f"/v1/tasks/{other}").json()["latest_attempt"]["id"])
+        with engine.begin() as connection:
+            cleaned = connection.execute(
+                text(
+                    "SELECT count(*) FROM attempts "
+                    "WHERE id IN (:a, :b) AND cleaned_up_at IS NOT NULL"
+                ),
+                {"a": slow_attempt, "b": other_attempt_id},
+            ).scalar()
+        assert cleaned == 2
+        assert _claim_exists(api, slow_attempt) and _claim_exists(api, other_attempt_id)
+
+        response = client.post(
+            f"/v1/tasks/{slow}/cancel",
+            json={"reason": "lab findings proof", "verbatim": "cancel it", "decided_by": "tests"},
+        )
+        assert response.status_code == 200, response.text
+        freed_by = time.monotonic() + 60
+        while time.monotonic() < freed_by and _claim_exists(api, slow_attempt):
+            await supervisor.tick()
+            await asyncio.sleep(1)
+        assert not _claim_exists(api, slow_attempt), "the cancelled task's claim stayed"
+        assert _claim_exists(api, other_attempt_id), "a claim a task still needs was removed"
+        assert "retention_applied" in event_kinds(client, slow)
+        print(
+            f"lab findings: {k8sspec.object_name('ws', slow_attempt)} freed after the cancel; "
+            f"{k8sspec.object_name('ws', other_attempt_id)} kept for the open task"
+        )
+        client.post(
+            f"/v1/tasks/{other}/cancel",
+            json={"reason": "lab findings proof done", "verbatim": "stop", "decided_by": "tests"},
+        )
+        for _ in range(20):
+            await supervisor.tick()
+            if not _claim_exists(api, other_attempt_id):
+                break
+            await asyncio.sleep(1)
+        assert not _claim_exists(api, other_attempt_id)
+    await supervisor.stop()
+
+
+async def test_lab_findings_an_api_server_outage_during_collect_loses_no_attempt(
+    engine: Engine,
+    migrated: str,
+    artifact_root: Path,
+    registry: CraneRegistryClient,
+) -> None:
+    """The collector Job's create meets a refused connection twice (the real transport
+    error, through the real client). The attempt is not failed as environment: it is
+    collected again from the untouched claim and the task reaches review with every
+    gate passing."""
+    outage_api = OutageKubernetesClient(
+        kubeconfig_access(os.environ["CRUCIBLE_E2E_KIND_KUBECONFIG"]),
+        "crucible-workers",
+        timeout=15,
+    )
+    provider = _provider(outage_api, registry)
+    ctx, tokens, app, harnesses = _kind_app(engine, migrated, artifact_root, provider, registry)
+    supervisor = Supervisor(
+        ctx.uow_factory,
+        {"kubernetes": provider},
+        ctx.clock,
+        holder="e2e-kind-outage",
+        artifact_store=ctx.artifact_store,
+        lease_ttl_seconds=15,
+        grace_seconds=5,
+        harnesses=harnesses,
+    )
+    with TestClient(app, headers={"Authorization": f"Bearer {tokens['operator']}"}) as client:
+        outage_api.outages[k8sspec.ROLE_COLLECTOR] = 2
+        task_id = _kind_task(client, ctx, "lab-outage", _origin("lab-outage"))
+        state = await run_until(
+            supervisor,
+            client,
+            task_id,
+            {"awaiting_internal_review", "pre_pr_gates_failed"},
+            max_ticks=240,
+            min_seconds=400,
+        )
+        attempt = client.get(f"/v1/tasks/{task_id}").json()["latest_attempt"]
+        print(
+            f"lab findings: collector creates refused {len(outage_api.refused)} time(s); "
+            f"task {state}, attempt exit class {attempt['exit_class']}"
+        )
+        assert outage_api.refused == [k8sspec.ROLE_COLLECTOR, k8sspec.ROLE_COLLECTOR]
+        assert state == "awaiting_internal_review", gate_results(client, task_id)
+        assert attempt["exit_class"] == "completed"
+        executions = client.get(f"/v1/tasks/{task_id}").json()["executions"]
+        assert sum(len(e["attempts"]) for e in executions) == 1
+        response = client.post(
+            f"/v1/tasks/{task_id}/cancel",
+            json={"reason": "lab findings proof done", "verbatim": "stop", "decided_by": "tests"},
+        )
+        assert response.status_code == 200
+        await run_until(supervisor, client, task_id, {"cancelled"}, max_ticks=20, min_seconds=0)
+    await supervisor.stop()
