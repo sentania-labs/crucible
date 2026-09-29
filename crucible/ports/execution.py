@@ -100,6 +100,9 @@ class LaunchSpec:
     # Issue 128: the per-command timeout the harness is launched with, resolved from the
     # policy and the contract and capped at timeout_seconds. None: the default, capped.
     command_timeout_ms: int | None = None
+    # FDY-0140: the harness's saved run settings (`harness.<name>`), handed to the
+    # adapter's launch as LaunchContext.harness_settings.
+    harness_settings: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         validate_endpoint(self.endpoint, self.endpoint_url)

@@ -4,6 +4,7 @@ as a pointer, no secret anywhere in argv or env, and the credential spec each de
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import replace
 from typing import Any
 
@@ -141,8 +142,11 @@ def test_hermes_launch_matches_07_and_uses_the_optional_api_key() -> None:
         POINTER,
     )
     assert launch.env == {
-        "PATH": "/opt/hermes/bin:/usr/local/bin:/usr/bin:/bin",
+        # FDY-0140: no PATH, so the model's commands never resolve into the Hermes venv.
         "HERMES_HOME": "/home/worker/.hermes",
+        "CRUCIBLE_HERMES_IDENTITY": "/crucible/identity/IDENTITY.md",
+        "CRUCIBLE_HERMES_MAX_TURNS": "300",
+        "CRUCIBLE_HERMES_CONTEXT_LENGTH": "131072",
         "OPENAI_BASE_URL": "http://spark.example.internal:11434/v1",
         "OPENAI_API_KEY": "local-no-auth",
         "CRUCIBLE_HERMES_USAGE": "/crucible/report/hermes-usage.json",
@@ -160,6 +164,19 @@ def test_hermes_launch_matches_07_and_uses_the_optional_api_key() -> None:
     assert credential.minimum_mode is MountMode.RO
     assert not credential.required_for_launch
     assert [(item.name, item.sync_back) for item in credential.auth_files] == [("api-key", False)]
+
+
+def test_hermes_run_limits_come_from_the_saved_setting() -> None:
+    """FDY-0140: the Local gateway page's limits reach the launch."""
+    launch = HermesAdapter().build_launch(
+        dataclasses.replace(
+            context(model="coder", endpoint="local", endpoint_url="http://gw.invalid/v1"),
+            harness_settings={"max_turns": 450, "context_length": 0},
+        )
+    )
+    assert launch.env["CRUCIBLE_HERMES_MAX_TURNS"] == "450"
+    assert launch.env["CRUCIBLE_HERMES_CONTEXT_LENGTH"] == "0"
+    assert "PATH" not in launch.env
 
 
 @pytest.mark.parametrize(

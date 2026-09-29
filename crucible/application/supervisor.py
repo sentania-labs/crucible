@@ -95,6 +95,7 @@ from crucible.domain.entities import (
 from crucible.domain.events import PRINCIPAL_CRUCIBLE, EventKind
 from crucible.domain.exit_class import CLEAN_EXIT_CLASSES, ExitClass, classify_exit
 from crucible.domain.gates import GateName, GateResult, evaluate_gate
+from crucible.domain.harness_settings import setting_name
 from crucible.domain.ids import new_id
 from crucible.domain.lifecycle import (
     ATTEMPT_TERMINAL,
@@ -1331,6 +1332,13 @@ class Supervisor:
             if route is not None:
                 endpoint = route.endpoint
                 endpoint_url = route.endpoint_url
+            saved = (
+                route_uow.provider_settings.get(setting_name(selected_harness))
+                if selected_harness
+                else None
+            )
+        # FDY-0140: the harness's run settings as saved now, read at every launch.
+        harness_settings = dict(saved.document) if saved is not None else {}
         # Issue 128: the policy default, narrowed by the contract, capped at the attempt.
         command_timeout_ms = effective_command_timeout_ms(
             execution.policy_snapshot, contract, execution.timeout_seconds
@@ -1354,6 +1362,7 @@ class Supervisor:
             endpoint=endpoint,
             endpoint_url=endpoint_url,
             command_timeout_ms=command_timeout_ms,
+            harness_settings=harness_settings,
         )
         adapter = self._harnesses.get(selected_harness) if self._harnesses else None
         if adapter is None:
@@ -1387,6 +1396,7 @@ class Supervisor:
                 endpoint=endpoint,
                 endpoint_url=endpoint_url,
                 command_timeout_ms=command_timeout_ms,
+                harness_settings=harness_settings,
             )
         )
         return replace(

@@ -245,14 +245,15 @@ RUN ln -s /opt/python3.12/bin/python3.12 /usr/local/bin/python3.12
 #   `-c check_for_update_on_startup=false` at launch.
 # - Hermes 0.19.0 has no automatic update facility.
 # The read-only root makes any self-update fail regardless (S7, S11).
-# PATH stays Debian's default: the Hermes venv is not on it, so no other harness's
-# `python3` resolves into Hermes's dependencies. The Hermes adapter launches
-# /usr/local/bin/crucible-hermes, which runs /opt/hermes/bin/hermes by path, and
-# puts the venv first on PATH for its own process only.
+# PATH stays Debian's default: the Hermes venv is not on it, so no command any model
+# runs, Hermes's included, resolves `python3` into Hermes's dependencies. The Hermes
+# adapter launches /usr/local/bin/crucible-hermes, which starts Hermes with the venv's
+# own Python by path and adds nothing to PATH (FDY-0140).
 # uv (hades #184): never download a Python, since no worker reaches the host it would
 # come from and the image carries the one the project asks for; and copy rather than
-# hardlink, because its cache is on the memory-backed home and the project's .venv is
-# on the workspace, two filesystems, where a hardlink always falls back with a warning.
+# hardlink, because its cache (UV_CACHE_DIR, which the provider points at the
+# workspace's package-cache mount, FDY-0140) and the project's .venv in the checkout
+# are two mounts, where a hardlink always falls back with a warning.
 ENV HOME=/home/worker \
     UV_PYTHON_DOWNLOADS=never \
     UV_LINK_MODE=copy \

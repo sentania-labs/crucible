@@ -296,6 +296,16 @@ def record_collection_evidence(
                 "error": parsed_report.run_evidence_error,
             },
         )
+    if parsed_report is not None and parsed_report.limit_reached is not None:
+        # FDY-0140: recorded, not failed on. The gates and the review judge the work.
+        _add(
+            uow,
+            clock,
+            attempt=attempt,
+            kind=EvidenceKind.ARTIFACT_PRESENT,
+            source=EvidenceSource.CRUCIBLE,
+            payload={"role": "harness_limit_reached", "detail": parsed_report.limit_reached},
+        )
     head_sha: str | None = None
     if outputs.bundle is not None:
         bundle = outputs.bundle

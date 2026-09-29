@@ -28,17 +28,16 @@ _VERSION = re.compile(r"^(\d+)\.(\d+)\.(\d+)")
 CLAUDE_CODE_BINARY = "/usr/local/bin/claude"
 CODEX_BINARY = "/usr/local/bin/codex"
 AGY_BINARY = "/usr/local/bin/agy"
+# The Hermes launch wrapper. It starts Hermes with its virtual environment's Python by
+# path and puts nothing on PATH, so no command any model runs, Hermes's included,
+# resolves `python3` into that environment (FDY-0140).
 HERMES_BINARY = "/usr/local/bin/crucible-hermes"
-# The Hermes virtual environment. Only the Hermes launch puts it on PATH; the image's
-# own PATH leaves it off, so no other harness's `python3` resolves into it.
-HERMES_PATH = "/opt/hermes/bin:/usr/local/bin:/usr/bin:/bin"
 
 __all__ = [
     "AGY_BINARY",
     "CLAUDE_CODE_BINARY",
     "CODEX_BINARY",
     "HERMES_BINARY",
-    "HERMES_PATH",
     "AdapterLaunch",
     "AuthFile",
     "CredentialSource",
@@ -260,6 +259,9 @@ class LaunchContext:
     probe: bool = False
     # Issue 128: the per-command timeout, from the launch spec. None: the default.
     command_timeout_ms: int | None = None
+    # FDY-0140: the harness's own run settings an administrator saved (the Hermes run
+    # limits on the Local gateway page), from the launch spec. Empty: the defaults.
+    harness_settings: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         validate_endpoint(self.endpoint, self.endpoint_url)
@@ -343,6 +345,9 @@ class ParsedReport:
     transcript_lines: int = 0
     transcript_name: str | None = None
     run_evidence_error: str | None = None
+    # FDY-0140: the harness ended the run because it reached one of its own run limits
+    # (Hermes's turn budget), in words. None when it did not, or cannot say.
+    limit_reached: str | None = None
     # Issue 128: a command the harness's own transcript shows it was waiting on and cut
     # off at exit (Claude Code's auto-background). A background process the worker chose
     # to leave running is not listed (issue 153). Non-empty makes a clean exit
