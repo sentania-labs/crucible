@@ -5082,6 +5082,11 @@ shopt -s extglob
 LC_ALL=C
 token_re=${CRUCIBLE_LOGIN_TOKEN_PATTERN:-}
 token_file=${CRUCIBLE_LOGIN_TOKEN_FILE:-}
+# The token's literal start (`sk-ant-` for Claude Code): a quiet partial line that holds
+# it may be a token still arriving, so only that line is held back, not every one.
+regex_meta='[][(){}.*+?\\|^$]'
+token_start=${token_re#\(}
+token_start=${token_start%%$regex_meta*}
 prompt_re='((paste|enter).{0,40}(code|token).{0,40}|code|token)[[:space:]]*[:>?][[:space:]]*$'
 render() {
   local line=$1
@@ -5111,7 +5116,7 @@ show() {
   printf '%s\n' "$line"
 }
 filter() {
-  local buf='' chunk status lower idle=0 quiet=0
+  local buf='' chunk status lower idle=0
   while :; do
     chunk=''
     IFS= read -r -t 1 chunk
@@ -5135,14 +5140,28 @@ filter() {
     fi
     render "$buf"
     lower=${rendered,,}
-    quiet=0
-    if [ -z "$token_re" ] && [ "$idle" -ge 3 ] && [ -n "${rendered//[[:space:]]/}" ]; then
-      quiet=1
-    fi
-    if [[ $lower =~ $prompt_re ]] || [ "$quiet" -eq 1 ]; then
+    if [[ $lower =~ $prompt_re ]]; then
       show "$buf"
       buf=''
       idle=0
+      continue
+    fi
+    # A CLI that went quiet on a partial line is showing something the operator needs:
+    # an error such as Claude Code's "OAuth error ... Press Enter to retry", which it
+    # draws with cursor moves and carriage returns and ends with no newline, so the
+    # rendered last segment is empty (hades #173). Every visible segment is shown. Only
+    # a buffer that may hold part of a token is held back.
+    if [ "$idle" -ge 3 ] && { [ -z "$token_start" ] || [[ $buf != *"$token_start"* ]]; }; then
+      local segment shown=0 segments=()
+      # read splits without glob expansion: the masked code is a row of asterisks.
+      IFS=$'\r' read -r -d '' -a segments <<< "$buf"
+      for segment in "${segments[@]}"; do
+        render "$segment"
+        [ -n "${rendered//[[:space:]]/}" ] || continue
+        show "$segment"
+        shown=1
+      done
+      [ "$shown" -eq 1 ] && { buf=''; idle=0; }
     fi
   done
 }

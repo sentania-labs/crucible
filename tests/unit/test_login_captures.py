@@ -278,6 +278,44 @@ def test_the_driver_shows_an_unfinished_line_once_the_cli_goes_quiet(tmp_path: P
     assert "crucible-login.exit=0" in text
 
 
+@needs_pty_tools
+def test_the_driver_shows_claude_codes_oauth_error_drawn_with_cursor_moves(
+    tmp_path: Path,
+) -> None:
+    """Claude Code 2.1.280 answers a refused code with "OAuth error ... Press Enter to
+    retry", drawn with cursor moves and carriage returns and no newline, so its last
+    segment renders empty. The operator sees the error (hades #173); the bytes are the
+    ones it printed in the worker image on 2026-09-29."""
+    stand_in = (
+        "echo 'Visit https://claude.com/cai/oauth/authorize?code=true'; "
+        "printf ' Paste code here if prompted > '; IFS= read -r -t 8 code; "
+        "printf '\\r\\033[1C\\033[4A\\033[95mOAuth error: Request failed with status "
+        "code 400\\033[39m\\033[K\\r\\033[2B\\033[K\\r\\033[1C\\033[1B\\033[97mPress "
+        "\\033[1mEnter\\033[22m to retry.\\r\\033[1B\\033[39m\\033[K\\r\\033[1B\\033[K\\r"
+        "\\033[1A'; sleep 6; exit 1"
+    )
+    text, _session = run_driver(tmp_path, "claude_code", stand_in, code="refused-code#state")
+    assert "OAuth error: Request failed with status code 400" in text, text
+    assert "Press Enter to retry." in text, text
+    assert "refused-code" not in text
+
+
+@needs_pty_tools
+def test_the_driver_never_shows_a_token_that_arrives_in_two_pieces(tmp_path: Path) -> None:
+    """A quiet partial line is shown, unless it may be the start of a token: the token's
+    first half waits for the rest, and the whole token is captured and masked."""
+    first, rest = "sk-ant-oat01-", "A" * 40
+    stand_in = (
+        "echo 'Visit https://claude.com/cai/oauth/authorize?code=true'; "
+        "printf ' Paste code here if prompted > '; IFS= read -r -t 8 code; "
+        f"printf '{first}'; sleep 5; printf '{rest}\\n'; exit 0"
+    )
+    text, _session = run_driver(tmp_path, "claude_code", stand_in, code="good-code#state")
+    assert first not in text, text
+    assert "[captured to oauth-token]" in text, text
+    assert "crucible-login.exit=0" in text
+
+
 # ----- the code box for a prompt nobody has captured -------------------------------------
 
 
