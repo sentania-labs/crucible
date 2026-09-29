@@ -605,6 +605,9 @@ class KubernetesProvider:
         # Why `_await_job` ended a wait early, by Job name (a quota refusal, a Pod that
         # never started); `_run_role_job` moves it into `last_error`.
         self._job_refusals: dict[str, str] = {}
+        # Jobs whose wait ran out while the API server was not answering (PR 237 review):
+        # that is an outage to retry, not a role that took too long.
+        self._job_unanswered: set[str] = set()
         self.probe: NamespaceProbe | None = None
         # One lock per event loop: the API serves requests on its own loop and runs each
         # login on a loop of its own thread, and an asyncio lock belongs to one loop.
@@ -3812,6 +3815,17 @@ class KubernetesProvider:
             )
             refusal = self._job_refusals.pop(name, None)
             if code is None:
+                if name in self._job_unanswered:
+                    self._job_unanswered.discard(name)
+                    self._role_error(
+                        role,
+                        spec.attempt_id,
+                        f"the API server did not answer while the {role} Job ran",
+                        True,
+                    )
+                    # An API error, not a timeout, so every collection step's
+                    # unavailable check sees it and the attempt is collected again later.
+                    return JOB_API_ERROR
                 self._role_error(
                     role,
                     spec.attempt_id,
@@ -4069,15 +4083,19 @@ class KubernetesProvider:
         started = time.monotonic()
         deadline = started + start_wait + timeout
         running = False
+        unanswered = False
         self._job_refusals.pop(name, None)
+        self._job_unanswered.discard(name)
         while time.monotonic() < deadline:
             await _stop_if_cancelled(cancelled, f"while {name} ran")
             try:
                 pod = await self._pod_of(name)
-            except KubernetesApiError:
+            except KubernetesApiError as exc:
                 # A failed look is not an answer; ask again on the next poll.
+                unanswered = isinstance(exc, KubernetesUnavailableError)
                 await asyncio.sleep(self.config.poll_interval_seconds)
                 continue
+            unanswered = False
             if pod is not None:
                 terminated = _terminated_state(pod.get("status") or {})
                 if terminated is not None:
@@ -4110,6 +4128,8 @@ class KubernetesProvider:
                     if not wait_for_quota:
                         return JOB_API_ERROR
             await asyncio.sleep(self.config.poll_interval_seconds)
+        if unanswered:
+            self._job_unanswered.add(name)
         return None
 
     async def _quota_refusal(self, job_name: str, job: Mapping[str, Any]) -> str | None:

@@ -10,7 +10,8 @@ from typing import Any
 
 import pytest
 
-from crucible.adapters.execution import k8sspec
+from crucible.adapters.execution import k8sspec, kubernetes
+from crucible.adapters.execution.k8sapi import KubernetesUnavailableError
 from crucible.adapters.execution.kubernetes import (
     CollectionUnavailableError,
     HarnessRefusedError,
@@ -129,6 +130,31 @@ async def test_a_collector_the_api_server_could_not_create_is_collected_again() 
     assert api.outages[-1][2] == 0
     outputs = await provider.collect(handle, workspace, launch)
     assert outputs.report is not None
+
+
+async def test_a_collector_wait_the_api_server_never_answered_is_collected_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR 237 review: when every look at the collector's Pod fails until the wait runs
+    out, that is an outage to retry, not a collector that took too long."""
+    _api, _registry, provider = build(config=KubernetesConfig(poll_interval_seconds=0))
+    launch = spec()
+    workspace = await provider.prepare(launch)
+    handle = await provider.launch(workspace, launch)
+    await _run_to_exit(provider, handle)
+    looks = provider._pod_of
+    real = time.monotonic
+
+    async def unanswered(job_name: str) -> Any:
+        if job_name.startswith(kubernetes.OBJECT_PREFIX[k8sspec.ROLE_COLLECTOR]):
+            # The outage outlasts the whole wait: the clock jumps past its deadline.
+            monkeypatch.setattr(time, "monotonic", lambda: real() + 10**6)
+            raise KubernetesUnavailableError(503, "the API server is down")
+        return await looks(job_name)
+
+    provider._pod_of = unanswered  # type: ignore[method-assign]
+    with pytest.raises(CollectionUnavailableError, match="did not answer"):
+        await provider.collect(handle, workspace, launch)
 
 
 # ----- a full namespace says so at once ------------------------------------

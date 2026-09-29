@@ -588,9 +588,11 @@ def _exec_over_websocket(
                 raise KubernetesUnavailableError(0, "the exec upgrade carried no socket", path=path)
             if stdin is not None:
                 sock.sendall(_client_frame(bytes([_CHANNEL_STDIN]) + stdin))
+            # The socket can also reset or time out after the upgrade, while the frames
+            # are read: that is the same unavailable API server, not a failed command.
+            return _read_exec_channels(sock, limit=limit, stdout=stdout)
         except _TRANSPORT_ERRORS as exc:
             raise _unreachable(exc, path) from exc
-        return _read_exec_channels(sock, limit=limit, stdout=stdout)
     finally:
         conn.close()
 
@@ -670,16 +672,14 @@ def _exit_status(raw: bytes) -> int | None:
 
 def _websocket_frames(sock: Any) -> Iterator[bytes]:
     """RFC 6455 frames from a server, which are never masked. Continuations are joined;
-    a close, an empty read, or a socket error ends the stream."""
+    a close or an empty read ends the stream. A socket error is raised: a reset or a
+    timeout mid-stream is an unavailable API server, not a finished command."""
     buffer = bytearray()
     pending = bytearray()
 
     def need(count: int) -> bool:
         while len(buffer) < count:
-            try:
-                chunk = sock.recv(65536)
-            except (OSError, ssl.SSLError):
-                return False
+            chunk = sock.recv(65536)
             if not chunk:
                 return False
             buffer.extend(chunk)
