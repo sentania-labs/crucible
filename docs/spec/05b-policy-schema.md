@@ -57,7 +57,7 @@ images:
 git:
   author_name: "crucible-worker"
   author_email: "crucible-worker@users.noreply.github.com"
-  commit_trailer: "Crucible-Attempt"   # trailer key carrying the attempt ID
+  commit_trailer: "Crucible-Attempt"   # trailer key; Crucible's commit hook adds `<key>: <external_id>` (06)
   work_branch_pattern: "crucible/*"
   protected_branches: ["main", "release/*"]
 
@@ -92,6 +92,7 @@ gates:
     - feedback_dispositions_complete
     - ci_green_for_head
   skipped: []                          # release gates live on the release contract (24)
+                                       # commit_policy is never listed: it always runs before review (11)
 
 deliverables:
   allow_branch_only: false             # `branch` deliverables refused unless true

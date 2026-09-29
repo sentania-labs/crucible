@@ -17,6 +17,7 @@ from crucible.domain.endpoints import validate_endpoint
 from crucible.domain.exit_class import ExitClass
 from crucible.domain.gates import (
     ALL_GATES,
+    ENFORCED_PRE_PR_GATES,
     POST_PR_GATES,
     PRE_PR_GATES,
     PUBLICATION_GATES,
@@ -186,6 +187,9 @@ class Gates(StrictModel):
     def _partition(self) -> Gates:
         groups = (self.pre_pr, self.publication, self.post_pr, self.skipped)
         listed = [gate for group in groups for gate in group]
+        enforced = sorted(set(listed) & ENFORCED_PRE_PR_GATES)
+        if enforced:
+            raise ValueError(f"{enforced} always run before review and are not listed in a policy")
         unknown = sorted(set(listed) - ALL_GATES)
         if unknown:
             raise ValueError(f"unknown gates: {unknown}")
