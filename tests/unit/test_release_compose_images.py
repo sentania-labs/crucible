@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 REPOSITORY = Path(__file__).resolve().parents[2]
 SCRIPT = REPOSITORY / "tools" / "release" / "compose_images.py"
@@ -44,7 +47,20 @@ def invoke(
     )
 
 
+def _needs_docker_compose() -> None:
+    """The first two cases render with the real `docker compose config`. The worker image
+    has no Docker CLI (hades #184), so they skip there; CI's test job sets
+    CRUCIBLE_COMPOSE_REQUIRED=1, which turns that skip into a failure so CI can never lose
+    them quietly (the same rule as tests/unit/test_deploy_manifests.py and kubectl)."""
+    if shutil.which("docker") is None:
+        message = "the Docker CLI is needed to render compose.yaml"
+        if os.environ.get("CRUCIBLE_COMPOSE_REQUIRED"):
+            raise AssertionError(message)
+        pytest.skip(message)
+
+
 def test_repository_candidate_services_are_explicit() -> None:
+    _needs_docker_compose()
     result = invoke()
     assert result.returncode == 0, result.stderr
     candidate_services = {
@@ -56,6 +72,7 @@ def test_repository_candidate_services_are_explicit() -> None:
 
 
 def test_a_service_without_an_image_fails_loudly(tmp_path: Path) -> None:
+    _needs_docker_compose()
     compose_file = tmp_path / "compose.yaml"
     compose_file.write_text(
         """\

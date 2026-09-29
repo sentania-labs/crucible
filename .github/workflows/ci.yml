@@ -82,7 +82,11 @@ jobs:
       - uses: astral-sh/setup-uv@eb1897b8dc4b5d5bfe39a428a8f2304605e0983c # v7.0.0
         with:
           enable-cache: true
+      # The runner has the Docker CLI, so the compose-rendering unit cases must run here,
+      # not skip as they do in the worker image (hades #184).
       - run: make test
+        env:
+          CRUCIBLE_COMPOSE_REQUIRED: "1"
 
   # The end-to-end tier (18) on the runner's own rootful daemon. The local run is on
   # the dedicated rootless daemon (13, S9); this is the same tier, same targets, on the
