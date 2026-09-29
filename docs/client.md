@@ -105,7 +105,7 @@ What `next` offers follows the API's own checks: the lifecycle table (09) and
 each endpoint's state guard (an acceptance only in `awaiting_acceptance`, a
 correction only in the four correctable states, and so on), filtered by the
 role the route admits. What a state cannot show is still the API's to decide:
-a live supervisor lease for an admin mutation, a review comment that exists,
+a live supervisor lease for the admin mutations that need one, a review comment that exists,
 a prepared directory for a rotation, an import already authoritative when
 another verified one is committed. If the API refuses, the refusal comes
 back in `error`; read the record again and follow its new `next`.
@@ -182,7 +182,7 @@ can do; it is `null` for a code with no general advice.
 | `forbidden` | wrong role for this route, or another orchestrator's task |
 | `not-found` | check the id |
 | `transition-not-allowed`, `conflict` | read the record again and follow `next` |
-| `supervisor-not-live` | an admin mutation needs a live supervisor; retry once it runs |
+| `supervisor-not-live` | this admin mutation (a bootstrap commit, a credential rotation or removal) needs a live supervisor; retry once it runs |
 | `request-invalid`, `contract-invalid` | see `problem.errors` |
 | `unreachable` | check the base URL and that the API is up |
 

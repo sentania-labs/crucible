@@ -151,6 +151,21 @@ restart it is stranded as before. So a prepare that takes minutes never
 keeps the supervisor from renewing its lease or serving another attempt
 (hades #190, 2026-09-28).
 
+Collection is the same (the lab findings of 2026-09-29): the final log
+drain, `collect` and the finish of an exited attempt run as a task of their
+own, which the tick waits on for the same bound and otherwise leaves running.
+On Kubernetes a collection is the collector, bundle verifier, verifier and
+reader Pods, up to about 90 minutes in the worst case, and it used to hold
+the tick for all of it. The attempt is that task's alone until it ends: the
+observe step, the cancel sweep and the stranded rule leave it be. A lost
+lease or a stop cancels it, and the attempt, still `running` with its logs
+drained, is collected again by the next holder from the untouched workspace.
+A collection the provider could not finish because its backend could not
+answer (`ProviderUnavailableError`: a refused, reset or timed-out
+connection, an API server that answered 429 or 5xx, a namespace quota that
+refused a Pod) is tried again every 30 seconds for up to 30 minutes from the
+first failure, and only then fails the attempt as environment.
+
 Reconciliation is idempotent; running it twice changes nothing the second
 time except lease expiry times and the liveness row. That property is
 tested. The liveness row records the last successful tick, the last tick

@@ -148,11 +148,24 @@ The credential copy is not subject to `workspace_on_success` or
 `workspace_on_failure`: it is removed under every option, `keep` included,
 and on every path that never reaches a validated sync at all, including a
 start that failed after seeding, a worker the provider lost, and a
-transport failure during the read-back (12).
+transport failure during the read-back (12; on Kubernetes that last one
+collects again first, and cleanup removes the copy if it never can).
 
 A cleanup pass runs each reconcile tick. Every deletion is an event and a
 `RetentionAction` row naming the policy version that authorized it.
 Nothing that a gate consumed is deleted before the task is terminal.
+
+A workspace a cleanup policy kept (`keep`, `keep_diff_only`) is released by
+the retention step, one `RetentionAction` of kind `workspace` per attempt,
+once its task is terminal (closed, rejected, cancelled) or the task's work
+was published, or once `completed_workspaces_days` have passed since
+cleanup, whichever is first. It is never released while something may still
+read it: the task's latest implementing or correcting attempt stays until
+its own bundle is published (acceptance, the publisher and a republish read
+the bundle off it), and an attempt whose quota checkpoint never reached the
+remote stays while its task is open. Before the lab findings of 2026-09-29
+nothing released a kept workspace, and on Kubernetes the kept claims filled
+the namespace's claim quota.
 
 ## Retention (initial defaults, configurable per policy)
 
@@ -162,7 +175,7 @@ Nothing that a gate consumed is deleted before the task is terminal.
 | completion claims, review reports, evidence, external reviews, CI certifications, release records | indefinite |
 | diffs and artifact metadata | indefinite; artifact bytes size-capped per attempt by policy |
 | worker logs and transcripts | 90 days, then deleted with an event |
-| completed worker workspaces | 14 days |
+| completed worker workspaces | 14 days after cleanup, sooner once the task is terminal or published, never while still needed (above) |
 | per-attempt credential copies | removed immediately after validated synchronization, and on every path that skips it |
 | wakes | 30 days after ack |
 | bootstrap SQLite archive | 180 days |
