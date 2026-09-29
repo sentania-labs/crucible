@@ -510,18 +510,25 @@ def _claim_with_output(root: Path, *, mode: int = 0o750) -> Path:
     return output
 
 
-def test_the_leaf_script_makes_publish_owned_and_moded_as_output_is(tmp_path: Path) -> None:
+@pytest.mark.parametrize("mode", [0o750, 0o2750])
+def test_the_leaf_script_makes_publish_owned_and_moded_as_output_is(
+    tmp_path: Path, mode: int
+) -> None:
     """The kubelet is never left to create the `publish` subPath: the script does, as the
-    worker uid, with the owner and mode `output/` has (hades PR 225 review)."""
-    output = _claim_with_output(tmp_path)
+    worker uid, with the owner and access bits `output/` has (hades PR 225 review)."""
+    output = _claim_with_output(tmp_path, mode=mode).stat()
     result = _run_leaf_script(tmp_path)
     assert result.returncode == 0, result.stderr
     made = (tmp_path / "publish").stat()
     assert stat.S_ISDIR(made.st_mode)
-    assert (made.st_uid, stat.S_IMODE(made.st_mode)) == (
-        output.stat().st_uid,
-        stat.S_IMODE(output.stat().st_mode),
-    )
+    assert (made.st_uid, made.st_mode & 0o777) == (output.st_uid, output.st_mode & 0o777)
+    # The setgid bit grants no access; it decides the group new files get. On a Pod's
+    # fsGroup volume the claim root, and so pytest's tmp_path under /tmp, carries it
+    # (hades #184), and the leaf keeps it whether it came from `output/` or from the
+    # parent, so the publisher's files stay in the fsGroup as the preparer's do.
+    parent = tmp_path.stat()
+    expected = (output.st_mode | parent.st_mode) & stat.S_ISGID
+    assert stat.S_IMODE(made.st_mode) & ~0o777 == expected
     # A second push of the same attempt finds the leaf already there.
     assert _run_leaf_script(tmp_path).returncode == 0
 
