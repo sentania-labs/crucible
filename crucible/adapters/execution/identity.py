@@ -47,10 +47,7 @@ def render_identity_md(
 ) -> str:
     """The ten sections of 06, rendered from the contract and the policy."""
     scope = contract.get("scope", {})
-    repository = contract.get("repository", {})
     verification = contract.get("required_verification", [])
-    git = policy.get("git", {})
-    trailer = commit_trailer(policy)
     verification_lines = (
         "\n".join(
             f"- `{v.get('id')}`: `{v.get('command')}` (expect exit {v.get('expect_exit', 0)})"
@@ -176,20 +173,7 @@ check the report against `report-schema.json` yourself.
 
 ## 10. Commits
 
-Commit locally on `{work_branch}`. Every commit must be authored as
-`{git.get("author_name", "crucible-worker")} <{git.get("author_email", "")}>`
-and carry the trailer `{trailer}: {external_id}`. The checkout is already set
-up for both: its git config names that author, and Crucible's own
-`commit-msg` hook adds the trailer to every commit you make. Leave
-`user.name`, `user.email` and `core.hooksPath` as they are, and do not commit
-with `--no-verify`. Crucible checks every commit's author and trailer before
-review, and a commit without them fails the `commit_policy` gate.
-
-Crucible collects, verifies, and publishes the commits. The claim's
-`proposed_pull_request` is a draft Crucible may rewrite.
-
-Repository: {repository.get("url", "(unset)")} at base ref
-`{repository.get("base_ref", "main")}`.
+Commit your work on `{work_branch}`.
 """
 
 
