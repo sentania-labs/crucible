@@ -8,7 +8,6 @@ from __future__ import annotations
 import json
 import os
 import stat
-import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -202,10 +201,23 @@ def test_the_driver_times_out_a_login_that_never_finishes(tmp_path: Path) -> Non
     session = LoginSession(harness="codex", started_at=0.0)
     result = run_login(FLOWS["codex"], str(tmp_path / "d"), session=session, argv=(cli,), timeout=1)
     assert result.state == "failed" and result.error == "login timed out"
-    assert (
-        subprocess.run(["pgrep", "-f", "fake-hang"], capture_output=True, check=False).returncode
-        != 0
-    )
+    assert _processes_running(cli) == []
+
+
+def _processes_running(path: str) -> list[int]:
+    """The pids whose command line names `path`, read from /proc rather than with pgrep,
+    which the worker image does not carry (hades #184)."""
+    found: list[int] = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit() or int(entry.name) == os.getpid():
+            continue
+        try:
+            argv = (entry / "cmdline").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        if any(path.encode() in arg for arg in argv):
+            found.append(int(entry.name))
+    return found
 
 
 # ----- shape, shred, rotate ------------------------------------------------------

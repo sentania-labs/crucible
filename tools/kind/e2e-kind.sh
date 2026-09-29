@@ -12,9 +12,11 @@ scratch=$(mktemp -d -t crucible-kind.XXXXXX)
 kubeconfig="$scratch/kubeconfig"
 cache="$scratch/reference-cache"
 registry_ref=""
+worker_registry_ref=""
 cluster_created=0
 registry_started=0
 tag_created=0
+worker_tag_created=0
 # Set by crucible_kind_start_registry the moment it creates the `kind` network, so cleanup
 # sees it even when the registry's own `docker run` fails right after (77).
 CRUCIBLE_KIND_NETWORK_CREATED=0
@@ -63,6 +65,16 @@ cleanup() {
       cleanup_failed=1
     elif ! docker info >/dev/null 2>&1; then
       echo "e2e-kind cleanup: docker daemon unreachable, cannot confirm image tag $registry_ref removed" >&2
+      cleanup_failed=1
+    fi
+  fi
+  if [ "$worker_tag_created" -eq 1 ]; then
+    docker image rm "$worker_registry_ref" >/dev/null 2>&1 || :
+    if docker image inspect "$worker_registry_ref" >/dev/null 2>&1; then
+      echo "e2e-kind cleanup: image tag $worker_registry_ref remains" >&2
+      cleanup_failed=1
+    elif ! docker info >/dev/null 2>&1; then
+      echo "e2e-kind cleanup: docker daemon unreachable, cannot confirm image tag $worker_registry_ref removed" >&2
       cleanup_failed=1
     fi
   fi
@@ -120,6 +132,15 @@ if ! docker image inspect "$worker_image" >/dev/null 2>&1; then
   echo "e2e-kind: run 'make e2e-image' first" >&2
   exit 2
 fi
+# hades #184: CRUCIBLE_E2E_KIND_WORKER_IMAGE names the combined worker image as well
+# (`make e2e-kind-self-hosting` passes the WORKER tag images/manifest.env pins), for a
+# case that runs a real harness and the verifier in the image the lab runs.
+combined_image=${CRUCIBLE_E2E_KIND_WORKER_IMAGE:-}
+if [ -n "$combined_image" ] && ! docker image inspect "$combined_image" >/dev/null 2>&1; then
+  echo "e2e-kind: CRUCIBLE_E2E_KIND_WORKER_IMAGE is $combined_image but the host daemon lacks it" >&2
+  echo "e2e-kind: run 'make images' first" >&2
+  exit 2
+fi
 
 registry_started=1
 crucible_kind_start_registry "$registry"
@@ -129,6 +150,12 @@ crucible_kind_await_registry "http://127.0.0.1:${registry_port}"
 tag_created=1
 docker tag "$worker_image" "$registry_ref"
 docker push "$registry_ref" >/dev/null
+if [ -n "$combined_image" ]; then
+  worker_registry_ref="localhost:${registry_port}/crucible-worker:worker-${run_id}"
+  worker_tag_created=1
+  docker tag "$combined_image" "$worker_registry_ref"
+  docker push "$worker_registry_ref" >/dev/null
+fi
 
 cat > "$scratch/kind.yaml" <<EOF
 kind: Cluster
@@ -235,6 +262,7 @@ export CRUCIBLE_E2E_KIND_DNS_IP="$dns_ip"
 export CRUCIBLE_E2E_KIND_PEER_IP="$peer_ip"
 export CRUCIBLE_E2E_KIND_API_IP="$api_ip"
 export CRUCIBLE_E2E_KIND_REGISTRY="$registry_ref"
+export CRUCIBLE_E2E_KIND_WORKER_REGISTRY="$worker_registry_ref"
 export CRUCIBLE_E2E_KIND_KUBECONFIG="$supervisor_kubeconfig"
 export CRUCIBLE_E2E_KIND_CANARY_LOG="$scratch/canary.log"
 export CRUCIBLE_E2E_DOCKER_SOCKET="${CRUCIBLE_E2E_DOCKER_SOCKET:-/var/run/docker.sock}"
@@ -245,4 +273,5 @@ uv sync --frozen --quiet
 # CRUCIBLE_E2E_KIND_PYTEST_ARGS narrows the run (for example `-k login -s`) when one
 # case is being proven on its own cluster; CI leaves it empty and runs the whole tier.
 read -r -a extra_args <<< "${CRUCIBLE_E2E_KIND_PYTEST_ARGS:-}"
-uv run pytest tests/e2e/test_kind.py -q -m e2e "${extra_args[@]}"
+# CRUCIBLE_E2E_KIND_TESTS picks the file; the default is the tier CI runs.
+uv run pytest "${CRUCIBLE_E2E_KIND_TESTS:-tests/e2e/test_kind.py}" -q -m e2e "${extra_args[@]}"

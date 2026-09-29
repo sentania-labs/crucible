@@ -66,6 +66,8 @@ repository:
     - "make lint"
     - "make test"
     - "make scan"                      # vulnerability, dependency, and secret scanning as the repo defines it
+  required_programs: []               # optional (hades #184): programs those checks call beyond their first word;
+                                       # never read at run time, `make images-policy-check` proves each is in the worker image
 
 gates:
   pre_pr:                              # evaluated on the collected head before anything is pushed

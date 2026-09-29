@@ -394,6 +394,7 @@ def record_collection_evidence(
                 "exit_code": run.exit_code,
                 "ran": run.ran,
                 "detail": run.detail,
+                "seconds": run.seconds,
             },
             artifact_id=verify_artifact_id,
         )

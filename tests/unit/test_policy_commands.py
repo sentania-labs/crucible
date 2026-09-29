@@ -43,13 +43,28 @@ def test_shipped_policies_include_the_seed_and_every_example() -> None:
         assert str(path.relative_to(REPOSITORY)) in labels
 
 
+SELF_HOSTING_PROGRAMS = {"git", "uv", "python3.12", "gitleaks", "bash", "jq", "tar", "sha256sum"}
+
+
 def test_the_shipped_policies_require_make() -> None:
     programs = policy_commands.required_programs(policy_commands.shipped_policies())
-    assert set(programs) == {"make"}
+    assert set(programs) == {"make"} | SELF_HOSTING_PROGRAMS
     sources = "\n".join(programs["make"])
     for check in ("make lint", "make test", "make scan"):
         assert f"seeded default-software (migration 0001): {check}" in sources
         assert f"examples/policies/default-software.yaml: {check}" in sources
+    for check in ("make lint", "make test-unit", "make scan"):
+        assert f"examples/policies/hades-self-hosting.yaml: {check}" in sources
+
+
+def test_declared_programs_are_probed_with_their_policy_named() -> None:
+    """hades #184: what a policy's checks call beyond their first word, when it says so."""
+    programs = policy_commands.required_programs(policy_commands.shipped_policies())
+    for program in SELF_HOSTING_PROGRAMS:
+        assert programs[program] == ["examples/policies/hades-self-hosting.yaml: required_programs"]
+    assert policy_commands.required_programs(
+        [("p", {"repository": {"required_checks": ["make lint"], "required_programs": ["uv"]}})]
+    ) == {"make": ["p: make lint"], "uv": ["p: required_programs"]}
 
 
 def test_only_migration_0001_seeds_required_checks() -> None:
@@ -140,13 +155,28 @@ def test_main_fails_and_names_the_policy_when_make_is_missing(tmp_path: Path) ->
     assert "lacks a program a shipped policy requires" in result.stderr
 
 
-def test_main_passes_when_the_image_carries_make(tmp_path: Path) -> None:
+def test_main_fails_and_names_the_policy_when_a_declared_program_is_missing(
+    tmp_path: Path,
+) -> None:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    _executable(bin_dir, "make")
+    for program in {"make"} | SELF_HOSTING_PROGRAMS - {"gitleaks"}:
+        _executable(bin_dir, program)
+    result = _run_main(_fake_docker(tmp_path, bin_dir))
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "MISSING  gitleaks" in result.stderr
+    assert "examples/policies/hades-self-hosting.yaml: required_programs" in result.stderr
+
+
+def test_main_passes_when_the_image_carries_every_program(tmp_path: Path) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for program in {"make"} | SELF_HOSTING_PROGRAMS:
+        _executable(bin_dir, program)
     result = _run_main(_fake_docker(tmp_path, bin_dir))
     assert result.returncode == 0, result.stdout + result.stderr
     assert f"ok       make -> {bin_dir / 'make'}" in result.stdout
+    assert f"ok       uv -> {bin_dir / 'uv'}" in result.stdout
 
 
 def test_worker_image_reads_the_manifest() -> None:
