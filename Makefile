@@ -65,7 +65,7 @@ CRUCIBLE_DEPLOY_PORT ?= 8080
 
 .PHONY: up dev down reset lint check-image-manifest scan scan-tree scan-history smoke test test-unit \
 	test-integration e2e e2e-github e2e-live e2e-admin e2e-image build proxy-config proxies preflight \
-	e2e-kind e2e-command-timeout registry-check manifests deploy-kind first-run-kind release-images-classify release-images-pull release-images-verify \
+	e2e-kind e2e-kind-self-hosting e2e-command-timeout registry-check manifests deploy-kind first-run-kind release-images-classify release-images-pull release-images-verify \
 	deploy-local deploy-local-down images images-check images-policy-check release-notes
 
 up: preflight proxy-config ## normal mode: postgres, proxies, migrate, crucible
@@ -238,6 +238,20 @@ e2e-kind: check-image-manifest ## Kubernetes-provider e2e on a disposable kind c
 	CRUCIBLE_E2E_DOCKER="$(DOCKER)" \
 	CRUCIBLE_E2E_DOCKER_SOCKET="$(CRUCIBLE_DOCKER_SOCKET)" \
 	CRUCIBLE_E2E_KIND_PYTEST_ARGS="-o faulthandler_timeout=$(KIND_DUMP_SECONDS) $${CRUCIBLE_E2E_KIND_PYTEST_ARGS:-}" \
+	tools/kind/e2e-kind.sh
+
+# hades #184: the self-hosting proof on the same disposable cluster. A Hermes task under
+# examples/policies/hades-self-hosting.yaml, against a bare copy of this repository at
+# HEAD, in the combined worker image images/manifest.env pins (`make images` first),
+# with the real per-worker NetworkPolicy and PyPI reached through it. The model is a
+# stub Pod; the verifier runs `make lint`, `make test-unit` and `make scan`. Needs the
+# network (PyPI), about 8 GiB free, and a committed HEAD. Local only, not in CI.
+e2e-kind-self-hosting: check-image-manifest ## the repository's own checks in the worker image, on kind (hades #184)
+	CRUCIBLE_E2E_DOCKER="$(DOCKER)" \
+	CRUCIBLE_E2E_DOCKER_SOCKET="$(CRUCIBLE_DOCKER_SOCKET)" \
+	CRUCIBLE_E2E_KIND_WORKER_IMAGE="$$(awk -F= '$$1 == "WORKER" {print $$2}' images/manifest.env)" \
+	CRUCIBLE_E2E_KIND_TESTS=tests/e2e/test_kind_self_hosting.py \
+	CRUCIBLE_E2E_KIND_PYTEST_ARGS="-s -o faulthandler_timeout=$(KIND_DUMP_SECONDS) $${CRUCIBLE_E2E_KIND_PYTEST_ARGS:-}" \
 	tools/kind/e2e-kind.sh
 
 # The command-timeout tier (issue 128): Claude Code, Codex and Hermes from the pinned
