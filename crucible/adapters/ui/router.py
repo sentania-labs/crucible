@@ -35,6 +35,7 @@ from crucible.application.admin import (
     login,
     repositories,
     routing,
+    routing_preference,
     status,
     tokens,
 )
@@ -1534,6 +1535,8 @@ def routing_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
     egress = kubernetes_admin.egress_view(ctx.admin, uow)
     gateway_endpoint, _source = routing.gateway_url(uow)
     command_timeout = limits_admin.command_timeout_view(uow)
+    preference = routing_preference.preference_view(uow)
+    rotation = preference["rotation"]
     classes = gate_classes_admin.gate_classes_view(uow)
     admin = principal.role is Role.ADMIN
     bounds = command_timeout["command_timeout_ms"]
@@ -1563,6 +1566,36 @@ def routing_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                 "hint": f"models in use: {local_models}",
             },
             {"kind": "link", "href": "/ui/gateway", "label": "Set up on Local gateway"},
+        ],
+        [
+            "Routing order",
+            {
+                "kind": "note",
+                "value": "; ".join(
+                    f"{name}: {_pool_order_words(rule)}"
+                    for name, rule in preference["tiers"].items()
+                ),
+                "hint": "other allowed models are fallbacks when these are unavailable",
+            },
+            "",
+        ],
+        [
+            "Demotion",
+            {
+                "kind": "note",
+                "value": (
+                    f"at {rotation['demote_failure_percent']}% blocking-gate failures over "
+                    f"at least {rotation['demote_min_sample']} of the last "
+                    f"{rotation['quality_window']} attempts in a project"
+                    if rotation["quality_feedback"]
+                    else "off: failures never move routing"
+                ),
+                "hint": (
+                    f"a demoted model is tried again after {rotation['probe_after_minutes']} "
+                    "minutes; one failure never demotes"
+                ),
+            },
+            "",
         ],
         [
             "Per-command timeout",
@@ -1611,6 +1644,7 @@ def routing_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
             "rows": in_force,
             "details": [
                 _document_section("Local endpoint", local),
+                _document_section("Routing order and demotion", preference),
                 _document_section("Kubernetes egress selectors", egress),
                 _document_section("Per-command timeout", command_timeout),
                 _document_section("Gate classes", classes),
@@ -1649,6 +1683,84 @@ def routing_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
         },
     ]
     if admin:
+        tier_fields: list[dict[str, Any]] = []
+        for name, rule in preference["tiers"].items():
+            tier_fields.extend(
+                [
+                    {
+                        "name": f"prefer_{name}",
+                        "label": f"{name}: pools first, in order",
+                        "value": ", ".join(rule["prefer_pools"]),
+                        "placeholder": "no preference",
+                    },
+                    {
+                        "name": f"default_{name}",
+                        "label": f"{name}: use the default",
+                        "kind": "checkbox",
+                        "value": rule["default"],
+                    },
+                ]
+            )
+        sections.append(
+            {
+                "title": "Edit routing order and demotion",
+                "note": (
+                    "Per tier, the pools routing tries first, in order (pool names, comma "
+                    f"separated; the pools are {', '.join(preference['pools'])}). Leave it "
+                    "empty for no preference, where the tier's capability preference "
+                    "decides. The default is "
+                    f"{preference['default_rule']}. A model is demoted in a project when "
+                    "the percentage of its judged attempts that failed a blocking gate "
+                    "reaches the threshold, over at least the minimum sample; a demoted "
+                    "model is tried again once its last attempt is the probe interval old. "
+                    "Saving writes a new routing version and a delivery policy version "
+                    "naming it."
+                ),
+                "form": {
+                    "action": "/ui/actions/routing-preference",
+                    "label": "Save routing order",
+                    "collapsed": "Change the routing order or demotion",
+                    "fields": [
+                        *tier_fields,
+                        {
+                            "name": "quality_feedback",
+                            "label": "Demote models that fail blocking gates",
+                            "kind": "checkbox",
+                            "value": rotation["quality_feedback"],
+                        },
+                        {
+                            "name": "quality_window",
+                            "label": "Attempts judged per model",
+                            "kind": "number",
+                            "value": rotation["quality_window"],
+                            "required": True,
+                        },
+                        {
+                            "name": "demote_failure_percent",
+                            "label": "Failure percentage that demotes",
+                            "kind": "number",
+                            "value": rotation["demote_failure_percent"],
+                            "required": True,
+                        },
+                        {
+                            "name": "demote_min_sample",
+                            "label": "Minimum judged attempts (2 or more)",
+                            "kind": "number",
+                            "value": rotation["demote_min_sample"],
+                            "required": True,
+                        },
+                        {
+                            "name": "probe_after_minutes",
+                            "label": "Probe a demoted model after (minutes)",
+                            "kind": "number",
+                            "value": rotation["probe_after_minutes"],
+                            "required": True,
+                        },
+                        {"name": "reason", "label": "Reason", "required": True},
+                    ],
+                },
+            }
+        )
         sections.append(
             {
                 "title": "Edit per-command timeout",
@@ -3073,6 +3185,39 @@ def _milliseconds(form: dict[str, str], name: str) -> int | None:
     return int(raw)
 
 
+def _whole_number(form: dict[str, str], name: str) -> int | None:
+    raw = form.get(name, "").strip()
+    if not raw:
+        return None
+    if not raw.isdigit():
+        raise ContractValidationError(
+            f"{name} must be a whole number",
+            errors=[{"path": name, "message": "a whole number"}],
+        )
+    return int(raw)
+
+
+def _tier_order(form: dict[str, str], tier: str, shown: list[str]) -> list[str] | None:
+    """A tier's order from the Routing form. "Use the default" keeps the default only
+    while the order field still shows what was on the page: an order typed over it is
+    the administrator's, not something to discard under a ticked box."""
+    typed = routing_preference.parse_pool_order(form.get(f"prefer_{tier}", ""))
+    if form.get(f"default_{tier}") == "true" and (typed is None or typed == shown):
+        return None
+    return typed
+
+
+def _pool_order_words(rule: dict[str, Any]) -> str:
+    """One tier's pool order as the Routing page says it (ADR 0028)."""
+    pools = rule["prefer_pools"]
+    words = (
+        f"{' then '.join(pools)} first"
+        if pools
+        else f"no pool preference ({', '.join(rule['prefer'])} first by capability)"
+    )
+    return f"{words} (default)" if rule["default"] else words
+
+
 @router.post("/actions/{action}")
 async def action(request: Request, action: str, ctx: Ctx, uow: UoW) -> Response:
     found = _require(request, ctx, uow)
@@ -3332,6 +3477,31 @@ async def action(request: Request, action: str, ctx: Ctx, uow: UoW) -> Response:
         elif action == "routing-clear":
             routing.clear_exhaustion(
                 ctx.admin, uow, principal=principal.name, pool=form.get("pool", ""), reason=reason
+            )
+        elif action == "routing-preference":
+            tiers = routing_preference.preference_view(uow)["tiers"]
+            routing_preference.save_preference(
+                ctx.admin,
+                uow,
+                principal=principal,
+                tiers={
+                    name: _tier_order(form, name, rule["prefer_pools"])
+                    for name, rule in tiers.items()
+                },
+                rotation={
+                    "quality_feedback": form.get("quality_feedback") == "true",
+                    **{
+                        key: value
+                        for key in (
+                            "quality_window",
+                            "demote_failure_percent",
+                            "demote_min_sample",
+                            "probe_after_minutes",
+                        )
+                        if (value := _whole_number(form, key)) is not None
+                    },
+                },
+                reason=reason,
             )
         elif action == "gate-classes":
             gate_classes_admin.save_gate_classes(
