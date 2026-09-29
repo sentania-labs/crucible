@@ -196,8 +196,11 @@ Enabling a harness is an administrator's decision the service stores (hades
    Harnesses page. The row records that an administrator decided
    (`enabled_decided`, migration 0027).
 
-Until an administrator has decided, both have to say yes, so an upgrade
-changes no harness's availability. Once one has, the stored decision alone
+Until an administrator has decided, both have to say yes. Migration 0027
+records a disable as a decision only when a principal made it (the row's
+`updated_by`); a row a migration seeded off (Codex, 0008) starts undecided
+with its runtime flag on, so the configuration default governs it. With the
+shipped configuration an upgrade changes no harness's availability. Once one has, the stored decision alone
 decides: enabling a harness the configuration keeps off is one action, it
 takes effect for routing at once with no restart (the row is read on every
 submit and launch), and changing the configuration afterwards changes

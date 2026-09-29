@@ -29,6 +29,10 @@ state and Codex's one-time code replaced by filler of the same shape.
 - 2026-09-27, hades #174: enabling a harness is one audited UI action; an unverified
   harness shows why and can be enabled anyway; the configuration entry becomes an
   initial default only. Recorded as ADR 0021.
+- 2026-09-28, PR 224 review (Codex, accepted by Foundry): migration 0027 counts a
+  disabled row as an administrator's decision only when a principal disabled it
+  (`updated_by` is not `migration`). The Codex row 0008 seeded off starts undecided, so
+  its configuration entry governs it. ADR 0021 point 4 amended.
 - 2026-09-27, hades #173 (comment): recognise each harness's real prompt from captured
   output, show the code box whenever the CLI waits after printing a URL, drop the chmod
   noise, and tell the operator to copy AGY's `code` from the redirect that fails to load.

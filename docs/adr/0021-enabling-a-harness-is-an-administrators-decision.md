@@ -30,9 +30,18 @@ gate read-only. That broke the rule that every tunable has a UI.
    `warning` wherever the harness is shown and in the enable answer, and recorded with
    the decision as `configuration_warning`. The harness test (crucible#118) is how the
    operator proves the harness works.
-4. **An upgrade changes nothing by itself.** Migration 0027 records a row an
-   administrator had disabled as that decision, and starts every enabled row undecided,
-   so a harness the configuration keeps off stays off until an administrator enables it.
+4. **An upgrade records only real decisions.** Migration 0027 records a row an
+   administrator had disabled (or a credential removal had) as that decision, told
+   apart by the row's provenance: the service stamps `updated_by` with the principal,
+   the seeds with `migration`. A seeded row is no one's decision: Codex, seeded off in
+   0008, starts undecided with its runtime flag on, so the configuration default
+   governs it, and a harness the configuration keeps off stays off until an
+   administrator enables it. Every enabled row starts undecided too. With the shipped
+   configuration an upgrade changes no harness's availability; a deployment whose
+   configuration already enables Codex gets it on, as its configuration says.
+   (Amended 2026-09-28 after Codex's review of PR 224: the first version marked every
+   disabled row decided, which turned the Codex seed into an administrator's disable
+   that no administrator made and no audit event records.)
 5. **Removing a credential is a decision too.** `credentials remove` disables the
    harness through the same service, so the harness stays off, whatever its
    configuration says, until an administrator enables it again.
@@ -41,7 +50,8 @@ gate read-only. That broke the rule that every tunable has a UI.
 
 Changing a harness's configuration entry after an administrator has decided does not
 change that harness's availability; the Settings page says the entry is the starting
-value only. A rollback past 0027 drops the decision, and the two gates apply again.
+value only. A rollback past 0027 drops the decision, puts an untouched Codex seed back off,
+and the two gates apply again.
 
 The harness test runs only on an enabled harness, so an unverified harness is enabled
 for new tasks before the test can prove it. Letting the test run on a harness that is

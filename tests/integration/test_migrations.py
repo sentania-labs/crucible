@@ -8,10 +8,12 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import Connection, inspect, text
 
+from crucible.adapters.harness.registry import default_registry
 from crucible.adapters.persistence import migrate
 from crucible.adapters.persistence.unit_of_work import SqlUnitOfWorkFactory, make_engine
 from crucible.application.routing import load_routing
 from crucible.contracts.policy import RoutingPolicyV1
+from crucible.ports.harness import HarnessGate, HarnessUnavailableError
 from tests.fixtures import contract_document
 from tests.integration.conftest import rebuild, reset, submit_and_start
 
@@ -1195,34 +1197,70 @@ def test_0021_command_timeout_down_and_up_keeps_the_audit_trail(database_url: st
     engine.dispose()
 
 
-def test_0027_starts_every_harness_undecided_and_comes_back_off(database_url: str) -> None:
-    """hades #174: an upgrade changes no harness's availability. An enabled row starts
-    undecided, so the configuration default still applies until an administrator
-    decides; a rollback drops only the decision."""
+def test_0027_decides_only_an_administrators_disable_and_comes_back_off(
+    database_url: str,
+) -> None:
+    """hades #174 (Codex round on PR 224): only an administrator's disable becomes a
+    decision. A row a migration seeded off (Codex, 0008) starts undecided, so the
+    configuration default governs it: off while the configuration keeps it off, on as
+    soon as the configuration says so. A row an administrator disabled is decided and
+    stays off whatever the configuration says. A rollback drops only the decision and
+    puts the untouched seed back."""
     migrate.upgrade(database_url)
     engine = make_engine(database_url)
     migrate.downgrade(database_url, "0026_github_app_manifest")
+    with engine.connect() as conn:
+        seeded = conn.execute(
+            text("SELECT enabled, reason, updated_by FROM harnesses WHERE name = 'codex'")
+        ).one()
+    assert (seeded.enabled, seeded.updated_by) == (False, "migration")
     with engine.begin() as conn:
-        conn.execute(text("DELETE FROM harnesses"))
+        conn.execute(text("DELETE FROM harnesses WHERE name <> 'codex'"))
         conn.execute(
             text(
                 "INSERT INTO harnesses (name, enabled, reason, session_compatibility, "
                 "updated_at, updated_by) VALUES "
-                "('codex', true, '', 'unverified', now(), 't'), "
-                "('agy', false, 'rotating', 'unverified', now(), 't')"
+                "('claude_code', true, '', 'verified', now(), 'migration'), "
+                "('agy', false, 'rotating', 'unverified', now(), 'admin-scott')"
             )
         )
     migrate.upgrade(database_url)
     with engine.connect() as conn:
-        decided = {
-            str(r.name): (r.enabled, r.enabled_decided)
-            for r in conn.execute(text("SELECT name, enabled, enabled_decided FROM harnesses"))
+        rows = {
+            str(r.name): (r.enabled, r.enabled_decided, r.reason)
+            for r in conn.execute(
+                text("SELECT name, enabled, enabled_decided, reason FROM harnesses")
+            )
         }
-    # An enabled row is undecided, so the configuration default still applies to it; a
-    # disabled one was an administrator's decision, and stays disabled either way.
-    assert decided == {"codex": (True, False), "agy": (False, True)}
+    assert rows == {
+        "codex": (True, False, ""),
+        "claude_code": (True, False, ""),
+        "agy": (False, True, "rotating"),
+    }
+
+    registry = default_registry()
+    off = {"codex": HarnessGate(enabled=False, reason="unverified"), "agy": HarnessGate()}
+    on = {"codex": HarnessGate(enabled=True), "agy": HarnessGate(enabled=True)}
+    with SqlUnitOfWorkFactory(engine)() as uow:
+        codex, agy = uow.harnesses.get("codex"), uow.harnesses.get("agy")
+    with pytest.raises(HarnessUnavailableError, match="off by the configuration default"):
+        registry.resolve("codex", gates=off, state=codex)
+    assert registry.resolve("codex", gates=on, state=codex).name == "codex"
+    with pytest.raises(HarnessUnavailableError, match="disabled by an administrator"):
+        registry.resolve("agy", gates=on, state=agy)
+
     migrate.downgrade(database_url, "0026_github_app_manifest")
     assert "enabled_decided" not in {c["name"] for c in inspect(engine).get_columns("harnesses")}
+    with engine.connect() as conn:
+        back = {
+            str(r.name): (r.enabled, r.reason)
+            for r in conn.execute(text("SELECT name, enabled, reason FROM harnesses"))
+        }
+    assert back == {
+        "codex": (False, seeded.reason),
+        "claude_code": (True, ""),
+        "agy": (False, "rotating"),
+    }
     migrate.upgrade(database_url)
     ok, detail = migrate.is_current(engine, database_url)
     assert ok, detail
