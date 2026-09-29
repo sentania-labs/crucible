@@ -1,0 +1,123 @@
+{
+  "acceptance_criteria": [
+    {
+      "id": "AC1",
+      "text": "sh greet.sh prints 'Hello, world!'; sh greet.sh Ada prints 'Hello, Ada!'."
+    },
+    {
+      "id": "AC2",
+      "text": "sh tests/test_greet.sh exits 0 and fails if greet.sh is wrong."
+    },
+    {
+      "id": "AC3",
+      "text": "make lint, make test and make scan each exit 0."
+    }
+  ],
+  "constraints": {
+    "network": "policy",
+    "prohibited_actions": [
+      "modify files outside allowed_paths",
+      "delegate to other agents"
+    ]
+  },
+  "context": [],
+  "correction": null,
+  "deliverables": [
+    {
+      "closes": [],
+      "draft": false,
+      "kind": "pull_request",
+      "target": "main"
+    }
+  ],
+  "escalation": {
+    "action": "write report/blocked.md with the question and exit 75",
+    "conditions": [
+      "a required verification command cannot be made to pass"
+    ]
+  },
+  "execution_request": {
+    "command_timeout_ms": null,
+    "effort": null,
+    "harness": null,
+    "image": null,
+    "model": null,
+    "pin": null,
+    "pin_reason": null,
+    "provider": "kubernetes",
+    "rationale": "Practice task on v0.6.4: proves the delivery path end to end on Hermes.",
+    "tier": "trivial",
+    "timeout_seconds": 1800
+  },
+  "external_id": "HT-0004",
+  "lifecycle": {
+    "cleanup": "policy",
+    "max_attempts": 1,
+    "retry_on": [
+      "environment"
+    ]
+  },
+  "objective": "Add greet.sh, a POSIX sh script that prints 'Hello, NAME!' for its first argument, or 'Hello, world!' with no argument, and tests/test_greet.sh, a POSIX sh test that runs both cases, prints PASS or FAIL for each, and exits non-zero if either fails. Also add a Makefile with three targets: lint (runs sh -n on greet.sh and tests/test_greet.sh), test (runs sh tests/test_greet.sh), and scan (fails if any tracked file contains the text 'PRIVATE KEY'; passes otherwise).",
+  "parent_external_id": null,
+  "policy": {
+    "name": "default-software",
+    "version": 8
+  },
+  "project": "hades-scratch",
+  "project_instructions": [
+    {
+      "kind": "file",
+      "ref": "README.md"
+    }
+  ],
+  "reporting": {
+    "progress_events": true,
+    "report_dir": "/crucible/report",
+    "report_schema": "CompletionClaimV1"
+  },
+  "repository": {
+    "base_ref": "main",
+    "name": "hades-scratch",
+    "work_branch": "crucible/HT-0004"
+  },
+  "required_verification": [
+    {
+      "command": "make lint",
+      "expect_exit": 0,
+      "id": "V1",
+      "kind": "command"
+    },
+    {
+      "command": "make test",
+      "expect_exit": 0,
+      "id": "V2",
+      "kind": "command"
+    },
+    {
+      "command": "make scan",
+      "expect_exit": 0,
+      "id": "V3",
+      "kind": "command"
+    },
+    {
+      "id": "V4",
+      "kind": "artifact",
+      "path": "report/run-evidence.md"
+    }
+  ],
+  "schema_version": "1.0",
+  "scope": {
+    "allowed_paths": [
+      "greet.sh",
+      "tests/**",
+      "Makefile",
+      "report/**"
+    ],
+    "may_add_dependencies": false,
+    "may_modify_ci": false,
+    "prohibited_paths": [
+      ".github/**"
+    ]
+  },
+  "title": "Add a greet script with a test and make targets"
+}

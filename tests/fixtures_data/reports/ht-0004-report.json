@@ -1,0 +1,24 @@
+{
+  "acceptance_mapping": {
+    "AC1": {
+      "evidence": "v2-make-test.log: greet.sh prints 'Hello, world!' with no arg and 'Hello, Ada!' with argument",
+      "status": "met"
+    },
+    "AC2": {
+      "evidence": "v2-make-test.log: tests/test_greet.sh exits 0, prints PASS for both cases",
+      "status": "met"
+    },
+    "AC3": {
+      "evidence": "v1-make-lint.log, v2-make-test.log, v3-make-scan.log: make lint, make test, make scan all exit 0",
+      "status": "met"
+    }
+  },
+  "head": "e0fe7c25be501c187843a03f2bf300615f28d328",
+  "proposed_pull_request": {
+    "base": "main",
+    "body": "Closes HT-0004.\n\n- greet.sh: POSIX sh greeting script, prints \"Hello, NAME!\" or \"Hello, world!\"\n- tests/test_greet.sh: POSIX sh test suite with two cases\n- Makefile: lint, test, and scan targets\n",
+    "head": "crucible/HT-0004",
+    "title": "Add greet.sh with test and Makefile targets"
+  },
+  "schema_version": "1.0"
+}

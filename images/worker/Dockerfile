@@ -178,6 +178,10 @@ RUN set -eu; \
     diff -u /tmp/locked /tmp/installed; \
     rm -rf /root/.cache /tmp/requirements.lock /tmp/locked /tmp/installed /fetch
 COPY --chmod=0755 worker/crucible-hermes.py /usr/local/bin/crucible-hermes
+# hades #215: the worker checks its own report.yaml before it exits 0. Standard library
+# only; it re-executes under the Hermes venv's Python for PyYAML, by path, for its own
+# process alone, so PATH is unchanged. No network.
+COPY --chmod=0755 worker/crucible-report.py /usr/local/bin/crucible-report
 COPY --from=fetch-claude-code /fetch/claude /usr/local/bin/claude
 COPY --from=fetch-codex /fetch/codex /usr/local/bin/codex
 COPY --from=fetch-codex /fetch/codex-code-mode-host /usr/local/bin/codex-code-mode-host
