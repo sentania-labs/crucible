@@ -173,6 +173,21 @@ def _scanner_findings(
     return findings
 
 
+def _claimed_checks(claim: dict[str, Any]) -> list[dict[str, Any]]:
+    """Each check id and integer exit the worker's own report named, nothing else."""
+    checks = claim.get("checks")
+    if not isinstance(checks, list):
+        return []
+    return [
+        {"id": str(c["id"]), "exit": c["exit"]}
+        for c in checks
+        if isinstance(c, dict)
+        and isinstance(c.get("id"), str)
+        and isinstance(c.get("exit"), int)
+        and not isinstance(c.get("exit"), bool)
+    ]
+
+
 def _scanned_inputs(outputs: CollectedOutputs, claim: dict[str, Any] | None) -> list[str]:
     scanned = ["report" if claim is not None else "report:absent"]
     if outputs.diff_text is not None:
@@ -263,6 +278,9 @@ def record_collection_evidence(
                     "changed_files": report.get("changed_files") or [],
                     "filled_by_crucible": list(completed.filled) if completed else [],
                     "differences": [dict(d) for d in completed.differences] if completed else [],
+                    # The exits the worker itself reported, which verification_ran
+                    # compares with Crucible's re-run (ADR 0024).
+                    "claimed_checks": _claimed_checks(claim),
                 }
             )
         _add(

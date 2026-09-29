@@ -17,6 +17,8 @@ from crucible.domain.endpoints import validate_endpoint
 from crucible.domain.exit_class import ExitClass
 from crucible.domain.gates import (
     ALL_GATES,
+    ALWAYS_BLOCKING_GATES,
+    DEFAULT_ADVISORY_GATES,
     POST_PR_GATES,
     PRE_PR_GATES,
     PUBLICATION_GATES,
@@ -181,6 +183,25 @@ class Gates(StrictModel):
     publication: list[str]
     post_pr: list[str]
     skipped: list[str]
+    # ADR 0024: the pre-PR gates whose failure is carried to the reviewer instead of
+    # stopping the task; every other pre-PR gate blocks. Absent (a version written before
+    # the field existed) means the default set in crucible.domain.gates.
+    advisory: list[str] | None = None
+
+    @field_validator("advisory")
+    @classmethod
+    def _advisory(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        if len(set(value)) != len(value):
+            raise ValueError("duplicate entry in gates.advisory")
+        stray = sorted(set(value) - PRE_PR_GATES)
+        if stray:
+            raise ValueError(f"gates.advisory names gates that are not pre-PR gates: {stray}")
+        fixed = sorted(set(value) & ALWAYS_BLOCKING_GATES)
+        if fixed:
+            raise ValueError(f"gates.advisory may not include {fixed}: the review always blocks")
+        return value
 
     @model_validator(mode="after")
     def _partition(self) -> Gates:
@@ -327,6 +348,9 @@ class PolicyV1(StrictModel):
             out.append("deliverables.allow_branch_only")
         if not self.release.require_operator_approval:
             out.append("release.require_operator_approval")
+        # ADR 0024: turning a safety gate advisory is the operator's call.
+        for gate in sorted(set(self.gates.advisory or ()) - DEFAULT_ADVISORY_GATES):
+            out.append(f"gates.advisory.{gate}")
         return out
 
 

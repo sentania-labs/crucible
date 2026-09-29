@@ -380,7 +380,7 @@ async def test_an_amendment_beyond_the_policy_timeout_is_refused(client: TestCli
 async def test_a_correction_to_a_disallowed_image_is_refused(
     client: TestClient, supervisor: Supervisor
 ) -> None:
-    task_id = submit_and_start(client, "crucible-worker:fake-out-of-scope")
+    task_id = submit_and_start(client, "crucible-worker:fake-prohibited-path")
     await run_to_settled(supervisor, client, task_id)
     document = correction_document(client, task_id, image="docker.io/library/python:3.12")
     r = client.post(f"/v1/tasks/{task_id}/corrections", json=document)
@@ -391,7 +391,7 @@ async def test_a_correction_to_a_disallowed_image_is_refused(
 async def test_a_correction_beyond_the_attempt_cap_is_refused(
     client: TestClient, supervisor: Supervisor
 ) -> None:
-    task_id = submit_and_start(client, "crucible-worker:fake-out-of-scope")
+    task_id = submit_and_start(client, "crucible-worker:fake-prohibited-path")
     await run_to_settled(supervisor, client, task_id)
     document = correction_document(client, task_id, image="crucible-worker:fake-succeed")
     document["lifecycle"] = {**document["lifecycle"], "max_attempts": 99}
@@ -451,10 +451,10 @@ async def test_a_correction_naming_an_older_version_is_refused(
     client: TestClient, supervisor: Supervisor
 ) -> None:
     task_id = submit_and_start(
-        client, "crucible-worker:fake-out-of-scope", deliverables=ARTIFACTS_DELIVERABLE
+        client, "crucible-worker:fake-prohibited-path", deliverables=ARTIFACTS_DELIVERABLE
     )
     await run_to_settled(supervisor, client, task_id)
-    first = correction_document(client, task_id, image="crucible-worker:fake-out-of-scope")
+    first = correction_document(client, task_id, image="crucible-worker:fake-prohibited-path")
     assert client.post(f"/v1/tasks/{task_id}/corrections", json=first).status_code == 200
     assert await run_to_settled(supervisor, client, task_id) == "pre_pr_gates_failed"
     assert client.get(f"/v1/tasks/{task_id}").json()["contract_version"] == 2
@@ -471,9 +471,9 @@ async def test_narrowing_is_compared_against_the_current_version(
     client: TestClient, supervisor: Supervisor
 ) -> None:
     """A second correction may not re-widen back to what version 1 allowed."""
-    task_id = submit_and_start(client, "crucible-worker:fake-out-of-scope")
+    task_id = submit_and_start(client, "crucible-worker:fake-prohibited-path")
     await run_to_settled(supervisor, client, task_id)
-    narrowed = correction_document(client, task_id, image="crucible-worker:fake-out-of-scope")
+    narrowed = correction_document(client, task_id, image="crucible-worker:fake-prohibited-path")
     narrowed["scope"] = {**narrowed["scope"], "allowed_paths": ["src/ledger/**"]}
     assert client.post(f"/v1/tasks/{task_id}/corrections", json=narrowed).status_code == 200
     await run_to_settled(supervisor, client, task_id)

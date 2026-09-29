@@ -4,6 +4,9 @@ A gate evaluator is a pure function of a GateInput built from EvidenceV1 rows an
 contract. It never reads a database, a file, or a clock. Only `verified` evidence from a
 source other than the worker is admissible: worker-asserted facts are shown to Foundry
 and never satisfy a gate (11).
+
+Each pre-PR gate is blocking or advisory (ADR 0024). A blocking failure stops the task;
+an advisory one is recorded and carried in front of the internal reviewer, who decides.
 """
 
 from __future__ import annotations
@@ -68,6 +71,26 @@ PRE_PR_GATES: frozenset[str] = frozenset(
         GateName.INTERNAL_REVIEW_RECORDED,
     }
 )
+# ADR 0024, the operator on 2026-09-29: "We need to let the review be our enforcement
+# rather then dictating behavior". Hard gates stay where the damage is real or a claim is
+# false; these four are information for the reviewer unless a policy says otherwise.
+DEFAULT_ADVISORY_GATES: frozenset[str] = frozenset(
+    {
+        GateName.REPORT_PRESENT,
+        GateName.SCOPE_CONTAINED,
+        GateName.CRITERIA_MAPPED,
+        GateName.RUN_EVIDENCE_PRESENT,
+    }
+)
+# The review is the enforcement, so it is never itself advisory.
+ALWAYS_BLOCKING_GATES: frozenset[str] = frozenset({GateName.INTERNAL_REVIEW_RECORDED})
+
+
+class GateClass(StrEnum):
+    BLOCKING = "blocking"
+    ADVISORY = "advisory"
+
+
 PUBLICATION_GATES: frozenset[str] = frozenset(
     {GateName.BRANCH_PUSHED_AT_HEAD, GateName.PR_EXISTS_HEAD_MATCHES}
 )
@@ -168,6 +191,12 @@ class GateOutcome:
     result: GateResult
     detail: str
     evidence_ids: tuple[int, ...] = ()
+    # A failure that stops the task even when the gate is advisory: a prohibited path
+    # under scope_contained (ADR 0024).
+    always_blocks: bool = False
+    # Advisory findings for the reviewer that do not change the result, such as a
+    # worker's report contradicting Crucible's own re-run.
+    findings: tuple[str, ...] = ()
 
 
 def _missing(kind: str, *, role: str | None = None) -> GateOutcome:
@@ -306,6 +335,8 @@ def commits_present(gi: GateInput) -> GateOutcome:
 
 
 def scope_contained(gi: GateInput) -> GateOutcome:
+    """A path outside `allowed_paths` is for the reviewer when the gate is advisory; a
+    path matching `prohibited_paths` always stops the task (ADR 0024)."""
     item = gi.one("diff_paths")
     if item is None:
         return _missing("diff_paths")
@@ -317,11 +348,13 @@ def scope_contained(gi: GateInput) -> GateOutcome:
     forbidden = [p for p in paths if _matches_any(p, prohibited)]
     if outside or forbidden:
         parts = []
-        if outside:
-            parts.append(f"outside allowed_paths: {sorted(outside)[:10]}")
         if forbidden:
             parts.append(f"matching prohibited_paths: {sorted(forbidden)[:10]}")
-        return GateOutcome(GateResult.FAIL, "; ".join(parts), (item.id,))
+        if outside:
+            parts.append(f"outside allowed_paths: {sorted(outside)[:10]}")
+        return GateOutcome(
+            GateResult.FAIL, "; ".join(parts), (item.id,), always_blocks=bool(forbidden)
+        )
     return GateOutcome(
         GateResult.PASS, f"all {len(paths)} changed path(s) inside allowed_paths", (item.id,)
     )
@@ -517,19 +550,49 @@ def verification_ran(gi: GateInput) -> GateOutcome:
         actual = item.payload.get("exit_code")
         if actual != expect:
             failed.append(f"{check_id} exited {actual!r}, expected {expect}")
+    findings = contradicted_claims(gi, required, runs)
     if missing:
         return GateOutcome(
             GateResult.FAIL,
             f"Crucible did not re-run: {sorted(missing)}",
             tuple(ids),
+            findings=findings,
         )
     if failed:
-        return GateOutcome(GateResult.FAIL, "; ".join(sorted(failed)), tuple(ids))
+        return GateOutcome(
+            GateResult.FAIL, "; ".join(sorted(failed)), tuple(ids), findings=findings
+        )
     return GateOutcome(
         GateResult.PASS,
         f"Crucible re-ran {len(required)} required command(s) in a verifier container",
         tuple(ids),
     )
+
+
+def contradicted_claims(
+    gi: GateInput, required: list[dict[str, Any]], runs: dict[str, EvidenceItem]
+) -> tuple[str, ...]:
+    """ADR 0024: a check the worker reported passing that Crucible's own re-run failed is
+    a trust problem, named plainly for the reviewer. Only the contract's own check ids
+    are echoed, never text the worker wrote."""
+    claim = gi.one("artifact_present", role="completion_claim")
+    if claim is None:
+        return ()
+    reported = {
+        str(c.get("id")): c.get("exit")
+        for c in claim.payload.get("claimed_checks") or []
+        if isinstance(c, dict)
+    }
+    out: list[str] = []
+    for check in required:
+        check_id = str(check.get("id"))
+        item = runs.get(check_id)
+        if item is None or not item.payload.get("ran") or check_id not in reported:
+            continue
+        expect = int(check.get("expect_exit", 0))
+        if reported[check_id] == expect and item.payload.get("exit_code") != expect:
+            out.append(f"the worker reported {check_id} passing; Crucible's re-run failed it")
+    return tuple(sorted(out))
 
 
 def workspace_clean(gi: GateInput) -> GateOutcome:
@@ -607,18 +670,74 @@ def evaluate_pre_pr(gates: Sequence[str], gi: GateInput) -> dict[str, GateOutcom
     return {gate: evaluate_gate(gate, gi) for gate in gates}
 
 
-def blocking(outcomes: dict[str, GateOutcome]) -> list[str]:
-    """Gates whose result stops the task: fail and error (09 treats error as fail)."""
+def advisory_gates(policy: dict[str, Any]) -> frozenset[str]:
+    """The pre-PR gates the policy marks advisory (ADR 0024). A policy version written
+    before the field existed carries none, and takes the default."""
+    listed = (policy.get("gates") or {}).get("advisory")
+    if listed is None:
+        return DEFAULT_ADVISORY_GATES
+    return frozenset(str(g) for g in listed) - ALWAYS_BLOCKING_GATES
+
+
+def gate_class(gate: str, advisory: frozenset[str]) -> GateClass:
+    return GateClass.ADVISORY if gate in advisory else GateClass.BLOCKING
+
+
+def _failed(outcome: GateOutcome) -> bool:
+    return outcome.result in (GateResult.FAIL, GateResult.ERROR)
+
+
+def stops_the_task(gate: str, outcome: GateOutcome, advisory: frozenset[str]) -> bool:
+    """A fail or error (09 treats error as fail) on a blocking gate, or a failure that
+    blocks whatever the gate's class."""
+    return _failed(outcome) and (outcome.always_blocks or gate not in advisory)
+
+
+def blocking(outcomes: dict[str, GateOutcome], advisory: frozenset[str] = frozenset()) -> list[str]:
+    """Gates whose result stops the task."""
     return sorted(
-        name
-        for name, outcome in outcomes.items()
-        if outcome.result in (GateResult.FAIL, GateResult.ERROR)
+        name for name, outcome in outcomes.items() if stops_the_task(name, outcome, advisory)
     )
+
+
+def for_reviewer(
+    outcomes: dict[str, GateOutcome], advisory: frozenset[str]
+) -> list[dict[str, str]]:
+    """Failed advisory gates and every advisory finding, each with its detail: what the
+    internal reviewer is asked to weigh (ADR 0024)."""
+    out = [
+        {"gate": name, "detail": outcome.detail}
+        for name, outcome in sorted(outcomes.items())
+        if _failed(outcome) and not stops_the_task(name, outcome, advisory)
+    ]
+    out.extend(
+        {"gate": name, "detail": finding}
+        for name, outcome in sorted(outcomes.items())
+        for finding in outcome.findings
+    )
+    return out
 
 
 def waiting_for_review(outcomes: dict[str, GateOutcome]) -> bool:
     outcome = outcomes.get(GateName.INTERNAL_REVIEW_RECORDED)
     return outcome is not None and outcome.result is GateResult.PENDING
+
+
+class PrePrVerdict(StrEnum):
+    """Where the pre-PR gates send the task (09)."""
+
+    FAILED = "pre_pr_gates_failed"
+    REVIEW = "awaiting_internal_review"
+    PASSED = "gates_passed"
+
+
+def pre_pr_verdict(outcomes: dict[str, GateOutcome], advisory: frozenset[str]) -> PrePrVerdict:
+    """A blocking failure stops the task; an advisory one never does (ADR 0024)."""
+    if blocking(outcomes, advisory):
+        return PrePrVerdict.FAILED
+    if waiting_for_review(outcomes):
+        return PrePrVerdict.REVIEW
+    return PrePrVerdict.PASSED
 
 
 # ----- publication and post-PR gates (23) --------------------------------

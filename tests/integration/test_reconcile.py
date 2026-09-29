@@ -91,7 +91,7 @@ async def test_reconcile_twice_changes_nothing_after_acceptance(
 async def test_reconcile_twice_changes_nothing_after_a_gate_failure(
     client: TestClient, supervisor: Supervisor, engine: Engine
 ) -> None:
-    task_id = submit_and_start(client, "crucible-worker:fake-out-of-scope")
+    task_id = submit_and_start(client, "crucible-worker:fake-prohibited-path")
     assert await run_to_settled(supervisor, client, task_id) == "pre_pr_gates_failed"
     await supervisor.tick()
     before = snapshot(engine)

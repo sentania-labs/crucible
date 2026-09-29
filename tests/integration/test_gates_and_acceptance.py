@@ -7,6 +7,7 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
+from crucible.adapters.execution.fake import FakeProvider
 from crucible.application.supervisor import Supervisor
 from crucible.domain.gates import DEFERRED_MARKER, DEFERRED_TO_C3, GateName
 from tests.integration.conftest import (
@@ -18,6 +19,7 @@ from tests.integration.conftest import (
     run_until,
     submit_and_start,
 )
+from tests.integration.test_report_facts import judgement_only
 
 pytestmark = pytest.mark.integration
 
@@ -111,8 +113,11 @@ async def test_pull_request_deliverable_enters_publishing(
     assert body["pull_request"] is None
 
 
-async def test_fail_path_scope_contained(client: TestClient, supervisor: Supervisor) -> None:
-    task_id = submit_and_start(client, "crucible-worker:fake-out-of-scope")
+async def test_fail_path_scope_contained_on_a_prohibited_path(
+    client: TestClient, supervisor: Supervisor
+) -> None:
+    """ADR 0024: scope_contained is advisory, but a prohibited path always blocks."""
+    task_id = submit_and_start(client, "crucible-worker:fake-prohibited-path")
     assert await run_to_settled(supervisor, client, task_id) == "pre_pr_gates_failed"
     attempt_id = latest_attempt(client, task_id)
     results = gates(client, attempt_id)
@@ -120,12 +125,68 @@ async def test_fail_path_scope_contained(client: TestClient, supervisor: Supervi
     assert results[GateName.EXIT_CLEAN] == "pass"
     assert results[GateName.REPORT_PRESENT] == "pass"
     rows = client.get(f"/v1/attempts/{attempt_id}/gates").json()["items"]
-    detail = next(r["detail"] for r in rows if r["gate"] == GateName.SCOPE_CONTAINED)
-    assert "infrastructure/outside-the-contract.txt" in detail
+    scope = next(r for r in rows if r["gate"] == GateName.SCOPE_CONTAINED)
+    assert ".github/CODEOWNERS" in scope["detail"] and "prohibited_paths" in scope["detail"]
+    # The failure blocks, so this evaluation of the advisory gate is recorded blocking.
+    assert scope["classification"] == "blocking"
     summary = client.get(f"/v1/tasks/{task_id}").json()["gate_summary"]
     assert summary["failing"] == [GateName.SCOPE_CONTAINED.value]
+    assert summary["for_reviewer"] == []
     wakes = client.get("/v1/wakes").json()["items"]
     assert any(w["reason"] == "pre_pr_gates_failed" for w in wakes)
+
+
+async def test_advisory_failures_reach_the_review_and_are_listed_for_the_reviewer(
+    client: TestClient, supervisor: Supervisor, provider: FakeProvider
+) -> None:
+    """ADR 0024 (FDY-0138): a worker that changed a file outside allowed_paths (not
+    prohibited) and left `risks` out of its report reaches awaiting_internal_review,
+    and both are listed for the reviewer in the task view, the gate list, and the wake."""
+    report = judgement_only()
+    del report["risks"]
+    provider.set_report("EX-0001", report)
+    task_id = submit_and_start(
+        client, "crucible-worker:fake-out-of-scope", deliverables=ARTIFACTS_DELIVERABLE
+    )
+    assert await run_to_settled(supervisor, client, task_id) == "awaiting_internal_review"
+
+    view = client.get(f"/v1/tasks/{task_id}").json()
+    summary = view["gate_summary"]
+    assert summary["failing"] == []
+    assert summary["results"][GateName.SCOPE_CONTAINED] == "fail"
+    assert summary["results"][GateName.REPORT_PRESENT] == "fail"
+    assert summary["classification"][GateName.SCOPE_CONTAINED] == "advisory"
+    assert summary["classification"][GateName.REPORT_PRESENT] == "advisory"
+    assert summary["classification"][GateName.VERIFICATION_RAN] == "blocking"
+    listed = {item["gate"]: item["detail"] for item in summary["for_reviewer"]}
+    assert "infrastructure/outside-the-contract.txt" in listed[GateName.SCOPE_CONTAINED]
+    assert "did not parse" in listed[GateName.REPORT_PRESENT]
+
+    gate_list = client.get(f"/v1/attempts/{view['latest_attempt']['id']}/gates").json()
+    assert {i["gate"] for i in gate_list["for_reviewer"]} >= {
+        GateName.SCOPE_CONTAINED.value,
+        GateName.REPORT_PRESENT.value,
+    }
+    classes = {row["gate"]: row["classification"] for row in gate_list["items"]}
+    assert classes[GateName.SCOPE_CONTAINED] == "advisory"
+    assert classes[GateName.NO_SECRETS] == "blocking"
+    errors = client.get(f"/v1/attempts/{view['latest_attempt']['id']}").json()["report"][
+        "parse_errors"
+    ]
+    assert [".".join(e["loc"]) for e in errors] == ["risks"]
+
+    [wake] = [
+        w
+        for w in client.get("/v1/wakes").json()["items"]
+        if w["reason"] == "internal_review_needed" and w["task_id"] == task_id
+    ]
+    listed_in_wake = {i["gate"] for i in wake["payload"]["for_reviewer"]}
+    assert listed_in_wake >= {"scope_contained", "report_present"}
+    assert "For the reviewer: " in wake["summary"]
+    assert "infrastructure/outside-the-contract.txt" in wake["summary"]
+
+    # The review is the enforcement: once it is recorded the task moves on.
+    assert await review_and_settle(supervisor, client, task_id) == "awaiting_acceptance"
 
 
 @pytest.mark.parametrize(
@@ -164,7 +225,7 @@ async def test_correction_loop_from_pre_pr_gates_failed(
     client: TestClient, supervisor: Supervisor
 ) -> None:
     task_id = submit_and_start(
-        client, "crucible-worker:fake-out-of-scope", deliverables=ARTIFACTS_DELIVERABLE
+        client, "crucible-worker:fake-prohibited-path", deliverables=ARTIFACTS_DELIVERABLE
     )
     assert await run_to_settled(supervisor, client, task_id) == "pre_pr_gates_failed"
     failed_head = client.get(f"/v1/tasks/{task_id}").json()["head_sha"]
@@ -219,7 +280,7 @@ async def test_needs_more_work_then_a_correction(
 async def test_a_correction_that_widens_scope_is_refused(
     client: TestClient, supervisor: Supervisor
 ) -> None:
-    task_id = submit_and_start(client, "crucible-worker:fake-out-of-scope")
+    task_id = submit_and_start(client, "crucible-worker:fake-prohibited-path")
     await run_to_settled(supervisor, client, task_id)
     document = correction_document(client, task_id, image="crucible-worker:fake-succeed")
     document["scope"] = {**document["scope"], "allowed_paths": ["**"]}

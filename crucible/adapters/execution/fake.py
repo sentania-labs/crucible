@@ -17,6 +17,9 @@ optionally followed by `-<n>` observations before the scripted exit. Behaviors:
 - review             exit 0 with a valid ReviewReportV1 (used by a `review` execution)
 - review-disapprove  exit 0 with a ReviewReportV1 whose verdict is request_changes
 - out-of-scope       exit 0 with a report, but the diff touches a path outside allowed_paths
+                     (advisory by default, ADR 0024: the task goes on to its review)
+- prohibited-path    exit 0 with a report, but the diff touches a path matching
+                     prohibited_paths, which always stops the task (ADR 0024)
 - injected           exit 0 with a report, but the branch carries a `.crucible/` path
 - secret-leak        exit 0 with a report, but the scanner matches a credential shape
 - no-commits         exit 0 with a report, but the collected branch has no commit
@@ -96,6 +99,7 @@ Behavior = Literal[
     "review",
     "review-disapprove",
     "out-of-scope",
+    "prohibited-path",
     "injected",
     "secret-leak",
     "no-commits",
@@ -120,6 +124,7 @@ BEHAVIORS: frozenset[str] = frozenset(
         "review",
         "review-disapprove",
         "out-of-scope",
+        "prohibited-path",
         "injected",
         "secret-leak",
         "no-commits",
@@ -134,6 +139,7 @@ REPORTING_BEHAVIORS: frozenset[str] = frozenset(
     {
         "succeed",
         "out-of-scope",
+        "prohibited-path",
         "injected",
         "secret-leak",
         "no-commits",
@@ -144,6 +150,8 @@ REPORTING_BEHAVIORS: frozenset[str] = frozenset(
 REVIEW_BEHAVIORS: frozenset[str] = frozenset({"review", "review-disapprove"})
 
 OUT_OF_SCOPE_PATH = "infrastructure/outside-the-contract.txt"
+# Under the test contract's `.github/**` prohibition and outside every CI path.
+PROHIBITED_PATH = ".github/CODEOWNERS"
 INJECTED_PATH = ".crucible/identity.md"
 
 
@@ -164,6 +172,8 @@ def changed_paths(contract: dict[str, Any], behavior: str) -> tuple[str, ...]:
     paths = [_concrete(p) for p in allowed[:2]] or ["src/fake_change.py"]
     if behavior == "out-of-scope":
         paths.append(OUT_OF_SCOPE_PATH)
+    if behavior == "prohibited-path":
+        paths.append(PROHIBITED_PATH)
     if behavior == "injected":
         paths.append(INJECTED_PATH)
     return tuple(dict.fromkeys(paths))
