@@ -14,6 +14,7 @@ import re
 import subprocess
 import time
 from dataclasses import replace
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
@@ -2642,21 +2643,8 @@ async def test_fdy_0140_a_silent_worker_is_not_stalled_and_uncommitted_edits_are
         engine, migrated, artifact_root, provider, registry, version=40, stall_seconds=(2, 6)
     )
     headers = {"Authorization": f"Bearer {tokens['operator']}"}
+    done = {"awaiting_internal_review", "pre_pr_gates_failed"}
     with TestClient(app, headers=headers) as client:
-        silent = _kind_task(
-            client,
-            ctx,
-            "fdy-0140-silent",
-            _origin("fdy-0140-silent", "silent-work", extra={"e2e-silent-seconds": "20\n"}),
-            version=40,
-        )
-        uncommitted = _kind_task(
-            client,
-            ctx,
-            "fdy-0140-uncommitted",
-            _origin("fdy-0140-uncommitted", "no-commit"),
-            version=40,
-        )
         supervisor = Supervisor(
             ctx.uow_factory,
             {"kubernetes": provider},
@@ -2667,20 +2655,38 @@ async def test_fdy_0140_a_silent_worker_is_not_stalled_and_uncommitted_edits_are
             grace_seconds=5,
             harnesses=harnesses,
         )
-        done = {"awaiting_internal_review", "pre_pr_gates_failed"}
-        for task_id in (silent, uncommitted):
-            await run_until(supervisor, client, task_id, done, max_ticks=120, pause=0.5)
+        # One at a time, so another task's collection never holds the tick while the
+        # silent worker needs observing.
+        silent = _kind_task(
+            client,
+            ctx,
+            "fdy-0140-silent",
+            _origin("fdy-0140-silent", "silent-work", extra={"e2e-silent-seconds": "20\n"}),
+            version=40,
+        )
+        await run_until(supervisor, client, silent, done, max_ticks=120, pause=0.5)
+        uncommitted = _kind_task(
+            client,
+            ctx,
+            "fdy-0140-uncommitted",
+            _origin("fdy-0140-uncommitted", "no-commit"),
+            version=40,
+        )
+        await run_until(supervisor, client, uncommitted, done, max_ticks=120, pause=0.5)
         await supervisor.stop()
 
-        silent_attempt = client.get(f"/v1/tasks/{silent}").json()["latest_attempt"]
+        silent_id = client.get(f"/v1/tasks/{silent}").json()["latest_attempt"]["id"]
+        silent_attempt = client.get(f"/v1/attempts/{silent_id}").json()
         assert silent_attempt["termination_reason"] is None, silent_attempt
         assert silent_attempt["exit_class"] == "completed", silent_attempt
         assert "worker_stalled" not in event_kinds(client, silent)
         with ctx.uow_factory() as uow:
-            signals = [
-                h.signal
-                for h in uow.heartbeats.list_for_attempt(silent_attempt["id"], limit=10_000)
-            ]
+            signals = [h.signal for h in uow.heartbeats.list_for_attempt(silent_id, limit=10_000)]
+            stamps = [c.ts for c in uow.logs.list_for_attempt(silent_id, limit=500)]
+        # The log itself was silent for longer than the 6 s fail limit, and what kept the
+        # worker alive meanwhile was its files changing.
+        gaps = [(later - earlier).total_seconds() for earlier, later in pairwise(stamps)]
+        assert max(gaps) >= 15, gaps
         assert signals.count("fs_changed") >= 3, signals
 
         attempt = client.get(f"/v1/tasks/{uncommitted}").json()["latest_attempt"]
