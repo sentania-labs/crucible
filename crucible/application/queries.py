@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from crucible.application.errors import NotFoundError
+from crucible.application.publish import publishing_waits
 from crucible.contracts.api import (
     AcceptanceView,
     ArtifactList,
@@ -491,6 +492,9 @@ def _github_status(uow: UnitOfWork) -> dict[str, Any]:
         "last_poll_at": last_poll.isoformat() if last_poll else None,
         "deliveries_pending": uow.github_deliveries.count_unprocessed(),
         "reactions_unobservable": unobservable,
+        # hades FDY-0133: each task in `publishing` whose publication cannot start, and
+        # the reason the supervisor recorded, so a stuck task is never silent.
+        "publishing_waiting": publishing_waits(uow),
     }
 
 

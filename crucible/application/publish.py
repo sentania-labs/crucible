@@ -22,16 +22,18 @@ from __future__ import annotations
 import hashlib
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from crucible.application.decisions import open_escalation
 from crucible.application.transitions import move_task, record_event
 from crucible.application.wakes import create_wake
 from crucible.contracts.evidence import EvidenceKind
 from crucible.contracts.wake import WakeReason
 from crucible.domain.entities import (
     Attempt,
+    EscalationState,
     Execution,
     ExternalReviewCycle,
     PullRequest,
@@ -367,6 +369,129 @@ def record_token_minted(
             "note": "the token value is in memory and the publisher's tmpfs only (12)",
         },
     )
+
+
+def _publishing_entry(uow: UnitOfWork, task: Task) -> tuple[int, datetime]:
+    """When the task last entered `publishing`: the event's sequence and time. A task
+    with no such event (it cannot happen through the API) counts from its last update."""
+    entered = uow.events.latest_for_task_kind(task.id, EventKind.TASK_PUBLISHING.value)
+    if entered is None:
+        return 0, task.updated_at
+    return int(entered.seq or 0), entered.ts
+
+
+def _current_hold(uow: UnitOfWork, task: Task, entered_seq: int) -> dict[str, Any] | None:
+    """The `task_publish_pending` record of this entry into `publishing`, if the
+    publication is still waiting: none has started since it was written."""
+    pending = uow.events.latest_for_task_kind(task.id, EventKind.TASK_PUBLISH_PENDING.value)
+    if pending is None or int(pending.seq or 0) <= entered_seq:
+        return None
+    started = uow.events.latest_for_task_kind(task.id, EventKind.PUBLISH_STARTED.value)
+    if started is not None and int(started.seq or 0) > int(pending.seq or 0):
+        return None
+    return dict(pending.payload)
+
+
+def hold_publishing(
+    uow: UnitOfWork, clock: Clock, task: Task, *, reason: str, escalate_after_seconds: int
+) -> bool:
+    """A task in `publishing` whose publication cannot start, and why (hades FDY-0133).
+
+    The reason is recorded once per entry into `publishing`, and again only when it
+    changes, as a `task_publish_pending` event the task's events, `GET /v1/supervisor`
+    and the admin UI's task list all read. Once the task has waited
+    `escalate_after_seconds` (the publisher's own time limit: a push that could have
+    finished in that time has not started) an escalation is opened on the existing path,
+    once, with a wake. Returns True when a new reason was recorded, so the caller logs it
+    once per task rather than once per tick."""
+    entered_seq, entered_at = _publishing_entry(uow, task)
+    hold = _current_hold(uow, task, entered_seq)
+    escalation_id = str((hold or {}).get("escalation_id") or "")
+    recorded = False
+    payload: dict[str, Any] = {
+        "reason": reason,
+        "waiting_since": entered_at.isoformat(),
+        "escalate_after_seconds": escalate_after_seconds,
+    }
+    if hold is None or hold.get("reason") != reason:
+        if escalation_id:
+            payload["escalation_id"] = escalation_id
+        record_event(
+            uow,
+            clock,
+            EventKind.TASK_PUBLISH_PENDING,
+            principal=PRINCIPAL_CRUCIBLE,
+            task_id=task.id,
+            payload=payload,
+        )
+        recorded = True
+    if not escalation_id and clock.now() - entered_at >= timedelta(seconds=escalate_after_seconds):
+        minutes = max(1, escalate_after_seconds // 60)
+        escalation = open_escalation(
+            uow,
+            clock,
+            task=task,
+            attempt_id=None,
+            question=(
+                f"publication has not started after {minutes} minute(s) in publishing: {reason}"
+            )[:2000],
+            wake_reason=WakeReason.PUBLISH_FAILED,
+            summary=f"publication has not started: {reason}"[:500],
+        )
+        record_event(
+            uow,
+            clock,
+            EventKind.TASK_PUBLISH_PENDING,
+            principal=PRINCIPAL_CRUCIBLE,
+            task_id=task.id,
+            payload={**payload, "escalation_id": escalation.id},
+        )
+    return recorded
+
+
+def release_publishing_hold(uow: UnitOfWork, clock: Clock, task: Task) -> None:
+    """Publication started: an escalation the wait opened is closed, since what it asked
+    about is over. Called before `publish_started` is recorded."""
+    entered_seq, _ = _publishing_entry(uow, task)
+    hold = _current_hold(uow, task, entered_seq)
+    escalation_id = str((hold or {}).get("escalation_id") or "")
+    if not escalation_id:
+        return
+    escalation = uow.escalations.get(escalation_id, for_update=True)
+    if escalation is None or escalation.state is not EscalationState.OPEN:
+        return
+    escalation.state = EscalationState.CLOSED
+    escalation.closed_at = clock.now()
+    uow.escalations.save(escalation)
+    record_event(
+        uow,
+        clock,
+        EventKind.ESCALATION_CLOSED,
+        principal=PRINCIPAL_CRUCIBLE,
+        task_id=task.id,
+        payload={"escalation_id": escalation.id, "reason": "publication started"},
+    )
+
+
+def publishing_waits(uow: UnitOfWork) -> list[dict[str, Any]]:
+    """Every task in `publishing` whose publication is waiting, with the recorded reason.
+    What `GET /v1/supervisor` and the admin UI show; empty when nothing waits."""
+    out: list[dict[str, Any]] = []
+    for task in uow.tasks.list_by_state(TaskState.PUBLISHING):
+        entered_seq, _ = _publishing_entry(uow, task)
+        hold = _current_hold(uow, task, entered_seq)
+        if hold is None:
+            continue
+        out.append(
+            {
+                "task_id": task.id,
+                "external_id": task.external_id,
+                "reason": str(hold.get("reason") or ""),
+                "waiting_since": hold.get("waiting_since"),
+                "escalation_id": hold.get("escalation_id"),
+            }
+        )
+    return out
 
 
 def fail_publish(

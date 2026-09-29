@@ -408,6 +408,7 @@ def _supervisor_document(
         wakes=SimpleNamespace(count_unacked=lambda: 0),
         pull_requests=SimpleNamespace(list_in_states=lambda _states: []),
         github_deliveries=SimpleNamespace(count_unprocessed=lambda: 0),
+        tasks=SimpleNamespace(list_by_state=lambda _state: []),
     )
     return supervisor_view(uow, [], NOW, 30).model_dump(mode="json")
 

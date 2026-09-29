@@ -35,9 +35,18 @@ OPERATOR_ONLY_DECISION_KINDS = frozenset({"release_authorization"})
 
 
 def open_escalation(
-    uow: UnitOfWork, clock: Clock, *, task: Task, attempt_id: str | None, question: str
+    uow: UnitOfWork,
+    clock: Clock,
+    *,
+    task: Task,
+    attempt_id: str | None,
+    question: str,
+    wake_reason: WakeReason = WakeReason.BLOCKED,
+    summary: str | None = None,
 ) -> Escalation:
-    """09: entering `blocked` opens an escalation and creates a wake."""
+    """09: entering `blocked` opens an escalation and creates a wake. The supervisor
+    opens one the same way for a publication that cannot start (23), with its own wake
+    reason and summary."""
     now = clock.now()
     escalation = Escalation(
         id=new_id(),
@@ -62,8 +71,8 @@ def open_escalation(
         uow,
         clock,
         principal_id=task.principal_id,
-        reason=WakeReason.BLOCKED,
-        summary=f"the worker blocked and opened escalation {escalation.id}",
+        reason=wake_reason,
+        summary=summary or f"the worker blocked and opened escalation {escalation.id}",
         task=task,
         attempt_id=attempt_id,
         extra_links={"decisions": f"/v1/tasks/{task.id}/decisions"},

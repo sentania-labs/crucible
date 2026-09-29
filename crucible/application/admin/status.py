@@ -12,6 +12,7 @@ from crucible.application.admin.gateway import plain_outcome
 from crucible.application.admin.harnesses import list_images, read_harnesses
 from crucible.application.admin.providers import providers_status
 from crucible.application.admin.routing import gateway_url
+from crucible.application.publish import publishing_waits
 from crucible.application.queries import supervisor_view
 from crucible.domain.entities import Principal, Role
 from crucible.domain.lifecycle import AttemptState, TaskState
@@ -75,7 +76,13 @@ def tasks(uow: UnitOfWork, *, owner: str | None = None) -> dict[str, Any]:
                 {"id": t.id, "external_id": t.external_id, "updated_at": t.updated_at.isoformat()}
                 for t in rows
             ]
-    return {"counts": counts, "lists": lists}
+    mine = {
+        t.id
+        for t in uow.tasks.list_by_state(TaskState.PUBLISHING)
+        if owner is None or t.principal_id == owner
+    }
+    waiting = [item for item in publishing_waits(uow) if item["task_id"] in mine]
+    return {"counts": counts, "lists": lists, "publishing_waiting": waiting}
 
 
 def wakes(uow: UnitOfWork, *, owner: str | None = None) -> dict[str, Any]:
