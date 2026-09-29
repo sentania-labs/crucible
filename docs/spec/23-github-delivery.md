@@ -195,8 +195,8 @@ Polling is the complete observation path; webhooks only shorten latency.
   workflow-run lists included. A rate-limit refusal is never waited out
   inside the supervisor's tick: it is recorded (`github_rate_limited`)
   and delivery resumes on the first tick after GitHub's `retry-after` (or
-  rate-limit reset); a publication it interrupts stays in `publishing`
-  rather than failing. A CI decision or an operator waiver recorded since
+  rate-limit reset); a publication or a quota checkpoint push it
+  interrupts stays where it was rather than failing. A CI decision or an operator waiver recorded since
   the last poll makes the pull request due at once.
 - **Webhooks** (optional accelerator, off by default on a workstation;
   Q13): `POST /v1/github/webhook` accepts `pull_request`,
@@ -406,9 +406,9 @@ cycle opens on that head.
   `ci_certification.allow_no_ci: true`, an operator-recorded policy
   decision, which makes the gate `skipped` rather than passed. For one
   task, the operator's `accept_no_ci` decision (ADR 0025) does the same
-  when nothing at all has run on the accepted head; a check that does run
-  is still certified. On green the task moves to `ready_for_merge` and
-  wakes Foundry.
+  when nothing has run on the accepted head (a run a path filter skipped
+  counts as nothing); a check that does run is still certified. On green
+  the task moves to `ready_for_merge` and wakes Foundry.
 - Failed: any required check concluded `failure`, `cancelled`,
   `timed_out`, or `action_required`. Crucible captures the check name,
   workflow, job, head SHA, and the available log excerpt (through the
@@ -419,7 +419,9 @@ cycle opens on that head.
   its log is `GET /actions/jobs/{id}/logs`, and a failed workflow run is
   resolved to its first failed job. GitHub answers with a redirect to a
   signed URL on another host, which Crucible follows without sending the
-  token. It is fetched once per failed run, not on every poll.
+  token. It is fetched once per failed run, not on every poll, and a log
+  that cannot be read leaves the excerpt empty rather than failing the
+  poll.
 - Foundry's `POST /tasks/{id}/ci-decision` records the cause from the enum
   `false_pre_pr_evidence`, `wrong_sha_checked`, `correction_without_checks`,
   `environment_drift`, `flaky_test`, `crucible_verification_defect`,
@@ -427,10 +429,11 @@ cycle opens on that head.
   intent and wakes the operator to re-run it on GitHub, because re-running
   needs Actions write, which the App does not hold; 22), `correct` (a
   correction follows), `reject`, `cancel`. After `rerun` the failure the
-  decision was about is stale: a required check that concluded before the
-  decision is not counted again, the certification reads `pending` with a
-  detail that says so, and the task waits for a result that concluded
-  after the decision. A failure that concluded after it is a new failure.
+  decision was about is stale: the decision's event lists the failed runs
+  (GitHub's id and when each concluded), those runs are not counted again,
+  the certification reads `pending` with a detail that says so, and the
+  task waits for a fresh result. Any other failure, including a re-run of
+  a workflow that fails again under the same id, is a new failure.
 - A task in `ci_certification_failed` that observes a green (or skipped)
   certification on its accepted head goes back to
   `awaiting_ci_certification` and on to `ready_for_merge`: someone re-ran

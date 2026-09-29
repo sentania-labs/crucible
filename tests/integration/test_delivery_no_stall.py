@@ -25,7 +25,14 @@ from tests.fixtures import FakeClock
 from tests.integration import test_github_delivery as delivery
 from tests.integration.conftest import correction_document, event_kinds, run_to_settled
 from tests.integration.fake_github import FakeGitHubServer
-from tests.integration.test_github_delivery import REPOSITORY, REVIEWER, green, pr, publish
+from tests.integration.test_github_delivery import (
+    REPOSITORY,
+    REVIEWER,
+    gate,
+    green,
+    pr,
+    publish,
+)
 
 # The delivery tier's fixtures, shared rather than copied: the fake GitHub, the App key,
 # the client over real HTTP, the fake publisher, and the supervisor that drives them.
@@ -105,6 +112,10 @@ async def test_codex_finding_fix_correction_green_reaches_ready_for_merge(
         body="Codex Review. Reviewed commit: " + first_head,
         comments=[{"body": "P1 this is wrong", "path": "src/app.txt", "line": 1}],
     )
+    # Made on the first head, before the correction exists (the fake clock's hour).
+    github.state.repositories[REPOSITORY].pulls[1].review_comments[0]["created_at"] = (
+        BEFORE_DECISION
+    )
     await delivery_supervisor.tick()
     assert state(client, task_id) == "external_feedback_received"
     comment_id = pr(client, task_id)["comments"][0]["id"]
@@ -150,18 +161,41 @@ async def test_codex_finding_fix_correction_green_reaches_ready_for_merge(
     ]
     assert after_correction == []
 
+    # A reply on the old thread after the correction is new feedback, not settled.
+    review_id = github.state.repositories[REPOSITORY].pulls[1].reviews[0]["id"]
+    github.state.add_review_comment(
+        REPOSITORY,
+        1,
+        review_id=review_id,
+        login=REVIEWER,
+        body="P1 still wrong after the correction",
+        path="src/app.txt",
+        line=1,
+    )
+    reply = github.state.repositories[REPOSITORY].pulls[1].review_comments[-1]
+    reply["commit_id"] = first_head
+    reply["created_at"] = AFTER_DECISION
+    await delivery_supervisor.tick()
+    assert state(client, task_id) == "external_feedback_received"
+    assert gate(pr(client, task_id), "feedback_dispositions_complete") == "pending"
+
 
 # ----- 2: merged early, closed ---------------------------------------------------------
 
 
-@pytest.mark.parametrize("where", ["awaiting_external_review", "awaiting_ci_certification"])
+@pytest.mark.parametrize(
+    "where",
+    ["awaiting_external_review", "awaiting_ci_certification", "ci_certification_failed"],
+)
 async def test_an_early_merge_moves_the_task_to_merged_and_wakes_foundry(
     client: TestClient,
     delivery_supervisor: Supervisor,
     github: FakeGitHubServer,
     where: str,
 ) -> None:
-    if where == "awaiting_ci_certification":
+    if where == "ci_certification_failed":
+        task_id, _ = await failed_ci(client, delivery_supervisor, github)
+    elif where == "awaiting_ci_certification":
         task_id, _ = await green(client, delivery_supervisor, github)
     else:
         task_id, _ = await publish(client, delivery_supervisor)
@@ -286,6 +320,21 @@ async def test_accepting_no_ci_does_not_hide_a_check_that_runs(
     await delivery_supervisor.tick()
     assert state(client, task_id) == "awaiting_ci_certification"
     assert pr(client, task_id)["ci_certifications"][-1]["state"] == "pending"
+
+
+async def test_accepting_no_ci_counts_a_skipped_run_as_nothing(
+    client: TestClient,
+    operator: TestClient,
+    delivery_supervisor: Supervisor,
+    github: FakeGitHubServer,
+) -> None:
+    """A workflow a path filter skipped is no CI for this change."""
+    task_id, view = await green(client, delivery_supervisor, github)
+    github.state.set_check(REPOSITORY, view["head_sha"], name="docs-only", conclusion="skipped")
+    response = waive(operator, task_id, "accept_no_ci", "Only a skipped workflow here.")
+    assert response.status_code == 201, response.text
+    await delivery_supervisor.tick()
+    assert state(client, task_id) == "ready_for_merge"
 
 
 async def test_a_waiver_is_refused_outside_a_delivery_wait(
@@ -421,6 +470,28 @@ async def test_a_rerun_that_fails_again_is_a_new_failure(
     assert len(wakes(client, "ci_certification_failed")) == 2
 
 
+async def test_a_different_failure_after_a_rerun_decision_counts(
+    client: TestClient, delivery_supervisor: Supervisor, github: FakeGitHubServer
+) -> None:
+    """Staleness is about the runs the decision named, not a clock: a run the decision
+    never saw is a new failure even if GitHub says it concluded earlier."""
+    task_id, head = await failed_ci(client, delivery_supervisor, github)
+    client.post(
+        f"/v1/tasks/{task_id}/ci-decision",
+        json={"cause": "flaky_test", "action": "rerun", "reasoning": "A known flake."},
+    )
+    github.state.rerun_check(
+        REPOSITORY,
+        head,
+        name="build",
+        run_id="7006",
+        conclusion="failure",
+        completed_at=BEFORE_DECISION,
+    )
+    await delivery_supervisor.tick()
+    assert state(client, task_id) == "ci_certification_failed"
+
+
 async def test_a_green_certification_moves_a_failed_task_on(
     client: TestClient, delivery_supervisor: Supervisor, github: FakeGitHubServer
 ) -> None:
@@ -491,6 +562,23 @@ async def test_the_ci_log_excerpt_follows_the_redirect_once(
     assert github.state.log_download_authorized is False
     calls = [path for _, path in github.state.calls]
     assert calls.count(f"/repos/{REPOSITORY}/actions/jobs/7001/logs") == 1
+
+
+async def test_a_failed_workflow_run_logs_its_failed_job(
+    client: TestClient, delivery_supervisor: Supervisor, github: FakeGitHubServer
+) -> None:
+    task_id, view = await green(client, delivery_supervisor, github)
+    github.state.repositories[REPOSITORY].required_checks = ["ci"]
+    github.state.set_workflow_run(
+        REPOSITORY, view["head_sha"], name="ci", conclusion="failure", run_id="5151"
+    )
+    await delivery_supervisor.tick()
+    await delivery_supervisor.tick()
+    assert state(client, task_id) == "ci_certification_failed"
+    failure = pr(client, task_id)["ci_certifications"][-1]["failure"]
+    assert failure["source"] == "workflow_run"
+    assert "the required check failed" in failure["log_excerpt"]
+    assert github.state.log_downloads == ["/_signed-logs/job/515101"]
 
 
 async def test_comment_reactions_are_fetched_only_when_there_are_some(

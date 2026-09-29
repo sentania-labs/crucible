@@ -382,9 +382,12 @@ class RestGitHubClient:
             if exc.response_class == "rate_limited":
                 raise
             return b""
+        except Exception as exc:  # best effort: an excerpt never fails the poll
+            log.warning("ci failure log unreadable", extra={"error": type(exc).__name__})
+            return b""
         if status >= 400 or not isinstance(payload, bytes):
             return b""
-        return payload[-limit_bytes:]
+        return payload[-max(1, limit_bytes) :]
 
     # ----- mutations ----------------------------------------------------
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from http.client import IncompleteRead
 from typing import Any
 
 import pytest
@@ -107,6 +108,23 @@ def test_a_log_download_sends_no_token_and_keeps_the_tail() -> None:
     tail = transport.download("http://127.0.0.1:9/_signed/job/1?sig=x", limit_bytes=24)
     assert tail == body[-24:]
     assert "Authorization" not in seen[0]["headers"]
+
+
+class _Dropped(_Answer):
+    def read(self, size: int = -1) -> bytes:
+        raise IncompleteRead(b"partial")
+
+
+def test_a_log_download_cut_off_partway_is_a_github_error_not_a_crash() -> None:
+    """IncompleteRead is not an OSError; it must not escape into the supervisor's tick."""
+    seen: list[dict[str, Any]] = []
+    transport = RestTransport(
+        "http://127.0.0.1:9",
+        connection_factory=lambda host, port, timeout: _Dropped(seen, 200, b""),
+    )
+    with pytest.raises(GitHubError) as caught:
+        transport.download("http://127.0.0.1:9/_signed/job/1", limit_bytes=10)
+    assert caught.value.response_class == "transport"
 
 
 def test_a_log_redirect_to_plain_http_elsewhere_is_refused() -> None:

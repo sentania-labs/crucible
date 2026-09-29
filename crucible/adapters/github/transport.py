@@ -20,7 +20,7 @@ import json
 import logging
 import time
 from collections.abc import Callable, Mapping
-from http.client import HTTPConnection, HTTPSConnection
+from http.client import HTTPConnection, HTTPException, HTTPSConnection
 from typing import Any
 from urllib.parse import urlencode, urlsplit
 
@@ -215,6 +215,7 @@ class RestTransport:
             else HTTPSConnection(host, port, timeout=self.timeout)
         )
         target = parts.path + (f"?{parts.query}" if parts.query else "")
+        limit = max(1, limit_bytes)
         tail = b""
         try:
             conn.request("GET", target, headers={"User-Agent": USER_AGENT})
@@ -224,8 +225,10 @@ class RestTransport:
                 chunk = response.read(DOWNLOAD_CHUNK)
                 if not chunk:
                     break
-                tail = (tail + chunk)[-limit_bytes:]
-        except OSError as exc:
+                tail = (tail + chunk)[-limit:]
+        except (OSError, HTTPException) as exc:
+            # A connection the log host drops partway (IncompleteRead) is a failed read
+            # like any other, never an exception that escapes the tick.
             raise GitHubError(
                 0, f"{type(exc).__name__}: {exc}", path="[redirect]", response_class="transport"
             ) from exc

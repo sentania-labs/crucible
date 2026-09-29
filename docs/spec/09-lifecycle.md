@@ -107,11 +107,13 @@ policy has `retrigger_after_correction: false` and `required_rounds: 1`,
 the second pass through `publishing` lands in `awaiting_ci_certification`,
 never back in `awaiting_external_review`.
 
-Once the corrected head is the accepted head, review feedback on the heads
-Crucible pushed before it is **settled**: the correction is the answer to
-it, so a `fix` disposition on it no longer holds the task, and a comment on
-it asks for no disposition. Dispositions stay add-only; nothing is deleted.
-Feedback on the accepted head itself still needs one. A head someone else
+Once the corrected head is the accepted head, review feedback made on the
+heads Crucible pushed before it, before the corrected head appeared, is
+**settled**: the correction is the answer to it, so a `fix` disposition on
+it no longer holds the task, and a comment on it asks for no disposition.
+Dispositions stay add-only; nothing is deleted. Feedback on the accepted
+head itself still needs one, and so does a comment made after the
+corrected head appeared, even as a reply on an old thread. A head someone else
 pushed is never settled this way; it goes through `head_diverged`.
 
 **Every state after `publishing` is bound to the accepted head.** Gate

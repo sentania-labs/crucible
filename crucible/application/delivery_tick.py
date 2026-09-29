@@ -202,8 +202,15 @@ class DeliveryCoordinator:
                 done += 1
         return done
 
-    async def push_quota_checkpoint(self, attempt_id: str, *, required: bool) -> tuple[bool, str]:
-        """Push a collected quota checkpoint without opening or updating a pull request."""
+    async def push_quota_checkpoint(
+        self, attempt_id: str, *, required: bool
+    ) -> tuple[bool, str] | None:
+        """Push a collected quota checkpoint without opening or updating a pull request.
+
+        None while GitHub's rate limit says to wait: the checkpoint stays pending for a
+        later tick rather than failing (hades FDY-0139)."""
+        if self._rate_limited():
+            return None
         if self._github is None or self._publisher is None or not await self._github_ready_async():
             if required:
                 return False, "the GitHub publisher is not configured"
@@ -236,6 +243,9 @@ class DeliveryCoordinator:
             await self._host._db(lambda: self._record_pushed(plan, remote))
             return True, "checkpoint pushed"
         except GitHubError as exc:
+            if exc.response_class == "rate_limited":
+                self._defer_for_rate_limit(exc)
+                return None
             return False, redact(exc.message)
         except Exception as exc:
             return False, redact(f"{type(exc).__name__}: {exc}")
@@ -721,7 +731,7 @@ class DeliveryCoordinator:
             return None
         failure = certification.failure
         run_id = str(failure.get("run_id", ""))
-        if not run_id or failure.get("log_excerpt"):
+        if not run_id or failure.get("log_excerpt") or failure.get("log_fetched"):
             return None
         return str(failure.get("source") or "check_run"), run_id
 
@@ -780,7 +790,8 @@ class DeliveryCoordinator:
         finally:
             if token is not None:
                 token.discard()
-        await self._host._db(lambda: self._apply(plan, observation, excerpt))
+        fetched = plan.failed_check is not None
+        await self._host._db(lambda: self._apply(plan, observation, excerpt, fetched))
         return True
 
     def _record_rate_limited(self, task_id: str, exc: GitHubError) -> None:
@@ -820,7 +831,7 @@ class DeliveryCoordinator:
             )
             uow.commit()
 
-    def _apply(self, plan: PollPlan, observation: Any, excerpt: str) -> None:
+    def _apply(self, plan: PollPlan, observation: Any, excerpt: str, fetched: bool) -> None:
         with self._host._fenced() as uow:
             task = uow.tasks.get(plan.task_id, for_update=True)
             pull_request = uow.pull_requests.get(plan.pull_request_id, for_update=True)
@@ -836,6 +847,7 @@ class DeliveryCoordinator:
                 attempt_id=plan.attempt_id,
                 with_reactions=plan.with_reactions,
                 log_excerpt=excerpt,
+                log_fetched=fetched,
             )
             uow.commit()
 

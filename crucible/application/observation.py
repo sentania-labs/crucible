@@ -32,7 +32,6 @@ from crucible.domain.certification import (
 from crucible.domain.entities import (
     CIAction,
     CICertification,
-    CIDecision,
     Decision,
     DispositionKind,
     ExternalReview,
@@ -139,22 +138,46 @@ def accepted_head(uow: UnitOfWork, task: Task) -> str:
     return task.head_sha or ""
 
 
-def replaced_heads(uow: UnitOfWork, task: Task, pull_request: PullRequest) -> frozenset[str]:
-    """Heads Crucible pushed to this pull request that a later accepted head replaced.
+@dataclass(frozen=True, slots=True)
+class ReplacedHeads:
+    """Heads Crucible pushed to this pull request that the accepted head replaced, and
+    when the accepted head first appeared on it.
 
-    hades FDY-0139: feedback on one of these is settled. A `fix` disposition is Foundry
-    saying the work is not done; the correction that follows is the answer, and once its
-    head is the accepted one, the comments on the head it replaced ask nothing more.
-    Without this a `fix` held the task for ever, because dispositions are add-only and
-    the comments stay on the pull request. A head someone else pushed is never in this
-    set: it went through `head_diverged` and was never Crucible's to settle."""
+    hades FDY-0139: feedback on a replaced head is settled. A `fix` disposition is
+    Foundry saying the work is not done; the correction that follows is the answer, and
+    once its head is the accepted one, the comments made on the head it replaced ask
+    nothing more. Without this a `fix` held the task for ever, because dispositions are
+    add-only and the comments stay on the pull request. Only a comment made before the
+    accepted head appeared is settled: a reply on an old thread after the correction is
+    new feedback, whatever head its thread started on. A head someone else pushed is
+    never in the set: it went through `head_diverged` and was never Crucible's to
+    settle."""
+
+    heads: frozenset[str] = frozenset()
+    since: datetime | None = None
+
+    def settles(self, reviewed_sha: str | None, created_at: datetime) -> bool:
+        return (
+            self.since is not None
+            and bool(reviewed_sha)
+            and reviewed_sha in self.heads
+            and created_at < self.since
+        )
+
+
+def replaced_heads(uow: UnitOfWork, task: Task, pull_request: PullRequest) -> ReplacedHeads:
     head = accepted_head(uow, task)
     if not head:
-        return frozenset()
-    return frozenset(
-        row.sha
+        return ReplacedHeads()
+    rows = [
+        row
         for row in uow.pull_request_heads.list_for_pull_request(pull_request.id)
-        if row.pushed_by is PushedBy.CRUCIBLE and row.sha != head
+        if row.pushed_by is PushedBy.CRUCIBLE
+    ]
+    since = min((row.observed_at for row in rows if row.sha == head), default=None)
+    return ReplacedHeads(
+        heads=frozenset(row.sha for row in rows if row.sha != head),
+        since=since,
     )
 
 
@@ -448,7 +471,7 @@ def record_comments(
     observation: Observation,
     allowlist: frozenset[str],
     result: ObservationResult,
-    replaced: frozenset[str] = frozenset(),
+    replaced: ReplacedHeads | None = None,
 ) -> list[Signal]:
     """Store review comments and issue comments, updating one edited in place.
 
@@ -460,6 +483,7 @@ def record_comments(
     correction replaced is recorded and settled, so it does not count either."""
     signals: list[Signal] = []
     now = clock.now()
+    settled = replaced or ReplacedHeads()
     for comment in (*observation.review_comments, *observation.issue_comments):
         existing = uow.review_comments.get_by_github(
             pull_request.id, comment.kind, comment.github_id
@@ -470,7 +494,7 @@ def record_comments(
                 body_changed = existing.body_sha256 != digest
                 disposition_invalidated = False
                 if body_changed and comment.login in allowlist and comment.kind == "review_comment":
-                    if (existing.reviewed_sha or "") not in replaced:
+                    if not settled.settles(existing.reviewed_sha, existing.created_at):
                         result.edited_feedback += 1
                         result.new_comments += 1
                     old_disposition = uow.dispositions.get_by_comment(
@@ -557,7 +581,7 @@ def record_comments(
         if (
             comment.kind == "review_comment"
             and comment.login in allowlist
-            and (comment.commit_id or "") not in replaced
+            and not settled.settles(comment.commit_id, comment.created_at)
         ):
             # Only what the dispositions gate counts: a comment from another login, a
             # standalone issue comment, or one on a head a correction replaced, is
@@ -759,45 +783,53 @@ def _parse_iso(value: object) -> datetime | None:
         return None
 
 
-def pending_rerun(
-    uow: UnitOfWork,
-    task: Task,
-    *,
-    head_sha: str,
-    failed_at: list[datetime | None],
-) -> CIDecision | None:
-    """The re-run decision these failures are stale under, or None (hades FDY-0139).
+# A failed run as a re-run decision names it: GitHub's id and when it concluded. A
+# re-run of a job is a new id; a re-run of a workflow keeps the id and concludes later.
+FailedRun = tuple[str, str | None]
 
-    A `rerun` decision is about the failure it was recorded for. Until GitHub reports a
-    result that concluded after the decision, the old failure is not counted again:
-    otherwise the task went straight back to `ci_certification_failed` on the next poll,
-    before anyone could re-run anything. A failure with no conclusion time is taken as
-    the old one; the certification timeout still wakes Foundry if nothing new arrives."""
-    decisions = list(uow.ci_decisions.list_for_task(task.id))
-    if not decisions or decisions[-1].action != CIAction.RERUN.value:
+
+def pending_rerun(
+    uow: UnitOfWork, task: Task, *, head_sha: str, failures: list[FailedRun]
+) -> str | None:
+    """The id of the re-run decision these failures are stale under, or None.
+
+    hades FDY-0139: a `rerun` decision is about the failures it was recorded for, which
+    its event lists. While those are still what GitHub shows, they are not counted
+    again: otherwise the task went straight back to `ci_certification_failed` on the
+    next poll, before anyone could re-run anything. Any other failure is a new one. A
+    decision whose event lists no failures is judged by time: a failure that concluded
+    before it is the old one."""
+    event = uow.events.latest_for_task_kind(task.id, EventKind.CI_DECISION_RECORDED.value)
+    if event is None:
         return None
-    decision = decisions[-1]
-    decided_head = next(
-        (
-            row.head_sha
-            for row in uow.ci_certifications.list_for_task(task.id)
-            if row.id == decision.ci_certification_id
-        ),
-        None,
-    )
-    if decided_head != head_sha:
+    payload = event.payload
+    if payload.get("action") != CIAction.RERUN.value or payload.get("head_sha") != head_sha:
         return None
-    if all(at is None or at <= decision.created_at for at in failed_at):
-        return decision
+    decision_id = str(payload.get("ci_decision_id", ""))
+    listed = payload.get("stale_failures")
+    if isinstance(listed, list) and listed:
+        known = {
+            (str(item.get("run_id") or ""), item.get("completed_at"))
+            for item in listed
+            if isinstance(item, dict)
+        }
+        return decision_id if all(run in known for run in failures) else None
+    concluded = [_parse_iso(at) for _, at in failures]
+    if all(at is None or at <= event.ts for at in concluded):
+        return decision_id
     return None
 
 
-def certification_failed_at(certification: CICertification) -> list[datetime | None]:
-    """When each failure recorded on a stored certification concluded."""
+def certification_failures(certification: CICertification) -> list[FailedRun]:
+    """The failed runs a stored certification recorded."""
     rows = certification.failure.get("all")
     if not isinstance(rows, list):
-        return [None]
-    return [_parse_iso(row.get("completed_at")) for row in rows if isinstance(row, dict)] or [None]
+        return [(str(certification.failure.get("run_id", "")), None)]
+    return [
+        (str(row.get("run_id") or ""), row.get("completed_at"))
+        for row in rows
+        if isinstance(row, dict)
+    ]
 
 
 def certify_head(
@@ -810,6 +842,7 @@ def certify_head(
     policy: dict[str, Any],
     head_sha: str,
     log_excerpt: str = "",
+    log_fetched: bool = False,
 ) -> CICertification:
     """Compute and record the certification for the accepted head (23, ADR 0009).
 
@@ -844,42 +877,49 @@ def certify_head(
                     "check": c.name,
                     "conclusion": c.conclusion,
                     "url": c.url,
+                    "run_id": c.external_id,
                     "completed_at": _iso(c.completed_at),
                 }
                 for c in outcome.failures
             ],
         }
-        # The excerpt is fetched once per failed run, not on every poll; the stored one is
-        # kept while the same run is still the failure.
-        if (
-            not log_excerpt
-            and previous is not None
-            and previous.failure.get("run_id") == first.external_id
-        ):
+        # The excerpt is fetched once per failed run, not on every poll, even when it
+        # came back empty; the stored one is kept while the same run is the failure.
+        same_run = previous is not None and previous.failure.get("run_id") == first.external_id
+        if not log_fetched and previous is not None and same_run:
             log_excerpt = str(previous.failure.get("log_excerpt", ""))
+            log_fetched = bool(previous.failure.get("log_fetched"))
         if log_excerpt:
             failure["log_excerpt"] = log_excerpt
+        if log_fetched:
+            failure["log_fetched"] = True
         rerun = pending_rerun(
             uow,
             task,
             head_sha=head_sha,
-            failed_at=[c.completed_at for c in outcome.failures],
+            failures=[(c.external_id, _iso(c.completed_at)) for c in outcome.failures],
         )
         if rerun is not None:
             state = CertificationState.PENDING
             names = ", ".join(sorted({c.name for c in outcome.failures}))
             detail = (
-                f"a CI re-run was decided (ci decision {rerun.id}); the failure it was about "
+                f"a CI re-run was decided (ci decision {rerun}); the failure it was about "
                 f"({names}) is not counted again. Waiting for a result on {head_sha} that "
-                "concluded after the decision"
+                "is not the one the decision was about"
             )
-            failure["stale_after_rerun"] = rerun.id
-    elif state is CertificationState.PENDING and not outcome.required:
+            failure["stale_after_rerun"] = rerun
+    elif state is CertificationState.PENDING:
         waiver = task_waivers(uow, task).get(ACCEPT_NO_CI)
-        on_head = [
-            c for c in checks if c.head_sha == head_sha and c.source is not CheckSource.CHECK_SUITE
+        # Nothing ran: no check run or workflow run on the head, a suite being only a
+        # container and a run a path filter skipped being no run at all.
+        ran = [
+            c
+            for c in checks
+            if c.head_sha == head_sha
+            and c.source is not CheckSource.CHECK_SUITE
+            and not (c.concluded and c.conclusion == "skipped")
         ]
-        if waiver is not None and not on_head:
+        if waiver is not None and not ran:
             state = CertificationState.SKIPPED
             detail = (
                 f"the operator accepted that this repository has no CI for this task "
@@ -1085,14 +1125,14 @@ def evaluate_delivery_gates(
         list(uow.review_comments.list_for_pull_request(pull_request.id)) if pull_request else []
     )
     allowlist = reviewer_logins(policy)
-    replaced = replaced_heads(uow, task, pull_request) if pull_request else frozenset()
+    replaced = replaced_heads(uow, task, pull_request) if pull_request else ReplacedHeads()
     feedback = [c for c in comments if c.login in allowlist and c.kind == "review_comment"]
     # 09: advancement needs every comment dispositioned *and none of them fix*. A `fix`
     # is Foundry saying the work is not done; what follows it is a correction contract,
     # which clears it by replacing the head the comments belong to: a comment on a head
     # the accepted head replaced is settled and no longer counted (hades FDY-0139).
-    settled = [c for c in feedback if (c.reviewed_sha or "") in replaced]
-    needing = [c for c in feedback if (c.reviewed_sha or "") not in replaced]
+    settled = [c for c in feedback if replaced.settles(c.reviewed_sha, c.created_at)]
+    needing = [c for c in feedback if not replaced.settles(c.reviewed_sha, c.created_at)]
     recorded = list(
         uow.dispositions.list_for_comments(
             [c.id for c in needing], {c.id: c.body_sha256 for c in needing}
@@ -1362,7 +1402,7 @@ def advance_delivery(
                 uow,
                 task,
                 head_sha=certification.head_sha,
-                failed_at=certification_failed_at(certification),
+                failures=certification_failures(certification),
             ):
                 # The failure a re-run decision was about, not a new one; the next poll
                 # records it as stale and waits for the re-run's result.
@@ -1702,6 +1742,7 @@ def apply_observation(
     attempt_id: str,
     with_reactions: bool,
     log_excerpt: str = "",
+    log_fetched: bool = False,
 ) -> ObservationResult:
     """One poll, applied. The whole of what a tick does with a pull request."""
     result = ObservationResult()
@@ -1782,6 +1823,7 @@ def apply_observation(
             policy=policy,
             head_sha=head,
             log_excerpt=log_excerpt,
+            log_fetched=log_fetched,
         )
         result.certification = certification.state
     if result.diverged:

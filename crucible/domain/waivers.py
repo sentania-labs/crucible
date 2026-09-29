@@ -13,6 +13,7 @@ from collections.abc import Iterable
 
 from crucible.domain.entities import Decision
 from crucible.domain.lifecycle import TaskState
+from crucible.domain.secrets import redact
 
 # The remaining external review rounds for this task are waived.
 WAIVE_EXTERNAL_REVIEW = "waive_external_review"
@@ -48,7 +49,9 @@ def latest_waivers(decisions: Iterable[Decision]) -> dict[str, Decision]:
 
 def waiver_words(decision: Decision) -> str:
     """How a gate detail or a certification names the decision that waived it."""
-    reason = " ".join(decision.verbatim.split())
+    # The words are copied into gate and certification details, so they are redacted
+    # like any other text a person typed.
+    reason = redact(" ".join(decision.verbatim.split()))
     if len(reason) > 200:
         reason = reason[:197] + "..."
     return f"decision {decision.id}: {reason}"

@@ -21,21 +21,23 @@ escalate; neither meant a task to wait for ever.
   Foundry (`merged`, `pull_request_closed`). A person may act on the pull request
   at any time; Crucible records it.
 - **A correction settles the feedback on the head it replaced.** Once the
-  corrected head is accepted, comments on the heads Crucible pushed before it no
-  longer need a disposition, `fix` included. Dispositions stay add-only.
+  corrected head is accepted, comments made on the heads Crucible pushed before it,
+  before the corrected head appeared, no longer need a disposition, `fix` included.
+  A later reply is new feedback. Dispositions stay add-only.
 - **Two operator waivers, per task, as recorded Decisions.**
   `waive_external_review` waives the external review rounds still outstanding;
   the rounds gate reads `skipped` and names the decision. `accept_no_ci` accepts
   that the repository has no CI for this task: with nothing at all run on the
-  accepted head, certification is `skipped`; a check that does run is still
-  certified. Both are operator-only (like `release_authorization`), may be
-  recorded only while a pull request is under observation, need the operator's
-  words, and are made through the API, the CLI (`crucible decisions --kind`), or
-  the task page. Nothing but a recorded decision waives anything.
-- **A CI re-run decision is about the failure it was recorded for.** Until a
-  result that concluded after the decision arrives, that failure is stale and is
-  not counted again. A green certification on the accepted head moves a task out
-  of `ci_certification_failed` whether or not a decision preceded it.
+  accepted head (a skipped run counts as nothing), certification is `skipped`; a
+  check that does run is still certified. Both are operator-only (like
+  `release_authorization`), may be recorded only while a pull request is under
+  observation, need the operator's words, and are made through the API, the CLI
+  (`crucible decisions --kind`), or the task page. Nothing but a recorded decision
+  waives anything.
+- **A CI re-run decision is about the failure it was recorded for.** The runs it
+  names are stale and are not counted again; any other result is fresh. A green
+  certification on the accepted head moves a task out of `ci_certification_failed`
+  whether or not a decision preceded it.
 
 ## Consequences
 
