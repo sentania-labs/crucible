@@ -272,15 +272,56 @@ only refused.)
 **Selection rule.** Candidates are the policy's entries that are enabled,
 whose harness is enabled and holds a credential (25), whose capability is
 in the tier's `allowed_capability`, whose pool is under its soft limit,
-and whose pool carries no live exhaustion mark. Order them by: position of
-their capability in the tier's `prefer` list (unlisted last); then quality
-demotion as `rotation.quality_feedback` states; then weighted least-recent:
-a candidate never launched on this project ranks first, otherwise rank by
-`(now - last_launched_at) * weight`, largest first; then id, as the final
-tie break. Recency is read directly from the latest AttemptMetrics per
-model on the project, never through a paged task listing. The first candidate is selected. The launch event records the
-selected entry, the derived image, and the ordered candidate list with
-each exclusion's reason.
+and whose pool carries no live exhaustion mark. Order them by: quality
+demotion as `rotation` states (a demoted candidate ranks after every one
+that is not, unless its probe is due); then the position of its pool in the
+tier's preferred pool order (unlisted last); then the position of its
+capability in the tier's `prefer` list (unlisted last); then weighted
+least-recent: a candidate never launched on this project ranks first,
+otherwise rank by `(now - last_launched_at) * weight`, largest first; then
+id, as the final tie break. Recency is read directly from the latest
+AttemptMetrics per model on the project, never through a paged task
+listing. The first candidate is selected. The launch event records the
+selected entry, the derived image, and the ordered candidate list with each
+exclusion's reason, whether the candidate's pool is preferred, and its
+quality standing.
+
+**Preferred pool order (ADR 0028).** A tier's `prefer_pools` lists pools in
+the order routing tries them, ahead of the capability preference. A tier
+without the field (every version written before ADR 0028) reads as the
+default: the pools holding a `local` model (Hermes on the gateway) for
+`trivial` and `standard`, and no pool preference for any other tier, so
+`complex` goes to its preferred capability, frontier. An empty list is no
+preference. The models outside the preferred pools are the fallbacks: they
+are selected when every preferred one is excluded (disabled, no credential,
+pool at its soft limit or marked exhausted). When a worker on a `local`
+model exits `provider_error` (the gateway refused, was unreachable, or
+answered 5xx) and the previous finished attempt on that pool did too, the
+pool is marked for its `default_cooldown_seconds`, with that reason; the
+mark is listed and cleared like a quota mark. One provider error marks
+nothing, and a subscription model's provider error marks nothing. A pool
+at its `max_concurrency` is not excluded: the launch waits for a slot. (Decided 2026-09-29 on the operator's direction: "Hermes is not
+the anti-route. It should probably be close to our default doer with
+frontier being hard structural problems for scoping of items for
+hermes/qwen.")
+
+**Quality demotion (ADR 0028).** Per model and project, over its last
+`quality_window` attempts, the judged attempts are those that reached the
+gates, and a failure is one with a failed blocking gate: the metric
+`gates_failed` counts blocking gates only, so an advisory finding never
+counts, and corrections do not count. Gate counts are folded into the
+metrics once the pre-PR gates are evaluated, so a pass waiting for its
+review is judged as early as a failure. The model is demoted when at least
+`demote_min_sample` attempts were judged, at least two of them failed, and
+failures are at least `demote_failure_percent` of the judged. One failure
+never demotes. A demoted model whose last attempt is `probe_after_minutes`
+old ranks as if it were not demoted, unless an attempt already routed to it
+on the project has not launched yet: one probe at a time, and the probe's
+launch makes its last attempt new again. Passing probes bring its rate down
+until it is no longer demoted. `quality_feedback: false` turns demotion
+off. Bounds: `quality_window` 1 to 1000, `demote_min_sample` 2 to the
+window, `demote_failure_percent` 1 to 100, `probe_after_minutes` 1 to 10080.
+A version without the three new fields reads them as 50, 5 and 60.
 
 **Exhaustion marks.** A worker exit classified `quota_exhausted` (07, 16)
 marks the attempt's pool exhausted until `reset_at`: the reset the harness
@@ -317,6 +358,8 @@ tiers:                                 # task tiers Foundry assigns in the contr
   trivial:   { allowed_capability: ["small", "mid"],  prefer: ["small"] }     # frontier is refused, not merely dispreferred
   standard:  { allowed_capability: ["mid", "small"],  prefer: ["mid"] }       # a task that truly needs frontier is marked complex
   complex:   { allowed_capability: ["frontier", "mid"], prefer: ["frontier"] }
+  # ADR 0028: a tier may add prefer_pools: [pool, ...]; absent reads as the local pools
+  # first for trivial and standard, and no pool preference otherwise.
 models:                                # every entry weight 1: rotation is least-recent until the outcomes say otherwise
   - { id: "claude-haiku-4-5",      harness: claude_code, endpoint: subscription, capability: small,    cost: low,    speed: fast,   pool: anthropic-sub, weight: 1, enabled: true }
   - { id: "claude-sonnet-5",       harness: claude_code, endpoint: subscription, capability: mid,      cost: medium, speed: fast,   pool: anthropic-sub, weight: 1, enabled: true }
@@ -333,9 +376,13 @@ pools:                                 # budget_units is one of attempts | token
   openai-sub:    { window: "5h", budget_units: "tokens_out", soft_limit: 0, default_cooldown_seconds: 18000 }
   google-sub:    { window: "5h", budget_units: "attempts",   soft_limit: 0, default_cooldown_seconds: 3600 }
 rotation:
-  strategy: "weighted-least-recent"    # among models allowed for the tier, prefer the preferred capability, then the least recently used, weighted
-  quality_feedback: true               # a model whose last N attempts on this project ended in gate failures or corrections drops one preference step
+  strategy: "weighted-least-recent"    # among models allowed for the tier, prefer the preferred pools, then the preferred capability, then the least recently used, weighted
+  quality_feedback: true               # demote a model whose blocking-gate failure rate on this project is high (ADR 0028)
   quality_window: 20
+  # Added by ADR 0028; version 3 predates them and reads these defaults:
+  # demote_failure_percent: 50         # failures, as a percentage of judged attempts, that demote
+  # demote_min_sample: 5               # judged attempts needed before any demotion (2 or more)
+  # probe_after_minutes: 60            # a demoted model is tried again once its last attempt is this old
 reroute:                               # C6b: what happens when a worker dies of quota (16)
   reroute_max: 3                       # reroutes per task per contract version, counted apart from lifecycle.max_attempts
   resume_max_wait_seconds: 86400       # longest a task waits in awaiting_quota before it ends reported with a wake

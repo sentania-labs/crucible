@@ -40,6 +40,7 @@ from crucible.application.admin import (
     images,
     login,
     routing,
+    routing_preference,
 )
 from crucible.application.admin import gate_classes as gate_classes_admin
 from crucible.application.admin import kubernetes as kubernetes_admin
@@ -313,6 +314,35 @@ def build_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     state.add_argument("--disable", action="store_true")
     local_set.add_argument("--enable-thinking", action="store_true")
     local_set.add_argument("--max-concurrency", type=int, default=4)
+    route_sub.add_parser(
+        "preference", help="the pool order per tier and the demotion settings in force"
+    )
+    pref_set = route_sub.add_parser(
+        "set-preference",
+        help="write a routing version with this pool order or these demotion settings",
+    )
+    pref_set.add_argument(
+        "--tier",
+        action="append",
+        default=[],
+        metavar="TIER=POOL,POOL",
+        help="the pools routing tries first for TIER, in order; TIER= for none, "
+        "TIER=default for the default; repeat per tier",
+    )
+    feedback = pref_set.add_mutually_exclusive_group()
+    feedback.add_argument("--quality-feedback", dest="quality_feedback", action="store_true")
+    feedback.add_argument("--no-quality-feedback", dest="quality_feedback", action="store_false")
+    pref_set.set_defaults(quality_feedback=None)
+    pref_set.add_argument("--quality-window", type=int, help="attempts judged per model")
+    pref_set.add_argument(
+        "--demote-failure-percent", type=int, help="blocking-failure percentage that demotes"
+    )
+    pref_set.add_argument(
+        "--demote-min-sample", type=int, help="judged attempts needed before demoting (2+)"
+    )
+    pref_set.add_argument(
+        "--probe-after-minutes", type=int, help="minutes before a demoted model is probed"
+    )
 
     lim = sub.add_parser("limits", help="policy limits edited in place (issue 128)")
     lim_sub = lim.add_subparsers(dest="limits_command", required=True)
@@ -471,6 +501,32 @@ def _egress(args: argparse.Namespace) -> dict[str, Any]:
         raise UsageError(str(exc)) from None
 
 
+def _preference_args(
+    args: argparse.Namespace,
+) -> tuple[dict[str, list[str] | None], dict[str, Any]]:
+    """`set-preference` flags as the tiers and rotation settings the service checks."""
+    tiers: dict[str, list[str] | None] = {}
+    for item in args.tier:
+        name, sep, pools = item.partition("=")
+        if not sep or not name.strip():
+            raise UsageError(f"--tier takes TIER=POOL,POOL, not {item!r}")
+        tiers[name.strip()] = routing_preference.parse_pool_order(pools)
+    rotation = {
+        key: value
+        for key, value in (
+            ("quality_feedback", args.quality_feedback),
+            ("quality_window", args.quality_window),
+            ("demote_failure_percent", args.demote_failure_percent),
+            ("demote_min_sample", args.demote_min_sample),
+            ("probe_after_minutes", args.probe_after_minutes),
+        )
+        if value is not None
+    }
+    if not tiers and not rotation:
+        raise UsageError("name at least one --tier or rotation setting to change")
+    return tiers, rotation
+
+
 def _read_api_key() -> str:
     """Read a key from a hidden terminal prompt or stdin, never from argv."""
     return (
@@ -624,6 +680,15 @@ def _remote(args: argparse.Namespace, remote: Api) -> Any:
             return remote.call("POST", f"/v1/admin/routing/exhaustion/{args.pool}/clear", reason)
         if args.routing_command == "local-endpoint":
             return remote.call("GET", "/v1/admin/routing/local-endpoint")
+        if args.routing_command == "preference":
+            return remote.call("GET", "/v1/admin/routing/preference")
+        if args.routing_command == "set-preference":
+            tiers, rotation = _preference_args(args)
+            return remote.call(
+                "POST",
+                "/v1/admin/routing/preference",
+                {**reason, "tiers": tiers, "rotation": rotation},
+            )
         return remote.call(
             "POST",
             "/v1/admin/routing/local-endpoint",
@@ -895,6 +960,25 @@ def _local(args: argparse.Namespace, wiring: Wiring) -> Any:
                 return result
             if args.routing_command == "local-endpoint":
                 return routing.local_endpoint_view(uow)
+            if args.routing_command == "preference":
+                return routing_preference.preference_view(uow)
+            if args.routing_command == "set-preference":
+                tiers, rotation = _preference_args(args)
+                result = routing_preference.save_preference(
+                    admin,
+                    uow,
+                    principal=Principal(
+                        id=CLI_PRINCIPAL,
+                        name=CLI_PRINCIPAL,
+                        role=Role.ADMIN,
+                        created_at=wiring.ctx.clock.now(),
+                    ),
+                    tiers=tiers,
+                    rotation=rotation,
+                    reason=args.reason,
+                )
+                uow.commit()
+                return result
             result = routing.save_local_endpoint(
                 admin,
                 uow,
@@ -1283,6 +1367,8 @@ def kind_of(args: argparse.Namespace) -> str:
         ("routing", "clear-exhaustion"): "exhaustion_cleared",
         ("routing", "local-endpoint"): "local_endpoint",
         ("routing", "set-local-endpoint"): "local_endpoint",
+        ("routing", "preference"): "routing_preference",
+        ("routing", "set-preference"): "routing_preference",
         ("kubernetes", "egress"): "kubernetes_egress",
         ("kubernetes", "set-egress"): "kubernetes_egress",
         ("gates", "advisory"): "gate_classes",
@@ -1362,6 +1448,8 @@ def result_for(
         actions = nx.kubernetes_egress_actions(document, prefix)
     elif kind == "command_timeout":
         actions = nx.command_timeout_actions(document, prefix)
+    elif kind == "routing_preference":
+        actions = nx.routing_preference_actions(document, prefix)
     elif kind == "gate_classes":
         actions = nx.gate_classes_actions(document, prefix)
     elif kind == "audit_page":
