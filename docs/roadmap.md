@@ -3,17 +3,69 @@
 This is the working plan that turns `docs/vision.md` into milestones with exit tests.
 The vision is the operator's directive and wins where the two disagree; this document
 is the plan Foundry is executing against it, and it changes as decisions land.
-Last revised 2026-09-23.
+Last revised 2026-09-28 (status and issue-traceability reconciliation; milestone order unchanged).
 
 ## Where we are
 
-Crucible v0.5.2 is the proven execution MVP: task contracts, isolated per-attempt
-workers carrying Claude Code, Codex, AGY and Hermes in one image, durable evidence,
-mechanical completion gates, GitHub delivery, and Docker and Kubernetes providers.
-On the lab cluster it does not yet complete an attempt: #91 leaves workers with no DNS
-or model route, #93 keeps pods from scheduling, and #95 lets the PID gate pass falsely.
-#92 means harness credentials cannot be entered from the UI there, and #94 re-chowns
-NFS volumes on every mount. The Foundry bootstrap ledger has not been handed over.
+Hades has a substantial execution service: versioned task contracts, PostgreSQL
+state and evidence, isolated workers, mechanical gates, GitHub delivery, Docker
+and Kubernetes providers, and an administrative UI/API/CLI. Claude Code, Codex,
+AGY and Hermes have adapters; harness images are now independently promoted
+(ADR 0018), not one mandatory combined image.
+
+This is a dated source/backlog snapshot at
+[`7b62afa`](https://github.com/sentania-labs/hades/commit/7b62afacdc4f197106a5548ae9554f88af5ee72a).
+The release observed was v0.6.3. [#202](https://github.com/sentania-labs/hades/pull/202)
+merged after that release, addressing launch cancellation, supervisor launch
+blocking/readiness, GitHub egress and completion-report instructions. Merged code,
+a published release and verification on a deployed instance are different evidence.
+
+The original lab blockers #91, #93, #95, #92, #94 and #89 are closed. The Hermes
+worker-path proof is recorded in #146. Neither fact alone establishes M1c.
+Current gaps include #85 with #184 (self-testing inside isolated workers and
+pre-PR certification), #173 (live login regressions), #203/#204 (remaining
+supervisor collection/health behavior), and #183 (truthful reports when required
+tools are missing). Foundry must classify their actual impact on M1, not declare
+every open issue a release blocker. Codex's credential-refresh proof remains
+#42; it does not change the Claude Code and Hermes M1 paths.
+
+The public evidence does not establish completion of the real Foundry ledger
+handoff. [Readiness](readiness.md) still describes that gap. Foundry must reconcile
+it with authorized private evidence, without performing an irreversible handoff
+merely to update documentation.
+
+Persistent principal chat, independent work cards, curated agent definitions and
+durable agent routines remain product work, not capabilities implied by today's
+worker adapters or admin UI. The authentication `PrincipalRow` is not a
+conversational principal, and the supervisor tick is not the M5 routine scheduler.
+
+## Tracking and reconciliation
+
+[#207](https://github.com/sentania-labs/hades/issues/207) is Foundry's reconciliation
+task. It closes when findings are dispositioned and the backlog/docs are accurate,
+not when all future features ship. New issues and scope comments are for triage;
+they do not authorize implementation, change milestone order, or supersede the
+operator's vision.
+
+| Capability | Current position | Owning tracking |
+|---|---|---|
+| Bootstrap authority and self-development proof | Import machinery exists; actual handoff and full M1 exits need evidence reconciliation | [#207](https://github.com/sentania-labs/hades/issues/207), [#85](https://github.com/sentania-labs/hades/issues/85), [#184](https://github.com/sentania-labs/hades/issues/184) |
+| M2 persistent principal and harness continuity | Planned; dedicated conversation service and continuity spike not implemented | [#208](https://github.com/sentania-labs/hades/issues/208) |
+| M3 curated identities and skills | Partial backlog coverage; applicability, permissions and agent tests need explicit acceptance | [#199](https://github.com/sentania-labs/hades/issues/199), [#197](https://github.com/sentania-labs/hades/issues/197), [#198](https://github.com/sentania-labs/hades/issues/198) |
+| M4 brainstorm intake and independent cards | Planned; captured ideas must remain distinct from authorized execution | [#209](https://github.com/sentania-labs/hades/issues/209) |
+| M4/M5 human attention and daily briefing | Planned; distinct from execution telemetry | [#210](https://github.com/sentania-labs/hades/issues/210) |
+| M5 durable routines | Partial backlog coverage; persisted scheduling, restart and approval semantics need acceptance | [#199](https://github.com/sentania-labs/hades/issues/199) |
+| Noncoding research and content work | Current task contract still requires a repository, including artifact deliverables; place by first real use after bootstrap | [#211](https://github.com/sentania-labs/hades/issues/211) |
+| M6 optional tools and transports | Planned; select a concrete flow before implementation | [#212](https://github.com/sentania-labs/hades/issues/212) |
+| Execution visibility and independent review | Existing evidence/review primitives; proposed UI and cross-family review extensions | [#188](https://github.com/sentania-labs/hades/issues/188), [#201](https://github.com/sentania-labs/hades/issues/201); [#206](https://github.com/sentania-labs/hades/issues/206) remains optional ideas |
+| Browser and machine authentication | Token-based administration exists; OIDC/personal/service-token work and cookie remediation are tracked | [#180](https://github.com/sentania-labs/hades/issues/180), [#132](https://github.com/sentania-labs/hades/issues/132) |
+
+Foundry validates each finding as satisfied, partially covered, untracked,
+deliberately deferred, or needing an operator decision. Accepted scope belongs in
+the owning issue body, not only in superseding comments. README and CONTRIBUTING
+still contain pre-implementation/C7a-era descriptions; their reconciliation and
+readiness evidence updates belong to #207. This status update does not invent
+deployment or test results.
 
 ## Standing decisions
 
@@ -31,6 +83,9 @@ All of these are the operator's decisions.
 
 ### M0a: rollback point
 
+**Status:** the historical v0.5.3 rollback release and #96 are complete; retain
+the original exit criteria as the record of what had to be established.
+
 - #96: service `latest` is copied on the registry from the version tag, never pushed
   from a fresh local build, the rule main already applies to the worker images since
   #90 (after v0.5.2).
@@ -43,6 +98,10 @@ version tag.
 
 ### M0b: an honest, usable lab deployment
 
+**Status:** the original listed implementation issues are closed. #173 tracks
+subsequent login regressions. Closure is not a substitute for the combined live
+exit evidence below; Foundry reconciles that evidence in #207.
+
 1. #91 with #58: egress allows that work under Cilium with kube-proxy replacement
    (selector or CNI-aware rules, not `ipBlock` on service addresses), and a canary
    that proves DNS resolution and model-endpoint reachability rather than only
@@ -53,11 +112,12 @@ version tag.
    is no credential).
 3. #92: the Kubernetes login Job, driven from `/ui`, and Hermes gateway key entry from
    the UI on Kubernetes. This changes a documented design: spec 26 and
-   `docs/deployment.md` deliver harness Secrets through the GitOps repository today.
-   A new ADR, with amendments to specs 12, 25 and 26, makes the service the single
+   `docs/deployment.md` originally delivered harness Secrets through the GitOps repository.
+   The credential-ownership ADR and amendments to specs 12, 25 and 26 make the service the single
    owner of the harness credential Secrets and takes them out of GitOps, because a
    Secret written by both the service (login, token sync-back) and GitOps drifts. The
-   database, GitHub App and TLS Secrets stay with GitOps.
+   database and deployment TLS remain deployment-owned. The GitHub App Secret is
+   now also service-owned under ADR 0017; it must not have a competing GitOps writer.
 4. `docs/deployment.md` matches what ships.
 
 **Exit (seen working):** on a disposable kind cluster running Cilium with kube-proxy
@@ -70,6 +130,10 @@ a cluster must provide (kubelet PID limit, gateway selectors) is stated in
 
 ### M0c: authority handoff
 
+**Status:** import/verification machinery exists; the real ledger handoff is not
+established by the public evidence reviewed. Verify in #207, preserving the explicit
+authorization requirement below.
+
 Register the repositories (spec 25), then import, verify and commit the Foundry
 bootstrap ledger on the instance the deployer runs (spec 15). Commit and mark-migrated are irreversible
 and wait for the operator's verbatim go. Foundry's start-of-session then reads tasks
@@ -81,8 +145,9 @@ and wakes from Hades only.
 
 - README and operator documentation describe Hades, with `execution` as the subsystem.
 - Open issues are triaged as the vision sets out: bootstrap blocker, execution
-  hardening, later. #85 is the one M1 dependency outside the bootstrap blockers.
-- The repository is renamed to Hades on the operator's go. GitHub redirects the old
+  hardening, later. #85 with #184 is the known M1 testing dependency; classify newer
+  operational findings by whether they actually prevent the M1 acceptance path.
+- The repository has been renamed to Hades. GitHub redirects the old
   URL and image names are unchanged, but registrations store the repository URL and
   the push remote is built from `owner/name` (specs 03 and 23). So the rename lands
   before M0c registers repositories, or M0c re-registers after it.
@@ -93,20 +158,30 @@ token check work under the repository's final name.
 
 ### M1a: Hades can test itself from a pod (#85)
 
+**Status:** open. Coordinate #184 for the tools beneath each project's checks;
+a sidecar alone does not supply a working test toolchain.
+
 - Declared test services (PostgreSQL first) run as per-attempt sidecars, reachable on
   localhost only. The suite uses the service when it is present and falls back to
   testcontainers when it is not, so one suite runs on a laptop, in CI and in a pod.
-- Branch CI already runs every job on every push. What is new is that the service
+- The supervisor's publisher, never the worker, pushes the candidate head. Workers
+  keep no GitHub credential. Branch CI already runs every job on every push. What is new is that the service
   observes it: branch CI green becomes a required gate before review and the pull
   request, in the slot local tiers hold today. The heavy tiers stay on GitHub-hosted
   runners, as `ci.yml` places them for a public repository; moving any job to the
-  self-hosted pool is a separate decision.
+  self-hosted pool is a separate decision. Evidence must name the exact candidate
+  SHA; corrections require fresh head-specific verification. Required CI failures
+  escalate with evidence, not automatic correction/retry loops.
 - CI uploads a diagnostics bundle on failure only.
 
 **Exit:** a worker on the lab cluster runs the unit and integration tiers against its
 PostgreSQL sidecar, and an attempt whose branch CI is red cannot reach review.
 
 ### M1b: a deterministic model for tests
+
+**Status:** a deterministic model server already exists in
+`tests/e2e/stub_model.py`. Reuse it where appropriate; verify the gateway-alias
+acceptance path below before declaring this milestone complete (#207).
 
 A scripted OpenAI-compatible stub behind a gateway model alias, so tests of the Hermes
 path do not depend on a live model's output.
@@ -131,8 +206,9 @@ From here, Hades work is dispatched only through Hades.
 ### M1.5: burn-in
 
 - The `execution` rename.
-- The hardening backlog as the burn-in queue: #39, #40, #41, #55, #59, #60, #63, #65,
-  #66, #76.
+- The hardening backlog as the burn-in queue. The original examples #40, #41, #55,
+  #59, #60, #63, #65, #66 and #76 are now closed; #39 remains open. Select live,
+  bounded work during triage rather than reopen completed work to fill the queue.
 - AGY on Kubernetes through the UI login.
 
 **Exit:** the rename and at least five further changes are merged through Hades,
@@ -143,6 +219,11 @@ with no fix to Hades made outside it in that period.
 Order after burn-in follows real use.
 
 ### M2: persistent principal agent
+
+Tracking: [#208](https://github.com/sentania-labs/hades/issues/208). The first usable
+path can start with one harness; the continuity spike establishes the limits of
+additional harnesses. Operator-directed switching preserves recorded work and
+approvals, not hidden model state, and must not replay completed actions.
 
 - A dedicated service owns every conversation. Hades' own append-only log is the
   source of truth; a harness session is a cache that can be rebuilt from it.
@@ -167,6 +248,10 @@ conversation, and delegate through Hades.
 
 ### M3: agent identity and curation
 
+Tracking: [#199](https://github.com/sentania-labs/hades/issues/199),
+[#197](https://github.com/sentania-labs/hades/issues/197), and
+[#198](https://github.com/sentania-labs/hades/issues/198).
+
 - An agent card: identity, responsibility, tools, skills, routing preference, sample
   requests, and an enabled flag kept separate from observed health.
 - Skills state when to use them and when not to, name the sibling skill for the
@@ -181,6 +266,11 @@ its tests there, and enables it.
 
 ### M4: work and focus
 
+Tracking: [#209](https://github.com/sentania-labs/hades/issues/209) for intake/cards
+and [#210](https://github.com/sentania-labs/hades/issues/210) for human attention.
+Capturing an idea is not authorization to execute it. The worker dashboard in
+[#188](https://github.com/sentania-labs/hades/issues/188) is related but distinct.
+
 Lightweight cards that reference GitHub and other sources rather than copying them.
 The first view answers "what needs me?" from pending approvals, agents waiting, and
 real commitments, with lab and pet-project work visibly separate.
@@ -190,6 +280,9 @@ waiting on them.
 
 ### M5: routines and the daily view
 
+Tracking: [#199](https://github.com/sentania-labs/hades/issues/199) for scheduling
+and [#210](https://github.com/sentania-labs/hades/issues/210) for the daily view.
+
 A durable scheduler with leases, a stored next run and an explicit missed-run policy.
 Each run gets its own conversation. Each routine declares its pre-approved tools; a
 run that needs a new approval parks in "what needs me".
@@ -198,6 +291,11 @@ run that needs a new approval parks in "what needs me".
 daily view is the one the operator actually opens.
 
 ### M6: tools and transports
+
+Tracking: [#212](https://github.com/sentania-labs/hades/issues/212). Coordinate
+[#211](https://github.com/sentania-labs/hades/issues/211) when the selected workflow
+needs repository-independent research or content artifacts. Neither service becomes
+a mandatory Hades dependency.
 
 Chronicle, Coppermind, GitHub and Discord, each when a real flow needs it. Inbound
 triggers carry a per-trigger token stored hashed, a payload schema, and a delivery
