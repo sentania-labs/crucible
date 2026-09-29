@@ -161,6 +161,19 @@ class Git(StrictModel):
 
 class RepositoryRules(StrictModel):
     required_checks: list[str]
+    # hades #184: the programs those checks call beyond the first word of each (`uv`,
+    # `gitleaks` behind `make lint` and `make scan`). A declaration only: Crucible does
+    # not read it at run time; `make images-policy-check` proves each resolves in the
+    # worker image, so a shipped policy and the image cannot disagree about them.
+    required_programs: list[str] = Field(default_factory=list)
+
+    @field_validator("required_programs")
+    @classmethod
+    def _bare_program_names(cls, value: list[str]) -> list[str]:
+        for program in value:
+            if not program or program != program.strip() or any(c.isspace() for c in program):
+                raise ValueError(f"{program!r} is not a single program name")
+        return value
 
 
 class Gates(StrictModel):

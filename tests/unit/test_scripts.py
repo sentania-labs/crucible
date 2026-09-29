@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -378,6 +379,30 @@ def test_the_verifier_writes_one_file_per_id(tmp_path: Path) -> None:
         if "\t" in line
     )
     assert manifest == {"a%2Fb": "a/b", "a_b": "a_b", "plain": "plain"}
+
+
+def test_the_verifier_records_each_commands_wall_clock(tmp_path: Path) -> None:
+    """hades #184: seconds per command, measured in the verifier, read back as evidence."""
+    from crucible.adapters.execution.collected import read_verifications  # noqa: PLC0415
+
+    checks = [("quick", "true"), ("slow", "sleep 1; exit 2")]
+    script = scripts.verifier_script(checks)
+    parses(script)
+    verify = tmp_path / "verify"
+    repo = tmp_path / "repo"
+    verify.mkdir()
+    repo.mkdir()
+    body = script.replace(scripts.VERIFY_MOUNT, str(verify)).replace(scripts.REPO_MOUNT, str(repo))
+    subprocess.run(["sh", "-c", body], check=True, capture_output=True)
+    seconds = {path.stem: int(path.read_text()) for path in verify.glob("*.seconds")}
+    assert seconds["quick"] <= 1 and 1 <= seconds["slow"] <= 3
+    spec = SimpleNamespace(contract={"required_verification": []})
+    runs = {run.id: run for run in read_verifications(verify, spec, checks)}  # type: ignore[arg-type]
+    assert runs["slow"].seconds == seconds["slow"] and runs["slow"].exit_code == 2
+    (verify / "quick.seconds").write_text("garbage\n")
+    (verify / "slow.seconds").unlink()
+    runs = {run.id: run for run in read_verifications(verify, spec, checks)}  # type: ignore[arg-type]
+    assert runs["quick"].seconds is None and runs["slow"].seconds is None
 
 
 def test_a_verification_id_that_looks_like_a_command_stays_a_file_name(tmp_path: Path) -> None:

@@ -60,7 +60,9 @@ case "${NO_CACHE:-0}" in 0|"") ;; *) no_cache="--no-cache" ;; esac
 . "$here/pins.env"
 : "${BASE_IMAGE:?}" "${DEBIAN_SNAPSHOT:?}" "${GIT_VERSION:?}" "${CURL_VERSION:?}" \
   "${JQ_VERSION:?}" "${MAKE_VERSION:?}" "${CA_CERTIFICATES_VERSION:?}" "${LAB_CA_SHA256:?}" \
-  "${SOURCE_DATE_EPOCH:?}" "${BUILDKIT_IMAGE:?}"
+  "${SOURCE_DATE_EPOCH:?}" "${BUILDKIT_IMAGE:?}" "${UV_VERSION:?}" "${UV_SHA256:?}" \
+  "${CPYTHON_VERSION:?}" "${CPYTHON_BUILD:?}" "${CPYTHON_SHA256:?}" \
+  "${GITLEAKS_VERSION:?}" "${GITLEAKS_SHA256:?}"
 
 # rewrite-timestamp only clamps a file newer than SOURCE_DATE_EPOCH. A context file at
 # or before it (a checkout from before an epoch bump) would keep its own mtime in the
@@ -178,6 +180,13 @@ for image in "${images[@]}"; do
         --build-arg "LAB_CA_SHA256=$LAB_CA_SHA256" \
         --build-arg "PYTHON3_VERSION=$PYTHON3_VERSION" \
         --build-arg "PYTHON3_VENV_VERSION=$PYTHON3_VENV_VERSION" \
+        --build-arg "UV_VERSION=$UV_VERSION" \
+        --build-arg "UV_SHA256=$UV_SHA256" \
+        --build-arg "CPYTHON_VERSION=$CPYTHON_VERSION" \
+        --build-arg "CPYTHON_BUILD=$CPYTHON_BUILD" \
+        --build-arg "CPYTHON_SHA256=$CPYTHON_SHA256" \
+        --build-arg "GITLEAKS_VERSION=$GITLEAKS_VERSION" \
+        --build-arg "GITLEAKS_SHA256=$GITLEAKS_SHA256" \
         --label "org.opencontainers.image.version=$version-$build" \
         --label "org.opencontainers.image.created=$created" \
         --label "org.opencontainers.image.source=https://github.com/sentania-labs/crucible" \

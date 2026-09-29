@@ -209,6 +209,9 @@ class VerificationRun:
     log_tail: str
     ran: bool = True
     detail: str = ""
+    # hades #184: wall-clock seconds inside the verifier container; None when it did not
+    # record one (a verifier that never finished, or an older script).
+    seconds: int | None = None
 
     @property
     def ok(self) -> bool:

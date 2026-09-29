@@ -158,8 +158,12 @@ token check work under the repository's final name.
 
 ### M1a: Hades can test itself from a pod (#85)
 
-**Status:** open. Coordinate #184 for the tools beneath each project's checks;
-a sidecar alone does not supply a working test toolchain.
+**Status:** open. The toolchain half of #184 is in (ADR 0020, FDY-0131,
+2026-09-28): the worker image carries uv, CPython 3.12 and gitleaks, and tasks against
+this repository run under `hades-self-hosting`, whose required checks are `make lint`,
+`make test-unit` and `make scan`, proven on kind with the real worker image and
+NetworkPolicy (`make e2e-kind-self-hosting`). The integration and e2e tiers still need
+Postgres and Docker; until the sidecars below land, branch CI is their only proof.
 
 - Declared test services (PostgreSQL first) run as per-attempt sidecars, reachable on
   localhost only. The suite uses the service when it is present and falls back to

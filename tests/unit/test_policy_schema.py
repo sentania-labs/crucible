@@ -83,6 +83,36 @@ def test_the_example_policy_matches_the_seed() -> None:
     )
 
 
+SELF_HOSTING = EXAMPLE.parent / "hades-self-hosting.yaml"
+
+
+def test_the_self_hosting_policy_is_default_software_with_the_worker_checks() -> None:
+    """hades #184: the example differs from the seed only where its header says."""
+    document = yaml.safe_load(SELF_HOSTING.read_text())
+    policy = parse_policy(document)
+    assert (policy.name, policy.version) == ("hades-self-hosting", 1)
+    assert policy.repository.required_checks == ["make lint", "make test-unit", "make scan"]
+    assert {"uv", "python3.12", "gitleaks"} <= set(policy.repository.required_programs)
+    assert {"pypi.org", "files.pythonhosted.org"} <= set(policy.network.egress_allowlist)
+    assert "branch CI" in policy.description and "2026-09-28" in policy.description
+    assert policy.ci_certification.require_green_on_final_sha
+    seed = seeded_policy_v3()
+    ignored = {"name", "version", "description", "repository", "network", "routing"}
+    assert {k: v for k, v in document.items() if k not in ignored} == {
+        k: v for k, v in seed.items() if k not in ignored
+    }
+
+
+def test_required_programs_default_to_none_and_take_bare_names() -> None:
+    assert parse_policy(seeded_policy()).repository.required_programs == []
+    document = seeded_policy()
+    document["repository"]["required_programs"] = ["uv", "gitleaks"]
+    assert parse_policy(document).repository.required_programs == ["uv", "gitleaks"]
+    for bad in ("", " uv", "uv run", "a\tb"):
+        document["repository"]["required_programs"] = [bad]
+        assert any("single program name" in e for e in _errors(document)), bad
+
+
 def test_the_seeded_routing_policy_validates() -> None:
     routing = parse_routing_policy(m4.DEFAULT_ROUTING)
     assert routing.model("gpt-5-codex-mini") is not None

@@ -12,6 +12,7 @@ Everything here treats what it reads as data: it is a tree a worker influenced.
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -188,6 +189,8 @@ def read_verifications(
             )
             continue
         raw = text(exit_file).strip()
+        seconds_file = verify / f"{safe}.seconds"
+        seconds = text(seconds_file).strip() if seconds_file.is_file() else ""
         runs.append(
             VerificationRun(
                 id=check_id,
@@ -195,6 +198,9 @@ def read_verifications(
                 expect_exit=expected.get(check_id, 0),
                 exit_code=int(raw) if raw.lstrip("-").isdigit() else -1,
                 log_tail=tail(log_file, 32 * 1024),
+                # ASCII digits and a sane length only: the verifier ran worker code,
+                # which may have left anything in this file.
+                seconds=int(seconds) if re.fullmatch(r"[0-9]{1,9}", seconds) else None,
             )
         )
     return tuple(runs)
