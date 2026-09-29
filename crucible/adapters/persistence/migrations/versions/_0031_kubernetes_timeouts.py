@@ -6,7 +6,7 @@ for the publisher) may run once their Pod is Running (the lab findings of 2026-0
 No table changes; an absent row means the settings file's value.
 
 Revision ID: 0031_kubernetes_timeouts
-Revises: 0027_harness_enable_decision
+Revises: 0028_advisory_gates
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from crucible.adapters.persistence.migrations.versions._0026_github_app_manifest
 )
 
 revision = "0031_kubernetes_timeouts"
-down_revision = "0027_harness_enable_decision"
+down_revision = "0028_advisory_gates"
 branch_labels = None
 depends_on = None
 

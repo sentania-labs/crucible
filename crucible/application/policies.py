@@ -137,7 +137,10 @@ def put_policy(
             ),
         },
     )
-    for field in operator_only:
+    # The local admin CLI acts on the host with no principal row; its upload event above
+    # names it and the settings, and a Decision row needs a principal to point at.
+    recorded = uow.principals.get(principal.id) is not None
+    for field in operator_only if recorded else ():
         uow.decisions.add(
             Decision(
                 id=new_id(),

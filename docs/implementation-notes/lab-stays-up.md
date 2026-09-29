@@ -57,10 +57,9 @@ This note records what changed and the decisions taken under that direction.
 - **A canary the API server could not run fails the launch as environment**
   rather than deferring it: the attempt is already prepared, the lifecycle
   has no edge back to pending, and the retry rule covers it.
-- **Migration 0031** only adds the `kubernetes_timeouts_updated` event kind.
-  It revises 0027 on this branch; whatever lands first among the parallel
-  0028 to 0030 changes, the chain and the event-kind list are re-pointed at
-  merge.
+- **Migration 0031** only adds the `kubernetes_timeouts_updated` event kind. It
+  revises 0028 (advisory gates, which adds no event kind); a parallel change
+  numbered 0029 or 0030 that lands later is re-chained after it at merge.
 - **The publisher's Jobs wait for quota room** instead of failing fast. Everywhere
   else a quota-refused Job ends at once (a collection is tried again, a launch
   is an environment failure the retry rule covers), but a publication that gives

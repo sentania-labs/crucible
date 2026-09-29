@@ -125,9 +125,11 @@ async def test_a_report_missing_judgement_fails_report_present_in_its_own_words(
     task_id = submit_and_start(
         client, "crucible-worker:fake-succeed", deliverables=ARTIFACTS_DELIVERABLE
     )
-    assert await run_to_settled(supervisor, client, task_id) == "pre_pr_gates_failed"
+    # ADR 0024: report_present is advisory, so the task goes on to its review.
+    assert await run_to_settled(supervisor, client, task_id) == "awaiting_internal_review"
     attempt_id, rows = gate_rows(client, task_id)
     assert rows[GateName.REPORT_PRESENT]["result"] == "fail"
+    assert rows[GateName.REPORT_PRESENT]["classification"] == "advisory"
     errors = client.get(f"/v1/attempts/{attempt_id}").json()["report"]["parse_errors"]
     assert sorted(".".join(e["loc"]) for e in errors) == ["limitations", "summary"]
 

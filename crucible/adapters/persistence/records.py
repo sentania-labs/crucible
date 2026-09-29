@@ -329,6 +329,8 @@ class GateResults:
             detail=row.detail,
             evidence_ids=[int(x) for x in row.evidence_ids],
             evaluated_at=ensure_utc(row.evaluated_at),
+            blocking=bool(row.blocking),
+            findings=[str(x) for x in row.findings or []],
         )
 
     def put(self, result: GateResultRecord) -> None:
@@ -353,6 +355,8 @@ class GateResults:
         row.detail = result.detail
         row.evidence_ids = list(result.evidence_ids)
         row.evaluated_at = result.evaluated_at
+        row.blocking = result.blocking
+        row.findings = list(result.findings)
         self._s.flush()
 
     def list_for_attempt(self, attempt_id: str) -> Sequence[GateResultRecord]:

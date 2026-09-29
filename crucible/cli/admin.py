@@ -41,6 +41,7 @@ from crucible.application.admin import (
     login,
     routing,
 )
+from crucible.application.admin import gate_classes as gate_classes_admin
 from crucible.application.admin import kubernetes as kubernetes_admin
 from crucible.application.admin import limits as limits_admin
 from crucible.application.admin import providers as providers_admin
@@ -328,6 +329,20 @@ def build_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "--default",
         type=int,
         help="milliseconds, which a contract may narrow; omitted keeps the value",
+    )
+
+    gate = sub.add_parser("gates", help="which pre-PR gates block and which are advisory")
+    gate_sub = gate.add_subparsers(dest="gates_command", required=True)
+    gate_sub.add_parser("advisory", help="the advisory and blocking gates of the policy in force")
+    advisory_set = gate_sub.add_parser(
+        "set-advisory",
+        help="write a new policy version whose advisory gates are exactly these",
+    )
+    advisory_set.add_argument(
+        "--gate",
+        action="append",
+        default=[],
+        help="a pre-PR gate to make advisory; repeat for each. None given: every gate blocks",
     )
 
     kube = sub.add_parser(
@@ -637,6 +652,12 @@ def _remote(args: argparse.Namespace, remote: Api) -> Any:
                 "max_concurrency": args.max_concurrency,
             },
         )
+    if command == "gates":
+        if args.gates_command == "advisory":
+            return remote.call("GET", "/v1/admin/gates/advisory")
+        return remote.call(
+            "POST", "/v1/admin/gates/advisory", {**reason, "advisory": list(args.gate)}
+        )
     if command == "limits":
         if args.limits_command == "command-timeout":
             return remote.call("GET", "/v1/admin/limits/command-timeout")
@@ -932,6 +953,24 @@ def _local(args: argparse.Namespace, wiring: Wiring) -> Any:
                 minimum=args.min,
                 maximum=args.max,
                 default=args.default,
+                reason=args.reason,
+            )
+            uow.commit()
+            return result
+    if command == "gates":
+        with wiring.ctx.uow_factory() as uow:
+            if args.gates_command == "advisory":
+                return gate_classes_admin.gate_classes_view(uow)
+            result = gate_classes_admin.save_gate_classes(
+                admin,
+                uow,
+                principal=Principal(
+                    id=CLI_PRINCIPAL,
+                    name=CLI_PRINCIPAL,
+                    role=Role.ADMIN,
+                    created_at=wiring.ctx.clock.now(),
+                ),
+                advisory=list(args.gate),
                 reason=args.reason,
             )
             uow.commit()
@@ -1234,6 +1273,7 @@ def kind_of(args: argparse.Namespace) -> str:
         "routing": "routing_command",
         "kubernetes": "kubernetes_command",
         "limits": "limits_command",
+        "gates": "gates_command",
         "bootstrap": "bootstrap_command",
         "gateway": "gateway_command",
     }.get(command)
@@ -1278,6 +1318,8 @@ def kind_of(args: argparse.Namespace) -> str:
         ("kubernetes", "set-egress"): "kubernetes_egress",
         ("kubernetes", "timeouts"): "kubernetes_timeouts",
         ("kubernetes", "set-timeouts"): "kubernetes_timeouts",
+        ("gates", "advisory"): "gate_classes",
+        ("gates", "set-advisory"): "gate_classes",
         ("limits", "command-timeout"): "command_timeout",
         ("limits", "set-command-timeout"): "command_timeout",
         ("bootstrap", "list"): "bootstrap_import_list",
@@ -1355,6 +1397,8 @@ def result_for(
         actions = nx.kubernetes_timeouts_actions(document, prefix)
     elif kind == "command_timeout":
         actions = nx.command_timeout_actions(document, prefix)
+    elif kind == "gate_classes":
+        actions = nx.gate_classes_actions(document, prefix)
     elif kind == "audit_page":
         actions = nx.audit_actions(document, prefix, args.limit, args.cursor)
     return Result(kind=kind, data=document, state=state, next=actions, role=role)
