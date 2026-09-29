@@ -167,6 +167,14 @@ jobs:
         with:
           path: ${{ runner.temp }}/buildkit-cache
           key: worker-images-${{ hashFiles('images/**') }}
+      # hades #184, FDY-0134: the unit tier as the lab's verification runs it, in the
+      # image just built: uid 1000, read-only root, no Docker socket, no network for
+      # the tests (only `uv sync` gets one), and setgid fsGroup-style /tmp and
+      # workspace. Here rather than its own job because the image exists only in this
+      # job's daemon; moving 1.4 GB to another job costs more than the tier's minute.
+      # After the cache save, so a failure here on main still leaves branches a cache.
+      - name: unit tier inside the worker image
+        run: make test-unit-in-image
 
   # A real API server, kubelet, enforcing CNI and PVC on the runner's Docker daemon.
   # This belongs beside the Docker tier on GitHub-hosted infrastructure: it needs a

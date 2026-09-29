@@ -583,6 +583,9 @@ def publish_leaf_script(root: str = WORK_MOUNT) -> str:
     the Pod fails setup with nothing in its log. Neither leaf the publisher mounts is left
     to the kubelet: this runs as the worker uid with the whole claim mounted, as the
     preparer that made `output/` does, and creates `publish/` with `output/`'s mode.
+    A setgid bit is kept, never stripped: on the fsGroup claim `publish/` inherits it
+    from its parent, and it keeps the publisher's files in the fsGroup as `output/`'s
+    are (hades #184). It grants no one access.
 
     Exit 7: no bundle, or not a regular file (the kubelet would make a directory there).
     Exit 8: `publish/` is not a directory the worker uid owns and can write, as it owns
