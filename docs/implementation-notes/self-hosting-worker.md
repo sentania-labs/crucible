@@ -1,0 +1,52 @@
+# Hades works on its own repository from a worker (hades #184, part of #85, FDY-0131)
+
+## Decision
+
+The operator, 2026-09-28, on FDY-0131: every task against this repository failed
+`verification_ran`, because the worker image lacked what `make lint`, `make test` and
+`make scan` call here. Deliver the toolchain in the worker image, a way to the locked
+dependencies without open internet, and a policy for this repository whose required
+checks are `make lint`, `make test-unit` and `make scan`. The integration and e2e tiers
+need Postgres and Docker, and branch CI remains the full proof of record (the operator's
+decision, 2026-09-28). ADR 0020 records the choices.
+
+## What changed (2026-09-28)
+
+- **The image.** uv 0.10.12, CPython 3.12.13 and gitleaks 8.30.1 in
+  `images/worker/Dockerfile`, pinned in `images/pins.env`; both image tags moved and
+  `images/manifest.env` was rewritten by `make images`. `make images-check NO_CACHE=1`
+  reproduced both digests with every RUN step rebuilt.
+- **Dependencies.** Option (a) of the contract: PyPI at run time, `uv sync --frozen`,
+  through the policy's allowlist and the provider's hostAliases pinning (#191). Why not
+  (b) is in ADR 0020.
+- **The policy.** `examples/policies/hades-self-hosting.yaml`, uploaded through the
+  policies API with the routing policy the default-software in force names
+  (docs/deployment.md). `repository.required_programs` is new in 05b, a declaration
+  `make images-policy-check` checks against the image.
+- **The three targets in the image.** `make lint` and `make scan` needed nothing: in a
+  Crucible checkout `origin/main` exists (the worker's clone keeps its remote-tracking
+  ref, and the verifier's tree is cloned from that checkout, whose local `main` becomes
+  its `origin/main`), and `check-image-manifest` only needs bash, jq and tar. What
+  failed was the unit tier: `pgrep`, the Docker CLI and a mode check that did not allow
+  for a Pod's setgid `/tmp`. `scan-history` now names a missing `origin/main` instead of
+  failing inside gitleaks. `-n auto` follows the Pod's CPU quota (tests/conftest.py).
+- **Evidence.** The verifier writes each check's wall-clock seconds; `verification_run`
+  evidence carries them as `seconds`.
+- **Routing.** Nothing reads a policy's name on the submit, start or selection path.
+  `tests/integration/test_self_hosting_policy.py` uploads the policy the documented way
+  and a task under it selects the Hermes gateway model `fast`. The admin UI's routing
+  pages still write only default-software versions, so this policy follows a routing
+  change only when its next version is uploaded.
+- **No new tunable.** The two `UV_*` variables are constants of the image; the new
+  `CRUCIBLE_COMPOSE_REQUIRED` and `CRUCIBLE_E2E_KIND_*` variables belong to the test
+  tiers.
+
+## The kind proof
+
+`make e2e-kind-self-hosting` (tests/e2e/test_kind_self_hosting.py): a Calico kind
+cluster, the combined worker image, the real per-worker NetworkPolicy with no broad
+egress, a stub model Pod reached as the lab's gateway is, a Hermes task under the policy
+against a bare copy of this repository at HEAD. On 2026-09-28 at 9:42 PM it reached
+`awaiting_internal_review` with every pre-PR gate but the internal review passing, and
+the verifier's own clock read `make lint` 13 s (uv sync from PyPI included),
+`make test-unit` 53 s, `make scan` 1 s.

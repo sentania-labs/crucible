@@ -362,6 +362,43 @@ Done means seen working, so all three:
    like end to end is `tools/smoke/kubernetes_smoke.py`, which is what `make deploy-kind`
    runs against a disposable cluster.
 
+## Tasks against this repository
+
+Tasks Foundry submits against this repository (sentania-labs/hades) run under their own
+policy, `examples/policies/hades-self-hosting.yaml` (hades #184, ADR 0020). Its required
+checks are `make lint`, `make test-unit` and `make scan`, which run in the worker image
+with no Docker daemon and no Postgres; `make test-integration` and the e2e tiers need
+both, so branch CI on the pushed head stays their full proof of record (the operator's
+decision, 2026-09-28). The worker and the verifier fetch the hash-locked dependencies
+from PyPI, which the policy's egress allowlist keeps.
+
+The policy names a routing policy version. Upload it naming the one the default-software
+in force names, so it routes to the same models (the gateway's Hermes models included):
+
+```sh
+# The admin token is read from a file and never typed on a command line.
+TOKEN_FILE=/path/to/admin-token
+routing=$(curl -fsS -H "Authorization: Bearer $(cat "$TOKEN_FILE")" \
+  "$CRUCIBLE_URL/v1/routing/usage?policy=default-software" | jq -c .routing_policy)
+uv run python -c 'import json, sys, yaml
+document = yaml.safe_load(open("examples/policies/hades-self-hosting.yaml"))
+document["routing"] = {"policy": json.loads(sys.argv[1])}
+print(json.dumps(document))' "$routing" > /tmp/hades-self-hosting.json
+curl -fsS -X PUT -H "Authorization: Bearer $(cat "$TOKEN_FILE")" \
+  -H 'Content-Type: application/json' --data @/tmp/hades-self-hosting.json \
+  "$CRUCIBLE_URL/v1/policies/hades-self-hosting/1"
+```
+
+Contracts then name `{"name": "hades-self-hosting", "version": 1}`. A version is
+immutable once a task references it, and the admin UI's routing pages only ever write new
+default-software versions: after the operator changes routing there, upload the next
+version of this policy the same way (bump `version` in the document and the path).
+
+The worker image has to carry the toolchain; a lab running a worker image from before
+this change fails every such task at `verification_ran`, so promote a worker image built
+from this repository's current `images/` first. `make e2e-kind-self-hosting` proves the
+whole path on a disposable kind cluster.
+
 ## What the operator does alone
 
 **The public DNS record.** Operator rule 10 and 26 item 8: creating a public DNS record
