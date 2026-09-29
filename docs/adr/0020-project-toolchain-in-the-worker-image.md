@@ -40,7 +40,7 @@ image, a per-project image, or the repository.
    build inputs to one project's lock, so every dependency bump would mean a new worker
    image, a release and a promotion before a task could verify, and it would still need
    (a) whenever the lock had moved. The cost of (a) is a download per Pod: on the kind
-   proof the whole of `make lint`, uv sync from PyPI included, took 13 seconds in the
+   proof the whole of `make lint`, uv sync from PyPI included, took 14 seconds in the
    verifier.
 3. **This repository's tasks run under their own policy, `hades-self-hosting`.** It is
    default-software with `repository.required_checks` of `make lint`, `make test-unit`

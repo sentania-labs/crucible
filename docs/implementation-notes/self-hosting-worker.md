@@ -46,7 +46,8 @@ decision, 2026-09-28). ADR 0020 records the choices.
 `make e2e-kind-self-hosting` (tests/e2e/test_kind_self_hosting.py): a Calico kind
 cluster, the combined worker image, the real per-worker NetworkPolicy with no broad
 egress, a stub model Pod reached as the lab's gateway is, a Hermes task under the policy
-against a bare copy of this repository at HEAD. On 2026-09-28 at 9:42 PM it reached
-`awaiting_internal_review` with every pre-PR gate but the internal review passing, and
-the verifier's own clock read `make lint` 13 s (uv sync from PyPI included),
-`make test-unit` 53 s, `make scan` 1 s.
+against a bare copy of this repository at HEAD. On 2026-09-28 at 9:58 PM, at commit
+1f45019 with worker image `crucible-worker:20260916-17c611edd8d9`, it reached
+`awaiting_internal_review` in 125 s with every pre-PR gate but the internal review
+passing, and the verifier's own clock read `make lint` 14 s (uv sync from PyPI
+included), `make test-unit` 57 s, `make scan` 2 s.
