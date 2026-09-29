@@ -1,0 +1,195 @@
+# The policy for tasks against this repository (sentania-labs/hades), run from a worker
+# (hades #184, ADR 0020). default-software with three changes:
+#
+# - required_checks are `make lint`, `make test-unit` and `make scan`: what runs inside
+#   the worker image with no Docker daemon and no Postgres. `make test-integration` and
+#   the e2e tiers need both, and branch CI on the pushed head stays the full proof of
+#   record (the operator's decision, 2026-09-28). ci_certification is unchanged, so a
+#   task still waits for that CI run before it is done.
+# - required_programs names what those targets call, so `make images-policy-check`
+#   proves the worker image carries each one.
+# - the egress allowlist keeps PyPI (pypi.org and files.pythonhosted.org): `uv sync
+#   --frozen` fetches the hash-locked dependencies at run time, in the worker and again
+#   in the verifier. The Kubernetes provider pins both names to the addresses the policy
+#   permits (hades #191) and never gives a worker or a verifier github.com.
+#
+# routing.policy must name the routing policy the default-software in force names, or
+# this policy routes against an older model roster. Read it and fill it in at upload:
+#
+#   GET /v1/routing/usage?policy=default-software, its `routing_policy`
+#
+# then PUT /v1/policies/hades-self-hosting/<version> (admin) with this document as JSON.
+# docs/deployment.md has the whole procedure, with the admin token kept off every
+# command line. A new routing version later needs a new
+# version of this policy too.
+schema_version: '1.0'
+name: hades-self-hosting
+version: 1
+description: 'Tasks against sentania-labs/hades from a worker (hades #184): the required
+  checks are make lint, make test-unit and make scan, which run in the worker image with
+  no Docker and no Postgres. The integration and e2e tiers need both and are left to
+  branch CI, which stays the full proof of record (operator decision, 2026-09-28).'
+limits:
+  timeout_seconds:
+    min: 300
+    max: 14400
+    default: 3600
+  # command_timeout_ms (issue 128) is absent from the seeded version, which takes the
+  # default bounds { min: 1000, max: 14400000, default: 3600000 }. A new version sets
+  # it here, or through `crucible admin limits set-command-timeout`.
+  max_attempts:
+    max: 3
+    default: 2
+  grace_seconds: 60
+  stall_warn_seconds: 300
+  stall_fail_seconds: 1800
+  auth_retry_delay_seconds: 600
+  escalation_stale_hours: 24
+  wake_retry_hours: 24
+retry:
+  eligible_classes:
+  - environment
+  - lost
+  - auth_failure
+  auth_failure_max: 1
+concurrency:
+  per_provider: 3
+  per_harness:
+    claude_code: 1
+    codex: 1
+    agy: 1
+resources:
+  cpus: 2
+  memory: 4GiB
+  pids: 512
+  tmpfs_total: 20GiB
+network:
+  mode: egress-proxy
+  egress_allowlist:
+  - github.com
+  - objects.githubusercontent.com
+  - pypi.org
+  - files.pythonhosted.org
+  harness_endpoints: from-harness
+images:
+  allowlist:
+  - crucible-worker:*
+  - ghcr.io/sentania-labs/crucible-worker:*
+  require_default_or_retained: true
+git:
+  author_name: crucible-worker
+  author_email: crucible-worker@users.noreply.github.com
+  commit_trailer: Crucible-Attempt
+  work_branch_pattern: crucible/*
+  protected_branches:
+  - main
+  - release/*
+repository:
+  required_checks:
+  - make lint
+  - make test-unit
+  - make scan
+  # make lint: uv (ruff, mypy, import-linter under python3.12) and images/check-manifest.sh
+  # (bash, jq, tar, sha256sum); make scan: gitleaks, git and tar.
+  required_programs:
+  - make
+  - git
+  - uv
+  - python3.12
+  - gitleaks
+  - bash
+  - jq
+  - tar
+  - sha256sum
+gates:
+  pre_pr:
+  - report_present
+  - exit_clean
+  - commits_present
+  - scope_contained
+  - no_injected_files
+  - no_secrets
+  - verification_ran
+  - run_evidence_present
+  - criteria_mapped
+  - dependencies_unchanged
+  - ci_unchanged
+  - workspace_clean
+  - internal_review_recorded
+  publication:
+  - branch_pushed_at_head
+  - pr_exists_head_matches
+  post_pr:
+  - external_review_rounds
+  - feedback_dispositions_complete
+  - ci_green_for_head
+  skipped: []
+deliverables:
+  allow_branch_only: false
+  on_out_of_band_head: block
+pull_request:
+  require_pre_pr_verification: true
+  open_only_after_pre_pr_gates_pass: true
+  publish_requires_acceptance: true
+  title_from: claim
+  body_template: default
+  closing_refs: contract_only
+internal_review:
+  required: true
+  required_for_corrections: false
+  reviewer_must_not_be_author: true
+  executor: orchestrator_or_crucible
+external_review:
+  provider: codex
+  reviewer_logins:
+  - chatgpt-codex-connector[bot]
+  required_rounds: 1
+  retrigger_after_correction: false
+  require_review_on_final_sha: false
+  require_feedback_disposition: true
+  accepted_signals:
+  - review
+  - reaction:+1
+  round_counting: completed_cycles
+  wait_timeout_hours: 24
+ci_certification:
+  require_green_on_final_sha: true
+  required_checks: []
+  allow_no_ci: false
+  on_failure: escalate
+  automatic_retry: false
+  automatic_worker_correction: false
+  wait_timeout_hours: 6
+release:
+  require_operator_approval: true
+  authorization_recorder: orchestrator_relay
+  trigger: tag
+  tag_pattern: v{major}.{minor}.{patch}
+  version_files: []
+  changelog_required: true
+cleanup:
+  workspace_on_success: keep_diff_only
+  workspace_on_failure: keep
+  container_remove: always
+  credential_volume_remove: immediately_after_validated_sync
+retention:
+  logs_and_transcripts_days: 90
+  bootstrap_archive_days: 180
+  completed_workspaces_days: 14
+  wakes_after_ack_days: 30
+  indefinite:
+  - events
+  - completion_claims
+  - decisions
+  - gate_results
+  - review_reports
+  - external_reviews
+  - dispositions
+  - ci_certifications
+  - release_records
+  - diffs
+  - artifact_metadata
+routing:
+  policy:
+    name: default-routing
+    version: 7

@@ -334,7 +334,10 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> int:
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8765
-    ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
+    # Loopback unless told otherwise: the kind self-hosting case (hades #184) runs this
+    # as a Pod the worker reaches through a Service, so it binds every address there.
+    bind = os.environ.get("STUB_BIND", "127.0.0.1")
+    ThreadingHTTPServer((bind, port), Handler).serve_forever()
     return 0
 
 

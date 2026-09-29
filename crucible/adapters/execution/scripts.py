@@ -524,8 +524,8 @@ def encode_check_id(check_id: str) -> str:
 def verifier_script(checks: list[tuple[str, str]]) -> str:
     """Re-run each `required_verification` command from the collected tree (11).
 
-    Each command's exit and log go to the verify directory, which is the only place
-    this container may write besides its own tree copy. The commands come from the
+    Each command's exit, log and wall-clock seconds go to the verify directory, which is
+    the only place this container may write besides its own tree copy. The commands come from the
     repository, so this container is the one that runs worker-influenced code: it
     never sees the collector's output directory, only its own tree.
 
@@ -548,7 +548,11 @@ def verifier_script(checks: list[tuple[str, str]]) -> str:
         lines.append(f"CMD={_quote(command)}")
         lines.append('printf \'%s\\t%s\\n\' "$F" "$ID" >> "$MANIFEST"')
         lines.append('printf \'%s\\n\' "$CMD" > "$V/$F.cmd"')
+        # hades #184: the wall-clock seconds each command took, measured in this
+        # container, so the evidence says what a required check costs where it runs.
+        lines.append("S=$(date +%s)")
         lines.append('sh -c "$CMD" > "$V/$F.log" 2>&1; echo $? > "$V/$F.exit"')
+        lines.append('echo $(( $(date +%s) - S )) > "$V/$F.seconds"')
     lines.append("exit 0")
     return "\n".join(lines) + "\n"
 
