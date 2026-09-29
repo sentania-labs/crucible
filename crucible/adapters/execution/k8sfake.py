@@ -25,7 +25,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any
+from typing import IO, Any
 
 from crucible.adapters.execution.fake import (
     BEHAVIORS,
@@ -37,7 +37,12 @@ from crucible.adapters.execution.fake import (
     synthetic_diff,
     synthetic_head_sha,
 )
-from crucible.adapters.execution.k8sapi import ExecResult, KubernetesApiError, LogFrame
+from crucible.adapters.execution.k8sapi import (
+    ExecResult,
+    KubernetesApiError,
+    KubernetesUnavailableError,
+    LogFrame,
+)
 from crucible.adapters.execution.k8sregistry import RegistryError
 from crucible.adapters.execution.k8sspec import (
     CONTAINER_NAME,
@@ -272,6 +277,14 @@ class FakeKubernetesApi:
     publish_leaf_unwritable: bool = False
     # Called with each push, so a test's stand-in remote can move its branch.
     on_push: Callable[[dict[str, str]], None] | None = None
+    # An API server that cannot answer: each entry is (call, kind, count), and the next
+    # `count` calls of that name (`get`, `create`, `list_objects`, `pod_exec`, ...) on
+    # that kind ("" for any kind) raise a 503, as a restarting API server does.
+    outages: list[list[Any]] = field(default_factory=list)
+    # Roles whose Job the namespace quota refuses a Pod for: the Job exists, no Pod is
+    # ever created, and a `FailedCreate` event names the quota, as the Job controller
+    # records it.
+    quota_refused_roles: set[str] = field(default_factory=set)
     _uids: int = 0
 
     # ----- test controls ------------------------------------------------
@@ -333,10 +346,21 @@ class FakeKubernetesApi:
 
     # ----- the client surface -------------------------------------------
 
+    def fail_next(self, call: str, count: int = 1, *, kind: str = "") -> None:
+        """Make the next `count` calls of `call` (on `kind`, or any) answer 503."""
+        self.outages.append([call, kind, count])
+
+    def _outage(self, call: str, kind: str = "") -> None:
+        for entry in self.outages:
+            if entry[0] == call and entry[1] in ("", kind) and entry[2] > 0:
+                entry[2] -= 1
+                raise KubernetesUnavailableError(503, f"the fake API server is down ({call})")
+
     def version(self) -> str:
         return "v1.31.0"
 
     def create(self, kind: str, body: Mapping[str, Any]) -> dict[str, Any]:
+        self._outage("create", kind)
         metadata = dict(body.get("metadata") or {})
         name = str(metadata.get("name", ""))
         if kind in self.refuse_create:
@@ -365,6 +389,7 @@ class FakeKubernetesApi:
         return stored
 
     def get(self, kind: str, name: str) -> dict[str, Any]:
+        self._outage("get", kind)
         obj = self.objects.get((kind, name))
         if obj is None:
             raise KubernetesApiError(404, f"{kind}/{name} not found")
@@ -375,6 +400,9 @@ class FakeKubernetesApi:
     def list_objects(
         self, kind: str, *, label_selector: str | None = None, field_selector: str | None = None
     ) -> list[dict[str, Any]]:
+        self._outage("list_objects", kind)
+        if kind == "events":
+            return self._events(field_selector)
         wanted = _parse_selector(label_selector)
         out: list[dict[str, Any]] = []
         for (stored_kind, _), obj in list(self.objects.items()):
@@ -399,6 +427,7 @@ class FakeKubernetesApi:
         propagation: str = "Background",
         uid: str | None = None,
     ) -> None:
+        self._outage("delete", kind)
         obj = self.objects.get((kind, name))
         if obj is None:
             return
@@ -429,6 +458,7 @@ class FakeKubernetesApi:
             self.claims.pop(name, None)
 
     def patch(self, kind: str, name: str, body: Mapping[str, Any]) -> dict[str, Any]:
+        self._outage("patch", kind)
         obj = self.objects.get((kind, name))
         if obj is None:
             raise KubernetesApiError(404, f"{kind}/{name} not found")
@@ -445,6 +475,7 @@ class FakeKubernetesApi:
         timeout: float | None = None,
         limit_bytes: int | None = None,
     ) -> list[LogFrame]:
+        self._outage("pod_log", "pods")
         self.log_reads.append({"name": name, "since_time": since_time, "limit_bytes": limit_bytes})
         lines = self.logs.get(name, [])
         if not timestamps:
@@ -479,7 +510,52 @@ class FakeKubernetesApi:
         timeout: float | None = None,
         limit: int = 0,
         stdin: bytes | None = None,
+        stdout_to: IO[bytes] | None = None,
     ) -> ExecResult:
+        self._outage("pod_exec", "pods")
+        result = self._exec(name, command, stdin)
+        if stdout_to is None:
+            return result
+        stdout_to.write(result.stdout)
+        return ExecResult(b"", result.stderr, result.exit_code, stdout_size=len(result.stdout))
+
+    def pod_exec_to(
+        self,
+        name: str,
+        command: Sequence[str],
+        into: IO[bytes],
+        *,
+        container: str | None = None,
+        timeout: float | None = None,
+        limit: int = 0,
+    ) -> ExecResult:
+        return self.pod_exec(name, command, container=container, limit=limit, stdout_to=into)
+
+    def _events(self, field_selector: str | None) -> list[dict[str, Any]]:
+        """`FailedCreate` events for the Jobs whose Pod the quota refused."""
+        fields = dict(
+            part.split("=", 1) for part in (field_selector or "").split(",") if "=" in part
+        )
+        out: list[dict[str, Any]] = []
+        for (kind, name), obj in self.objects.items():
+            if kind != "jobs" or not obj.body.get("_quota_refused"):
+                continue
+            if fields.get("involvedObject.name") not in (None, name):
+                continue
+            out.append(
+                {
+                    "reason": "FailedCreate",
+                    "involvedObject": {"kind": "Job", "name": name},
+                    "message": (
+                        f'Error creating: pods "{name}-abc12" is forbidden: exceeded quota: '
+                        "crucible-workers, requested: limits.memory=4Gi, used: "
+                        "limits.memory=12Gi, limited: limits.memory=12Gi"
+                    ),
+                }
+            )
+        return out
+
+    def _exec(self, name: str, command: Sequence[str], stdin: bytes | None) -> ExecResult:
         obj = self.objects.get(("pods", name))
         if obj is None:
             raise KubernetesApiError(404, f"pods/{name} not found")
@@ -517,6 +593,9 @@ class FakeKubernetesApi:
         labels["job-name"] = name
         attempt_id = str(labels.get(LABEL_ATTEMPT, ""))
         if name in self.no_pod_yet or attempt_id in self.no_pod_yet:
+            return
+        if str(labels.get(LABEL_ROLE, "")) in self.quota_refused_roles:
+            self.objects[("jobs", name)].body["_quota_refused"] = True
             return
         pod_name = f"{name}-abc12"
         pod: dict[str, Any] = {

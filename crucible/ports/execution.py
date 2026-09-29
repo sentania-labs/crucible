@@ -414,6 +414,13 @@ class ProviderError(Exception):
     """A provider failed before or while the harness ran (exit class environment)."""
 
 
+class ProviderUnavailableError(ProviderError):
+    """The provider's backend could not answer right now (a refused, reset or timed-out
+    connection, or a server that said it is overloaded). Nothing about the attempt was
+    decided by it: a caller that can wait, such as collection, asks again later rather
+    than failing the attempt."""
+
+
 class LaunchRefusedError(ProviderError):
     """A launch the provider refused on purpose (07, 13): the image's harness version is
     outside the adapter's tested range, or the harness has no credential to run with.
@@ -475,6 +482,13 @@ class ExecutionProvider(Protocol):
     async def cleanup(
         self, ws: Workspace, policy: CleanupPolicy, spec: LaunchSpec | None = None
     ) -> None: ...
+
+    async def release_workspace(self, ws: Workspace, spec: LaunchSpec | None = None) -> None:
+        """Remove what a cleanup policy kept of an attempt's workspace (its claim, its
+        directory), once the retention step decided nothing needs it any more (16).
+        Idempotent: a workspace already gone is the state asked for. Raises
+        ProviderError when it could not be removed, so the step tries again."""
+        ...
 
     async def reconcile(self) -> list[Handle]: ...
 
