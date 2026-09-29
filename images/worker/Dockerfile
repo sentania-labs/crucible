@@ -220,6 +220,11 @@ RUN set -eu; \
     diff -u /tmp/locked /tmp/installed; \
     rm -rf /root/.cache /tmp/requirements.lock /tmp/locked /tmp/installed /fetch
 COPY --chmod=0755 worker/crucible-hermes.py /usr/local/bin/crucible-hermes
+# FDY-0140: Hermes puts the directory of whichever `hermes` it finds first on the PATH
+# of every command the model runs; with none on PATH it falls back to its own venv's
+# bin, which would shadow the image's python3. This link makes that /usr/local/bin,
+# already on PATH, so the prepend changes nothing.
+RUN ln -s /opt/hermes/bin/hermes /usr/local/bin/hermes
 # hades #215: the worker checks its own report.yaml before it exits 0. Standard library
 # only; it re-executes under the Hermes venv's Python for PyYAML, by path, for its own
 # process alone, so PATH is unchanged. No network.
@@ -245,14 +250,15 @@ RUN ln -s /opt/python3.12/bin/python3.12 /usr/local/bin/python3.12
 #   `-c check_for_update_on_startup=false` at launch.
 # - Hermes 0.19.0 has no automatic update facility.
 # The read-only root makes any self-update fail regardless (S7, S11).
-# PATH stays Debian's default: the Hermes venv is not on it, so no other harness's
-# `python3` resolves into Hermes's dependencies. The Hermes adapter launches
-# /usr/local/bin/crucible-hermes, which runs /opt/hermes/bin/hermes by path, and
-# puts the venv first on PATH for its own process only.
+# PATH stays Debian's default: the Hermes venv is not on it, so no command any model
+# runs, Hermes's included, resolves `python3` into Hermes's dependencies. The Hermes
+# adapter launches /usr/local/bin/crucible-hermes, which starts Hermes with the venv's
+# own Python by path and adds nothing to PATH (FDY-0140).
 # uv (hades #184): never download a Python, since no worker reaches the host it would
 # come from and the image carries the one the project asks for; and copy rather than
-# hardlink, because its cache is on the memory-backed home and the project's .venv is
-# on the workspace, two filesystems, where a hardlink always falls back with a warning.
+# hardlink, because its cache (UV_CACHE_DIR, which the provider points at the
+# workspace's package-cache mount, FDY-0140) and the project's .venv in the checkout
+# are two mounts, where a hardlink always falls back with a warning.
 ENV HOME=/home/worker \
     UV_PYTHON_DOWNLOADS=never \
     UV_LINK_MODE=copy \

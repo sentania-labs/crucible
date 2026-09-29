@@ -464,3 +464,25 @@ async def test_retention_reaps_stale_login_but_keeps_one_owned_by_this_process(
 
     assert removed == 2
     assert client.removed == ["stale-login", "orphan-worker"]
+
+
+def test_the_worker_keeps_its_package_caches_on_the_workspace(tmp_path: Path) -> None:
+    """FDY-0140: uv, pip and npm caches go to the workspace's `pkg-cache` leaf, never
+    the size-limited memory home."""
+    docker = provider(tmp_path, StubClient())
+    launch = spec()
+    _, env = docker._network_and_env(launch)
+    body = docker._worker_body(
+        workspace_for(tmp_path, launch.attempt_id),
+        launch,
+        resolved=IMAGE,
+        network="none",
+        env=env,
+    )
+    mounts = {m["Target"]: m for m in body["HostConfig"]["Mounts"]}
+    cache = mounts["/crucible/pkg-cache"]
+    assert cache["Source"].endswith(f"workspaces/{launch.attempt_id}/pkg-cache")
+    assert cache["ReadOnly"] is False
+    assert "UV_CACHE_DIR=/crucible/pkg-cache/uv" in body["Env"]
+    assert "PIP_CACHE_DIR=/crucible/pkg-cache/pip" in body["Env"]
+    assert "npm_config_cache=/crucible/pkg-cache/npm" in body["Env"]

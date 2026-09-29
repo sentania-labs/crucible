@@ -15,6 +15,7 @@ import socket
 import subprocess
 import time
 from dataclasses import replace
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
@@ -179,9 +180,9 @@ def _provider(
     )
 
 
-def _origin(name: str, behavior: str = "succeed") -> str:
+def _origin(name: str, behavior: str = "succeed", extra: dict[str, str] | None = None) -> str:
     cache = Path(os.environ["CRUCIBLE_E2E_KIND_CACHE"])
-    host_url = make_origin(cache, name, behavior)
+    host_url = make_origin(cache, name, behavior, extra=extra)
     bare = Path(host_url)
     subprocess.run(
         [
@@ -669,7 +670,7 @@ async def test_rows_5_7_11_23_supervisor_restart_and_full_gate_lifecycle(
                 text("SELECT exit_class, termination_reason FROM attempts WHERE id = :id"),
                 {"id": stall_attempt["id"]},
             ).one()
-        assert stall_row.exit_class == "timeout"
+        assert stall_row.exit_class == "stalled"
         assert stall_row.termination_reason == "stall"
         assert {"worker_quiet", "worker_stalled"} <= set(event_kinds(client, stall_task))
 
@@ -1991,9 +1992,13 @@ def _kind_app(
     artifact_root: Path,
     provider: KubernetesProvider,
     registry: CraneRegistryClient,
+    *,
+    version: int = 21,
+    stall_seconds: tuple[int, int] | None = None,
 ) -> tuple[AppContext, dict[str, str], Any, Any]:
-    """The API on the tier's database, the e2e policy at version 21 with two
-    script-harness workers allowed at once, and the tier's image promoted."""
+    """The API on the tier's database, the e2e policy at `version` (21 unless named)
+    with two script-harness workers allowed at once and, when given, the stall limits
+    `(warn, fail)`, and the tier's image promoted."""
     clock = SystemClock()
     harnesses = application_harnesses(test_fixtures=True)
     ctx = AppContext(
@@ -2018,10 +2023,14 @@ def _kind_app(
         assert admin.put(
             f"/v1/routing/{routing['name']}/{routing['version']}", json=routing
         ).status_code in (200, 201)
-        policy = e2e_policy_document(version=21)
+        policy = e2e_policy_document(version=version)
         policy["images"]["allowlist"] = ["localhost:*/*"]
         policy["resources"] = {"cpus": 1, "memory": "256MiB", "pids": 128, "tmpfs_total": "256MiB"}
         policy["concurrency"]["per_harness"]["script-harness"] = 2
+        if stall_seconds is not None:
+            warn, fail = stall_seconds
+            policy["limits"]["stall_warn_seconds"] = warn
+            policy["limits"]["stall_fail_seconds"] = fail
         response = admin.put(f"/v1/policies/{policy['name']}/{policy['version']}", json=policy)
         assert response.status_code in (200, 201), response.text
     with ctx.uow_factory() as uow:
@@ -2038,11 +2047,13 @@ def _kind_app(
     return ctx, tokens, app, harnesses
 
 
-def _kind_task(client: TestClient, ctx: AppContext, name: str, url: str) -> str:
+def _kind_task(
+    client: TestClient, ctx: AppContext, name: str, url: str, *, version: int = 21
+) -> str:
     register(ctx, name, url)
     document = e2e_contract(f"E2E-{name.upper()}", name, os.environ["CRUCIBLE_E2E_KIND_REGISTRY"])
     document["execution_request"]["provider"] = "kubernetes"
-    document["policy"]["version"] = 21
+    document["policy"]["version"] = version
     return submit_and_start(client, document)
 
 
@@ -2859,3 +2870,77 @@ async def test_lab_findings_an_api_server_outage_during_collect_loses_no_attempt
         assert response.status_code == 200
         await run_until(supervisor, client, task_id, {"cancelled"}, max_ticks=20, min_seconds=0)
     await supervisor.stop()
+
+
+async def test_fdy_0140_a_silent_worker_is_not_stalled_and_uncommitted_edits_are_collected(
+    engine: Engine,
+    migrated: str,
+    artifact_root: Path,
+    provider: KubernetesProvider,
+    registry: CraneRegistryClient,
+) -> None:
+    """FDY-0140 on a real cluster, with the stall limits at 2 s and 6 s. One worker
+    writes nothing to its log for 20 s while a file in its home keeps changing, as Hermes
+    `-z` does: the provider reads that off the Pod and the worker is not stalled. The
+    other edits its checkout and never commits: the collector commits the edit as the
+    policy's author with the attempt trailer, and it is in the collected branch."""
+    ctx, tokens, app, harnesses = _kind_app(
+        engine, migrated, artifact_root, provider, registry, version=40, stall_seconds=(2, 6)
+    )
+    headers = {"Authorization": f"Bearer {tokens['operator']}"}
+    done = {"awaiting_internal_review", "pre_pr_gates_failed"}
+    with TestClient(app, headers=headers) as client:
+        supervisor = Supervisor(
+            ctx.uow_factory,
+            {"kubernetes": provider},
+            ctx.clock,
+            holder="e2e-kind-fdy-0140",
+            artifact_store=ctx.artifact_store,
+            lease_ttl_seconds=120,
+            grace_seconds=5,
+            harnesses=harnesses,
+        )
+        # One at a time, so another task's collection never holds the tick while the
+        # silent worker needs observing.
+        silent = _kind_task(
+            client,
+            ctx,
+            "fdy-0140-silent",
+            _origin("fdy-0140-silent", "silent-work", extra={"e2e-silent-seconds": "20\n"}),
+            version=40,
+        )
+        await run_until(supervisor, client, silent, done, max_ticks=120, pause=0.5)
+        uncommitted = _kind_task(
+            client,
+            ctx,
+            "fdy-0140-uncommitted",
+            _origin("fdy-0140-uncommitted", "no-commit"),
+            version=40,
+        )
+        await run_until(supervisor, client, uncommitted, done, max_ticks=120, pause=0.5)
+        await supervisor.stop()
+
+        silent_id = client.get(f"/v1/tasks/{silent}").json()["latest_attempt"]["id"]
+        silent_attempt = client.get(f"/v1/attempts/{silent_id}").json()
+        assert silent_attempt["termination_reason"] is None, silent_attempt
+        assert silent_attempt["exit_class"] == "completed", silent_attempt
+        assert "worker_stalled" not in event_kinds(client, silent)
+        with ctx.uow_factory() as uow:
+            signals = [h.signal for h in uow.heartbeats.list_for_attempt(silent_id, limit=10_000)]
+            stamps = [c.ts for c in uow.logs.list_for_attempt(silent_id, limit=500)]
+        # The log itself was silent for longer than the 6 s fail limit, and what kept the
+        # worker alive meanwhile was its files changing.
+        gaps = [(later - earlier).total_seconds() for earlier, later in pairwise(stamps)]
+        assert max(gaps) >= 15, gaps
+        assert signals.count("fs_changed") >= 3, signals
+
+        attempt = client.get(f"/v1/tasks/{uncommitted}").json()["latest_attempt"]
+        assert attempt["exit_class"] == "completed", attempt
+        evidence = client.get(f"/v1/attempts/{attempt['id']}/evidence").json()["items"]
+        bundle = next(item["payload"] for item in evidence if item["kind"] == "bundle_head")
+        assert bundle["commits"] == 1 and bundle["bundle_verified"] is True, bundle
+        assert any("left uncommitted" in message for message in bundle["commit_messages"]), bundle
+        assert "src/e2e_change.txt" in bundle["commit_paths"], bundle
+        events = client.get(f"/v1/tasks/{uncommitted}/events", params={"limit": 200}).json()
+        collected = [e for e in events["items"] if e["kind"] == "attempt_collected"]
+        assert collected[-1]["payload"].get("uncommitted_work_committed") is True, collected

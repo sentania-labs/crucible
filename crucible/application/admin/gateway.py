@@ -35,6 +35,14 @@ from crucible.contracts.policy import parse_routing_policy
 from crucible.domain.endpoints import validate_endpoint
 from crucible.domain.entities import Principal, ProviderSetting
 from crucible.domain.events import EventKind
+from crucible.domain.harness_settings import (
+    CONTEXT_LENGTH_RANGE,
+    MAX_TURNS_RANGE,
+    HermesRunLimits,
+    hermes_limit_problems,
+    hermes_run_limits,
+    setting_name,
+)
 from crucible.ports.repository import UnitOfWork
 
 HERMES = credentials.HERMES
@@ -515,3 +523,66 @@ __all__ = [
     "save_models",
     "test_gateway",
 ]
+
+
+# ----- Hermes run limits (FDY-0140) ------------------------------------------------
+
+
+def hermes_limits_view(uow: UnitOfWork) -> dict[str, Any]:
+    """The turn and context limits the next Hermes launch gets, whether they were saved
+    or are the defaults, and the ranges a save accepts."""
+    saved = uow.provider_settings.get(setting_name(HERMES))
+    limits = hermes_run_limits(saved.document if saved is not None else None)
+    return {
+        **limits.as_dict(),
+        "saved": saved is not None,
+        "updated_at": saved.updated_at.isoformat() if saved is not None else None,
+        "updated_by": saved.updated_by if saved is not None else None,
+        "defaults": HermesRunLimits().as_dict(),
+        "max_turns_range": list(MAX_TURNS_RANGE),
+        "context_length_range": list(CONTEXT_LENGTH_RANGE),
+    }
+
+
+def save_hermes_limits(
+    ctx: AdminContext,
+    uow: UnitOfWork,
+    *,
+    principal: Principal,
+    max_turns: int,
+    context_length: int,
+    reason: str | None,
+) -> dict[str, Any]:
+    """Save the Hermes run limits. They apply from the next launch; a run already going
+    keeps the limits it started with."""
+    reason = guard_mutation(
+        ctx, uow, reason, principal=principal.name, operation="hermes limits set"
+    )
+    problems = hermes_limit_problems(max_turns, context_length)
+    if problems:
+        raise ContractValidationError(
+            "; ".join(problems),
+            errors=[{"path": "hermes_limits", "message": problem} for problem in problems],
+        )
+    before = hermes_limits_view(uow)
+    after = HermesRunLimits(max_turns=max_turns, context_length=context_length).as_dict()
+    uow.provider_settings.put(
+        ProviderSetting(
+            name=setting_name(HERMES),
+            document=after,
+            updated_at=ctx.clock.now(),
+            updated_by=principal.name,
+            reason=reason,
+        )
+    )
+    admin_event(
+        uow,
+        ctx,
+        EventKind.LOCAL_GATEWAY_UPDATED,
+        principal=principal.name,
+        reason=reason,
+        before={"max_turns": before["max_turns"], "context_length": before["context_length"]},
+        after=after,
+        change="hermes_limits",
+    )
+    return hermes_limits_view(uow)

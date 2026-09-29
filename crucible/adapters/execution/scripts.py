@@ -17,15 +17,21 @@ validation is what stops it being an option.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from typing import Any
+
 from crucible.ports.execution import (
     OUTPUT_MOUNT,
+    PACKAGE_CACHE_LEAF,
     REPO_MOUNT,
     REPORT_MOUNT,
+    VERIFIER_CACHE_LEAF,
     VERIFY_MOUNT,
     WORK_MOUNT,
 )
 
 __all__ = [
+    "ACTIVITY_SCRIPT",
     "BUNDLE_MOUNT",
     "BUNDLE_VERIFY_SCRIPT",
     "COMMIT_HOOK_DIR",
@@ -38,6 +44,7 @@ __all__ = [
     "collector_script",
     "commit_msg_hook",
     "encode_check_id",
+    "parse_activity",
     "preparer_script",
     "publish_leaf_script",
     "publisher_script",
@@ -425,6 +432,9 @@ touch "$REPO/.git/info/exclude"
 # it through the daemon before the worker starts and removes it right after the
 # sync-back.
 mkdir -m 0700 -p {WORK_MOUNT}/credential
+# FDY-0140: the package caches, the worker's and the verifier's, owned by the worker's
+# uid like the checkout.
+mkdir -p {WORK_MOUNT}/{PACKAGE_CACHE_LEAF} {WORK_MOUNT}/{VERIFIER_CACHE_LEAF}
 
 mkdir -p "$OUT"
 {GIT} rev-parse HEAD > "$OUT/prepared-head.txt"
@@ -432,17 +442,64 @@ printf '%s\n' "$STARTED" > "$OUT/started-from.txt"
 """
 
 
+# The policy's commit identity (05b `git`), with the defaults every shipped policy uses.
+_GIT_DEFAULTS = {
+    "author_name": "crucible-worker",
+    "author_email": "crucible-worker@users.noreply.github.com",
+    "commit_trailer": "Crucible-Attempt",
+}
+
+
+def policy_git(policy: Mapping[str, Any], name: str) -> str:
+    """One of the policy's `git` values: `author_name`, `author_email` or
+    `commit_trailer`."""
+    value = (policy.get("git") or {}).get(name)
+    return str(value) if value else _GIT_DEFAULTS[name]
+
+
+# FDY-0140: what the leftover commit never takes, as git pathspecs.
+_LEFTOVER_EXCLUDED = (
+    "**/__pycache__/**",
+    "**/*.pyc",
+    "**/node_modules/**",
+    "**/.venv/**",
+    "**/.pytest_cache/**",
+    "**/.mypy_cache/**",
+    "**/.ruff_cache/**",
+    "**/.tox/**",
+    "**/*.egg-info/**",
+    "**/.coverage",
+)
+_LEFTOVER_EXCLUDES = " ".join(f"':(exclude,glob){pattern}'" for pattern in _LEFTOVER_EXCLUDED)
+# The same paths as positive pathspecs, to unstage what the worker already added: an
+# exclusion only stops `git add` from adding, it does not take an entry out of the index.
+_LEFTOVER_EXCLUDED_PATHS = " ".join(f"':(glob){pattern}'" for pattern in _LEFTOVER_EXCLUDED)
+
+
 def collector_script(
     *,
     base_ref: str,
     work_branch: str,
     size_cap_bytes: int,
-    quota_attempt_id: str | None = None,
+    attempt_id: str = "",
+    quota_checkpoint: bool = False,
+    author_name: str = "crucible-worker",
     author_email: str = "crucible-worker@users.noreply.github.com",
     commit_trailer: str = "Crucible-Attempt",
+    trailer_value: str = "",
 ) -> str:
     """Produce the full diff, the path list, the head, the log, the bundle, and a copy
     of the report directory (08). Never a push, never a network: `--network none`.
+
+    With `attempt_id`, what the worker left uncommitted is committed first, as the
+    policy's author with the trailer the worker's own commits get (`trailer_value`, the
+    task's external id as the commit hook writes it; the attempt id when none is given),
+    so edits a model forgot to commit are collected and reviewed rather than lost
+    (FDY-0140). A quota checkpoint (16) is the
+    same commit with a `wip` subject; it is refused, and the collection fails, when the
+    repository's `.git` is not a plain directory or the commit cannot be made. Otherwise
+    such a commit is skipped with a note and the collection goes on with what the worker
+    committed itself.
 
     It also runs the publisher's commit policy over the same range the publisher will
     (the remote work branch when the checkout has one, else base_ref), so the
@@ -456,27 +513,39 @@ REPO={REPO_MOUNT}
 WORK_BRANCH={_quote(work_branch)}
 BASE_REF={_quote(base_ref)}
 SIZE_CAP={_quote(str(size_cap_bytes))}
-QUOTA_ATTEMPT={_quote(quota_attempt_id or "")}
+COMMIT_ATTEMPT={_quote(attempt_id)}
+QUOTA={_quote("1" if quota_checkpoint else "")}
 POLICY_AUTHOR_EMAIL={_quote(author_email)}
 TRAILER={_quote(commit_trailer)}
+TRAILER_VALUE={_quote(trailer_value or attempt_id)}
 mkdir -p "$OUT"
 : > "$OUT/copy-rejections.tsv"
 {_COPY_REPORT}
-{_commit_policy_check(GIT + ' -C "$REPO"')}if [ -n "$QUOTA_ATTEMPT" ]; then
-  refuse_checkpoint() {{
+{_commit_policy_check(GIT + ' -C "$REPO"')}LEFTOVER=0
+refuse_checkpoint() {{
+  if [ -n "$QUOTA" ]; then
     printf '%s\n' "$1" > "$OUT/checkpoint-refusal.txt"
     printf '%s\n' "$1" >&2
     exit 4
-  }}
+  fi
+  printf 'uncommitted work was not committed: %s\n' "$1" | tee "$OUT/leftover-refusal.txt" >&2
+  LEFTOVER=0
+}}
+if [ -n "$COMMIT_ATTEMPT" ]; then
+  LEFTOVER=1
   if [ ! -d "$REPO/.git" ] || [ -L "$REPO/.git" ]; then
     refuse_checkpoint "checkpoint refused: repository .git is not a real directory"
-  fi
-  if [ -e "$REPO/.git/commondir" ] || [ -L "$REPO/.git/commondir" ]; then
+  elif [ -e "$REPO/.git/commondir" ] || [ -L "$REPO/.git/commondir" ]; then
     refuse_checkpoint "checkpoint refused: repository .git contains a commondir redirect"
+  elif [ ! -f "$REPO/.git/config" ] || [ -L "$REPO/.git/config" ]; then
+    refuse_checkpoint "checkpoint refused: repository .git/config is not a regular file"
   fi
+fi
+if [ "$LEFTOVER" = "1" ]; then
   # The worker can edit both .git/config and .gitattributes. Replace its local
   # configuration while Git stages and commits, then restore it before collection
-  # continues. With no filter.* commands, a filter attribute is a no-op.
+  # continues. With no filter.* commands, a filter attribute is a no-op. The author
+  # comes from the environment, so no value the policy carries is parsed as config.
   ORIGINAL_CONFIG=/tmp/crucible-worker-git-config.$$
   EMPTY_HOOKS=/tmp/crucible-empty-hooks.$$
   cp "$REPO/.git/config" "$ORIGINAL_CONFIG"
@@ -485,7 +554,8 @@ mkdir -p "$OUT"
     cp "$ORIGINAL_CONFIG" "$REPO/.git/config"
     rm -rf "$ORIGINAL_CONFIG" "$EMPTY_HOOKS"
   }}
-  trap restore_worker_git_config EXIT HUP INT TERM
+  trap restore_worker_git_config EXIT
+  trap 'restore_worker_git_config; trap - EXIT; exit 4' HUP INT TERM
   rm -f "$REPO/.git/config"
   mkdir -p "$EMPTY_HOOKS"
   cat > "$REPO/.git/config" <<EOF
@@ -495,22 +565,34 @@ mkdir -p "$OUT"
   logallrefupdates = true
   hooksPath = $EMPTY_HOOKS
   fsmonitor = false
-[user]
-  name = crucible-worker
-  email = crucible-worker@users.noreply.github.com
 [commit]
   gpgsign = false
 [tag]
   gpgsign = false
 EOF
-  GIT_DIR="$REPO/.git" GIT_COMMON_DIR="$REPO/.git" \
-    {CHECKPOINT_GIT} -C "$REPO" add -A
-  if ! GIT_DIR="$REPO/.git" GIT_COMMON_DIR="$REPO/.git" \
-    {CHECKPOINT_GIT} -C "$REPO" diff --cached --quiet; then
-    GIT_DIR="$REPO/.git" GIT_COMMON_DIR="$REPO/.git" \
-      {CHECKPOINT_GIT} -C "$REPO" commit -q \
-      -m "wip(crucible): attempt $QUOTA_ATTEMPT" \
-      -m "Crucible-Attempt: $QUOTA_ATTEMPT"
+  if [ -n "$QUOTA" ]; then
+    SUBJECT="wip(crucible): attempt $COMMIT_ATTEMPT"
+  else
+    SUBJECT="crucible: commit what attempt $COMMIT_ATTEMPT left uncommitted"
+  fi
+  checkpoint_git() {{
+    GIT_DIR="$REPO/.git" GIT_COMMON_DIR="$REPO/.git" \\
+      GIT_AUTHOR_NAME={_quote(author_name)} GIT_AUTHOR_EMAIL={_quote(author_email)} \\
+      GIT_COMMITTER_NAME={_quote(author_name)} GIT_COMMITTER_EMAIL={_quote(author_email)} \\
+      {CHECKPOINT_GIT} -C "$REPO" "$@"
+  }}
+  # Build output and caches a repository forgot to ignore are never swept in: the
+  # commit is for the worker's edits, not what running its checks left behind.
+  if ! checkpoint_git add -A -- . {_LEFTOVER_EXCLUDES}; then
+    refuse_checkpoint "checkpoint refused: the working tree could not be staged"
+  elif ! checkpoint_git reset -q -- {_LEFTOVER_EXCLUDED_PATHS}; then
+    refuse_checkpoint "checkpoint refused: build output could not be unstaged"
+  elif checkpoint_git diff --cached --quiet; then
+    :
+  elif checkpoint_git commit -q -m "$SUBJECT" -m "$TRAILER: $TRAILER_VALUE"; then
+    printf '%s\n' "$COMMIT_ATTEMPT" > "$OUT/leftover-committed.txt"
+  else
+    refuse_checkpoint "checkpoint refused: the working tree could not be committed"
   fi
   restore_worker_git_config
   trap - EXIT HUP INT TERM
@@ -571,6 +653,43 @@ HEAD=$({GIT} -C "$REPO" rev-parse HEAD)
 REMOTE=$({GIT} --git-dir "$ORIGIN" rev-parse "refs/heads/$WORK_BRANCH")
 test "$REMOTE" = "$HEAD"
 """
+
+
+# FDY-0140: what the Kubernetes provider runs inside a live worker to see whether it is
+# working. The checkout, the report directory and the home directory, where a harness
+# keeps its own session state (Hermes writes its session store after every model turn
+# while `-z` writes nothing to stdout), are walked without crossing into another
+# filesystem, so a credential mount under the home is never entered. It prints one
+# line: the newest modification time in microseconds, the entry count and the total
+# bytes. Nothing is written and nothing the worker controls is run.
+ACTIVITY_MARKER = "# crucible: activity"
+# The walk is bounded in time: a tree too large to walk in ACTIVITY_WALK_SECONDS answers
+# `incomplete`, which the supervisor reads as "could not tell", never as activity. find
+# exits 1 when it could not read a path, which is still a whole walk.
+ACTIVITY_WALK_SECONDS = 10
+ACTIVITY_SCRIPT = f"""{ACTIVITY_MARKER}
+{{ timeout {ACTIVITY_WALK_SECONDS} find {REPO_MOUNT} {REPORT_MOUNT} "${{HOME:-/home/worker}}" \\
+    -xdev -printf '%T@ %s\\n' 2>/dev/null; echo "status $?"; }} \\
+  | awk 'BEGIN {{ newest = 0; files = 0; total = 0; status = 2 }}
+         $1 == "status" {{ status = $2; next }}
+         {{ if ($1 + 0 > newest) newest = $1 + 0; files += 1; total += $2 }}
+         END {{
+           if (status > 1) {{ print "incomplete"; exit }}
+           printf "activity %.0f %.0f %.0f\\n", newest * 1000000, files, total
+         }}'
+"""
+
+
+def parse_activity(stdout: bytes) -> tuple[int, int, int] | None:
+    """The fingerprint ACTIVITY_SCRIPT printed, or None for anything else."""
+    fields = stdout.decode("ascii", "replace").split()
+    if len(fields) != 4 or fields[0] != "activity":
+        return None
+    try:
+        newest, files, total = (int(value) for value in fields[1:])
+    except ValueError:
+        return None
+    return newest, files, total
 
 
 BUNDLE_VERIFY_SCRIPT = f"""set -eu

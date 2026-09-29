@@ -434,3 +434,33 @@ def test_provider_reset_comes_only_from_the_authoritative_event() -> None:
     event = adapter.provider_quota_event(refusal, "")
     assert event is not None
     assert event.reset_at == datetime(2026, 9, 21, 12, tzinfo=UTC)
+
+
+def test_hermes_blocked_md_on_a_clean_exit_is_blocked(tmp_path: Path) -> None:
+    """FDY-0140: Hermes exits 0 when the model stops; `blocked.md` then is the model's
+    escalation, even beside a report or a usage record that says the run failed.
+    Hermes's own 75 is still a provider failure (the test above)."""
+    usage = tmp_path / "hermes-usage.json"
+    adapter = HermesAdapter()
+    for document in (
+        '{"completed": true, "failed": false}',
+        '{"completed": false, "failed": true}',
+    ):
+        usage.write_text(document, encoding="utf-8")
+        exit = ExitInfo(exit_code=0, report_present=True, blocked_present=True)
+        assert adapter.classify_exit(exit, "", "", tmp_path) is ExitClass.BLOCKED
+
+
+def test_hermes_records_a_run_that_reached_its_turn_limit(tmp_path: Path) -> None:
+    usage = tmp_path / "hermes-usage.json"
+    usage.write_text(
+        '{"completed": false, "failed": false, "api_calls": 301, "max_turns": 300,'
+        ' "turn_limit_reached": true}',
+        encoding="utf-8",
+    )
+    parsed = HermesAdapter().parse_report(tmp_path, ExitInfo(exit_code=0))
+    assert parsed.limit_reached == (
+        "Hermes reached its turn limit of 300 after 301 model calls and stopped before finishing"
+    )
+    usage.write_text('{"completed": true, "failed": false, "api_calls": 12}', encoding="utf-8")
+    assert HermesAdapter().parse_report(tmp_path, ExitInfo(exit_code=0)).limit_reached is None

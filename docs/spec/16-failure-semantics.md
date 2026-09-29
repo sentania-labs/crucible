@@ -5,24 +5,31 @@
 | Class | Meaning | Default |
 |---|---|---|
 | `completed` | exit 0 and report present | gates |
-| `blocked` | exit 75, `blocked.md` present | escalation, wake, task `blocked` |
+| `blocked` | `blocked.md` present on a clean exit: exit 0, or 75 where the harness does not use 75 itself (a model cannot set its harness's exit code, FDY-0140) | escalation, wake, task `blocked` |
 | `environment` | exit 70, the provider failed before the harness ran, the kernel killed the worker out of memory (exit 137 with the daemon's OOM flag), or the harness was refused | retry if attempts remain; else `failed`. A harness refusal (07, 25) is the exception: it is never retried, because the same refusal would come back |
 | `auth_failure` | harness reported auth problem (adapter classified) | retry per policy (`retry.auth_failure_max`, after `auth_retry_delay_seconds`); wake regardless |
 | `quota_exhausted` | harness reported rate or quota limit | reroute (below): mark the pool, commit WIP, new attempt on the next candidate in the tier; if none, `awaiting_quota` until the earliest reset; caps exceeded or task pinned to the exhausted pool: task `reported` with the class visible, wake |
-| `timeout` | contract timeout or stall | no retry; gates run on what exists; wake |
+| `timeout` | contract timeout | no retry; gates run on what exists; wake |
+| `stalled` | Crucible ended the worker for a stall (below) | as `timeout`: no retry; gates run on what exists; wake (`timed_out`) |
 | `killed` | terminated by request | `cancelled` |
 | `crashed` | non-zero exit not otherwise classified | no retry by default; wake |
 | `lost` | provider cannot find the worker | retry if attempts remain and policy allows `lost`; else `failed` |
 | `completed_without_report` | exit 0, no report | report gate fails; no retry; wake |
 | `incomplete` | the harness exited cleanly while its own transcript shows a command it was waiting on cut off by the exit (07, issue 128): today only Claude Code's auto-background, a Bash call the CLI moved to the background on its own | attempt `failed`, never a completion, whatever the report claims; the cut-off commands are on `attempt_collected` as `work_in_flight`; no retry, as for `crashed`. A background process the worker chose to leave running (a server, a Codex session it did not poll, a Hermes `background=true` process) is not `incomplete` and is not recorded: it dies with the sandbox, and unfinished work is caught by the pre-PR gates and CI (issue 153) |
 
-A stall is `timeout` with reason `stall`: no activity (10) for the policy's
+A stall is `stalled`, with termination reason `stall` (FDY-0140; it was
+recorded as `timeout` before): no activity (10) for the policy's
 `stall_fail_seconds`. A command the harness reports in flight is activity (05b,
 issue 152), so a long silent build or test run is bounded by its command timeout
 and the attempt's `timeout_seconds`, not by the stall limit; a worker with
-nothing in flight and nothing written still stalls out. For AGY, and for a
-Hermes foreground command, no in-flight evidence exists during the run (07), and
-the stall limit counts their silent commands as before.
+nothing in flight and nothing written still stalls out. A file changing in the
+checkout, the report directory, or on Kubernetes the worker's home (where a
+harness keeps its session state) is activity too: the Kubernetes provider reads
+that off the running Pod, since its workspace is not a local path, and the Hermes
+launch wrapper writes a line whenever Hermes's session store changes. So a Hermes
+run that is taking turns is not stalled while it works silently; for AGY, and a
+Hermes foreground command that writes nothing, the stall limit counts their
+silent commands as before.
 
 Retry is never a way to re-roll the worker's judgment. A class retries only
 when it is in both the policy's `retry.eligible_classes` and the contract's

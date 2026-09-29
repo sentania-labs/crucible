@@ -161,9 +161,10 @@ def test_the_preparer_points_the_checkout_at_crucibles_hooks_only() -> None:
 
 def test_identity_md_names_the_exact_trailer_and_says_crucible_adds_it(tmp_path: Path) -> None:
     text = (_bundle(tmp_path) / "IDENTITY.md").read_text(encoding="utf-8")
-    section = text.split("## 10. Commits", 1)[1]
+    # FDY-0140: one line of the Scope section, not a section of its own.
+    section = text.split("## Scope", 1)[1].split("## ", 1)[0]
     assert "`Crucible-Attempt: HT-0007`" in section
-    assert "`commit-msg` hook adds the trailer" in section
+    assert "`commit-msg` hook adds the" in section
     assert "--no-verify" in section
     assert "`commit_policy` gate" in section
     policy_md = (tmp_path / "identity" / "policy.md").read_text(encoding="utf-8")

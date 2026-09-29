@@ -96,7 +96,11 @@ written while the harness's live log reports a command in flight (07, issue 152)
 whenever the newest activity is older than a minute, or than half the shorter
 stall limit when that is less; a command reported more than a minute past its
 command timeout no longer counts. Its `detail` names up to five commands and their
-`count`. The supervisor derives worker state:
+`count`. `fs_changed` is written when the worker's files have moved since the last
+look: the supervisor walks a local workspace (Docker) every tick; the Kubernetes
+provider, whose workspace is a claim, runs a read-only `find` in the live Pod over
+the checkout, the report directory and the home, no more often than a
+`command_running` renewal (FDY-0140). The supervisor derives worker state:
 any signal within `stall_warn_seconds` is `alive`; none within
 `stall_fail_seconds` is `stalled`. Defaults: 300 s warn, 1800 s fail,
 overridable per policy. A worker that emits progress lines but changes
