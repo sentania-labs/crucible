@@ -397,3 +397,41 @@ async def test_a_cancel_waits_for_a_collection_between_its_retries(
     assert await run_until(supervisor, client, task_id, {"cancelled"}) == "cancelled"
     assert provider.collect_calls.count(attempt["id"]) == 2
     await supervisor.stop()
+
+
+async def test_the_retention_sweep_leaves_a_finished_attempt_alone_until_its_cleanup(
+    client: TestClient, ctx: AppContext, provider: FakeProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """hades #237 on kind: a finished attempt whose cleanup had not run yet (its
+    collection still beside the tick, or a cleanup that failed) was left out of the
+    set the provider sweep keeps. Its claim had no retention label yet, so the sweep
+    deleted the workspace that acceptance and the publisher read the bundle from."""
+    from crucible.ports.execution import ProviderError  # noqa: PLC0415
+
+    kept: list[list[str]] = []
+
+    async def cleanup_refused(*_: Any, **__: Any) -> None:
+        raise ProviderError("the fake cannot clean up yet")
+
+    async def recorded(keep: Any) -> int:
+        kept.append(list(keep))
+        return 0
+
+    monkeypatch.setattr(provider, "cleanup", cleanup_refused)
+    monkeypatch.setattr(provider, "retention", recorded)
+    supervisor = make_supervisor(ctx, provider)
+    task_id = submit_and_start(client, "crucible-worker:fake-succeed", "EX-SWEEP")
+    assert await run_to_settled(supervisor, client, task_id) == "awaiting_internal_review"
+    (attempt,) = _attempts(client, task_id)
+    assert attempt["state"] == "succeeded"
+    await supervisor.tick()
+    assert attempt["id"] in kept[-1]
+
+    # Once cleanup has run (and labelled or deleted the claim), the sweep may judge it.
+    monkeypatch.undo()
+    monkeypatch.setattr(provider, "retention", recorded)
+    await supervisor.tick()
+    assert attempt["id"] in provider.cleaned
+    await supervisor.tick()
+    assert attempt["id"] not in kept[-1]
+    await supervisor.stop()
