@@ -153,6 +153,17 @@ TASK_TRANSITIONS: frozenset[tuple[TaskState, TaskState]] = frozenset(
         (_S.HEAD_DIVERGED, _S.CANCELLED),
         (_S.READY_FOR_MERGE, _S.MERGED),
         (_S.READY_FOR_MERGE, _S.REJECTED),
+        # hades FDY-0139: a merge is a fact about the pull request, and a person can merge
+        # at any point after it is opened. An observed merge from any delivery state moves
+        # the task to `merged`; otherwise the task waits for ever on a PR nobody polls.
+        (_S.AWAITING_EXTERNAL_REVIEW, _S.MERGED),
+        (_S.EXTERNAL_FEEDBACK_RECEIVED, _S.MERGED),
+        (_S.AWAITING_CI_CERTIFICATION, _S.MERGED),
+        (_S.CI_CERTIFICATION_FAILED, _S.MERGED),
+        (_S.HEAD_DIVERGED, _S.MERGED),
+        # hades FDY-0139: the operator waived the outstanding external review rounds, so
+        # the task stops waiting for a reviewer and goes on to certification.
+        (_S.AWAITING_EXTERNAL_REVIEW, _S.AWAITING_CI_CERTIFICATION),
         # 23: "a PR closed without merge moves the task to rejected". 09's table draws
         # that edge only from ready_for_merge, but a person can close a PR at any point
         # after it is opened (docs/implementation-notes/c4.md).
