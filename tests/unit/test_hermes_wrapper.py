@@ -115,17 +115,30 @@ def main():
 def test_the_bootstrap_sets_the_turn_budget_only_where_none_was_named(
     tmp_path: Path, limit: str, expected: str
 ) -> None:
-    (tmp_path / "run_agent.py").write_text(_STAND_IN_AGENT, encoding="utf-8")
-    (tmp_path / "hermes_cli").mkdir()
-    (tmp_path / "hermes_cli" / "__init__.py").write_text("", encoding="utf-8")
-    (tmp_path / "hermes_cli" / "main.py").write_text(_STAND_IN_MAIN, encoding="utf-8")
+    hermes = tmp_path / "hermes"
+    (hermes / "hermes_cli").mkdir(parents=True)
+    (hermes / "run_agent.py").write_text(_STAND_IN_AGENT, encoding="utf-8")
+    (hermes / "hermes_cli" / "__init__.py").write_text("", encoding="utf-8")
+    (hermes / "hermes_cli" / "main.py").write_text(_STAND_IN_MAIN, encoding="utf-8")
+    # The working directory is the task's checkout. Modules there named like Hermes's
+    # own must never be imported in their place.
+    checkout = tmp_path / "checkout"
+    (checkout / "hermes_cli").mkdir(parents=True)
+    (checkout / "run_agent.py").write_text("raise SystemExit('checkout module')\n")
+    (checkout / "hermes_cli" / "__init__.py").write_text("raise SystemExit('checkout')\n")
+    wrapper = _wrapper()
     result = subprocess.run(
-        [sys.executable, "-c", _wrapper().BOOTSTRAP, "-z", "prompt"],
+        [sys.executable, "-P", "-c", wrapper.BOOTSTRAP, "-z", "prompt"],
         capture_output=True,
         text=True,
         check=False,
-        cwd=tmp_path,
-        env={"PYTHONPATH": str(tmp_path), "CRUCIBLE_HERMES_MAX_TURNS": limit},
+        cwd=checkout,
+        env={"PYTHONPATH": str(hermes), "CRUCIBLE_HERMES_MAX_TURNS": limit},
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == f"['-z', 'prompt'] {expected}"
+
+
+def test_hermes_is_started_so_the_checkout_cannot_shadow_its_modules() -> None:
+    source = WRAPPER.read_text(encoding="utf-8")
+    assert '[HERMES_PYTHON, "-P", "-c", BOOTSTRAP,' in source

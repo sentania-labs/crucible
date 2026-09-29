@@ -220,6 +220,11 @@ RUN set -eu; \
     diff -u /tmp/locked /tmp/installed; \
     rm -rf /root/.cache /tmp/requirements.lock /tmp/locked /tmp/installed /fetch
 COPY --chmod=0755 worker/crucible-hermes.py /usr/local/bin/crucible-hermes
+# FDY-0140: Hermes puts the directory of whichever `hermes` it finds first on the PATH
+# of every command the model runs; with none on PATH it falls back to its own venv's
+# bin, which would shadow the image's python3. This link makes that /usr/local/bin,
+# already on PATH, so the prepend changes nothing.
+RUN ln -s /opt/hermes/bin/hermes /usr/local/bin/hermes
 # hades #215: the worker checks its own report.yaml before it exits 0. Standard library
 # only; it re-executes under the Hermes venv's Python for PyYAML, by path, for its own
 # process alone, so PATH is unchanged. No network.

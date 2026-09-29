@@ -10,6 +10,8 @@ FDY-0140:
   window is Hermes's own `model.context_length` setting, written to its home.
 - Nothing is added to PATH. Hermes is started by the virtual environment's own Python,
   by path, so every command the model runs sees the image's toolchain, not the venv's.
+  (Hermes puts the directory its `hermes` command is found in first on each subshell's
+  PATH; the image links `/usr/local/bin/hermes`, already on PATH, so that is a no-op.)
 - While Hermes works, a line goes to stderr each time its session store changes: `-z`
   writes nothing else until it ends, and a quiet worker is otherwise indistinguishable
   from a stuck one.
@@ -199,7 +201,13 @@ def main() -> int:
     write_settings(home, _limit("CRUCIBLE_HERMES_CONTEXT_LENGTH"))
     argv = inline_identity(sys.argv[1:], os.environ.get("CRUCIBLE_HERMES_IDENTITY"))
     # Stdout stays inherited. Crucible's launch wrapper is the sole transcript writer.
-    child = subprocess.Popen([HERMES_PYTHON, "-c", BOOTSTRAP, *argv])
+    # -P: the working directory is the task's checkout, and a module there named like
+    # one of Hermes's own (`cli`, `tools`, `agent`) must never be imported in its place.
+    try:
+        child = subprocess.Popen([HERMES_PYTHON, "-P", "-c", BOOTSTRAP, *argv])
+    except OSError:
+        # An identity too long for one argument (E2BIG): the pointer alone still works.
+        child = subprocess.Popen([HERMES_PYTHON, "-P", "-c", BOOTSTRAP, *sys.argv[1:]])
 
     def forward(signum: int, _frame: object) -> None:
         child.send_signal(signum)

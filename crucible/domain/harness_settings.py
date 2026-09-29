@@ -15,8 +15,9 @@ from typing import Any
 # Hermes 0.19 stops `-z` at 90 turns and assumes a 256k window when the gateway does not
 # say. A task that reads a repository, edits several files and runs its checks can use
 # several hundred turns; 300 leaves room for that without letting a looping model run
-# for ever. 131072 is a window every model the lab gateway serves for Hermes has, and
-# Hermes refuses anything below 64000.
+# for ever. 131072 is a common window for the coding models a local gateway serves and
+# above Hermes's 64000 floor; it is not read from the gateway, so a model with a smaller
+# window needs its real figure saved, or 0 to let Hermes probe for it.
 DEFAULT_HERMES_MAX_TURNS = 300
 DEFAULT_HERMES_CONTEXT_LENGTH = 131_072
 MAX_TURNS_RANGE = (10, 5000)
