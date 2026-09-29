@@ -274,9 +274,11 @@ supports them:
   gets the registries only when `required_verification` needs them and the
   policy says so).
 - login Job: the harness's login endpoints only, the adapter's
-  `login_endpoints` (Claude Code `platform.claude.com`, Codex
-  `auth.openai.com`, AGY `oauth2.googleapis.com` and `www.googleapis.com`),
-  never its model API (crucible#58). A harness without login endpoints gets no
+  `login_endpoints` (Claude Code `platform.claude.com` and `api.anthropic.com`,
+  Codex `auth.openai.com`, AGY `oauth2.googleapis.com` and `www.googleapis.com`),
+  never its model API (crucible#58). Claude Code is the exception: its
+  `setup-token` asks the model host for the account's roles before printing the
+  token, so its login reaches `api.anthropic.com` (2026-09-29). A harness without login endpoints gets no
   policy at all, and so no egress. (Made concrete 2026-09-24, FDY-0112.)
 
 A `networking.k8s.io/v1` policy has no deny verb and no FQDN rule, so the
