@@ -28,6 +28,7 @@ from crucible.ports.execution import (
 __all__ = [
     "BUNDLE_MOUNT",
     "BUNDLE_VERIFY_SCRIPT",
+    "COMMIT_HOOK_DIR",
     "MANIFEST",
     "PUBLISH_BUNDLE_LEAF",
     "PUBLISH_LEAF",
@@ -35,6 +36,7 @@ __all__ = [
     "REPO_MOUNT",
     "VERIFY_MOUNT",
     "collector_script",
+    "commit_msg_hook",
     "encode_check_id",
     "preparer_script",
     "publish_leaf_script",
@@ -121,6 +123,55 @@ trap drop_checkout_token EXIT
 fi
 {_CRED_HELPER_SCRIPT.strip()}
 printf '[credential]\\n\\thelper = "!sh /tmp/cred-helper.sh"\\n' >> /tmp/gitconfig
+"""
+
+
+# The hook every worker's checkout runs on `git commit` (hades FDY-0135). It lives in the
+# identity bundle, which is Crucible's own text mounted read-only, and the preparer points
+# the checkout's `core.hooksPath` at that directory, so the repository's own hooks never
+# run and the worker cannot edit this one. It adds `<commit_trailer>: <external_id>` to
+# the message unless a trailer with that key is already there, so a harness that adds
+# the trailer itself, an amend, or a second run never gets a duplicate. It reads and
+# writes only the message file git hands it: no network, no repository content.
+COMMIT_HOOK_DIR = "hooks"
+
+
+def commit_msg_hook(*, trailer: str, value: str) -> str:
+    """The `commit-msg` hook text: the trailer key and value bound as quoted literals."""
+    return f"""#!/bin/sh
+# Crucible's commit-msg hook: every commit on this attempt carries its trailer.
+set -eu
+KEY={_quote(trailer)}
+VALUE={_quote(value)}
+[ -n "${{1:-}}" ] || exit 0
+exec git interpret-trailers --in-place --if-exists doNothing --if-missing add \\
+  --trailer "$KEY: $VALUE" "$1"
+"""
+
+
+def _commit_policy_check(git: str) -> str:
+    """23 step 4: the one statement of the commit policy, shared by the publisher, which
+    refuses a push on it, and the collector, whose answer the `commit_policy` gate reads
+    before review (hades FDY-0135).
+
+    `commit_policy_check RANGE DIR` writes `DIR/author-problems.txt` (sha, tab, author
+    email) for each commit in RANGE whose author email is not `$POLICY_AUTHOR_EMAIL`, and
+    `DIR/trailer-problems.txt` (sha) for each commit with no `$TRAILER` trailer. `git` is
+    the command each caller already runs git with."""
+    return f"""commit_policy_check() {{
+  : > "$2/author-problems.txt"
+  : > "$2/trailer-problems.txt"
+  for sha in $({git} rev-list "$1" 2>/dev/null || true); do
+    who=$({git} show -s --format='%ae' "$sha")
+    if [ "$who" != "$POLICY_AUTHOR_EMAIL" ]; then
+      printf '%s\\t%s\\n' "$sha" "$who" >> "$2/author-problems.txt"
+    fi
+    if ! {git} show -s --format='%(trailers:key='"$TRAILER"',valueonly)' "$sha" \\
+        | grep -q .; then
+      printf '%s\\n' "$sha" >> "$2/trailer-problems.txt"
+    fi
+  done
+}}
 """
 
 
@@ -332,6 +383,9 @@ fi
 {GIT} remote set-url --push origin "$ORIGIN_PLACEHOLDER"
 {GIT} config user.name "$AUTHOR_NAME"
 {GIT} config user.email "$AUTHOR_EMAIL"
+# hades FDY-0135: the worker's commits run Crucible's commit-msg hook, which adds the
+# attempt trailer, from the read-only identity bundle; never a hook the repository has.
+{GIT} config core.hooksPath "$IDENTITY_MOUNT/{COMMIT_HOOK_DIR}"
 {GIT} config credential.helper ""
 {GIT} config http.extraHeader ""
 
@@ -374,9 +428,17 @@ def collector_script(
     work_branch: str,
     size_cap_bytes: int,
     quota_attempt_id: str | None = None,
+    author_email: str = "crucible-worker@users.noreply.github.com",
+    commit_trailer: str = "Crucible-Attempt",
 ) -> str:
     """Produce the full diff, the path list, the head, the log, the bundle, and a copy
-    of the report directory (08). Never a push, never a network: `--network none`."""
+    of the report directory (08). Never a push, never a network: `--network none`.
+
+    It also runs the publisher's commit policy over the same range the publisher will
+    (the remote work branch when the checkout has one, else base_ref), so the
+    `commit_policy` gate can refuse a bad commit before review rather than the publisher
+    after acceptance (hades FDY-0135). The answer goes to `commit-policy/`, with
+    `checked` written only once the check has finished."""
     return f"""set -eu
 {GIT_ENV}
 OUT={OUTPUT_MOUNT}
@@ -385,10 +447,12 @@ WORK_BRANCH={_quote(work_branch)}
 BASE_REF={_quote(base_ref)}
 SIZE_CAP={_quote(str(size_cap_bytes))}
 QUOTA_ATTEMPT={_quote(quota_attempt_id or "")}
+POLICY_AUTHOR_EMAIL={_quote(author_email)}
+TRAILER={_quote(commit_trailer)}
 mkdir -p "$OUT"
 : > "$OUT/copy-rejections.tsv"
 {_COPY_REPORT}
-if [ -n "$QUOTA_ATTEMPT" ]; then
+{_commit_policy_check(GIT + ' -C "$REPO"')}if [ -n "$QUOTA_ATTEMPT" ]; then
   refuse_checkpoint() {{
     printf '%s\n' "$1" > "$OUT/checkpoint-refusal.txt"
     printf '%s\n' "$1" >&2
@@ -458,6 +522,17 @@ if [ -n "$BASE" ]; then
     "$BASE..$WORK_BRANCH" > "$OUT/bundle.log" 2>&1 || true
   {GIT} -C "$REPO" rev-list --count "$BASE"..HEAD > "$OUT/commits.txt" \
     || echo 0 > "$OUT/commits.txt"
+  if {GIT} -C "$REPO" rev-parse --verify --quiet "refs/remotes/origin/$WORK_BRANCH" \
+      >/dev/null; then
+    POLICY_FROM="refs/remotes/origin/$WORK_BRANCH"
+  else
+    POLICY_FROM="$BASE"
+  fi
+  rm -rf "$OUT/commit-policy"
+  mkdir -p "$OUT/commit-policy"
+  if commit_policy_check "$POLICY_FROM..HEAD" "$OUT/commit-policy"; then
+    echo done > "$OUT/commit-policy/checked"
+  fi
 else
   : > "$OUT/diffstat.txt"; : > "$OUT/diff.patch"; : > "$OUT/changed.txt"
   : > "$OUT/log.txt"; : > "$OUT/commit-paths.txt"; echo 0 > "$OUT/commits.txt"
@@ -751,17 +826,8 @@ if [ -n "$REMOTE_BEFORE" ]; then
 else
   RANGE="refs/remotes/origin/$BASE_REF..refs/heads/crucible-publish"
 fi
-: > "$OUT/author-problems.txt"
-: > "$OUT/trailer-problems.txt"
-for sha in $(git rev-list "$RANGE" 2>/dev/null || true); do
-  who=$(git show -s --format='%ae' "$sha")
-  if [ "$who" != {_quote(author_email)} ]; then
-    printf '%s\t%s\n' "$sha" "$who" >> "$OUT/author-problems.txt"
-  fi
-  if ! git show -s --format='%(trailers:key='"$TRAILER"',valueonly)' "$sha" | grep -q .; then
-    printf '%s\n' "$sha" >> "$OUT/trailer-problems.txt"
-  fi
-done
+POLICY_AUTHOR_EMAIL={_quote(author_email)}
+{_commit_policy_check("git")}commit_policy_check "$RANGE" "$OUT"
 if [ -s "$OUT/author-problems.txt" ] || [ -s "$OUT/trailer-problems.txt" ]; then
   # 23 step 4: verify every commit's author and trailer match policy, *then* push. A
   # commit signed by someone the policy does not name, or missing the attempt trailer,
