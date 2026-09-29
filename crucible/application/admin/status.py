@@ -251,8 +251,9 @@ def harness_readiness(
     providers: list[dict[str, Any]],
     secrets: dict[str, credentials.SecretRead] | None = None,
 ) -> list[dict[str, Any]]:
-    """Each real harness `ready`, `not_ready` with the steps that fix it, or `off` when its
-    configuration gate is shut; test fixtures are left out. The Harnesses page reads its
+    """Each real harness `ready`, `not_ready` with the steps that fix it, or `off` when the
+    configuration default keeps it off and no administrator has decided (hades #174);
+    test fixtures are left out. The Harnesses page reads its
     one word from this too, so it and Status never disagree about a harness."""
     endpoint, _source = gateway_url(uow)
     enabled_models = _enabled_models(uow)
@@ -266,12 +267,16 @@ def harness_readiness(
         name = str(item["name"])
         if is_test_fixture(ctx, name):
             continue
-        if not item["enabled_by_configuration"]:
+        if not item["enabled_by_configuration"] and not item.get("decided_by_administrator"):
             harnesses.append(
                 {
                     "name": name,
                     "state": "off",
-                    "note": f"off by configuration: {item.get('reason') or 'no reason given'}",
+                    "note": (
+                        "off by the configuration default: "
+                        f"{item.get('reason') or 'no reason given'}. Enable it on Harnesses "
+                        "to use it"
+                    ),
                     "steps": [],
                 }
             )

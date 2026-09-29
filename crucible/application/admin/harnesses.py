@@ -120,7 +120,12 @@ def set_enabled(
     reason: str | None,
 ) -> dict[str, Any]:
     """25: configuration retained; running attempts finish (nothing here touches them);
-    new launches are refused with a wake by the registry (07)."""
+    new launches are refused with a wake by the registry (07).
+
+    hades #174: this is the administrator's decision, and it replaces the configuration
+    default for routing at once, with no restart. A harness the configuration keeps off
+    (unverified) can be enabled; the configuration's reason comes back as `warning` and
+    is recorded with the decision, and the harness test is how the operator proves it."""
     reason = guard_mutation(
         ctx,
         uow,
@@ -130,14 +135,26 @@ def set_enabled(
     )
     if ctx.harnesses.get(harness) is None:
         raise NotFoundError(f"no adapter declares harness {harness!r}")
+    gate = ctx.harness_gates.get(harness)
+    warning = (
+        (gate.reason or "off in configuration") if gate is not None and not gate.enabled else ""
+    )
     # set_harness_enabled records the harness_enabled or harness_disabled event with
     # the principal, the reason and the before-and-after summary (C5a).
     state = set_harness_enabled(
-        uow, ctx.clock, principal_name=principal, name=harness, enabled=enabled, reason=reason
+        uow,
+        ctx.clock,
+        principal_name=principal,
+        name=harness,
+        enabled=enabled,
+        reason=reason,
+        warning=warning,
     )
     return {
         "harness": harness,
         "enabled": state.enabled,
+        "decided_by_administrator": state.enabled_decided,
+        "warning": warning,
         "reason": state.reason,
         "session_compatibility": state.session_compatibility,
         "running_attempts": _concurrency(uow).get(harness, 0),

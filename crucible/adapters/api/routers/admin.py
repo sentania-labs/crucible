@@ -402,7 +402,7 @@ def admin_login(
 
 @router.get("/admin/credentials/{harness}/login")
 def admin_login_status(harness: str, ctx: Ctx, _principal: Admin) -> dict[str, Any]:
-    return login.login_status(ctx.logins, harness)
+    return login.login_status(ctx.logins, harness, ctx.admin)
 
 
 @router.post("/admin/credentials/{harness}/login/code")

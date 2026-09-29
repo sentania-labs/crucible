@@ -665,6 +665,11 @@ class HarnessStateRow(Base):
     __tablename__ = "harnesses"
     name: Mapped[str] = mapped_column(String(32), primary_key=True)
     enabled: Mapped[bool] = mapped_column(Boolean)
+    # hades #174: an administrator has decided, so the configuration default no longer
+    # applies (0027).
+    enabled_decided: Mapped[bool] = mapped_column(
+        Boolean, server_default=text("false"), default=False
+    )
     reason: Mapped[str] = mapped_column(Text)
     session_compatibility: Mapped[str] = mapped_column(String(16))
     mount_mode_observed: Mapped[str | None] = mapped_column(String(16), nullable=True)

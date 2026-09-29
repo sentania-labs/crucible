@@ -2787,9 +2787,10 @@ class KubernetesProvider:
                 buffer = consume(buffer + "".join(shown), flow, None, Path(root), session, None)
                 if exit_code is not None:
                     break
+                session.notice_waiting(flow)
                 if session.state == "waiting_for_code":
                     code = session.wait_for_code(0)
-                    if code is not None:
+                    if code is not None and session.error is None:
                         await self._send_login_code(pod_name, code)
                         session.state = "waiting_for_operator"
                 if _terminated_state(status) is not None or phase in ("Succeeded", "Failed"):
@@ -2843,6 +2844,10 @@ class KubernetesProvider:
         if flow.captures_token and flow.token_file in files:
             session.token_written = True
         if not problems:
+            if not files and session.error:
+                # The CLI wrote nothing and the login already says why (AGY's own wait
+                # ran out, hades #173); a shape failure would only bury that.
+                return
             problems.extend(await asyncio.to_thread(accept, files))
         if problems:
             session.error = "the login's auth files were not stored: " + "; ".join(problems)
@@ -4629,29 +4634,41 @@ echo "crucible-canary.done=1"
 # (`script`, util-linux, in every Debian image) and is the reason the Pod log can be the
 # operator's view of a login without carrying anything secret:
 #
-# - the CLI's output is filtered line by line before it reaches stdout, which is the
-#   log. The terminal is 4096 columns wide so nothing the CLI prints wraps; control
-#   sequences (CSI, OSC and the two-byte escapes) are stripped, and a carriage return
-#   keeps only what was drawn after it, as a terminal would show it;
+# - the CLI's output is rendered line by line, as a terminal would show it, before it
+#   reaches stdout, which is the log. The terminal is 4096 columns wide so nothing the
+#   CLI prints wraps. Every trailing carriage return goes (Ink ends each line `\r\r\n`
+#   through the pty), then a carriage return keeps only what was drawn after it; a
+#   cursor-column move is a space (Ink separates words with them); control sequences
+#   (CSI, OSC and the two-byte escapes) are stripped, which leaves an OSC 8 hyperlink's
+#   visible text, the URL; stray control characters go (hades #173);
 # - the one-time token a CLI prints (Claude Code's `setup-token`) is written to the
 #   token file under the login directory, mode 0600, and replaced in the line by the
 #   note the Docker login shows;
 # - a partial line is held until its newline, except a prompt waiting for input (the
-#   same pattern as `PASTE_RE`), which is shown so the operator knows to paste. A
-#   partial line that already matches the token pattern is never shown early;
+#   same pattern as `PASTE_RE`), or, when no token pattern is set, a partial line the
+#   CLI has left unfinished for three seconds: either is shown so the operator knows to
+#   paste. A partial line that already matches the token pattern is never shown early;
 # - the code the operator pastes arrives over exec stdin into a FIFO that is the CLI's
-#   input, and is masked wherever the terminal echoes it.
+#   input, ended with a carriage return, the Enter key, and is masked wherever the
+#   terminal echoes it.
+#
+# Only directories the Pod's user owns are made private: AGY's login directory is the
+# home the Pod mounts, and a chmod of it failing was shown to the operator as the
+# login's status (hades #173).
 #
 # When the CLI exits the driver prints its exit code and waits for the service to read
 # the auth files off it over exec and delete the Job; the Job's deadline ends it if the
-# service never comes back.
+# service never comes back. CRUCIBLE_LOGIN_CONTROL moves the control directory for a
+# test that runs the driver on a host.
 _LOGIN_EXIT_MARKER = "crucible-login.exit="
 _LOGIN_DRIVER = r"""set -u
 dir=${CRUCIBLE_LOGIN_DIR:?}
-ctl=/tmp/crucible-login
+ctl=${CRUCIBLE_LOGIN_CONTROL:-/tmp/crucible-login}
 umask 077
 mkdir -p "$dir" "$ctl"
-chmod 0700 "$dir" "$ctl"
+for owned in "$dir" "$ctl"; do
+  if [ -O "$owned" ]; then chmod 0700 "$owned"; fi
+done
 rm -f "$ctl/in" "$ctl/pasted"
 mkfifo "$ctl/in"
 exec 3<>"$ctl/in"
@@ -4662,14 +4679,22 @@ shopt -s extglob
 LC_ALL=C
 token_re=${CRUCIBLE_LOGIN_TOKEN_PATTERN:-}
 token_file=${CRUCIBLE_LOGIN_TOKEN_FILE:-}
-prompt_re='((paste|enter).{0,40}(code|token).{0,20}|code|token)[[:space:]]*[:>?][[:space:]]*$'
-show() {
-  local line=$1 tok pasted
-  line=${line%$'\r'}
+prompt_re='((paste|enter).{0,40}(code|token).{0,40}|code|token)[[:space:]]*[:>?][[:space:]]*$'
+render() {
+  local line=$1
+  line=${line%%+($'\r')}
   line=${line##*$'\r'}
+  line=${line//$'\e'\[*([0-9])[GC]/ }
   line=${line//$'\e'\[*([0-?])*([\ -\/])[@-~]/}
   line=${line//$'\e'\]*([!$'\a'$'\e'])@($'\a'|$'\e'\\)/}
-  line=${line//$'\e'?([()])?[A-Za-z0-9=>]/}
+  line=${line//$'\e'?([()])[A-Za-z0-9=>]/}
+  line=${line//[$'\001'-$'\010'$'\013'-$'\037'$'\177']/}
+  rendered=$line
+}
+show() {
+  local line tok pasted
+  render "$1"
+  line=$rendered
   if [ -n "$token_re" ] && [[ $line =~ $token_re ]]; then
     tok=${BASH_REMATCH[1]}
     printf '%s\n' "$tok" > "$dir/$token_file"
@@ -4683,7 +4708,7 @@ show() {
   printf '%s\n' "$line"
 }
 filter() {
-  local buf='' chunk status lower
+  local buf='' chunk status lower idle=0 quiet=0
   while :; do
     chunk=''
     IFS= read -r -t 1 chunk
@@ -4691,18 +4716,30 @@ filter() {
     if [ "$status" -eq 0 ]; then
       show "$buf$chunk"
       buf=''
+      idle=0
       continue
     fi
+    [ -n "$chunk" ] && idle=0
     buf=$buf$chunk
     if [ "$status" -le 128 ]; then
       [ -n "$buf" ] && show "$buf"
       return 0
     fi
     [ -n "$buf" ] || continue
-    lower=${buf,,}
-    if [[ $lower =~ $prompt_re ]] && ! { [ -n "$token_re" ] && [[ $buf =~ $token_re ]]; }; then
+    idle=$((idle + 1))
+    if [ -n "$token_re" ] && [[ $buf =~ $token_re ]]; then
+      continue
+    fi
+    render "$buf"
+    lower=${rendered,,}
+    quiet=0
+    if [ -z "$token_re" ] && [ "$idle" -ge 3 ] && [ -n "${rendered//[[:space:]]/}" ]; then
+      quiet=1
+    fi
+    if [[ $lower =~ $prompt_re ]] || [ "$quiet" -eq 1 ]; then
       show "$buf"
       buf=''
+      idle=0
     fi
   done
 }
@@ -4717,11 +4754,13 @@ while :; do sleep 5; done
 """
 
 # Hands the pasted code to the login driver: the mask first, so the terminal's echo of
-# the code is already masked when it arrives, then the CLI's input.
+# the code is already masked when it arrives, then the CLI's input, ended with a
+# carriage return, which is what the Enter key sends (hades #173).
 _LOGIN_CODE_SCRIPT = (
+    'd="${CRUCIBLE_LOGIN_CONTROL:-/tmp/crucible-login}"; '
     "IFS= read -r c || exit 3; umask 077; "
-    'printf "%s" "$c" > /tmp/crucible-login/pasted; '
-    'printf "%s\\n" "$c" > /tmp/crucible-login/in'
+    'printf "%s" "$c" > "$d/pasted"; '
+    'printf "%s\\r" "$c" > "$d/in"'
 )
 
 

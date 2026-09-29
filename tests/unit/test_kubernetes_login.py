@@ -33,8 +33,9 @@ from crucible.adapters.execution.kubernetes import (
     KubernetesProvider,
     LoginLockHeldError,
 )
-from crucible.application.admin.login import FLOWS, LoginSession
+from crucible.application.admin.login import FLOWS, LoginSession, render_line
 from crucible.ports.execution import ProbeRequest, ProviderError
+from tests.login_captures import capture
 from tests.unit.kubernetes_fixtures import build, created, spec
 
 WORKER = "crucible-worker:20260916-login"
@@ -196,7 +197,8 @@ async def test_agy_logs_in_from_the_home_directory_its_token_sits_under() -> Non
     api, provider = login_provider()
     token = json.dumps({"token": {"expiry": "2026-09-24T01:00:00Z"}}).encode()
     api.login = FakeLogin(
-        prompt="Enter the authorization code: ",
+        # AGY's own prompt, as captured (tests/fixtures_data/logins/agy.raw).
+        prompt="Or, paste the authorization code here and press Enter:",
         files={"/home/worker/.gemini/antigravity-cli/antigravity-oauth-token": token},
     )
     session = LoginSession(harness="agy", started_at=0)
@@ -214,6 +216,45 @@ async def test_agy_logs_in_from_the_home_directory_its_token_sits_under() -> Non
     assert env["HOME"] == "/home/worker" and env["CRUCIBLE_LOGIN_DIR"] == "/home/worker"
     stored = api.harness_secret("crucible-harness-agy")
     assert stored == {"antigravity-cli_antigravity-oauth-token": token}
+
+
+async def test_agy_running_out_of_time_is_named_not_buried_under_a_shape_failure() -> None:
+    """hades #173: AGY gives up after its own 60 seconds and exits having written
+    nothing; the operator reads that, not a list of missing auth files."""
+    api, provider = login_provider()
+    raw = capture("agy_timeout").decode("utf-8")
+    api.login = FakeLogin(lines=[render_line(line) for line in raw.split("\n")], exit_code=1)
+    session = LoginSession(harness="agy", started_at=0)
+    await run_login(provider, "agy", session)
+    assert session.state == "failed"
+    assert session.error == FLOWS["agy"].timed_out_message
+    assert session.credential_written is False
+
+
+async def test_each_captured_login_reaches_its_state_through_the_pod_log() -> None:
+    """The driver's rendered lines of each real capture, as the Pod log carries them,
+    bring the URL and the prompt through and ask for a code where one is pasted."""
+    prompts = {
+        "claude_code": "Paste code here if prompted >",
+        "agy": "Or, paste the authorization code here and press Enter:",
+    }
+    for harness, prompt in prompts.items():
+        api, provider = login_provider()
+        raw = capture(harness).decode("utf-8")
+        rendered = [render_line(line) for line in raw.split("\n")]
+        at = [line.strip() for line in rendered].index(prompt)
+        api.login = FakeLogin(lines=rendered[:at], prompt=rendered[at])
+        session = LoginSession(harness=harness, started_at=0)
+        seen: list[str | None] = []
+
+        async def look(session: LoginSession = session, seen: list[str | None] = seen) -> None:
+            await wait_for_state(session, "waiting_for_code")
+            seen.append(session.prompt)
+            session.request_cancel()
+
+        await run_login(provider, harness, session, during=look)
+        assert seen == [prompt]
+        assert session.url is not None and session.url.startswith("https://")
 
 
 # ----- the paste flow and the token --------------------------------------------------
@@ -670,12 +711,11 @@ def test_the_driver_masks_the_token_and_the_pasted_code_and_reports_the_exit(
     )
     cli.chmod(0o755)
     login_dir = tmp_path / "login"
-    control = Path("/tmp/crucible-login")
-    if control.exists():
-        pytest.skip("another login driver owns /tmp/crucible-login on this host")
+    control = tmp_path / "control"
     env = {
         **os.environ,
         "CRUCIBLE_LOGIN_DIR": str(login_dir),
+        "CRUCIBLE_LOGIN_CONTROL": str(control),
         "CRUCIBLE_LOGIN_TOKEN_PATTERN": FLOWS["claude_code"].token_pattern,
         "CRUCIBLE_LOGIN_TOKEN_FILE": "oauth-token",
         "TERM": "xterm",
@@ -707,7 +747,10 @@ def test_the_driver_masks_the_token_and_the_pasted_code_and_reports_the_exit(
                 seen = bytes(output)
             if not pasted and b"Paste code here" in seen:
                 subprocess.run(
-                    ["sh", "-c", _LOGIN_CODE_SCRIPT], input=b"MY-PASTED-CODE\n", check=True
+                    ["sh", "-c", _LOGIN_CODE_SCRIPT],
+                    input=b"MY-PASTED-CODE\n",
+                    env=env,
+                    check=True,
                 )
                 pasted = True
             if b"crucible-login.exit=" in seen:

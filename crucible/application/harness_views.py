@@ -37,20 +37,24 @@ def harness_list(
         state = states.get(adapter.name)
         gate = gates.get(adapter.name, HarnessGate())
         by_admin = state.enabled if state is not None else True
+        decided = state is not None and state.enabled_decided
         installed = sorted(
             {version for i in images if (version := i.version_of(adapter.name)) is not None}
         )
         credential = credential_state(adapter.credential_spec(), sources.get(adapter.name), state)
         default = defaults.get(adapter.name)
-        reasons = [
-            r for r in (gate.reason if not gate.enabled else "", state.reason if state else "") if r
-        ]
+        # hades #174: an administrator's decision replaces the configuration default,
+        # whose reason stays as a warning.
+        gate_reason = gate.reason if not gate.enabled and not decided else ""
+        reasons = [r for r in (gate_reason, state.reason if state else "") if r]
         items.append(
             HarnessView(
                 name=adapter.name,
-                enabled=gate.enabled and by_admin,
+                enabled=by_admin if decided else gate.enabled and by_admin,
                 enabled_by_configuration=gate.enabled,
                 enabled_by_administrator=by_admin,
+                decided_by_administrator=decided,
+                warning=(gate.reason or "off in configuration") if not gate.enabled else "",
                 reason="; ".join(reasons),
                 supported_versions=adapter.supported_versions.text,
                 installed_versions=installed,

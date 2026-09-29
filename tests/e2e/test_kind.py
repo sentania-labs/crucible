@@ -6,6 +6,7 @@ import asyncio
 import base64
 import contextlib
 import hashlib
+import html
 import json
 import os
 import re
@@ -37,7 +38,7 @@ from crucible.adapters.harness.script import ScriptHarnessAdapter
 from crucible.adapters.persistence.unit_of_work import SqlUnitOfWorkFactory
 from crucible.adapters.storage.disk import DiskArtifactStore
 from crucible.application.admin.context import AdminContext
-from crucible.application.admin.login import LoginFlow
+from crucible.application.admin.login import FLOWS, LoginFlow
 from crucible.application.auth import mint_token
 from crucible.application.harnesses import HarnessRegistry
 from crucible.application.supervisor import Supervisor
@@ -73,6 +74,7 @@ from tests.e2e.repo import make_origin
 from tests.e2e.test_class_routing import _install_class_policy
 from tests.e2e.test_isolation import MUST_BE_REFUSED
 from tests.fixtures import contract_document, promote_for_test
+from tests.login_captures import replay_script
 
 pytestmark = [
     pytest.mark.e2e,
@@ -1639,6 +1641,200 @@ async def test_login_from_an_empty_secret_to_a_probe_and_an_attempt_through_the_
             events = client.get(f"/v1/tasks/{task_id}/events", params={"limit": 200}).json()
             synced = [e for e in events["items"] if e["kind"] == "credential_synced"]
             print("credential sync:", json.dumps([e["payload"] for e in synced], indent=2))
+    finally:
+        with contextlib.suppress(KubernetesApiError):
+            api.delete("secrets", secret)
+
+
+# ----- hades #173: each harness's real login output, replayed through the Pod's driver ---
+
+# What the stand-in writes once it has read the code: the stand-in credential.
+_STAND_IN_SESSION = """printf '{"authenticated": true}' > "$CRUCIBLE_LOGIN_DIR/session.json"; """
+
+
+def _captured_flow(harness: str) -> LoginFlow:
+    """The real harness's flow (its captured prompt, its code handling, its token
+    pattern, its guidance) run as the stand-in harness, whose credential is
+    `session.json`. Claude Code's token pattern stays set, so the driver runs as it does
+    in production, with no early flush of a quiet partial line."""
+    return replace(
+        FLOWS[harness],
+        harness="script-harness",
+        argv=("crucible-script-harness", "login-stub"),
+        image_binary="/usr/local/bin/crucible-script-harness",
+        directory_env="CRUCIBLE_LOGIN_DIR",
+    )
+
+
+def _ui_sign_in(browser: TestClient, token: str) -> str:
+    form = browser.get("/ui/sign-in")
+    nonce = re.search(r'name="csrf" value="([a-f0-9]+)"', form.text)
+    assert nonce is not None, form.text
+    signed = browser.post(
+        "/ui/sign-in",
+        data={"csrf": nonce.group(1), "token": token, "next": "/ui"},
+        follow_redirects=False,
+    )
+    assert signed.status_code == 303, signed.text
+    csrf = re.search(r'name="csrf" value="([a-f0-9]+)"', browser.get("/ui").text)
+    assert csrf is not None
+    return csrf.group(1)
+
+
+def _poll_until(admin: TestClient, done: Any, what: str, timeout: float = 180) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout
+    state: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        state = admin.get("/v1/admin/credentials/script-harness/login").json()
+        if done(state):
+            return state
+        time.sleep(0.5)
+    raise AssertionError(f"the replayed login never reached {what}: {state}")
+
+
+async def test_each_captured_harness_login_reaches_its_state_and_the_page_shows_link_and_box(
+    engine: Engine,
+    migrated: str,
+    artifact_root: Path,
+    api: KubernetesClient,
+    registry: CraneRegistryClient,
+) -> None:
+    """hades #173 on a real cluster: the login Job runs the real driver under `script`,
+    with a stand-in CLI that replays each harness's captured login output byte for byte
+    and then reads the code the way that CLI does (Claude Code raw, where only a
+    carriage return submits; AGY a line; Codex nothing). The service reaches the right
+    state from the Pod log, the Login page shows the sign-in link and, where a code is
+    pasted, the code box, and a code submitted through that box reaches the CLI whole."""
+    harnesses = HarnessRegistry((StandInLoginAdapter(),))
+    provider = _provider(api, registry, harnesses=harnesses)
+    clock = SystemClock()
+    secret = provider.credential_secret("script-harness")
+    with contextlib.suppress(KubernetesApiError):
+        api.delete("secrets", secret)
+    ctx = AppContext(
+        uow_factory=SqlUnitOfWorkFactory(engine),
+        clock=clock,
+        providers=[provider],
+        database_url=migrated,
+        engine=engine,
+        artifact_store=DiskArtifactStore(artifact_root / "kind-captured-logins"),
+        harnesses=harnesses,
+    )
+    admin_ctx = AdminContext(
+        uow_factory=ctx.uow_factory,
+        clock=clock,
+        providers={"fake": FakeProvider(), "kubernetes": provider},
+        harnesses=harnesses,
+        lease_ttl_seconds=300,
+        login_timeout_seconds=180,
+    )
+    ctx.admin = admin_ctx
+    with ctx.uow_factory() as uow:
+        token = mint_token(uow, clock, name="captured-login-admin", role=Role.ADMIN).token
+        uow.commit()
+    supervisor = Supervisor(
+        ctx.uow_factory,
+        {"kubernetes": provider},
+        clock,
+        holder="e2e-kind-captured-login",
+        artifact_store=ctx.artifact_store,
+        lease_ttl_seconds=300,
+        grace_seconds=5,
+        harnesses=harnesses,
+    )
+    await supervisor.tick()
+    resolved = await asyncio.to_thread(registry.resolve, os.environ["CRUCIBLE_E2E_KIND_REGISTRY"])
+    with ctx.uow_factory() as uow:
+        promote_for_test(
+            uow,
+            digest=resolved.digest,
+            reference=resolved.reference,
+            harnesses=dict(resolved.harnesses),
+            at=clock.now(),
+            by="e2e-kind",
+            reason="the captured logins' stand-in image",
+        )
+        uow.commit()
+    app = create_app(ctx)
+    page_path = "/ui/credentials/script-harness/login"
+    # Claude Code's code carries its `#state`; AGY's is pasted as the whole redirect
+    # address, percent-encoded, and reaches the CLI decoded.
+    cases = {
+        "claude_code": ("the-pasted-code#state-part", "the-pasted-code#state-part"),
+        "agy": (
+            "http://localhost:38123/oauth-callback?state=S&code=4%2F0Afixture-code&scope=x",
+            "4/0Afixture-code",
+        ),
+        "codex": (None, None),
+    }
+    try:
+        with (
+            TestClient(app, headers={"Authorization": f"Bearer {token}"}) as admin,
+            TestClient(app) as browser,
+        ):
+            csrf = _ui_sign_in(browser, token)
+            for harness, (pasted, reaches) in cases.items():
+                admin_ctx.login_flows["script-harness"] = _captured_flow(harness)
+                admin_ctx.login_commands["script-harness"] = (
+                    "bash",
+                    "-c",
+                    replay_script(
+                        harness,
+                        finish=_STAND_IN_SESSION + ("sleep 12; " if pasted is None else ""),
+                    ),
+                )
+                started = admin.post(
+                    "/v1/admin/credentials/script-harness/login",
+                    json={"reason": f"kind: {harness} capture", "replace": True},
+                )
+                assert started.status_code == 200, started.text
+                if pasted is None:
+                    state = _poll_until(admin, lambda s: s["code"] is not None, "the device code")
+                    assert state["state"] == "waiting_for_operator", state
+                    assert state["url"] == "https://auth.openai.com/codex/device"
+                    assert state["code"] == "TEST-C0DE9"
+                    page = html.unescape(browser.get(page_path).text)
+                    assert 'class="login-url">https://auth.openai.com/codex/device<' in page
+                    assert "Device code: <code>TEST-C0DE9</code>" in page
+                    assert 'name="code"' not in page
+                else:
+                    state = _poll_until(
+                        admin, lambda s: s["state"] == "waiting_for_code", "waiting_for_code"
+                    )
+                    print(harness, "waiting:", json.dumps(state, indent=2))
+                    flow = FLOWS[harness]
+                    assert re.search(flow.prompt_pattern, state["prompt"] or ""), state
+                    assert state["url"] and state["url"].startswith("https://"), state
+                    assert state["guidance"] == list(flow.guidance)
+                    page = html.unescape(browser.get(page_path).text)
+                    assert f'class="login-url">{state["url"]}<' in page
+                    assert 'name="code"' in page and "Submit code" in page
+                    assert state["prompt"] in page
+                    submitted = browser.post(
+                        "/ui/actions/login-code",
+                        data={
+                            "csrf": csrf,
+                            "harness": "script-harness",
+                            "code": pasted,
+                            "return_to": page_path,
+                        },
+                        follow_redirects=False,
+                    )
+                    assert submitted.status_code == 303, submitted.text
+                    assert "kind=bad" not in submitted.headers["location"], submitted.headers
+                state = _poll_until(
+                    admin, lambda s: s["state"] in ("finished", "failed"), "its end"
+                )
+                print(harness, "ended:", json.dumps(state, indent=2))
+                assert state["state"] == "finished", state
+                assert state["credential_written"] is True, state
+                tail = "\n".join(state["output_tail"])
+                assert "chmod" not in tail
+                if pasted is not None and reaches is not None:
+                    assert f"stand-in read {len(reaches)} characters" in tail, tail
+                    # The CLI's echo of the code reaches the page masked.
+                    assert "[pasted code]" in tail, tail
+                    assert pasted not in tail and reaches not in tail
     finally:
         with contextlib.suppress(KubernetesApiError):
             api.delete("secrets", secret)

@@ -1654,7 +1654,7 @@ class DockerProvider:
         a one-time provider token in process memory long enough to capture it without
         placing it in Docker logs. The container is always reaped.
         """
-        from crucible.application.admin.login import _consume  # noqa: PLC0415
+        from crucible.application.admin.login import ENTER, _consume  # noqa: PLC0415
 
         login_id = f"login{new_id()}"[:26]
         adapter = self.harnesses.require(flow.harness)
@@ -1789,10 +1789,13 @@ class DockerProvider:
                         break
                     buffer += chunk.decode("utf-8", "replace")
                     buffer = _consume(buffer, flow, token_re, source, session, None)
+                session.notice_waiting(flow)
                 if session.state == "waiting_for_code":
                     code = session.wait_for_code(0)
-                    if code is not None:
-                        sock.sendall((code.strip() + "\n").encode("utf-8"))
+                    if code is not None and session.error is None:
+                        # The Enter key: Claude Code submits only on a carriage return
+                        # (hades #173).
+                        sock.sendall((code.strip() + ENTER).encode("utf-8"))
                         session.state = "waiting_for_operator"
                 state = await self._call(self.client.inspect_container, container_id)
                 if not bool((state.get("State") or {}).get("Running", False)):
