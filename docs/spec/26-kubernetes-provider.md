@@ -476,9 +476,17 @@ the namespace. A deployment therefore names one exact, pullable reference in
   taken from the Job's own creation timestamp; one whose Pod already
   finished and was reaped is left alone for cleanup, not adopted.
 
-Heartbeats and stall detection (10, C6c) are unchanged: log progress and
-the filesystem fingerprint come from the PVC through the reader Pod, and
-`container_running` is the Pod phase.
+Heartbeats and stall detection (10, C6c): log progress comes from the Pod log,
+and `container_running` is the Pod phase. The filesystem fingerprint comes from
+the running worker itself (FDY-0140): the provider's `activity` execs a
+read-only `find` in the worker container over the checkout, the report
+directory and the home (where a harness keeps its session state), and the
+supervisor compares one answer with the next. The workspace path is a `k8s://`
+name, so the supervisor's own walk would see nothing and a silent worker, Hermes
+under `-z` above all, was stalled out while it worked. The probe is asked no
+more often than a `command_running` renewal, and a failed ask is neither
+activity nor its absence. The worker and the verifier also mount the claim's
+`pkg-cache` leaf at `/crucible/pkg-cache` for the package caches (08).
 
 ## Credentials on the cluster (12, made concrete)
 

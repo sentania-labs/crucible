@@ -27,50 +27,42 @@ The bundle's content hash is recorded on the attempt. The rendered
 `IDENTITY.md` is stored as an artifact so the exact instructions a worker saw
 are reproducible.
 
-## IDENTITY.md sections (rendered from templates in `crucible/adapters/harness/templates/`)
+## IDENTITY.md (rendered by `crucible/adapters/execution/identity.py`)
 
-1. **Role.** "You are a worker executing task `<external_id>` for
-   `<orchestrator principal>`. You implement; you do not redefine the task."
+Short and plain: about 300 words for a typical contract (the operator's
+direction of 2026-09-29, FDY-0140). Crucible re-runs every check, commits what
+the worker leaves uncommitted, and enforces the scope and the gates itself, so
+the worker is told what to do, not how Crucible checks it. In order:
+
+1. **Heading and role.** The task id and title; the repository by name, the
+   checkout path, the work branch and the base ref; "do the task yourself; do
+   not redefine, widen or delegate it."
 2. **Objective.** From the contract.
-3. **Authority and boundaries.** Allowed and prohibited paths, prohibited
-   actions, dependency and CI rules, network mode, branch name, the rule that
-   nothing outside the checkout is yours.
-4. **Instruction precedence.** Operator's explicit words, safety and
-   repository protection, this contract, project docs and skills, the
-   delivery policy, global skills, harness defaults. On material conflict:
-   stop and escalate.
-5. **Procedure pointers.** Which project files and skills to read first.
-6. **Verification.** The `required_verification` list, verbatim, and the
-   instruction to capture each command's output to `report/`.
-7. **Reporting protocol.** The report directory is `/crucible/report`,
-   mounted writable and outside the checkout. Write `report.yaml` there
-   matching `CompletionClaimV1`, with `schema_version: "1.0"` (the format
-   version, not the schema's name, hades #181); write `progress.jsonl`
-   lines as milestones pass; capture each verification command's output to a log file there;
-   write `blocked.md` and exit 75 to escalate; exit 0 only after
-   `report.yaml` exists. Every path inside the report resolves against this
-   directory. It lists the contract's acceptance criteria and says that
-   `acceptance_mapping` has one entry per criterion, keyed by the criterion's
-   id and never by a verification id, with a one-line example of each
-   accepted form (a list, or a mapping keyed by id). It names the judgement
-   fields the worker writes and the facts Crucible fills itself
-   (`task_external_id`, `changed_files`, `refs`, `checks`, `run_evidence`),
-   which the worker may leave out; a value it does write is only compared
-   (hades #187, #215). It tells the worker to run
-   `crucible-report check /crucible/report/report.yaml` and fix every
-   problem it prints before exiting 0, and to check against
-   `report-schema.json` by hand in an image without the command.
-8. **Exit codes.** 0 done with report, 75 blocked, 70 cannot proceed (bad
-   environment), anything else is failure.
-9. **Prohibitions.** No pushing at all (the checkout has no remote
-   credential; Crucible pushes after verification), no force, no branch
-   other than `work_branch`, no delegating, no writing anywhere but the
-   checkout and `/crucible/report`, no claiming completion without
-   evidence, no closing references to issues the contract did not name.
-10. **Commits.** Commit locally on `work_branch` with the policy's author
-    identity and the attempt trailer; Crucible collects, verifies, and
-    publishes the commits. The claim's `proposed_pull_request` is a draft
-    Crucible may rewrite.
+3. **This is a correction** (only on a correction version). The correction's
+   instructions and the review comments or findings it addresses.
+4. **Scope.** Allowed and prohibited paths, whether dependencies may be added
+   and CI changed (yes or no), the network mode, "commit on your branch; never
+   push", and each of the contract's `constraints.prohibited_actions`.
+5. **Read first** (when the contract names any). The contract's `context`
+   references and `project_instructions`, each as `kind: ref`.
+6. **Acceptance criteria.** Each criterion's id and text.
+7. **Checks.** The `required_verification` commands, verbatim, to run and fix
+   what fails; an artifact entry is the file to write in the report directory.
+8. **Report.** Write `/crucible/report/report.yaml` against
+   `report-schema.json` with `schema_version: "1.0"` (the format version, not
+   the schema's name, hades #181), `summary`, `acceptance_mapping` (one entry
+   per criterion id, which it lists, hades #187), `proposed_pull_request`, and
+   the four lists; then run `crucible-report check` and fix every problem it
+   prints (hades #215).
+9. **If you are stuck.** Write `/crucible/report/blocked.md` saying what
+   blocks you and what you tried, then stop; with the contract's
+   `escalation.conditions` listed as the cases to stop in.
+
+No exit codes (a model cannot set its harness's exit code; `blocked.md` on a
+clean exit is the escalation, 16), no precedence list, no author line (the
+collector commits as the policy's author, 08), and no log capture (Crucible
+re-runs the checks, 11). Lists and booleans are rendered as words, never as
+Python values.
 
 ## Harness-specific delivery
 
@@ -80,7 +72,9 @@ shim when the checkout has no applicable project instruction file. Claude Code
 uses the existing project `CLAUDE.md` when one is present, so Crucible writes
 no `AGENTS.md` shim in that case. Codex gets `IDENTITY.md` on stdin ahead of
 the prompt; AGY gets `--add-dir /crucible/identity` and a short argv prompt
-that says to read `IDENTITY.md` first.
+that says to read `IDENTITY.md` first. Hermes gets the text of `IDENTITY.md`
+in its prompt, ahead of the pointer (FDY-0140): its launch wrapper reads the
+mounted file, so the argv Crucible builds still carries only the pointer.
 
 Shims are written by Crucible after checkout, listed in
 `.git/info/exclude`, and their absence from the diff is a gate (11).
