@@ -53,6 +53,19 @@ def test_wake_document_is_a_valid_wake_v1() -> None:
     assert document["created_at"].endswith("+00:00")
 
 
+def test_wake_document_carries_what_the_reviewer_is_asked_to_weigh() -> None:
+    """ADR 0024: failed advisory gates travel in the wake Foundry receives."""
+    assert WakeV1.model_validate(wake_document(_wake(), principal_name="f")).for_reviewer == []
+    wake = _wake(WakeReason.INTERNAL_REVIEW_NEEDED)
+    wake.payload["for_reviewer"] = [
+        {"gate": "scope_contained", "detail": "outside allowed_paths: ['infra/x']"}
+    ]
+    model = WakeV1.model_validate(wake_document(wake, principal_name="foundry"))
+    assert model.for_reviewer == [
+        {"gate": "scope_contained", "detail": "outside allowed_paths: ['infra/x']"}
+    ]
+
+
 def test_backoff_schedule_is_bounded_and_monotonic() -> None:
     values = [next_backoff(n) for n in range(1, len(RETRY_BACKOFF_SECONDS) + 3)]
     assert values[: len(RETRY_BACKOFF_SECONDS)] == list(RETRY_BACKOFF_SECONDS)

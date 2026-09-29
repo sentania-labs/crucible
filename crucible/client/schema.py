@@ -338,6 +338,17 @@ def kind_schemas() -> dict[str, dict[str, Any]]:
             {"tiers": ANY_OBJ, "rotation": ANY_OBJ, "pools": {"type": "array"}},
             {"policy": ANY_OBJ, "routing_policy": ANY_OBJ, "local_pools": {"type": "array"}},
         ),
+        "gate_classes": _obj(
+            "which pre-PR gates of the policy in force are advisory (a failure goes to the "
+            "reviewer) and which block (a failure stops the task), ADR 0024",
+            {"policy": ANY_OBJ, "advisory": {"type": "array"}, "blocking": {"type": "array"}},
+            {
+                "default": BOOL,
+                "default_advisory": {"type": "array"},
+                "always_blocking": {"type": "array"},
+                "note": STR,
+            },
+        ),
         "bootstrap_import": bootstrap,
         "bootstrap_import_list": _items("bootstrap imports", ANY_OBJ),
         # this command
