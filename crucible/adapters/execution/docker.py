@@ -84,6 +84,9 @@ from crucible.ports.execution import (
     IDENTITY_MOUNT,
     LEGACY_HARNESS_LABEL,
     OUTPUT_MOUNT,
+    PACKAGE_CACHE_ENV,
+    PACKAGE_CACHE_LEAF,
+    PACKAGE_CACHE_MOUNT,
     REPO_MOUNT,
     REPORT_MOUNT,
     VERIFY_MOUNT,
@@ -750,6 +753,7 @@ class DockerProvider:
             "CRUCIBLE_REPORT_DIR": REPORT_MOUNT,
             "CRUCIBLE_REPO_DIR": REPO_MOUNT,
             "HOME": "/home/worker",
+            **PACKAGE_CACHE_ENV,
             **spec.env,
         }
         network_policy = str(spec.policy.get("network", {}).get("mode", "egress-proxy"))
@@ -797,6 +801,9 @@ class DockerProvider:
             self._daemon_mount(spec.attempt_id, "repo", REPO_MOUNT, read_only=False),
             self._daemon_mount(spec.attempt_id, "identity", IDENTITY_MOUNT, read_only=True),
             self._daemon_mount(spec.attempt_id, "report", REPORT_MOUNT, read_only=False),
+            self._daemon_mount(
+                spec.attempt_id, PACKAGE_CACHE_LEAF, PACKAGE_CACHE_MOUNT, read_only=False
+            ),
             *self._credential_mounts(spec),
         ]
         command, launch_env = self._command(spec)
@@ -1180,7 +1187,9 @@ class DockerProvider:
                 for check_id, command in checks
             )
         network = "none" if spec.network == "none" else self.config.workers_network
-        _, env = self._network_and_env(spec) if network != "none" else ("none", {})
+        _, env = (
+            self._network_and_env(spec) if network != "none" else ("none", dict(PACKAGE_CACHE_ENV))
+        )
         code = await self._run_throwaway(
             spec,
             role=ROLE_VERIFIER,
@@ -1188,6 +1197,9 @@ class DockerProvider:
             mounts=[
                 self._daemon_mount(spec.attempt_id, "output/tree", REPO_MOUNT, read_only=False),
                 self._daemon_mount(spec.attempt_id, "verify", VERIFY_MOUNT, read_only=False),
+                self._daemon_mount(
+                    spec.attempt_id, PACKAGE_CACHE_LEAF, PACKAGE_CACHE_MOUNT, read_only=False
+                ),
             ],
             network=network,
             timeout=self.config.verifier_timeout_seconds,

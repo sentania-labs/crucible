@@ -17,6 +17,7 @@ from crucible.adapters.execution.kubernetes import KubernetesConfig
 from crucible.ports.execution import (
     IDENTITY_MOUNT,
     OUTPUT_MOUNT,
+    PACKAGE_CACHE_MOUNT,
     REPO_MOUNT,
     REPORT_MOUNT,
     VERIFY_MOUNT,
@@ -233,6 +234,20 @@ async def test_the_preparer_gets_the_whole_claim_and_the_collector_gets_it_read_
     assert verifier[REPO_MOUNT]["subPath"] == "output/tree"
     assert verifier[VERIFY_MOUNT]["subPath"] == "verify"
     assert OUTPUT_MOUNT not in verifier
+    # FDY-0140: the package caches are a claim leaf, shared by the worker and the
+    # verifier, never the memory-backed home.
+    worker = mounts("worker-")
+    for pod in (worker, verifier):
+        assert pod[PACKAGE_CACHE_MOUNT]["subPath"] == "pkg-cache"
+        assert pod[PACKAGE_CACHE_MOUNT]["readOnly"] is False
+    worker_env = {e["name"]: e.get("value") for e in pod_of(api, "worker-")["containers"][0]["env"]}
+    assert worker_env["UV_CACHE_DIR"] == "/crucible/pkg-cache/uv"
+    assert worker_env["PIP_CACHE_DIR"] == "/crucible/pkg-cache/pip"
+    assert worker_env["npm_config_cache"] == "/crucible/pkg-cache/npm"
+    verifier_env = {
+        e["name"]: e.get("value") for e in pod_of(api, "verifier-")["containers"][0]["env"]
+    }
+    assert verifier_env["UV_CACHE_DIR"] == "/crucible/pkg-cache/uv"
 
     reader = mounts("reader-")
     assert reader[WORK_MOUNT]["readOnly"] is True

@@ -87,6 +87,9 @@ from crucible.domain.time import parse_rfc3339
 from crucible.ports.execution import (
     IDENTITY_MOUNT,
     OUTPUT_MOUNT,
+    PACKAGE_CACHE_ENV,
+    PACKAGE_CACHE_LEAF,
+    PACKAGE_CACHE_MOUNT,
     REPO_MOUNT,
     REPORT_MOUNT,
     VERIFY_MOUNT,
@@ -2976,6 +2979,7 @@ class KubernetesProvider:
             "CRUCIBLE_REPORT_DIR": REPORT_MOUNT,
             "CRUCIBLE_REPO_DIR": REPO_MOUNT,
             "HOME": "/home/worker",
+            **PACKAGE_CACHE_ENV,
             "CRUCIBLE_EGRESS_ALLOWLIST": ",".join(
                 self._egress_plan(spec, k8sspec.ROLE_WORKER).hosts
             ),
@@ -2989,6 +2993,7 @@ class KubernetesProvider:
             # directory at REPORT_MOUNT, so those are where they are mounted.
             Mount("ws", REPO_MOUNT, sub_path="repo"),
             Mount("ws", REPORT_MOUNT, sub_path="report"),
+            Mount("ws", PACKAGE_CACHE_MOUNT, sub_path=PACKAGE_CACHE_LEAF),
             Mount("identity", IDENTITY_MOUNT, read_only=True),
         ]
         volumes = [
@@ -3731,9 +3736,11 @@ class KubernetesProvider:
             mounts=[
                 Mount("ws", REPO_MOUNT, sub_path="output/tree"),
                 Mount("ws", VERIFY_MOUNT, sub_path="verify"),
+                Mount("ws", PACKAGE_CACHE_MOUNT, sub_path=PACKAGE_CACHE_LEAF),
             ],
             volumes=[self._claim_volume(spec.attempt_id)],
             limits=limits,
+            env=PACKAGE_CACHE_ENV,
             timeout=self.config.verifier_timeout_seconds,
             plan=self._egress_plan(spec, k8sspec.ROLE_VERIFIER),
         )

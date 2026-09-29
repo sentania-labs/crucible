@@ -21,6 +21,17 @@ OUTPUT_MOUNT = "/crucible/out"
 # not the uid a bind source on the host already has).
 WORK_MOUNT = "/crucible/work"
 VERIFY_MOUNT = "/crucible/verify"
+# FDY-0140: the package caches (uv, pip, npm) live on the workspace, a leaf of its own
+# beside the checkout, not on the worker's memory-backed home, whose size limit a
+# single `uv sync` can fill. The worker and the verifier both mount it, so the
+# verifier's re-run starts from what the worker downloaded.
+PACKAGE_CACHE_LEAF = "pkg-cache"
+PACKAGE_CACHE_MOUNT = "/crucible/pkg-cache"
+PACKAGE_CACHE_ENV = {
+    "UV_CACHE_DIR": f"{PACKAGE_CACHE_MOUNT}/uv",
+    "PIP_CACHE_DIR": f"{PACKAGE_CACHE_MOUNT}/pip",
+    "npm_config_cache": f"{PACKAGE_CACHE_MOUNT}/npm",
+}
 
 
 class IsolationLevel(StrEnum):
