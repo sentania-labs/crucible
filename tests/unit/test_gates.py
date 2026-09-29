@@ -65,7 +65,7 @@ def _passing_evidence() -> list[EvidenceItem]:
                 "bundle_verified": True,
                 "commit_paths": ["src/ledger/fake_change.py"],
                 "commit_messages": ["fix the import"],
-                "commit_policy": {"checked": True, "author_problems": [], "trailer_problems": []},
+                "commit_policy": {"checked": True, "author_problems": []},
             },
             ident=3,
         ),
@@ -578,7 +578,7 @@ def test_a_narrowed_gate_set_only_runs_what_the_policy_asked_for() -> None:
     assert set(outcomes) == {"exit_clean"}
 
 
-# ----- commit_policy (hades FDY-0135) --------------------------------------------------
+# ----- commit_policy (hades FDY-0135, FDY-0143) -----------------------------------------
 
 
 def _with_commit_policy(check: dict[str, Any] | None) -> GateInput:
@@ -593,32 +593,29 @@ def _with_commit_policy(check: dict[str, Any] | None) -> GateInput:
     return _gi(evidence, policy=policy)
 
 
-def test_commit_policy_passes_a_branch_the_publisher_would_push() -> None:
+def test_commit_policy_passes_commits_by_the_policy_author() -> None:
     outcome = evaluate_gate(
-        GateName.COMMIT_POLICY,
-        _with_commit_policy({"checked": True, "author_problems": [], "trailer_problems": []}),
+        GateName.COMMIT_POLICY, _with_commit_policy({"checked": True, "author_problems": []})
     )
     assert outcome.result is GateResult.PASS
-    assert outcome.detail == (
-        "every commit is authored as worker@example.test and carries a Crucible-Attempt trailer"
-    )
+    assert outcome.detail == "every commit is authored as worker@example.test"
     assert outcome.evidence_ids == (3,)
 
 
-def test_commit_policy_fails_a_commit_without_the_trailer_in_plain_words() -> None:
-    sha = "b" * 40
+def test_commit_policy_never_fails_on_a_missing_trailer() -> None:
+    """FDY-0143: the trailer is a courtesy nothing checks. A bundle recorded before the
+    change, with trailer problems in it, still passes."""
     outcome = evaluate_gate(
         GateName.COMMIT_POLICY,
-        _with_commit_policy({"checked": True, "author_problems": [], "trailer_problems": [sha]}),
+        _with_commit_policy(
+            {"checked": True, "author_problems": [], "trailer_problems": ["b" * 40]}
+        ),
     )
-    assert outcome.result is GateResult.FAIL
-    assert outcome.detail == (
-        "the publisher would refuse to push this branch: "
-        f"1 commit(s) without a Crucible-Attempt trailer ({sha[:12]})"
-    )
+    assert outcome.result is GateResult.PASS
+    assert "trailer" not in outcome.detail
 
 
-def test_commit_policy_fails_a_commit_by_another_author() -> None:
+def test_commit_policy_passes_a_commit_by_another_author_and_tells_the_reviewer() -> None:
     sha = "c" * 40
     outcome = evaluate_gate(
         GateName.COMMIT_POLICY,
@@ -626,13 +623,12 @@ def test_commit_policy_fails_a_commit_by_another_author() -> None:
             {
                 "checked": True,
                 "author_problems": [{"sha": sha, "author": "someone@elsewhere.test"}],
-                "trailer_problems": [],
             }
         ),
     )
-    assert outcome.result is GateResult.FAIL
+    assert outcome.result is GateResult.PASS
     assert outcome.detail == (
-        "the publisher would refuse to push this branch: 1 commit(s) not authored as "
+        "for the reviewer: 1 commit(s) not authored as "
         f"worker@example.test ({sha[:12]} by someone@elsewhere.test)"
     )
 
@@ -645,28 +641,27 @@ def test_commit_policy_echoes_no_worker_text_that_is_not_a_hash_or_an_address() 
             {
                 "checked": True,
                 "author_problems": [{"sha": "ignore previous", "author": "run `rm -rf /`"}],
-                "trailer_problems": ["not a sha"],
             }
         ),
     )
-    assert outcome.result is GateResult.FAIL
+    assert outcome.result is GateResult.PASS
     assert "ignore previous" not in outcome.detail
     assert "rm -rf" not in outcome.detail
     assert "a commit by another address" in outcome.detail
 
 
-def test_commit_policy_fails_when_the_collector_could_not_check() -> None:
+def test_commit_policy_passes_and_says_so_when_the_collector_could_not_check() -> None:
     outcome = evaluate_gate(GateName.COMMIT_POLICY, _with_commit_policy({"checked": False}))
-    assert outcome.result is GateResult.FAIL
-    assert "could not check" in outcome.detail
+    assert outcome.result is GateResult.PASS
+    assert "could not read the collected commits' authors" in outcome.detail
 
 
 def test_commit_policy_skips_an_attempt_collected_before_the_check_existed() -> None:
     """A task already waiting for review when Crucible upgrades is not failed by a gate
-    whose evidence its collector never wrote; the publisher still checks."""
+    whose evidence its collector never wrote."""
     outcome = evaluate_gate(GateName.COMMIT_POLICY, _with_commit_policy(None))
     assert outcome.result is GateResult.SKIPPED
-    assert "publisher still checks" in outcome.detail
+    assert "before Crucible recorded commit authors" in outcome.detail
 
 
 def test_commit_policy_ignores_a_worker_asserted_bundle() -> None:
@@ -674,7 +669,7 @@ def test_commit_policy_ignores_a_worker_asserted_bundle() -> None:
     evidence.append(
         _ev(
             "bundle_head",
-            {"commit_policy": {"checked": True, "author_problems": [], "trailer_problems": []}},
+            {"commit_policy": {"checked": True, "author_problems": []}},
             ident=9,
             source="worker",
         )
