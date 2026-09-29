@@ -189,12 +189,7 @@ def read_commit_policy(directory: Path) -> CommitPolicyCheck | None:
         sha, _, email = line.partition("\t")
         if sha.strip():
             authors.append((sha.strip()[:64], email.strip()[:200]))
-    trailers = tuple(
-        line.strip()[:64]
-        for line in text(directory / "trailer-problems.txt").splitlines()[:1000]
-        if line.strip()
-    )
-    return CommitPolicyCheck(author_problems=tuple(authors), trailer_problems=trailers)
+    return CommitPolicyCheck(author_problems=tuple(authors))
 
 
 def read_verifications(

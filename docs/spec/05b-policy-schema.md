@@ -57,7 +57,7 @@ images:
 git:
   author_name: "crucible-worker"
   author_email: "crucible-worker@users.noreply.github.com"
-  commit_trailer: "Crucible-Attempt"   # trailer key; Crucible's commit hook adds `<key>: <external_id>` (06)
+  commit_trailer: "Crucible-Attempt"   # trailer key; Crucible's commit hook adds `<key>: <external_id>` as a courtesy nothing checks (06)
   work_branch_pattern: "crucible/*"
   protected_branches: ["main", "release/*"]
 
@@ -92,7 +92,7 @@ gates:
     - feedback_dispositions_complete
     - ci_green_for_head
   skipped: []                          # release gates live on the release contract (24)
-                                       # commit_policy is never listed: it always runs before review (11)
+                                       # commit_policy is never listed: it always runs, always advisory (11)
   advisory:                            # ADR 0024: a failure of these goes to the internal reviewer instead of stopping the task
     - criteria_mapped                  # absent (every version written before 2026-09-29): this default set
     - report_present

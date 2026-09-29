@@ -17,11 +17,7 @@ import pytest
 
 from crucible.adapters.execution import scripts
 from crucible.adapters.execution.docker import DockerConfig, DockerProvider
-from crucible.adapters.execution.publisher import (
-    COMMIT_POLICY_REFUSED,
-    DockerPublisher,
-    PublisherConfig,
-)
+from crucible.adapters.execution.publisher import DockerPublisher, PublisherConfig
 from crucible.ports.publish import PublishRequest
 from tests.integration.fake_github import installation_token_value
 
@@ -73,7 +69,6 @@ def test_the_create_body_carries_no_token_anywhere_the_daemon_records(
             expected_head=request.expected_head,
             author_name="crucible-worker",
             author_email="crucible-worker@users.noreply.github.com",
-            commit_trailer="Crucible-Attempt",
         ),
         env={"HOME": "/home/worker"},
     )
@@ -115,7 +110,6 @@ def test_the_publisher_script_can_never_force_push(publisher: DockerPublisher) -
         expected_head=HEAD,
         author_name="crucible-worker",
         author_email="crucible-worker@users.noreply.github.com",
-        commit_trailer="Crucible-Attempt",
     )
     # No force flag anywhere in the script, in any spelling.
     for forbidden in ("--force", "--force-with-lease", "--mirror", "+refs/", ":+refs/"):
@@ -129,9 +123,9 @@ def test_the_publisher_script_can_never_force_push(publisher: DockerPublisher) -
         assert f" {forbidden}" not in push_line, forbidden
 
 
-def test_the_script_refuses_the_push_when_commit_policy_fails() -> None:
-    """23 step 4: verify every commit's author and trailer, then push. The check has to
-    stop the push, not merely be written down beside it."""
+def test_the_script_has_no_commit_policy_refusal() -> None:
+    """FDY-0143 (operator decision, 2026-09-29): no refusal for a commit's author or
+    trailer. The guarantees before the push are the seal and the accepted head."""
     script = scripts.publisher_script(
         clone_url="https://github.com/owner/repo.git",
         work_branch="crucible/FDY-0042",
@@ -139,31 +133,13 @@ def test_the_script_refuses_the_push_when_commit_policy_fails() -> None:
         expected_head=HEAD,
         author_name="crucible-worker",
         author_email="crucible-worker@users.noreply.github.com",
-        commit_trailer="Crucible-Attempt",
     )
-    refusal = script.index("commit policy refused")
+    assert "commit policy refused" not in script
+    assert "commit-policy" not in script
+    assert "exit 6" not in script
     push = script.index("git push --quiet origin")
-    assert refusal < push, "the refusal must come before the push"
-    assert f"exit {COMMIT_POLICY_REFUSED}" in script
-    # And the token goes before the script does, on that path as on every other.
-    tail = script[refusal:push]
-    assert "drop_token" in tail
-    assert 'drop_token() { rm -f "$TOKDIR/token"; }' in script
-
-
-def test_a_commit_policy_refusal_maps_to_an_outcome_that_did_not_push(
-    publisher: DockerPublisher, tmp_path: Path
-) -> None:
-    out = tmp_path / "out"
-    out.mkdir()
-    (out / "step.txt").write_text("commit-policy", encoding="utf-8")
-    (out / "author-problems.txt").write_text(f"{HEAD}\tsomeone@example.invalid\n", encoding="utf-8")
-    (out / "trailer-problems.txt").write_text(f"{HEAD}\n", encoding="utf-8")
-    outcome = publisher._read_outcome(out, COMMIT_POLICY_REFUSED)
-    assert not outcome.pushed
-    assert outcome.step == "commit-policy"
-    assert outcome.author_problems and outcome.trailer_problems
-    assert "nothing was pushed" in outcome.detail
+    assert script.index('"$ACTUAL" != "$SEAL"') < push
+    assert script.index('"$HEAD_SHA" != "$EXPECTED"') < push
 
 
 def test_the_publisher_outcome_is_redacted_before_it_is_recorded(

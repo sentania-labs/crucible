@@ -50,7 +50,7 @@ from crucible.ports.execution import ImageInfo
 from crucible.ports.harness import CredentialSource, HarnessGate
 from crucible.settings import Settings
 from tests.admin_cli import admin_main, envelope_data
-from tests.fixtures import contract_document, promote_for_test
+from tests.fixtures import FakeClock, contract_document, promote_for_test
 
 pytestmark = pytest.mark.integration
 
@@ -3024,11 +3024,13 @@ def test_advisory_gates_through_api_cli_and_ui(
     asyncio.run(live_supervisor.tick())
     first = admin_client.get("/v1/admin/gates/advisory").json()
     assert first["advisory"] == [
+        "commit_policy",
         "criteria_mapped",
         "report_present",
         "run_evidence_present",
         "scope_contained",
     ]
+    assert first["always_advisory"] == ["commit_policy"]
     assert "no_secrets" in first["blocking"] and "internal_review_recorded" in first["blocking"]
     start = first["policy"]["version"]
 
@@ -3037,7 +3039,8 @@ def test_advisory_gates_through_api_cli_and_ui(
         json={"reason": "api: scope blocks here", "advisory": ["report_present"]},
     )
     assert saved.status_code == 200, saved.text
-    assert saved.json()["advisory"] == ["report_present"] and not saved.json()["default"]
+    assert saved.json()["advisory"] == ["commit_policy", "report_present"]
+    assert not saved.json()["default"]
     assert "scope_contained" in saved.json()["blocking"]
     stored = admin_client.get(f"/v1/policies/default-software/{start + 1}").json()["document"]
     assert stored["gates"]["advisory"] == ["report_present"]
@@ -3062,7 +3065,7 @@ def test_advisory_gates_through_api_cli_and_ui(
     assert admin_client.get("/v1/admin/gates/advisory").json()["policy"]["version"] == start + 1
 
     cli_view = run_cli(config_file, "gates", "advisory", capsys=capsys)
-    assert cli_view["advisory"] == ["report_present"]
+    assert cli_view["advisory"] == ["commit_policy", "report_present"]
     cli_saved = run_cli(
         config_file,
         "--reason",
@@ -3073,7 +3076,7 @@ def test_advisory_gates_through_api_cli_and_ui(
         "--gate=scope_contained",
         capsys=capsys,
     )
-    assert cli_saved["advisory"] == ["ci_unchanged", "scope_contained"]
+    assert cli_saved["advisory"] == ["ci_unchanged", "commit_policy", "scope_contained"]
     assert cli_saved["policy"]["version"] == start + 2
     decisions = [
         d
@@ -3204,6 +3207,25 @@ def test_the_cli_remote_mode_sends_the_command_timeout(monkeypatch: pytest.Monke
         ("GET", "/v1/admin/limits/command-timeout", None),
         ("POST", "/v1/admin/limits/command-timeout", {"reason": "r", "max": 7_200_000}),
     ]
+
+
+def test_recently_updated_reads_the_newest_tasks_only(
+    client: TestClient, ctx: AppContext, clock: FakeClock
+) -> None:
+    """hades PR 238 review: the Tasks page reads its rows with one bounded query, newest
+    update first, instead of every task of the last 14 days."""
+    since = clock.now()
+    ids = []
+    for n in range(3):
+        clock.advance(60)
+        response = client.post("/v1/tasks", json=contract_document(external_id=f"EX-RU{n}"))
+        assert response.status_code == 201, response.text
+        ids.append(response.json()["id"])
+    with ctx.uow_factory() as uow:
+        newest = [t.id for t in uow.tasks.recently_updated(since=since, limit=2)]
+        later = [t.id for t in uow.tasks.recently_updated(since=clock.now(), limit=50)]
+    assert newest == [ids[2], ids[1]]
+    assert later == [ids[2]]
 
 
 def test_hermes_run_limits_have_api_cli_and_ui_controls(

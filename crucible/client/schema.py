@@ -352,6 +352,7 @@ def kind_schemas() -> dict[str, dict[str, Any]]:
                 "default": BOOL,
                 "default_advisory": {"type": "array"},
                 "always_blocking": {"type": "array"},
+                "always_advisory": {"type": "array"},
                 "note": STR,
             },
         ),

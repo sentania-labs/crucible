@@ -19,6 +19,7 @@ from crucible.contracts.api import (
     CompletionClaimView,
     ContractVersionView,
     DecisionView,
+    DeliveryView,
     EscalationView,
     EventList,
     EventView,
@@ -188,6 +189,7 @@ def task_view(uow: UnitOfWork, task_id: str) -> TaskView:
         head_sha=task.head_sha,
         gate_summary=gate_summary(uow, task.id),
         pull_request=_pr_summary(uow, task.id),
+        delivery=delivery_view(uow, task.id, task_events),
         open_escalations=[
             _escalation_view(e).model_dump(mode="json")
             for e in uow.escalations.list_for_task(task.id)
@@ -736,6 +738,46 @@ def wake_list(
 # ----- C4 views: the pull request and what GitHub said about it (04, 23) --------
 
 
+def delivery_view(uow: UnitOfWork, task_id: str, events: list[Any]) -> DeliveryView:
+    """The task's paper trail (hades FDY-0143): what Crucible pushed, the pull request,
+    and the merge. The latest `branch_pushed` event is what Crucible itself pushed; a
+    pull request's own branch and head stand in for a task published before that event
+    carried them. A republish that resumes after the push records the same head again,
+    so the time is the first event for that head: when Crucible actually pushed it."""
+    latest = next((e for e in reversed(events) if e.kind == "branch_pushed"), None)
+    pushed = (
+        next(
+            e
+            for e in events
+            if e.kind == "branch_pushed"
+            and e.payload.get("head_sha") == latest.payload.get("head_sha")
+        )
+        if latest is not None
+        else None
+    )
+    payload = pushed.payload if pushed is not None else {}
+    pull_request = uow.pull_requests.get_for_task(task_id)
+    return DeliveryView(
+        work_branch=(
+            str(payload["work_branch"])
+            if payload.get("work_branch")
+            else (pull_request.work_branch if pull_request else None)
+        ),
+        pushed_head=(
+            str(payload["head_sha"])
+            if payload.get("head_sha")
+            else (pull_request.head_sha if pull_request else None)
+        ),
+        pushed_at=pushed.ts if pushed is not None else None,
+        pull_request_number=pull_request.number if pull_request else None,
+        pull_request_url=pull_request.url if pull_request else None,
+        pull_request_state=pull_request.state.value if pull_request else None,
+        merge_sha=pull_request.merge_sha if pull_request else None,
+        merged_by=pull_request.merged_by if pull_request else None,
+        merged_at=pull_request.merged_at if pull_request else None,
+    )
+
+
 def _pr_summary(uow: UnitOfWork, task_id: str) -> dict[str, Any] | None:
     """The short form the task view carries; the full record is /pull-request."""
     pull_request = uow.pull_requests.get_for_task(task_id)
@@ -751,6 +793,7 @@ def _pr_summary(uow: UnitOfWork, task_id: str) -> dict[str, Any] | None:
         "number": pull_request.number,
         "url": pull_request.url,
         "state": pull_request.state.value,
+        "work_branch": pull_request.work_branch,
         "head_sha": pull_request.head_sha,
         "base_ref": pull_request.base_ref,
         "merged_at": pull_request.merged_at.isoformat() if pull_request.merged_at else None,

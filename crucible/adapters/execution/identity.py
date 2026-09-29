@@ -108,10 +108,7 @@ def render_identity_md(
         f"- Never touch: {_paths(scope.get('prohibited_paths'))}\n"
         f"- Add dependencies: {_yes_no(scope.get('may_add_dependencies'))}. "
         f"Change CI: {_yes_no(scope.get('may_modify_ci'))}. Network: {network_mode}.\n"
-        "- Commit on your branch; never push. Crucible's `commit-msg` hook adds the "
-        f"trailer `{commit_trailer(policy)}: {external_id}` to each commit: leave the "
-        "checkout's git author and hooks as they are and do not use `--no-verify`, or "
-        "the `commit_policy` gate fails."
+        f"- Commit your work on `{work_branch}`; never push."
         + "".join(
             f"\n- Do not {str(a).strip()}" for a in _items(constraints.get("prohibited_actions"))
         )

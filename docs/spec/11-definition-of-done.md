@@ -124,7 +124,8 @@ listed "for the reviewer" in the task view, the gate list, the admin UI's
 Tasks page and the wake, and the task goes on to its internal review, or to
 acceptance when the policy requires no review for that head. The policy's
 `gates.advisory` decides (05b); the default is below, and
-`internal_review_recorded`, `no_secrets` and `commit_policy` always block.
+`internal_review_recorded` and `no_secrets` always block, and `commit_policy`
+is always advisory.
 `error` counts as `fail` in both classes.
 
 | Gate | Default | Passes when | Evidence consumed |
@@ -142,13 +143,13 @@ acceptance when the policy requires no review for that head. The policy's
 | `ci_unchanged` | blocking | when `may_modify_ci` is false: no change under workflow paths | diff |
 | `workspace_clean` | blocking | no leftover ephemeral clusters or containers labeled for this attempt | provider reconcile |
 | `internal_review_recorded` | always blocking | a `ReviewReportV1` for this exact head SHA exists from a reviewer that is not the implementing attempt; `pending` until then (the task waits in `awaiting_internal_review`) | review report with reviewer identity |
-| `commit_policy` | always blocking | every commit the publisher would push is authored with the policy's `author_email` and carries a `commit_trailer` trailer: the publisher's own check (23), run by the collector, so a commit the publisher would refuse fails here instead of after acceptance. The detail names the commits by hash and says which rule each broke. `skipped` only for an attempt collected before the check existed; `fail` when the collector could not finish it, including when git could not list or read the commits (hades FDY-0135, 2026-09-29) | collector's commit check over the collected checkout's commits, the ones the bundle carries |
+| `commit_policy` | always advisory | every new commit is authored with the policy's `author_email`. The collector checks each commit's author, and a commit authored by someone else fails the gate, named by hash and address in the detail, so it is listed for the reviewer; it never stops the task. The attempt trailer is not checked. `skipped` only for an attempt collected before the check existed; `fail` (advisory) when the collector could not read the commits. The operator decided on 2026-09-29 that the trailer is not required and the task record is the paper trail (hades FDY-0143); before that the gate blocked (FDY-0135) | collector's author check over the collected checkout's commits, the ones the bundle carries |
 
 `commit_policy` is evaluated whatever `gates.pre_pr` lists, and a policy may
-not name it: the publisher applies its rule whatever the policy says, so the
-early warning cannot be dropped either, and a policy stored before the gate
-existed still gets it. It always blocks, and `gates.advisory` may not name
-it either.
+not name it, so the reviewer always sees who authored the commits and a
+policy stored before the gate existed still gets it. It is always advisory,
+whatever `gates.advisory` lists, and `gates.advisory` may not name it
+either.
 
 ## Publication and post-PR gates (23)
 

@@ -199,6 +199,12 @@ class Gates(StrictModel):
         fixed = sorted(set(value) & ALWAYS_BLOCKING_GATES)
         if fixed:
             raise ValueError(f"gates.advisory may not include {fixed}: these always block")
+        always = sorted(set(value) & ENFORCED_PRE_PR_GATES)
+        if always:
+            raise ValueError(
+                f"gates.advisory may not include {always}: these are always advisory "
+                "and are not listed in a policy"
+            )
         stray = sorted(set(value) - PRE_PR_GATES)
         if stray:
             raise ValueError(f"gates.advisory names gates that are not pre-PR gates: {stray}")

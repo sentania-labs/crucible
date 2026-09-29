@@ -19,6 +19,7 @@ from crucible.application.gates import configured_pre_pr_gates
 from crucible.application.policies import put_policy
 from crucible.domain.entities import Principal
 from crucible.domain.gates import (
+    ALWAYS_ADVISORY_GATES,
     ALWAYS_BLOCKING_GATES,
     DEFAULT_ADVISORY_GATES,
     PRE_PR_GATES,
@@ -39,6 +40,8 @@ def gate_classes_view(uow: UnitOfWork) -> dict[str, Any]:
         "default": (policy.document.get("gates") or {}).get("advisory") is None,
         "default_advisory": sorted(DEFAULT_ADVISORY_GATES),
         "always_blocking": sorted(ALWAYS_BLOCKING_GATES),
+        # FDY-0143: listed as advisory above whatever the policy says.
+        "always_advisory": sorted(ALWAYS_ADVISORY_GATES),
         "note": (
             "a path matching the contract's prohibited_paths stops the task even when "
             "scope_contained is advisory"
@@ -54,7 +57,9 @@ def save_gate_classes(
     advisory: list[str],
     reason: str | None,
 ) -> dict[str, Any]:
-    """Write a policy version whose advisory set is exactly `advisory`."""
+    """Write a policy version whose advisory set is exactly `advisory`. A gate that is
+    always advisory is accepted and not stored, so the view's own list saves back."""
+    advisory = [gate for gate in advisory if gate not in ALWAYS_ADVISORY_GATES]
     reason = guard_mutation(
         ctx, uow, reason, principal=principal.name, operation="gates set-advisory"
     )

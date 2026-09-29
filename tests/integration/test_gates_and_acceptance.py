@@ -281,31 +281,30 @@ async def test_each_fail_fixture_fails_its_gate(
     assert gates(client, latest_attempt(client, task_id))[gate] == "fail"
 
 
-async def test_a_commit_without_the_trailer_fails_before_internal_review(
+async def test_a_commit_by_another_author_without_the_trailer_reaches_review(
     client: TestClient, supervisor: Supervisor
 ) -> None:
-    """hades FDY-0135: the publisher refuses such a commit after acceptance, which is
-    the most expensive place to find it. The commit_policy gate finds it at collection,
-    so the task never reaches awaiting_internal_review, and says why in plain words."""
-    task_id = submit_and_start(client, "crucible-worker:fake-no-trailer", external_id="HT-0007")
-    assert await run_to_settled(supervisor, client, task_id) == "pre_pr_gates_failed"
+    """hades FDY-0143 (operator decision, 2026-09-29): commit_policy is always advisory,
+    so the author difference fails it and is listed for the reviewer, and the task goes
+    on to review; nothing checks the trailer."""
+    task_id = submit_and_start(client, "crucible-worker:fake-other-author", external_id="HT-0007")
+    assert await run_to_settled(supervisor, client, task_id) == "awaiting_internal_review"
     attempt_id = latest_attempt(client, task_id)
     results = gates(client, attempt_id)
     assert results[GateName.COMMIT_POLICY] == "fail"
-    assert results[GateName.COMMITS_PRESENT] == "pass"
     rows = client.get(f"/v1/attempts/{attempt_id}/gates").json()["items"]
     detail = next(r["detail"] for r in rows if r["gate"] == GateName.COMMIT_POLICY)
-    head = client.get(f"/v1/tasks/{task_id}").json()["head_sha"]
+    view = client.get(f"/v1/tasks/{task_id}").json()
+    head = view["head_sha"]
     assert detail == (
-        "the publisher would refuse to push this branch: "
-        f"1 commit(s) without a Crucible-Attempt trailer ({head[:12]})"
+        "1 commit(s) not authored as "
+        f"crucible-worker@users.noreply.github.com ({head[:12]} by someone-else@example.test)"
     )
-    assert client.get(f"/v1/tasks/{task_id}").json()["gate_summary"]["failing"] == [
-        GateName.COMMIT_POLICY.value
-    ]
+    assert "trailer" not in detail
+    assert {"gate": "commit_policy", "detail": detail} in view["gate_summary"]["for_reviewer"]
+    assert "commit_policy" not in view["gate_summary"]["failing"]
     kinds = event_kinds(client, task_id)
-    assert "task_pre_pr_gates_failed" in kinds
-    assert "task_awaiting_internal_review" not in kinds
+    assert "task_pre_pr_gates_failed" not in kinds
 
 
 async def test_a_secret_in_the_diff_is_never_stored(

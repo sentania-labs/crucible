@@ -66,6 +66,7 @@ def test_the_default_classification_is_the_operators() -> None:
         GateName.REPORT_PRESENT,
         GateName.CRITERIA_MAPPED,
         GateName.RUN_EVIDENCE_PRESENT,
+        GateName.COMMIT_POLICY,
     } == DEFAULT
     for gate in (
         GateName.VERIFICATION_RAN,
@@ -85,16 +86,18 @@ def test_a_policy_without_the_field_takes_the_default() -> None:
     """The lab's default-software v8 and hades-self-hosting v1 carry no list."""
     seeded = seeded_policy_v3()
     assert "advisory" not in seeded["gates"]
-    assert advisory_gates(seeded) == DEFAULT_ADVISORY_GATES
-    assert advisory_gates({"gates": {"advisory": None}}) == DEFAULT_ADVISORY_GATES
+    assert advisory_gates(seeded) == DEFAULT_ADVISORY_GATES | {GateName.COMMIT_POLICY}
+    assert advisory_gates({"gates": {"advisory": None}}) == DEFAULT_ADVISORY_GATES | {
+        GateName.COMMIT_POLICY
+    }
 
 
 def test_a_policy_list_decides_and_the_review_always_blocks() -> None:
-    assert advisory_gates({"gates": {"advisory": []}}) == frozenset()
+    assert advisory_gates({"gates": {"advisory": []}}) == {GateName.COMMIT_POLICY}
     chosen = advisory_gates(
         {"gates": {"advisory": ["ci_unchanged", "no_secrets", "internal_review_recorded"]}}
     )
-    assert chosen == {GateName.CI_UNCHANGED}
+    assert chosen == {GateName.CI_UNCHANGED, GateName.COMMIT_POLICY}
 
 
 # ----- the verdict ----------------------------------------------------------------
@@ -354,7 +357,7 @@ def test_the_policy_field_is_optional_and_validated() -> None:
         (["no_such_gate"], "not pre-PR gates"),
         (["internal_review_recorded"], "always block"),
         (["no_secrets"], "always block"),
-        (["commit_policy"], "always block"),
+        (["commit_policy"], "always advisory"),
         (["scope_contained", "scope_contained"], "duplicate"),
     ):
         with pytest.raises(ValidationError, match=words):
@@ -374,8 +377,37 @@ def test_no_gate_is_both_always_blocking_and_advisory_by_default() -> None:
     assert DEFAULT_ADVISORY_GATES <= PRE_PR_GATES
 
 
-def test_the_commit_policy_gate_always_blocks() -> None:
-    """FDY-0135's gate, which no policy lists, stays blocking whatever the advisory set."""
-    assert GateName.COMMIT_POLICY in ALWAYS_BLOCKING_GATES
-    stored = {"gates": {"advisory": ["commit_policy", "scope_contained"]}}
-    assert gate_class(GateName.COMMIT_POLICY, advisory_gates(stored)) is GateClass.BLOCKING
+def test_the_commit_policy_gate_is_always_advisory() -> None:
+    """FDY-0143 (operator, 2026-09-29): the commit author is for the reviewer and the
+    trailer is not checked, so no advisory set, not even an empty one, makes it block."""
+    assert GateName.COMMIT_POLICY not in ALWAYS_BLOCKING_GATES
+    stored: dict[str, Any]
+    for stored in ({}, {"gates": {"advisory": []}}, {"gates": {"advisory": ["ci_unchanged"]}}):
+        assert gate_class(GateName.COMMIT_POLICY, advisory_gates(stored)) is GateClass.ADVISORY
+
+
+def test_a_commit_by_another_author_is_for_the_reviewer_and_never_stops_the_task() -> None:
+    evidence = _without_review(_passing_evidence())
+    bundle = next(i for i, e in enumerate(evidence) if e.kind == "bundle_head")
+    payload = dict(evidence[bundle].payload)
+    payload["commit_policy"] = {
+        "checked": True,
+        "author_problems": [{"sha": "c" * 40, "author": "someone@elsewhere.test"}],
+    }
+    evidence[bundle] = _ev("bundle_head", payload, ident=evidence[bundle].id)
+    gi = _gi(evidence, policy={"git": {"author_email": "worker@example.test"}})
+    gates = sorted(PRE_PR_GATES | {GateName.COMMIT_POLICY})
+    outcomes = evaluate_pre_pr(gates, gi)
+    advisory = advisory_gates({"gates": {"advisory": []}})
+    assert outcomes[GateName.COMMIT_POLICY].result is GateResult.FAIL
+    assert blocking(outcomes, advisory) == []
+    assert pre_pr_verdict(outcomes, advisory) is PrePrVerdict.REVIEW
+    assert for_reviewer(outcomes, advisory) == [
+        {
+            "gate": GateName.COMMIT_POLICY,
+            "detail": (
+                "1 commit(s) not authored as worker@example.test "
+                f"({'c' * 12} by someone@elsewhere.test)"
+            ),
+        }
+    ]

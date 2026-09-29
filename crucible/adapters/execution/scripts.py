@@ -141,7 +141,8 @@ printf '[credential]\\n\\thelper = "!sh /tmp/cred-helper.sh"\\n' >> /tmp/gitconf
 # the trailer itself, an amend, or a second run never gets a duplicate. It reads and
 # writes only the message file git hands it: no network, no repository content.
 # `--no-divider`: a `---` line in a body is prose, not the start of a patch, so the
-# trailer goes at the end of the message, where the commit policy check reads it.
+# trailer goes at the end of the message. The trailer is a courtesy: since 2026-09-29
+# nothing checks it, and the task record is the paper trail.
 COMMIT_HOOK_DIR = "hooks"
 
 
@@ -159,31 +160,23 @@ exec git interpret-trailers --in-place --no-divider --if-exists doNothing \\
 
 
 def _commit_policy_check(git: str) -> str:
-    """23 step 4: the one statement of the commit policy, shared by the publisher, which
-    refuses a push on it, and the collector, whose answer the `commit_policy` gate reads
-    before review (hades FDY-0135).
+    """The collector's author check, whose answer the `commit_policy` gate shows the
+    reviewer (hades FDY-0135). Since 2026-09-29 it is information, not a refusal:
+    neither the gate nor the publisher stops a branch on it.
 
     `commit_policy_check RANGE DIR` writes `DIR/author-problems.txt` (sha, tab, author
-    email) for each commit in RANGE whose author email is not `$POLICY_AUTHOR_EMAIL`, and
-    `DIR/trailer-problems.txt` (sha) for each commit with no `$TRAILER` trailer. `git` is
-    the command each caller already runs git with.
+    email) for each commit in RANGE whose author email is not `$POLICY_AUTHOR_EMAIL`.
+    `git` is the command the collector runs git with.
 
-    It returns non-zero when git cannot list or read the commits, so neither caller
-    takes a check that did not run for one that found nothing: the publisher refuses
-    the push, and the collector records the check as unfinished, which fails the gate."""
+    It returns non-zero when git cannot list or read the commits, so a check that did
+    not run is never taken for one that found nothing."""
     return f"""commit_policy_check() {{
   : > "$2/author-problems.txt"
-  : > "$2/trailer-problems.txt"
   shas=$({git} rev-list "$1") || return 1
   for sha in $shas; do
     who=$({git} show -s --format='%ae' "$sha") || return 1
     if [ "$who" != "$POLICY_AUTHOR_EMAIL" ]; then
       printf '%s\\t%s\\n' "$sha" "$who" >> "$2/author-problems.txt"
-    fi
-    found=$({git} show -s --format='%(trailers:key='"$TRAILER"',valueonly)' "$sha") \\
-      || return 1
-    if [ -z "$found" ]; then
-      printf '%s\\n' "$sha" >> "$2/trailer-problems.txt"
     fi
   done
 }}
@@ -501,11 +494,11 @@ def collector_script(
     such a commit is skipped with a note and the collection goes on with what the worker
     committed itself.
 
-    It also runs the publisher's commit policy over the same range the publisher will
-    (the remote work branch when the checkout has one, else base_ref), so the
-    `commit_policy` gate can refuse a bad commit before review rather than the publisher
-    after acceptance (hades FDY-0135). The answer goes to `commit-policy/`, with
-    `checked` written only once the check has finished."""
+    It also checks each new commit's author (from the remote work branch when the
+    checkout has one, else base_ref), so the `commit_policy` gate can show the reviewer
+    a commit authored by someone other than the policy's author (hades FDY-0135). The
+    answer goes to `commit-policy/`, with `checked` written only once the check has
+    finished."""
     return f"""set -eu
 {GIT_ENV}
 OUT={OUTPUT_MOUNT}
@@ -840,7 +833,6 @@ def publisher_script(
     expected_head: str,
     author_name: str,
     author_email: str,
-    commit_trailer: str,
     credential_host: str = "github.com",
     token_source: str = "stdin",
     bundle_sha256: str = "",
@@ -882,7 +874,6 @@ WORK_BRANCH={_quote(work_branch)}
 BASE_REF={_quote(base_ref)}
 EXPECTED={_quote(expected_head)}
 CLONE_URL={_quote(clone_url)}
-TRAILER={_quote(commit_trailer)}
 SEAL={_quote(bundle_sha256)}
 drop_token() {{ {drop}; }}
 mkdir -p "$OUT"
@@ -947,40 +938,10 @@ echo ls-remote > "$OUT/step.txt"
 git ls-remote origin "refs/heads/$WORK_BRANCH" > "$OUT/ls-remote-before.txt" \
   2>> "$OUT/publisher.log" || true
 awk '{{print $1}}' "$OUT/ls-remote-before.txt" | head -n 1 > "$OUT/remote-head-before.txt"
-# Every commit the bundle carries must match the policy's author and the attempt
-# trailer, checked here where the commits are, not after they are on the remote.
-echo commit-policy > "$OUT/step.txt"
-REMOTE_BEFORE=$(cat "$OUT/remote-head-before.txt")
-if [ -n "$REMOTE_BEFORE" ]; then
-  git fetch --quiet origin "refs/heads/$WORK_BRANCH:refs/remotes/origin/$WORK_BRANCH" \
-    >> "$OUT/publisher.log" 2>&1 || true
-  RANGE="refs/remotes/origin/$WORK_BRANCH..refs/heads/crucible-publish"
-else
-  RANGE="refs/remotes/origin/$BASE_REF..refs/heads/crucible-publish"
-fi
-POLICY_AUTHOR_EMAIL={_quote(author_email)}
-{_commit_policy_check("git")}if ! commit_policy_check "$RANGE" "$OUT"; then
-  echo "commit policy refused the push: the commits to push could not be read" \
-    > "$OUT/error.txt"
-  echo refused > "$OUT/push.txt"
-  drop_token
-  chmod 0644 "$OUT"/* 2>/dev/null || true
-  exit 6
-fi
-if [ -s "$OUT/author-problems.txt" ] || [ -s "$OUT/trailer-problems.txt" ]; then
-  # 23 step 4: verify every commit's author and trailer match policy, *then* push. A
-  # commit signed by someone the policy does not name, or missing the attempt trailer,
-  # is not this attempt's work, and a push is not undoable.
-  AUTHORS=$(wc -l < "$OUT/author-problems.txt")
-  TRAILERS=$(wc -l < "$OUT/trailer-problems.txt")
-  printf 'commit policy refused the push: %s author problem(s), %s trailer problem(s)\n' \
-    "$AUTHORS" "$TRAILERS" > "$OUT/error.txt"
-  echo commit-policy > "$OUT/step.txt"
-  echo refused > "$OUT/push.txt"
-  drop_token
-  chmod 0644 "$OUT"/* 2>/dev/null || true
-  exit 6
-fi
+# The operator's decision of 2026-09-29: the publisher does not refuse a push for a
+# commit's author or trailer. What it guarantees is the bundle: sealed, verified, and
+# at the reviewed and accepted head. The author is shown to the reviewer at collection
+# (the `commit_policy` gate) instead.
 echo push > "$OUT/step.txt"
 # No force, ever. A remote head that is not an ancestor of the bundle head fails here,
 # which is exactly what 23 asks for: record it, wake Foundry, never overwrite.

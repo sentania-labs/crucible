@@ -74,9 +74,10 @@ PRE_PR_GATES: frozenset[str] = frozenset(
         GateName.INTERNAL_REVIEW_RECORDED,
     }
 )
-# hades FDY-0135: a pre-PR gate no policy lists, moves, or skips, because the publisher
-# enforces the same rule whatever the policy says. Evaluated alongside the policy's
-# `gates.pre_pr`, so a policy stored before the gate existed still gets it.
+# hades FDY-0135: a pre-PR gate no policy lists, moves, or skips, evaluated alongside
+# the policy's `gates.pre_pr`, so a policy stored before the gate existed still gets it.
+# Since FDY-0143 (operator decision, 2026-09-29) it is always advisory: it is there so
+# the reviewer sees who authored the commits, not to stop a branch.
 ENFORCED_PRE_PR_GATES: frozenset[str] = frozenset({GateName.COMMIT_POLICY})
 
 # ADR 0024, the operator on 2026-09-29: "We need to let the review be our enforcement
@@ -92,10 +93,12 @@ DEFAULT_ADVISORY_GATES: frozenset[str] = frozenset(
 )
 # The review is the enforcement, so it is never itself advisory. A secret, once pushed,
 # cannot be taken back, so no policy may send one to the reviewer instead of stopping.
-# commit_policy is the publisher's own rule, checked early, so it blocks too.
 ALWAYS_BLOCKING_GATES: frozenset[str] = frozenset(
-    {GateName.INTERNAL_REVIEW_RECORDED, GateName.NO_SECRETS} | ENFORCED_PRE_PR_GATES
+    {GateName.INTERNAL_REVIEW_RECORDED, GateName.NO_SECRETS}
 )
+# FDY-0143: the commit author is for the reviewer and the trailer is not checked at all,
+# so no policy can make commit_policy stop a task.
+ALWAYS_ADVISORY_GATES: frozenset[str] = ENFORCED_PRE_PR_GATES
 
 
 class GateClass(StrEnum):
@@ -678,10 +681,14 @@ def _named_commit(sha: object) -> str:
 
 
 def commit_policy(gi: GateInput) -> GateOutcome:
-    """The publisher's author and trailer checks, run by the collector on the collected
-    branch, so a commit the publisher would refuse fails here, before review and
-    acceptance, not after (hades FDY-0135). The rule itself is the one shell function
-    both run; this gate only reads its answer."""
+    """Who authored the collected commits, for the reviewer (hades FDY-0135, FDY-0143).
+
+    The collector checks every new commit's author against the policy's `author_email`.
+    A commit by someone else fails this gate, which is always advisory, so the failure
+    is listed for the reviewer and never stops the task. The attempt trailer is not
+    checked: the operator decided on 2026-09-29 that the task record is the paper
+    trail, and the publisher's guarantee is the sealed bundle at the reviewed and
+    accepted head."""
     bundle = gi.one("bundle_head")
     if bundle is None:
         return _missing("bundle_head")
@@ -690,21 +697,17 @@ def commit_policy(gi: GateInput) -> GateOutcome:
     if not isinstance(check, dict):
         return GateOutcome(
             GateResult.SKIPPED,
-            "this attempt was collected before Crucible checked commits at collection; "
-            "the publisher still checks them before it pushes",
+            "this attempt was collected before Crucible recorded commit authors",
             ids,
         )
     if not check.get("checked"):
         return GateOutcome(
             GateResult.FAIL,
-            "Crucible could not check the collected commits' author and trailer, so it "
-            "cannot say the publisher would accept them",
+            "Crucible could not read the collected commits' authors; check them in the diff",
             ids,
         )
     git = gi.policy.get("git", {})
     author = str(git.get("author_email") or "crucible-worker@users.noreply.github.com")
-    trailer = str(git.get("commit_trailer") or "Crucible-Attempt")
-    problems: list[str] = []
     authors = [a for a in check.get("author_problems") or [] if isinstance(a, dict)]
     if authors:
         named = ", ".join(
@@ -716,22 +719,12 @@ def commit_policy(gi: GateInput) -> GateOutcome:
             )
             for a in authors[:5]
         )
-        problems.append(f"{len(authors)} commit(s) not authored as {author} ({named})")
-    trailers = [str(t) for t in check.get("trailer_problems") or []]
-    if trailers:
-        named = ", ".join(_named_commit(t) for t in trailers[:5])
-        problems.append(f"{len(trailers)} commit(s) without a {trailer} trailer ({named})")
-    if problems:
         return GateOutcome(
             GateResult.FAIL,
-            "the publisher would refuse to push this branch: " + "; ".join(problems),
+            f"{len(authors)} commit(s) not authored as {author} ({named})",
             ids,
         )
-    return GateOutcome(
-        GateResult.PASS,
-        f"every commit is authored as {author} and carries a {trailer} trailer",
-        ids,
-    )
+    return GateOutcome(GateResult.PASS, f"every commit is authored as {author}", ids)
 
 
 PRE_PR_EVALUATORS: dict[str, Callable[[GateInput], GateOutcome]] = {
@@ -772,8 +765,8 @@ def advisory_gates(policy: dict[str, Any]) -> frozenset[str]:
     before the field existed carries none, and takes the default."""
     listed = (policy.get("gates") or {}).get("advisory")
     if listed is None:
-        return DEFAULT_ADVISORY_GATES
-    return frozenset(str(g) for g in listed) - ALWAYS_BLOCKING_GATES
+        return DEFAULT_ADVISORY_GATES | ALWAYS_ADVISORY_GATES
+    return (frozenset(str(g) for g in listed) - ALWAYS_BLOCKING_GATES) | ALWAYS_ADVISORY_GATES
 
 
 def gate_class(gate: str, advisory: frozenset[str]) -> GateClass:

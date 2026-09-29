@@ -1,11 +1,14 @@
-"""Crucible puts the attempt trailer on the worker's commits, and the collector runs the
-publisher's commit check so a bad commit fails before review (hades FDY-0135).
+"""Crucible puts the attempt trailer on the worker's commits as a courtesy, the collector
+records who authored them for the reviewer, and nothing refuses a commit for either
+(hades FDY-0135, FDY-0143: the operator's decision of 2026-09-29).
 
 These run real git against a scratch repository: the hook as the identity bundle writes
-it, and the collector script as the collector container runs it."""
+it, the collector script as the collector container runs it, and the publisher script
+pushing into a local bare repository."""
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import subprocess
@@ -15,8 +18,14 @@ import pytest
 
 from crucible.adapters.execution import identity, kubernetes, scripts
 from crucible.adapters.execution.collected import read_commit_policy
+from crucible.adapters.execution.publisher import outcome_from_files
 from crucible.contracts.policy import Gates
-from crucible.ports.execution import IDENTITY_MOUNT, OUTPUT_MOUNT, REPORT_MOUNT
+from crucible.ports.execution import (
+    IDENTITY_MOUNT,
+    OUTPUT_MOUNT,
+    REPORT_MOUNT,
+    CommitPolicyCheck,
+)
 from tests.fixtures import contract_document
 
 AUTHOR = "crucible-worker@users.noreply.github.com"
@@ -139,8 +148,8 @@ def test_the_hook_keeps_a_trailer_the_worker_already_wrote(tmp_path: Path) -> No
 
 
 def test_the_hook_is_skipped_by_no_verify(tmp_path: Path) -> None:
-    """What the commit_policy gate is for: the hook is a convenience, the gate is the
-    check, and `--no-verify` is exactly how a worker gets past the first."""
+    """The hook is a courtesy: `--no-verify` skips it, and since FDY-0143 nothing checks
+    the trailer, so a commit without it is still published."""
     hooks = _bundle(tmp_path) / scripts.COMMIT_HOOK_DIR
     repo = _checkout(tmp_path, hooks)
     (repo / "a.txt").write_text("a\n", encoding="utf-8")
@@ -159,14 +168,15 @@ def test_the_preparer_points_the_checkout_at_crucibles_hooks_only() -> None:
     assert "-c core.hooksPath=/dev/null" in script
 
 
-def test_identity_md_names_the_exact_trailer_and_says_crucible_adds_it(tmp_path: Path) -> None:
+def test_identity_md_says_only_commit_on_the_branch(tmp_path: Path) -> None:
+    """FDY-0143: the worker is told to commit on its branch, and nothing about the
+    trailer, the author, hooks or `--no-verify`."""
     text = (_bundle(tmp_path) / "IDENTITY.md").read_text(encoding="utf-8")
-    # FDY-0140: one line of the Scope section, not a section of its own.
+    # FDY-0140 made it a line of the Scope section; FDY-0143 made it this one line.
     section = text.split("## Scope", 1)[1].split("## ", 1)[0]
-    assert "`Crucible-Attempt: HT-0007`" in section
-    assert "`commit-msg` hook adds the" in section
-    assert "--no-verify" in section
-    assert "`commit_policy` gate" in section
+    assert "- Commit your work on `crucible/test`; never push." in section
+    for word in ("trailer", "Crucible-Attempt", "author", "hook", "--no-verify"):
+        assert word not in section
     policy_md = (tmp_path / "identity" / "policy.md").read_text(encoding="utf-8")
     assert "- commit_policy" in policy_md
 
@@ -188,7 +198,7 @@ def test_a_policy_cannot_list_the_enforced_gate() -> None:
         Gates(pre_pr=["commit_policy"], publication=[], post_pr=[], skipped=[])
 
 
-# ----- the collector runs the publisher's check ---------------------------------------
+# ----- the collector records authors for the reviewer ------------------------------
 
 
 def _collect(tmp_path: Path, repo: Path) -> Path:
@@ -201,7 +211,6 @@ def _collect(tmp_path: Path, repo: Path) -> Path:
         work_branch="crucible/test",
         size_cap_bytes=1024,
         author_email=AUTHOR,
-        commit_trailer="Crucible-Attempt",
     )
     generated = generated.replace(scripts.REPO_MOUNT, str(repo))
     generated = generated.replace(OUTPUT_MOUNT, str(output))
@@ -227,14 +236,13 @@ def _worker_branch(tmp_path: Path) -> Path:
     return repo
 
 
-def test_the_collector_records_a_commit_without_the_trailer(tmp_path: Path) -> None:
+def test_a_commit_without_the_trailer_is_no_problem_at_collection(tmp_path: Path) -> None:
     repo = _worker_branch(tmp_path)
     _commit(repo, "greet.sh", "Add greet.sh, tests/test_greet.sh, and Makefile")
-    head = _git(repo, "rev-parse", "HEAD").strip()
-    check = read_commit_policy(_collect(tmp_path, repo) / "commit-policy")
-    assert check is not None
-    assert check.trailer_problems == (head,)
-    assert check.author_problems == ()
+    output = _collect(tmp_path, repo)
+    check = read_commit_policy(output / "commit-policy")
+    assert check == CommitPolicyCheck()
+    assert not (output / "commit-policy" / "trailer-problems.txt").exists()
 
 
 def test_the_collector_records_a_commit_by_another_author(tmp_path: Path) -> None:
@@ -256,7 +264,6 @@ def test_the_collector_records_a_commit_by_another_author(tmp_path: Path) -> Non
     check = read_commit_policy(_collect(tmp_path, repo) / "commit-policy")
     assert check is not None
     assert check.author_problems == ((head, "someone@elsewhere.test"),)
-    assert check.trailer_problems == ()
 
 
 def test_the_collector_passes_commits_the_hook_made(tmp_path: Path) -> None:
@@ -268,21 +275,21 @@ def test_the_collector_passes_commits_the_hook_made(tmp_path: Path) -> None:
     check = read_commit_policy(output / "commit-policy")
     assert check is not None
     assert check.author_problems == ()
-    assert check.trailer_problems == ()
-    # The base commit, by someone else and with no trailer, is not this attempt's work.
+    # The base commit, by someone else, is not this attempt's work.
     assert (output / "commits.txt").read_text().strip() == "2"
 
 
 def test_an_unfinished_check_reads_as_not_checked(tmp_path: Path) -> None:
     directory = tmp_path / "commit-policy"
     directory.mkdir()
-    (directory / "trailer-problems.txt").write_text("", encoding="utf-8")
+    (directory / "author-problems.txt").write_text("", encoding="utf-8")
     assert read_commit_policy(directory) is None
     assert read_commit_policy(tmp_path / "absent") is None
 
 
-def test_the_publisher_and_the_collector_run_one_rule() -> None:
-    """Not a fork: the same function text, differing only in how each calls git."""
+def test_the_publisher_runs_no_commit_check() -> None:
+    """FDY-0143: the collector's author check is the only one, and the publisher has no
+    refusal for an author or a trailer."""
     publisher = scripts.publisher_script(
         clone_url="https://github.com/o/r.git",
         work_branch="crucible/test",
@@ -290,14 +297,15 @@ def test_the_publisher_and_the_collector_run_one_rule() -> None:
         expected_head="a" * 40,
         author_name="crucible-worker",
         author_email=AUTHOR,
-        commit_trailer="Crucible-Attempt",
     )
     collector = scripts.collector_script(
         base_ref="main", work_branch="crucible/test", size_cap_bytes=1024
     )
-    assert scripts._commit_policy_check("git") in publisher
+    assert "commit_policy_check" not in publisher
+    assert "TRAILER" not in publisher
+    assert "%(trailers" not in publisher
+    assert "exit 6" not in publisher
     assert scripts._commit_policy_check(scripts.GIT + ' -C "$REPO"') in collector
-    assert 'commit_policy_check "$RANGE" "$OUT"' in publisher
 
 
 def test_the_hook_puts_the_trailer_last_even_after_a_dashed_line(tmp_path: Path) -> None:
@@ -325,30 +333,80 @@ def test_the_check_reports_a_range_it_cannot_read_as_not_checked(tmp_path: Path)
     assert read_commit_policy(output / "commit-policy") is None
 
 
-def test_the_publisher_refuses_when_it_cannot_read_the_commits(tmp_path: Path) -> None:
-    """The publisher side of the same rule: no push on a check that did not run."""
-    repo = _worker_branch(tmp_path)
-    out = tmp_path / "publish"
-    out.mkdir()
-    body = scripts._commit_policy_check("git") + 'commit_policy_check "nosuchref..HEAD" "$OUT"'
+def _run_publisher(tmp_path: Path, repo: Path, origin: Path, head: str) -> tuple[int, Path]:
+    """The real publisher script, with its container paths moved under `tmp_path`,
+    pushing the collected bundle into a local bare repository."""
+    root = tmp_path / "publisher"
+    for name in ("tmp", "token", "publish", "bundle", "home"):
+        (root / name).mkdir(parents=True)
+    bundle = root / "bundle" / "work_branch.bundle"
+    _git(repo, "bundle", "create", str(bundle), "main..crucible/test")
+    script = scripts.publisher_script(
+        clone_url="CRUCIBLE-TEST-ORIGIN",
+        work_branch="crucible/test",
+        base_ref="main",
+        expected_head=head,
+        author_name="crucible-worker",
+        author_email=AUTHOR,
+        bundle_sha256=hashlib.sha256(bundle.read_bytes()).hexdigest(),
+    )
+    # `/tmp/` first: the moved paths below live under a temporary directory themselves.
+    script = script.replace("/tmp/", f"{root}/tmp/")
+    script = script.replace(scripts.TOKEN_MOUNT, str(root / "token"))
+    script = script.replace(scripts.PUBLISH_MOUNT, str(root / "publish"))
+    script = script.replace(scripts.BUNDLE_MOUNT, str(root / "bundle"))
+    script = script.replace("/home/worker", str(root / "home"))
+    script = script.replace("CRUCIBLE-TEST-ORIGIN", str(origin))
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     result = subprocess.run(
-        ["sh", "-c", f"cd {repo}; OUT={out}; POLICY_AUTHOR_EMAIL={AUTHOR}; TRAILER=X; {body}"],
+        ["sh", "-c", script],
+        input="a-test-token-value",
         capture_output=True,
         text=True,
         check=False,
+        env=env,
     )
-    assert result.returncode != 0
-    publisher = scripts.publisher_script(
-        clone_url="https://github.com/o/r.git",
-        work_branch="crucible/test",
-        base_ref="main",
-        expected_head="a" * 40,
-        author_name="crucible-worker",
-        author_email=AUTHOR,
-        commit_trailer="Crucible-Attempt",
-    )
-    refusal = publisher.split('if ! commit_policy_check "$RANGE" "$OUT"; then', 1)[1]
-    assert refusal.split("fi\n", 1)[0].rstrip().endswith("exit 6")
+    return result.returncode, root / "publish"
+
+
+def test_a_bundle_without_the_trailer_by_another_author_publishes(tmp_path: Path) -> None:
+    """FDY-0143: the publisher pushes the sealed bundle at the accepted head whatever the
+    commits' author or trailer; the author difference is for the reviewer, before."""
+    repo = _worker_branch(tmp_path)
+    origin = tmp_path / "origin.git"
+    _git(tmp_path, "init", "-q", "--bare", "-b", "main", str(origin))
+    _git(repo, "push", "-q", str(origin), "main")
+    (repo / "a.txt").write_text("a\n", encoding="utf-8")
+    _git(repo, "add", "a.txt")
+    _git(repo, "-c", "user.email=someone@elsewhere.test", "commit", "-q", "-m", "Add a")
+    head = _git(repo, "rev-parse", "HEAD").strip()
+    assert _trailers(repo) == []
+    check = read_commit_policy(_collect(tmp_path, repo) / "commit-policy")
+    assert check is not None
+    assert check.author_problems == ((head, "someone@elsewhere.test"),)
+    code, out = _run_publisher(tmp_path, repo, origin, head)
+    files = {p.name: p.read_text(encoding="utf-8") for p in out.iterdir() if p.is_file()}
+    assert code == 0, files
+    outcome = outcome_from_files(files, code)
+    assert outcome.pushed
+    assert outcome.step == "done"
+    assert outcome.head_sha == head
+    assert _git(origin, "rev-parse", "refs/heads/crucible/test").strip() == head
+
+
+def test_the_publisher_still_refuses_a_bundle_that_is_not_the_accepted_head(
+    tmp_path: Path,
+) -> None:
+    """The guarantees that stay: the sealed bundle, at the head Crucible accepted."""
+    repo = _worker_branch(tmp_path)
+    origin = tmp_path / "origin.git"
+    _git(tmp_path, "init", "-q", "--bare", "-b", "main", str(origin))
+    _git(repo, "push", "-q", str(origin), "main")
+    _commit(repo, "a.txt", "Add a")
+    code, out = _run_publisher(tmp_path, repo, origin, "f" * 40)
+    assert code == 4
+    assert (out / "step.txt").read_text(encoding="utf-8").strip() == "head-mismatch"
+    assert _git(origin, "branch", "--list", "crucible/test").strip() == ""
 
 
 def test_the_collector_never_verifies_a_signature_a_worker_planted(tmp_path: Path) -> None:
