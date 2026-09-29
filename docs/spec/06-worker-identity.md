@@ -15,6 +15,8 @@ identity/
   skills/<name>/       only the skills the contract names
   policy.md            the deterministic policy in words: timeouts, paths, gates
   report-schema.json   CompletionClaimV1 JSON schema
+  hooks/commit-msg     Crucible's commit hook, the one executable file: adds the
+                       `<commit_trailer>: <external_id>` trailer to every commit
   history/             prior attempts' reports, open and answered escalations with
                        verbatim decisions, and the latest AcceptanceResult reasoning
                        (present on retries, after a decision, and on needs_more_work)
@@ -67,10 +69,36 @@ are reproducible.
    other than `work_branch`, no delegating, no writing anywhere but the
    checkout and `/crucible/report`, no claiming completion without
    evidence, no closing references to issues the contract did not name.
-10. **Commits.** Commit locally on `work_branch` with the policy's author
-    identity and the attempt trailer; Crucible collects, verifies, and
-    publishes the commits. The claim's `proposed_pull_request` is a draft
-    Crucible may rewrite.
+10. **Commits.** Commit locally on `work_branch`. Every commit is authored
+    with the policy's author identity and carries the trailer
+    `<commit_trailer>: <external_id>` (for example `Crucible-Attempt: HT-0007`),
+    written out with its exact value. The section says Crucible supplies both:
+    the checkout's git config names the author, and Crucible's `commit-msg`
+    hook adds the trailer. It tells the worker to leave `user.name`,
+    `user.email` and `core.hooksPath` alone and not to commit with
+    `--no-verify`, and that the `commit_policy` gate checks every commit
+    before review. Crucible collects, verifies, and publishes the commits.
+    The claim's `proposed_pull_request` is a draft Crucible may rewrite.
+
+## The commit hook
+
+A mechanical fact Crucible knows is not left to the model (hades FDY-0135,
+2026-09-29: a worker whose commit lacked the trailer passed review and
+acceptance, then the publisher refused it). The preparer sets the checkout's
+`core.hooksPath` to `/crucible/identity/hooks`, so the only hook that runs
+on a worker's commit is Crucible's own text, mounted read-only and covered by
+the bundle hash; the repository's own hooks never run. The hook runs `git
+interpret-trailers --if-exists doNothing --if-missing add` on the message
+file and nothing else: no network, no repository content. A trailer with the
+same key already in the message is kept as it is, so an amend, a harness
+that writes the trailer itself, or a second run never adds a duplicate.
+`--no-divider` keeps a `---` line in a body from being read as the start of
+a patch, which would put the trailer where no check reads it. Any harness
+that commits through the git command line gets the hook. It is a
+convenience, not the check: `--no-verify`, a rewritten `core.hooksPath`, a
+cherry-pick, or a git library that does not run hooks can still leave a
+commit without the trailer, and the `commit_policy` gate (11) is what
+catches that.
 
 ## Harness-specific delivery
 

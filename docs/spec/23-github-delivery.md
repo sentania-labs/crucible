@@ -114,7 +114,9 @@ review is recorded, and Foundry's `AcceptanceResult` for that head is
    the publication**: an author or trailer that does not match policy
    refuses with its own exit code before the push is attempted, the token
    goes first, and the problems reach the event, the wake, and
-   `publish_failed`. A remote head that is not an ancestor of the bundle
+   `publish_failed`. The check is one shell function the collector runs
+   too, so the `commit_policy` gate (11) fails such a commit before review
+   and this refusal is the last line of defence, not the first. A remote head that is not an ancestor of the bundle
    head (someone
    pushed out of band) fails the push, records `publish_failed` with the
    remote head, and wakes Foundry; Crucible never force-pushes.
