@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import re
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -131,10 +132,14 @@ def webhook_client(
 
 
 async def publish(
-    client: TestClient, supervisor: Supervisor, *, external_id: str = "EX-0001"
+    client: TestClient,
+    supervisor: Supervisor,
+    *,
+    external_id: str = "EX-0001",
+    image: str = "crucible-worker:fake-succeed",
 ) -> tuple[str, dict[str, Any]]:
     """Run a task from submit to a published pull request."""
-    task_id = submit_and_start(client, "crucible-worker:fake-succeed", external_id=external_id)
+    task_id = submit_and_start(client, image, external_id=external_id)
     await run_to_settled(supervisor, client, task_id)
     await review_and_settle(supervisor, client, task_id)
     accepted = client.post(
@@ -1284,32 +1289,88 @@ async def test_a_second_tick_with_nothing_new_changes_nothing(
 # ----- the C4 correction round ------------------------------------------
 
 
-async def test_commit_policy_refuses_the_push_and_lands_in_publish_failed(
-    client: TestClient, delivery_supervisor: Supervisor, publisher: FakePublisher
+async def test_a_commit_by_another_author_without_the_trailer_publishes(
+    client: TestClient,
+    delivery_supervisor: Supervisor,
+    publisher: FakePublisher,
+    github: FakeGitHubServer,
+    ctx: AppContext,
+    tokens: dict[str, str],
 ) -> None:
-    """23 step 4: the author and trailer check stops the push. The problems reach the
-    event and the wake, and nothing is on the remote."""
-    publisher.refuse_push = "commit policy refused the push"
-    publisher.refuse_step = "commit-policy"
-    publisher.author_problems = ("deadbeef\tsomeone@example.invalid",)
-    publisher.trailer_problems = ("deadbeef",)
-    task_id = submit_and_start(client, "crucible-worker:fake-succeed")
-    await run_to_settled(delivery_supervisor, client, task_id)
-    await review_and_settle(delivery_supervisor, client, task_id)
-    client.post(
-        f"/v1/tasks/{task_id}/accept", json={"verdict": "accepted", "reasoning": "publish it"}
+    """FDY-0143 (operator decision, 2026-09-29): neither the author nor the trailer stops
+    a branch. The author difference is in the commit_policy detail for the reviewer, the
+    branch is pushed and the PR opened, and the task record is the paper trail: the
+    branch, the pushed head, the PR, and once merged the merge commit and who merged."""
+    task_id, view = await publish(
+        client,
+        delivery_supervisor,
+        external_id="HT-0143",
+        image="crucible-worker:fake-other-author",
     )
+    head = view["head_sha"]
+    rows = client.get(f"/v1/attempts/{view['latest_attempt']['id']}/gates").json()["items"]
+    commit_policy = next(r for r in rows if r["gate"] == "commit_policy")
+    assert commit_policy["result"] == "pass"
+    assert commit_policy["detail"] == (
+        "for the reviewer: 1 commit(s) not authored as "
+        f"crucible-worker@users.noreply.github.com ({head[:12]} by someone-else@example.test)"
+    )
+    assert publisher.pushes == [(view["delivery"]["work_branch"], head)]
+    delivery = view["delivery"]
+    assert delivery["work_branch"] and delivery["work_branch"].startswith("crucible/")
+    assert delivery["pushed_head"] == head
+    assert delivery["pushed_at"]
+    assert delivery["pull_request_number"] == 1
+    assert delivery["pull_request_url"].endswith("/pull/1")
+    assert delivery["pull_request_state"] == "open"
+    assert (delivery["merge_sha"], delivery["merged_by"], delivery["merged_at"]) == (
+        None,
+        None,
+        None,
+    )
+    assert view["pull_request"]["work_branch"] == delivery["work_branch"]
+
+    github.state.add_reaction(REPOSITORY, 1, login=REVIEWER, content="+1")
     await delivery_supervisor.tick()
-    assert client.get(f"/v1/tasks/{task_id}").json()["state"] == "publish_failed"
-    failed = [
-        e
-        for e in client.get(f"/v1/tasks/{task_id}/events", params={"limit": 200}).json()["items"]
-        if e["kind"] == "task_publish_failed"
-    ]
-    assert failed and failed[-1]["payload"]["step"] == "commit-policy"
-    assert failed[-1]["payload"]["author_problems"]
-    assert failed[-1]["payload"]["trailer_problems"]
-    assert not publisher.pushes
+    github.state.repositories[REPOSITORY].required_checks = ["build"]
+    github.state.set_check(REPOSITORY, head, name="build", conclusion="success")
+    await delivery_supervisor.tick()
+    assert client.get(f"/v1/tasks/{task_id}").json()["state"] == "ready_for_merge"
+    github.state.merge(REPOSITORY, 1, by="sentania", sha="e" * 40)
+    await delivery_supervisor.tick()
+    merged = client.get(f"/v1/tasks/{task_id}").json()
+    assert merged["state"] == "merged"
+    assert merged["delivery"]["merge_sha"] == "e" * 40
+    assert merged["delivery"]["merged_by"] == "sentania"
+    assert merged["delivery"]["merged_at"]
+    assert merged["delivery"]["pushed_head"] == head
+
+    with TestClient(create_app(ctx)) as browser:
+        form = browser.get("/ui/sign-in")
+        preauth = re.search(r'name="csrf" value="([a-f0-9]+)"', form.text)
+        assert preauth is not None
+        signed_in = browser.post(
+            "/ui/sign-in",
+            data={"csrf": preauth.group(1), "token": tokens["observer"], "next": "/ui/tasks"},
+            follow_redirects=False,
+        )
+        assert signed_in.status_code == 303
+        listing = browser.get("/ui/tasks")
+        assert listing.status_code == 200
+        assert f'href="/ui/tasks/{task_id}"' in listing.text
+        page = browser.get(f"/ui/tasks/{task_id}")
+        assert page.status_code == 200, page.text
+        for text_shown in (
+            delivery["work_branch"],
+            head,
+            f'href="{delivery["pull_request_url"]}"',
+            "#1",
+            "e" * 40,
+            "sentania",
+        ):
+            assert text_shown in page.text, text_shown
+        missing = browser.get("/ui/tasks/no-such-task", follow_redirects=False)
+        assert missing.status_code == 303
 
 
 async def test_a_fix_disposition_holds_the_task_until_a_correction(

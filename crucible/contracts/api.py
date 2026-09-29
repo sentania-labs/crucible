@@ -63,6 +63,22 @@ class ExecutionSummary(Response):
     attempts: list[AttemptSummary]
 
 
+class DeliveryView(Response):
+    """The task's paper trail on GitHub (hades FDY-0143): the branch Crucible pushed,
+    the head it pushed, the pull request, and, once merged, the merge commit and who
+    merged it. Each is null until it happens."""
+
+    work_branch: str | None = None
+    pushed_head: str | None = None
+    pushed_at: Rfc3339 | None = None
+    pull_request_number: int | None = None
+    pull_request_url: str | None = None
+    pull_request_state: str | None = None
+    merge_sha: str | None = None
+    merged_by: str | None = None
+    merged_at: Rfc3339 | None = None
+
+
 class TaskView(Response):
     id: str
     external_id: str
@@ -83,6 +99,7 @@ class TaskView(Response):
     head_sha: str | None
     gate_summary: dict[str, Any]
     pull_request: dict[str, Any] | None
+    delivery: DeliveryView = Field(default_factory=DeliveryView)
     open_escalations: list[dict[str, Any]]
     review_reports: list[dict[str, Any]]
     acceptance_results: list[dict[str, Any]]

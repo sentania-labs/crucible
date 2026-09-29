@@ -45,7 +45,7 @@ also carries a signed-session CSRF value. Sign-out clears the cookie.
 |---|---|---|
 | POST | `/tasks` | Submit a task contract (body: `TaskContractV1`). Validates, persists, returns the task in `submitted`. Does not launch. |
 | GET | `/tasks` | List with filters: `state`, `project`, `repository`, `external_id`, `updated_since`. |
-| GET | `/tasks/{id}` | Full task view: contract versions, executions, latest attempt summary, gate summary, PR summary, open escalations. |
+| GET | `/tasks/{id}` | Full task view: contract versions, executions, latest attempt summary, gate summary, PR summary, open escalations, and `delivery`, the task's paper trail: the work branch, the head Crucible pushed and when, the PR number, link and state, and once merged the merge commit SHA, who merged and when (hades FDY-0143). |
 | POST | `/tasks/{id}/start` | Move to `scheduled`; body names harness, model, image, provider, policy version, and optional overrides. This is Foundry's dispatch decision. Overrides create an amendment (05); until the amendment path exists (C2) the body must agree with the contract. |
 | POST | `/tasks/{id}/cancel` | Request cancellation; body carries reason and the deciding principal's verbatim words. The API writes the task state and enqueues termination for the supervisor. |
 | POST | `/tasks/{id}/amend` | Attach a new contract version; allowed only in `submitted`, `blocked`, or `awaiting_acceptance`. |

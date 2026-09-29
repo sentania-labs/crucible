@@ -8,7 +8,7 @@ import json
 import os
 import re
 import tomllib
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlsplit, urlunsplit
@@ -47,10 +47,11 @@ from crucible.application.errors import (
     ConflictError,
     ContractValidationError,
     ForbiddenError,
+    NotFoundError,
 )
 from crucible.application.first_run import discard_after_use
 from crucible.application.policies import put_policy, put_routing_policy
-from crucible.application.queries import supervisor_health
+from crucible.application.queries import supervisor_health, task_view
 from crucible.contracts.api import ExternalReviewAttestation, RepositoryRegistration
 from crucible.contracts.task_contract import HarnessName
 from crucible.domain.cluster_egress import format_labels, parse_labels
@@ -2357,18 +2358,31 @@ def tasks_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
     principal, csrf = found
     document = status.tasks(uow)
     attention = [
-        [item["external_id"] or item["id"], _state_words(state), item["updated_at"]]
+        [_task_link(item["id"], item["external_id"]), _state_words(state), item["updated_at"]]
         for state, items in document["lists"].items()
         for item in items
     ] + [
         # hades FDY-0133: a task in publishing whose publication cannot start says why.
         [
-            item["external_id"] or item["task_id"],
+            _task_link(item["task_id"], item["external_id"]),
             f"Waiting to publish: {item['reason']}",
             item["waiting_since"],
         ]
         for item in document.get("publishing_waiting", [])
     ]
+    recent = sorted(
+        uow.tasks.search(
+            state=None,
+            project=None,
+            repository_id=None,
+            external_id=None,
+            updated_since=ctx.clock.now() - timedelta(days=RECENT_TASK_DAYS),
+            after_id=None,
+            limit=500,
+        ),
+        key=lambda task: task.updated_at,
+        reverse=True,
+    )[:RECENT_TASK_ROWS]
     return _page(
         request,
         principal,
@@ -2390,6 +2404,101 @@ def tasks_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                 "rows": [
                     [_state_words(state), count]
                     for state, count in sorted(document["counts"].items())
+                ],
+            },
+            {
+                "title": "Recently updated",
+                "note": (
+                    f"Tasks updated in the last {RECENT_TASK_DAYS} days, newest first. Open "
+                    "one for its branch, pull request and merge."
+                ),
+                "empty": f"No task was updated in the last {RECENT_TASK_DAYS} days.",
+                "columns": ["Task", "State", "Updated"],
+                "rows": [
+                    [
+                        _task_link(task.id, task.external_id),
+                        _state_words(task.state.value),
+                        task.updated_at.isoformat(),
+                    ]
+                    for task in recent
+                ],
+            },
+        ],
+    )
+
+
+RECENT_TASK_DAYS = 14
+RECENT_TASK_ROWS = 50
+
+
+def _task_link(task_id: str, external_id: str | None) -> dict[str, str]:
+    return {"kind": "link", "href": f"/ui/tasks/{quote(task_id)}", "label": external_id or task_id}
+
+
+@router.get("/tasks/{task_id}", response_class=HTMLResponse)
+def task_page(request: Request, task_id: str, ctx: Ctx, uow: UoW) -> Response:
+    """One task's paper trail (hades FDY-0143): the branch Crucible pushed, the head it
+    pushed, the pull request, and the merge commit and who merged it."""
+    found = _require(request, ctx, uow)
+    if isinstance(found, RedirectResponse):
+        return found
+    principal, csrf = found
+    try:
+        view = task_view(uow, task_id)
+    except NotFoundError:
+        return RedirectResponse(
+            f"/ui/tasks?kind=bad&message={quote(f'No task {task_id}.')}", status_code=303
+        )
+    delivery = view.delivery
+    not_yet = "not yet"
+    pull_request: Any = not_yet
+    if delivery.pull_request_number is not None:
+        label = f"#{delivery.pull_request_number}"
+        pull_request = (
+            {"href": delivery.pull_request_url, "label": label}
+            if (delivery.pull_request_url or "").startswith("https://")
+            else label
+        )
+    return _page(
+        request,
+        principal,
+        csrf,
+        active="/ui/tasks",
+        heading=f"Task {view.external_id or view.id}",
+        intro=view.title,
+        badge=_state_words(view.state.value),
+        sections=[
+            {
+                "title": "Delivery",
+                "note": "The task's paper trail on GitHub. Each line fills in when it happens.",
+                "columns": ["What", "Value"],
+                "rows": [
+                    ["Work branch", delivery.work_branch or not_yet],
+                    ["Pushed head", delivery.pushed_head or not_yet],
+                    [
+                        "Pushed at",
+                        delivery.pushed_at.isoformat() if delivery.pushed_at else not_yet,
+                    ],
+                    ["Pull request", pull_request],
+                    ["Pull request state", delivery.pull_request_state or not_yet],
+                    ["Merge commit", delivery.merge_sha or not_yet],
+                    ["Merged by", delivery.merged_by or not_yet],
+                    [
+                        "Merged at",
+                        delivery.merged_at.isoformat() if delivery.merged_at else not_yet,
+                    ],
+                ],
+            },
+            {
+                "title": "Task",
+                "columns": ["What", "Value"],
+                "rows": [
+                    ["Id", view.id],
+                    ["Repository", view.repository],
+                    ["Owner", view.principal],
+                    ["Collected head", view.head_sha or not_yet],
+                    ["Created", view.created_at.isoformat()],
+                    ["Updated", view.updated_at.isoformat()],
                 ],
             },
         ],
