@@ -229,18 +229,37 @@ def _matches_any(path: str, patterns: Sequence[str]) -> bool:
 # ----- evaluators -------------------------------------------------------------
 
 
+def _claim_notes(payload: dict[str, Any]) -> str:
+    """hades #215: which fact fields Crucible filled, and where the worker's own value
+    differed from Crucible's evidence. Information only; never a failure. The text was
+    written by Crucible and repeats nothing the worker wrote but a hash or a number."""
+    notes = ""
+    filled = [str(f) for f in payload.get("filled_by_crucible") or []]
+    if filled:
+        notes += f"; Crucible filled {', '.join(filled)} from its own evidence"
+    differences = [
+        f"{d.get('field')} ({d.get('detail')})"
+        for d in payload.get("differences") or []
+        if isinstance(d, dict)
+    ]
+    if differences:
+        notes += "; the report differs from Crucible's evidence: " + "; ".join(differences)
+    return notes
+
+
 def report_present(gi: GateInput) -> GateOutcome:
     item = gi.one("artifact_present", role="completion_claim")
     if item is None:
         return _missing("artifact_present", role="completion_claim")
+    notes = _claim_notes(item.payload)
     if not item.payload.get("parsed_ok"):
         errors = item.payload.get("parse_errors") or []
         return GateOutcome(
             GateResult.FAIL,
-            f"the report did not parse as CompletionClaimV1 ({len(errors)} problems)",
+            f"the report did not parse as CompletionClaimV1 ({len(errors)} problems)" + notes,
             (item.id,),
         )
-    return GateOutcome(GateResult.PASS, "CompletionClaimV1 parsed with every field", (item.id,))
+    return GateOutcome(GateResult.PASS, "CompletionClaimV1 parsed" + notes, (item.id,))
 
 
 def exit_clean(gi: GateInput) -> GateOutcome:

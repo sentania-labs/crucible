@@ -25,7 +25,7 @@ def test_default_report_parses() -> None:
     assert errors == []
     assert claim is not None
     assert [m.id for m in claim.acceptance_mapping] == ["AC1", "AC2"]
-    assert [c.command for c in claim.checks] == ["make lint", "make test", "make scan"]
+    assert [c.command for c in claim.checks or []] == ["make lint", "make test", "make scan"]
 
 
 def test_missing_field_is_an_error_not_an_exception() -> None:

@@ -1,13 +1,45 @@
 """CompletionClaimV1 (11): the worker's report. A claim, never an acceptance.
-C1 parses only; gates that consume it are C2."""
+C1 parses only; gates that consume it are C2.
+
+hades #215: the worker writes judgement and Crucible derives facts. The judgement
+fields (summary, acceptance_mapping, the proposed pull request's title and body,
+limitations, risks, blockers, follow_ups) are the worker's to write and stay required.
+The fact fields (task_external_id, changed_files, refs, checks, run_evidence) are
+optional: Crucible fills them from its own evidence, and a value the worker did write is
+only compared with Crucible's and any difference recorded as information. The form is
+lenient where the meaning is plain: `acceptance_mapping` may be an object keyed by
+criterion id as well as a list."""
 
 from __future__ import annotations
 
+import re
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from pydantic import Field, ValidationError, field_validator
 
 from crucible.contracts.common import StrictModel, check_major_version
+
+# The fields Crucible derives from its own evidence, and the ones only the worker can
+# write. images/worker/crucible-report.py mirrors both lists; a unit test holds them equal.
+FACT_FIELDS: tuple[str, ...] = (
+    "task_external_id",
+    "changed_files",
+    "refs",
+    "checks",
+    "run_evidence",
+)
+JUDGEMENT_FIELDS: tuple[str, ...] = (
+    "summary",
+    "acceptance_mapping",
+    "proposed_pull_request",
+    "limitations",
+    "risks",
+    "blockers",
+    "follow_ups",
+)
+
+_FILLED = "Optional: Crucible fills it from its own evidence and only notes a different value."
 
 
 class ClaimRefs(StrictModel):
@@ -37,7 +69,27 @@ class AcceptanceMapping(StrictModel):
 class ProposedPullRequest(StrictModel):
     title: str = Field(min_length=1)
     body: str
-    closes: list[str]
+    # Crucible keeps only the contract's own closing references (23), so a worker that
+    # leaves this out loses nothing.
+    closes: list[str] = Field(default_factory=list)
+
+
+def normalise_mapping(value: Any) -> Any:
+    """`{AC1: {status: met, evidence: ...}}` as `[{id: AC1, status: met, ...}]`.
+
+    A bare status (`{AC1: met}`) is read as that status with no evidence text. Anything
+    else is returned unchanged, for the model to reject in its own words."""
+    if not isinstance(value, dict):
+        return value
+    out: list[Any] = []
+    for key, entry in value.items():
+        if isinstance(entry, dict):
+            out.append({"id": key, **{k: v for k, v in entry.items() if k != "id"}})
+        elif isinstance(entry, str):
+            out.append({"id": key, "status": entry, "evidence": ""})
+        else:
+            out.append(entry)
+    return out
 
 
 class CompletionClaimV1(StrictModel):
@@ -49,16 +101,17 @@ class CompletionClaimV1(StrictModel):
         examples=["1.0"],
         json_schema_extra={"pattern": r"^1\.[0-9]+$"},
     )
-    task_external_id: str = Field(min_length=1)
+    task_external_id: str | None = Field(default=None, min_length=1, description=_FILLED)
     summary: str = Field(min_length=1)
-    changed_files: list[str]
-    refs: ClaimRefs
-    checks: list[ClaimCheck]
+    changed_files: list[str] | None = Field(default=None, description=_FILLED)
+    refs: ClaimRefs | None = Field(default=None, description=_FILLED)
+    checks: list[ClaimCheck] | None = Field(default=None, description=_FILLED)
     acceptance_mapping: list[AcceptanceMapping] = Field(
         description="One entry per contract acceptance criterion, keyed by its id "
-        "(AC1, AC2, ...), never by a verification id (V1, ...)."
+        "(AC1, AC2, ...), never by a verification id (V1, ...). A list of entries, or an "
+        "object keyed by criterion id."
     )
-    run_evidence: list[str]
+    run_evidence: list[str] | None = Field(default=None, description=_FILLED)
     proposed_pull_request: ProposedPullRequest
     limitations: list[str]
     risks: list[str]
@@ -69,6 +122,11 @@ class CompletionClaimV1(StrictModel):
     @classmethod
     def _version(cls, value: str) -> str:
         return check_major_version(value)
+
+    @field_validator("acceptance_mapping", mode="before")
+    @classmethod
+    def _mapping(cls, value: Any) -> Any:
+        return normalise_mapping(value)
 
 
 def parse_claim(document: object) -> tuple[CompletionClaimV1 | None, list[dict[str, Any]]]:
@@ -83,3 +141,136 @@ def parse_claim(document: object) -> tuple[CompletionClaimV1 | None, list[dict[s
             for err in exc.errors(include_url=False, include_input=False)
         ]
         return None, errors
+
+
+@dataclass(frozen=True, slots=True)
+class ClaimFacts:
+    """What Crucible itself knows of an attempt at collection (hades #215): the task, the
+    collected diff and branch, its own re-run of each check, and the run evidence it
+    copied out. `refs` is None when no branch was collected."""
+
+    task_external_id: str
+    changed_files: tuple[str, ...]
+    refs: dict[str, Any] | None
+    checks: tuple[dict[str, Any], ...]
+    run_evidence: tuple[str, ...]
+
+    def value(self, name: str) -> Any:
+        if name == "task_external_id":
+            return self.task_external_id
+        if name == "refs":
+            return dict(self.refs) if self.refs is not None else None
+        if name == "checks":
+            return [dict(c) for c in self.checks]
+        return list(getattr(self, name))
+
+
+@dataclass(frozen=True, slots=True)
+class CompletedClaim:
+    """The worker's document with Crucible's facts in place, and what that changed."""
+
+    document: dict[str, Any]
+    filled: tuple[str, ...] = ()
+    differences: tuple[dict[str, str], ...] = field(default_factory=tuple)
+
+
+_HEX = re.compile(r"[0-9a-f]{7,64}")
+
+
+def _count(n: int, one: str, many: str) -> str:
+    return f"{n} {one if n == 1 else many}"
+
+
+def _paths_difference(worker: Any, crucible: list[str], what: str) -> str | None:
+    if not isinstance(worker, list) or not all(isinstance(p, str) for p in worker):
+        return "not a list of paths"
+    listed, actual = set(worker), set(crucible)
+    parts = []
+    if listed - actual:
+        parts.append(_count(len(listed - actual), "path", "paths") + f" listed that {what}")
+    if actual - listed:
+        parts.append(_count(len(actual - listed), "path", "paths") + " not listed")
+    return "; ".join(parts) or None
+
+
+def _refs_difference(worker: Any, crucible: dict[str, Any]) -> str | None:
+    if not isinstance(worker, dict):
+        return "not a mapping of branch, head_sha and commits"
+    parts = []
+    if worker.get("branch") != crucible.get("branch"):
+        parts.append("branch is not the collected work branch")
+    head = worker.get("head_sha")
+    if head != crucible.get("head_sha"):
+        # Worker-written: echoed only when it is a hash, never as free text.
+        named = str(head)[:12] if isinstance(head, str) and _HEX.fullmatch(head) else None
+        parts.append(
+            f"head_sha {named} is not the collected head"
+            if named
+            else "head_sha is not the collected head"
+        )
+    commits = worker.get("commits")
+    if commits != crucible.get("commits"):
+        shown = commits if isinstance(commits, int) else "another value"
+        parts.append(f"commits {shown}, collected {crucible.get('commits')}")
+    return "; ".join(parts) or None
+
+
+def _checks_difference(worker: Any, crucible: list[dict[str, Any]]) -> str | None:
+    if not isinstance(worker, list) or not all(isinstance(c, dict) for c in worker):
+        return "not a list of checks"
+    ran = {str(c["id"]): c for c in crucible}
+    reported = {str(c.get("id")): c for c in worker}
+    parts = []
+    for check_id in sorted(ran):
+        if check_id not in reported:
+            parts.append(f"{check_id} not reported")
+            continue
+        exit_code = reported[check_id].get("exit")
+        if exit_code != ran[check_id]["exit"]:
+            shown = exit_code if isinstance(exit_code, int) else "another value"
+            parts.append(
+                f"{check_id} reported exit {shown}, Crucible's re-run {ran[check_id]['exit']}"
+            )
+    unknown = [c for c in reported if c not in ran]
+    if unknown:
+        parts.append(_count(len(unknown), "check", "checks") + " Crucible did not re-run")
+    return "; ".join(parts) or None
+
+
+def _difference(name: str, worker: Any, crucible: Any) -> str | None:
+    if name == "task_external_id":
+        return None if worker == crucible else "names another task"
+    if name == "changed_files":
+        return _paths_difference(worker, crucible, "the collected diff does not change")
+    if name == "run_evidence":
+        return _paths_difference(worker, crucible, "Crucible did not collect")
+    if name == "refs":
+        return _refs_difference(worker, crucible)
+    return _checks_difference(worker, crucible)
+
+
+def complete_claim(document: dict[str, Any], facts: ClaimFacts) -> CompletedClaim:
+    """Put Crucible's facts into the worker's document (hades #215).
+
+    Each fact field takes Crucible's value. One the worker left out is listed as
+    filled; one the worker wrote is compared, and a difference is described in plain
+    words that never repeat the worker's free text. A fact Crucible does not have (no
+    collected branch, so no refs) leaves the worker's value, if any, to be validated as
+    written. The mapping is normalised to its list form."""
+    out = dict(document)
+    filled: list[str] = []
+    differences: list[dict[str, str]] = []
+    for name in FACT_FIELDS:
+        crucible = facts.value(name)
+        if crucible is None:
+            continue
+        if name not in document or document[name] is None:
+            filled.append(name)
+        else:
+            detail = _difference(name, document[name], crucible)
+            if detail:
+                differences.append({"field": name, "detail": detail})
+        out[name] = crucible
+    if "acceptance_mapping" in out:
+        out["acceptance_mapping"] = normalise_mapping(out["acceptance_mapping"])
+    return CompletedClaim(out, tuple(filled), tuple(differences))
