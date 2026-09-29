@@ -58,15 +58,31 @@ class _Images:
         return next((row for row in self.rows if row.harness == harness), None)
 
 
+class _Attempts:
+    def __init__(self, rows: list[Any]) -> None:
+        self.rows = rows
+
+    def list_in_states(self, states: Any, **_: Any) -> list[Any]:
+        return [row for row in self.rows if row.state in states]
+
+
+class _Tasks:
+    def get(self, task_id: str) -> Any:
+        return SimpleNamespace(id=task_id, project="p")
+
+
 def _uow(
     rows: list[AttemptMetrics] | None = None,
     marks: list[PoolExhaustion] | None = None,
     images: list[Any] | None = None,
+    attempts: list[Any] | None = None,
 ) -> Any:
     return SimpleNamespace(
         attempt_metrics=_Metrics(rows or []),
         pool_exhaustions=_Marks(marks or []),
         harness_images=_Images(images),
+        attempts=_Attempts(attempts or []),
+        tasks=_Tasks(),
     )
 
 
@@ -187,7 +203,8 @@ def test_weighted_least_recent_tie_ends_at_model_id() -> None:
     assert result.selected is not None and result.selected.id == "a-model"
 
 
-def test_quality_failure_demotes_one_preference_step() -> None:
+def test_one_quality_failure_does_not_demote() -> None:
+    """ADR 0028: one failed blocking gate never moves routing off a model."""
     routing = _routing([_model("mid", capability="mid"), _model("small", capability="small")])
     result = select_model(
         _uow([_metric("a1", "mid", at=NOW, gates_failed=1)]),
@@ -197,7 +214,7 @@ def test_quality_failure_demotes_one_preference_step() -> None:
         provider="fake",
         now=NOW,
     )
-    assert result.selected is not None and result.selected.id == "small"
+    assert result.selected is not None and result.selected.id == "mid"
 
 
 def test_live_exhaustion_mark_excludes_the_pool_and_records_the_reason() -> None:

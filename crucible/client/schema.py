@@ -338,6 +338,12 @@ def kind_schemas() -> dict[str, dict[str, Any]]:
             {"policy": ANY_OBJ, "command_timeout_ms": ANY_OBJ},
             {"timeout_seconds": ANY_OBJ},
         ),
+        "routing_preference": _obj(
+            "the pool order routing tries first per tier, and when a model is demoted "
+            "for failing blocking gates and probed again (ADR 0028)",
+            {"tiers": ANY_OBJ, "rotation": ANY_OBJ, "pools": {"type": "array"}},
+            {"policy": ANY_OBJ, "routing_policy": ANY_OBJ, "local_pools": {"type": "array"}},
+        ),
         "gate_classes": _obj(
             "which pre-PR gates of the policy in force are advisory (a failure goes to the "
             "reviewer) and which block (a failure stops the task), ADR 0024",

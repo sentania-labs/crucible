@@ -501,6 +501,44 @@ def command_timeout_actions(document: Any, prefix: Sequence[str]) -> list[dict[s
     ]
 
 
+def routing_preference_actions(document: Any, prefix: Sequence[str]) -> list[dict[str, Any]]:
+    """One action: write the pool order and demotion settings, prefilled with what is in
+    force, so the command as offered changes nothing until a value in it is edited."""
+    if not isinstance(document, dict) or not isinstance(document.get("tiers"), dict):
+        return []
+    found = document.get("rotation")
+    rotation: dict[str, Any] = found if isinstance(found, dict) else {}
+    tiers = [
+        f"--tier={name}={'default' if rule.get('default') else ','.join(rule['prefer_pools'])}"
+        for name, rule in sorted(document["tiers"].items())
+        if isinstance(rule, dict) and isinstance(rule.get("prefer_pools"), list)
+    ]
+    feedback = (
+        ["--quality-feedback" if rotation.get("quality_feedback") else "--no-quality-feedback"]
+        if isinstance(rotation.get("quality_feedback"), bool)
+        else []
+    )
+    numbers = [
+        f"--{flag}={rotation[key]}"
+        for key, flag in (
+            ("quality_window", "quality-window"),
+            ("demote_failure_percent", "demote-failure-percent"),
+            ("demote_min_sample", "demote-min-sample"),
+            ("probe_after_minutes", "probe-after-minutes"),
+        )
+        if isinstance(rotation.get(key), int)
+    ]
+    return [
+        action(
+            "set-preference",
+            "write a routing version with this pool order per tier and these demotion settings",
+            [*prefix, "routing", "set-preference", *tiers, *feedback, *numbers],
+            optional=OPTIONAL_REASON,
+            roles=(ADMIN,),
+        )
+    ]
+
+
 def gate_classes_actions(document: Any, prefix: Sequence[str]) -> list[dict[str, Any]]:
     """One action: write the advisory set, prefilled with the set in force, so the
     command as offered changes nothing until a gate is added or removed (ADR 0024)."""
