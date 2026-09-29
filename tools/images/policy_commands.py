@@ -160,7 +160,7 @@ def main(argv: list[str]) -> int:
             file=sys.stderr,
         )
         return 1
-    print(f"policy_commands.py: {image} carries the program every shipped policy check starts with")
+    print(f"policy_commands.py: {image} carries every program the shipped policies require")
     return 0
 
 

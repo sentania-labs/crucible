@@ -188,6 +188,8 @@ def read_verifications(
             )
             continue
         raw = text(exit_file).strip()
+        seconds_file = verify / f"{safe}.seconds"
+        seconds = text(seconds_file).strip() if seconds_file.is_file() else ""
         runs.append(
             VerificationRun(
                 id=check_id,
@@ -195,6 +197,7 @@ def read_verifications(
                 expect_exit=expected.get(check_id, 0),
                 exit_code=int(raw) if raw.lstrip("-").isdigit() else -1,
                 log_tail=tail(log_file, 32 * 1024),
+                seconds=int(seconds) if seconds.isdigit() else None,
             )
         )
     return tuple(runs)
