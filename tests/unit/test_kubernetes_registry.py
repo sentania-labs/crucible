@@ -11,6 +11,7 @@ import asyncio
 import base64
 import json
 import os
+import stat
 import sys
 import threading
 import time
@@ -152,7 +153,11 @@ def test_the_credential_reaches_crane_only_through_a_private_docker_config(
     client.resolve("ghcr.io/o/r:1")
 
     for call in _calls(stub):
-        assert call["dir_mode"] == 0o700
+        # The access bits. A directory made under a setgid parent inherits the setgid
+        # bit, which is what a Pod's fsGroup volume does to /tmp (hades #184); it
+        # decides the group new files get, and grants no one access.
+        assert call["dir_mode"] & 0o777 == 0o700
+        assert call["dir_mode"] & ~0o777 in (0, stat.S_ISGID)
         assert call["file_mode"] == 0o600
         # Only the registry being read; never the argv.
         assert call["config"] == {
