@@ -29,11 +29,15 @@ __all__ = [
     "BUNDLE_MOUNT",
     "BUNDLE_VERIFY_SCRIPT",
     "MANIFEST",
+    "PUBLISH_BUNDLE_LEAF",
+    "PUBLISH_LEAF",
+    "PUBLISH_LEAF_MARKER",
     "REPO_MOUNT",
     "VERIFY_MOUNT",
     "collector_script",
     "encode_check_id",
     "preparer_script",
+    "publish_leaf_script",
     "publisher_script",
     "quota_checkpoint_push_script",
     "verifier_script",
@@ -557,6 +561,47 @@ def _quote(value: str) -> str:
 
 BUNDLE_MOUNT = "/crucible/bundle"
 PUBLISH_MOUNT = "/crucible/publish"
+
+# The two leaves of a Kubernetes workspace claim the publisher mounts as subPaths: the
+# bundle, where the collector writes it, and the directory its outcome files go to.
+PUBLISH_BUNDLE_LEAF = "output/work_branch.bundle"
+PUBLISH_LEAF = "publish"
+# The line that names the claim-leaf script, so a reader of a Job (or the fake cluster)
+# can tell it from the preparer's checkout script, which runs in the same role.
+PUBLISH_LEAF_MARKER = "# crucible: prepare the publish leaf"
+
+
+def publish_leaf_script(root: str = WORK_MOUNT) -> str:
+    """Make the claim ready for a publisher Pod, or say by exit code why it is not.
+
+    A subPath that does not exist is created by the kubelet as root when the Pod starts,
+    and on NFS that directory may be unwritable by the worker uid or refused outright, so
+    the Pod fails setup with nothing in its log. Neither leaf the publisher mounts is left
+    to the kubelet: this runs as the worker uid with the whole claim mounted, as the
+    preparer that made `output/` does, and creates `publish/` with `output/`'s mode.
+
+    Exit 7: no bundle, or not a regular file (the kubelet would make a directory there).
+    Exit 8: `publish/` is not a directory the worker uid owns and can write, as it owns
+    and writes `output/`."""
+    bundle = _quote(PUBLISH_BUNDLE_LEAF)
+    leaf = _quote(PUBLISH_LEAF)
+    return f"""set -eu
+{PUBLISH_LEAF_MARKER}
+cd {_quote(root)}
+if [ ! -f {bundle} ] || [ -L {bundle} ]; then
+  echo "no branch bundle at {PUBLISH_BUNDLE_LEAF} on the workspace claim" >&2; exit 7
+fi
+if [ -L {leaf} ] || {{ [ -e {leaf} ] && [ ! -d {leaf} ]; }}; then
+  echo "{PUBLISH_LEAF} on the workspace claim is not a directory" >&2; exit 8
+fi
+mkdir -p {leaf}
+chmod "$(stat -c '%a' output)" {leaf} 2>/dev/null || true
+if [ "$(stat -c '%u' {leaf})" != "$(stat -c '%u' output)" ] || [ ! -w {leaf} ]; then
+  echo "{PUBLISH_LEAF} on the workspace claim is not owned and writable as output is" >&2
+  exit 8
+fi
+"""
+
 
 # The publisher's git configuration: the helper above, no hooks, no pager, and the
 # policy's author. The value of `helper` has spaces, so it lives in a git config file in

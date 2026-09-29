@@ -93,7 +93,7 @@ Per attempt the provider creates, in `crucible-workers`, all labelled
 
 | Object | Role | Lifetime |
 |---|---|---|
-| PersistentVolumeClaim `ws-<attempt>` | the workspace: `repo/`, `report/`, `output/` | attempt, then per cleanup policy |
+| PersistentVolumeClaim `ws-<attempt>` | the workspace: `repo/`, `report/`, `output/`, and `publish/` (the publisher's outcome, made before a push) | attempt, then per cleanup policy |
 | ConfigMap `identity-<attempt>` (or a projected volume from an object store above the ConfigMap size cap, 08) | the identity bundle, read-only | attempt |
 | Secret `cred-<attempt>` | the per-attempt copy of one harness credential directory, seeded from the harness's dedicated Secret in `crucible-workers`, `rw-narrow` where the adapter declares it (12) | attempt, deleted under every cleanup policy |
 | Secret `checkout-<attempt>` | a private repository's read-only installation token (ADR 0019), key `token`, mounted mode 0400 at `/run/crucible-token` into the refresher and the preparer Jobs and nothing else | created just before the refresher, deleted once the preparer's Pod is gone, on every path; a deletion that fails fails the prepare, and `discard`, `cleanup` and the retention sweep retry it |
@@ -103,6 +103,7 @@ Per attempt the provider creates, in `crucible-workers`, all labelled
 | Job `collect-<attempt>` | the collector, no network, repo and report read-only, output read-write (08) | until complete |
 | Job `verify-bundle-<attempt>` | `git bundle verify`, no network | until complete |
 | Job `verifier-<attempt>` | re-runs `required_verification` on an independent clone from the bundle (10, 11) | until complete |
+| Job `prepare-<attempt>` (before a push) | runs `publish_leaf_script` as the worker uid with the whole claim mounted and no network: refuses (exit 7) unless `output/work_branch.bundle` is a regular file, creates `publish/` with `output/`'s owner and mode, and refuses (exit 8) if it cannot. The publisher's subPaths therefore always exist before its Pod starts, and are never made by the kubelet | until complete, then deleted with its Pod |
 | Job `publish-<attempt>` | the publisher (23, ADR 0022): mounts `output/work_branch.bundle` off `ws-<attempt>` as one read-only file and the claim's `publish/` leaf for its outcome, checks the bundle against its seal, builds from it and pushes without force. Its egress is its own NetworkPolicy `np-publisher-<attempt>` | until complete, then deleted with its Pod and policy |
 | Secret `publish-token-<attempt>` | the installation token for one push, key `token`, mounted mode 0400 at `/run/crucible-token` into the publisher Job and nothing else | created just before the Job, deleted once its Pod is gone, on every path; one a crashed supervisor left is replaced by the next push of that attempt and removed by the retention sweep |
 | Job `login-<harness>-<id>` (admin flow, 25) | the harness's own login in that harness's default worker image (ADR 0018), no workspace, no credential mounted, a memory-backed home; the service reads the auth files back over exec and writes the harness Secret (ADR 0015). Labelled `crucible.role=login`, `crucible.harness`, `crucible.login` and never `crucible.attempt` | until the service has read it back, cancelled, or timed out; its own deadline and a TTL remove it if the api died |

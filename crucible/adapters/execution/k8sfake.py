@@ -57,6 +57,11 @@ from crucible.adapters.execution.k8sspec import (
     ROLE_VERIFIER,
     ROLE_WORKER,
 )
+from crucible.adapters.execution.scripts import (
+    PUBLISH_BUNDLE_LEAF,
+    PUBLISH_LEAF,
+    PUBLISH_LEAF_MARKER,
+)
 from crucible.domain.time import parse_rfc3339
 from crucible.ports.execution import ImageInfo
 
@@ -261,6 +266,10 @@ class FakeKubernetesApi:
     # fail the commit-policy check the way the script does (exit 6).
     pushes: list[dict[str, str]] = field(default_factory=list)
     publisher_refuses: bool = False
+    # The claim's `publish/` leaf as the preparer finds it before a push: a claim on
+    # storage where the worker uid cannot make or write it (an NFS export that squashes
+    # it, say) fails the leaf script with exit 8, as the real script does.
+    publish_leaf_unwritable: bool = False
     # Called with each push, so a test's stand-in remote can move its branch.
     on_push: Callable[[dict[str, str]], None] | None = None
     _uids: int = 0
@@ -665,6 +674,19 @@ class FakeKubernetesApi:
     def _act_preparer(self, obj: _Object, attempt_id: str) -> None:
         behavior, _ = self._behavior(attempt_id, obj)
         claim = self._claim_of(obj)
+        container = ((obj.body.get("spec") or {}).get("containers") or [{}])[0]
+        if PUBLISH_LEAF_MARKER in str((container.get("command") or [""])[-1]):
+            # `scripts.publish_leaf_script`: the bundle must be a file, and the leaf a
+            # directory the worker uid can write. A dict claim has no empty directories.
+            if PUBLISH_BUNDLE_LEAF not in claim:
+                self.logs[obj.name] = [f"no branch bundle at {PUBLISH_BUNDLE_LEAF}"]
+                self._finish(obj, 7, reason="Error")
+            elif self.publish_leaf_unwritable:
+                self.logs[obj.name] = [f"{PUBLISH_LEAF} is not owned and writable as output is"]
+                self._finish(obj, 8, reason="Error")
+            else:
+                self._finish(obj, 0)
+            return
         if behavior == "prepare-fails":
             self.logs[obj.name] = ["the fake preparer could not clone"]
             self._finish(obj, 3, reason="Error")

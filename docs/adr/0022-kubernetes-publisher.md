@@ -46,6 +46,17 @@ in, and no Docker network, so the Docker publisher cannot simply be reused.
    mounts, the script hashes the bundle inside the Pod against the collector's seal
    before any remote is contacted (the Docker publisher now runs the same check, after
    its own host-side one).
+   Neither subPath is left for the kubelet to create. A subPath that does not exist is
+   made by the kubelet as root when the Pod starts, and on an NFS claim that directory
+   may be unwritable by the worker uid or refused, which fails the Pod's setup with
+   nothing in its log. Before the Secret exists, a short Job in the preparer role (the
+   role that makes the claim's other leaves), running as the worker uid with the whole
+   claim mounted and no network, checks that the bundle is a regular file and creates
+   `publish/` with the owner and mode `output/` has. A missing bundle is refused at
+   `bundle-seal`, a `publish/` leaf the worker uid cannot own and write at
+   `publish-leaf`, both by name and before any token is placed. The check runs on every
+   push rather than at collection, so a claim collected before this shipped (HT-0007's)
+   is made ready the same way. Added 2026-09-28 on the review of hades PR 225.
 6. **The outcome comes back through the reader Pod over exec**, as every other file an
    attempt's Pod writes does (26), never through a Pod log (12). The script exits 0 only
    after its push succeeded, so a Job that exited 0 whose outcome files cannot be read

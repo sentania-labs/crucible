@@ -12,12 +12,17 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
+import stat
+import subprocess
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import pytest
 
 from crucible.adapters.execution import k8sspec, scripts
+from crucible.adapters.execution.k8sapi import KubernetesApiError
 from crucible.adapters.execution.k8sfake import FakeKubernetesApi
 from crucible.adapters.execution.k8spublisher import (
     BUNDLE_LEAF,
@@ -30,7 +35,7 @@ from crucible.adapters.execution.k8spublisher import (
 )
 from crucible.adapters.execution.kubernetes import KubernetesConfig, KubernetesProvider
 from crucible.adapters.execution.publisher import BUNDLE_SEAL_REFUSED, COMMIT_POLICY_REFUSED
-from crucible.ports.execution import ProviderError
+from crucible.ports.execution import WORK_MOUNT, ProviderError
 from crucible.ports.github import InstallationToken
 from crucible.ports.publish import PublishOutcome, PublishRequest
 from tests.integration.fake_github import installation_token_value
@@ -221,10 +226,19 @@ async def test_the_network_policy_selects_the_publisher_pod_and_opens_only_the_g
     assert {"ip": "140.82.121.4", "hostnames": ["github.com"]} in aliases
 
 
-async def test_a_job_that_cannot_be_created_still_removes_the_secret() -> None:
+async def test_a_job_that_cannot_be_created_still_removes_the_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     api, _provider, publisher = _setup()
     await _provider.ensure_ready()
-    api.refuse_create.add("jobs")
+    create = api.create
+
+    def refuse_the_publisher_job(kind: str, body: dict[str, Any]) -> dict[str, Any]:
+        if kind == "jobs" and body["metadata"]["name"] == job_name(ATTEMPT):
+            raise KubernetesApiError(500, "the fake refuses to create the publisher Job")
+        return create(kind, body)
+
+    monkeypatch.setattr(api, "create", refuse_the_publisher_job)
     outcome = await publisher.push(_request(), _token(installation_token_value()))
     assert not outcome.pushed and outcome.step == "container"
     assert token_secret_name(ATTEMPT) in [s["metadata"]["name"] for s in _created(api, "secrets")]
@@ -425,8 +439,11 @@ async def test_a_pod_slow_to_be_removed_does_not_fail_a_finished_push(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     api, provider, publisher = _setup()
+    gone = provider._await_job_pods_gone
 
     async def lingering(name: str, *, timeout: float = 15) -> None:
+        if name != job_name(ATTEMPT) and not name.startswith("cleaner"):
+            return await gone(name)
         raise ProviderError(f"Pods for Job {name!r} were still present after {timeout:g} seconds")
 
     monkeypatch.setattr(provider, "_await_job_pods_gone", lingering)
@@ -474,3 +491,115 @@ def test_the_script_asks_the_helper_for_the_token_before_any_remote() -> None:
         line = script[check : script.index("\n", check)]
         assert "| grep -q '^password=.'" in line
         assert "printf 'protocol=https\\nhost=%s\\n\\n'" in script
+
+
+def _run_leaf_script(root: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["sh", "-c", scripts.publish_leaf_script(str(root))],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _claim_with_output(root: Path, *, mode: int = 0o750) -> Path:
+    output = root / "output"
+    output.mkdir()
+    (output / "work_branch.bundle").write_bytes(BUNDLE)
+    output.chmod(mode)
+    return output
+
+
+def test_the_leaf_script_makes_publish_owned_and_moded_as_output_is(tmp_path: Path) -> None:
+    """The kubelet is never left to create the `publish` subPath: the script does, as the
+    worker uid, with the owner and mode `output/` has (hades PR 225 review)."""
+    output = _claim_with_output(tmp_path)
+    result = _run_leaf_script(tmp_path)
+    assert result.returncode == 0, result.stderr
+    made = (tmp_path / "publish").stat()
+    assert stat.S_ISDIR(made.st_mode)
+    assert (made.st_uid, stat.S_IMODE(made.st_mode)) == (
+        output.stat().st_uid,
+        stat.S_IMODE(output.stat().st_mode),
+    )
+    # A second push of the same attempt finds the leaf already there.
+    assert _run_leaf_script(tmp_path).returncode == 0
+
+
+def test_the_leaf_script_refuses_a_missing_bundle_or_a_leaf_that_is_not_a_directory(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "output").mkdir()
+    result = _run_leaf_script(tmp_path)
+    assert result.returncode == 7 and "no branch bundle" in result.stderr
+    assert not (tmp_path / "publish").exists()
+
+    (tmp_path / "output" / "work_branch.bundle").write_bytes(BUNDLE)
+    (tmp_path / "publish").write_bytes(b"not a directory")
+    result = _run_leaf_script(tmp_path)
+    assert result.returncode == 8 and "not a directory" in result.stderr
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root writes a directory whatever its mode")
+def test_the_leaf_script_refuses_a_publish_leaf_the_worker_uid_cannot_write(
+    tmp_path: Path,
+) -> None:
+    """What a root-made, root-squashed subPath looks like to the worker uid: there, but
+    not writable. The script says so rather than letting the push fail inside the Pod."""
+    _claim_with_output(tmp_path, mode=0o555)
+    (tmp_path / "publish").mkdir(mode=0o555)
+    try:
+        result = _run_leaf_script(tmp_path)
+    finally:
+        (tmp_path / "output").chmod(0o755)
+        (tmp_path / "publish").chmod(0o755)
+    assert result.returncode == 8
+    assert "not owned and writable as output is" in result.stderr
+
+
+async def test_the_publish_leaf_is_made_by_the_worker_uid_before_the_publisher_pod() -> None:
+    api, _provider, publisher = _setup()
+    outcome = await publisher.push(_request(), _token(installation_token_value()))
+    assert outcome.pushed, outcome
+    jobs = _created(api, "jobs")
+    roles = [body["metadata"]["labels"][k8sspec.LABEL_ROLE] for body in jobs]
+    assert roles == [k8sspec.ROLE_PREPARER, k8sspec.ROLE_PUBLISHER]
+    leaf_pod = jobs[0]["spec"]["template"]["spec"]
+    container = leaf_pod["containers"][0]
+    assert scripts.PUBLISH_LEAF_MARKER in container["command"][-1]
+    assert leaf_pod["securityContext"]["runAsUser"] == k8sspec.WORKER_UID
+    claim_mounts = [m for m in container["volumeMounts"] if m["name"] == "ws"]
+    assert [(m["mountPath"], m.get("subPath")) for m in claim_mounts] == [(WORK_MOUNT, None)]
+    assert "publish-token" not in json.dumps(leaf_pod)
+    # No network for it: no policy of its own, so the namespace's default deny holds.
+    assert k8sspec.ROLE_PREPARER not in [
+        body["metadata"]["labels"][k8sspec.LABEL_ROLE] for body in _created(api, "networkpolicies")
+    ]
+
+
+async def test_a_publish_leaf_that_cannot_be_made_is_refused_by_name_before_a_token() -> None:
+    api, _provider, publisher = _setup()
+    api.publish_leaf_unwritable = True
+    outcome = await publisher.push(_request(), _token(installation_token_value()))
+    assert not outcome.pushed
+    assert outcome.step == "publish-leaf"
+    assert "publish/ leaf of the workspace claim" in outcome.detail
+    assert f"ws-{ATTEMPT.lower()}" in outcome.detail
+    assert _created(api, "secrets") == []
+    assert k8sspec.ROLE_PUBLISHER not in [
+        body["metadata"]["labels"][k8sspec.LABEL_ROLE] for body in _created(api, "jobs")
+    ]
+    assert api.pushes == []
+
+
+async def test_a_missing_bundle_is_refused_before_a_subpath_is_mounted() -> None:
+    """The bundle is mounted as a single-file subPath; a missing one would have the
+    kubelet make a directory there. The leaf Job finds it missing first."""
+    api, _provider, publisher = _setup(bundle=None)
+    outcome = await publisher.push(_request(), _token(installation_token_value()))
+    assert not outcome.pushed and outcome.step == "bundle-seal"
+    assert f"no branch bundle at {BUNDLE_LEAF}" in outcome.detail
+    assert _created(api, "secrets") == []
+    assert k8sspec.ROLE_PUBLISHER not in [
+        body["metadata"]["labels"][k8sspec.LABEL_ROLE] for body in _created(api, "jobs")
+    ]

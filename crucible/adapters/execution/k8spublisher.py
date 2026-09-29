@@ -31,7 +31,7 @@ from dataclasses import dataclass, replace
 from crucible.adapters.execution import k8sspec, scripts
 from crucible.adapters.execution import kubernetes as k8s
 from crucible.adapters.execution.k8sapi import KubernetesApiError
-from crucible.adapters.execution.k8sspec import EgressPlan, Mount, SpecError
+from crucible.adapters.execution.k8sspec import EgressPlan, Limits, Mount, SpecError
 from crucible.adapters.execution.publisher import (
     MAX_PUBLISHER_SECONDS,
     OUTCOME_FILES,
@@ -39,7 +39,7 @@ from crucible.adapters.execution.publisher import (
     request_spec,
 )
 from crucible.domain.secrets import redact
-from crucible.ports.execution import ProviderError
+from crucible.ports.execution import WORK_MOUNT, LaunchSpec, ProviderError
 from crucible.ports.github import InstallationToken
 from crucible.ports.publish import Publisher, PublishOutcome, PublishRequest
 
@@ -48,10 +48,12 @@ log = logging.getLogger("crucible.publisher")
 TOKEN_KEY = "token"
 # The claim leaf the script writes its outcome files to. It holds the step, the heads
 # and git's own messages, never the token (the script reads that from its mount only).
-PUBLISH_LEAF = "publish"
+PUBLISH_LEAF = scripts.PUBLISH_LEAF
 # The one leaf of a workspace claim a bundle may be published from: where the collector
 # writes it (`scripts.collector_script`) and where `build_plan` points.
-BUNDLE_LEAF = "output/work_branch.bundle"
+BUNDLE_LEAF = scripts.PUBLISH_BUNDLE_LEAF
+# How long the Job that makes the claim ready for the publisher may take.
+LEAF_TIMEOUT_SECONDS = 120
 # How much of one outcome file is read back. The outcome keeps a few kilobytes of each
 # (`OUTCOME_FILES`); this only bounds the read of a file git wrote into.
 OUTCOME_READ_LIMIT = 256 * 1024
@@ -148,6 +150,9 @@ class KubernetesPublisher:
             return _refused("namespace", f"the workers namespace is not ready ({probe.detail})")
 
         limits = provider._limits(spec)
+        refusal = await self._prepare_claim(spec, request, claim, limits)
+        if refusal is not None:
+            return refusal
         timeout = int(min(request.timeout_seconds, self.config.timeout_seconds))
         script = scripts.publisher_script(
             clone_url=request.repository_url,
@@ -262,6 +267,54 @@ class KubernetesPublisher:
         return outcome_from_files(
             {name: _text(files.get(f"{PUBLISH_LEAF}/{name}")) for name in OUTCOME_FILES},
             exit_code,
+        )
+
+    async def _prepare_claim(
+        self, spec: LaunchSpec, request: PublishRequest, claim: str, limits: Limits
+    ) -> PublishOutcome | None:
+        """Check the bundle and create the `publish` leaf before any Pod mounts either.
+
+        Neither subPath is left for the kubelet to create when the publisher Pod starts: on
+        an NFS claim a directory it makes as root may be unwritable by the worker uid, or
+        refused, and the Pod then fails setup with the token already placed and nothing in
+        its log. This Job runs as the worker uid in the preparer role, with the whole claim
+        and no network, before the Secret exists. None when the claim is ready."""
+        provider = self._provider
+        try:
+            code = await provider._run_role_job(
+                spec,
+                role=k8sspec.ROLE_PREPARER,
+                image=request.image,
+                script=scripts.publish_leaf_script(),
+                mounts=[Mount("ws", WORK_MOUNT)],
+                volumes=[provider._claim_volume(request.attempt_id)],
+                limits=limits,
+                timeout=LEAF_TIMEOUT_SECONDS,
+                plan=EgressPlan(),
+            )
+        except (KubernetesApiError, SpecError, ProviderError) as exc:
+            return _refused(
+                "publish-leaf",
+                f"the Job that prepares the {PUBLISH_LEAF}/ leaf could not run: {exc}",
+            )
+        if code == 0:
+            return None
+        tail = provider.last_error.get(k8sspec.ROLE_PREPARER, "")
+        if code == 7:
+            return _refused(
+                "bundle-seal",
+                f"no branch bundle at {BUNDLE_LEAF} on the workspace claim {claim!r}",
+            )
+        if code == 8:
+            return _refused(
+                "publish-leaf",
+                f"the {PUBLISH_LEAF}/ leaf of the workspace claim {claim!r} is not a directory "
+                f"the worker uid owns and can write, as it does output/: {tail}",
+            )
+        return _refused(
+            "publish-leaf",
+            f"the Job that prepares the {PUBLISH_LEAF}/ leaf of the workspace claim {claim!r} "
+            f"exited {code}: {tail}",
         )
 
     async def cleanup(self, attempt_ids: Sequence[str]) -> int:
