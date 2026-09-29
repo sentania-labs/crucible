@@ -22,7 +22,7 @@ from crucible.contracts.evidence import (
 from crucible.domain.entities import Artifact, Attempt, EvidenceRecord, Task
 from crucible.domain.events import PRINCIPAL_CRUCIBLE, EventKind
 from crucible.domain.ids import new_id
-from crucible.domain.secrets import find_secrets, scan_text
+from crucible.domain.secrets import find_secrets, redact, scan_text
 from crucible.ports.artifacts import ArtifactStore, SecretInArtifactError
 from crucible.ports.clock import Clock
 from crucible.ports.execution import CollectedOutputs
@@ -147,6 +147,12 @@ def _scanner_findings(
             {"where": f"report.{m.path}" if m.path else "report", "pattern": m.pattern}
             for m in find_secrets(claim)
         )
+    elif outputs.report_raw:
+        # A report that did not parse is still the worker's text, and its parse error
+        # goes to the reviewer (ADR 0024).
+        hit = scan_text(outputs.report_raw)
+        if hit:
+            findings.append({"where": "report", "pattern": hit})
     if outputs.blocked_md:
         hit = scan_text(outputs.blocked_md)
         if hit:
@@ -173,6 +179,12 @@ def _scanner_findings(
     return findings
 
 
+def _scrubbed(error: dict[str, Any]) -> dict[str, Any]:
+    """A parse error as the reviewer sees it: the message redacted and cut short, in
+    depth behind the scan above."""
+    return {**error, "msg": redact(str(error.get("msg", "")))[:300]}
+
+
 def _claimed_checks(claim: dict[str, Any]) -> list[dict[str, Any]]:
     """Each check id and integer exit the worker's own report named, nothing else."""
     checks = claim.get("checks")
@@ -189,7 +201,7 @@ def _claimed_checks(claim: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _scanned_inputs(outputs: CollectedOutputs, claim: dict[str, Any] | None) -> list[str]:
-    scanned = ["report" if claim is not None else "report:absent"]
+    scanned = ["report" if claim is not None or outputs.report_raw else "report:absent"]
     if outputs.diff_text is not None:
         scanned.append("diff")
     scanned.extend(f"diff-path:{p}" for p in outputs.diff_paths)
@@ -212,12 +224,15 @@ def record_collection_evidence(
     parse_errors: list[dict[str, Any]],
     parsed_report: ParsedReport | None = None,
     completed: CompletedClaim | None = None,
+    unparsed_errors: list[dict[str, Any]] | None = None,
 ) -> str | None:
     """Write the artifacts and evidence a pre-PR gate consumes. Returns the collected head.
 
     `claim` is the document the worker wrote; `completed` is that document with
     Crucible's own facts in place (hades #215), which is what the stored report and the
-    gates read. The worker's own values are kept as the worker's claim."""
+    gates read. The worker's own values are kept as the worker's claim.
+    `unparsed_errors` says a report file was there and was not a YAML mapping: it is
+    recorded as a present report that did not parse, not as no report (ADR 0024)."""
     findings = _scanner_findings(outputs, claim)
     _add(
         uow,
@@ -300,6 +315,21 @@ def record_collection_evidence(
             kind=EvidenceKind.ARTIFACT_PRESENT,
             source=EvidenceSource.WORKER,
             payload={"role": ROLE_WORKER_CLAIM, "asserted": {} if findings else claim},
+        )
+    elif unparsed_errors is not None:
+        redacted = bool(findings)
+        _add(
+            uow,
+            clock,
+            attempt=attempt,
+            kind=EvidenceKind.ARTIFACT_PRESENT,
+            source=EvidenceSource.CRUCIBLE,
+            payload={
+                "role": ROLE_COMPLETION_CLAIM,
+                "parsed_ok": False,
+                "parse_errors": [] if redacted else [_scrubbed(e) for e in unparsed_errors],
+                "redacted": redacted,
+            },
         )
     if parsed_report is not None and parsed_report.run_evidence_error is not None:
         _add(

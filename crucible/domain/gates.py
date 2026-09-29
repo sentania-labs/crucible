@@ -20,6 +20,7 @@ from functools import lru_cache
 from typing import Any
 
 from crucible.domain.exit_class import CLEAN_EXIT_CLASSES
+from crucible.domain.secrets import redact
 
 
 class GateName(StrEnum):
@@ -279,6 +280,21 @@ def _claim_notes(payload: dict[str, Any]) -> str:
     return notes
 
 
+def _parse_problems(errors: list[dict[str, Any]], shown: int = 3) -> str:
+    """The first few parse problems, each as its field and message. The messages come
+    from the parser's position and problem, not the report's text; they are redacted and
+    cut short all the same."""
+    if not errors:
+        return ""
+    parts = []
+    for error in errors[:shown]:
+        loc = ".".join(str(p) for p in error.get("loc") or [])
+        msg = redact(str(error.get("msg") or ""))[:200]
+        parts.append(f"{loc}: {msg}" if loc else msg)
+    more = f"; and {len(errors) - shown} more" if len(errors) > shown else ""
+    return ": " + "; ".join(parts) + more
+
+
 def report_present(gi: GateInput) -> GateOutcome:
     """A report that is malformed or lacks a judgement field is for the reviewer when the
     gate is advisory; no report at all always stops the task (ADR 0024)."""
@@ -288,10 +304,12 @@ def report_present(gi: GateInput) -> GateOutcome:
         return GateOutcome(missing.result, missing.detail, always_blocks=True)
     notes = _claim_notes(item.payload)
     if not item.payload.get("parsed_ok"):
-        errors = item.payload.get("parse_errors") or []
+        errors = [e for e in item.payload.get("parse_errors") or [] if isinstance(e, dict)]
         return GateOutcome(
             GateResult.FAIL,
-            f"the report did not parse as CompletionClaimV1 ({len(errors)} problems)" + notes,
+            f"the report did not parse as CompletionClaimV1 ({len(errors)} problems)"
+            + _parse_problems(errors)
+            + notes,
             (item.id,),
         )
     return GateOutcome(GateResult.PASS, "CompletionClaimV1 parsed" + notes, (item.id,))

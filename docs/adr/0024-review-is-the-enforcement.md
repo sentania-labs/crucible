@@ -29,7 +29,10 @@ Foundry write a correction for work that was already right.
    `internal_review_recorded`. Advisory: `scope_contained`, `report_present`,
    `criteria_mapped`, `run_evidence_present`. A gate added later is blocking unless a
    policy lists it. `report_present` is advisory for a report that is malformed or
-   lacks a judgement field; no report at all still stops the task.
+   lacks a judgement field; no report at all still stops the task. A `report.yaml`
+   that is there but is not YAML, or not a mapping, is malformed, not absent: it is
+   recorded as a present report that did not parse, and the parser's problem and
+   position (never the file's text) are listed for the reviewer.
 3. **A prohibited path always blocks.** `scope_contained` is split by its outcome: a
    path matching the contract's `prohibited_paths` stops the task whatever the gate's
    class, and a path merely outside `allowed_paths` is advisory. The stored row for

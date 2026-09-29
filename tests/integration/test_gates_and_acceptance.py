@@ -220,6 +220,48 @@ async def test_advisory_failures_reach_the_review_and_are_listed_for_the_reviewe
     assert await review_and_settle(supervisor, client, task_id) == "awaiting_acceptance"
 
 
+async def test_a_report_that_is_not_yaml_goes_to_the_reviewer_with_its_parse_error(
+    client: TestClient, supervisor: Supervisor
+) -> None:
+    """ADR 0024 (FDY-0138 correction): a report.yaml that is there but is not YAML is a
+    present report that did not parse, not a missing one. The task reaches review with
+    the parser's problem listed; none of the report's own text is echoed."""
+    task_id = submit_and_start(
+        client, "crucible-worker:fake-malformed-report", deliverables=ARTIFACTS_DELIVERABLE
+    )
+    assert await run_to_settled(supervisor, client, task_id) == "awaiting_internal_review"
+
+    summary = client.get(f"/v1/tasks/{task_id}").json()["gate_summary"]
+    assert summary["failing"] == []
+    assert summary["results"][GateName.REPORT_PRESENT] == "fail"
+    listed = {item["gate"]: item["detail"] for item in summary["for_reviewer"]}
+    detail = listed[GateName.REPORT_PRESENT]
+    assert "report.yaml is not YAML: mapping values are not allowed here" in detail
+    assert "at line 1, column 12" in detail
+    assert "live run" not in detail
+
+    [wake] = [
+        w
+        for w in client.get("/v1/wakes").json()["items"]
+        if w["reason"] == "internal_review_needed" and w["task_id"] == task_id
+    ]
+    [item] = [i for i in wake["payload"]["for_reviewer"] if i["gate"] == "report_present"]
+    assert "mapping values are not allowed here" in item["detail"]
+
+
+async def test_no_report_at_all_still_stops_the_task(
+    client: TestClient, supervisor: Supervisor
+) -> None:
+    """ADR 0024: only a report that is genuinely absent always blocks."""
+    task_id = submit_and_start(
+        client, "crucible-worker:fake-succeed-noreport", deliverables=ARTIFACTS_DELIVERABLE
+    )
+    assert await run_to_settled(supervisor, client, task_id) == "pre_pr_gates_failed"
+    summary = client.get(f"/v1/tasks/{task_id}").json()["gate_summary"]
+    assert GateName.REPORT_PRESENT in summary["failing"]
+    assert GateName.REPORT_PRESENT not in {i["gate"] for i in summary["for_reviewer"]}
+
+
 @pytest.mark.parametrize(
     ("image", "gate"),
     [

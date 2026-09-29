@@ -44,3 +44,10 @@ real or a claim is false, everything else information for the reviewer.
   taken back and never committing a secret outranks the contract's "the
   policy decides"; and the wake summary names gates only, keeping paths the
   worker chose in the structured list.
+- After Codex's review of PR 231 (2026-09-29): a `report.yaml` that is not
+  YAML, or not a mapping, was recorded as no report and so blocked. It is now
+  a present report that did not parse, with the parser's problem and line and
+  column as its parse error, so it goes to the reviewer. The message is built
+  from the parser's problem and position, not its excerpt of the file, and the
+  unparsed text is secret-scanned under `no_secrets` like a parsed report. The
+  fake provider gained `malformed-report` for the test.

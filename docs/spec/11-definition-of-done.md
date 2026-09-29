@@ -77,7 +77,9 @@ schema in agreement.
 
 All paths are relative to `/crucible/report`. Missing or unparsable report is
 a report-gate failure. An unparsable report is advisory by default (ADR 0024):
-the reviewer sees it and decides. No report at all stops the task.
+the reviewer sees it and decides; a file that is not YAML is unparsable, not
+missing, and its parse error names the problem and position. No report at all
+stops the task.
 The claim has no `pushed`, `pull_request`, or `ci` fields: workers cannot
 push and never see CI. Those facts are Crucible's to observe.
 

@@ -100,6 +100,7 @@ Behavior = Literal[
     "review-disapprove",
     "out-of-scope",
     "prohibited-path",
+    "malformed-report",
     "injected",
     "secret-leak",
     "no-commits",
@@ -125,6 +126,7 @@ BEHAVIORS: frozenset[str] = frozenset(
         "review-disapprove",
         "out-of-scope",
         "prohibited-path",
+        "malformed-report",
         "injected",
         "secret-leak",
         "no-commits",
@@ -140,6 +142,7 @@ REPORTING_BEHAVIORS: frozenset[str] = frozenset(
         "succeed",
         "out-of-scope",
         "prohibited-path",
+        "malformed-report",
         "injected",
         "secret-leak",
         "no-commits",
@@ -150,6 +153,7 @@ REPORTING_BEHAVIORS: frozenset[str] = frozenset(
 REVIEW_BEHAVIORS: frozenset[str] = frozenset({"review", "review-disapprove"})
 
 OUT_OF_SCOPE_PATH = "infrastructure/outside-the-contract.txt"
+MALFORMED_REPORT = "summary: c5: live run\nrisks: none\n"
 # Under the test contract's `.github/**` prohibition and outside every CI path.
 PROHIBITED_PATH = ".github/CODEOWNERS"
 INJECTED_PATH = ".crucible/identity.md"
@@ -583,9 +587,12 @@ class FakeProvider:
                             content_type="text/markdown",
                         )
                     )
+            # malformed-report: the work is committed and the report file is there, but
+            # it is not YAML, an unquoted colon in a value (ADR 0024).
+            malformed = behavior == "malformed-report"
             return CollectedOutputs(
-                report=report,
-                report_raw=None,
+                report=None if malformed else report,
+                report_raw=MALFORMED_REPORT if malformed else None,
                 blocked_md=None,
                 diff_paths=paths,
                 diff_text=synthetic_diff(paths, behavior),

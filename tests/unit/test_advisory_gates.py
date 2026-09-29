@@ -10,8 +10,9 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from crucible.application.evidence import _claimed_checks
+from crucible.application.evidence import _claimed_checks, _scanner_findings
 from crucible.application.queries import reviewer_items
+from crucible.contracts.completion_claim import load_report
 from crucible.contracts.policy import parse_policy
 from crucible.domain.entities import GateResultRecord
 from crucible.domain.gates import (
@@ -30,6 +31,7 @@ from crucible.domain.gates import (
     gate_class,
     pre_pr_verdict,
 )
+from crucible.ports.execution import CollectedOutputs
 from tests.fixtures import contract_document
 from tests.unit.test_gates import _claim_payload, _ev, _gi, _passing_evidence
 from tests.unit.test_policy_schema import seeded_policy_v3
@@ -172,6 +174,56 @@ def test_a_missing_judgement_field_is_for_the_reviewer() -> None:
         GateName.REPORT_PRESENT,
         GateName.CRITERIA_MAPPED,
     }
+
+
+def test_a_report_that_is_not_yaml_is_for_the_reviewer_with_its_parse_error() -> None:
+    """The correction to FDY-0138: a report file that is there but is not YAML is recorded
+    as present and unparsed (only a message and position, no fact fields), and goes to
+    the reviewer with the parser's problem."""
+    _, errors = load_report("summary: c5: live run\n")
+    claim = {"role": "completion_claim", "parsed_ok": False, "parse_errors": errors}
+    evidence = _without_review(_replace(_passing_evidence(), 1, _ev("artifact_present", claim)))
+    outcomes = evaluate_pre_pr(sorted(PRE_PR_GATES), _gi(evidence))
+    report = outcomes[GateName.REPORT_PRESENT]
+    assert report.result is GateResult.FAIL and not report.always_blocks
+    assert "report.yaml is not YAML: mapping values are not allowed here" in report.detail
+    assert "at line 1, column 12" in report.detail
+    assert pre_pr_verdict(outcomes, DEFAULT) is PrePrVerdict.REVIEW
+
+
+def test_the_parse_problems_shown_are_few_redacted_and_short() -> None:
+    token = "ghp_" + "a" * 36
+    errors = [{"loc": ["x", 0], "msg": f"bad {token}", "type": "t"}] + [
+        {"loc": [], "msg": "m" * 500, "type": "t"}
+    ] * 4
+    claim = {"role": "completion_claim", "parsed_ok": False, "parse_errors": errors}
+    evidence = _replace(_passing_evidence(), 1, _ev("artifact_present", claim))
+    detail = evaluate_pre_pr([GateName.REPORT_PRESENT], _gi(evidence))[
+        GateName.REPORT_PRESENT
+    ].detail
+    assert token not in detail and "x.0: bad [redacted:" in detail
+    assert "m" * 201 not in detail and detail.endswith("; and 2 more")
+
+
+@pytest.mark.parametrize(
+    ("raw", "message"),
+    [
+        ("- a\n- b\n", "report is not a mapping"),
+        ("just text\n", "report is not a mapping"),
+        ("a: [1, 2\n", "report.yaml is not YAML: expected ',' or ']', but got '<stream end>'"),
+    ],
+)
+def test_load_report_says_why_without_the_reports_text(raw: str, message: str) -> None:
+    report, errors = load_report(raw)
+    assert report is None and errors[0]["msg"].startswith(message)
+    assert load_report("summary: ok\n") == ({"summary": "ok"}, [])
+
+
+def test_a_secret_in_a_report_that_is_not_yaml_is_still_found() -> None:
+    """Its parse error now reaches the reviewer, so its text is scanned like any report."""
+    raw = "summary: key: ghp_" + "a" * 36 + "\n"
+    outputs = CollectedOutputs(report=None, report_raw=raw, blocked_md=None)
+    assert [f["where"] for f in _scanner_findings(outputs, None)] == ["report"]
 
 
 def test_no_report_at_all_still_blocks() -> None:
