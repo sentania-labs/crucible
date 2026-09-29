@@ -163,10 +163,8 @@ def check(document: Any, criteria: list[str] | None) -> list[str]:
         problems.append('schema_version is missing: write `schema_version: "1.0"`.')
     elif not isinstance(version, str):
         problems.append('schema_version must be text: write it quoted, `schema_version: "1.0"`.')
-    elif not VERSION.match(version):
-        problems.append(
-            'schema_version must be the format version "1.0", not the schema\'s name.'
-        )
+    elif not VERSION.fullmatch(version):
+        problems.append('schema_version must be the format version "1.0", not the schema\'s name.')
 
     summary = document.get("summary")
     if summary is None:
@@ -289,8 +287,7 @@ def main(argv: list[str]) -> int:
         print(f"note: no contract at {contract}, so acceptance criteria coverage is not checked")
     if not problems:
         print(
-            f"{report}: no problems. Crucible fills {', '.join(FACT_FIELDS)} from its own "
-            "evidence."
+            f"{report}: no problems. Crucible fills {', '.join(FACT_FIELDS)} from its own evidence."
         )
         return 0
     print(f"{report}: {len(problems)} problem{'s' if len(problems) != 1 else ''}")
