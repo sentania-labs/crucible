@@ -24,15 +24,20 @@ in, and no Docker network, so the Docker publisher cannot simply be reused.
    for both providers, and both turn its output files into a `PublishOutcome` with one
    function (`outcome_from_files`). A change to what a publication checks is made once.
 2. **One Job per push**, `publish-<attempt>`, role `publisher`, the pod shape of every
-   role (26), `backoffLimit: 0`, deadline `min(policy publish timeout,
-   github.publisher_timeout_seconds)`.
+   role (26), `backoffLimit: 0`, deadline `github.publisher_timeout_seconds` (default
+   600), the same limit the Docker publisher's container gets.
 3. **The token is a Secret created for that push alone**, `publish-token-<attempt>`,
    mounted read-only (mode 0400) as a Secret volume, which the kubelet keeps in memory,
    at the path the script reads. It is never in an env var, the command, the Job, the
    Pod spec, a NetworkPolicy, a log, an event, or the database. It is deleted as soon as
    the Job's Pod is gone, on every path (failure and cancel included), and a stale one
    of the same name is deleted before the next push creates its own.
-4. **The bundle is read where the collector left it.** The Pod mounts
+4. **Before it pushes, the script asks the credential helper for the token** (`git
+   credential fill` for https on `github.credential_host`) and refuses (exit 3) unless a
+   password comes back; only that answer is recorded, never the value. On Kubernetes
+   this is what proves the Secret volume is readable by the Pod's uid through the very
+   path the push uses; the Docker publisher runs the same check.
+5. **The bundle is read where the collector left it.** The Pod mounts
    `output/work_branch.bundle` off the attempt's workspace claim as one read-only file.
    Nothing else of the claim is visible to it except its own `publish/` leaf for the
    outcome. The publish request's bundle path must be exactly
@@ -41,15 +46,19 @@ in, and no Docker network, so the Docker publisher cannot simply be reused.
    mounts, the script hashes the bundle inside the Pod against the collector's seal
    before any remote is contacted (the Docker publisher now runs the same check, after
    its own host-side one).
-5. **The outcome comes back through the reader Pod over exec**, as every other file an
-   attempt's Pod writes does (26), never through a Pod log (12).
-6. **Egress is the publisher's own NetworkPolicy** (`github.com`, `api.github.com`, and
+6. **The outcome comes back through the reader Pod over exec**, as every other file an
+   attempt's Pod writes does (26), never through a Pod log (12). The script exits 0 only
+   after its push succeeded, so a Job that exited 0 whose outcome files cannot be read
+   back is reported as pushed at the expected head, and Crucible's own remote-head check
+   decides; a Pod that is slow to be removed after its Job is logged, not turned into a
+   failed publication.
+7. **Egress is the publisher's own NetworkPolicy** (`github.com`, `api.github.com`, and
    `github.credential_host` when it is another host), resolved and pinned into the
    Pod's `hostAliases` (hades #191). A namespace whose egress enforcement the readiness
    probe has not proven gets no publisher Pod and no Secret.
-7. **With both providers wired, the bundle path picks the publisher**: a `k8s://` path is
+8. **With both providers wired, the bundle path picks the publisher**: a `k8s://` path is
    the Kubernetes publisher's, anything else the Docker one's.
-8. **A publication that cannot start says so** (23): a `task_publish_pending` event with
+9. **A publication that cannot start says so** (23): a `task_publish_pending` event with
    the reason, a warning logged once per task, `GET /supervisor`'s
    `github.publishing_waiting`, the admin UI's task list, and an escalation after
    `github.publisher_timeout_seconds`. No new setting: the wait is the publisher's own

@@ -30,6 +30,7 @@ from crucible.adapters.execution.k8spublisher import (
 )
 from crucible.adapters.execution.kubernetes import KubernetesConfig, KubernetesProvider
 from crucible.adapters.execution.publisher import BUNDLE_SEAL_REFUSED, COMMIT_POLICY_REFUSED
+from crucible.ports.execution import ProviderError
 from crucible.ports.github import InstallationToken
 from crucible.ports.publish import PublishOutcome, PublishRequest
 from tests.integration.fake_github import installation_token_value
@@ -401,3 +402,75 @@ def test_the_script_checks_the_seal_before_it_contacts_any_remote() -> None:
             commit_trailer="t",
             token_source="env",
         )
+
+
+async def test_a_push_whose_outcome_cannot_be_read_back_still_reports_the_push() -> None:
+    """The script exits 0 only after its push; a reader Pod that cannot be created then
+    must not turn a branch already on the remote into a failed publication. The
+    supervisor's own remote-head check is what confirms it."""
+    api, _provider, publisher = _setup()
+    api.on_push = lambda _push: api.refuse_create.add("pods")
+    outcome = await publisher.push(_request(), _token(installation_token_value()))
+    assert (outcome.pushed, outcome.head_sha, outcome.step, outcome.exit_code) == (
+        True,
+        HEAD,
+        "done",
+        0,
+    )
+    assert "could not be read" in outcome.detail
+    assert not api.secret_exists(token_secret_name(ATTEMPT))
+
+
+async def test_a_pod_slow_to_be_removed_does_not_fail_a_finished_push(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api, provider, publisher = _setup()
+
+    async def lingering(name: str, *, timeout: float = 15) -> None:
+        raise ProviderError(f"Pods for Job {name!r} were still present after {timeout:g} seconds")
+
+    monkeypatch.setattr(provider, "_await_job_pods_gone", lingering)
+    outcome = await publisher.push(_request(), _token(installation_token_value()))
+    assert outcome.pushed and outcome.step == "done"
+    assert not api.secret_exists(token_secret_name(ATTEMPT))
+    # Every other role still treats a lingering Pod as the error it is.
+    with pytest.raises(ProviderError, match="still present"):
+        await provider._run_role_job(
+            _request_spec(),
+            role=k8sspec.ROLE_CLEANER,
+            image=DIGEST_IMAGE,
+            script="exit 0\n",
+            mounts=[],
+            volumes=[],
+            limits=provider._limits(_request_spec()),
+            timeout=30,
+            plan=k8sspec.EgressPlan(),
+        )
+
+
+def _request_spec() -> Any:
+    from crucible.adapters.execution.publisher import request_spec  # noqa: PLC0415
+
+    return request_spec(_request())
+
+
+def test_the_script_asks_the_helper_for_the_token_before_any_remote() -> None:
+    for source in ("stdin", "file"):
+        script = scripts.publisher_script(
+            clone_url="https://github.com/o/r.git",
+            work_branch="crucible/X",
+            base_ref="main",
+            expected_head=HEAD,
+            author_name="crucible-worker",
+            author_email="crucible-worker@users.noreply.github.com",
+            commit_trailer="Crucible-Attempt",
+            token_source=source,
+            bundle_sha256="b" * 64,
+        )
+        check = script.index("git credential fill")
+        assert check < script.index("git fetch --quiet origin")
+        assert check < script.index("git push --quiet origin")
+        # Only whether a password came back: the answer goes to grep and nowhere else.
+        line = script[check : script.index("\n", check)]
+        assert "| grep -q '^password=.'" in line
+        assert "printf 'protocol=https\\nhost=%s\\n\\n'" in script

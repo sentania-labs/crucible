@@ -3618,10 +3618,14 @@ class KubernetesProvider:
         plan: EgressPlan,
         env: Mapping[str, str] | None = None,
         cancelled: CancelCheck | None = None,
+        tolerate_lingering_pod: bool = False,
     ) -> int:
         """Run one single-purpose Job to completion and delete it. With `cancelled`, a
         cancel ends the wait (hades #189): the Job and its policy are deleted on the way
-        out, as on every other path."""
+        out, as on every other path. With `tolerate_lingering_pod`, a Pod the API server
+        is slow to remove after its Job is deleted is logged rather than raised, so an
+        exit already seen (the publisher's, after a push that cannot be undone) is not
+        replaced by an error about garbage collection."""
         name = k8sspec.object_name(OBJECT_PREFIX.get(role, role), spec.attempt_id)
         policy_name: str | None = None
         with contextlib.suppress(KubernetesApiError):
@@ -3667,6 +3671,10 @@ class KubernetesProvider:
                 await self._call(self.client.delete, "jobs", name)
             try:
                 await self._await_job_pods_gone(name)
+            except (ProviderError, KubernetesApiError) as exc:
+                if not tolerate_lingering_pod:
+                    raise
+                log.warning("%s Pod outlived its Job", role, extra={"error": str(exc)})
             finally:
                 if policy_name:
                     with contextlib.suppress(KubernetesApiError):

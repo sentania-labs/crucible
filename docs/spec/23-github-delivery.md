@@ -100,7 +100,10 @@ review is recorded, and Foundry's `AcceptanceResult` for that head is
    the bundle. Before any of that, the bundle is hashed inside the
    container and compared with the seal the collector recorded; a bundle
    that is missing or no longer matches is refused (exit 7) before any
-   remote is contacted. The bundle is `base_ref..work_branch`, so it names
+   remote is contacted, and the credential helper is asked for the token
+   (`git credential fill`), refusing (exit 3) unless a password comes back,
+   so an unreadable token fails here and not as an authentication error at
+   the remote. The bundle is `base_ref..work_branch`, so it names
    prerequisite commits and neither verify nor fetch will look at it until
    the repository holds them; the base fetch is what supplies them. Nothing
    else enters this container: not the worker's tree, not the worker's

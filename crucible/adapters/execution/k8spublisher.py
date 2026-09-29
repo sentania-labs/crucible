@@ -201,13 +201,15 @@ class KubernetesPublisher:
                 timeout=timeout,
                 plan=self._plan(),
                 env={"HOME": "/home/worker", "CRUCIBLE_ATTEMPT_ID": request.attempt_id},
+                tolerate_lingering_pod=True,
             )
         except (KubernetesApiError, SpecError, ProviderError) as exc:
             return _refused("container", f"the publisher Job could not run: {exc}")
         finally:
-            # `_run_role_job` returns only once the Job's Pod is gone, so nothing holds
-            # the Secret by now. Deleted on every path, a cancel included; a deletion
-            # that fails twice is logged, and `cleanup` and the retention sweep retry.
+            # The Job's Pod has ended by now (a Pod slow to be removed is terminated,
+            # not running). Deleted on every path, a cancel included; a deletion that
+            # fails twice is logged, the next push of this attempt deletes it first,
+            # and the retention sweep removes it once the attempt is no longer live.
             if not await provider._delete_token_secret(secret, what="publisher"):
                 log.warning(
                     "the publisher token Secret outlived its push",
@@ -235,13 +237,28 @@ class KubernetesPublisher:
                 limit=OUTCOME_READ_LIMIT,
             )
         except (ProviderError, KubernetesApiError) as exc:
+            if exit_code == 0:
+                # The script exits 0 only after `git push` succeeded, so the push
+                # happened; the caller confirms the remote head before it records one.
+                return PublishOutcome(
+                    pushed=True,
+                    head_sha=request.expected_head,
+                    step="done",
+                    detail=redact(
+                        f"the publisher exited 0; its outcome files could not be read: {exc}"
+                    ),
+                    exit_code=0,
+                )
             return PublishOutcome(
                 pushed=False,
                 head_sha="",
                 step="outcome",
-                detail=f"the publisher exited {exit_code} and its outcome could not be read: {exc}",
+                detail=redact(
+                    f"the publisher exited {exit_code} and its outcome could not be read: {exc}"
+                ),
                 exit_code=exit_code,
             )
+
         return outcome_from_files(
             {name: _text(files.get(f"{PUBLISH_LEAF}/{name}")) for name in OUTCOME_FILES},
             exit_code,
@@ -304,7 +321,7 @@ def _text(raw: object) -> str:
 
 def _refused(step: str, detail: str) -> PublishOutcome:
     """Nothing was pushed, and nothing that holds a token was created."""
-    return PublishOutcome(pushed=False, head_sha="", step=step, detail=detail, exit_code=-1)
+    return PublishOutcome(pushed=False, head_sha="", step=step, detail=redact(detail), exit_code=-1)
 
 
 class ByWorkspacePublisher:

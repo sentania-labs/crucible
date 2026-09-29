@@ -649,6 +649,14 @@ export CRUCIBLE_CREDENTIAL_HOST={_quote(credential_host)}
 export CRUCIBLE_AUTHOR_NAME={_quote(author_name)}
 export CRUCIBLE_AUTHOR_EMAIL={_quote(author_email)}
 {_CRED_HELPER}
+# The token must be readable by this uid through the very helper the push will use, or
+# the push fails at the remote with an authentication error that says nothing about why.
+# Only whether a password came back is recorded; the value goes to grep and nowhere else.
+echo credential > "$OUT/step.txt"
+if ! printf 'protocol=https\\nhost=%s\\n\\n' "$CRUCIBLE_CREDENTIAL_HOST" \\
+    | git credential fill 2>> "$OUT/publisher.log" | grep -q '^password=.'; then
+  echo "the credential helper could not read the token" > "$OUT/error.txt"; drop_token; exit 3
+fi
 cd /home/worker
 rm -rf publish && mkdir publish && cd publish
 echo bundle-seal > "$OUT/step.txt"
