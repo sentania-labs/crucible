@@ -92,7 +92,12 @@ gates:
     - feedback_dispositions_complete
     - ci_green_for_head
   skipped: []                          # release gates live on the release contract (24)
-                                       # commit_policy is never listed: it always runs, for the reviewer (11)
+                                       # commit_policy is never listed: it always runs, always advisory (11)
+  advisory:                            # ADR 0024: a failure of these goes to the internal reviewer instead of stopping the task
+    - criteria_mapped                  # absent (every version written before 2026-09-29): this default set
+    - report_present
+    - run_evidence_present
+    - scope_contained                  # a path matching prohibited_paths still stops the task
 
 deliverables:
   allow_branch_only: false             # `branch` deliverables refused unless true
@@ -196,6 +201,17 @@ retention:
 - `release.require_operator_approval` may only be `false` under a policy
   the operator uploaded (principal role `operator` or `admin`), which is
   recorded as a decision.
+- `gates.advisory` (ADR 0024) is optional. When present it lists pre-PR
+  gates only, each once, and never `internal_review_recorded` (the review is
+  the enforcement), `no_secrets` (a pushed secret cannot be taken back) or
+  `commit_policy` (the publisher's own rule, never listed in a policy).
+  Every pre-PR gate it does not list blocks. Absent, the
+  default set applies, so a version written before the field existed
+  behaves as the default without being rewritten. Listing a gate outside
+  the default set (making a safety gate advisory) may only be done by an
+  `operator` or `admin` principal and is recorded as a decision (from the
+  local admin CLI, on the upload event). It is edited in place from the admin
+  API, CLI and UI (25).
 
 ## The per-command timeout
 

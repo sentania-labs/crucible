@@ -113,7 +113,7 @@ async def test_a_client_reconstructs_a_correction_loop(
     from tests.integration.conftest import correction_document  # noqa: PLC0415
 
     task_id = submit_and_start(
-        client, "crucible-worker:fake-out-of-scope", deliverables=ARTIFACTS_DELIVERABLE
+        client, "crucible-worker:fake-prohibited-path", deliverables=ARTIFACTS_DELIVERABLE
     )
     await run_to_settled(supervisor, client, task_id)
     failed = reconstruct(client, task_id)

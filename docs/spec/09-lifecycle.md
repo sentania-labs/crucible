@@ -25,9 +25,9 @@ awaiting_quota --wait cap exceeded, or reroute cap exceeded--> reported --wake--
 awaiting_quota --cancel--> cancelled
 blocked --decision--> scheduled
 
-reported --mechanical pre-PR gates fail--> pre_pr_gates_failed --wake-->
-reported --mechanical gates pass, internal review required for this head--> awaiting_internal_review --wake-->
-reported --mechanical gates pass, internal review not required for this head--> gates_passed
+reported --a blocking pre-PR gate fails--> pre_pr_gates_failed --wake-->
+reported --no blocking gate fails, internal review required for this head--> awaiting_internal_review --wake-->
+reported --no blocking gate fails, internal review not required for this head--> gates_passed
 awaiting_internal_review --ReviewReport recorded for this head--> gates_passed
 gates_passed --wake--> awaiting_acceptance
 

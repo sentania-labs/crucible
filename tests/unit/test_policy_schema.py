@@ -28,7 +28,7 @@ from crucible.contracts.policy import (
     parse_routing_policy,
     window_seconds,
 )
-from crucible.domain.gates import ALL_GATES
+from crucible.domain.gates import ALL_GATES, DEFAULT_ADVISORY_GATES
 
 EXAMPLE = Path(__file__).resolve().parents[2] / "examples" / "policies" / "default-software.yaml"
 
@@ -74,11 +74,21 @@ def test_the_seeded_policy_v2_validates() -> None:
     assert policy.version == 2 and policy.routing.policy.version == 2
 
 
+def _without_advisory(document: dict[str, Any]) -> dict[str, Any]:
+    """ADR 0024: the examples list `gates.advisory` explicitly; a seeded version has no
+    such field and takes the same set as its default."""
+    out = copy.deepcopy(document)
+    advisory = out["gates"].pop("advisory")
+    assert frozenset(advisory) == DEFAULT_ADVISORY_GATES
+    return out
+
+
 def test_the_example_policy_matches_the_seed() -> None:
-    """The shipped example is the current seed, version 3."""
+    """The shipped example is the current seed, version 3, with the advisory gates the
+    seed takes by default written out."""
     document = yaml.safe_load(EXAMPLE.read_text())
     parse_policy(document)
-    assert json.loads(json.dumps(document, sort_keys=True)) == json.loads(
+    assert json.loads(json.dumps(_without_advisory(document), sort_keys=True)) == json.loads(
         json.dumps(seeded_policy_v3(), sort_keys=True)
     )
 
@@ -90,6 +100,7 @@ def test_the_self_hosting_policy_is_default_software_with_the_worker_checks() ->
     """hades #184: the example differs from the seed only where its header says."""
     document = yaml.safe_load(SELF_HOSTING.read_text())
     policy = parse_policy(document)
+    document = _without_advisory(document)
     assert (policy.name, policy.version) == ("hades-self-hosting", 1)
     assert policy.repository.required_checks == ["make lint", "make test-unit", "make scan"]
     assert {"uv", "python3.12", "gitleaks"} <= set(policy.repository.required_programs)

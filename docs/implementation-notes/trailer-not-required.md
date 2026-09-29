@@ -18,12 +18,15 @@ with another author. This change keeps the hook and removes every requirement.
   reviewed and accepted head (exit 4), and the push is never forced.
 - The collector checks authors only. `commit-policy/trailer-problems.txt` is no longer
   written, and `CommitPolicyCheck` has no `trailer_problems`.
-- The `commit_policy` gate always passes once the collector has run. Commits authored by
-  someone other than the policy's `author_email` are named in its detail, starting "for
-  the reviewer:". A collector that could not read the commits passes too, and says so.
-  The gate is still evaluated whatever the policy lists. PR 231's advisory gate mechanism
-  was not on main when this was written; once it is, `commit_policy` is a natural
-  advisory gate.
+- The `commit_policy` gate is always advisory, using the advisory mechanism of PR 231
+  (ADR 0024), which merged while this change was in flight. PR 231 had made it always
+  blocking; it is now the reverse: no `gates.advisory` list can make it block, and a
+  policy may not name it there. A commit authored by someone other than the policy's
+  `author_email` fails it, named by hash and address in the detail, so it is listed
+  "for the reviewer" in the task view, the gate list, the Tasks page and the wake, and
+  the task goes on to review. A collector that could not read the commits fails it the
+  same way. The trailer is not checked. The gate is still evaluated whatever the policy
+  lists.
 - The commit-msg hook still adds `<commit_trailer>: <external_id>` as a courtesy. Nothing
   reads it. `git.commit_trailer` stays in the policy schema for the hook.
 - IDENTITY.md section 10 is one line: "Commit your work on `<branch>`."

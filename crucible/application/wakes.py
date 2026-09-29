@@ -35,6 +35,11 @@ def wake_document(wake: Wake, *, principal_name: str) -> dict[str, Any]:
         attempt_id=payload.pop("attempt_id", None),
         pull_request=payload.pop("pull_request", None),
         summary=str(payload.pop("summary", "")),
+        for_reviewer=[
+            {"gate": str(i.get("gate", "")), "detail": str(i.get("detail", ""))}
+            for i in payload.pop("for_reviewer", []) or []
+            if isinstance(i, dict)
+        ],
         links={str(k): str(v) for k, v in (payload.pop("links", {}) or {}).items()},
         created_at=wake.created_at,
     )
@@ -52,6 +57,7 @@ def create_wake(
     attempt_id: str | None = None,
     extra_links: dict[str, str] | None = None,
     raised_by: str = PRINCIPAL_CRUCIBLE,
+    for_reviewer: list[dict[str, str]] | None = None,
 ) -> Wake:
     """Write the wake row. The caller commits it with the state change it belongs to.
 
@@ -74,6 +80,8 @@ def create_wake(
         payload["attempt_id"] = attempt_id
     links.update(extra_links or {})
     payload["links"] = links
+    if for_reviewer:
+        payload["for_reviewer"] = [dict(i) for i in for_reviewer]
     wake = Wake(
         id=new_id(),
         principal_id=principal_id,

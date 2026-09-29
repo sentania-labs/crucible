@@ -581,6 +581,16 @@ class GateResultView(Response):
     head_sha: str
     evidence_ids: list[int]
     evaluated_at: Rfc3339
+    # ADR 0024: `blocking` stops the task on a failure; `advisory` is for the reviewer.
+    classification: Literal["blocking", "advisory"] = "blocking"
+    findings: list[str] = Field(default_factory=list)
+
+
+class ReviewerItem(Response):
+    """A failed advisory gate or an advisory finding, with its detail (ADR 0024)."""
+
+    gate: str
+    detail: str
 
 
 class GateList(Response):
@@ -588,6 +598,7 @@ class GateList(Response):
     head_sha: str | None
     items: list[GateResultView]
     counts: dict[str, int]
+    for_reviewer: list[ReviewerItem] = Field(default_factory=list)
 
 
 class EvidenceView(Response):

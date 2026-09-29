@@ -35,6 +35,7 @@ from crucible.contracts.api import (
     ReactionView,
     ReviewCommentView,
     ReviewCycleView,
+    ReviewerItem,
     ReviewReportView,
     SupervisorView,
     TaskList,
@@ -570,7 +571,22 @@ def _gate_view(g: GateResultRecord) -> GateResultView:
         head_sha=g.head_sha,
         evidence_ids=list(g.evidence_ids),
         evaluated_at=g.evaluated_at,
+        classification="blocking" if g.blocking else "advisory",
+        findings=list(g.findings),
     )
+
+
+def reviewer_items(rows: list[GateResultRecord]) -> list[dict[str, str]]:
+    """Failed advisory gates, then advisory findings, each with its detail: what the
+    internal reviewer is asked to weigh (ADR 0024)."""
+    ordered = sorted(rows, key=lambda r: r.gate)
+    out = [
+        {"gate": r.gate, "detail": r.detail}
+        for r in ordered
+        if not r.blocking and r.result in ("fail", "error")
+    ]
+    out.extend({"gate": r.gate, "detail": f} for r in ordered for f in r.findings)
+    return out
 
 
 def gate_summary(uow: UnitOfWork, task_id: str) -> dict[str, Any]:
@@ -588,7 +604,12 @@ def gate_summary(uow: UnitOfWork, task_id: str) -> dict[str, Any]:
         "head_sha": task.head_sha if task else None,
         "counts": counts,
         "results": {row.gate: row.result for row in rows},
-        "failing": sorted(row.gate for row in rows if row.result in ("fail", "error")),
+        "classification": {row.gate: "blocking" if row.blocking else "advisory" for row in rows},
+        # Only a failure that stops the task; an advisory one is under for_reviewer.
+        "failing": sorted(
+            row.gate for row in rows if row.blocking and row.result in ("fail", "error")
+        ),
+        "for_reviewer": reviewer_items(rows),
     }
 
 
@@ -601,11 +622,13 @@ def attempt_gates(uow: UnitOfWork, attempt_id: str) -> GateList:
     for row in rows:
         counts[row.result] = counts.get(row.result, 0) + 1
     task = uow.tasks.get(attempt.task_id)
+    current = [r for r in rows if task is None or not task.head_sha or r.head_sha == task.head_sha]
     return GateList(
         attempt_id=attempt_id,
         head_sha=task.head_sha if task else None,
         items=[_gate_view(r) for r in rows],
         counts=counts,
+        for_reviewer=[ReviewerItem(**item) for item in reviewer_items(current)],
     )
 
 

@@ -1298,9 +1298,10 @@ async def test_a_commit_by_another_author_without_the_trailer_publishes(
     tokens: dict[str, str],
 ) -> None:
     """FDY-0143 (operator decision, 2026-09-29): neither the author nor the trailer stops
-    a branch. The author difference is in the commit_policy detail for the reviewer, the
-    branch is pushed and the PR opened, and the task record is the paper trail: the
-    branch, the pushed head, the PR, and once merged the merge commit and who merged."""
+    a branch. The author difference fails the always-advisory commit_policy gate, which
+    lists it for the reviewer; the branch is pushed and the PR opened, and the task
+    record is the paper trail: the branch, the pushed head, the PR, and once merged the
+    merge commit and who merged."""
     task_id, view = await publish(
         client,
         delivery_supervisor,
@@ -1310,9 +1311,9 @@ async def test_a_commit_by_another_author_without_the_trailer_publishes(
     head = view["head_sha"]
     rows = client.get(f"/v1/attempts/{view['latest_attempt']['id']}/gates").json()["items"]
     commit_policy = next(r for r in rows if r["gate"] == "commit_policy")
-    assert commit_policy["result"] == "pass"
+    assert commit_policy["result"] == "fail"
     assert commit_policy["detail"] == (
-        "for the reviewer: 1 commit(s) not authored as "
+        "1 commit(s) not authored as "
         f"crucible-worker@users.noreply.github.com ({head[:12]} by someone-else@example.test)"
     )
     assert publisher.pushes == [(view["delivery"]["work_branch"], head)]

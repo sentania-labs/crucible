@@ -7,6 +7,7 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
+from crucible.adapters.execution.fake import FakeProvider
 from crucible.application.supervisor import Supervisor
 from crucible.domain.gates import DEFERRED_MARKER, DEFERRED_TO_C3, GateName
 from tests.integration.conftest import (
@@ -18,6 +19,7 @@ from tests.integration.conftest import (
     run_until,
     submit_and_start,
 )
+from tests.integration.test_report_facts import judgement_only
 
 pytestmark = pytest.mark.integration
 
@@ -112,8 +114,36 @@ async def test_pull_request_deliverable_enters_publishing(
     assert body["pull_request"] is None
 
 
-async def test_fail_path_scope_contained(client: TestClient, supervisor: Supervisor) -> None:
-    task_id = submit_and_start(client, "crucible-worker:fake-out-of-scope")
+async def test_a_report_that_contradicts_the_rerun_is_named_for_the_reviewer(
+    client: TestClient, supervisor: Supervisor
+) -> None:
+    """ADR 0024: the fake worker reports every check passing and the verifier fails V1,
+    so verification_ran blocks and the contradiction is its own named finding."""
+    task_id = submit_and_start(
+        client, "crucible-worker:fake-verification-fails", deliverables=ARTIFACTS_DELIVERABLE
+    )
+    assert await run_to_settled(supervisor, client, task_id) == "pre_pr_gates_failed"
+    view = client.get(f"/v1/tasks/{task_id}").json()
+    assert view["gate_summary"]["failing"] == [GateName.VERIFICATION_RAN.value]
+    finding = "the worker reported V1 passing; Crucible's re-run failed it"
+    assert {"gate": "verification_ran", "detail": finding} in view["gate_summary"]["for_reviewer"]
+    rows = client.get(f"/v1/attempts/{view['latest_attempt']['id']}/gates").json()["items"]
+    verification = next(r for r in rows if r["gate"] == GateName.VERIFICATION_RAN)
+    assert verification["classification"] == "blocking"
+    assert verification["findings"] == [finding]
+    [wake] = [
+        w
+        for w in client.get("/v1/wakes").json()["items"]
+        if w["reason"] == "pre_pr_gates_failed" and w["task_id"] == task_id
+    ]
+    assert {"gate": "verification_ran", "detail": finding} in wake["payload"]["for_reviewer"]
+
+
+async def test_fail_path_scope_contained_on_a_prohibited_path(
+    client: TestClient, supervisor: Supervisor
+) -> None:
+    """ADR 0024: scope_contained is advisory, but a prohibited path always blocks."""
+    task_id = submit_and_start(client, "crucible-worker:fake-prohibited-path")
     assert await run_to_settled(supervisor, client, task_id) == "pre_pr_gates_failed"
     attempt_id = latest_attempt(client, task_id)
     results = gates(client, attempt_id)
@@ -121,12 +151,116 @@ async def test_fail_path_scope_contained(client: TestClient, supervisor: Supervi
     assert results[GateName.EXIT_CLEAN] == "pass"
     assert results[GateName.REPORT_PRESENT] == "pass"
     rows = client.get(f"/v1/attempts/{attempt_id}/gates").json()["items"]
-    detail = next(r["detail"] for r in rows if r["gate"] == GateName.SCOPE_CONTAINED)
-    assert "infrastructure/outside-the-contract.txt" in detail
+    scope = next(r for r in rows if r["gate"] == GateName.SCOPE_CONTAINED)
+    assert ".github/CODEOWNERS" in scope["detail"] and "prohibited_paths" in scope["detail"]
+    # The failure blocks, so this evaluation of the advisory gate is recorded blocking.
+    assert scope["classification"] == "blocking"
     summary = client.get(f"/v1/tasks/{task_id}").json()["gate_summary"]
     assert summary["failing"] == [GateName.SCOPE_CONTAINED.value]
+    assert summary["for_reviewer"] == []
     wakes = client.get("/v1/wakes").json()["items"]
     assert any(w["reason"] == "pre_pr_gates_failed" for w in wakes)
+
+
+async def test_advisory_failures_reach_the_review_and_are_listed_for_the_reviewer(
+    client: TestClient, supervisor: Supervisor, provider: FakeProvider
+) -> None:
+    """ADR 0024 (FDY-0138): a worker that changed a file outside allowed_paths (not
+    prohibited) and left `risks` out of its report reaches awaiting_internal_review,
+    and both are listed for the reviewer in the task view, the gate list, and the wake."""
+    report = judgement_only()
+    del report["risks"]
+    provider.set_report("EX-0001", report)
+    task_id = submit_and_start(
+        client, "crucible-worker:fake-out-of-scope", deliverables=ARTIFACTS_DELIVERABLE
+    )
+    assert await run_to_settled(supervisor, client, task_id) == "awaiting_internal_review"
+
+    view = client.get(f"/v1/tasks/{task_id}").json()
+    summary = view["gate_summary"]
+    assert summary["failing"] == []
+    assert summary["results"][GateName.SCOPE_CONTAINED] == "fail"
+    assert summary["results"][GateName.REPORT_PRESENT] == "fail"
+    assert summary["classification"][GateName.SCOPE_CONTAINED] == "advisory"
+    assert summary["classification"][GateName.REPORT_PRESENT] == "advisory"
+    assert summary["classification"][GateName.VERIFICATION_RAN] == "blocking"
+    listed = {item["gate"]: item["detail"] for item in summary["for_reviewer"]}
+    assert "infrastructure/outside-the-contract.txt" in listed[GateName.SCOPE_CONTAINED]
+    assert "did not parse" in listed[GateName.REPORT_PRESENT]
+
+    gate_list = client.get(f"/v1/attempts/{view['latest_attempt']['id']}/gates").json()
+    assert {i["gate"] for i in gate_list["for_reviewer"]} >= {
+        GateName.SCOPE_CONTAINED.value,
+        GateName.REPORT_PRESENT.value,
+    }
+    classes = {row["gate"]: row["classification"] for row in gate_list["items"]}
+    assert classes[GateName.SCOPE_CONTAINED] == "advisory"
+    assert classes[GateName.NO_SECRETS] == "blocking"
+    errors = client.get(f"/v1/attempts/{view['latest_attempt']['id']}").json()["report"][
+        "parse_errors"
+    ]
+    assert [".".join(e["loc"]) for e in errors] == ["risks"]
+
+    [wake] = [
+        w
+        for w in client.get("/v1/wakes").json()["items"]
+        if w["reason"] == "internal_review_needed" and w["task_id"] == task_id
+    ]
+    listed_in_wake = {i["gate"] for i in wake["payload"]["for_reviewer"]}
+    assert listed_in_wake >= {"scope_contained", "report_present"}
+    assert "For the reviewer: " in wake["summary"]
+    assert "report_present" in wake["summary"] and "scope_contained" in wake["summary"]
+    # A path the worker chose stays in the structured list, never in the summary line.
+    assert "infrastructure/" not in wake["summary"]
+    assert any(
+        "infrastructure/outside-the-contract.txt" in i["detail"]
+        for i in wake["payload"]["for_reviewer"]
+    )
+
+    # The review is the enforcement: once it is recorded the task moves on.
+    assert await review_and_settle(supervisor, client, task_id) == "awaiting_acceptance"
+
+
+async def test_a_report_that_is_not_yaml_goes_to_the_reviewer_with_its_parse_error(
+    client: TestClient, supervisor: Supervisor
+) -> None:
+    """ADR 0024 (FDY-0138 correction): a report.yaml that is there but is not YAML is a
+    present report that did not parse, not a missing one. The task reaches review with
+    the parser's problem listed; none of the report's own text is echoed."""
+    task_id = submit_and_start(
+        client, "crucible-worker:fake-malformed-report", deliverables=ARTIFACTS_DELIVERABLE
+    )
+    assert await run_to_settled(supervisor, client, task_id) == "awaiting_internal_review"
+
+    summary = client.get(f"/v1/tasks/{task_id}").json()["gate_summary"]
+    assert summary["failing"] == []
+    assert summary["results"][GateName.REPORT_PRESENT] == "fail"
+    listed = {item["gate"]: item["detail"] for item in summary["for_reviewer"]}
+    detail = listed[GateName.REPORT_PRESENT]
+    assert "report.yaml is not YAML: mapping values are not allowed here" in detail
+    assert "at line 1, column 12" in detail
+    assert "live run" not in detail
+
+    [wake] = [
+        w
+        for w in client.get("/v1/wakes").json()["items"]
+        if w["reason"] == "internal_review_needed" and w["task_id"] == task_id
+    ]
+    [item] = [i for i in wake["payload"]["for_reviewer"] if i["gate"] == "report_present"]
+    assert "mapping values are not allowed here" in item["detail"]
+
+
+async def test_no_report_at_all_still_stops_the_task(
+    client: TestClient, supervisor: Supervisor
+) -> None:
+    """ADR 0024: only a report that is genuinely absent always blocks."""
+    task_id = submit_and_start(
+        client, "crucible-worker:fake-succeed-noreport", deliverables=ARTIFACTS_DELIVERABLE
+    )
+    assert await run_to_settled(supervisor, client, task_id) == "pre_pr_gates_failed"
+    summary = client.get(f"/v1/tasks/{task_id}").json()["gate_summary"]
+    assert GateName.REPORT_PRESENT in summary["failing"]
+    assert GateName.REPORT_PRESENT not in {i["gate"] for i in summary["for_reviewer"]}
 
 
 @pytest.mark.parametrize(
@@ -150,22 +284,25 @@ async def test_each_fail_fixture_fails_its_gate(
 async def test_a_commit_by_another_author_without_the_trailer_reaches_review(
     client: TestClient, supervisor: Supervisor
 ) -> None:
-    """hades FDY-0143 (operator decision, 2026-09-29): the commit_policy gate passes and
-    puts the author difference in its detail for the reviewer; nothing checks the
-    trailer."""
+    """hades FDY-0143 (operator decision, 2026-09-29): commit_policy is always advisory,
+    so the author difference fails it and is listed for the reviewer, and the task goes
+    on to review; nothing checks the trailer."""
     task_id = submit_and_start(client, "crucible-worker:fake-other-author", external_id="HT-0007")
     assert await run_to_settled(supervisor, client, task_id) == "awaiting_internal_review"
     attempt_id = latest_attempt(client, task_id)
     results = gates(client, attempt_id)
-    assert results[GateName.COMMIT_POLICY] == "pass"
+    assert results[GateName.COMMIT_POLICY] == "fail"
     rows = client.get(f"/v1/attempts/{attempt_id}/gates").json()["items"]
     detail = next(r["detail"] for r in rows if r["gate"] == GateName.COMMIT_POLICY)
-    head = client.get(f"/v1/tasks/{task_id}").json()["head_sha"]
+    view = client.get(f"/v1/tasks/{task_id}").json()
+    head = view["head_sha"]
     assert detail == (
-        "for the reviewer: 1 commit(s) not authored as "
+        "1 commit(s) not authored as "
         f"crucible-worker@users.noreply.github.com ({head[:12]} by someone-else@example.test)"
     )
     assert "trailer" not in detail
+    assert {"gate": "commit_policy", "detail": detail} in view["gate_summary"]["for_reviewer"]
+    assert "commit_policy" not in view["gate_summary"]["failing"]
     kinds = event_kinds(client, task_id)
     assert "task_pre_pr_gates_failed" not in kinds
 
@@ -188,7 +325,7 @@ async def test_correction_loop_from_pre_pr_gates_failed(
     client: TestClient, supervisor: Supervisor
 ) -> None:
     task_id = submit_and_start(
-        client, "crucible-worker:fake-out-of-scope", deliverables=ARTIFACTS_DELIVERABLE
+        client, "crucible-worker:fake-prohibited-path", deliverables=ARTIFACTS_DELIVERABLE
     )
     assert await run_to_settled(supervisor, client, task_id) == "pre_pr_gates_failed"
     failed_head = client.get(f"/v1/tasks/{task_id}").json()["head_sha"]
@@ -243,7 +380,7 @@ async def test_needs_more_work_then_a_correction(
 async def test_a_correction_that_widens_scope_is_refused(
     client: TestClient, supervisor: Supervisor
 ) -> None:
-    task_id = submit_and_start(client, "crucible-worker:fake-out-of-scope")
+    task_id = submit_and_start(client, "crucible-worker:fake-prohibited-path")
     await run_to_settled(supervisor, client, task_id)
     document = correction_document(client, task_id, image="crucible-worker:fake-succeed")
     document["scope"] = {**document["scope"], "allowed_paths": ["**"]}

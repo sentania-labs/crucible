@@ -13,7 +13,7 @@ from crucible.application.admin.harnesses import list_images, read_harnesses
 from crucible.application.admin.providers import providers_status
 from crucible.application.admin.routing import gateway_url
 from crucible.application.publish import publishing_waits
-from crucible.application.queries import supervisor_view
+from crucible.application.queries import reviewer_items, supervisor_view
 from crucible.domain.entities import Principal, Role
 from crucible.domain.lifecycle import AttemptState, TaskState
 from crucible.ports.repository import UnitOfWork
@@ -24,6 +24,12 @@ LISTED_STATES = (
     TaskState.PUBLISH_FAILED,
     TaskState.CI_CERTIFICATION_FAILED,
     TaskState.HEAD_DIVERGED,
+)
+# ADR 0024: the states in which a task's pre-PR gates are what a person reads next.
+GATE_STATES = (
+    TaskState.AWAITING_INTERNAL_REVIEW,
+    TaskState.PRE_PR_GATES_FAILED,
+    TaskState.AWAITING_ACCEPTANCE,
 )
 CAPABILITY_PARTS = ("harnesses", "providers", "github", "workers", "tasks", "wakes")
 
@@ -82,7 +88,38 @@ def tasks(uow: UnitOfWork, *, owner: str | None = None) -> dict[str, Any]:
         if owner is None or t.principal_id == owner
     }
     waiting = [item for item in publishing_waits(uow) if item["task_id"] in mine]
-    return {"counts": counts, "lists": lists, "publishing_waiting": waiting}
+    gates = [
+        _task_gates(uow, t)
+        for state in GATE_STATES
+        for t in uow.tasks.list_by_state(state)
+        if owner is None or t.principal_id == owner
+    ]
+    return {"counts": counts, "lists": lists, "publishing_waiting": waiting, "gates": gates}
+
+
+def _task_gates(uow: UnitOfWork, task: Any) -> dict[str, Any]:
+    """Each pre-PR gate on the task's current head, marked blocking or advisory, and
+    what the reviewer is asked to weigh (ADR 0024)."""
+    rows = [
+        r
+        for r in uow.gate_results.list_for_task(task.id)
+        if r.phase == "pre_pr" and r.head_sha == (task.head_sha or "")
+    ]
+    return {
+        "id": task.id,
+        "external_id": task.external_id,
+        "state": task.state.value,
+        "gates": [
+            {
+                "gate": r.gate,
+                "result": r.result,
+                "classification": "blocking" if r.blocking else "advisory",
+                "detail": r.detail,
+            }
+            for r in sorted(rows, key=lambda r: r.gate)
+        ],
+        "for_reviewer": reviewer_items(rows),
+    }
 
 
 def wakes(uow: UnitOfWork, *, owner: str | None = None) -> dict[str, Any]:

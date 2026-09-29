@@ -5,9 +5,10 @@
 1. **Worker completion.** The worker wrote a `CompletionClaimV1`, made local
    commits on `work_branch`, ran every required check, and exited 0. A
    claim.
-2. **Crucible completion.** Every pre-PR gate the policy requires has `pass`
-   for the collected head, the internal review is recorded, and the evidence
-   rows the gates used exist. Recorded as task state `gates_passed`. After
+2. **Crucible completion.** No blocking pre-PR gate the policy requires has
+   failed for the collected head, the internal review is recorded, and the
+   evidence rows the gates used exist. A failed advisory gate is listed for the
+   reviewer instead (ADR 0024). Recorded as task state `gates_passed`. After
    publication, Crucible completion extends to the post-PR gates: external
    review rounds received and dispositioned, CI certification green on the
    final head. Recorded as `ready_for_merge`.
@@ -75,7 +76,10 @@ fix every problem before exiting 0. A unit test holds the checker and the
 schema in agreement.
 
 All paths are relative to `/crucible/report`. Missing or unparsable report is
-a report-gate failure.
+a report-gate failure. An unparsable report is advisory by default (ADR 0024):
+the reviewer sees it and decides; a file that is not YAML is unparsable, not
+missing, and its parse error names the problem and position. No report at all
+stops the task.
 The claim has no `pushed`, `pull_request`, or `ci` fields: workers cannot
 push and never see CI. Those facts are Crucible's to observe.
 
@@ -113,26 +117,39 @@ it cannot check stays with Foundry or the user.
 
 ## Pre-PR gates (evaluated on the collected head, before any push)
 
-| Gate | Passes when | Evidence consumed |
-|---|---|---|
-| `report_present` | report parsed once Crucible filled its facts, every judgement field present; the detail names the facts Crucible filled and any the worker wrote differently (hades #215) | CompletionClaim artifact |
-| `exit_clean` | exit code 0 and exit class `completed` or `completed_without_report` (an `incomplete` attempt exits 0 too, issue 128) | attempt exit info |
-| `commits_present` | the collected `work_branch` has at least one commit beyond `base_ref`, the bundle verifies, and the bundle names its head. The head is the bundle's; a reported `head_sha` that differs is noted in the gate's detail and does not fail it (hades #187, 2026-09-28) | branch bundle from `collect` |
-| `scope_contained` | every changed path matches `allowed_paths` and none matches `prohibited_paths` | diff path list from `collect` |
-| `no_injected_files` | `AGENTS.md`, `CLAUDE.md`, other shims, `.crucible/`, and identity paths absent from diff and from any commit on `work_branch` | diff, `git log --stat` |
-| `no_secrets` | secret scanner over the diff, every commit message, and the report finds nothing | scanner output artifact |
-| `verification_ran` | for each `required_verification` command: Crucible itself re-ran the command after exit, in a fresh verifier container from the collected tree (same image, `network` per policy), and its exit matches `expect_exit`. The worker's own check logs are stored as a claim and shown to Foundry, never consumed by the gate | verifier exit and log (verified) |
-| `run_evidence_present` | each `kind: artifact` verification path exists and is non-empty | artifacts |
-| `criteria_mapped` | every `acceptance_criteria.id` appears in `acceptance_mapping` with a status | report |
-| `dependencies_unchanged` | when `may_add_dependencies` is false: lockfiles and manifests unchanged | diff |
-| `ci_unchanged` | when `may_modify_ci` is false: no change under workflow paths | diff |
-| `workspace_clean` | no leftover ephemeral clusters or containers labeled for this attempt | provider reconcile |
-| `internal_review_recorded` | a `ReviewReportV1` for this exact head SHA exists from a reviewer that is not the implementing attempt; `pending` until then (the task waits in `awaiting_internal_review`) | review report with reviewer identity |
-| `commit_policy` | always, once the collector has run: it is information for the reviewer, not a check that stops a branch. The collector compares each new commit's author with the policy's `author_email`, and the detail names any commit authored by someone else, by hash and address. The attempt trailer is not checked. `skipped` only for an attempt collected before the check existed; when the collector could not read the commits the gate still passes and says so (hades FDY-0135; made informational by the operator's decision of 2026-09-29, FDY-0143, that the trailer is not required and the task record is the paper trail) | collector's author check over the collected checkout's commits, the ones the bundle carries |
+Each pre-PR gate is **blocking** or **advisory** (ADR 0024, the operator's
+decision of 2026-09-29). A failed blocking gate sends the task to
+`pre_pr_gates_failed`. A failed advisory gate is recorded with its detail and
+listed "for the reviewer" in the task view, the gate list, the admin UI's
+Tasks page and the wake, and the task goes on to its internal review, or to
+acceptance when the policy requires no review for that head. The policy's
+`gates.advisory` decides (05b); the default is below, and
+`internal_review_recorded` and `no_secrets` always block, and `commit_policy`
+is always advisory.
+`error` counts as `fail` in both classes.
+
+| Gate | Default | Passes when | Evidence consumed |
+|---|---|---|---|
+| `report_present` | advisory, except no report at all | report parsed once Crucible filled its facts, every judgement field present; the detail names the facts Crucible filled and any the worker wrote differently (hades #215) | CompletionClaim artifact |
+| `exit_clean` | blocking | exit code 0 and exit class `completed` or `completed_without_report` (an `incomplete` attempt exits 0 too, issue 128) | attempt exit info |
+| `commits_present` | blocking | the collected `work_branch` has at least one commit beyond `base_ref`, the bundle verifies, and the bundle names its head. The head is the bundle's; a reported `head_sha` that differs is noted in the gate's detail and does not fail it (hades #187, 2026-09-28) | branch bundle from `collect` |
+| `scope_contained` | advisory, except a prohibited path | every changed path matches `allowed_paths` and none matches `prohibited_paths`. A path matching `prohibited_paths` stops the task even when the gate is advisory; a path merely outside `allowed_paths` is for the reviewer | diff path list from `collect` |
+| `no_injected_files` | blocking | `AGENTS.md`, `CLAUDE.md`, other shims, `.crucible/`, and identity paths absent from diff and from any commit on `work_branch` | diff, `git log --stat` |
+| `no_secrets` | always blocking | secret scanner over the diff, every commit message, and the report finds nothing | scanner output artifact |
+| `verification_ran` | blocking | for each `required_verification` command: Crucible itself re-ran the command after exit, in a fresh verifier container from the collected tree (same image, `network` per policy), and its exit matches `expect_exit`. The worker's own check logs are stored as a claim and shown to Foundry, never consumed by the gate. A check the worker's report says passed and the re-run failed is also recorded as the advisory finding "the worker reported V3 passing; Crucible's re-run failed it" (ADR 0024) | verifier exit and log (verified) |
+| `run_evidence_present` | advisory | each `kind: artifact` verification path exists and is non-empty | artifacts |
+| `criteria_mapped` | advisory | every `acceptance_criteria.id` appears in `acceptance_mapping` with a status | report |
+| `dependencies_unchanged` | blocking | when `may_add_dependencies` is false: lockfiles and manifests unchanged | diff |
+| `ci_unchanged` | blocking | when `may_modify_ci` is false: no change under workflow paths | diff |
+| `workspace_clean` | blocking | no leftover ephemeral clusters or containers labeled for this attempt | provider reconcile |
+| `internal_review_recorded` | always blocking | a `ReviewReportV1` for this exact head SHA exists from a reviewer that is not the implementing attempt; `pending` until then (the task waits in `awaiting_internal_review`) | review report with reviewer identity |
+| `commit_policy` | always advisory | every new commit is authored with the policy's `author_email`. The collector checks each commit's author, and a commit authored by someone else fails the gate, named by hash and address in the detail, so it is listed for the reviewer; it never stops the task. The attempt trailer is not checked. `skipped` only for an attempt collected before the check existed; `fail` (advisory) when the collector could not read the commits. The operator decided on 2026-09-29 that the trailer is not required and the task record is the paper trail (hades FDY-0143); before that the gate blocked (FDY-0135) | collector's author check over the collected checkout's commits, the ones the bundle carries |
 
 `commit_policy` is evaluated whatever `gates.pre_pr` lists, and a policy may
 not name it, so the reviewer always sees who authored the commits and a
-policy stored before the gate existed still gets it.
+policy stored before the gate existed still gets it. It is always advisory,
+whatever `gates.advisory` lists, and `gates.advisory` may not name it
+either.
 
 ## Publication and post-PR gates (23)
 
@@ -148,8 +165,10 @@ Three evaluation rules. A pre-PR gate whose evidence is produced by
 collection (`report_present`, `exit_clean`, `commits_present`,
 `scope_contained`, `no_injected_files`, `no_secrets`,
 `run_evidence_present`, `criteria_mapped`, `dependencies_unchanged`,
-`ci_unchanged`, `commit_policy`) and is absent after collection is `fail`, not `pending`,
-so a failed attempt reaches `pre_pr_gates_failed` unambiguously.
+`ci_unchanged`, `commit_policy`) and is absent after collection is `fail`,
+not `pending`, so a failed attempt reaches `pre_pr_gates_failed`
+unambiguously when that gate blocks, and is listed for the reviewer when it
+is advisory.
 `internal_review_recorded` is the one pre-PR gate whose evidence arrives
 after collection; it stays `pending` and the task waits in
 `awaiting_internal_review`. A gate whose evaluator belongs to a later

@@ -2901,6 +2901,178 @@ def test_command_timeout_through_api_cli_and_ui(
     assert len([k for k in kinds if k[0] == "command_timeout_updated"]) == 3
 
 
+def test_advisory_gates_through_api_cli_and_ui(
+    ctx: AppContext,
+    tokens: dict[str, str],
+    admin_client: TestClient,
+    live_supervisor: Supervisor,
+    config_file: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """ADR 0024: which pre-PR gates are advisory is a policy field with API, CLI and UI
+    parity. Each save writes a new policy version with only that list changed; making a
+    gate outside the default set advisory is recorded as an operator decision."""
+    asyncio.run(live_supervisor.tick())
+    first = admin_client.get("/v1/admin/gates/advisory").json()
+    assert first["advisory"] == [
+        "commit_policy",
+        "criteria_mapped",
+        "report_present",
+        "run_evidence_present",
+        "scope_contained",
+    ]
+    assert first["always_advisory"] == ["commit_policy"]
+    assert "no_secrets" in first["blocking"] and "internal_review_recorded" in first["blocking"]
+    start = first["policy"]["version"]
+
+    saved = admin_client.post(
+        "/v1/admin/gates/advisory",
+        json={"reason": "api: scope blocks here", "advisory": ["report_present"]},
+    )
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["advisory"] == ["commit_policy", "report_present"]
+    assert not saved.json()["default"]
+    assert "scope_contained" in saved.json()["blocking"]
+    stored = admin_client.get(f"/v1/policies/default-software/{start + 1}").json()["document"]
+    assert stored["gates"]["advisory"] == ["report_present"]
+    previous = admin_client.get(f"/v1/policies/default-software/{start}").json()["document"]
+
+    def rest(document: dict[str, Any]) -> dict[str, Any]:
+        normal = PolicyV1.model_validate(document).model_dump(mode="json")
+        del normal["version"], normal["description"], normal["gates"]["advisory"]
+        return normal
+
+    assert rest(stored) == rest(previous)
+
+    for body in (
+        {"reason": "api: the review", "advisory": ["internal_review_recorded"]},
+        {"reason": "api: secrets", "advisory": ["no_secrets"]},
+        {"reason": "api: no such gate", "advisory": ["no_such_gate"]},
+        {"reason": "api: post-PR", "advisory": ["ci_green_for_head"]},
+        {"reason": "api: not a list", "advisory": "scope_contained"},
+    ):
+        refused = admin_client.post("/v1/admin/gates/advisory", json=body)
+        assert refused.status_code == 422, (body, refused.text)
+    assert admin_client.get("/v1/admin/gates/advisory").json()["policy"]["version"] == start + 1
+
+    cli_view = run_cli(config_file, "gates", "advisory", capsys=capsys)
+    assert cli_view["advisory"] == ["commit_policy", "report_present"]
+    cli_saved = run_cli(
+        config_file,
+        "--reason",
+        "cli: CI edits go to the reviewer",
+        "gates",
+        "set-advisory",
+        "--gate=ci_unchanged",
+        "--gate=scope_contained",
+        capsys=capsys,
+    )
+    assert cli_saved["advisory"] == ["ci_unchanged", "commit_policy", "scope_contained"]
+    assert cli_saved["policy"]["version"] == start + 2
+    decisions = [
+        d
+        for d in admin_client.get("/v1/admin/audit", params={"limit": 200}).json()["items"]
+        if d["kind"] == "policy_uploaded"
+    ]
+    assert any(
+        "gates.advisory.ci_unchanged" in (d["payload"].get("operator_only_settings") or [])
+        for d in decisions
+    )
+
+    with TestClient(create_app(ctx)) as browser:
+        csrf = ui_sign_in(browser, tokens["admin"])
+        page = browser.get("/ui/routing")
+        assert page.status_code == 200
+        assert "Advisory gates" in page.text
+        assert 'action="/ui/actions/gate-classes"' in page.text
+        assert 'name="advisory_ci_unchanged" value="true" checked' in page.text
+        assert 'name="advisory_internal_review_recorded"' not in page.text
+        assert 'name="advisory_no_secrets"' not in page.text
+        ui_saved = browser.post(
+            "/ui/actions/gate-classes",
+            data={
+                "csrf": csrf,
+                "advisory_criteria_mapped": "true",
+                "advisory_report_present": "true",
+                "advisory_run_evidence_present": "true",
+                "advisory_scope_contained": "true",
+                "reason": "ui: back to the default set",
+                "return_to": "/ui/routing",
+            },
+            follow_redirects=False,
+        )
+        assert ui_saved.status_code == 303
+        assert "Completed" in unquote(ui_saved.headers.get("location", ""))
+    final = admin_client.get("/v1/admin/gates/advisory").json()
+    assert final["advisory"] == first["advisory"]
+    assert final["policy"]["version"] == start + 3
+    kinds = audit_kinds(admin_client)
+    assert ("policy_uploaded", "admin-principal") in kinds
+    assert ("policy_uploaded", "crucible-admin") in kinds
+
+
+async def test_the_tasks_page_marks_each_gate_and_lists_what_is_for_the_reviewer(
+    ctx: AppContext,
+    tokens: dict[str, str],
+    client: TestClient,
+    provider: FakeProvider,
+    admin_ctx: AdminContext,
+) -> None:
+    """ADR 0024: a task at its internal review shows every pre-PR gate as blocking or
+    advisory, and the failed advisory ones with their detail under For the reviewer."""
+    from tests.integration.conftest import (  # noqa: PLC0415
+        ARTIFACTS_DELIVERABLE,
+        make_supervisor,
+        run_to_settled,
+        submit_and_start,
+    )
+    from tests.integration.test_report_facts import judgement_only  # noqa: PLC0415
+
+    report = judgement_only()
+    del report["risks"]
+    provider.set_report("EX-0001", report)
+    task_id = submit_and_start(
+        client, "crucible-worker:fake-out-of-scope", deliverables=ARTIFACTS_DELIVERABLE
+    )
+    supervisor = make_supervisor(ctx, provider)
+    assert await run_to_settled(supervisor, client, task_id) == "awaiting_internal_review"
+    with TestClient(create_app(ctx)) as browser:
+        ui_sign_in(browser, tokens["admin"])
+        page = html.unescape(browser.get("/ui/tasks").text)
+    assert "Gates by task" in page and "For the reviewer" in page
+    assert "scope_contained (advisory)" in page and "no_secrets (blocking)" in page
+    assert "scope_contained: outside allowed_paths" in page
+    assert "infrastructure/outside-the-contract.txt" in page
+    assert "report_present: the report did not parse" in page
+
+
+def test_the_cli_remote_mode_sends_the_advisory_gates(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[str, str, Any]] = []
+
+    def fake_call(self: Any, method: str, path: str, body: Any = None, **_: Any) -> Any:
+        calls.append((method, path, body))
+        return {"policy": {}, "advisory": ["scope_contained"], "blocking": []}
+
+    monkeypatch.setattr(Api, "call", fake_call)
+    monkeypatch.setenv(ADMIN_TOKEN_ENV, "cru_" + "0" * 26 + "." + "s" * 40)
+    admin_main(["--api-url", "http://127.0.0.1:1", "gates", "advisory"])
+    admin_main(
+        [
+            "--api-url",
+            "http://127.0.0.1:1",
+            "--reason",
+            "r",
+            "gates",
+            "set-advisory",
+            "--gate=scope_contained",
+        ]
+    )
+    assert calls == [
+        ("GET", "/v1/admin/gates/advisory", None),
+        ("POST", "/v1/admin/gates/advisory", {"reason": "r", "advisory": ["scope_contained"]}),
+    ]
+
+
 def test_the_cli_remote_mode_sends_the_command_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[tuple[str, str, Any]] = []
 

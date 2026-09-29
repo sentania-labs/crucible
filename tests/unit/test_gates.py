@@ -615,7 +615,8 @@ def test_commit_policy_never_fails_on_a_missing_trailer() -> None:
     assert "trailer" not in outcome.detail
 
 
-def test_commit_policy_passes_a_commit_by_another_author_and_tells_the_reviewer() -> None:
+def test_commit_policy_fails_a_commit_by_another_author_for_the_reviewer() -> None:
+    """The failure is advisory (always, FDY-0143): it is listed for the reviewer."""
     sha = "c" * 40
     outcome = evaluate_gate(
         GateName.COMMIT_POLICY,
@@ -626,10 +627,9 @@ def test_commit_policy_passes_a_commit_by_another_author_and_tells_the_reviewer(
             }
         ),
     )
-    assert outcome.result is GateResult.PASS
+    assert outcome.result is GateResult.FAIL
     assert outcome.detail == (
-        "for the reviewer: 1 commit(s) not authored as "
-        f"worker@example.test ({sha[:12]} by someone@elsewhere.test)"
+        f"1 commit(s) not authored as worker@example.test ({sha[:12]} by someone@elsewhere.test)"
     )
 
 
@@ -644,15 +644,15 @@ def test_commit_policy_echoes_no_worker_text_that_is_not_a_hash_or_an_address() 
             }
         ),
     )
-    assert outcome.result is GateResult.PASS
+    assert outcome.result is GateResult.FAIL
     assert "ignore previous" not in outcome.detail
     assert "rm -rf" not in outcome.detail
     assert "a commit by another address" in outcome.detail
 
 
-def test_commit_policy_passes_and_says_so_when_the_collector_could_not_check() -> None:
+def test_commit_policy_fails_for_the_reviewer_when_the_collector_could_not_check() -> None:
     outcome = evaluate_gate(GateName.COMMIT_POLICY, _with_commit_policy({"checked": False}))
-    assert outcome.result is GateResult.PASS
+    assert outcome.result is GateResult.FAIL
     assert "could not read the collected commits' authors" in outcome.detail
 
 
