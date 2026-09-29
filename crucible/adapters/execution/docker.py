@@ -89,6 +89,7 @@ from crucible.ports.execution import (
     PACKAGE_CACHE_MOUNT,
     REPO_MOUNT,
     REPORT_MOUNT,
+    VERIFIER_CACHE_LEAF,
     VERIFY_MOUNT,
     WORK_MOUNT,
     CancelCheck,
@@ -1205,7 +1206,7 @@ class DockerProvider:
                 self._daemon_mount(spec.attempt_id, "output/tree", REPO_MOUNT, read_only=False),
                 self._daemon_mount(spec.attempt_id, "verify", VERIFY_MOUNT, read_only=False),
                 self._daemon_mount(
-                    spec.attempt_id, PACKAGE_CACHE_LEAF, PACKAGE_CACHE_MOUNT, read_only=False
+                    spec.attempt_id, VERIFIER_CACHE_LEAF, PACKAGE_CACHE_MOUNT, read_only=False
                 ),
             ],
             network=network,

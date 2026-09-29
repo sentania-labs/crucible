@@ -25,6 +25,7 @@ from crucible.ports.execution import (
     PACKAGE_CACHE_LEAF,
     REPO_MOUNT,
     REPORT_MOUNT,
+    VERIFIER_CACHE_LEAF,
     VERIFY_MOUNT,
     WORK_MOUNT,
 )
@@ -367,8 +368,9 @@ touch "$REPO/.git/info/exclude"
 # it through the daemon before the worker starts and removes it right after the
 # sync-back.
 mkdir -m 0700 -p {WORK_MOUNT}/credential
-# FDY-0140: the package caches, owned by the worker's uid like the checkout.
-mkdir -p {WORK_MOUNT}/{PACKAGE_CACHE_LEAF}
+# FDY-0140: the package caches, the worker's and the verifier's, owned by the worker's
+# uid like the checkout.
+mkdir -p {WORK_MOUNT}/{PACKAGE_CACHE_LEAF} {WORK_MOUNT}/{VERIFIER_CACHE_LEAF}
 
 mkdir -p "$OUT"
 {GIT} rev-parse HEAD > "$OUT/prepared-head.txt"

@@ -92,6 +92,7 @@ from crucible.ports.execution import (
     PACKAGE_CACHE_MOUNT,
     REPO_MOUNT,
     REPORT_MOUNT,
+    VERIFIER_CACHE_LEAF,
     VERIFY_MOUNT,
     WORK_MOUNT,
     CancelCheck,
@@ -3743,7 +3744,7 @@ class KubernetesProvider:
             mounts=[
                 Mount("ws", REPO_MOUNT, sub_path="output/tree"),
                 Mount("ws", VERIFY_MOUNT, sub_path="verify"),
-                Mount("ws", PACKAGE_CACHE_MOUNT, sub_path=PACKAGE_CACHE_LEAF),
+                Mount("ws", PACKAGE_CACHE_MOUNT, sub_path=VERIFIER_CACHE_LEAF),
             ],
             volumes=[self._claim_volume(spec.attempt_id)],
             limits=limits,

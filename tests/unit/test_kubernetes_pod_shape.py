@@ -235,11 +235,12 @@ async def test_the_preparer_gets_the_whole_claim_and_the_collector_its_leaves(
     assert verifier[REPO_MOUNT]["subPath"] == "output/tree"
     assert verifier[VERIFY_MOUNT]["subPath"] == "verify"
     assert OUTPUT_MOUNT not in verifier
-    # FDY-0140: the package caches are a claim leaf, shared by the worker and the
-    # verifier, never the memory-backed home.
+    # FDY-0140: the package caches are claim leaves, never the memory-backed home, and
+    # the verifier's is its own: a cache the worker wrote is never what it runs from.
     worker = mounts("worker-")
+    assert worker[PACKAGE_CACHE_MOUNT]["subPath"] == "pkg-cache"
+    assert verifier[PACKAGE_CACHE_MOUNT]["subPath"] == "pkg-cache-verifier"
     for pod in (worker, verifier):
-        assert pod[PACKAGE_CACHE_MOUNT]["subPath"] == "pkg-cache"
         assert pod[PACKAGE_CACHE_MOUNT]["readOnly"] is False
     worker_env = {e["name"]: e.get("value") for e in pod_of(api, "worker-")["containers"][0]["env"]}
     assert worker_env["UV_CACHE_DIR"] == "/crucible/pkg-cache/uv"
