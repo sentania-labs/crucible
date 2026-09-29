@@ -181,14 +181,34 @@ def _count(n: int, one: str, many: str) -> str:
     return f"{n} {one if n == 1 else many}"
 
 
-def _paths_difference(worker: Any, crucible: list[str], what: str) -> str | None:
+REPORT_PREFIX = "report/"
+_REPORT_MOUNT_PREFIX = "/crucible/report/"
+
+
+def _as_report_path(path: str) -> str:
+    """A run-evidence path as Crucible names it, `report/<name>`. IDENTITY.md tells the
+    worker paths resolve against the report directory, so `V1.log`,
+    `report/V1.log` and `/crucible/report/V1.log` are the same file."""
+    if path.startswith(_REPORT_MOUNT_PREFIX):
+        path = path[len(_REPORT_MOUNT_PREFIX) :]
+    return path if path.startswith(REPORT_PREFIX) else REPORT_PREFIX + path
+
+
+def _paths_difference(
+    worker: Any, crucible: list[str], what: str, *, report_paths: bool = False
+) -> str | None:
+    """Changed files are compared both ways. Run evidence only one way: Crucible collects
+    every file in the report directory (logs, progress, transcript), and the worker lists
+    the ones that are evidence, so only a listed file Crucible did not collect is news."""
     if not isinstance(worker, list) or not all(isinstance(p, str) for p in worker):
         return "not a list of paths"
     listed, actual = set(worker), set(crucible)
+    if report_paths:
+        listed = {_as_report_path(p) for p in listed}
     parts = []
     if listed - actual:
         parts.append(_count(len(listed - actual), "path", "paths") + f" listed that {what}")
-    if actual - listed:
+    if not report_paths and actual - listed:
         parts.append(_count(len(actual - listed), "path", "paths") + " not listed")
     return "; ".join(parts) or None
 
@@ -243,7 +263,7 @@ def _difference(name: str, worker: Any, crucible: Any) -> str | None:
     if name == "changed_files":
         return _paths_difference(worker, crucible, "the collected diff does not change")
     if name == "run_evidence":
-        return _paths_difference(worker, crucible, "Crucible did not collect")
+        return _paths_difference(worker, crucible, "Crucible did not collect", report_paths=True)
     if name == "refs":
         return _refs_difference(worker, crucible)
     return _checks_difference(worker, crucible)

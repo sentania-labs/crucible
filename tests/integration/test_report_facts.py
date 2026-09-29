@@ -130,3 +130,21 @@ async def test_a_report_missing_judgement_fails_report_present_in_its_own_words(
     assert rows[GateName.REPORT_PRESENT]["result"] == "fail"
     errors = client.get(f"/v1/attempts/{attempt_id}").json()["report"]["parse_errors"]
     assert sorted(".".join(e["loc"]) for e in errors) == ["limitations", "summary"]
+
+
+async def test_a_null_fact_is_left_out_and_filled_not_a_crash(
+    client: TestClient, supervisor: Supervisor, provider: FakeProvider
+) -> None:
+    """`refs: null` reads as left out: Crucible fills it, and the worker's own head is
+    simply absent from commits_present's note (review of hades #215)."""
+    report = judgement_only()
+    report.update({"refs": None, "checks": None, "changed_files": None})
+    provider.set_report("EX-0001", report)
+    task_id = submit_and_start(
+        client, "crucible-worker:fake-succeed", deliverables=ARTIFACTS_DELIVERABLE
+    )
+    assert await run_to_settled(supervisor, client, task_id) == "awaiting_internal_review"
+    _, rows = gate_rows(client, task_id)
+    assert rows[GateName.REPORT_PRESENT]["result"] == "pass"
+    assert rows[GateName.COMMITS_PRESENT]["result"] == "pass"
+    assert "the report named no head_sha" in rows[GateName.COMMITS_PRESENT]["detail"]

@@ -114,9 +114,11 @@ def claim_facts(task: Task, outputs: CollectedOutputs) -> ClaimFacts:
     return ClaimFacts(
         task_external_id=task.external_id,
         changed_files=tuple(outputs.diff_paths),
+        # No refs of Crucible's own without a collected branch that names itself and its
+        # head; the worker's, if any, then stands as written.
         refs=(
             {"branch": bundle.work_branch, "head_sha": bundle.head_sha, "commits": bundle.commits}
-            if bundle is not None
+            if bundle is not None and bundle.work_branch and bundle.head_sha
             else None
         ),
         checks=tuple(
@@ -298,7 +300,9 @@ def record_collection_evidence(
     if outputs.bundle is not None:
         bundle = outputs.bundle
         head_sha = bundle.head_sha
-        claimed = (claim or {}).get("refs", {}).get("head_sha") if claim else None
+        # The worker's own refs, when it wrote a mapping; `refs: null` or text is no head.
+        claimed_refs = claim.get("refs") if claim else None
+        claimed = claimed_refs.get("head_sha") if isinstance(claimed_refs, dict) else None
         _add(
             uow,
             clock,

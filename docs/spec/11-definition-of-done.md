@@ -58,7 +58,10 @@ bundle, `checks` from its own verifier re-run and `run_evidence` from the run
 evidence it copied out. A fact the worker did write is compared with
 Crucible's and replaced by it; each difference is recorded as information in
 the `report_present` detail, in words that repeat nothing of the worker's but
-a hash or a number, and never fails the gate. The stored report is the
+a hash or a number, and never fails the gate. Run evidence is compared one
+way: Crucible collects every file in the report directory, so only a path the
+worker listed that Crucible did not collect is a difference, and `V1.log`,
+`report/V1.log` and `/crucible/report/V1.log` name the same file. The stored report is the
 completed document; the worker's own document is kept as the worker's claim.
 `acceptance_mapping` may be a list of entries or a mapping keyed by criterion
 id (`AC1: {status: met, evidence: "..."}`); Crucible stores the list form.

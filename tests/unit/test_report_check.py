@@ -230,6 +230,9 @@ def _variants() -> list[tuple[str, dict[str, Any]]]:
     version = copy.deepcopy(whole)
     version["schema_version"] = "CompletionClaimV1"
     out.append(("the schema's name as the version", version))
+    newline = copy.deepcopy(whole)
+    newline["schema_version"] = "1.0\n"
+    out.append(("a version with a trailing newline", newline))
     floating = copy.deepcopy(whole)
     floating["schema_version"] = 1.0
     out.append(("an unquoted version", floating))
@@ -349,8 +352,27 @@ def test_differences_are_described_without_the_worker_s_free_text() -> None:
         "head; commits another value, collected 1",
         "checks": "V1 not reported; V2 not reported; V3 not reported; 1 check Crucible "
         "did not re-run",
-        "run_evidence": "1 path not listed",
     }
+
+
+def test_run_evidence_is_named_as_crucible_names_it_and_compared_one_way() -> None:
+    """Crucible collects every file in the report directory, and the worker lists the
+    ones that are evidence, by any of the names IDENTITY.md makes equivalent. Only a
+    listed file Crucible did not collect is a difference."""
+    many = ClaimFacts(
+        task_external_id="HT-0004",
+        changed_files=(),
+        refs=None,
+        checks=(),
+        run_evidence=("report/run-evidence.md", "report/progress.jsonl", "report/v1.log"),
+    )
+    document = judgement_only()
+    document["run_evidence"] = ["run-evidence.md", "/crucible/report/v1.log"]
+    assert complete_claim(document, many).differences == ()
+    document["run_evidence"] = ["run-evidence.md", "report/missing.log"]
+    assert complete_claim(document, many).differences == (
+        {"field": "run_evidence", "detail": "1 path listed that Crucible did not collect"},
+    )
 
 
 def test_report_present_says_what_crucible_filled_and_where_the_report_differs() -> None:

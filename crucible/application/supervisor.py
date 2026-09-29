@@ -3424,7 +3424,9 @@ class Supervisor:
                 completed = complete_claim(outputs.report, claim_facts(task, outputs))
                 claim, errors = parse_claim(completed.document)
                 claim_ok = claim is not None
-                secret_hits = find_secrets(outputs.report)
+                # The worker's document and the completed one: Crucible's facts carry
+                # names the worker chose (changed paths, report file names).
+                secret_hits = find_secrets(outputs.report) + find_secrets(completed.document)
                 if secret_hits:
                     errors = errors + [
                         {"loc": [m.path], "msg": f"secret pattern {m.pattern}", "type": "secret"}
