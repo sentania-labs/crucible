@@ -44,10 +44,12 @@ from crucible.adapters.persistence.unit_of_work import SqlUnitOfWorkFactory, mak
 from crucible.adapters.storage.disk import DiskArtifactStore
 from crucible.application.auth import mint_token
 from crucible.application.harnesses import set_harness_enabled
+from crucible.application.repositories import register_repository
 from crucible.application.supervisor import Supervisor
+from crucible.contracts.api import ExternalReviewAttestation, RepositoryRegistration
 from crucible.domain.cluster_egress import ClusterEgress
 from crucible.domain.entities import Role
-from tests.e2e.conftest import e2e_contract, gate_results, register
+from tests.e2e.conftest import e2e_contract, gate_results
 from tests.e2e.test_kind import CreateRecordingClient, _recording_client
 from tests.fixtures import promote_for_test
 
@@ -348,7 +350,22 @@ async def test_hades_184_a_hermes_task_passes_the_repositorys_own_checks_in_the_
         _upload(admin, ctx)
 
     url = _repository("hades-self")
-    register(ctx, "hades-self", url)
+    with ctx.uow_factory() as uow:
+        register_repository(
+            uow,
+            clock,
+            principal_name="e2e-kind",
+            name="hades-self",
+            registration=RepositoryRegistration(
+                url=url,
+                default_branch="main",
+                policy_name="hades-self-hosting",
+                external_review=ExternalReviewAttestation(
+                    attested_all_prs=True, attested_by="e2e-kind"
+                ),
+            ),
+        )
+        uow.commit()
     document = e2e_contract("HADES-184-KIND", "hades-self", image)
     document["scope"]["allowed_paths"] = ["docs/**"]
     document["acceptance_criteria"] = [{"id": "AC1", "text": "docs/roadmap.md gains one line."}]
