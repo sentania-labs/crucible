@@ -87,6 +87,15 @@ def record_ci_decision(
             "action": decision.action,
             "reasoning": decision.reasoning,
             "head_sha": task.head_sha,
+            # hades FDY-0139: the failed runs this decision is about. After a rerun they
+            # are not counted again; any other failure is a new one.
+            "stale_failures": [
+                {"run_id": row.get("run_id"), "completed_at": row.get("completed_at")}
+                for row in (certification.failure.get("all") or [] if certification else [])
+                # A row recorded before FDY-0139 carries no run id; listing it would match
+                # nothing, so it is left out and the decision falls back to its time.
+                if isinstance(row, dict) and row.get("run_id")
+            ],
         },
     )
     if request.action is CIAction.RERUN:

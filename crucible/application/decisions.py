@@ -27,11 +27,14 @@ from crucible.domain.entities import (
 from crucible.domain.events import PRINCIPAL_CRUCIBLE, EventKind
 from crucible.domain.ids import new_id
 from crucible.domain.lifecycle import TaskState, check_transition
+from crucible.domain.waivers import WAIVABLE_STATES, WAIVER_KINDS
 from crucible.ports.clock import Clock
 from crucible.ports.repository import UnitOfWork
 
 DEFAULT_ESCALATION_STALE_HOURS = 24
-OPERATOR_ONLY_DECISION_KINDS = frozenset({"release_authorization"})
+# ADR 0025: waiving the remaining external review rounds, or accepting that a repository
+# has no CI, is the operator's call on one task, like authorizing a release.
+OPERATOR_ONLY_DECISION_KINDS = frozenset({"release_authorization", *WAIVER_KINDS})
 
 
 def open_escalation(
@@ -129,6 +132,13 @@ def record_decision(
         # Validated before anything is written: 11 level 4 says the verbatim words are the
         # record, and a refusal after the insert would roll them back with the rest.
         check_transition("escalation", escalation.id, escalation.state, EscalationState.ANSWERED)
+    if request.kind in WAIVER_KINDS and task.state not in WAIVABLE_STATES:
+        # A waiver is about a pull request Crucible is watching; anywhere else it would be
+        # a record that waives nothing, or one that surprises a later state.
+        raise TransitionNotAllowedError(
+            f"a {request.kind} decision is recorded while a pull request is under "
+            f"observation; task is {task.state.value}"
+        )
     if request.reschedule and task.state is not TaskState.BLOCKED:
         raise TransitionNotAllowedError(
             f"reschedule applies to a blocked task; task is {task.state.value}"

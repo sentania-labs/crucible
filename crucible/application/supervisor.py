@@ -2784,6 +2784,10 @@ class Supervisor:
                 repository_url.startswith("/") or repository_url.startswith("file://")
             )
             outcome = await self.delivery.push_quota_checkpoint(attempt_id, required=required)
+            if outcome is None:
+                # GitHub's rate limit: the checkpoint stays pending and a later tick pushes
+                # it, rather than the tick sleeping (hades FDY-0139).
+                return
         await self._db(partial(self._finish_deferred_quota, attempt_id, *outcome))
 
     def _attempt_by_id(self, attempt_id: str) -> Attempt | None:

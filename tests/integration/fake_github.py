@@ -89,6 +89,10 @@ class FakeGitHub:
         self.mint_failure_once = False
         self.mint_calls = 0
         self.workflow_log = b"fake workflow log: the required check failed\n"
+        # The signed log URLs GitHub redirects to, and whether any request for one carried
+        # an Authorization header (it must not: the URL is its own credential).
+        self.log_downloads: list[str] = []
+        self.log_download_authorized = False
         self.lock = threading.Lock()
         # A real git remote standing in for the repository's branches (the kind tier's
         # pushable git host): when set, a branch head is read from it, so what Crucible
@@ -152,6 +156,7 @@ class FakeGitHub:
                     "pull_request_review_id": review_id,
                     "created_at": now_iso(),
                     "updated_at": now_iso(),
+                    "reactions": {"total_count": 0},
                 }
             )
         repo.next_object_id += len(comments or [])
@@ -198,6 +203,7 @@ class FakeGitHub:
                 "pull_request_review_id": review_id,
                 "created_at": now_iso(),
                 "updated_at": now_iso(),
+                "reactions": {"total_count": 0},
             }
         )
         return comment_id
@@ -218,6 +224,7 @@ class FakeGitHub:
                 "body": body,
                 "created_at": now_iso(),
                 "updated_at": now_iso(),
+                "reactions": {"total_count": 0},
             }
         )
         return comment_id
@@ -231,12 +238,14 @@ class FakeGitHub:
         status: str = "completed",
         conclusion: str | None = "success",
         run_id: str = "9001",
+        completed_at: str | None = None,
     ) -> None:
         repo = self.repositories[full_name]
         runs = repo.check_runs.setdefault(sha, [])
+        done = completed_at or (now_iso() if status == "completed" else None)
         for run in runs:
             if run["name"] == name:
-                run.update({"status": status, "conclusion": conclusion})
+                run.update({"status": status, "conclusion": conclusion, "completed_at": done})
                 return
         runs.append(
             {
@@ -247,7 +256,33 @@ class FakeGitHub:
                 "head_sha": sha,
                 "html_url": f"https://github.com/{full_name}/runs/{run_id}",
                 "app": {"slug": "github-actions"},
+                "completed_at": done,
             }
+        )
+
+    def rerun_check(
+        self,
+        full_name: str,
+        sha: str,
+        *,
+        name: str,
+        run_id: str,
+        status: str = "completed",
+        conclusion: str | None = "success",
+        completed_at: str | None = None,
+    ) -> None:
+        """A re-run of a job: GitHub makes a new check run with a new id, and the
+        check-runs endpoint (filter=latest) shows only the newest run of each name."""
+        repo = self.repositories[full_name]
+        repo.check_runs[sha] = [r for r in repo.check_runs.get(sha, []) if r["name"] != name]
+        self.set_check(
+            full_name,
+            sha,
+            name=name,
+            status=status,
+            conclusion=conclusion,
+            run_id=run_id,
+            completed_at=completed_at,
         )
 
     def set_workflow_run(
@@ -345,6 +380,19 @@ class _Handler(BaseHTTPRequestHandler):
         query = parse_qs(parsed.query)
         with self.state.lock:
             self.state.calls.append((method, path))
+        if path.startswith("/_signed-logs/"):
+            # GitHub's signed log URL, on another host in real life: no token needed, and
+            # none may be sent.
+            self.state.log_downloads.append(path)
+            if self.headers.get("Authorization"):
+                self.state.log_download_authorized = True
+            payload = self.state.workflow_log
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         if not self._authorized():
             self._send(401, {"message": "Bad credentials"})
             return
@@ -485,13 +533,16 @@ class _Handler(BaseHTTPRequestHandler):
         if rest[:1] == ["commits"] and len(rest) == 3:
             sha = rest[1]
             if rest[2] == "check-runs":
-                self._send(
-                    200,
-                    {
-                        "total_count": len(repo.check_runs.get(sha, [])),
-                        "check_runs": repo.check_runs.get(sha, []),
-                    },
-                )
+                # Paginated like GitHub: `per_page` (default 30) and `page`, with a `Link`
+                # header while there is more.
+                runs = repo.check_runs.get(sha, [])
+                per_page = int((query.get("per_page") or ["30"])[0])
+                page = int((query.get("page") or ["1"])[0])
+                chunk = runs[(page - 1) * per_page : page * per_page]
+                headers = {}
+                if page * per_page < len(runs):
+                    headers["Link"] = f'<{self.path}&page={page + 1}>; rel="next"'
+                self._send(200, {"total_count": len(runs), "check_runs": chunk}, headers)
                 return
             if rest[2] == "check-suites":
                 self._send(200, {"total_count": 0, "check_suites": []})
@@ -500,6 +551,20 @@ class _Handler(BaseHTTPRequestHandler):
             sha = (query.get("head_sha") or [""])[0]
             runs = repo.workflow_runs.get(sha, [])
             self._send(200, {"total_count": len(runs), "workflow_runs": runs})
+            return
+        if rest[:2] == ["actions", "runs"] and rest[3:] == ["jobs"]:
+            run_id = rest[2]
+            jobs = [
+                {"id": f"{run_id}01", "name": "build", "conclusion": "failure"},
+            ]
+            self._send(200, {"total_count": len(jobs), "jobs": jobs})
+            return
+        if rest[:2] == ["actions", "jobs"] and rest[3:] == ["logs"]:
+            host = self.headers.get("Host", "")
+            self.send_response(302)
+            self.send_header("Location", f"http://{host}/_signed-logs/job/{rest[2]}?sig=x")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
             return
         if rest[:2] == ["actions", "runs"] and rest[3:] == ["logs"]:
             self.send_response(200)
