@@ -43,6 +43,7 @@ from crucible.adapters.harness.registry import default_registry as application_h
 from crucible.adapters.harness.script import ScriptHarnessAdapter
 from crucible.adapters.persistence.unit_of_work import SqlUnitOfWorkFactory
 from crucible.adapters.storage.disk import DiskArtifactStore
+from crucible.application import supervisor as supervisor_module
 from crucible.application.admin.context import AdminContext
 from crucible.application.admin.login import FLOWS, LoginFlow
 from crucible.application.auth import mint_token
@@ -2692,7 +2693,7 @@ async def test_lab_findings_a_long_collect_blocks_no_launch_and_the_sweep_frees_
     api: KubernetesClient,
     registry: CraneRegistryClient,
 ) -> None:
-    """A collection whose verifier runs 45 seconds, three times the lease: every tick
+    """A collection whose verifier runs 25 seconds, past the 15 second lease: every tick
     still renews the lease and another task launches beside it. Then the claims: both
     attempts keep theirs (keep_diff_only) while their tasks wait on review; cancelling
     one task frees its claim on the next tick, and the other task's claim, which a
@@ -2718,7 +2719,7 @@ async def test_lab_findings_a_long_collect_blocks_no_launch_and_the_sweep_frees_
         document["execution_request"]["provider"] = "kubernetes"
         document["policy"]["version"] = 21
         document["required_verification"].append(
-            {"id": "V5", "command": "sleep 45", "expect_exit": 0}
+            {"id": "V5", "command": "sleep 25", "expect_exit": 0}
         )
         slow = submit_and_start(client, document)
         deadline = time.monotonic() + LAUNCH_DEADLINE_SECONDS + 120
@@ -2803,11 +2804,14 @@ async def test_lab_findings_an_api_server_outage_during_collect_loses_no_attempt
     migrated: str,
     artifact_root: Path,
     registry: CraneRegistryClient,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The collector Job's create meets a refused connection twice (the real transport
     error, through the real client). The attempt is not failed as environment: it is
     collected again from the untouched claim and the task reaches review with every
     gate passing."""
+    # The retry interval only paces the tier; the rule is the same at 30 seconds.
+    monkeypatch.setattr(supervisor_module, "COLLECT_RETRY_INTERVAL_SECONDS", 5)
     outage_api = OutageKubernetesClient(
         kubeconfig_access(os.environ["CRUCIBLE_E2E_KIND_KUBECONFIG"]),
         "crucible-workers",
@@ -2834,7 +2838,7 @@ async def test_lab_findings_an_api_server_outage_during_collect_loses_no_attempt
             task_id,
             {"awaiting_internal_review", "pre_pr_gates_failed"},
             max_ticks=240,
-            min_seconds=400,
+            min_seconds=300,
         )
         attempt = client.get(f"/v1/tasks/{task_id}").json()["latest_attempt"]
         print(
