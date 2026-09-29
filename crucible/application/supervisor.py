@@ -2614,8 +2614,14 @@ class Supervisor:
         return applied
 
     def _live_attempt_ids(self) -> list[str]:
+        """The attempts whose provider objects the retention sweep must leave alone.
+
+        A finished attempt stays in the set until its cleanup has run: until then its
+        claim carries no retention label, and the sweep would delete a workspace that
+        acceptance and the publisher still read the bundle from (hades #237). Cleanup is
+        what labels a kept claim or deletes it."""
         with self._uow_factory() as uow:
-            return [
+            live = [
                 attempt.id
                 for attempt in uow.attempts.list_in_states(
                     [
@@ -2629,6 +2635,12 @@ class Supervisor:
                     ]
                 )
             ]
+            live.extend(
+                attempt.id
+                for attempt in uow.attempts.list_in_states(sorted(ATTEMPT_TERMINAL))
+                if attempt.cleaned_up_at is None
+            )
+            return live
 
     async def _release_workspaces(self) -> int:
         """16 and the lab findings of 2026-09-29: a workspace a cleanup policy kept is
