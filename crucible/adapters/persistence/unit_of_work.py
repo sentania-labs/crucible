@@ -690,9 +690,15 @@ class Attempts:
             stmt = stmt.with_for_update()
         return [self._to_entity(r) for r in self._s.scalars(stmt).all()]
 
-    def list_cleaned_unreleased(self, retention_kind: str) -> Sequence[Attempt]:
+    def list_cleaned_unreleased(self, retention_kind: str, *, limit: int) -> Sequence[Attempt]:
         released = select(RetentionActionRow.subject).where(
             RetentionActionRow.kind == retention_kind
+        )
+        # A workspace cleanup already deleted has nothing left to release.
+        deleted = select(EventRow.attempt_id).where(
+            EventRow.kind == "attempt_cleaned_up",
+            EventRow.attempt_id.is_not(None),
+            EventRow.payload["workspace"].astext == "delete",
         )
         stmt = (
             select(AttemptRow)
@@ -700,8 +706,10 @@ class Attempts:
                 AttemptRow.cleaned_up_at.is_not(None),
                 AttemptRow.unsupervised.is_(False),
                 AttemptRow.id.not_in(released),
+                AttemptRow.id.not_in(deleted),
             )
             .order_by(AttemptRow.cleaned_up_at, AttemptRow.id)
+            .limit(limit)
         )
         return [self._to_entity(r) for r in self._s.scalars(stmt).all()]
 

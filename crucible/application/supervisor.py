@@ -448,7 +448,7 @@ class Supervisor:
         self._collects: dict[str, asyncio.Task[bool]] = {}
         # A collection the provider could not finish is tried again after an interval,
         # for a bounded window counted from its first failure (in memory: a restart
-        # starts the window again, and the workspace is untouched meanwhile).
+        # starts the window again, and the workspace stays in place meanwhile).
         self._collect_failing_since: dict[str, float] = {}
         self._collect_retry_at: dict[str, float] = {}
         self.fenced_token: int | None = None
@@ -617,10 +617,13 @@ class Supervisor:
     async def _abandon_launches(self) -> None:
         """Cancel the launches and collections in flight. A collection cancelled here
         leaves its attempt exited and uncollected, which the next holder collects
-        again from the untouched workspace, as after a crash."""
+        again from its workspace, which still holds the work, as after a crash."""
         running = [*self._launches.values(), *self._collects.values()]
         self._launches.clear()
         self._collects.clear()
+        # A later holder, this process included, starts the retry window afresh.
+        self._collect_failing_since.clear()
+        self._collect_retry_at.clear()
         for task in running:
             task.cancel()
         if running:
@@ -2515,6 +2518,10 @@ class Supervisor:
         the checkout lease, and record it. Only ever after `logs_drained`."""
         cleaned = 0
         for attempt, provider_name, choice in await self._db(self._list_cleanup_due):
+            if attempt.id in self._collects:
+                # Finished and visible, but its task is still pushing a quota checkpoint
+                # off this workspace; cleanup waits for the task to end.
+                continue
             try:
                 provider = self._provider(provider_name)
             except ProviderError:
@@ -2531,6 +2538,8 @@ class Supervisor:
                 log.exception("cleanup failed; the next tick tries again")
                 continue
             await self._db(partial(self._mark_cleaned, attempt.id, choice))
+            self._collect_failing_since.pop(attempt.id, None)
+            self._collect_retry_at.pop(attempt.id, None)
             self._workspaces.pop(attempt.id, None)
             self._workspace_fingerprints.pop(attempt.id, None)
             self._command_watches.pop(attempt.id, None)
@@ -2621,7 +2630,9 @@ class Supervisor:
         now = self._clock.now()
         out: list[_WorkspaceRelease] = []
         with self._uow_factory() as uow:
-            for attempt in uow.attempts.list_cleaned_unreleased(RETENTION_WORKSPACE):
+            for attempt in uow.attempts.list_cleaned_unreleased(
+                RETENTION_WORKSPACE, limit=RETENTION_BATCH
+            ):
                 if len(out) >= WORKSPACE_RELEASE_BATCH:
                     break
                 execution = uow.executions.get(attempt.execution_id)
@@ -2891,8 +2902,8 @@ class Supervisor:
                 outputs = await provider.collect(handle, self._workspace_for(attempt), spec)
             except ProviderUnavailableError as exc:
                 # The cluster could not answer or take a step right now. The workspace
-                # is untouched, so the attempt is collected again rather than failed,
-                # until the window runs out (lab findings of 2026-09-29).
+                # still holds the work, so the attempt is collected again rather than
+                # failed, until the window runs out (lab findings of 2026-09-29).
                 first = self._collect_failing_since.setdefault(attempt.id, time.monotonic())
                 if time.monotonic() - first < COLLECT_RETRY_WINDOW_SECONDS:
                     self._collect_retry_at[attempt.id] = (
@@ -2963,6 +2974,10 @@ class Supervisor:
 
     async def _resume_quota_checkpoints(self) -> None:
         for attempt_id in await self._db(self._pending_quota_checkpoints):
+            if attempt_id in self._collects:
+                # Its collection task pushes the checkpoint itself once it has finished
+                # the attempt; a second push here would race it on the same Job.
+                continue
             await self._complete_quota_checkpoint(attempt_id)
 
     def _quota_checkpoint_safety(self, attempt_id: str) -> tuple[bool, str]:
@@ -4633,9 +4648,9 @@ class Supervisor:
             if attempt is None:
                 await self._db(partial(self._settle_cancelled_task, work.task_id))
                 continue
-            if attempt.id in self._collects:
-                # Its worker has exited and its collection is running; the attempt
-                # finishes on its own and the task settles on a later pass.
+            if attempt.id in self._collects or attempt.id in self._collect_retry_at:
+                # Its worker has exited and its collection is running or waiting to run
+                # again; the attempt finishes on its own and the task settles later.
                 continue
             with log_context(
                 task_id=attempt.task_id, execution_id=attempt.execution_id, attempt_id=attempt.id

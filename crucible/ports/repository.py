@@ -179,10 +179,11 @@ class AttemptRepository(Protocol):
         them; `list_for_task` and `list_for_execution` still return it."""
         ...
 
-    def list_cleaned_unreleased(self, retention_kind: str) -> Sequence[Attempt]:
-        """Supervised attempts that were cleaned up and have no retention action of
-        `retention_kind` yet: the ones whose kept workspace the retention step has still
-        to judge (16), oldest cleanup first."""
+    def list_cleaned_unreleased(self, retention_kind: str, *, limit: int) -> Sequence[Attempt]:
+        """Supervised attempts whose cleanup kept their workspace (the cleanup event's
+        `workspace` was not `delete`) and that have no retention action of
+        `retention_kind` yet: the kept workspaces the retention step has still to judge
+        (16), oldest cleanup first, at most `limit`."""
         ...
 
 
