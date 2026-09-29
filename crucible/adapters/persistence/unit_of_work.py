@@ -690,6 +690,21 @@ class Attempts:
             stmt = stmt.with_for_update()
         return [self._to_entity(r) for r in self._s.scalars(stmt).all()]
 
+    def list_cleaned_unreleased(self, retention_kind: str) -> Sequence[Attempt]:
+        released = select(RetentionActionRow.subject).where(
+            RetentionActionRow.kind == retention_kind
+        )
+        stmt = (
+            select(AttemptRow)
+            .where(
+                AttemptRow.cleaned_up_at.is_not(None),
+                AttemptRow.unsupervised.is_(False),
+                AttemptRow.id.not_in(released),
+            )
+            .order_by(AttemptRow.cleaned_up_at, AttemptRow.id)
+        )
+        return [self._to_entity(r) for r in self._s.scalars(stmt).all()]
+
 
 class PoolExhaustions:
     def __init__(self, session: Session) -> None:

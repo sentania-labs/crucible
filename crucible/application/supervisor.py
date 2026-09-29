@@ -99,6 +99,7 @@ from crucible.domain.ids import new_id
 from crucible.domain.lifecycle import (
     ATTEMPT_TERMINAL,
     EXECUTION_TERMINAL,
+    TASK_TERMINAL,
     AttemptState,
     ExecutionState,
     IllegalTransitionError,
@@ -122,8 +123,10 @@ from crucible.ports.execution import (
     LaunchSpec,
     LogChunk,
     LogOffset,
+    Observation,
     ObservationState,
     ProviderError,
+    ProviderUnavailableError,
     Workspace,
 )
 from crucible.ports.github import GitHubClient
@@ -156,6 +159,16 @@ DEFAULT_LOG_RETENTION_DAYS = 90
 DEFAULT_WORKSPACE_RETENTION_DAYS = 14
 DEFAULT_WAKE_RETENTION_DAYS = 30
 RETENTION_BATCH = 200
+# A collection the provider could not finish because the cluster could not answer is
+# tried again every interval until the window, counted from the first failure, runs out;
+# then the attempt fails as environment, as any other failed collection does.
+COLLECT_RETRY_INTERVAL_SECONDS = 30
+COLLECT_RETRY_WINDOW_SECONDS = 1800
+# The retention action a released workspace records, one per attempt (16).
+RETENTION_WORKSPACE = "workspace"
+# How many kept workspaces one tick releases. An upgrade that finds a backlog spreads the
+# provider calls over a few ticks instead of holding one tick for all of them.
+WORKSPACE_RELEASE_BATCH = 10
 # How many pulls the final log drain makes before it stops (issue 63). A provider that
 # bounds one pull at 4 MiB drains 1 GiB of backlog in this many; past that the log is
 # still arriving faster than it is read, and the attempt moves on with what was stored.
@@ -310,6 +323,61 @@ def _secret_holds(provider: Any, harness: str, credential: Any) -> bool:
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _WorkspaceRelease:
+    attempt: Attempt
+    provider: str
+    reason: str
+    policy_name: str
+    policy_version: int
+    days: int
+
+
+def workspace_release_reason(
+    uow: UnitOfWork, task: Task | None, attempt: Attempt, now: datetime, days: int
+) -> str | None:
+    """Why the kept workspace of a cleaned-up attempt may be removed now, or None while
+    it must stay (16, the lab findings of 2026-09-29).
+
+    It goes once its task is terminal (closed, rejected, cancelled) or the task's work
+    was published, or once `days` have passed since cleanup, whichever is first; but
+    never while something may still read it:
+
+    - the task's latest implementing or correcting attempt, until that attempt's own
+      bundle is published: acceptance, the publisher, and a republish after a failed
+      push all read the bundle off this workspace (23);
+    - an attempt whose quota checkpoint never reached the remote, while its task is
+      open: the workspace holds the only copy of that work."""
+    if attempt.cleaned_up_at is None:
+        return None
+    if task is None:
+        return "task_gone"
+    if task.state in TASK_TERMINAL:
+        return f"task_{task.state.value}"
+    if uow.events.latest_for_task_kind(
+        task.id, EventKind.TASK_PUBLISH_FAILED.value
+    ) is not None and any(
+        event.attempt_id == attempt.id
+        and event.kind == EventKind.TASK_PUBLISH_FAILED.value
+        and event.payload.get("step") == "quota_checkpoint"
+        for event in Supervisor._all_task_events(uow, task.id)
+    ):
+        return None
+    published = uow.events.latest_for_task_kind(task.id, EventKind.PUBLISH_COMPLETED.value)
+    work = latest_work_attempt(uow, task)
+    if (
+        work is not None
+        and work[0].id == attempt.id
+        and (published is None or published.attempt_id != attempt.id)
+    ):
+        return None
+    if published is not None:
+        return "published"
+    if now - attempt.cleaned_up_at >= timedelta(days=days):
+        return "retention_window"
+    return None
+
+
 class Supervisor:
     def __init__(
         self,
@@ -328,6 +396,7 @@ class Supervisor:
         checkout_lease_ttl_seconds: int = 21600,
         grace_seconds: int = 60,
         launch_wait_seconds: float | None = None,
+        collect_wait_seconds: float | None = None,
         harnesses: HarnessRegistry | None = None,
         harness_gates: Mapping[str, HarnessGate] | None = None,
         credential_sources: Mapping[str, CredentialSource] | None = None,
@@ -363,9 +432,25 @@ class Supervisor:
             if launch_wait_seconds is not None
             else min(5.0, lease_ttl_seconds / 3)
         )
+        # The same bound for the collections a tick starts, kept apart so a test can
+        # hold launches to a short wait without making quick collections miss the gates
+        # of the tick that finished them.
+        self.collect_wait_seconds = (
+            collect_wait_seconds
+            if collect_wait_seconds is not None
+            else min(5.0, lease_ttl_seconds / 3)
+        )
         # The launches in flight, by attempt id. An attempt in here is this process's
         # to finish; nothing else in the tick touches it until its task is done.
         self._launches: dict[str, asyncio.Task[bool]] = {}
+        # The collections in flight, by attempt id, and the same rule: an attempt in
+        # here is its collection's until it ends (lab findings of 2026-09-29).
+        self._collects: dict[str, asyncio.Task[bool]] = {}
+        # A collection the provider could not finish is tried again after an interval,
+        # for a bounded window counted from its first failure (in memory: a restart
+        # starts the window again, and the workspace is untouched meanwhile).
+        self._collect_failing_since: dict[str, float] = {}
+        self._collect_retry_at: dict[str, float] = {}
         self.fenced_token: int | None = None
         self._handles: dict[str, Handle] = {}
         self._workspaces: dict[str, Workspace] = {}
@@ -530,12 +615,16 @@ class Supervisor:
         await self._db(self._release_step)
 
     async def _abandon_launches(self) -> None:
-        launches = list(self._launches.values())
+        """Cancel the launches and collections in flight. A collection cancelled here
+        leaves its attempt exited and uncollected, which the next holder collects
+        again from the untouched workspace, as after a crash."""
+        running = [*self._launches.values(), *self._collects.values()]
         self._launches.clear()
-        for launch in launches:
-            launch.cancel()
-        if launches:
-            await asyncio.gather(*launches, return_exceptions=True)
+        self._collects.clear()
+        for task in running:
+            task.cancel()
+        if running:
+            await asyncio.gather(*running, return_exceptions=True)
 
     # ----- tick -----------------------------------------------------------
 
@@ -1128,16 +1217,20 @@ class Supervisor:
         return launched + self._harvest_launches()
 
     def _harvest_launches(self) -> int:
-        """Collect the launches that ended; a lost lease in any of them is the tick's."""
-        launched = 0
+        return self._harvest(self._launches, "launch")
+
+    def _harvest(self, running: dict[str, asyncio.Task[bool]], what: str) -> int:
+        """Take the background tasks of one kind that ended and count those that
+        returned True; a lost lease in any of them is the tick's."""
+        done = 0
         lease_lost = False
-        for attempt_id, launch in list(self._launches.items()):
-            if not launch.done():
+        for attempt_id, task in list(running.items()):
+            if not task.done():
                 continue
-            del self._launches[attempt_id]
-            if launch.cancelled():
+            del running[attempt_id]
+            if task.cancelled():
                 continue
-            error = launch.exception()
+            error = task.exception()
             if error is not None and not isinstance(error, Exception):
                 # What ends the process (a crash, an exit) ends it here too.
                 raise error
@@ -1146,14 +1239,15 @@ class Supervisor:
             elif error is not None:
                 with log_context(attempt_id=attempt_id):
                     log.error(
-                        "launch step failed; continuing with the next attempt",
+                        "%s step failed; continuing with the next attempt",
+                        what,
                         exc_info=(type(error), error, error.__traceback__),
                     )
-            elif launch.result():
-                launched += 1
+            elif task.result():
+                done += 1
         if lease_lost:
-            raise LeaseLostError("the lease was lost during a launch")
-        return launched
+            raise LeaseLostError(f"the lease was lost during a {what}")
+        return done
 
     async def _begin_launch(self, item: _Pending) -> tuple[_Pending, ExecutionProvider] | None:
         """The quick half of a launch, in the tick itself: route, gate, take the
@@ -2467,6 +2561,7 @@ class Supervisor:
     async def _retention_step(self) -> int:
         """16: deterministic, idempotent, and every deletion an event and a row."""
         applied = await self._db(self._retention_sweep)
+        applied += await self._release_workspaces()
         keep = await self._db(self._live_attempt_ids)
         for provider in self._providers.values():
             try:
@@ -2491,6 +2586,98 @@ class Supervisor:
                     ]
                 )
             ]
+
+    async def _release_workspaces(self) -> int:
+        """16 and the lab findings of 2026-09-29: a workspace a cleanup policy kept is
+        removed once nothing needs it, where before it stayed until an operator deleted
+        it and the claims filled the namespace quota. `workspace_release_reason` is the
+        rule; each release is a retention action and an event naming the policy version
+        whose window applied."""
+        released = 0
+        for item in await self._db(self._list_workspace_releases):
+            attempt = item.attempt
+            with log_context(
+                task_id=attempt.task_id, execution_id=attempt.execution_id, attempt_id=attempt.id
+            ):
+                try:
+                    provider = self._provider(item.provider)
+                    spec = await self._spec_for(attempt)
+                    await provider.release_workspace(self._workspace_for(attempt), spec)
+                except LeaseLostError:
+                    raise
+                except Exception:
+                    log.warning(
+                        "a kept workspace could not be released; the next tick tries again",
+                        exc_info=True,
+                    )
+                    continue
+                finally:
+                    self._workspaces.pop(attempt.id, None)
+                if await self._db(partial(self._record_workspace_release, item)):
+                    released += 1
+        return released
+
+    def _list_workspace_releases(self) -> list[_WorkspaceRelease]:
+        now = self._clock.now()
+        out: list[_WorkspaceRelease] = []
+        with self._uow_factory() as uow:
+            for attempt in uow.attempts.list_cleaned_unreleased(RETENTION_WORKSPACE):
+                if len(out) >= WORKSPACE_RELEASE_BATCH:
+                    break
+                execution = uow.executions.get(attempt.execution_id)
+                if execution is None:
+                    continue
+                task = uow.tasks.get(attempt.task_id)
+                section, name, version = self._retention_for(uow, task)
+                days = int(
+                    section.get("completed_workspaces_days") or DEFAULT_WORKSPACE_RETENTION_DAYS
+                )
+                reason = workspace_release_reason(uow, task, attempt, now, days)
+                if reason is not None:
+                    out.append(
+                        _WorkspaceRelease(
+                            attempt=attempt,
+                            provider=execution.provider,
+                            reason=reason,
+                            policy_name=name,
+                            policy_version=version,
+                            days=days,
+                        )
+                    )
+        return out
+
+    def _record_workspace_release(self, item: _WorkspaceRelease) -> bool:
+        with self._fenced() as uow:
+            row = uow.retention.record(
+                RetentionAction(
+                    id=new_id(),
+                    kind=RETENTION_WORKSPACE,
+                    subject=item.attempt.id,
+                    policy_name=item.policy_name,
+                    policy_version=item.policy_version,
+                    acted_at=self._clock.now(),
+                    detail={"reason": item.reason, "days": item.days, "provider": item.provider},
+                )
+            )
+            if row is None:
+                return False
+            record_event(
+                uow,
+                self._clock,
+                EventKind.RETENTION_APPLIED,
+                principal=PRINCIPAL_CRUCIBLE,
+                task_id=item.attempt.task_id,
+                execution_id=item.attempt.execution_id,
+                attempt_id=item.attempt.id,
+                payload={
+                    "kind": RETENTION_WORKSPACE,
+                    "subject": item.attempt.id,
+                    "reason": item.reason,
+                    "days": item.days,
+                },
+            )
+            uow.commit()
+            return True
 
     def _retention_for(self, uow: UnitOfWork, task: Task | None) -> tuple[dict[str, Any], str, int]:
         """The retention section of the policy that governs this task, and its version.
@@ -2580,10 +2767,15 @@ class Supervisor:
             )
 
     async def _observe_attempts(self) -> tuple[int, int]:
-        observed = finished = 0
+        observed = 0
+        finished = self._harvest(self._collects, "collection")
+        started = set(self._collects)
         for attempt in await self._db(self._list_live):
             if attempt.id in self._launches:
                 # Its launch is still running here; it is not stranded (hades #190).
+                continue
+            if attempt.id in self._collects:
+                # Its collection is still running beside the tick.
                 continue
             with log_context(
                 task_id=attempt.task_id, execution_id=attempt.execution_id, attempt_id=attempt.id
@@ -2596,6 +2788,14 @@ class Supervisor:
                     raise
                 except Exception:
                     log.exception("observe step failed; continuing with the next attempt")
+        # As for launches: this tick waits a bounded time (`collect_wait_seconds`) for
+        # the collections it started, so a quick one ends in the tick that began it and
+        # the gates after this step see it; a slow one is counted by the tick that sees
+        # it end.
+        begun = [task for key, task in self._collects.items() if key not in started]
+        if begun:
+            await asyncio.wait(begun, timeout=self.collect_wait_seconds)
+        finished += self._harvest(self._collects, "collection")
         return observed, finished
 
     async def _observe_one(self, attempt: Attempt) -> bool:
@@ -2655,38 +2855,85 @@ class Supervisor:
             await self._db(partial(self._mark_logs_drained, attempt.id))
             await self._db(partial(self._finish_lost, attempt.id, observation.detail))
             return True
-        # The final drain before anything is collected or cleaned up (08, 10).
-        await self._drain_logs(attempt, provider, handle)
-        await self._db(partial(self._mark_logs_drained, attempt.id))
-        spec = await self._spec_for(attempt)
-        collection_error: str | None = None
-        try:
-            outputs = await provider.collect(handle, self._workspace_for(attempt), spec)
-        except ProviderError as exc:
-            # 16: a provider that failed while producing the outputs is an environment
-            # failure. The attempt still finishes, with nothing collected, so the next
-            # tick does not try the same collection again forever.
-            collection_error = str(exc)
-            outputs = CollectedOutputs(report=None, report_raw=None, blocked_md=None)
-            log.warning("collection failed (%s); the attempt fails as environment", exc)
-        await self._db(
-            partial(
-                self._finish_exited,
-                attempt.id,
-                observation.exit_code,
-                outputs,
-                collection_error,
-                observation.oom_killed,
-                defer_quota=True,
-            )
+        # The final drain, the collection and the finish run beside the tick, as a
+        # launch does (hades #190): a collection can take the collector's, the
+        # verifier's and the reader Pods' whole timeouts, and the tick has to keep
+        # renewing its lease and launching other tasks meanwhile (lab findings of
+        # 2026-09-29). Until it ends the attempt is that task's alone.
+        retry_at = self._collect_retry_at.get(attempt.id)
+        if retry_at is not None and time.monotonic() < retry_at:
+            return False
+        self._collects[attempt.id] = asyncio.create_task(
+            self._collect_attempt(attempt, provider, handle, observation),
+            name=f"collect-{attempt.id}",
         )
-        if await self._db(partial(self._quota_checkpoint_pending, attempt.id)):
-            await self._complete_quota_checkpoint(attempt.id)
-        self._handles.pop(attempt.id, None)
-        self._workspaces.pop(attempt.id, None)
-        self._workspace_fingerprints.pop(attempt.id, None)
-        self._command_watches.pop(attempt.id, None)
-        return True
+        return False
+
+    async def _collect_attempt(
+        self,
+        attempt: Attempt,
+        provider: ExecutionProvider,
+        handle: Handle,
+        observation: Observation,
+    ) -> bool:
+        """Drain, collect and finish one exited attempt. True when it finished; False
+        when the provider could not answer and the collection is tried again later."""
+        with log_context(
+            task_id=attempt.task_id, execution_id=attempt.execution_id, attempt_id=attempt.id
+        ):
+            if attempt.logs_drained_at is None:
+                # The final drain before anything is collected or cleaned up (08, 10).
+                await self._drain_logs(attempt, provider, handle)
+                await self._db(partial(self._mark_logs_drained, attempt.id))
+            spec = await self._spec_for(attempt)
+            collection_error: str | None = None
+            try:
+                outputs = await provider.collect(handle, self._workspace_for(attempt), spec)
+            except ProviderUnavailableError as exc:
+                # The cluster could not answer or take a step right now. The workspace
+                # is untouched, so the attempt is collected again rather than failed,
+                # until the window runs out (lab findings of 2026-09-29).
+                first = self._collect_failing_since.setdefault(attempt.id, time.monotonic())
+                if time.monotonic() - first < COLLECT_RETRY_WINDOW_SECONDS:
+                    self._collect_retry_at[attempt.id] = (
+                        time.monotonic() + COLLECT_RETRY_INTERVAL_SECONDS
+                    )
+                    log.warning("collection could not finish (%s); it runs again", exc)
+                    return False
+                collection_error = (
+                    f"{exc} (the provider could not finish a collection for "
+                    f"{COLLECT_RETRY_WINDOW_SECONDS}s)"
+                )
+                outputs = CollectedOutputs(report=None, report_raw=None, blocked_md=None)
+                log.warning("collection failed (%s); the attempt fails as environment", exc)
+            except ProviderError as exc:
+                # 16: a provider that failed while producing the outputs is an
+                # environment failure. The attempt still finishes, with nothing
+                # collected, so the next tick does not try the same collection again
+                # forever.
+                collection_error = str(exc)
+                outputs = CollectedOutputs(report=None, report_raw=None, blocked_md=None)
+                log.warning("collection failed (%s); the attempt fails as environment", exc)
+            self._collect_failing_since.pop(attempt.id, None)
+            self._collect_retry_at.pop(attempt.id, None)
+            await self._db(
+                partial(
+                    self._finish_exited,
+                    attempt.id,
+                    observation.exit_code,
+                    outputs,
+                    collection_error,
+                    observation.oom_killed,
+                    defer_quota=True,
+                )
+            )
+            if await self._db(partial(self._quota_checkpoint_pending, attempt.id)):
+                await self._complete_quota_checkpoint(attempt.id)
+            self._handles.pop(attempt.id, None)
+            self._workspaces.pop(attempt.id, None)
+            self._workspace_fingerprints.pop(attempt.id, None)
+            self._command_watches.pop(attempt.id, None)
+            return True
 
     def _pending_quota_checkpoints(self) -> list[str]:
         with self._uow_factory() as uow:
@@ -4385,6 +4632,10 @@ class Supervisor:
             attempt = work.attempt
             if attempt is None:
                 await self._db(partial(self._settle_cancelled_task, work.task_id))
+                continue
+            if attempt.id in self._collects:
+                # Its worker has exited and its collection is running; the attempt
+                # finishes on its own and the task settles on a later pass.
                 continue
             with log_context(
                 task_id=attempt.task_id, execution_id=attempt.execution_id, attempt_id=attempt.id
