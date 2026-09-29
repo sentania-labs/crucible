@@ -128,6 +128,12 @@ it cannot check stays with Foundry or the user.
 | `ci_unchanged` | when `may_modify_ci` is false: no change under workflow paths | diff |
 | `workspace_clean` | no leftover ephemeral clusters or containers labeled for this attempt | provider reconcile |
 | `internal_review_recorded` | a `ReviewReportV1` for this exact head SHA exists from a reviewer that is not the implementing attempt; `pending` until then (the task waits in `awaiting_internal_review`) | review report with reviewer identity |
+| `commit_policy` | every commit the publisher would push is authored with the policy's `author_email` and carries a `commit_trailer` trailer: the publisher's own check (23), run by the collector, so a commit the publisher would refuse fails here instead of after acceptance. The detail names the commits by hash and says which rule each broke. `skipped` only for an attempt collected before the check existed; `fail` when the collector could not finish it (hades FDY-0135, 2026-09-29) | collector's commit check on the branch bundle |
+
+`commit_policy` is evaluated whatever `gates.pre_pr` lists, and a policy may
+not name it: the publisher applies its rule whatever the policy says, so the
+early warning cannot be dropped either, and a policy stored before the gate
+existed still gets it.
 
 ## Publication and post-PR gates (23)
 
@@ -143,7 +149,7 @@ Three evaluation rules. A pre-PR gate whose evidence is produced by
 collection (`report_present`, `exit_clean`, `commits_present`,
 `scope_contained`, `no_injected_files`, `no_secrets`,
 `run_evidence_present`, `criteria_mapped`, `dependencies_unchanged`,
-`ci_unchanged`) and is absent after collection is `fail`, not `pending`,
+`ci_unchanged`, `commit_policy`) and is absent after collection is `fail`, not `pending`,
 so a failed attempt reaches `pre_pr_gates_failed` unambiguously.
 `internal_review_recorded` is the one pre-PR gate whose evidence arrives
 after collection; it stays `pending` and the task waits in
