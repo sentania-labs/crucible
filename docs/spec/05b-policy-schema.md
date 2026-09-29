@@ -277,12 +277,13 @@ default: the pools holding a `local` model (Hermes on the gateway) for
 `complex` goes to its preferred capability, frontier. An empty list is no
 preference. The models outside the preferred pools are the fallbacks: they
 are selected when every preferred one is excluded (disabled, no credential,
-pool at its soft limit or marked exhausted). A worker on a `local` model
-whose exit is classified `provider_error` (the gateway refused, was
-unreachable, or answered 5xx) marks its pool for the pool's
-`default_cooldown_seconds`, with that reason; the mark is listed and
-cleared like a quota mark. A subscription model's provider error marks
-nothing. (Decided 2026-09-29 on the operator's direction: "Hermes is not
+pool at its soft limit or marked exhausted). When a worker on a `local`
+model exits `provider_error` (the gateway refused, was unreachable, or
+answered 5xx) and the previous finished attempt on that pool did too, the
+pool is marked for its `default_cooldown_seconds`, with that reason; the
+mark is listed and cleared like a quota mark. One provider error marks
+nothing, and a subscription model's provider error marks nothing. A pool
+at its `max_concurrency` is not excluded: the launch waits for a slot. (Decided 2026-09-29 on the operator's direction: "Hermes is not
 the anti-route. It should probably be close to our default doer with
 frontier being hard structural problems for scoping of items for
 hermes/qwen.")
@@ -291,15 +292,19 @@ hermes/qwen.")
 `quality_window` attempts, the judged attempts are those that reached the
 gates, and a failure is one with a failed blocking gate: the metric
 `gates_failed` counts blocking gates only, so an advisory finding never
-counts, and corrections do not count. The model is demoted when at least
+counts, and corrections do not count. Gate counts are folded into the
+metrics once the pre-PR gates are evaluated, so a pass waiting for its
+review is judged as early as a failure. The model is demoted when at least
 `demote_min_sample` attempts were judged, at least two of them failed, and
 failures are at least `demote_failure_percent` of the judged. One failure
 never demotes. A demoted model whose last attempt is `probe_after_minutes`
-old ranks as if it were not demoted; the probe's launch makes its last
-attempt new again, so it gets one probe per interval, and passing probes
-bring its rate down until it is no longer demoted. `quality_feedback: false`
-turns demotion off. A version without the three new fields reads them as
-50, 5 and 60.
+old ranks as if it were not demoted, unless an attempt already routed to it
+on the project has not launched yet: one probe at a time, and the probe's
+launch makes its last attempt new again. Passing probes bring its rate down
+until it is no longer demoted. `quality_feedback: false` turns demotion
+off. Bounds: `quality_window` 1 to 1000, `demote_min_sample` 2 to the
+window, `demote_failure_percent` 1 to 100, `probe_after_minutes` 1 to 10080.
+A version without the three new fields reads them as 50, 5 and 60.
 
 **Exhaustion marks.** A worker exit classified `quota_exhausted` (07, 16)
 marks the attempt's pool exhausted until `reset_at`: the reset the harness
