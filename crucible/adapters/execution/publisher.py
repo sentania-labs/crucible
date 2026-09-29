@@ -7,9 +7,10 @@ database, the socket, or any credential other than the one token, and that token
 on stdin and lives only on a tmpfs the container loses when it stops.
 
 What it does inside: verify the bundle, fetch the work branch from it, assert the fetched
-head is the collected head Crucible recorded, check every commit's author and trailer
-against policy, and push without force. Every API call after the push is Crucible's own,
-so the container needs no API token beyond git's.
+head is the collected head Crucible recorded, and push without force. It does not check
+commit authors or trailers (operator decision, 2026-09-29): the reviewer sees the author
+at collection, and the task record is the paper trail. Every API call after the push is
+Crucible's own, so the container needs no API token beyond git's.
 """
 
 from __future__ import annotations
@@ -48,9 +49,6 @@ from crucible.ports.publish import PublishOutcome, PublishRequest
 log = logging.getLogger("crucible.publisher")
 
 ROLE_PUBLISHER = "publisher"
-# The script's own exit for "every commit was checked and at least one failed policy".
-# Distinct from a failed push, because nothing was attempted against the remote.
-COMMIT_POLICY_REFUSED = 6
 # The script's exit for "the bundle is missing or no longer matches its seal", checked
 # inside the container before any remote is contacted.
 BUNDLE_SEAL_REFUSED = 7
@@ -115,7 +113,6 @@ class DockerPublisher:
             expected_head=request.expected_head,
             author_name=request.author_name,
             author_email=request.author_email,
-            commit_trailer=request.commit_trailer,
             credential_host=self.config.credential_host,
             bundle_sha256=request.bundle_sha256,
         )
@@ -302,8 +299,6 @@ OUTCOME_FILES: dict[str, int] = {
     "bundle-head.txt": 4000,
     "error.txt": 4000,
     "push.txt": 4000,
-    "author-problems.txt": 4000,
-    "trailer-problems.txt": 4000,
     "remote-head-before.txt": 4000,
     "publisher.log": 8000,
 }
@@ -319,20 +314,10 @@ def outcome_from_files(files: Mapping[str, str], exit_code: int) -> PublishOutco
     def text(name: str) -> str:
         return (files.get(name) or "")[: OUTCOME_FILES.get(name, 4000)].strip()
 
-    def lines(name: str) -> list[str]:
-        return [line for line in text(name).splitlines() if line.strip()]
-
     step = text("step.txt") or "unknown"
     head = text("bundle-head.txt")
     detail = redact(text("error.txt"))
     pushed = text("push.txt") == "ok" and exit_code == 0
-    authors = tuple(lines("author-problems.txt"))
-    trailers = tuple(lines("trailer-problems.txt"))
-    if exit_code == COMMIT_POLICY_REFUSED and not detail:
-        detail = (
-            f"commit policy refused the push: {len(authors)} author problem(s), "
-            f"{len(trailers)} trailer problem(s); nothing was pushed"
-        )
     return PublishOutcome(
         pushed=pushed,
         head_sha=head,
@@ -343,8 +328,6 @@ def outcome_from_files(files: Mapping[str, str], exit_code: int) -> PublishOutco
         # Crucible's own container output, redacted before it is recorded: git can be
         # made to print a header and a remote can answer with anything (12).
         log_tail=redact(text("publisher.log")[-8000:]),
-        trailer_problems=trailers,
-        author_problems=authors,
     )
 
 

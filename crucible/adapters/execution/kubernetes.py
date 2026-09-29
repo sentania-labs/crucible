@@ -1718,7 +1718,6 @@ class KubernetesProvider:
                         "author_email", "crucible-worker@users.noreply.github.com"
                     )
                 ),
-                commit_trailer=identity_bundle.commit_trailer(spec.policy),
             ),
             mounts=[
                 Mount("ws", REPO_MOUNT, read_only=not quota_checkpoint, sub_path="repo"),

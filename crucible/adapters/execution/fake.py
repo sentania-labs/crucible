@@ -103,7 +103,7 @@ Behavior = Literal[
     "quota",
     "verification-fails",
     "dirty-workspace",
-    "no-trailer",
+    "other-author",
 ]
 BEHAVIORS: frozenset[str] = frozenset(
     {
@@ -128,7 +128,7 @@ BEHAVIORS: frozenset[str] = frozenset(
         "quota",
         "verification-fails",
         "dirty-workspace",
-        "no-trailer",
+        "other-author",
     }
 )
 
@@ -142,11 +142,12 @@ REPORTING_BEHAVIORS: frozenset[str] = frozenset(
         "no-commits",
         "verification-fails",
         "dirty-workspace",
-        "no-trailer",
+        "other-author",
     }
 )
 REVIEW_BEHAVIORS: frozenset[str] = frozenset({"review", "review-disapprove"})
 
+OTHER_AUTHOR = "someone-else@example.test"
 OUT_OF_SCOPE_PATH = "infrastructure/outside-the-contract.txt"
 INJECTED_PATH = ".crucible/identity.md"
 
@@ -157,11 +158,12 @@ def synthetic_head_sha(attempt_id: str) -> str:
 
 
 def fake_commit_policy(behavior: str, head: str) -> CommitPolicyCheck:
-    """The collector's commit check as the fake reports it: `no-trailer` is a worker
-    whose one commit lacks the attempt trailer (hades FDY-0135); every other behavior
-    commits as the policy asks."""
-    if behavior == "no-trailer":
-        return CommitPolicyCheck(trailer_problems=(head,))
+    """The collector's commit check as the fake reports it: `other-author` is a worker
+    whose one commit is authored by someone other than the policy's author and carries
+    no attempt trailer (hades FDY-0143); every other behavior commits as the policy
+    asks."""
+    if behavior == "other-author":
+        return CommitPolicyCheck(author_problems=((head, OTHER_AUTHOR),))
     return CommitPolicyCheck()
 
 

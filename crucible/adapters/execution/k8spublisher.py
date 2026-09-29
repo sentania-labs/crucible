@@ -161,7 +161,6 @@ class KubernetesPublisher:
             expected_head=request.expected_head,
             author_name=request.author_name,
             author_email=request.author_email,
-            commit_trailer=request.commit_trailer,
             credential_host=self.config.credential_host,
             token_source="file",
             bundle_sha256=request.bundle_sha256,

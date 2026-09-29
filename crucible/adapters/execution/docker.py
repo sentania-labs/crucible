@@ -1070,7 +1070,6 @@ class DockerProvider:
                         "author_email", "crucible-worker@users.noreply.github.com"
                     )
                 ),
-                commit_trailer=identity_bundle.commit_trailer(spec.policy),
             ),
             mounts=mounts,
             network="none",

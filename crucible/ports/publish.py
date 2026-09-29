@@ -40,7 +40,6 @@ class PublishRequest:
     policy: Mapping[str, object] = field(default_factory=dict)
     author_name: str = "crucible-worker"
     author_email: str = "crucible-worker@users.noreply.github.com"
-    commit_trailer: str = "Crucible-Attempt"
     timeout_seconds: int = 600
 
 
@@ -55,8 +54,6 @@ class PublishOutcome:
     exit_code: int = 0
     remote_head_before: str = ""
     log_tail: str = ""
-    trailer_problems: tuple[str, ...] = ()
-    author_problems: tuple[str, ...] = ()
 
 
 class Publisher(Protocol):

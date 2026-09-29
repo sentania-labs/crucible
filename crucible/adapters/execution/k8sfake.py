@@ -263,10 +263,8 @@ class FakeKubernetesApi:
     deadline_keeps_pod: bool = False
     # The publisher (23): each push it acted out, with the remote, the branch, the head
     # and the token it found in its Secret, so a test sees what reached the push without
-    # the token ever being anywhere else. `publisher_refuses` makes the next publisher
-    # fail the commit-policy check the way the script does (exit 6).
+    # the token ever being anywhere else.
     pushes: list[dict[str, str]] = field(default_factory=list)
-    publisher_refuses: bool = False
     # The claim's `publish/` leaf as the preparer finds it before a push: a claim on
     # storage where the worker uid cannot make or write it (an NFS export that squashes
     # it, say) fails the leaf script with exit 8, as the real script does.
@@ -740,9 +738,6 @@ class FakeKubernetesApi:
         claim["output/commit-policy/author-problems.txt"] = "".join(
             f"{sha}\t{who}\n" for sha, who in check.author_problems
         ).encode()
-        claim["output/commit-policy/trailer-problems.txt"] = "".join(
-            f"{sha}\n" for sha in check.trailer_problems
-        ).encode()
         claim["output/commit-policy/checked"] = b"done\n"
         report = self._report_for(spec, behavior, head)
         if report is not None:
@@ -844,17 +839,7 @@ class FakeKubernetesApi:
         expected = bound("EXPECTED")
         out["bundle-head.txt"] = f"{expected}\n".encode()
         out["remote-head-before.txt"] = b"\n"
-        out["publisher.log"] = b"fake publisher: fetched, verified, checked\n"
-        if self.publisher_refuses:
-            out.update(
-                {
-                    "step.txt": b"commit-policy\n",
-                    "push.txt": b"refused\n",
-                    "author-problems.txt": f"{expected}\tsomeone@example.invalid\n".encode(),
-                    "trailer-problems.txt": b"",
-                }
-            )
-            return finish(6)
+        out["publisher.log"] = b"fake publisher: fetched, verified\n"
         push = {
             "remote": bound("CLONE_URL"),
             "branch": bound("WORK_BRANCH"),

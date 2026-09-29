@@ -58,15 +58,14 @@ def _add(
 
 
 def _commit_policy_payload(bundle: BranchBundle) -> dict[str, Any]:
-    """What the `commit_policy` gate reads: whether the collector finished the
-    publisher's commit check, and what it found (hades FDY-0135)."""
+    """What the `commit_policy` gate reads: whether the collector finished its author
+    check, and what it found (hades FDY-0135)."""
     check = bundle.commit_policy
     if check is None:
         return {"checked": False}
     return {
         "checked": True,
         "author_problems": [{"sha": sha, "author": who} for sha, who in check.author_problems],
-        "trailer_problems": list(check.trailer_problems),
     }
 
 

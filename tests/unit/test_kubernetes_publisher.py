@@ -34,7 +34,7 @@ from crucible.adapters.execution.k8spublisher import (
     token_secret_name,
 )
 from crucible.adapters.execution.kubernetes import KubernetesConfig, KubernetesProvider
-from crucible.adapters.execution.publisher import BUNDLE_SEAL_REFUSED, COMMIT_POLICY_REFUSED
+from crucible.adapters.execution.publisher import BUNDLE_SEAL_REFUSED
 from crucible.ports.execution import WORK_MOUNT, ProviderError
 from crucible.ports.github import InstallationToken
 from crucible.ports.publish import PublishOutcome, PublishRequest
@@ -298,17 +298,6 @@ async def test_a_namespace_without_egress_enforcement_gets_no_token() -> None:
     assert _created(api, "secrets") == []
 
 
-async def test_a_commit_policy_refusal_is_the_same_outcome_as_on_docker() -> None:
-    api, _provider, publisher = _setup(publisher_refuses=True)
-    outcome = await publisher.push(_request(), _token(installation_token_value()))
-    assert not outcome.pushed
-    assert (outcome.step, outcome.exit_code) == ("commit-policy", COMMIT_POLICY_REFUSED)
-    assert outcome.author_problems == (f"{HEAD}\tsomeone@example.invalid",)
-    assert "nothing was pushed" in outcome.detail
-    assert api.pushes == []
-    assert not api.secret_exists(token_secret_name(ATTEMPT))
-
-
 async def test_a_retried_push_replaces_a_secret_an_earlier_try_left() -> None:
     api, _provider, publisher = _setup()
     api.put_harness_secret(token_secret_name(ATTEMPT), {"token": b"an expired token"})
@@ -395,7 +384,6 @@ def test_the_script_checks_the_seal_before_it_contacts_any_remote() -> None:
             expected_head=HEAD,
             author_name="crucible-worker",
             author_email="crucible-worker@users.noreply.github.com",
-            commit_trailer="Crucible-Attempt",
             token_source=source,
             bundle_sha256="b" * 64,
         )
@@ -413,7 +401,6 @@ def test_the_script_checks_the_seal_before_it_contacts_any_remote() -> None:
             expected_head=HEAD,
             author_name="a",
             author_email="e",
-            commit_trailer="t",
             token_source="env",
         )
 
@@ -480,7 +467,6 @@ def test_the_script_asks_the_helper_for_the_token_before_any_remote() -> None:
             expected_head=HEAD,
             author_name="crucible-worker",
             author_email="crucible-worker@users.noreply.github.com",
-            commit_trailer="Crucible-Attempt",
             token_source=source,
             bundle_sha256="b" * 64,
         )

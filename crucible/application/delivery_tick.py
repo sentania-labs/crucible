@@ -245,9 +245,6 @@ class DeliveryCoordinator:
                     "author_email", "crucible-worker@users.noreply.github.com"
                 )
             ),
-            commit_trailer=str(
-                plan.policy.get("git", {}).get("commit_trailer", "Crucible-Attempt")
-            ),
             timeout_seconds=self.config.publisher_timeout_seconds,
         )
 
@@ -334,11 +331,7 @@ class DeliveryCoordinator:
                             plan,
                             step=outcome.step,
                             detail=outcome.detail or f"the publisher exited {outcome.exit_code}",
-                            extra={
-                                "remote_head_before": outcome.remote_head_before,
-                                "author_problems": list(outcome.author_problems),
-                                "trailer_problems": list(outcome.trailer_problems),
-                            },
+                            extra={"remote_head_before": outcome.remote_head_before},
                         )
                     )
                     return False
@@ -466,8 +459,6 @@ class DeliveryCoordinator:
                     "exit_code": outcome.exit_code,
                     "bundle_head": outcome.head_sha,
                     "remote_head_before": outcome.remote_head_before,
-                    "author_problems": list(outcome.author_problems),
-                    "trailer_problems": list(outcome.trailer_problems),
                     # Both already redacted by the publisher adapter (12); truncated
                     # here so one failing container cannot fill the event log.
                     "detail": outcome.detail[:500],
