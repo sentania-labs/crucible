@@ -25,6 +25,11 @@ from crucible.adapters.execution.k8sapi import (
     in_cluster_access,
     kubeconfig_access,
 )
+from crucible.adapters.execution.k8spublisher import (
+    ByWorkspacePublisher,
+    KubernetesPublisher,
+    KubernetesPublisherConfig,
+)
 from crucible.adapters.execution.k8sregistry import CraneRegistryClient
 from crucible.adapters.execution.kubernetes import (
     KubernetesConfig,
@@ -537,9 +542,47 @@ def wire(settings: Settings) -> Wiring:
         settings=settings,
         first_run=first_run,
     )
-    publisher: Publisher | None = None
-    if docker is not None and github is not None:
-        publisher = DockerPublisher(
+    publisher = build_publisher(settings, docker, providers.get("kubernetes"), github)
+    return Wiring(
+        settings=settings,
+        ctx=ctx,
+        providers=providers,
+        artifact_store=artifact_store,
+        wake_deliverer=wake_deliverer,
+        github=github,
+        publisher=publisher,
+        harnesses=registry,
+        admin=admin,
+    )
+
+
+def build_publisher(
+    settings: Settings,
+    docker: DockerProvider | None,
+    kubernetes: ExecutionProvider | None,
+    github: GitHubClient | None,
+) -> Publisher | None:
+    """The publisher of 23 for each provider that is wired, when GitHub is.
+
+    A Kubernetes attempt's bundle is on its workspace claim and is pushed by a Job in
+    the workers namespace; a Docker attempt's is pushed by a container on the daemon.
+    With both providers the bundle path says which one holds it. With neither, or with
+    no GitHub client, there is no publisher, and the supervisor says so for every task
+    that waits in `publishing` (hades FDY-0133) rather than skipping it without a word."""
+    if github is None:
+        return None
+    kube: Publisher | None = None
+    if isinstance(kubernetes, KubernetesProvider):
+        kube = KubernetesPublisher(
+            kubernetes,
+            KubernetesPublisherConfig(
+                credential_host=settings.github.credential_host,
+                timeout_seconds=settings.github.publisher_timeout_seconds,
+            ),
+        )
+    dock: Publisher | None = None
+    if docker is not None:
+        dock = DockerPublisher(
             docker,
             PublisherConfig(
                 # 23 step 3: the publisher's own egress network, not the workers'.
@@ -552,14 +595,6 @@ def wire(settings: Settings) -> Wiring:
                 timeout_seconds=settings.github.publisher_timeout_seconds,
             ),
         )
-    return Wiring(
-        settings=settings,
-        ctx=ctx,
-        providers=providers,
-        artifact_store=artifact_store,
-        wake_deliverer=wake_deliverer,
-        github=github,
-        publisher=publisher,
-        harnesses=registry,
-        admin=admin,
-    )
+    if dock is not None and kube is not None:
+        return ByWorkspacePublisher(dock, kube)
+    return dock or kube
