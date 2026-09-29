@@ -35,6 +35,7 @@ from crucible.adapters.execution.kubernetes import (
     KubernetesConfig,
     KubernetesProvider,
     SettingsSource,
+    TimeoutsSource,
 )
 from crucible.adapters.execution.publisher import DockerPublisher, PublisherConfig
 from crucible.adapters.first_run import FILE_NAME, FileDelivery, SecretDelivery
@@ -61,6 +62,7 @@ from crucible.application.proxy_config import (
 from crucible.application.supervisor import Supervisor
 from crucible.domain.cluster_egress import SETTING_NAME, parse_cluster_egress
 from crucible.domain.ids import new_id
+from crucible.domain.role_timeouts import SETTING_NAME as ROLE_TIMEOUTS_SETTING
 from crucible.ports.artifacts import ArtifactStore
 from crucible.ports.execution import ExecutionProvider
 from crucible.ports.first_run import FirstRunDelivery
@@ -217,6 +219,18 @@ def kubernetes_settings_source(factory: UnitOfWorkFactory) -> SettingsSource:
     return read
 
 
+def kubernetes_timeouts_source(factory: UnitOfWorkFactory) -> TimeoutsSource:
+    """What the provider reads back on each refresh: the saved `kubernetes.timeouts`
+    document, if any."""
+
+    def read() -> Mapping[str, object] | None:
+        with factory() as uow:
+            row = uow.provider_settings.get(ROLE_TIMEOUTS_SETTING)
+        return row.document if row is not None else None
+
+    return read
+
+
 def kubernetes_config(
     settings: Settings, *, local_endpoint_url: str | None = None
 ) -> KubernetesConfig:
@@ -232,6 +246,7 @@ def kubernetes_config(
         prepare_timeout_seconds=k.prepare_timeout_seconds,
         collector_timeout_seconds=k.collector_timeout_seconds,
         verifier_timeout_seconds=k.verifier_timeout_seconds,
+        role_timeout_seconds=k.role_timeout_seconds,
         report_size_cap_bytes=k.report_size_cap_bytes,
         max_concurrency=k.max_concurrency,
         poll_interval_seconds=k.poll_interval_seconds,
@@ -293,6 +308,7 @@ def kubernetes_provider(
         CraneRegistryClient(),
         harnesses=registry,
         settings_source=kubernetes_settings_source(factory) if factory is not None else None,
+        timeouts_source=kubernetes_timeouts_source(factory) if factory is not None else None,
     )
 
 
@@ -523,6 +539,7 @@ def wire(settings: Settings) -> Wiring:
         proxy_reload_timeout_seconds=settings.admin.proxy_reload_timeout_seconds,
         kubernetes_egress_seed=kubernetes_egress_seed(settings),
         kubernetes_protected_namespaces=kubernetes_protected_namespaces(settings),
+        kubernetes_role_timeout_seed=settings.kubernetes.role_timeout_seconds,
         first_run=first_run,
     )
     ctx = AppContext(

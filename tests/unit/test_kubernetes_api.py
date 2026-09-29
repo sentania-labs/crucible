@@ -9,6 +9,7 @@ import pytest
 from crucible.adapters.execution.k8sapi import (
     ClusterAccess,
     KubernetesClient,
+    KubernetesUnavailableError,
     _exec_over_websocket,
 )
 
@@ -57,6 +58,27 @@ def test_exec_websocket_does_not_ask_for_a_json_representation() -> None:
     assert connection.headers["Accept"] == "*/*"
     assert connection.headers["Sec-WebSocket-Protocol"] == "v4.channel.k8s.io"
     assert result.exit_code is None
+
+
+class _ResetSocket:
+    def recv(self, _count: int) -> bytes:
+        raise ConnectionResetError(104, "Connection reset by peer")
+
+
+def test_a_socket_reset_while_reading_exec_frames_is_an_unavailable_api_server() -> None:
+    """PR 237 review: a reset after the upgrade, while frames are read, is the same
+    unavailable API server as one before it, so collection retries it."""
+    connection = _Connection()
+    connection.sock = _ResetSocket()  # type: ignore[assignment]
+
+    with pytest.raises(KubernetesUnavailableError):
+        _exec_over_websocket(
+            connection,  # type: ignore[arg-type]
+            {},
+            "https://127.0.0.1:6443",
+            "/api/v1/namespaces/workers/pods/reader/exec",
+            limit=1024,
+        )
 
 
 class _Body:

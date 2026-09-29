@@ -55,7 +55,7 @@ carries and what a unit test holds it to (C9):
 | `secrets`, `persistentvolumeclaims` | create, get, list, watch, **patch**, delete |
 | `pods/log` | get |
 | `pods/exec` | create, get |
-| `resourcequotas` | get, list |
+| `resourcequotas`, `events` | get, list |
 | `batch/jobs` | create, get, list, watch, delete |
 | `networking.k8s.io/networkpolicies` | create, get, list, watch, delete |
 
@@ -67,7 +67,9 @@ that. There is no `update` on anything. The three additions to the sentence
 above are the ones the implemented provider needs: `patch` on PersistentVolumeClaims writes the retention label
 `cleanup` leaves behind, `patch` on Secrets is the `rw-narrow` credential
 sync-back (12), and reading the ResourceQuota is where `max_concurrency` on
-`GET /providers` comes from. `pods/exec` needs `create` as well as `get`
+`GET /providers` comes from. Reading events is how a Job whose Pod the namespace
+quota refused (`FailedCreate`, "exceeded quota") is seen at once rather than at the
+end of its timeout. `pods/exec` needs `create` as well as `get`
 because the API server authorizes an exec against `create` even when the
 client opens it as a GET WebSocket upgrade, which is how the reader Pod's tar
 stream is opened; a Role with only `get` is refused at the upgrade with a 403
@@ -93,7 +95,7 @@ Per attempt the provider creates, in `crucible-workers`, all labelled
 
 | Object | Role | Lifetime |
 |---|---|---|
-| PersistentVolumeClaim `ws-<attempt>` | the workspace: `repo/`, `report/`, `output/`, and `publish/` (the publisher's outcome, made before a push) | attempt, then per cleanup policy |
+| PersistentVolumeClaim `ws-<attempt>` | the workspace: `repo/`, `report/`, `output/`, and `publish/` (the publisher's outcome, made before a push) | attempt, then per cleanup policy; a kept claim is deleted by the retention step once nothing needs it (16) |
 | ConfigMap `identity-<attempt>` (or a projected volume from an object store above the ConfigMap size cap, 08) | the identity bundle, read-only | attempt |
 | Secret `cred-<attempt>` | the per-attempt copy of one harness credential directory, seeded from the harness's dedicated Secret in `crucible-workers`, `rw-narrow` where the adapter declares it (12) | attempt, deleted under every cleanup policy |
 | Secret `checkout-<attempt>` | a private repository's read-only installation token (ADR 0019), key `token`, mounted mode 0400 at `/run/crucible-token` into the refresher and the preparer Jobs and nothing else | created just before the refresher, deleted once the preparer's Pod is gone, on every path; a deletion that fails fails the prepare, and `discard`, `cleanup` and the retention sweep retry it |
@@ -116,7 +118,19 @@ collector, verifier, publisher are distinct processes with distinct
 mounts), and lets Kubernetes own restarts, deadlines, and garbage
 collection. `activeDeadlineSeconds` on each Job is the policy's timeout for
 that role; Crucible still drains before the deadline and classifies the
-exit itself (16).
+exit itself (16). A single-purpose role's own time (the collector, the
+verifier, the bundle verifier, the cleaner, the Job that readies a claim for
+the publisher) is counted from when its Pod is Running: pulling the image and
+waiting for a node are bounded by the launch timeout instead, and the Job's
+`activeDeadlineSeconds` is the role's time plus the launch timeout, since
+Kubernetes counts it from the Job's start. The short roles' time is the
+`kubernetes.timeouts` setting (`role_timeout_seconds`, 120 by default, 25);
+before the lab findings of 2026-09-29 it was a fixed 120 seconds that
+included the pull. A role Job whose Pod the namespace quota refuses ends at
+once with the quota's own message rather than at its timeout, except the
+publisher's two Jobs, which wait for room until their deadline (a failed
+publication needs an operator's retry, and a full namespace is not a failed
+push), and whose timeout then names the quota.
 
 ## Pod shape (every role)
 
@@ -440,6 +454,7 @@ the namespace. A deployment therefore names one exact, pullable reference in
   | exists | Pending past the launch timeout | launch failure, the Pod's conditions as detail (image pull, no schedulable node, PVC unbound), not a stall |
   | exists | terminated container | `exited(code)` |
   | exists | evicted, or its node is gone | `lost` |
+  | exists | none yet, and a `FailedCreate` naming the namespace quota | launch failure at once, with the quota's message (the lab findings of 2026-09-29; the Job controller retries such a Pod forever and never fails the Job) |
   | exists | none yet, within the launch timeout | `running` (a Job controller can take a few seconds to create a Pod on a busy node; this is not a loss, 103) |
   | exists | none yet, past the launch timeout | launch failure ("the Job controller never created a Pod") |
   | exists | had one, now gone | `lost` (the Pod existed and disappeared, unlike the row above) |
@@ -462,14 +477,27 @@ the namespace. A deployment therefore names one exact, pullable reference in
 - `collect`: the collector Job with the workspace mounted read-only and an
   output subpath read-write; then the bundle verifier Job; outputs are read
   by the supervisor from the PVC through a short-lived reader Pod, never by
-  mounting the PVC into the Crucible pods.
+  mounting the PVC into the Crucible pods. The reader's tar is streamed to a
+  scratch file and extracted from there, so the supervisor never holds the
+  collected archive (up to 256 MiB) in memory. A step the cluster could not
+  take or answer (an API server that refused, reset or timed out a
+  connection or answered 429 or 5xx, a quota-refused role Pod, a reader Pod
+  that did not start, an exec stream that ended before its status) raises
+  `ProviderUnavailableError`, and the supervisor collects again later from the
+  claim, which still holds the work, rather than failing the attempt (10); a
+  credential copy already synced is not synced twice. A failed status look
+  while a Pod starts is asked again until the deadline, never taken as the
+  answer.
 - `terminate`: `drain` deletes the Pod with the policy grace period, read
   off the Pod itself (SIGTERM, then SIGKILL by the kubelet); `kill` deletes
   with grace zero.
 - `cleanup`: only after `logs_drained`; delete Jobs and NetworkPolicy;
   delete the per-attempt Secret under every policy; keep or delete the PVC
-  per policy (retained PVCs carry a retention label the sweep honours);
-  release the lease.
+  per policy (retained PVCs carry a retention label the orphan sweep
+  honours); release the lease. `release_workspace` deletes a kept claim and
+  anything else still labelled for its attempt once the retention step
+  decided nothing needs it (16), and reports a claim still there so the step
+  tries again.
 - `reconcile`: list Jobs by label; a Job with no live attempt row is
   orphaned and deleted; a live attempt with no Job is `lost`. A Job still
   waiting on its Pod is adopted like a running one (103), its launch time
@@ -551,6 +579,16 @@ runs in one api process by design and keeps the in-memory check alone; it sets
 `finished` or `failed` before it removes the login container, so it never reads
 `finishing`.
 
+Every failure of the Kubernetes API client is a `KubernetesApiError`, which
+is a `ProviderError`, so none escapes the supervisor's handlers; a refused,
+reset or timed-out connection and a 429 or 5xx answer are its
+`KubernetesUnavailableError` form, which is also `ProviderUnavailableError`
+(nothing is decided from it). A readiness canary that could not run because
+the API server could not answer is not a refusal: the launch fails as an
+environment failure the retry rule covers, and the next launch runs the
+canary again. A credential Secret that could not be read for the same reason
+does not refuse the launch either.
+
 A credential probe whose harness hangs is ended by the worker Job's
 `activeDeadlineSeconds` before the provider's own wait runs out. The provider
 reads the Job's `DeadlineExceeded` condition and records that probe as a
@@ -578,7 +616,11 @@ period its Pod was created with, which is the task policy's. (Made concrete
 `GET /providers` reports the Kubernetes provider with `isolation: pod`,
 `network_control: true`, `resource_limits: true`, `shared_disk: false`, the
 harnesses that have a default image (each harness its own, ADR 0018), and `max_concurrency` from the
-namespace's ResourceQuota. The admin status page (25) shows the namespace
+namespace's ResourceQuotas: the fewest attempts any one limit admits, with
+`count/jobs.batch` divided by five Jobs an attempt and the CPU and memory
+requests and limits by one Pod's worth at the limits of the last launch (the
+policy defaults before one). Until the lab findings of 2026-09-29 only the Job
+count was read. The admin status page (25) shows the namespace
 readiness probe, the CNI egress enforcement result, the pod PID limit, and
 the runtime class in use ("standard" in this version). Attempt evidence
 records the image digest, the Job and Pod names, the node, the effective

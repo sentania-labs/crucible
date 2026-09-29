@@ -108,10 +108,20 @@ resource.
 | show or update the per-command timeout | `GET`, `POST /admin/limits/command-timeout` | `limits command-timeout`, `limits set-command-timeout` | 05b `limits.command_timeout_ms` of the policy in force: min, max and default in milliseconds. A save writes a new policy version with only that limit changed; a bound left out keeps its value, and one that is not a JSON integer, or bounds out of order, are refused. Tasks whose contracts name the new version launch with it (issue 128) |
 | show or update the advisory gates | `GET`, `POST /admin/gates/advisory` | `gates advisory`, `gates set-advisory --gate NAME ...` | ADR 0024, 05b `gates.advisory` of the policy in force: which pre-PR gates are advisory (a failure goes to the reviewer) and which block. A save states the whole advisory set and writes a new policy version with only that list changed, audited as `policy_uploaded` with the reason; a gate that is not pre-PR, `internal_review_recorded`, `no_secrets` or `commit_policy` is refused. Making a gate outside the default set advisory is recorded as an operator decision (from the local CLI, on the upload event only). On the Routing page under Advisory gates |
 | show or update the Kubernetes egress selectors | `GET`, `POST /admin/kubernetes/egress` | `kubernetes egress`, `kubernetes set-egress` | 26: the `kubernetes.egress` setting, the cluster resolver's and an in-cluster local endpoint's namespace, pod labels and port. The settings file seeds it and a save wins over the file; the response says which (`source`). Refused naming the field when a selector is empty, malformed, or names the workers or Crucible namespace. A save states both halves (`dns` and `local_endpoint`); a missing one is refused rather than read as off. The supervisor reads a save back within 15 seconds without a restart, and the readiness canary runs again before a launch uses it (crucible#91) |
+| show or update the Kubernetes short-role timeout | `GET`, `POST /admin/kubernetes/timeouts` | `kubernetes timeouts`, `kubernetes set-timeouts --role-seconds N` | 26: the `kubernetes.timeouts` setting, `role_timeout_seconds`, how long the bundle verifier, the cleaner and the Job that readies a claim for the publisher may run once their Pod is Running (the image pull and scheduling count against the launch timeout instead). A whole number from 10 to 3600; anything else is refused naming the field. The settings file's `kubernetes.role_timeout_seconds` (120) seeds it and a save wins; the response says which (`source`). The Routing page shows it and edits it. Every process reads a save back within 15 seconds (the lab findings of 2026-09-29) |
 
-Every mutation records the principal and is refused when the supervisor
-lease is not held by a live instance (so a stale instance cannot
-administer). A reason is an audit note the operator may leave out; the event
+Every mutation records the principal. Only the mutations that hand the
+supervisor work or take away something a running worker may be using
+(committing a bootstrap import, rotating a credential, removing a
+credential) are refused when the supervisor lease is not held by a live
+instance; every configuration write (a token, a repository, a harness
+enablement, the gateway, the GitHub App, an image promotion, a policy or
+runtime setting, a login) proceeds while the supervisor misses a tick, and
+the supervisor reads it when it next runs. This is the operator's direction
+of 2026-09-29 ("stop micromanaging"; hard failures only where the damage is
+real): until then every mutation waited on a live supervisor, so one missed
+tick refused every administrative change. A refusal is still recorded as
+`admin_refused`. A reason is an audit note the operator may leave out; the event
 records who acted, when, and what changed whether or not one was given. It
 is required only where the operation is destructive or hard to reverse:
 revoking a token, removing a repository, removing a credential, and
@@ -119,10 +129,11 @@ committing a bootstrap import. A read-only check (the GitHub connectivity
 check, a harness test, a gateway test) never asks for one. This is the operator's decision of
 2026-09-25 (crucible#117, "I shouldn't have to provide a reason for
 everything"); the API, the CLI and the UI apply the same rule, because they
-call the same guard. One guard applies the lease rule, the reason rule, and
-the secret-shape check below, so no operation can carry only one of them,
-and they bind every state-changing row of the table above without
-exception: registering a repository and finishing a login are mutations too,
+call the same guard. One guard applies the lease rule (where the operation
+needs it), the reason rule, and the secret-shape check below, so no operation
+can carry only one of them, and they bind every state-changing row of the
+table above without exception: registering a repository and finishing a login
+are mutations too,
 and a login's completion writes `session_compatibility` and clears
 `last_validated_at`, which is exactly the kind of change the rules exist
 for. Where a reason is required, it is a string an operator wrote: an

@@ -390,9 +390,21 @@ def build_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     )
 
     kube = sub.add_parser(
-        "kubernetes", help="the Kubernetes provider's cluster egress selectors (26, #91)"
+        "kubernetes",
+        help="the Kubernetes provider's cluster egress selectors (26, #91) and role timeout",
     )
     kube_sub = kube.add_subparsers(dest="kubernetes_command", required=True)
+    kube_sub.add_parser("timeouts", help="the kubernetes.timeouts setting in force and its source")
+    timeouts_set = kube_sub.add_parser(
+        "set-timeouts",
+        help="replace kubernetes.timeouts: the short roles' seconds from their Pod Running",
+    )
+    timeouts_set.add_argument(
+        "--role-seconds",
+        type=int,
+        required=True,
+        help="the bundle verifier's, the cleaner's and the publisher claim Job's seconds",
+    )
     kube_sub.add_parser("egress", help="the kubernetes.egress setting in force and its source")
     egress_set = kube_sub.add_parser(
         "set-egress",
@@ -756,6 +768,14 @@ def _remote(args: argparse.Namespace, remote: Api) -> Any:
     if command == "kubernetes":
         if args.kubernetes_command == "egress":
             return remote.call("GET", "/v1/admin/kubernetes/egress")
+        if args.kubernetes_command == "timeouts":
+            return remote.call("GET", "/v1/admin/kubernetes/timeouts")
+        if args.kubernetes_command == "set-timeouts":
+            return remote.call(
+                "POST",
+                "/v1/admin/kubernetes/timeouts",
+                {**reason, "role_timeout_seconds": args.role_seconds},
+            )
         return remote.call("POST", "/v1/admin/kubernetes/egress", {**reason, **_egress(args)})
     if command == "bootstrap":
         verb = args.bootstrap_command
@@ -1066,9 +1086,20 @@ def _local(args: argparse.Namespace, wiring: Wiring) -> Any:
         with wiring.ctx.uow_factory() as uow:
             if args.kubernetes_command == "egress":
                 return kubernetes_admin.egress_view(admin, uow)
-            result = kubernetes_admin.save_egress(
-                admin, uow, principal=principal, document=_egress(args), reason=args.reason
-            )
+            if args.kubernetes_command == "timeouts":
+                return kubernetes_admin.timeouts_view(admin, uow)
+            if args.kubernetes_command == "set-timeouts":
+                result = kubernetes_admin.save_timeouts(
+                    admin,
+                    uow,
+                    principal=principal,
+                    document={"role_timeout_seconds": args.role_seconds},
+                    reason=args.reason,
+                )
+            else:
+                result = kubernetes_admin.save_egress(
+                    admin, uow, principal=principal, document=_egress(args), reason=args.reason
+                )
             uow.commit()
             return result
     if command == "bootstrap":
@@ -1416,6 +1447,8 @@ def kind_of(args: argparse.Namespace) -> str:
         ("routing", "set-preference"): "routing_preference",
         ("kubernetes", "egress"): "kubernetes_egress",
         ("kubernetes", "set-egress"): "kubernetes_egress",
+        ("kubernetes", "timeouts"): "kubernetes_timeouts",
+        ("kubernetes", "set-timeouts"): "kubernetes_timeouts",
         ("gates", "advisory"): "gate_classes",
         ("gates", "set-advisory"): "gate_classes",
         ("limits", "command-timeout"): "command_timeout",
@@ -1491,6 +1524,8 @@ def result_for(
         actions = nx.local_endpoint_actions(document, prefix)
     elif kind == "kubernetes_egress":
         actions = nx.kubernetes_egress_actions(document, prefix)
+    elif kind == "kubernetes_timeouts":
+        actions = nx.kubernetes_timeouts_actions(document, prefix)
     elif kind == "command_timeout":
         actions = nx.command_timeout_actions(document, prefix)
     elif kind == "routing_preference":

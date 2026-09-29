@@ -30,11 +30,13 @@ import tempfile
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
-from http.client import HTTPConnection, HTTPResponse, HTTPSConnection
-from typing import Any
+from http.client import HTTPConnection, HTTPException, HTTPResponse, HTTPSConnection
+from typing import IO, Any
 from urllib.parse import quote, urlencode, urlsplit
 
 import yaml
+
+from crucible.ports.execution import ProviderError, ProviderUnavailableError
 
 DEFAULT_TIMEOUT = 30.0
 SERVICE_ACCOUNT_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
@@ -52,14 +54,41 @@ _KINDS: dict[str, tuple[str, str]] = {
 }
 
 
-class KubernetesApiError(Exception):
-    """An API call failed. Carries the status so a caller can tell 404 from 409."""
+# The answers that mean "the API server could not answer right now", not "the answer
+# is no": throttling and the server-side errors a restart, an overloaded etcd or a
+# load balancer in front of the API server produce.
+UNAVAILABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
+
+
+class KubernetesApiError(ProviderError):
+    """An API call failed. Carries the status so a caller can tell 404 from 409.
+
+    It is a `ProviderError`, so one that escapes a provider method is the environment
+    failure the port promises and never an exception the supervisor did not expect."""
 
     def __init__(self, status: int, message: str, *, path: str = "") -> None:
         super().__init__(f"{status} on {path}: {message}" if path else f"{status}: {message}")
         self.status = status
         self.message = message
         self.path = path
+
+
+class KubernetesUnavailableError(KubernetesApiError, ProviderUnavailableError):
+    """The API server could not be reached or could not answer: a refused, reset or
+    timed-out connection (status 0), or one of `UNAVAILABLE_STATUSES`. The same call
+    may succeed a moment later, so nothing is decided from it."""
+
+
+def _api_error(status: int, message: str, *, path: str) -> KubernetesApiError:
+    if status in UNAVAILABLE_STATUSES:
+        return KubernetesUnavailableError(status, message, path=path)
+    return KubernetesApiError(status, message, path=path)
+
+
+# What a request that never got an answer raises: a refused or reset connection, a
+# timeout (both are OSError), a TLS failure mid-stream, and a response http.client
+# could not parse because the connection dropped partway.
+_TRANSPORT_ERRORS: tuple[type[BaseException], ...] = (OSError, HTTPException, ssl.SSLError)
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +101,10 @@ class ExecResult:
     stdout: bytes
     stderr: bytes
     exit_code: int | None
+    # How many stdout bytes the stream carried, counted past `limit` as well. When the
+    # exec wrote stdout to a file (`pod_exec_to`) `stdout` is empty and this is the
+    # only measure of it.
+    stdout_size: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -292,11 +325,14 @@ class KubernetesClient:
             headers["Content-Type"] = "application/json"
         conn = self._connect(timeout)
         try:
-            conn.request(method, url, body=payload, headers=headers)
-            response = conn.getresponse()
-            if response.status >= 400:
-                raw = response.read().decode("utf-8", "replace")
-                raise KubernetesApiError(response.status, _message(raw), path=url)
+            try:
+                conn.request(method, url, body=payload, headers=headers)
+                response = conn.getresponse()
+                if response.status >= 400:
+                    raw = response.read().decode("utf-8", "replace")
+                    raise _api_error(response.status, _message(raw), path=url)
+            except _TRANSPORT_ERRORS as exc:
+                raise _unreachable(exc, url) from exc
             yield response
         finally:
             conn.close()
@@ -311,7 +347,10 @@ class KubernetesClient:
         timeout: float | None = None,
     ) -> Any:
         with self._request(method, path, params=params, body=body, timeout=timeout) as response:
-            raw = response.read()
+            try:
+                raw = response.read()
+            except _TRANSPORT_ERRORS as exc:
+                raise _unreachable(exc, path) from exc
         return json.loads(raw.decode("utf-8")) if raw else None
 
     # ----- paths -------------------------------------------------------
@@ -394,9 +433,11 @@ class KubernetesClient:
             response = conn.getresponse()
             raw = response.read()
             if response.status >= 400:
-                raise KubernetesApiError(
+                raise _api_error(
                     response.status, _message(raw.decode("utf-8", "replace")), path=url
                 )
+        except _TRANSPORT_ERRORS as exc:
+            raise _unreachable(exc, url) from exc
         finally:
             conn.close()
         data = json.loads(raw.decode("utf-8")) if raw else {}
@@ -432,7 +473,10 @@ class KubernetesClient:
         path = f"{self._base('pods')}/{quote(name, safe='')}/log"
         try:
             with self._request("GET", path, params=params, timeout=timeout) as response:
-                raw = response.read()
+                try:
+                    raw = response.read()
+                except _TRANSPORT_ERRORS as exc:
+                    raise _unreachable(exc, path) from exc
         except KubernetesApiError as exc:
             if exc.status in (400, 404):
                 # 400 is what a Pod that has not started a container answers.
@@ -449,6 +493,7 @@ class KubernetesClient:
         timeout: float | None = None,
         limit: int = 64 * 1024 * 1024,
         stdin: bytes | None = None,
+        stdout_to: IO[bytes] | None = None,
     ) -> ExecResult:
         """Run one command in a Pod and return both streams and its exit status.
 
@@ -472,6 +517,25 @@ class KubernetesClient:
             path,
             limit=limit,
             stdin=stdin,
+            stdout=stdout_to,
+        )
+
+    def pod_exec_to(
+        self,
+        name: str,
+        command: Sequence[str],
+        into: IO[bytes],
+        *,
+        container: str | None = None,
+        timeout: float | None = None,
+        limit: int = 64 * 1024 * 1024,
+    ) -> ExecResult:
+        """`pod_exec` with stdout written to `into` as it arrives rather than held in
+        memory: the collected archive can be hundreds of megabytes, and the supervisor
+        should not hold it once, let alone twice. At most `limit` bytes are written;
+        `stdout_size` says how many the Pod sent."""
+        return self.pod_exec(
+            name, command, container=container, timeout=timeout, limit=limit, stdout_to=into
         )
 
 
@@ -492,6 +556,7 @@ def _exec_over_websocket(
     *,
     limit: int,
     stdin: bytes | None = None,
+    stdout: IO[bytes] | None = None,
 ) -> ExecResult:
     key = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
     parsed = urlsplit(server)
@@ -509,20 +574,25 @@ def _exec_over_websocket(
         "Sec-WebSocket-Protocol": "v4.channel.k8s.io",
     }
     try:
-        conn.putrequest("GET", path, skip_host=True, skip_accept_encoding=True)
-        for header, value in request_headers.items():
-            conn.putheader(header, value)
-        conn.endheaders()
-        response = conn.getresponse()
-        if response.status != 101:
-            raw = response.read().decode("utf-8", "replace")
-            raise KubernetesApiError(response.status, _message(raw), path=path)
-        sock = conn.sock
-        if sock is None:
-            raise KubernetesApiError(0, "the exec upgrade carried no socket", path=path)
-        if stdin is not None:
-            sock.sendall(_client_frame(bytes([_CHANNEL_STDIN]) + stdin))
-        return _read_exec_channels(sock, limit=limit)
+        try:
+            conn.putrequest("GET", path, skip_host=True, skip_accept_encoding=True)
+            for header, value in request_headers.items():
+                conn.putheader(header, value)
+            conn.endheaders()
+            response = conn.getresponse()
+            if response.status != 101:
+                raw = response.read().decode("utf-8", "replace")
+                raise _api_error(response.status, _message(raw), path=path)
+            sock = conn.sock
+            if sock is None:
+                raise KubernetesUnavailableError(0, "the exec upgrade carried no socket", path=path)
+            if stdin is not None:
+                sock.sendall(_client_frame(bytes([_CHANNEL_STDIN]) + stdin))
+            # The socket can also reset or time out after the upgrade, while the frames
+            # are read: that is the same unavailable API server, not a failed command.
+            return _read_exec_channels(sock, limit=limit, stdout=stdout)
+        except _TRANSPORT_ERRORS as exc:
+            raise _unreachable(exc, path) from exc
     finally:
         conn.close()
 
@@ -541,13 +611,14 @@ def _client_frame(payload: bytes) -> bytes:
     return header + mask + masked
 
 
-def _read_exec_channels(sock: Any, *, limit: int) -> ExecResult:
+def _read_exec_channels(sock: Any, *, limit: int, stdout: IO[bytes] | None = None) -> ExecResult:
     streams: dict[int, bytearray] = {
         _CHANNEL_STDOUT: bytearray(),
         _CHANNEL_STDERR: bytearray(),
         _CHANNEL_ERROR: bytearray(),
     }
     total = 0
+    stdout_size = 0
     for payload in _websocket_frames(sock):
         if not payload:
             continue
@@ -558,7 +629,14 @@ def _read_exec_channels(sock: Any, *, limit: int) -> ExecResult:
         # Bounded before anything is parsed: a Pod owns what it writes and the reader
         # asks for a file a worker could have replaced with anything (12).
         room = max(0, limit - total)
-        buffer.extend(body[:room])
+        if channel == _CHANNEL_STDOUT:
+            stdout_size += len(body)
+            if stdout is not None:
+                stdout.write(body[:room])
+            else:
+                buffer.extend(body[:room])
+        else:
+            buffer.extend(body[:room])
         total += len(body)
         if total > limit:
             break
@@ -566,6 +644,7 @@ def _read_exec_channels(sock: Any, *, limit: int) -> ExecResult:
         stdout=bytes(streams[_CHANNEL_STDOUT]),
         stderr=bytes(streams[_CHANNEL_STDERR]),
         exit_code=_exit_status(bytes(streams[_CHANNEL_ERROR])),
+        stdout_size=stdout_size,
     )
 
 
@@ -593,16 +672,14 @@ def _exit_status(raw: bytes) -> int | None:
 
 def _websocket_frames(sock: Any) -> Iterator[bytes]:
     """RFC 6455 frames from a server, which are never masked. Continuations are joined;
-    a close, an empty read, or a socket error ends the stream."""
+    a close or an empty read ends the stream. A socket error is raised: a reset or a
+    timeout mid-stream is an unavailable API server, not a finished command."""
     buffer = bytearray()
     pending = bytearray()
 
     def need(count: int) -> bool:
         while len(buffer) < count:
-            try:
-                chunk = sock.recv(65536)
-            except (OSError, ssl.SSLError):
-                return False
+            chunk = sock.recv(65536)
             if not chunk:
                 return False
             buffer.extend(chunk)
@@ -641,6 +718,14 @@ def _websocket_frames(sock: Any) -> Iterator[bytes]:
         if final:
             yield bytes(pending)
             pending.clear()
+
+
+def _unreachable(exc: BaseException, path: str) -> KubernetesUnavailableError:
+    """A request that got no answer, as the one error type the provider handles."""
+    what = "timed out" if isinstance(exc, TimeoutError) else "failed"
+    return KubernetesUnavailableError(
+        0, f"the API server connection {what}: {type(exc).__name__}: {exc}", path=path
+    )
 
 
 def _message(raw: str) -> str:

@@ -478,6 +478,7 @@ def commit(
         principal=principal,
         operation=f"bootstrap commit {import_id}",
         reason_required=True,
+        needs_supervisor=True,
     )
     record = uow.bootstrap_imports.get(import_id, for_update=True)
     if record is None:

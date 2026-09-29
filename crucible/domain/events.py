@@ -181,6 +181,7 @@ class EventKind(StrEnum):
     ADMIN_REFUSED = "admin_refused"
     LOCAL_ENDPOINT_UPDATED = "local_endpoint_updated"
     KUBERNETES_EGRESS_UPDATED = "kubernetes_egress_updated"
+    KUBERNETES_TIMEOUTS_UPDATED = "kubernetes_timeouts_updated"
     # the first-run setup (crucible#119, #120, #121): the gateway URL and its models,
     # and the GitHub App credential the service now owns (ADR 0017)
     LOCAL_GATEWAY_UPDATED = "local_gateway_updated"

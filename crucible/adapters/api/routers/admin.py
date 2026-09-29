@@ -393,6 +393,31 @@ def admin_save_kubernetes_egress(
     return result
 
 
+@router.get("/admin/kubernetes/timeouts")
+def admin_kubernetes_timeouts(ctx: Ctx, uow: UoW, _principal: Admin) -> dict[str, Any]:
+    return kubernetes_admin.timeouts_view(_admin(ctx), uow)
+
+
+@router.post("/admin/kubernetes/timeouts")
+def admin_save_kubernetes_timeouts(
+    ctx: Ctx,
+    uow: UoW,
+    principal: Admin,
+    body: Annotated[dict[str, Any], Body()],
+) -> dict[str, Any]:
+    """The body is the `kubernetes.timeouts` document (`role_timeout_seconds`) and a
+    `reason`; the service refuses a value that is not a whole number within bounds."""
+    result = kubernetes_admin.save_timeouts(
+        _admin(ctx),
+        uow,
+        principal=principal.name,
+        document={key: body[key] for key in ("role_timeout_seconds",) if key in body},
+        reason=_reason(body),
+    )
+    uow.commit()
+    return result
+
+
 @router.get("/admin/status")
 async def admin_status(ctx: Ctx, uow: UoW, _principal: Admin) -> dict[str, Any]:
     return await status_admin.status(_admin(ctx), uow)

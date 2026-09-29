@@ -180,8 +180,14 @@ whenever an attempt reaches collection.)
 
 The copy is removed on **every** path, not only the clean one: a start that
 failed after seeding, a worker the daemon lost, and a transport failure
-during the read-back all remove it, the last from a `finally` path so a
-repeatedly failing read-back cannot leave it on disk for a retry to find.
+during the read-back all remove it. On Docker the last is a `finally` path,
+so a repeatedly failing read-back cannot leave it on disk for a retry to find.
+On Kubernetes a copy is never removed before it was read back (the lab
+findings of 2026-09-29): it is on the attempt's own claim, which no retry
+mounts, and it may hold the only live token the harness rotated into it. A
+read-back the cluster could not answer leaves it in place and the collection
+runs again; once read, it is removed on every path, and if the collection
+never gets an answer, the attempt fails as environment and cleanup removes it.
 Cleanup removes it under every retention policy, `keep` included, so 08's
 "keep or delete the workspace per policy" never keeps the credential copy.
 A harness counts against its concurrency cap until its copy has been synced
