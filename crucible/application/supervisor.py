@@ -58,7 +58,12 @@ from crucible.application.review import (
     record_review_report,
     review_evidence_payload,
 )
-from crucible.application.routing import load_routing, reserve, select_model
+from crucible.application.routing import (
+    count_blocking_failures,
+    load_routing,
+    reserve,
+    select_model,
+)
 from crucible.application.transitions import (
     move_attempt,
     move_execution,
@@ -74,6 +79,7 @@ from crucible.application.wakes import (
 )
 from crucible.contracts.completion_claim import CompletedClaim, complete_claim, parse_claim
 from crucible.contracts.evidence import ROLE_RUN_EVIDENCE, EvidenceKind, EvidenceSource
+from crucible.contracts.policy import window_seconds
 from crucible.contracts.task_contract import TaskContractV1
 from crucible.contracts.wake import WakeReason
 from crucible.domain.command_timeout import effective_command_timeout_ms
@@ -946,7 +952,11 @@ class Supervisor:
         with self._fenced() as uow:
             # States whose metrics can still change. A closed or cancelled task is done
             # with, and rescanning it every tick would grow the tick without end.
+            # The review states too (ADR 0028): a pass waiting for its review counts
+            # as soon as a failure does, or routing would read too high a failure rate.
             settled = (
+                TaskState.AWAITING_INTERNAL_REVIEW,
+                TaskState.GATES_PASSED,
                 TaskState.AWAITING_ACCEPTANCE,
                 TaskState.ACCEPTED,
                 TaskState.PRE_PR_GATES_FAILED,
@@ -972,13 +982,8 @@ class Supervisor:
                     continue
                 gates = uow.gate_results.list_for_attempt(attempt.id)
                 passed = sum(1 for g in gates if g.result == "pass")
-                # ADR 0028: routing judges a model on blocking failures only; a failed
-                # advisory gate (ADR 0024) is a finding for the reviewer, not a failure.
-                failed = sum(
-                    1
-                    for g in gates
-                    if g.result in ("fail", "error") and getattr(g, "blocking", True)
-                )
+                # ADR 0028: routing judges a model on blocking failures only.
+                failed = count_blocking_failures(gates)
                 after = sum(
                     1
                     for c in uow.contracts.list_for_task(task.id)
@@ -3883,18 +3888,33 @@ class Supervisor:
     def _mark_local_endpoint_down(
         self, uow: UnitOfWork, attempt: Attempt, execution: Execution
     ) -> None:
-        """ADR 0028: a local model whose gateway failed (the harness classified the exit
-        `provider_error`: refused, unreachable, 5xx) takes its pool out of routing for the
-        pool's default cooldown, so the tier's fallbacks carry the work meanwhile. The
-        mark is the one a quota exhaustion leaves: listed on Routing and clearable there.
-        A subscription model's provider error leaves routing as it was."""
+        """ADR 0028: a local model whose gateway failed twice in a row (the harness
+        classified both exits `provider_error`: refused, unreachable, 5xx) takes its pool
+        out of routing for the pool's default cooldown, so the tier's fallbacks carry the
+        work meanwhile. One blip moves nothing. The mark is the one a quota exhaustion
+        leaves: listed on Routing and clearable there. A subscription model's provider
+        error leaves routing as it was."""
         task = uow.tasks.get(attempt.task_id)
         assert task is not None
         context = self._routing_context(uow, task, execution)
         if context is None:
             return
-        entry = context[0].model(execution.model)
+        routing = context[0]
+        entry = routing.model(execution.model)
         if entry is None or entry.endpoint != "local":
+            return
+        since = self._clock.now() - timedelta(
+            seconds=window_seconds(routing.pools[entry.pool].window)
+        )
+        earlier = [
+            row
+            for row in uow.attempt_metrics.list_since(since=since, model=None, task_ids=None)
+            if row.pool == entry.pool and row.attempt_id != attempt.id and row.exit_class
+        ]
+        if not earlier:
+            return
+        latest = max(earlier, key=lambda row: (row.created_at or since, row.attempt_id))
+        if latest.exit_class != ExitClass.PROVIDER_ERROR.value:
             return
         self._mark_pool_exhausted(
             uow,
@@ -3949,6 +3969,7 @@ class Supervisor:
                 "pool": mark.pool,
                 "reset_at": mark.reset_at.isoformat(),
                 "source": "harness" if parsed_reset else "policy_default_cooldown",
+                "reason": reason,
             },
         )
 

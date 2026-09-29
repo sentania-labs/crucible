@@ -67,6 +67,23 @@ def preference_view(uow: UnitOfWork) -> dict[str, Any]:
     }
 
 
+def _effective(document: dict[str, Any]) -> Any:
+    """What routing does with a document: a save that changes none of it is refused, so
+    a form sent back unchanged writes no version. An invalid document is compared as
+    itself and left for validation to refuse."""
+    try:
+        routing = RoutingPolicyV1.model_validate(document)
+    except ValueError:
+        return document
+    return (
+        {
+            name: (routing.preferred_pools(name), rule.prefer_pools is None)
+            for name, rule in routing.tiers.items()
+        },
+        {field: getattr(routing.rotation, field) for field in ROTATION_FIELDS},
+    )
+
+
 def save_preference(
     ctx: AdminContext,
     uow: UnitOfWork,
@@ -97,6 +114,11 @@ def save_preference(
     for name, pools in tiers.items():
         document["tiers"][name]["prefer_pools"] = None if pools is None else list(pools)
     document.setdefault("rotation", {}).update(rotation)
+    if _effective(document) == _effective(record.document):
+        raise ContractValidationError(
+            "the routing order and demotion are already these; nothing was saved",
+            errors=[{"path": "tiers", "message": "no change"}],
+        )
     publish_routing(
         ctx,
         uow,

@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import fnmatch
-from dataclasses import dataclass
+from collections.abc import Iterable
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from crucible.application.harnesses import HarnessRegistry
 from crucible.contracts.policy import RoutingModel, RoutingPolicyV1, window_seconds
 from crucible.domain.entities import AttemptMetrics
+from crucible.domain.lifecycle import AttemptState
 from crucible.ports.repository import UnitOfWork
 
 Problem = dict[str, Any]
@@ -263,6 +265,7 @@ def select_model(
         uow, project, [entry.id for entry in routing.models], routing.rotation.quality_window
     )
     preferred = routing.preferred_pools(tier)
+    probing: set[str] | None = None
     ranked: list[tuple[tuple[Any, ...], RoutingModel, str, list[str], QualityState]] = []
     for entry in routing.models:
         reasons: list[str] = []
@@ -314,6 +317,12 @@ def select_model(
         )
         recent = metrics.get(entry.id, [])[-routing.rotation.quality_window :]
         quality = quality_state(routing, recent, now)
+        if quality.probe:
+            if probing is None:
+                probing = _routed_not_launched(uow, project)
+            if entry.id in probing:
+                # The probe is taken: an attempt routed to it has no metrics row yet.
+                quality = replace(quality, probe=False)
         last = recent[-1].created_at if recent else None
         weight = max(entry.weight, 1)
         age_weight = (now - last).total_seconds() * weight if last is not None else 0.0
@@ -343,6 +352,29 @@ def select_model(
     )
     chosen = next(((entry, image) for _, entry, image, reasons, _ in ranked if not reasons), None)
     return Selection(chosen[0] if chosen else None, chosen[1] if chosen else None, ordered)
+
+
+def _routed_not_launched(uow: UnitOfWork, project: str) -> set[str]:
+    """Models with an attempt on `project` that routing chose and whose launch has not
+    yet written its metrics row (it is written at launch). One such attempt is the
+    probe of a demoted model, so a second task in the same tick falls back."""
+    out: set[str] = set()
+    for attempt in uow.attempts.list_in_states([AttemptState.PREPARING, AttemptState.LAUNCHING]):
+        if attempt.selected_model is None or attempt.selected_model in out:
+            continue
+        task = uow.tasks.get(attempt.task_id)
+        if task is not None and task.project == project:
+            out.add(attempt.selected_model)
+    return out
+
+
+def count_blocking_failures(gates: Iterable[Any]) -> int:
+    """ADR 0028: the gate failures routing judges a model on. A failed advisory gate
+    (ADR 0024) is a finding for the reviewer, not a failure; a gate result from before
+    that classification is blocking."""
+    return sum(
+        1 for gate in gates if gate.result in ("fail", "error") and getattr(gate, "blocking", True)
+    )
 
 
 @dataclass(frozen=True, slots=True)

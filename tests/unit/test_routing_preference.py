@@ -4,19 +4,22 @@ demotion that judges a failure rate and lets a model recover."""
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from pydantic import ValidationError
 
 from crucible.application.admin.routing_preference import parse_pool_order
-from crucible.application.routing import quality_state, select_model
+from crucible.application.routing import count_blocking_failures, quality_state, select_model
 from crucible.contracts.policy import RoutingPolicyV1
 from crucible.domain.entities import AttemptMetrics, PoolExhaustion
+from crucible.domain.lifecycle import AttemptState
 from tests.unit.test_class_routing import _uow
 
 NOW = datetime(2026, 9, 29, 12, 0, tzinfo=UTC)
 GATEWAY = "http://gateway.lab.test:4000/v1"
+MID_FALLBACKS = {"claude-sonnet-5", "gemini-3.8-flash-high"}
 
 
 def _entry(model_id: str, harness: str, capability: str, pool: str) -> dict[str, Any]:
@@ -110,7 +113,7 @@ def _pick(
     routing: RoutingPolicyV1, tier: str, rows: list[AttemptMetrics] | None = None, **kw: Any
 ) -> str | None:
     result = select_model(
-        _uow(rows, marks=kw.pop("marks", None)),
+        _uow(rows, marks=kw.pop("marks", None), attempts=kw.pop("attempts", None)),
         routing,
         tier=tier,
         project="p",
@@ -281,3 +284,40 @@ def test_pool_order_spelling() -> None:
     assert parse_pool_order("lab-local anthropic-sub") == ["lab-local", "anthropic-sub"]
     assert parse_pool_order("") == []
     assert parse_pool_order(" Default ") is None
+
+
+def test_a_probe_already_routed_is_not_handed_out_twice() -> None:
+    """Two tasks routed in one tick: the first takes the probe, the second falls back,
+    because the first's metrics row is written only at its launch."""
+    routing = _routing()
+    failing = _history("coder", "pfpfff", last=NOW - timedelta(minutes=61))
+    assert _pick(routing, "standard", failing) == "coder"
+    routed = SimpleNamespace(
+        state=AttemptState.PREPARING, selected_model="coder", task_id="task-probe"
+    )
+    assert _pick(routing, "standard", failing, attempts=[routed]) in MID_FALLBACKS
+
+
+def test_only_blocking_gate_failures_count() -> None:
+    gates = [
+        SimpleNamespace(result="fail", blocking=False),  # advisory (ADR 0024)
+        SimpleNamespace(result="error", blocking=False),
+        SimpleNamespace(result="pass", blocking=True),
+        SimpleNamespace(result="fail", blocking=True),
+        SimpleNamespace(result="error"),  # a record from before the classification
+        SimpleNamespace(result="pending"),
+    ]
+    assert count_blocking_failures(gates) == 2
+
+
+@pytest.mark.parametrize(
+    "rotation",
+    [
+        {"quality_window": 20, "probe_after_minutes": 10081},
+        {"quality_window": 1001},
+        {"quality_window": 4, "demote_min_sample": 5},
+    ],
+)
+def test_rotation_limits(rotation: dict[str, Any]) -> None:
+    with pytest.raises(ValidationError):
+        _routing(rotation={"strategy": "w", "quality_feedback": True, **rotation})

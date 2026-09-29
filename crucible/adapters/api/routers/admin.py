@@ -168,7 +168,7 @@ def _preference_body(body: dict[str, Any]) -> tuple[dict[str, list[str] | None],
     `rotation` holds JSON integers and `quality_feedback` a JSON boolean. A stringified
     number or flag is refused, not read: it would be a setting nobody chose."""
     errors: list[dict[str, Any]] = []
-    tiers = body.get("tiers") or {}
+    tiers = body.get("tiers", {})
     if not isinstance(tiers, dict):
         errors.append({"loc": ("body", "tiers"), "msg": "tiers must be an object"})
         tiers = {}
@@ -182,11 +182,16 @@ def _preference_body(body: dict[str, Any]) -> tuple[dict[str, list[str] | None],
                     "msg": "a tier's pools must be a list of pool names, or null for the default",
                 }
             )
-    rotation = body.get("rotation") or {}
+    rotation = body.get("rotation", {})
     if not isinstance(rotation, dict):
         errors.append({"loc": ("body", "rotation"), "msg": "rotation must be an object"})
         rotation = {}
     for name, value in rotation.items():
+        if name not in routing_preference.ROTATION_FIELDS:
+            errors.append(
+                {"loc": ("body", "rotation", name), "msg": "not an editable rotation setting"}
+            )
+            continue
         wanted = bool if name == "quality_feedback" else int
         if isinstance(value, bool) is not (wanted is bool) or not isinstance(value, wanted):
             errors.append(
@@ -195,6 +200,8 @@ def _preference_body(body: dict[str, Any]) -> tuple[dict[str, list[str] | None],
                     "msg": f"{name} must be a JSON {'boolean' if wanted is bool else 'integer'}",
                 }
             )
+    if not tiers and not rotation and not errors:
+        errors.append({"loc": ("body",), "msg": "name at least one tier or rotation setting"})
     if errors:
         raise RequestValidationError(errors)
     return tiers, rotation

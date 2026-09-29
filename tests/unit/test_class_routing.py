@@ -58,15 +58,31 @@ class _Images:
         return next((row for row in self.rows if row.harness == harness), None)
 
 
+class _Attempts:
+    def __init__(self, rows: list[Any]) -> None:
+        self.rows = rows
+
+    def list_in_states(self, states: Any, **_: Any) -> list[Any]:
+        return [row for row in self.rows if row.state in states]
+
+
+class _Tasks:
+    def get(self, task_id: str) -> Any:
+        return SimpleNamespace(id=task_id, project="p")
+
+
 def _uow(
     rows: list[AttemptMetrics] | None = None,
     marks: list[PoolExhaustion] | None = None,
     images: list[Any] | None = None,
+    attempts: list[Any] | None = None,
 ) -> Any:
     return SimpleNamespace(
         attempt_metrics=_Metrics(rows or []),
         pool_exhaustions=_Marks(marks or []),
         harness_images=_Images(images),
+        attempts=_Attempts(attempts or []),
+        tasks=_Tasks(),
     )
 
 

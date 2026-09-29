@@ -86,7 +86,7 @@ def test_routing_preference_through_api_cli_and_ui(
     # The version before is untouched: a task that references it routes as it did.
     assert _routing(admin_client, first) == before
 
-    for refused in (
+    refusals: list[dict[str, Any]] = [
         {"tiers": {"standard": ["nowhere"]}},
         {"tiers": {"standard": "lab-local"}},
         {"tiers": {"urgent": ["lab-local"]}},
@@ -94,7 +94,14 @@ def test_routing_preference_through_api_cli_and_ui(
         {"rotation": {"demote_min_sample": "3"}},
         {"rotation": {"quality_feedback": "false"}},
         {"rotation": {"strategy": "random"}},
-    ):
+        {"rotation": {"demote_min_sample": 21}},
+        {"rotation": {"probe_after_minutes": 10**13}},
+        {"tiers": []},
+        {},
+        # The order already in force: nothing to save, so no version is written.
+        {"tiers": {"standard": ["anthropic-sub", "lab-local"]}},
+    ]
+    for refused in refusals:
         response = admin_client.post(
             "/v1/admin/routing/preference", json={"reason": "api: refused", **refused}
         )
@@ -137,8 +144,12 @@ def test_routing_preference_through_api_cli_and_ui(
             data={
                 "csrf": csrf,
                 "default_trivial": "true",
+                "prefer_trivial": "lab-local",
+                # The box stays ticked, but the order typed over the default wins.
+                "default_standard": "true",
                 "prefer_standard": "lab-local, anthropic-sub",
                 "default_complex": "true",
+                "prefer_complex": "google-sub",
                 "quality_feedback": "true",
                 "quality_window": "20",
                 "demote_failure_percent": "40",

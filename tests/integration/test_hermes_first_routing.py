@@ -17,7 +17,7 @@ from crucible.application.supervisor import Supervisor
 from crucible.domain.entities import Policy, RoutingPolicyRecord
 from crucible.domain.exit_class import ExitClass
 from tests.fixtures import FakeClock, contract_document
-from tests.integration.conftest import review_and_settle, run_to_settled
+from tests.integration.conftest import run_to_settled
 
 pytestmark = pytest.mark.integration
 
@@ -138,9 +138,9 @@ async def _route(
 
 
 async def _passes(client: TestClient, supervisor: Supervisor, task_id: str) -> None:
-    """A clean attempt is judged once its gates settle: review it to acceptance."""
+    """A clean attempt counts once its pre-PR gates pass, while it still waits for its
+    review: a failure counts that early, so a pass must too."""
     assert await run_to_settled(supervisor, client, task_id) == "awaiting_internal_review"
-    assert await review_and_settle(supervisor, client, task_id) == "awaiting_acceptance"
     await supervisor.tick()
 
 
@@ -210,9 +210,9 @@ async def test_a_local_endpoint_failure_moves_work_to_the_fallbacks(
     supervisor: Supervisor,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The gateway down: Hermes's attempt ends `provider_error`, its pool is marked for
-    the pool's cooldown, and the next standard task goes to a fallback. A subscription
-    model's provider error marks nothing."""
+    """The gateway down: one Hermes attempt ending `provider_error` moves nothing; two in
+    a row mark its pool for the pool's cooldown, and the next standard task goes to a
+    fallback. A subscription model's provider error marks nothing."""
     _install(ctx, clock, {"quality_feedback": True, "quality_window": 20})
     assert ctx.harnesses is not None
     for name in ("hermes", "claude_code", "agy"):
@@ -220,6 +220,12 @@ async def test_a_local_endpoint_failure_moves_work_to_the_fallbacks(
         assert adapter is not None
         monkeypatch.setattr(adapter, "classify_exit", lambda *_a, **_k: ExitClass.PROVIDER_ERROR)
     task, model = await _route(client, supervisor, "HF-DOWN-1", "standard", SUCCEED)
+    assert model == "coder"
+    await run_to_settled(supervisor, client, task)
+    with ctx.uow_factory() as uow:
+        assert uow.pool_exhaustions.get("lab-local") is None, "one blip moved routing"
+
+    task, model = await _route(client, supervisor, "HF-DOWN-1B", "standard", SUCCEED)
     assert model == "coder"
     await run_to_settled(supervisor, client, task)
     with ctx.uow_factory() as uow:

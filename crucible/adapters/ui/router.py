@@ -2887,6 +2887,16 @@ def _whole_number(form: dict[str, str], name: str) -> int | None:
     return int(raw)
 
 
+def _tier_order(form: dict[str, str], tier: str, shown: list[str]) -> list[str] | None:
+    """A tier's order from the Routing form. "Use the default" keeps the default only
+    while the order field still shows what was on the page: an order typed over it is
+    the administrator's, not something to discard under a ticked box."""
+    typed = routing_preference.parse_pool_order(form.get(f"prefer_{tier}", ""))
+    if form.get(f"default_{tier}") == "true" and (typed is None or typed == shown):
+        return None
+    return typed
+
+
 def _pool_order_words(rule: dict[str, Any]) -> str:
     """One tier's pool order as the Routing page says it (ADR 0028)."""
     pools = rule["prefer_pools"]
@@ -3165,10 +3175,8 @@ async def action(request: Request, action: str, ctx: Ctx, uow: UoW) -> Response:
                 uow,
                 principal=principal,
                 tiers={
-                    name: None
-                    if form.get(f"default_{name}") == "true"
-                    else routing_preference.parse_pool_order(form.get(f"prefer_{name}", ""))
-                    for name in tiers
+                    name: _tier_order(form, name, rule["prefer_pools"])
+                    for name, rule in tiers.items()
                 },
                 rotation={
                     "quality_feedback": form.get("quality_feedback") == "true",

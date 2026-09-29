@@ -407,7 +407,7 @@ class RoutingPool(StrictModel):
 class Rotation(StrictModel):
     strategy: str = Field(min_length=1)
     quality_feedback: bool
-    quality_window: int = Field(ge=1)
+    quality_window: int = Field(ge=1, le=1000)
     # ADR 0028: a model is demoted in a project when, over its last `quality_window`
     # attempts that reached the gates, at least `demote_min_sample` did and at least
     # `demote_failure_percent` of them failed a blocking gate. Two failures at least:
@@ -415,7 +415,17 @@ class Rotation(StrictModel):
     # attempt is `probe_after_minutes` old, so it can recover. Absent reads as these.
     demote_failure_percent: int = Field(default=50, ge=1, le=100)
     demote_min_sample: int = Field(default=5, ge=2)
-    probe_after_minutes: int = Field(default=60, ge=1)
+    probe_after_minutes: int = Field(default=60, ge=1, le=10080)
+
+    @model_validator(mode="after")
+    def _sample_fits_window(self) -> Rotation:
+        # A minimum sample the window cannot hold would switch demotion off unseen.
+        if self.demote_min_sample > self.quality_window:
+            raise ValueError(
+                f"demote_min_sample {self.demote_min_sample} exceeds quality_window "
+                f"{self.quality_window}"
+            )
+        return self
 
 
 class Reroute(StrictModel):
