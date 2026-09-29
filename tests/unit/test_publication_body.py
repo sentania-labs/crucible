@@ -52,11 +52,32 @@ def test_a_title_carrying_a_secret_is_refused_by_pattern_name() -> None:
         validate_title(f"push with {value}")
 
 
-def test_an_over_long_or_empty_title_is_refused() -> None:
-    with pytest.raises(TitleRefusedError, match="limit"):
-        validate_title("x" * (MAX_TITLE_LENGTH + 1))
+def test_an_empty_title_is_refused() -> None:
     with pytest.raises(TitleRefusedError, match="empty"):
         validate_title("   ")
+
+
+def test_an_over_long_title_is_shortened_at_a_word_not_refused() -> None:
+    """The lab, 2026-09-29: a 75-character title stopped a finished task at publication."""
+    proposed = "Status page version row: test the real page (#234), Hermes via Hades now"
+    proposed += " ok"
+    assert len(proposed) > MAX_TITLE_LENGTH
+    title = validate_title(proposed)
+    assert len(title) <= MAX_TITLE_LENGTH
+    assert title.endswith("...")
+    assert proposed.startswith(title.removesuffix("..."))
+    assert not title.removesuffix("...").endswith(" ")
+    # One word longer than the limit is cut mid-word.
+    single = validate_title("x" * (MAX_TITLE_LENGTH + 5))
+    assert single == "x" * (MAX_TITLE_LENGTH - 3) + "..."
+    # A title within the limit is untouched.
+    assert validate_title("x" * MAX_TITLE_LENGTH) == "x" * MAX_TITLE_LENGTH
+
+
+def test_a_secret_past_the_cut_still_refuses_the_title() -> None:
+    value = "ghs_" + "a1b2c3d4e5" * 6
+    with pytest.raises(TitleRefusedError, match="github_installation_token"):
+        validate_title("a long title that goes on and on before it reaches " + value)
 
 
 @pytest.mark.parametrize(
