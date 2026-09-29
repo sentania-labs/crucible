@@ -65,6 +65,8 @@ async def test_submit_start_run_to_reported(client: TestClient, supervisor: Supe
         "wake_created",
         # 08, 16: cleanup runs after the gates and only ever after logs_drained.
         "attempt_cleaned_up",
+        # ADR 0028: the passed gates count for routing while the review is awaited.
+        "attempt_metrics_recorded",
     ]
     events = client.get(f"/v1/tasks/{task_id}/events").json()["items"]
     principals = {e["kind"]: e["principal"] for e in events}
