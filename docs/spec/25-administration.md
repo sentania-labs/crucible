@@ -71,7 +71,7 @@ resource.
 | `credentials[harness]` | `state`: `absent`, `configured` (files present, shape unchecked), `invalid` (the shape check failed, or a probe observed the provider refusing the credential; never a probe that merely did not finish), `validated` (a conclusive probe ran the credential); `mount_mode` (`ro`, `rw-narrow`); `last_validated_at`; `last_auth_failure_at` and its exit class (set only by those two conclusive outcomes); `refresh_verified` (bool, from the compatibility test); `source_fingerprint` (sha256 of the file **names and sizes**, never contents); `session_compatibility`: `unverified`, `verified`, `failed` |
 | `providers[]` | name, capabilities, `health`: `ok`, `degraded`, `unavailable` with detail (daemon reachable, proxy reachable, network present, disk headroom) |
 | `github` | App id (public), whether a credential is configured, key present (bool), key fingerprint (sha256 of the public key), where it is kept (`stored_in`: the Secret or directory, whether it exists and whether the service owns it), per registered repository: installation covers it, last check, webhook enabled. The App's slug, install link and installations are read live by the picker, not stored |
-| `readiness` | crucible#123: `ready`, `ready_harnesses`, the global `steps` (supervisor, no repository, no harness ready), and per real harness `ready`, `off` (configuration gate shut) or `not_ready` with its `steps`, each `{code, text, fix}` naming the page that fixes it. Read from the same state the other pages show (on Kubernetes the credential is the harness Secret's state). Test fixtures (the script harness) are left out |
+| `readiness` | crucible#123: `ready`, `ready_harnesses`, the global `steps` (supervisor, no repository, no harness ready), and per real harness `ready`, `off` (the configuration default keeps it off and no administrator has decided, hades #174) or `not_ready` with its `steps`, each `{code, text, fix}` naming the page that fixes it. Read from the same state the other pages show (on Kubernetes the credential is the harness Secret's state). Test fixtures (the script harness) are left out |
 | `supervisor` | as `GET /supervisor` (lease, last tick, last error) |
 | `workers` | active attempts with task, harness, model, image digest, started_at, last heartbeat |
 | `tasks` | counts by state; lists for `blocked`, `pre_pr_gates_failed`, `publish_failed`, `ci_certification_failed`, `head_diverged` |
@@ -320,9 +320,9 @@ the page shows the code box. The Docker, local and Kubernetes paths render
 the CLI's output by the same rules. A pasted code is ended with a carriage
 return, which is what the Enter key sends: Claude Code reads raw and submits
 only on one. The Login page lists what the operator does for that harness;
-for AGY that Google's redirect lands on an address the browser cannot load,
-often a localhost one, and that the code is the `code` value in that
-address bar (the whole address may be pasted, and a percent-encoded code is
+for AGY that after sign-in the browser ends on an address that does not
+load (on the lab on 2026-09-27 a localhost one), and that the code is the
+`code` value in that address bar (the whole address may be pasted, and a percent-encoded code is
 decoded). AGY stops waiting sixty seconds after printing its link and exits
 ("authentication timed out"); the page shows the local time it stops, the
 login then ends with that said plainly, and **Start a new login** runs a fresh

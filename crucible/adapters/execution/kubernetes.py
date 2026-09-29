@@ -2790,7 +2790,7 @@ class KubernetesProvider:
                 session.notice_waiting(flow)
                 if session.state == "waiting_for_code":
                     code = session.wait_for_code(0)
-                    if code is not None:
+                    if code is not None and session.error is None:
                         await self._send_login_code(pod_name, code)
                         session.state = "waiting_for_operator"
                 if _terminated_state(status) is not None or phase in ("Succeeded", "Failed"):

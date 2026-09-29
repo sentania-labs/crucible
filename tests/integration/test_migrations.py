@@ -1196,7 +1196,7 @@ def test_0021_command_timeout_down_and_up_keeps_the_audit_trail(database_url: st
 
 
 def test_0027_starts_every_harness_undecided_and_comes_back_off(database_url: str) -> None:
-    """hades #174: an upgrade changes no harness's availability. Each existing row starts
+    """hades #174: an upgrade changes no harness's availability. An enabled row starts
     undecided, so the configuration default still applies until an administrator
     decides; a rollback drops only the decision."""
     migrate.upgrade(database_url)
@@ -1207,15 +1207,20 @@ def test_0027_starts_every_harness_undecided_and_comes_back_off(database_url: st
         conn.execute(
             text(
                 "INSERT INTO harnesses (name, enabled, reason, session_compatibility, "
-                "updated_at, updated_by) VALUES ('codex', true, '', 'unverified', now(), 't')"
+                "updated_at, updated_by) VALUES "
+                "('codex', true, '', 'unverified', now(), 't'), "
+                "('agy', false, 'rotating', 'unverified', now(), 't')"
             )
         )
     migrate.upgrade(database_url)
     with engine.connect() as conn:
-        decided = conn.execute(
-            text("SELECT enabled, enabled_decided FROM harnesses WHERE name = 'codex'")
-        ).one()
-    assert tuple(decided) == (True, False)
+        decided = {
+            str(r.name): (r.enabled, r.enabled_decided)
+            for r in conn.execute(text("SELECT name, enabled, enabled_decided FROM harnesses"))
+        }
+    # An enabled row is undecided, so the configuration default still applies to it; a
+    # disabled one was an administrator's decision, and stays disabled either way.
+    assert decided == {"codex": (True, False), "agy": (False, True)}
     migrate.downgrade(database_url, "0026_github_app_manifest")
     assert "enabled_decided" not in {c["name"] for c in inspect(engine).get_columns("harnesses")}
     migrate.upgrade(database_url)

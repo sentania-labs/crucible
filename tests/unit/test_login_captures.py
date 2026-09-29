@@ -83,7 +83,9 @@ def test_agy_capture_reaches_its_prompt_and_starts_its_60_second_clock(tmp_path:
     assert session.prompt == AGY_PROMPT
     assert session.state == "waiting_for_code"
     assert session.code_wait_ends_at is not None
-    assert before + 59 <= session.code_wait_ends_at <= time.time() + 61
+    # Shown a few seconds early rather than late: the service sees the prompt after AGY
+    # printed it.
+    assert before + 54 <= session.code_wait_ends_at <= time.time() + 55
     assert session.as_dict()["code_wait_ends_at"].endswith("+00:00")
 
 
@@ -91,6 +93,12 @@ def test_agy_running_out_of_time_says_so_in_plain_words(tmp_path: Path) -> None:
     session = feed_raw("agy_timeout", "agy", tmp_path)
     assert session.error == FLOWS["agy"].timed_out_message
     assert "60 seconds" in (session.error or "")
+    # AGY has stopped reading: the code box goes, a code is refused, and silence does not
+    # bring the box back.
+    assert session.state == "waiting_for_operator"
+    assert session.accept_code("too-late") is False
+    session.notice_waiting(FLOWS["agy"], now=session.last_output_at + 60)
+    assert session.state == "waiting_for_operator"
 
 
 def test_codex_capture_shows_the_url_and_device_code_and_never_asks_for_one(
@@ -214,6 +222,8 @@ def test_the_driver_brings_claude_codes_url_and_prompt_through_and_enter_submits
     # Raw mode ends the input on a carriage return only: every character arrived, and
     # the read ended, which a newline would not have done.
     assert f"stand-in read {len(pasted)} characters" in text
+    # The prompt redrawn with the code in it reaches the log masked.
+    assert "Paste code here [pasted code]" in text
     assert _LOGIN_CODE_SCRIPT.endswith('\\r" "$c" > "$d/in"')
     assert pasted not in text
     assert "\x1b" not in text and "\r" not in text
@@ -324,3 +334,13 @@ def test_agys_code_is_taken_from_the_redirect_the_browser_could_not_load() -> No
     assert normalize_code(agy, "state=xyz&code=4%2F0AVG7fiQabc") == "4/0AVG7fiQabc"
     # Claude Code's code is pasted as the page shows it, `#` and all.
     assert normalize_code(FLOWS["claude_code"], " abc%2Fdef#state ") == "abc%2Fdef#state"
+
+
+def test_a_pasted_code_the_cli_echoes_is_masked_on_every_path(tmp_path: Path) -> None:
+    """The Docker and local logins read the CLI's terminal directly, where AGY echoes
+    what is typed; the pasted code is masked there as the Kubernetes driver masks it."""
+    session = feed_raw("agy", "agy", tmp_path)
+    assert session.accept_code("4/0AVG7fiQ-secretish")
+    _consume("4/0AVG7fiQ-secretish\r\n", FLOWS["agy"], None, tmp_path, session, None)
+    assert session.lines[-1] == "[pasted code]"
+    assert not any("4/0AVG7fiQ-secretish" in line for line in session.lines)

@@ -1653,17 +1653,16 @@ _STAND_IN_SESSION = """printf '{"authenticated": true}' > "$CRUCIBLE_LOGIN_DIR/s
 
 
 def _captured_flow(harness: str) -> LoginFlow:
-    """The real harness's flow (its captured prompt, its code handling, its guidance)
-    run as the stand-in harness, whose credential is `session.json`."""
+    """The real harness's flow (its captured prompt, its code handling, its token
+    pattern, its guidance) run as the stand-in harness, whose credential is
+    `session.json`. Claude Code's token pattern stays set, so the driver runs as it does
+    in production, with no early flush of a quiet partial line."""
     return replace(
         FLOWS[harness],
         harness="script-harness",
         argv=("crucible-script-harness", "login-stub"),
         image_binary="/usr/local/bin/crucible-script-harness",
         directory_env="CRUCIBLE_LOGIN_DIR",
-        captures_token=False,
-        token_pattern="",
-        token_file="",
     )
 
 
@@ -1833,6 +1832,8 @@ async def test_each_captured_harness_login_reaches_its_state_and_the_page_shows_
                 assert "chmod" not in tail
                 if pasted is not None and reaches is not None:
                     assert f"stand-in read {len(reaches)} characters" in tail, tail
+                    # The CLI's echo of the code reaches the page masked.
+                    assert "[pasted code]" in tail, tail
                     assert pasted not in tail and reaches not in tail
     finally:
         with contextlib.suppress(KubernetesApiError):

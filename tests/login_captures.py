@@ -34,12 +34,15 @@ def capture(name: str) -> bytes:
 _READERS = {
     # A byte at a time through dd: bash's own `read` puts the terminal back into a
     # mode that turns a carriage return into a newline, which Ink's raw mode never
-    # does. A newline is kept as part of the code, as Ink keeps it.
+    # does. A newline is kept as part of the code, as Ink keeps it. The prompt is then
+    # redrawn with the code in it, Ink's way: the real CLI draws asterisks there, and
+    # the stand-in draws the code itself, the worst case the driver's mask is for.
     "claude_code": (
         "stty raw -echo; "
         "while :; do ch=$(dd bs=1 count=1 2>/dev/null; echo x); ch=${ch%x}; "
         '[ -z "$ch" ] && break; [ "$ch" = $\'\\r\' ] && break; code=$code$ch; done; '
-        "stty sane -onlcr; printf '\\r\\n'; "
+        "stty sane -onlcr; "
+        "printf '\\033[2GPaste\\033[8Gcode\\033[13Ghere\\033[31G%s\\r\\r\\n' \"$code\"; "
     ),
     "agy": "stty sane -onlcr; IFS= read -r code; ",
     "codex": "sleep 2; ",

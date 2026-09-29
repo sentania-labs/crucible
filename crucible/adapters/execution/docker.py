@@ -1792,7 +1792,7 @@ class DockerProvider:
                 session.notice_waiting(flow)
                 if session.state == "waiting_for_code":
                     code = session.wait_for_code(0)
-                    if code is not None:
+                    if code is not None and session.error is None:
                         # The Enter key: Claude Code submits only on a carriage return
                         # (hades #173).
                         sock.sendall((code.strip() + ENTER).encode("utf-8"))

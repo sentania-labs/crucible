@@ -80,6 +80,10 @@ ENTER = "\r"
 # A CLI that has printed its sign-in URL and then nothing for this long is waiting for
 # the operator, whatever its prompt says (hades #173).
 QUIET_PROMPT_SECONDS = 5.0
+# The service sees a prompt a little after the CLI printed it (the driver's one-second
+# read, the log poll), so the deadline it shows for a CLI that gives up on its own is
+# this much early rather than late (hades #173).
+CODE_WAIT_MARGIN_SECONDS = 5
 
 # What a terminal would show for one line of a CLI's output (hades #173). Ink (Claude
 # Code) ends every line `\r\r\n` through the pty and separates words with cursor-column
@@ -215,10 +219,11 @@ FLOWS: dict[str, LoginFlow] = {
             "link. Sign in to Google in this browser before starting, so the sign-in "
             "is one click.",
             "Open the sign-in link and choose the Google account AGY is to use.",
-            "Google then sends the browser to an address that does not load (often a "
-            "localhost address this browser cannot reach). That is expected. Copy the "
-            "whole address from the address bar, or just the value after code= up to "
-            "the next &, paste it into the Authorization code box below and submit.",
+            "After you sign in, the browser ends on an address that does not load (on "
+            "the lab, 2026-09-27, it was a localhost address this browser cannot "
+            "reach). That is expected. Copy the whole address from the address bar, or "
+            "just the value after code= up to the next &, paste it into the "
+            "Authorization code box below and submit.",
             "If the 60 seconds run out, the login ends and says so. Start it again: it "
             "prints a new link, and a code from the old one no longer works.",
         ),
@@ -276,6 +281,10 @@ class LoginSession:
     # When the CLI last printed a line (monotonic), for QUIET_PROMPT_SECONDS.
     last_output_at: float = field(default_factory=time.monotonic)
     _code_from_operator: str | None = None
+    # The codes the operator pasted, masked wherever the CLI echoes one back: the
+    # Kubernetes driver masks in the Pod, and this is the same for the Docker and local
+    # logins, which read the CLI's terminal directly.
+    _pasted: list[str] = field(default_factory=list)
     _wake: threading.Event = field(default_factory=threading.Event)
     _guard: threading.Lock = field(default_factory=threading.Lock)
 
@@ -313,6 +322,8 @@ class LoginSession:
                 return False
             self._code_from_operator = code
             self.codes_submitted += 1
+            if code.strip():
+                self._pasted.append(code.strip())
         self._wake.set()
         return True
 
@@ -321,7 +332,7 @@ class LoginSession:
         for the operator, so the code box is shown even when its prompt was not
         recognised. Only before the first code: after one, the CLI's own prompt says
         whether it wants another."""
-        if not flow.pastes_code or self.url is None or self.codes_submitted:
+        if not flow.pastes_code or self.url is None or self.codes_submitted or self.error:
             return
         moment = time.monotonic() if now is None else now
         with self._guard:
@@ -441,7 +452,7 @@ def run_login(
             session.notice_waiting(flow)
             if session.state == "waiting_for_code":
                 code = session.wait_for_code(0.25)
-                if code is not None:
+                if code is not None and session.error is None:
                     os.write(master, (code.strip() + ENTER).encode("utf-8"))
                     session.state = "waiting_for_operator"
         process.wait(timeout=5)
@@ -500,6 +511,8 @@ def _line(
             _write_token(target / flow.token_file, match.group(1))
             session.token_written = True
             shown = line.replace(match.group(1), "[captured to " + flow.token_file + "]")
+    for pasted in session._pasted:
+        shown = shown.replace(pasted, "[pasted code]")
     shown = redact(shown)
     session.lines.append(shown)
     session.last_output_at = time.monotonic()
@@ -513,10 +526,18 @@ def _line(
         session.code = code.group(1)
     if flow.timed_out_pattern and re.search(flow.timed_out_pattern, shown, re.IGNORECASE):
         session.error = session.error or flow.timed_out_message or shown.strip()
+        # The CLI has stopped reading: no code box, and a code is refused rather than
+        # handed to a CLI on its way out.
+        with session._guard:
+            if session.state == "waiting_for_code":
+                session.state = "waiting_for_operator"
+        return
     if flow.pastes_code and _prompt_re(flow).search(shown):
         session.prompt = shown.strip()
         if flow.code_wait_seconds and session.code_wait_ends_at is None:
-            session.code_wait_ends_at = time.time() + flow.code_wait_seconds
+            session.code_wait_ends_at = (
+                time.time() + flow.code_wait_seconds - CODE_WAIT_MARGIN_SECONDS
+            )
         session.state = "waiting_for_code"
 
 

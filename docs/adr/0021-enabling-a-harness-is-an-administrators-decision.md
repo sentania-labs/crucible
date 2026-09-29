@@ -30,12 +30,19 @@ gate read-only. That broke the rule that every tunable has a UI.
    `warning` wherever the harness is shown and in the enable answer, and recorded with
    the decision as `configuration_warning`. The harness test (crucible#118) is how the
    operator proves the harness works.
-4. **An upgrade changes nothing by itself.** Migration 0027 starts every existing row
-   undecided, so a harness the configuration keeps off stays off until an administrator
-   enables it.
+4. **An upgrade changes nothing by itself.** Migration 0027 records a row an
+   administrator had disabled as that decision, and starts every enabled row undecided,
+   so a harness the configuration keeps off stays off until an administrator enables it.
+5. **Removing a credential is a decision too.** `credentials remove` disables the
+   harness through the same service, so the harness stays off, whatever its
+   configuration says, until an administrator enables it again.
 
 ## Consequences
 
 Changing a harness's configuration entry after an administrator has decided does not
 change that harness's availability; the Settings page says the entry is the starting
 value only. A rollback past 0027 drops the decision, and the two gates apply again.
+
+The harness test runs only on an enabled harness, so an unverified harness is enabled
+for new tasks before the test can prove it. Letting the test run on a harness that is
+off is a possible follow-up.

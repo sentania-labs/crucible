@@ -226,12 +226,23 @@ def kind_schemas() -> dict[str, dict[str, Any]]:
             _obj(
                 "a harness",
                 {"name": STR, "enabled": BOOL, "enabled_by_administrator": BOOL},
+                {
+                    "enabled_by_configuration": BOOL,
+                    "decided_by_administrator": BOOL,
+                    "warning": STR,
+                },
             ),
         ),
         "harness": _obj(
             "a harness after enable or disable",
             {"harness": STR, "enabled": BOOL},
-            {"reason": STR, "session_compatibility": STR, "running_attempts": {"type": "integer"}},
+            {
+                "reason": STR,
+                "session_compatibility": STR,
+                "running_attempts": {"type": "integer"},
+                "decided_by_administrator": BOOL,
+                "warning": STR,
+            },
         ),
         "credential_state": credential,
         "credential_report": _obj(

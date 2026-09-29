@@ -6,8 +6,10 @@ has, the configuration entry `harnesses.<name>.enabled` is the starting value an
 launch needs it and the runtime flag both, as before; once one has, the stored decision
 alone decides, with no restart, and the configuration's reason stays a warning.
 
-Every existing row starts undecided, so an upgrade changes no harness's availability:
-a harness the configuration keeps off stays off until an administrator enables it.
+An upgrade changes no harness's availability. A row an administrator had disabled (or a
+credential removal had) is recorded as that decision, which it was; every enabled row
+starts undecided, so a harness the configuration keeps off stays off until an
+administrator enables it.
 
 Revision ID: 0027_harness_enable_decision
 Revises: 0026_github_app_manifest
@@ -29,6 +31,7 @@ def upgrade() -> None:
         "harnesses",
         sa.Column("enabled_decided", sa.Boolean, nullable=False, server_default=sa.false()),
     )
+    op.execute("UPDATE harnesses SET enabled_decided = true WHERE NOT enabled")
 
 
 def downgrade() -> None:
