@@ -53,6 +53,7 @@ async def test_pass_path_reaches_awaiting_acceptance_then_accepted(
     assert results[GateName.NO_SECRETS] == "pass"
     assert results[GateName.RUN_EVIDENCE_PRESENT] == "pass"
     assert results[GateName.CRITERIA_MAPPED] == "pass"
+    assert results[GateName.COMMIT_POLICY] == "pass"
 
     assert await review_and_settle(supervisor, client, task_id) == "awaiting_acceptance"
     assert gates(client, attempt_id)[GateName.INTERNAL_REVIEW_RECORDED] == "pass"
@@ -144,6 +145,33 @@ async def test_each_fail_fixture_fails_its_gate(
     task_id = submit_and_start(client, image, external_id=f"EX-{gate}")
     assert await run_to_settled(supervisor, client, task_id) == "pre_pr_gates_failed"
     assert gates(client, latest_attempt(client, task_id))[gate] == "fail"
+
+
+async def test_a_commit_without_the_trailer_fails_before_internal_review(
+    client: TestClient, supervisor: Supervisor
+) -> None:
+    """hades FDY-0135: the publisher refuses such a commit after acceptance, which is
+    the most expensive place to find it. The commit_policy gate finds it at collection,
+    so the task never reaches awaiting_internal_review, and says why in plain words."""
+    task_id = submit_and_start(client, "crucible-worker:fake-no-trailer", external_id="HT-0007")
+    assert await run_to_settled(supervisor, client, task_id) == "pre_pr_gates_failed"
+    attempt_id = latest_attempt(client, task_id)
+    results = gates(client, attempt_id)
+    assert results[GateName.COMMIT_POLICY] == "fail"
+    assert results[GateName.COMMITS_PRESENT] == "pass"
+    rows = client.get(f"/v1/attempts/{attempt_id}/gates").json()["items"]
+    detail = next(r["detail"] for r in rows if r["gate"] == GateName.COMMIT_POLICY)
+    head = client.get(f"/v1/tasks/{task_id}").json()["head_sha"]
+    assert detail == (
+        "the publisher would refuse to push this branch: "
+        f"1 commit(s) without a Crucible-Attempt trailer ({head[:12]})"
+    )
+    assert client.get(f"/v1/tasks/{task_id}").json()["gate_summary"]["failing"] == [
+        GateName.COMMIT_POLICY.value
+    ]
+    kinds = event_kinds(client, task_id)
+    assert "task_pre_pr_gates_failed" in kinds
+    assert "task_awaiting_internal_review" not in kinds
 
 
 async def test_a_secret_in_the_diff_is_never_stored(

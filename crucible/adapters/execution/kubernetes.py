@@ -1713,6 +1713,12 @@ class KubernetesProvider:
                 work_branch=work_branch,
                 size_cap_bytes=self.config.report_size_cap_bytes,
                 quota_attempt_id=spec.attempt_id if quota_checkpoint else None,
+                author_email=str(
+                    spec.policy.get("git", {}).get(
+                        "author_email", "crucible-worker@users.noreply.github.com"
+                    )
+                ),
+                commit_trailer=identity_bundle.commit_trailer(spec.policy),
             ),
             mounts=[
                 Mount("ws", REPO_MOUNT, read_only=not quota_checkpoint, sub_path="repo"),
@@ -2910,7 +2916,7 @@ class KubernetesProvider:
             "configMap": {
                 "name": k8sspec.object_name("identity", spec.attempt_id),
                 "defaultMode": 0o444,
-                "items": [{"key": key, "path": path} for key, path in sorted(paths.items())],
+                "items": [_identity_item(key, path) for key, path in sorted(paths.items())],
             },
         }
 
@@ -4219,6 +4225,15 @@ def _bundle_key(relative: str) -> str:
     separator a bundle path can carry becomes a double underscore and the volume's
     `items` maps it back to the real relative path."""
     return relative.replace("/", "__")
+
+
+def _identity_item(key: str, path: str) -> dict[str, Any]:
+    """One key of the identity ConfigMap projected to its path. The commit hook is the
+    one executable file in the bundle: git skips a hook it cannot execute (FDY-0135)."""
+    item: dict[str, Any] = {"key": key, "path": path}
+    if path.startswith(f"{scripts.COMMIT_HOOK_DIR}/"):
+        item["mode"] = 0o555
+    return item
 
 
 def _render_identity(
