@@ -1751,6 +1751,7 @@ class KubernetesProvider:
                 author_name=scripts.policy_git(spec.policy, "author_name"),
                 author_email=scripts.policy_git(spec.policy, "author_email"),
                 commit_trailer=scripts.policy_git(spec.policy, "commit_trailer"),
+                trailer_value=spec.external_id,
             ),
             mounts=[
                 # FDY-0140: writable always, since what the worker left uncommitted is
@@ -2952,7 +2953,7 @@ class KubernetesProvider:
             "configMap": {
                 "name": k8sspec.object_name("identity", spec.attempt_id),
                 "defaultMode": 0o444,
-                "items": [{"key": key, "path": path} for key, path in sorted(paths.items())],
+                "items": [_identity_item(key, path) for key, path in sorted(paths.items())],
             },
         }
 
@@ -4266,6 +4267,15 @@ def _bundle_key(relative: str) -> str:
     separator a bundle path can carry becomes a double underscore and the volume's
     `items` maps it back to the real relative path."""
     return relative.replace("/", "__")
+
+
+def _identity_item(key: str, path: str) -> dict[str, Any]:
+    """One key of the identity ConfigMap projected to its path. The commit hook is the
+    one executable file in the bundle: git skips a hook it cannot execute (FDY-0135)."""
+    item: dict[str, Any] = {"key": key, "path": path}
+    if path.startswith(f"{scripts.COMMIT_HOOK_DIR}/"):
+        item["mode"] = 0o555
+    return item
 
 
 def _render_identity(

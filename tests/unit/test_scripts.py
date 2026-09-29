@@ -403,6 +403,7 @@ def test_edits_left_uncommitted_are_committed_as_the_policy_author_with_the_trai
         author_name="Policy Author",
         author_email="policy@example.invalid",
         commit_trailer="Crucible-Attempt",
+        trailer_value="EX-0001",
     )
     assert result.returncode == 0, result.stderr
     changed = set((output / "changed.txt").read_text().split())
@@ -423,7 +424,8 @@ def test_edits_left_uncommitted_are_committed_as_the_policy_author_with_the_trai
     ).stdout.splitlines()
     assert shown[0] == shown[1] == "Policy Author <policy@example.invalid>"
     assert shown[2] == "crucible: commit what attempt 01ATTEMPT left uncommitted"
-    assert shown[3] == "01ATTEMPT"
+    # The value the commit hook gives the worker's own commits: the task's external id.
+    assert shown[3] == "EX-0001"
     # The bundle carries the extra commit, so it is what the review sees.
     assert (output / "work_branch.bundle").stat().st_size > 0
     status = subprocess.run(

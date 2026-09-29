@@ -23,11 +23,19 @@ from crucible.adapters.execution import scripts
 from crucible.ports.execution import (
     BranchBundle,
     CollectedArtifact,
+    CommitPolicyCheck,
     LaunchSpec,
     VerificationRun,
 )
 
-__all__ = ["Outputs", "read_outputs", "read_verifications", "tail", "text"]
+__all__ = [
+    "Outputs",
+    "read_commit_policy",
+    "read_outputs",
+    "read_verifications",
+    "tail",
+    "text",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,6 +102,7 @@ def read_outputs(
     changed = tuple(p for p in text(output / "changed.txt").splitlines() if p.strip())
     diff_text = text(output / "diff.patch") if (output / "diff.patch").is_file() else None
     commit_paths = tuple(p for p in text(output / "commit-paths.txt").splitlines() if p.strip())
+    commit_policy = read_commit_policy(output / "commit-policy")
     messages: list[str] = []
     for record in text(output / "log.txt").split("\x1e"):
         parts = record.strip("\n").split("\x1f")
@@ -119,6 +128,7 @@ def read_outputs(
             ),
             commit_paths=commit_paths,
             commit_messages=tuple(messages),
+            commit_policy=commit_policy,
         )
 
     artifacts: list[CollectedArtifact] = []
@@ -165,6 +175,26 @@ def read_outputs(
         leftover_committed=(output / "leftover-committed.txt").is_file(),
         leftover_note=text(output / "leftover-refusal.txt").strip() or None,
     )
+
+
+def read_commit_policy(directory: Path) -> CommitPolicyCheck | None:
+    """The collector's commit policy answer, or None when it did not finish the check.
+
+    The emails are what the worker's commits say, so they are data: capped in count and
+    length here, and echoed by the gate only when they look like an address."""
+    if not (directory / "checked").is_file():
+        return None
+    authors: list[tuple[str, str]] = []
+    for line in text(directory / "author-problems.txt").splitlines()[:1000]:
+        sha, _, email = line.partition("\t")
+        if sha.strip():
+            authors.append((sha.strip()[:64], email.strip()[:200]))
+    trailers = tuple(
+        line.strip()[:64]
+        for line in text(directory / "trailer-problems.txt").splitlines()[:1000]
+        if line.strip()
+    )
+    return CommitPolicyCheck(author_problems=tuple(authors), trailer_problems=trailers)
 
 
 def read_verifications(

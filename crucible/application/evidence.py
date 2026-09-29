@@ -25,7 +25,7 @@ from crucible.domain.ids import new_id
 from crucible.domain.secrets import find_secrets, scan_text
 from crucible.ports.artifacts import ArtifactStore, SecretInArtifactError
 from crucible.ports.clock import Clock
-from crucible.ports.execution import CollectedOutputs
+from crucible.ports.execution import BranchBundle, CollectedOutputs
 from crucible.ports.harness import ParsedReport
 from crucible.ports.repository import UnitOfWork
 
@@ -55,6 +55,19 @@ def _add(
         artifact_id=artifact_id,
     )
     return uow.evidence.add(record)
+
+
+def _commit_policy_payload(bundle: BranchBundle) -> dict[str, Any]:
+    """What the `commit_policy` gate reads: whether the collector finished the
+    publisher's commit check, and what it found (hades FDY-0135)."""
+    check = bundle.commit_policy
+    if check is None:
+        return {"checked": False}
+    return {
+        "checked": True,
+        "author_problems": [{"sha": sha, "author": who} for sha, who in check.author_problems],
+        "trailer_problems": list(check.trailer_problems),
+    }
 
 
 def store_artifact(
@@ -329,6 +342,7 @@ def record_collection_evidence(
                 "commit_paths": list(bundle.commit_paths),
                 "commit_messages": list(bundle.commit_messages),
                 "claimed_head_sha": claimed,
+                "commit_policy": _commit_policy_payload(bundle),
             },
         )
     if outputs.diff_paths or outputs.bundle is not None:

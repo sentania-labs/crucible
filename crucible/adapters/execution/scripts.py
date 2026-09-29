@@ -34,6 +34,7 @@ __all__ = [
     "ACTIVITY_SCRIPT",
     "BUNDLE_MOUNT",
     "BUNDLE_VERIFY_SCRIPT",
+    "COMMIT_HOOK_DIR",
     "MANIFEST",
     "PUBLISH_BUNDLE_LEAF",
     "PUBLISH_LEAF",
@@ -41,6 +42,7 @@ __all__ = [
     "REPO_MOUNT",
     "VERIFY_MOUNT",
     "collector_script",
+    "commit_msg_hook",
     "encode_check_id",
     "parse_activity",
     "preparer_script",
@@ -131,9 +133,68 @@ printf '[credential]\\n\\thelper = "!sh /tmp/cred-helper.sh"\\n' >> /tmp/gitconf
 """
 
 
+# The hook every worker's checkout runs on `git commit` (hades FDY-0135). It lives in the
+# identity bundle, which is Crucible's own text mounted read-only, and the preparer points
+# the checkout's `core.hooksPath` at that directory, so the repository's own hooks never
+# run and the worker cannot edit this one. It adds `<commit_trailer>: <external_id>` to
+# the message unless a trailer with that key is already there, so a harness that adds
+# the trailer itself, an amend, or a second run never gets a duplicate. It reads and
+# writes only the message file git hands it: no network, no repository content.
+# `--no-divider`: a `---` line in a body is prose, not the start of a patch, so the
+# trailer goes at the end of the message, where the commit policy check reads it.
+COMMIT_HOOK_DIR = "hooks"
+
+
+def commit_msg_hook(*, trailer: str, value: str) -> str:
+    """The `commit-msg` hook text: the trailer key and value bound as quoted literals."""
+    return f"""#!/bin/sh
+# Crucible's commit-msg hook: every commit on this attempt carries its trailer.
+set -eu
+KEY={_quote(trailer)}
+VALUE={_quote(value)}
+[ -n "${{1:-}}" ] || exit 0
+exec git interpret-trailers --in-place --no-divider --if-exists doNothing \\
+  --if-missing add --trailer "$KEY: $VALUE" "$1"
+"""
+
+
+def _commit_policy_check(git: str) -> str:
+    """23 step 4: the one statement of the commit policy, shared by the publisher, which
+    refuses a push on it, and the collector, whose answer the `commit_policy` gate reads
+    before review (hades FDY-0135).
+
+    `commit_policy_check RANGE DIR` writes `DIR/author-problems.txt` (sha, tab, author
+    email) for each commit in RANGE whose author email is not `$POLICY_AUTHOR_EMAIL`, and
+    `DIR/trailer-problems.txt` (sha) for each commit with no `$TRAILER` trailer. `git` is
+    the command each caller already runs git with.
+
+    It returns non-zero when git cannot list or read the commits, so neither caller
+    takes a check that did not run for one that found nothing: the publisher refuses
+    the push, and the collector records the check as unfinished, which fails the gate."""
+    return f"""commit_policy_check() {{
+  : > "$2/author-problems.txt"
+  : > "$2/trailer-problems.txt"
+  shas=$({git} rev-list "$1") || return 1
+  for sha in $shas; do
+    who=$({git} show -s --format='%ae' "$sha") || return 1
+    if [ "$who" != "$POLICY_AUTHOR_EMAIL" ]; then
+      printf '%s\\t%s\\n' "$sha" "$who" >> "$2/author-problems.txt"
+    fi
+    found=$({git} show -s --format='%(trailers:key='"$TRAILER"',valueonly)' "$sha") \\
+      || return 1
+    if [ -z "$found" ]; then
+      printf '%s\\n' "$sha" >> "$2/trailer-problems.txt"
+    fi
+  done
+}}
+"""
+
+
+# `log.showSignature=false`: a worker-written `.git/config` could otherwise have `git
+# show` verify a planted signature with a `gpg.program` of its choosing.
 GIT = (
     "git -c core.fsmonitor= -c diff.external= -c core.pager=cat "
-    "-c core.hooksPath=/dev/null -c 'safe.directory=*'"
+    "-c core.hooksPath=/dev/null -c log.showSignature=false -c 'safe.directory=*'"
 )
 CHECKPOINT_GIT = (
     "git -c core.fsmonitor= -c diff.external= -c core.pager=cat "
@@ -339,6 +400,9 @@ fi
 {GIT} remote set-url --push origin "$ORIGIN_PLACEHOLDER"
 {GIT} config user.name "$AUTHOR_NAME"
 {GIT} config user.email "$AUTHOR_EMAIL"
+# hades FDY-0135: the worker's commits run Crucible's commit-msg hook, which adds the
+# attempt trailer, from the read-only identity bundle; never a hook the repository has.
+{GIT} config core.hooksPath "$IDENTITY_MOUNT/{COMMIT_HOOK_DIR}"
 {GIT} config credential.helper ""
 {GIT} config http.extraHeader ""
 
@@ -421,17 +485,26 @@ def collector_script(
     author_name: str = "crucible-worker",
     author_email: str = "crucible-worker@users.noreply.github.com",
     commit_trailer: str = "Crucible-Attempt",
+    trailer_value: str = "",
 ) -> str:
     """Produce the full diff, the path list, the head, the log, the bundle, and a copy
     of the report directory (08). Never a push, never a network: `--network none`.
 
     With `attempt_id`, what the worker left uncommitted is committed first, as the
-    policy's author with the attempt trailer, so edits a model forgot to commit are
-    collected and reviewed rather than lost (FDY-0140). A quota checkpoint (16) is the
+    policy's author with the trailer the worker's own commits get (`trailer_value`, the
+    task's external id as the commit hook writes it; the attempt id when none is given),
+    so edits a model forgot to commit are collected and reviewed rather than lost
+    (FDY-0140). A quota checkpoint (16) is the
     same commit with a `wip` subject; it is refused, and the collection fails, when the
     repository's `.git` is not a plain directory or the commit cannot be made. Otherwise
     such a commit is skipped with a note and the collection goes on with what the worker
-    committed itself."""
+    committed itself.
+
+    It also runs the publisher's commit policy over the same range the publisher will
+    (the remote work branch when the checkout has one, else base_ref), so the
+    `commit_policy` gate can refuse a bad commit before review rather than the publisher
+    after acceptance (hades FDY-0135). The answer goes to `commit-policy/`, with
+    `checked` written only once the check has finished."""
     return f"""set -eu
 {GIT_ENV}
 OUT={OUTPUT_MOUNT}
@@ -441,11 +514,13 @@ BASE_REF={_quote(base_ref)}
 SIZE_CAP={_quote(str(size_cap_bytes))}
 COMMIT_ATTEMPT={_quote(attempt_id)}
 QUOTA={_quote("1" if quota_checkpoint else "")}
+POLICY_AUTHOR_EMAIL={_quote(author_email)}
 TRAILER={_quote(commit_trailer)}
+TRAILER_VALUE={_quote(trailer_value or attempt_id)}
 mkdir -p "$OUT"
 : > "$OUT/copy-rejections.tsv"
 {_COPY_REPORT}
-LEFTOVER=0
+{_commit_policy_check(GIT + ' -C "$REPO"')}LEFTOVER=0
 refuse_checkpoint() {{
   if [ -n "$QUOTA" ]; then
     printf '%s\n' "$1" > "$OUT/checkpoint-refusal.txt"
@@ -511,7 +586,7 @@ EOF
     refuse_checkpoint "checkpoint refused: the working tree could not be staged"
   elif checkpoint_git diff --cached --quiet; then
     :
-  elif checkpoint_git commit -q -m "$SUBJECT" -m "$TRAILER: $COMMIT_ATTEMPT"; then
+  elif checkpoint_git commit -q -m "$SUBJECT" -m "$TRAILER: $TRAILER_VALUE"; then
     printf '%s\n' "$COMMIT_ATTEMPT" > "$OUT/leftover-committed.txt"
   else
     refuse_checkpoint "checkpoint refused: the working tree could not be committed"
@@ -519,6 +594,7 @@ EOF
   restore_worker_git_config
   trap - EXIT HUP INT TERM
 fi
+rm -rf "$OUT/commit-policy"
 BASE=$({GIT} -C "$REPO" rev-parse --verify --quiet "$BASE_REF" \
   || {GIT} -C "$REPO" rev-parse --verify --quiet "origin/$BASE_REF" \
   || echo "")
@@ -536,6 +612,16 @@ if [ -n "$BASE" ]; then
     "$BASE..$WORK_BRANCH" > "$OUT/bundle.log" 2>&1 || true
   {GIT} -C "$REPO" rev-list --count "$BASE"..HEAD > "$OUT/commits.txt" \
     || echo 0 > "$OUT/commits.txt"
+  if {GIT} -C "$REPO" rev-parse --verify --quiet "refs/remotes/origin/$WORK_BRANCH" \
+      >/dev/null; then
+    POLICY_FROM="refs/remotes/origin/$WORK_BRANCH"
+  else
+    POLICY_FROM="$BASE"
+  fi
+  mkdir -p "$OUT/commit-policy"
+  if commit_policy_check "$POLICY_FROM..HEAD" "$OUT/commit-policy"; then
+    echo done > "$OUT/commit-policy/checked"
+  fi
 else
   : > "$OUT/diffstat.txt"; : > "$OUT/diff.patch"; : > "$OUT/changed.txt"
   : > "$OUT/log.txt"; : > "$OUT/commit-paths.txt"; echo 0 > "$OUT/commits.txt"
@@ -698,6 +784,9 @@ def publish_leaf_script(root: str = WORK_MOUNT) -> str:
     the Pod fails setup with nothing in its log. Neither leaf the publisher mounts is left
     to the kubelet: this runs as the worker uid with the whole claim mounted, as the
     preparer that made `output/` does, and creates `publish/` with `output/`'s mode.
+    A setgid bit is kept, never stripped: on the fsGroup claim `publish/` inherits it
+    from its parent, and it keeps the publisher's files in the fsGroup as `output/`'s
+    are (hades #184). It grants no one access.
 
     Exit 7: no bundle, or not a regular file (the kubelet would make a directory there).
     Exit 8: `publish/` is not a directory the worker uid owns and can write, as it owns
@@ -866,17 +955,15 @@ if [ -n "$REMOTE_BEFORE" ]; then
 else
   RANGE="refs/remotes/origin/$BASE_REF..refs/heads/crucible-publish"
 fi
-: > "$OUT/author-problems.txt"
-: > "$OUT/trailer-problems.txt"
-for sha in $(git rev-list "$RANGE" 2>/dev/null || true); do
-  who=$(git show -s --format='%ae' "$sha")
-  if [ "$who" != {_quote(author_email)} ]; then
-    printf '%s\t%s\n' "$sha" "$who" >> "$OUT/author-problems.txt"
-  fi
-  if ! git show -s --format='%(trailers:key='"$TRAILER"',valueonly)' "$sha" | grep -q .; then
-    printf '%s\n' "$sha" >> "$OUT/trailer-problems.txt"
-  fi
-done
+POLICY_AUTHOR_EMAIL={_quote(author_email)}
+{_commit_policy_check("git")}if ! commit_policy_check "$RANGE" "$OUT"; then
+  echo "commit policy refused the push: the commits to push could not be read" \
+    > "$OUT/error.txt"
+  echo refused > "$OUT/push.txt"
+  drop_token
+  chmod 0644 "$OUT"/* 2>/dev/null || true
+  exit 6
+fi
 if [ -s "$OUT/author-problems.txt" ] || [ -s "$OUT/trailer-problems.txt" ]; then
   # 23 step 4: verify every commit's author and trailer match policy, *then* push. A
   # commit signed by someone the policy does not name, or missing the attempt trailer,

@@ -34,6 +34,7 @@ from crucible.adapters.execution.fake import (
     changed_paths,
     default_report,
     default_review_report,
+    fake_commit_policy,
     synthetic_diff,
     synthetic_head_sha,
 )
@@ -752,6 +753,15 @@ class FakeKubernetesApi:
         claim["output/copy-rejections.tsv"] = b""
         claim["output/collector.ok"] = b"done\n"
         claim["output/bundle.log"] = b""
+        # hades FDY-0135: the collector's commit check, as the Docker fake reports it.
+        check = fake_commit_policy(behavior, head)
+        claim["output/commit-policy/author-problems.txt"] = "".join(
+            f"{sha}\t{who}\n" for sha, who in check.author_problems
+        ).encode()
+        claim["output/commit-policy/trailer-problems.txt"] = "".join(
+            f"{sha}\n" for sha in check.trailer_problems
+        ).encode()
+        claim["output/commit-policy/checked"] = b"done\n"
         report = self._report_for(spec, behavior, head)
         if report is not None:
             claim["output/report/report.yaml"] = report

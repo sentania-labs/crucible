@@ -1080,6 +1080,7 @@ class DockerProvider:
                 author_name=scripts.policy_git(spec.policy, "author_name"),
                 author_email=scripts.policy_git(spec.policy, "author_email"),
                 commit_trailer=scripts.policy_git(spec.policy, "commit_trailer"),
+                trailer_value=spec.external_id,
             ),
             mounts=mounts,
             network="none",

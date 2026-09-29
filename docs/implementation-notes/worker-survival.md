@@ -24,7 +24,9 @@ reasons are Foundry's contract and were left alone.
 ## Work left uncommitted is committed at collection
 
 The collector commits what the worker left uncommitted, as the policy's `git` author
-with the attempt trailer, before it bundles `base..work_branch`. The checkout is
+with the attempt trailer, before it bundles `base..work_branch`. The trailer carries the
+task's external id, the value FDY-0135's commit hook gives the worker's own commits, so the
+`commit_policy` gate (which runs after this commit) and the publisher accept it. The checkout is
 therefore mounted writable into the collector on both providers. It is the quota
 checkpoint's commit, with its guards (the worker's `.git/config` replaced, an empty hooks
 directory); where the checkpoint refuses an unsafe `.git` and fails the collection, the

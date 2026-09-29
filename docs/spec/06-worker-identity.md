@@ -15,6 +15,8 @@ identity/
   skills/<name>/       only the skills the contract names
   policy.md            the deterministic policy in words: timeouts, paths, gates
   report-schema.json   CompletionClaimV1 JSON schema
+  hooks/commit-msg     Crucible's commit hook, the one executable file: adds the
+                       `<commit_trailer>: <external_id>` trailer to every commit
   history/             prior attempts' reports, open and answered escalations with
                        verbatim decisions, and the latest AcceptanceResult reasoning
                        (present on retries, after a decision, and on needs_more_work)
@@ -42,7 +44,9 @@ the worker is told what to do, not how Crucible checks it. In order:
    instructions and the review comments or findings it addresses.
 4. **Scope.** Allowed and prohibited paths, whether dependencies may be added
    and CI changed (yes or no), the network mode, "commit on your branch; never
-   push", and each of the contract's `constraints.prohibited_actions`.
+   push", one line asking the worker to leave the checkout's git author and
+   hooks as they are because Crucible's hook adds the named trailer (hades
+   FDY-0135), and each of the contract's `constraints.prohibited_actions`.
 5. **Read first** (when the contract names any). The contract's `context`
    references and `project_instructions`, each as `kind: ref`.
 6. **Acceptance criteria.** Each criterion's id and text.
@@ -60,9 +64,30 @@ the worker is told what to do, not how Crucible checks it. In order:
 
 No exit codes (a model cannot set its harness's exit code; `blocked.md` on a
 clean exit is the escalation, 16), no precedence list, no author line (the
-collector commits as the policy's author, 08), and no log capture (Crucible
+checkout's git config names the author, and the collector commits anything left
+uncommitted as the policy's author, 08), and no log capture (Crucible
 re-runs the checks, 11). Lists and booleans are rendered as words, never as
 Python values.
+
+## The commit hook
+
+A mechanical fact Crucible knows is not left to the model (hades FDY-0135,
+2026-09-29: a worker whose commit lacked the trailer passed review and
+acceptance, then the publisher refused it). The preparer sets the checkout's
+`core.hooksPath` to `/crucible/identity/hooks`, so the only hook that runs
+on a worker's commit is Crucible's own text, mounted read-only and covered by
+the bundle hash; the repository's own hooks never run. The hook runs `git
+interpret-trailers --if-exists doNothing --if-missing add` on the message
+file and nothing else: no network, no repository content. A trailer with the
+same key already in the message is kept as it is, so an amend, a harness
+that writes the trailer itself, or a second run never adds a duplicate.
+`--no-divider` keeps a `---` line in a body from being read as the start of
+a patch, which would put the trailer where no check reads it. Any harness
+that commits through the git command line gets the hook. It is a
+convenience, not the check: `--no-verify`, a rewritten `core.hooksPath`, a
+cherry-pick, or a git library that does not run hooks can still leave a
+commit without the trailer, and the `commit_policy` gate (11) is what
+catches that.
 
 ## Harness-specific delivery
 
