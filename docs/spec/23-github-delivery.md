@@ -108,16 +108,15 @@ review is recorded, and Foundry's `AcceptanceResult` for that head is
    the repository holds them; the base fetch is what supplies them. Nothing
    else enters this container: not the worker's tree, not the worker's
    `.git`, not a cache a worker could have influenced. Then verify the
-   fetched head equals the collected head SHA Crucible recorded; verify
-   every commit's author and trailer match policy; push `work_branch` to
-   the derived push remote without force. **The commit-policy check aborts
-   the publication**: an author or trailer that does not match policy
-   refuses with its own exit code before the push is attempted, the token
-   goes first, and the problems reach the event, the wake, and
-   `publish_failed`. The check is one shell function the collector runs
-   too, so the `commit_policy` gate (11) fails such a commit before review
-   and this refusal is the last line of defence, not the first. A remote head that is not an ancestor of the bundle
-   head (someone
+   fetched head equals the collected head SHA Crucible recorded; push
+   `work_branch` to the derived push remote without force. The publisher
+   does not check commit authors or trailers: on 2026-09-29 the operator
+   decided the trailer is not required and the task record is the paper
+   trail (hades FDY-0143). What it guarantees is that it pushes exactly the
+   sealed, verified bundle at the reviewed and accepted head. Who authored
+   the commits is shown to the reviewer before review, in the
+   `commit_policy` gate's detail (11). A remote head that is not an
+   ancestor of the bundle head (someone
    pushed out of band) fails the push, records `publish_failed` with the
    remote head, and wakes Foundry; Crucible never force-pushes.
 5. From Crucible (API calls, same token): `ls-remote` to confirm

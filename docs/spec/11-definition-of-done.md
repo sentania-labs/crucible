@@ -128,12 +128,11 @@ it cannot check stays with Foundry or the user.
 | `ci_unchanged` | when `may_modify_ci` is false: no change under workflow paths | diff |
 | `workspace_clean` | no leftover ephemeral clusters or containers labeled for this attempt | provider reconcile |
 | `internal_review_recorded` | a `ReviewReportV1` for this exact head SHA exists from a reviewer that is not the implementing attempt; `pending` until then (the task waits in `awaiting_internal_review`) | review report with reviewer identity |
-| `commit_policy` | every commit the publisher would push is authored with the policy's `author_email` and carries a `commit_trailer` trailer: the publisher's own check (23), run by the collector, so a commit the publisher would refuse fails here instead of after acceptance. The detail names the commits by hash and says which rule each broke. `skipped` only for an attempt collected before the check existed; `fail` when the collector could not finish it, including when git could not list or read the commits (hades FDY-0135, 2026-09-29) | collector's commit check over the collected checkout's commits, the ones the bundle carries |
+| `commit_policy` | always, once the collector has run: it is information for the reviewer, not a check that stops a branch. The collector compares each new commit's author with the policy's `author_email`, and the detail names any commit authored by someone else, by hash and address. The attempt trailer is not checked. `skipped` only for an attempt collected before the check existed; when the collector could not read the commits the gate still passes and says so (hades FDY-0135; made informational by the operator's decision of 2026-09-29, FDY-0143, that the trailer is not required and the task record is the paper trail) | collector's author check over the collected checkout's commits, the ones the bundle carries |
 
 `commit_policy` is evaluated whatever `gates.pre_pr` lists, and a policy may
-not name it: the publisher applies its rule whatever the policy says, so the
-early warning cannot be dropped either, and a policy stored before the gate
-existed still gets it.
+not name it, so the reviewer always sees who authored the commits and a
+policy stored before the gate existed still gets it.
 
 ## Publication and post-PR gates (23)
 
