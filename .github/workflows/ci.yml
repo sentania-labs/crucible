@@ -11,7 +11,14 @@ name: ci
 # (operator decision, 2026-09-23).
 on:
   push:
-    branches: ["**"]
+    # The merge queue's temporary branches are proven by the merge_group run below; a
+    # push run on the same ref would share its concurrency group and cancel it.
+    branches: ["**", "!gh-readonly-queue/**"]
+  # The merge queue (operator decision, 2026-09-29): each queued pull request is tested
+  # once on top of main and the PRs ahead of it, instead of each one being brought up to
+  # date and re-run in turn. The required checks are matched by name on the group's
+  # commit, so every job runs here exactly as on a branch push.
+  merge_group:
   # Manual escape hatch for 114: a branch push restores main's BuildKit cache in the
   # images job, so a change to a fetch or install step is only proven fresh from that
   # layer on. Dispatching this workflow with no_cache=true builds the images job from
