@@ -327,3 +327,85 @@ async def test_a_role_that_may_wait_for_quota_room_waits_and_names_the_quota() -
     text, _unavailable = provider.role_errors[(k8sspec.ROLE_PUBLISHER, launch.attempt_id)]
     assert "exceeded quota" in text
     del workspace
+
+
+async def test_an_exec_the_api_server_broke_keeps_the_copy_too() -> None:
+    """Review of 2026-09-29: the reader Pod came up but its exec failed, which the read
+    records as unreadable rather than raising. That is still "not read back", so the
+    copy stays, and the second collection syncs it once and removes it."""
+    api, provider, launch, workspace = await _codex()
+    handle = await provider.launch(workspace, launch)
+    api.claims[CLAIM]["credential/auth.json"] = _auth("2026-09-21T00:00:00Z")
+    await _run_to_exit(provider, handle)
+    api.fail_next("pod_exec", 1)
+    with pytest.raises(CollectionUnavailableError, match=r"credential/auth\.json"):
+        await provider.collect(handle, workspace, launch)
+    assert api.claims[CLAIM]["credential/auth.json"] == _auth("2026-09-21T00:00:00Z")
+    assert api.harness_secret("crucible-harness-codex")["auth.json"] == _auth(
+        "2026-09-20T00:00:00Z"
+    )
+    outputs = await provider.collect(handle, workspace, launch)
+    assert outputs.credential_sync is not None and outputs.credential_sync.removed
+    assert api.harness_secret("crucible-harness-codex")["auth.json"] == _auth(
+        "2026-09-21T00:00:00Z"
+    )
+
+
+async def test_a_collection_run_again_records_the_first_sync_not_an_absent_file() -> None:
+    """The copy was read back, written back and removed, then the collector could not be
+    created: the retried collection reports the sync that happened."""
+    api, provider, launch, workspace = await _codex()
+    handle = await provider.launch(workspace, launch)
+    api.claims[CLAIM]["credential/auth.json"] = _auth("2026-09-21T00:00:00Z")
+    await _run_to_exit(provider, handle)
+    api.quota_refused_roles.add(k8sspec.ROLE_COLLECTOR)
+    with pytest.raises(CollectionUnavailableError):
+        await provider.collect(handle, workspace, launch)
+    assert "credential/auth.json" not in api.claims[CLAIM]
+    api.quota_refused_roles.clear()
+    outputs = await provider.collect(handle, workspace, launch)
+    sync = outputs.credential_sync
+    assert sync is not None and sync.removed
+    assert [(f.name, f.synced, f.reason) for f in sync.files] == [
+        ("auth.json", True, "changed; newer issued-at, written back")
+    ]
+
+
+async def test_a_quota_refusal_the_last_try_met_does_not_end_the_next_one() -> None:
+    """Role Job names repeat and an event outlives its Job: only this Job's events, by
+    uid, count, so a retry after the namespace has room is not refused by the old one."""
+    api, _registry, provider = build(
+        config=KubernetesConfig(poll_interval_seconds=0, launch_timeout_seconds=3600)
+    )
+    launch = spec()
+    workspace = await provider.prepare(launch)
+    handle = await provider.launch(workspace, launch)
+    await _run_to_exit(provider, handle)
+    api.quota_refused_roles.add(k8sspec.ROLE_COLLECTOR)
+    with pytest.raises(CollectionUnavailableError, match="exceeded quota"):
+        await provider.collect(handle, workspace, launch)
+    assert api.events, "the refusal left an event behind"
+    api.quota_refused_roles.clear()
+    outputs = await provider.collect(handle, workspace, launch)
+    assert outputs.report is not None
+
+
+async def test_a_full_local_disk_fails_the_collection_rather_than_escaping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from crucible.adapters.execution import kubernetes as kubernetes_module  # noqa: PLC0415
+    from crucible.adapters.execution.kubernetes import CollectionFailedError  # noqa: PLC0415
+
+    _api, _registry, provider = build()
+    launch = spec()
+    workspace = await provider.prepare(launch)
+    handle = await provider.launch(workspace, launch)
+    await _run_to_exit(provider, handle)
+
+    def full(archive: Any, into: Any) -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(kubernetes_module, "_extract", full)
+    with pytest.raises(CollectionFailedError, match="No space left") as raised:
+        await provider.collect(handle, workspace, launch)
+    assert not isinstance(raised.value, ProviderUnavailableError)

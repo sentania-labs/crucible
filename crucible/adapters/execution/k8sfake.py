@@ -285,6 +285,8 @@ class FakeKubernetesApi:
     # ever created, and a `FailedCreate` event names the quota, as the Job controller
     # records it.
     quota_refused_roles: set[str] = field(default_factory=set)
+    # Every event recorded, which outlives the object it names, as on an API server.
+    events: list[dict[str, Any]] = field(default_factory=list)
     _uids: int = 0
 
     # ----- test controls ------------------------------------------------
@@ -371,11 +373,12 @@ class FakeKubernetesApi:
         if (kind, name) in self.objects:
             raise KubernetesApiError(409, f"{kind}/{name} already exists")
         stored: dict[str, Any] = json.loads(json.dumps(dict(body)))
-        if (
+        if kind == "jobs" or (
             kind == "configmaps"
             and (stored.get("metadata") or {}).get("labels", {}).get(LABEL_ROLE) == ROLE_LOGIN_LOCK
         ):
-            # The API server gives every object a uid; the login lock is deleted by it.
+            # The API server gives every object a uid; the login lock is deleted by it,
+            # and a Job's events name it.
             self._uids += 1
             stored["metadata"]["uid"] = f"uid-{self._uids}"
         self.objects[(kind, name)] = _Object(kind, name, stored)
@@ -532,27 +535,21 @@ class FakeKubernetesApi:
         return self.pod_exec(name, command, container=container, limit=limit, stdout_to=into)
 
     def _events(self, field_selector: str | None) -> list[dict[str, Any]]:
-        """`FailedCreate` events for the Jobs whose Pod the quota refused."""
+        """The recorded events a field selector matches (kind, name, uid, reason)."""
         fields = dict(
             part.split("=", 1) for part in (field_selector or "").split(",") if "=" in part
         )
         out: list[dict[str, Any]] = []
-        for (kind, name), obj in self.objects.items():
-            if kind != "jobs" or not obj.body.get("_quota_refused"):
-                continue
-            if fields.get("involvedObject.name") not in (None, name):
-                continue
-            out.append(
-                {
-                    "reason": "FailedCreate",
-                    "involvedObject": {"kind": "Job", "name": name},
-                    "message": (
-                        f'Error creating: pods "{name}-abc12" is forbidden: exceeded quota: '
-                        "crucible-workers, requested: limits.memory=4Gi, used: "
-                        "limits.memory=12Gi, limited: limits.memory=12Gi"
-                    ),
-                }
-            )
+        for event in self.events:
+            involved = event.get("involvedObject") or {}
+            wanted = {
+                "involvedObject.kind": involved.get("kind"),
+                "involvedObject.name": involved.get("name"),
+                "involvedObject.uid": involved.get("uid"),
+                "reason": event.get("reason"),
+            }
+            if all(fields.get(key) in (None, value) for key, value in wanted.items()):
+                out.append(event)
         return out
 
     def _exec(self, name: str, command: Sequence[str], stdin: bytes | None) -> ExecResult:
@@ -595,7 +592,18 @@ class FakeKubernetesApi:
         if name in self.no_pod_yet or attempt_id in self.no_pod_yet:
             return
         if str(labels.get(LABEL_ROLE, "")) in self.quota_refused_roles:
-            self.objects[("jobs", name)].body["_quota_refused"] = True
+            uid = str((job.get("metadata") or {}).get("uid") or "")
+            self.events.append(
+                {
+                    "reason": "FailedCreate",
+                    "involvedObject": {"kind": "Job", "name": name, "uid": uid},
+                    "message": (
+                        f'Error creating: pods "{name}-abc12" is forbidden: exceeded quota: '
+                        "crucible-workers, requested: limits.memory=4Gi, used: "
+                        "limits.memory=12Gi, limited: limits.memory=12Gi"
+                    ),
+                }
+            )
             return
         pod_name = f"{name}-abc12"
         pod: dict[str, Any] = {

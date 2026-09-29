@@ -274,7 +274,8 @@ class CollectionFailedError(ProviderError):
 class CollectionUnavailableError(CollectionFailedError, ProviderUnavailableError):
     """Collection could not finish because the cluster could not take or answer a step
     right now (the API server, the namespace quota, a reader Pod that did not start).
-    The workspace claim is untouched, so the supervisor collects again later."""
+    The claim still holds the worker's work, so the supervisor collects again later;
+    a step that already ran (the credential sync, the collector) runs or answers again."""
 
 
 class LoginLockHeldError(ProviderError):
@@ -597,6 +598,10 @@ class KubernetesProvider:
         # text, and whether the Job could not be taken right now (the API server or the
         # namespace quota) rather than refused or failed.
         self.role_errors: dict[tuple[str, str], tuple[str, bool]] = {}
+        # The credential sync of an attempt whose copy was read back and removed, kept
+        # until cleanup, so a collection that runs again records that outcome and not
+        # "absent after the run" (in memory: a restart records the second reading).
+        self._credential_syncs: dict[str, CredentialSync] = {}
         # Why `_await_job` ended a wait early, by Job name (a quota refusal, a Pod that
         # never started); `_run_role_job` moves it into `last_error`.
         self._job_refusals: dict[str, str] = {}
@@ -1996,14 +2001,22 @@ class KubernetesProvider:
                     k8sspec.object_name("ws", ws.attempt_id),
                     {"metadata": {"labels": {k8sspec.LABEL_RETAIN: policy.value}}},
                 )
-        self._launched.pop(ws.attempt_id, None)
-        self._seeded.pop(ws.attempt_id, None)
+        self._forget(ws.attempt_id)
+
+    def _forget(self, attempt_id: str) -> None:
+        """What this process remembers of an attempt that is cleaned up or gone."""
+        self._launched.pop(attempt_id, None)
+        self._seeded.pop(attempt_id, None)
+        self._credential_syncs.pop(attempt_id, None)
+        for key in [key for key in self.role_errors if key[1] == attempt_id]:
+            del self.role_errors[key]
 
     async def release_workspace(self, ws: Workspace, spec: LaunchSpec | None = None) -> None:
         """16: the claim a cleanup policy kept, and everything else still labelled for
         the attempt, once the retention step decided nothing needs it. A claim that is
         still there afterwards (a Pod still mounting it holds its deletion) is not
         released yet: the step tries again on a later tick."""
+        self._forget(ws.attempt_id)
         await self._delete_attempt_objects(ws.attempt_id)
         claim = k8sspec.object_name("ws", ws.attempt_id)
         try:
@@ -2364,12 +2377,10 @@ class KubernetesProvider:
                 )
             handle = await self.launch(ws, spec)
             started = time.monotonic()
-            # The Pod's scheduling and image pull are not the harness's time; the
-            # Job's own deadline still ends a harness that runs past the timeout.
-            code_seen = await self._await_job(
-                handle.ref,
-                timeout=request.timeout_seconds + self.config.launch_timeout_seconds,
-            )
+            # The Pod's scheduling and image pull are not the harness's time: the wait
+            # counts the probe's time from Running and gives the start the launch
+            # timeout. The Job's own deadline still ends a harness that runs past it.
+            code_seen = await self._await_job(handle.ref, timeout=request.timeout_seconds)
             if code_seen is None:
                 timed_out = True
                 detail = f"the probe did not finish within {request.timeout_seconds}s"
@@ -3569,19 +3580,20 @@ class KubernetesProvider:
         again. A cluster that keeps failing the read-back does not keep the copy for as
         long as it fails: the supervisor's collection window ends, and cleanup removes it
         under every policy."""
+        done = self._credential_syncs.get(h.attempt_id)
+        if done is not None:
+            # A collection that ran again after a later step failed: the copy was read
+            # back, written back and removed the first time, and that is the outcome.
+            return done
         launched = self._launched.get(h.attempt_id)
         copy = launched.credential if launched is not None else self._credential_copy(spec)
         if copy is None:
             return None
         files: list[CredentialFileSync] = []
         if copy.writable:
+            paths = [f"{k8sspec.CREDENTIAL_LEAF}/{a.name}" for a in copy.spec.auth_files]
             try:
-                read = await self._read_files(
-                    spec,
-                    [f"{k8sspec.CREDENTIAL_LEAF}/{a.name}" for a in copy.spec.auth_files],
-                    limits,
-                    limit=CREDENTIAL_READ_LIMIT,
-                )
+                read = await self._read_files(spec, paths, limits, limit=CREDENTIAL_READ_LIMIT)
             except ProviderError as exc:
                 # 12: a copy that was never read back is not removed, because the token
                 # the harness rotated into it may be the only live one. Collection runs
@@ -3589,6 +3601,13 @@ class KubernetesProvider:
                 raise CollectionUnavailableError(
                     f"the credential copy could not be read back: {exc}"
                 ) from exc
+            unreadable = [path for path in paths if read.get(path) is _UNREADABLE]
+            if unreadable:
+                # An exec the API server broke, or a stream that ended before its status:
+                # "could not read" is not "read", so the copy stays for the next try.
+                raise CollectionUnavailableError(
+                    f"the credential copy could not be read back: {', '.join(unreadable)}"
+                )
         try:
             if copy.writable:
                 for auth in copy.spec.auth_files:
@@ -3608,13 +3627,16 @@ class KubernetesProvider:
             # Once read, removed on every path: a sync-back that raised must not keep
             # the copy on the claim.
             removed = await self._remove_credential(spec, copy)
-        return CredentialSync(
+        sync = CredentialSync(
             harness=copy.spec.harness,
             mount_mode=copy.mode.value,
             files=tuple(files),
             removed=removed,
             detail="" if copy.seeded else "seeded hashes unknown",
         )
+        if removed:
+            self._credential_syncs[h.attempt_id] = sync
+        return sync
 
     async def _sync_file(
         self, copy: _CredentialCopy, auth: AuthFile, data: bytes | None
@@ -3935,15 +3957,22 @@ class KubernetesProvider:
         archive = into.parent / f".{into.name}-collected.tar"
         try:
             async with self._reader(spec, limits) as pod:
-                with archive.open("wb") as sink:
-                    result = await self._call(
-                        self.client.pod_exec_to,
-                        pod,
-                        ["sh", "-c", _OUTPUT_TAR_SCRIPT],
-                        sink,
-                        container=k8sspec.CONTAINER_NAME,
-                        limit=OUTPUT_READ_LIMIT,
-                    )
+                try:
+                    with archive.open("wb") as sink:
+                        result = await self._call(
+                            self.client.pod_exec_to,
+                            pod,
+                            ["sh", "-c", _OUTPUT_TAR_SCRIPT],
+                            sink,
+                            container=k8sspec.CONTAINER_NAME,
+                            limit=OUTPUT_READ_LIMIT,
+                        )
+                except OSError as exc:
+                    # The supervisor's own disk (full, unwritable): a provider failure
+                    # with a cause, not an exception every later tick meets again.
+                    raise CollectionFailedError(
+                        f"the collected output could not be written to local disk: {exc}"
+                    ) from exc
             if result.exit_code is None:
                 # The API server never sent the error channel: the stream ended early.
                 # Accepting it would let a partial tar through `_extract`, which
@@ -3970,9 +3999,15 @@ class KubernetesProvider:
                 )
             if not result.stdout_size:
                 return
-            await asyncio.to_thread(_extract, archive, into)
+            try:
+                await asyncio.to_thread(_extract, archive, into)
+            except OSError as exc:
+                raise CollectionFailedError(
+                    f"the collected output could not be extracted on local disk: {exc}"
+                ) from exc
         finally:
-            archive.unlink(missing_ok=True)
+            with contextlib.suppress(OSError):
+                archive.unlink(missing_ok=True)
 
     async def _remove_from_claim(self, spec: LaunchSpec, leaves: Sequence[str]) -> None:
         """Remove leaves of the workspace claim through a Pod, never as this process.
@@ -4082,14 +4117,15 @@ class KubernetesProvider:
             text = f"{condition.get('reason', '')} {condition.get('message', '')}"
             if "FailedCreate" in text and _names_quota(text):
                 return str(condition.get("message") or text).strip()
+        # Role Job names repeat for an attempt, and an event outlives its Job by an
+        # hour: only this incarnation's events count, by uid, so a refusal the last try
+        # met does not end the next one before its Pod is even created.
+        uid = str((job.get("metadata") or {}).get("uid") or "")
+        selector = f"involvedObject.kind=Job,involvedObject.name={job_name},reason=FailedCreate"
+        if uid:
+            selector += f",involvedObject.uid={uid}"
         try:
-            events = await self._call(
-                self.client.list_objects,
-                "events",
-                field_selector=(
-                    f"involvedObject.kind=Job,involvedObject.name={job_name},reason=FailedCreate"
-                ),
-            )
+            events = await self._call(self.client.list_objects, "events", field_selector=selector)
         except KubernetesApiError:
             # An events list the Role does not allow, or that failed, is not a refusal.
             return None

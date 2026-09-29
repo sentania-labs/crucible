@@ -1626,7 +1626,9 @@ async def test_an_exec_stream_that_ended_early_fails_the_collection() -> None:
 
 
 async def test_an_exec_stream_that_ended_early_is_not_an_absent_credential() -> None:
-    """12: a read that failed is a recorded outcome, and it is not 'the file was gone'."""
+    """12: a read that failed is not 'the file was gone', and since the lab findings of
+    2026-09-29 it is not a read either: the copy stays on the claim, the source is
+    untouched, and the collection is one the supervisor runs again."""
     api, provider, launch, workspace = await codex_attempt()
     handle = await provider.launch(workspace, launch)
     api.claims["ws-01attempt0000000000000000a"]["credential/auth.json"] = _auth(
@@ -1642,17 +1644,15 @@ async def test_an_exec_stream_that_ended_early_is_not_an_absent_credential() -> 
         return ExecResult(result.stdout, b"", None)
 
     api.pod_exec = truncated
-    outputs = await provider.collect(handle, workspace, launch)
+    with pytest.raises(CollectionUnavailableError, match="could not be read back"):
+        await provider.collect(handle, workspace, launch)
     api.pod_exec = real
-    sync = outputs.credential_sync
-    assert sync is not None
-    assert sync.files[0].present is False
-    assert "read failed" in sync.files[0].reason
-    # The source is untouched and the per-attempt Secret is still gone.
     assert api.harness_secret("crucible-harness-codex")["auth.json"] == _auth(
         "2026-09-20T00:00:00Z"
     )
-    assert not api.secret_exists("cred-01attempt0000000000000000a")
+    assert api.claims["ws-01attempt0000000000000000a"]["credential/auth.json"] == _auth(
+        "2026-09-21T00:00:00Z"
+    )
 
 
 async def test_a_cleaner_job_that_failed_is_not_a_successful_removal() -> None:

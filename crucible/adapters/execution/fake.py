@@ -365,7 +365,7 @@ class FakeProvider:
 
     def collect_unavailable(self, external_id: str, times: int = 1) -> None:
         """The next `times` collections of this task fail as a cluster that could not
-        answer (ProviderUnavailableError), with the workspace untouched."""
+        answer (ProviderUnavailableError), with the workspace left in place."""
         self._collect_outages[external_id] = times
 
     def hold_launch(self, external_id: str, where: Literal["before", "after"]) -> asyncio.Event:
