@@ -222,6 +222,18 @@ crucible admin [--config F | --api-url URL | --remote] [--reason TEXT] VERB ...
 crucible serve --all|--api|--supervisor [--config F]
 ```
 
+Two decision kinds are the operator's way out of a delivery wait (ADR 0025),
+with an operator or admin token, while the task's pull request is under
+observation. `next` offers both to those roles:
+
+```
+crucible decisions ID --kind waive_external_review --verbatim "why" --resolves "the external reviewer did not review" --reason TEXT
+crucible decisions ID --kind accept_no_ci --verbatim "why" --resolves "this repository has no CI for this task" --reason TEXT
+```
+
+The task page in the UI (`/ui/tasks/ID`, linked from Tasks) has a button for
+each.
+
 `crucible admin --help` and each verb's `--help` list the admin verbs and
 their arguments. An admin `--reason` goes before or after the verb and is an
 optional audit note, except where the operation requires one (token revoke,

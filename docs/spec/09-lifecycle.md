@@ -48,6 +48,7 @@ publish_failed --cancel--> cancelled
 awaiting_external_review --review signal from allowlisted login--> external_feedback_received --wake-->
 awaiting_ci_certification --review signal from allowlisted login--> external_feedback_received --wake-->
 awaiting_external_review --wait_timeout_hours elapsed--> (repeat wake, reason external_review_overdue; no state change)
+awaiting_external_review --operator waived the remaining rounds (ADR 0025)--> awaiting_ci_certification
 external_feedback_received --every comment dispositioned, none is fix, rounds satisfied--> awaiting_ci_certification
 external_feedback_received --every comment dispositioned, none is fix, rounds outstanding--> awaiting_external_review
 external_feedback_received --correction attached--> scheduled
@@ -57,6 +58,7 @@ awaiting_ci_certification --a required check failed on the accepted head--> ci_c
 ready_for_merge --a required check on the accepted head turns red--> ci_certification_failed --wake-->
 ready_for_merge --new review signal from allowlisted login--> external_feedback_received --wake-->
 ci_certification_failed --ci-decision rerun--> awaiting_ci_certification
+ci_certification_failed --green certification observed on the accepted head--> awaiting_ci_certification
 ci_certification_failed --ci-decision correct, correction attached--> scheduled
 ci_certification_failed --ci-decision reject--> rejected
 
@@ -66,9 +68,10 @@ head_diverged --head-decision recollect--> scheduled    (a `correct` execution a
 head_diverged --head-decision reject--> rejected
 head_diverged --cancel--> cancelled
 
-ready_for_merge --PR merged (observed)--> merged --wake-->
 {awaiting_external_review, external_feedback_received, awaiting_ci_certification,
- ready_for_merge} --PR closed unmerged (observed)--> rejected
+ ci_certification_failed, head_diverged, ready_for_merge} --PR merged (observed)--> merged --wake-->
+{awaiting_external_review, external_feedback_received, awaiting_ci_certification,
+ ci_certification_failed, head_diverged, ready_for_merge} --PR closed unmerged (observed)--> rejected --wake-->
 merged --included in a release contract--> release_candidate
 release_candidate --release succeeded--> released
 release_candidate --release failed or cancelled--> merged
@@ -103,6 +106,15 @@ architectural risk) or the policy sets
 policy has `retrigger_after_correction: false` and `required_rounds: 1`,
 the second pass through `publishing` lands in `awaiting_ci_certification`,
 never back in `awaiting_external_review`.
+
+Once the corrected head is the accepted head, review feedback made on the
+heads Crucible pushed before it, before the corrected head appeared, is
+**settled**: the correction is the answer to it, so a `fix` disposition on
+it no longer holds the task, and a comment on it asks for no disposition.
+Dispositions stay add-only; nothing is deleted. Feedback on the accepted
+head itself still needs one, and so does a comment made after the
+corrected head appeared, even as a reply on an old thread. A head someone else
+pushed is never settled this way; it goes through `head_diverged`.
 
 **Every state after `publishing` is bound to the accepted head.** Gate
 results, the review report, and the AcceptanceResult all name the SHA

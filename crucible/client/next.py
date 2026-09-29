@@ -72,6 +72,30 @@ CORRECTABLE = frozenset(
     }
 )
 CLOSABLE = frozenset({"accepted", "merged", "released"})
+# ADR 0025 (crucible/domain/waivers.py): the operator's waivers, while a pull request is
+# under observation. Operator-only in the decision service, like release_authorization.
+WAIVABLE = frozenset(
+    {
+        "awaiting_external_review",
+        "external_feedback_received",
+        "awaiting_ci_certification",
+        "ci_certification_failed",
+        "ready_for_merge",
+    }
+)
+WAIVERS = (
+    (
+        "waive_external_review",
+        "waive the remaining external review rounds for this task (operator only)",
+        "the external reviewer did not review this pull request",
+    ),
+    (
+        "accept_no_ci",
+        "accept that this repository has no CI for this task (operator only)",
+        "this repository has no CI for this task",
+    ),
+)
+OPERATOR_DECISION = (OPERATOR, ADMIN)
 
 
 def action(
@@ -249,6 +273,31 @@ def task_actions(task: Any, role: str | None, prefix: Sequence[str]) -> list[dic
                 owner=owner,
             ),
         )
+    if state in WAIVABLE:
+        for kind, description, resolves in WAIVERS:
+            offer(
+                OPERATOR_DECISION,
+                action(
+                    "decisions",
+                    description,
+                    [
+                        *p,
+                        "decisions",
+                        tid,
+                        "--kind",
+                        kind,
+                        "--verbatim",
+                        "{verbatim}",
+                        "--resolves",
+                        resolves,
+                        "--reason",
+                        "{reason}",
+                    ],
+                    needs={"verbatim": "the operator's own words: why", **REASON},
+                    roles=OPERATOR_DECISION,
+                    owner=owner,
+                ),
+            )
     escalations = task.get("open_escalations")
     for escalation in escalations if isinstance(escalations, list) else []:
         if not isinstance(escalation, dict) or escalation.get("state") != "open":

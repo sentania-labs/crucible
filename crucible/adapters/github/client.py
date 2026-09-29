@@ -36,6 +36,15 @@ log = logging.getLogger("crucible.github")
 LOG_EXCERPT_BYTES = 64 * 1024
 
 
+def _refused(exc: GitHubError) -> bool:
+    """A permission or not-found refusal that the caller may treat as unobservable.
+
+    GitHub reports a rate limit as a 403 too. That one is not a refusal: it must reach the
+    delivery tick so the whole poll is deferred, rather than being read as "no protected
+    checks" or "no reactions" (hades FDY-0139)."""
+    return exc.status in (403, 404) and exc.response_class != "rate_limited"
+
+
 class RestGitHubClient:
     """The `GitHubClient` port over `api.github.com`."""
 
@@ -133,7 +142,7 @@ class RestGitHubClient:
                     if isinstance(check, dict) and check.get("context"):
                         names.append(str(check["context"]))
         except GitHubError as exc:
-            if exc.status not in (403, 404):
+            if not _refused(exc):
                 raise
         try:
             rules = self._http.get(
@@ -147,7 +156,7 @@ class RestGitHubClient:
                     if isinstance(check, dict) and check.get("context"):
                         names.append(str(check["context"]))
         except GitHubError as exc:
-            if exc.status not in (403, 404):
+            if not _refused(exc):
                 raise
         return tuple(dict.fromkeys(names))
 
@@ -160,7 +169,7 @@ class RestGitHubClient:
                 f"/repos/{repository}/issues/{number}/reactions", bearer=token.reveal()
             )
         except GitHubError as exc:
-            if exc.status in (403, 404):
+            if _refused(exc):
                 self.reactions_unobservable.add(repository)
                 raise UnobservableError(
                     f"reactions on {repository}#{number}", status=exc.status
@@ -184,7 +193,7 @@ class RestGitHubClient:
                 f"/repos/{repository}/issues/{number}/events", bearer=token.reveal()
             )
         except GitHubError as exc:
-            if exc.status in (403, 404):
+            if _refused(exc):
                 return None
             raise
         for row in reversed(rows):
@@ -200,6 +209,10 @@ class RestGitHubClient:
     ) -> list[ReactionRecord]:
         out: list[ReactionRecord] = []
         for comment in comments:
+            if comment.reaction_count == 0:
+                # The comment says it has none, so there is nothing to fetch; one call per
+                # comment per poll adds up on a long review (hades FDY-0139).
+                continue
             endpoint = (
                 f"/repos/{repository}/pulls/comments/{comment.github_id}/reactions"
                 if comment.kind == "review_comment"
@@ -208,7 +221,7 @@ class RestGitHubClient:
             try:
                 rows = self._http.paginate(endpoint, bearer=token.reveal())
             except GitHubError as exc:
-                if exc.status in (403, 404):
+                if _refused(exc):
                     continue
                 raise
             out.extend(
@@ -298,58 +311,92 @@ class RestGitHubClient:
     ) -> tuple[CheckRecord, ...]:
         if not head_sha:
             return ()
-        out: list[CheckRecord] = []
-        runs = self._http.get(
-            f"/repos/{repository}/commits/{head_sha}/check-runs", bearer=token.reveal()
-        )
-        if isinstance(runs, dict):
-            out.extend(
-                normalize.check_run(row)
-                for row in runs.get("check_runs") or []
-                if isinstance(row, dict)
+        # Every page of each: a repository with a wide matrix has more than one page of
+        # check runs, and a required check on the second page must not read as missing.
+        out: list[CheckRecord] = [
+            normalize.check_run(row)
+            for row in self._http.paginate(
+                f"/repos/{repository}/commits/{head_sha}/check-runs",
+                bearer=token.reveal(),
+                key="check_runs",
             )
-        suites = self._http.get(
-            f"/repos/{repository}/commits/{head_sha}/check-suites", bearer=token.reveal()
-        )
-        if isinstance(suites, dict):
-            out.extend(
-                normalize.check_suite(row)
-                for row in suites.get("check_suites") or []
-                if isinstance(row, dict)
+            if isinstance(row, dict)
+        ]
+        out.extend(
+            normalize.check_suite(row)
+            for row in self._http.paginate(
+                f"/repos/{repository}/commits/{head_sha}/check-suites",
+                bearer=token.reveal(),
+                key="check_suites",
             )
-        workflows = self._http.get(
-            f"/repos/{repository}/actions/runs",
-            bearer=token.reveal(),
-            params={"head_sha": head_sha, "per_page": 100},
+            if isinstance(row, dict)
         )
-        if isinstance(workflows, dict):
-            out.extend(
-                normalize.workflow_run(row)
-                for row in workflows.get("workflow_runs") or []
-                if isinstance(row, dict)
+        out.extend(
+            normalize.workflow_run(row)
+            for row in self._http.paginate(
+                f"/repos/{repository}/actions/runs",
+                bearer=token.reveal(),
+                params={"head_sha": head_sha},
+                key="workflow_runs",
             )
+            if isinstance(row, dict)
+        )
         return tuple(out)
 
-    def workflow_run_logs(
-        self, token: InstallationToken, *, repository: str, run_id: str, limit_bytes: int
+    def ci_failure_log(
+        self,
+        token: InstallationToken,
+        *,
+        repository: str,
+        source: str,
+        external_id: str,
+        limit_bytes: int,
     ) -> bytes:
         """The log excerpt captured on a CI failure (Actions read, 23).
 
-        The endpoint answers with a redirect to a zip; what is kept is the first
-        `limit_bytes` of whatever comes back, which is enough for the failure record and
-        bounded enough not to become an artifact store of its own."""
+        A check run from Actions is a job, and its id is the job id, so its log is the
+        job's own plain-text log. A failed workflow run is resolved to its first failed
+        job the same way. Either endpoint answers with a redirect to a signed URL on
+        another host, which is followed without the token. What is kept is the tail, where
+        a failing job prints its failure (hades FDY-0139). Best effort: anything that
+        cannot be read leaves the excerpt empty rather than failing the poll."""
         try:
-            status, payload, _ = self._http.request(
+            job_id = external_id
+            if source == "workflow_run":
+                jobs = self._http.paginate(
+                    f"/repos/{repository}/actions/runs/{external_id}/jobs",
+                    bearer=token.reveal(),
+                    key="jobs",
+                )
+                failed = [
+                    job
+                    for job in jobs
+                    if isinstance(job, dict)
+                    and job.get("conclusion") not in (None, "success", "skipped", "neutral")
+                ]
+                if not failed:
+                    return b""
+                job_id = str(failed[0].get("id", ""))
+            if not job_id:
+                return b""
+            status, payload, headers = self._http.request(
                 "GET",
-                f"/repos/{repository}/actions/runs/{run_id}/logs",
+                f"/repos/{repository}/actions/jobs/{job_id}/logs",
                 bearer=token.reveal(),
                 raw=True,
             )
-        except GitHubError:
+            if status in (301, 302, 303, 307, 308) and headers.get("location"):
+                return self._http.download(headers["location"], limit_bytes=limit_bytes)
+        except GitHubError as exc:
+            if exc.response_class == "rate_limited":
+                raise
+            return b""
+        except Exception as exc:  # best effort: an excerpt never fails the poll
+            log.warning("ci failure log unreadable", extra={"error": type(exc).__name__})
             return b""
         if status >= 400 or not isinstance(payload, bytes):
             return b""
-        return payload[:limit_bytes]
+        return payload[-max(1, limit_bytes) :]
 
     # ----- mutations ----------------------------------------------------
 

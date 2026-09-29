@@ -40,7 +40,12 @@ def github_connected(github: GitHubClient | None) -> bool:
 def _refusal(repository: Repository, slug: str, exc: Exception) -> CheckoutRefusedError:
     installation = repository.installation_id
     if isinstance(exc, GitHubError):
-        if exc.status == 404:
+        if exc.response_class == "rate_limited":
+            detail = (
+                f"GitHub's rate limit refused the App's request for {slug}; it asks for "
+                f"{int(exc.retry_after or 60)}s before the next call"
+            )
+        elif exc.status == 404:
             detail = (
                 f"GitHub has no installation {installation} for this App (HTTP 404); "
                 "register the repository under the installation that covers it"
