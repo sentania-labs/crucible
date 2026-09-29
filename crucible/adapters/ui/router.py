@@ -20,6 +20,7 @@ from fastapi.templating import Jinja2Templates
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from starlette.staticfiles import StaticFiles
 
+import crucible
 from crucible.adapters.api.deps import Ctx, UoW
 from crucible.application.admin import (
     audit,
@@ -796,6 +797,15 @@ async def dashboard(request: Request, ctx: Ctx, uow: UoW) -> Response:
     attention = sum(len(rows) for rows in tasks_part["lists"].values())
     running = len(document["workers"])
     overview: list[list[Any]] = [
+        [
+            "Version",
+            {
+                "kind": "status",
+                "value": crucible.__version__,
+                "tone": "ok",
+            },
+            "",
+        ],
         [
             "Supervisor",
             {

@@ -1105,3 +1105,30 @@ def test_the_settings_page_shows_broad_egress_and_the_resolve_ttl(
     assert rows["kubernetes.resolve_ttl_seconds"][1:3] == [120.0, "environment"]
     # Every setting here is read at start, which the page intro says once (crucible#115).
     assert rows["kubernetes.resolve_ttl_seconds"][3] == ""
+
+
+def test_status_page_shows_version_as_first_row() -> None:
+    """hades #214: the Status page Service table lists a Version row first, carrying
+    ``crucible.__version__`` rendered as a status cell."""
+    import crucible  # noqa: PLC0415
+
+    service_section: dict[str, Any] = {
+        "title": "Service",
+        "columns": ["Part", "State", ""],
+        "rows": [
+            [
+                "Version",
+                {
+                    "kind": "status",
+                    "value": crucible.__version__,
+                    "tone": "ok",
+                },
+                "",
+            ],
+        ],
+    }
+
+    rendered = _render_documents([service_section])
+
+    assert "Version" in rendered
+    assert crucible.__version__ in rendered
