@@ -259,6 +259,10 @@ class HermesAdapter:
             return ExitClass.KILLED
         if exit.oom_killed:
             return ExitClass.ENVIRONMENT
+        if exit.blocked_present and exit.exit_code == 0:
+            # FDY-0140: the model cannot set Hermes's exit code, so `blocked.md` on a
+            # clean exit is its escalation. Hermes's own 75 is a provider failure below.
+            return ExitClass.BLOCKED
         usage, _ = _usage(report_dir)
         tails = (stdout_tail[-base.TAIL_LIMIT :], stderr_tail[-base.TAIL_LIMIT :])
         quota = base.first_match(tails, QUOTA_PATTERNS) is not None
@@ -267,7 +271,7 @@ class HermesAdapter:
             if quota:
                 return ExitClass.QUOTA_EXHAUSTED
             return ExitClass.PROVIDER_ERROR if provider_error else ExitClass.CRASHED
-        if exit.exit_code == 75:
+        if exit.exit_code == EXIT_CODE_BLOCKED:
             return ExitClass.QUOTA_EXHAUSTED if quota else ExitClass.PROVIDER_ERROR
         if provider_error:
             return ExitClass.PROVIDER_ERROR
@@ -282,7 +286,7 @@ class HermesAdapter:
         return classify_exit(
             exit_code=exit.exit_code,
             report_present=exit.report_present,
-            blocked_present=False,
+            blocked_present=exit.blocked_present,
         )
 
 
