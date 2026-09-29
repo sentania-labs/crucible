@@ -208,7 +208,7 @@ async def test_the_worker_mount_layout(ran: Any) -> None:
     assert "IDENTITY.md" in paths and "contract.yaml" in paths
 
 
-async def test_the_preparer_gets_the_whole_claim_and_the_collector_gets_it_read_only(
+async def test_the_preparer_gets_the_whole_claim_and_the_collector_its_leaves(
     ran: Any,
 ) -> None:
     api, _provider, _launch = ran
@@ -220,8 +220,9 @@ async def test_the_preparer_gets_the_whole_claim_and_the_collector_gets_it_read_
     assert preparer[WORK_MOUNT]["readOnly"] is False and "subPath" not in preparer[WORK_MOUNT]
 
     collector = mounts("collect-")
-    # 08: the checkout and the report directory read-only, an output directory writable.
-    assert collector[REPO_MOUNT]["readOnly"] is True
+    # 08: the report directory read-only, an output directory writable. FDY-0140: the
+    # checkout is writable, because what the worker left uncommitted is committed.
+    assert collector[REPO_MOUNT]["readOnly"] is False
     assert collector[REPORT_MOUNT]["readOnly"] is True
     assert collector[OUTPUT_MOUNT]["readOnly"] is False
 

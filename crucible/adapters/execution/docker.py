@@ -1060,7 +1060,9 @@ class DockerProvider:
             is ExitClass.QUOTA_EXHAUSTED
         )
         mounts = [
-            self._daemon_mount(spec.attempt_id, "repo", REPO_MOUNT, read_only=not quota_checkpoint),
+            # FDY-0140: writable always, since what the worker left uncommitted is
+            # committed before anything is collected.
+            self._daemon_mount(spec.attempt_id, "repo", REPO_MOUNT, read_only=False),
             self._daemon_mount(spec.attempt_id, "report", REPORT_MOUNT, read_only=True),
             self._daemon_mount(spec.attempt_id, "output", OUTPUT_MOUNT, read_only=False),
         ]
@@ -1071,7 +1073,11 @@ class DockerProvider:
                 base_ref=str(repository.get("base_ref", "main")),
                 work_branch=work_branch,
                 size_cap_bytes=self.config.report_size_cap_bytes,
-                quota_attempt_id=spec.attempt_id if quota_checkpoint else None,
+                attempt_id=spec.attempt_id,
+                quota_checkpoint=quota_checkpoint,
+                author_name=scripts.policy_git(spec.policy, "author_name"),
+                author_email=scripts.policy_git(spec.policy, "author_email"),
+                commit_trailer=scripts.policy_git(spec.policy, "commit_trailer"),
             ),
             mounts=mounts,
             network="none",

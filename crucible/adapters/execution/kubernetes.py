@@ -1742,10 +1742,16 @@ class KubernetesProvider:
                 base_ref=str(repository.get("base_ref", "main")),
                 work_branch=work_branch,
                 size_cap_bytes=self.config.report_size_cap_bytes,
-                quota_attempt_id=spec.attempt_id if quota_checkpoint else None,
+                attempt_id=spec.attempt_id,
+                quota_checkpoint=quota_checkpoint,
+                author_name=scripts.policy_git(spec.policy, "author_name"),
+                author_email=scripts.policy_git(spec.policy, "author_email"),
+                commit_trailer=scripts.policy_git(spec.policy, "commit_trailer"),
             ),
             mounts=[
-                Mount("ws", REPO_MOUNT, read_only=not quota_checkpoint, sub_path="repo"),
+                # FDY-0140: writable always, since what the worker left uncommitted is
+                # committed before anything is collected.
+                Mount("ws", REPO_MOUNT, sub_path="repo"),
                 Mount("ws", REPORT_MOUNT, read_only=True, sub_path="report"),
                 Mount("ws", OUTPUT_MOUNT, sub_path="output"),
             ],
