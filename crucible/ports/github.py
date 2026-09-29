@@ -24,13 +24,21 @@ class GitHubError(Exception):
     body that might echo a request header."""
 
     def __init__(
-        self, status: int, message: str, *, path: str = "", response_class: str = ""
+        self,
+        status: int,
+        message: str,
+        *,
+        path: str = "",
+        response_class: str = "",
+        retry_after: float | None = None,
     ) -> None:
         super().__init__(f"{status} on {path}: {message}" if path else f"{status}: {message}")
         self.status = status
         self.message = message
         self.path = path
         self.response_class = response_class or classify(status)
+        # On a rate limit, how many seconds GitHub asked the caller to wait.
+        self.retry_after = retry_after
 
 
 def classify(status: int) -> str:
@@ -140,6 +148,8 @@ class CommentRecord:
     line: int | None = None
     commit_id: str | None = None
     review_id: str | None = None
+    # The comment's reaction total from its own payload; None when not reported.
+    reaction_count: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,6 +173,9 @@ class CheckRecord:
     workflow: str = ""
     job: str = ""
     source: str = "check_run"
+    # When the run concluded, as GitHub reports it. A failure that concluded before a
+    # re-run decision is the one the decision was about (hades FDY-0139).
+    completed_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -252,10 +265,17 @@ class GitHubClient(Protocol):
         Raises `UnobservableError` when the App lacks Issues read for the PR-level call."""
         ...
 
-    def workflow_run_logs(
-        self, token: InstallationToken, *, repository: str, run_id: str, limit_bytes: int
+    def ci_failure_log(
+        self,
+        token: InstallationToken,
+        *,
+        repository: str,
+        source: str,
+        external_id: str,
+        limit_bytes: int,
     ) -> bytes:
-        """The available log excerpt for a failed run (Actions read)."""
+        """The tail of the failed job's log for a failed check run or workflow run
+        (Actions read). Empty when it cannot be read."""
         ...
 
     def post_issue_comment(

@@ -87,7 +87,7 @@ def github() -> Iterator[FakeGitHubServer]:
 
 @pytest.fixture
 def github_client(github: FakeGitHubServer, app_key: str) -> RestGitHubClient:
-    transport = RestTransport(github.url, timeout=10.0, sleep=lambda _: None)
+    transport = RestTransport(github.url, timeout=10.0)
     authenticator = AppAuthenticator(
         AppConfig(app_id=4969317, private_key_path=app_key, api_base=github.url), transport
     )

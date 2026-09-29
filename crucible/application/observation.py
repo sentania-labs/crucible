@@ -30,7 +30,9 @@ from crucible.domain.certification import (
     wait_timeout_hours,
 )
 from crucible.domain.entities import (
+    CIAction,
     CICertification,
+    Decision,
     DispositionKind,
     ExternalReview,
     ExternalReviewCycle,
@@ -62,12 +64,20 @@ from crucible.domain.gates import (
     POST_PR_GATES,
     PUBLICATION_GATES,
     DeliveryInput,
+    GateName,
+    GateOutcome,
     GateResult,
     configured,
     evaluate_delivery,
 )
 from crucible.domain.ids import new_id
 from crucible.domain.lifecycle import TaskState
+from crucible.domain.waivers import (
+    ACCEPT_NO_CI,
+    WAIVE_EXTERNAL_REVIEW,
+    latest_waivers,
+    waiver_words,
+)
 from crucible.ports.clock import Clock
 from crucible.ports.github import Observation
 from crucible.ports.repository import UnitOfWork
@@ -126,6 +136,61 @@ def policy_for(uow: UnitOfWork, task: Task) -> dict[str, Any]:
 def accepted_head(uow: UnitOfWork, task: Task) -> str:
     """The head every state after `publishing` is bound to (09)."""
     return task.head_sha or ""
+
+
+@dataclass(frozen=True, slots=True)
+class ReplacedHeads:
+    """Heads Crucible pushed to this pull request that the accepted head replaced, and
+    when the accepted head first appeared on it.
+
+    hades FDY-0139: feedback on a replaced head is settled. A `fix` disposition is
+    Foundry saying the work is not done; the correction that follows is the answer, and
+    once its head is the accepted one, the comments made on the head it replaced ask
+    nothing more. Without this a `fix` held the task for ever, because dispositions are
+    add-only and the comments stay on the pull request. Only a comment made before the
+    accepted head appeared is settled: a reply on an old thread after the correction is
+    new feedback, whatever head its thread started on. A head someone else pushed is
+    never in the set: it went through `head_diverged` and was never Crucible's to
+    settle."""
+
+    heads: frozenset[str] = frozenset()
+    since: datetime | None = None
+
+    def settles(self, reviewed_sha: str | None, created_at: datetime) -> bool:
+        return (
+            self.since is not None
+            and bool(reviewed_sha)
+            and reviewed_sha in self.heads
+            and created_at < self.since
+        )
+
+
+def _last_written(comment: ReviewComment) -> datetime:
+    """When the comment's text was last written: its creation, or a later edit."""
+    if comment.updated_at is not None and comment.updated_at > comment.created_at:
+        return comment.updated_at
+    return comment.created_at
+
+
+def replaced_heads(uow: UnitOfWork, task: Task, pull_request: PullRequest) -> ReplacedHeads:
+    head = accepted_head(uow, task)
+    if not head:
+        return ReplacedHeads()
+    rows = [
+        row
+        for row in uow.pull_request_heads.list_for_pull_request(pull_request.id)
+        if row.pushed_by is PushedBy.CRUCIBLE
+    ]
+    since = min((row.observed_at for row in rows if row.sha == head), default=None)
+    return ReplacedHeads(
+        heads=frozenset(row.sha for row in rows if row.sha != head),
+        since=since,
+    )
+
+
+def task_waivers(uow: UnitOfWork, task: Task) -> dict[str, Decision]:
+    """The operator's waiver decisions on this task, newest of each kind (ADR 0025)."""
+    return latest_waivers(uow.decisions.list_for_task(task.id))
 
 
 # ----- heads and divergence ---------------------------------------------
@@ -413,14 +478,19 @@ def record_comments(
     observation: Observation,
     allowlist: frozenset[str],
     result: ObservationResult,
+    replaced: ReplacedHeads | None = None,
 ) -> list[Signal]:
     """Store review comments and issue comments, updating one edited in place.
 
     The reviewer's summary comment is edited rather than replaced (S12), so a changed
     body or `updated_at` is a change; the row keeps its identity and the edit never counts
-    as a round."""
+    as a round. Only an inline review comment is feedback that needs a disposition, so
+    only its edit counts as feedback: the summary is an issue comment, and its edit is
+    recorded and asks nothing of Foundry (hades FDY-0139). A comment on a head a
+    correction replaced is recorded and settled, so it does not count either."""
     signals: list[Signal] = []
     now = clock.now()
+    settled = replaced or ReplacedHeads()
     for comment in (*observation.review_comments, *observation.issue_comments):
         existing = uow.review_comments.get_by_github(
             pull_request.id, comment.kind, comment.github_id
@@ -430,28 +500,31 @@ def record_comments(
             if existing.body_sha256 != digest or existing.updated_at < comment.updated_at:
                 body_changed = existing.body_sha256 != digest
                 disposition_invalidated = False
-                if body_changed and comment.login in allowlist:
-                    result.edited_feedback += 1
-                    if comment.kind == "review_comment":
+                if body_changed and comment.login in allowlist and comment.kind == "review_comment":
+                    # The edit is judged by when it happened, not when the comment was
+                    # first made: new text after the correction is new feedback.
+                    edited_at = comment.updated_at or now
+                    if not settled.settles(existing.reviewed_sha, edited_at):
+                        result.edited_feedback += 1
                         result.new_comments += 1
-                        old_disposition = uow.dispositions.get_by_comment(
-                            existing.id, existing.body_sha256
+                    old_disposition = uow.dispositions.get_by_comment(
+                        existing.id, existing.body_sha256
+                    )
+                    if old_disposition is not None:
+                        disposition_invalidated = True
+                        record_event(
+                            uow,
+                            clock,
+                            EventKind.DISPOSITION_INVALIDATED,
+                            principal=PRINCIPAL_CRUCIBLE,
+                            task_id=task.id,
+                            payload={
+                                "disposition_id": old_disposition.id,
+                                "review_comment_id": existing.id,
+                                "old_body_sha256": existing.body_sha256,
+                                "new_body_sha256": digest,
+                            },
                         )
-                        if old_disposition is not None:
-                            disposition_invalidated = True
-                            record_event(
-                                uow,
-                                clock,
-                                EventKind.DISPOSITION_INVALIDATED,
-                                principal=PRINCIPAL_CRUCIBLE,
-                                task_id=task.id,
-                                payload={
-                                    "disposition_id": old_disposition.id,
-                                    "review_comment_id": existing.id,
-                                    "old_body_sha256": existing.body_sha256,
-                                    "new_body_sha256": digest,
-                                },
-                            )
                 existing.body = comment.body
                 existing.body_sha256 = digest
                 existing.updated_at = comment.updated_at
@@ -515,9 +588,14 @@ def record_comments(
             },
         )
         result.changed = True
-        if comment.kind == "review_comment" and comment.login in allowlist:
-            # Only what the dispositions gate counts: a comment from another login, or a
-            # standalone issue comment, is recorded and asks nothing of Foundry.
+        if (
+            comment.kind == "review_comment"
+            and comment.login in allowlist
+            and not settled.settles(comment.commit_id, comment.created_at)
+        ):
+            # Only what the dispositions gate counts: a comment from another login, a
+            # standalone issue comment, or one on a head a correction replaced, is
+            # recorded and asks nothing of Foundry.
             result.new_comments += 1
         # An inline review comment belongs to its review object, which carries the
         # round; only a standalone comment is a signal of its own.
@@ -696,9 +774,74 @@ def observed_checks(observation: Observation) -> tuple[ObservedCheck, ...]:
             external_id=check.external_id,
             workflow=check.workflow,
             job=check.job,
+            completed_at=check.completed_at,
         )
         for check in observation.checks
     )
+
+
+def _iso(value: datetime | None) -> str | None:
+    return value.isoformat() if value is not None else None
+
+
+def _parse_iso(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+# A failed run as a re-run decision names it: GitHub's id and when it concluded. A
+# re-run of a job is a new id; a re-run of a workflow keeps the id and concludes later.
+FailedRun = tuple[str, str | None]
+
+
+def pending_rerun(
+    uow: UnitOfWork, task: Task, *, head_sha: str, failures: list[FailedRun]
+) -> str | None:
+    """The id of the re-run decision these failures are stale under, or None.
+
+    hades FDY-0139: a `rerun` decision is about the failures it was recorded for, which
+    its event lists. While those are still what GitHub shows, they are not counted
+    again: otherwise the task went straight back to `ci_certification_failed` on the
+    next poll, before anyone could re-run anything. Any other failure is a new one. A
+    decision whose event lists no failures is judged by time: a failure that concluded
+    before it is the old one."""
+    event = uow.events.latest_for_task_kind(task.id, EventKind.CI_DECISION_RECORDED.value)
+    if event is None:
+        return None
+    payload = event.payload
+    if payload.get("action") != CIAction.RERUN.value or payload.get("head_sha") != head_sha:
+        return None
+    decision_id = str(payload.get("ci_decision_id", ""))
+    listed = payload.get("stale_failures")
+    # An entry with no run id (a failure recorded before FDY-0139) identifies nothing, so
+    # a decision that lists only those is judged by time instead.
+    known = {
+        (str(item["run_id"]), item.get("completed_at"))
+        for item in (listed if isinstance(listed, list) else [])
+        if isinstance(item, dict) and item.get("run_id")
+    }
+    if known:
+        return decision_id if all(run in known for run in failures) else None
+    concluded = [_parse_iso(at) for _, at in failures]
+    if all(at is None or at <= event.ts for at in concluded):
+        return decision_id
+    return None
+
+
+def certification_failures(certification: CICertification) -> list[FailedRun]:
+    """The failed runs a stored certification recorded."""
+    rows = certification.failure.get("all")
+    if not isinstance(rows, list):
+        return [(str(certification.failure.get("run_id", "")), None)]
+    return [
+        (str(row.get("run_id") or ""), row.get("completed_at"))
+        for row in rows
+        if isinstance(row, dict)
+    ]
 
 
 def certify_head(
@@ -711,8 +854,14 @@ def certify_head(
     policy: dict[str, Any],
     head_sha: str,
     log_excerpt: str = "",
+    log_fetched: bool = False,
 ) -> CICertification:
-    """Compute and record the certification for the accepted head (23, ADR 0009)."""
+    """Compute and record the certification for the accepted head (23, ADR 0009).
+
+    Two recorded decisions shape it (hades FDY-0139): an `accept_no_ci` waiver turns an
+    empty required set with nothing at all observed on the head into `skipped`, and a
+    `rerun` decision keeps the failure it was about from being counted again until a
+    fresh result arrives."""
     checks = observed_checks(observation)
     outcome = certify(
         policy,
@@ -720,8 +869,11 @@ def certify_head(
         branch_protection=observation.required_checks,
         observed=checks,
     )
+    state = outcome.state
+    detail = outcome.detail
+    previous = uow.ci_certifications.get_for_head(pull_request.id, head_sha)
     failure: dict[str, Any] = {}
-    if outcome.state is CertificationState.FAILED:
+    if state is CertificationState.FAILED:
         first = outcome.failures[0]
         failure = {
             "check": first.name,
@@ -731,19 +883,68 @@ def certify_head(
             "head_sha": first.head_sha,
             "url": first.url,
             "run_id": first.external_id,
+            "source": first.source.value,
             "all": [
-                {"check": c.name, "conclusion": c.conclusion, "url": c.url}
+                {
+                    "check": c.name,
+                    "conclusion": c.conclusion,
+                    "url": c.url,
+                    "run_id": c.external_id,
+                    "completed_at": _iso(c.completed_at),
+                }
                 for c in outcome.failures
             ],
         }
+        # The excerpt is fetched once per failed run, not on every poll, even when it
+        # came back empty; the stored one is kept while the same run is the failure.
+        same_run = previous is not None and previous.failure.get("run_id") == first.external_id
+        if not log_fetched and previous is not None and same_run:
+            log_excerpt = str(previous.failure.get("log_excerpt", ""))
+            log_fetched = bool(previous.failure.get("log_fetched"))
         if log_excerpt:
             failure["log_excerpt"] = log_excerpt
+        if log_fetched:
+            failure["log_fetched"] = True
+        rerun = pending_rerun(
+            uow,
+            task,
+            head_sha=head_sha,
+            failures=[(c.external_id, _iso(c.completed_at)) for c in outcome.failures],
+        )
+        if rerun is not None:
+            state = CertificationState.PENDING
+            names = ", ".join(sorted({c.name for c in outcome.failures}))
+            detail = (
+                f"a CI re-run was decided (ci decision {rerun}); the failure it was about "
+                f"({names}) is not counted again. Waiting for a result on {head_sha} that "
+                "is not the one the decision was about"
+            )
+            failure["stale_after_rerun"] = rerun
+    elif state is CertificationState.PENDING:
+        waiver = task_waivers(uow, task).get(ACCEPT_NO_CI)
+        # Nothing ran: no check run or workflow run on the head, a suite being only a
+        # container and a run a path filter skipped being no run at all.
+        ran = [
+            c
+            for c in checks
+            if c.head_sha == head_sha
+            and c.source is not CheckSource.CHECK_SUITE
+            and not (c.concluded and c.conclusion == "skipped")
+        ]
+        # Only a repository that requires nothing: a configured required check that has not
+        # appeared yet is late, not absent, and stays subject to certification.
+        if waiver is not None and not ran and not outcome.required:
+            state = CertificationState.SKIPPED
+            detail = (
+                f"the operator accepted that this repository has no CI for this task "
+                f"({waiver_words(waiver)})"
+            )
     certification = CICertification(
         id=new_id(),
         pull_request_id=pull_request.id,
         task_id=task.id,
         head_sha=head_sha,
-        state=outcome.state.value,
+        state=state.value,
         required_checks=list(outcome.required),
         check_runs=[
             {
@@ -753,14 +954,14 @@ def certify_head(
                 "source": c.source.value,
                 "url": c.url,
                 "workflow": c.workflow,
+                "completed_at": _iso(c.completed_at),
             }
             for c in outcome.observed
         ],
         failure=failure,
-        detail=outcome.detail,
+        detail=detail,
         evaluated_at=clock.now(),
     )
-    previous = uow.ci_certifications.get_for_head(pull_request.id, head_sha)
     stored = uow.ci_certifications.put(certification)
     if previous is None or previous.state != stored.state or previous.detail != stored.detail:
         record_event(
@@ -817,32 +1018,7 @@ def observe_state(
             },
         )
         result.changed = True
-        if task.state is TaskState.READY_FOR_MERGE:
-            move_task(
-                uow,
-                clock,
-                task,
-                TaskState.MERGED,
-                EventKind.TASK_MERGED,
-                payload={
-                    "pull_request": pull_request.number,
-                    "merge_sha": pull_request.merge_sha,
-                    "merged_by": pull_request.merged_by,
-                    "merged_at": (pull_request.merged_at or now).isoformat(),
-                },
-            )
-            create_wake(
-                uow,
-                clock,
-                principal_id=task.principal_id,
-                reason=WakeReason.MERGED,
-                summary=(
-                    f"pull request #{pull_request.number} was merged by "
-                    f"{pull_request.merged_by or 'someone'} as {pull_request.merge_sha}"
-                ),
-                task=task,
-                extra_links={"pull_request": f"/v1/tasks/{task.id}/pull-request"},
-            )
+        settle_pull_request_state(uow, clock, task=task, pull_request=pull_request)
         return
     if ref.state == "closed" and not ref.merged and pull_request.state is PullRequestState.OPEN:
         pull_request.state = PullRequestState.CLOSED
@@ -862,19 +1038,84 @@ def observe_state(
             },
         )
         result.changed = True
-        if task.state in OBSERVED_STATES and task.state is not TaskState.HEAD_DIVERGED:
-            move_task(
-                uow,
-                clock,
-                task,
-                TaskState.REJECTED,
-                EventKind.TASK_REJECTED,
-                payload={
-                    "pull_request": pull_request.number,
-                    "reason": "the pull request was closed without being merged (23)",
-                    "closed_by": pull_request.closed_by,
-                },
-            )
+        settle_pull_request_state(uow, clock, task=task, pull_request=pull_request)
+
+
+def settle_pull_request_state(
+    uow: UnitOfWork, clock: Clock, *, task: Task, pull_request: PullRequest
+) -> bool:
+    """Move a task whose pull request is merged or closed, and wake Foundry (23).
+
+    hades FDY-0139: from any delivery state, not only `ready_for_merge`. A person can
+    merge or close at any point after the PR opens, and a merged or closed PR is never
+    polled again, so a task left behind here waited for ever. Also called on every tick
+    for a task already stranded that way. True when the task moved."""
+    if task.state not in OBSERVED_STATES:
+        return False
+    now = clock.now()
+    if pull_request.state is PullRequestState.MERGED:
+        merged_from = task.state.value
+        early = task.state is not TaskState.READY_FOR_MERGE
+        move_task(
+            uow,
+            clock,
+            task,
+            TaskState.MERGED,
+            EventKind.TASK_MERGED,
+            payload={
+                "pull_request": pull_request.number,
+                "merge_sha": pull_request.merge_sha,
+                "merged_by": pull_request.merged_by,
+                "merged_at": (pull_request.merged_at or now).isoformat(),
+                "merged_from": merged_from,
+            },
+        )
+        summary = (
+            f"pull request #{pull_request.number} was merged by "
+            f"{pull_request.merged_by or 'someone'} as {pull_request.merge_sha}"
+        )
+        if early:
+            summary += f", before Crucible saw it ready for merge (the task was {merged_from})"
+        create_wake(
+            uow,
+            clock,
+            principal_id=task.principal_id,
+            reason=WakeReason.MERGED,
+            summary=summary,
+            task=task,
+            extra_links={"pull_request": f"/v1/tasks/{task.id}/pull-request"},
+        )
+        return True
+    if pull_request.state is PullRequestState.CLOSED:
+        closed_from = task.state.value
+        move_task(
+            uow,
+            clock,
+            task,
+            TaskState.REJECTED,
+            EventKind.TASK_REJECTED,
+            payload={
+                "pull_request": pull_request.number,
+                "reason": "the pull request was closed without being merged (23)",
+                "closed_by": pull_request.closed_by,
+                "closed_from": closed_from,
+            },
+        )
+        create_wake(
+            uow,
+            clock,
+            principal_id=task.principal_id,
+            reason=WakeReason.PULL_REQUEST_CLOSED,
+            summary=(
+                f"pull request #{pull_request.number} was closed without being merged by "
+                f"{pull_request.closed_by or 'someone'} while the task was {closed_from}; "
+                "the task is rejected"
+            ),
+            task=task,
+            extra_links={"pull_request": f"/v1/tasks/{task.id}/pull-request"},
+        )
+        return True
+    return False
 
 
 def evaluate_delivery_gates(
@@ -898,16 +1139,22 @@ def evaluate_delivery_gates(
         list(uow.review_comments.list_for_pull_request(pull_request.id)) if pull_request else []
     )
     allowlist = reviewer_logins(policy)
-    needing = [c for c in comments if c.login in allowlist and c.kind == "review_comment"]
+    replaced = replaced_heads(uow, task, pull_request) if pull_request else ReplacedHeads()
+    feedback = [c for c in comments if c.login in allowlist and c.kind == "review_comment"]
+    # 09: advancement needs every comment dispositioned *and none of them fix*. A `fix`
+    # is Foundry saying the work is not done; what follows it is a correction contract,
+    # which clears it by replacing the head the comments belong to: a comment on a head
+    # the accepted head replaced is settled and no longer counted (hades FDY-0139).
+    # A comment edited after the correction is judged by its edit, so its new text needs a
+    # disposition like any other fresh feedback.
+    settled = [c for c in feedback if replaced.settles(c.reviewed_sha, _last_written(c))]
+    needing = [c for c in feedback if not replaced.settles(c.reviewed_sha, _last_written(c))]
     recorded = list(
         uow.dispositions.list_for_comments(
             [c.id for c in needing], {c.id: c.body_sha256 for c in needing}
         )
     )
     dispositioned = {d.review_comment_id for d in recorded}
-    # 09: advancement needs every comment dispositioned *and none of them fix*. A `fix`
-    # is Foundry saying the work is not done; what follows it is a correction contract,
-    # which clears it by replacing the head the comments belong to.
     fix_dispositions = tuple(
         d.review_comment_id for d in recorded if d.disposition is DispositionKind.FIX
     )
@@ -933,9 +1180,15 @@ def evaluate_delivery_gates(
         if pull_request
         else []
     )
+    waivers = task_waivers(uow, task)
+    review_waiver = waivers.get(WAIVE_EXTERNAL_REVIEW)
     final_sha = None
     section = policy.get("external_review", {})
-    if isinstance(section, dict) and section.get("require_review_on_final_sha"):
+    if (
+        review_waiver is None
+        and isinstance(section, dict)
+        and section.get("require_review_on_final_sha")
+    ):
         final_sha = final_sha_satisfied(cycles, signals, head)
     di = DeliveryInput(
         policy=policy,
@@ -959,6 +1212,20 @@ def evaluate_delivery_gates(
     if PHASE_POST_PR in phases:
         names.extend(configured(policy, "post_pr", POST_PR_GATES))
     outcomes = evaluate_delivery(names, di)
+    rounds_gate = GateName.EXTERNAL_REVIEW_ROUNDS.value
+    rounds = outcomes.get(rounds_gate)
+    if (
+        review_waiver is not None
+        and rounds is not None
+        and rounds.result not in (GateResult.PASS, GateResult.SKIPPED)
+    ):
+        # ADR 0025: the operator waived the rounds still outstanding for this task. The
+        # gate says so and names the decision; it does not pretend a round happened.
+        outcomes[rounds_gate] = GateOutcome(
+            GateResult.SKIPPED,
+            f"{di.completed_rounds} of {di.required_rounds} round(s) completed; the rest "
+            f"were waived by the operator ({waiver_words(review_waiver)})",
+        )
     stored = {
         row.gate: (row.result, row.detail)
         for row in uow.gate_results.list_for_attempt(attempt_id)
@@ -991,6 +1258,8 @@ def evaluate_delivery_gates(
         "required_rounds": di.required_rounds,
         "undispositioned": list(di.undispositioned),
         "fix_dispositions": list(di.fix_dispositions),
+        "settled_by_correction": [c.id for c in settled],
+        "rounds_waived": review_waiver is not None,
     }
     if changed:
         record_event(
@@ -1093,6 +1362,50 @@ def advance_delivery(
         )
         return
     if (
+        task.state is TaskState.AWAITING_EXTERNAL_REVIEW
+        and gates.get("rounds_waived")
+        and dispositions_ok
+    ):
+        # ADR 0025: the operator waived the rounds still outstanding, so the task stops
+        # waiting for the reviewer and goes on to certification in this same pass.
+        move_task(
+            uow,
+            clock,
+            task,
+            TaskState.AWAITING_CI_CERTIFICATION,
+            EventKind.TASK_AWAITING_CI_CERTIFICATION,
+            payload={
+                "pull_request": pull_request.number,
+                "completed_rounds": gates.get("completed_rounds"),
+                "required_rounds": gates.get("required_rounds"),
+                "note": "the remaining external review rounds were waived by the operator",
+            },
+        )
+    if (
+        task.state is TaskState.CI_CERTIFICATION_FAILED
+        and certification is not None
+        and certification.head_sha == accepted_head(uow, task)
+        and certification.state
+        in (CertificationState.GREEN.value, CertificationState.SKIPPED.value)
+    ):
+        # hades FDY-0139: CI went green on the accepted head after the failure, whether
+        # someone re-ran it before or after a decision. The failure no longer describes
+        # the head, so the task goes back to certification and on from there.
+        move_task(
+            uow,
+            clock,
+            task,
+            TaskState.AWAITING_CI_CERTIFICATION,
+            EventKind.TASK_AWAITING_CI_CERTIFICATION,
+            payload={
+                "pull_request": pull_request.number,
+                "certification_id": certification.id,
+                "head_sha": certification.head_sha,
+                "certification": certification.state,
+                "note": "a later certification on the same head is green; the failure is past",
+            },
+        )
+    if (
         task.state
         in (
             TaskState.AWAITING_CI_CERTIFICATION,
@@ -1101,6 +1414,15 @@ def advance_delivery(
         and certification is not None
     ):
         if certification.state == CertificationState.FAILED.value:
+            if pending_rerun(
+                uow,
+                task,
+                head_sha=certification.head_sha,
+                failures=certification_failures(certification),
+            ):
+                # The failure a re-run decision was about, not a new one; the next poll
+                # records it as stale and waits for the re-run's result.
+                return
             move_task(
                 uow,
                 clock,
@@ -1196,10 +1518,11 @@ def advance_from_feedback(
     gates: dict[str, Any],
     policy: dict[str, Any],
 ) -> None:
-    """09: every comment dispositioned, none is `fix`, and the rounds decide where next."""
+    """09: every comment dispositioned, none is `fix`, and the rounds decide where next.
+    Rounds the operator waived (ADR 0025) count as decided."""
     completed = int(gates.get("completed_rounds", 0))
     needed = int(gates.get("required_rounds", 0))
-    if completed >= needed:
+    if completed >= needed or gates.get("rounds_waived"):
         move_task(
             uow,
             clock,
@@ -1333,11 +1656,19 @@ def repeat_overdue_wakes(
         reason = WakeReason.EXTERNAL_REVIEW_OVERDUE
         entered = EventKind.TASK_AWAITING_EXTERNAL_REVIEW
         what = "an external review signal"
+        way_out = (
+            "; the operator can waive the remaining rounds for this task "
+            f"(decision kind {WAIVE_EXTERNAL_REVIEW})"
+        )
     elif task.state is TaskState.AWAITING_CI_CERTIFICATION:
         hours = wait_timeout_hours(policy, "ci_certification", DEFAULT_CI_TIMEOUT_HOURS)
         reason = WakeReason.CI_CERTIFICATION_OVERDUE
         entered = EventKind.TASK_AWAITING_CI_CERTIFICATION
         what = "a required check conclusion"
+        way_out = (
+            "; if the repository has no CI, the operator can accept that for this task "
+            f"(decision kind {ACCEPT_NO_CI})"
+        )
     else:
         return False
     since = waiting_since(uow, task, entered, fallback=pull_request.opened_at)
@@ -1353,7 +1684,7 @@ def repeat_overdue_wakes(
         reason=reason,
         summary=(
             f"#{pull_request.number} has waited more than {hours}h for {what} on "
-            f"{pull_request.head_sha}"
+            f"{pull_request.head_sha}{way_out}"
         ),
         task=task,
         extra_links={"pull_request": f"/v1/tasks/{task.id}/pull-request"},
@@ -1427,6 +1758,7 @@ def apply_observation(
     attempt_id: str,
     with_reactions: bool,
     log_excerpt: str = "",
+    log_fetched: bool = False,
 ) -> ObservationResult:
     """One poll, applied. The whole of what a tick does with a pull request."""
     result = ObservationResult()
@@ -1467,6 +1799,7 @@ def apply_observation(
         observation=observation,
         allowlist=allowlist,
         result=result,
+        replaced=replaced_heads(uow, task, pull_request),
     )
     if with_reactions:
         signals += record_reactions(
@@ -1506,6 +1839,7 @@ def apply_observation(
             policy=policy,
             head_sha=head,
             log_excerpt=log_excerpt,
+            log_fetched=log_fetched,
         )
         result.certification = certification.state
     if result.diverged:

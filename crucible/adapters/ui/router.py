@@ -44,6 +44,7 @@ from crucible.application.admin import limits as limits_admin
 from crucible.application.admin.context import guard_mutation
 from crucible.application.admin.providers import providers_status
 from crucible.application.auth import authenticate
+from crucible.application.decisions import record_decision
 from crucible.application.errors import (
     ApplicationError,
     ConflictError,
@@ -53,13 +54,19 @@ from crucible.application.errors import (
 )
 from crucible.application.first_run import discard_after_use
 from crucible.application.policies import put_policy, put_routing_policy
-from crucible.application.queries import supervisor_health, task_view
-from crucible.contracts.api import ExternalReviewAttestation, RepositoryRegistration
+from crucible.application.queries import pull_request_view, supervisor_health, task_view
+from crucible.contracts.api import (
+    DecisionRequest,
+    ExternalReviewAttestation,
+    RepositoryRegistration,
+)
 from crucible.contracts.task_contract import HarnessName
 from crucible.domain.cluster_egress import format_labels, parse_labels
 from crucible.domain.entities import Principal, Role
 from crucible.domain.gates import ALWAYS_BLOCKING_GATES, PRE_PR_GATES
+from crucible.domain.lifecycle import TaskState
 from crucible.domain.secrets import redact, scan_text
+from crucible.domain.waivers import ACCEPT_NO_CI, WAIVABLE_STATES, WAIVE_EXTERNAL_REVIEW
 from crucible.ports.repository import UnitOfWork
 
 ROOT = Path(__file__).parent
@@ -2455,6 +2462,17 @@ def tasks_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
             since=ctx.clock.now() - timedelta(days=RECENT_TASK_DAYS), limit=RECENT_TASK_ROWS
         )
     )
+    # hades FDY-0139: every task with a pull request under observation, each linking to
+    # its page, where the operator can waive what the task is still waiting for.
+    delivering = [
+        [
+            {"kind": "link", "href": f"/ui/tasks/{task.id}", "label": task.external_id or task.id},
+            _state_words(task.state.value),
+            task.updated_at.isoformat(),
+        ]
+        for state in DELIVERY_STATES
+        for task in uow.tasks.list_by_state(state)
+    ]
     return _page(
         request,
         principal,
@@ -2468,6 +2486,12 @@ def tasks_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                 "empty": "No task needs attention.",
                 "columns": ["Task", "Why", "Since"],
                 "rows": attention,
+            },
+            {
+                "title": "Pull requests in delivery",
+                "empty": "No pull request is open for a task.",
+                "columns": ["Task", "State", "Since"],
+                "rows": delivering,
             },
             {
                 # ADR 0024: every pre-PR gate marked blocking or advisory, and what the
@@ -2533,10 +2557,35 @@ def _task_link(task_id: str, external_id: str | None) -> dict[str, str]:
     return {"kind": "link", "href": f"/ui/tasks/{quote(task_id)}", "label": external_id or task_id}
 
 
+# The states a task page offers the operator's waivers from, in the order a PR moves.
+DELIVERY_STATES = (
+    TaskState.AWAITING_EXTERNAL_REVIEW,
+    TaskState.EXTERNAL_FEEDBACK_RECEIVED,
+    TaskState.AWAITING_CI_CERTIFICATION,
+    TaskState.CI_CERTIFICATION_FAILED,
+    TaskState.HEAD_DIVERGED,
+    TaskState.READY_FOR_MERGE,
+)
+WAIVER_FORMS = (
+    (
+        WAIVE_EXTERNAL_REVIEW,
+        "Waive the remaining external review rounds",
+        "The task stops waiting for the external reviewer and goes on to CI. Use it when "
+        "the reviewer will not review this pull request.",
+        "the external reviewer did not review this pull request",
+    ),
+    (
+        ACCEPT_NO_CI,
+        "Accept that this repository has no CI",
+        "With no check run or workflow run on the head, CI certification is skipped "
+        "instead of waiting. A check that does run is still certified.",
+        "this repository has no CI for this task",
+    ),
+)
+
+
 @router.get("/tasks/{task_id}", response_class=HTMLResponse)
 def task_page(request: Request, task_id: str, ctx: Ctx, uow: UoW) -> Response:
-    """One task's paper trail (hades FDY-0143): the branch Crucible pushed, the head it
-    pushed, the pull request, and the merge commit and who merged it."""
     found = _require(request, ctx, uow)
     if isinstance(found, RedirectResponse):
         return found
@@ -2547,62 +2596,177 @@ def task_page(request: Request, task_id: str, ctx: Ctx, uow: UoW) -> Response:
         return RedirectResponse(
             f"/ui/tasks?kind=bad&message={quote(f'No task {task_id}.')}", status_code=303
         )
+    # hades FDY-0143: the task's paper trail on GitHub, beside what it is waiting for.
     delivery = view.delivery
     not_yet = "not yet"
-    pull_request: Any = not_yet
+    delivered_pr: Any = not_yet
     if delivery.pull_request_number is not None:
         label = f"#{delivery.pull_request_number}"
-        pull_request = (
+        delivered_pr = (
             {"href": delivery.pull_request_url, "label": label}
             if (delivery.pull_request_url or "").startswith("https://")
             else label
         )
+    sections: list[dict[str, Any]] = [
+        {
+            "title": "Task",
+            "columns": ["Field", "Value"],
+            "rows": [
+                ["Task", view.external_id],
+                ["Title", view.title],
+                ["State", _state_words(view.state.value)],
+                ["Id", view.id],
+                ["Repository", view.repository],
+                ["Owner", view.principal],
+                ["Accepted head", view.head_sha or "none yet"],
+                ["Created", view.created_at.isoformat()],
+                ["Updated", view.updated_at.isoformat()],
+            ],
+        },
+        {
+            "title": "Delivery",
+            "note": "The task's paper trail on GitHub. Each line fills in when it happens.",
+            "columns": ["What", "Value"],
+            "rows": [
+                ["Work branch", delivery.work_branch or not_yet],
+                ["Pushed head", delivery.pushed_head or not_yet],
+                [
+                    "Pushed at",
+                    delivery.pushed_at.isoformat()
+                    if delivery.pushed_at
+                    else ("not recorded" if delivery.pushed_head else not_yet),
+                ],
+                ["Pull request", delivered_pr],
+                ["Pull request state", delivery.pull_request_state or not_yet],
+                ["Merge commit", delivery.merge_sha or not_yet],
+                ["Merged by", delivery.merged_by or not_yet],
+                ["Merged at", delivery.merged_at.isoformat() if delivery.merged_at else not_yet],
+            ],
+        },
+    ]
+    try:
+        record = pull_request_view(uow, task_id)
+    except NotFoundError:
+        record = None
+    if record is not None:
+        certification = record.ci_certifications[-1] if record.ci_certifications else None
+        sections.append(
+            {
+                "title": "Pull request",
+                "columns": ["Field", "Value"],
+                "rows": [
+                    ["Pull request", {"href": record.url, "label": f"#{record.number}"}],
+                    ["State", record.state],
+                    ["Head", record.head_sha],
+                    [
+                        "External review",
+                        f"{record.completed_rounds} of {record.required_rounds} round(s)",
+                    ],
+                    [
+                        "CI",
+                        f"{certification.state}: {certification.detail}"
+                        if certification
+                        else "not certified yet",
+                    ],
+                    [
+                        "Last polled",
+                        record.last_polled_at.isoformat() if record.last_polled_at else "never",
+                    ],
+                ],
+            }
+        )
+        sections.append(
+            {
+                "title": "Gates after the pull request",
+                "empty": "No gate has been evaluated yet.",
+                "columns": ["Gate", "Result", "Detail"],
+                "rows": [
+                    [gate.gate, gate.result, gate.detail]
+                    for gate in record.gates
+                    if gate.head_sha == view.head_sha
+                ],
+            }
+        )
+    waivers = [d for d in view.decisions if d.get("kind") in (WAIVE_EXTERNAL_REVIEW, ACCEPT_NO_CI)]
+    sections.append(
+        {
+            "title": "Operator waivers",
+            "empty": "No waiver is recorded for this task.",
+            "columns": ["Kind", "Reason", "By", "Recorded"],
+            "rows": [
+                [d.get("kind"), d.get("verbatim"), d.get("principal"), d.get("created_at")]
+                for d in waivers
+            ],
+        }
+    )
+    if principal.role is Role.ADMIN and view.state in WAIVABLE_STATES:
+        for kind, title, note, resolves in WAIVER_FORMS:
+            sections.append(
+                {
+                    "title": title,
+                    "note": note,
+                    "form": {
+                        "action": f"/ui/tasks/{task_id}/decisions",
+                        "label": title,
+                        "fields": [
+                            {"kind": "hidden", "name": "kind", "value": kind},
+                            {"kind": "hidden", "name": "resolves", "value": resolves},
+                            {
+                                # Not `reason`: this is the decision's verbatim record,
+                                # always required, not the optional audit note.
+                                "name": "verbatim",
+                                "label": "Reason (required; recorded on the task)",
+                                "required": True,
+                            },
+                        ],
+                    },
+                }
+            )
     return _page(
         request,
         principal,
         csrf,
-        active="/ui/tasks",
-        heading=f"Task {view.external_id or view.id}",
-        intro=view.title,
-        badge=_state_words(view.state.value),
-        sections=[
-            {
-                "title": "Delivery",
-                "note": "The task's paper trail on GitHub. Each line fills in when it happens.",
-                "columns": ["What", "Value"],
-                "rows": [
-                    ["Work branch", delivery.work_branch or not_yet],
-                    ["Pushed head", delivery.pushed_head or not_yet],
-                    [
-                        "Pushed at",
-                        delivery.pushed_at.isoformat()
-                        if delivery.pushed_at
-                        else ("not recorded" if delivery.pushed_head else not_yet),
-                    ],
-                    ["Pull request", pull_request],
-                    ["Pull request state", delivery.pull_request_state or not_yet],
-                    ["Merge commit", delivery.merge_sha or not_yet],
-                    ["Merged by", delivery.merged_by or not_yet],
-                    [
-                        "Merged at",
-                        delivery.merged_at.isoformat() if delivery.merged_at else not_yet,
-                    ],
-                ],
-            },
-            {
-                "title": "Task",
-                "columns": ["What", "Value"],
-                "rows": [
-                    ["Id", view.id],
-                    ["Repository", view.repository],
-                    ["Owner", view.principal],
-                    ["Collected head", view.head_sha or not_yet],
-                    ["Created", view.created_at.isoformat()],
-                    ["Updated", view.updated_at.isoformat()],
-                ],
-            },
-        ],
+        active=f"/ui/tasks/{task_id}",
+        heading=f"Task {view.external_id}",
+        intro="The task, its pull request, and what it is waiting for.",
+        sections=sections,
     )
+
+
+@router.post("/tasks/{task_id}/decisions")
+async def task_decision(request: Request, task_id: str, ctx: Ctx, uow: UoW) -> Response:
+    """ADR 0025: the operator's waiver, recorded through the same decision service the
+    API's `POST /v1/tasks/{id}/decisions` uses, so it is audited the same way."""
+    found = _require(request, ctx, uow)
+    if isinstance(found, RedirectResponse):
+        return found
+    principal, csrf = found
+    form = await _form(request)
+    form["return_to"] = f"/ui/tasks/{task_id}"
+    try:
+        _csrf(form, csrf)
+        _admin(principal)
+        kind = form.get("kind", "")
+        if kind not in (WAIVE_EXTERNAL_REVIEW, ACCEPT_NO_CI):
+            raise ConflictError(f"the task page records only waivers, not {kind!r}")
+        reason = (form.get("verbatim") or "").strip()
+        if not reason:
+            raise ConflictError("a waiver needs a reason")
+        record_decision(
+            uow,
+            ctx.clock,
+            principal=principal,
+            task_id=task_id,
+            request=DecisionRequest(
+                kind=kind,
+                verbatim=reason,
+                resolves=form.get("resolves") or kind,
+            ),
+        )
+        uow.commit()
+        return _redirect(form, f"Recorded: {kind}. The next supervisor tick acts on it.")
+    except ApplicationError as exc:
+        return _redirect(form, exc.detail, kind="bad")
 
 
 @router.get("/wakes", response_class=HTMLResponse)
