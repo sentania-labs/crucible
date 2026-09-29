@@ -168,12 +168,13 @@ def test_the_preparer_points_the_checkout_at_crucibles_hooks_only() -> None:
     assert "-c core.hooksPath=/dev/null" in script
 
 
-def test_identity_md_section_10_is_one_line(tmp_path: Path) -> None:
+def test_identity_md_says_only_commit_on_the_branch(tmp_path: Path) -> None:
     """FDY-0143: the worker is told to commit on its branch, and nothing about the
     trailer, the author, hooks or `--no-verify`."""
     text = (_bundle(tmp_path) / "IDENTITY.md").read_text(encoding="utf-8")
-    section = text.split("## 10. Commits", 1)[1]
-    assert section.strip() == "Commit your work on `crucible/test`."
+    # FDY-0140 made it a line of the Scope section; FDY-0143 made it this one line.
+    section = text.split("## Scope", 1)[1].split("## ", 1)[0]
+    assert "- Commit your work on `crucible/test`; never push." in section
     for word in ("trailer", "Crucible-Attempt", "author", "hook", "--no-verify"):
         assert word not in section
     policy_md = (tmp_path / "identity" / "policy.md").read_text(encoding="utf-8")

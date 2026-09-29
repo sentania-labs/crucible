@@ -39,6 +39,21 @@ CONTRACT="$ID/contract.json"
 behavior=$(cat "$REPO/e2e-behavior" 2>/dev/null || echo succeed)
 log "behavior=$behavior"
 
+# FDY-0140: Hermes under `-z` writes nothing while it works, but its session store in
+# the home directory changes after every turn. This works the same way, silently, for
+# `e2e-silent-seconds` (committed in the repository, default 30), then carries on.
+if [ "$behavior" = "silent-work" ]; then
+  silent=$(cat "$REPO/e2e-silent-seconds" 2>/dev/null || echo 30)
+  mkdir -p "$HOME/.e2e-session"
+  end=$(( $(date +%s) + silent ))
+  turn=0
+  while [ "$(date +%s)" -lt "$end" ]; do
+    turn=$((turn + 1))
+    printf 'turn %s\n' "$turn" > "$HOME/.e2e-session/state"
+    sleep 2
+  done
+fi
+
 case "$behavior" in
   hang)      log "sleeping until Crucible drains me"; while : ; do sleep 1; done ;;
   environment) log "bad environment"; exit 70 ;;
@@ -104,11 +119,15 @@ if [ "$behavior" = "break-verification" ]; then
   printf 'exit 1\n' >> "$REPO/checks/test.sh"
 fi
 
-git -C "$REPO" add -A
-trailer=$(jq -r '.commit_trailer // "Crucible-Attempt"' "$CONTRACT" 2>/dev/null || echo Crucible-Attempt)
-git -C "$REPO" commit -q \
-  -m "e2e: change for ${CRUCIBLE_TASK_EXTERNAL_ID:-unknown}" \
-  -m "$trailer: ${CRUCIBLE_ATTEMPT_ID:-unknown}" || log "nothing to commit"
+# FDY-0140: `no-commit` leaves its edit in the working tree, as a model that forgot to
+# commit does; the collector commits it.
+if [ "$behavior" != "no-commit" ]; then
+  git -C "$REPO" add -A
+  trailer=$(jq -r '.commit_trailer // "Crucible-Attempt"' "$CONTRACT" 2>/dev/null || echo Crucible-Attempt)
+  git -C "$REPO" commit -q \
+    -m "e2e: change for ${CRUCIBLE_TASK_EXTERNAL_ID:-unknown}" \
+    -m "$trailer: ${CRUCIBLE_ATTEMPT_ID:-unknown}" || log "nothing to commit"
+fi
 head=$(git -C "$REPO" rev-parse HEAD)
 commits=$(git -C "$REPO" rev-list --count "$(jq -r '.repository.base_ref // "main"' "$CONTRACT")"..HEAD 2>/dev/null || echo 1)
 log "committed $head"

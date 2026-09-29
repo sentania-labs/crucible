@@ -84,8 +84,12 @@ from crucible.ports.execution import (
     IDENTITY_MOUNT,
     LEGACY_HARNESS_LABEL,
     OUTPUT_MOUNT,
+    PACKAGE_CACHE_ENV,
+    PACKAGE_CACHE_LEAF,
+    PACKAGE_CACHE_MOUNT,
     REPO_MOUNT,
     REPORT_MOUNT,
+    VERIFIER_CACHE_LEAF,
     VERIFY_MOUNT,
     WORK_MOUNT,
     CancelCheck,
@@ -750,6 +754,7 @@ class DockerProvider:
             "CRUCIBLE_REPORT_DIR": REPORT_MOUNT,
             "CRUCIBLE_REPO_DIR": REPO_MOUNT,
             "HOME": "/home/worker",
+            **PACKAGE_CACHE_ENV,
             **spec.env,
         }
         network_policy = str(spec.policy.get("network", {}).get("mode", "egress-proxy"))
@@ -797,6 +802,9 @@ class DockerProvider:
             self._daemon_mount(spec.attempt_id, "repo", REPO_MOUNT, read_only=False),
             self._daemon_mount(spec.attempt_id, "identity", IDENTITY_MOUNT, read_only=True),
             self._daemon_mount(spec.attempt_id, "report", REPORT_MOUNT, read_only=False),
+            self._daemon_mount(
+                spec.attempt_id, PACKAGE_CACHE_LEAF, PACKAGE_CACHE_MOUNT, read_only=False
+            ),
             *self._credential_mounts(spec),
         ]
         command, launch_env = self._command(spec)
@@ -852,6 +860,7 @@ class DockerProvider:
             endpoint=spec.endpoint,
             endpoint_url=spec.endpoint_url,
             command_timeout_ms=spec.command_timeout_ms,
+            harness_settings=spec.harness_settings,
         )
 
     def _credential_source(self, harness: str) -> CredentialSource | None:
@@ -1053,7 +1062,9 @@ class DockerProvider:
             is ExitClass.QUOTA_EXHAUSTED
         )
         mounts = [
-            self._daemon_mount(spec.attempt_id, "repo", REPO_MOUNT, read_only=not quota_checkpoint),
+            # FDY-0140: writable always, since what the worker left uncommitted is
+            # committed before anything is collected.
+            self._daemon_mount(spec.attempt_id, "repo", REPO_MOUNT, read_only=False),
             self._daemon_mount(spec.attempt_id, "report", REPORT_MOUNT, read_only=True),
             self._daemon_mount(spec.attempt_id, "output", OUTPUT_MOUNT, read_only=False),
         ]
@@ -1064,12 +1075,12 @@ class DockerProvider:
                 base_ref=str(repository.get("base_ref", "main")),
                 work_branch=work_branch,
                 size_cap_bytes=self.config.report_size_cap_bytes,
-                quota_attempt_id=spec.attempt_id if quota_checkpoint else None,
-                author_email=str(
-                    spec.policy.get("git", {}).get(
-                        "author_email", "crucible-worker@users.noreply.github.com"
-                    )
-                ),
+                attempt_id=spec.attempt_id,
+                quota_checkpoint=quota_checkpoint,
+                author_name=scripts.policy_git(spec.policy, "author_name"),
+                author_email=scripts.policy_git(spec.policy, "author_email"),
+                commit_trailer=scripts.policy_git(spec.policy, "commit_trailer"),
+                trailer_value=spec.external_id,
             ),
             mounts=mounts,
             network="none",
@@ -1132,6 +1143,8 @@ class DockerProvider:
             copy_rejections=outputs.copy_rejections,
             credential_sync=credential_sync,
             checkpoint_refusal=outputs.checkpoint_refusal,
+            leftover_committed=outputs.leftover_committed,
+            leftover_note=outputs.leftover_note,
         )
 
     async def push_quota_checkpoint(
@@ -1185,7 +1198,9 @@ class DockerProvider:
                 for check_id, command in checks
             )
         network = "none" if spec.network == "none" else self.config.workers_network
-        _, env = self._network_and_env(spec) if network != "none" else ("none", {})
+        _, env = (
+            self._network_and_env(spec) if network != "none" else ("none", dict(PACKAGE_CACHE_ENV))
+        )
         code = await self._run_throwaway(
             spec,
             role=ROLE_VERIFIER,
@@ -1193,6 +1208,9 @@ class DockerProvider:
             mounts=[
                 self._daemon_mount(spec.attempt_id, "output/tree", REPO_MOUNT, read_only=False),
                 self._daemon_mount(spec.attempt_id, "verify", VERIFY_MOUNT, read_only=False),
+                self._daemon_mount(
+                    spec.attempt_id, VERIFIER_CACHE_LEAF, PACKAGE_CACHE_MOUNT, read_only=False
+                ),
             ],
             network=network,
             timeout=self.config.verifier_timeout_seconds,

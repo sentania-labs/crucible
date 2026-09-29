@@ -52,6 +52,8 @@ class Outputs:
     verifications: tuple[VerificationRun, ...]
     copy_rejections: tuple[dict[str, str], ...]
     checkpoint_refusal: str | None
+    leftover_committed: bool = False
+    leftover_note: str | None = None
 
 
 def text(path: Path, limit: int = 8 * 1024 * 1024) -> str:
@@ -170,6 +172,8 @@ def read_outputs(
         verifications=verifications,
         copy_rejections=tuple(rejections),
         checkpoint_refusal=text(output / "checkpoint-refusal.txt").strip() or None,
+        leftover_committed=(output / "leftover-committed.txt").is_file(),
+        leftover_note=text(output / "leftover-refusal.txt").strip() or None,
     )
 
 

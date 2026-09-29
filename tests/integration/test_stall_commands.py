@@ -18,6 +18,7 @@ from crucible.adapters.api.app import create_app
 from crucible.adapters.api.deps import AppContext
 from crucible.adapters.execution.fake import FakeProvider
 from crucible.application.supervisor import Supervisor
+from crucible.domain.entities import ProviderSetting
 from crucible.ports.execution import LogChunk
 from tests.fixtures import FakeClock, contract_document
 from tests.integration.conftest import event_kinds, make_supervisor
@@ -337,3 +338,41 @@ async def test_a_command_reported_past_its_command_timeout_stops_pausing_the_clo
     await advance(supervisor, clock, 60 + STALL_FAIL + 2 * TICK)
     assert worker.drains == 1
     assert client.get(f"/v1/attempts/{attempt_id}").json()["termination_reason"] == "stall"
+
+
+async def test_the_saved_hermes_run_limits_reach_the_launch(
+    operator: TestClient,
+    supervisor: Supervisor,
+    provider: FakeProvider,
+    ctx: AppContext,
+    tokens: dict[str, str],
+) -> None:
+    """FDY-0140: the limits saved on the Local gateway page are read at each launch and
+    handed to the Hermes wrapper; nothing puts the Hermes venv on the worker's PATH."""
+    client = operator
+    admin_headers = {"Authorization": f"Bearer {tokens['admin']}"}
+    await supervisor.tick()
+    with TestClient(create_app(ctx), headers=admin_headers) as admin:
+        policy_version = local_endpoint_policy(client, admin, version=154)
+    # What the Local gateway page saves (test_admin drives the page, the API and the CLI).
+    with ctx.uow_factory() as uow:
+        uow.provider_settings.put(
+            ProviderSetting(
+                name="harness.hermes",
+                document={"max_turns": 420, "context_length": 98304},
+                updated_at=ctx.clock.now(),
+                updated_by="tests",
+            )
+        )
+        uow.commit()
+    task_id = start(client, "hermes", "EX-0140-LIMITS", policy_version)
+    await supervisor.tick()
+    attempt_id = client.get(f"/v1/tasks/{task_id}").json()["latest_attempt"]["id"]
+    worker = provider.worker(attempt_id)
+    assert worker is not None
+    env = worker.spec.env
+    assert env["CRUCIBLE_HERMES_MAX_TURNS"] == "420"
+    assert env["CRUCIBLE_HERMES_CONTEXT_LENGTH"] == "98304"
+    assert env["CRUCIBLE_HERMES_IDENTITY"] == "/crucible/identity/IDENTITY.md"
+    assert "PATH" not in env
+    assert worker.spec.harness_settings == {"max_turns": 420, "context_length": 98304}

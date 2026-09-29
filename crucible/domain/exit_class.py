@@ -20,6 +20,9 @@ class ExitClass(StrEnum):
     PROVIDER_ERROR = "provider_error"
     QUOTA_EXHAUSTED = "quota_exhausted"
     TIMEOUT = "timeout"
+    # Crucible ended the worker because nothing it did was seen for the policy's
+    # stall_fail_seconds (10, FDY-0140): a stall, which is not the attempt's timeout.
+    STALLED = "stalled"
     KILLED = "killed"
     CRASHED = "crashed"
     LOST = "lost"
@@ -54,11 +57,15 @@ def classify_exit(
         return ExitClass.KILLED
     if exit_code is None:
         return ExitClass.UNKNOWN
+    if blocked_present and exit_code in (0, EXIT_CODE_BLOCKED):
+        # FDY-0140: a model cannot choose its harness's exit code, so `blocked.md` on a
+        # clean exit is the escalation whatever the code, and it wins over a report.
+        return ExitClass.BLOCKED
     if exit_code == 0:
         return ExitClass.COMPLETED if report_present else ExitClass.COMPLETED_WITHOUT_REPORT
     if exit_code == EXIT_CODE_BLOCKED:
         # exit 75 without blocked.md is a plain failure (07)
-        return ExitClass.BLOCKED if blocked_present else ExitClass.CRASHED
+        return ExitClass.CRASHED
     if exit_code == EXIT_CODE_ENVIRONMENT:
         return ExitClass.ENVIRONMENT
     return ExitClass.CRASHED

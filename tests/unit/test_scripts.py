@@ -17,7 +17,9 @@ from types import SimpleNamespace
 import pytest
 
 from crucible.adapters.execution import scripts, workspace
-from crucible.ports.execution import IDENTITY_MOUNT, OUTPUT_MOUNT, REPORT_MOUNT
+from crucible.adapters.execution.collected import read_outputs
+from crucible.ports.execution import IDENTITY_MOUNT, OUTPUT_MOUNT, REPORT_MOUNT, LaunchSpec
+from tests.fixtures import contract_document
 
 HOSTILE_REFS = [
     "crucible/$(touch /tmp/crucible-pwned)",
@@ -264,7 +266,8 @@ def test_quota_checkpoint_ignores_worker_filter_and_signing_programs(tmp_path: P
         base_ref="main",
         work_branch="crucible/test",
         size_cap_bytes=1024,
-        quota_attempt_id="attempt-1",
+        attempt_id="attempt-1",
+        quota_checkpoint=True,
     )
     generated = generated.replace(scripts.REPO_MOUNT, str(repo))
     generated = generated.replace(OUTPUT_MOUNT, str(output))
@@ -338,7 +341,8 @@ def test_quota_checkpoint_refuses_a_worker_commondir_redirect(tmp_path: Path) ->
         base_ref="main",
         work_branch="crucible/test",
         size_cap_bytes=1024,
-        quota_attempt_id="attempt-redirect",
+        attempt_id="attempt-redirect",
+        quota_checkpoint=True,
     )
     generated = generated.replace(scripts.REPO_MOUNT, str(repo))
     generated = generated.replace(OUTPUT_MOUNT, str(output))
@@ -349,6 +353,244 @@ def test_quota_checkpoint_refuses_a_worker_commondir_redirect(tmp_path: Path) ->
     assert "commondir redirect" in (output / "checkpoint-refusal.txt").read_text()
     assert not filter_sentinel.exists()
     assert not hook_sentinel.exists()
+
+
+def _work_repo(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """A checkout on `crucible/test` one commit past `main`, with a report and an
+    output directory beside it, as the collector finds them."""
+    repo, output, report = tmp_path / "repo", tmp_path / "output", tmp_path / "report"
+    for path in (repo, output, report):
+        path.mkdir()
+    identity = ["-c", "user.name=test", "-c", "user.email=test@example.invalid"]
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+    (repo / "tracked.txt").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
+    subprocess.run(["git", *identity, "commit", "-q", "-m", "base"], cwd=repo, check=True)
+    subprocess.run(["git", "checkout", "-q", "-b", "crucible/test"], cwd=repo, check=True)
+    (repo / "committed.txt").write_text("committed by the worker\n", encoding="utf-8")
+    subprocess.run(["git", "add", "committed.txt"], cwd=repo, check=True)
+    subprocess.run(["git", *identity, "commit", "-q", "-m", "work"], cwd=repo, check=True)
+    return repo, output, report
+
+
+def _collect(
+    repo: Path, output: Path, report: Path, **kw: object
+) -> subprocess.CompletedProcess[str]:
+    generated = scripts.collector_script(
+        base_ref="main",
+        work_branch="crucible/test",
+        size_cap_bytes=1024,
+        **kw,  # type: ignore[arg-type]
+    )
+    generated = generated.replace(scripts.REPO_MOUNT, str(repo))
+    generated = generated.replace(OUTPUT_MOUNT, str(output))
+    generated = generated.replace(REPORT_MOUNT, str(report))
+    return subprocess.run(["sh", "-c", generated], capture_output=True, text=True, check=False)
+
+
+def test_edits_left_uncommitted_are_committed_as_the_policy_author_with_the_trailer(
+    tmp_path: Path,
+) -> None:
+    """FDY-0140: a model that forgot to commit still has its edits collected."""
+    repo, output, report = _work_repo(tmp_path)
+    (repo / "tracked.txt").write_text("edited, never committed\n", encoding="utf-8")
+    (repo / "new.txt").write_text("created, never added\n", encoding="utf-8")
+    result = _collect(
+        repo,
+        output,
+        report,
+        attempt_id="01ATTEMPT",
+        author_name="Policy Author",
+        author_email="policy@example.invalid",
+        commit_trailer="Crucible-Attempt",
+        trailer_value="EX-0001",
+    )
+    assert result.returncode == 0, result.stderr
+    changed = set((output / "changed.txt").read_text().split())
+    assert {"committed.txt", "tracked.txt", "new.txt"} <= changed
+    assert (output / "commits.txt").read_text().strip() == "2"
+    assert (output / "leftover-committed.txt").read_text().strip() == "01ATTEMPT"
+    shown = subprocess.run(
+        [
+            "git",
+            "log",
+            "-1",
+            "--format=%an <%ae>%n%cn <%ce>%n%s%n%(trailers:key=Crucible-Attempt,valueonly)",
+        ],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.splitlines()
+    assert shown[0] == shown[1] == "Policy Author <policy@example.invalid>"
+    assert shown[2] == "crucible: commit what attempt 01ATTEMPT left uncommitted"
+    # The value the commit hook gives the worker's own commits: the task's external id.
+    assert shown[3] == "EX-0001"
+    # The bundle carries the extra commit, so it is what the review sees.
+    assert (output / "work_branch.bundle").stat().st_size > 0
+    status = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=repo, capture_output=True, text=True, check=True
+    )
+    assert status.stdout == ""
+
+
+def test_a_clean_tree_gets_no_extra_commit(tmp_path: Path) -> None:
+    repo, output, report = _work_repo(tmp_path)
+    result = _collect(repo, output, report, attempt_id="01ATTEMPT")
+    assert result.returncode == 0, result.stderr
+    assert (output / "commits.txt").read_text().strip() == "1"
+    assert not (output / "leftover-committed.txt").exists()
+
+
+def test_a_redirected_git_dir_skips_the_leftover_commit_without_a_refusal(
+    tmp_path: Path,
+) -> None:
+    """Outside a quota checkpoint, an unsafe `.git` is no checkpoint refusal: the
+    uncommitted edit is left, with a note, and nothing is committed through it."""
+    repo, output, report = _work_repo(tmp_path)
+    (repo / ".git" / "commondir").write_text(str(tmp_path) + "\n", encoding="utf-8")
+    (repo / "tracked.txt").write_text("edited\n", encoding="utf-8")
+    result = _collect(repo, output, report, attempt_id="01ATTEMPT")
+    assert "commondir redirect" in result.stderr
+    assert not (output / "checkpoint-refusal.txt").exists()
+    assert not (output / "leftover-committed.txt").exists()
+    assert result.returncode != 4
+
+
+def test_build_output_is_never_swept_into_the_leftover_commit(tmp_path: Path) -> None:
+    """Caches and build output a repository forgot to ignore stay out of the commit;
+    the worker's edit beside them goes in."""
+    repo, output, report = _work_repo(tmp_path)
+    (repo / "tracked.txt").write_text("edited\n", encoding="utf-8")
+    for junk in ("src/__pycache__/mod.cpython-312.pyc", "node_modules/x/index.js", ".coverage"):
+        (repo / junk).parent.mkdir(parents=True, exist_ok=True)
+        (repo / junk).write_text("junk\n", encoding="utf-8")
+    result = _collect(repo, output, report, attempt_id="01ATTEMPT")
+    assert result.returncode == 0, result.stderr
+    changed = set((output / "changed.txt").read_text().split())
+    assert "tracked.txt" in changed
+    assert not any(
+        "__pycache__" in path or "node_modules" in path or path == ".coverage" for path in changed
+    ), changed
+
+
+def test_build_output_the_worker_already_staged_stays_out_of_the_leftover_commit(
+    tmp_path: Path,
+) -> None:
+    """A worker that ran `git add` on build output and then exited without committing:
+    the exclusions still hold, because an entry already in the index is unstaged."""
+    repo, output, report = _work_repo(tmp_path)
+    (repo / "tracked.txt").write_text("edited\n", encoding="utf-8")
+    for junk in ("node_modules/x/index.js", ".venv/bin/tool", ".coverage"):
+        (repo / junk).parent.mkdir(parents=True, exist_ok=True)
+        (repo / junk).write_text("junk\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A", "-f", "."], cwd=repo, check=True)
+    result = _collect(repo, output, report, attempt_id="01ATTEMPT")
+    assert result.returncode == 0, result.stderr
+    changed = set((output / "changed.txt").read_text().split())
+    assert "tracked.txt" in changed
+    assert not any(
+        "node_modules" in path or ".venv" in path or path == ".coverage" for path in changed
+    ), changed
+
+
+@pytest.mark.parametrize("breakage", ["missing", "directory"])
+def test_a_broken_git_config_skips_the_leftover_commit_and_still_collects(
+    tmp_path: Path, breakage: str
+) -> None:
+    """A worker that removed or replaced `.git/config` loses only the leftover commit,
+    with a note the collection keeps; what it committed is still collected."""
+    repo, output, report = _work_repo(tmp_path)
+    (repo / "tracked.txt").write_text("edited\n", encoding="utf-8")
+    (repo / ".git" / "config").unlink()
+    if breakage == "directory":
+        (repo / ".git" / "config").mkdir()
+    result = _collect(repo, output, report, attempt_id="01ATTEMPT")
+    assert "config is not a regular file" in (output / "leftover-refusal.txt").read_text()
+    assert not (output / "checkpoint-refusal.txt").exists()
+    if breakage == "missing":
+        assert result.returncode == 0, result.stderr
+        assert (output / "collector.ok").is_file()
+        assert (output / "commits.txt").read_text().strip() == "1"
+    else:
+        # No git command can read a repository whose config is a directory, so the
+        # collection itself fails, as it did before the leftover commit existed.
+        assert result.returncode != 0
+
+
+def test_the_leftover_commit_and_its_note_are_read_back(tmp_path: Path) -> None:
+    """FDY-0140: what the collector did with uncommitted work reaches the supervisor,
+    which records it on `attempt_collected`."""
+    repo, output, report = _work_repo(tmp_path)
+    (repo / "tracked.txt").write_text("edited\n", encoding="utf-8")
+    assert _collect(repo, output, report, attempt_id="01ATTEMPT").returncode == 0
+    spec = LaunchSpec(
+        attempt_id="01ATTEMPT",
+        task_id="01TASK",
+        external_id="EX-0001",
+        role="implement",
+        harness="script-harness",
+        model="none",
+        image="crucible-worker:test",
+        timeout_seconds=600,
+        contract=contract_document(),
+    )
+    outputs = read_outputs(
+        output,
+        tmp_path / "verify",
+        spec=spec,
+        bundle_verified=True,
+        collector_exit=0,
+        verifications=(),
+        tail_bytes=1024,
+    )
+    assert outputs.leftover_committed is True and outputs.leftover_note is None
+    (output / "leftover-committed.txt").unlink()
+    (output / "leftover-refusal.txt").write_text("uncommitted work was not committed: x\n")
+    again = read_outputs(
+        output,
+        tmp_path / "verify",
+        spec=spec,
+        bundle_verified=True,
+        collector_exit=0,
+        verifications=(),
+        tail_bytes=1024,
+    )
+    assert again.leftover_committed is False
+    assert again.leftover_note == "uncommitted work was not committed: x"
+
+
+def test_the_activity_walk_fingerprints_the_worker_trees_and_sees_a_change(
+    tmp_path: Path,
+) -> None:
+    """FDY-0140: what the Kubernetes provider runs in a live worker. A missing home is
+    still a whole walk; a change anywhere in the trees changes the answer."""
+    repo, report, home = tmp_path / "repo", tmp_path / "report", tmp_path / "home"
+    for path in (repo, report, home):
+        path.mkdir()
+    (home / "state.db").write_bytes(b"turn 1")
+    script = scripts.ACTIVITY_SCRIPT.replace(scripts.REPO_MOUNT, str(repo)).replace(
+        REPORT_MOUNT, str(report)
+    )
+
+    def ask(home_dir: Path) -> tuple[int, int, int] | None:
+        result = subprocess.run(
+            ["sh", "-c", script],
+            capture_output=True,
+            check=False,
+            env={"HOME": str(home_dir), "PATH": "/usr/bin:/bin"},
+        )
+        assert result.returncode == 0, result.stderr
+        return scripts.parse_activity(result.stdout)
+
+    first = ask(home)
+    assert first is not None and first[1] == 4
+    assert ask(home) == first
+    (home / "state.db").write_bytes(b"turn 2, longer")
+    assert ask(home) != first
+    assert ask(tmp_path / "absent") is not None
+    assert scripts.parse_activity(b"incomplete\n") is None
+    assert scripts.parse_activity(b"") is None
 
 
 def test_a_verification_id_cannot_collide_with_another() -> None:

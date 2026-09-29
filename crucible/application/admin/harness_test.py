@@ -35,6 +35,7 @@ STEPS = (ENABLED, IMAGE, CREDENTIAL, ROUTE, WORKER, MODEL)
 EXIT_WORDS = {
     ExitClass.AUTH_FAILURE.value: "the model provider refused the credential",
     ExitClass.TIMEOUT.value: "no answer before the time limit",
+    ExitClass.STALLED.value: "no activity before the stall limit",
     ExitClass.QUOTA_EXHAUSTED.value: "the model provider says the quota is used up",
     ExitClass.PROVIDER_ERROR.value: "the model provider or the endpoint returned an error",
     ExitClass.ENVIRONMENT.value: "the worker could not run the harness (environment)",

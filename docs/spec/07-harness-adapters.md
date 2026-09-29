@@ -24,7 +24,7 @@ dir, user, resource limits, network mode, expected exit semantics.
 
 `ExitClass` is the one enum used by contracts, policies, and 16:
 `completed`, `completed_without_report`, `blocked`, `environment`,
-`auth_failure`, `provider_error`, `quota_exhausted`, `timeout`, `killed`, `crashed`, `lost`,
+`auth_failure`, `provider_error`, `quota_exhausted`, `timeout`, `stalled`, `killed`, `crashed`, `lost`,
 `incomplete`, `unknown`. Which classes may retry is a policy decision (05b
 `retry.eligible_classes`), narrowed by the contract's `retry_on`; a retry
 happens only when the class is in both. Gate failures are never a class and
@@ -188,12 +188,32 @@ never retry.
   permitted only because the read-only worker container is the permission
   boundary. `HERMES_HOME` is a per-attempt tmpfs, so rules, memory, plugins, MCP
   configuration, and session `state.db` do not cross attempts.
+- The image wrapper (FDY-0140) puts the text of `IDENTITY.md`
+  (`CRUCIBLE_HERMES_IDENTITY`) in the prompt ahead of the pointer, or only the
+  pointer when the text is too long for one argument; starts Hermes with the
+  venv's own Python by path, with `-P` so a module in the checkout is never
+  imported in place of Hermes's own, and sets no PATH, so the commands the model
+  runs resolve `python3`, `pytest` and `uv` to the image's toolchain (Hermes
+  prepends the directory of the `hermes` it finds to each command's PATH; the
+  image's `/usr/local/bin/hermes` link makes that a directory already on it);
+  and applies
+  the run limits saved on the Local gateway page (25): `CRUCIBLE_HERMES_MAX_TURNS`
+  (default 300; Hermes 0.19's `-z` fixes 90 and reads no setting, so a bootstrap
+  sets the budget an agent is built with when its caller named none) and
+  `CRUCIBLE_HERMES_CONTEXT_LENGTH` (default 131072, 0 to let Hermes find it),
+  written as Hermes's own `model.context_length` in its home. It writes
+  `crucible-hermes: working, session updated` to stderr whenever the session store
+  changes, which is log activity (10). A run that ends on its turn budget is marked
+  in the usage record (`turn_limit_reached`) and recorded as `harness_limit_reached`
+  evidence; it is not failed for that.
 - Hermes's usage JSON is mandatory run evidence. Its input and output token counts
   come from that file. The image wrapper enriches duration and tool-call count from
   the same attempt's SQLite session row before exit. Missing or unparsable usage
   fails `run_evidence_present`.
 - Classification checks Crucible termination facts first, then usage and provider
-  text, then report presence. `failed: true` overrides exit 0. Exit 75 is
+  text, then report presence. `blocked.md` on exit 0 is `blocked` (FDY-0140),
+  checked before the usage record, so it wins over `failed: true`; otherwise
+  `failed: true` overrides exit 0. Exit 75 is Hermes's own and is
   `provider_error` unless explicit quota text makes it `quota_exhausted`; a local
   5xx or connection refusal is always `provider_error` and never marks the pool.
 - Crucible's launch wrapper is the sole transcript writer. The Hermes image wrapper
@@ -208,9 +228,10 @@ own evidence (11, hades #215). A missing file with exit 0 is
 recorded as `report_parse_failed` with the parser's errors and
 `report_present` true; it is never recorded as "no report". Either way the
 report gate fails hard and neither is a success; what differs is that the
-record says which happened. `blocked.md` with exit 75 produces an escalation
-and moves the task
-to `blocked`; exit 75 without it is `failed`. Progress lines are ingested as
+record says which happened. `blocked.md` on a clean exit, 0 or 75, produces an
+escalation and moves the task to `blocked`, whatever the report says: a model
+cannot choose its harness's exit code (FDY-0140). Exit 75 without it is
+`failed`. Progress lines are ingested as
 `worker_progress` events under the principal `worker` and marked
 `unverified`, at most 200 per attempt and 1000 characters per line, each
 line redacted before it is stored (12).
