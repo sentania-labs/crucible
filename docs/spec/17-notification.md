@@ -58,8 +58,9 @@ Foundry.
 
 `for_reviewer` (ADR 0024) lists the failed advisory pre-PR gates and the
 advisory findings, each as `{gate, detail}`, on the `internal_review_needed`,
-`gates_passed` and `pre_pr_gates_failed` wakes; the summary repeats them after
-"For the reviewer:". It is empty on every other wake.
+`gates_passed` and `pre_pr_gates_failed` wakes; the summary names the gates
+after "For the reviewer:", and the details, which can carry paths the worker
+chose, stay in the list. It is empty on every other wake.
 
 ## Delivery
 

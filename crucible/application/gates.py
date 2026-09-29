@@ -151,10 +151,11 @@ def summarize(outcomes: dict[str, GateOutcome], advisory: frozenset[str]) -> dic
 
 
 def reviewer_note(items: list[dict[str, str]]) -> str:
-    """The wake's words for what the reviewer is asked to weigh (ADR 0024)."""
+    """The wake summary names the gates for the reviewer; their details, which can carry
+    paths the worker chose, travel only in the wake's `for_reviewer` (ADR 0024)."""
     if not items:
         return ""
-    return " For the reviewer: " + "; ".join(f"{i['gate']}: {i['detail']}" for i in items) + "."
+    return " For the reviewer: " + ", ".join(sorted({i["gate"] for i in items})) + "."
 
 
 def _unchanged(

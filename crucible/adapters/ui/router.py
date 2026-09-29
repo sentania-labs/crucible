@@ -1676,10 +1676,13 @@ def routing_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                 "note": (
                     "Ticked gates are advisory: a failure is recorded and listed for the "
                     "reviewer, and the task goes on to its internal review. Unticked gates "
-                    "block. internal_review_recorded always blocks, and a path matching a "
-                    "contract's prohibited_paths stops the task even when scope_contained is "
-                    "advisory. Making a gate outside the default set advisory is recorded "
-                    "as an operator decision. Saving writes a new delivery policy version."
+                    "block. internal_review_recorded and no_secrets always block, a path "
+                    "matching a contract's prohibited_paths stops the task even when "
+                    "scope_contained is advisory, and so does a missing report. A task "
+                    "whose policy requires no internal review for its head goes to "
+                    "acceptance, with the list in the wake. Making a gate outside the "
+                    "default set advisory is an operator decision. Saving writes a new "
+                    "delivery policy version."
                 ),
                 "form": {
                     "action": "/ui/actions/gate-classes",

@@ -15,7 +15,9 @@ real or a claim is false, everything else information for the reviewer.
   (`scope_contained`, `report_present`, `criteria_mapped`,
   `run_evidence_present`). No policy version is rewritten; the lab's
   default-software v8 and hades-self-hosting v1 take the default when read.
-- A prohibited path stops the task even though `scope_contained` is advisory.
+- A prohibited path stops the task even though `scope_contained` is advisory,
+  and no report at all stops it even though `report_present` is advisory.
+- `no_secrets` can never be made advisory, like the review itself.
 - `gate_results.blocking` and `gate_results.findings` (migration 0028) record
   each evaluation's class and its advisory findings.
 - `verification_ran` names a worker's report that says a check passed when
@@ -36,3 +38,9 @@ real or a claim is false, everything else information for the reviewer.
   saves is recorded on the `policy_uploaded` event and not as a Decision row.
   Before this change no local CLI verb could save one.
 - No new event kind: a save is a policy upload and is audited as one.
+- After the non-author review round (2026-09-29): no report at all blocks (the
+  contract scoped the advisory part to a missing or malformed judgement
+  field); `no_secrets` is fixed blocking, because a pushed secret cannot be
+  taken back and never committing a secret outranks the contract's "the
+  policy decides"; and the wake summary names gates only, keeping paths the
+  worker chose in the structured list.

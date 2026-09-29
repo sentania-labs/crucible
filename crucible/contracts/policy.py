@@ -200,7 +200,7 @@ class Gates(StrictModel):
             raise ValueError(f"gates.advisory names gates that are not pre-PR gates: {stray}")
         fixed = sorted(set(value) & ALWAYS_BLOCKING_GATES)
         if fixed:
-            raise ValueError(f"gates.advisory may not include {fixed}: the review always blocks")
+            raise ValueError(f"gates.advisory may not include {fixed}: these always block")
         return value
 
     @model_validator(mode="after")

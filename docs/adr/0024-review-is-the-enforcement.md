@@ -18,34 +18,44 @@ Foundry write a correction for work that was already right.
 1. **Each pre-PR gate is blocking or advisory.** A failed blocking gate keeps today's
    behaviour: the task goes to `pre_pr_gates_failed`. A failed advisory gate still
    runs and records its result and detail, but the task goes on to
-   `awaiting_internal_review` (or, with no review required, `gates_passed`), and the
-   failure is carried in front of the reviewer. `error` is treated as `fail` either way.
+   `awaiting_internal_review`, and the failure is carried in front of the reviewer.
+   When the policy requires no internal review for the head (a correction under
+   `required_for_corrections: false` that does not ask for one), the task goes to
+   `gates_passed` and `awaiting_acceptance` as before, and Foundry, whose acceptance
+   is then the review, gets the same list in the `gates_passed` wake. `error` is treated as `fail` either way.
 2. **The default.** Blocking, where the damage is real or a claim is false:
    `verification_ran`, `no_secrets`, `ci_unchanged`, `dependencies_unchanged`,
    `commits_present`, `no_injected_files`, `workspace_clean`, `exit_clean`, and
    `internal_review_recorded`. Advisory: `scope_contained`, `report_present`,
    `criteria_mapped`, `run_evidence_present`. A gate added later is blocking unless a
-   policy lists it.
+   policy lists it. `report_present` is advisory for a report that is malformed or
+   lacks a judgement field; no report at all still stops the task.
 3. **A prohibited path always blocks.** `scope_contained` is split by its outcome: a
    path matching the contract's `prohibited_paths` stops the task whatever the gate's
    class, and a path merely outside `allowed_paths` is advisory. The stored row for
    that evaluation says `blocking`.
 4. **The policy decides.** `gates.advisory` lists the advisory pre-PR gates; every
    other pre-PR gate blocks. It is validated (pre-PR gates only, no duplicates, never
-   `internal_review_recorded`) and versioned with the rest of the policy. A version
+   `internal_review_recorded` or `no_secrets`) and versioned with the rest of the
+   policy. `no_secrets` is fixed because a secret, once pushed, cannot be taken back,
+   and never committing a secret outranks any policy. A version
    without the field, including every version written before it existed, takes the
    default set when it is read. Nothing is rewritten on upgrade: the lab's
    `default-software` version 8 and `hades-self-hosting` version 1 carry no list and so
    take the default, with no new version and no change to a version a task references.
    The shipped examples write the default out. Listing a gate outside the default set
    (turning a safety gate advisory) is an operator-only setting, recorded as a
-   decision, like `allow_no_ci`.
+   decision, like `allow_no_ci` (from the local admin CLI, which has no principal row,
+   on the upload event only).
 5. **The reviewer sees it.** Each gate result records its class (`gate_results.blocking`,
    migration 0028). The task view's `gate_summary`, `GET /v1/attempts/{id}/gates` (the
    CLI's `--gates`) and the admin UI's Tasks page mark each gate blocking or advisory and
    list the failed advisory gates under "for the reviewer" with their detail. `failing`
    names only what stops the task. The `internal_review_needed`, `gates_passed` and
-   `pre_pr_gates_failed` wakes carry the same list, as `for_reviewer` and in the summary.
+   `pre_pr_gates_failed` wakes carry the same list as `for_reviewer`, and their summary
+   names the gates; a detail, which can carry a path the worker chose, is never put in
+   the summary line. A Crucible review execution is launched with the contract and the
+   head, as before, and does not receive the list.
 6. **A contradicted claim is its own finding.** When the worker's report says a
    required check passed and Crucible's own re-run failed it, `verification_ran`
    records the advisory finding "the worker reported V3 passing; Crucible's re-run

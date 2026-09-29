@@ -113,6 +113,31 @@ async def test_pull_request_deliverable_enters_publishing(
     assert body["pull_request"] is None
 
 
+async def test_a_report_that_contradicts_the_rerun_is_named_for_the_reviewer(
+    client: TestClient, supervisor: Supervisor
+) -> None:
+    """ADR 0024: the fake worker reports every check passing and the verifier fails V1,
+    so verification_ran blocks and the contradiction is its own named finding."""
+    task_id = submit_and_start(
+        client, "crucible-worker:fake-verification-fails", deliverables=ARTIFACTS_DELIVERABLE
+    )
+    assert await run_to_settled(supervisor, client, task_id) == "pre_pr_gates_failed"
+    view = client.get(f"/v1/tasks/{task_id}").json()
+    assert view["gate_summary"]["failing"] == [GateName.VERIFICATION_RAN.value]
+    finding = "the worker reported V1 passing; Crucible's re-run failed it"
+    assert {"gate": "verification_ran", "detail": finding} in view["gate_summary"]["for_reviewer"]
+    rows = client.get(f"/v1/attempts/{view['latest_attempt']['id']}/gates").json()["items"]
+    verification = next(r for r in rows if r["gate"] == GateName.VERIFICATION_RAN)
+    assert verification["classification"] == "blocking"
+    assert verification["findings"] == [finding]
+    [wake] = [
+        w
+        for w in client.get("/v1/wakes").json()["items"]
+        if w["reason"] == "pre_pr_gates_failed" and w["task_id"] == task_id
+    ]
+    assert {"gate": "verification_ran", "detail": finding} in wake["payload"]["for_reviewer"]
+
+
 async def test_fail_path_scope_contained_on_a_prohibited_path(
     client: TestClient, supervisor: Supervisor
 ) -> None:
@@ -183,7 +208,13 @@ async def test_advisory_failures_reach_the_review_and_are_listed_for_the_reviewe
     listed_in_wake = {i["gate"] for i in wake["payload"]["for_reviewer"]}
     assert listed_in_wake >= {"scope_contained", "report_present"}
     assert "For the reviewer: " in wake["summary"]
-    assert "infrastructure/outside-the-contract.txt" in wake["summary"]
+    assert "report_present" in wake["summary"] and "scope_contained" in wake["summary"]
+    # A path the worker chose stays in the structured list, never in the summary line.
+    assert "infrastructure/" not in wake["summary"]
+    assert any(
+        "infrastructure/outside-the-contract.txt" in i["detail"]
+        for i in wake["payload"]["for_reviewer"]
+    )
 
     # The review is the enforcement: once it is recorded the task moves on.
     assert await review_and_settle(supervisor, client, task_id) == "awaiting_acceptance"

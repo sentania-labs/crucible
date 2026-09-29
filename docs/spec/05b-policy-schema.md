@@ -201,13 +201,15 @@ retention:
   the operator uploaded (principal role `operator` or `admin`), which is
   recorded as a decision.
 - `gates.advisory` (ADR 0024) is optional. When present it lists pre-PR
-  gates only, each once, and never `internal_review_recorded`: the review is
-  the enforcement. Every pre-PR gate it does not list blocks. Absent, the
+  gates only, each once, and never `internal_review_recorded` (the review is
+  the enforcement) or `no_secrets` (a pushed secret cannot be taken back).
+  Every pre-PR gate it does not list blocks. Absent, the
   default set applies, so a version written before the field existed
   behaves as the default without being rewritten. Listing a gate outside
   the default set (making a safety gate advisory) may only be done by an
-  `operator` or `admin` principal and is recorded as a decision. It is
-  edited in place from the admin API, CLI and UI (25).
+  `operator` or `admin` principal and is recorded as a decision (from the
+  local admin CLI, on the upload event). It is edited in place from the admin
+  API, CLI and UI (25).
 
 ## The per-command timeout
 

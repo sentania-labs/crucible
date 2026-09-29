@@ -89,8 +89,10 @@ def test_a_policy_without_the_field_takes_the_default() -> None:
 
 def test_a_policy_list_decides_and_the_review_always_blocks() -> None:
     assert advisory_gates({"gates": {"advisory": []}}) == frozenset()
-    chosen = advisory_gates({"gates": {"advisory": ["no_secrets", "internal_review_recorded"]}})
-    assert chosen == {GateName.NO_SECRETS}
+    chosen = advisory_gates(
+        {"gates": {"advisory": ["ci_unchanged", "no_secrets", "internal_review_recorded"]}}
+    )
+    assert chosen == {GateName.CI_UNCHANGED}
 
 
 # ----- the verdict ----------------------------------------------------------------
@@ -170,6 +172,17 @@ def test_a_missing_judgement_field_is_for_the_reviewer() -> None:
         GateName.REPORT_PRESENT,
         GateName.CRITERIA_MAPPED,
     }
+
+
+def test_no_report_at_all_still_blocks() -> None:
+    evidence = _without_review(
+        [e for e in _passing_evidence() if e.payload.get("role") != "completion_claim"]
+    )
+    outcomes = evaluate_pre_pr(sorted(PRE_PR_GATES), _gi(evidence))
+    report = outcomes[GateName.REPORT_PRESENT]
+    assert report.result is GateResult.FAIL and report.always_blocks
+    assert blocking(outcomes, DEFAULT) == [GateName.REPORT_PRESENT]
+    assert pre_pr_verdict(outcomes, DEFAULT) is PrePrVerdict.FAILED
 
 
 def test_an_advisory_gate_that_errors_goes_to_the_reviewer() -> None:
@@ -287,7 +300,8 @@ def test_the_policy_field_is_optional_and_validated() -> None:
     for bad, words in (
         (["ci_green_for_head"], "not pre-PR gates"),
         (["no_such_gate"], "not pre-PR gates"),
-        (["internal_review_recorded"], "the review always blocks"),
+        (["internal_review_recorded"], "always block"),
+        (["no_secrets"], "always block"),
         (["scope_contained", "scope_contained"], "duplicate"),
     ):
         with pytest.raises(ValidationError, match=words):
@@ -298,8 +312,8 @@ def test_making_a_safety_gate_advisory_is_an_operator_setting() -> None:
     assert (
         parse_policy(_with_advisory(sorted(DEFAULT_ADVISORY_GATES))).operator_only_settings() == []
     )
-    policy = parse_policy(_with_advisory(["no_secrets", "scope_contained"]))
-    assert policy.operator_only_settings() == ["gates.advisory.no_secrets"]
+    policy = parse_policy(_with_advisory(["verification_ran", "scope_contained"]))
+    assert policy.operator_only_settings() == ["gates.advisory.verification_ran"]
 
 
 def test_no_gate_is_both_always_blocking_and_advisory_by_default() -> None:

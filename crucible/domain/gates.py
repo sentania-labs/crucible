@@ -82,8 +82,11 @@ DEFAULT_ADVISORY_GATES: frozenset[str] = frozenset(
         GateName.RUN_EVIDENCE_PRESENT,
     }
 )
-# The review is the enforcement, so it is never itself advisory.
-ALWAYS_BLOCKING_GATES: frozenset[str] = frozenset({GateName.INTERNAL_REVIEW_RECORDED})
+# The review is the enforcement, so it is never itself advisory. A secret, once pushed,
+# cannot be taken back, so no policy may send one to the reviewer instead of stopping.
+ALWAYS_BLOCKING_GATES: frozenset[str] = frozenset(
+    {GateName.INTERNAL_REVIEW_RECORDED, GateName.NO_SECRETS}
+)
 
 
 class GateClass(StrEnum):
@@ -277,9 +280,12 @@ def _claim_notes(payload: dict[str, Any]) -> str:
 
 
 def report_present(gi: GateInput) -> GateOutcome:
+    """A report that is malformed or lacks a judgement field is for the reviewer when the
+    gate is advisory; no report at all always stops the task (ADR 0024)."""
     item = gi.one("artifact_present", role="completion_claim")
     if item is None:
-        return _missing("artifact_present", role="completion_claim")
+        missing = _missing("artifact_present", role="completion_claim")
+        return GateOutcome(missing.result, missing.detail, always_blocks=True)
     notes = _claim_notes(item.payload)
     if not item.payload.get("parsed_ok"):
         errors = item.payload.get("parse_errors") or []

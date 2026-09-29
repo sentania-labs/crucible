@@ -76,8 +76,8 @@ fix every problem before exiting 0. A unit test holds the checker and the
 schema in agreement.
 
 All paths are relative to `/crucible/report`. Missing or unparsable report is
-a report-gate failure, which is advisory by default (ADR 0024): the reviewer
-sees it and decides.
+a report-gate failure. An unparsable report is advisory by default (ADR 0024):
+the reviewer sees it and decides. No report at all stops the task.
 The claim has no `pushed`, `pull_request`, or `ci` fields: workers cannot
 push and never see CI. Those facts are Crucible's to observe.
 
@@ -119,18 +119,20 @@ Each pre-PR gate is **blocking** or **advisory** (ADR 0024, the operator's
 decision of 2026-09-29). A failed blocking gate sends the task to
 `pre_pr_gates_failed`. A failed advisory gate is recorded with its detail and
 listed "for the reviewer" in the task view, the gate list, the admin UI's
-Tasks page and the wake, and the task goes on to its internal review. The
-policy's `gates.advisory` decides (05b); the default is below. `error` counts
-as `fail` in both classes.
+Tasks page and the wake, and the task goes on to its internal review, or to
+acceptance when the policy requires no review for that head. The policy's
+`gates.advisory` decides (05b); the default is below, and
+`internal_review_recorded` and `no_secrets` always block. `error` counts as
+`fail` in both classes.
 
 | Gate | Default | Passes when | Evidence consumed |
 |---|---|---|---|
-| `report_present` | advisory | report parsed once Crucible filled its facts, every judgement field present; the detail names the facts Crucible filled and any the worker wrote differently (hades #215) | CompletionClaim artifact |
+| `report_present` | advisory, except no report at all | report parsed once Crucible filled its facts, every judgement field present; the detail names the facts Crucible filled and any the worker wrote differently (hades #215) | CompletionClaim artifact |
 | `exit_clean` | blocking | exit code 0 and exit class `completed` or `completed_without_report` (an `incomplete` attempt exits 0 too, issue 128) | attempt exit info |
 | `commits_present` | blocking | the collected `work_branch` has at least one commit beyond `base_ref`, the bundle verifies, and the bundle names its head. The head is the bundle's; a reported `head_sha` that differs is noted in the gate's detail and does not fail it (hades #187, 2026-09-28) | branch bundle from `collect` |
 | `scope_contained` | advisory, except a prohibited path | every changed path matches `allowed_paths` and none matches `prohibited_paths`. A path matching `prohibited_paths` stops the task even when the gate is advisory; a path merely outside `allowed_paths` is for the reviewer | diff path list from `collect` |
 | `no_injected_files` | blocking | `AGENTS.md`, `CLAUDE.md`, other shims, `.crucible/`, and identity paths absent from diff and from any commit on `work_branch` | diff, `git log --stat` |
-| `no_secrets` | blocking | secret scanner over the diff, every commit message, and the report finds nothing | scanner output artifact |
+| `no_secrets` | always blocking | secret scanner over the diff, every commit message, and the report finds nothing | scanner output artifact |
 | `verification_ran` | blocking | for each `required_verification` command: Crucible itself re-ran the command after exit, in a fresh verifier container from the collected tree (same image, `network` per policy), and its exit matches `expect_exit`. The worker's own check logs are stored as a claim and shown to Foundry, never consumed by the gate. A check the worker's report says passed and the re-run failed is also recorded as the advisory finding "the worker reported V3 passing; Crucible's re-run failed it" (ADR 0024) | verifier exit and log (verified) |
 | `run_evidence_present` | advisory | each `kind: artifact` verification path exists and is non-empty | artifacts |
 | `criteria_mapped` | advisory | every `acceptance_criteria.id` appears in `acceptance_mapping` with a status | report |

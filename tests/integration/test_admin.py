@@ -2943,6 +2943,7 @@ def test_advisory_gates_through_api_cli_and_ui(
 
     for body in (
         {"reason": "api: the review", "advisory": ["internal_review_recorded"]},
+        {"reason": "api: secrets", "advisory": ["no_secrets"]},
         {"reason": "api: no such gate", "advisory": ["no_such_gate"]},
         {"reason": "api: post-PR", "advisory": ["ci_green_for_head"]},
         {"reason": "api: not a list", "advisory": "scope_contained"},
@@ -2956,14 +2957,14 @@ def test_advisory_gates_through_api_cli_and_ui(
     cli_saved = run_cli(
         config_file,
         "--reason",
-        "cli: secrets go to the reviewer",
+        "cli: CI edits go to the reviewer",
         "gates",
         "set-advisory",
-        "--gate=no_secrets",
+        "--gate=ci_unchanged",
         "--gate=scope_contained",
         capsys=capsys,
     )
-    assert cli_saved["advisory"] == ["no_secrets", "scope_contained"]
+    assert cli_saved["advisory"] == ["ci_unchanged", "scope_contained"]
     assert cli_saved["policy"]["version"] == start + 2
     decisions = [
         d
@@ -2971,7 +2972,7 @@ def test_advisory_gates_through_api_cli_and_ui(
         if d["kind"] == "policy_uploaded"
     ]
     assert any(
-        "gates.advisory.no_secrets" in (d["payload"].get("operator_only_settings") or [])
+        "gates.advisory.ci_unchanged" in (d["payload"].get("operator_only_settings") or [])
         for d in decisions
     )
 
@@ -2981,8 +2982,9 @@ def test_advisory_gates_through_api_cli_and_ui(
         assert page.status_code == 200
         assert "Advisory gates" in page.text
         assert 'action="/ui/actions/gate-classes"' in page.text
-        assert 'name="advisory_no_secrets" value="true" checked' in page.text
+        assert 'name="advisory_ci_unchanged" value="true" checked' in page.text
         assert 'name="advisory_internal_review_recorded"' not in page.text
+        assert 'name="advisory_no_secrets"' not in page.text
         ui_saved = browser.post(
             "/ui/actions/gate-classes",
             data={
