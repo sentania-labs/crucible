@@ -153,6 +153,13 @@ of the previous version's. `required_verification` may not shrink.
   422 naming the tier and why each candidate was excluded. Selection itself
   happens at attempt launch (05b) and is recorded on the attempt, so the
   contract stays valid across reroutes.
+- `tier` is how the orchestrator asks for a kind of worker (ADR 0028).
+  `trivial` and `standard` go to the local pool first (Hermes on the
+  gateway), the default doer. `complex` goes to a frontier model: it is the
+  tier for hard structural problems and for scoping, such as "scope this
+  into Hermes-sized tasks", where the deliverable is a set of smaller
+  contracts Foundry then submits as `trivial` or `standard`. No other field
+  is needed to ask for frontier work.
 - `execution_request.pin`, when present, is the operator's explicit choice
   (bootstrap contract: an explicit model or harness selection from the
   operator takes precedence). It carries `harness`, `model`, and a
