@@ -42,7 +42,6 @@ from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
-from io import BytesIO
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
@@ -55,6 +54,7 @@ from crucible.adapters.execution.k8sapi import (
     ExecResult,
     KubernetesApiError,
     KubernetesClient,
+    KubernetesUnavailableError,
     LogFrame,
 )
 from crucible.adapters.execution.k8sregistry import (
@@ -82,6 +82,7 @@ from crucible.contracts.completion_claim import CompletionClaimV1
 from crucible.domain.cluster_egress import ClusterEgress, parse_cluster_egress
 from crucible.domain.exit_class import ExitClass
 from crucible.domain.ids import new_id
+from crucible.domain.role_timeouts import DEFAULT_ROLE_TIMEOUT_SECONDS, parse_role_timeouts
 from crucible.domain.secrets import redact
 from crucible.domain.time import parse_rfc3339
 from crucible.ports.execution import (
@@ -112,6 +113,7 @@ from crucible.ports.execution import (
     ProviderCapabilities,
     ProviderError,
     ProviderHealth,
+    ProviderUnavailableError,
     VerificationRun,
     Workspace,
     WorkspaceState,
@@ -145,6 +147,8 @@ CANARY_DNS_NAME = "kubernetes.default.svc"
 # The runtime settings source: the `kubernetes.egress` document (None when it was never
 # saved) and the enabled local endpoint URL (None when no local model is enabled).
 SettingsSource = Callable[[], tuple[Mapping[str, Any] | None, str | None]]
+# The saved `kubernetes.timeouts` document, or None for the settings file's value.
+TimeoutsSource = Callable[[], Mapping[str, Any] | None]
 
 # Where `prepare` records which ConfigMap key is which bundle file, so `launch` projects
 # every file back to the relative path the bundle hash covers.
@@ -267,6 +271,12 @@ class CollectionFailedError(ProviderError):
     failure and nothing is collected from it (16)."""
 
 
+class CollectionUnavailableError(CollectionFailedError, ProviderUnavailableError):
+    """Collection could not finish because the cluster could not take or answer a step
+    right now (the API server, the namespace quota, a reader Pod that did not start).
+    The workspace claim is untouched, so the supervisor collects again later."""
+
+
 class LoginLockHeldError(ProviderError):
     """Another login of the harness holds its lock, in this api replica or another."""
 
@@ -293,6 +303,11 @@ class KubernetesConfig:
     prepare_timeout_seconds: int = 900
     collector_timeout_seconds: int = 900
     verifier_timeout_seconds: int = 3600
+    # The short roles' own time, counted from when their Pod is Running (the image pull
+    # and scheduling come out of `launch_timeout_seconds`): the bundle verifier, the
+    # cleaner, and the Job that readies a claim for the publisher. The settings file
+    # seeds it and the `kubernetes.timeouts` admin setting replaces it at runtime.
+    role_timeout_seconds: int = DEFAULT_ROLE_TIMEOUT_SECONDS
     report_size_cap_bytes: int = 10 * 1024 * 1024
     log_tail_bytes: int = 64 * 1024
     max_concurrency: int = 3
@@ -400,6 +415,10 @@ class NamespaceProbe:
     # cgroup namespace hides it, "cgroup-v1" when the hierarchy is the unsupported one,
     # or "" when the probe never got far enough to know.
     pid_limit_source: str = ""
+    # The canary could not run because the API server could not answer. That is no
+    # verdict on the namespace: a launch that meets it fails as an environment failure
+    # the retry rule covers, never a refusal, and the next launch runs the canary again.
+    unavailable: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -553,11 +572,14 @@ class KubernetesProvider:
         harnesses: HarnessRegistry | None = None,
         resolver: Resolver | None = None,
         settings_source: SettingsSource | None = None,
+        timeouts_source: TimeoutsSource | None = None,
     ) -> None:
         self.config = config
         # The runtime settings (the `kubernetes.egress` admin setting and the enabled
         # local endpoint), read back from the database; None in the unit tier.
         self._settings_source = settings_source
+        self._timeouts_source = timeouts_source
+        self._file_role_timeout = config.role_timeout_seconds
         self._settings_read_at: float | None = None
         self._file_egress = config.egress
         # Injected so the unit tier resolves without a network and the e2e tier can
@@ -571,6 +593,13 @@ class KubernetesProvider:
         self._launched: dict[str, _Launched] = {}
         self._images: dict[str, ImageInfo] = {}
         self.last_error: dict[str, str] = {}
+        # The same, per role and attempt, since collections now run side by side: the
+        # text, and whether the Job could not be taken right now (the API server or the
+        # namespace quota) rather than refused or failed.
+        self.role_errors: dict[tuple[str, str], tuple[str, bool]] = {}
+        # Why `_await_job` ended a wait early, by Job name (a quota refusal, a Pod that
+        # never started); `_run_role_job` moves it into `last_error`.
+        self._job_refusals: dict[str, str] = {}
         self.probe: NamespaceProbe | None = None
         # One lock per event loop: the API serves requests on its own loop and runs each
         # login on a loop of its own thread, and an asyncio lock belongs to one loop.
@@ -590,6 +619,9 @@ class KubernetesProvider:
         # only: after a restart the copy is compared by issued-at alone, as before.
         self._seeded: dict[str, dict[str, str | None]] = {}
         self._quota_concurrency: int | None = None
+        # One Pod's limits as the most recent launch asked for them, which is what the
+        # quota's CPU and memory are divided by for the advertised capacity.
+        self._last_limits: Limits | None = None
         self._pull_auths_loaded = False
         self._resolved: dict[str, tuple[float, tuple[str, ...]]] = {}
         # Registry reads run crane and wait on another host; they get threads of their
@@ -722,6 +754,26 @@ class KubernetesProvider:
             log.warning("the kubernetes runtime settings are unreadable: %s", exc)
             return
         self.apply_settings(document, endpoint_url)
+        if self._timeouts_source is not None:
+            try:
+                timeouts = await self._call(self._timeouts_source)
+            except Exception as exc:  # the value in force stays in force
+                log.warning("the kubernetes.timeouts setting is unreadable: %s", exc)
+                return
+            self.apply_timeouts(timeouts)
+
+    def apply_timeouts(self, document: Mapping[str, Any] | None) -> None:
+        """Take the `kubernetes.timeouts` document (None: the settings file's value).
+        A timeout is not a rule a canary proves, so the readiness probe stands."""
+        seconds = self._file_role_timeout
+        if document is not None:
+            try:
+                seconds = parse_role_timeouts(document)["role_timeout_seconds"]
+            except ValueError as exc:
+                log.error("the kubernetes.timeouts setting is refused: %s", exc)
+                return
+        if seconds != self.config.role_timeout_seconds:
+            self.config = replace(self.config, role_timeout_seconds=seconds)
 
     @staticmethod
     def _probe_is_settled(probe: NamespaceProbe) -> bool:
@@ -892,16 +944,14 @@ class KubernetesProvider:
             try:
                 await self._call(self.client.create, "networkpolicies", policy)
             except KubernetesApiError as exc:
-                return NamespaceProbe(
-                    False, False, None, f"the canary NetworkPolicy was refused: {exc}", False
-                )
+                return _canary_failed(f"the canary NetworkPolicy was refused: {exc}", exc)
         try:
             await self._call(self.client.create, "pods", pod)
         except KubernetesApiError as exc:
             if policy_name is not None:
                 with contextlib.suppress(KubernetesApiError):
                     await self._call(self.client.delete, "networkpolicies", policy_name)
-            return NamespaceProbe(False, False, None, f"the canary Pod was refused: {exc}", False)
+            return _canary_failed(f"the canary Pod was refused: {exc}", exc)
         try:
             phase = await self._await_pod(name, timeout=self.config.launch_timeout_seconds)
             if phase is None:
@@ -912,17 +962,21 @@ class KubernetesProvider:
             # worker log pulls need timestamps for resume, but the one-shot canary does
             # not, and a real API server prefixes every line when timestamps are left
             # enabled.
-            body = await self._call(
-                self.client.pod_log,
-                name,
-                container=k8sspec.CONTAINER_NAME,
-                timestamps=False,
-            )
+            try:
+                body = await self._call(
+                    self.client.pod_log,
+                    name,
+                    container=k8sspec.CONTAINER_NAME,
+                    timestamps=False,
+                )
+            except KubernetesApiError as exc:
+                return _canary_failed(f"the canary's log could not be read: {exc}", exc)
             return b"".join(frame.payload for frame in body).decode("utf-8", "replace")
         finally:
             with contextlib.suppress(KubernetesApiError):
                 await self._call(self.client.delete, "pods", name, grace_period_seconds=0)
-            await self._await_pod_gone(name)
+            with contextlib.suppress(ProviderError):
+                await self._await_pod_gone(name)
             if policy_name is not None:
                 with contextlib.suppress(KubernetesApiError):
                     await self._call(self.client.delete, "networkpolicies", policy_name)
@@ -975,6 +1029,8 @@ class KubernetesProvider:
         secret_name = self.config.credential_secret_name(harness)
         try:
             source = await self._call(self.client.get, "secrets", secret_name)
+        except KubernetesUnavailableError:
+            raise
         except KubernetesApiError as exc:
             if exc.status == 404:
                 return False
@@ -1380,6 +1436,10 @@ class KubernetesProvider:
         a retry: the next attempt would meet the same cluster."""
         probe = await self.ensure_ready()
         if not probe.passed:
+            if probe.unavailable:
+                raise ProviderUnavailableError(
+                    f"the workers namespace could not be checked ({probe.detail})"
+                )
             raise HarnessRefusedError(
                 f"refusing to launch: the workers namespace is not ready ({probe.detail})"
             )
@@ -1392,6 +1452,7 @@ class KubernetesProvider:
         gated_under = self.config
         resolved = await self._resolve_image(spec)
         limits = self._limits(spec)
+        self._last_limits = limits
         copy = self._credential_copy(spec)
         if copy is not None:
             copy.seeded.update(self._seeded.pop(spec.attempt_id, {}))
@@ -1401,6 +1462,9 @@ class KubernetesProvider:
         cred_secret_name = k8sspec.object_name("cred", spec.attempt_id)
         try:
             credential_keys = await self._credential_keys(spec.attempt_id) if copy else []
+        except KubernetesUnavailableError:
+            # Could not look is not "not readable": no refusal from a hiccup.
+            raise
         except KubernetesApiError as exc:
             raise HarnessRefusedError(
                 f"refusing to launch: the credential Secret {cred_secret_name!r} for harness "
@@ -1418,12 +1482,7 @@ class KubernetesProvider:
             if self.config is not gated_under:
                 # The egress settings changed after the gate: the worker's rules are the
                 # new ones, so the canary proves them first (crucible#91).
-                probe = await self.ensure_ready()
-                if not probe.passed:
-                    raise HarnessRefusedError(
-                        f"refusing to launch: the workers namespace is not ready ({probe.detail})"
-                    )
-                self._check_endpoint_ready(probe, spec)
+                await self._require_ready(spec)
                 plan = self._egress_plan(spec, k8sspec.ROLE_WORKER)
             # hades #189: the readiness gate and the image resolution above can take a
             # while; a cancel that landed during them creates nothing.
@@ -1490,6 +1549,19 @@ class KubernetesProvider:
             # read deserves.
             raise ProviderError(f"could not read the Pod of {h.ref}: {exc}") from exc
         if pod is None:
+            if (
+                launched is not None
+                and job
+                and not launched.pod_name
+                and launched.exit_code is None
+                and launched.terminated is None
+            ):
+                refusal = await self._quota_refusal(h.ref, job)
+                if refusal is not None:
+                    # 26 with the lab findings of 2026-09-29: a full namespace is a
+                    # launch failure now, with the quota's own words, not a silent wait
+                    # for the launch timeout.
+                    return Observation(ObservationState.EXITED, exit_code=70, detail=refusal)
             return self._observation_without_pod(h, launched, job)
         status = pod.get("status") or {}
         phase = str(status.get("phase", ""))
@@ -1679,6 +1751,7 @@ class KubernetesProvider:
     async def collect(
         self, h: Handle, ws: Workspace, spec: LaunchSpec | None = None
     ) -> CollectedOutputs:
+        await self._refresh_settings()
         launched = self._launched.get(h.attempt_id)
         spec = spec or (launched.spec if launched else None)
         if spec is None:
@@ -1725,26 +1798,30 @@ class KubernetesProvider:
             plan=EgressPlan(),
         )
         if collector_exit in (JOB_TIMED_OUT, JOB_API_ERROR):
-            raise CollectionFailedError(
-                self.last_error.get(k8sspec.ROLE_COLLECTOR)
-                or f"the collector did not finish within {self.config.collector_timeout_seconds}s"
+            text, unavailable = self.role_errors.get(
+                (k8sspec.ROLE_COLLECTOR, spec.attempt_id), ("", False)
             )
+            text = text or (
+                f"the collector did not finish within {self.config.collector_timeout_seconds}s"
+            )
+            if unavailable:
+                raise CollectionUnavailableError(text)
+            raise CollectionFailedError(text)
         bundle_ok = False
         if collector_exit == 0:
-            bundle_ok = (
-                await self._run_role_job(
-                    spec,
-                    role=k8sspec.ROLE_BUNDLE,
-                    image=launched.image_digest if launched else spec.image,
-                    script=scripts.BUNDLE_VERIFY_SCRIPT,
-                    mounts=[Mount("ws", OUTPUT_MOUNT, read_only=True, sub_path="output")],
-                    volumes=[self._claim_volume(spec.attempt_id)],
-                    limits=limits,
-                    timeout=120,
-                    plan=EgressPlan(),
-                )
-                == 0
+            bundle_exit = await self._run_role_job(
+                spec,
+                role=k8sspec.ROLE_BUNDLE,
+                image=launched.image_digest if launched else spec.image,
+                script=scripts.BUNDLE_VERIFY_SCRIPT,
+                mounts=[Mount("ws", OUTPUT_MOUNT, read_only=True, sub_path="output")],
+                volumes=[self._claim_volume(spec.attempt_id)],
+                limits=limits,
+                timeout=self.config.role_timeout_seconds,
+                plan=EgressPlan(),
             )
+            self._raise_if_unavailable(k8sspec.ROLE_BUNDLE, spec.attempt_id, bundle_exit)
+            bundle_ok = bundle_exit == 0
         verifications = await self._run_verifier(spec, limits)
         with tempfile.TemporaryDirectory(prefix="crucible-k8s-") as scratch:
             root = Path(scratch)
@@ -1921,6 +1998,22 @@ class KubernetesProvider:
                 )
         self._launched.pop(ws.attempt_id, None)
         self._seeded.pop(ws.attempt_id, None)
+
+    async def release_workspace(self, ws: Workspace, spec: LaunchSpec | None = None) -> None:
+        """16: the claim a cleanup policy kept, and everything else still labelled for
+        the attempt, once the retention step decided nothing needs it. A claim that is
+        still there afterwards (a Pod still mounting it holds its deletion) is not
+        released yet: the step tries again on a later tick."""
+        await self._delete_attempt_objects(ws.attempt_id)
+        claim = k8sspec.object_name("ws", ws.attempt_id)
+        try:
+            row = await self._call(self.client.get, "persistentvolumeclaims", claim)
+        except KubernetesApiError as exc:
+            if exc.status == 404:
+                return
+            raise
+        if not (row.get("metadata") or {}).get("deletionTimestamp"):
+            raise ProviderError(f"the workspace claim {claim!r} was not deleted")
 
     async def reconcile(self) -> list[Handle]:
         """Adopt by label (10, 26). A Job is a handle while its Pod is alive, or while
@@ -3471,21 +3564,33 @@ class KubernetesProvider:
     ) -> CredentialSync | None:
         """Read the rotated auth files back and write back only a valid, newer one (12).
 
-        The removal is in a `finally` path: a cluster that keeps failing the read-back
-        must not keep the copy for as long as it fails."""
+        The copy is removed only after it was read back (lab findings of 2026-09-29): a
+        read that failed raises CollectionUnavailableError and the supervisor collects
+        again. A cluster that keeps failing the read-back does not keep the copy for as
+        long as it fails: the supervisor's collection window ends, and cleanup removes it
+        under every policy."""
         launched = self._launched.get(h.attempt_id)
         copy = launched.credential if launched is not None else self._credential_copy(spec)
         if copy is None:
             return None
         files: list[CredentialFileSync] = []
-        try:
-            if copy.writable:
+        if copy.writable:
+            try:
                 read = await self._read_files(
                     spec,
                     [f"{k8sspec.CREDENTIAL_LEAF}/{a.name}" for a in copy.spec.auth_files],
                     limits,
                     limit=CREDENTIAL_READ_LIMIT,
                 )
+            except ProviderError as exc:
+                # 12: a copy that was never read back is not removed, because the token
+                # the harness rotated into it may be the only live one. Collection runs
+                # again; if it never can, cleanup removes the copy under every policy.
+                raise CollectionUnavailableError(
+                    f"the credential copy could not be read back: {exc}"
+                ) from exc
+        try:
+            if copy.writable:
                 for auth in copy.spec.auth_files:
                     files.append(
                         await self._sync_file(
@@ -3500,6 +3605,8 @@ class KubernetesProvider:
                     for auth in copy.spec.auth_files
                 ]
         finally:
+            # Once read, removed on every path: a sync-back that raised must not keep
+            # the copy on the claim.
             removed = await self._remove_credential(spec, copy)
         return CredentialSync(
             harness=copy.spec.harness,
@@ -3624,13 +3731,17 @@ class KubernetesProvider:
         env: Mapping[str, str] | None = None,
         cancelled: CancelCheck | None = None,
         tolerate_lingering_pod: bool = False,
+        wait_for_quota: bool = False,
     ) -> int:
         """Run one single-purpose Job to completion and delete it. With `cancelled`, a
         cancel ends the wait (hades #189): the Job and its policy are deleted on the way
         out, as on every other path. With `tolerate_lingering_pod`, a Pod the API server
         is slow to remove after its Job is deleted is logged rather than raised, so an
         exit already seen (the publisher's, after a push that cannot be undone) is not
-        replaced by an error about garbage collection."""
+        replaced by an error about garbage collection. With `wait_for_quota`, a Job whose
+        Pod the namespace quota refuses waits for room until its deadline rather than
+        ending at once: the publisher's Jobs, where giving up is a failed publication an
+        operator has to retry, not a collection the supervisor tries again."""
         name = k8sspec.object_name(OBJECT_PREFIX.get(role, role), spec.attempt_id)
         policy_name: str | None = None
         with contextlib.suppress(KubernetesApiError):
@@ -3655,21 +3766,38 @@ class KubernetesProvider:
                         host_aliases=k8sspec.host_aliases(resolved_plan),
                     )
                 ),
-                active_deadline_seconds=timeout,
+                # The Job's own deadline counts from its start, image pull included;
+                # Crucible's wait counts the role's time from Running (lab findings of 2026-09-29).
+                active_deadline_seconds=timeout + self.config.launch_timeout_seconds,
             )
             await self._create("jobs", body)
         except (KubernetesApiError, SpecError) as exc:
             log.warning("%s Job failed", role, extra={"error": str(exc)})
-            self.last_error[role] = str(exc)
+            self._role_error(
+                role, spec.attempt_id, str(exc), isinstance(exc, KubernetesUnavailableError)
+            )
             return JOB_API_ERROR
+        self.role_errors.pop((role, spec.attempt_id), None)
         try:
-            code = await self._await_job(name, timeout=timeout, cancelled=cancelled)
+            code = await self._await_job(
+                name, timeout=timeout, cancelled=cancelled, wait_for_quota=wait_for_quota
+            )
+            refusal = self._job_refusals.pop(name, None)
             if code is None:
-                self.last_error[role] = f"the {role} Job did not finish within {timeout}s"
+                self._role_error(
+                    role,
+                    spec.attempt_id,
+                    refusal or f"the {role} Job did not finish within {timeout}s of running",
+                )
                 return JOB_TIMED_OUT
+            if code == JOB_API_ERROR and refusal is not None:
+                # A full namespace is a wait, not a verdict on the attempt.
+                self._role_error(role, spec.attempt_id, refusal, True)
+                return JOB_API_ERROR
             if code != 0:
-                self.last_error[role] = await self._job_tail(name)
-                log.warning("%s Job exited %s", role, code, extra={"tail": self.last_error[role]})
+                tail = await self._job_tail(name)
+                self._role_error(role, spec.attempt_id, tail)
+                log.warning("%s Job exited %s", role, code, extra={"tail": tail})
             return code
         finally:
             with contextlib.suppress(KubernetesApiError):
@@ -3684,6 +3812,10 @@ class KubernetesProvider:
                 if policy_name:
                     with contextlib.suppress(KubernetesApiError):
                         await self._call(self.client.delete, "networkpolicies", policy_name)
+
+    def _role_error(self, role: str, attempt_id: str, text: str, unavailable: bool = False) -> None:
+        self.last_error[role] = text
+        self.role_errors[(role, attempt_id)] = (text, unavailable)
 
     async def _run_verifier(
         self, spec: LaunchSpec, limits: Limits
@@ -3710,9 +3842,19 @@ class KubernetesProvider:
             timeout=self.config.verifier_timeout_seconds,
             plan=self._egress_plan(spec, k8sspec.ROLE_VERIFIER),
         )
+        self._raise_if_unavailable(k8sspec.ROLE_VERIFIER, spec.attempt_id, code)
         # None means "the verifier could not be re-run": the caller marks every command
         # unverified rather than letting a gate read an exit nobody produced (11).
         return None if code in (JOB_TIMED_OUT, JOB_API_ERROR) else ()
+
+    def _raise_if_unavailable(self, role: str, attempt_id: str, code: int) -> None:
+        """A collection step the cluster could not take right now is collected again
+        later, never recorded as a verdict on the attempt's work."""
+        if code != JOB_API_ERROR:
+            return
+        text, unavailable = self.role_errors.get((role, attempt_id), ("", False))
+        if unavailable:
+            raise CollectionUnavailableError(f"the {role} Job could not run: {text}")
 
     # ----- the reader Pod ------------------------------------------------
 
@@ -3749,7 +3891,9 @@ class KubernetesProvider:
         await self._create("pods", body)
         try:
             if not await self._await_running(name, timeout=self.config.launch_timeout_seconds):
-                raise ProviderError(f"the reader Pod for {spec.attempt_id} never became ready")
+                raise CollectionUnavailableError(
+                    f"the reader Pod for {spec.attempt_id} never became ready"
+                )
             yield name
         finally:
             with contextlib.suppress(KubernetesApiError):
@@ -3785,35 +3929,50 @@ class KubernetesProvider:
         """The collected output and the verifier's logs, as a tar off the claim.
 
         `output/tree` is excluded: it is a git clone the verifier already ran against
-        and nothing on the Crucible side reads it."""
-        async with self._reader(spec, limits) as pod:
-            result = await self._call(
-                self.client.pod_exec,
-                pod,
-                ["sh", "-c", _OUTPUT_TAR_SCRIPT],
-                container=k8sspec.CONTAINER_NAME,
-                limit=OUTPUT_READ_LIMIT,
-            )
-        if result.exit_code != 0 or result.stderr:
-            # A `None` exit is the API server never sending the error channel, which
-            # means the stream ended early. Accepting it would let a partial tar through
-            # `_extract`, which suppresses tar errors, and a report or a diff quietly
-            # missing files is a wrong gate result rather than a visible failure.
-            raise CollectionFailedError(
-                "the reader Pod could not hand the collected output back "
-                f"(exit {result.exit_code}, None means the stream ended early): "
-                f"{result.stderr.decode('utf-8', 'replace')[:400]}"
-            )
-        if len(result.stdout) >= OUTPUT_READ_LIMIT:
-            # 16: outputs Crucible could not read whole are an environment failure. A
-            # partial extraction would give the gates a diff and a report quietly
-            # missing files, which is worse than failing the attempt.
-            raise CollectionFailedError(
-                f"the collected output exceeded {OUTPUT_READ_LIMIT} bytes and was truncated"
-            )
-        if not result.stdout:
-            return
-        await asyncio.to_thread(_extract, result.stdout, into)
+        and nothing on the Crucible side reads it. The tar is written to a scratch file
+        beside `into` as it arrives and extracted from there, so the supervisor never
+        holds the archive in memory (lab findings of 2026-09-29)."""
+        archive = into.parent / f".{into.name}-collected.tar"
+        try:
+            async with self._reader(spec, limits) as pod:
+                with archive.open("wb") as sink:
+                    result = await self._call(
+                        self.client.pod_exec_to,
+                        pod,
+                        ["sh", "-c", _OUTPUT_TAR_SCRIPT],
+                        sink,
+                        container=k8sspec.CONTAINER_NAME,
+                        limit=OUTPUT_READ_LIMIT,
+                    )
+            if result.exit_code is None:
+                # The API server never sent the error channel: the stream ended early.
+                # Accepting it would let a partial tar through `_extract`, which
+                # suppresses tar errors; the claim still holds everything, so it is
+                # read again later rather than failing the attempt.
+                raise CollectionUnavailableError(
+                    "the reader Pod's output stream ended before the command reported "
+                    f"a status: {result.stderr.decode('utf-8', 'replace')[:400]}"
+                )
+            if result.exit_code != 0 or result.stderr:
+                # A report or a diff quietly missing files is a wrong gate result
+                # rather than a visible failure.
+                raise CollectionFailedError(
+                    "the reader Pod could not hand the collected output back "
+                    f"(exit {result.exit_code}): "
+                    f"{result.stderr.decode('utf-8', 'replace')[:400]}"
+                )
+            if result.stdout_size >= OUTPUT_READ_LIMIT:
+                # 16: outputs Crucible could not read whole are an environment failure.
+                # A partial extraction would give the gates a diff and a report quietly
+                # missing files, which is worse than failing the attempt.
+                raise CollectionFailedError(
+                    f"the collected output exceeded {OUTPUT_READ_LIMIT} bytes and was truncated"
+                )
+            if not result.stdout_size:
+                return
+            await asyncio.to_thread(_extract, archive, into)
+        finally:
+            archive.unlink(missing_ok=True)
 
     async def _remove_from_claim(self, spec: LaunchSpec, leaves: Sequence[str]) -> None:
         """Remove leaves of the workspace claim through a Pod, never as this process.
@@ -3832,7 +3991,7 @@ class KubernetesProvider:
             mounts=[Mount("ws", WORK_MOUNT)],
             volumes=[self._claim_volume(spec.attempt_id)],
             limits=self._limits(spec),
-            timeout=120,
+            timeout=self.config.role_timeout_seconds,
             plan=EgressPlan(),
         )
         if code != 0:
@@ -3847,11 +4006,29 @@ class KubernetesProvider:
     # ----- waiting -------------------------------------------------------
 
     async def _await_job(
-        self, name: str, *, timeout: int, cancelled: CancelCheck | None = None
+        self,
+        name: str,
+        *,
+        timeout: int,
+        cancelled: CancelCheck | None = None,
+        start_timeout: int | None = None,
+        wait_for_quota: bool = False,
     ) -> int | None:
         """Wait for a Job's Pod to terminate and return the container's exit code. A
-        cancel raises LaunchCancelledError (hades #189)."""
-        deadline = time.monotonic() + timeout
+        cancel raises LaunchCancelledError (hades #189).
+
+        `timeout` is the role's own time and starts when its Pod is Running: pulling
+        the image and waiting for a node are bounded by `start_timeout` (the launch
+        timeout by default) instead, so a short role is never spent on a slow pull
+        (lab findings of 2026-09-29). None is returned when either runs out. A Job the
+        API server refused to create a Pod for because of the namespace quota ends the
+        wait at once with JOB_API_ERROR, and `_job_refusals` says why; with
+        `wait_for_quota` it waits for room instead, and a timeout names the quota."""
+        start_wait = self.config.launch_timeout_seconds if start_timeout is None else start_timeout
+        started = time.monotonic()
+        deadline = started + start_wait + timeout
+        running = False
+        self._job_refusals.pop(name, None)
         while time.monotonic() < deadline:
             await _stop_if_cancelled(cancelled, f"while {name} ran")
             try:
@@ -3867,14 +4044,59 @@ class KubernetesProvider:
                 phase = str((pod.get("status") or {}).get("phase", ""))
                 if phase == "Failed":
                     return JOB_API_ERROR
+                if phase == "Running" and not running:
+                    running = True
+                    deadline = time.monotonic() + timeout
+                elif not running and time.monotonic() - started > start_wait:
+                    self._job_refusals[name] = (
+                        f"the {name} Pod did not start within {start_wait}s: "
+                        f"{self._pending_failure(pod).detail}"
+                    )
+                    return None
             else:
                 try:
                     job = await self._call(self.client.get, "jobs", name)
-                except KubernetesApiError:
-                    return JOB_API_ERROR
+                except KubernetesApiError as exc:
+                    if exc.status == 404:
+                        return JOB_API_ERROR
+                    await asyncio.sleep(self.config.poll_interval_seconds)
+                    continue
                 if int((job.get("status") or {}).get("failed") or 0):
                     return JOB_API_ERROR
+                refusal = await self._quota_refusal(name, job)
+                if refusal is not None:
+                    self._job_refusals[name] = refusal
+                    if not wait_for_quota:
+                        return JOB_API_ERROR
             await asyncio.sleep(self.config.poll_interval_seconds)
+        return None
+
+    async def _quota_refusal(self, job_name: str, job: Mapping[str, Any]) -> str | None:
+        """Why the Job controller could not create this Job's Pod, when the namespace
+        quota is the reason: a `FailedCreate` condition or event naming the quota. The
+        controller retries such a Pod with backoff and never fails the Job, so without
+        this a full namespace is a wait for the whole timeout that says nothing."""
+        for condition in (job.get("status") or {}).get("conditions") or []:
+            if not isinstance(condition, dict):
+                continue
+            text = f"{condition.get('reason', '')} {condition.get('message', '')}"
+            if "FailedCreate" in text and _names_quota(text):
+                return str(condition.get("message") or text).strip()
+        try:
+            events = await self._call(
+                self.client.list_objects,
+                "events",
+                field_selector=(
+                    f"involvedObject.kind=Job,involvedObject.name={job_name},reason=FailedCreate"
+                ),
+            )
+        except KubernetesApiError:
+            # An events list the Role does not allow, or that failed, is not a refusal.
+            return None
+        for event in events:
+            message = str(event.get("message") or "")
+            if _names_quota(message):
+                return f"the namespace quota refused the Pod: {message}"
         return None
 
     async def _job_deadline_exceeded(self, name: str) -> bool:
@@ -3902,12 +4124,19 @@ class KubernetesProvider:
         return False
 
     async def _await_pod(self, name: str, *, timeout: int) -> str | None:
+        """The Pod's terminal phase, or None when it has none by the deadline or is
+        gone. A look that failed is not an answer: it is asked again until the deadline,
+        as `_await_job` does, so one API server hiccup never reads as a canary that
+        failed (lab findings of 2026-09-29)."""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             try:
                 pod = await self._call(self.client.get, "pods", name)
-            except KubernetesApiError:
-                return None
+            except KubernetesApiError as exc:
+                if exc.status == 404:
+                    return None
+                await asyncio.sleep(self.config.poll_interval_seconds)
+                continue
             phase = str((pod.get("status") or {}).get("phase", ""))
             if phase in ("Succeeded", "Failed"):
                 return phase
@@ -3915,14 +4144,22 @@ class KubernetesProvider:
         return None
 
     async def _await_running(self, name: str, *, timeout: int) -> bool:
+        """Whether the Pod reached Running by the deadline. A failed look is asked
+        again, as in `_await_pod`; a Pod that is gone or ended first never will."""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             try:
                 pod = await self._call(self.client.get, "pods", name)
-            except KubernetesApiError:
-                return False
-            if str((pod.get("status") or {}).get("phase", "")) == "Running":
+            except KubernetesApiError as exc:
+                if exc.status == 404:
+                    return False
+                await asyncio.sleep(self.config.poll_interval_seconds)
+                continue
+            phase = str((pod.get("status") or {}).get("phase", ""))
+            if phase == "Running":
                 return True
+            if phase in ("Succeeded", "Failed"):
+                return False
             await asyncio.sleep(self.config.poll_interval_seconds)
         return False
 
@@ -3954,6 +4191,8 @@ class KubernetesProvider:
         while time.monotonic() < deadline:
             try:
                 await self._call(self.client.get, "pods", name)
+            except KubernetesUnavailableError:
+                pass
             except KubernetesApiError as exc:
                 if exc.status == 404:
                     return
@@ -3965,9 +4204,12 @@ class KubernetesProvider:
         """Wait for background Job propagation to remove its Pod."""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            rows = await self._call(
-                self.client.list_objects, "pods", label_selector=f"job-name={job_name}"
-            )
+            try:
+                rows = await self._call(
+                    self.client.list_objects, "pods", label_selector=f"job-name={job_name}"
+                )
+            except KubernetesUnavailableError:
+                rows = [{}]
             if not rows:
                 return
             await asyncio.sleep(self.config.poll_interval_seconds)
@@ -4042,20 +4284,54 @@ class KubernetesProvider:
         )
 
     async def _read_quota(self) -> int | None:
-        """26: attempt capacity from the namespace's ResourceQuota."""
+        """26: attempt capacity from the namespace's ResourceQuotas: the fewest attempts
+        any one limit admits. An attempt is five Jobs over its life and one Pod at a
+        time, so `count/jobs.batch` is divided by five and the CPU and memory limits by
+        one Pod's worth at the limits of the last launch (the defaults before one).
+        Before the lab findings of 2026-09-29 only the Job count was read, so a
+        namespace whose memory fitted fewer attempts still advertised more."""
         rows = await self._call(self.client.list_objects, "resourcequotas")
+        limits = self._last_limits or k8sspec.limits_from_policy({})
+        per_attempt = {
+            "count/jobs.batch": float(JOBS_PER_ATTEMPT),
+            "pods": 1.0,
+            "requests.cpu": k8sspec.quantity(limits.cpu_request) or 0.0,
+            "limits.cpu": k8sspec.quantity(limits.cpu) or 0.0,
+            "requests.memory": k8sspec.quantity(limits.memory_request) or 0.0,
+            "limits.memory": k8sspec.quantity(limits.memory) or 0.0,
+        }
+        capacity: int | None = None
         for row in rows:
             hard = (row.get("spec") or {}).get("hard") or {}
-            if "count/jobs.batch" in hard:
-                with contextlib.suppress(ValueError):
-                    return int(str(hard["count/jobs.batch"])) // JOBS_PER_ATTEMPT
-            if "pods" in hard:
-                with contextlib.suppress(ValueError):
-                    return int(str(hard["pods"]))
-        return None
+            for key, each in per_attempt.items():
+                total = k8sspec.quantity(hard.get(key)) if key in hard else None
+                if total is None or each <= 0:
+                    continue
+                fits = int(total // each)
+                capacity = fits if capacity is None else min(capacity, fits)
+        return capacity
 
 
 # ----- pure helpers -------------------------------------------------------
+
+
+def _canary_failed(detail: str, exc: KubernetesApiError) -> NamespaceProbe:
+    return NamespaceProbe(
+        False,
+        False,
+        None,
+        detail,
+        checked=False,
+        unavailable=isinstance(exc, KubernetesUnavailableError),
+    )
+
+
+def _names_quota(text: str) -> bool:
+    """Whether an API server message is a ResourceQuota refusal: "exceeded quota: ..."
+    when the namespace is full, "failed quota: ..." when a Pod leaves out a resource the
+    quota counts."""
+    lowered = text.lower()
+    return "exceeded quota" in lowered or "failed quota" in lowered
 
 
 async def _stop_if_cancelled(cancelled: CancelCheck | None, where: str) -> None:
@@ -4318,14 +4594,15 @@ def _merge_verifications(
     return runs
 
 
-def _extract(raw: bytes, into: Path) -> None:
-    """Extract the reader Pod's tar. `filter="data"` refuses an absolute path, a `..`
-    component, a device, a symlink out of the tree, and anything else that is not a
-    plain file or directory: the tar comes off a claim a worker wrote into."""
+def _extract(archive: Path, into: Path) -> None:
+    """Extract the reader Pod's tar from the file it was streamed to. `filter="data"`
+    refuses an absolute path, a `..` component, a device, a symlink out of the tree, and
+    anything else that is not a plain file or directory: the tar comes off a claim a
+    worker wrote into."""
     into.mkdir(parents=True, exist_ok=True)
     with (
         contextlib.suppress(tarfile.TarError, EOFError),
-        tarfile.open(fileobj=BytesIO(raw), mode="r|*") as tar,
+        tarfile.open(archive, mode="r|*") as tar,
     ):
         tar.extractall(into, filter="data")
 

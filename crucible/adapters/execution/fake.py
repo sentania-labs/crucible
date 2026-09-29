@@ -58,6 +58,7 @@ from crucible.ports.execution import (
     ProviderCapabilities,
     ProviderError,
     ProviderHealth,
+    ProviderUnavailableError,
     VerificationRun,
     Workspace,
     WorkspaceState,
@@ -321,11 +322,18 @@ class FakeProvider:
         self._review_heads: dict[str, str] = {}
         self.cleaned: list[str] = []
         self.cleanup_policies: dict[str, CleanupPolicy] = {}
+        # The attempts whose kept workspace the retention step released (16), in order.
+        self.released: list[str] = []
+        self.release_fails = False
         # The checkout token each private repository's prepare received (ADR 0019).
         self.checkout_tokens: dict[str, CheckoutTokenSeen] = {}
         # hades #189, #190: prepares a test holds open, by external id, until it
         # releases them; and the attempts whose prepare stopped for a cancel.
         self._prepare_holds: dict[str, asyncio.Event] = {}
+        self._collect_holds: dict[str, asyncio.Event] = {}
+        self._collect_outages: dict[str, int] = {}
+        # Each collection started, by attempt id, retries included.
+        self.collect_calls: list[str] = []
         self.prepare_cancelled: list[str] = []
         self.prepares_started: list[str] = []
         # hades #189: launches a test holds open, and those that stopped for a cancel.
@@ -347,6 +355,18 @@ class FakeProvider:
         hold = self._prepare_holds.pop(external_id, None)
         if hold is not None:
             hold.set()
+
+    def hold_collect(self, external_id: str) -> asyncio.Event:
+        """Hold the next collection of this task open until the returned event is set,
+        as a collector, verifier and reader Pods that take their whole timeouts would."""
+        hold = asyncio.Event()
+        self._collect_holds[external_id] = hold
+        return hold
+
+    def collect_unavailable(self, external_id: str, times: int = 1) -> None:
+        """The next `times` collections of this task fail as a cluster that could not
+        answer (ProviderUnavailableError), with the workspace untouched."""
+        self._collect_outages[external_id] = times
 
     def hold_launch(self, external_id: str, where: Literal["before", "after"]) -> asyncio.Event:
         """Hold the next launch of this task open until the returned event is set:
@@ -496,6 +516,12 @@ class FakeProvider:
         if worker is None:
             return CollectedOutputs(report=None, report_raw=None, blocked_md=None)
         spec = worker.spec
+        self.collect_calls.append(spec.attempt_id)
+        await self._held(self._collect_holds.pop(spec.external_id, None))
+        outages = self._collect_outages.get(spec.external_id, 0)
+        if outages > 0:
+            self._collect_outages[spec.external_id] = outages - 1
+            raise ProviderUnavailableError("the fake cluster could not answer the collection")
         behavior = worker.behavior
         head = synthetic_head_sha(spec.attempt_id)
         if behavior == "quota":
@@ -616,6 +642,11 @@ class FakeProvider:
         self.cleaned.append(ws.attempt_id)
         self.cleanup_policies[ws.attempt_id] = policy
         self._workspaces.pop(ws.attempt_id, None)
+
+    async def release_workspace(self, ws: Workspace, spec: LaunchSpec | None = None) -> None:
+        if self.release_fails:
+            raise ProviderError("the fake refuses to release a workspace")
+        self.released.append(ws.attempt_id)
 
     async def list_images(self) -> list[ImageInfo]:
         """The fake provider runs behaviours, not images (08): it lists what a test

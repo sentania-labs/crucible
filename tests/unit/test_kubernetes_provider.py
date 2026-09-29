@@ -22,6 +22,7 @@ from crucible.adapters.execution.k8sapi import ExecResult, KubernetesApiError, L
 from crucible.adapters.execution.k8sfake import FakeKubernetesApi
 from crucible.adapters.execution.kubernetes import (
     CollectionFailedError,
+    CollectionUnavailableError,
     HarnessRefusedError,
     KubernetesConfig,
     KubernetesProvider,
@@ -1606,7 +1607,9 @@ async def test_a_failed_pod_with_no_terminated_container_is_still_terminal() -> 
 async def test_an_exec_stream_that_ended_early_fails_the_collection() -> None:
     """`exit_code` is None when the API server never sent the error channel, which means
     the stream ended before the command reported. Accepting it would let a partial tar
-    through and produce a report quietly missing files."""
+    through and produce a report quietly missing files. The claim still holds everything,
+    so the failure is one the supervisor collects again after (lab findings of
+    2026-09-29), not a verdict on the attempt."""
     api, _registry, provider, launch, workspace = await prepared()
     handle = await provider.launch(workspace, launch)
     await run_to_exit(provider, handle)
@@ -1617,7 +1620,7 @@ async def test_an_exec_stream_that_ended_early_fails_the_collection() -> None:
         return ExecResult(result.stdout, b"", None)
 
     api.pod_exec = truncated
-    with pytest.raises(CollectionFailedError, match="stream ended early"):
+    with pytest.raises(CollectionUnavailableError, match="stream ended before"):
         await provider.collect(handle, workspace, launch)
     api.pod_exec = real
 
