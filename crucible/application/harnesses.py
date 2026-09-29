@@ -1,10 +1,12 @@
 """The harness registry and its administration (07, 13, 25).
 
 The registry resolves a harness name to an adapter and refuses an unknown or disabled
-name with a reason the supervisor turns into a wake. A harness is launchable only when
-the operator's configuration gate and the admin's runtime flag both say so: the gate
-ships closed for a harness whose dedicated session is unverified (S1b), and the flag is
-what `crucible admin harnesses disable` flips without touching configuration.
+name with a reason the supervisor turns into a wake. The operator's configuration entry
+is a harness's starting value (it ships off for a harness whose dedicated session is
+unverified, S1b, with the reason); until an administrator decides, a launch needs it and
+the admin's runtime flag both. Once an administrator has enabled or disabled the harness
+(`crucible admin harnesses enable|disable`, the Harnesses page, the admin API), that
+stored decision alone decides, without a restart (hades #174).
 
 Also here: the image-version check every launch runs (a combination outside the tested
 range is a refusal, never a warning), the egress allowlist a worker gets (the union of
@@ -102,12 +104,20 @@ class HarnessRegistry:
         `gates` is the operator's configuration; `state` is the admin's runtime row. A
         harness with no row is enabled by default, so a registry test without a
         database behaves like a fresh deployment's seeded defaults for the verified
-        harness."""
+        harness.
+
+        The configuration is the starting value only (hades #174): once an
+        administrator has enabled or disabled the harness through the service, that
+        decision alone decides, read from the row on every call, so it takes effect
+        with no restart."""
         adapter = self.require(name)
         gate = (gates or {}).get(name)
-        if gate is not None and not gate.enabled:
+        decided = state is not None and state.enabled_decided
+        if gate is not None and not gate.enabled and not decided:
             raise HarnessUnavailableError(
-                name, f"disabled in configuration: {gate.reason or 'no reason recorded'}"
+                name,
+                f"off by the configuration default: {gate.reason or 'no reason recorded'}; "
+                "an administrator can enable it on Harnesses",
             )
         if state is not None and not state.enabled:
             raise HarnessUnavailableError(
@@ -379,6 +389,7 @@ def ingest_progress(
 def _summary(state: HarnessState) -> dict[str, Any]:
     return {
         "enabled": state.enabled,
+        "enabled_decided": state.enabled_decided,
         "reason": state.reason,
         "session_compatibility": state.session_compatibility,
         "mount_mode_observed": state.mount_mode_observed,
@@ -414,13 +425,18 @@ def set_harness_enabled(
     enabled: bool,
     reason: str,
     session_compatibility: SessionCompatibility | None = None,
+    warning: str = "",
 ) -> HarnessState:
     """Enable or disable a harness (25): configuration retained, running attempts finish,
     new launches refused with a wake. Every change is an event with the principal, the
-    reason when one was given, and a before-and-after summary that carries no value."""
+    reason when one was given, and a before-and-after summary that carries no value.
+
+    It is an administrator's decision (hades #174): from here the configuration entry
+    no longer decides the harness's availability, this row does."""
     state = _ensure_state(uow, clock, name)
     before = _summary(state)
     state.enabled = enabled
+    state.enabled_decided = True
     state.reason = reason.strip()
     if session_compatibility is not None:
         state.session_compatibility = session_compatibility.value
@@ -437,6 +453,9 @@ def set_harness_enabled(
             "reason": state.reason,
             "before": before,
             "after": _summary(state),
+            # What the configuration said when the administrator decided anyway: the
+            # unverified reason, recorded with the decision (hades #174).
+            **({"configuration_warning": warning} if warning else {}),
         },
     )
     return state

@@ -461,6 +461,10 @@ class HarnessState:
     # The last harness test (crucible#118): when, pass or fail, and each step's result in
     # plain words. Never output: the steps say what was checked and why it failed.
     last_test: dict[str, Any] | None = None
+    # hades #174: whether an administrator has enabled or disabled the harness through
+    # the service. Until one has, the configuration entry is the starting value and a
+    # launch needs it and `enabled` both; once one has, `enabled` alone decides.
+    enabled_decided: bool = False
 
 
 @dataclass(slots=True)

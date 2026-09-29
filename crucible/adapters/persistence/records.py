@@ -839,6 +839,7 @@ class HarnessStates:
         return HarnessState(
             name=row.name,
             enabled=row.enabled,
+            enabled_decided=bool(row.enabled_decided),
             reason=row.reason,
             session_compatibility=row.session_compatibility,
             updated_at=ensure_utc(row.updated_at),
@@ -866,6 +867,7 @@ class HarnessStates:
             row = HarnessStateRow(name=state.name)
             self._s.add(row)
         row.enabled = state.enabled
+        row.enabled_decided = state.enabled_decided
         row.reason = state.reason
         row.session_compatibility = state.session_compatibility
         row.mount_mode_observed = state.mount_mode_observed

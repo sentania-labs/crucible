@@ -108,8 +108,9 @@ LABELS = {
     "configured": "App configured",
     "content_sha256": "Content fingerprint",
     "counts": "Tasks by state",
-    "enabled_by_administrator": "Runtime gate",
-    "enabled_by_configuration": "Configuration gate",
+    "decided_by_administrator": "Decided by an administrator",
+    "enabled_by_administrator": "Administrator's setting",
+    "enabled_by_configuration": "Configuration default",
     "exhausted_at": "Exhausted at",
     "external_id": "External ID",
     "health_detail": "Health detail",
@@ -885,8 +886,14 @@ STEP_WORDS = {
 def _harness_status(item: dict[str, Any], ready: dict[str, Any] | None) -> dict[str, Any]:
     """The one word an operator acts on, most blocking first, from the same readiness
     Status shows. A test fixture has no readiness entry and is judged on its image."""
-    if not item["enabled_by_configuration"]:
-        return {"kind": "status", "value": "off in configuration", "tone": "bad"}
+    if not item["enabled_by_configuration"] and not item.get("decided_by_administrator"):
+        # hades #174: the configuration is the starting value, and Enable here decides.
+        return {
+            "kind": "status",
+            "value": "off by default",
+            "tone": "warn",
+            "hint": f"{item.get('warning') or 'off in configuration'}. Enable it to use it.",
+        }
     if ready is not None and ready["steps"]:
         step = ready["steps"][0]
         return {
@@ -894,6 +901,13 @@ def _harness_status(item: dict[str, Any], ready: dict[str, Any] | None) -> dict[
             "value": STEP_WORDS.get(step["code"], "not ready"),
             "tone": "warn",
             "hint": step["text"] if len(ready["steps"]) == 1 else None,
+        }
+    if item.get("warning") and item["enabled"]:
+        return {
+            "kind": "status",
+            "value": "ready, unverified",
+            "tone": "warn",
+            "hint": f"{item['warning']}. Test proves it.",
         }
     if ready is None and not item["enabled"]:
         return {"kind": "status", "value": "disabled", "tone": "warn"}
@@ -941,7 +955,7 @@ async def harness_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
         image = item.get("default_image")
         last = item.get("last_test")
         actions: list[dict[str, Any]] = []
-        if admin and item["enabled_by_configuration"]:
+        if admin and item["enabled"]:
             actions.append(
                 {
                     "kind": "form",
@@ -951,15 +965,18 @@ async def harness_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                     "hidden": {"harness": name},
                 }
             )
+        if admin:
+            # hades #174: every harness, whatever its configuration default; enabling an
+            # unverified one is allowed, with the warning beside it in the Status column.
             actions.append(
                 {
                     "kind": "form",
                     "action": "/ui/actions/harness",
-                    "label": "Disable" if item["enabled_by_administrator"] else "Enable",
+                    "label": "Disable" if item["enabled"] else "Enable",
                     "reason": "optional",
                     "hidden": {
                         "harness": name,
-                        "enabled": "false" if item["enabled_by_administrator"] else "true",
+                        "enabled": "false" if item["enabled"] else "true",
                     },
                 }
             )
@@ -996,9 +1013,10 @@ async def harness_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                     "title": "Gates, versions and use",
                     "columns": [
                         "Harness",
-                        "Configuration gate",
-                        "Runtime gate",
+                        "Configuration default",
+                        "Administrator's decision",
                         "Why",
+                        "Warning",
                         "Tested versions",
                         "Running now",
                     ],
@@ -1006,16 +1024,23 @@ async def harness_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                         [
                             item["name"],
                             "on" if item["enabled_by_configuration"] else "off",
-                            "on" if item["enabled_by_administrator"] else "off",
+                            (
+                                ("enabled" if item["enabled_by_administrator"] else "disabled")
+                                if item.get("decided_by_administrator")
+                                else "none yet"
+                            ),
                             item["reason"] or "none",
+                            item.get("warning") or "none",
                             item["supported_versions"],
                             item.get("concurrency_in_use", 0),
                         ]
                         for item in items
                     ],
                     "note": (
-                        "The configuration gate is restart-bound (Settings); the runtime "
-                        "gate is the Enable and Disable buttons above."
+                        "The configuration default (Settings) is where a harness starts. "
+                        "Once an administrator enables or disables it with the buttons "
+                        "above, that decision holds, takes effect for new tasks at once, "
+                        "and needs no restart."
                     ),
                 }
             ],
@@ -2614,6 +2639,13 @@ _BROAD_EGRESS_REASON = (
 )
 
 
+# hades #174: a harness's configuration entry is where it starts, not a lock.
+_HARNESS_DEFAULT_REASON = (
+    "The starting value only. Enable or disable the harness on Harnesses; an "
+    "administrator's decision there wins and needs no restart."
+)
+
+
 def _settings_rows(settings: Any) -> list[list[Any]]:
     if settings is None or not hasattr(settings, "model_dump"):
         return []
@@ -2664,6 +2696,8 @@ def _settings_rows(settings: Any) -> list[list[Any]]:
             if path.split(".")[:2] in _EGRESS_SEEDS
             else _BROAD_EGRESS_REASON
             if path == "kubernetes.broad_egress"
+            else _HARNESS_DEFAULT_REASON
+            if path.startswith("harnesses.") and path.endswith(".enabled")
             else ""
         )
         rows.append([path, shown, source, reason])

@@ -1193,3 +1193,32 @@ def test_0021_command_timeout_down_and_up_keeps_the_audit_trail(database_url: st
     ok, detail = migrate.is_current(engine, database_url)
     assert ok, detail
     engine.dispose()
+
+
+def test_0027_starts_every_harness_undecided_and_comes_back_off(database_url: str) -> None:
+    """hades #174: an upgrade changes no harness's availability. Each existing row starts
+    undecided, so the configuration default still applies until an administrator
+    decides; a rollback drops only the decision."""
+    migrate.upgrade(database_url)
+    engine = make_engine(database_url)
+    migrate.downgrade(database_url, "0026_github_app_manifest")
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM harnesses"))
+        conn.execute(
+            text(
+                "INSERT INTO harnesses (name, enabled, reason, session_compatibility, "
+                "updated_at, updated_by) VALUES ('codex', true, '', 'unverified', now(), 't')"
+            )
+        )
+    migrate.upgrade(database_url)
+    with engine.connect() as conn:
+        decided = conn.execute(
+            text("SELECT enabled, enabled_decided FROM harnesses WHERE name = 'codex'")
+        ).one()
+    assert tuple(decided) == (True, False)
+    migrate.downgrade(database_url, "0026_github_app_manifest")
+    assert "enabled_decided" not in {c["name"] for c in inspect(engine).get_columns("harnesses")}
+    migrate.upgrade(database_url)
+    ok, detail = migrate.is_current(engine, database_url)
+    assert ok, detail
+    engine.dispose()
