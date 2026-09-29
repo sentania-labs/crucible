@@ -65,6 +65,19 @@ def snapshot_seeds(engine: Engine) -> None:
             conn.execute(text(f"CREATE TABLE {SEED_SCHEMA}.{table} AS TABLE public.{table}"))
 
 
+def rebuild(url: str) -> None:
+    """The schema from nothing, for a database a failed migration test left somewhere
+    `upgrade` cannot come back from. The seed copy lives in its own schema and stays."""
+    engine = make_engine(url)
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("DROP SCHEMA public CASCADE"))
+            conn.execute(text("CREATE SCHEMA public"))
+    finally:
+        engine.dispose()
+    migrate.upgrade(url)
+
+
 def reset(engine: Engine) -> None:
     """Every table empty, then the migrations' seeded rows back as they were."""
     with engine.begin() as conn:
@@ -89,10 +102,11 @@ def reset(engine: Engine) -> None:
             )
 
 
-def worker_database_name(worker_id: str) -> str:
-    """The database one test process owns (issue 195): `crucible_test_gw0` for an
-    xdist worker, `crucible_test_master` for a serial run."""
-    return f"crucible_test_{worker_id}"
+def worker_database_name(worker_id: str, run_id: str) -> str:
+    """The database one test process owns (issue 195): `crucible_test_gw0_<run>` for an
+    xdist worker, `crucible_test_master_<run>` for a serial run. The run's own id keeps
+    two runs against one CRUCIBLE_TEST_DATABASE_URL server off each other's databases."""
+    return f"crucible_test_{worker_id}_{run_id[:12]}"
 
 
 @contextmanager
@@ -111,11 +125,12 @@ def own_database(server_url: str, name: str) -> Iterator[str]:
 
 
 @pytest.fixture(scope="session")
-def database_url(worker_id: str) -> Iterator[str]:
+def database_url(worker_id: str, testrun_uid: str) -> Iterator[str]:
     # Session scope is per process, so each xdist worker (and a serial run) gets its own
     # database, named from the worker id, on CRUCIBLE_TEST_DATABASE_URL's server or on
-    # a container of its own. No test can see another process's rows (issue 195).
-    name = worker_database_name(worker_id)
+    # a container of its own. No test can see another process's rows (issue 195). The
+    # URL's role needs CREATEDB.
+    name = worker_database_name(worker_id, testrun_uid)
     url = os.environ.get("CRUCIBLE_TEST_DATABASE_URL")
     if url:
         with own_database(url, name) as own:

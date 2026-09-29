@@ -13,7 +13,7 @@ from crucible.adapters.persistence.unit_of_work import SqlUnitOfWorkFactory, mak
 from crucible.application.routing import load_routing
 from crucible.contracts.policy import RoutingPolicyV1
 from tests.fixtures import contract_document
-from tests.integration.conftest import reset, submit_and_start
+from tests.integration.conftest import rebuild, reset, submit_and_start
 
 pytestmark = pytest.mark.integration
 
@@ -34,7 +34,13 @@ def at_clean_head(migrated: str) -> Iterator[None]:
 
     clean()
     yield
-    clean()
+    try:
+        clean()
+    except Exception:
+        # A test that failed halfway down can leave a revision `upgrade` cannot leave.
+        # Rebuild, so one real failure is one failure and not every test after it.
+        rebuild(migrated)
+        clean()
 
 
 def test_up_down_up_from_empty(database_url: str) -> None:
