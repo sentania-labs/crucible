@@ -330,9 +330,18 @@ class PolicyV1(StrictModel):
         return out
 
 
+# ADR 0028: the tiers whose default pool order puts the local pools first. Hermes on the
+# local gateway is the default doer; `complex` (scoping and structural work) has no pool
+# preference by default, so its capability preference (frontier) decides.
+LOCAL_FIRST_TIERS = frozenset({"trivial", "standard"})
+
+
 class RoutingTier(StrictModel):
     allowed_capability: list[Literal["small", "mid", "frontier"]] = Field(min_length=1)
     prefer: list[Literal["small", "mid", "frontier"]] = Field(min_length=1)
+    # ADR 0028: pools in the order routing tries them, ahead of `prefer`. Absent (every
+    # version before 0028) reads as the default: `RoutingPolicyV1.preferred_pools`.
+    prefer_pools: list[str] | None = None
 
     @model_validator(mode="after")
     def _prefer_subset(self) -> RoutingTier:
@@ -399,6 +408,14 @@ class Rotation(StrictModel):
     strategy: str = Field(min_length=1)
     quality_feedback: bool
     quality_window: int = Field(ge=1)
+    # ADR 0028: a model is demoted in a project when, over its last `quality_window`
+    # attempts that reached the gates, at least `demote_min_sample` did and at least
+    # `demote_failure_percent` of them failed a blocking gate. Two failures at least:
+    # one failure never demotes. A demoted model gets a probe attempt once its last
+    # attempt is `probe_after_minutes` old, so it can recover. Absent reads as these.
+    demote_failure_percent: int = Field(default=50, ge=1, le=100)
+    demote_min_sample: int = Field(default=5, ge=2)
+    probe_after_minutes: int = Field(default=60, ge=1)
 
 
 class Reroute(StrictModel):
@@ -431,10 +448,31 @@ class RoutingPolicyV1(StrictModel):
             raise ValueError(f"models reference pools the policy does not define: {unknown_pools}")
         if not self.tiers:
             raise ValueError("at least one tier is required")
+        for tier, rule in self.tiers.items():
+            stray = sorted(set(rule.prefer_pools or []) - set(self.pools))
+            if stray:
+                raise ValueError(f"tier {tier} prefers pools the policy does not define: {stray}")
+            if len(set(rule.prefer_pools or [])) != len(rule.prefer_pools or []):
+                raise ValueError(f"tier {tier} lists a preferred pool twice")
         return self
 
     def model(self, model_id: str) -> RoutingModel | None:
         return next((m for m in self.models if m.id == model_id), None)
+
+    def local_pools(self) -> list[str]:
+        """Pools holding a model on a local endpoint (Hermes on the gateway), by name."""
+        return sorted({m.pool for m in self.models if m.endpoint == "local"})
+
+    def preferred_pools(self, tier: str) -> list[str]:
+        """ADR 0028: the pool order routing tries first for `tier`. A tier that sets
+        `prefer_pools` gets exactly that; one that does not gets the default, the local
+        pools for `trivial` and `standard` and no preference otherwise."""
+        rule = self.tiers.get(tier)
+        if rule is None:
+            return []
+        if rule.prefer_pools is not None:
+            return list(rule.prefer_pools)
+        return self.local_pools() if tier in LOCAL_FIRST_TIERS else []
 
 
 def parse_policy(document: object) -> PolicyV1:

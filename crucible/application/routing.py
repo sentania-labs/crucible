@@ -262,7 +262,8 @@ def select_model(
     metrics = _project_metrics(
         uow, project, [entry.id for entry in routing.models], routing.rotation.quality_window
     )
-    ranked: list[tuple[tuple[Any, ...], RoutingModel, str, list[str]]] = []
+    preferred = routing.preferred_pools(tier)
+    ranked: list[tuple[tuple[Any, ...], RoutingModel, str, list[str], QualityState]] = []
     for entry in routing.models:
         reasons: list[str] = []
         if pinned_model is not None and entry.id != pinned_model:
@@ -302,27 +303,29 @@ def select_model(
                 fnmatch.fnmatchcase(image, pattern) for pattern in image_allowlist
             ):
                 reasons.append("derived image is outside the policy allowlist")
+        # ADR 0028: the tier's pool order first, then its capability preference. A
+        # model in a preferred pool is the default; the rest are fallbacks, tried when
+        # every preferred one is excluded above.
+        pool_rank = preferred.index(entry.pool) if entry.pool in preferred else len(preferred)
         cap_rank = (
             tier_rule.prefer.index(entry.capability)
             if entry.capability in tier_rule.prefer
             else len(tier_rule.prefer)
         )
         recent = metrics.get(entry.id, [])[-routing.rotation.quality_window :]
-        demoted = int(
-            routing.rotation.quality_feedback
-            and bool(recent)
-            and any(row.gates_failed > 0 or row.corrections_after > 0 for row in recent)
-        )
+        quality = quality_state(routing, recent, now)
         last = recent[-1].created_at if recent else None
         weight = max(entry.weight, 1)
         age_weight = (now - last).total_seconds() * weight if last is not None else 0.0
         rank = (
-            cap_rank + demoted,
+            int(quality.demoted and not quality.probe),
+            pool_rank,
+            cap_rank,
             0 if last is None else 1,
             -age_weight,
             entry.id,
         )
-        ranked.append((rank, entry, image, reasons))
+        ranked.append((rank, entry, image, reasons, quality))
     ranked.sort(key=lambda item: item[0])
     ordered = tuple(
         {
@@ -333,11 +336,59 @@ def select_model(
             "image": image or None,
             "eligible": not reasons,
             "excluded": reasons,
+            "preferred_pool": entry.pool in preferred,
+            "quality": quality.as_dict(),
         }
-        for _, entry, image, reasons in ranked
+        for _, entry, image, reasons, quality in ranked
     )
-    chosen = next(((entry, image) for _, entry, image, reasons in ranked if not reasons), None)
+    chosen = next(((entry, image) for _, entry, image, reasons, _ in ranked if not reasons), None)
     return Selection(chosen[0] if chosen else None, chosen[1] if chosen else None, ordered)
+
+
+@dataclass(frozen=True, slots=True)
+class QualityState:
+    """A model's standing in a project (ADR 0028). `demoted` ranks it after every model
+    that is not, until `probe` says its turn to prove itself again has come."""
+
+    sample: int
+    failures: int
+    demoted: bool
+    probe: bool
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "sample": self.sample,
+            "blocking_failures": self.failures,
+            "demoted": self.demoted,
+            "probe": self.probe,
+        }
+
+
+def quality_state(
+    routing: RoutingPolicyV1, recent: list[AttemptMetrics], now: datetime
+) -> QualityState:
+    """Judge a failure rate, not a single failure. The sample is the attempts in the
+    window that reached the gates; a failure is one with a failed blocking gate (the
+    supervisor counts only those into `gates_failed`, so advisory findings never count).
+    Demotion needs the minimum sample, the failure percentage, and two failures at
+    least. A demoted model whose last attempt is `probe_after_minutes` old ranks as if
+    it were not demoted, once: the probe's launch makes its last attempt new again."""
+    rotation = routing.rotation
+    judged = [row for row in recent if row.gates_passed + row.gates_failed > 0]
+    failures = sum(1 for row in judged if row.gates_failed > 0)
+    demoted = (
+        rotation.quality_feedback
+        and len(judged) >= rotation.demote_min_sample
+        and failures >= 2
+        and failures * 100 >= rotation.demote_failure_percent * len(judged)
+    )
+    last = recent[-1].created_at if recent else None
+    probe = (
+        demoted
+        and last is not None
+        and now - last >= timedelta(minutes=rotation.probe_after_minutes)
+    )
+    return QualityState(sample=len(judged), failures=failures, demoted=demoted, probe=probe)
 
 
 def reserve(

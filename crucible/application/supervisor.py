@@ -972,7 +972,13 @@ class Supervisor:
                     continue
                 gates = uow.gate_results.list_for_attempt(attempt.id)
                 passed = sum(1 for g in gates if g.result == "pass")
-                failed = sum(1 for g in gates if g.result in ("fail", "error"))
+                # ADR 0028: routing judges a model on blocking failures only; a failed
+                # advisory gate (ADR 0024) is a finding for the reviewer, not a failure.
+                failed = sum(
+                    1
+                    for g in gates
+                    if g.result in ("fail", "error") and getattr(g, "blocking", True)
+                )
                 after = sum(
                     1
                     for c in uow.contracts.list_for_task(task.id)
@@ -3329,6 +3335,8 @@ class Supervisor:
             )
             if provider_quota is not None:
                 self._mark_pool_exhausted(uow, attempt, execution, provider_quota.reset_at)
+            if attempt.exit_class is ExitClass.PROVIDER_ERROR:
+                self._mark_local_endpoint_down(uow, attempt, execution)
             parsed: ParsedReport | None = None
             if adapter is not None and report_dir is not None and report_dir.is_dir():
                 parsed = adapter.parse_report(report_dir, exit_info)
@@ -3872,12 +3880,38 @@ class Supervisor:
                 attempt_id=attempt.id,
             )
 
+    def _mark_local_endpoint_down(
+        self, uow: UnitOfWork, attempt: Attempt, execution: Execution
+    ) -> None:
+        """ADR 0028: a local model whose gateway failed (the harness classified the exit
+        `provider_error`: refused, unreachable, 5xx) takes its pool out of routing for the
+        pool's default cooldown, so the tier's fallbacks carry the work meanwhile. The
+        mark is the one a quota exhaustion leaves: listed on Routing and clearable there.
+        A subscription model's provider error leaves routing as it was."""
+        task = uow.tasks.get(attempt.task_id)
+        assert task is not None
+        context = self._routing_context(uow, task, execution)
+        if context is None:
+            return
+        entry = context[0].model(execution.model)
+        if entry is None or entry.endpoint != "local":
+            return
+        self._mark_pool_exhausted(
+            uow,
+            attempt,
+            execution,
+            None,
+            reason="local endpoint failed (provider_error)",
+        )
+
     def _mark_pool_exhausted(
         self,
         uow: UnitOfWork,
         attempt: Attempt,
         execution: Execution,
         reset_at: Any,
+        *,
+        reason: str = "harness reported quota_exhausted",
     ) -> None:
         task = uow.tasks.get(attempt.task_id)
         assert task is not None
@@ -3899,7 +3933,7 @@ class Supervisor:
                 reset_at=reset,
                 task_id=attempt.task_id,
                 attempt_id=attempt.id,
-                reason="harness reported quota_exhausted",
+                reason=reason,
             )
         )
 
