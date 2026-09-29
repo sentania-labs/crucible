@@ -3,7 +3,9 @@
 # chose one image over one per harness on 2026-09-22 at 3:09 PM (C11): one digest
 # to build, publish, promote and roll back. Debian slim by digest, uid 1000 worker,
 # git, curl, jq, make, the lab root CA, the Python runtime Hermes needs, the four CLIs,
-# nothing else. Shared pins mirror images/pins.env; build with images/build.sh.
+# and the toolchain a Python project's own checks call (uv, CPython 3.12 and gitleaks,
+# hades #184, ADR 0020), nothing else. Shared pins mirror images/pins.env; build with
+# images/build.sh.
 #
 # Every harness pin is an `ARG HARNESS_<NAME>_VERSION` here. build.sh reads those
 # lines and labels the image `crucible.harness.<name>.version` for each, which is
@@ -88,6 +90,46 @@ ARG HARNESS_HERMES_SHA256=bd0bac012aee38a60894781f4597dc29ee7bedb3448540249921f1
 ADD --checksum=sha256:${HARNESS_HERMES_SHA256} --chmod=0644 \
     https://files.pythonhosted.org/packages/e5/30/c85be8290e9565dc3c7a9720e93f3e59e09b1b163487be4946c3aa848f80/hermes_agent-${HARNESS_HERMES_VERSION}-py3-none-any.whl \
     /fetch/hermes_agent-${HARNESS_HERMES_VERSION}-py3-none-any.whl
+
+# The project toolchain (hades #184, ADR 0020): what a repository's `make lint`,
+# `make test-unit` and `make scan` call when the repository is a uv project, which
+# Crucible itself is. Each is its publisher's release archive, by the sha256 that
+# publisher lists for it (uv's .sha256 file, python-build-standalone's SHA256SUMS,
+# gitleaks' checksums.txt), recomputed over the download on 2026-09-28. The project's
+# own dependencies are not here: uv fetches them hash-locked from PyPI at run time,
+# under the project policy's egress allowlist (ADR 0020).
+FROM ${BASE_IMAGE} AS fetch-toolchain
+ARG SOURCE_DATE_EPOCH
+ARG UV_VERSION=0.10.12
+ARG UV_SHA256=ec72570c9d1f33021aa80b176d7baba390de2cfeb1abcbefca346d563bf17484
+ARG CPYTHON_VERSION=3.12.13
+ARG CPYTHON_BUILD=20260310
+ARG CPYTHON_SHA256=7e08911171bd1ea2af43ae9d54917d9b2179d2cba4057057e0fd3c8ac1469368
+ARG GITLEAKS_VERSION=8.30.1
+ARG GITLEAKS_SHA256=551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+ADD --checksum=sha256:${UV_SHA256} --chmod=0644 \
+    https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-x86_64-unknown-linux-gnu.tar.gz \
+    /fetch/uv.tar.gz
+ADD --checksum=sha256:${CPYTHON_SHA256} --chmod=0644 \
+    https://github.com/astral-sh/python-build-standalone/releases/download/${CPYTHON_BUILD}/cpython-${CPYTHON_VERSION}%2B${CPYTHON_BUILD}-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz \
+    /fetch/cpython.tar.gz
+ADD --checksum=sha256:${GITLEAKS_SHA256} --chmod=0644 \
+    https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz \
+    /fetch/gitleaks.tar.gz
+# The archives' own entry mtimes are pinned by their sha256, so what is extracted from
+# them is fixed; the two binaries moved into place are touched to the epoch like every
+# other fetched binary, and nothing keeps the archive's owner.
+RUN set -eu; \
+    mkdir -p /fetch/bin /fetch/opt; \
+    tar -xzf /fetch/uv.tar.gz -C /fetch --no-same-owner uv-x86_64-unknown-linux-gnu/uv; \
+    mv /fetch/uv-x86_64-unknown-linux-gnu/uv /fetch/bin/uv; \
+    tar -xzf /fetch/gitleaks.tar.gz -C /fetch/bin --no-same-owner gitleaks; \
+    chmod 0755 /fetch/bin/uv /fetch/bin/gitleaks; \
+    touch -h -d "@${SOURCE_DATE_EPOCH}" /fetch/bin/uv /fetch/bin/gitleaks; \
+    tar -xzf /fetch/cpython.tar.gz -C /fetch/opt --no-same-owner; \
+    test "$(/fetch/opt/python/bin/python3.12 -c 'import platform; print(platform.python_version())')" = "${CPYTHON_VERSION}"; \
+    test "$(/fetch/bin/uv --version | cut -d' ' -f2)" = "${UV_VERSION}"; \
+    test "$(/fetch/bin/gitleaks version)" = "${GITLEAKS_VERSION}"
 
 FROM ${BASE_IMAGE}
 # Declared here so it reaches the RUN below: useradd stamps /etc/shadow with
@@ -186,6 +228,13 @@ COPY --from=fetch-claude-code /fetch/claude /usr/local/bin/claude
 COPY --from=fetch-codex /fetch/codex /usr/local/bin/codex
 COPY --from=fetch-codex /fetch/codex-code-mode-host /usr/local/bin/codex-code-mode-host
 COPY --from=fetch-agy /fetch/agy /usr/local/bin/agy
+# The project toolchain (hades #184). CPython 3.12 is on PATH only as `python3.12`, the
+# name uv looks for when a project asks for 3.12; `python3` stays Debian's 3.11, so the
+# Hermes wrapper and anything else that runs `python3` is unchanged.
+COPY --from=fetch-toolchain /fetch/bin/uv /usr/local/bin/uv
+COPY --from=fetch-toolchain /fetch/bin/gitleaks /usr/local/bin/gitleaks
+COPY --from=fetch-toolchain /fetch/opt/python /opt/python3.12
+RUN ln -s /opt/python3.12/bin/python3.12 /usr/local/bin/python3.12
 
 # Auto-update opt-outs, one per harness, all inert for the other three:
 # - Claude Code: DISABLE_AUTOUPDATER stops background updates and DISABLE_UPDATES
@@ -200,7 +249,13 @@ COPY --from=fetch-agy /fetch/agy /usr/local/bin/agy
 # `python3` resolves into Hermes's dependencies. The Hermes adapter launches
 # /usr/local/bin/crucible-hermes, which runs /opt/hermes/bin/hermes by path, and
 # puts the venv first on PATH for its own process only.
+# uv (hades #184): never download a Python, since no worker reaches the host it would
+# come from and the image carries the one the project asks for; and copy rather than
+# hardlink, because its cache is on the memory-backed home and the project's .venv is
+# on the workspace, two filesystems, where a hardlink always falls back with a warning.
 ENV HOME=/home/worker \
+    UV_PYTHON_DOWNLOADS=never \
+    UV_LINK_MODE=copy \
     DISABLE_AUTOUPDATER=1 \
     DISABLE_UPDATES=1 \
     AGY_CLI_DISABLE_AUTO_UPDATE=1 \
