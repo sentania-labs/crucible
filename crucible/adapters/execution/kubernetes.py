@@ -1699,6 +1699,9 @@ class KubernetesProvider:
                 name,
                 ["sh", "-c", scripts.ACTIVITY_SCRIPT],
                 container=k8sspec.CONTAINER_NAME,
+                # The walk stops itself; this bounds a stream that never ends, so one
+                # slow Pod cannot hold the supervisor's tick for the others.
+                timeout=scripts.ACTIVITY_WALK_SECONDS + 5,
                 limit=ACTIVITY_READ_LIMIT,
             )
         except KubernetesApiError:

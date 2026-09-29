@@ -551,11 +551,20 @@ test "$REMOTE" = "$HEAD"
 # line: the newest modification time in microseconds, the entry count and the total
 # bytes. Nothing is written and nothing the worker controls is run.
 ACTIVITY_MARKER = "# crucible: activity"
+# The walk is bounded in time: a tree too large to walk in ACTIVITY_WALK_SECONDS answers
+# `incomplete`, which the supervisor reads as "could not tell", never as activity. find
+# exits 1 when it could not read a path, which is still a whole walk.
+ACTIVITY_WALK_SECONDS = 10
 ACTIVITY_SCRIPT = f"""{ACTIVITY_MARKER}
-find {REPO_MOUNT} {REPORT_MOUNT} "${{HOME:-/home/worker}}" -xdev -printf '%T@ %s\\n' 2>/dev/null \\
-  | awk 'BEGIN {{ newest = 0; files = 0; total = 0 }}
+{{ timeout {ACTIVITY_WALK_SECONDS} find {REPO_MOUNT} {REPORT_MOUNT} "${{HOME:-/home/worker}}" \\
+    -xdev -printf '%T@ %s\\n' 2>/dev/null; echo "status $?"; }} \\
+  | awk 'BEGIN {{ newest = 0; files = 0; total = 0; status = 2 }}
+         $1 == "status" {{ status = $2; next }}
          {{ if ($1 + 0 > newest) newest = $1 + 0; files += 1; total += $2 }}
-         END {{ printf "activity %.0f %.0f %.0f\\n", newest * 1000000, files, total }}'
+         END {{
+           if (status > 1) {{ print "incomplete"; exit }}
+           printf "activity %.0f %.0f %.0f\\n", newest * 1000000, files, total
+         }}'
 """
 
 

@@ -375,6 +375,7 @@ class Supervisor:
         self._workspace_fingerprints: dict[str, tuple[int, int, int]] = {}
         # FDY-0140: when each attempt's provider was last asked for its activity.
         self._activity_asked: dict[str, datetime] = {}
+        self._activity_refresh: dict[str, int] = {}
         # Rebuilt from the stored log after a restart or takeover, so nothing is lost.
         self._command_watches: dict[str, _CommandWatch] = {}
         # ADR 0019: a private repository's checkout token is minted through this client.
@@ -1303,6 +1304,7 @@ class Supervisor:
         self._workspaces.pop(attempt_id, None)
         self._workspace_fingerprints.pop(attempt_id, None)
         self._activity_asked.pop(attempt_id, None)
+        self._activity_refresh.pop(attempt_id, None)
         self._command_watches.pop(attempt_id, None)
 
     async def _build_spec(
@@ -2454,6 +2456,7 @@ class Supervisor:
             self._workspaces.pop(attempt.id, None)
             self._workspace_fingerprints.pop(attempt.id, None)
             self._activity_asked.pop(attempt.id, None)
+            self._activity_refresh.pop(attempt.id, None)
             self._command_watches.pop(attempt.id, None)
             self._handles.pop(attempt.id, None)
             cleaned += 1
@@ -2701,6 +2704,7 @@ class Supervisor:
         self._workspaces.pop(attempt.id, None)
         self._workspace_fingerprints.pop(attempt.id, None)
         self._activity_asked.pop(attempt.id, None)
+        self._activity_refresh.pop(attempt.id, None)
         self._command_watches.pop(attempt.id, None)
         return True
 
@@ -3078,9 +3082,13 @@ class Supervisor:
         else:
             now = self._clock.now()
             asked = self._activity_asked.get(attempt.id)
-            refresh = await self._db(partial(self._activity_refresh_seconds, attempt))
-            if asked is not None and (now - asked).total_seconds() < refresh:
-                return False
+            if asked is not None:
+                refresh = self._activity_refresh.get(attempt.id)
+                if refresh is None:
+                    refresh = await self._db(partial(self._activity_refresh_seconds, attempt))
+                    self._activity_refresh[attempt.id] = refresh
+                if (now - asked).total_seconds() < refresh:
+                    return False
             self._activity_asked[attempt.id] = now
             try:
                 current = await probe(handle, self._workspace_for(attempt))
