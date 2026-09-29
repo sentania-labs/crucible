@@ -22,7 +22,7 @@ import json
 import re
 import tarfile
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -52,9 +52,15 @@ from crucible.adapters.execution.k8sspec import (
     ROLE_LOGIN,
     ROLE_LOGIN_LOCK,
     ROLE_PREPARER,
+    ROLE_PUBLISHER,
     ROLE_READER,
     ROLE_VERIFIER,
     ROLE_WORKER,
+)
+from crucible.adapters.execution.scripts import (
+    PUBLISH_BUNDLE_LEAF,
+    PUBLISH_LEAF,
+    PUBLISH_LEAF_MARKER,
 )
 from crucible.domain.time import parse_rfc3339
 from crucible.ports.execution import ImageInfo
@@ -254,6 +260,18 @@ class FakeKubernetesApi:
     # Pod is removed (or left terminated with 137 when `deadline_keeps_pod`).
     job_deadline_fires: bool = False
     deadline_keeps_pod: bool = False
+    # The publisher (23): each push it acted out, with the remote, the branch, the head
+    # and the token it found in its Secret, so a test sees what reached the push without
+    # the token ever being anywhere else. `publisher_refuses` makes the next publisher
+    # fail the commit-policy check the way the script does (exit 6).
+    pushes: list[dict[str, str]] = field(default_factory=list)
+    publisher_refuses: bool = False
+    # The claim's `publish/` leaf as the preparer finds it before a push: a claim on
+    # storage where the worker uid cannot make or write it (an NFS export that squashes
+    # it, say) fails the leaf script with exit 8, as the real script does.
+    publish_leaf_unwritable: bool = False
+    # Called with each push, so a test's stand-in remote can move its branch.
+    on_push: Callable[[dict[str, str]], None] | None = None
     _uids: int = 0
 
     # ----- test controls ------------------------------------------------
@@ -544,6 +562,7 @@ class FakeKubernetesApi:
             ROLE_CANARY: self._act_canary,
             ROLE_WORKER: self._act_worker,
             ROLE_LOGIN: self._act_login,
+            ROLE_PUBLISHER: self._act_publisher,
         }.get(role)
         if handler is not None:
             handler(obj, attempt_id)
@@ -655,6 +674,19 @@ class FakeKubernetesApi:
     def _act_preparer(self, obj: _Object, attempt_id: str) -> None:
         behavior, _ = self._behavior(attempt_id, obj)
         claim = self._claim_of(obj)
+        container = ((obj.body.get("spec") or {}).get("containers") or [{}])[0]
+        if PUBLISH_LEAF_MARKER in str((container.get("command") or [""])[-1]):
+            # `scripts.publish_leaf_script`: the bundle must be a file, and the leaf a
+            # directory the worker uid can write. A dict claim has no empty directories.
+            if PUBLISH_BUNDLE_LEAF not in claim:
+                self.logs[obj.name] = [f"no branch bundle at {PUBLISH_BUNDLE_LEAF}"]
+                self._finish(obj, 7, reason="Error")
+            elif self.publish_leaf_unwritable:
+                self.logs[obj.name] = [f"{PUBLISH_LEAF} is not owned and writable as output is"]
+                self._finish(obj, 8, reason="Error")
+            else:
+                self._finish(obj, 0)
+            return
         if behavior == "prepare-fails":
             self.logs[obj.name] = ["the fake preparer could not clone"]
             self._finish(obj, 3, reason="Error")
@@ -756,6 +788,74 @@ class FakeKubernetesApi:
             for path in [p for p in claim if p == leaf or p.startswith(f"{leaf}/")]:
                 del claim[path]
         self._finish(obj, 0)
+
+    def _act_publisher(self, obj: _Object, attempt_id: str) -> None:
+        """The publisher script's observable contract, acted out: the token from the
+        mounted Secret, the bundle from its single-file mount, the seal, then a push, with
+        the outcome files on the claim's `publish` leaf where the reader finds them."""
+        spec = obj.body.get("spec") or {}
+        claim = self._claim_of(obj)
+        container = (spec.get("containers") or [{}])[0]
+        script = str((container.get("command") or [""])[-1])
+
+        def bound(name: str) -> str:
+            found = re.search(rf"^{name}='([^']*)'$", script, re.MULTILINE)
+            return found.group(1) if found else ""
+
+        bundle_leaf = ""
+        for mount in container.get("volumeMounts") or []:
+            if str(mount.get("mountPath", "")).endswith("/work_branch.bundle"):
+                bundle_leaf = str(mount.get("subPath") or "")
+        secret_name = ""
+        for volume in spec.get("volumes") or []:
+            if volume.get("name") == "publish-token":
+                secret_name = str((volume.get("secret") or {}).get("secretName") or "")
+        token = self.harness_secret(secret_name).get("token", b"") if secret_name else b""
+        out: dict[str, bytes] = {}
+
+        def finish(code: int) -> None:
+            for key in [k for k in claim if k.startswith("publish/")]:
+                del claim[key]
+            for name, body in out.items():
+                claim[f"publish/{name}"] = body
+            self._finish(obj, code)
+
+        if not token:
+            out.update({"step.txt": b"no-token\n", "error.txt": b"no token arrived\n"})
+            return finish(3)
+        bundle = claim.get(bundle_leaf) if bundle_leaf else None
+        out["step.txt"] = b"bundle-seal\n"
+        if bundle is None:
+            out["error.txt"] = b"no branch bundle where the collector left it\n"
+            return finish(7)
+        if hashlib.sha256(bundle).hexdigest() != bound("SEAL"):
+            out["error.txt"] = b"the branch bundle no longer matches its sealed sha256\n"
+            return finish(7)
+        expected = bound("EXPECTED")
+        out["bundle-head.txt"] = f"{expected}\n".encode()
+        out["remote-head-before.txt"] = b"\n"
+        out["publisher.log"] = b"fake publisher: fetched, verified, checked\n"
+        if self.publisher_refuses:
+            out.update(
+                {
+                    "step.txt": b"commit-policy\n",
+                    "push.txt": b"refused\n",
+                    "author-problems.txt": f"{expected}\tsomeone@example.invalid\n".encode(),
+                    "trailer-problems.txt": b"",
+                }
+            )
+            return finish(6)
+        push = {
+            "remote": bound("CLONE_URL"),
+            "branch": bound("WORK_BRANCH"),
+            "head": expected,
+            "token": token.decode("utf-8"),
+        }
+        self.pushes.append(push)
+        if self.on_push is not None:
+            self.on_push(push)
+        out.update({"step.txt": b"done\n", "push.txt": b"ok\n"})
+        return finish(0)
 
     def _act_login(self, obj: _Object, attempt_id: str) -> None:
         """The login Pod's driver: the CLI's lines in the log, stamped as the API server

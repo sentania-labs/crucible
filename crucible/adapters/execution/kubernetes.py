@@ -1137,10 +1137,15 @@ class KubernetesProvider:
         return workspace_ready
 
     async def _delete_checkout_secret(self, attempt_id: str) -> bool:
-        """Remove the checkout token Secret; a missing one is already the goal. True
-        when it is gone. Never raises: it runs on failure paths whose own error is the
-        one to report."""
-        name = k8sspec.object_name("checkout", attempt_id)
+        """Remove the checkout token Secret; a missing one is already the goal."""
+        return await self._delete_token_secret(
+            k8sspec.object_name("checkout", attempt_id), what="checkout"
+        )
+
+    async def _delete_token_secret(self, name: str, *, what: str) -> bool:
+        """Remove a token Secret (the checkout's, ADR 0019, or a push's, 23); a missing
+        one is already the goal. True when it is gone. Never raises: it runs on failure
+        paths whose own error is the one to report."""
         for _ in range(2):
             try:
                 await self._call(self.client.delete, "secrets", name)
@@ -1148,10 +1153,10 @@ class KubernetesProvider:
             except KubernetesApiError as exc:
                 if exc.status == 404:
                     return True
-                log.warning("checkout token secret removal failed", extra={"error": str(exc)})
+                log.warning(f"{what} token secret removal failed", extra={"error": str(exc)})
             except Exception as exc:
                 log.warning(
-                    "checkout token secret removal failed",
+                    f"{what} token secret removal failed",
                     extra={"error": type(exc).__name__},
                 )
         return False
@@ -3618,10 +3623,14 @@ class KubernetesProvider:
         plan: EgressPlan,
         env: Mapping[str, str] | None = None,
         cancelled: CancelCheck | None = None,
+        tolerate_lingering_pod: bool = False,
     ) -> int:
         """Run one single-purpose Job to completion and delete it. With `cancelled`, a
         cancel ends the wait (hades #189): the Job and its policy are deleted on the way
-        out, as on every other path."""
+        out, as on every other path. With `tolerate_lingering_pod`, a Pod the API server
+        is slow to remove after its Job is deleted is logged rather than raised, so an
+        exit already seen (the publisher's, after a push that cannot be undone) is not
+        replaced by an error about garbage collection."""
         name = k8sspec.object_name(OBJECT_PREFIX.get(role, role), spec.attempt_id)
         policy_name: str | None = None
         with contextlib.suppress(KubernetesApiError):
@@ -3667,6 +3676,10 @@ class KubernetesProvider:
                 await self._call(self.client.delete, "jobs", name)
             try:
                 await self._await_job_pods_gone(name)
+            except (ProviderError, KubernetesApiError) as exc:
+                if not tolerate_lingering_pod:
+                    raise
+                log.warning("%s Pod outlived its Job", role, extra={"error": str(exc)})
             finally:
                 if policy_name:
                     with contextlib.suppress(KubernetesApiError):

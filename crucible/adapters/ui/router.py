@@ -2360,6 +2360,14 @@ def tasks_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
         [item["external_id"] or item["id"], _state_words(state), item["updated_at"]]
         for state, items in document["lists"].items()
         for item in items
+    ] + [
+        # hades FDY-0133: a task in publishing whose publication cannot start says why.
+        [
+            item["external_id"] or item["task_id"],
+            f"Waiting to publish: {item['reason']}",
+            item["waiting_since"],
+        ]
+        for item in document.get("publishing_waiting", [])
     ]
     return _page(
         request,

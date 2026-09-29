@@ -29,11 +29,15 @@ __all__ = [
     "BUNDLE_MOUNT",
     "BUNDLE_VERIFY_SCRIPT",
     "MANIFEST",
+    "PUBLISH_BUNDLE_LEAF",
+    "PUBLISH_LEAF",
+    "PUBLISH_LEAF_MARKER",
     "REPO_MOUNT",
     "VERIFY_MOUNT",
     "collector_script",
     "encode_check_id",
     "preparer_script",
+    "publish_leaf_script",
     "publisher_script",
     "quota_checkpoint_push_script",
     "verifier_script",
@@ -562,6 +566,47 @@ def _quote(value: str) -> str:
 BUNDLE_MOUNT = "/crucible/bundle"
 PUBLISH_MOUNT = "/crucible/publish"
 
+# The two leaves of a Kubernetes workspace claim the publisher mounts as subPaths: the
+# bundle, where the collector writes it, and the directory its outcome files go to.
+PUBLISH_BUNDLE_LEAF = "output/work_branch.bundle"
+PUBLISH_LEAF = "publish"
+# The line that names the claim-leaf script, so a reader of a Job (or the fake cluster)
+# can tell it from the preparer's checkout script, which runs in the same role.
+PUBLISH_LEAF_MARKER = "# crucible: prepare the publish leaf"
+
+
+def publish_leaf_script(root: str = WORK_MOUNT) -> str:
+    """Make the claim ready for a publisher Pod, or say by exit code why it is not.
+
+    A subPath that does not exist is created by the kubelet as root when the Pod starts,
+    and on NFS that directory may be unwritable by the worker uid or refused outright, so
+    the Pod fails setup with nothing in its log. Neither leaf the publisher mounts is left
+    to the kubelet: this runs as the worker uid with the whole claim mounted, as the
+    preparer that made `output/` does, and creates `publish/` with `output/`'s mode.
+
+    Exit 7: no bundle, or not a regular file (the kubelet would make a directory there).
+    Exit 8: `publish/` is not a directory the worker uid owns and can write, as it owns
+    and writes `output/`."""
+    bundle = _quote(PUBLISH_BUNDLE_LEAF)
+    leaf = _quote(PUBLISH_LEAF)
+    return f"""set -eu
+{PUBLISH_LEAF_MARKER}
+cd {_quote(root)}
+if [ ! -f {bundle} ] || [ -L {bundle} ]; then
+  echo "no branch bundle at {PUBLISH_BUNDLE_LEAF} on the workspace claim" >&2; exit 7
+fi
+if [ -L {leaf} ] || {{ [ -e {leaf} ] && [ ! -d {leaf} ]; }}; then
+  echo "{PUBLISH_LEAF} on the workspace claim is not a directory" >&2; exit 8
+fi
+mkdir -p {leaf}
+chmod "$(stat -c '%a' output)" {leaf} 2>/dev/null || true
+if [ "$(stat -c '%u' {leaf})" != "$(stat -c '%u' output)" ] || [ ! -w {leaf} ]; then
+  echo "{PUBLISH_LEAF} on the workspace claim is not owned and writable as output is" >&2
+  exit 8
+fi
+"""
+
+
 # The publisher's git configuration: the helper above, no hooks, no pager, and the
 # policy's author. The value of `helper` has spaces, so it lives in a git config file in
 # the container's own tmpfs rather than on a command line, which is the same shape the
@@ -590,6 +635,8 @@ def publisher_script(
     author_email: str,
     commit_trailer: str,
     credential_host: str = "github.com",
+    token_source: str = "stdin",
+    bundle_sha256: str = "",
 ) -> str:
     """Fetch the base from the remote and the branch from the bundle, then push (23).
 
@@ -606,7 +653,19 @@ def publisher_script(
     curl runs at all, because the API calls stay on Crucible's side.
 
     `GIT_TRACE*` and `GIT_CURL_VERBOSE` print the Authorization header, so the script
-    unsets them rather than trusting the environment it inherited (S10 risks)."""
+    unsets them rather than trusting the environment it inherited (S10 risks).
+
+    `token_source` is `stdin` for the Docker provider, as above, or `file` for the
+    Kubernetes provider, which mounts the token from a per-push Secret at the same path
+    (a Secret volume is memory-backed and read-only, so the script neither writes nor
+    removes it; the Secret's deletion is the removal). `bundle_sha256` is the seal the
+    collector recorded: the bundle is hashed here, inside the container, before any
+    remote is contacted, and a bundle that no longer matches is refused (exit 7)."""
+    if token_source not in ("stdin", "file"):
+        raise ValueError(f"unknown token source {token_source!r}")
+    receive = 'cat > "$TOKDIR/token"\n' if token_source == "stdin" else ""
+    secure = 'chmod 0600 "$TOKDIR/token"\n' if token_source == "stdin" else ""
+    drop = 'rm -f "$TOKDIR/token"' if token_source == "stdin" else ":"
     return f"""set -eu
 umask 077
 TOKDIR={_quote(TOKEN_MOUNT)}
@@ -617,17 +676,20 @@ BASE_REF={_quote(base_ref)}
 EXPECTED={_quote(expected_head)}
 CLONE_URL={_quote(clone_url)}
 TRAILER={_quote(commit_trailer)}
+SEAL={_quote(bundle_sha256)}
+drop_token() {{ {drop}; }}
 mkdir -p "$OUT"
-cat > "$TOKDIR/token"
-if [ ! -s "$TOKDIR/token" ]; then
-  echo "no token arrived on stdin" > "$OUT/error.txt"; echo no-token > "$OUT/step.txt"; exit 3
+# A retried publication of the same attempt writes into the same directory; nothing a
+# previous run left may be read back as this run's outcome.
+find "$OUT" -mindepth 1 -maxdepth 1 -exec rm -rf {{}} + 2>/dev/null || true
+{receive}if [ ! -s "$TOKDIR/token" ]; then
+  echo "no token arrived for this push" > "$OUT/error.txt"; echo no-token > "$OUT/step.txt"; exit 3
 fi
-chmod 0600 "$TOKDIR/token"
-# Back to the ordinary mask before anything is written to the output directory: what
+{secure}# Back to the ordinary mask before anything is written to the output directory: what
 # lands there is Crucible's own record of the run, and under the rootless daemon this
 # container's uid is not the one that reads it back (S9 Test E).
 umask 022
-stat -c '%a' "$TOKDIR/token" > "$OUT/token-mode.txt"
+stat -L -c '%a' "$TOKDIR/token" > "$OUT/token-mode.txt"
 unset GIT_TRACE GIT_TRACE_CURL GIT_CURL_VERBOSE GIT_TRACE_PACKET GIT_TRACE2 || true
 export GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0
 export HOME=/home/worker LC_ALL=C
@@ -636,8 +698,27 @@ export CRUCIBLE_CREDENTIAL_HOST={_quote(credential_host)}
 export CRUCIBLE_AUTHOR_NAME={_quote(author_name)}
 export CRUCIBLE_AUTHOR_EMAIL={_quote(author_email)}
 {_CRED_HELPER}
+# The token must be readable by this uid through the very helper the push will use, or
+# the push fails at the remote with an authentication error that says nothing about why.
+# Only whether a password came back is recorded; the value goes to grep and nowhere else.
+echo credential > "$OUT/step.txt"
+if ! printf 'protocol=https\\nhost=%s\\n\\n' "$CRUCIBLE_CREDENTIAL_HOST" \\
+    | git credential fill 2>> "$OUT/publisher.log" | grep -q '^password=.'; then
+  echo "the credential helper could not read the token" > "$OUT/error.txt"; drop_token; exit 3
+fi
 cd /home/worker
 rm -rf publish && mkdir publish && cd publish
+echo bundle-seal > "$OUT/step.txt"
+if [ ! -f "$BUNDLE" ]; then
+  echo "no branch bundle where the collector left it" > "$OUT/error.txt"; drop_token; exit 7
+fi
+if [ -n "$SEAL" ]; then
+  ACTUAL=$(sha256sum "$BUNDLE" | cut -d' ' -f1)
+  if [ "$ACTUAL" != "$SEAL" ]; then
+    echo "the branch bundle no longer matches its sealed sha256" > "$OUT/error.txt"
+    drop_token; exit 7
+  fi
+fi
 echo init > "$OUT/step.txt"
 git init --quiet -b "$BASE_REF" >> "$OUT/publisher.log" 2>&1
 git remote add origin "$CLONE_URL"
@@ -691,7 +772,7 @@ if [ -s "$OUT/author-problems.txt" ] || [ -s "$OUT/trailer-problems.txt" ]; then
     "$AUTHORS" "$TRAILERS" > "$OUT/error.txt"
   echo commit-policy > "$OUT/step.txt"
   echo refused > "$OUT/push.txt"
-  rm -f "$TOKDIR/token"
+  drop_token
   chmod 0644 "$OUT"/* 2>/dev/null || true
   exit 6
 fi
@@ -705,11 +786,11 @@ else
   echo failed > "$OUT/push.txt"
   cp "$OUT/push.err" "$OUT/error.txt" 2>/dev/null || true
   echo push > "$OUT/step.txt"
-  rm -f "$TOKDIR/token"
+  drop_token
   exit 5
 fi
 echo done > "$OUT/step.txt"
-rm -f "$TOKDIR/token"
+drop_token
 chmod 0644 "$OUT"/* 2>/dev/null || true
 exit 0
 """

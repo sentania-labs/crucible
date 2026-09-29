@@ -34,9 +34,11 @@ from crucible.application.publish import (
     advance_after_publish,
     build_plan,
     fail_publish,
+    hold_publishing,
     open_review_cycle,
     record_publish_started,
     record_token_minted,
+    release_publishing_hold,
     repository_slug,
     upsert_pull_request,
 )
@@ -139,8 +141,31 @@ class DeliveryCoordinator:
 
     # ----- publication --------------------------------------------------
 
+    async def waiting_reason(self) -> str | None:
+        """Why no publication can start, or None when one can (hades FDY-0133)."""
+        if self._github is None:
+            return (
+                "GitHub is not configured for this deployment: no GitHub App client is "
+                "wired, so no branch can be pushed"
+            )
+        if self._publisher is None:
+            return (
+                "no publisher is configured for this deployment: neither a Docker nor a "
+                "Kubernetes provider is wired to push the branch"
+            )
+        if not await self._github_ready_async():
+            return (
+                "GitHub is not ready: the App credential is not in place; connect the App "
+                "on the GitHub page"
+            )
+        return None
+
     async def publish(self) -> int:
-        if self._publisher is None or not await self._github_ready_async():
+        reason = await self.waiting_reason()
+        if reason is not None:
+            # Never silent: every task waiting in `publishing` says why, is logged once,
+            # and escalates after the publisher's own time limit (hades FDY-0133).
+            await self._host._db(lambda: self._hold_publishing(reason))
             return 0
         plans = await self._host._db(self._take_publishing)
         done = 0
@@ -226,10 +251,29 @@ class DeliveryCoordinator:
             timeout_seconds=self.config.publisher_timeout_seconds,
         )
 
+    def _hold_publishing(self, reason: str) -> None:
+        with self._host._fenced() as uow:
+            for task in uow.tasks.list_by_state(TaskState.PUBLISHING, for_update=True):
+                if hold_publishing(
+                    uow,
+                    self._clock,
+                    task,
+                    reason=reason,
+                    escalate_after_seconds=self.config.publisher_timeout_seconds,
+                ):
+                    log.warning(
+                        "task %s is in publishing and its publication cannot start: %s",
+                        task.external_id,
+                        reason,
+                        extra={"task_id": task.id},
+                    )
+            uow.commit()
+
     def _take_publishing(self) -> list[PublishPlan]:
         plans: list[PublishPlan] = []
         with self._host._fenced() as uow:
             for task in uow.tasks.list_by_state(TaskState.PUBLISHING, for_update=True):
+                release_publishing_hold(uow, self._clock, task)
                 work = latest_work_attempt(uow, task)
                 if work is None:
                     fail_publish(

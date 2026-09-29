@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import secrets
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -89,6 +90,15 @@ class FakeGitHub:
         self.mint_calls = 0
         self.workflow_log = b"fake workflow log: the required check failed\n"
         self.lock = threading.Lock()
+        # A real git remote standing in for the repository's branches (the kind tier's
+        # pushable git host): when set, a branch head is read from it, so what Crucible
+        # confirms after a push is what the push actually left there.
+        self.ref_source: Callable[[str, str], str | None] | None = None
+
+    def head_of(self, repo: RepositoryState, branch: str) -> str | None:
+        if self.ref_source is not None:
+            return self.ref_source(repo.full_name, branch)
+        return repo.branches.get(branch)
 
     # ----- test-facing helpers ------------------------------------------
 
@@ -393,7 +403,7 @@ class _Handler(BaseHTTPRequestHandler):
         rest = parts[3:]
         if rest[:2] == ["git", "ref"] and rest[2:3] == ["heads"]:
             branch = "/".join(rest[3:])
-            sha = repo.branches.get(branch)
+            sha = state.head_of(repo, branch)
             if sha is None:
                 self._send(404, {"message": "Not Found"})
                 return
@@ -522,7 +532,7 @@ class _Handler(BaseHTTPRequestHandler):
             number=number,
             head_branch=head,
             base_ref=str(body.get("base", repo.default_branch)),
-            head_sha=repo.branches.get(head, "0" * 40),
+            head_sha=self.state.head_of(repo, head) or "0" * 40,
             title=str(body.get("title", "")),
             body=str(body.get("body", "")),
             draft=bool(body.get("draft", False)),

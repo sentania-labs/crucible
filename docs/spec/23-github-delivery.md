@@ -11,7 +11,8 @@ delivery half of the task lifecycle (09).
   0017) and mints
   short-lived installation tokens scoped to one repository, on demand, for
   one publisher job at a time. Tokens live in memory and in the tmpfs of
-  the publisher container, never elsewhere. A private repository's
+  the publisher container (on Kubernetes, the publisher Pod's per-push
+  Secret volume, ADR 0022), never elsewhere. A private repository's
   preparation step also gets one, read-only (`contents: read`), for the
   length of that step only (ADR 0019, 12).
 - App permissions: Metadata read, Contents read/write, Pull requests
@@ -75,10 +76,34 @@ review is recorded, and Foundry's `AcceptanceResult` for that head is
    in Crucible's own argv. Inside the container it is a file on tmpfs read
    by a git credential helper that answers only for the configured protocol
    and host.
+
+   **On Kubernetes the publisher is a Job, `publish-<attempt>` (26, ADR
+   0022).** A Pod has no stdin to write to and no host directory to stage
+   in, so the carriers differ and nothing else does: the same script, the
+   same checks, the same outcome. The token is a Secret,
+   `publish-token-<attempt>`, created for this push, mounted read-only
+   (mode 0400) at the same path as a Secret volume, which the kubelet keeps
+   in memory, and deleted as soon as the Job's Pod is gone, on every path.
+   The bundle is mounted as one file, read-only, straight off the attempt's
+   workspace claim where the collector left it
+   (`output/work_branch.bundle`); a bundle path that is not that leaf of
+   that attempt's claim is refused before anything is created. The Pod
+   writes its outcome to the claim's `publish/` leaf, which Crucible reads
+   back through the reader Pod over exec, never through a log. Its egress
+   is its own NetworkPolicy (`github.com`, `api.github.com`, and
+   `github.credential_host` when that is another host), resolved and pinned
+   into the Pod's `hostAliases` (hades #191). A workers namespace whose
+   egress enforcement is not proven gets no publisher Pod and no Secret.
 4. Inside, the repository is **built from the bundle**, not cloned from a
    cache: `git init`, fetch `base_ref` from the remote the publisher is
    about to push to, `git bundle verify`, then fetch `work_branch` out of
-   the bundle. The bundle is `base_ref..work_branch`, so it names
+   the bundle. Before any of that, the bundle is hashed inside the
+   container and compared with the seal the collector recorded; a bundle
+   that is missing or no longer matches is refused (exit 7) before any
+   remote is contacted, and the credential helper is asked for the token
+   (`git credential fill`), refusing (exit 3) unless a password comes back,
+   so an unreadable token fails here and not as an authentication error at
+   the remote. The bundle is `base_ref..work_branch`, so it names
    prerequisite commits and neither verify nor fetch will look at it until
    the repository holds them; the base fetch is what supplies them. Nothing
    else enters this container: not the worker's tree, not the worker's
@@ -135,6 +160,20 @@ review is recorded, and Foundry's `AcceptanceResult` for that head is
 7. Publisher container removed; token discarded. Any failure between 2
    and 6 is `publish_failed`, with the step and the API response class
    (never the token) recorded.
+
+**A publication that cannot start is never silent.** A task in `publishing`
+waits when the deployment has no GitHub App client, no publisher (no Docker
+or Kubernetes provider wired to push), or an App credential that is not in
+place yet. On each tick the supervisor records the reason on the task as a
+`task_publish_pending` event, once per entry into `publishing` and again only
+when the reason changes, and logs it at warning the same once. `GET
+/supervisor` lists every such task under `github.publishing_waiting`, and the
+admin UI's task list shows it under "Needs attention" as "Waiting to
+publish". Once the task has waited `github.publisher_timeout_seconds` (the
+publisher's own time limit, default 600) an escalation opens on the 09 path,
+once, with a `publish_failed` wake. The wait resolves itself: the first tick
+on which a publisher and a ready App exist publishes the task with no manual
+step, and closes the escalation the wait opened.
 
 ## Observation
 
