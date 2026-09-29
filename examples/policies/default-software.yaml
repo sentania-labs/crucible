@@ -1,5 +1,7 @@
 # The operator's default policy, exactly as migration 0011 seeds version 3.
 # Older immutable versions remain for tasks that reference them.
+# gates.advisory writes out the default set (ADR 0024, 2026-09-29); a seeded version has
+# no such list and takes the same default when it is read.
 # Upload with: PUT /v1/policies/default-software/3 (admin).
 schema_version: '1.0'
 name: default-software
@@ -91,6 +93,13 @@ gates:
   - feedback_dispositions_complete
   - ci_green_for_head
   skipped: []
+  # ADR 0024: a failure of these goes to the internal reviewer instead of stopping the
+  # task. A path matching a contract's prohibited_paths still stops it.
+  advisory:
+  - criteria_mapped
+  - report_present
+  - run_evidence_present
+  - scope_contained
 deliverables:
   allow_branch_only: false
   on_out_of_band_head: block

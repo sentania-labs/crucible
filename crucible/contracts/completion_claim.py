@@ -16,6 +16,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+import yaml
 from pydantic import Field, ValidationError, field_validator
 
 from crucible.contracts.common import StrictModel, check_major_version
@@ -141,6 +142,26 @@ def parse_claim(document: object) -> tuple[CompletionClaimV1 | None, list[dict[s
             for err in exc.errors(include_url=False, include_input=False)
         ]
         return None, errors
+
+
+def load_report(raw: str) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    """`report.yaml` as a mapping, or why it is not one (ADR 0024).
+
+    The reason names the parser's problem and its line and column, never the text of the
+    file: a report that does not parse is shown to the reviewer, and its content is
+    whatever the worker wrote."""
+    try:
+        loaded = yaml.safe_load(raw)
+    except yaml.MarkedYAMLError as exc:
+        where = exc.problem_mark or exc.context_mark
+        at = f" at line {where.line + 1}, column {where.column + 1}" if where else ""
+        problem = exc.problem or exc.context or "a syntax error"
+        return None, [{"loc": [], "msg": f"report.yaml is not YAML: {problem}{at}", "type": "yaml"}]
+    except yaml.YAMLError:
+        return None, [{"loc": [], "msg": "report.yaml is not YAML", "type": "yaml"}]
+    if isinstance(loaded, dict):
+        return loaded, []
+    return None, [{"loc": [], "msg": "report is not a mapping", "type": "shape"}]
 
 
 @dataclass(frozen=True, slots=True)

@@ -14,9 +14,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-import yaml
-
-from crucible.contracts.completion_claim import parse_claim
+from crucible.contracts.completion_claim import load_report, parse_claim
 from crucible.domain.exit_class import ExitClass, classify_exit
 from crucible.ports.execution import IDENTITY_MOUNT, REPORT_MOUNT
 from crucible.ports.harness import ExitInfo, ParsedReport, ProviderQuotaEvent, ReportMetrics
@@ -269,16 +267,9 @@ def parse_report_dir(
     claim: dict[str, Any] | None = None
     errors: list[dict[str, Any]] = []
     if raw is not None:
-        try:
-            loaded = yaml.safe_load(raw)
-        except yaml.YAMLError as exc:
-            loaded = None
-            errors.append({"loc": [], "msg": f"report.yaml is not YAML: {exc}", "type": "yaml"})
-        if isinstance(loaded, dict):
-            claim = loaded
-            _, errors = parse_claim(loaded)
-        elif not errors:
-            errors.append({"loc": [], "msg": "report is not a mapping", "type": "shape"})
+        claim, errors = load_report(raw)
+        if claim is not None:
+            _, errors = parse_claim(claim)
     blocked = report_dir / "blocked.md"
     blocked_md = read_text(blocked) if blocked.is_file() else None
     progress = tuple(json_lines(report_dir / PROGRESS_NAME, 4 * 1024 * 1024))[:1000]

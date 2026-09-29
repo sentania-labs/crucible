@@ -2,9 +2,10 @@
 
 The evaluators are pure functions in `crucible.domain.gates`. This module supplies them
 with the contract, the policy, and the evidence rows, persists one GateResult per gate,
-and then moves the task: any fail or error goes to `pre_pr_gates_failed`, a pending
-internal review goes to `awaiting_internal_review`, everything else to `gates_passed`
-and straight on to `awaiting_acceptance`."""
+and then moves the task: a fail or error on a blocking gate goes to
+`pre_pr_gates_failed`, a pending internal review goes to `awaiting_internal_review`,
+everything else to `gates_passed` and straight on to `awaiting_acceptance`. A failed
+advisory gate stops nothing: it is recorded and named for the reviewer (ADR 0024)."""
 
 from __future__ import annotations
 
@@ -30,9 +31,12 @@ from crucible.domain.gates import (
     GateInput,
     GateOutcome,
     GateResult,
+    PrePrVerdict,
+    advisory_gates,
     blocking,
     evaluate_pre_pr,
-    waiting_for_review,
+    for_reviewer,
+    pre_pr_verdict,
 )
 from crucible.domain.ids import new_id
 from crucible.domain.lifecycle import TaskState
@@ -112,6 +116,7 @@ def persist_outcomes(
     task: Task,
     attempt: Attempt,
     outcomes: dict[str, GateOutcome],
+    advisory: frozenset[str],
 ) -> None:
     now = clock.now()
     for gate, outcome in outcomes.items():
@@ -127,34 +132,59 @@ def persist_outcomes(
                 detail=outcome.detail,
                 evidence_ids=list(outcome.evidence_ids),
                 evaluated_at=now,
+                blocking=gate not in advisory or outcome.always_blocks,
+                findings=list(outcome.findings),
             )
         )
 
 
-def summarize(outcomes: dict[str, GateOutcome]) -> dict[str, Any]:
+def summarize(outcomes: dict[str, GateOutcome], advisory: frozenset[str]) -> dict[str, Any]:
     counts: dict[str, int] = {}
     for outcome in outcomes.values():
         counts[outcome.result.value] = counts.get(outcome.result.value, 0) + 1
     return {
         "counts": counts,
         "results": {gate: outcome.result.value for gate, outcome in outcomes.items()},
-        "failing": blocking(outcomes),
+        "failing": blocking(outcomes, advisory),
+        "advisory": sorted(g for g in outcomes if g in advisory),
+        "for_reviewer": for_reviewer(outcomes, advisory),
         "deferred": sorted(g for g in outcomes if g in DEFERRED_TO_C3),
     }
 
 
+def reviewer_note(items: list[dict[str, str]]) -> str:
+    """The wake summary names the gates for the reviewer; their details, which can carry
+    paths the worker chose, travel only in the wake's `for_reviewer` (ADR 0024)."""
+    if not items:
+        return ""
+    return " For the reviewer: " + ", ".join(sorted({i["gate"] for i in items})) + "."
+
+
 def _unchanged(
-    uow: UnitOfWork, *, task: Task, attempt: Attempt, outcomes: dict[str, GateOutcome]
+    uow: UnitOfWork,
+    *,
+    task: Task,
+    attempt: Attempt,
+    outcomes: dict[str, GateOutcome],
+    advisory: frozenset[str],
 ) -> bool:
     """True when the stored rows already say exactly this for this head."""
     stored = {
-        row.gate: (row.result, row.detail)
+        row.gate: (row.result, row.detail, row.blocking, list(row.findings))
         for row in uow.gate_results.list_for_attempt(attempt.id)
         if row.head_sha == (task.head_sha or "")
     }
     if not stored:
         return False
-    return stored == {gate: (o.result.value, o.detail) for gate, o in outcomes.items()}
+    return stored == {
+        gate: (
+            o.result.value,
+            o.detail,
+            gate not in advisory or o.always_blocks,
+            list(o.findings),
+        )
+        for gate, o in outcomes.items()
+    }
 
 
 def evaluate_and_advance(
@@ -171,13 +201,14 @@ def evaluate_and_advance(
     moves when the transition table permits it."""
     gi = gate_input(uow, task=task, attempt=attempt, execution=execution)
     gates = configured_pre_pr_gates(gi.policy)
+    advisory = advisory_gates(gi.policy)
     outcomes = evaluate_pre_pr(gates, gi)
-    summary = summarize(outcomes)
-    if _unchanged(uow, task=task, attempt=attempt, outcomes=outcomes):
+    summary = summarize(outcomes, advisory)
+    if _unchanged(uow, task=task, attempt=attempt, outcomes=outcomes, advisory=advisory):
         # A task waiting for its internal review is re-evaluated on every tick; writing
         # the same answer again would make reconciliation not idempotent (10).
         return outcomes
-    persist_outcomes(uow, clock, task=task, attempt=attempt, outcomes=outcomes)
+    persist_outcomes(uow, clock, task=task, attempt=attempt, outcomes=outcomes, advisory=advisory)
     record_event(
         uow,
         clock,
@@ -189,12 +220,13 @@ def evaluate_and_advance(
         payload={"head_sha": task.head_sha, "phase": PHASE_PRE_PR, **summary},
     )
     failing = summary["failing"]
+    verdict = pre_pr_verdict(outcomes, advisory)
     if (
         task.state is not TaskState.REPORTED
         and task.state is not TaskState.AWAITING_INTERNAL_REVIEW
     ):
         return outcomes
-    if failing:
+    if verdict is PrePrVerdict.FAILED:
         move_task(
             uow,
             clock,
@@ -210,13 +242,15 @@ def evaluate_and_advance(
             clock,
             principal_id=task.principal_id,
             reason=WakeReason.PRE_PR_GATES_FAILED,
-            summary=f"pre-PR gates failed on {task.head_sha}: {', '.join(failing)}",
+            summary=f"pre-PR gates failed on {task.head_sha}: {', '.join(failing)}."
+            + reviewer_note(summary["for_reviewer"]),
             task=task,
             attempt_id=attempt.id,
             extra_links={"gates": f"/v1/attempts/{attempt.id}/gates"},
+            for_reviewer=summary["for_reviewer"],
         )
         return outcomes
-    if waiting_for_review(outcomes):
+    if verdict is PrePrVerdict.REVIEW:
         if task.state is TaskState.REPORTED:
             move_task(
                 uow,
@@ -237,12 +271,17 @@ def evaluate_and_advance(
                 principal_id=task.principal_id,
                 reason=WakeReason.INTERNAL_REVIEW_NEEDED,
                 summary=(
-                    f"the mechanical gates pass on {task.head_sha}; "
-                    "a non-author internal review is required before acceptance"
+                    f"the blocking gates pass on {task.head_sha}; "
+                    "a non-author internal review is required before acceptance."
+                    + reviewer_note(summary["for_reviewer"])
                 ),
                 task=task,
                 attempt_id=attempt.id,
-                extra_links={"review": f"/v1/tasks/{task.id}/review"},
+                extra_links={
+                    "review": f"/v1/tasks/{task.id}/review",
+                    "gates": f"/v1/attempts/{attempt.id}/gates",
+                },
+                for_reviewer=summary["for_reviewer"],
             )
         return outcomes
     move_task(
@@ -271,12 +310,14 @@ def evaluate_and_advance(
         principal_id=task.principal_id,
         reason=WakeReason.GATES_PASSED,
         summary=(
-            f"every required pre-PR gate passed on {task.head_sha}; "
-            "Foundry's AcceptanceResult is what moves this forward"
+            f"every blocking pre-PR gate passed on {task.head_sha}; "
+            "Foundry's AcceptanceResult is what moves this forward."
+            + reviewer_note(summary["for_reviewer"])
         ),
         task=task,
         attempt_id=attempt.id,
         extra_links={"accept": f"/v1/tasks/{task.id}/accept"},
+        for_reviewer=summary["for_reviewer"],
     )
     return outcomes
 
@@ -292,6 +333,7 @@ def _review_note(uow: UnitOfWork, task: Task) -> str:
 
 
 def counts_for_metrics(outcomes: dict[str, GateOutcome]) -> tuple[int, int]:
+    # Counts every failure, advisory ones included: the metric is how often gates fail.
     passed = sum(1 for o in outcomes.values() if o.result is GateResult.PASS)
     failed = sum(1 for o in outcomes.values() if o.result in (GateResult.FAIL, GateResult.ERROR))
     return passed, failed

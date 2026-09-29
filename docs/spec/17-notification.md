@@ -50,10 +50,17 @@ Foundry.
   "attempt_id": "01J...",
   "pull_request": { "number": 18, "url": "...", "head_sha": "abc123..." },
   "summary": "1 review from chatgpt-codex-connector[bot] on abc123: 3 comments, 0 dispositions recorded",
+  "for_reviewer": [],
   "links": { "task": "/v1/tasks/01J...", "pull_request": "/v1/tasks/01J.../pull-request" },
   "created_at": "2026-09-16T06:10:00-05:00"
 }
 ```
+
+`for_reviewer` (ADR 0024) lists the failed advisory pre-PR gates and the
+advisory findings, each as `{gate, detail}`, on the `internal_review_needed`,
+`gates_passed` and `pre_pr_gates_failed` wakes; the summary names the gates
+after "For the reviewer:", and the details, which can carry paths the worker
+chose, stay in the list. It is empty on every other wake.
 
 ## Delivery
 
