@@ -61,6 +61,14 @@ This note records what changed and the decisions taken under that direction.
   It revises 0027 on this branch; whatever lands first among the parallel
   0028 to 0030 changes, the chain and the event-kind list are re-pointed at
   merge.
+- **The publisher's Jobs wait for quota room** instead of failing fast. Everywhere
+  else a quota-refused Job ends at once (a collection is tried again, a launch
+  is an environment failure the retry rule covers), but a publication that gives
+  up needs an operator's republish, and a full namespace is not a failed push
+  (hades #226 is that situation). Its timeout names the quota.
+- **Quota events are matched to the Job's uid.** Role Job names repeat for an
+  attempt and an event outlives its Job by an hour, so without the uid a
+  collection retried after the namespace had room would still be refused.
 - **The Docker provider's credential read-back is unchanged**: the finding and
   the contract named the Kubernetes path, and on Docker the copy is on the
   host where a retry could find it.

@@ -159,7 +159,9 @@ reader Pods, up to about 90 minutes in the worst case, and it used to hold
 the tick for all of it. The attempt is that task's alone until it ends: the
 observe step, the cancel sweep and the stranded rule leave it be. A lost
 lease or a stop cancels it, and the attempt, still `running` with its logs
-drained, is collected again by the next holder from the untouched workspace.
+drained, is collected again by the next holder from its workspace, which
+still holds the work (a collection that ran partway may have written its own
+output there, and the next one writes it again).
 A collection the provider could not finish because its backend could not
 answer (`ProviderUnavailableError`: a refused, reset or timed-out
 connection, an API server that answered 429 or 5xx, a namespace quota that

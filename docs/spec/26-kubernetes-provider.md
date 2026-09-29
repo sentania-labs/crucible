@@ -484,7 +484,8 @@ the namespace. A deployment therefore names one exact, pullable reference in
   connection or answered 429 or 5xx, a quota-refused role Pod, a reader Pod
   that did not start, an exec stream that ended before its status) raises
   `ProviderUnavailableError`, and the supervisor collects again later from the
-  untouched claim rather than failing the attempt (10). A failed status look
+  claim, which still holds the work, rather than failing the attempt (10); a
+  credential copy already synced is not synced twice. A failed status look
   while a Pod starts is asked again until the deadline, never taken as the
   answer.
 - `terminate`: `drain` deletes the Pod with the policy grace period, read
