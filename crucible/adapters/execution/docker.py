@@ -1065,6 +1065,12 @@ class DockerProvider:
                 work_branch=work_branch,
                 size_cap_bytes=self.config.report_size_cap_bytes,
                 quota_attempt_id=spec.attempt_id if quota_checkpoint else None,
+                author_email=str(
+                    spec.policy.get("git", {}).get(
+                        "author_email", "crucible-worker@users.noreply.github.com"
+                    )
+                ),
+                commit_trailer=identity_bundle.commit_trailer(spec.policy),
             ),
             mounts=mounts,
             network="none",

@@ -194,6 +194,18 @@ class BranchBundle:
     sha256: str = ""
     commit_paths: tuple[str, ...] = ()
     commit_messages: tuple[str, ...] = ()
+    # hades FDY-0135: the publisher's commit policy, run by the collector. None when the
+    # collector did not finish the check; otherwise the commits whose author email is
+    # not the policy's, as (sha, email), and the commits with no attempt trailer.
+    commit_policy: CommitPolicyCheck | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CommitPolicyCheck:
+    """What `commit_policy_check` found over the range the publisher will push."""
+
+    author_problems: tuple[tuple[str, str], ...] = ()
+    trailer_problems: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

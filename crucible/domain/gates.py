@@ -34,6 +34,8 @@ class GateName(StrEnum):
     CI_UNCHANGED = "ci_unchanged"
     WORKSPACE_CLEAN = "workspace_clean"
     INTERNAL_REVIEW_RECORDED = "internal_review_recorded"
+    # pre-PR, evaluated whatever the policy lists (hades FDY-0135)
+    COMMIT_POLICY = "commit_policy"
     # publication (23)
     BRANCH_PUSHED_AT_HEAD = "branch_pushed_at_head"
     PR_EXISTS_HEAD_MATCHES = "pr_exists_head_matches"
@@ -68,6 +70,10 @@ PRE_PR_GATES: frozenset[str] = frozenset(
         GateName.INTERNAL_REVIEW_RECORDED,
     }
 )
+# hades FDY-0135: a pre-PR gate no policy lists, moves, or skips, because the publisher
+# enforces the same rule whatever the policy says. Evaluated alongside the policy's
+# `gates.pre_pr`, so a policy stored before the gate existed still gets it.
+ENFORCED_PRE_PR_GATES: frozenset[str] = frozenset({GateName.COMMIT_POLICY})
 PUBLICATION_GATES: frozenset[str] = frozenset(
     {GateName.BRANCH_PUSHED_AT_HEAD, GateName.PR_EXISTS_HEAD_MATCHES}
 )
@@ -91,6 +97,7 @@ COLLECTOR_MARKER = "incomplete:collector"
 
 WORKER_SOURCE = "worker"
 _HEX = re.compile(r"[0-9a-f]{7,64}")
+_EMAIL = re.compile(r"[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,190}")
 
 # Shims and identity paths a worker must never leave behind (11).
 INJECTED_PREFIXES: tuple[str, ...] = (".crucible/", "crucible/identity/", ".crucible-shims/")
@@ -575,6 +582,69 @@ def internal_review_recorded(gi: GateInput) -> GateOutcome:
     )
 
 
+def _named_commit(sha: object) -> str:
+    """A commit id from the collected branch, echoed only when it is a hash."""
+    text = str(sha)
+    return text[:12] if _HEX.fullmatch(text) else "a commit"
+
+
+def commit_policy(gi: GateInput) -> GateOutcome:
+    """The publisher's author and trailer checks, run by the collector on the collected
+    branch, so a commit the publisher would refuse fails here, before review and
+    acceptance, not after (hades FDY-0135). The rule itself is the one shell function
+    both run; this gate only reads its answer."""
+    bundle = gi.one("bundle_head")
+    if bundle is None:
+        return _missing("bundle_head")
+    ids = (bundle.id,)
+    check = bundle.payload.get("commit_policy")
+    if not isinstance(check, dict):
+        return GateOutcome(
+            GateResult.SKIPPED,
+            "this attempt was collected before Crucible checked commits at collection; "
+            "the publisher still checks them before it pushes",
+            ids,
+        )
+    if not check.get("checked"):
+        return GateOutcome(
+            GateResult.FAIL,
+            "Crucible could not check the collected commits' author and trailer, so it "
+            "cannot say the publisher would accept them",
+            ids,
+        )
+    git = gi.policy.get("git", {})
+    author = str(git.get("author_email") or "crucible-worker@users.noreply.github.com")
+    trailer = str(git.get("commit_trailer") or "Crucible-Attempt")
+    problems: list[str] = []
+    authors = [a for a in check.get("author_problems") or [] if isinstance(a, dict)]
+    if authors:
+        named = ", ".join(
+            f"{_named_commit(a.get('sha'))} by "
+            + (
+                str(a.get("author"))
+                if _EMAIL.fullmatch(str(a.get("author")))
+                else "another address"
+            )
+            for a in authors[:5]
+        )
+        problems.append(f"{len(authors)} commit(s) not authored as {author} ({named})")
+    trailers = [str(t) for t in check.get("trailer_problems") or []]
+    if trailers:
+        named = ", ".join(_named_commit(t) for t in trailers[:5])
+        problems.append(f"{len(trailers)} commit(s) without a {trailer} trailer ({named})")
+    if problems:
+        return GateOutcome(
+            GateResult.FAIL,
+            "the publisher would refuse to push this branch: " + "; ".join(problems),
+            ids,
+        )
+    return GateOutcome(
+        GateResult.PASS,
+        f"every commit is authored as {author} and carries a {trailer} trailer",
+        ids,
+    )
+
+
 PRE_PR_EVALUATORS: dict[str, Callable[[GateInput], GateOutcome]] = {
     GateName.REPORT_PRESENT: report_present,
     GateName.EXIT_CLEAN: exit_clean,
@@ -589,6 +659,7 @@ PRE_PR_EVALUATORS: dict[str, Callable[[GateInput], GateOutcome]] = {
     GateName.CI_UNCHANGED: ci_unchanged,
     GateName.WORKSPACE_CLEAN: workspace_clean,
     GateName.INTERNAL_REVIEW_RECORDED: internal_review_recorded,
+    GateName.COMMIT_POLICY: commit_policy,
 }
 
 

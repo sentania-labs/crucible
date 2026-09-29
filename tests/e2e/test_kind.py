@@ -2443,7 +2443,12 @@ async def test_fdy_0133_a_task_in_publishing_is_pushed_by_the_kubernetes_publish
     a real Job under Calico with its own NetworkPolicy, the token from a per-push Secret,
     the bundle off the attempt's claim, to a real git remote, and a stand-in GitHub API
     that reads the branch head from that remote. The branch lands at the accepted head,
-    the pull request opens, and the Job, its Pod, its policy and the Secret are gone."""
+    the pull request opens, and the Job, its Pod, its policy and the Secret are gone.
+
+    FDY-0135: the policy names a trailer key the script harness never writes, so the
+    push succeeds only because Crucible's commit-msg hook, projected from the identity
+    ConfigMap into the real worker Pod, added `Crucible-Task: E2E-FDY-0133`, and the
+    commit_policy gate passed it before review."""
     name = "fdy-0133"
     url, bare = _stand_in_repository(name)
     subprocess.run(
@@ -2472,6 +2477,12 @@ async def test_fdy_0133_a_task_in_publishing_is_pushed_by_the_kubernetes_publish
             denied_cidrs=_denied_except(host),
         )
         ctx, tokens, app, harnesses = _kind_app(engine, migrated, artifact_root, provider, registry)
+        with TestClient(app, headers={"Authorization": f"Bearer {tokens['admin']}"}) as admin:
+            policy = admin.get("/v1/policies/e2e-script/21").json()["document"]
+            policy["version"] = 22
+            policy["git"]["commit_trailer"] = "Crucible-Task"
+            response = admin.put("/v1/policies/e2e-script/22", json=policy)
+            assert response.status_code in (200, 201), response.text
         with ctx.uow_factory() as uow:
             register_repository(
                 uow,
@@ -2509,7 +2520,7 @@ async def test_fdy_0133_a_task_in_publishing_is_pushed_by_the_kubernetes_publish
         ) as client:
             document = e2e_contract("E2E-FDY-0133", name, os.environ["CRUCIBLE_E2E_KIND_REGISTRY"])
             document["execution_request"]["provider"] = "kubernetes"
-            document["policy"]["version"] = 21
+            document["policy"]["version"] = 22
             document["deliverables"] = [
                 {"kind": "pull_request", "target": "main", "draft": False, "closes": []}
             ]
@@ -2523,6 +2534,8 @@ async def test_fdy_0133_a_task_in_publishing_is_pushed_by_the_kubernetes_publish
                 pause=0.5,
             )
             assert state == "awaiting_internal_review", gate_results(client, task_id)
+            gates = gate_results(client, task_id)
+            assert gates["commit_policy"] == "pass", gates
             upload_review(client, task_id)
             assert (
                 await run_until(supervisor, client, task_id, {"awaiting_acceptance"})
@@ -2566,12 +2579,29 @@ async def test_fdy_0133_a_task_in_publishing_is_pushed_by_the_kubernetes_publish
                 assert kind in kinds, kind
             # The branch is on the remote at the accepted head, and the PR carries it.
             assert _branch_head(bare, branch) == head
+            trailers = subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "safe.directory=*",
+                    "--git-dir",
+                    str(bare),
+                    "log",
+                    "--format=%(trailers:key=Crucible-Task,valueonly)",
+                    f"main..{head}",
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.split()
+            assert trailers == ["E2E-FDY-0133"], trailers
             [pull] = github.state.repositories[full_name].pulls.values()
             assert (pull.head_branch, pull.head_sha, pull.base_ref) == (branch, head, "main")
             attempt_id = str(client.get(f"/v1/tasks/{task_id}").json()["latest_attempt"]["id"])
             print(
                 f"fdy-0133: {branch} pushed to {url} at {head} in "
-                f"{time.monotonic() - started:.1f}s; PR #{pull.number}; task {state}"
+                f"{time.monotonic() - started:.1f}s; PR #{pull.number}; task {state}; "
+                f"Crucible-Task trailers on the pushed commits: {trailers}"
             )
 
         # What the provider sent: one Secret carrying a token the App minted, one Job

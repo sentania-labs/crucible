@@ -44,6 +44,7 @@ from crucible.ports.execution import (
     CleanupPolicy,
     CollectedArtifact,
     CollectedOutputs,
+    CommitPolicyCheck,
     Handle,
     ImageInfo,
     IsolationLevel,
@@ -103,6 +104,7 @@ Behavior = Literal[
     "quota",
     "verification-fails",
     "dirty-workspace",
+    "no-trailer",
 ]
 BEHAVIORS: frozenset[str] = frozenset(
     {
@@ -127,6 +129,7 @@ BEHAVIORS: frozenset[str] = frozenset(
         "quota",
         "verification-fails",
         "dirty-workspace",
+        "no-trailer",
     }
 )
 
@@ -140,6 +143,7 @@ REPORTING_BEHAVIORS: frozenset[str] = frozenset(
         "no-commits",
         "verification-fails",
         "dirty-workspace",
+        "no-trailer",
     }
 )
 REVIEW_BEHAVIORS: frozenset[str] = frozenset({"review", "review-disapprove"})
@@ -151,6 +155,15 @@ INJECTED_PATH = ".crucible/identity.md"
 def synthetic_head_sha(attempt_id: str) -> str:
     """A deterministic 40-hex stand-in for the head the collector would read (08)."""
     return hashlib.sha256(f"crucible-fake-head:{attempt_id}".encode()).hexdigest()[:40]
+
+
+def fake_commit_policy(behavior: str, head: str) -> CommitPolicyCheck:
+    """The collector's commit check as the fake reports it: `no-trailer` is a worker
+    whose one commit lacks the attempt trailer (hades FDY-0135); every other behavior
+    commits as the policy asks."""
+    if behavior == "no-trailer":
+        return CommitPolicyCheck(trailer_problems=(head,))
+    return CommitPolicyCheck()
 
 
 def _concrete(pattern: str) -> str:
@@ -541,6 +554,7 @@ class FakeProvider:
                 sha256=hashlib.sha256(f"fake-bundle:{head}".encode()).hexdigest(),
                 commit_paths=quota_paths,
                 commit_messages=(f"wip(crucible): attempt {spec.attempt_id}",),
+                commit_policy=fake_commit_policy(behavior, head),
             )
             return CollectedOutputs(
                 report=None,
@@ -577,6 +591,7 @@ class FakeProvider:
                 sha256=hashlib.sha256(f"fake-bundle:{head}".encode()).hexdigest(),
                 commit_paths=paths,
                 commit_messages=(f"Fake commit for {spec.external_id}",) if commits else (),
+                commit_policy=fake_commit_policy(behavior, head),
             )
             artifacts = [
                 CollectedArtifact(
