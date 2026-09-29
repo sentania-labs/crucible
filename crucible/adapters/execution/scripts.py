@@ -520,8 +520,8 @@ def encode_check_id(check_id: str) -> str:
 def verifier_script(checks: list[tuple[str, str]]) -> str:
     """Re-run each `required_verification` command from the collected tree (11).
 
-    Each command's exit, log and wall-clock seconds go to the verify directory, which is the only place
-    this container may write besides its own tree copy. The commands come from the
+    Each command's exit, log and wall-clock seconds go to the verify directory, which is
+    the only place this container may write besides its own tree copy. The commands come from the
     repository, so this container is the one that runs worker-influenced code: it
     never sees the collector's output directory, only its own tree.
 
