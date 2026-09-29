@@ -52,8 +52,6 @@ PUBLISH_LEAF = scripts.PUBLISH_LEAF
 # The one leaf of a workspace claim a bundle may be published from: where the collector
 # writes it (`scripts.collector_script`) and where `build_plan` points.
 BUNDLE_LEAF = scripts.PUBLISH_BUNDLE_LEAF
-# How long the Job that makes the claim ready for the publisher may take.
-LEAF_TIMEOUT_SECONDS = 120
 # How much of one outcome file is read back. The outcome keeps a few kilobytes of each
 # (`OUTCOME_FILES`); this only bounds the read of a file git wrote into.
 OUTCOME_READ_LIMIT = 256 * 1024
@@ -206,6 +204,8 @@ class KubernetesPublisher:
                 plan=self._plan(),
                 env={"HOME": "/home/worker", "CRUCIBLE_ATTEMPT_ID": request.attempt_id},
                 tolerate_lingering_pod=True,
+                # A full namespace is a wait for a slot, not a failed publication.
+                wait_for_quota=True,
             )
         except (KubernetesApiError, SpecError, ProviderError) as exc:
             return _refused("container", f"the publisher Job could not run: {exc}")
@@ -288,8 +288,10 @@ class KubernetesPublisher:
                 mounts=[Mount("ws", WORK_MOUNT)],
                 volumes=[provider._claim_volume(request.attempt_id)],
                 limits=limits,
-                timeout=LEAF_TIMEOUT_SECONDS,
+                # How long the Job that readies the claim may run, from its Pod Running.
+                timeout=provider.config.role_timeout_seconds,
                 plan=EgressPlan(),
+                wait_for_quota=True,
             )
         except (KubernetesApiError, SpecError, ProviderError) as exc:
             return _refused(

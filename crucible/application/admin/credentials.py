@@ -1266,7 +1266,12 @@ def rotate(
     than now. Disposing of the source is the operator's to do, and the response and the
     event both say it was left."""
     reason = guard_mutation(
-        ctx, uow, reason, principal=principal, operation=f"credentials rotate {harness}"
+        ctx,
+        uow,
+        reason,
+        principal=principal,
+        operation=f"credentials rotate {harness}",
+        needs_supervisor=True,
     )
     _refuse_for_secret(ctx, harness, "rotate")
     spec = spec_for(ctx, harness)
@@ -1418,6 +1423,7 @@ def remove(
         principal=principal,
         operation=f"credentials remove {harness}",
         reason_required=True,
+        needs_supervisor=True,
     )
     _refuse_for_secret(ctx, harness, "remove")
     spec_for(ctx, harness)

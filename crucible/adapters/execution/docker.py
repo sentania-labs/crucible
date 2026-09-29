@@ -1411,6 +1411,13 @@ class DockerProvider:
             # arrangement (S9 Test E), so what the daemon made, the daemon removes.
             await self._remove_through_daemon(ws, spec, left)
 
+    async def release_workspace(self, ws: Workspace, spec: LaunchSpec | None = None) -> None:
+        """16: the workspace directory a cleanup policy kept, once the retention step
+        decided nothing needs it. The same removal `cleanup` does under `delete`."""
+        await self.cleanup(ws, CleanupPolicy.DELETE, spec)
+        if self._root(ws.attempt_id).exists():
+            raise ProviderError(f"the workspace of {ws.attempt_id} could not be removed")
+
     async def _remove_through_daemon(
         self, ws: Workspace, spec: LaunchSpec | None, leaves: Sequence[str]
     ) -> None:

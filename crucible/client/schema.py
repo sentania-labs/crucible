@@ -326,6 +326,12 @@ def kind_schemas() -> dict[str, dict[str, Any]]:
             {"setting": STR, "source": STR, "document": ANY_OBJ},
             {"settings_file": ANY_OBJ, "provider_enabled": BOOL},
         ),
+        "kubernetes_timeouts": _obj(
+            "the kubernetes.timeouts setting: the short roles' seconds from their Pod "
+            "Running, its bounds, and where the value came from",
+            {"setting": STR, "source": STR, "document": ANY_OBJ},
+            {"settings_file": ANY_OBJ, "bounds": ANY_OBJ, "provider_enabled": BOOL},
+        ),
         "command_timeout": _obj(
             "the per-command timeout bounds of the policy in force, in milliseconds "
             "(issue 128): a contract may narrow the default within them",

@@ -720,17 +720,46 @@ def test_every_remaining_ui_mutation_dispatches_to_the_shared_application_servic
     ]
 
 
-def test_a_mutation_is_refused_without_a_live_supervisor(
+def test_only_a_mutation_that_needs_the_supervisor_waits_for_it(
     admin_client: TestClient, config_file: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    """The operator's direction of 2026-09-29: a configuration write proceeds while the
+    supervisor misses a tick; removing or rotating a credential, or committing a
+    bootstrap import, still needs a live one, and the refusal is recorded."""
     response = admin_client.post("/v1/admin/harnesses/agy/disable", json={"reason": "test"})
-    assert response.status_code == 503, response.text
-    assert response.json()["type"].endswith("supervisor-not-live")
+    assert response.status_code == 200, response.text
+    token = admin_client.post(
+        "/v1/admin/tokens", json={"name": "while-down", "role": "orchestrator"}
+    )
+    assert token.status_code in (200, 201), token.text
+    cli = run_cli(config_file, "--reason", "test", "harnesses", "enable", "agy", capsys=capsys)
+    assert "agy" in json.dumps(cli)
+
+    removed = admin_client.post(
+        "/v1/admin/credentials/codex/remove", json={"reason": "test while down"}
+    )
+    assert removed.status_code == 503, removed.text
+    assert removed.json()["type"].endswith("supervisor-not-live")
     with pytest.raises(SystemExit):
         admin_main(
-            ["--config", str(config_file), "--reason", "test", "harnesses", "disable", "agy"]
+            [
+                "--config",
+                str(config_file),
+                "--reason",
+                "test while down",
+                "credentials",
+                "remove",
+                "--harness",
+                "codex",
+            ]
         )
     assert "supervisor-not-live" in capsys.readouterr().out
+    refusals = [
+        e["payload"]["operation"]
+        for e in admin_client.get("/v1/admin/audit", params={"limit": 200}).json()["items"]
+        if e["kind"] == "admin_refused"
+    ]
+    assert "credentials remove codex" in refusals
 
 
 def test_a_reason_is_an_optional_note_except_on_a_destructive_mutation(
@@ -1927,30 +1956,14 @@ def test_registering_a_repository_takes_both_guards_on_both_entry_points(
     config_file: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """B3: the admin route called the legacy service directly, so it registered with no
-    reason and with the supervisor down."""
+    """B3: the admin route called the legacy service directly, so it skipped the guard.
+    A registration is a configuration write, so since the operator's direction of
+    2026-09-29 it proceeds with the supervisor down; the guard still audits it."""
     body = {"url": "https://github.com/example-org/guarded", "attested_all_prs": True}
     down = admin_client.put("/v1/admin/repositories/guarded", json={**body, "reason": "x"})
-    assert down.status_code == 503, down.text
-    with pytest.raises(SystemExit):
-        admin_main(
-            [
-                "--config",
-                str(config_file),
-                "--reason",
-                "x",
-                "repositories",
-                "register",
-                "--name",
-                "guarded-cli",
-                "--url",
-                "https://github.com/example-org/guarded-cli",
-                "--attest-external-review-all-prs",
-            ]
-        )
-    assert "supervisor-not-live" in capsys.readouterr().out
+    assert down.status_code == 200, down.text
     asyncio.run(live_supervisor.tick())
-    # A reason is an optional note on a registration (crucible#117); the guard is the lease.
+    # A reason is an optional note on a registration (crucible#117).
     assert admin_client.put("/v1/admin/repositories/guarded", json=body).status_code == 200
     registered = run_cli(
         config_file,
@@ -1972,11 +1985,13 @@ def test_finishing_a_login_takes_both_guards(
     credential_root: Path,
 ) -> None:
     """B4: it writes session_compatibility and clears last_validated_at, so it is a
-    mutation and was the one without the guards."""
+    mutation and was the one without the guards. It needs no live supervisor (the
+    operator's direction of 2026-09-29): with none, what refuses a finish with nothing
+    to finish is still the login state."""
     no_lease = admin_client.post(
         "/v1/admin/credentials/codex/login/finish", json={"reason": "done"}
     )
-    assert no_lease.status_code == 503, no_lease.text
+    assert no_lease.status_code == 409, no_lease.text
     asyncio.run(live_supervisor.tick())
     # The reason is an optional note (crucible#117): with the lease held, what refuses a
     # finish with nothing to finish is the login state, not a missing reason.
@@ -2596,6 +2611,100 @@ def test_kubernetes_egress_through_api_cli_and_ui(
     assert ("kubernetes_egress_updated", "admin-principal") in kinds
     assert ("kubernetes_egress_updated", "crucible-admin") in kinds
     assert len([k for k in kinds if k[0] == "kubernetes_egress_updated"]) == 3
+
+
+def test_kubernetes_timeouts_through_api_cli_and_ui(
+    ctx: AppContext,
+    tokens: dict[str, str],
+    admin_client: TestClient,
+    admin_ctx: AdminContext,
+    config_file: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The short-role timeout (lab findings of 2026-09-29) is a runtime setting with API,
+    CLI and UI parity, one audit trail, and the provider told to read it back. It is a
+    configuration write, so it needs no live supervisor."""
+    probe = _EgressProbe()
+    admin_ctx.providers["kubernetes"] = probe
+    first = admin_client.get("/v1/admin/kubernetes/timeouts").json()
+    assert first["source"] == "settings"
+    assert first["document"] == {"role_timeout_seconds": 120}
+    assert first["bounds"] == {"min": 10, "max": 3600}
+
+    saved = admin_client.post(
+        "/v1/admin/kubernetes/timeouts",
+        json={"role_timeout_seconds": 300, "reason": "api: slow NFS"},
+    )
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["source"] == "database"
+    assert saved.json()["document"] == {"role_timeout_seconds": 300}
+    assert probe.reloads == 1
+    for bad in (5, 99999, "300", None):
+        refused = admin_client.post(
+            "/v1/admin/kubernetes/timeouts", json={"role_timeout_seconds": bad}
+        )
+        assert refused.status_code == 422, (bad, refused.text)
+    assert admin_client.get("/v1/admin/kubernetes/timeouts").json()["document"] == {
+        "role_timeout_seconds": 300
+    }
+
+    assert run_cli(config_file, "kubernetes", "timeouts", capsys=capsys)["document"] == {
+        "role_timeout_seconds": 300
+    }
+    cli_saved = run_cli(
+        config_file,
+        "kubernetes",
+        "set-timeouts",
+        "--role-seconds=240",
+        capsys=capsys,
+    )
+    assert cli_saved["document"] == {"role_timeout_seconds": 240}
+
+    with TestClient(create_app(ctx)) as browser:
+        csrf = ui_sign_in(browser, tokens["admin"])
+        page = browser.get("/ui/routing")
+        assert page.status_code == 200
+        assert 'action="/ui/actions/kubernetes-timeouts"' in page.text
+        assert 'value="240"' in page.text
+        ui_saved = browser.post(
+            "/ui/actions/kubernetes-timeouts",
+            data={
+                "csrf": csrf,
+                "role_timeout_seconds": "180",
+                "reason": "ui: back down",
+                "return_to": "/ui/routing",
+            },
+            follow_redirects=False,
+        )
+        assert ui_saved.status_code == 303
+        assert "Completed" in unquote(ui_saved.headers.get("location", ""))
+    final = admin_client.get("/v1/admin/kubernetes/timeouts").json()
+    assert final["document"] == {"role_timeout_seconds": 180}
+    assert final["reason"] == "ui: back down"
+    assert probe.reloads == 2
+    kinds = audit_kinds(admin_client)
+    assert len([k for k in kinds if k[0] == "kubernetes_timeouts_updated"]) == 3
+
+
+def test_the_cli_remote_mode_sends_the_timeouts_document(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, str, Any]] = []
+
+    def fake_call(self: Any, method: str, path: str, body: Any = None, **_: Any) -> Any:
+        calls.append((method, path, body))
+        return {"setting": "kubernetes.timeouts", "source": "database", "document": {}}
+
+    monkeypatch.setattr(Api, "call", fake_call)
+    monkeypatch.setenv(ADMIN_TOKEN_ENV, "cru_" + "0" * 26 + "." + "s" * 40)
+    admin_main(["--api-url", "http://127.0.0.1:1", "kubernetes", "timeouts"])
+    admin_main(
+        ["--api-url", "http://127.0.0.1:1", "kubernetes", "set-timeouts", "--role-seconds=90"]
+    )
+    assert calls == [
+        ("GET", "/v1/admin/kubernetes/timeouts", None),
+        ("POST", "/v1/admin/kubernetes/timeouts", {"reason": "", "role_timeout_seconds": 90}),
+    ]
 
 
 def test_the_cli_remote_mode_sends_the_egress_document(monkeypatch: pytest.MonkeyPatch) -> None:

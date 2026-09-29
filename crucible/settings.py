@@ -113,6 +113,10 @@ class KubernetesSettings(BaseModel):
     prepare_timeout_seconds: int = 900
     collector_timeout_seconds: int = 900
     verifier_timeout_seconds: int = 3600
+    # The short roles' time once their Pod is Running (the bundle verifier, the cleaner,
+    # the Job that readies a claim for the publisher). Seeds the `kubernetes.timeouts`
+    # admin setting; a value saved through the admin API, CLI or UI wins over it.
+    role_timeout_seconds: int = 120
     report_size_cap_bytes: int = 10 * 1024 * 1024
     poll_interval_seconds: float = 2.0
     max_concurrency: int = 3

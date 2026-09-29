@@ -590,6 +590,22 @@ def kubernetes_egress_actions(document: Any, prefix: Sequence[str]) -> list[dict
     ]
 
 
+def kubernetes_timeouts_actions(document: Any, prefix: Sequence[str]) -> list[dict[str, Any]]:
+    """One action: replace the short-role timeout, prefilled with the value in force."""
+    if not isinstance(document, dict) or not isinstance(document.get("document"), dict):
+        return []
+    current = document["document"].get("role_timeout_seconds", "")
+    return [
+        action(
+            "set-timeouts",
+            "replace the short roles' timeout, counted from their Pod Running",
+            [*prefix, "kubernetes", "set-timeouts", f"--role-seconds={current}"],
+            optional=OPTIONAL_REASON,
+            roles=(ADMIN,),
+        )
+    ]
+
+
 def local_endpoint_actions(document: Any, prefix: Sequence[str]) -> list[dict[str, Any]]:
     """One action per model in data.models, already set to flip its current state:
     `enable` for a disabled model, `disable` for an enabled one. The parser's

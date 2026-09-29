@@ -1588,6 +1588,8 @@ def routing_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
     exhaustion = routing.list_exhaustions(ctx.admin, uow)
     local = routing.local_endpoint_view(uow)
     egress = kubernetes_admin.egress_view(ctx.admin, uow)
+    role_timeouts = kubernetes_admin.timeouts_view(ctx.admin, uow)
+    role_seconds = int(role_timeouts["document"].get("role_timeout_seconds") or 0)
     gateway_endpoint, _source = routing.gateway_url(uow)
     command_timeout = limits_admin.command_timeout_view(uow)
     preference = routing_preference.preference_view(uow)
@@ -1690,6 +1692,17 @@ def routing_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
             },
             "",
         ],
+        [
+            "Kubernetes short-role timeout",
+            {
+                "kind": "note",
+                "value": f"{_duration_words(role_seconds * 1000)} from the Pod running"
+                if role_timeouts["provider_enabled"]
+                else "not in use: the Kubernetes provider is off",
+                "hint": "bundle verifier, cleaner, and the Job that readies a publish",
+            },
+            "",
+        ],
     ]
     marks = [item for item in exhaustion["items"] if item["active"]]
     sections: list[dict[str, Any]] = [
@@ -1701,6 +1714,7 @@ def routing_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                 _document_section("Local endpoint", local),
                 _document_section("Routing order and demotion", preference),
                 _document_section("Kubernetes egress selectors", egress),
+                _document_section("Kubernetes short-role timeout", role_timeouts),
                 _document_section("Per-command timeout", command_timeout),
                 _document_section("Gate classes", classes),
                 _document_section("Delivery policy document", policy.document if policy else {}),
@@ -1928,6 +1942,34 @@ def routing_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                             "label": "Local endpoint pod port (0: the URL's port)",
                             "kind": "number",
                             "value": endpoint.get("port", 0),
+                        },
+                        {"name": "reason", "label": "Reason", "required": True},
+                    ],
+                },
+            }
+        )
+        sections.append(
+            {
+                "title": "Edit Kubernetes short-role timeout",
+                "note": (
+                    "How long the short Kubernetes roles may run once their Pod is "
+                    "running: the bundle verifier, the cleaner, and the Job that readies a "
+                    "workspace for a publish. Pulling the image and waiting for a node "
+                    "count against the launch timeout instead. Seconds, "
+                    f"{role_timeouts['bounds']['min']} to {role_timeouts['bounds']['max']}. "
+                    "Every process picks a save up within 15 seconds."
+                ),
+                "form": {
+                    "action": "/ui/actions/kubernetes-timeouts",
+                    "label": "Save role timeout",
+                    "collapsed": "Change the short-role timeout",
+                    "fields": [
+                        {
+                            "name": "role_timeout_seconds",
+                            "label": "Short-role timeout (seconds)",
+                            "kind": "number",
+                            "value": role_seconds,
+                            "required": True,
                         },
                         {"name": "reason", "label": "Reason", "required": True},
                     ],
@@ -3242,6 +3284,8 @@ def _settings_rows(settings: Any) -> list[list[Any]]:
             if path in sensitive
             else "Seeds the egress selectors; edit them on Routing, where a saved value wins."
             if path.split(".")[:2] in _EGRESS_SEEDS
+            else "Seeds the short-role timeout; edit it on Routing, where a saved value wins."
+            if path == "kubernetes.role_timeout_seconds"
             else _BROAD_EGRESS_REASON
             if path == "kubernetes.broad_egress"
             else _HARNESS_DEFAULT_REASON
@@ -3669,6 +3713,19 @@ async def action(request: Request, action: str, ctx: Ctx, uow: UoW) -> Response:
                         "pod_labels": parse_labels(form.get("endpoint_labels", "")),
                         "port": int(form.get("endpoint_port") or "0"),
                     },
+                },
+                reason=reason,
+            )
+        elif action == "kubernetes-timeouts":
+            raw_seconds = form.get("role_timeout_seconds", "").strip()
+            kubernetes_admin.save_timeouts(
+                ctx.admin,
+                uow,
+                principal=principal.name,
+                document={
+                    "role_timeout_seconds": int(raw_seconds)
+                    if raw_seconds.lstrip("-").isdigit()
+                    else raw_seconds
                 },
                 reason=reason,
             )

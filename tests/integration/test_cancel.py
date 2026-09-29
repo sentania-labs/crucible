@@ -114,7 +114,10 @@ async def test_cancel_blocked_task_closes_its_execution(
     await supervisor.tick()
     view = client.get(f"/v1/tasks/{task_id}").json()
     assert view["executions"][0]["state"] == "cancelled"
-    assert event_kinds(client, task_id)[-1] == "execution_cancelled"
+    # The same tick releases the cancelled task's kept workspace (16), after the close.
+    kinds = event_kinds(client, task_id)
+    assert [k for k in kinds if k != "retention_applied"][-1] == "execution_cancelled"
+    assert kinds[-1] == "retention_applied"
 
 
 async def test_cancel_with_partial_report_is_not_parsed(

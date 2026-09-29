@@ -1,8 +1,8 @@
 """What every administrative service needs, and the rules they all obey (25): a mutation
-needs a live supervisor lease and is an event with the principal and a before-and-after
-summary that never carries a value. A reason is an optional audit note, required only
-for the destructive or hard-to-reverse operations (the operator's decision of
-2026-09-25, crucible#117)."""
+is an event with the principal and a before-and-after summary that never carries a
+value, and the few that hand the supervisor work need a live supervisor lease. A reason
+is an optional audit note, required only for the destructive or hard-to-reverse
+operations (the operator's decision of 2026-09-25, crucible#117)."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from crucible.application.queries import supervisor_health
 from crucible.application.transitions import record_event
 from crucible.domain.entities import Event
 from crucible.domain.events import EventKind
+from crucible.domain.role_timeouts import DEFAULT_ROLE_TIMEOUT_SECONDS
 from crucible.domain.secrets import scan_text
 from crucible.ports.clock import Clock
 from crucible.ports.execution import ExecutionProvider
@@ -69,6 +70,9 @@ class AdminContext:
     # and the namespaces no selector may name (crucible#91).
     kubernetes_egress_seed: dict[str, Any] = field(default_factory=dict)
     kubernetes_protected_namespaces: tuple[str, ...] = ()
+    # The settings file's `kubernetes.role_timeout_seconds`, shown until a save of the
+    # `kubernetes.timeouts` setting replaces it.
+    kubernetes_role_timeout_seed: int = DEFAULT_ROLE_TIMEOUT_SECONDS
     # Where the first-run administrator token was delivered; a revoke of that principal
     # removes it (ADR 0016).
     first_run: FirstRunDelivery | None = None
@@ -171,15 +175,24 @@ def guard_mutation(
     principal: str,
     operation: str,
     reason_required: bool = False,
+    needs_supervisor: bool = False,
 ) -> str:
     """The rules every mutation obeys (25), in one call so no operation can skip one: a
     reason that is not a credential, required when `reason_required` (bootstrap commit,
-    repository remove, token revoke, credential remove), and a live supervisor lease.
-    Either refusal is recorded as `admin_refused`."""
+    repository remove, token revoke, credential remove), and, when `needs_supervisor`,
+    a live supervisor lease. Either refusal is recorded as `admin_refused`.
+
+    Only an operation that hands the supervisor work or takes away something a running
+    worker may be using waits for a live supervisor: committing a bootstrap import, and
+    rotating or removing a credential. A configuration write (a token, a repository, the
+    gateway, the GitHub App, an image promotion, a setting) proceeds while the
+    supervisor misses a tick, and the supervisor reads it when it next runs (the
+    operator's direction of 2026-09-29)."""
     cleaned = require_reason(
         reason, ctx, principal=principal, operation=operation, required=reason_required
     )
-    require_live_supervisor(ctx, uow, principal=principal, operation=operation)
+    if needs_supervisor:
+        require_live_supervisor(ctx, uow, principal=principal, operation=operation)
     return cleaned
 
 
