@@ -1,0 +1,72 @@
+# ADR 0024: The review is the enforcement; paperwork gates are advisory
+
+Status: accepted. The operator's decision of 2026-09-29: "We need to let the review be
+our enforcement rather then dictating behavior" and "I want to stop fucking around ...
+so do what it takes". Built by FDY-0138 on 2026-09-29. Amends spec 11's rule that every
+required pre-PR gate must pass, and spec 05b's `gates` section.
+
+## Context
+
+Every pre-PR gate blocked. On the lab, Hermes did correct work and the task still went
+to `pre_pr_gates_failed` because it touched a file outside a narrow `allowed_paths`
+list, or because its report left out a judgement field. Neither is damage and neither is
+a false claim; each is something a reviewer can weigh in seconds. Blocking on them made
+Foundry write a correction for work that was already right.
+
+## Decision
+
+1. **Each pre-PR gate is blocking or advisory.** A failed blocking gate keeps today's
+   behaviour: the task goes to `pre_pr_gates_failed`. A failed advisory gate still
+   runs and records its result and detail, but the task goes on to
+   `awaiting_internal_review` (or, with no review required, `gates_passed`), and the
+   failure is carried in front of the reviewer. `error` is treated as `fail` either way.
+2. **The default.** Blocking, where the damage is real or a claim is false:
+   `verification_ran`, `no_secrets`, `ci_unchanged`, `dependencies_unchanged`,
+   `commits_present`, `no_injected_files`, `workspace_clean`, `exit_clean`, and
+   `internal_review_recorded`. Advisory: `scope_contained`, `report_present`,
+   `criteria_mapped`, `run_evidence_present`. A gate added later is blocking unless a
+   policy lists it.
+3. **A prohibited path always blocks.** `scope_contained` is split by its outcome: a
+   path matching the contract's `prohibited_paths` stops the task whatever the gate's
+   class, and a path merely outside `allowed_paths` is advisory. The stored row for
+   that evaluation says `blocking`.
+4. **The policy decides.** `gates.advisory` lists the advisory pre-PR gates; every
+   other pre-PR gate blocks. It is validated (pre-PR gates only, no duplicates, never
+   `internal_review_recorded`) and versioned with the rest of the policy. A version
+   without the field, including every version written before it existed, takes the
+   default set when it is read. Nothing is rewritten on upgrade: the lab's
+   `default-software` version 8 and `hades-self-hosting` version 1 carry no list and so
+   take the default, with no new version and no change to a version a task references.
+   The shipped examples write the default out. Listing a gate outside the default set
+   (turning a safety gate advisory) is an operator-only setting, recorded as a
+   decision, like `allow_no_ci`.
+5. **The reviewer sees it.** Each gate result records its class (`gate_results.blocking`,
+   migration 0028). The task view's `gate_summary`, `GET /v1/attempts/{id}/gates` (the
+   CLI's `--gates`) and the admin UI's Tasks page mark each gate blocking or advisory and
+   list the failed advisory gates under "for the reviewer" with their detail. `failing`
+   names only what stops the task. The `internal_review_needed`, `gates_passed` and
+   `pre_pr_gates_failed` wakes carry the same list, as `for_reviewer` and in the summary.
+6. **A contradicted claim is its own finding.** When the worker's report says a
+   required check passed and Crucible's own re-run failed it, `verification_ran`
+   records the advisory finding "the worker reported V3 passing; Crucible's re-run
+   failed it" (`gate_results.findings`), listed for the reviewer as a trust problem.
+   The check failing is still a blocking `verification_ran` failure. Only the
+   contract's own check ids are echoed.
+7. **Every tunable has a UI.** The advisory set is shown and edited on the Routing page
+   (Advisory gates, in force and in its own form), from `GET` and
+   `POST /v1/admin/gates/advisory`, and from `crucible admin gates advisory` and
+   `crucible admin gates set-advisory --gate NAME ...`. Each save writes a new policy
+   version with only that list changed.
+
+## Consequences
+
+A task can reach Foundry's acceptance with a changed file outside its allowed paths or
+an incomplete report. That is the point: the reviewer decides, with the detail in front
+of it. The reviewer's `request_changes` verdict still does not move the task by itself
+(11); Foundry reads it and decides.
+
+The local admin CLI has no principal row, so an operator-only setting it saves is
+recorded on the upload event, not as a Decision row.
+
+Rolling back to a release before 0028 drops the class and the findings from the stored
+gate rows, and that release blocks on every gate again.
