@@ -28,7 +28,10 @@ with the attempt trailer, before it bundles `base..work_branch`. The checkout is
 therefore mounted writable into the collector on both providers. It is the quota
 checkpoint's commit, with its guards (the worker's `.git/config` replaced, an empty hooks
 directory); where the checkpoint refuses an unsafe `.git` and fails the collection, the
-ordinary case skips the commit with a note and collects what was committed.
+ordinary case skips the commit with a note and collects what was committed. Caches and
+build output a repository forgot to ignore are never swept in, so a model that ran the
+tests does not fail the scope gate on `__pycache__`. `attempt_collected` says when
+Crucible made that commit, so the review knows whose it is.
 
 ## "I'm stuck" works with every harness
 
@@ -48,19 +51,25 @@ contract renders to 240 words.
 ## Hermes: inline instructions, its own PATH, run limits
 
 The wrapper puts the text of `IDENTITY.md` in the prompt. It starts Hermes with the venv's
-own Python by path and sets no PATH, so the model's `python3` and `uv` are the image's.
+own Python by path (with `-P`, since the working directory is the task's checkout and a
+`tools` or `cli` module there would otherwise be imported in place of Hermes's own) and
+sets no PATH, so the model's `python3` and `uv` are the image's. Hermes 0.19 prepends the
+directory of the `hermes` it finds to every command's PATH, falling back to its own venv;
+the image links `/usr/local/bin/hermes` so what it finds is already on PATH.
 Hermes 0.19's `-z` builds its agent with a fixed 90-turn budget and reads no setting for
 it; the wrapper runs Hermes's own entry point under a bootstrap that sets the budget when
 the caller named none (checked against 0.19.0 in the image: 300 applied, an explicit 45
 kept). The context window is Hermes's own `model.context_length`, written to its home.
 Defaults: 300 turns (the operator's own Hermes uses 150 interactively; a task that reads,
-edits and runs checks needs more) and 131072 tokens (above Hermes's 64000 floor, and a
-window the lab's gateway models have). Both are on the Local gateway page, the admin API
+edits and runs checks needs more) and 131072 tokens (above Hermes's 64000 floor; not read
+from the gateway and not checked against the lab's models, so a model with a smaller
+window needs its real figure, or 0 to let Hermes probe for it). Both are on the Local gateway page, the admin API
 and `crucible-admin gateway limits`. A run that ends on its turn budget is recorded as
 `harness_limit_reached` evidence, not failed.
 
 ## Package caches
 
-`UV_CACHE_DIR`, `PIP_CACHE_DIR` and `npm_config_cache` point at the workspace's
-`pkg-cache` leaf, mounted into the worker and the verifier, instead of the 512Mi memory
-home. The verifier's re-run starts from what the worker downloaded.
+`UV_CACHE_DIR`, `PIP_CACHE_DIR` and `npm_config_cache` point at a leaf of the workspace
+instead of the 512Mi memory home. The worker and the verifier each have their own: uv and
+pip reuse what is in their cache without checking it again, so sharing the worker's cache
+would let the worker change what the verifier's checks run.

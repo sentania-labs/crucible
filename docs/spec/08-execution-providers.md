@@ -81,11 +81,13 @@ It is a test fixture: wired only when `test_fixtures` is on (18).
   CPU limits from policy, `--pids-limit`, network per policy (dedicated
   bridge with egress allowlist via the proxy's network, or `none`), mounts:
   repo (rw), identity (ro), one credential dir (ro or narrow rw), report dir
-  (rw), and the workspace's package-cache leaf at `/crucible/pkg-cache` (rw),
+  (rw), and the workspace's `pkg-cache` leaf at `/crucible/pkg-cache` (rw),
   which `UV_CACHE_DIR`, `PIP_CACHE_DIR` and `npm_config_cache` point into so a
-  dependency install never fills the memory-backed home (FDY-0140; the
-  verifier mounts the same leaf). Labels: `crucible.attempt`, `crucible.task`,
-  `crucible.owner`.
+  dependency install never fills the memory-backed home (FDY-0140). The
+  verifier mounts a leaf of its own, `pkg-cache-verifier`, at the same path:
+  uv and pip reuse cache entries without checking them again, so a cache the
+  worker wrote is never what the verifier's checks run from. Labels:
+  `crucible.attempt`, `crucible.task`, `crucible.owner`.
 - `observe`: container inspect; `lost` if the container ID no longer exists.
 - `logs`: docker logs with timestamps, since offset. `--since` is
   inclusive (S8), so resume is strict-after by the stored
@@ -97,9 +99,13 @@ It is a test fixture: wired only when `test_fixtures` is on (18).
   the worker left uncommitted, as the policy's `git` author with the attempt
   trailer, so edits a model forgot to commit are collected and reviewed rather
   than lost (FDY-0140). That commit runs with the worker's `.git/config`
-  replaced by a minimal one and an empty hooks directory, and is skipped with a
-  note when `.git` is not a plain directory; a quota checkpoint (16) is the same
-  commit with a `wip` subject, refused in that case. It then produces: `git diff
+  replaced by a minimal one and an empty hooks directory, never takes caches
+  and build output a repository forgot to ignore (`__pycache__`, `*.pyc`,
+  `node_modules`, `.venv`, tool caches, `*.egg-info`, `.coverage`), and is
+  skipped with a note when `.git` or `.git/config` is not a plain directory or
+  file; a quota checkpoint (16) is the same commit with a `wip` subject, refused
+  in that case. `attempt_collected` records `uncommitted_work_committed` or the
+  `uncommitted_work_note`. It then produces: `git diff
   --stat` and the **full diff** against `base_ref` (the `no_secrets` and
   scope gates consume the diff content, never only the path list), the
   changed-path list, HEAD

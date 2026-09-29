@@ -484,9 +484,10 @@ directory and the home (where a harness keeps its session state), and the
 supervisor compares one answer with the next. The workspace path is a `k8s://`
 name, so the supervisor's own walk would see nothing and a silent worker, Hermes
 under `-z` above all, was stalled out while it worked. The probe is asked no
-more often than a `command_running` renewal, and a failed ask is neither
-activity nor its absence. The worker and the verifier also mount the claim's
-`pkg-cache` leaf at `/crucible/pkg-cache` for the package caches (08).
+more often than a `command_running` renewal; the walk stops itself after 10 s
+and the exec after 15 s, and a failed or unfinished ask is neither activity nor
+its absence. The worker mounts the claim's `pkg-cache` leaf and the verifier its
+`pkg-cache-verifier` leaf at `/crucible/pkg-cache` for the package caches (08).
 
 ## Credentials on the cluster (12, made concrete)
 

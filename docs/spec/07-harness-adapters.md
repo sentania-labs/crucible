@@ -189,9 +189,14 @@ never retry.
   boundary. `HERMES_HOME` is a per-attempt tmpfs, so rules, memory, plugins, MCP
   configuration, and session `state.db` do not cross attempts.
 - The image wrapper (FDY-0140) puts the text of `IDENTITY.md`
-  (`CRUCIBLE_HERMES_IDENTITY`) in the prompt ahead of the pointer; starts Hermes
-  with the venv's own Python by path and sets no PATH, so the commands the model
-  runs resolve `python3`, `pytest` and `uv` to the image's toolchain; and applies
+  (`CRUCIBLE_HERMES_IDENTITY`) in the prompt ahead of the pointer, or only the
+  pointer when the text is too long for one argument; starts Hermes with the
+  venv's own Python by path, with `-P` so a module in the checkout is never
+  imported in place of Hermes's own, and sets no PATH, so the commands the model
+  runs resolve `python3`, `pytest` and `uv` to the image's toolchain (Hermes
+  prepends the directory of the `hermes` it finds to each command's PATH; the
+  image's `/usr/local/bin/hermes` link makes that a directory already on it);
+  and applies
   the run limits saved on the Local gateway page (25): `CRUCIBLE_HERMES_MAX_TURNS`
   (default 300; Hermes 0.19's `-z` fixes 90 and reads no setting, so a bootstrap
   sets the budget an agent is built with when its caller named none) and
@@ -206,7 +211,8 @@ never retry.
   the same attempt's SQLite session row before exit. Missing or unparsable usage
   fails `run_evidence_present`.
 - Classification checks Crucible termination facts first, then usage and provider
-  text, then report presence. `blocked.md` on exit 0 is `blocked` (FDY-0140).
+  text, then report presence. `blocked.md` on exit 0 is `blocked` (FDY-0140),
+  checked before the usage record, so it wins over `failed: true`; otherwise
   `failed: true` overrides exit 0. Exit 75 is Hermes's own and is
   `provider_error` unless explicit quota text makes it `quota_exhausted`; a local
   5xx or connection refusal is always `provider_error` and never marks the pool.
