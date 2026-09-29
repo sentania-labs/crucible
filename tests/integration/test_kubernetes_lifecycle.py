@@ -442,7 +442,7 @@ def github_client(github_server: FakeGitHubServer, tmp_path: Path) -> RestGitHub
         )
     )
     path.chmod(0o600)
-    transport = RestTransport(github_server.url, timeout=10.0, sleep=lambda _: None)
+    transport = RestTransport(github_server.url, timeout=10.0)
     return RestGitHubClient(
         AppAuthenticator(
             AppConfig(app_id=4969317, private_key_path=str(path), api_base=github_server.url),

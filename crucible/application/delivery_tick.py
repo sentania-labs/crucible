@@ -17,6 +17,7 @@ import logging
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Any, Protocol, TypeVar
 
 from crucible.application.observation import (
@@ -27,6 +28,7 @@ from crucible.application.observation import (
     evaluate_delivery_gates,
     policy_for,
     poll_due,
+    settle_pull_request_state,
     to_cycle,
 )
 from crucible.application.publish import (
@@ -51,6 +53,7 @@ from crucible.domain.external_review import completed_rounds
 from crucible.domain.lifecycle import TaskState
 from crucible.domain.publication import body_sha256
 from crucible.domain.secrets import redact
+from crucible.domain.waivers import WAIVER_KINDS
 from crucible.ports.clock import Clock
 from crucible.ports.github import GitHubClient, GitHubError, InstallationToken
 from crucible.ports.publish import Publisher, PublishRequest
@@ -88,7 +91,8 @@ class PollPlan:
     base_ref: str
     attempt_id: str
     with_reactions: bool
-    failed_run_id: str = ""
+    # The failed check whose log excerpt is still to be fetched: (source, GitHub id).
+    failed_check: tuple[str, str] | None = None
 
 
 @dataclass(slots=True)
@@ -116,6 +120,26 @@ class DeliveryCoordinator:
         self._github = github
         self._publisher = publisher
         self.config = config or DeliveryConfig()
+        # hades FDY-0139: GitHub refused a call for the rate limit. Nothing sleeps inside
+        # the tick; polling and publication wait for a later tick past this time.
+        self.rate_limited_until: datetime | None = None
+
+    def _rate_limited(self) -> bool:
+        until = self.rate_limited_until
+        if until is None:
+            return False
+        if self._clock.now() >= until:
+            self.rate_limited_until = None
+            return False
+        return True
+
+    def _defer_for_rate_limit(self, exc: GitHubError) -> None:
+        seconds = exc.retry_after if exc.retry_after is not None else 60.0
+        self.rate_limited_until = self._clock.now() + timedelta(seconds=max(1.0, seconds))
+        log.warning(
+            "github rate limit: delivery waits for a later tick",
+            extra={"seconds": seconds, "path": exc.path},
+        )
 
     @property
     def enabled(self) -> bool:
@@ -161,6 +185,8 @@ class DeliveryCoordinator:
         return None
 
     async def publish(self) -> int:
+        if self._rate_limited():
+            return 0
         reason = await self.waiting_reason()
         if reason is not None:
             # Never silent: every task waiting in `publishing` says why, is logged once,
@@ -170,6 +196,8 @@ class DeliveryCoordinator:
         plans = await self._host._db(self._take_publishing)
         done = 0
         for plan in plans:
+            if self._rate_limited():
+                break
             if await self._publish_one(plan):
                 done += 1
         return done
@@ -421,6 +449,12 @@ class DeliveryCoordinator:
             return True
         except GitHubError as exc:
             failure = exc
+            if failure.response_class == "rate_limited":
+                # Not a publication failure: the task stays in `publishing` and a later
+                # tick resumes it, as a restart would (hades FDY-0139).
+                self._defer_for_rate_limit(failure)
+                await self._host._db(lambda: self._record_rate_limited(plan.task_id, failure))
+                return False
             await self._host._db(
                 lambda: self._fail(
                     plan,
@@ -584,11 +618,15 @@ class DeliveryCoordinator:
     async def observe(self) -> int:
         if not await self._github_ready_async():
             return 0
-        plans = await self._host._db(self._due_polls)
         polled = 0
-        for plan in plans:
-            if await self._observe_one(plan):
-                polled += 1
+        if not self._rate_limited():
+            plans = await self._host._db(self._due_polls)
+            for plan in plans:
+                if self._rate_limited():
+                    # The rest are still due and are polled on a later tick.
+                    break
+                if await self._observe_one(plan):
+                    polled += 1
         await self._host._db(self._evaluate_gates)
         return polled
 
@@ -612,7 +650,9 @@ class DeliveryCoordinator:
                         reactions_interval_seconds=self.config.reactions_poll_interval_seconds,
                         task_state=task.state,
                     )
-                    if pull_request.id in forced:
+                    if pull_request.id in forced or self._decided_since_poll(
+                        uow, task.id, pull_request.last_polled_at
+                    ):
                         due = True
                         # 23: a review or comment delivery triggers an immediate
                         # reaction poll for its subject, and while the PR awaits
@@ -620,7 +660,7 @@ class DeliveryCoordinator:
                         # delivery about it brings the reaction poll forward.
                         with_reactions = (
                             with_reactions
-                            or forced[pull_request.id]
+                            or forced.get(pull_request.id, False)
                             or task.state is TaskState.AWAITING_EXTERNAL_REVIEW
                         )
                     if not due:
@@ -641,7 +681,7 @@ class DeliveryCoordinator:
                             base_ref=pull_request.base_ref,
                             attempt_id=work[0].id,
                             with_reactions=with_reactions,
-                            failed_run_id=self._failed_run_id(uow, pull_request.id, task),
+                            failed_check=self._failed_check(uow, pull_request.id, task),
                         )
                     )
             uow.commit()
@@ -671,11 +711,33 @@ class DeliveryCoordinator:
                         )
         return forced
 
-    def _failed_run_id(self, uow: UnitOfWork, pull_request_id: str, task: Task) -> str:
+    def _failed_check(
+        self, uow: UnitOfWork, pull_request_id: str, task: Task
+    ) -> tuple[str, str] | None:
+        """The failed check whose log is still to be fetched. Once the excerpt is stored
+        it is not fetched again on every poll (hades FDY-0139)."""
         certification = uow.ci_certifications.get_for_head(pull_request_id, task.head_sha or "")
         if certification is None or certification.state != "failed":
-            return ""
-        return str(certification.failure.get("run_id", ""))
+            return None
+        failure = certification.failure
+        run_id = str(failure.get("run_id", ""))
+        if not run_id or failure.get("log_excerpt"):
+            return None
+        return str(failure.get("source") or "check_run"), run_id
+
+    @staticmethod
+    def _decided_since_poll(uow: UnitOfWork, task_id: str, last_polled: datetime | None) -> bool:
+        """A CI decision or a waiver recorded since the last poll brings the next poll
+        forward: what it changes is decided on a fresh observation, not on the one taken
+        before it (hades FDY-0139)."""
+        if last_polled is None:
+            return False
+        if any(d.created_at > last_polled for d in uow.ci_decisions.list_for_task(task_id)):
+            return True
+        return any(
+            d.kind in WAIVER_KINDS and d.created_at > last_polled
+            for d in uow.decisions.list_for_task(task_id)
+        )
 
     async def _observe_one(self, plan: PollPlan) -> bool:
         assert self._github is not None
@@ -695,12 +757,14 @@ class DeliveryCoordinator:
                 with_reactions=plan.with_reactions,
             )
             excerpt = ""
-            if plan.failed_run_id:
+            if plan.failed_check is not None:
+                source, external_id = plan.failed_check
                 raw = await asyncio.to_thread(
-                    self._github.workflow_run_logs,
+                    self._github.ci_failure_log,
                     token,
                     repository=plan.repository_name,
-                    run_id=plan.failed_run_id,
+                    source=source,
+                    external_id=external_id,
                     limit_bytes=self.config.ci_log_excerpt_bytes,
                 )
                 # 12: a workflow log is text the repository controls, and it lands in
@@ -709,6 +773,8 @@ class DeliveryCoordinator:
                 excerpt = redact(raw.decode("utf-8", "replace")[-4000:]) if raw else ""
         except GitHubError as exc:
             failure = exc
+            if failure.response_class == "rate_limited":
+                self._defer_for_rate_limit(failure)
             await self._host._db(lambda: self._record_poll_error(plan, failure))
             return False
         finally:
@@ -716,6 +782,23 @@ class DeliveryCoordinator:
                 token.discard()
         await self._host._db(lambda: self._apply(plan, observation, excerpt))
         return True
+
+    def _record_rate_limited(self, task_id: str, exc: GitHubError) -> None:
+        with self._host._fenced() as uow:
+            record_event(
+                uow,
+                self._clock,
+                EventKind.GITHUB_RATE_LIMITED,
+                principal=PRINCIPAL_CRUCIBLE,
+                task_id=task_id,
+                payload={
+                    "step": "publish",
+                    "status": exc.status,
+                    "retry_after_seconds": exc.retry_after,
+                    "note": "deferred to a later tick; the task stays in publishing",
+                },
+            )
+            uow.commit()
 
     def _record_poll_error(self, plan: PollPlan, exc: GitHubError) -> None:
         with self._host._fenced() as uow:
@@ -732,6 +815,7 @@ class DeliveryCoordinator:
                     "ok": False,
                     "response_class": exc.response_class,
                     "status": exc.status,
+                    "retry_after_seconds": exc.retry_after,
                 },
             )
             uow.commit()
@@ -759,16 +843,22 @@ class DeliveryCoordinator:
         """09: post-PR gates re-evaluate each reconcile tick until they resolve.
 
         This is also what turns a disposition recorded through the API into progress
-        without waiting for the next poll."""
+        without waiting for the next poll. A task whose pull request is already recorded
+        merged or closed is moved here, because such a pull request is never polled again
+        (hades FDY-0139)."""
         with self._host._fenced() as uow:
-            for state in (
-                TaskState.EXTERNAL_FEEDBACK_RECEIVED,
-                TaskState.AWAITING_CI_CERTIFICATION,
-                TaskState.AWAITING_EXTERNAL_REVIEW,
-            ):
+            for state in sorted(OBSERVED_STATES, key=lambda s: s.value):
                 for task in uow.tasks.list_by_state(state, for_update=True):
                     pull_request = uow.pull_requests.get_for_task(task.id, for_update=True)
                     if pull_request is None:
+                        continue
+                    if settle_pull_request_state(
+                        uow, self._clock, task=task, pull_request=pull_request
+                    ):
+                        continue
+                    if task.state in (TaskState.READY_FOR_MERGE, TaskState.HEAD_DIVERGED):
+                        # Both move only on a fresh observation: a new signal or a red
+                        # check for the first, a decision for the second.
                         continue
                     work = latest_work_attempt(uow, task)
                     if work is None:

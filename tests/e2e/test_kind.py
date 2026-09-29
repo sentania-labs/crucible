@@ -2452,7 +2452,7 @@ async def test_fdy_0133_a_task_in_publishing_is_pushed_by_the_kubernetes_publish
     with _git_push_host() as host, FakeGitHubServer() as github:
         github.state.add_repository(full_name)
         github.state.ref_source = lambda _repo, branch: _branch_head(bare, branch)
-        transport = RestTransport(github.url, timeout=10.0, sleep=lambda _: None)
+        transport = RestTransport(github.url, timeout=10.0)
         github_client = RestGitHubClient(
             AppAuthenticator(
                 AppConfig(

@@ -92,11 +92,27 @@ def review(payload: Any) -> ReviewRecord:
     )
 
 
+def reaction_count(payload: dict[str, Any]) -> int | None:
+    """The comment's own reaction total, or None when the payload does not carry it.
+
+    GitHub puts a `reactions` summary on every comment, so the client fetches a
+    comment's reactions only when there is something to fetch (hades FDY-0139)."""
+    summary = payload.get("reactions")
+    if not isinstance(summary, dict):
+        return None
+    total = summary.get("total_count")
+    return total if isinstance(total, int) else None
+
+
 def review_comment(payload: Any) -> CommentRecord:
     assert isinstance(payload, dict)
     body, _ = clean_text(payload.get("body"))
     line = payload.get("line")
     review_id = payload.get("pull_request_review_id")
+    # `commit_id` follows the pull request forward when a later head leaves the line
+    # alone; `original_commit_id` is the head the reviewer actually commented on, which
+    # is what decides whether a correction has since replaced it (hades FDY-0139).
+    commit_id = payload.get("original_commit_id") or payload.get("commit_id")
     return CommentRecord(
         github_id=str(payload.get("id", "")),
         login=login_of(payload),
@@ -106,8 +122,9 @@ def review_comment(payload: Any) -> CommentRecord:
         kind="review_comment",
         path=str(payload["path"]) if payload.get("path") else None,
         line=int(line) if isinstance(line, int) else None,
-        commit_id=str(payload["commit_id"]) if payload.get("commit_id") else None,
+        commit_id=str(commit_id) if commit_id else None,
         review_id=str(review_id) if review_id else None,
+        reaction_count=reaction_count(payload),
     )
 
 
@@ -121,6 +138,7 @@ def issue_comment(payload: Any) -> CommentRecord:
         created_at=parse_time(payload.get("created_at")),
         updated_at=parse_time(payload.get("updated_at") or payload.get("created_at")),
         kind="issue_comment",
+        reaction_count=reaction_count(payload),
     )
 
 
@@ -149,6 +167,7 @@ def check_run(payload: Any) -> CheckRecord:
         workflow=str(app.get("slug", "")),
         job=str(payload.get("name", "")),
         source="check_run",
+        completed_at=parse_time(payload["completed_at"]) if payload.get("completed_at") else None,
     )
 
 
@@ -164,6 +183,12 @@ def workflow_run(payload: Any) -> CheckRecord:
         workflow=str(payload.get("path") or payload.get("name") or ""),
         job="",
         source="workflow_run",
+        # A re-run keeps the run id; its `updated_at` is when this attempt last changed.
+        completed_at=(
+            parse_time(payload["updated_at"])
+            if payload.get("conclusion") and payload.get("updated_at")
+            else None
+        ),
     )
 
 

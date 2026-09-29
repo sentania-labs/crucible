@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import StrEnum
 
 SUCCESS = "success"
@@ -57,6 +58,7 @@ class ObservedCheck:
     external_id: str = ""
     workflow: str = ""
     job: str = ""
+    completed_at: datetime | None = None
 
     @property
     def concluded(self) -> bool:
