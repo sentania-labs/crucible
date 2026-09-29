@@ -6,8 +6,8 @@ one 23 fixes, and each step is an event before and after:
 
 1. `publish_started` with the head SHA and the bundle it will push;
 2. mint a repository-scoped installation token;
-3. run the publisher container, which verifies the bundle, asserts the head, checks
-   commit authorship and trailers, and pushes without force;
+3. run the publisher container, which verifies the bundle, asserts the head, and pushes
+   without force (it checks no commit author or trailer: operator, 2026-09-29);
 4. from Crucible, confirm the remote head (`branch_pushed_at_head`);
 5. open the PR, or leave the existing one whose head just moved, with a body rendered
    from the contract and verified evidence only;

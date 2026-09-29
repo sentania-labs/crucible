@@ -55,7 +55,7 @@ from crucible.application.queries import supervisor_health, task_view
 from crucible.contracts.api import ExternalReviewAttestation, RepositoryRegistration
 from crucible.contracts.task_contract import HarnessName
 from crucible.domain.cluster_egress import format_labels, parse_labels
-from crucible.domain.entities import Principal, Role
+from crucible.domain.entities import Principal, Role, Task
 from crucible.domain.secrets import redact, scan_text
 from crucible.ports.repository import UnitOfWork
 
@@ -2371,15 +2371,7 @@ def tasks_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
         for item in document.get("publishing_waiting", [])
     ]
     recent = sorted(
-        uow.tasks.search(
-            state=None,
-            project=None,
-            repository_id=None,
-            external_id=None,
-            updated_since=ctx.clock.now() - timedelta(days=RECENT_TASK_DAYS),
-            after_id=None,
-            limit=500,
-        ),
+        _tasks_updated_since(uow, ctx.clock.now() - timedelta(days=RECENT_TASK_DAYS)),
         key=lambda task: task.updated_at,
         reverse=True,
     )[:RECENT_TASK_ROWS]
@@ -2431,6 +2423,29 @@ RECENT_TASK_DAYS = 14
 RECENT_TASK_ROWS = 50
 
 
+def _tasks_updated_since(uow: UnitOfWork, since: datetime) -> list[Task]:
+    """Every task updated since `since`. The search pages by id, not by update time, so
+    each page is read: a first page alone could leave out the newest updates."""
+    found: list[Task] = []
+    after: str | None = None
+    while True:
+        page = list(
+            uow.tasks.search(
+                state=None,
+                project=None,
+                repository_id=None,
+                external_id=None,
+                updated_since=since,
+                after_id=after,
+                limit=500,
+            )
+        )
+        found.extend(page)
+        if len(page) < 500:
+            return found
+        after = page[-1].id
+
+
 def _task_link(task_id: str, external_id: str | None) -> dict[str, str]:
     return {"kind": "link", "href": f"/ui/tasks/{quote(task_id)}", "label": external_id or task_id}
 
@@ -2477,7 +2492,9 @@ def task_page(request: Request, task_id: str, ctx: Ctx, uow: UoW) -> Response:
                     ["Pushed head", delivery.pushed_head or not_yet],
                     [
                         "Pushed at",
-                        delivery.pushed_at.isoformat() if delivery.pushed_at else not_yet,
+                        delivery.pushed_at.isoformat()
+                        if delivery.pushed_at
+                        else ("not recorded" if delivery.pushed_head else not_yet),
                     ],
                     ["Pull request", pull_request],
                     ["Pull request state", delivery.pull_request_state or not_yet],
