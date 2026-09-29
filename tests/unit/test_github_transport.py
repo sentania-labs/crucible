@@ -147,3 +147,44 @@ def test_a_log_redirect_to_plain_http_elsewhere_is_refused() -> None:
 def test_an_observed_merge_is_allowed_from_every_delivery_state(state: TaskState) -> None:
     assert is_allowed("task", state, TaskState.MERGED)
     assert is_allowed("task", state, TaskState.REJECTED)
+
+
+class _RefusingTransport:
+    """Answers every call with one GitHubError, as the transport raises it."""
+
+    def __init__(self, error: GitHubError) -> None:
+        self._error = error
+
+    def get(self, path: str, **_: Any) -> Any:
+        raise self._error
+
+    def paginate(self, path: str, **_: Any) -> Any:
+        raise self._error
+
+
+def _client(error: GitHubError) -> Any:
+    from datetime import UTC, datetime  # noqa: PLC0415
+
+    from crucible.adapters.github.client import RestGitHubClient  # noqa: PLC0415
+    from crucible.ports.github import InstallationToken  # noqa: PLC0415
+
+    client = RestGitHubClient(None, _RefusingTransport(error))  # type: ignore[arg-type]
+    return client, InstallationToken("t", expires_at=datetime.now(UTC), repository="o/r")
+
+
+def test_a_rate_limited_403_is_not_read_as_no_protected_checks() -> None:
+    """GitHub reports a rate limit as a 403 too; it must defer the poll, not empty the
+    required-check set (hades FDY-0139)."""
+    limited = GitHubError(403, "rate limited", response_class="rate_limited", retry_after=60)
+    client, token = _client(limited)
+    with pytest.raises(GitHubError) as raised:
+        client.list_required_checks(token, repository="o/r", branch="main")
+    assert raised.value.response_class == "rate_limited"
+    with pytest.raises(GitHubError):
+        client.closed_by(token, repository="o/r", number=1)
+
+
+def test_a_permission_403_is_still_no_protected_checks() -> None:
+    client, token = _client(GitHubError(403, "Resource not accessible by integration"))
+    assert tuple(client.list_required_checks(token, repository="o/r", branch="main")) == ()
+    assert client.closed_by(token, repository="o/r", number=1) is None

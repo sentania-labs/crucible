@@ -96,13 +96,16 @@ def waive(client: TestClient, task_id: str, kind: str, words: str) -> Any:
 # ----- 1: a fix disposition, its correction, green CI --------------------------------
 
 
+@pytest.mark.parametrize("afterwards", ["reply", "edit"])
 async def test_codex_finding_fix_correction_green_reaches_ready_for_merge(
     client: TestClient,
     delivery_supervisor: Supervisor,
     github: FakeGitHubServer,
+    afterwards: str,
 ) -> None:
     """The whole path: a finding, `fix`, the correction on the same PR, green CI on the
-    corrected head, and `ready_for_merge`. The `fix` on the replaced head is settled."""
+    corrected head, and `ready_for_merge`. The `fix` on the replaced head is settled, but a
+    reply on its thread, or an edit to it, after the correction is new feedback."""
     task_id, view = await publish(client, delivery_supervisor)
     first_head = view["head_sha"]
     github.state.add_review(
@@ -113,9 +116,8 @@ async def test_codex_finding_fix_correction_green_reaches_ready_for_merge(
         comments=[{"body": "P1 this is wrong", "path": "src/app.txt", "line": 1}],
     )
     # Made on the first head, before the correction exists (the fake clock's hour).
-    github.state.repositories[REPOSITORY].pulls[1].review_comments[0]["created_at"] = (
-        BEFORE_DECISION
-    )
+    finding = github.state.repositories[REPOSITORY].pulls[1].review_comments[0]
+    finding["created_at"] = finding["updated_at"] = BEFORE_DECISION
     await delivery_supervisor.tick()
     assert state(client, task_id) == "external_feedback_received"
     comment_id = pr(client, task_id)["comments"][0]["id"]
@@ -161,20 +163,26 @@ async def test_codex_finding_fix_correction_green_reaches_ready_for_merge(
     ]
     assert after_correction == []
 
-    # A reply on the old thread after the correction is new feedback, not settled.
-    review_id = github.state.repositories[REPOSITORY].pulls[1].reviews[0]["id"]
-    github.state.add_review_comment(
-        REPOSITORY,
-        1,
-        review_id=review_id,
-        login=REVIEWER,
-        body="P1 still wrong after the correction",
-        path="src/app.txt",
-        line=1,
-    )
-    reply = github.state.repositories[REPOSITORY].pulls[1].review_comments[-1]
-    reply["commit_id"] = first_head
-    reply["created_at"] = AFTER_DECISION
+    pull = github.state.repositories[REPOSITORY].pulls[1]
+    if afterwards == "reply":
+        # A reply on the old thread after the correction is new feedback, not settled.
+        github.state.add_review_comment(
+            REPOSITORY,
+            1,
+            review_id=pull.reviews[0]["id"],
+            login=REVIEWER,
+            body="P1 still wrong after the correction",
+            path="src/app.txt",
+            line=1,
+        )
+        reply = pull.review_comments[-1]
+        reply["commit_id"] = first_head
+        reply["created_at"] = AFTER_DECISION
+    else:
+        # The original finding rewritten after the correction: judged by the edit, not by
+        # when the comment was first made.
+        pull.review_comments[0]["body"] = "P1 still wrong, and here is why"
+        pull.review_comments[0]["updated_at"] = AFTER_DECISION
     await delivery_supervisor.tick()
     assert state(client, task_id) == "external_feedback_received"
     assert gate(pr(client, task_id), "feedback_dispositions_complete") == "pending"
@@ -315,6 +323,22 @@ async def test_accepting_no_ci_does_not_hide_a_check_that_runs(
 ) -> None:
     task_id, view = await green(client, delivery_supervisor, github)
     github.state.set_check(REPOSITORY, view["head_sha"], name="build", status="in_progress")
+    response = waive(operator, task_id, "accept_no_ci", "We thought there was no CI.")
+    assert response.status_code == 201, response.text
+    await delivery_supervisor.tick()
+    assert state(client, task_id) == "awaiting_ci_certification"
+    assert pr(client, task_id)["ci_certifications"][-1]["state"] == "pending"
+
+
+async def test_accepting_no_ci_does_not_skip_a_required_check_that_never_appeared(
+    client: TestClient,
+    operator: TestClient,
+    delivery_supervisor: Supervisor,
+    github: FakeGitHubServer,
+) -> None:
+    """A configured required check that has not shown up yet is late, not absent."""
+    task_id, _ = await green(client, delivery_supervisor, github)
+    github.state.repositories[REPOSITORY].required_checks = ["build"]
     response = waive(operator, task_id, "accept_no_ci", "We thought there was no CI.")
     assert response.status_code == 201, response.text
     await delivery_supervisor.tick()

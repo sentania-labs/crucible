@@ -36,6 +36,15 @@ log = logging.getLogger("crucible.github")
 LOG_EXCERPT_BYTES = 64 * 1024
 
 
+def _refused(exc: GitHubError) -> bool:
+    """A permission or not-found refusal that the caller may treat as unobservable.
+
+    GitHub reports a rate limit as a 403 too. That one is not a refusal: it must reach the
+    delivery tick so the whole poll is deferred, rather than being read as "no protected
+    checks" or "no reactions" (hades FDY-0139)."""
+    return exc.status in (403, 404) and exc.response_class != "rate_limited"
+
+
 class RestGitHubClient:
     """The `GitHubClient` port over `api.github.com`."""
 
@@ -133,7 +142,7 @@ class RestGitHubClient:
                     if isinstance(check, dict) and check.get("context"):
                         names.append(str(check["context"]))
         except GitHubError as exc:
-            if exc.status not in (403, 404):
+            if not _refused(exc):
                 raise
         try:
             rules = self._http.get(
@@ -147,7 +156,7 @@ class RestGitHubClient:
                     if isinstance(check, dict) and check.get("context"):
                         names.append(str(check["context"]))
         except GitHubError as exc:
-            if exc.status not in (403, 404):
+            if not _refused(exc):
                 raise
         return tuple(dict.fromkeys(names))
 
@@ -160,7 +169,7 @@ class RestGitHubClient:
                 f"/repos/{repository}/issues/{number}/reactions", bearer=token.reveal()
             )
         except GitHubError as exc:
-            if exc.status in (403, 404):
+            if _refused(exc):
                 self.reactions_unobservable.add(repository)
                 raise UnobservableError(
                     f"reactions on {repository}#{number}", status=exc.status
@@ -184,7 +193,7 @@ class RestGitHubClient:
                 f"/repos/{repository}/issues/{number}/events", bearer=token.reveal()
             )
         except GitHubError as exc:
-            if exc.status in (403, 404):
+            if _refused(exc):
                 return None
             raise
         for row in reversed(rows):
@@ -212,7 +221,7 @@ class RestGitHubClient:
             try:
                 rows = self._http.paginate(endpoint, bearer=token.reveal())
             except GitHubError as exc:
-                if exc.status in (403, 404):
+                if _refused(exc):
                     continue
                 raise
             out.extend(

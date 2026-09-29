@@ -165,6 +165,13 @@ class ReplacedHeads:
         )
 
 
+def _last_written(comment: ReviewComment) -> datetime:
+    """When the comment's text was last written: its creation, or a later edit."""
+    if comment.updated_at is not None and comment.updated_at > comment.created_at:
+        return comment.updated_at
+    return comment.created_at
+
+
 def replaced_heads(uow: UnitOfWork, task: Task, pull_request: PullRequest) -> ReplacedHeads:
     head = accepted_head(uow, task)
     if not head:
@@ -494,7 +501,10 @@ def record_comments(
                 body_changed = existing.body_sha256 != digest
                 disposition_invalidated = False
                 if body_changed and comment.login in allowlist and comment.kind == "review_comment":
-                    if not settled.settles(existing.reviewed_sha, existing.created_at):
+                    # The edit is judged by when it happened, not when the comment was
+                    # first made: new text after the correction is new feedback.
+                    edited_at = comment.updated_at or now
+                    if not settled.settles(existing.reviewed_sha, edited_at):
                         result.edited_feedback += 1
                         result.new_comments += 1
                     old_disposition = uow.dispositions.get_by_comment(
@@ -807,12 +817,14 @@ def pending_rerun(
         return None
     decision_id = str(payload.get("ci_decision_id", ""))
     listed = payload.get("stale_failures")
-    if isinstance(listed, list) and listed:
-        known = {
-            (str(item.get("run_id") or ""), item.get("completed_at"))
-            for item in listed
-            if isinstance(item, dict)
-        }
+    # An entry with no run id (a failure recorded before FDY-0139) identifies nothing, so
+    # a decision that lists only those is judged by time instead.
+    known = {
+        (str(item["run_id"]), item.get("completed_at"))
+        for item in (listed if isinstance(listed, list) else [])
+        if isinstance(item, dict) and item.get("run_id")
+    }
+    if known:
         return decision_id if all(run in known for run in failures) else None
     concluded = [_parse_iso(at) for _, at in failures]
     if all(at is None or at <= event.ts for at in concluded):
@@ -919,7 +931,9 @@ def certify_head(
             and c.source is not CheckSource.CHECK_SUITE
             and not (c.concluded and c.conclusion == "skipped")
         ]
-        if waiver is not None and not ran:
+        # Only a repository that requires nothing: a configured required check that has not
+        # appeared yet is late, not absent, and stays subject to certification.
+        if waiver is not None and not ran and not outcome.required:
             state = CertificationState.SKIPPED
             detail = (
                 f"the operator accepted that this repository has no CI for this task "
@@ -1131,8 +1145,10 @@ def evaluate_delivery_gates(
     # is Foundry saying the work is not done; what follows it is a correction contract,
     # which clears it by replacing the head the comments belong to: a comment on a head
     # the accepted head replaced is settled and no longer counted (hades FDY-0139).
-    settled = [c for c in feedback if replaced.settles(c.reviewed_sha, c.created_at)]
-    needing = [c for c in feedback if not replaced.settles(c.reviewed_sha, c.created_at)]
+    # A comment edited after the correction is judged by its edit, so its new text needs a
+    # disposition like any other fresh feedback.
+    settled = [c for c in feedback if replaced.settles(c.reviewed_sha, _last_written(c))]
+    needing = [c for c in feedback if not replaced.settles(c.reviewed_sha, _last_written(c))]
     recorded = list(
         uow.dispositions.list_for_comments(
             [c.id for c in needing], {c.id: c.body_sha256 for c in needing}

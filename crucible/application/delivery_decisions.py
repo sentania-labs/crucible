@@ -92,7 +92,9 @@ def record_ci_decision(
             "stale_failures": [
                 {"run_id": row.get("run_id"), "completed_at": row.get("completed_at")}
                 for row in (certification.failure.get("all") or [] if certification else [])
-                if isinstance(row, dict)
+                # A row recorded before FDY-0139 carries no run id; listing it would match
+                # nothing, so it is left out and the decision falls back to its time.
+                if isinstance(row, dict) and row.get("run_id")
             ],
         },
     )
