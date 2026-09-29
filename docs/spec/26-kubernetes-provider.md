@@ -103,7 +103,8 @@ Per attempt the provider creates, in `crucible-workers`, all labelled
 | Job `collect-<attempt>` | the collector, no network, repo and report read-only, output read-write (08) | until complete |
 | Job `verify-bundle-<attempt>` | `git bundle verify`, no network | until complete |
 | Job `verifier-<attempt>` | re-runs `required_verification` on an independent clone from the bundle (10, 11) | until complete |
-| Job `publish-<attempt>` | pushes the sealed bundle with a token on an in-memory volume (23) | until complete |
+| Job `publish-<attempt>` | the publisher (23, ADR 0022): mounts `output/work_branch.bundle` off `ws-<attempt>` as one read-only file and the claim's `publish/` leaf for its outcome, checks the bundle against its seal, builds from it and pushes without force. Its egress is its own NetworkPolicy `np-publisher-<attempt>` | until complete, then deleted with its Pod and policy |
+| Secret `publish-token-<attempt>` | the installation token for one push, key `token`, mounted mode 0400 at `/run/crucible-token` into the publisher Job and nothing else | created just before the Job, deleted once its Pod is gone, on every path; one a crashed supervisor left is replaced by the next push of that attempt and removed by the retention sweep |
 | Job `login-<harness>-<id>` (admin flow, 25) | the harness's own login in that harness's default worker image (ADR 0018), no workspace, no credential mounted, a memory-backed home; the service reads the auth files back over exec and writes the harness Secret (ADR 0015). Labelled `crucible.role=login`, `crucible.harness`, `crucible.login` and never `crucible.attempt` | until the service has read it back, cancelled, or timed out; its own deadline and a TTL remove it if the api died |
 | NetworkPolicy `np-login-<id>` | the login Job's egress: the adapter's `login_endpoints` only | with its Job; the retention sweep removes one whose Job is gone |
 | ConfigMap `login-lock-<harness>` (admin flow, 25) | the harness's login lock across every api replica: created before the login Job, so exactly one replica gets it and the others are refused naming its holder. Carries the holder and an expiry (the login deadline, the read-back window and five minutes). Labelled `crucible.role=login-lock` and `crucible.harness`, never `crucible.attempt` | deleted by the api that took it, by uid, however the login ends; a lock past its expiry (its api died) is deleted by uid and replaced by the next login |
@@ -252,7 +253,8 @@ supports them:
 - preparer and publisher: `github.com` and `api.github.com` only. For a
   private repository whose `github.credential_host` is not `github.com`
   (GitHub Enterprise Server, ADR 0019), the preparer and the refresher may
-  also reach that host and port, resolved like any other allowlisted name.
+  also reach that host and port, resolved like any other allowlisted name,
+  and the publisher always may, because that is where it pushes.
 - collector, bundle verifier, verifier: no egress at all (the verifier
   gets the registries only when `required_verification` needs them and the
   policy says so).
