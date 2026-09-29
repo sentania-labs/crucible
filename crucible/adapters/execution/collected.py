@@ -181,13 +181,13 @@ def read_commit_policy(directory: Path) -> CommitPolicyCheck | None:
     if not (directory / "checked").is_file():
         return None
     authors: list[tuple[str, str]] = []
-    for line in text(directory / "author-problems.txt").splitlines()[:100]:
+    for line in text(directory / "author-problems.txt").splitlines()[:1000]:
         sha, _, email = line.partition("\t")
         if sha.strip():
             authors.append((sha.strip()[:64], email.strip()[:200]))
     trailers = tuple(
         line.strip()[:64]
-        for line in text(directory / "trailer-problems.txt").splitlines()[:100]
+        for line in text(directory / "trailer-problems.txt").splitlines()[:1000]
         if line.strip()
     )
     return CommitPolicyCheck(author_problems=tuple(authors), trailer_problems=trailers)

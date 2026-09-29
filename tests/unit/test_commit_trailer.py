@@ -98,8 +98,9 @@ def test_the_bundle_carries_an_executable_read_only_commit_msg_hook(tmp_path: Pa
         if line and not line.startswith("#") and "=" not in line.split(" ")[0]
     ]
     assert [c for c in commands if "git" in c] == [
-        "exec git interpret-trailers --in-place --if-exists doNothing --if-missing add \\"
+        "exec git interpret-trailers --in-place --no-divider --if-exists doNothing \\"
     ]
+    assert '  --if-missing add --trailer "$KEY: $VALUE" "$1"' in text
 
 
 def test_the_hook_value_is_data_whatever_the_external_id_holds(tmp_path: Path) -> None:
@@ -296,3 +297,84 @@ def test_the_publisher_and_the_collector_run_one_rule() -> None:
     assert scripts._commit_policy_check("git") in publisher
     assert scripts._commit_policy_check(scripts.GIT + ' -C "$REPO"') in collector
     assert 'commit_policy_check "$RANGE" "$OUT"' in publisher
+
+
+def test_the_hook_puts_the_trailer_last_even_after_a_dashed_line(tmp_path: Path) -> None:
+    """A `---` line in a body is prose. Without `--no-divider`, git reads it as the start
+    of a patch and puts the trailer above it, where no check finds it."""
+    hooks = _bundle(tmp_path) / scripts.COMMIT_HOOK_DIR
+    repo = _checkout(tmp_path, hooks)
+    _commit(repo, "a.txt", "Add a", "Notes:\n\n---\n\nMore notes", env=_git_only_path(tmp_path))
+    assert _trailers(repo) == ["HT-0007"]
+    message = _git(repo, "show", "-s", "--format=%B", "HEAD")
+    assert message.rstrip("\n").endswith("More notes\n\nCrucible-Attempt: HT-0007")
+
+
+def test_the_check_reports_a_range_it_cannot_read_as_not_checked(tmp_path: Path) -> None:
+    """A check that did not run is never read as one that found nothing."""
+    repo = _worker_branch(tmp_path)
+    _commit(repo, "a.txt", "Add a")
+    # A remote-tracking ref that names an object the checkout does not have.
+    (repo / ".git" / "refs" / "remotes" / "origin").mkdir(parents=True)
+    (repo / ".git" / "refs" / "remotes" / "origin" / "crucible" / "test").parent.mkdir()
+    (repo / ".git" / "refs" / "remotes" / "origin" / "crucible" / "test").write_text(
+        "f" * 40 + "\n", encoding="utf-8"
+    )
+    output = _collect(tmp_path, repo)
+    assert read_commit_policy(output / "commit-policy") is None
+
+
+def test_the_publisher_refuses_when_it_cannot_read_the_commits(tmp_path: Path) -> None:
+    """The publisher side of the same rule: no push on a check that did not run."""
+    repo = _worker_branch(tmp_path)
+    out = tmp_path / "publish"
+    out.mkdir()
+    body = scripts._commit_policy_check("git") + 'commit_policy_check "nosuchref..HEAD" "$OUT"'
+    result = subprocess.run(
+        ["sh", "-c", f"cd {repo}; OUT={out}; POLICY_AUTHOR_EMAIL={AUTHOR}; TRAILER=X; {body}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    publisher = scripts.publisher_script(
+        clone_url="https://github.com/o/r.git",
+        work_branch="crucible/test",
+        base_ref="main",
+        expected_head="a" * 40,
+        author_name="crucible-worker",
+        author_email=AUTHOR,
+        commit_trailer="Crucible-Attempt",
+    )
+    refusal = publisher.split('if ! commit_policy_check "$RANGE" "$OUT"; then', 1)[1]
+    assert refusal.split("fi\n", 1)[0].rstrip().endswith("exit 6")
+
+
+def test_the_collector_never_verifies_a_signature_a_worker_planted(tmp_path: Path) -> None:
+    """A worker-written `.git/config` with `log.showSignature` and a `gpg.program` of its
+    choosing must not run that program from the collector's `git show`."""
+    repo = _worker_branch(tmp_path)
+    sentinel = tmp_path / "gpg-ran"
+    program = tmp_path / "fake-gpg"
+    program.write_text(f"#!/bin/sh\ntouch {sentinel}\nexit 1\n", encoding="utf-8")
+    program.chmod(0o755)
+    _commit(repo, "a.txt", "Add a", "Crucible-Attempt: HT-0007")
+    # A commit object with a gpgsig header, written by hand.
+    raw = _git(repo, "cat-file", "commit", "HEAD")
+    header, _, message = raw.partition("\n\n")
+    signature = "-----BEGIN PGP SIGNATURE-----\n x\n -----END PGP SIGNATURE-----"
+    signed = f"{header}\ngpgsig {signature}\n\n{message}"
+    sha = subprocess.run(
+        ["git", "hash-object", "-t", "commit", "-w", "--stdin"],
+        cwd=repo,
+        input=signed,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    _git(repo, "update-ref", "refs/heads/crucible/test", sha)
+    _git(repo, "config", "log.showSignature", "true")
+    _git(repo, "config", "gpg.program", str(program))
+    check = read_commit_policy(_collect(tmp_path, repo) / "commit-policy")
+    assert check is not None
+    assert not sentinel.exists()

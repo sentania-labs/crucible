@@ -91,11 +91,14 @@ the bundle hash; the repository's own hooks never run. The hook runs `git
 interpret-trailers --if-exists doNothing --if-missing add` on the message
 file and nothing else: no network, no repository content. A trailer with the
 same key already in the message is kept as it is, so an amend, a harness
-that writes the trailer itself, or a second run never adds a duplicate. It
-works for every harness, since it is git that runs it. It is a convenience,
-not the check: `--no-verify`, a rewritten `core.hooksPath`, or a rebase can
-still leave a commit without the trailer, and the `commit_policy` gate (11)
-is what catches that.
+that writes the trailer itself, or a second run never adds a duplicate.
+`--no-divider` keeps a `---` line in a body from being read as the start of
+a patch, which would put the trailer where no check reads it. Any harness
+that commits through the git command line gets the hook. It is a
+convenience, not the check: `--no-verify`, a rewritten `core.hooksPath`, a
+cherry-pick, or a git library that does not run hooks can still leave a
+commit without the trailer, and the `commit_policy` gate (11) is what
+catches that.
 
 ## Harness-specific delivery
 

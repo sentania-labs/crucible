@@ -17,7 +17,7 @@ from typing import Any
 import yaml
 
 from crucible.adapters.execution import scripts
-from crucible.domain.gates import ENFORCED_PRE_PR_GATES
+from crucible.domain.gates import ENFORCED_PRE_PR_GATES, PRE_PR_GATES
 from crucible.ports.execution import IDENTITY_MOUNT, REPO_MOUNT, REPORT_MOUNT
 
 __all__ = ["IDENTITY_MOUNT", "REPORT_MOUNT", "REPO_MOUNT", "bundle_sha256", "write_bundle"]
@@ -197,6 +197,9 @@ def render_policy_md(policy: dict[str, Any], contract: dict[str, Any]) -> str:
     """The deterministic policy in words (06): timeouts, paths, gates."""
     limits = policy.get("limits", {})
     gates = policy.get("gates", {})
+    # With no list the whole pre-PR set runs (11), and the enforced gates run either way.
+    listed = gates.get("pre_pr")
+    pre_pr = [*(sorted(PRE_PR_GATES) if listed is None else listed), *sorted(ENFORCED_PRE_PR_GATES)]
     timeout = contract.get("timeout_seconds") or limits.get("timeout_seconds", {}).get("default")
     return f"""# Delivery policy
 
@@ -209,7 +212,7 @@ def render_policy_md(policy: dict[str, Any], contract: dict[str, Any]) -> str:
 
 ## Gates Crucible evaluates before anything is published
 
-{_bullets([*(gates.get("pre_pr") or []), *sorted(ENFORCED_PRE_PR_GATES)])}
+{_bullets(pre_pr)}
 
 These are mechanical. Crucible re-runs every required verification command
 itself, from the collected tree, in a container you do not control. Your own
@@ -259,6 +262,9 @@ def write_bundle(
     # Crucible's text, read-only, and covered by the bundle hash like the rest.
     hook_dir = directory / scripts.COMMIT_HOOK_DIR
     hook_dir.mkdir(exist_ok=True)
+    # Traversable by the worker uid whatever the service's umask; git skips a hook it
+    # cannot reach or execute without a word.
+    os.chmod(hook_dir, 0o755)
     hook = hook_dir / "commit-msg"
     hook.write_text(
         scripts.commit_msg_hook(

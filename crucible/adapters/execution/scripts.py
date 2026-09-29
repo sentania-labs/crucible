@@ -133,6 +133,8 @@ printf '[credential]\\n\\thelper = "!sh /tmp/cred-helper.sh"\\n' >> /tmp/gitconf
 # the message unless a trailer with that key is already there, so a harness that adds
 # the trailer itself, an amend, or a second run never gets a duplicate. It reads and
 # writes only the message file git hands it: no network, no repository content.
+# `--no-divider`: a `---` line in a body is prose, not the start of a patch, so the
+# trailer goes at the end of the message, where the commit policy check reads it.
 COMMIT_HOOK_DIR = "hooks"
 
 
@@ -144,8 +146,8 @@ set -eu
 KEY={_quote(trailer)}
 VALUE={_quote(value)}
 [ -n "${{1:-}}" ] || exit 0
-exec git interpret-trailers --in-place --if-exists doNothing --if-missing add \\
-  --trailer "$KEY: $VALUE" "$1"
+exec git interpret-trailers --in-place --no-divider --if-exists doNothing \\
+  --if-missing add --trailer "$KEY: $VALUE" "$1"
 """
 
 
@@ -157,17 +159,23 @@ def _commit_policy_check(git: str) -> str:
     `commit_policy_check RANGE DIR` writes `DIR/author-problems.txt` (sha, tab, author
     email) for each commit in RANGE whose author email is not `$POLICY_AUTHOR_EMAIL`, and
     `DIR/trailer-problems.txt` (sha) for each commit with no `$TRAILER` trailer. `git` is
-    the command each caller already runs git with."""
+    the command each caller already runs git with.
+
+    It returns non-zero when git cannot list or read the commits, so neither caller
+    takes a check that did not run for one that found nothing: the publisher refuses
+    the push, and the collector records the check as unfinished, which fails the gate."""
     return f"""commit_policy_check() {{
   : > "$2/author-problems.txt"
   : > "$2/trailer-problems.txt"
-  for sha in $({git} rev-list "$1" 2>/dev/null || true); do
-    who=$({git} show -s --format='%ae' "$sha")
+  shas=$({git} rev-list "$1") || return 1
+  for sha in $shas; do
+    who=$({git} show -s --format='%ae' "$sha") || return 1
     if [ "$who" != "$POLICY_AUTHOR_EMAIL" ]; then
       printf '%s\\t%s\\n' "$sha" "$who" >> "$2/author-problems.txt"
     fi
-    if ! {git} show -s --format='%(trailers:key='"$TRAILER"',valueonly)' "$sha" \\
-        | grep -q .; then
+    found=$({git} show -s --format='%(trailers:key='"$TRAILER"',valueonly)' "$sha") \\
+      || return 1
+    if [ -z "$found" ]; then
       printf '%s\\n' "$sha" >> "$2/trailer-problems.txt"
     fi
   done
@@ -175,9 +183,11 @@ def _commit_policy_check(git: str) -> str:
 """
 
 
+# `log.showSignature=false`: a worker-written `.git/config` could otherwise have `git
+# show` verify a planted signature with a `gpg.program` of its choosing.
 GIT = (
     "git -c core.fsmonitor= -c diff.external= -c core.pager=cat "
-    "-c core.hooksPath=/dev/null -c 'safe.directory=*'"
+    "-c core.hooksPath=/dev/null -c log.showSignature=false -c 'safe.directory=*'"
 )
 CHECKPOINT_GIT = (
     "git -c core.fsmonitor= -c diff.external= -c core.pager=cat "
@@ -505,6 +515,7 @@ EOF
   restore_worker_git_config
   trap - EXIT HUP INT TERM
 fi
+rm -rf "$OUT/commit-policy"
 BASE=$({GIT} -C "$REPO" rev-parse --verify --quiet "$BASE_REF" \
   || {GIT} -C "$REPO" rev-parse --verify --quiet "origin/$BASE_REF" \
   || echo "")
@@ -528,7 +539,6 @@ if [ -n "$BASE" ]; then
   else
     POLICY_FROM="$BASE"
   fi
-  rm -rf "$OUT/commit-policy"
   mkdir -p "$OUT/commit-policy"
   if commit_policy_check "$POLICY_FROM..HEAD" "$OUT/commit-policy"; then
     echo done > "$OUT/commit-policy/checked"
@@ -827,7 +837,14 @@ else
   RANGE="refs/remotes/origin/$BASE_REF..refs/heads/crucible-publish"
 fi
 POLICY_AUTHOR_EMAIL={_quote(author_email)}
-{_commit_policy_check("git")}commit_policy_check "$RANGE" "$OUT"
+{_commit_policy_check("git")}if ! commit_policy_check "$RANGE" "$OUT"; then
+  echo "commit policy refused the push: the commits to push could not be read" \
+    > "$OUT/error.txt"
+  echo refused > "$OUT/push.txt"
+  drop_token
+  chmod 0644 "$OUT"/* 2>/dev/null || true
+  exit 6
+fi
 if [ -s "$OUT/author-problems.txt" ] || [ -s "$OUT/trailer-problems.txt" ]; then
   # 23 step 4: verify every commit's author and trailer match policy, *then* push. A
   # commit signed by someone the policy does not name, or missing the attempt trailer,
