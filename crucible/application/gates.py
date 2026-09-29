@@ -25,6 +25,7 @@ from crucible.domain.entities import (
 from crucible.domain.events import PRINCIPAL_CRUCIBLE, EventKind
 from crucible.domain.gates import (
     DEFERRED_TO_C3,
+    ENFORCED_PRE_PR_GATES,
     PRE_PR_GATES,
     EvidenceItem,
     GateInput,
@@ -100,11 +101,12 @@ def gate_input(uow: UnitOfWork, *, task: Task, attempt: Attempt, execution: Exec
 def configured_pre_pr_gates(policy: dict[str, Any]) -> list[str]:
     """The policy names the required set (05b); with no policy document, every pre-PR gate.
 
-    An explicit empty list is an empty set, which is not the same as no policy at all."""
+    An explicit empty list is an empty set, which is not the same as no policy at all.
+    The enforced gates are added either way: the publisher applies their rule whatever
+    the policy says, so the policy cannot drop the early warning (hades FDY-0135)."""
     gates = policy.get("gates", {}).get("pre_pr")
-    if gates is None:
-        return sorted(PRE_PR_GATES)
-    return [str(g) for g in gates]
+    listed = sorted(PRE_PR_GATES) if gates is None else [str(g) for g in gates]
+    return listed + sorted(g for g in ENFORCED_PRE_PR_GATES if g not in listed)
 
 
 def persist_outcomes(

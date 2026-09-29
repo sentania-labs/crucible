@@ -19,6 +19,7 @@ from crucible.domain.gates import (
     ALL_GATES,
     ALWAYS_BLOCKING_GATES,
     DEFAULT_ADVISORY_GATES,
+    ENFORCED_PRE_PR_GATES,
     POST_PR_GATES,
     PRE_PR_GATES,
     PUBLICATION_GATES,
@@ -195,18 +196,21 @@ class Gates(StrictModel):
             return None
         if len(set(value)) != len(value):
             raise ValueError("duplicate entry in gates.advisory")
-        stray = sorted(set(value) - PRE_PR_GATES)
-        if stray:
-            raise ValueError(f"gates.advisory names gates that are not pre-PR gates: {stray}")
         fixed = sorted(set(value) & ALWAYS_BLOCKING_GATES)
         if fixed:
             raise ValueError(f"gates.advisory may not include {fixed}: these always block")
+        stray = sorted(set(value) - PRE_PR_GATES)
+        if stray:
+            raise ValueError(f"gates.advisory names gates that are not pre-PR gates: {stray}")
         return value
 
     @model_validator(mode="after")
     def _partition(self) -> Gates:
         groups = (self.pre_pr, self.publication, self.post_pr, self.skipped)
         listed = [gate for group in groups for gate in group]
+        enforced = sorted(set(listed) & ENFORCED_PRE_PR_GATES)
+        if enforced:
+            raise ValueError(f"{enforced} always run before review and are not listed in a policy")
         unknown = sorted(set(listed) - ALL_GATES)
         if unknown:
             raise ValueError(f"unknown gates: {unknown}")

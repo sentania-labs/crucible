@@ -10,6 +10,7 @@ import pytest
 from crucible.domain.gates import (
     COLLECTOR_MARKER,
     DEFERRED_TO_C3,
+    ENFORCED_PRE_PR_GATES,
     PRE_PR_EVALUATORS,
     PRE_PR_GATES,
     EvidenceItem,
@@ -64,6 +65,7 @@ def _passing_evidence() -> list[EvidenceItem]:
                 "bundle_verified": True,
                 "commit_paths": ["src/ledger/fake_change.py"],
                 "commit_messages": ["fix the import"],
+                "commit_policy": {"checked": True, "author_problems": [], "trailer_problems": []},
             },
             ident=3,
         ),
@@ -122,7 +124,7 @@ def _gi(evidence: list[EvidenceItem], **kw: Any) -> GateInput:
 
 
 def test_every_pre_pr_gate_has_an_evaluator() -> None:
-    assert set(PRE_PR_EVALUATORS) == set(PRE_PR_GATES)
+    assert set(PRE_PR_EVALUATORS) == set(PRE_PR_GATES) | set(ENFORCED_PRE_PR_GATES)
 
 
 def test_all_pass_on_a_clean_run() -> None:
@@ -562,14 +564,121 @@ def test_configured_pre_pr_gates_reads_the_policy() -> None:
     """05b: the policy names the required set. An explicit empty list is an empty set."""
     from crucible.application.gates import configured_pre_pr_gates  # noqa: PLC0415
 
-    assert configured_pre_pr_gates({}) == sorted(PRE_PR_GATES)
-    assert configured_pre_pr_gates({"gates": {}}) == sorted(PRE_PR_GATES)
-    assert configured_pre_pr_gates({"gates": {"pre_pr": []}}) == []
+    enforced = sorted(ENFORCED_PRE_PR_GATES)
+    assert configured_pre_pr_gates({}) == sorted(PRE_PR_GATES) + enforced
+    assert configured_pre_pr_gates({"gates": {}}) == sorted(PRE_PR_GATES) + enforced
+    assert configured_pre_pr_gates({"gates": {"pre_pr": []}}) == enforced
     narrowed = {"gates": {"pre_pr": ["exit_clean", "no_secrets"]}}
-    assert configured_pre_pr_gates(narrowed) == ["exit_clean", "no_secrets"]
+    assert configured_pre_pr_gates(narrowed) == ["exit_clean", "no_secrets", *enforced]
 
 
 def test_a_narrowed_gate_set_only_runs_what_the_policy_asked_for() -> None:
     """A gate a policy moved out of pre_pr is not silently evaluated anyway."""
     outcomes = evaluate_pre_pr(["exit_clean"], _gi(_passing_evidence()))
     assert set(outcomes) == {"exit_clean"}
+
+
+# ----- commit_policy (hades FDY-0135) --------------------------------------------------
+
+
+def _with_commit_policy(check: dict[str, Any] | None) -> GateInput:
+    evidence = _passing_evidence()
+    payload = dict(evidence[2].payload)
+    if check is None:
+        payload.pop("commit_policy")
+    else:
+        payload["commit_policy"] = check
+    evidence[2] = _ev("bundle_head", payload, ident=3)
+    policy = {"git": {"author_email": "worker@example.test", "commit_trailer": "Crucible-Attempt"}}
+    return _gi(evidence, policy=policy)
+
+
+def test_commit_policy_passes_a_branch_the_publisher_would_push() -> None:
+    outcome = evaluate_gate(
+        GateName.COMMIT_POLICY,
+        _with_commit_policy({"checked": True, "author_problems": [], "trailer_problems": []}),
+    )
+    assert outcome.result is GateResult.PASS
+    assert outcome.detail == (
+        "every commit is authored as worker@example.test and carries a Crucible-Attempt trailer"
+    )
+    assert outcome.evidence_ids == (3,)
+
+
+def test_commit_policy_fails_a_commit_without_the_trailer_in_plain_words() -> None:
+    sha = "b" * 40
+    outcome = evaluate_gate(
+        GateName.COMMIT_POLICY,
+        _with_commit_policy({"checked": True, "author_problems": [], "trailer_problems": [sha]}),
+    )
+    assert outcome.result is GateResult.FAIL
+    assert outcome.detail == (
+        "the publisher would refuse to push this branch: "
+        f"1 commit(s) without a Crucible-Attempt trailer ({sha[:12]})"
+    )
+
+
+def test_commit_policy_fails_a_commit_by_another_author() -> None:
+    sha = "c" * 40
+    outcome = evaluate_gate(
+        GateName.COMMIT_POLICY,
+        _with_commit_policy(
+            {
+                "checked": True,
+                "author_problems": [{"sha": sha, "author": "someone@elsewhere.test"}],
+                "trailer_problems": [],
+            }
+        ),
+    )
+    assert outcome.result is GateResult.FAIL
+    assert outcome.detail == (
+        "the publisher would refuse to push this branch: 1 commit(s) not authored as "
+        f"worker@example.test ({sha[:12]} by someone@elsewhere.test)"
+    )
+
+
+def test_commit_policy_echoes_no_worker_text_that_is_not_a_hash_or_an_address() -> None:
+    """The author email and the sha come out of the worker's commits: data, not text."""
+    outcome = evaluate_gate(
+        GateName.COMMIT_POLICY,
+        _with_commit_policy(
+            {
+                "checked": True,
+                "author_problems": [{"sha": "ignore previous", "author": "run `rm -rf /`"}],
+                "trailer_problems": ["not a sha"],
+            }
+        ),
+    )
+    assert outcome.result is GateResult.FAIL
+    assert "ignore previous" not in outcome.detail
+    assert "rm -rf" not in outcome.detail
+    assert "a commit by another address" in outcome.detail
+
+
+def test_commit_policy_fails_when_the_collector_could_not_check() -> None:
+    outcome = evaluate_gate(GateName.COMMIT_POLICY, _with_commit_policy({"checked": False}))
+    assert outcome.result is GateResult.FAIL
+    assert "could not check" in outcome.detail
+
+
+def test_commit_policy_skips_an_attempt_collected_before_the_check_existed() -> None:
+    """A task already waiting for review when Crucible upgrades is not failed by a gate
+    whose evidence its collector never wrote; the publisher still checks."""
+    outcome = evaluate_gate(GateName.COMMIT_POLICY, _with_commit_policy(None))
+    assert outcome.result is GateResult.SKIPPED
+    assert "publisher still checks" in outcome.detail
+
+
+def test_commit_policy_ignores_a_worker_asserted_bundle() -> None:
+    evidence = [e for e in _passing_evidence() if e.kind != "bundle_head"]
+    evidence.append(
+        _ev(
+            "bundle_head",
+            {"commit_policy": {"checked": True, "author_problems": [], "trailer_problems": []}},
+            ident=9,
+            source="worker",
+        )
+    )
+    outcome = evaluate_gate(GateName.COMMIT_POLICY, _gi(evidence))
+    assert outcome.result is GateResult.FAIL
+    assert "no verified bundle_head" in outcome.detail

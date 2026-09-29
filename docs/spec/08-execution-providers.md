@@ -68,7 +68,9 @@ It is a test fixture: wired only when `test_fixtures` is on (18).
   head, else create `work_branch` from `base_ref`; record which happened
   as an event; replace the `origin` URL with a placeholder so no push can
   succeed; write shims and `.git/info/exclude`; install the author
-  identity from policy (an empty credential helper, whatever the clone used); render the identity bundle to
+  identity from policy (an empty credential helper, whatever the clone used); point
+  `core.hooksPath` at the identity bundle's `hooks/` directory, so the worker's commits
+  run Crucible's `commit-msg` hook and never a repository hook (06); render the identity bundle to
   `<artifact_root>/workspaces/<attempt>/identity`; create the empty report
   directory at `<artifact_root>/workspaces/<attempt>/report`.
 - `launch`: resolve the image tag to a digest and record it on the
@@ -107,6 +109,11 @@ It is a test fixture: wired only when `test_fixtures` is on (18).
   `--network none` runs `git bundle verify` on it (never the Crucible
   process, which has no git and must not parse worker-produced files);
   the bundle is the only thing the publisher (23) ever fetches from.
+  The collector also runs the publisher's commit policy check, the same
+  shell function the publisher runs, over the range the publisher will
+  push (the remote `work_branch` when the checkout has one, else
+  `base_ref`), and writes what it found to `commit-policy/` for the
+  `commit_policy` gate (11).
   Everything read from the tree is data.
 - `terminate`: `drain` sends SIGTERM and waits the policy grace; `kill`
   sends SIGKILL.

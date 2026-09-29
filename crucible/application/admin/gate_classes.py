@@ -58,7 +58,7 @@ def save_gate_classes(
     reason = guard_mutation(
         ctx, uow, reason, principal=principal.name, operation="gates set-advisory"
     )
-    unknown = sorted(set(advisory) - PRE_PR_GATES)
+    unknown = sorted(set(advisory) - PRE_PR_GATES - ALWAYS_BLOCKING_GATES)
     fixed = sorted(set(advisory) & ALWAYS_BLOCKING_GATES)
     if unknown or fixed:
         errors = [

@@ -57,7 +57,7 @@ images:
 git:
   author_name: "crucible-worker"
   author_email: "crucible-worker@users.noreply.github.com"
-  commit_trailer: "Crucible-Attempt"   # trailer key carrying the attempt ID
+  commit_trailer: "Crucible-Attempt"   # trailer key; Crucible's commit hook adds `<key>: <external_id>` (06)
   work_branch_pattern: "crucible/*"
   protected_branches: ["main", "release/*"]
 
@@ -92,6 +92,7 @@ gates:
     - feedback_dispositions_complete
     - ci_green_for_head
   skipped: []                          # release gates live on the release contract (24)
+                                       # commit_policy is never listed: it always runs before review (11)
   advisory:                            # ADR 0024: a failure of these goes to the internal reviewer instead of stopping the task
     - criteria_mapped                  # absent (every version written before 2026-09-29): this default set
     - report_present
@@ -202,7 +203,8 @@ retention:
   recorded as a decision.
 - `gates.advisory` (ADR 0024) is optional. When present it lists pre-PR
   gates only, each once, and never `internal_review_recorded` (the review is
-  the enforcement) or `no_secrets` (a pushed secret cannot be taken back).
+  the enforcement), `no_secrets` (a pushed secret cannot be taken back) or
+  `commit_policy` (the publisher's own rule, never listed in a policy).
   Every pre-PR gate it does not list blocks. Absent, the
   default set applies, so a version written before the field existed
   behaves as the default without being rewritten. Listing a gate outside

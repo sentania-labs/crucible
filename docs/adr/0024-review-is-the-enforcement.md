@@ -28,7 +28,7 @@ Foundry write a correction for work that was already right.
    `commits_present`, `no_injected_files`, `workspace_clean`, `exit_clean`, and
    `internal_review_recorded`. Advisory: `scope_contained`, `report_present`,
    `criteria_mapped`, `run_evidence_present`. A gate added later is blocking unless a
-   policy lists it. `report_present` is advisory for a report that is malformed or
+   policy lists it. `commit_policy` (FDY-0135, which no policy lists) always blocks. `report_present` is advisory for a report that is malformed or
    lacks a judgement field; no report at all still stops the task. A `report.yaml`
    that is there but is not YAML, or not a mapping, is malformed, not absent: it is
    recorded as a present report that did not parse, and the parser's problem and
@@ -39,7 +39,7 @@ Foundry write a correction for work that was already right.
    that evaluation says `blocking`.
 4. **The policy decides.** `gates.advisory` lists the advisory pre-PR gates; every
    other pre-PR gate blocks. It is validated (pre-PR gates only, no duplicates, never
-   `internal_review_recorded` or `no_secrets`) and versioned with the rest of the
+   `internal_review_recorded`, `no_secrets` or `commit_policy`) and versioned with the rest of the
    policy. `no_secrets` is fixed because a secret, once pushed, cannot be taken back,
    and never committing a secret outranks any policy. A version
    without the field, including every version written before it existed, takes the

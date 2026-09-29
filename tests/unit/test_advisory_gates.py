@@ -354,6 +354,7 @@ def test_the_policy_field_is_optional_and_validated() -> None:
         (["no_such_gate"], "not pre-PR gates"),
         (["internal_review_recorded"], "always block"),
         (["no_secrets"], "always block"),
+        (["commit_policy"], "always block"),
         (["scope_contained", "scope_contained"], "duplicate"),
     ):
         with pytest.raises(ValidationError, match=words):
@@ -371,3 +372,10 @@ def test_making_a_safety_gate_advisory_is_an_operator_setting() -> None:
 def test_no_gate_is_both_always_blocking_and_advisory_by_default() -> None:
     assert not ALWAYS_BLOCKING_GATES & DEFAULT_ADVISORY_GATES
     assert DEFAULT_ADVISORY_GATES <= PRE_PR_GATES
+
+
+def test_the_commit_policy_gate_always_blocks() -> None:
+    """FDY-0135's gate, which no policy lists, stays blocking whatever the advisory set."""
+    assert GateName.COMMIT_POLICY in ALWAYS_BLOCKING_GATES
+    stored = {"gates": {"advisory": ["commit_policy", "scope_contained"]}}
+    assert gate_class(GateName.COMMIT_POLICY, advisory_gates(stored)) is GateClass.BLOCKING
