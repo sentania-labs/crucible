@@ -58,6 +58,7 @@ from crucible.adapters.execution.k8sspec import (
     ROLE_WORKER,
 )
 from crucible.adapters.execution.scripts import (
+    ACTIVITY_MARKER,
     PUBLISH_BUNDLE_LEAF,
     PUBLISH_LEAF,
     PUBLISH_LEAF_MARKER,
@@ -255,6 +256,8 @@ class FakeKubernetesApi:
     login_runs: dict[str, _LoginRun] = field(default_factory=dict)
     # Every stdin an exec was given, by Pod name, so a test sees what went in.
     exec_stdin: dict[str, list[bytes]] = field(default_factory=dict)
+    # FDY-0140: what the activity probe prints for a Pod, one answer per ask.
+    activity_answers: dict[str, list[bytes]] = field(default_factory=dict)
     # The Job controller's `activeDeadlineSeconds` firing on a hanging worker before
     # Crucible's own wait ends: the Job is marked failed with `DeadlineExceeded` and its
     # Pod is removed (or left terminated with 137 when `deadline_keeps_pod`).
@@ -490,6 +493,8 @@ class FakeKubernetesApi:
             return self._login_exec(name, run, command[-1], stdin)
         claim = self._claim_of(obj)
         script = command[-1]
+        if ACTIVITY_MARKER in script:
+            return self._activity(name, claim)
         if "tar cf -" in script:
             return ExecResult(_tar(claim), b"", 0)
         match = re.match(r"^p='(?P<path>[^']*)'", script)
@@ -500,6 +505,19 @@ class FakeKubernetesApi:
         if data is None:
             return ExecResult(b"absent\n", b"", 0)
         return ExecResult(b"ok\n" + base64.b64encode(data), b"", 0)
+
+    def _activity(self, name: str, claim: Mapping[str, bytes]) -> ExecResult:
+        """FDY-0140: the activity probe's one line. A test scripts it per Pod through
+        `activity_answers` (one answer used per ask, the last one kept); otherwise it is
+        derived from the claim's checkout and report leaves."""
+        answers = self.activity_answers.get(name)
+        if answers:
+            answer = answers.pop(0) if len(answers) > 1 else answers[0]
+            return ExecResult(answer, b"", 0)
+        files = sorted((k, v) for k, v in claim.items() if k.startswith(("repo/", "report/")))
+        newest = int(hashlib.sha256(repr(files).encode()).hexdigest()[:12], 16)
+        total = sum(len(v) for _, v in files)
+        return ExecResult(f"activity {newest} {len(files)} {total}\n".encode(), b"", 0)
 
     # ----- acting out a role ---------------------------------------------
 

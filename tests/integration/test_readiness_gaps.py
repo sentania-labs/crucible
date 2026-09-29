@@ -65,7 +65,7 @@ async def test_stall_warns_then_drains_and_kills_as_timeout(
     await supervisor.tick()
     await supervisor.tick()
     attempt = client.get(f"/v1/attempts/{attempt_id}").json()
-    assert attempt["exit_class"] == "timeout"
+    assert attempt["exit_class"] == "stalled"
     assert attempt["termination_reason"] == "stall"
     assert attempt["heartbeat_summary"]["state"] == "stalled"
     assert "worker_stalled" in event_kinds(client, task_id)

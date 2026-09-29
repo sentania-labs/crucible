@@ -20,6 +20,9 @@ class ExitClass(StrEnum):
     PROVIDER_ERROR = "provider_error"
     QUOTA_EXHAUSTED = "quota_exhausted"
     TIMEOUT = "timeout"
+    # Crucible ended the worker because nothing it did was seen for the policy's
+    # stall_fail_seconds (10, FDY-0140): a stall, which is not the attempt's timeout.
+    STALLED = "stalled"
     KILLED = "killed"
     CRASHED = "crashed"
     LOST = "lost"

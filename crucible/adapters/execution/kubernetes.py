@@ -228,6 +228,8 @@ LOG_READ_CEILING = 64 * 1024 * 1024
 # How much of a collected output tar is accepted. The tree is excluded from it, so this
 # is the diff, the bundle, the report copy and the verifier logs.
 OUTPUT_READ_LIMIT = 256 * 1024 * 1024
+# The one line the activity probe prints (FDY-0140).
+ACTIVITY_READ_LIMIT = 4096
 
 # How long an administrative run's objects (a probe's claim and Jobs, a login's policy)
 # are left alone by the retention sweep. The API process that created them removes them
@@ -1675,6 +1677,31 @@ class KubernetesProvider:
                 limit = min(limit * 4, LOG_READ_CEILING)
                 continue
             return _skip_crowded_second(payload, limit, since)
+
+    async def activity(self, h: Handle, ws: Workspace) -> tuple[int, int, int] | None:
+        """FDY-0140: the workspace is a claim, not a local path, so the supervisor's own
+        walk sees nothing. The live worker is asked instead, over exec, never through a
+        log. Any failure to ask is None: the stall clock is neither reset nor pushed."""
+        try:
+            pod = await self._pod_of(h.ref)
+        except KubernetesApiError:
+            return None
+        if pod is None or str((pod.get("status") or {}).get("phase", "")) != "Running":
+            return None
+        name = str((pod.get("metadata") or {}).get("name") or "")
+        try:
+            result: ExecResult = await self._call(
+                self.client.pod_exec,
+                name,
+                ["sh", "-c", scripts.ACTIVITY_SCRIPT],
+                container=k8sspec.CONTAINER_NAME,
+                limit=ACTIVITY_READ_LIMIT,
+            )
+        except KubernetesApiError:
+            return None
+        if result.exit_code != 0:
+            return None
+        return scripts.parse_activity(result.stdout)
 
     async def collect(
         self, h: Handle, ws: Workspace, spec: LaunchSpec | None = None

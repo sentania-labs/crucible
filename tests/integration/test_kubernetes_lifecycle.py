@@ -700,3 +700,77 @@ def test_wiring_routes_by_workspace_when_both_providers_are_on(
     # And with no GitHub App at all there is no publisher, which the supervisor reports.
     bare = Settings(database={"url": migrated}, docker=settings.docker)
     assert wire(bare).publisher is None
+
+
+# ----- FDY-0140: a quiet worker that is working is not stalled ------------------------
+
+
+def _worker_pod(k8s_api: FakeKubernetesApi, attempt_id: str) -> str:
+    prefix = f"worker-{attempt_id.lower()}"
+    names = [name for kind, name in k8s_api.objects if kind == "pods" and name.startswith(prefix)]
+    assert len(names) == 1, names
+    return names[0]
+
+
+async def _quiet_hang(
+    k8s_client: TestClient,
+    k8s_supervisor: Supervisor,
+    k8s_api: FakeKubernetesApi,
+    external_id: str,
+) -> tuple[str, str]:
+    """A worker that writes nothing to its log for as long as it runs, as Hermes `-z`
+    does, on the seeded limits (warn 300 s, fail 1800 s) and an hour's timeout."""
+    k8s_api.script_all("hang")
+    document = k8s_contract(external_id)
+    document["execution_request"]["timeout_seconds"] = 3600
+    task_id = start(k8s_client, document)
+    for _ in range(10):
+        await k8s_supervisor.tick()
+        attempt = k8s_client.get(f"/v1/tasks/{task_id}").json().get("latest_attempt")
+        if attempt and attempt["state"] == "running":
+            return task_id, str(attempt["id"])
+    raise AssertionError("the quiet worker never started")
+
+
+async def test_a_silent_worker_whose_files_change_is_not_stalled(
+    k8s_client: TestClient,
+    k8s_supervisor: Supervisor,
+    k8s_api: FakeKubernetesApi,
+    clock: FakeClock,
+) -> None:
+    """The checkout path is a `k8s://` name, so the supervisor's own walk sees nothing;
+    the provider asks the Pod. A worker whose files keep moving works on past the fail
+    limit with no log line at all."""
+    task_id, attempt_id = await _quiet_hang(k8s_client, k8s_supervisor, k8s_api, "EX-0140A")
+    pod = _worker_pod(k8s_api, attempt_id)
+    k8s_api.activity_answers[pod] = [f"activity {n} 10 100\n".encode() for n in range(1000)]
+    for _ in range(50):
+        clock.advance(50)
+        await k8s_supervisor.tick()
+    kinds = event_kinds(k8s_client, task_id)
+    assert "worker_stalled" not in kinds and "worker_quiet" not in kinds
+    attempt = k8s_client.get(f"/v1/attempts/{attempt_id}").json()
+    assert attempt["state"] == "running" and attempt["termination_reason"] is None
+    with k8s_supervisor._uow_factory() as uow:
+        signals = [h.signal for h in uow.heartbeats.list_for_attempt(attempt_id, limit=1000)]
+    # Asked about once a minute, not every tick: 2500 s is about 40 asks.
+    assert 20 <= signals.count("fs_changed") <= 45, signals.count("fs_changed")
+
+
+async def test_a_worker_whose_files_do_not_move_is_stalled_and_recorded_as_a_stall(
+    k8s_client: TestClient,
+    k8s_supervisor: Supervisor,
+    k8s_api: FakeKubernetesApi,
+    clock: FakeClock,
+) -> None:
+    task_id, attempt_id = await _quiet_hang(k8s_client, k8s_supervisor, k8s_api, "EX-0140B")
+    pod = _worker_pod(k8s_api, attempt_id)
+    k8s_api.activity_answers[pod] = [b"activity 1 10 100\n"]
+    for _ in range(45):
+        clock.advance(50)
+        await k8s_supervisor.tick()
+    kinds = event_kinds(k8s_client, task_id)
+    assert "worker_stalled" in kinds
+    attempt = k8s_client.get(f"/v1/attempts/{attempt_id}").json()
+    assert attempt["termination_reason"] == "stall"
+    assert attempt["exit_class"] == "stalled"

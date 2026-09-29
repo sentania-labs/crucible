@@ -667,7 +667,7 @@ async def test_rows_5_7_11_23_supervisor_restart_and_full_gate_lifecycle(
                 text("SELECT exit_class, termination_reason FROM attempts WHERE id = :id"),
                 {"id": stall_attempt["id"]},
             ).one()
-        assert stall_row.exit_class == "timeout"
+        assert stall_row.exit_class == "stalled"
         assert stall_row.termination_reason == "stall"
         assert {"worker_quiet", "worker_stalled"} <= set(event_kinds(client, stall_task))
 

@@ -26,6 +26,7 @@ from crucible.ports.execution import (
 )
 
 __all__ = [
+    "ACTIVITY_SCRIPT",
     "BUNDLE_MOUNT",
     "BUNDLE_VERIFY_SCRIPT",
     "MANIFEST",
@@ -36,6 +37,7 @@ __all__ = [
     "VERIFY_MOUNT",
     "collector_script",
     "encode_check_id",
+    "parse_activity",
     "preparer_script",
     "publish_leaf_script",
     "publisher_script",
@@ -486,6 +488,34 @@ HEAD=$({GIT} -C "$REPO" rev-parse HEAD)
 REMOTE=$({GIT} --git-dir "$ORIGIN" rev-parse "refs/heads/$WORK_BRANCH")
 test "$REMOTE" = "$HEAD"
 """
+
+
+# FDY-0140: what the Kubernetes provider runs inside a live worker to see whether it is
+# working. The checkout, the report directory and the home directory, where a harness
+# keeps its own session state (Hermes writes its session store after every model turn
+# while `-z` writes nothing to stdout), are walked without crossing into another
+# filesystem, so a credential mount under the home is never entered. It prints one
+# line: the newest modification time in microseconds, the entry count and the total
+# bytes. Nothing is written and nothing the worker controls is run.
+ACTIVITY_MARKER = "# crucible: activity"
+ACTIVITY_SCRIPT = f"""{ACTIVITY_MARKER}
+find {REPO_MOUNT} {REPORT_MOUNT} "${{HOME:-/home/worker}}" -xdev -printf '%T@ %s\\n' 2>/dev/null \\
+  | awk 'BEGIN {{ newest = 0; files = 0; total = 0 }}
+         {{ if ($1 + 0 > newest) newest = $1 + 0; files += 1; total += $2 }}
+         END {{ printf "activity %.0f %.0f %.0f\\n", newest * 1000000, files, total }}'
+"""
+
+
+def parse_activity(stdout: bytes) -> tuple[int, int, int] | None:
+    """The fingerprint ACTIVITY_SCRIPT printed, or None for anything else."""
+    fields = stdout.decode("ascii", "replace").split()
+    if len(fields) != 4 or fields[0] != "activity":
+        return None
+    try:
+        newest, files, total = (int(value) for value in fields[1:])
+    except ValueError:
+        return None
+    return newest, files, total
 
 
 BUNDLE_VERIFY_SCRIPT = f"""set -eu

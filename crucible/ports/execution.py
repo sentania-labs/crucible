@@ -502,3 +502,16 @@ class ExecutionProvider(Protocol):
     async def health(self) -> ProviderHealth:
         """25: daemon reachable, network present, disk headroom, as one state."""
         ...
+
+
+class ActivityProbe(Protocol):
+    """A provider whose workspace is not a local path (26) reads activity off the
+    running worker itself (FDY-0140). The supervisor walks a local workspace on its own;
+    a provider that has this method answers instead of that walk."""
+
+    async def activity(self, h: Handle, ws: Workspace) -> tuple[int, int, int] | None:
+        """A fingerprint of the worker's checkout, report directory and home: the
+        newest modification time, the entry count and the total bytes. Only equality
+        between two answers means anything. None when it could not be read this time,
+        which is neither activity nor its absence."""
+        ...
