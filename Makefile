@@ -63,7 +63,7 @@ DEPLOY_TAG ?= 0.2.1
 CRUCIBLE_DEPLOY_IMAGE ?= ghcr.io/sentania-labs/crucible:$(DEPLOY_TAG)
 CRUCIBLE_DEPLOY_PORT ?= 8080
 
-.PHONY: up dev down reset lint check-image-manifest scan scan-tree scan-history smoke test test-unit \
+.PHONY: up dev down reset lint check-image-manifest scan scan-tree scan-history smoke test test-unit test-unit-in-image \
 	test-integration e2e e2e-github e2e-live e2e-admin e2e-image build proxy-config proxies preflight \
 	e2e-kind e2e-kind-self-hosting e2e-command-timeout registry-check manifests deploy-kind first-run-kind release-images-classify release-images-pull release-images-verify \
 	deploy-local deploy-local-down images images-check images-policy-check release-notes
@@ -162,6 +162,13 @@ images-check: ## build both images and fail if any tag, harness version or OCI d
 images-policy-check: ## fail when the worker image lacks a program a shipped policy's checks start with or declare
 	$(UV) sync --frozen --quiet
 	DOCKER="$(DOCKER)" $(UV) run python tools/images/policy_commands.py
+
+# hades #184, FDY-0134: the unit tier as a Kubernetes worker Pod runs it, in the WORKER
+# image images/manifest.env declares: uid 1000, read-only root, no network for the tests,
+# and fsGroup-style setgid /tmp, home and workspace. A test that only passes on a plain
+# host (a mode comparison on tmp_path, say) fails here. Needs the image in the daemon.
+test-unit-in-image: ## the unit tier inside the worker image, as a worker Pod runs it; needs `make images` first
+	DOCKER="$(DOCKER)" tools/images/unit_in_image.sh
 
 # Reads the registry through DOCKER, so log it in first: reading a manifest back is
 # still an authenticated registry call.

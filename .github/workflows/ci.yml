@@ -161,6 +161,13 @@ jobs:
           enable-cache: true
       - name: the worker image carries the programs the shipped policies' checks need
         run: make images-policy-check
+      # hades #184, FDY-0134: the unit tier as the lab's verification runs it, in the
+      # image just built: uid 1000, read-only root, no Docker socket, no network for
+      # the tests (only `uv sync` gets one), and setgid fsGroup-style /tmp and
+      # workspace. Here rather than its own job because the image exists only in this
+      # job's daemon; moving 1.4 GB to another job costs more than the tier's minute.
+      - name: unit tier inside the worker image
+        run: make test-unit-in-image
       - name: keep the layer cache for branches
         if: github.ref == 'refs/heads/main'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
