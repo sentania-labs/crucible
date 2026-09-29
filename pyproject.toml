@@ -39,6 +39,7 @@ dev = [
     "pytest>=8.4",
     "pytest-asyncio>=1.1",
     "pytest-timeout>=2.4",
+    "pytest-xdist>=3.8",
     "ruff>=0.12",
     "testcontainers[postgres]>=4.10",
     "types-pyyaml>=6.0",

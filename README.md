@@ -54,6 +54,7 @@ make dev         # postgres and the proxies; then: uv run crucible serve --all
 make proxies     # the socket proxy and the egress proxy only
 make lint        # ruff, mypy --strict, import-linter
 make test        # unit tier, then the integration tier against postgres:16 in a container
+make test PYTEST_WORKERS=0  # the same, serially in one process, for debugging
 make smoke       # after `make up`: drive one task end to end; the same script CI and release run
 make e2e-image   # the script-harness worker image the e2e tier runs
 make e2e         # the Docker provider against real containers, no model

@@ -19,6 +19,21 @@ be interrupted. A module whose cases legitimately need longer sets its own
 `tests/unit/test_test_time_limit.py` runs a deliberately hanging fixture and
 proves it fails within the limit and names itself.
 
+## Parallel, one database per process
+
+`make test` runs the unit and integration tiers with `pytest-xdist`, one worker
+per CPU (`-n auto`), locally and in CI (issue 195). Each integration worker owns
+its own database, named from its worker id (`crucible_test_gw0`, and
+`crucible_test_master` for a serial run), on its own PostgreSQL container or on
+the server `CRUCIBLE_TEST_DATABASE_URL` names; it is migrated once per process
+and dropped at the end. Before and after every test each table is emptied and the
+rows the migrations seed (policies, routing policies, harnesses) are put back
+from a copy taken right after migrating, so no test depends on what an earlier
+one left. The migration tests, which drive the schema themselves, start and end
+at head with the same reset. `make test PYTEST_WORKERS=0` runs serially in one
+process for debugging. The suite passes in random order (`pytest-randomly`, run
+by hand, not a dependency).
+
 ## Test fixtures are off in production
 
 The fake provider (08) runs nothing and the script harness reports completion

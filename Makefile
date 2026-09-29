@@ -195,15 +195,21 @@ release-images-verify: ## prove every CRUCIBLE_IMAGE service container uses the 
 	@test -n "$(CRUCIBLE_IMAGE)" || { echo "set CRUCIBLE_IMAGE"; exit 2; }
 	@COMPOSE="$(COMPOSE)" DOCKER="$(DOCKER)" python3 tools/release/compose_images.py verify-candidate
 
+# The unit and integration tiers run in parallel, one pytest-xdist worker per CPU, and each
+# integration worker owns its own database (issue 195). PYTEST_WORKERS=0 runs them serially
+# in one process, for debugging: `make test PYTEST_WORKERS=0`. Every test has a time limit
+# either way (issue 192, pyproject.toml).
+PYTEST_WORKERS ?= auto
+
 test: test-unit test-integration
 
 test-unit:
 	$(UV) sync --frozen --quiet
-	$(UV) run pytest tests/unit -q
+	$(UV) run pytest tests/unit -q -n $(PYTEST_WORKERS)
 
 test-integration: ## needs Docker for postgres:16 (testcontainers) or CRUCIBLE_TEST_DATABASE_URL
 	$(UV) sync --frozen --quiet
-	$(UV) run pytest tests/integration -q -m integration
+	$(UV) run pytest tests/integration -q -m integration -n $(PYTEST_WORKERS)
 
 e2e-image: ## build the e2e worker image (18) on whichever daemon DOCKER names
 	DOCKER_HOST=$${DOCKER_HOST:-} images/build.sh script-harness
