@@ -121,6 +121,8 @@ def _why_not_configured() -> str:
 NOT_CONFIGURED = _why_not_configured()
 pytestmark = [
     pytest.mark.e2e_live,
+    # A real harness does real work against a real model, local only (issue 192).
+    pytest.mark.timeout(3600),
     pytest.mark.skipif(bool(NOT_CONFIGURED), reason=NOT_CONFIGURED or "configured"),
 ]
 

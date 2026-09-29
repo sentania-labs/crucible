@@ -40,6 +40,8 @@ from crucible.ports.harness import AdapterLaunch, ExitInfo, HarnessAdapter, Laun
 
 pytestmark = [
     pytest.mark.e2e_command_timeout,
+    # Each case starts a real harness in the worker image (issue 192).
+    pytest.mark.timeout(600),
     pytest.mark.skipif(
         not os.environ.get("CRUCIBLE_E2E_COMMAND_TIMEOUT"), reason="needs make e2e-command-timeout"
     ),

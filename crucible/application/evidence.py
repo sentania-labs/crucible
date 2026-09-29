@@ -11,6 +11,7 @@ import logging
 from typing import Any
 
 from crucible.application.transitions import record_event
+from crucible.contracts.completion_claim import ClaimFacts, CompletedClaim
 from crucible.contracts.evidence import (
     ROLE_COMPLETION_CLAIM,
     ROLE_RUN_EVIDENCE,
@@ -106,6 +107,34 @@ def store_artifact(
     return artifact
 
 
+def claim_facts(task: Task, outputs: CollectedOutputs) -> ClaimFacts:
+    """Crucible's own values for the report's fact fields (hades #215): the task, the
+    collected diff and branch, the verifier's re-runs, and the run evidence copied out."""
+    bundle = outputs.bundle
+    return ClaimFacts(
+        task_external_id=task.external_id,
+        changed_files=tuple(outputs.diff_paths),
+        # No refs of Crucible's own without a collected branch that names itself and its
+        # head; the worker's, if any, then stands as written.
+        refs=(
+            {"branch": bundle.work_branch, "head_sha": bundle.head_sha, "commits": bundle.commits}
+            if bundle is not None and bundle.work_branch and bundle.head_sha
+            else None
+        ),
+        checks=tuple(
+            {
+                "id": run.id,
+                "command": run.command,
+                "exit": run.exit_code,
+                "log": f"verify/{run.id}.log",
+            }
+            for run in outputs.verifications
+            if run.ran
+        ),
+        run_evidence=tuple(a.name for a in outputs.artifacts if a.type == "run_evidence"),
+    )
+
+
 def _scanner_findings(
     outputs: CollectedOutputs, claim: dict[str, Any] | None
 ) -> list[dict[str, str]]:
@@ -167,8 +196,13 @@ def record_collection_evidence(
     claim_parsed_ok: bool,
     parse_errors: list[dict[str, Any]],
     parsed_report: ParsedReport | None = None,
+    completed: CompletedClaim | None = None,
 ) -> str | None:
-    """Write the artifacts and evidence a pre-PR gate consumes. Returns the collected head."""
+    """Write the artifacts and evidence a pre-PR gate consumes. Returns the collected head.
+
+    `claim` is the document the worker wrote; `completed` is that document with
+    Crucible's own facts in place (hades #215), which is what the stored report and the
+    gates read. The worker's own values are kept as the worker's claim."""
     findings = _scanner_findings(outputs, claim)
     _add(
         uow,
@@ -183,6 +217,7 @@ def record_collection_evidence(
         },
     )
     claim_artifact_id: str | None = None
+    report = completed.document if completed is not None else claim
     if claim is not None and not findings:
         try:
             artifact = store_artifact(
@@ -192,13 +227,15 @@ def record_collection_evidence(
                 attempt=attempt,
                 name="report/completion-claim.json",
                 artifact_type="completion_claim",
-                content=json.dumps(claim, sort_keys=True, indent=2).encode("utf-8"),
+                content=json.dumps(report, sort_keys=True, indent=2).encode("utf-8"),
                 content_type="application/json",
             )
             claim_artifact_id = artifact.id
         except SecretInArtifactError as exc:
             findings.append({"where": "report/completion-claim.json", "pattern": exc.pattern})
-    if claim is not None:
+    if claim is not None and report is not None:
+        # The head and commit count the worker itself wrote, if any: commits_present
+        # compares them with the collected branch (hades #187).
         refs = claim.get("refs", {}) if isinstance(claim.get("refs"), dict) else {}
         # A report the scanner matched is never copied into a row: 14 says no table ever
         # holds a secret, and the gate that reads this one has already failed.
@@ -210,17 +247,22 @@ def record_collection_evidence(
             "redacted": redacted,
         }
         if not redacted:
+            mapping = report.get("acceptance_mapping")
+            if not isinstance(mapping, list):
+                mapping = []
             payload.update(
                 {
                     "claimed_head_sha": refs.get("head_sha"),
                     "claimed_commits": refs.get("commits"),
                     "mapped_criteria": [
                         {"id": m.get("id"), "status": m.get("status")}
-                        for m in claim.get("acceptance_mapping", [])
+                        for m in mapping
                         if isinstance(m, dict)
                     ],
-                    "run_evidence": claim.get("run_evidence", []),
-                    "changed_files": claim.get("changed_files", []),
+                    "run_evidence": report.get("run_evidence") or [],
+                    "changed_files": report.get("changed_files") or [],
+                    "filled_by_crucible": list(completed.filled) if completed else [],
+                    "differences": [dict(d) for d in completed.differences] if completed else [],
                 }
             )
         _add(
@@ -258,7 +300,9 @@ def record_collection_evidence(
     if outputs.bundle is not None:
         bundle = outputs.bundle
         head_sha = bundle.head_sha
-        claimed = (claim or {}).get("refs", {}).get("head_sha") if claim else None
+        # The worker's own refs, when it wrote a mapping; `refs: null` or text is no head.
+        claimed_refs = claim.get("refs") if claim else None
+        claimed = claimed_refs.get("head_sha") if isinstance(claimed_refs, dict) else None
         _add(
             uow,
             clock,

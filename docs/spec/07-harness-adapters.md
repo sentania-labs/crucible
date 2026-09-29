@@ -202,7 +202,8 @@ never retry.
 ## Report parsing (all harnesses)
 
 `/crucible/report/report.yaml` is parsed against `CompletionClaimV1` from
-the collector's copy (08). A missing file with exit 0 is
+the collector's copy (08), after Crucible has filled the fact fields from its
+own evidence (11, hades #215). A missing file with exit 0 is
 `completed_without_report`. A file that is present but does not parse is
 recorded as `report_parse_failed` with the parser's errors and
 `report_present` true; it is never recorded as "no report". Either way the

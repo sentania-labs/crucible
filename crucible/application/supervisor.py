@@ -42,7 +42,7 @@ from crucible.application.decisions import (
 )
 from crucible.application.delivery_tick import DeliveryConfig, DeliveryCoordinator
 from crucible.application.errors import ApplicationError
-from crucible.application.evidence import record_collection_evidence, store_artifact
+from crucible.application.evidence import claim_facts, record_collection_evidence, store_artifact
 from crucible.application.gates import evaluate_and_advance, gate_input
 from crucible.application.harnesses import (
     CREDENTIAL_HOLDING_STATES,
@@ -72,7 +72,7 @@ from crucible.application.wakes import (
     retry_hours_from_policy,
     wake_body,
 )
-from crucible.contracts.completion_claim import parse_claim
+from crucible.contracts.completion_claim import CompletedClaim, complete_claim, parse_claim
 from crucible.contracts.evidence import ROLE_RUN_EVIDENCE, EvidenceKind, EvidenceSource
 from crucible.contracts.task_contract import TaskContractV1
 from crucible.contracts.wake import WakeReason
@@ -3418,10 +3418,15 @@ class Supervisor:
                         )
                     },
                 )
+            completed: CompletedClaim | None = None
             if outputs.report is not None and not cancelled:
-                claim, errors = parse_claim(outputs.report)
+                # hades #215: Crucible's own facts in place of the worker's, then parse.
+                completed = complete_claim(outputs.report, claim_facts(task, outputs))
+                claim, errors = parse_claim(completed.document)
                 claim_ok = claim is not None
-                secret_hits = find_secrets(outputs.report)
+                # The worker's document and the completed one: Crucible's facts carry
+                # names the worker chose (changed paths, report file names).
+                secret_hits = find_secrets(outputs.report) + find_secrets(completed.document)
                 if secret_hits:
                     errors = errors + [
                         {"loc": [m.path], "msg": f"secret pattern {m.pattern}", "type": "secret"}
@@ -3430,7 +3435,7 @@ class Supervisor:
                     claim_ok = False
                     document: dict[str, Any] = {"redacted": True}
                 else:
-                    document = outputs.report
+                    document = completed.document
                 uow.claims.put(
                     CompletionClaimRecord(
                         attempt_id=attempt.id,
@@ -3447,7 +3452,11 @@ class Supervisor:
                     task_id=attempt.task_id,
                     execution_id=attempt.execution_id,
                     attempt_id=attempt.id,
-                    payload={"errors": errors} if errors else {"schema": "CompletionClaimV1"},
+                    payload={
+                        **({"errors": errors} if errors else {"schema": "CompletionClaimV1"}),
+                        "filled_by_crucible": list(completed.filled),
+                        "differences": [dict(d) for d in completed.differences],
+                    },
                 )
             blocked_text: str | None = None
             if outputs.blocked_md is not None:
@@ -3491,6 +3500,7 @@ class Supervisor:
                 claim_parsed_ok=claim_ok,
                 parse_errors=errors,
                 parsed_report=parsed,
+                completed=completed,
             )
             if head:
                 task.head_sha = head

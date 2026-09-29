@@ -195,15 +195,28 @@ release-images-verify: ## prove every CRUCIBLE_IMAGE service container uses the 
 	@test -n "$(CRUCIBLE_IMAGE)" || { echo "set CRUCIBLE_IMAGE"; exit 2; }
 	@COMPOSE="$(COMPOSE)" DOCKER="$(DOCKER)" python3 tools/release/compose_images.py verify-candidate
 
+# The unit and integration tiers run in parallel, one pytest-xdist worker per CPU, and each
+# integration worker owns its own database (issue 195). PYTEST_WORKERS=0 runs them serially
+# in one process, for debugging: `make test PYTEST_WORKERS=0`. Every test has a time limit
+# either way (issue 192, pyproject.toml).
+PYTEST_WORKERS ?= auto
+# The all-thread dump (faulthandler_timeout, pyproject.toml) fires after 180 s, a little
+# past the default 120 s limit. The e2e, kind and live tiers set longer limits on their
+# own cases, so their targets move the dump past those limits too, rather than dumping
+# every thread of a slow but healthy case (issue 192).
+E2E_DUMP_SECONDS ?= 660
+KIND_DUMP_SECONDS ?= 960
+LIVE_DUMP_SECONDS ?= 3660
+
 test: test-unit test-integration
 
 test-unit:
 	$(UV) sync --frozen --quiet
-	$(UV) run pytest tests/unit -q
+	$(UV) run pytest tests/unit -q -n $(PYTEST_WORKERS)
 
 test-integration: ## needs Docker for postgres:16 (testcontainers) or CRUCIBLE_TEST_DATABASE_URL
 	$(UV) sync --frozen --quiet
-	$(UV) run pytest tests/integration -q -m integration
+	$(UV) run pytest tests/integration -q -m integration -n $(PYTEST_WORKERS)
 
 e2e-image: ## build the e2e worker image (18) on whichever daemon DOCKER names
 	DOCKER_HOST=$${DOCKER_HOST:-} images/build.sh script-harness
@@ -212,11 +225,12 @@ e2e: check-image-manifest ## the Docker-provider end-to-end tier (18): real cont
 	$(UV) sync --frozen --quiet
 	CRUCIBLE_E2E_DOCKER="$(DOCKER)" \
 	CRUCIBLE_E2E_DOCKER_SOCKET="$(CRUCIBLE_DOCKER_SOCKET)" \
-	$(UV) run pytest tests/e2e -q -m e2e
+	$(UV) run pytest tests/e2e -q -m e2e -o faulthandler_timeout=$(E2E_DUMP_SECONDS)
 
 e2e-kind: check-image-manifest ## Kubernetes-provider e2e on a disposable kind cluster (18, 26)
 	CRUCIBLE_E2E_DOCKER="$(DOCKER)" \
 	CRUCIBLE_E2E_DOCKER_SOCKET="$(CRUCIBLE_DOCKER_SOCKET)" \
+	CRUCIBLE_E2E_KIND_PYTEST_ARGS="-o faulthandler_timeout=$(KIND_DUMP_SECONDS) $${CRUCIBLE_E2E_KIND_PYTEST_ARGS:-}" \
 	tools/kind/e2e-kind.sh
 
 # The command-timeout tier (issue 128): Claude Code, Codex and Hermes from the pinned
@@ -228,7 +242,7 @@ e2e-kind: check-image-manifest ## Kubernetes-provider e2e on a disposable kind c
 e2e-command-timeout: check-image-manifest ## real harnesses against a stub model: the launch-set command timeout (128)
 	$(UV) sync --frozen --quiet
 	CRUCIBLE_E2E_COMMAND_TIMEOUT=1 CRUCIBLE_E2E_DOCKER="$(DOCKER)" \
-	$(UV) run pytest tests/e2e/test_command_timeout.py -q -m e2e_command_timeout
+	$(UV) run pytest tests/e2e/test_command_timeout.py -q -m e2e_command_timeout -o faulthandler_timeout=$(E2E_DUMP_SECONDS)
 
 # The registry adapter with the real crane the service image ships (108): a stub registry
 # that redirects its blobs to another host and demands a password, then an anonymous
@@ -289,7 +303,7 @@ e2e-github: ## the live GitHub tier: a real App against a throwaway repository
 	CRUCIBLE_GITHUB_APP_JSON="$(CRUCIBLE_GITHUB_APP_JSON)" \
 	CRUCIBLE_GITHUB_APP_KEY="$(CRUCIBLE_GITHUB_APP_KEY)" \
 	CRUCIBLE_GITHUB_TARGET_REPO="$(CRUCIBLE_GITHUB_TARGET_REPO)" \
-	$(UV) run pytest tests/e2e -q -m e2e_github
+	$(UV) run pytest tests/e2e -q -m e2e_github -o faulthandler_timeout=$(LIVE_DUMP_SECONDS)
 
 # The live harness tier (07, 12, 18). Local only, never in CI: it runs the real Claude
 # Code, Codex and AGY images with the dedicated Crucible credentials (never the
@@ -324,7 +338,7 @@ e2e-live: ## the live harness tier: real harness images, the dedicated credentia
 	CRUCIBLE_GITHUB_APP_JSON="$(CRUCIBLE_GITHUB_APP_JSON)" \
 	CRUCIBLE_GITHUB_APP_KEY="$(CRUCIBLE_GITHUB_APP_KEY)" \
 	CRUCIBLE_GITHUB_TARGET_REPO="$(CRUCIBLE_GITHUB_TARGET_REPO)" \
-	$(UV) run pytest tests/e2e -q -m e2e_live -s
+	$(UV) run pytest tests/e2e -q -m e2e_live -s -o faulthandler_timeout=$(LIVE_DUMP_SECONDS)
 
 # The live administration tier (25, C5b): every row of the operations table through
 # `/v1/admin` and through `crucible-admin`, against a live stack on the daemon DOCKER
@@ -346,7 +360,7 @@ e2e-admin: ## the live administration tier: API and CLI parity on a live stack, 
 	CRUCIBLE_GITHUB_APP_JSON="$(CRUCIBLE_GITHUB_APP_JSON)" \
 	CRUCIBLE_GITHUB_APP_KEY="$(CRUCIBLE_GITHUB_APP_KEY)" \
 	CRUCIBLE_GITHUB_TARGET_REPO="$(CRUCIBLE_GITHUB_TARGET_REPO)" \
-	$(UV) run pytest tests/e2e -q -m e2e_admin -s
+	$(UV) run pytest tests/e2e -q -m e2e_admin -s -o faulthandler_timeout=$(LIVE_DUMP_SECONDS)
 
 build:
 	docker build -t crucible:dev .

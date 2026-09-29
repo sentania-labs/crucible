@@ -121,17 +121,33 @@ command's output to a log file there. Write `blocked.md` and exit 75 to escalate
 `report.yaml` exists. Every path inside the report resolves against this
 directory.
 
+The report is your judgement. Write these fields:
+
+- `summary`: what you changed and why, in a few sentences.
+- `acceptance_mapping`: one entry per acceptance criterion below (see next).
+- `proposed_pull_request`: a `title` and a `body` (`closes` is optional).
+- `limitations`, `risks`, `blockers`, `follow_ups`: each a list of text items,
+  `[]` when there are none.
+
+Crucible fills the facts itself, from the collected branch, its own re-run of
+each check and the files it copies out: `task_external_id`, `changed_files`,
+`refs`, `checks` and `run_evidence`. You may leave them out. A value you do
+write is compared with Crucible's and a difference is noted, never used.
+Write no other field: Crucible sets the pull request's base and head itself.
+
 `acceptance_mapping` has one entry for each acceptance criterion below, keyed
 by that criterion's own `id`. The verification ids in section 6 are not
 acceptance criteria and never go here. `status` is one of `met`, `not_met`,
-`not_exercised` or `partial`. For example:
-`- {{id: {first_criterion}, status: met, evidence: "v2-make-test.log: the new case passes"}}`
+`not_exercised` or `partial`. A list of entries, for example
+`- {{id: {first_criterion}, status: met, evidence: "v2-make-test.log: the new case passes"}}`,
+or a mapping keyed by id, `{first_criterion}: {{status: met, evidence: "..."}}`, are both accepted.
 
 {criteria_lines}
 
-`refs.head_sha` is the output of `git rev-parse HEAD` run after your final
-commit; write it last. Crucible reads the head from the collected branch
-itself and records a different value as a note, never as the head.
+Before you exit 0, run `crucible-report check {REPORT_MOUNT}/report.yaml`. It
+prints each problem with the report in plain words; fix every one and run it
+again until it reports no problems. If the command is not in this image,
+check the report against `report-schema.json` yourself.
 
 ## 8. Exit codes
 

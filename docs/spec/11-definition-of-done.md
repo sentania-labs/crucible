@@ -23,33 +23,59 @@
 
 ```yaml
 schema_version: "1.0"
-task_external_id: "FDY-0042"
+task_external_id: "FDY-0042"       # fact: optional, Crucible fills it
 summary: "..."
-changed_files: ["src/ledger/import.py", "tests/ledger/test_import.py"]
-refs:
+changed_files: ["src/ledger/import.py", "tests/ledger/test_import.py"]   # fact
+refs:                              # fact
   branch: "crucible/FDY-0042"
   head_sha: "abc123..."            # the worker's local HEAD; Crucible collects, never trusts
   commits: 3
-checks:
+checks:                            # fact
   - { id: "V1", command: "make lint", exit: 0, log: "report/V1.log" }
   - { id: "V2", command: "make test", exit: 0, log: "report/V2.log" }
   - { id: "V3", command: "make scan", exit: 0, log: "report/V3.log" }
-acceptance_mapping:
+acceptance_mapping:                # a list, or a mapping keyed by criterion id
   - { id: "AC1", status: "met", evidence: "tests/ledger/test_import.py::test_duplicate_id_409" }
   - { id: "AC2", status: "met", evidence: "report/V2.log" }
-run_evidence: ["report/run-evidence.md", "report/screenshot-1.png"]
+run_evidence: ["report/run-evidence.md", "report/screenshot-1.png"]   # fact
 proposed_pull_request:
   title: "Return 409 on duplicate import ID"
   body: "..."                      # the worker's draft; Crucible renders the real body (23)
-  closes: ["https://github.com/example-org/example-service/issues/17"]  # must match the contract
+  closes: ["https://github.com/example-org/example-service/issues/17"]  # optional; must match the contract
 limitations: ["..."]
 risks: ["..."]
 blockers: []
 follow_ups: ["..."]
 ```
 
-Every field required; empty lists are explicit. All paths are relative to
-`/crucible/report`. Missing or unparsable report is a report-gate failure.
+The worker writes judgement and Crucible derives facts (hades #215,
+2026-09-28). The judgement fields are required, and empty lists are explicit:
+`summary`, `acceptance_mapping`, `proposed_pull_request` (its `title` and
+`body`), `limitations`, `risks`, `blockers` and `follow_ups`. The fact fields
+are optional: at collection Crucible fills `task_external_id` from the task,
+`changed_files` from the collected diff, `refs` from the collected branch
+bundle, `checks` from its own verifier re-run and `run_evidence` from the run
+evidence it copied out. A fact the worker did write is compared with
+Crucible's and replaced by it; each difference is recorded as information in
+the `report_present` detail, in words that repeat nothing of the worker's but
+a hash or a number, and never fails the gate. Run evidence is compared one
+way: Crucible collects every file in the report directory, so only a path the
+worker listed that Crucible did not collect is a difference, and `V1.log`,
+`report/V1.log` and `/crucible/report/V1.log` name the same file. The stored report is the
+completed document; the worker's own document is kept as the worker's claim.
+`acceptance_mapping` may be a list of entries or a mapping keyed by criterion
+id (`AC1: {status: met, evidence: "..."}`); Crucible stores the list form.
+Unknown fields are still refused.
+
+The worker image carries `crucible-report check <report.yaml>`, a
+standard-library mirror of this schema that prints each problem in plain
+words and reads the contract from the identity bundle to check that every
+acceptance criterion has an entry. IDENTITY.md tells the worker to run it and
+fix every problem before exiting 0. A unit test holds the checker and the
+schema in agreement.
+
+All paths are relative to `/crucible/report`. Missing or unparsable report is
+a report-gate failure.
 The claim has no `pushed`, `pull_request`, or `ci` fields: workers cannot
 push and never see CI. Those facts are Crucible's to observe.
 
@@ -89,7 +115,7 @@ it cannot check stays with Foundry or the user.
 
 | Gate | Passes when | Evidence consumed |
 |---|---|---|
-| `report_present` | report parsed, all fields present | CompletionClaim artifact |
+| `report_present` | report parsed once Crucible filled its facts, every judgement field present; the detail names the facts Crucible filled and any the worker wrote differently (hades #215) | CompletionClaim artifact |
 | `exit_clean` | exit code 0 and exit class `completed` or `completed_without_report` (an `incomplete` attempt exits 0 too, issue 128) | attempt exit info |
 | `commits_present` | the collected `work_branch` has at least one commit beyond `base_ref`, the bundle verifies, and the bundle names its head. The head is the bundle's; a reported `head_sha` that differs is noted in the gate's detail and does not fail it (hades #187, 2026-09-28) | branch bundle from `collect` |
 | `scope_contained` | every changed path matches `allowed_paths` and none matches `prohibited_paths` | diff path list from `collect` |

@@ -41,6 +41,8 @@ from tests.fixtures import promote_for_test
 NOT_CONFIGURED = github_live.why_not_configured()
 pytestmark = [
     pytest.mark.e2e_github,
+    # Real GitHub round trips and CI on a throwaway repository, local only (issue 192).
+    pytest.mark.timeout(1800),
     pytest.mark.skipif(bool(NOT_CONFIGURED), reason=NOT_CONFIGURED or "configured"),
 ]
 

@@ -114,10 +114,11 @@ def test_the_worker_is_told_the_report_format_version(tmp_path: Path) -> None:
     assert "1.0" in version["description"]
 
 
-def test_identity_md_says_how_to_fill_acceptance_mapping_and_head_sha(tmp_path: Path) -> None:
+def test_identity_md_says_how_to_fill_acceptance_mapping_and_the_facts(tmp_path: Path) -> None:
     """hades #187: HT-0002 keyed `acceptance_mapping` by the verification ids and copied
-    a head it did not end on. The bundle names the criterion ids to map and says where
-    `refs.head_sha` comes from."""
+    a head it did not end on. The bundle names the criterion ids to map. hades #215: the
+    worker writes judgement, Crucible fills the facts (the head among them), and the
+    worker checks its report with `crucible-report` before it exits 0."""
     text, _, _ = build(tmp_path)
     criteria = [str(c["id"]) for c in contract_document()["acceptance_criteria"]]
     section = text[text.index("## 7. Reporting protocol") : text.index("## 8. Exit codes")]
@@ -126,5 +127,15 @@ def test_identity_md_says_how_to_fill_acceptance_mapping_and_head_sha(tmp_path: 
     for criterion in criteria:
         assert f"- `{criterion}`: " in section
     assert f"{{id: {criteria[0]}, status: met, evidence:" in section
-    assert "`refs.head_sha` is the output of `git rev-parse HEAD`" in section
-    assert "Crucible reads the head from the collected branch" in section
+    assert "or a mapping keyed by id" in section
+    for name in ("summary", "proposed_pull_request", "limitations", "follow_ups"):
+        assert f"`{name}`" in section
+    assert (
+        "Crucible fills the facts itself, from the collected branch, its own re-run of\n"
+        "each check and the files it copies out: `task_external_id`, `changed_files`,\n"
+        "`refs`, `checks` and `run_evidence`. You may leave them out."
+    ) in section
+    assert "Before you exit 0, run `crucible-report check /crucible/report/report.yaml`" in (
+        section
+    )
+    assert "fix every one and run it\nagain until it reports no problems" in section

@@ -194,10 +194,14 @@ def test_a_referenced_routing_policy_is_immutable(
 
 
 def test_upload_a_new_routing_policy_version(client: TestClient, tokens: dict[str, str]) -> None:
+    # The migrations seed several versions, so the new one is the next free number.
+    version = 3
+    while client.get(f"/v1/routing/default-routing/{version}").status_code == 200:
+        version += 1
     document = copy.deepcopy(client.get("/v1/routing/default-routing/2").json()["document"])
-    document["version"] = 3
+    document["version"] = version
     document["models"][1]["enabled"] = False
-    r = client.put("/v1/routing/default-routing/3", json=document, headers=admin(tokens))
+    r = client.put(f"/v1/routing/default-routing/{version}", json=document, headers=admin(tokens))
     assert r.status_code == 200, r.text
 
 

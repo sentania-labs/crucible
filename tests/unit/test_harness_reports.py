@@ -65,7 +65,9 @@ def test_a_malformed_report_carries_the_errors(tmp_path: Path) -> None:
     (tmp_path / "report.yaml").write_text("schema_version: '1.0'\nsummary: 3\n", encoding="utf-8")
     parsed = ClaudeCodeAdapter().parse_report(tmp_path, exit_ok())
     assert parsed.report_present and parsed.claim is not None
-    assert parsed.errors and any("task_external_id" in ".".join(e["loc"]) for e in parsed.errors)
+    # A judgement field the worker must write (hades #215); the facts Crucible fills.
+    assert parsed.errors and any("limitations" in ".".join(e["loc"]) for e in parsed.errors)
+    assert not any("task_external_id" in ".".join(e["loc"]) for e in parsed.errors)
 
 
 def test_a_report_that_is_not_yaml_is_an_error_not_a_crash(tmp_path: Path) -> None:

@@ -78,6 +78,8 @@ def _why_not() -> str:
 NOT_CONFIGURED = _why_not()
 pytestmark = [
     pytest.mark.e2e_admin,
+    # Live probes and a live stack, local only (issue 192).
+    pytest.mark.timeout(1800),
     pytest.mark.skipif(bool(NOT_CONFIGURED), reason=NOT_CONFIGURED or "configured"),
 ]
 

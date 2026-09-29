@@ -51,10 +51,15 @@ are reproducible.
    `report.yaml` exists. Every path inside the report resolves against this
    directory. It lists the contract's acceptance criteria and says that
    `acceptance_mapping` has one entry per criterion, keyed by the criterion's
-   id and never by a verification id, with a one-line example; and that
-   `refs.head_sha` is `git rev-parse HEAD` after the final commit, which
-   Crucible only notes, because it reads the head from the collected branch
-   (hades #187).
+   id and never by a verification id, with a one-line example of each
+   accepted form (a list, or a mapping keyed by id). It names the judgement
+   fields the worker writes and the facts Crucible fills itself
+   (`task_external_id`, `changed_files`, `refs`, `checks`, `run_evidence`),
+   which the worker may leave out; a value it does write is only compared
+   (hades #187, #215). It tells the worker to run
+   `crucible-report check /crucible/report/report.yaml` and fix every
+   problem it prints before exiting 0, and to check against
+   `report-schema.json` by hand in an image without the command.
 8. **Exit codes.** 0 done with report, 75 blocked, 70 cannot proceed (bad
    environment), anything else is failure.
 9. **Prohibitions.** No pushing at all (the checkout has no remote

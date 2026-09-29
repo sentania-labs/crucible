@@ -24,7 +24,12 @@ from tests.e2e.conftest import (
     submit_and_start,
 )
 
-pytestmark = pytest.mark.e2e
+pytestmark = [
+    pytest.mark.e2e,
+    # Real containers, and the first case also pays for the session's stack; the waits
+    # inside allow up to four minutes (issue 192).
+    pytest.mark.timeout(600),
+]
 
 MUST_BE_REFUSED = (
     "docker-socket-unix",
