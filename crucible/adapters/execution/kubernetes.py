@@ -87,8 +87,12 @@ from crucible.domain.time import parse_rfc3339
 from crucible.ports.execution import (
     IDENTITY_MOUNT,
     OUTPUT_MOUNT,
+    PACKAGE_CACHE_ENV,
+    PACKAGE_CACHE_LEAF,
+    PACKAGE_CACHE_MOUNT,
     REPO_MOUNT,
     REPORT_MOUNT,
+    VERIFIER_CACHE_LEAF,
     VERIFY_MOUNT,
     WORK_MOUNT,
     CancelCheck,
@@ -228,6 +232,8 @@ LOG_READ_CEILING = 64 * 1024 * 1024
 # How much of a collected output tar is accepted. The tree is excluded from it, so this
 # is the diff, the bundle, the report copy and the verifier logs.
 OUTPUT_READ_LIMIT = 256 * 1024 * 1024
+# The one line the activity probe prints (FDY-0140).
+ACTIVITY_READ_LIMIT = 4096
 
 # How long an administrative run's objects (a probe's claim and Jobs, a login's policy)
 # are left alone by the retention sweep. The API process that created them removes them
@@ -1676,6 +1682,34 @@ class KubernetesProvider:
                 continue
             return _skip_crowded_second(payload, limit, since)
 
+    async def activity(self, h: Handle, ws: Workspace) -> tuple[int, int, int] | None:
+        """FDY-0140: the workspace is a claim, not a local path, so the supervisor's own
+        walk sees nothing. The live worker is asked instead, over exec, never through a
+        log. Any failure to ask is None: the stall clock is neither reset nor pushed."""
+        try:
+            pod = await self._pod_of(h.ref)
+        except KubernetesApiError:
+            return None
+        if pod is None or str((pod.get("status") or {}).get("phase", "")) != "Running":
+            return None
+        name = str((pod.get("metadata") or {}).get("name") or "")
+        try:
+            result: ExecResult = await self._call(
+                self.client.pod_exec,
+                name,
+                ["sh", "-c", scripts.ACTIVITY_SCRIPT],
+                container=k8sspec.CONTAINER_NAME,
+                # The walk stops itself; this bounds a stream that never ends, so one
+                # slow Pod cannot hold the supervisor's tick for the others.
+                timeout=scripts.ACTIVITY_WALK_SECONDS + 5,
+                limit=ACTIVITY_READ_LIMIT,
+            )
+        except KubernetesApiError:
+            return None
+        if result.exit_code != 0:
+            return None
+        return scripts.parse_activity(result.stdout)
+
     async def collect(
         self, h: Handle, ws: Workspace, spec: LaunchSpec | None = None
     ) -> CollectedOutputs:
@@ -1712,16 +1746,17 @@ class KubernetesProvider:
                 base_ref=str(repository.get("base_ref", "main")),
                 work_branch=work_branch,
                 size_cap_bytes=self.config.report_size_cap_bytes,
-                quota_attempt_id=spec.attempt_id if quota_checkpoint else None,
-                author_email=str(
-                    spec.policy.get("git", {}).get(
-                        "author_email", "crucible-worker@users.noreply.github.com"
-                    )
-                ),
-                commit_trailer=identity_bundle.commit_trailer(spec.policy),
+                attempt_id=spec.attempt_id,
+                quota_checkpoint=quota_checkpoint,
+                author_name=scripts.policy_git(spec.policy, "author_name"),
+                author_email=scripts.policy_git(spec.policy, "author_email"),
+                commit_trailer=scripts.policy_git(spec.policy, "commit_trailer"),
+                trailer_value=spec.external_id,
             ),
             mounts=[
-                Mount("ws", REPO_MOUNT, read_only=not quota_checkpoint, sub_path="repo"),
+                # FDY-0140: writable always, since what the worker left uncommitted is
+                # committed before anything is collected.
+                Mount("ws", REPO_MOUNT, sub_path="repo"),
                 Mount("ws", REPORT_MOUNT, read_only=True, sub_path="report"),
                 Mount("ws", OUTPUT_MOUNT, sub_path="output"),
             ],
@@ -1782,6 +1817,8 @@ class KubernetesProvider:
             copy_rejections=outputs.copy_rejections,
             credential_sync=credential_sync,
             checkpoint_refusal=outputs.checkpoint_refusal,
+            leftover_committed=outputs.leftover_committed,
+            leftover_note=outputs.leftover_note,
         )
 
     def _launch_evidence(self, spec: LaunchSpec, observation: Observation) -> CollectedArtifact:
@@ -2955,6 +2992,7 @@ class KubernetesProvider:
             "CRUCIBLE_REPORT_DIR": REPORT_MOUNT,
             "CRUCIBLE_REPO_DIR": REPO_MOUNT,
             "HOME": "/home/worker",
+            **PACKAGE_CACHE_ENV,
             "CRUCIBLE_EGRESS_ALLOWLIST": ",".join(
                 self._egress_plan(spec, k8sspec.ROLE_WORKER).hosts
             ),
@@ -2968,6 +3006,7 @@ class KubernetesProvider:
             # directory at REPORT_MOUNT, so those are where they are mounted.
             Mount("ws", REPO_MOUNT, sub_path="repo"),
             Mount("ws", REPORT_MOUNT, sub_path="report"),
+            Mount("ws", PACKAGE_CACHE_MOUNT, sub_path=PACKAGE_CACHE_LEAF),
             Mount("identity", IDENTITY_MOUNT, read_only=True),
         ]
         volumes = [
@@ -3158,6 +3197,7 @@ class KubernetesProvider:
             endpoint=spec.endpoint,
             endpoint_url=spec.endpoint_url,
             command_timeout_ms=spec.command_timeout_ms,
+            harness_settings=spec.harness_settings,
         )
 
     # ----- the network policy (26) --------------------------------------
@@ -3710,9 +3750,11 @@ class KubernetesProvider:
             mounts=[
                 Mount("ws", REPO_MOUNT, sub_path="output/tree"),
                 Mount("ws", VERIFY_MOUNT, sub_path="verify"),
+                Mount("ws", PACKAGE_CACHE_MOUNT, sub_path=VERIFIER_CACHE_LEAF),
             ],
             volumes=[self._claim_volume(spec.attempt_id)],
             limits=limits,
+            env=PACKAGE_CACHE_ENV,
             timeout=self.config.verifier_timeout_seconds,
             plan=self._egress_plan(spec, k8sspec.ROLE_VERIFIER),
         )

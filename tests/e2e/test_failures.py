@@ -403,7 +403,7 @@ async def test_a_stalled_real_worker_warns_then_drains_and_kills(
     state = await run_until(supervisor, client, task_id, DONE, max_ticks=30, pause=1.0)
     assert state in DONE
     stored = client.get(f"/v1/attempts/{attempt_id}").json()
-    assert stored["exit_class"] == "timeout"
+    assert stored["exit_class"] == "stalled"
     assert stored["termination_reason"] == "stall"
     kinds = event_kinds(client, task_id)
     assert "worker_quiet" in kinds and "worker_stalled" in kinds

@@ -1448,6 +1448,7 @@ async def gateway_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                 ],
             }
         sections.append(listing)
+    sections.append(_hermes_limits_section(gateway.hermes_limits_view(uow), principal))
     return _page(
         request,
         principal,
@@ -1459,6 +1460,60 @@ async def gateway_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
         badge="tested" if view["last_outcome"] == "probe:completed" else "not verified",
         badge_kind="ok" if view["last_outcome"] == "probe:completed" else "warn",
     )
+
+
+def _hermes_limits_section(limits: dict[str, Any], principal: Principal) -> dict[str, Any]:
+    """FDY-0140: how far one Hermes run may go, and the window it is told the model has."""
+    context = limits["context_length"]
+    section: dict[str, Any] = {
+        "title": "Hermes run limits",
+        "note": (
+            "Applied from the next Hermes launch. A run that reaches its turn limit stops "
+            "and is recorded as having reached it. The context length is the model's "
+            "window in tokens; 0 lets Hermes find it from the gateway."
+        ),
+        "columns": ["Max turns", "Context length", "Source"],
+        "rows": [
+            [
+                limits["max_turns"],
+                context or "found by Hermes",
+                f"saved by {limits['updated_by']}" if limits["saved"] else "default",
+            ]
+        ],
+    }
+    if principal.role is Role.ADMIN:
+        low_turns, high_turns = limits["max_turns_range"]
+        low_context, high_context = limits["context_length_range"]
+        section["form"] = {
+            "action": "/ui/actions/hermes-limits",
+            "label": "Save limits",
+            "collapsed": "Change the limits",
+            "fields": [
+                {
+                    "name": "max_turns",
+                    "label": f"Max turns ({low_turns} to {high_turns})",
+                    "kind": "number",
+                    "value": limits["max_turns"],
+                    "required": True,
+                },
+                {
+                    "name": "context_length",
+                    "label": f"Context length (0, or {low_context} to {high_context})",
+                    "kind": "number",
+                    "value": context,
+                    "required": True,
+                },
+                {"name": "reason", "label": "Reason", "required": True},
+            ],
+        }
+    return section
+
+
+def _whole(form: dict[str, str], name: str, label: str) -> int:
+    try:
+        return int(form.get(name, "").strip())
+    except ValueError:
+        raise ConflictError(f"{label} must be a whole number") from None
 
 
 @router.get("/images", response_class=HTMLResponse)
@@ -3300,6 +3355,17 @@ async def action(request: Request, action: str, ctx: Ctx, uow: UoW) -> Response:
                 result["test"]["summary"],
                 kind="ok" if result["test"]["passed"] else "warn",
             )
+        elif action == "hermes-limits":
+            gateway.save_hermes_limits(
+                ctx.admin,
+                uow,
+                principal=principal,
+                max_turns=_whole(form, "max_turns", "Max turns"),
+                context_length=_whole(form, "context_length", "Context length"),
+                reason=reason,
+            )
+            uow.commit()
+            return _redirect(form, "Saved the Hermes run limits. The next launch uses them.")
         elif action == "gateway-models":
             picks = []
             index = 0

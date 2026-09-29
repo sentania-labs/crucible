@@ -21,6 +21,19 @@ OUTPUT_MOUNT = "/crucible/out"
 # not the uid a bind source on the host already has).
 WORK_MOUNT = "/crucible/work"
 VERIFY_MOUNT = "/crucible/verify"
+# FDY-0140: the package caches (uv, pip, npm) live on the workspace, a leaf of its own
+# beside the checkout, not on the worker's memory-backed home, whose size limit a
+# single `uv sync` can fill. The verifier gets a leaf of its own at the same path: uv
+# and pip reuse what is in their cache without checking it again, so a cache the
+# worker wrote could change what the verifier's checks run.
+PACKAGE_CACHE_LEAF = "pkg-cache"
+VERIFIER_CACHE_LEAF = "pkg-cache-verifier"
+PACKAGE_CACHE_MOUNT = "/crucible/pkg-cache"
+PACKAGE_CACHE_ENV = {
+    "UV_CACHE_DIR": f"{PACKAGE_CACHE_MOUNT}/uv",
+    "PIP_CACHE_DIR": f"{PACKAGE_CACHE_MOUNT}/pip",
+    "npm_config_cache": f"{PACKAGE_CACHE_MOUNT}/npm",
+}
 
 
 class IsolationLevel(StrEnum):
@@ -89,6 +102,9 @@ class LaunchSpec:
     # Issue 128: the per-command timeout the harness is launched with, resolved from the
     # policy and the contract and capped at timeout_seconds. None: the default, capped.
     command_timeout_ms: int | None = None
+    # FDY-0140: the harness's saved run settings (`harness.<name>`), handed to the
+    # adapter's launch as LaunchContext.harness_settings.
+    harness_settings: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         validate_endpoint(self.endpoint, self.endpoint_url)
@@ -269,6 +285,10 @@ class CollectedOutputs:
     # A quota checkpoint collector can refuse worker-controlled Git metadata before it
     # runs Git. This survives collection so the unsafe-checkpoint wake names the cause.
     checkpoint_refusal: str | None = None
+    # FDY-0140: the collector committed what the worker left uncommitted, or wrote why
+    # it did not.
+    leftover_committed: bool = False
+    leftover_note: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -513,4 +533,17 @@ class ExecutionProvider(Protocol):
 
     async def health(self) -> ProviderHealth:
         """25: daemon reachable, network present, disk headroom, as one state."""
+        ...
+
+
+class ActivityProbe(Protocol):
+    """A provider whose workspace is not a local path (26) reads activity off the
+    running worker itself (FDY-0140). The supervisor walks a local workspace on its own;
+    a provider that has this method answers instead of that walk."""
+
+    async def activity(self, h: Handle, ws: Workspace) -> tuple[int, int, int] | None:
+        """A fingerprint of the worker's checkout, report directory and home: the
+        newest modification time, the entry count and the total bytes. Only equality
+        between two answers means anything. None when it could not be read this time,
+        which is neither activity nor its absence."""
         ...

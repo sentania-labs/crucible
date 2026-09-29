@@ -26,10 +26,10 @@ from pathlib import Path
 from typing import Any
 
 from crucible.adapters.harness import base
-from crucible.domain.exit_class import ExitClass, classify_exit
+from crucible.domain.exit_class import EXIT_CODE_BLOCKED, ExitClass, classify_exit
+from crucible.domain.harness_settings import hermes_run_limits
 from crucible.ports.harness import (
     HERMES_BINARY,
-    HERMES_PATH,
     AdapterLaunch,
     AuthFile,
     CredentialSpec,
@@ -115,6 +115,17 @@ def _metrics(document: Mapping[str, Any] | None) -> ReportMetrics:
     )
 
 
+def _limit_reached(document: Mapping[str, Any] | None) -> str | None:
+    """FDY-0140: the launch wrapper marks a run that ended on its turn budget."""
+    if document is None or document.get("turn_limit_reached") is not True:
+        return None
+    calls = document.get("api_calls")
+    return (
+        f"Hermes reached its turn limit of {document.get('max_turns')} "
+        f"after {calls} model calls and stopped before finishing"
+    )
+
+
 class HermesAdapter:
     name = NAME
     supported_versions = VersionRange("0.19.0", "0.20.0")
@@ -157,6 +168,7 @@ class HermesAdapter:
         if ctx.endpoint != "local" or ctx.endpoint_url is None:
             raise ValueError("Hermes is supported only with a configured local endpoint")
         usage_path = f"{ctx.report_mount}/{USAGE_NAME}"
+        limits = hermes_run_limits(ctx.harness_settings)
         # Whole seconds, rounded up; the launch value is already within the attempt.
         seconds = str(max(1, -(-ctx.command_timeout // 1000)))
         spec = self.credential_spec()
@@ -185,10 +197,15 @@ class HermesAdapter:
                 base.POINTER_PROMPT,
             ),
             env={
-                # The worker image leaves the Hermes venv off PATH (C11); Hermes's own
-                # process gets it first, as its dedicated image used to give it.
-                "PATH": HERMES_PATH,
+                # FDY-0140: no PATH of its own. The wrapper starts Hermes with the venv's
+                # Python by path, so the commands the model runs find the image's
+                # `python3`, `pytest` and `uv`, never the Hermes venv's.
                 "HERMES_HOME": HERMES_HOME,
+                # FDY-0140: the instructions go in the prompt, not only a pointer.
+                "CRUCIBLE_HERMES_IDENTITY": f"{ctx.identity_mount}/IDENTITY.md",
+                # FDY-0140: the run limits the Local gateway page sets.
+                "CRUCIBLE_HERMES_MAX_TURNS": str(limits.max_turns),
+                "CRUCIBLE_HERMES_CONTEXT_LENGTH": str(limits.context_length),
                 "OPENAI_BASE_URL": ctx.endpoint_url,
                 "OPENAI_API_KEY": "local-no-auth",
                 "CRUCIBLE_HERMES_USAGE": usage_path,
@@ -224,6 +241,7 @@ class HermesAdapter:
             transcript_lines=parsed.transcript_lines,
             transcript_name=parsed.transcript_name,
             run_evidence_error=error,
+            limit_reached=_limit_reached(usage),
         )
 
     def classify_exit(
@@ -241,6 +259,10 @@ class HermesAdapter:
             return ExitClass.KILLED
         if exit.oom_killed:
             return ExitClass.ENVIRONMENT
+        if exit.blocked_present and exit.exit_code == 0:
+            # FDY-0140: the model cannot set Hermes's exit code, so `blocked.md` on a
+            # clean exit is its escalation. Hermes's own 75 is a provider failure below.
+            return ExitClass.BLOCKED
         usage, _ = _usage(report_dir)
         tails = (stdout_tail[-base.TAIL_LIMIT :], stderr_tail[-base.TAIL_LIMIT :])
         quota = base.first_match(tails, QUOTA_PATTERNS) is not None
@@ -249,7 +271,7 @@ class HermesAdapter:
             if quota:
                 return ExitClass.QUOTA_EXHAUSTED
             return ExitClass.PROVIDER_ERROR if provider_error else ExitClass.CRASHED
-        if exit.exit_code == 75:
+        if exit.exit_code == EXIT_CODE_BLOCKED:
             return ExitClass.QUOTA_EXHAUSTED if quota else ExitClass.PROVIDER_ERROR
         if provider_error:
             return ExitClass.PROVIDER_ERROR
@@ -264,7 +286,7 @@ class HermesAdapter:
         return classify_exit(
             exit_code=exit.exit_code,
             report_present=exit.report_present,
-            blocked_present=False,
+            blocked_present=exit.blocked_present,
         )
 
 

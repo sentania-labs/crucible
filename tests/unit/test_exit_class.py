@@ -54,3 +54,22 @@ def test_loss_timeout_kill_precedence() -> None:
         classify_exit(exit_code=None, report_present=False, blocked_present=False)
         is ExitClass.UNKNOWN
     )
+
+
+def test_blocked_md_on_a_clean_exit_is_blocked_whatever_the_code() -> None:
+    """FDY-0140: a model cannot set its harness's exit code. `blocked.md` on exit 0 is the
+    escalation, and it wins over a report written beside it."""
+    for report_present in (False, True):
+        assert (
+            classify_exit(exit_code=0, report_present=report_present, blocked_present=True)
+            is ExitClass.BLOCKED
+        )
+    # A failure is still a failure: `blocked.md` on a crash does not hide the crash.
+    assert (
+        classify_exit(exit_code=1, report_present=False, blocked_present=True) is ExitClass.CRASHED
+    )
+    # A termination Crucible performed keeps its own class.
+    assert (
+        classify_exit(exit_code=0, report_present=False, blocked_present=True, timed_out=True)
+        is ExitClass.TIMEOUT
+    )

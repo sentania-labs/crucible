@@ -335,6 +335,39 @@ async def admin_save_gateway_models(
     return result
 
 
+@router.get("/admin/gateway/hermes-limits")
+def admin_hermes_limits(ctx: Ctx, uow: UoW, _principal: Admin) -> dict[str, Any]:
+    """FDY-0140: the turn and context limits the next Hermes launch gets."""
+    return gateway.hermes_limits_view(uow)
+
+
+@router.post("/admin/gateway/hermes-limits")
+def admin_save_hermes_limits(
+    ctx: Ctx,
+    uow: UoW,
+    principal: Admin,
+    body: Annotated[dict[str, Any], Body()],
+) -> dict[str, Any]:
+    """`max_turns` and `context_length`, whole numbers; `context_length` 0 lets Hermes
+    find the window itself. Applies from the next launch."""
+    values = {}
+    for name in ("max_turns", "context_length"):
+        value = body.get(name)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ConflictError(f"{name} must be a whole number")
+        values[name] = value
+    result = gateway.save_hermes_limits(
+        _admin(ctx),
+        uow,
+        principal=principal,
+        max_turns=values["max_turns"],
+        context_length=values["context_length"],
+        reason=_reason(body),
+    )
+    uow.commit()
+    return result
+
+
 @router.get("/admin/kubernetes/egress")
 def admin_kubernetes_egress(ctx: Ctx, uow: UoW, _principal: Admin) -> dict[str, Any]:
     return kubernetes_admin.egress_view(_admin(ctx), uow)

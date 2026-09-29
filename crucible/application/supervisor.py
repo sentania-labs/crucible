@@ -106,6 +106,7 @@ from crucible.domain.entities import (
 from crucible.domain.events import PRINCIPAL_CRUCIBLE, EventKind
 from crucible.domain.exit_class import CLEAN_EXIT_CLASSES, ExitClass, classify_exit
 from crucible.domain.gates import GateName, GateResult, evaluate_gate
+from crucible.domain.harness_settings import setting_name
 from crucible.domain.ids import new_id
 from crucible.domain.lifecycle import (
     ATTEMPT_TERMINAL,
@@ -383,6 +384,9 @@ class Supervisor:
         # The harnesses a login is running for, read once per launch pass (12, 25).
         self._logins_now: frozenset[str] = frozenset()
         self._workspace_fingerprints: dict[str, tuple[int, int, int]] = {}
+        # FDY-0140: when each attempt's provider was last asked for its activity.
+        self._activity_asked: dict[str, datetime] = {}
+        self._activity_refresh: dict[str, int] = {}
         # Rebuilt from the stored log after a restart or takeover, so nothing is lost.
         self._command_watches: dict[str, _CommandWatch] = {}
         # ADR 0019: a private repository's checkout token is minted through this client.
@@ -1265,7 +1269,8 @@ class Supervisor:
                 await self._db(partial(self._environment_failure, attempt.id, "prepare", detail))
                 return False
             self._workspaces[attempt.id] = ws
-            self._workspace_fingerprints[attempt.id] = workspace_fingerprint(ws)
+            if getattr(provider, "activity", None) is None:
+                self._workspace_fingerprints[attempt.id] = workspace_fingerprint(ws)
             await self._db(partial(self._record_prepared, attempt.id, ws))
             if not await self._db(partial(self._mark_launching, attempt.id, ws)):
                 await self._discard(provider, ws, spec)
@@ -1314,6 +1319,8 @@ class Supervisor:
     def _forget_workspace(self, attempt_id: str) -> None:
         self._workspaces.pop(attempt_id, None)
         self._workspace_fingerprints.pop(attempt_id, None)
+        self._activity_asked.pop(attempt_id, None)
+        self._activity_refresh.pop(attempt_id, None)
         self._command_watches.pop(attempt_id, None)
 
     async def _build_spec(
@@ -1343,6 +1350,13 @@ class Supervisor:
             if route is not None:
                 endpoint = route.endpoint
                 endpoint_url = route.endpoint_url
+            saved = (
+                route_uow.provider_settings.get(setting_name(selected_harness))
+                if selected_harness
+                else None
+            )
+        # FDY-0140: the harness's run settings as saved now, read at every launch.
+        harness_settings = dict(saved.document) if saved is not None else {}
         # Issue 128: the policy default, narrowed by the contract, capped at the attempt.
         command_timeout_ms = effective_command_timeout_ms(
             execution.policy_snapshot, contract, execution.timeout_seconds
@@ -1366,6 +1380,7 @@ class Supervisor:
             endpoint=endpoint,
             endpoint_url=endpoint_url,
             command_timeout_ms=command_timeout_ms,
+            harness_settings=harness_settings,
         )
         adapter = self._harnesses.get(selected_harness) if self._harnesses else None
         if adapter is None:
@@ -1399,6 +1414,7 @@ class Supervisor:
                 endpoint=endpoint,
                 endpoint_url=endpoint_url,
                 command_timeout_ms=command_timeout_ms,
+                harness_settings=harness_settings,
             )
         )
         return replace(
@@ -2455,6 +2471,8 @@ class Supervisor:
             await self._db(partial(self._mark_cleaned, attempt.id, choice))
             self._workspaces.pop(attempt.id, None)
             self._workspace_fingerprints.pop(attempt.id, None)
+            self._activity_asked.pop(attempt.id, None)
+            self._activity_refresh.pop(attempt.id, None)
             self._command_watches.pop(attempt.id, None)
             self._handles.pop(attempt.id, None)
             cleaned += 1
@@ -2647,7 +2665,7 @@ class Supervisor:
             # Pull before checking for a stall so bytes arriving on this observation
             # count as activity. A merely running container is liveness, not progress.
             await self._pull_logs(attempt, provider, handle)
-            changed = await self._db(partial(self._workspace_changed, attempt))
+            changed = await self._workspace_changed(attempt, provider, handle)
             if changed:
                 await self._db(partial(self._record_workspace_activity, attempt.id))
             await self._note_running_commands(attempt)
@@ -2701,6 +2719,8 @@ class Supervisor:
         self._handles.pop(attempt.id, None)
         self._workspaces.pop(attempt.id, None)
         self._workspace_fingerprints.pop(attempt.id, None)
+        self._activity_asked.pop(attempt.id, None)
+        self._activity_refresh.pop(attempt.id, None)
         self._command_watches.pop(attempt.id, None)
         return True
 
@@ -3067,11 +3087,48 @@ class Supervisor:
                 warned_at=warned_at,
             )
 
-    def _workspace_changed(self, attempt: Attempt) -> bool:
-        current = workspace_fingerprint(self._workspace_for(attempt))
+    async def _workspace_changed(
+        self, attempt: Attempt, provider: ExecutionProvider, handle: Handle
+    ) -> bool:
+        """Whether the worker's files moved since the last look. A local workspace is
+        walked here every tick. A provider whose workspace is not local (Kubernetes)
+        answers through its activity probe instead (FDY-0140), asked no more often than
+        a command in flight renews activity, since each ask is an exec into the Pod."""
+        probe = getattr(provider, "activity", None)
+        if probe is None:
+            current: tuple[int, int, int] | None = await self._db(
+                partial(workspace_fingerprint, self._workspace_for(attempt))
+            )
+        else:
+            now = self._clock.now()
+            asked = self._activity_asked.get(attempt.id)
+            if asked is not None:
+                refresh = self._activity_refresh.get(attempt.id)
+                if refresh is None:
+                    refresh = await self._db(partial(self._activity_refresh_seconds, attempt))
+                    self._activity_refresh[attempt.id] = refresh
+                if (now - asked).total_seconds() < refresh:
+                    return False
+            self._activity_asked[attempt.id] = now
+            try:
+                current = await probe(handle, self._workspace_for(attempt))
+            except Exception:
+                log.exception("the activity probe failed; the stall clock runs")
+                current = None
+        if current is None:
+            return False
         previous = self._workspace_fingerprints.get(attempt.id)
         self._workspace_fingerprints[attempt.id] = current
         return previous is not None and current != previous
+
+    def _activity_refresh_seconds(self, attempt: Attempt) -> int:
+        with self._uow_factory() as uow:
+            execution = uow.executions.get(attempt.execution_id)
+            limits = ((execution.policy_snapshot if execution else None) or {}).get("limits", {})
+        return command_refresh_seconds(
+            int(limits.get("stall_warn_seconds", 300)),
+            int(limits.get("stall_fail_seconds", 1800)),
+        )
 
     def _record_workspace_activity(self, attempt_id: str) -> None:
         with self._fenced() as uow:
@@ -3342,6 +3399,12 @@ class Supervisor:
                 )
                 if oom_killed and not (timed_out or killed):
                     attempt.exit_class = ExitClass.ENVIRONMENT
+            if (
+                attempt.termination_reason == TERMINATION_STALL
+                and attempt.exit_class is ExitClass.TIMEOUT
+            ):
+                # FDY-0140: Crucible ended it for a stall, so it is recorded as one.
+                attempt.exit_class = ExitClass.STALLED
             provider_quota = (
                 adapter.provider_quota_event(outputs.stdout_tail, outputs.stderr_tail)
                 if attempt.exit_class is ExitClass.QUOTA_EXHAUSTED and adapter is not None
@@ -3503,6 +3566,14 @@ class Supervisor:
                     **(
                         {"work_in_flight": [redact(item) for item in parsed.in_flight]}
                         if parsed is not None and parsed.in_flight
+                        else {}
+                    ),
+                    # FDY-0140: Crucible committed what the worker left uncommitted, or
+                    # could not, and why. The commit itself is in the collected branch.
+                    **({"uncommitted_work_committed": True} if outputs.leftover_committed else {}),
+                    **(
+                        {"uncommitted_work_note": redact(outputs.leftover_note)[:500]}
+                        if outputs.leftover_note
                         else {}
                     ),
                 },
@@ -4364,6 +4435,7 @@ class Supervisor:
     # Exit classes that wake Foundry once no retry remains (17).
     _FAILURE_WAKE_REASONS: ClassVar[dict[ExitClass, WakeReason]] = {
         ExitClass.TIMEOUT: WakeReason.TIMED_OUT,
+        ExitClass.STALLED: WakeReason.TIMED_OUT,
         ExitClass.LOST: WakeReason.LOST,
         ExitClass.AUTH_FAILURE: WakeReason.AUTH_FAILURE,
         ExitClass.QUOTA_EXHAUSTED: WakeReason.QUOTA_EXHAUSTED,
