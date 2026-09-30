@@ -18,6 +18,7 @@ from crucible.adapters.ui.pages import github as github_ui
 from crucible.adapters.ui.pages import harnesses as harnesses_ui
 from crucible.adapters.ui.pages import images as images_ui
 from crucible.adapters.ui.pages import repositories as repositories_ui
+from crucible.adapters.ui.pages import retention as retention_ui
 from crucible.adapters.ui.pages import routing as routing_ui
 from crucible.adapters.ui.pages import tasks as tasks_ui
 from crucible.adapters.ui.pages import tokens as tokens_ui
@@ -33,7 +34,6 @@ from crucible.adapters.ui.session import (
 from crucible.application.admin import (
     audit,
     bootstrap,
-    status,
 )
 from crucible.application.errors import (
     ApplicationError,
@@ -41,40 +41,6 @@ from crucible.application.errors import (
 from crucible.domain.entities import Principal, Role
 
 router = APIRouter(prefix="/ui", include_in_schema=False)
-
-
-@router.get("/retention", response_class=HTMLResponse)
-def retention_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
-    found = _require(request, ctx, uow)
-    if isinstance(found, RedirectResponse):
-        return found
-    principal, csrf = found
-    recent = list(uow.retention.list_recent(200))
-    summary = status.retention(uow)
-    return _page(
-        request,
-        principal,
-        csrf,
-        active="/ui/retention",
-        heading="Retention and cleanup",
-        intro=f"What the cleanup sweep removed. Last run: {summary['last_run'] or 'never'}.",
-        sections=[
-            {
-                "title": "Recent actions",
-                "empty": "The sweep has not removed anything yet.",
-                "columns": ["What", "Subject", "When", "Detail"],
-                "rows": [
-                    [
-                        item.kind.replace("_", " ").capitalize(),
-                        item.subject,
-                        item.acted_at.isoformat(),
-                        item.detail,
-                    ]
-                    for item in recent
-                ],
-            },
-        ],
-    )
 
 
 @router.get("/audit", response_class=HTMLResponse)
@@ -425,3 +391,4 @@ router.routes.extend(github_ui.router.routes)
 router.routes.extend(workers_ui.router.routes)
 router.routes.extend(tasks_ui.router.routes)
 router.routes.extend(wakes_ui.router.routes)
+router.routes.extend(retention_ui.router.routes)
