@@ -78,6 +78,7 @@
 | [`0025-the-delivery-half-always-has-a-way-out.md`](adr/0025-the-delivery-half-always-has-a-way-out.md) | ADR 0025: The delivery half always has a way out |
 | [`0028-hermes-first-routing.md`](adr/0028-hermes-first-routing.md) | ADR 0028: Hermes first in routing; frontier by intent; demotion that recovers |
 | [`0029-discard-an-import-and-rename-a-principal.md`](adr/0029-discard-an-import-and-rename-a-principal.md) | ADR 0029: Discard a verified import, skip native tasks, rename a principal |
+| [`0030-ui-sessions-server-side.md`](adr/0030-ui-sessions-server-side.md) | ADR 0030: UI sessions are server-side |
 
 **History** -- Implementation notes and spikes.
 
