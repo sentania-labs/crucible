@@ -13,6 +13,7 @@ from typing import Any, cast
 import pytest
 from starlette.requests import Request
 
+import crucible
 from crucible.adapters.execution.fake import FakeProvider
 from crucible.adapters.persistence.migrations.versions._0001_walking_skeleton import (
     DEFAULT_POLICY,
@@ -21,6 +22,7 @@ from crucible.adapters.persistence.migrations.versions._0008_harness_adapters im
     VERIFIED_ROUTING,
 )
 from crucible.adapters.ui import render as ui_render
+from crucible.adapters.ui.pages import dashboard
 from crucible.adapters.ui.pages import settings as ui_settings
 from crucible.adapters.ui.pages import workers as ui_workers
 from crucible.adapters.ui.pages.settings import _settings_rows
@@ -1109,28 +1111,58 @@ def test_the_settings_page_shows_broad_egress_and_the_resolve_ttl(
     assert rows["kubernetes.resolve_ttl_seconds"][3] == ""
 
 
-def test_status_page_shows_version_as_first_row() -> None:
+def test_status_page_shows_version_as_first_row(monkeypatch: pytest.MonkeyPatch) -> None:
     """hades #214: the Status page Service table lists a Version row first, carrying
     ``crucible.__version__`` rendered as a status cell."""
-    import crucible  # noqa: PLC0415
 
-    service_section: dict[str, Any] = {
-        "title": "Service",
-        "columns": ["Part", "State", ""],
-        "rows": [
-            [
-                "Version",
-                {
-                    "kind": "status",
-                    "value": crucible.__version__,
-                    "tone": "ok",
-                },
-                "",
-            ],
-        ],
+    minimal = {
+        "readiness": {
+            "ready": True,
+            "ready_harnesses": [],
+            "steps": [],
+            "harnesses": [],
+        },
+        "supervisor": {
+            "healthy": True,
+            "health_detail": "",
+            "last_tick_at": "2026-09-30T00:00:00Z",
+        },
+        "tasks": {"lists": {}},
+        "workers": [],
+        "providers": [],
+        "wakes": {"unacked": 0},
     }
 
-    rendered = _render_documents([service_section])
+    principal = SimpleNamespace(name="reader", role=SimpleNamespace(value="observer"))
+    sections_captured: list[dict[str, Any]] = []
 
-    assert "Version" in rendered
-    assert crucible.__version__ in rendered
+    async def _fake_status(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        return minimal
+
+    status_ns = SimpleNamespace(status=_fake_status)
+    monkeypatch.setattr(dashboard, "_require", lambda *args, **kwargs: (principal, "fixture-csrf"))
+    monkeypatch.setattr(dashboard, "status", status_ns)
+    monkeypatch.setattr(
+        dashboard,
+        "_page",
+        lambda *args, sections, **kwargs: sections_captured.extend(sections),
+    )
+
+    ctx = SimpleNamespace(admin=object())
+    asyncio.run(
+        dashboard.dashboard(
+            Request({"type": "http", "method": "GET", "path": "/ui", "headers": []}),
+            cast(Any, ctx),
+            cast(Any, SimpleNamespace()),
+        )
+    )
+
+    for section in sections_captured:
+        if section["title"] == "Service":
+            rows = section["rows"]
+            break
+    else:
+        raise AssertionError("Service section not found")
+
+    assert rows[0][0] == "Version"
+    assert rows[0][1]["value"] == crucible.__version__
