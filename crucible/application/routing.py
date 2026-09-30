@@ -12,6 +12,7 @@ from crucible.application.harnesses import HarnessRegistry
 from crucible.contracts.policy import RoutingModel, RoutingPolicyV1, window_seconds
 from crucible.domain.entities import AttemptMetrics
 from crucible.domain.lifecycle import AttemptState
+from crucible.domain.verification import task_specific_checks
 from crucible.ports.repository import UnitOfWork
 
 Problem = dict[str, Any]
@@ -250,6 +251,8 @@ def select_model(
     project: str,
     provider: str,
     now: datetime,
+    contract: dict[str, Any] | None = None,
+    policy_document: dict[str, Any] | None = None,
     eligible_harnesses: set[str] | None = None,
     harnesses: HarnessRegistry | None = None,
     image_allowlist: list[str] | None = None,
@@ -264,11 +267,15 @@ def select_model(
     metrics = _project_metrics(
         uow, project, [entry.id for entry in routing.models], routing.rotation.quality_window
     )
+    has_task_check = bool(task_specific_checks(contract or {}, policy_document or {}))
+    local_pools = set(routing.local_pools())
     preferred = routing.preferred_pools(tier)
     probing: set[str] | None = None
     ranked: list[tuple[tuple[Any, ...], RoutingModel, str, list[str], QualityState]] = []
     for entry in routing.models:
         reasons: list[str] = []
+        if not has_task_check and (entry.endpoint == "local" or entry.pool in local_pools):
+            reasons.append("no task-specific check")
         if pinned_model is not None and entry.id != pinned_model:
             reasons.append("not the operator pin")
         if pinned_harness is not None and entry.harness != pinned_harness:

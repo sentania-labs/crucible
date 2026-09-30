@@ -172,6 +172,7 @@ def test_codex_first_and_hermes_fallback(tier: str) -> None:
         result = select_model(
             _uow(),
             route,
+            contract={"required_verification": [{"command": "python3 -m unittest tests.test_x"}]},
             tier=tier,
             project="p",
             provider="fake",

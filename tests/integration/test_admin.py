@@ -614,7 +614,8 @@ def test_every_remaining_ui_mutation_dispatches_to_the_shared_application_servic
 ) -> None:
     """API and CLI parity tests above exercise the services themselves. This matrix
     proves every other mutating UI form reaches those same service functions."""
-    ui = import_module("crucible.adapters.ui.router")
+    ui = import_module("crucible.application.admin")
+    routing_ui = import_module("crucible.adapters.ui.pages.routing")
     calls: list[str] = []
 
     def stub(name: str) -> Any:
@@ -649,8 +650,8 @@ def test_every_remaining_ui_mutation_dispatches_to_the_shared_application_servic
         (ui.bootstrap, "commit", stub("bootstrap-commit")),
     ):
         monkeypatch.setattr(owner, name, replacement)
-    monkeypatch.setattr(ui, "put_routing_policy", stub("routing-upload"))
-    monkeypatch.setattr(ui, "put_policy", stub("policy-upload"))
+    monkeypatch.setattr(routing_ui, "put_routing_policy", stub("routing-upload"))
+    monkeypatch.setattr(routing_ui, "put_policy", stub("policy-upload"))
 
     asyncio.run(live_supervisor.tick())
     common = {"reason": "UI dispatch parity", "return_to": "/ui"}

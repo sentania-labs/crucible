@@ -41,6 +41,16 @@ class PrincipalRow(Base):
     disabled_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
 
 
+class UiSessionRow(Base):
+    __tablename__ = "ui_sessions"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    principal_id: Mapped[str] = mapped_column(ID, ForeignKey("principals.id"))
+    csrf: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(TZ)
+    expires_at: Mapped[datetime] = mapped_column(TZ, index=True)
+    last_seen_at: Mapped[datetime] = mapped_column(TZ)
+
+
 class RepositoryRow(Base):
     __tablename__ = "repositories"
     id: Mapped[str] = mapped_column(ID, primary_key=True)
