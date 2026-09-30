@@ -26,3 +26,11 @@ first tagged release the initial revision may be squashed, only together with a
 existing database is wrong after a squash. Readiness compares the live schema to
 the ORM and reports "schema drift" when they differ; that check exists because
 revision 0001 was once rewritten in place after it had been applied.
+
+Integration tier: the ``make test-integration`` target runs the integration suite
+with ``-n auto`` (pytest-xdist) by default.  With xdist the integration
+``database_url`` fixture starts a single Postgres container shared by all workers
+and each worker creates its own database on that container, so a cold image pull
+lands inside the first test's time limit.  A serial run (``-n 0`` or no ``-n``)
+behaves identically to before: one container, one database.  The shared container
+is stopped when the last worker finishes.

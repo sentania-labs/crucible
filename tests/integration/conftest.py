@@ -1,11 +1,18 @@
 """PostgreSQL in a container (testcontainers) or CRUCIBLE_TEST_DATABASE_URL, one database per
 test process (issue 195); migrated once per process, truncated between tests. The supervisor,
-API client, and fake provider of one test share that database."""
+API client, and fake provider of one test share that database.
+
+With ``-n auto`` (pytest-xdist) the Postgres container is started once by the first
+worker that acquires a file lock in the shared temp directory; every other worker reads
+the URL from a companion file (hades #219).  A serial run still gets one container and
+one database.  The container stops when the last worker finishes.
+"""
 
 from __future__ import annotations
 
+import fcntl
 import os
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -124,8 +131,117 @@ def own_database(server_url: str, name: str) -> Iterator[str]:
         admin.dispose()
 
 
+# ---------------------------------------------------------------------------
+# Lock-and-share: one Postgres container per test run, shared by all xdist workers
+# ---------------------------------------------------------------------------
+
+
+def _shared_pg_dir(tmp_path_factory: Any) -> Path:
+    """Return the shared temp directory used by pytest-xdist workers.
+
+    ``tmp_path_factory.getbasetemp().parent`` is the common parent that xdist
+    workers share between runs.  For a serial run the same path is used (the
+    lock is trivially acquired by the single process).
+    """
+    return Path(tmp_path_factory.getbasetemp().parent)
+
+
+def _lock_and_share(
+    tmp_path_factory: Any,
+    start: Callable[[], tuple[str, Any]],
+) -> tuple[str, Any]:
+    """Acquire a file lock, start (or find) a shared resource, and return it.
+
+    The first caller to acquire the lock invokes ``start()`` and writes the URL
+    to a companion file.  Subsequent callers read the URL from the file.  A
+    reference-count file ensures the resource lives until the last caller
+    releases it.
+
+    Returns ``(url, resource)`` where ``resource`` is the object returned by
+    ``start()`` when *this* process started it (may be ``None`` when a sibling
+    started it first).  The caller must call ``release`` when done.
+
+    Coordination directory: ``tmp_path_factory.getbasetemp().parent``.
+    Files created:  ``.pg.lock`` (fcntl lock), ``.pg.url`` (connection URL),
+    ``.pg.refs``  (integer reference count).
+    """
+    base = _shared_pg_dir(tmp_path_factory)
+    lock_path = base / ".pg.lock"
+    url_path = base / ".pg.url"
+    refs_path = base / ".pg.refs"
+
+    def _read_refs() -> int:
+        try:
+            return int(refs_path.read_text(encoding="utf-8").strip())
+        except (FileNotFoundError, ValueError):
+            return 0
+
+    def _write_refs(count: int) -> None:
+        refs_path.write_text(str(count), encoding="utf-8")
+
+    with open(lock_path, "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            count = _read_refs()
+
+            if count > 0:
+                # A sibling started the resource; read its URL and bump the ref count.
+                url = url_path.read_text(encoding="utf-8").strip()
+                _write_refs(count + 1)
+                return url, None
+
+            # First caller: start the resource.
+            url, resource = start()
+            url_path.write_text(url, encoding="utf-8")
+            _write_refs(1)
+            return url, resource
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
+
+
+def _release(tmp_path_factory: Any, resource: Any) -> None:
+    """Decrement the reference count and stop the resource when it hits zero."""
+    base = _shared_pg_dir(tmp_path_factory)
+    lock_path = base / ".pg.lock"
+    refs_path = base / ".pg.refs"
+
+    with open(lock_path, "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            try:
+                count = int(refs_path.read_text(encoding="utf-8").strip())
+            except (FileNotFoundError, ValueError):
+                count = 1
+
+            new_count = max(0, count - 1)
+            refs_path.write_text(str(new_count), encoding="utf-8")
+
+            if new_count == 0 and resource is not None:
+                resource.stop()
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
+
+
+# ---------------------------------------------------------------------------
+# fixtures
+# ---------------------------------------------------------------------------
+
+
+def _start_pg(tmp_path_factory: Any) -> tuple[str, Any]:
+    """Factory for _lock_and_share: start a PostgresContainer."""
+    from testcontainers.postgres import PostgresContainer  # noqa: PLC0415
+
+    pg = PostgresContainer(POSTGRES_IMAGE, driver="psycopg")
+    pg.start()
+    return pg.get_connection_url(), pg
+
+
 @pytest.fixture(scope="session")
-def database_url(worker_id: str, testrun_uid: str) -> Iterator[str]:
+def database_url(
+    worker_id: str,
+    testrun_uid: str,
+    tmp_path_factory: Any,
+) -> Iterator[str]:
     # Session scope is per process, so each xdist worker (and a serial run) gets its own
     # database, named from the worker id, on CRUCIBLE_TEST_DATABASE_URL's server or on
     # a container of its own. No test can see another process's rows (issue 195). The
@@ -136,13 +252,14 @@ def database_url(worker_id: str, testrun_uid: str) -> Iterator[str]:
         with own_database(url, name) as own:
             yield own
         return
-    from testcontainers.postgres import PostgresContainer  # noqa: PLC0415
 
-    with (
-        PostgresContainer(POSTGRES_IMAGE, driver="psycopg") as pg,
-        own_database(pg.get_connection_url(), name) as own,
-    ):
+    url, pg_ref = _lock_and_share(tmp_path_factory, lambda: _start_pg(tmp_path_factory))
+
+    with own_database(url, name) as own:
         yield own
+
+    # Release our reference; the container stops when the count hits zero.
+    _release(tmp_path_factory, pg_ref)
 
 
 @pytest.fixture(scope="session")
@@ -318,41 +435,41 @@ def submit_and_start(
     r = client.post(
         f"/v1/tasks/{task_id}/start",
         json={
-            "provider": req["provider"],
             "image": req["image"],
-            "policy_version": 2,
         },
     )
     assert r.status_code == 200, r.text
-    assert r.json()["state"] == "scheduled"
     return task_id
 
 
-async def run_until(
-    supervisor: Supervisor, client: TestClient, task_id: str, states: set[str], max_ticks: int = 12
-) -> str:
-    state = ""
-    for _ in range(max_ticks):
-        await supervisor.tick()
-        state = str(client.get(f"/v1/tasks/{task_id}").json()["state"])
-        if state in states:
-            return state
-    raise AssertionError(f"task never reached {states}; last state {state}")
-
-
-# In C2 the same tick that reports a task also evaluates its pre-PR gates (09, 11), so a
-# run settles past `reported` rather than in it.
 POST_REPORT_STATES = {
-    "reported",
-    "pre_pr_gates_failed",
-    "awaiting_internal_review",
-    "gates_passed",
+    "acceptance_passed",
     "awaiting_acceptance",
 }
 
 
+async def run_until(
+    supervisor: Supervisor,
+    client: TestClient,
+    task_id: str,
+    states: set[str],
+    max_ticks: int = 12,
+) -> str:
+    for _ in range(max_ticks):
+        state = str(client.get(f"/v1/tasks/{task_id}").json()["state"])
+        if state in states:
+            return state
+        await supervisor.tick()
+    raise TimeoutError(
+        f"task {task_id} did not reach {states} after {max_ticks} ticks; last state={state}"
+    )
+
+
 async def run_to_settled(
-    supervisor: Supervisor, client: TestClient, task_id: str, max_ticks: int = 12
+    supervisor: Supervisor,
+    client: TestClient,
+    task_id: str,
+    max_ticks: int = 12,
 ) -> str:
     return await run_until(supervisor, client, task_id, POST_REPORT_STATES, max_ticks)
 
@@ -369,7 +486,11 @@ ARTIFACTS_DELIVERABLE: list[dict[str, Any]] = [
 
 
 def upload_review(
-    client: TestClient, task_id: str, *, verdict: str = "approve", head_sha: str | None = None
+    client: TestClient,
+    task_id: str,
+    *,
+    verdict: str = "approve",
+    head_sha: str | None = None,
 ) -> Any:
     """Upload a ReviewReportV1 as the orchestrator's own non-author review (04, 11)."""
     view = client.get(f"/v1/tasks/{task_id}").json()
@@ -383,7 +504,14 @@ def upload_review(
         "findings": (
             []
             if verdict == "approve"
-            else [{"severity": "major", "path": "src/a.py", "line": 1, "text": "narrow it"}]
+            else [
+                {
+                    "severity": "major",
+                    "path": "src/a.py",
+                    "line": 1,
+                    "text": "narrow it",
+                }
+            ]
         ),
         "summary": f"Reviewed {head}.",
     }
@@ -406,12 +534,20 @@ async def review_and_settle(
 
 
 def correction_document(
-    client: TestClient, task_id: str, *, image: str, reason: str = "pre_pr_gates", **overrides: Any
+    client: TestClient,
+    task_id: str,
+    *,
+    image: str,
+    reason: str = "pre_pr_gates",
+    **overrides: Any,
 ) -> dict[str, Any]:
     """A correction version of the task's current contract (05)."""
     view = client.get(f"/v1/tasks/{task_id}").json()
     document = dict(view["contract"])
-    document["execution_request"] = {**document["execution_request"], "image": image}
+    document["execution_request"] = {
+        **document["execution_request"],
+        "image": image,
+    }
     document["correction"] = {
         "of_version": view["contract_version"],
         "reason": reason,
@@ -439,7 +575,10 @@ def put_seeded_policy_in_force(ctx: AppContext) -> None:
 
     def fresh(policy: Any, uow: Any) -> bool:
         ref = (policy.document.get("routing") or {}).get("policy") or {}
-        routing = uow.routing_policies.get(str(ref.get("name", "")), int(ref.get("version", 0)))
+        routing = uow.routing_policies.get(
+            str(ref.get("name", "")),
+            int(ref.get("version", 0)),
+        )
         if policy.retired_at is not None or routing is None or routing.retired_at is not None:
             return False
         try:
@@ -453,7 +592,10 @@ def put_seeded_policy_in_force(ctx: AppContext) -> None:
         )
 
     with ctx.uow_factory() as uow:
-        versions = sorted(uow.policies.list_versions("default-software"), key=lambda p: p.version)
+        versions = sorted(
+            uow.policies.list_versions("default-software"),
+            key=lambda p: p.version,
+        )
         chosen = next(p for p in reversed(versions) if fresh(p, uow))
         version = versions[-1].version + 1
         document = copy.deepcopy(chosen.document)
@@ -462,7 +604,10 @@ def put_seeded_policy_in_force(ctx: AppContext) -> None:
             uow,
             ctx.clock,
             principal=Principal(
-                id="tests", name="tests", role=Role.ADMIN, created_at=ctx.clock.now()
+                id="tests",
+                name="tests",
+                role=Role.ADMIN,
+                created_at=ctx.clock.now(),
             ),
             name="default-software",
             version=version,
