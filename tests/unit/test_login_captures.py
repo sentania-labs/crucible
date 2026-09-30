@@ -257,7 +257,11 @@ def test_the_driver_brings_claude_codes_url_and_prompt_through_and_enter_submits
     assert f"stand-in read {len(pasted)} characters" in text
     # The prompt redrawn with the code in it reaches the log masked.
     assert "Paste code here [pasted code]" in text
+    # Code is sent first, sleep 1, then only the carriage return:
+    assert 'printf "%s" "$c" > "$d/in"' in _LOGIN_CODE_SCRIPT
+    assert "sleep 1" in _LOGIN_CODE_SCRIPT
     assert _LOGIN_CODE_SCRIPT.endswith('printf "\\r" > "$d/in"')
+    assert 'printf "%s\\r" "$c" > "$d/in"' not in _LOGIN_CODE_SCRIPT
     assert pasted not in text
     assert "\x1b" not in text and "\r" not in text
 
@@ -427,4 +431,39 @@ def test_the_code_script_sends_enter_a_second_after_the_code() -> None:
     # Must NOT write the code and \\r in one printf
     assert 'printf "%s\\r" "$c" > "$d/in"' not in _LOGIN_CODE_SCRIPT
     # ENTER_PAUSE_SECONDS must be at least 1.0 so the pause matches the sleep
+    assert ENTER_PAUSE_SECONDS >= 1.0
+
+
+def test_a_second_code_during_the_enter_pause_is_refused() -> None:
+    """During the one-second Enter pause the session is already ``waiting_for_operator``,
+    so a second pasted code is refused by ``accept_code`` (hades #173, P2 review)."""
+    flow = FLOWS["claude_code"]
+    session = LoginSession(harness="claude_code", started_at=0.0, guidance=flow.guidance)
+    session.state = "waiting_for_operator"
+    _consume(
+        "Welcome to Claude Code v2.1.280\n"
+        "https://claude.com/cai/oauth/authorize?code=true\n"
+        " Paste code here if prompted >\n",
+        flow,
+        None,
+        Path("/tmp"),
+        session,
+        None,
+    )
+    assert session.state == "waiting_for_code"
+
+    # First code accepted while waiting_for_code
+    assert session.accept_code("first-code") is True
+
+    # Simulate: the login path writes the code, sets state to
+    # waiting_for_operator immediately, then sleeps ENTER_PAUSE_SECONDS before
+    # sending Enter.  The accept_code check must fail once state is
+    # waiting_for_operator (i.e. the state has already changed before the sleep
+    # starts).
+    session.state = "waiting_for_operator"
+    assert session.accept_code("second-code-during-pause") is False
+
+    # After the sleep the path sends Enter but the session is already done.
+    assert session.state == "waiting_for_operator"
+    # Verify the constant is non-zero so a sleep actually happens.
     assert ENTER_PAUSE_SECONDS >= 1.0

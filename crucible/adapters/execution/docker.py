@@ -1861,9 +1861,9 @@ class DockerProvider:
                         # The Enter key: Claude Code submits only on a carriage return,
                         # and only one that arrives apart from the code (hades #173).
                         sock.sendall(code.strip().encode("utf-8"))
+                        session.state = "waiting_for_operator"
                         await asyncio.sleep(ENTER_PAUSE_SECONDS)
                         sock.sendall(ENTER.encode("utf-8"))
-                        session.state = "waiting_for_operator"
                 state = await self._call(self.client.inspect_container, container_id)
                 if not bool((state.get("State") or {}).get("Running", False)):
                     break

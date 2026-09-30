@@ -459,9 +459,9 @@ def run_login(
                 code = session.wait_for_code(0.25)
                 if code is not None and session.error is None:
                     os.write(master, code.strip().encode("utf-8"))
+                    session.state = "waiting_for_operator"
                     time.sleep(ENTER_PAUSE_SECONDS)
                     os.write(master, ENTER.encode("utf-8"))
-                    session.state = "waiting_for_operator"
         process.wait(timeout=5)
     finally:
         os.close(master)
