@@ -133,7 +133,11 @@ class AgyAdapter:
             # 1.2.8 binary's strings on 2026-09-24. daily-cloudcode-pa is the model API,
             # so the prompt AGY's login command ends with cannot reach it from a login
             # Job; the token is judged by its shape and then by the probe.
-            login_endpoints=("oauth2.googleapis.com", "www.googleapis.com"),
+            login_endpoints=(
+                "lh3.googleusercontent.com",  # profile picture fetch after sign-in; hades #241
+                "oauth2.googleapis.com",
+                "www.googleapis.com",
+            ),
         )
 
     def credential_spec(self) -> CredentialSpec:

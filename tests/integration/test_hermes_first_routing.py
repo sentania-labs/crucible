@@ -110,6 +110,9 @@ def _install(ctx: AppContext, clock: FakeClock, rotation: dict[str, Any]) -> Non
 
 def _submit(client: TestClient, external_id: str, tier: str, image: str) -> str:
     document = contract_document(external_id=external_id)
+    document["required_verification"].append(
+        {"id": "V5", "command": "python3 -m unittest tests.test_x", "expect_exit": 0}
+    )
     document["repository"]["work_branch"] = f"crucible/{external_id}"
     document["policy"] = {"name": "default-software", "version": VERSION}
     for field in ("harness", "model", "pin_reason"):

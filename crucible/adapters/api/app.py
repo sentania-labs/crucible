@@ -17,8 +17,8 @@ from crucible.adapters.api.routers import (
     supervision,
     tasks,
 )
+from crucible.adapters.ui.render import static as ui_static
 from crucible.adapters.ui.router import router as ui_router
-from crucible.adapters.ui.router import static as ui_static
 
 API_PREFIX = "/v1"
 
