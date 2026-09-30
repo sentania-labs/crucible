@@ -63,7 +63,7 @@ from crucible.contracts.api import (
 )
 from crucible.contracts.task_contract import HarnessName
 from crucible.domain.cluster_egress import format_labels, parse_labels
-from crucible.domain.entities import Principal, Role
+from crucible.domain.entities import Principal, Role, UiSession
 from crucible.domain.gates import ALWAYS_BLOCKING_GATES, PRE_PR_GATES
 from crucible.domain.lifecycle import TaskState
 from crucible.domain.secrets import redact, scan_text
@@ -422,22 +422,32 @@ def _preauth_serializer(ctx: Any) -> URLSafeTimedSerializer:
     return URLSafeTimedSerializer(ctx.ui_signing_key, salt="crucible-ui-preauth-v1")
 
 
-def _session(request: Request, ctx: Any, uow: UnitOfWork) -> tuple[Principal, str] | None:
+def _session_id(request: Request, ctx: Any) -> str | None:
     raw = request.cookies.get(COOKIE)
     if not raw:
         return None
     try:
-        document = _serializer(ctx).loads(raw, max_age=SESSION_MAX_AGE)
+        session_id = _serializer(ctx).loads(raw, max_age=SESSION_MAX_AGE)
     except (BadSignature, SignatureExpired):
         return None
-    if not isinstance(document, dict):
+    return session_id if isinstance(session_id, str) else None
+
+
+def _session(request: Request, ctx: Any, uow: UnitOfWork) -> tuple[Principal, str] | None:
+    session_id = _session_id(request, ctx)
+    if session_id is None:
         return None
-    token = document.get("token")
-    csrf = document.get("csrf")
-    if not isinstance(token, str) or not isinstance(csrf, str):
+    session = uow.ui_sessions.get(session_id)
+    now = ctx.clock.now()
+    if session is None or session.expires_at <= now:
         return None
-    principal = authenticate(uow, token)
-    return (principal, csrf) if principal is not None else None
+    principal = uow.principals.get(session.principal_id)
+    if principal is None or principal.disabled_at is not None:
+        return None
+    if session.last_seen_at <= now - timedelta(minutes=1):
+        uow.ui_sessions.touch(session.id, now)
+        uow.commit()
+    return principal, session.csrf
 
 
 def _require(
@@ -715,8 +725,22 @@ async def sign_in(request: Request, ctx: Ctx, uow: UoW) -> Response:
     # ADR 0016: the first-run token has done its job once it has signed someone in;
     # it does not stay in its Secret or file for the next reader.
     await asyncio.to_thread(discard_after_use, ctx.first_run, principal.name)
+    now = ctx.clock.now()
     csrf = os.urandom(24).hex()
-    value = _serializer(ctx).dumps({"token": token, "csrf": csrf})
+    session_id = os.urandom(32).hex()
+    uow.ui_sessions.delete_expired(now)
+    uow.ui_sessions.create(
+        UiSession(
+            id=session_id,
+            principal_id=principal.id,
+            csrf=csrf,
+            created_at=now,
+            expires_at=now + timedelta(seconds=SESSION_MAX_AGE),
+            last_seen_at=now,
+        )
+    )
+    uow.commit()
+    value = _serializer(ctx).dumps(session_id)
     target = form.get("next", "/ui")
     if not target.startswith("/ui") or target.startswith("//"):
         target = "/ui"
@@ -739,6 +763,10 @@ async def sign_out(request: Request, ctx: Ctx, uow: UoW) -> RedirectResponse:
     found = _session(request, ctx, uow)
     if found is not None:
         _csrf(form, found[1])
+        session_id = _session_id(request, ctx)
+        assert session_id is not None
+        uow.ui_sessions.delete(session_id)
+        uow.commit()
     response = RedirectResponse("/ui/sign-in", status_code=303)
     response.delete_cookie(COOKIE, path="/ui", httponly=True, samesite="strict")
     return response

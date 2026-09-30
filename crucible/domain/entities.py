@@ -38,6 +38,16 @@ class Principal:
 
 
 @dataclass(slots=True)
+class UiSession:
+    id: str
+    principal_id: str
+    csrf: str
+    created_at: datetime
+    expires_at: datetime
+    last_seen_at: datetime
+
+
+@dataclass(slots=True)
 class Repository:
     id: str
     name: str

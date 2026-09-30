@@ -50,6 +50,7 @@ from crucible.domain.entities import (
     SupervisorStatus,
     Task,
     TaskContract,
+    UiSession,
     Wake,
 )
 from crucible.domain.lifecycle import AttemptState, ExecutionState, TaskState
@@ -71,6 +72,18 @@ class PrincipalRepository(Protocol):
     def disable(self, principal_id: str, at: datetime) -> bool: ...
 
     def rename(self, principal_id: str, name: str) -> bool: ...
+
+
+class UiSessionRepository(Protocol):
+    def create(self, session: UiSession) -> None: ...
+
+    def get(self, session_id: str) -> UiSession | None: ...
+
+    def delete(self, session_id: str) -> None: ...
+
+    def delete_expired(self, now: datetime) -> int: ...
+
+    def touch(self, session_id: str, last_seen_at: datetime) -> None: ...
 
 
 class RepositoryRegistry(Protocol):
@@ -603,6 +616,7 @@ class IdempotencyRepository(Protocol):
 
 class UnitOfWork(Protocol):
     principals: PrincipalRepository
+    ui_sessions: UiSessionRepository
     repositories: RepositoryRegistry
     policies: PolicyRepository
     tasks: TaskRepository
