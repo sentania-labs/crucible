@@ -25,7 +25,7 @@ from crucible.domain.ids import new_id
 from crucible.domain.secrets import find_secrets, redact, scan_text
 from crucible.ports.artifacts import ArtifactStore, SecretInArtifactError
 from crucible.ports.clock import Clock
-from crucible.ports.execution import BranchBundle, CollectedOutputs
+from crucible.ports.execution import BranchBundle, CollectedOutputs, VerificationRun
 from crucible.ports.harness import ParsedReport
 from crucible.ports.repository import UnitOfWork
 
@@ -210,6 +210,48 @@ def _claimed_checks(claim: dict[str, Any]) -> list[dict[str, Any]]:
         and isinstance(c.get("exit"), int)
         and not isinstance(c.get("exit"), bool)
     ]
+
+
+def _emit_false_claims(
+    uow: UnitOfWork,
+    clock: Clock,
+    attempt: Attempt,
+    claim: dict[str, Any] | None,
+    verifications: tuple[VerificationRun, ...],
+    task: Task,
+) -> None:
+    """ADR 0024: for each required check the worker reported exit 0 while the
+    re-run exited nonzero, record a FALSE_CLAIM evidence row."""
+    if claim is None:
+        return
+    reported: dict[str, int] = {}
+    for c in claim.get("checks") or []:
+        if (
+            isinstance(c, dict)
+            and isinstance(c.get("id"), str)
+            and isinstance(c.get("exit"), int)
+            and not isinstance(c.get("exit"), bool)
+        ):
+            reported[c["id"]] = c["exit"]
+    rerun: dict[str, dict[str, Any]] = {}
+    for run in verifications:
+        if run.ran:
+            rerun[run.id] = {"exit_code": run.exit_code, "command": run.command}
+    for cid, info in rerun.items():
+        if reported.get(cid) == 0 and info["exit_code"] not in (0, None):
+            _add(
+                uow,
+                clock,
+                attempt=attempt,
+                kind=EvidenceKind.FALSE_CLAIM,
+                source=EvidenceSource.CRUCIBLE,
+                payload={
+                    "check": cid,
+                    "claimed_exit": 0,
+                    "rerun_exit": info["exit_code"],
+                    "command": info.get("command", ""),
+                },
+            )
 
 
 def _scanned_inputs(outputs: CollectedOutputs, claim: dict[str, Any] | None) -> list[str]:
@@ -485,6 +527,8 @@ def record_collection_evidence(
                 "ran": run.ran,
             },
         )
+    # ADR 0024: detect false claims — worker reported exit 0, re-run exited nonzero.
+    _emit_false_claims(uow, clock, attempt, claim, outputs.verifications, task)
     if outputs.workspace_state is not None:
         _add(
             uow,

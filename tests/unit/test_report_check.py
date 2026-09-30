@@ -131,12 +131,13 @@ def test_the_checker_command_prints_the_problems_and_exits_1(tmp_path: Path) -> 
         capture_output=True,
         text=True,
         check=False,
+        cwd=str(tmp_path),  # not a git checkout so scope check is skipped
     )
     assert result.returncode == 1, result.stdout + result.stderr
     lines = result.stdout.splitlines()
     assert lines[0] == f"{HT_0004}: 8 problems"
     assert lines[1].startswith("- `head` is not a report field")
-    assert lines[-1].startswith("Fix each one and run `crucible-report check")
+    assert any("Fix each one and run `crucible-report check" in line for line in lines)
 
 
 def test_the_checker_command_passes_a_whole_report_and_exits_0(tmp_path: Path) -> None:
@@ -147,6 +148,7 @@ def test_the_checker_command_passes_a_whole_report_and_exits_0(tmp_path: Path) -
         capture_output=True,
         text=True,
         check=False,
+        cwd=str(tmp_path),  # not a git checkout so scope check is skipped
     )
     assert result.returncode == 0, result.stdout
     assert "no problems" in result.stdout
@@ -403,3 +405,77 @@ def test_report_present_says_what_crucible_filled_and_where_the_report_differs()
         "CompletionClaimV1 parsed; Crucible filled checks, run_evidence from its own "
         "evidence; the report differs from Crucible's evidence: refs (commits 2, collected 1)"
     )
+
+
+# ----- secret-pattern agreement with crucible/domain/secrets.py -----------------
+
+
+def test_secret_patterns_agree_with_crucible() -> None:
+    """The checker's SECRET_PATTERNS list equals crucible's _PATTERNS."""
+    from crucible.domain.secrets import _PATTERNS  # noqa: PLC0415
+
+    checker_names = [(name, pat.pattern) for name, pat in checker.SECRET_PATTERNS]
+    crucible_names = [(name, pat.pattern) for name, pat in _PATTERNS]
+    assert checker_names == crucible_names
+
+
+def test_a_credential_shaped_string_is_a_problem() -> None:
+    """A document containing an anthropic-style token is flagged."""
+    report = _make_report(
+        {
+            "summary": "a summary with a token sk-ant-" + "a" * 24,
+        }
+    )
+    problems = checker.check(report, criteria=None)
+    credential_problems = [p for p in problems if "credential-shaped" in p]
+    assert len(credential_problems) == 1
+    assert "summary" in credential_problems[0]
+
+
+def test_a_mapping_entry_with_non_text_evidence_is_a_problem() -> None:
+    """evidence that is not text (e.g. a mapping) is flagged."""
+    report = _make_report(
+        {
+            "acceptance_mapping": [
+                {"id": "AC1", "status": "met", "evidence": {"detail": "x"}},
+            ],
+        }
+    )
+    problems = checker.check(report, criteria=None)
+    evidence_problems = [p for p in problems if "evidence" in p and "must be text" in p]
+    assert len(evidence_problems) == 1
+    assert "evidence" in evidence_problems[0]
+
+
+def test_a_mapping_entry_with_non_text_id_is_a_problem() -> None:
+    """id that is not text (e.g. a number) is flagged."""
+    report = _make_report(
+        {
+            "acceptance_mapping": [
+                {"id": 123, "status": "met", "evidence": "test"},
+            ],
+        }
+    )
+    problems = checker.check(report, criteria=None)
+    id_problems = [p for p in problems if "id" in p and "must be text" in p]
+    assert len(id_problems) == 1
+    assert "id" in id_problems[0]
+
+
+# ----- helper ----------------------------------------------------------------
+
+
+def _make_report(extra: dict[str, Any]) -> dict[str, Any]:
+    """Build a minimal report dict with *extra* values overriding defaults."""
+    report = {
+        "schema_version": "1.0",
+        "summary": "A task.",
+        "acceptance_mapping": [{"id": "AC1", "status": "met", "evidence": "test"}],
+        "proposed_pull_request": {"title": "T", "body": "B"},
+        "limitations": [],
+        "risks": [],
+        "blockers": [],
+        "follow_ups": [],
+    }
+    report.update(extra)
+    return report

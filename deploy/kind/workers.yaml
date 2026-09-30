@@ -30,7 +30,7 @@ metadata:
   namespace: crucible-workers
 spec:
   hard:
-    count/jobs.batch: "15"
+    count/jobs.batch: "17"
     # The tier's earlier cases keep their claims (their cleanup policy keeps the diff),
     # and the hades #189, #190 and #191 cases at the end of the file need five more.
     persistentvolumeclaims: "24"

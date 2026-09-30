@@ -31,6 +31,7 @@ class ContractVersionView(Response):
 
 
 class AttemptSummary(Response):
+    ordered_candidates: list[dict[str, Any]] = Field(default_factory=list)
     id: str
     execution_id: str
     number: int

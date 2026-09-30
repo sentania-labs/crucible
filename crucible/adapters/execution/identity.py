@@ -124,6 +124,9 @@ def render_identity_md(
     sections.append(
         "## Checks\n\nRun these from the checkout and fix what fails:\n\n"
         + _bullets([_check(v) for v in checks])
+        + "\n- If a required command's program is missing from the image, do not "
+        "write a substitute for it; write report/blocked.md naming the program and "
+        "exit 75."
     )
     sections.append(
         "## Report\n\n"

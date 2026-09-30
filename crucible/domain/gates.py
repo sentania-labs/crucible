@@ -558,7 +558,8 @@ def verification_ran(gi: GateInput) -> GateOutcome:
     """Crucible itself re-ran each required command from the collected tree (11).
 
     The worker's own check logs are a claim, stored and shown to Foundry; this gate
-    reads only the verifier container's exits."""
+    reads only the verifier container's exits. When the worker claimed exit 0 but
+    the re-run exited nonzero, the gate is blocking and names the false claim."""
     required = [
         v
         for v in gi.contract.get("required_verification", [])
@@ -570,6 +571,7 @@ def verification_ran(gi: GateInput) -> GateOutcome:
     ids: list[int] = []
     missing: list[str] = []
     failed: list[str] = []
+    false_claims: list[str] = []
     for check in required:
         check_id = str(check.get("id"))
         item = runs.get(check_id)
@@ -586,7 +588,20 @@ def verification_ran(gi: GateInput) -> GateOutcome:
         actual = item.payload.get("exit_code")
         if actual != expect:
             failed.append(f"{check_id} exited {actual!r}, expected {expect}")
+        # ADR 0024: the worker claimed this check passed while the re-run did not.
+        false_claim = _find_false_claim(gi, check_id, item)
+        if false_claim is not None:
+            false_claims.append(false_claim)
     findings = contradicted_claims(gi, required, runs)
+    if false_claims:
+        # A false claim is blocking — the worker asserted a fact that proved false.
+        return GateOutcome(
+            GateResult.FAIL,
+            "; ".join(false_claims),
+            tuple(ids),
+            findings=findings,
+            always_blocks=True,
+        )
     if missing:
         return GateOutcome(
             GateResult.FAIL,
@@ -605,6 +620,27 @@ def verification_ran(gi: GateInput) -> GateOutcome:
     )
 
 
+def _find_false_claim(gi: GateInput, check_id: str, item: EvidenceItem) -> str | None:
+    """ADR 0024: if the worker claimed exit 0 but the re-run exited nonzero, return
+    the blocking message. Returns None when there is no false claim."""
+    claim = gi.one("artifact_present", role="completion_claim")
+    if claim is None:
+        return None
+    reported = {
+        str(c.get("id")): c.get("exit")
+        for c in claim.payload.get("claimed_checks") or []
+        if isinstance(c, dict)
+        and isinstance(c.get("exit"), int)
+        and not isinstance(c.get("exit"), bool)
+    }
+    claimed_exit = reported.get(check_id)
+    if claimed_exit == 0:
+        rerun_exit = item.payload.get("exit_code")
+        if rerun_exit not in (0, None):
+            return f"the worker reported {check_id} exit 0; Crucible's re-run exited {rerun_exit}"
+    return None
+
+
 def contradicted_claims(
     gi: GateInput, required: list[dict[str, Any]], runs: dict[str, EvidenceItem]
 ) -> tuple[str, ...]:
@@ -618,6 +654,8 @@ def contradicted_claims(
         str(c.get("id")): c.get("exit")
         for c in claim.payload.get("claimed_checks") or []
         if isinstance(c, dict)
+        and isinstance(c.get("exit"), int)
+        and not isinstance(c.get("exit"), bool)
     }
     out: list[str] = []
     for check in required:

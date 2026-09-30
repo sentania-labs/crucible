@@ -63,7 +63,7 @@ DEPLOY_TAG ?= 0.2.1
 CRUCIBLE_DEPLOY_IMAGE ?= ghcr.io/sentania-labs/crucible:$(DEPLOY_TAG)
 CRUCIBLE_DEPLOY_PORT ?= 8080
 
-.PHONY: up dev down reset lint check-image-manifest scan scan-tree scan-history smoke test test-unit test-unit-in-image \
+.PHONY: up dev down reset lint check-image-manifest check-green-gate scan scan-tree scan-history smoke test test-unit test-unit-in-image \
 	test-integration e2e e2e-github e2e-live e2e-admin e2e-image build proxy-config proxies preflight \
 	e2e-kind e2e-kind-self-hosting e2e-command-timeout registry-check manifests deploy-kind first-run-kind release-images-classify release-images-pull release-images-verify \
 	deploy-local deploy-local-down images images-check images-policy-check release-notes
@@ -125,15 +125,18 @@ down:
 reset: ## DESTRUCTIVE: down plus postgres, artifact, and credential volumes
 	$(COMPOSE) --profile "*" down --volumes
 
-lint: check-image-manifest
+lint: check-image-manifest check-green-gate
 	$(UV) sync --frozen --quiet
-	$(UV) run ruff format --check crucible tests tools/release tools/smoke tools/registry tools/images
-	$(UV) run ruff check crucible tests tools/release tools/smoke tools/registry tools/images
-	$(UV) run mypy crucible tests tools/release tools/smoke tools/registry tools/images
+	$(UV) run ruff format --check crucible tests tools/release tools/smoke tools/registry tools/images tools/ci
+	$(UV) run ruff check crucible tests tools/release tools/smoke tools/registry tools/images tools/ci
+	$(UV) run mypy crucible tests tools/release tools/smoke tools/registry tools/images tools/ci
 	$(UV) run lint-imports
 
 check-image-manifest: ## fail when a declared worker-image tag is stale
 	images/check-manifest.sh
+
+check-green-gate: ## fail when a CI job is missing from the `green` gate's needs
+	$(UV) run python3 tools/ci/check-green-gate.py
 
 # The worker images (13, C11). One worker image carries Claude Code, Codex, AGY and
 # Hermes; the script-harness image is the e2e tier's. Both targets build both from a

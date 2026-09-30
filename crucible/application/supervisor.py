@@ -1818,6 +1818,8 @@ class Supervisor:
             project=item.task.project,
             provider=request.provider.value,
             now=self._clock.now(),
+            contract=item.contract,
+            policy_document=item.execution.policy_snapshot or {},
             eligible_harnesses=eligible,
             harnesses=self._harnesses,
             image_allowlist=[
@@ -1963,6 +1965,16 @@ class Supervisor:
         execution: Execution,
         selection: Any,
     ) -> None:
+        reasons = sorted(
+            {
+                reason
+                for candidate in (selection.candidates if selection else ())
+                for reason in candidate.get("excluded", [])
+            }
+        )
+        detail = "no eligible routing candidate"
+        if reasons:
+            detail += ": " + "; ".join(reasons)
         now = self._clock.now()
         attempt.exit_class = ExitClass.ENVIRONMENT
         attempt.ended_at = now
@@ -1980,11 +1992,24 @@ class Supervisor:
             execution,
             ExecutionState.FAILED,
             EventKind.EXECUTION_FAILED,
-            payload={"reason": "no eligible routing candidate"},
+            payload={"reason": detail, "ordered_candidates": attempt.ordered_candidates},
         )
         if task.state is TaskState.SCHEDULED:
             move_task(uow, self._clock, task, TaskState.RUNNING, EventKind.TASK_RUNNING)
-        self._task_reported(uow, task, attempt, ExitClass.ENVIRONMENT, {})
+        if "no task-specific check" in reasons:
+            move_task(
+                uow,
+                self._clock,
+                task,
+                TaskState.BLOCKED,
+                EventKind.TASK_BLOCKED,
+                payload={"reason": detail},
+            )
+            open_escalation(
+                uow, self._clock, task=task, attempt_id=attempt.id, question=detail, summary=detail
+            )
+        else:
+            self._task_reported(uow, task, attempt, ExitClass.ENVIRONMENT, {}, wake_summary=detail)
 
     async def _prepare(
         self, provider: ExecutionProvider, spec: LaunchSpec, repository: Repository | None

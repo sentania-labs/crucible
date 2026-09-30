@@ -40,6 +40,7 @@ from crucible.adapters.persistence.models import (
     SupervisorStatusRow,
     TaskContractRow,
     TaskRow,
+    UiSessionRow,
 )
 from crucible.adapters.persistence.records import (
     Acceptances,
@@ -77,6 +78,7 @@ from crucible.domain.entities import (
     SupervisorStatus,
     Task,
     TaskContract,
+    UiSession,
 )
 from crucible.domain.exit_class import ExitClass
 from crucible.domain.ids import new_id
@@ -126,6 +128,7 @@ from crucible.ports.repository import (
     RoutingPolicyRepository,
     SupervisorStatusRepository,
     TaskRepository,
+    UiSessionRepository,
     UnitOfWork,
     WakeRepository,
 )
@@ -229,6 +232,53 @@ class Principals:
         row.name = name
         self._s.flush()
         return True
+
+
+class UiSessions:
+    def __init__(self, session: Session) -> None:
+        self._s = session
+
+    @staticmethod
+    def _to_entity(row: UiSessionRow) -> UiSession:
+        return UiSession(
+            id=row.id,
+            principal_id=row.principal_id,
+            csrf=row.csrf,
+            created_at=ensure_utc(row.created_at),
+            expires_at=ensure_utc(row.expires_at),
+            last_seen_at=ensure_utc(row.last_seen_at),
+        )
+
+    def create(self, session: UiSession) -> None:
+        self._s.add(
+            UiSessionRow(
+                id=session.id,
+                principal_id=session.principal_id,
+                csrf=session.csrf,
+                created_at=session.created_at,
+                expires_at=session.expires_at,
+                last_seen_at=session.last_seen_at,
+            )
+        )
+        self._s.flush()
+
+    def get(self, session_id: str) -> UiSession | None:
+        row = self._s.get(UiSessionRow, session_id)
+        return self._to_entity(row) if row else None
+
+    def delete(self, session_id: str) -> None:
+        self._s.execute(delete(UiSessionRow).where(UiSessionRow.id == session_id))
+
+    def delete_expired(self, now: datetime) -> int:
+        result = self._s.execute(delete(UiSessionRow).where(UiSessionRow.expires_at <= now))
+        return result.rowcount  # type: ignore[attr-defined,no-any-return]
+
+    def touch(self, session_id: str, last_seen_at: datetime) -> None:
+        self._s.execute(
+            update(UiSessionRow)
+            .where(UiSessionRow.id == session_id)
+            .values(last_seen_at=last_seen_at)
+        )
 
 
 class Repositories:
@@ -1346,6 +1396,7 @@ class SqlUnitOfWork:
     """One database transaction. Use as a context manager; commit explicitly."""
 
     principals: PrincipalRepository
+    ui_sessions: UiSessionRepository
     repositories: RepositoryRegistry
     policies: PolicyRepository
     tasks: TaskRepository
@@ -1401,6 +1452,7 @@ class SqlUnitOfWork:
         self._session.begin()
         s = self._session
         self.principals = Principals(s)
+        self.ui_sessions = UiSessions(s)
         self.repositories = Repositories(s)
         self.policies = Policies(s)
         self.tasks = Tasks(s)

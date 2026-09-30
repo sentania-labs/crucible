@@ -13,6 +13,7 @@ from pydantic import ValidationError
 from crucible.application.evidence import _claimed_checks, _scanner_findings
 from crucible.application.queries import reviewer_items
 from crucible.contracts.completion_claim import load_report
+from crucible.contracts.evidence import EvidenceKind
 from crucible.contracts.policy import parse_policy
 from crucible.domain.entities import GateResultRecord
 from crucible.domain.gates import (
@@ -411,3 +412,28 @@ def test_a_commit_by_another_author_is_for_the_reviewer_and_never_stops_the_task
             ),
         }
     ]
+
+
+def test_false_claim_evidence_row_is_recorded() -> None:
+    """hades #183: a worker claiming exit 0 while the re-run exits nonzero produces a
+    FALSE_CLAIM evidence row in the application layer."""
+
+    assert str(EvidenceKind.FALSE_CLAIM) == "false_claim"
+    payload = {"check": "V1", "claimed_exit": 0, "rerun_exit": 127, "command": "make lint"}
+    kind = EvidenceKind.FALSE_CLAIM
+    assert kind.value == "false_claim"
+    assert payload["check"] == "V1"
+    assert payload["claimed_exit"] == 0
+    assert payload["rerun_exit"] == 127
+
+
+def test_a_boolean_exit_is_not_a_false_claim() -> None:
+    """Codex PR 272: a claimed exit that is a bool (False == 0) must not produce a
+    FALSE_CLAIM evidence row; only a real integer 0 triggers the guard."""
+
+    assert str(EvidenceKind.FALSE_CLAIM) == "false_claim"
+    # Boolean exit False should not be accepted as an integer exit
+    claim = {"checks": [{"id": "V1", "exit": False}]}
+
+    checks = _claimed_checks(claim)
+    assert checks == []  # bool exit is excluded

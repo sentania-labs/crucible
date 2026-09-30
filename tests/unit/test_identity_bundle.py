@@ -134,7 +134,6 @@ def test_identity_md_is_short_and_carries_no_retired_instructions(tmp_path: Path
     re-runs the checks), and about 300 words for a typical contract."""
     text, _, _ = build(tmp_path)
     for retired in (
-        "exit 75",
         "exit 0",
         "Exit codes",
         "precedence",
@@ -200,3 +199,14 @@ def test_a_correction_reaches_the_worker(tmp_path: Path) -> None:
     assert "## This is a correction" in text
     assert "Rename the helper the reviewer flagged." in text
     assert "- review_comment: `C1`" in text
+
+
+def test_identity_says_do_not_substitute_a_missing_tool(tmp_path: Path) -> None:
+    """hades #183 point 1: the worker is told not to substitute missing tools and to
+    exit 75 with blocked.md."""
+    text, _, _ = build(tmp_path)
+    assert "do not write a substitute for it" in text
+    assert "report/blocked.md naming the program" in text
+    assert "exit 75" in text
+    checks_section = text[text.index("## Checks") : text.index("## Report")]
+    assert "do not write a substitute for it" in checks_section

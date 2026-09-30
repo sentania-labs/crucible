@@ -1,0 +1,372 @@
+from __future__ import annotations
+
+from typing import Any
+
+from fastapi import APIRouter, Request
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
+
+from crucible.adapters.api.deps import Ctx, UoW
+from crucible.adapters.ui.actions import register
+from crucible.adapters.ui.render import _page, _redirect, _without_migration
+from crucible.adapters.ui.session import _require
+from crucible.application.admin import (
+    credentials,
+    gateway,
+)
+from crucible.application.errors import (
+    ConflictError,
+)
+from crucible.domain.entities import Principal, Role
+
+router = APIRouter(prefix="/ui", include_in_schema=False)
+
+CAPABILITY_OPTIONS = [("small", "small"), ("mid", "mid"), ("frontier", "frontier")]
+
+
+@router.get("/gateway", response_class=HTMLResponse)
+async def gateway_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
+    """crucible#119, #121: the gateway URL and the Hermes key in one place, a test of
+    both in plain words, and the gateway's own model list to pick from."""
+    found = _require(request, ctx, uow)
+    if isinstance(found, RedirectResponse):
+        return found
+    principal, csrf = found
+    assert ctx.admin is not None
+    secrets = await credentials.read_secrets(ctx.admin, [credentials.HERMES])
+    view = gateway.gateway_view(ctx.admin, uow, secrets.get(credentials.HERMES))
+    offered = await gateway.models_view(ctx.admin, uow)
+    passed = view["last_outcome"] == "probe:completed"
+    # crucible#115: one row in plain words; the credential's state is on Credentials.
+    sections: list[dict[str, Any]] = [
+        {
+            "title": "Gateway",
+            "columns": ["URL", "Key", "Last test"],
+            "rows": [
+                [
+                    view["endpoint_url"] or "not set",
+                    "set" if view["key_set"] else "not set",
+                    {
+                        "kind": "status",
+                        "value": view["last_test"],
+                        "tone": "ok" if passed else "warn",
+                        "hint": view["last_tested_at"] or "",
+                    },
+                ]
+            ],
+        }
+    ]
+    listing: dict[str, Any] = {
+        "title": "Models the key can see",
+        "note": offered["error"]
+        or (
+            f"Gateway {offered['endpoint_url']} lists {offered['offered_count']} "
+            "model(s) for this key. Tick the ones to use; saving writes a new routing "
+            "policy version. A model the gateway no longer offers is disabled, not removed."
+        ),
+    }
+    if principal.role is not Role.ADMIN:
+        listing.update(
+            columns=["Model", "Offered", "Hermes", "Codex", "Thinking", "Capability", "Note"],
+            rows=[
+                [
+                    row["id"],
+                    row["offered"],
+                    row["enabled"],
+                    row["codex_enabled"],
+                    row["enable_thinking"],
+                    row["capability"],
+                    _without_migration(row["note"]),
+                ]
+                for row in offered["models"]
+            ],
+        )
+        sections.append(listing)
+    else:
+        sections.append(
+            {
+                "title": "Set the gateway URL and key",
+                "note": (
+                    "The URL ends in /v1. Codex and Hermes share this LiteLLM virtual key; "
+                    "it is stored as the Hermes credential and never shown. Saving tests "
+                    "both."
+                ),
+                "form": {
+                    "action": "/ui/actions/gateway-save",
+                    "label": "Save and test",
+                    "collapsed": "Change the URL or key" if view["endpoint_url"] else None,
+                    "fields": [
+                        {
+                            "name": "endpoint_url",
+                            "label": "Gateway URL",
+                            "kind": "url",
+                            "value": view["endpoint_url"] or "",
+                            "placeholder": "https://llm.example.internal/v1",
+                            "required": True,
+                        },
+                        {
+                            "name": "api_key",
+                            "label": "Key (empty keeps the current one)"
+                            if view["key_set"]
+                            else "Key",
+                            "kind": "password",
+                            "required": not view["key_set"],
+                        },
+                        {"name": "reason", "label": "Reason", "required": True},
+                    ],
+                },
+            }
+        )
+        if view["endpoint_url"]:
+            # A check: no reason is asked for (crucible#117).
+            sections[0]["form"] = {
+                "action": "/ui/actions/gateway-test",
+                "label": "Test the gateway again",
+                "fields": [{"name": "reason", "label": "Reason"}],
+            }
+        if offered["models"]:
+            rows = []
+            for index, row in enumerate(offered["models"]):
+                rows.append(
+                    [
+                        {"kind": "hidden", "name": f"model.{index}.id", "value": row["id"]},
+                        {
+                            "kind": "checkbox",
+                            "name": f"model.{index}.enabled",
+                            "value": row["enabled"],
+                            "label": f"use {row['id']}",
+                        },
+                        {
+                            "kind": "checkbox",
+                            "name": f"model.{index}.codex",
+                            "value": row["codex_enabled"],
+                            "label": f"use Codex for {row['id']}",
+                        },
+                        {
+                            "kind": "checkbox",
+                            "name": f"model.{index}.thinking",
+                            "value": row["enable_thinking"],
+                            "label": f"thinking for {row['id']}",
+                        },
+                        {
+                            "kind": "select",
+                            "name": f"model.{index}.capability",
+                            "value": row["capability"],
+                            "options": CAPABILITY_OPTIONS,
+                            "label": f"capability of {row['id']}",
+                        },
+                        # The note without the migration that wrote it (crucible#115).
+                        {"value": _without_migration(row["note"])},
+                    ]
+                )
+            listing["form"] = {
+                "action": "/ui/actions/gateway-models",
+                "label": "Save model choices",
+                "fields": [
+                    {
+                        "kind": "grid",
+                        "label": "",
+                        "columns": ["Model", "Hermes", "Codex", "Thinking", "Capability", "Note"],
+                        "rows": rows,
+                    },
+                    {
+                        "name": "max_concurrency",
+                        "label": "Pool max concurrency",
+                        "kind": "number",
+                        "value": (offered["pool"] or {}).get("max_concurrency") or 4,
+                        "required": True,
+                    },
+                    {"name": "reason", "label": "Reason", "required": True},
+                ],
+            }
+        sections.append(listing)
+    sections.append(_hermes_limits_section(gateway.hermes_limits_view(uow), principal))
+    return _page(
+        request,
+        principal,
+        csrf,
+        active="/ui/gateway",
+        heading="Local gateway",
+        intro="The gateway Hermes uses: its URL, its key, a test of both, and its models.",
+        sections=sections,
+        badge="tested" if view["last_outcome"] == "probe:completed" else "not verified",
+        badge_kind="ok" if view["last_outcome"] == "probe:completed" else "warn",
+    )
+
+
+def _hermes_limits_section(limits: dict[str, Any], principal: Principal) -> dict[str, Any]:
+    """FDY-0140: how far one Hermes run may go, and the window it is told the model has."""
+    context = limits["context_length"]
+    section: dict[str, Any] = {
+        "title": "Local run limits",
+        "note": (
+            "Applied from the next launch. Max turns applies to Hermes only. "
+            "Context length is the model's window in tokens for Hermes and local Codex; "
+            "0 lets Hermes find it from the gateway and uses 131072 for Codex."
+        ),
+        "columns": ["Max turns", "Context length", "Source"],
+        "rows": [
+            [
+                limits["max_turns"],
+                context or "found by Hermes",
+                f"saved by {limits['updated_by']}" if limits["saved"] else "default",
+            ]
+        ],
+    }
+    if principal.role is Role.ADMIN:
+        low_turns, high_turns = limits["max_turns_range"]
+        low_context, high_context = limits["context_length_range"]
+        section["form"] = {
+            "action": "/ui/actions/hermes-limits",
+            "label": "Save limits",
+            "collapsed": "Change the limits",
+            "fields": [
+                {
+                    "name": "max_turns",
+                    "label": f"Max turns ({low_turns} to {high_turns})",
+                    "kind": "number",
+                    "value": limits["max_turns"],
+                    "required": True,
+                },
+                {
+                    "name": "context_length",
+                    "label": f"Context length (0, or {low_context} to {high_context})",
+                    "kind": "number",
+                    "value": context,
+                    "required": True,
+                },
+                {"name": "reason", "label": "Reason", "required": True},
+            ],
+        }
+    return section
+
+
+def _whole(form: dict[str, str], name: str, label: str) -> int:
+    try:
+        return int(form.get(name, "").strip())
+    except ValueError:
+        raise ConflictError(f"{label} must be a whole number") from None
+
+
+async def _action_gateway_save(
+    request: Request,
+    action: str,
+    ctx: Ctx,
+    uow: UoW,
+    principal: Principal,
+    csrf: str,
+    form: dict[str, str],
+    reason: str | None,
+) -> Response | None:
+    assert ctx.admin is not None
+    result = await gateway.save_gateway(
+        ctx.admin,
+        uow,
+        principal=principal,
+        endpoint_url=form.get("endpoint_url", ""),
+        api_key=form.get("api_key") or None,
+        reason=reason,
+    )
+    uow.commit()
+    return _redirect(
+        form,
+        f"Saved. {result['test']['summary']}",
+        kind="ok" if result["test"]["passed"] else "warn",
+    )
+
+
+register("gateway-save", _action_gateway_save)
+
+
+async def _action_gateway_test(
+    request: Request,
+    action: str,
+    ctx: Ctx,
+    uow: UoW,
+    principal: Principal,
+    csrf: str,
+    form: dict[str, str],
+    reason: str | None,
+) -> Response | None:
+    assert ctx.admin is not None
+    result = await gateway.test_gateway(ctx.admin, uow, principal=principal, reason=reason)
+    uow.commit()
+    return _redirect(
+        form,
+        result["test"]["summary"],
+        kind="ok" if result["test"]["passed"] else "warn",
+    )
+
+
+register("gateway-test", _action_gateway_test)
+
+
+async def _action_hermes_limits(
+    request: Request,
+    action: str,
+    ctx: Ctx,
+    uow: UoW,
+    principal: Principal,
+    csrf: str,
+    form: dict[str, str],
+    reason: str | None,
+) -> Response | None:
+    assert ctx.admin is not None
+    gateway.save_hermes_limits(
+        ctx.admin,
+        uow,
+        principal=principal,
+        max_turns=_whole(form, "max_turns", "Max turns"),
+        context_length=_whole(form, "context_length", "Context length"),
+        reason=reason,
+    )
+    uow.commit()
+    return _redirect(form, "Saved the Hermes run limits. The next launch uses them.")
+
+
+register("hermes-limits", _action_hermes_limits)
+
+
+async def _action_gateway_models(
+    request: Request,
+    action: str,
+    ctx: Ctx,
+    uow: UoW,
+    principal: Principal,
+    csrf: str,
+    form: dict[str, str],
+    reason: str | None,
+) -> Response | None:
+    assert ctx.admin is not None
+    picks = []
+    index = 0
+    while f"model.{index}.id" in form:
+        picks.append(
+            {
+                "id": form[f"model.{index}.id"],
+                "enabled": form.get(f"model.{index}.enabled") == "true",
+                "codex_enabled": form.get(f"model.{index}.codex") == "true",
+                "enable_thinking": form.get(f"model.{index}.thinking") == "true",
+                "capability": form.get(f"model.{index}.capability") or None,
+            }
+        )
+        index += 1
+    saved = await gateway.save_models(
+        ctx.admin,
+        uow,
+        principal=principal,
+        models=picks,
+        max_concurrency=int(form.get("max_concurrency") or "0") or None,
+        reason=reason,
+    )
+    uow.commit()
+    enabled = ", ".join(saved["enabled"]) or "none"
+    dropped = saved["disabled_not_offered"]
+    return _redirect(
+        form,
+        f"Saved routing policy version {saved['routing_policy']['version']}. "
+        f"Enabled: {enabled}."
+        + (f" Disabled as no longer offered: {', '.join(dropped)}." if dropped else ""),
+    )
+
+
+register("gateway-models", _action_gateway_models)

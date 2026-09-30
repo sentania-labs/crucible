@@ -20,13 +20,15 @@ from crucible.adapters.persistence.migrations.versions._0001_walking_skeleton im
 from crucible.adapters.persistence.migrations.versions._0008_harness_adapters import (
     VERIFIED_ROUTING,
 )
-from crucible.adapters.ui import router as ui_router
-from crucible.adapters.ui.router import (
+from crucible.adapters.ui import render as ui_render
+from crucible.adapters.ui.pages import settings as ui_settings
+from crucible.adapters.ui.pages import workers as ui_workers
+from crucible.adapters.ui.pages.settings import _settings_rows
+from crucible.adapters.ui.render import (
     _document_section,
     _localize,
     _panel,
     _safe_value,
-    _settings_rows,
     templates,
 )
 from crucible.application.admin import audit as audit_service
@@ -429,14 +431,14 @@ def test_live_log_tail_redacts_secret_shaped_output(monkeypatch: pytest.MonkeyPa
     )
     principal = SimpleNamespace(name="reader", role=SimpleNamespace(value="observer"))
     rendered: dict[str, Any] = {}
-    monkeypatch.setattr(ui_router, "_require", lambda *_args: (principal, "fixture-csrf"))
+    monkeypatch.setattr(ui_workers, "_require", lambda *_args: (principal, "fixture-csrf"))
     monkeypatch.setattr(
-        ui_router,
+        ui_workers,
         "_page",
         lambda *_args, sections, **_kwargs: rendered.update(sections=sections),
     )
 
-    ui_router.worker_logs(
+    ui_workers.worker_logs(
         request("/ui/workers/attempt-1/logs"),
         "attempt-1",
         cast(Any, SimpleNamespace()),
@@ -971,7 +973,7 @@ def test_a_reason_is_asked_for_only_where_the_service_requires_one() -> None:
             },
         }
 
-    sections = ui_router._reason_fields(
+    sections = ui_render._reason_fields(
         [
             form("/ui/actions/token-revoke"),
             form("/ui/actions/harness"),
@@ -1031,7 +1033,7 @@ def test_settings_for_a_provider_that_is_off_are_not_listed() -> None:
 
     kubernetes = Settings(kubernetes={"enabled": True}, docker={"enabled": False})
     kubernetes.credentials = {"codex": CredentialSettings(path="/x")}
-    paths = [row[0] for row in ui_router._settings_rows(kubernetes)]
+    paths = [row[0] for row in ui_settings._settings_rows(kubernetes)]
     assert "docker.enabled" in paths
     assert not [p for p in paths if p.startswith("docker.") and p != "docker.enabled"]
     assert any(p.startswith("kubernetes.") and p != "kubernetes.enabled" for p in paths)
@@ -1039,7 +1041,7 @@ def test_settings_for_a_provider_that_is_off_are_not_listed() -> None:
     assert "credentials.codex.mount_mode" in paths
     docker = Settings(kubernetes={"enabled": False}, docker={"enabled": True})
     docker.credentials = {"codex": CredentialSettings(path="/x")}
-    paths = [row[0] for row in ui_router._settings_rows(docker)]
+    paths = [row[0] for row in ui_settings._settings_rows(docker)]
     assert "credentials.codex.path" in paths
     assert not [p for p in paths if p.startswith("kubernetes.") and p != "kubernetes.enabled"]
 
@@ -1047,7 +1049,7 @@ def test_settings_for_a_provider_that_is_off_are_not_listed() -> None:
 def test_once_a_harness_is_ready_the_others_gaps_leave_the_to_do_list() -> None:
     """Review of the first-run integration: Status must not read "ready" above a list of
     what stands before a task. Other harnesses' gaps stay under Details."""
-    from crucible.adapters.ui.router import _readiness_sections  # noqa: PLC0415
+    from crucible.adapters.ui.pages.dashboard import _readiness_sections  # noqa: PLC0415
 
     step = {"code": "credential_missing", "text": "codex has no credential.", "fix": "/ui/x"}
     codex = {"name": "codex", "state": "not_ready", "note": "", "steps": [step]}
@@ -1075,7 +1077,7 @@ def test_once_a_harness_is_ready_the_others_gaps_leave_the_to_do_list() -> None:
 
 def test_the_harnesses_word_is_the_first_readiness_step() -> None:
     """Review of the first-run integration: the Harnesses page and Status agree."""
-    from crucible.adapters.ui.router import _harness_status  # noqa: PLC0415
+    from crucible.adapters.ui.pages.harnesses import _harness_status  # noqa: PLC0415
 
     item = _harness("hermes")
     gap = {"code": "endpoint_not_configured", "text": "The gateway URL is not set.", "fix": "/"}
