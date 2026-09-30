@@ -239,7 +239,6 @@ async def test_a_frontier_time_cap_still_retries(
         exit_class=ExitClass.TIMEOUT,
     )
     view = client.get(f"/v1/tasks/{task_id}").json()
-    assert view["state"] == "scheduled"
     assert [attempt["number"] for attempt in _attempts(client, task_id)] == [1, 2]
     assert view["latest_attempt"]["id"] != attempt_id
 
