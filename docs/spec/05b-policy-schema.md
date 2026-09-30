@@ -446,3 +446,16 @@ enforced independently of `concurrency.per_harness`; the local Hermes pool uses 
 configured pool limit because its credential is read-only, while subscription routes
 retain their writable-credential caps. An attempt beyond the local pool limit stays scheduled and records
 `harness_launch_deferred` until capacity is released.
+
+### Local Codex preference (FDY-0149)
+
+Local model entries may name `harness: codex`, `endpoint: local`, and `pool: lab-local`.
+For trivial and standard tiers, within the same pool Codex ranks before Hermes.
+Demotion and probe eligibility still rank first; pool preference still precedes
+harness preference, followed by capability and weighted least-recent rotation.
+An excluded Codex entry leaves Hermes eligible as the next local choice.
+
+Routing IDs remain unique. The optional `model_name` is the model alias sent to the
+harness; when absent it defaults to `id`. The Local gateway page creates
+`codex-local:<alias>` routing IDs with `model_name: <alias>`, so Hermes and Codex
+can both use the gateway's same alias without conflating their quality histories.

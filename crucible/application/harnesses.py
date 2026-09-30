@@ -202,7 +202,7 @@ def egress_allowlist(
     """The union of the policy's allowlist and the adapter's declared endpoints (13)."""
     adapter = registry.get(harness)
     hosts = set(policy_hosts) | set(extra)
-    if adapter is not None:
+    if adapter is not None and not endpoint_url:
         hosts |= set(adapter.capabilities().endpoints)
     if endpoint_url:
         parsed = urlsplit(endpoint_url)

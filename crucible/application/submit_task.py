@@ -301,6 +301,15 @@ def eligible_harness_names(
         adapter = harnesses.get(name)
         if adapter is None:
             continue
+        # Local Codex uses the optional read-only gateway key, not auth.json.
+        # Keep its eligibility separate so subscription routes still need their source.
+        if name == "codex":
+            try:
+                harnesses.resolve(name, gates=harness_gates, state=uow.harnesses.get(name))
+            except HarnessUnavailableError:
+                pass
+            else:
+                eligible.add("codex:local")
         source = (credential_sources or {}).get(name)
         if (
             needs_credential

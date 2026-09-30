@@ -971,3 +971,100 @@ def test_the_return_address_setting_overrides_the_browsers(
     assert run_cli(config_file, "github", "external-url", capsys=capsys)["source"] == "database"
     audit = admin.get("/v1/admin/audit", params={"limit": 200}).text
     assert audit.count("github_external_url_updated") == 3
+
+
+def test_local_codex_models_api_ui_and_cli(
+    admin: TestClient,
+    live: Supervisor,
+    stubs: Any,
+    ctx: AppContext,
+    tokens: dict[str, str],
+    config_file: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#249: both harnesses can use one gateway alias, with a version per save."""
+    asyncio.run(live.tick())
+    saved = admin.post(
+        "/v1/admin/gateway",
+        json={"reason": "local Codex", "endpoint_url": f"{stubs.url}/v1", "api_key": GATEWAY_KEY},
+    )
+    assert saved.status_code == 200, saved.text
+    picked = admin.post(
+        "/v1/admin/gateway/models",
+        json={
+            "reason": "both harnesses",
+            "models": [
+                {"id": "fast", "enabled": True, "codex_enabled": True, "capability": "small"}
+            ],
+        },
+    )
+    assert picked.status_code == 200, picked.text
+    version = picked.json()["routing_policy"]["version"]
+    assert set(picked.json()["enabled"]) == {"fast", "codex-local:fast"}
+    local = admin.get("/v1/admin/routing/local-endpoint").json()
+    codex = next(m for m in local["models"] if m["harness"] == "codex")
+    assert codex["model_name"] == "fast" and codex["pool"] == "lab-local"
+    assert codex["endpoint"] == "local" and codex["capability"] == "small"
+    refused = admin.post(
+        "/v1/admin/gateway/models",
+        json={"reason": "invalid flag", "models": [{"id": "fast", "codex_enabled": "false"}]},
+    )
+    assert refused.status_code == 422
+    with TestClient(create_app(ctx)) as browser:
+        csrf = ui_sign_in(browser, tokens["admin"])
+        page = browser.get("/ui/gateway").text
+        assert "use Codex for fast" in page
+        rows = re.findall(r'name="model\.(\d+)\.id" value="([^"]+)"', page)
+        index = next(i for i, model in rows if model == "fast")
+        response = browser.post(
+            "/ui/actions/gateway-models",
+            data={
+                "csrf": csrf,
+                "reason": "use Codex alone",
+                "return_to": "/ui/gateway",
+                "model.0.id": "fast",
+                "model.0.codex": "true",
+                "max_concurrency": "3",
+            },
+            follow_redirects=False,
+        )
+        assert f'name="model.{index}.codex"' in page
+        assert response.status_code == 303 and "kind=ok" in response.headers["location"]
+    local = admin.get("/v1/admin/routing/local-endpoint").json()
+    assert local["routing_policy"]["version"] > version
+    assert {m["id"] for m in local["models"] if m["enabled"]} == {"codex-local:fast"}
+    cli = run_cli(
+        config_file,
+        "--reason",
+        "disable Codex",
+        "gateway",
+        "pick",
+        "--harness",
+        "codex",
+        "--disable",
+        "fast",
+        capsys=capsys,
+    )
+    assert cli["enabled"] == []
+    cli = run_cli(
+        config_file,
+        "--reason",
+        "enable Codex",
+        "gateway",
+        "pick",
+        "--harness",
+        "codex",
+        "--enable",
+        "fast",
+        capsys=capsys,
+    )
+    assert cli["enabled"] == ["codex-local:fast"]
+
+    # A Codex-only alias that disappears still saves as disabled, just like Hermes.
+    stubs.stubs.config["models"] = ["coder-large"]
+    stale = admin.post(
+        "/v1/admin/gateway/models",
+        json={"reason": "stale model list", "models": [{"id": "fast", "codex_enabled": True}]},
+    )
+    assert stale.status_code == 200, stale.text
+    assert stale.json()["disabled_not_offered"] == ["codex-local:fast"]

@@ -148,6 +148,8 @@ def gateway_view(
         "models": [
             {
                 "id": entry.get("id"),
+                "harness": entry.get("harness"),
+                "model_name": entry.get("model_name") or entry.get("id"),
                 "enabled": entry.get("enabled") is True,
                 "enable_thinking": (entry.get("chat_template_kwargs") or {}).get(
                     "enable_thinking", False
@@ -180,10 +182,18 @@ async def models_view(ctx: AdminContext, uow: UnitOfWork) -> dict[str, Any]:
                 offered = await asyncio.to_thread(fetch_models, endpoint, bearer)
             except GatewayError as exc:
                 error = exc.detail
-    by_id = {str(entry.get("id")): entry for entry in entries}
+    codex = {
+        str(entry.get("model_name") or entry["id"]): entry
+        for entry in entries
+        if entry.get("harness") == "codex"
+    }
+    by_id = {str(entry.get("id")): entry for entry in entries if entry.get("harness") != "codex"}
+    for model_id in codex:
+        by_id.setdefault(model_id, {})
     rows: list[dict[str, Any]] = []
     for model_id in [*(offered or []), *(i for i in by_id if i not in (offered or []))]:
         entry = by_id.get(model_id)
+        display_entry = entry or codex.get(model_id)
         is_offered = None if offered is None else model_id in offered
         rows.append(
             {
@@ -191,11 +201,12 @@ async def models_view(ctx: AdminContext, uow: UnitOfWork) -> dict[str, Any]:
                 "offered": is_offered,
                 "in_policy": entry is not None,
                 "enabled": bool(entry and entry.get("enabled") is True),
+                "codex_enabled": bool(codex.get(model_id, {}).get("enabled")),
                 "enable_thinking": bool(
                     entry and (entry.get("chat_template_kwargs") or {}).get("enable_thinking")
                 ),
-                "capability": (entry or {}).get("capability") or "mid",
-                "note": _row_note(entry, is_offered),
+                "capability": (display_entry or {}).get("capability") or "mid",
+                "note": _row_note(display_entry, is_offered),
             }
         )
     return {
@@ -401,9 +412,12 @@ async def save_models(
                 errors=[{"path": f"models.{index}.capability", "message": "unknown capability"}],
             )
         picks[model_id] = {
-            "enabled": _flag(item, "enabled", index),
+            "enabled": _flag(item, "enabled", index) if "enabled" in item else None,
             "enable_thinking": _flag(item, "enable_thinking", index),
             "capability": capability,
+            "codex_enabled": _flag(item, "codex_enabled", index)
+            if "codex_enabled" in item
+            else None,
         }
     policy, routing = active_documents(uow)
     document = copy.deepcopy(routing.document)
@@ -418,8 +432,15 @@ async def save_models(
     # A new model the gateway does not list is a typo or a stale page: refused by name.
     # An entry already in force that the gateway stopped listing is disabled below with
     # that reason, whatever the pick said, so a page saved as it was shown still saves.
+    known_aliases = {
+        str(m.get("model_name") or m["id"]) for m in entries if m.get("endpoint") == "local"
+    }
     unoffered = sorted(
-        i for i, pick in picks.items() if pick["enabled"] and i not in offered and i not in by_id
+        i
+        for i, pick in picks.items()
+        if (pick["enabled"] or pick["codex_enabled"])
+        and i not in offered
+        and i not in known_aliases
     )
     if unoffered:
         raise GatewayError(
@@ -434,14 +455,34 @@ async def save_models(
     if max_concurrency is not None:
         pools[pool_name]["max_concurrency"] = max_concurrency
     added: list[str] = []
+    expanded: list[tuple[str, str, str, dict[str, Any]]] = []
     for model_id, pick in picks.items():
+        if pick["enabled"] is not None:
+            expanded.append((model_id, model_id, HERMES, pick))
+        if pick["codex_enabled"] is not None:
+            existing = next(
+                (
+                    m
+                    for m in local
+                    if m.get("harness") == "codex" and (m.get("model_name") or m["id"]) == model_id
+                ),
+                None,
+            )
+            route_id = str(existing["id"]) if existing else f"codex-local:{model_id}"
+            if route_id in by_id and existing is None:
+                raise GatewayError(f"routing id {route_id!r} is already in use")
+            expanded.append(
+                (route_id, model_id, "codex", {**pick, "enabled": pick["codex_enabled"]})
+            )
+    for model_id, gateway_model, harness, pick in expanded:
         entry = by_id.get(model_id)
         if entry is None:
             if not pick["enabled"]:
                 continue  # nothing to keep for a model that was neither in use nor picked
             entry = {
                 "id": model_id,
-                "harness": HERMES,
+                "harness": harness,
+                "model_name": gateway_model,
                 "endpoint": "local",
                 "endpoint_url": endpoint,
                 "capability": pick["capability"] or "mid",
@@ -465,7 +506,7 @@ async def save_models(
     disabled_not_offered: list[str] = []
     for entry in local:
         entry["endpoint_url"] = endpoint
-        if str(entry["id"]) not in offered and entry.get("enabled"):
+        if str(entry.get("model_name") or entry["id"]) not in offered and entry.get("enabled"):
             entry["enabled"] = False
             entry["disabled_reason"] = NOT_OFFERED
             disabled_not_offered.append(str(entry["id"]))

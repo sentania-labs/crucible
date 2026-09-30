@@ -1448,7 +1448,13 @@ class Supervisor:
                 endpoint = route.endpoint
                 endpoint_url = route.endpoint_url
             saved = (
-                route_uow.provider_settings.get(setting_name(selected_harness))
+                route_uow.provider_settings.get(
+                    setting_name(
+                        "hermes"
+                        if endpoint == "local" and selected_harness == "codex"
+                        else selected_harness
+                    )
+                )
                 if selected_harness
                 else None
             )
@@ -1482,8 +1488,12 @@ class Supervisor:
         adapter = self._harnesses.get(selected_harness) if self._harnesses else None
         if adapter is None:
             return spec
-        credential = adapter.credential_spec()
-        source = self._credential_sources.get(selected_harness)
+        credential_harness = (
+            "hermes" if selected_harness == "codex" and endpoint == "local" else selected_harness
+        )
+        credential_adapter = self._harnesses.get(credential_harness) if self._harnesses else None
+        credential = credential_adapter.credential_spec() if credential_adapter else None
+        source = self._credential_sources.get(credential_harness)
         if credential_mounted is None:
             if credential is not None:
                 if source is not None and credential.held_by(source.path):
@@ -1491,7 +1501,7 @@ class Supervisor:
                 elif execution.provider in self._providers:
                     credential_mounted = await self._providers[
                         execution.provider
-                    ].credential_available(selected_harness)
+                    ].credential_available(credential_harness)
                 else:
                     credential_mounted = False
             else:
@@ -1501,7 +1511,7 @@ class Supervisor:
         launch = adapter.build_launch(
             LaunchContext(
                 attempt_id=attempt.id,
-                model=selected_model,
+                model=(route.model_name or route.id) if route else selected_model,
                 effort=execution.effort,
                 timeout_seconds=execution.timeout_seconds,
                 identity_mount=IDENTITY_MOUNT,
@@ -1599,19 +1609,24 @@ class Supervisor:
             return self._harness_busy_in_uow(uow, execution)
 
     def _harness_busy_in_uow(self, uow: UnitOfWork, execution: Execution) -> str | None:
-        if execution.harness in self._logins_now:
+        policy = execution.policy_snapshot or {}
+        routing = load_routing(uow, policy)
+        selected = routing.model(execution.model) if routing is not None else None
+        local_codex = (
+            execution.harness == "codex" and selected is not None and selected.endpoint == "local"
+        )
+        if execution.harness in self._logins_now and not local_codex:
             return (
                 f"a login for {execution.harness} is running and will replace its "
                 "credential; the launch waits for it"
             )
-        policy = execution.policy_snapshot or {}
-        routing = load_routing(uow, policy)
-        selected = routing.model(execution.model) if routing is not None else None
         limit = int(
             (policy.get("concurrency", {}).get("per_harness") or {}).get(execution.harness, 1)
         )
         adapter = self._harnesses.get(execution.harness) if self._harnesses else None
         credential = adapter.credential_spec() if adapter is not None else None
+        if local_codex:
+            credential = None
         if credential is not None:
             source = self._credential_sources.get(execution.harness)
             if effective_mount_mode(credential, source) is MountMode.RW_NARROW:
@@ -1624,6 +1639,10 @@ class Supervisor:
         for other in live:
             other_execution = uow.executions.get(other.execution_id)
             if other_execution is not None and other_execution.harness == execution.harness:
+                other_routing = load_routing(uow, other_execution.policy_snapshot or {})
+                other_model = other_routing.model(other_execution.model) if other_routing else None
+                if execution.harness == "codex" and other_model and other_model.endpoint == "local":
+                    continue
                 running += 1
         # A writable credential forces the per-harness cap even for a local route. The
         # Hermes key is read-only, so its pool-wide limit remains the effective cap.
@@ -1666,6 +1685,17 @@ class Supervisor:
                 adapter = self._harnesses.get(name)
                 if adapter is None:
                     continue
+                # An endpoint-specific eligibility marker never admits a subscription
+                # model without its own credential. Local Codex uses the gateway key.
+                if name == "codex":
+                    try:
+                        self._harnesses.resolve(
+                            name, gates=self._harness_gates, state=uow.harnesses.get(name)
+                        )
+                    except HarnessUnavailableError:
+                        pass
+                    else:
+                        eligible.add("codex:local")
                 source = self._credential_sources.get(name)
                 credential = adapter.credential_spec()
                 if (

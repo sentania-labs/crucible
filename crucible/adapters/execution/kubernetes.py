@@ -3286,7 +3286,9 @@ class KubernetesProvider:
         self, spec: LaunchSpec, *, credential_mounted: bool | None = None
     ) -> LaunchContext:
         if credential_mounted is None:
-            adapter = self.harnesses.get(spec.harness)
+            adapter = self.harnesses.get(
+                "hermes" if spec.harness == "codex" and spec.endpoint == "local" else spec.harness
+            )
             credential = adapter.credential_spec() if adapter is not None else None
             credential_mounted = bool(spec.env_from_files) or (
                 self._credential_copy(spec) is not None
@@ -3536,16 +3538,20 @@ class KubernetesProvider:
     # ----- credentials (12) ---------------------------------------------
 
     def _credential_copy(self, spec: LaunchSpec) -> _CredentialCopy | None:
-        adapter = self.harnesses.get(spec.harness)
+        adapter = self.harnesses.get(
+            "hermes" if spec.harness == "codex" and spec.endpoint == "local" else spec.harness
+        )
         credential = adapter.credential_spec() if adapter is not None else None
         if credential is None:
             return None
         # An optional credential whose Secret is absent is not seeded (see
         # `_seed_credential`), which keeps the adapter's unauthenticated fallback.
-        secret_name = self.config.credential_secret_name(spec.harness)
+        secret_name = self.config.credential_secret_name(credential.harness)
         mode = credential.minimum_mode
-        if self.config.credential_modes.get(spec.harness) is MountMode.RW_NARROW:
+        if self.config.credential_modes.get(credential.harness) is MountMode.RW_NARROW:
             mode = MountMode.RW_NARROW
+        if spec.harness == "codex" and spec.endpoint == "local":
+            mode = MountMode.RO
         return _CredentialCopy(spec=credential, source_secret=secret_name, mode=mode)
 
     async def _credential_keys(self, attempt_id: str) -> list[str]:
@@ -4621,7 +4627,9 @@ def _render_identity(
     is removed before this returns; nothing of it is ever mounted."""
     scratch = Path(tempfile.mkdtemp(prefix="crucible-identity-"))
     try:
-        adapter = harnesses.get(spec.harness)
+        adapter = harnesses.get(
+            "hermes" if spec.harness == "codex" and spec.endpoint == "local" else spec.harness
+        )
         credential = adapter.credential_spec() if adapter is not None else None
         if credential is not None and credential.templates:
             template_dir = scratch / k8sspec.TEMPLATE_PREFIX

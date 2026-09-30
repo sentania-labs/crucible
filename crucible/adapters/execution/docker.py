@@ -167,6 +167,11 @@ WORKER_UID = 1000
 # it changes, so the supervisor can see a command in flight during the run. Only the
 # count leaves the file.
 LAUNCH_WRAPPER = r"""set -u
+if [ -n "${CRUCIBLE_CODEX_CONFIG:-}" ]; then
+  mkdir -p "$CODEX_HOME" || exit 1
+  printf '%s\n' "$CRUCIBLE_CODEX_CONFIG" > "$CODEX_HOME/config.toml" || exit 1
+  unset CRUCIBLE_CODEX_CONFIG
+fi
 for pair in ${CRUCIBLE_ENV_FROM_FILES:-}; do
   var=${pair%%=*}; file=${pair#*=}
   if [ -r "$file" ]; then
@@ -619,7 +624,9 @@ class DockerProvider:
             raise workspace.WorkspaceError("the preparer produced no HEAD")
         # 12: the Crucible-owned templates that go read-only on top of the credential
         # copy. They live inside the identity bundle so the bundle hash covers them.
-        adapter = self.harnesses.get(spec.harness)
+        adapter = self.harnesses.get(
+            "hermes" if spec.harness == "codex" and spec.endpoint == "local" else spec.harness
+        )
         credential = adapter.credential_spec() if adapter is not None else None
         if credential is not None and credential.templates:
             template_dir = paths["identity"] / "harness"
@@ -877,11 +884,13 @@ class DockerProvider:
 
         A harness that declares a credential and has no configured source is refused
         at launch: it would only fail authentication after spending an attempt."""
-        adapter = self.harnesses.get(spec.harness)
+        adapter = self.harnesses.get(
+            "hermes" if spec.harness == "codex" and spec.endpoint == "local" else spec.harness
+        )
         credential = adapter.credential_spec() if adapter is not None else None
         if credential is None:
             return None
-        source = self._credential_source(spec.harness)
+        source = self._credential_source(credential.harness)
         if source is not None and not credential.held_by(source.path):
             source = None
         if source is None:
@@ -892,7 +901,14 @@ class DockerProvider:
                 f"harness {spec.harness!r} (credentials.{spec.harness}.path)"
             )
         return _CredentialCopy(
-            spec=credential, source=source, mode=effective_mount_mode(credential, source), seeded={}
+            spec=credential,
+            source=source,
+            mode=(
+                MountMode.RO
+                if spec.harness == "codex" and spec.endpoint == "local"
+                else effective_mount_mode(credential, source)
+            ),
+            seeded={},
         )
 
     def _credential_mounts(self, spec: LaunchSpec) -> list[dict[str, Any]]:

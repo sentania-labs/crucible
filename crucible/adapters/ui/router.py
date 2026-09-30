@@ -1344,12 +1344,13 @@ async def gateway_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
     }
     if principal.role is not Role.ADMIN:
         listing.update(
-            columns=["Model", "Offered", "In use", "Thinking", "Capability", "Note"],
+            columns=["Model", "Offered", "Hermes", "Codex", "Thinking", "Capability", "Note"],
             rows=[
                 [
                     row["id"],
                     row["offered"],
                     row["enabled"],
+                    row["codex_enabled"],
                     row["enable_thinking"],
                     row["capability"],
                     _without_migration(row["note"]),
@@ -1363,7 +1364,7 @@ async def gateway_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
             {
                 "title": "Set the gateway URL and key",
                 "note": (
-                    "The URL ends in /v1. The key is the LiteLLM virtual key Hermes sends; "
+                    "The URL ends in /v1. Codex and Hermes share this LiteLLM virtual key; "
                     "it is stored as the Hermes credential and never shown. Saving tests "
                     "both."
                 ),
@@ -1414,6 +1415,12 @@ async def gateway_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                         },
                         {
                             "kind": "checkbox",
+                            "name": f"model.{index}.codex",
+                            "value": row["codex_enabled"],
+                            "label": f"use Codex for {row['id']}",
+                        },
+                        {
+                            "kind": "checkbox",
                             "name": f"model.{index}.thinking",
                             "value": row["enable_thinking"],
                             "label": f"thinking for {row['id']}",
@@ -1436,7 +1443,7 @@ async def gateway_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                     {
                         "kind": "grid",
                         "label": "",
-                        "columns": ["Model", "Use", "Thinking", "Capability", "Note"],
+                        "columns": ["Model", "Hermes", "Codex", "Thinking", "Capability", "Note"],
                         "rows": rows,
                     },
                     {
@@ -1468,11 +1475,11 @@ def _hermes_limits_section(limits: dict[str, Any], principal: Principal) -> dict
     """FDY-0140: how far one Hermes run may go, and the window it is told the model has."""
     context = limits["context_length"]
     section: dict[str, Any] = {
-        "title": "Hermes run limits",
+        "title": "Local run limits",
         "note": (
-            "Applied from the next Hermes launch. A run that reaches its turn limit stops "
-            "and is recorded as having reached it. The context length is the model's "
-            "window in tokens; 0 lets Hermes find it from the gateway."
+            "Applied from the next launch. Max turns applies to Hermes only. "
+            "Context length is the model's window in tokens for Hermes and local Codex; "
+            "0 lets Hermes find it from the gateway and uses 131072 for Codex."
         ),
         "columns": ["Max turns", "Context length", "Source"],
         "rows": [
@@ -3525,6 +3532,7 @@ async def action(request: Request, action: str, ctx: Ctx, uow: UoW) -> Response:
                     {
                         "id": form[f"model.{index}.id"],
                         "enabled": form.get(f"model.{index}.enabled") == "true",
+                        "codex_enabled": form.get(f"model.{index}.codex") == "true",
                         "enable_thinking": form.get(f"model.{index}.thinking") == "true",
                         "capability": form.get(f"model.{index}.capability") or None,
                     }
