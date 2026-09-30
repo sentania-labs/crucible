@@ -51,6 +51,10 @@ async def _finish_at_cap(
             entry.pop("endpoint_url", None)
         routing.document = document
         uow.routing_policies.put(routing)
+        # Submission uses the fixture policy's eligible classes. Exercise timeout
+        # retry eligibility directly on this execution without changing that policy.
+        execution.retry_on = ["timeout"]
+        uow.executions.save(execution)
         attempt.state = AttemptState.COLLECTED
         attempt.exit_class = exit_class
         uow.attempts.save(attempt)
@@ -182,7 +186,7 @@ async def test_a_local_turn_cap_blocks_instead_of_retrying(
     task_id = submit_and_start(
         client,
         "crucible-worker:fake-hang",
-        lifecycle={"max_attempts": 3, "retry_on": ["timeout"], "cleanup": "policy"},
+        lifecycle={"max_attempts": 3, "retry_on": ["environment", "lost"], "cleanup": "policy"},
     )
     _, attempt_id = await _finish_at_cap(
         client,
@@ -204,7 +208,7 @@ async def test_a_local_time_cap_blocks_instead_of_retrying(
     task_id = submit_and_start(
         client,
         "crucible-worker:fake-hang",
-        lifecycle={"max_attempts": 3, "retry_on": ["timeout"], "cleanup": "policy"},
+        lifecycle={"max_attempts": 3, "retry_on": ["environment", "lost"], "cleanup": "policy"},
     )
     _, attempt_id = await _finish_at_cap(
         client,
@@ -225,7 +229,7 @@ async def test_a_frontier_time_cap_still_retries(
     task_id = submit_and_start(
         client,
         "crucible-worker:fake-hang",
-        lifecycle={"max_attempts": 3, "retry_on": ["timeout"], "cleanup": "policy"},
+        lifecycle={"max_attempts": 3, "retry_on": ["environment", "lost"], "cleanup": "policy"},
     )
     _, attempt_id = await _finish_at_cap(
         client,
@@ -251,8 +255,9 @@ async def test_the_too_big_wake_names_the_cap(client: TestClient, supervisor: Su
         turn_cap_reached=True,
     )
     wakes = client.get("/v1/wakes").json()["items"]
-    wake = next(item for item in wakes if item["attempt_id"] == attempt_id)
-    assert wake["summary"] == "split the task: the local attempt hit its turn cap"
+    (wake,) = [item for item in wakes if item["payload"].get("attempt_id") == attempt_id]
+    assert wake["reason"] == "blocked"
+    assert wake["payload"]["summary"] == "split the task: the local attempt hit its turn cap"
 
 
 async def test_report_with_secret_is_redacted(

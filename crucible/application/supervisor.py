@@ -4760,15 +4760,7 @@ class Supervisor:
                 task=task,
                 attempt_id=attempt.id,
                 question=reason,
-            )
-            create_wake(
-                uow,
-                self._clock,
-                principal_id=task.principal_id,
-                reason=WakeReason.BLOCKED,
                 summary=too_big_wake_summary(local_cap),
-                task=task,
-                attempt_id=attempt.id,
             )
             return
         if exit_class is ExitClass.QUOTA_EXHAUSTED:
