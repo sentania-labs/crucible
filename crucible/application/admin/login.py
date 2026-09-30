@@ -77,6 +77,11 @@ PASTE_RE = re.compile(
 # CLI that reads a line in the terminal's normal mode gets a newline from it, as it
 # would from a keyboard.
 ENTER = "\r"
+# How long the Enter waits after the code. Claude Code takes a code and its Enter that
+# arrive in one read as a paste, so the carriage return becomes part of the pasted text
+# and nothing submits; a separate keypress a moment later submits. Seen on the lab on
+# 2026-09-29 with Claude Code 2.1.280 (hades #173).
+ENTER_PAUSE_SECONDS = 1.0
 # A CLI that has printed its sign-in URL and then nothing for this long is waiting for
 # the operator, whatever its prompt says (hades #173).
 QUIET_PROMPT_SECONDS = 5.0
@@ -453,7 +458,9 @@ def run_login(
             if session.state == "waiting_for_code":
                 code = session.wait_for_code(0.25)
                 if code is not None and session.error is None:
-                    os.write(master, (code.strip() + ENTER).encode("utf-8"))
+                    os.write(master, code.strip().encode("utf-8"))
+                    time.sleep(ENTER_PAUSE_SECONDS)
+                    os.write(master, ENTER.encode("utf-8"))
                     session.state = "waiting_for_operator"
         process.wait(timeout=5)
     finally:

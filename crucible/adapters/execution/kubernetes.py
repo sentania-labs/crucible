@@ -5240,12 +5240,16 @@ while :; do sleep 5; done
 
 # Hands the pasted code to the login driver: the mask first, so the terminal's echo of
 # the code is already masked when it arrives, then the CLI's input, ended with a
-# carriage return, which is what the Enter key sends (hades #173).
+# carriage return, which is what the Enter key sends (hades #173). The carriage return
+# goes a second after the code: Claude Code reads a code and its Enter that arrive
+# together as one paste and never submits (ENTER_PAUSE_SECONDS in the login module).
 _LOGIN_CODE_SCRIPT = (
     'd="${CRUCIBLE_LOGIN_CONTROL:-/tmp/crucible-login}"; '
     "IFS= read -r c || exit 3; umask 077; "
     'printf "%s" "$c" > "$d/pasted"; '
-    'printf "%s\\r" "$c" > "$d/in"'
+    'printf "%s" "$c" > "$d/in"; '
+    "sleep 1; "
+    'printf "\\r" > "$d/in"'
 )
 
 

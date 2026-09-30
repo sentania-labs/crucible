@@ -17,6 +17,7 @@ import pytest
 
 from crucible.adapters.execution.kubernetes import _LOGIN_CODE_SCRIPT, _LOGIN_DRIVER
 from crucible.application.admin.login import (
+    ENTER_PAUSE_SECONDS,
     FLOWS,
     QUIET_PROMPT_SECONDS,
     LoginFlow,
@@ -256,7 +257,7 @@ def test_the_driver_brings_claude_codes_url_and_prompt_through_and_enter_submits
     assert f"stand-in read {len(pasted)} characters" in text
     # The prompt redrawn with the code in it reaches the log masked.
     assert "Paste code here [pasted code]" in text
-    assert _LOGIN_CODE_SCRIPT.endswith('\\r" "$c" > "$d/in"')
+    assert _LOGIN_CODE_SCRIPT.endswith('printf "\\r" > "$d/in"')
     assert pasted not in text
     assert "\x1b" not in text and "\r" not in text
 
@@ -414,3 +415,16 @@ def test_a_pasted_code_the_cli_echoes_is_masked_on_every_path(tmp_path: Path) ->
     _consume("4/0AVG7fiQ-secretish\r\n", FLOWS["agy"], None, tmp_path, session, None)
     assert session.lines[-1] == "[pasted code]"
     assert not any("4/0AVG7fiQ-secretish" in line for line in session.lines)
+
+
+def test_the_code_script_sends_enter_a_second_after_the_code() -> None:
+    """The Kubernetes login code script writes the code to $d/in, sleeps one second,
+    then writes only the carriage return (hades #173)."""
+    # Must contain: code to $d/in, then sleep 1, then only \\r to $d/in
+    assert 'printf "%s" "$c" > "$d/in"' in _LOGIN_CODE_SCRIPT
+    assert "sleep 1" in _LOGIN_CODE_SCRIPT
+    assert 'printf "\\r" > "$d/in"' in _LOGIN_CODE_SCRIPT
+    # Must NOT write the code and \\r in one printf
+    assert 'printf "%s\\r" "$c" > "$d/in"' not in _LOGIN_CODE_SCRIPT
+    # ENTER_PAUSE_SECONDS must be at least 1.0 so the pause matches the sleep
+    assert ENTER_PAUSE_SECONDS >= 1.0
