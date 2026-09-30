@@ -34,7 +34,7 @@ the login, so no Crucible-side refresh has been observed and Codex ships
 off in its configuration default (25), with that reason as a warning an
 administrator can enable it past (hades #174), until one is.
 
-Spike results go in `docs/spikes/S<n>.md` with commands, output excerpts,
+Spike results go in `docs/history/spikes/S<n>.md` with commands, output excerpts,
 and the decision. Credentials used during spikes are the operator's own
 host directories, copied to a scratch location and deleted after; nothing
 is committed. Throwaway Apps and repositories created for S10 and S12 are

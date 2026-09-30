@@ -240,7 +240,7 @@ Foundry is not required to remain connected for any of this.
 
 ## Triggering the external reviewer
 
-S12's rerun (docs/spikes/S12.md, 2026-09-16) settled it: with the
+S12's rerun (docs/history/spikes/S12.md, 2026-09-16) settled it: with the
 repository's Codex setting "review all pull requests" enabled, an
 App-authored PR is reviewed automatically (pickup 11 s after open,
 completion 101 s) with no human comment. **Repository onboarding

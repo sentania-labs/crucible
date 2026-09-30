@@ -18,7 +18,7 @@ each in the bootstrap ledger.
 
 ## Phase C0: spikes (no product code)
 
-Deliverable: `docs/spikes/` with results for S1 to S12 (21). S9 (rootless
+Deliverable: `docs/history/spikes/` with results for S1 to S12 (21). S9 (rootless
 Docker) and S10 (GitHub App token minting and publisher push) run first
 because their outcomes change the local security arrangement and the
 publication design. Acceptance: each spike has a recorded outcome, a
