@@ -14,7 +14,8 @@ from starlette.responses import RedirectResponse
 from starlette.testclient import TestClient
 
 from crucible.adapters.api.deps import app_context, unit_of_work
-from crucible.adapters.ui import router as ui
+from crucible.adapters.ui import session as ui
+from crucible.adapters.ui.router import router
 from crucible.application.first_run import discard_after_use
 from crucible.domain.entities import Principal, Role, UiSession
 from crucible.ports.first_run import FirstRunDelivery
@@ -144,7 +145,7 @@ def test_the_first_run_token_survives_a_failed_session_insert(
 
     monkeypatch.setattr(target, failure, fail_once)
     app = FastAPI()
-    app.include_router(ui.router)
+    app.include_router(router)
     app.dependency_overrides[app_context] = lambda: ctx
     app.dependency_overrides[unit_of_work] = lambda: uow
     preauth = ui._preauth_serializer(ctx).dumps({"csrf": "preauth-csrf"})
