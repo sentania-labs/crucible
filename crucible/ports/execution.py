@@ -105,6 +105,13 @@ class LaunchSpec:
     # FDY-0140: the harness's saved run settings (`harness.<name>`), handed to the
     # adapter's launch as LaunchContext.harness_settings.
     harness_settings: dict[str, Any] = field(default_factory=dict)
+    # An unpublished correction starts from the preceding attempt's sealed bundle.
+    # The provider mounts this one file into the preparer; the worker never sees the
+    # preceding workspace.
+    resume_bundle_path: str | None = None
+    resume_bundle_attempt_id: str | None = None
+    resume_bundle_head: str | None = None
+    resume_bundle_sha256: str | None = None
 
     def __post_init__(self) -> None:
         validate_endpoint(self.endpoint, self.endpoint_url)

@@ -1279,6 +1279,28 @@ class KubernetesProvider:
         adapter = self.harnesses.require(spec.harness)
         cache_mounts: list[Mount] = []
         cache_volumes: list[dict[str, Any]] = []
+        resume_mounts: list[Mount] = []
+        resume_volumes: list[dict[str, Any]] = []
+        resume_bundle = None
+        if spec.resume_bundle_attempt_id:
+            resume_bundle = f"{scripts.BUNDLE_MOUNT}/work_branch.bundle"
+            resume_mounts.append(
+                Mount(
+                    "resume-bundle",
+                    resume_bundle,
+                    read_only=True,
+                    sub_path="output/work_branch.bundle",
+                )
+            )
+            resume_volumes.append(
+                {
+                    "name": "resume-bundle",
+                    "persistentVolumeClaim": {
+                        "claimName": k8sspec.object_name("ws", spec.resume_bundle_attempt_id),
+                        "readOnly": True,
+                    },
+                }
+            )
         cache_name: str | None = None
         gate: _CacheGate | None = None
         if self.config.use_reference_cache and self.config.cache_claim:
@@ -1333,12 +1355,25 @@ class KubernetesProvider:
                     shims=workspace.SHIM_NAMES,
                     exclude_entries=workspace.EXCLUDE_ENTRIES,
                     identity_mount=IDENTITY_MOUNT,
+                    resume_bundle=resume_bundle,
+                    resume_bundle_head=spec.resume_bundle_head,
+                    resume_bundle_sha256=spec.resume_bundle_sha256,
                     refresh_cache=False,
                     checkout_token="file" if token else None,
                     credential_host=self.config.credential_host,
                 ),
-                mounts=[Mount("ws", WORK_MOUNT), *cache_mounts, *token_mounts],
-                volumes=[self._claim_volume(spec.attempt_id), *cache_volumes, *token_volumes],
+                mounts=[
+                    Mount("ws", WORK_MOUNT),
+                    *cache_mounts,
+                    *resume_mounts,
+                    *token_mounts,
+                ],
+                volumes=[
+                    self._claim_volume(spec.attempt_id),
+                    *cache_volumes,
+                    *resume_volumes,
+                    *token_volumes,
+                ],
                 limits=limits,
                 timeout=self.config.prepare_timeout_seconds,
                 plan=self._checkout_plan(spec, k8sspec.ROLE_PREPARER, token is not None),

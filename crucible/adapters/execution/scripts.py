@@ -296,6 +296,9 @@ def preparer_script(
     shims: tuple[str, ...],
     exclude_entries: tuple[str, ...],
     identity_mount: str,
+    resume_bundle: str | None = None,
+    resume_bundle_head: str | None = None,
+    resume_bundle_sha256: str | None = None,
     refresh_cache: bool = True,
     checkout_token: str | None = None,
     credential_host: str = "github.com",
@@ -328,6 +331,28 @@ if [ -d "{cache_dir}" ]; then
 fi
 """
     resume = "1" if from_remote_branch else "0"
+    bundle_resume = ""
+    if resume_bundle is not None:
+        bundle_resume = f"""
+if [ ! -f {_quote(resume_bundle)} ] || [ -L {_quote(resume_bundle)} ]; then
+  printf 'previous attempt bundle is gone\\n' >&2
+  exit 4
+fi
+ACTUAL_SEAL=$(sha256sum {_quote(resume_bundle)} | cut -d' ' -f1)
+if [ "$ACTUAL_SEAL" != {_quote(resume_bundle_sha256 or "")} ]; then
+  printf 'previous attempt bundle does not match its seal\\n' >&2
+  exit 4
+fi
+{GIT} bundle verify {_quote(resume_bundle)} >/dev/null
+{GIT} fetch {_quote(resume_bundle)} "$WORK_BRANCH:refs/crucible/resume"
+ACTUAL_HEAD=$({GIT} rev-parse refs/crucible/resume)
+if [ "$ACTUAL_HEAD" != {_quote(resume_bundle_head or "")} ]; then
+  printf 'previous attempt bundle head does not match its record\\n' >&2
+  exit 4
+fi
+{GIT} checkout -B "$WORK_BRANCH" refs/crucible/resume --
+STARTED="$ACTUAL_HEAD"
+"""
     credential = drop = ""
     if checkout_token is not None:
         credential = _checkout_credential(checkout_token, credential_host)
@@ -373,7 +398,10 @@ rm -rf "$REPO"
 {GIT} clone --no-hardlinks --no-checkout $REFERENCE -- "$CLONE_URL" "$REPO"
 {drop}cd "$REPO"
 STARTED=""
-if [ "{resume}" = "1" ] \
+if [ -n {_quote(resume_bundle or "")} ]; then
+  :
+  {bundle_resume}
+elif [ "{resume}" = "1" ] \
   && {GIT} rev-parse --verify --quiet "refs/remotes/origin/$WORK_BRANCH" >/dev/null; then
   {GIT} checkout -B "$WORK_BRANCH" "origin/$WORK_BRANCH" --
   STARTED="origin/$WORK_BRANCH"

@@ -7,9 +7,13 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
+from crucible.adapters.api.deps import AppContext
 from crucible.adapters.execution.fake import FakeProvider
+from crucible.application.corrections import PREVIOUS_BUNDLE_GONE
 from crucible.application.supervisor import Supervisor
+from crucible.domain.entities import RetentionAction
 from crucible.domain.gates import DEFERRED_MARKER, DEFERRED_TO_C3, GateName
+from crucible.domain.ids import new_id
 from tests.integration.conftest import (
     ARTIFACTS_DELIVERABLE,
     correction_document,
@@ -352,6 +356,39 @@ async def test_correction_loop_from_pre_pr_gates_failed(
     ).json()
     assert body["state"] == "accepted"
     assert "task_correction_attached" in event_kinds(client, task_id)
+
+
+async def test_a_correction_is_refused_at_attach_time_when_its_bundle_is_gone(
+    client: TestClient, supervisor: Supervisor, ctx: AppContext
+) -> None:
+    task_id = submit_and_start(
+        client, "crucible-worker:fake-prohibited-path", deliverables=ARTIFACTS_DELIVERABLE
+    )
+    assert await run_to_settled(supervisor, client, task_id) == "pre_pr_gates_failed"
+    attempt_id = latest_attempt(client, task_id)
+    assert supervisor.fenced_token is not None
+    with ctx.uow_factory() as uow:
+        uow.set_fenced_token(supervisor.fenced_token)
+        task = uow.tasks.get(task_id)
+        assert task is not None
+        uow.retention.record(
+            RetentionAction(
+                id=new_id(),
+                kind="workspace",
+                subject=attempt_id,
+                policy_name=task.policy_name,
+                policy_version=task.policy_version,
+                acted_at=ctx.clock.now(),
+                detail={"reason": "test"},
+            )
+        )
+        uow.commit()
+
+    document = correction_document(client, task_id, image="crucible-worker:fake-succeed")
+    response = client.post(f"/v1/tasks/{task_id}/corrections", json=document)
+
+    assert response.status_code == 422
+    assert any(error["message"] == PREVIOUS_BUNDLE_GONE for error in response.json()["errors"])
 
 
 async def test_needs_more_work_then_a_correction(
