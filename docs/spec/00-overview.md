@@ -1,6 +1,6 @@
 # 00. Overview, scope, and non-goals
 
-Status: draft for review. Version 0.3, 2026-09-16, incorporating the operator's decisions on the sixteen open questions and the corrections from one external review round on PR #1 (22). Version 0.2 followed one non-author adversarial review round.
+Status: version 0.3 of the design, written 2026-09-16 before implementation. The code and the ADRs under docs/adr/ are the source of truth where they differ; this document is kept for the boundary and the rationale.
 
 ## Purpose
 
@@ -44,7 +44,7 @@ Crucible only records.
 - PostgreSQL persistence with Alembic migrations.
 - Lifecycle state machines for task, execution, attempt, worker, gate.
 - Fake execution provider (tests) and Docker execution provider (local).
-- Harness adapters for Claude Code, Codex, AGY, non-interactive only.
+- Harness adapters for Claude Code, Codex, AGY and Hermes (a local model behind a gateway), non-interactive only.
 - Lease and heartbeat based liveness; restart reconciliation.
 - Deterministic definition-of-done gates with evidence records.
 - Structured logging, durable events, artifact and log storage on disk.
@@ -62,10 +62,9 @@ Crucible only records.
 
 ## Explicit non-goals
 
-- Any user interface. Boards, chat, and Kanban consume the API later.
+- Boards and chat as products. An administrative UI exists at /ui (spec 25); a work board consumes the API later.
 - Model selection, prompt authoring, or planning.
 - Interactive worker sessions. Crucible runs harnesses in print or exec mode.
-- Kubernetes execution provider (26; built in phase C8, standard runtime first, runtime class later).
 - Multi-tenant authorization. One trust domain, one operator.
 - Secret storage. Credentials are mounted from outside; never persisted.
 - Deployment of the products workers build. The tag is a one-way handoff
