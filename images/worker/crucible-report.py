@@ -230,6 +230,12 @@ def _mapping_entries(value: Any, problems: list[str]) -> list[dict[str, Any]]:
                     f"acceptance_mapping[{index}].{key} is missing: give every entry an "
                     "id, a status and the evidence."
                 )
+        for key in ("id", "evidence"):
+            value = entry.get(key)
+            if value is not None and not isinstance(value, str):
+                problems.append(
+                    f"acceptance_mapping[{index}].{key} must be text, got {type(value).__name__}."
+                )
         status = entry.get("status")
         if status not in STATUSES:
             problems.append(

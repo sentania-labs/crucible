@@ -432,6 +432,36 @@ def test_a_credential_shaped_string_is_a_problem() -> None:
     assert "summary" in credential_problems[0]
 
 
+def test_a_mapping_entry_with_non_text_evidence_is_a_problem() -> None:
+    """evidence that is not text (e.g. a mapping) is flagged."""
+    report = _make_report(
+        {
+            "acceptance_mapping": [
+                {"id": "AC1", "status": "met", "evidence": {"detail": "x"}},
+            ],
+        }
+    )
+    problems = checker.check(report, criteria=None)
+    evidence_problems = [p for p in problems if "evidence" in p and "must be text" in p]
+    assert len(evidence_problems) == 1
+    assert "evidence" in evidence_problems[0]
+
+
+def test_a_mapping_entry_with_non_text_id_is_a_problem() -> None:
+    """id that is not text (e.g. a number) is flagged."""
+    report = _make_report(
+        {
+            "acceptance_mapping": [
+                {"id": 123, "status": "met", "evidence": "test"},
+            ],
+        }
+    )
+    problems = checker.check(report, criteria=None)
+    id_problems = [p for p in problems if "id" in p and "must be text" in p]
+    assert len(id_problems) == 1
+    assert "id" in id_problems[0]
+
+
 # ----- helper ----------------------------------------------------------------
 
 
