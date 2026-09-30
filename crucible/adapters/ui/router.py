@@ -21,6 +21,7 @@ from crucible.adapters.ui.pages import repositories as repositories_ui
 from crucible.adapters.ui.pages import routing as routing_ui
 from crucible.adapters.ui.pages import tasks as tasks_ui
 from crucible.adapters.ui.pages import tokens as tokens_ui
+from crucible.adapters.ui.pages import wakes as wakes_ui
 from crucible.adapters.ui.pages import workers as workers_ui
 from crucible.adapters.ui.render import (
     _document_section,
@@ -40,43 +41,6 @@ from crucible.application.errors import (
 from crucible.domain.entities import Principal, Role
 
 router = APIRouter(prefix="/ui", include_in_schema=False)
-
-
-@router.get("/wakes", response_class=HTMLResponse)
-def wakes_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
-    found = _require(request, ctx, uow)
-    if isinstance(found, RedirectResponse):
-        return found
-    principal, csrf = found
-    rows = uow.wakes.list_for_principal(principal.id, since=None, include_acked=True, limit=200)
-    summary = status.wakes(uow)
-    return _page(
-        request,
-        principal,
-        csrf,
-        active="/ui/wakes",
-        heading="Wakes",
-        intro=(
-            f"Notifications for {principal.name}. {summary['unacked']} pending across "
-            "every principal."
-        ),
-        sections=[
-            {
-                "title": "Your wakes",
-                "empty": "No wakes for you.",
-                "columns": ["Why", "Created", "Acknowledged", ""],
-                "rows": [
-                    [
-                        item.reason.replace("_", " ").capitalize(),
-                        item.created_at.isoformat(),
-                        item.acked_at.isoformat() if item.acked_at else "no",
-                        {"kind": "more", "label": "Details", "value": item.payload},
-                    ]
-                    for item in rows
-                ],
-            },
-        ],
-    )
 
 
 @router.get("/retention", response_class=HTMLResponse)
@@ -460,3 +424,4 @@ router.routes.extend(tokens_ui.router.routes)
 router.routes.extend(github_ui.router.routes)
 router.routes.extend(workers_ui.router.routes)
 router.routes.extend(tasks_ui.router.routes)
+router.routes.extend(wakes_ui.router.routes)
