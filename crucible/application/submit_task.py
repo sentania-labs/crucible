@@ -116,6 +116,8 @@ def _check_routing(
         project=contract.project,
         provider=request.provider.value,
         now=clock.now(),
+        contract=to_document(contract),
+        policy_document=policy.document,
         eligible_harnesses=eligible_harnesses,
         harnesses=harnesses,
         image_allowlist=[

@@ -103,6 +103,7 @@ def _attempt_summary(a: Attempt, reroute_from_attempt_id: str | None = None) -> 
         harness=a.selected_harness,
         image=a.selected_image,
         pool=a.selected_pool,
+        ordered_candidates=a.ordered_candidates,
         reroute_from_attempt_id=reroute_from_attempt_id,
         resume_from_remote=a.resume_from_remote,
     )
