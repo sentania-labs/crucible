@@ -256,6 +256,7 @@ class FakeKubernetesApi:
     # window before the Job controller has produced anything to observe (26).
     no_pod_yet: set[str] = field(default_factory=set)
     created: list[dict[str, Any]] = field(default_factory=list)
+    create_attempts: list[dict[str, str]] = field(default_factory=list)
     deleted: list[tuple[str, str]] = field(default_factory=list)
     # What the next login Pod acts out, and each login Pod's run by Pod name.
     login: FakeLogin = field(default_factory=FakeLogin)
@@ -283,6 +284,7 @@ class FakeKubernetesApi:
     # `count` calls of that name (`get`, `create`, `list_objects`, `pod_exec`, ...) on
     # that kind ("" for any kind) raise a 503, as a restarting API server does.
     outages: list[list[Any]] = field(default_factory=list)
+    transport_outages: list[list[Any]] = field(default_factory=list)
     # Roles whose Job the namespace quota refuses a Pod for: the Job exists, no Pod is
     # ever created, and a `FailedCreate` event names the quota, as the Job controller
     # records it.
@@ -356,11 +358,19 @@ class FakeKubernetesApi:
         """Make the next `count` calls of `call` (on `kind`, or any) answer 503."""
         self.outages.append([call, kind, count])
 
+    def refuse_connections_next(self, call: str, count: int = 1, *, kind: str = "") -> None:
+        """Make the next matching calls fail before the API server answers."""
+        self.transport_outages.append([call, kind, count])
+
     def _outage(self, call: str, kind: str = "") -> None:
         # Check transport_fails: simulate a refused/reset connection, not a 503.
         if self.transport_fails > 0:
             self.transport_fails -= 1
             raise KubernetesUnavailableError(0, "Connection refused")
+        for entry in self.transport_outages:
+            if entry[0] == call and entry[1] in ("", kind) and entry[2] > 0:
+                entry[2] -= 1
+                raise KubernetesUnavailableError(0, "Connection refused")
         for entry in self.outages:
             if entry[0] == call and entry[1] in ("", kind) and entry[2] > 0:
                 entry[2] -= 1
@@ -370,9 +380,10 @@ class FakeKubernetesApi:
         return "v1.31.0"
 
     def create(self, kind: str, body: Mapping[str, Any]) -> dict[str, Any]:
-        self._outage("create", kind)
         metadata = dict(body.get("metadata") or {})
         name = str(metadata.get("name", ""))
+        self.create_attempts.append({"kind": kind, "name": name})
+        self._outage("create", kind)
         if kind in self.refuse_create:
             raise KubernetesApiError(500, f"the fake refuses to create a {kind}")
         role = str((metadata.get("labels") or {}).get(LABEL_ROLE, ""))

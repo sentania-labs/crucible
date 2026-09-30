@@ -1875,11 +1875,7 @@ async def test_attempts_of_one_repository_prepared_together_share_one_refresh() 
 async def test_a_refused_connection_at_prepare_is_retried_then_succeeds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Two transport failures during the canary probe are retried; the attempt proceeds.
-
-    The fake's transport_fails counter is consumed by calls in the canary probe
-    (NetworkPolicy create and Pod create), then the probe recovers and succeed.
-    """
+    """Two refused PVC creates are retried before the attempt proceeds."""
     api, _registry, provider = build(
         config=KubernetesConfig(
             poll_interval_seconds=0,
@@ -1890,45 +1886,47 @@ async def test_a_refused_connection_at_prepare_is_retried_then_succeeds(
         )
     )
     launch = spec()
-    # The canary's NetworkPolicy create and Pod create will each hit a transport fail.
-    api.transport_fails = 2
+    await provider._resolve_image(launch)
+    assert (await provider.ensure_ready()).passed
+    api.refuse_connections_next("create", 2, kind="persistentvolumeclaims")
+
+    async def no_sleep(_seconds: float) -> None:
+        pass
+
+    monkeypatch.setattr(asyncio, "sleep", no_sleep)
 
     workspace = await provider.prepare(launch)
     assert workspace is not None
-
-    # The provider should have retried and eventually succeeded. The fake records the
-    # actual creates: PVC, configmap, and the preparer Job.
-    creates = [row["kind"] for row in api.created]
-    assert "persistentvolumeclaims" in creates
-    assert "configmaps" in creates
+    pvc_attempts = [row for row in api.create_attempts if row["kind"] == "persistentvolumeclaims"]
+    assert len(pvc_attempts) == 3
 
 
 async def test_a_4xx_at_prepare_is_not_retried(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A 4xx error from the API server is not retried; it is raised immediately.
-
-    The fake raises a 500 for refused creates, which is also not a transport
-    error. A 4xx refusal would behave the same: _call_with_backoff raises it
-    without retrying because KubernetesApiError(4xx).is_transport is False.
-    """
+    """A 4xx error from the API server is raised immediately."""
     api, _registry, provider = build(
         config=KubernetesConfig(
             poll_interval_seconds=0,
             launch_timeout_seconds=5,
             storage_class="lab-ssd",
             image_pull_secret="ghcr-pull",
-        ),
-        egress_enforced=False,
+        )
     )
     launch = spec()
-    # Make the fake refuse the first create with a 500 (not transport).
-    api.refuse_create.add("persistentvolumeclaims")
+    await provider._resolve_image(launch)
+    assert (await provider.ensure_ready()).passed
+    real_create = api.create
 
-    with pytest.raises(ProviderError):
+    def refuse_pvc(kind: str, body: Mapping[str, Any]) -> dict[str, Any]:
+        if kind == "persistentvolumeclaims":
+            api.create_attempts.append({"kind": kind, "name": str(body["metadata"]["name"])})
+            raise KubernetesApiError(403, "forbidden")
+        return real_create(kind, body)
+
+    monkeypatch.setattr(api, "create", refuse_pvc)
+
+    with pytest.raises(KubernetesApiError, match="403"):
         await provider.prepare(launch)
-
-    # No PVC should have been created.
-    pvcs = [row for row in api.created if row["kind"] == "persistentvolumeclaims"]
-    assert len(pvcs) == 0
+    assert len([row for row in api.create_attempts if row["kind"] == "persistentvolumeclaims"]) == 1
 
 
 async def test_the_retry_deadline_reraises_the_last_transport_error(
@@ -1944,11 +1942,15 @@ async def test_the_retry_deadline_reraises_the_last_transport_error(
             api_retry_seconds=1,
         )
     )
-    # Use the fake's get to exercise _call_with_backoff. Fail all of them.
-    api.transport_fails = 10
+    api.refuse_connections_next("get", 10, kind="secrets")
+
+    async def no_sleep(_seconds: float) -> None:
+        pass
+
+    monkeypatch.setattr(asyncio, "sleep", no_sleep)
 
     with pytest.raises(KubernetesApiError) as exc_info:
-        await provider._call_with_backoff(api.get, "secrets", "nonexistent", deadline_seconds=1)
+        await provider._call_with_backoff(api.get, "secrets", "nonexistent", deadline_seconds=0)
 
     err = exc_info.value
 
@@ -1972,6 +1974,11 @@ async def test_launch_retries_the_worker_job_create_on_a_503(
     workspace = await provider.prepare(launch)
     # The first Job create for the worker will get a 503 (outage).
     api.fail_next("create", 1, kind="jobs")
+
+    async def no_sleep(_seconds: float) -> None:
+        pass
+
+    monkeypatch.setattr(asyncio, "sleep", no_sleep)
 
     handle = await provider.launch(workspace, launch)
     assert handle is not None

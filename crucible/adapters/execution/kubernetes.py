@@ -127,6 +127,13 @@ from crucible.ports.harness import AuthFile, CredentialSpec, ExitInfo, LaunchCon
 
 log = logging.getLogger("crucible.provider.kubernetes")
 
+_RETRYABLE_API_STATUSES = frozenset({0, 502, 503, 504})
+
+
+def _is_transport_failure(exc: KubernetesApiError) -> bool:
+    """Whether the client classified this as one of the retryable transport cases."""
+    return isinstance(exc, KubernetesUnavailableError) and exc.status in _RETRYABLE_API_STATUSES
+
 
 def _inside_declared_network(
     network: ipaddress.IPv4Network | ipaddress.IPv6Network, declared: str
@@ -672,25 +679,27 @@ class KubernetesProvider:
         if deadline_seconds is None:
             deadline_seconds = float(self.config.api_retry_seconds)
         backoff = 1.0
-        deadline = time.monotonic() + deadline_seconds
-        attempt = 0
+        deadline = time.monotonic() + max(0.0, deadline_seconds)
+        retry = 0
         while True:
-            attempt += 1
             try:
                 return await self._call(fn, *args, **kwargs)
             except KubernetesApiError as exc:
-                if not exc.is_transport:
+                if not _is_transport_failure(exc):
                     raise
-                if time.monotonic() + backoff >= deadline:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
                     raise
+                retry += 1
+                delay = min(backoff, remaining)
                 log.info(
-                    "API transport failure, retry %d in %.0fs",
-                    attempt,
-                    backoff,
-                    extra={"error": type(exc).__name__},
+                    "API transport failure, retry %d in %.0fs (%s)",
+                    retry,
+                    delay,
+                    type(exc).__name__,
                 )
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, deadline - time.monotonic())
+                await asyncio.sleep(delay)
+                backoff = min(backoff * 2, 16.0)
 
     async def _create_with_backoff(
         self, kind: str, body: Mapping[str, Any], deadline_seconds: float | None = None
@@ -3157,7 +3166,7 @@ class KubernetesProvider:
         }
 
     async def _identity_paths(self, attempt_id: str) -> dict[str, str]:
-        body = await self._call(
+        body = await self._call_with_backoff(
             self.client.get, "configmaps", k8sspec.object_name("identity", attempt_id)
         )
         annotations = (body.get("metadata") or {}).get("annotations") or {}
@@ -3681,7 +3690,8 @@ class KubernetesProvider:
         holds a copy of the credential as it stands, which the login then declines to
         replace (12). Nothing an attempt holds is ever mixed with a new session."""
         try:
-            source = await self._call_with_backoff(self.client.get, "secrets", copy.source_secret)
+            call = self._call_with_backoff if use_backoff else self._call
+            source = await call(self.client.get, "secrets", copy.source_secret)
         except KubernetesApiError as exc:
             if not copy.spec.required_for_launch and exc.status == 404:
                 return
@@ -3933,7 +3943,9 @@ class KubernetesProvider:
         with contextlib.suppress(KubernetesApiError):
             await self._call(self.client.delete, "jobs", name)
         try:
-            policy_name, resolved_plan = await self._apply_policy(spec, role, plan)
+            policy_name, resolved_plan = await self._apply_policy(
+                spec, role, plan, use_backoff=use_backoff
+            )
             body = k8sspec.job(
                 name=name,
                 namespace=self.config.namespace,

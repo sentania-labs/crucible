@@ -72,10 +72,6 @@ class KubernetesApiError(ProviderError):
         self.message = message
         self.path = path
 
-    @property
-    def is_transport(self) -> bool:
-        return isinstance(self, KubernetesUnavailableError)
-
 
 class KubernetesUnavailableError(KubernetesApiError, ProviderUnavailableError):
     """The API server could not be reached or could not answer: a refused, reset or

@@ -77,11 +77,11 @@ async def test_a_canary_the_api_server_could_not_run_does_not_refuse_the_launch(
         config=KubernetesConfig(
             poll_interval_seconds=0,
             launch_timeout_seconds=5,
-            api_retry_seconds=2,
+            api_retry_seconds=0,
         )
     )
     launch = spec()
-    api.fail_next("create", 2, kind="pods")
+    api.fail_next("create", 1, kind="pods")
     with pytest.raises(ProviderUnavailableError) as raised:
         await provider.prepare(launch)
     assert not isinstance(raised.value, HarnessRefusedError)
