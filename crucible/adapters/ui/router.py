@@ -722,9 +722,6 @@ async def sign_in(request: Request, ctx: Ctx, uow: UoW) -> Response:
             message="Token not recognized.",
             status_code=401,
         )
-    # ADR 0016: the first-run token has done its job once it has signed someone in;
-    # it does not stay in its Secret or file for the next reader.
-    await asyncio.to_thread(discard_after_use, ctx.first_run, principal.name)
     now = ctx.clock.now()
     csrf = os.urandom(24).hex()
     session_id = os.urandom(32).hex()
@@ -740,6 +737,9 @@ async def sign_in(request: Request, ctx: Ctx, uow: UoW) -> Response:
         )
     )
     uow.commit()
+    # ADR 0016: discard the first-run token only after the session is committed,
+    # so a failed insert or commit leaves the token available for a retry.
+    await asyncio.to_thread(discard_after_use, ctx.first_run, principal.name)
     value = _serializer(ctx).dumps(session_id)
     target = form.get("next", "/ui")
     if not target.startswith("/ui") or target.startswith("//"):

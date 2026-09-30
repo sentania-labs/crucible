@@ -5,13 +5,19 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
+from fastapi import FastAPI
 from starlette.requests import Request
 from starlette.responses import RedirectResponse
+from starlette.testclient import TestClient
 
+from crucible.adapters.api.deps import app_context, unit_of_work
 from crucible.adapters.ui import router as ui
+from crucible.application.first_run import discard_after_use
 from crucible.domain.entities import Principal, Role, UiSession
+from crucible.ports.first_run import FirstRunDelivery
 
 NOW = datetime(2026, 9, 30, 12, 0, tzinfo=UTC)
 PRINCIPAL = Principal("01K6H9ZH2J7F0X7M6C1Y8D3P4Q", "admin", Role.ADMIN, NOW)
@@ -110,6 +116,59 @@ async def test_sign_in_cookie_contains_no_bearer_token(monkeypatch: pytest.Monke
     )
     assert len(uow.ui_sessions.rows) == 1
     assert len(next(iter(uow.ui_sessions.rows))) == 64
+
+
+@pytest.mark.parametrize("failure", ["create", "commit"])
+def test_the_first_run_token_survives_a_failed_session_insert(
+    monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    ctx, uow = context(), Uow()
+    ctx.first_run = Mock(spec=FirstRunDelivery)
+    principal = Principal(PRINCIPAL.id, "first-run-admin", Role.ADMIN, NOW)
+    token = "faketok-first-run-retry"
+    monkeypatch.setattr(
+        ui, "authenticate", lambda _uow, supplied: principal if supplied == token else None
+    )
+    discard = Mock(wraps=discard_after_use)
+    monkeypatch.setattr(ui, "discard_after_use", discard)
+    target = uow.ui_sessions if failure == "create" else uow
+    original = getattr(target, failure)
+    failed = False
+
+    def fail_once(*args: Any) -> None:
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise RuntimeError("transient session database failure")
+        original(*args)
+
+    monkeypatch.setattr(target, failure, fail_once)
+    app = FastAPI()
+    app.include_router(ui.router)
+    app.dependency_overrides[app_context] = lambda: ctx
+    app.dependency_overrides[unit_of_work] = lambda: uow
+    preauth = ui._preauth_serializer(ctx).dumps({"csrf": "preauth-csrf"})
+    with TestClient(app, raise_server_exceptions=False, follow_redirects=False) as client:
+        client.cookies.set(ui.PREAUTH_COOKIE, preauth, path="/ui/sign-in")
+        form = {"csrf": "preauth-csrf", "token": token}
+        response = client.post("/ui/sign-in", data=form)
+
+        assert response.status_code == 500
+        assert ui.COOKIE not in response.cookies
+        discard.assert_not_called()
+        ctx.first_run.discard.assert_not_called()
+        assert uow.commits == 0
+
+        response = client.post("/ui/sign-in", data=form)
+
+        assert response.status_code == 303
+        session_id = ui._serializer(ctx).loads(response.cookies[ui.COOKIE])
+        session = uow.ui_sessions.get(session_id)
+        assert session is not None
+        assert session.principal_id == principal.id
+        assert uow.commits == 1
+        discard.assert_called_once_with(ctx.first_run, principal.name)
+        ctx.first_run.discard.assert_called_once_with()
 
 
 def test_deleted_session_redirects_to_sign_in() -> None:
