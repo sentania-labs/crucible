@@ -866,7 +866,6 @@ def certify_head(
     outcome = certify(
         policy,
         head_sha=head_sha,
-        branch_protection=observation.required_checks,
         observed=checks,
     )
     state = outcome.state
@@ -931,8 +930,7 @@ def certify_head(
             and c.source is not CheckSource.CHECK_SUITE
             and not (c.concluded and c.conclusion == "skipped")
         ]
-        # Only a repository that requires nothing: a configured required check that has not
-        # appeared yet is late, not absent, and stays subject to certification.
+        # A narrowing that excludes observed runs cannot turn them into absent CI.
         if waiver is not None and not ran and not outcome.required:
             state = CertificationState.SKIPPED
             detail = (
