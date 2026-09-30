@@ -1483,13 +1483,15 @@ class Supervisor:
                 else None
             )
             resume_bundle: dict[str, str] = {}
-            published = route_uow.events.latest_for_task_kind(
-                task.id, EventKind.PUBLISH_COMPLETED.value
-            )
+            # Only a correction reads the task's events: an ordinary launch has no
+            # previous attempt to resume from (#258).
             if (
                 execution.role is ExecutionRole.CORRECT
                 and not attempt.resume_from_remote
-                and published is None
+                and route_uow.events.latest_for_task_kind(
+                    task.id, EventKind.PUBLISH_COMPLETED.value
+                )
+                is None
             ):
                 previous_attempt = max(
                     (
