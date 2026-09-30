@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import tomllib
@@ -21,6 +20,7 @@ from crucible.adapters.ui.pages import harnesses as harnesses_ui
 from crucible.adapters.ui.pages import images as images_ui
 from crucible.adapters.ui.pages import repositories as repositories_ui
 from crucible.adapters.ui.pages import routing as routing_ui
+from crucible.adapters.ui.pages import tokens as tokens_ui
 from crucible.adapters.ui.render import (
     _base,
     _check_words,
@@ -43,7 +43,6 @@ from crucible.application.admin import (
     github,
     github_manifest,
     status,
-    tokens,
 )
 from crucible.application.decisions import record_decision
 from crucible.application.errors import (
@@ -62,106 +61,6 @@ from crucible.domain.waivers import ACCEPT_NO_CI, WAIVABLE_STATES, WAIVE_EXTERNA
 from crucible.ports.repository import UnitOfWork
 
 router = APIRouter(prefix="/ui", include_in_schema=False)
-
-
-@router.get("/tokens", response_class=HTMLResponse)
-def tokens_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
-    found = _require(request, ctx, uow)
-    if isinstance(found, RedirectResponse):
-        return found
-    principal, csrf = found
-    items = tokens.list_principals(uow)
-    admin = principal.role is Role.ADMIN
-
-    def revoke(item: dict[str, Any]) -> Any:
-        # The row's own action, never a typed ID (crucible#127). Revoking is hard to
-        # reverse, so it asks for a reason (crucible#117).
-        if not admin or item["disabled_at"] is not None:
-            return ""
-        return {
-            "kind": "form",
-            "action": "/ui/actions/token-revoke",
-            "label": "Revoke",
-            "danger": True,
-            "reason": True,
-            "hidden": {"principal_id": item["id"]},
-        }
-
-    sections: list[dict[str, Any]] = [
-        {
-            "title": "Principals",
-            "columns": ["Name", "Role", "Created", "Revoked", ""],
-            "rows": [
-                [
-                    item["name"],
-                    item["role"],
-                    item["created_at"],
-                    item["disabled_at"] or "no",
-                    revoke(item),
-                ]
-                for item in items
-            ],
-        }
-    ]
-    if admin:
-        sections.append(
-            {
-                "title": "Rename principal",
-                "note": (
-                    "Its tasks and token follow it; past events keep the name they were "
-                    "written with."
-                ),
-                "form": {
-                    "action": "/ui/actions/token-rename",
-                    "label": "Rename",
-                    "fields": [
-                        {
-                            "name": "principal_id",
-                            "label": "Principal",
-                            "kind": "select",
-                            "options": [
-                                (item["id"], item["name"])
-                                for item in items
-                                if item["disabled_at"] is None
-                            ],
-                        },
-                        {"name": "name", "label": "New name", "required": True},
-                        {"name": "reason", "label": "Reason", "required": True},
-                    ],
-                },
-            }
-        )
-        sections.append(
-            {
-                "title": "Create token",
-                "note": (
-                    "The token is shown on the next page once and is never stored in plaintext."
-                ),
-                "form": {
-                    "action": "/ui/actions/token-create",
-                    "label": "Create token",
-                    "fields": [
-                        {"name": "name", "label": "Principal name", "required": True},
-                        {
-                            "name": "role",
-                            "label": "Role",
-                            "kind": "select",
-                            "options": [(role.value, role.value) for role in Role],
-                        },
-                        {"name": "reason", "label": "Reason"},
-                    ],
-                },
-            }
-        )
-    return _page(
-        request,
-        principal,
-        csrf,
-        active="/ui/tokens",
-        heading="Tokens",
-        intro="Who can sign in or call the API, and with which role.",
-        sections=sections,
-    )
 
 
 @router.get("/github", response_class=HTMLResponse)
@@ -1366,37 +1265,6 @@ async def _actions(
             f"Registered {added['repository']} ({added['url']}, default branch "
             f"{added['default_branch']}, installation {added['installation_id']}).",
         )
-    elif action == "token-create":
-        minted = tokens.create(
-            ctx.admin,
-            uow,
-            principal=principal.name,
-            name=form.get("name", ""),
-            role=form.get("role", "observer"),
-            reason=reason,
-        )
-        uow.commit()
-        context = _base(request, principal, csrf, title="Token created", active="/ui/tokens")
-        context.update(
-            token=minted.token,
-            token_name=minted.principal.name,
-            token_role=minted.principal.role.value,
-        )
-        response = templates.TemplateResponse(
-            request=request, name="token_once.html", context=context
-        )
-        response.headers["Cache-Control"] = "no-store"
-        return response
-    elif action == "token-revoke":
-        revoked = tokens.revoke(
-            ctx.admin,
-            uow,
-            principal=principal.name,
-            principal_id=form.get("principal_id", ""),
-            reason=reason,
-        )
-        uow.commit()
-        await asyncio.to_thread(tokens.after_revoke, ctx.admin, revoked)
     elif action == "github-check":
         github.check(ctx.admin, uow, principal=principal.name, reason=reason)
     elif action == "bootstrap-commit":
@@ -1415,27 +1283,15 @@ async def _actions(
             import_id=form.get("import_id", ""),
             reason=reason,
         )
-    elif action == "token-rename":
-        tokens.rename(
-            ctx.admin,
-            uow,
-            principal=principal.name,
-            principal_id=form.get("principal_id", ""),
-            name=form.get("name", ""),
-            reason=reason,
-        )
     return None
 
 
 register("github-create-app", _actions)
 register("github-external-url", _actions)
 register("github-add-repository", _actions)
-register("token-create", _actions)
-register("token-revoke", _actions)
 register("github-check", _actions)
 register("bootstrap-commit", _actions)
 register("bootstrap-discard", _actions)
-register("token-rename", _actions)
 
 router.routes.extend(session.router.routes)
 router.routes.extend(actions.router.routes)
@@ -1446,3 +1302,4 @@ router.routes.extend(gateway_ui.router.routes)
 router.routes.extend(images_ui.router.routes)
 router.routes.extend(routing_ui.router.routes)
 router.routes.extend(repositories_ui.router.routes)
+router.routes.extend(tokens_ui.router.routes)
