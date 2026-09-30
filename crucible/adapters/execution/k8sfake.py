@@ -290,6 +290,8 @@ class FakeKubernetesApi:
     # Every event recorded, which outlives the object it names, as on an API server.
     events: list[dict[str, Any]] = field(default_factory=list)
     _uids: int = 0
+    # Transport-fail the next N API calls (any kind), then succeed.
+    transport_fails: int = 0
 
     # ----- test controls ------------------------------------------------
 
@@ -355,6 +357,10 @@ class FakeKubernetesApi:
         self.outages.append([call, kind, count])
 
     def _outage(self, call: str, kind: str = "") -> None:
+        # Check transport_fails: simulate a refused/reset connection, not a 503.
+        if self.transport_fails > 0:
+            self.transport_fails -= 1
+            raise KubernetesUnavailableError(0, "Connection refused")
         for entry in self.outages:
             if entry[0] == call and entry[1] in ("", kind) and entry[2] > 0:
                 entry[2] -= 1

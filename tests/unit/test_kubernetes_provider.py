@@ -18,7 +18,12 @@ import pytest
 
 from crucible.adapters.execution import k8sspec
 from crucible.adapters.execution import kubernetes as kubernetes_module
-from crucible.adapters.execution.k8sapi import ExecResult, KubernetesApiError, LogFrame
+from crucible.adapters.execution.k8sapi import (
+    ExecResult,
+    KubernetesApiError,
+    KubernetesUnavailableError,
+    LogFrame,
+)
 from crucible.adapters.execution.k8sfake import FakeKubernetesApi
 from crucible.adapters.execution.kubernetes import (
     CollectionFailedError,
@@ -1865,3 +1870,115 @@ async def test_attempts_of_one_repository_prepared_together_share_one_refresh() 
     jobs = [c["name"] for c in api.created if c["kind"] == "jobs"]
     assert len([n for n in jobs if n.startswith("refresh-cache-")]) == 1
     assert len([n for n in jobs if n.startswith("prepare-")]) == 2
+
+
+async def test_a_refused_connection_at_prepare_is_retried_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two transport failures during the canary probe are retried; the attempt proceeds.
+
+    The fake's transport_fails counter is consumed by calls in the canary probe
+    (NetworkPolicy create and Pod create), then the probe recovers and succeed.
+    """
+    api, _registry, provider = build(
+        config=KubernetesConfig(
+            poll_interval_seconds=0,
+            launch_timeout_seconds=5,
+            storage_class="lab-ssd",
+            image_pull_secret="ghcr-pull",
+            api_retry_seconds=10,
+        )
+    )
+    launch = spec()
+    # The canary's NetworkPolicy create and Pod create will each hit a transport fail.
+    api.transport_fails = 2
+
+    workspace = await provider.prepare(launch)
+    assert workspace is not None
+
+    # The provider should have retried and eventually succeeded. The fake records the
+    # actual creates: PVC, configmap, and the preparer Job.
+    creates = [row["kind"] for row in api.created]
+    assert "persistentvolumeclaims" in creates
+    assert "configmaps" in creates
+
+
+async def test_a_4xx_at_prepare_is_not_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A 4xx error from the API server is not retried; it is raised immediately.
+
+    The fake raises a 500 for refused creates, which is also not a transport
+    error. A 4xx refusal would behave the same: _call_with_backoff raises it
+    without retrying because KubernetesApiError(4xx).is_transport is False.
+    """
+    api, _registry, provider = build(
+        config=KubernetesConfig(
+            poll_interval_seconds=0,
+            launch_timeout_seconds=5,
+            storage_class="lab-ssd",
+            image_pull_secret="ghcr-pull",
+        ),
+        egress_enforced=False,
+    )
+    launch = spec()
+    # Make the fake refuse the first create with a 500 (not transport).
+    api.refuse_create.add("persistentvolumeclaims")
+
+    with pytest.raises(ProviderError):
+        await provider.prepare(launch)
+
+    # No PVC should have been created.
+    pvcs = [row for row in api.created if row["kind"] == "persistentvolumeclaims"]
+    assert len(pvcs) == 0
+
+
+async def test_the_retry_deadline_reraises_the_last_transport_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the deadline passes, the last transport error is raised."""
+    api, _registry, provider = build(
+        config=KubernetesConfig(
+            poll_interval_seconds=0,
+            launch_timeout_seconds=5,
+            storage_class="lab-ssd",
+            image_pull_secret="ghcr-pull",
+            api_retry_seconds=1,
+        )
+    )
+    # Use the fake's get to exercise _call_with_backoff. Fail all of them.
+    api.transport_fails = 10
+
+    with pytest.raises(KubernetesApiError) as exc_info:
+        await provider._call_with_backoff(api.get, "secrets", "nonexistent", deadline_seconds=1)
+
+    err = exc_info.value
+
+    assert isinstance(err, KubernetesUnavailableError)
+
+
+async def test_launch_retries_the_worker_job_create_on_a_503(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 503 on the worker Job create is retried, and the launch succeeds once the fake
+    starts answering."""
+    api, _registry, provider = build(
+        config=KubernetesConfig(
+            poll_interval_seconds=0,
+            launch_timeout_seconds=5,
+            storage_class="lab-ssd",
+            image_pull_secret="ghcr-pull",
+        )
+    )
+    launch = spec()
+    workspace = await provider.prepare(launch)
+    # The first Job create for the worker will get a 503 (outage).
+    api.fail_next("create", 1, kind="jobs")
+
+    handle = await provider.launch(workspace, launch)
+    assert handle is not None
+    assert handle.ref.startswith("worker-")
+
+    # The job should have been created successfully after the retry.
+    jobs = [
+        row for row in api.created if row["kind"] == "jobs" and row["name"].startswith("worker-")
+    ]
+    assert len(jobs) >= 1

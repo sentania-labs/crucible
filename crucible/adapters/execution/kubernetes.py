@@ -320,6 +320,8 @@ class KubernetesConfig:
     max_concurrency: int = 3
     poll_interval_seconds: float = 2.0
     api_timeout_seconds: float = 30.0
+    # Retry deadline for transport failures on API calls before the worker Pod exists.
+    api_retry_seconds: int = 60
     # The cluster's DNS service address. 26 allows port 53 on this address and nothing
     # else on it; every other destination inside the cluster stays denied.
     cluster_dns_ip: str = "10.96.0.10"
@@ -653,6 +655,58 @@ class KubernetesProvider:
     async def _call(self, fn: Any, *args: Any, **kwargs: Any) -> Any:
         return await asyncio.to_thread(fn, *args, **kwargs)
 
+    async def _call_with_backoff(
+        self,
+        fn: Any,
+        *args: Any,
+        deadline_seconds: float | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Call fn and retry on transport failures up to a deadline.
+
+        Transport failures are situations where the API server could not be
+        reached (connection refused, reset, DNS failure, read timeout, or
+        HTTP 502/503/504).  Other errors (4xx, or 5xx that the client does
+        not classify as unavailable) are raised immediately.
+        """
+        if deadline_seconds is None:
+            deadline_seconds = float(self.config.api_retry_seconds)
+        backoff = 1.0
+        deadline = time.monotonic() + deadline_seconds
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                return await self._call(fn, *args, **kwargs)
+            except KubernetesApiError as exc:
+                if not exc.is_transport:
+                    raise
+                if time.monotonic() + backoff >= deadline:
+                    raise
+                log.info(
+                    "API transport failure, retry %d in %.0fs",
+                    attempt,
+                    backoff,
+                    extra={"error": type(exc).__name__},
+                )
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, deadline - time.monotonic())
+
+    async def _create_with_backoff(
+        self, kind: str, body: Mapping[str, Any], deadline_seconds: float | None = None
+    ) -> None:
+        """Create an object, retrying transport failures up to a deadline."""
+        try:
+            await self._call_with_backoff(
+                self.client.create,
+                kind,
+                body,
+                deadline_seconds=deadline_seconds,
+            )
+        except KubernetesApiError as exc:
+            if exc.status != 409:
+                raise
+
     async def _registry_call(self, fn: Any, *args: Any, **kwargs: Any) -> Any:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
@@ -956,11 +1010,11 @@ class KubernetesProvider:
         )
         if policy_name is not None:
             try:
-                await self._call(self.client.create, "networkpolicies", policy)
+                await self._call_with_backoff(self.client.create, "networkpolicies", policy)
             except KubernetesApiError as exc:
                 return _canary_failed(f"the canary NetworkPolicy was refused: {exc}", exc)
         try:
-            await self._call(self.client.create, "pods", pod)
+            await self._call_with_backoff(self.client.create, "pods", pod)
         except KubernetesApiError as exc:
             if policy_name is not None:
                 with contextlib.suppress(KubernetesApiError):
@@ -977,7 +1031,7 @@ class KubernetesProvider:
             # not, and a real API server prefixes every line when timestamps are left
             # enabled.
             try:
-                body = await self._call(
+                body = await self._call_with_backoff(
                     self.client.pod_log,
                     name,
                     container=k8sspec.CONTAINER_NAME,
@@ -1083,7 +1137,7 @@ class KubernetesProvider:
 
         # 26: the PVC, the ConfigMap and the per-attempt Secret, then the preparer Job.
         await self._delete_attempt_objects(spec.attempt_id)
-        await self._create(
+        await self._create_with_backoff(
             "persistentvolumeclaims",
             k8sspec.workspace_claim(
                 name=k8sspec.object_name("ws", spec.attempt_id),
@@ -1096,7 +1150,7 @@ class KubernetesProvider:
         bundle, identity_paths, identity_sha = await asyncio.to_thread(
             _render_identity, spec, work_branch, self.harnesses
         )
-        await self._create(
+        await self._create_with_backoff(
             "configmaps",
             k8sspec.config_map(
                 name=k8sspec.object_name("identity", spec.attempt_id),
@@ -1108,7 +1162,7 @@ class KubernetesProvider:
         )
         copy = self._credential_copy(spec)
         if copy is not None:
-            await self._seed_credential(spec, copy)
+            await self._seed_credential(spec, copy, use_backoff=True)
             self._seeded[spec.attempt_id] = dict(copy.seeded)
         try:
             return await self._prepare_checkout(
@@ -1171,7 +1225,7 @@ class KubernetesProvider:
                     f"the checkout token Secret {name!r} left by an earlier try could not "
                     "be removed"
                 )
-            await self._call(
+            await self._call_with_backoff(
                 self.client.create,
                 "secrets",
                 k8sspec.secret(
@@ -1338,6 +1392,7 @@ class KubernetesProvider:
             exit_code = await self._run_role_job(
                 spec,
                 role=k8sspec.ROLE_PREPARER,
+                use_backoff=True,
                 image=resolved,
                 script=scripts.preparer_script(
                     url=url,
@@ -1536,7 +1591,9 @@ class KubernetesProvider:
             # hades #189: the readiness gate and the image resolution above can take a
             # while; a cancel that landed during them creates nothing.
             await _stop_if_cancelled(cancelled, "before the worker was created")
-            policy_name, plan = await self._apply_policy(spec, k8sspec.ROLE_WORKER, plan)
+            policy_name, plan = await self._apply_policy(
+                spec, k8sspec.ROLE_WORKER, plan, use_backoff=True
+            )
             body = k8sspec.job(
                 name=job_name,
                 namespace=self.config.namespace,
@@ -1553,7 +1610,7 @@ class KubernetesProvider:
                 ),
                 active_deadline_seconds=max(60, spec.timeout_seconds + limits.grace_seconds),
             )
-            await self._create("jobs", body)
+            await self._create_with_backoff("jobs", body)
         except (KubernetesApiError, SpecError) as exc:
             with contextlib.suppress(Exception):
                 await self._call(self.client.delete, "jobs", job_name)
@@ -3459,7 +3516,7 @@ class KubernetesProvider:
         )
 
     async def _apply_policy(
-        self, spec: LaunchSpec, role: str, plan: EgressPlan
+        self, spec: LaunchSpec, role: str, plan: EgressPlan, *, use_backoff: bool = False
     ) -> tuple[str | None, EgressPlan]:
         """One NetworkPolicy per attempt per role that needs egress.
 
@@ -3477,7 +3534,10 @@ class KubernetesProvider:
         plan = await self._resolve_plan(plan)
         name = k8sspec.object_name(f"np-{role}", spec.attempt_id)
         body = self._policy_body(name, self._labels(spec, role), spec.attempt_id, role, plan)
-        await self._create("networkpolicies", body)
+        if use_backoff:
+            await self._create_with_backoff("networkpolicies", body)
+        else:
+            await self._create("networkpolicies", body)
         return name, plan
 
     async def _resolve_plan(self, plan: EgressPlan) -> EgressPlan:
@@ -3597,7 +3657,7 @@ class KubernetesProvider:
         raised rather than folded into absence, so a required credential does not
         read a transient API error as "no keys" and launch unauthenticated."""
         try:
-            body = await self._call(
+            body = await self._call_with_backoff(
                 self.client.get, "secrets", k8sspec.object_name("cred", attempt_id)
             )
         except KubernetesApiError as exc:
@@ -3606,7 +3666,9 @@ class KubernetesProvider:
             raise
         return [str(key) for key in (body.get("data") or {})]
 
-    async def _seed_credential(self, spec: LaunchSpec, copy: _CredentialCopy) -> None:
+    async def _seed_credential(
+        self, spec: LaunchSpec, copy: _CredentialCopy, *, use_backoff: bool = False
+    ) -> None:
         """26: per attempt, copy the harness Secret into `cred-<attempt>`.
 
         Only the named auth files, never the whole Secret: a harness Secret can hold
@@ -3619,7 +3681,7 @@ class KubernetesProvider:
         holds a copy of the credential as it stands, which the login then declines to
         replace (12). Nothing an attempt holds is ever mixed with a new session."""
         try:
-            source = await self._call(self.client.get, "secrets", copy.source_secret)
+            source = await self._call_with_backoff(self.client.get, "secrets", copy.source_secret)
         except KubernetesApiError as exc:
             if not copy.spec.required_for_launch and exc.status == 404:
                 return
@@ -3650,15 +3712,26 @@ class KubernetesProvider:
             value = base64.b64decode(str(raw))
             payload[key] = value
             copy.seeded[auth.name] = hashlib.sha256(value).hexdigest()
-        await self._create(
-            "secrets",
-            k8sspec.secret(
-                name=k8sspec.object_name("cred", spec.attempt_id),
-                namespace=self.config.namespace,
-                object_labels=self._labels(spec, k8sspec.ROLE_WORKER),
-                data=payload,
-            ),
-        )
+        if use_backoff:
+            await self._create_with_backoff(
+                "secrets",
+                k8sspec.secret(
+                    name=k8sspec.object_name("cred", spec.attempt_id),
+                    namespace=self.config.namespace,
+                    object_labels=self._labels(spec, k8sspec.ROLE_WORKER),
+                    data=payload,
+                ),
+            )
+        else:
+            await self._create(
+                "secrets",
+                k8sspec.secret(
+                    name=k8sspec.object_name("cred", spec.attempt_id),
+                    namespace=self.config.namespace,
+                    object_labels=self._labels(spec, k8sspec.ROLE_WORKER),
+                    data=payload,
+                ),
+            )
 
     async def _sync_credential(
         self, h: Handle, spec: LaunchSpec, limits: Limits
@@ -3844,6 +3917,7 @@ class KubernetesProvider:
         cancelled: CancelCheck | None = None,
         tolerate_lingering_pod: bool = False,
         wait_for_quota: bool = False,
+        use_backoff: bool = False,
     ) -> int:
         """Run one single-purpose Job to completion and delete it. With `cancelled`, a
         cancel ends the wait (hades #189): the Job and its policy are deleted on the way
@@ -3882,7 +3956,10 @@ class KubernetesProvider:
                 # Crucible's wait counts the role's time from Running (lab findings of 2026-09-29).
                 active_deadline_seconds=timeout + self.config.launch_timeout_seconds,
             )
-            await self._create("jobs", body)
+            if use_backoff:
+                await self._create_with_backoff("jobs", body)
+            else:
+                await self._create("jobs", body)
         except (KubernetesApiError, SpecError) as exc:
             log.warning("%s Job failed", role, extra={"error": str(exc)})
             self._role_error(

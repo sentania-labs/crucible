@@ -73,9 +73,15 @@ async def test_a_canary_the_api_server_could_not_run_does_not_refuse_the_launch(
     """A readiness canary that failed because the API server could not answer is no
     verdict on the namespace: the launch fails as an environment failure the retry
     rule covers (never a refusal and a wake), and the next launch runs it again."""
-    api, _registry, provider = build()
+    api, _registry, provider = build(
+        config=KubernetesConfig(
+            poll_interval_seconds=0,
+            launch_timeout_seconds=5,
+            api_retry_seconds=2,
+        )
+    )
     launch = spec()
-    api.fail_next("create", 1, kind="pods")
+    api.fail_next("create", 2, kind="pods")
     with pytest.raises(ProviderUnavailableError) as raised:
         await provider.prepare(launch)
     assert not isinstance(raised.value, HarnessRefusedError)
