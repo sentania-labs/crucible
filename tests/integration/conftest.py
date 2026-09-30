@@ -138,6 +138,12 @@ def database_url(worker_id: str, testrun_uid: str) -> Iterator[str]:
         return
     from testcontainers.postgres import PostgresContainer  # noqa: PLC0415
 
+    try:
+        import docker as _docker  # type: ignore[import-untyped]  # noqa: PLC0415
+
+        _docker.from_env().ping()
+    except Exception:
+        pytest.skip("Docker daemon not available")
     with (
         PostgresContainer(POSTGRES_IMAGE, driver="psycopg") as pg,
         own_database(pg.get_connection_url(), name) as own,
