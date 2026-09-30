@@ -1,6 +1,6 @@
 # 20. Proposed implementation phases
 
-Status: this plan was written 2026-09-16 and is kept as history. The phases through C9 (the Kubernetes provider) have shipped; releases since are tagged on main and described in docs/implementation-notes/ and docs/roadmap.md.
+Status: this plan was written 2026-09-16 and is kept as history. The phases through C9 have shipped (C8 is the Kubernetes execution provider, C9 the cluster deployment); releases since are tagged on main and described in docs/implementation-notes/ and docs/roadmap.md.
 
 Each phase ends with a merged, verified PR, a demo the operator can run
 with one command, and a Foundry review. Releases are cut only when the

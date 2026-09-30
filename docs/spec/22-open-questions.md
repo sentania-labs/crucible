@@ -1,6 +1,6 @@
 # 22. Decisions taken and questions still open
 
-Status: the decisions below are the 2026-09-16 set. Later decisions are ADRs under docs/adr/ (0019 onward, through 2026-09-29) and are not folded back into this table; where an ADR and a row here differ, the ADR wins.
+Status: the decisions below are the 2026-09-16 set. Later decisions are ADRs under docs/adr/ (0015 onward, through 2026-09-29) and are not folded back into this table; where an ADR and a row here differ, the ADR wins.
 
 ## Decided by the operator, 2026-09-16 (incorporated in v0.3)
 
