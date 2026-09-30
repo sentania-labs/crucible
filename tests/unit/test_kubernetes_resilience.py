@@ -202,7 +202,7 @@ def _quota(api: Any, hard: dict[str, str]) -> None:
         # The shipped base quota: every limit fits three attempts at the defaults.
         (
             {
-                "count/jobs.batch": "15",
+                "count/jobs.batch": "17",
                 "requests.cpu": "3",
                 "requests.memory": "12Gi",
                 "limits.cpu": "6",

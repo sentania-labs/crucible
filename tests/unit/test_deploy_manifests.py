@@ -605,7 +605,7 @@ def test_the_quota_reports_attempt_capacity_from_its_job_count(
     rendered: dict[str, list[dict[str, Any]]],
 ) -> None:
     """An attempt uses five Jobs, so the raw quota must be converted before display."""
-    expected = {"base": "15", "overlays/lab": "30", "overlays/kind": "15"}
+    expected = {"base": "17", "overlays/lab": "30", "overlays/kind": "17"}
     for target, jobs in expected.items():
         quota = _named(rendered[target], "ResourceQuota", "crucible-workers")
         hard = quota["spec"]["hard"]
@@ -613,6 +613,9 @@ def test_the_quota_reports_attempt_capacity_from_its_job_count(
         assert "pods" not in hard, target
         # The claim count is the structural attempt cap, one claim per attempt.
         assert "persistentvolumeclaims" in hard, target
+        # The base quota has two extra Jobs of headroom above a multiple of five.
+        if target == "base":
+            assert int(hard["count/jobs.batch"]) % 5 == 2, target
 
 
 LAB_STARTUP_PLACEHOLDER_KEYS = frozenset(
