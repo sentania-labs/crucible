@@ -357,6 +357,7 @@ def readiness(
     harnesses = harness_readiness(ctx, uow, document["harnesses"], document["providers"], secrets)
     steps: list[dict[str, str]] = []
     supervisor = document["supervisor"]
+    repositories = uow.repositories.list_all()
     if not supervisor["healthy"]:
         steps.append(
             _step(
@@ -365,11 +366,22 @@ def readiness(
                 "/ui",
             )
         )
-    if not uow.repositories.list_all():
+    if not repositories:
         steps.append(
             _step(
                 "no_repository",
                 "No repository is registered. Pick one on GitHub, or register it on Repositories.",
+                "/ui/github",
+            )
+        )
+    if (
+        any("github.com" in getattr(repo, "url", "") for repo in repositories)
+        and document.get("github", {}).get("configured") is not True
+    ):
+        steps.append(
+            _step(
+                "github_app_not_connected",
+                "A GitHub repository is registered but no GitHub App is connected.",
                 "/ui/github",
             )
         )

@@ -634,6 +634,48 @@ def test_hermes_steps_name_the_real_blocker_and_the_page_that_fixes_it(
     assert all("script-harness" not in step["text"] for step in readiness["steps"])
 
 
+def test_github_repository_without_connected_app_adds_readiness_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #141: a github.com repository with no connected App shows a readiness step."""
+
+    repo_github = SimpleNamespace(url="https://github.com/o/r")
+    repo_non_github = SimpleNamespace(url="https://gitlab.example.com/o/r")
+
+    # configured=False: step present
+    document: dict[str, Any] = {
+        "supervisor": _supervisor_document(_lease(), _status()),
+        "harnesses": [_harness("hermes")],
+        "providers": [],
+    }
+    document["github"] = {"configured": False}
+    readiness = _readiness(
+        document, monkeypatch, repositories=[repo_github], enabled_models={"hermes"}
+    )
+    codes = [step["code"] for step in readiness["steps"]]
+    assert "github_app_not_connected" in codes
+    step = next(s for s in readiness["steps"] if s["code"] == "github_app_not_connected")
+    assert step["fix"] == "/ui/github"
+    assert "A GitHub repository is registered but no GitHub App is connected" in step["text"]
+    assert readiness["ready"] is False
+
+    # configured=True: step absent
+    document["github"] = {"configured": True}
+    readiness = _readiness(
+        document, monkeypatch, repositories=[repo_github], enabled_models={"hermes"}
+    )
+    codes = [step["code"] for step in readiness["steps"]]
+    assert "github_app_not_connected" not in codes
+
+    # non-GitHub URL: step absent even with configured=False
+    document["github"] = {"configured": False}
+    readiness = _readiness(
+        document, monkeypatch, repositories=[repo_non_github], enabled_models={"hermes"}
+    )
+    codes = [step["code"] for step in readiness["steps"]]
+    assert "github_app_not_connected" not in codes
+
+
 def test_a_missing_credential_and_image_are_named_per_harness(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
