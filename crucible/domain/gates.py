@@ -630,6 +630,8 @@ def _find_false_claim(gi: GateInput, check_id: str, item: EvidenceItem) -> str |
         str(c.get("id")): c.get("exit")
         for c in claim.payload.get("claimed_checks") or []
         if isinstance(c, dict)
+        and isinstance(c.get("exit"), int)
+        and not isinstance(c.get("exit"), bool)
     }
     claimed_exit = reported.get(check_id)
     if claimed_exit == 0:
@@ -652,6 +654,8 @@ def contradicted_claims(
         str(c.get("id")): c.get("exit")
         for c in claim.payload.get("claimed_checks") or []
         if isinstance(c, dict)
+        and isinstance(c.get("exit"), int)
+        and not isinstance(c.get("exit"), bool)
     }
     out: list[str] = []
     for check in required:

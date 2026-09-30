@@ -226,7 +226,12 @@ def _emit_false_claims(
         return
     reported: dict[str, int] = {}
     for c in claim.get("checks") or []:
-        if isinstance(c, dict) and isinstance(c.get("id"), str) and isinstance(c.get("exit"), int):
+        if (
+            isinstance(c, dict)
+            and isinstance(c.get("id"), str)
+            and isinstance(c.get("exit"), int)
+            and not isinstance(c.get("exit"), bool)
+        ):
             reported[c["id"]] = c["exit"]
     rerun: dict[str, dict[str, Any]] = {}
     for run in verifications:

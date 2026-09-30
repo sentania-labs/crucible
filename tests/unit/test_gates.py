@@ -708,6 +708,35 @@ def test_a_false_claim_is_named_in_verification_ran() -> None:
     assert "127" in outcome.detail
 
 
+def test_a_boolean_exit_is_not_a_false_claim() -> None:
+    """Codex PR 272: a claimed exit that is a bool (False == 0) is not treated as
+    an integer exit 0, so it cannot be a false claim. Claim V1 exit False, re-run 127:
+    the gate may still fail because V1 exited 127, but not because of a false claim."""
+    evidence = []
+    for e in _passing_evidence():
+        if e.kind == "verification_run" and e.payload.get("id") == "V1":
+            continue
+        if e.kind == "artifact_present" and e.payload.get("role") == "completion_claim":
+            evidence.append(
+                _ev(
+                    "artifact_present",
+                    {
+                        **e.payload,
+                        "claimed_checks": [{"id": "V1", "exit": False}],
+                    },
+                    ident=e.id,
+                )
+            )
+        else:
+            evidence.append(e)
+    evidence.append(_ev("verification_run", {"id": "V1", "exit_code": 127, "ran": True}, ident=31))
+    outcome = evaluate_gate(GateName.VERIFICATION_RAN, _gi(evidence))
+    assert outcome.result is GateResult.FAIL
+    assert outcome.always_blocks is False
+    # The gate fails because V1 exited 127, not because of a false claim.
+    assert "the worker reported" not in outcome.detail
+
+
 def test_matching_exits_are_not_a_false_claim() -> None:
     """hades #183 point 2: when the claim matches the rerun exit, there is no false
     claim and the gate passes."""

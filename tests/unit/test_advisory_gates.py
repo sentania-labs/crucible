@@ -425,3 +425,15 @@ def test_false_claim_evidence_row_is_recorded() -> None:
     assert payload["check"] == "V1"
     assert payload["claimed_exit"] == 0
     assert payload["rerun_exit"] == 127
+
+
+def test_a_boolean_exit_is_not_a_false_claim() -> None:
+    """Codex PR 272: a claimed exit that is a bool (False == 0) must not produce a
+    FALSE_CLAIM evidence row; only a real integer 0 triggers the guard."""
+
+    assert str(EvidenceKind.FALSE_CLAIM) == "false_claim"
+    # Boolean exit False should not be accepted as an integer exit
+    claim = {"checks": [{"id": "V1", "exit": False}]}
+
+    checks = _claimed_checks(claim)
+    assert checks == []  # bool exit is excluded
