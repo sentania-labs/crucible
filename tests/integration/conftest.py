@@ -4,10 +4,12 @@ API client, and fake provider of one test share that database."""
 
 from __future__ import annotations
 
+import fcntl
 import os
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
 import pytest
@@ -117,37 +119,89 @@ def own_database(server_url: str, name: str) -> Iterator[str]:
         with admin.connect() as conn:
             conn.execute(text(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)'))
             conn.execute(text(f'CREATE DATABASE "{name}"'))
-        yield make_url(server_url).set(database=name).render_as_string(hide_password=False)
-        with admin.connect() as conn:
-            conn.execute(text(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)'))
+        try:
+            yield make_url(server_url).set(database=name).render_as_string(hide_password=False)
+        finally:
+            with admin.connect() as conn:
+                conn.execute(text(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)'))
     finally:
         admin.dispose()
 
 
-@pytest.fixture(scope="session")
-def database_url(worker_id: str, testrun_uid: str) -> Iterator[str]:
-    # Session scope is per process, so each xdist worker (and a serial run) gets its own
-    # database, named from the worker id, on CRUCIBLE_TEST_DATABASE_URL's server or on
-    # a container of its own. No test can see another process's rows (issue 195). The
-    # URL's role needs CREATEDB.
-    name = worker_database_name(worker_id, testrun_uid)
-    url = os.environ.get("CRUCIBLE_TEST_DATABASE_URL")
-    if url:
-        with own_database(url, name) as own:
-            yield own
+SERVER_URL = pytest.StashKey[str | None]()
+SERVER_STOP = pytest.StashKey[Callable[[], None]]()
+WORKER_SERVER_URL = "integration_postgres_url"
+
+
+def lock_and_share(directory: Path, start: Callable[[], str]) -> str:
+    """Publish a server URL once, only after startup succeeds, under a Linux file lock."""
+    with (directory / "postgres.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            url_file = directory / "postgres.url"
+            if not url_file.exists():
+                url = start()
+                pending = directory / "postgres.url.tmp"
+                pending.write_text(url, encoding="utf-8")
+                pending.replace(url_file)
+            return url_file.read_text(encoding="utf-8")
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """The controller owns Postgres, so worker exit order cannot shorten its lifetime."""
+    if hasattr(config, "workerinput"):
+        config.stash[SERVER_URL] = config.workerinput[WORKER_SERVER_URL]
         return
+    config.stash[SERVER_URL] = os.environ.get("CRUCIBLE_TEST_DATABASE_URL")
+    if config.stash[SERVER_URL] or config.option.collectonly:
+        return
+
+    import docker as _docker  # type: ignore[import-untyped]  # noqa: PLC0415
     from testcontainers.postgres import PostgresContainer  # noqa: PLC0415
 
     try:
-        import docker as _docker  # type: ignore[import-untyped]  # noqa: PLC0415
-
-        _docker.from_env().ping()
+        with _docker.from_env() as client:
+            client.ping()
     except Exception:
+        # Preserve the tier's skip when Docker is unavailable.
+        return
+
+    pg = PostgresContainer(POSTGRES_IMAGE, driver="psycopg")
+    # Register before startup so partial startup failures also get cleaned up.
+    config.stash[SERVER_STOP] = pg.stop
+
+    def start() -> str:
+        pg.start()
+        return str(pg.get_connection_url())
+
+    # With controller ownership, workers receive the URL over xdist's channel;
+    # publication files need only live during controller configuration.
+    with TemporaryDirectory(prefix="integration-postgres-") as directory:
+        config.stash[SERVER_URL] = lock_and_share(Path(directory), start)
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_configure_node(node: Any) -> None:
+    node.workerinput[WORKER_SERVER_URL] = node.config.stash[SERVER_URL]
+
+
+def pytest_unconfigure(config: pytest.Config) -> None:
+    if not hasattr(config, "workerinput") and SERVER_STOP in config.stash:
+        stop = config.stash[SERVER_STOP]
+        del config.stash[SERVER_STOP]
+        stop()
+
+
+@pytest.fixture(scope="session")
+def database_url(worker_id: str, testrun_uid: str, pytestconfig: pytest.Config) -> Iterator[str]:
+    # The URL's role needs CREATEDB. Only the server is shared: each worker still
+    # creates, migrates and drops its own database (issue 195).
+    url = pytestconfig.stash[SERVER_URL]
+    if not url:
         pytest.skip("Docker daemon not available")
-    with (
-        PostgresContainer(POSTGRES_IMAGE, driver="psycopg") as pg,
-        own_database(pg.get_connection_url(), name) as own,
-    ):
+    with own_database(url, worker_database_name(worker_id, testrun_uid)) as own:
         yield own
 
 
