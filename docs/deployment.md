@@ -193,6 +193,34 @@ credential Secrets are created by Crucible at runtime and are not part of the de
 state. Argo tracks only what it applied, so it neither reports those as drift nor
 prunes them.
 
+
+### ResourceQuota sizing
+
+The base quota fits three concurrent attempts at the default policy (2 CPU limit, 0.5
+CPU request fraction, 4 GiB memory limit). Its `count/jobs.batch` is 5 x 3 + 2 = 17: five
+Jobs per attempt (preparer, worker, collector, bundle-verifier, verifier) plus two
+headroom Jobs for the Kubernetes publisher (issue #226). The provider divides
+`count/jobs.batch` by five when reporting capacity, so this base quota advertises three
+attempts (integer division).
+
+The deployer sets the quota's values as an overlay. For any worker count N with the
+default policy the sizing rule is:
+
+```
+count/jobs.batch    = 5N + 2      (5 Jobs per attempt + 2 publisher headroom)
+persistentvolumeclaims = 4N       (each attempt claims four PVCs: workspace, reference
+                                  cache, bundle output, artifact root)
+requests.cpu        = N           (2 CPU limit x 0.5 fraction = 1 CPU per attempt)
+limits.cpu          = 2N          (2 CPU limit per attempt)
+requests.memory     = 4N GiB      (4 GiB per attempt)
+limits.memory       = 4N GiB      (4 GiB per attempt, Guaranteed-for-memory)
+```
+
+Worked example for N = 10 (the lab's default): 52 Jobs, 40 claims, 10 CPU requested, 20
+CPU limit, 40 GiB memory. The quota is the deployer's overlay to set; the provider
+advertises capacity from it, so a stale quota shows up as a smaller max_concurrency on
+the Providers page, never as an unbounded launch.
+
 ## Applying it
 
 1. Copy the whole `deploy/kubernetes` tree into lab-admin's GitOps repository, keeping

@@ -16,7 +16,8 @@ metadata:
   namespace: crucible-workers
 spec:
   hard:
-    count/jobs.batch: "30"
+    # 5N + 2 where N = 6 for the lab: 5 * 6 + 2 = 32 Jobs (5 per attempt + publisher headroom)
+    count/jobs.batch: "32"
     persistentvolumeclaims: "24"
     requests.cpu: "6"
     requests.memory: 24Gi
