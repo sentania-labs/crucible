@@ -516,6 +516,18 @@ class DockerProvider:
         # The preparer gets the workspace itself, so git creates the checkout directory
         # and the container's uid owns it end to end (S9 Test E).
         mounts = [self._daemon_mount(spec.attempt_id, "", WORK_MOUNT, read_only=False)]
+        resume_bundle = None
+        if spec.resume_bundle_path:
+            resume_bundle = f"{scripts.BUNDLE_MOUNT}/work_branch.bundle"
+            source = Path(spec.resume_bundle_path)
+            artifact_root = Path(self.config.artifact_root).resolve()
+            try:
+                relative = str(source.resolve().relative_to(artifact_root))
+            except ValueError as exc:
+                raise ProviderError(
+                    "the previous attempt bundle is outside artifact storage"
+                ) from exc
+            mounts.append(self._volume_mount(relative, resume_bundle, read_only=True))
         network = "none"
         env: dict[str, str] = {}
         cache_name: str | None = None
@@ -557,6 +569,9 @@ class DockerProvider:
                 shims=workspace.SHIM_NAMES,
                 exclude_entries=workspace.EXCLUDE_ENTRIES,
                 identity_mount=IDENTITY_MOUNT,
+                resume_bundle=resume_bundle,
+                resume_bundle_head=spec.resume_bundle_head,
+                resume_bundle_sha256=spec.resume_bundle_sha256,
                 checkout_token="stdin" if private else None,
                 credential_host=self.config.credential_host,
             ),

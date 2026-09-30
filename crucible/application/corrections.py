@@ -8,6 +8,7 @@ correction section, allowed only where 04 says."""
 from __future__ import annotations
 
 from collections.abc import Collection
+from pathlib import Path
 from typing import Any
 
 from crucible.application.errors import (
@@ -16,6 +17,7 @@ from crucible.application.errors import (
     TransitionNotAllowedError,
 )
 from crucible.application.harnesses import HarnessRegistry
+from crucible.application.review import latest_work_attempt
 from crucible.application.submit_task import (
     eligible_harness_names,
     parse_contract,
@@ -50,6 +52,37 @@ CORRECTABLE_STATES = frozenset(
 AMENDABLE_STATES = frozenset(
     {TaskState.SUBMITTED, TaskState.BLOCKED, TaskState.AWAITING_ACCEPTANCE}
 )
+PREVIOUS_BUNDLE_GONE = "previous_attempt_bundle_gone"
+
+
+def _unpublished_bundle_problem(uow: UnitOfWork, task: Task) -> dict[str, str] | None:
+    """Name why an unpublished correction cannot resume, or return None when it can."""
+    if uow.events.latest_for_task_kind(task.id, EventKind.PUBLISH_COMPLETED.value) is not None:
+        return None
+    work = latest_work_attempt(uow, task)
+    if work is None:
+        return {"path": "correction", "message": PREVIOUS_BUNDLE_GONE}
+    attempt = work[0]
+    evidence = next(
+        (
+            row
+            for row in reversed(uow.evidence.list_for_attempt(attempt.id))
+            if row.kind == "bundle_head"
+            and row.verified
+            and row.payload.get("bundle_verified")
+            and row.payload.get("bundle_sha256")
+        ),
+        None,
+    )
+    released = any(
+        action.kind == "workspace" and action.subject == attempt.id
+        for action in uow.retention.list_recent(10_000)
+    )
+    path = f"{attempt.workspace_path}/output/work_branch.bundle"
+    local_missing = "://" not in path and not Path(path).is_file()
+    if evidence is None or released or local_missing:
+        return {"path": "correction", "message": PREVIOUS_BUNDLE_GONE}
+    return None
 
 
 def _next_version(uow: UnitOfWork, task: Task) -> int:
@@ -139,6 +172,9 @@ def attach_correction(
     )
     problems.extend(unwired_provider_problems(contract, wired_providers))
     problems.extend(correction_narrows(previous, contract))
+    bundle_problem = _unpublished_bundle_problem(uow, task)
+    if bundle_problem is not None:
+        problems.append(bundle_problem)
     if task.state is TaskState.AWAITING_ACCEPTANCE:
         # The current verdict only. A needs_more_work that a later accept superseded is
         # not a standing request for more work.

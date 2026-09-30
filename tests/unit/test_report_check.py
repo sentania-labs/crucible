@@ -175,7 +175,16 @@ def test_the_checker_needs_nothing_but_the_standard_library_for_json(tmp_path: P
     report = tmp_path / "report.yaml"
     report.write_text(json.dumps(judgement_only()), encoding="utf-8")
     result = subprocess.run(
-        [sys.executable, "-I", "-S", str(CHECKER), "check", str(report)],
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            str(CHECKER),
+            "check",
+            str(report),
+            "--contract",
+            str(tmp_path / "no-contract.json"),
+        ],
         capture_output=True,
         text=True,
         check=False,

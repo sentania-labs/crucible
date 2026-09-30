@@ -365,6 +365,7 @@ def _run_publisher(tmp_path: Path, repo: Path, origin: Path, head: str) -> tuple
         text=True,
         check=False,
         env=env,
+        cwd=root / "home",
     )
     return result.returncode, root / "publish"
 

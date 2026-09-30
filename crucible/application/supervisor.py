@@ -383,6 +383,30 @@ def workspace_release_reason(
         and (published is None or published.attempt_id != attempt.id)
     ):
         return None
+    # Once a correction is materialized it becomes `latest_work_attempt`, but its
+    # preparer still needs the immediately preceding unpublished attempt's bundle.
+    # Keep that source across a supervisor restart until preparation has produced the
+    # correction's own workspace.
+    if work is not None:
+        latest_attempt, latest_execution = work
+        if (
+            latest_execution.role is ExecutionRole.CORRECT
+            and not latest_attempt.resume_from_remote
+            and not latest_attempt.workspace_path
+        ):
+            preceding = max(
+                (
+                    candidate
+                    for candidate_execution in uow.executions.list_for_task(task.id)
+                    if candidate_execution.id != latest_execution.id
+                    and candidate_execution.role is not ExecutionRole.REVIEW
+                    for candidate in uow.attempts.list_for_execution(candidate_execution.id)
+                ),
+                key=lambda candidate: candidate.id,
+                default=None,
+            )
+            if preceding is not None and preceding.id == attempt.id:
+                return None
     if published is not None:
         return "published"
     if now - attempt.cleaned_up_at >= timedelta(days=days):
@@ -1452,6 +1476,48 @@ class Supervisor:
                 if selected_harness
                 else None
             )
+            resume_bundle: dict[str, str] = {}
+            published = route_uow.events.latest_for_task_kind(
+                task.id, EventKind.PUBLISH_COMPLETED.value
+            )
+            if (
+                execution.role is ExecutionRole.CORRECT
+                and not attempt.resume_from_remote
+                and published is None
+            ):
+                previous_attempt = max(
+                    (
+                        candidate
+                        for candidate_execution in route_uow.executions.list_for_task(task.id)
+                        if candidate_execution.id != execution.id
+                        and candidate_execution.role is not ExecutionRole.REVIEW
+                        for candidate in route_uow.attempts.list_for_execution(
+                            candidate_execution.id
+                        )
+                    ),
+                    key=lambda candidate: candidate.id,
+                    default=None,
+                )
+                if previous_attempt is not None:
+                    bundle = next(
+                        (
+                            row
+                            for row in reversed(
+                                route_uow.evidence.list_for_attempt(previous_attempt.id)
+                            )
+                            if row.kind == EvidenceKind.BUNDLE_HEAD.value
+                            and row.verified
+                            and row.payload.get("bundle_verified")
+                        ),
+                        None,
+                    )
+                    if bundle is not None:
+                        resume_bundle = {
+                            "path": f"{previous_attempt.workspace_path}/output/work_branch.bundle",
+                            "attempt_id": previous_attempt.id,
+                            "head": str(bundle.payload.get("head_sha") or ""),
+                            "sha256": str(bundle.payload.get("bundle_sha256") or ""),
+                        }
         # FDY-0140: the harness's run settings as saved now, read at every launch.
         harness_settings = dict(saved.document) if saved is not None else {}
         # Issue 128: the policy default, narrowed by the contract, capped at the attempt.
@@ -1478,6 +1544,10 @@ class Supervisor:
             endpoint_url=endpoint_url,
             command_timeout_ms=command_timeout_ms,
             harness_settings=harness_settings,
+            resume_bundle_path=resume_bundle.get("path"),
+            resume_bundle_attempt_id=resume_bundle.get("attempt_id"),
+            resume_bundle_head=resume_bundle.get("head"),
+            resume_bundle_sha256=resume_bundle.get("sha256"),
         )
         adapter = self._harnesses.get(selected_harness) if self._harnesses else None
         if adapter is None:
