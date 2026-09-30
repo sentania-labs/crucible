@@ -1890,21 +1890,38 @@ class Supervisor:
                     self._refuse_unroutable(uow, task, attempt, execution, selection)
                 uow.commit()
                 return None
-            chosen = selection.selected
-            attempt.selected_model = chosen.id
-            attempt.selected_harness = chosen.harness
-            attempt.selected_image = selection.image
-            attempt.selected_pool = chosen.pool
-            attempt.ordered_candidates = list(selection.candidates)
-            execution.model = chosen.id
-            execution.harness = chosen.harness
-            execution.image = selection.image
-            busy = self._harness_busy_in_uow(uow, execution)
-            if busy is not None:
+            routing = load_routing(uow, execution.policy_snapshot or {})
+            assert routing is not None
+            candidates = copy.deepcopy(list(selection.candidates))
+            skipped_busy: list[dict[str, str]] = []
+            chosen = None
+            chosen_image = None
+            for candidate in candidates:
+                if not candidate.get("eligible"):
+                    continue
+                model = routing.model(str(candidate["model"]))
+                assert model is not None
+                execution.model = model.id
+                execution.harness = model.harness
+                execution.image = str(candidate["image"])
+                busy = self._harness_busy_in_uow(uow, execution)
+                if busy is None:
+                    chosen = model
+                    chosen_image = str(candidate["image"])
+                    break
+                candidate["busy"] = busy
+                skipped_busy.append({"model": model.id, "harness": model.harness, "reason": busy})
+            assert chosen is not None or skipped_busy
+            attempt.ordered_candidates = candidates
+            if chosen is None:
                 latest = uow.events.latest_for_task_kind(
                     attempt.task_id, EventKind.HARNESS_LAUNCH_DEFERRED.value
                 )
                 if latest is None or latest.payload.get("attempt_id") != attempt.id:
+                    detail = "; ".join(
+                        f"{item['model']} on {item['harness']}: {item['reason']}"
+                        for item in skipped_busy
+                    )
                     record_event(
                         uow,
                         self._clock,
@@ -1913,10 +1930,24 @@ class Supervisor:
                         task_id=attempt.task_id,
                         execution_id=attempt.execution_id,
                         attempt_id=attempt.id,
-                        payload={"attempt_id": attempt.id, "detail": busy},
+                        payload={
+                            "attempt_id": attempt.id,
+                            "detail": detail,
+                            "skipped_busy": skipped_busy,
+                            "ordered_candidates": candidates,
+                        },
                     )
+                uow.attempts.save(attempt)
                 uow.commit()
                 return None
+            assert chosen_image is not None
+            attempt.selected_model = chosen.id
+            attempt.selected_harness = chosen.harness
+            attempt.selected_image = chosen_image
+            attempt.selected_pool = chosen.pool
+            execution.model = chosen.id
+            execution.harness = chosen.harness
+            execution.image = chosen_image
             uow.attempts.save(attempt)
             uow.executions.save(execution)
             move_attempt(
@@ -1949,9 +1980,10 @@ class Supervisor:
                     "tier": item.contract["execution_request"]["tier"],
                     "model": chosen.id,
                     "harness": chosen.harness,
-                    "image": selection.image,
+                    "image": chosen_image,
                     "pool": chosen.pool,
-                    "ordered_candidates": list(selection.candidates),
+                    "ordered_candidates": candidates,
+                    "skipped_busy": skipped_busy,
                 },
             )
             uow.commit()

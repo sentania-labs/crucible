@@ -6,12 +6,14 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from crucible.adapters.ui.pages.tasks import _busy_fallthrough
 from crucible.application.queries import task_view
 from crucible.application.routing import Selection, select_model
 from crucible.application.submit_task import _check_routing
 from crucible.application.supervisor import Supervisor, _Pending
 from crucible.contracts.task_contract import TaskContractV1
 from crucible.domain.entities import Attempt, Execution, ExecutionRole, Policy, Task
+from crucible.domain.events import EventKind
 from crucible.domain.lifecycle import AttemptState, ExecutionState, TaskState
 from tests.fixtures import FakeClock, contract_document
 from tests.unit.test_class_routing import NOW, _model, _routing, _uow
@@ -67,6 +69,141 @@ def test_a_task_specific_check_allows_the_local_route() -> None:
 
 def test_operator_pin_cannot_bypass_task_specific_check() -> None:
     assert _select(pinned=True).selected is None
+
+
+def _routing_attempt(monkeypatch: pytest.MonkeyPatch, *, all_busy: bool) -> tuple[Any, Any, Any]:
+    routing = _routing(
+        [
+            _model("a-first", harness="codex"),
+            _model("b-second", harness="agy"),
+        ]
+    )
+    selection = select_model(
+        _uow(), routing, tier="standard", project="p", provider="fake", now=NOW
+    )
+    task = Task(
+        "task",
+        "FDY-0190",
+        "foundry",
+        "p",
+        "Busy harness fallthrough",
+        TaskState.SCHEDULED,
+        1,
+        "policy",
+        1,
+        "repo",
+        NOW,
+        NOW,
+    )
+    policy = {"routing": {"policy": {"name": routing.name, "version": routing.version}}}
+    execution = Execution(
+        "execution",
+        task.id,
+        ExecutionRole.IMPLEMENT,
+        1,
+        "",
+        "",
+        None,
+        "fake",
+        "",
+        policy,
+        ExecutionState.CREATED,
+        1,
+        [],
+        60,
+        NOW,
+    )
+    attempt = Attempt("attempt", execution.id, task.id, 1, AttemptState.PENDING, NOW)
+    uow: Any = MagicMock()
+    uow.tasks.get.return_value = task
+    uow.executions.get.return_value = execution
+    uow.attempts.get.return_value = attempt
+    uow.events.latest_for_task_kind.return_value = None
+    uow.routing_policies.get.return_value = MagicMock(document=routing.model_dump(mode="json"))
+    supervisor = object.__new__(Supervisor)
+    supervisor._clock = FakeClock(NOW)
+    monkeypatch.setattr(supervisor, "_fenced", lambda: nullcontext(uow))
+    monkeypatch.setattr(supervisor, "_selection_for", lambda *_a, **_kw: selection)
+    monkeypatch.setattr(
+        supervisor,
+        "_harness_busy_in_uow",
+        lambda _uow, candidate: (
+            f"1 of 1 {candidate.harness} worker(s) already running"
+            if all_busy or candidate.harness == "codex"
+            else None
+        ),
+    )
+    pending = _Pending(
+        task=task,
+        execution=execution,
+        attempt=attempt,
+        contract={"execution_request": {"tier": "standard"}},
+    )
+    result = supervisor._route_pending(pending)
+    return result, attempt, uow
+
+
+def test_busy_first_candidate_launches_the_next_without_demotion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result, attempt, uow = _routing_attempt(monkeypatch, all_busy=False)
+
+    assert result is not None
+    assert attempt.selected_model == "b-second"
+    assert attempt.selected_harness == "agy"
+    assert attempt.state is AttemptState.PREPARING
+    first = attempt.ordered_candidates[0]
+    assert first["busy"] == "1 of 1 codex worker(s) already running"
+    assert first["quality"]["demoted"] is False
+    routed = next(
+        event
+        for event in (call.args[0] for call in uow.events.append.call_args_list)
+        if event.kind == EventKind.ATTEMPT_ROUTED.value
+    )
+    assert routed.payload["skipped_busy"] == [
+        {
+            "model": "a-first",
+            "harness": "codex",
+            "reason": "1 of 1 codex worker(s) already running",
+        }
+    ]
+    assert uow.attempt_metrics.add.call_count == 0
+
+
+def test_all_busy_candidates_defer_with_every_reason(monkeypatch: pytest.MonkeyPatch) -> None:
+    result, attempt, uow = _routing_attempt(monkeypatch, all_busy=True)
+
+    assert result is None
+    assert attempt.state is AttemptState.PENDING
+    deferred = next(
+        event
+        for event in (call.args[0] for call in uow.events.append.call_args_list)
+        if event.kind == EventKind.HARNESS_LAUNCH_DEFERRED.value
+    )
+    assert [item["model"] for item in deferred.payload["skipped_busy"]] == [
+        "a-first",
+        "b-second",
+    ]
+    assert all(candidate.get("busy") for candidate in deferred.payload["ordered_candidates"])
+
+
+def test_task_page_words_explain_a_busy_first_choice() -> None:
+    attempt = MagicMock(
+        model="b-second",
+        harness="agy",
+        ordered_candidates=[
+            {
+                "model": "a-first",
+                "harness": "codex",
+                "busy": "1 of 1 codex worker(s) already running",
+            },
+            {"model": "b-second", "harness": "agy"},
+        ],
+    )
+
+    assert _busy_fallthrough(attempt) == (
+        "Ran on b-second on agy, its next available choice, because a-first on codex was busy."
+    )
 
 
 def test_pinned_local_model_needs_a_task_specific_check() -> None:
