@@ -241,6 +241,9 @@ async def test_local_pool_cap_is_independent_of_subscription_harness_caps(
         document = contract_document(external_id=external_id)
         document["repository"]["work_branch"] = f"crucible/{external_id}"
         document["policy"] = {"name": "default-software", "version": 41}
+        document["required_verification"].append(
+            {"id": "V9", "command": "test -f made-by-the-worker", "expect_exit": 0}
+        )
         document["execution_request"].update(
             {
                 "harness": local_harness,
@@ -311,6 +314,9 @@ async def test_an_empty_hermes_credential_directory_keeps_the_no_key_fallback(
         document = contract_document(external_id=external_id)
         document["repository"]["work_branch"] = f"crucible/{external_id}"
         document["policy"] = {"name": "default-software", "version": 42}
+        document["required_verification"].append(
+            {"id": "V9", "command": "test -f made-by-the-worker", "expect_exit": 0}
+        )
         document["execution_request"].update(
             {
                 "harness": "hermes",

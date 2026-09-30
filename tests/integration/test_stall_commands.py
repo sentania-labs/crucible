@@ -117,6 +117,9 @@ def start(
     command_timeout_ms: int | None = None,
 ) -> str:
     doc = contract_document(external_id=external_id)
+    doc["required_verification"].append(
+        {"id": "V9", "command": "test -f made-by-the-worker", "expect_exit": 0}
+    )
     if command_timeout_ms is not None:
         doc["execution_request"]["command_timeout_ms"] = command_timeout_ms
     if policy_version is not None:

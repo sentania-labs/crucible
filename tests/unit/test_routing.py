@@ -8,10 +8,12 @@ import pytest
 
 from crucible.application.queries import task_view
 from crucible.application.routing import Selection, select_model
+from crucible.application.submit_task import _check_routing
 from crucible.application.supervisor import Supervisor, _Pending
-from crucible.domain.entities import Attempt, Execution, ExecutionRole, Task
+from crucible.contracts.task_contract import TaskContractV1
+from crucible.domain.entities import Attempt, Execution, ExecutionRole, Policy, Task
 from crucible.domain.lifecycle import AttemptState, ExecutionState, TaskState
-from tests.fixtures import FakeClock
+from tests.fixtures import FakeClock, contract_document
 from tests.unit.test_class_routing import NOW, _model, _routing, _uow
 
 
@@ -65,6 +67,38 @@ def test_a_task_specific_check_allows_the_local_route() -> None:
 
 def test_operator_pin_cannot_bypass_task_specific_check() -> None:
     assert _select(pinned=True).selected is None
+
+
+def test_pinned_local_model_needs_a_task_specific_check() -> None:
+    model = {
+        **_model("codex-local", pool="lab-local"),
+        "endpoint": "local",
+        "endpoint_url": "http://spark:4000/v1",
+    }
+    routing = _routing([model])
+    policy_document = {
+        "routing": {"policy": {"name": routing.name, "version": routing.version}},
+        "repository": {"required_checks": ["make lint", "make test", "make scan"]},
+    }
+    document = contract_document()
+    document["execution_request"].update(
+        {
+            "harness": "codex",
+            "model": "codex-local",
+            "pin_reason": "operator selects the local model",
+        }
+    )
+    contract = TaskContractV1.model_validate(document)
+    policy = Policy("policy", 1, policy_document, NOW)
+    uow = MagicMock()
+    uow.routing_policies.get.return_value = MagicMock(document=routing.model_dump(mode="json"))
+    uow.attempt_metrics.list_since.return_value = []
+    uow.pool_exhaustions.get.return_value = None
+    uow.harness_images.get.return_value = None
+
+    problems = _check_routing(uow, FakeClock(NOW), contract, policy, None, None)
+
+    assert {problem["message"] for problem in problems} == {"no task-specific check"}
 
 
 @pytest.mark.parametrize("quota", [False, True])
