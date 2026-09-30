@@ -113,7 +113,7 @@ async def test_amendment_and_correction_refuse_a_provider_this_deployment_does_n
         client, "crucible-worker:fake-succeed", external_id="UNWIRED-AMEND", start=False
     )
     correction_task_id = submit_and_start(
-        client, "crucible-worker:fake-no-report", external_id="UNWIRED-CORRECTION"
+        client, "crucible-worker:fake-verification-fails", external_id="UNWIRED-CORRECTION"
     )
     assert await run_to_settled(supervisor, client, correction_task_id) == "pre_pr_gates_failed"
     amendment = contract_of(client, amend_task_id)
