@@ -27,6 +27,7 @@ HOST_ADDRESSES = {
     "platform.claude.com": ["160.79.104.20/32"],
     "oauth2.googleapis.com": ["142.250.80.10/32"],
     "www.googleapis.com": ["142.250.80.11/32"],
+    "lh3.googleusercontent.com": ["142.250.80.12/32"],
 }
 
 
