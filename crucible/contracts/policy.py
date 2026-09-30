@@ -258,7 +258,9 @@ class InternalReview(StrictModel):
 
 
 class ExternalReview(StrictModel):
-    provider: str = Field(min_length=1)
+    provider: str | None = None
+    request_on_publish: bool = True
+    trigger_comment: str | None = None
     reviewer_logins: list[str]
     required_rounds: int = Field(ge=0)
     retrigger_after_correction: bool
@@ -273,6 +275,8 @@ class ExternalReview(StrictModel):
     def _logins_when_required(self) -> ExternalReview:
         if self.required_rounds > 0 and not self.reviewer_logins:
             raise ValueError("reviewer_logins must be non-empty when required_rounds is above 0")
+        if self.trigger_comment is None and self.provider == "codex":
+            self.trigger_comment = "@codex review"
         return self
 
 

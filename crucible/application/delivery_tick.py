@@ -35,13 +35,16 @@ from crucible.application.publish import (
     PublishPlan,
     advance_after_publish,
     build_plan,
+    external_review_trigger,
     fail_publish,
     hold_publishing,
     open_review_cycle,
+    record_external_review_requested,
     record_publish_started,
     record_token_minted,
     release_publishing_hold,
     repository_slug,
+    request_external_review,
     upsert_pull_request,
 )
 from crucible.application.review import latest_work_attempt
@@ -448,6 +451,23 @@ class DeliveryCoordinator:
                     )
                 )
                 return False
+            await self._host._db(lambda: self._record_pull_request(plan, resolved))
+            trigger = external_review_trigger(plan.policy)
+            if trigger is not None:
+                github_step = "external_review_request"
+                previous = await self._host._db(lambda: self._external_review_request(plan))
+                comment = await asyncio.to_thread(
+                    request_external_review,
+                    self._github,
+                    token,
+                    plan=plan,
+                    pull_request_number=resolved.number,
+                    previous=previous,
+                )
+                if comment is not None:
+                    await self._host._db(
+                        lambda: self._record_external_review_request(plan, resolved, comment)
+                    )
             await self._host._db(lambda: self._finish(plan, ref=resolved))
             return True
         except GitHubError as exc:
@@ -528,6 +548,38 @@ class DeliveryCoordinator:
             )
             uow.commit()
 
+    def _record_pull_request(self, plan: PublishPlan, ref: Any) -> None:
+        with self._host._fenced() as uow:
+            task = uow.tasks.get(plan.task_id, for_update=True)
+            if task is None or task.state is not TaskState.PUBLISHING:
+                return
+            upsert_pull_request(
+                uow,
+                self._clock,
+                task=task,
+                plan=plan,
+                ref=ref,
+                body_hash=body_sha256(plan.body),
+            )
+            uow.commit()
+
+    def _external_review_request(self, plan: PublishPlan) -> Any | None:
+        with self._host._fenced() as uow:
+            return uow.events.latest_for_task_kind(
+                plan.task_id, EventKind.EXTERNAL_REVIEW_REQUESTED.value
+            )
+
+    def _record_external_review_request(self, plan: PublishPlan, ref: Any, comment: Any) -> None:
+        with self._host._fenced() as uow:
+            record_external_review_requested(
+                uow,
+                self._clock,
+                plan=plan,
+                pull_request_number=ref.number,
+                comment=comment,
+            )
+            uow.commit()
+
     def _fail(
         self,
         plan: PublishPlan,
@@ -561,9 +613,11 @@ class DeliveryCoordinator:
             body_hash = body_sha256(plan.body)
             pull_request = None
             if ref is not None:
-                pull_request, _opened = upsert_pull_request(
-                    uow, self._clock, task=task, plan=plan, ref=ref, body_hash=body_hash
-                )
+                pull_request = uow.pull_requests.get_for_task(task.id, for_update=True)
+                if pull_request is None:
+                    pull_request, _opened = upsert_pull_request(
+                        uow, self._clock, task=task, plan=plan, ref=ref, body_hash=body_hash
+                    )
             record_event(
                 uow,
                 self._clock,

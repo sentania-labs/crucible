@@ -234,6 +234,16 @@ crucible decisions ID --kind accept_no_ci --verbatim "why" --resolves "this repo
 The task page in the UI (`/ui/tasks/ID`, linked from Tasks) has a button for
 each.
 
+## External review publication policy
+
+When `external_review.provider` is named, `required_rounds` is above zero, and
+`request_on_publish` is true, publication posts `trigger_comment` on the new pull
+request as the GitHub App. `request_on_publish` defaults to true. The Codex default is
+`@codex review`; repositories whose reviewer starts automatically set
+`request_on_publish: false`. Republish checks the pull request's issue comments and the
+recorded request, and does not post the App's trigger a second time. Corrections do not
+retrigger it.
+
 `crucible admin --help` and each verb's `--help` list the admin verbs and
 their arguments. An admin `--reason` goes before or after the verb and is an
 optional audit note, except where the operation requires one (token revoke,

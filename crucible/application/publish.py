@@ -58,12 +58,99 @@ from crucible.domain.publication import (
     validate_title,
 )
 from crucible.ports.clock import Clock
-from crucible.ports.github import PullRequestRef
+from crucible.ports.github import CommentRecord, GitHubClient, InstallationToken, PullRequestRef
 from crucible.ports.repository import UnitOfWork
 
 log = logging.getLogger("crucible.publish")
 
 DEFAULT_TITLE = "Crucible delivery"
+
+
+def external_review_trigger(policy: dict[str, Any]) -> str | None:
+    """The publication trigger, or None when publication must not request a review."""
+    review = policy.get("external_review", {})
+    if not isinstance(review, dict):
+        return None
+    provider = str(review.get("provider") or "")
+    if not provider or int(review.get("required_rounds", 0)) <= 0:
+        return None
+    if not bool(review.get("request_on_publish", True)):
+        return None
+    configured = review.get("trigger_comment")
+    if configured is not None:
+        return str(configured) or None
+    return {"codex": "@codex review"}.get(provider)
+
+
+def external_review_request_exists(
+    previous: Any | None,
+    comments: tuple[CommentRecord, ...],
+    trigger: str,
+    pull_request_number: int,
+) -> bool:
+    """Whether this PR already carries the App-authored request recorded by Crucible."""
+    if previous is None:
+        return False
+    payload = previous.payload
+    if int(payload.get("pull_request") or 0) != pull_request_number:
+        return False
+    comment_id = str(payload.get("comment_id") or "")
+    comment_login = str(payload.get("comment_login") or "")
+    return any(
+        comment.github_id == comment_id
+        and comment.login == comment_login
+        and comment.body == trigger
+        for comment in comments
+    ) or bool(comment_id)
+
+
+def request_external_review(
+    github: GitHubClient,
+    token: InstallationToken,
+    *,
+    plan: PublishPlan,
+    pull_request_number: int,
+    previous: Any | None,
+) -> CommentRecord | None:
+    """Post the publication trigger if this pull request has not already received it."""
+    trigger = external_review_trigger(plan.policy)
+    if trigger is None:
+        return None
+    comments = github.issue_comments(
+        token, repository=plan.repository_name, number=pull_request_number
+    )
+    if external_review_request_exists(previous, comments, trigger, pull_request_number):
+        return None
+    return github.post_issue_comment(
+        token,
+        repository=plan.repository_name,
+        number=pull_request_number,
+        body=trigger,
+    )
+
+
+def record_external_review_requested(
+    uow: UnitOfWork,
+    clock: Clock,
+    *,
+    plan: PublishPlan,
+    pull_request_number: int,
+    comment: CommentRecord,
+) -> None:
+    record_event(
+        uow,
+        clock,
+        EventKind.EXTERNAL_REVIEW_REQUESTED,
+        principal=PRINCIPAL_CRUCIBLE,
+        task_id=plan.task_id,
+        attempt_id=plan.attempt_id,
+        payload={
+            "pull_request": pull_request_number,
+            "provider": plan.policy.get("external_review", {}).get("provider"),
+            "comment_id": comment.github_id,
+            "comment_login": comment.login,
+        },
+    )
 
 
 @dataclass(frozen=True, slots=True)

@@ -511,7 +511,10 @@ class _Handler(BaseHTTPRequestHandler):
                         login="crucible-spike[bot]",
                         body=str(body.get("body", "")),
                     )
-                    self._send(201, {"id": comment_id})
+                    comment = next(
+                        row for row in pull.issue_comments if str(row["id"]) == comment_id
+                    )
+                    self._send(201, comment)
                     return
                 self._send(200, pull.issue_comments)
                 return

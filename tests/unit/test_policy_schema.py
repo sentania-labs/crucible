@@ -66,6 +66,8 @@ def seeded_policy_v3() -> dict[str, Any]:
 def test_the_seeded_policy_validates() -> None:
     policy = parse_policy(seeded_policy())
     assert policy.name == "default-software" and policy.version == 1
+    assert policy.external_review.request_on_publish is True
+    assert policy.external_review.trigger_comment == "@codex review"
     assert policy.operator_only_settings() == []
 
 

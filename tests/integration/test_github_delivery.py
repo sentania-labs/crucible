@@ -228,11 +228,24 @@ async def test_publication_pushes_the_head_and_opens_the_pull_request(
     ):
         assert kind in kinds, kind
     assert [h["pushed_by"] for h in record["heads"]] == ["crucible"]
+    comments = github.state.repositories[REPOSITORY].pulls[1].issue_comments
+    assert [(row["user"]["login"], row["body"]) for row in comments] == [
+        ("crucible-spike[bot]", "@codex review")
+    ]
+    requested = [
+        event
+        for event in client.get(f"/v1/tasks/{task_id}/events", params={"limit": 200}).json()[
+            "items"
+        ]
+        if event["kind"] == "external_review_requested"
+    ]
+    assert requested[0]["payload"]["comment_id"] == comments[0]["id"]
 
 
 async def test_publish_failure_can_be_republished(
     client: TestClient,
     delivery_supervisor: Supervisor,
+    github: FakeGitHubServer,
     publisher: FakePublisher,
 ) -> None:
     publisher.refuse_push = "HTTP 503 Service Unavailable"
@@ -260,6 +273,7 @@ async def test_publish_failure_can_be_republished(
     wakes = [w for w in client.get("/v1/wakes").json()["items"] if w["reason"] == "publish_failed"]
     assert wakes and "1 remaining" not in wakes[0]["summary"]
     assert "3 remaining" in wakes[0]["summary"]
+    assert len(github.state.repositories[REPOSITORY].pulls[1].issue_comments) == 1
 
 
 async def test_token_mint_failure_republishes_from_before_push(

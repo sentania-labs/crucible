@@ -2,9 +2,8 @@
 
 Crucible performs every routine GitHub mutation through this one interface: mint a
 repository-scoped installation token, read everything observation needs, create the pull
-request and update it, and delete a ref at cleanup. There is deliberately no merge call
-and no issue-comment write on the default path: merging is the operator's act, and the
-trigger comment is gated off (23).
+request and update it, post the configured external-review trigger, and delete a ref at
+cleanup. There is deliberately no merge call: merging is the operator's act.
 
 Nothing here returns a token. `installation_token` hands back an opaque object whose
 value is readable exactly once by the publisher's hand-over, and whose `__repr__` and
@@ -257,6 +256,12 @@ class GitHubClient(Protocol):
         with_reactions: bool = True,
     ) -> Observation: ...
 
+    def issue_comments(
+        self, token: InstallationToken, *, repository: str, number: int
+    ) -> tuple[CommentRecord, ...]:
+        """Issue comments on the pull request, including their author identities."""
+        ...
+
     def reactions_for(
         self, token: InstallationToken, *, repository: str, number: int
     ) -> tuple[ReactionRecord, ...]:
@@ -280,9 +285,8 @@ class GitHubClient(Protocol):
 
     def post_issue_comment(
         self, token: InstallationToken, *, repository: str, number: int, body: str
-    ) -> str:
-        """Gated off by configuration on the default path (23): the trigger comment is
-        the orchestrator's act under the operator's account, never Crucible's."""
+    ) -> CommentRecord:
+        """Post one pull request issue comment under the App's identity."""
         ...
 
     def closed_by(self, token: InstallationToken, *, repository: str, number: int) -> str | None:
