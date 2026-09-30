@@ -1,27 +1,43 @@
-"""HTML administration adapter under ``/ui``."""
-
 from __future__ import annotations
 
 import asyncio
-import hmac
 import json
 import os
-import re
 import tomllib
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, quote, unquote, urlsplit, urlunsplit
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from urllib.parse import quote, urlsplit, urlunsplit
 
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
-from fastapi.templating import Jinja2Templates
-from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
-from starlette.staticfiles import StaticFiles
 
 import crucible
 from crucible.adapters.api.deps import Ctx, UoW
+from crucible.adapters.ui import actions, session
+from crucible.adapters.ui.actions import register
+from crucible.adapters.ui.render import (
+    CREDENTIAL_TONES,
+    _base,
+    _check_words,
+    _document_section,
+    _duration_words,
+    _localize,
+    _operator_label,
+    _page,
+    _panel,
+    _redirect,
+    _safe_value,
+    _state_words,
+    _without_migration,
+    templates,
+)
+from crucible.adapters.ui.session import (
+    _admin,
+    _csrf,
+    _form,
+    _require,
+    _session,
+)
 from crucible.application.admin import (
     audit,
     bootstrap,
@@ -44,569 +60,29 @@ from crucible.application.admin import kubernetes as kubernetes_admin
 from crucible.application.admin import limits as limits_admin
 from crucible.application.admin.context import guard_mutation
 from crucible.application.admin.providers import providers_status
-from crucible.application.auth import authenticate
 from crucible.application.decisions import record_decision
 from crucible.application.errors import (
     ApplicationError,
     ConflictError,
     ContractValidationError,
-    ForbiddenError,
     NotFoundError,
 )
-from crucible.application.first_run import discard_after_use
 from crucible.application.policies import put_policy, put_routing_policy
-from crucible.application.queries import pull_request_view, supervisor_health, task_view
+from crucible.application.queries import pull_request_view, task_view
 from crucible.contracts.api import (
     DecisionRequest,
     ExternalReviewAttestation,
     RepositoryRegistration,
 )
-from crucible.contracts.task_contract import HarnessName
 from crucible.domain.cluster_egress import format_labels, parse_labels
-from crucible.domain.entities import Principal, Role, UiSession
+from crucible.domain.entities import Principal, Role
 from crucible.domain.gates import ALWAYS_BLOCKING_GATES, PRE_PR_GATES
 from crucible.domain.lifecycle import TaskState
 from crucible.domain.secrets import redact, scan_text
 from crucible.domain.waivers import ACCEPT_NO_CI, WAIVABLE_STATES, WAIVE_EXTERNAL_REVIEW
 from crucible.ports.repository import UnitOfWork
 
-ROOT = Path(__file__).parent
-templates = Jinja2Templates(directory=str(ROOT / "templates"))
 router = APIRouter(prefix="/ui", include_in_schema=False)
-static = StaticFiles(directory=str(ROOT / "static"))
-COOKIE = "crucible_ui"
-PREAUTH_COOKIE = "crucible_ui_preauth"
-SESSION_MAX_AGE = 12 * 60 * 60
-PREAUTH_MAX_AGE = 10 * 60
-# Grouped so the operator's path reads in order (crucible#115): what to set up, the work
-# running, then administration. An entry with no link is a group's label.
-NAV = (
-    ("/ui", "Status"),
-    ("", "Set up"),
-    ("/ui/harnesses", "Harnesses"),
-    ("/ui/credentials", "Credentials"),
-    ("/ui/gateway", "Local gateway"),
-    ("/ui/images", "Images"),
-    ("/ui/routing", "Routing"),
-    ("/ui/repositories", "Repositories"),
-    ("/ui/github", "GitHub"),
-    ("", "Work"),
-    ("/ui/tasks", "Tasks"),
-    ("/ui/workers", "Workers"),
-    ("/ui/wakes", "Wakes"),
-    ("", "Admin"),
-    ("/ui/tokens", "Tokens"),
-    ("/ui/audit", "Audit"),
-    ("/ui/settings", "Settings"),
-    ("/ui/retention", "Retention"),
-    ("/ui/bootstrap", "Bootstrap"),
-)
-# Shown only once they have something in them, or while one is open: a new deployment
-# has run no cleanup and imported no ledger (crucible#115).
-HIDDEN_WHEN_EMPTY = ("/ui/retention", "/ui/bootstrap")
-
-
-LABELS = {
-    "active": "Currently active",
-    "api_base": "API base",
-    "app_id": "App ID",
-    "attempt_id": "Attempt ID",
-    "authoritative": "Authoritative import",
-    "checked_at": "Last checked",
-    "clear_reason": "Clear reason",
-    "cleared_at": "Cleared at",
-    "cleared_by": "Cleared by",
-    "committed_at": "Committed at",
-    "configured": "App configured",
-    "content_sha256": "Content fingerprint",
-    "counts": "Tasks by state",
-    "decided_by_administrator": "Decided by an administrator",
-    "enabled_by_administrator": "Administrator's setting",
-    "enabled_by_configuration": "Configuration default",
-    "exhausted_at": "Exhausted at",
-    "external_id": "External ID",
-    "health_detail": "Health detail",
-    "healthy": "Supervisor health",
-    "holder": "Lease holder",
-    "image_digest": "Image digest",
-    "installation_covers": "Installation coverage",
-    "installation_id": "Installation ID",
-    "key_fingerprint": "Public key fingerprint",
-    "key_present": "Private key",
-    "last_check": "Last connectivity check",
-    "last_error": "Last error",
-    "last_error_at": "Last error time",
-    "last_heartbeat": "Last heartbeat",
-    "last_run": "Last cleanup action",
-    "last_success_at": "Last successful tick",
-    "last_tick_at": "Last tick",
-    "lease": "Supervisor lease",
-    "lists": "Tasks needing attention",
-    "next_cursor": "Next cursor",
-    "oldest_pending": "Oldest pending wake",
-    "pending": "Deliveries pending by principal",
-    "recent_actions": "Recent actions",
-    "repositories": "Repositories",
-    "reset_at": "Automatic reset at",
-    "task_id": "Task ID",
-    "tick_ms": "Tick duration (ms)",
-    "unacked": "Deliveries pending",
-    "updated_at": "Last updated",
-    "verified_at": "Verified at",
-    "webhook_enabled": "Webhook",
-    "webhook_secret_present": "Webhook secret",
-}
-
-# A field is hidden when its own name says it holds a credential value (crucible#126).
-# The name is compared whole, or by a credential prefix or suffix, and the names that
-# only look like one are listed as what they are: a harness called `claude_code` is a
-# harness, not a login code, and its version is not a secret.
-SECRET_NAMES = {
-    "access_token",
-    "api_key",
-    "apikey",
-    "auth_code",
-    "authorization",
-    "authorization_code",
-    "bearer",
-    "client_secret",
-    "code",
-    "cookie",
-    "credential_value",
-    "device_code",
-    "id_token",
-    "oauth_token",
-    "passwd",
-    "password",
-    "private_key",
-    "refresh_token",
-    "secret",
-    "session_token",
-    "token",
-    "user_code",
-}
-SECRET_SUFFIXES = ("_api_key", "_code", "_password", "_private_key", "_secret", "_token")
-SECRET_PREFIXES = (
-    "api_key_",
-    "authorization_",
-    "password_",
-    "private_key_",
-    "secret_",
-    "token_",
-)
-# Names that describe a credential without holding one: whether it is there, what it
-# fingerprints to, where it is kept, when it changed.
-DESCRIBES_SECRET_SUFFIXES = ("_at", "_fingerprint", "_path", "_present", "_set", "_source")
-NON_SECRET_FIELDS = {
-    "error_code",
-    "exit_code",
-    "fenced_token",
-    "http_code",
-    "status_code",
-    "tokens_in",
-    "tokens_out",
-    # Harness names key the version maps an image promotion records (crucible#126).
-    *(harness.value.replace("-", "_") for harness in HarnessName),
-}
-
-
-# A reason is an audit note the operator may leave out (the operator's decision of
-# 2026-09-25, crucible#117). These forms' services require one, because what they do is
-# destructive or hard to reverse; a read-only check never asks for one.
-REASON_REQUIRED_ACTIONS = frozenset(
-    {
-        "/ui/actions/bootstrap-commit",
-        "/ui/actions/bootstrap-discard",
-        "/ui/actions/repository-remove",
-        "/ui/actions/token-revoke",
-        "/ui/actions/token-rename",
-    }
-)
-NO_REASON_ACTIONS = frozenset(
-    {"/ui/actions/github-check", "/ui/actions/harness-test", "/ui/actions/gateway-test"}
-)
-# A row action names its reason mode itself, since one action path can serve both a
-# check and a removal (credential validate and remove): `True` is required (destructive),
-# "optional" is an audit note the operator may leave out, absent asks for none.
-
-
-def _reason_fields(sections: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Every form's reason field, set by one rule rather than form by form: required
-    where the service requires one, optional elsewhere, absent on a read-only check."""
-    for section in sections:
-        form = section.get("form")
-        if not isinstance(form, dict):
-            continue
-        action = str(form.get("action", ""))
-        fields = []
-        for field in form.get("fields", []):
-            if field.get("name") != "reason":
-                fields.append(field)
-                continue
-            if action in NO_REASON_ACTIONS:
-                continue
-            required = action in REASON_REQUIRED_ACTIONS
-            label = field.get("reason_label") or ("Reason" if required else "Reason (optional)")
-            fields.append({**field, "label": label, "required": required})
-        form["fields"] = fields
-    return sections
-
-
-def _operator_label(key: str) -> str:
-    """Turn an API key into an operator label while retaining the key separately."""
-    if key in LABELS:
-        return LABELS[key]
-    words = key.replace(".", " ").replace("_", " ").split()
-    expanded = [
-        word.upper() if word.lower() in {"api", "id", "sha256", "url"} else word for word in words
-    ]
-    label = " ".join(expanded)
-    return label[:1].upper() + label[1:]
-
-
-def _secret_field(key: str) -> bool:
-    """Whether a field's value is a credential, decided by what its name means."""
-    separated = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", key).lower()
-    name = separated.rsplit(".", 1)[-1].replace("-", "_")
-    if name in NON_SECRET_FIELDS or name.endswith(DESCRIBES_SECRET_SUFFIXES):
-        return False
-    return (
-        name in SECRET_NAMES or name.endswith(SECRET_SUFFIXES) or name.startswith(SECRET_PREFIXES)
-    )
-
-
-def _safe_value(key: str, value: Any) -> Any:
-    """Return readable scalar content without exposing secret-shaped values."""
-    lowered = key.lower()
-    if _secret_field(lowered):
-        return "not displayed"
-    if isinstance(value, str) and "://" in value:
-        try:
-            parsed = urlsplit(value)
-            url_parameters = unquote(f"{parsed.query}&{parsed.fragment}")
-            sensitive_parameters = any(
-                _secret_field(partition.partition("=")[0])
-                for partition in re.split(r"[&?;]", url_parameters)
-                if partition
-            )
-            if parsed.username is not None or parsed.password is not None or sensitive_parameters:
-                hostname = parsed.hostname or ""
-                if parsed.port is not None:
-                    hostname += f":{parsed.port}"
-                return urlunsplit((parsed.scheme, hostname, parsed.path, "", ""))
-        except ValueError:
-            return "invalid URL"
-    if isinstance(value, bool):
-        if lowered.endswith("healthy") or lowered == "healthy":
-            return "healthy" if value else "not healthy"
-        if lowered.endswith("present"):
-            return "present" if value else "absent"
-        if lowered.endswith("enabled") or lowered.startswith("enabled_"):
-            return "enabled" if value else "disabled"
-        if lowered in {"active", "configured", "installation_covers"}:
-            words = {
-                "active": ("active", "inactive"),
-                "configured": ("configured", "not configured"),
-                "installation_covers": ("covered", "not covered"),
-            }[lowered]
-            return words[0] if value else words[1]
-        if lowered == "ok":
-            return "successful" if value else "failed"
-        return "yes" if value else "no"
-    if value is None:
-        return "none"
-    if isinstance(value, str):
-        return redact(value)
-    return value
-
-
-def _flatten_table_row(value: dict[str, Any], prefix: str = "") -> dict[str, Any]:
-    if not value:
-        return {prefix or "value": _panel(value, key=prefix)}
-    row: dict[str, Any] = {}
-    for child_key, item in value.items():
-        path = f"{prefix}.{child_key}" if prefix else str(child_key)
-        if isinstance(item, dict):
-            row.update(_flatten_table_row(item, path))
-        elif isinstance(item, list):
-            row[path] = _panel(item, key=path)
-        else:
-            row[path] = _safe_value(path, item)
-    return row
-
-
-def _panel(value: Any, *, key: str = "") -> dict[str, Any]:
-    """Build the three readable panel kinds used by the administration template."""
-    if isinstance(value, dict):
-        items = []
-        for child_key, child in value.items():
-            item: dict[str, Any] = {
-                "label": _operator_label(str(child_key)),
-                "source": str(child_key),
-            }
-            if isinstance(child, (dict, list)):
-                item["panel"] = _panel(child, key=str(child_key))
-            else:
-                item["value"] = _safe_value(str(child_key), child)
-            items.append(item)
-        return {"kind": "fields", "items": items}
-    if isinstance(value, list):
-        if not value:
-            return {"kind": "empty"}
-        if all(isinstance(item, dict) for item in value):
-            flattened = [_flatten_table_row(item) for item in value]
-            column_keys = list(dict.fromkeys(path for row in flattened for path in row))
-            return {
-                "kind": "table",
-                "columns": [
-                    {"label": _operator_label(path), "source": path} for path in column_keys
-                ],
-                "rows": [[row.get(path, "none") for path in column_keys] for row in flattened],
-            }
-        if not any(isinstance(item, (dict, list)) for item in value):
-            # A plain list reads as a list, not a one-column table headed "Value"
-            # (crucible#115).
-            return {"kind": "values", "items": [_safe_value(key, item) for item in value]}
-        rows = [
-            [_panel(item, key=key)] if isinstance(item, (dict, list)) else [_safe_value(key, item)]
-            for item in value
-        ]
-        return {
-            "kind": "table",
-            "columns": [{"label": "Value", "source": key}],
-            "rows": rows,
-        }
-    return {"kind": "value", "value": _safe_value(key, value)}
-
-
-def _without_migration(note: Any) -> str:
-    """A model note without the migration that wrote it (crucible#115)."""
-    return re.sub(r" \(\d{4}_[a-z0-9_]+\)", "", str(note))
-
-
-def _check_words(check: Any) -> str:
-    """A repository's last connectivity check in one phrase."""
-    if not isinstance(check, dict) or not check:
-        return "not checked yet"
-    when = check.get("checked_at") or check.get("at") or ""
-    outcome = "passed" if check.get("ok") else f"failed: {check.get('error') or 'no detail'}"
-    return f"last check {outcome} {when}".strip()
-
-
-def _duration_words(milliseconds: Any) -> str:
-    """A millisecond bound in the unit an operator reads it in."""
-    try:
-        value = int(milliseconds)
-    except (TypeError, ValueError):
-        return str(milliseconds)
-    for unit, size in (("hour", 3_600_000), ("minute", 60_000), ("second", 1000)):
-        if value >= size and value % size == 0:
-            count = value // size
-            return f"{count} {unit}{'' if count == 1 else 's'}"
-    return f"{value} ms"
-
-
-def _document_section(title: str, document: Any) -> dict[str, Any]:
-    return {"title": title, "panel": _panel(document)}
-
-
-templates.env.globals["panel_from_cell"] = _panel
-templates.env.globals["safe_value"] = _safe_value
-
-
-def _serializer(ctx: Any) -> URLSafeTimedSerializer:
-    return URLSafeTimedSerializer(ctx.ui_signing_key, salt="crucible-ui-session-v1")
-
-
-def _preauth_serializer(ctx: Any) -> URLSafeTimedSerializer:
-    return URLSafeTimedSerializer(ctx.ui_signing_key, salt="crucible-ui-preauth-v1")
-
-
-def _session_id(request: Request, ctx: Any) -> str | None:
-    raw = request.cookies.get(COOKIE)
-    if not raw:
-        return None
-    try:
-        session_id = _serializer(ctx).loads(raw, max_age=SESSION_MAX_AGE)
-    except (BadSignature, SignatureExpired):
-        return None
-    return session_id if isinstance(session_id, str) else None
-
-
-def _session(request: Request, ctx: Any, uow: UnitOfWork) -> tuple[Principal, str] | None:
-    session_id = _session_id(request, ctx)
-    if session_id is None:
-        return None
-    session = uow.ui_sessions.get(session_id)
-    now = ctx.clock.now()
-    if session is None or session.expires_at <= now:
-        return None
-    principal = uow.principals.get(session.principal_id)
-    if principal is None or principal.disabled_at is not None:
-        return None
-    if session.last_seen_at <= now - timedelta(minutes=1):
-        uow.ui_sessions.touch(session.id, now)
-        uow.commit()
-    return principal, session.csrf
-
-
-def _require(
-    request: Request, ctx: Any, uow: UnitOfWork
-) -> tuple[Principal, str] | RedirectResponse:
-    found = _session(request, ctx, uow)
-    if found is not None:
-        return found
-    return RedirectResponse(f"/ui/sign-in?next={quote(request.url.path)}", status_code=303)
-
-
-def _base(
-    request: Request,
-    principal: Principal | None,
-    csrf: str = "",
-    *,
-    title: str,
-    active: str,
-    hidden: frozenset[str] = frozenset(),
-) -> dict[str, Any]:
-    return {
-        "request": request,
-        "title": title,
-        "active": active,
-        "nav": tuple(item for item in NAV if item[0] not in hidden or item[0] == active),
-        "principal": principal,
-        "csrf": csrf,
-        "message": request.query_params.get("message"),
-        "message_kind": request.query_params.get("kind", "info"),
-        "supervisor_warning": _supervisor_warning(request) if principal is not None else None,
-    }
-
-
-def _supervisor_warning(request: Request) -> str | None:
-    """hades #190: readiness no longer reflects the supervisor, so every signed-in page
-    says when it is not healthy. None when it is, or when there is nothing to ask."""
-    try:
-        ctx = request.app.state.ctx
-        with ctx.uow_factory() as uow:
-            healthy, detail = supervisor_health(uow, ctx.clock.now(), ctx.lease_ttl_seconds)
-    except (AttributeError, KeyError):
-        return None
-    if healthy:
-        return None
-    settings = getattr(ctx, "settings", None)
-    timezone = settings.service.render_timezone if settings is not None else "America/Chicago"
-    return str(_localize(str(detail), timezone))
-
-
-def _page(
-    request: Request,
-    principal: Principal,
-    csrf: str,
-    *,
-    active: str,
-    heading: str,
-    intro: str,
-    sections: list[dict[str, Any]],
-    badge: str | None = None,
-    badge_kind: str = "accent",
-) -> HTMLResponse:
-    timezone = "America/Chicago"
-    settings = getattr(request.app.state.ctx, "settings", None)
-    if settings is not None:
-        timezone = settings.service.render_timezone
-    sections = _reason_fields(_localize(sections, timezone))
-    intro = str(_localize(intro, timezone))
-    context = _base(
-        request, principal, csrf, title=heading, active=active, hidden=_empty_sections(request)
-    )
-    context.update(
-        heading=heading,
-        intro=intro,
-        sections=sections,
-        badge=badge,
-        badge_kind=badge_kind,
-    )
-    return templates.TemplateResponse(request=request, name="page.html", context=context)
-
-
-def _empty_sections(request: Request) -> frozenset[str]:
-    """The navigation entries with nothing behind them yet (HIDDEN_WHEN_EMPTY)."""
-    try:
-        factory = request.app.state.ctx.uow_factory
-    except (AttributeError, KeyError):
-        return frozenset()
-    empty: set[str] = set()
-    with factory() as uow:
-        if not list(uow.retention.list_recent(1)):
-            empty.add("/ui/retention")
-        if not list(uow.bootstrap_imports.list_all()):
-            empty.add("/ui/bootstrap")
-    return frozenset(empty)
-
-
-def _localize(value: Any, timezone: str) -> Any:
-    """Render stored UTC instants in the operator's configured local zone."""
-    if isinstance(value, dict):
-        return {key: _localize(item, timezone) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_localize(item, timezone) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_localize(item, timezone) for item in value)
-    moment: datetime | None = value if isinstance(value, datetime) else None
-    if isinstance(value, str) and "T" in value:
-        pattern = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})")
-
-        def replace(match: re.Match[str]) -> str:
-            try:
-                parsed = datetime.fromisoformat(match.group(0).replace("Z", "+00:00"))
-            except ValueError:
-                return match.group(0)
-            try:
-                local = parsed.astimezone(ZoneInfo(timezone))
-            except ZoneInfoNotFoundError:
-                local = parsed.astimezone(ZoneInfo("America/Chicago"))
-            return local.strftime("%Y-%m-%d %I:%M:%S %p %Z")
-
-        replaced = pattern.sub(replace, value)
-        if replaced != value:
-            return replaced
-    if isinstance(value, str) and "T" in value and (value.endswith("Z") or "+" in value[10:]):
-        try:
-            moment = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except ValueError:
-            moment = None
-    if moment is None or moment.tzinfo is None:
-        return value
-    try:
-        local = moment.astimezone(ZoneInfo(timezone))
-    except ZoneInfoNotFoundError:
-        local = moment.astimezone(ZoneInfo("America/Chicago"))
-    return local.strftime("%Y-%m-%d %I:%M:%S %p %Z")
-
-
-async def _form(request: Request) -> dict[str, str]:
-    body = (await request.body()).decode("utf-8", "replace")
-    return {key: values[-1] for key, values in parse_qs(body, keep_blank_values=True).items()}
-
-
-def _admin(principal: Principal) -> None:
-    if principal.role is not Role.ADMIN:
-        raise ForbiddenError("admin role required")
-
-
-def _csrf(form: dict[str, str], expected: str) -> None:
-    supplied = form.get("csrf", "")
-    if not supplied or not hmac.compare_digest(supplied, expected):
-        raise ForbiddenError("the form expired or its CSRF token is invalid")
-
-
-def _redirect(form: dict[str, str], message: str, *, kind: str = "ok") -> RedirectResponse:
-    target = form.get("return_to", "/ui")
-    if not target.startswith("/ui") or target.startswith("//"):
-        target = "/ui"
-    separator = "&" if "?" in target else "?"
-    return RedirectResponse(
-        f"{target}{separator}kind={quote(kind)}&message={quote(message)}", status_code=303
-    )
 
 
 def _readiness_sections(readiness: dict[str, Any]) -> tuple[list[dict[str, Any]], list[Any]]:
@@ -658,148 +134,7 @@ def _readiness_sections(readiness: dict[str, Any]) -> tuple[list[dict[str, Any]]
     return sections, [summary, detail]
 
 
-@router.get("/sign-in", response_class=HTMLResponse)
-def sign_in_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
-    if _session(request, ctx, uow) is not None:
-        return RedirectResponse("/ui", status_code=303)
-    return _sign_in_form(request, ctx, next_path=request.query_params.get("next", "/ui"))
-
-
-def _sign_in_form(
-    request: Request,
-    ctx: Any,
-    *,
-    next_path: str,
-    message: str | None = None,
-    status_code: int = 200,
-) -> Response:
-    csrf = os.urandom(24).hex()
-    context = _base(request, None, title="Sign in", active="")
-    context.update(
-        next=next_path,
-        csrf=csrf,
-        message=message,
-        message_kind="bad",
-        first_run_where=ctx.first_run.where() if ctx.first_run is not None else None,
-    )
-    response = templates.TemplateResponse(
-        request=request, name="signin.html", context=context, status_code=status_code
-    )
-    response.set_cookie(
-        PREAUTH_COOKIE,
-        _preauth_serializer(ctx).dumps({"csrf": csrf}),
-        max_age=PREAUTH_MAX_AGE,
-        httponly=True,
-        samesite="strict",
-        path="/ui/sign-in",
-    )
-    return response
-
-
-@router.post("/sign-in")
-async def sign_in(request: Request, ctx: Ctx, uow: UoW) -> Response:
-    form = await _form(request)
-    raw_preauth = request.cookies.get(PREAUTH_COOKIE, "")
-    try:
-        preauth = _preauth_serializer(ctx).loads(raw_preauth, max_age=PREAUTH_MAX_AGE)
-        expected = preauth.get("csrf", "") if isinstance(preauth, dict) else ""
-        _csrf(form, expected)
-    except (BadSignature, SignatureExpired, ForbiddenError):
-        return _sign_in_form(
-            request,
-            ctx,
-            next_path=form.get("next", "/ui"),
-            message="The sign-in form expired or its CSRF token is invalid.",
-            status_code=403,
-        )
-    token = form.get("token", "")
-    principal = authenticate(uow, token)
-    if principal is None:
-        return _sign_in_form(
-            request,
-            ctx,
-            next_path=form.get("next", "/ui"),
-            message="Token not recognized.",
-            status_code=401,
-        )
-    now = ctx.clock.now()
-    csrf = os.urandom(24).hex()
-    session_id = os.urandom(32).hex()
-    uow.ui_sessions.delete_expired(now)
-    uow.ui_sessions.create(
-        UiSession(
-            id=session_id,
-            principal_id=principal.id,
-            csrf=csrf,
-            created_at=now,
-            expires_at=now + timedelta(seconds=SESSION_MAX_AGE),
-            last_seen_at=now,
-        )
-    )
-    uow.commit()
-    # ADR 0016: discard the first-run token only after the session is committed,
-    # so a failed insert or commit leaves the token available for a retry.
-    await asyncio.to_thread(discard_after_use, ctx.first_run, principal.name)
-    value = _serializer(ctx).dumps(session_id)
-    target = form.get("next", "/ui")
-    if not target.startswith("/ui") or target.startswith("//"):
-        target = "/ui"
-    response = RedirectResponse(target, status_code=303)
-    response.set_cookie(
-        COOKIE,
-        value,
-        max_age=SESSION_MAX_AGE,
-        httponly=True,
-        samesite="strict",
-        path="/ui",
-    )
-    response.delete_cookie(PREAUTH_COOKIE, path="/ui/sign-in", httponly=True, samesite="strict")
-    return response
-
-
-@router.post("/sign-out")
-async def sign_out(request: Request, ctx: Ctx, uow: UoW) -> RedirectResponse:
-    form = await _form(request)
-    found = _session(request, ctx, uow)
-    if found is not None:
-        _csrf(form, found[1])
-        session_id = _session_id(request, ctx)
-        assert session_id is not None
-        uow.ui_sessions.delete(session_id)
-        uow.commit()
-    response = RedirectResponse("/ui/sign-in", status_code=303)
-    response.delete_cookie(COOKIE, path="/ui", httponly=True, samesite="strict")
-    return response
-
-
-# Task states in the words an operator uses (crucible#115). A state not named here is
-# shown as its own name with the underscores taken out.
-STATE_WORDS = {
-    "blocked": "Blocked: needs a decision",
-    "pre_pr_gates_failed": "Checks failed before the pull request",
-    "publish_failed": "Publishing failed",
-    "ci_certification_failed": "CI did not certify",
-    "head_diverged": "Branch changed outside Crucible",
-    "awaiting_internal_review": "Awaiting internal review",
-    "awaiting_acceptance": "Awaiting acceptance",
-    "awaiting_external_review": "Awaiting external review",
-    "awaiting_ci_certification": "Awaiting CI",
-    "ready_for_merge": "Ready to merge",
-}
 PROVIDER_TONES = {"ok": "ok", "degraded": "warn", "unavailable": "bad"}
-CREDENTIAL_TONES = {
-    "validated": "ok",
-    "valid": "ok",
-    "not_required": "accent",
-    "configured": "warn",
-    "absent": "warn",
-    "invalid": "bad",
-    "unreadable": "bad",
-}
-
-
-def _state_words(state: str) -> str:
-    return STATE_WORDS.get(state, state.replace("_", " ").capitalize())
 
 
 def _provider_detail(item: dict[str, Any]) -> str:
@@ -1253,79 +588,6 @@ def login_page(request: Request, harness: str, ctx: Ctx, uow: UoW) -> Response:
     return templates.TemplateResponse(request=request, name="login.html", context=context)
 
 
-def _image_label(entry: dict[str, Any] | None, harness: str) -> str:
-    if not entry:
-        return "none"
-    return f"{entry['reference']} ({harness} {entry['version']})"
-
-
-def _image_rows(rows: list[dict[str, Any]], *, admin: bool) -> list[list[Any]]:
-    """One row per harness (ADR 0018): its default, the image a rollback returns to, and
-    a pulldown of the images that carry it at a supported version."""
-    out: list[list[Any]] = []
-    for row in rows:
-        harness = row["harness"]
-        current = row.get("current")
-        previous = row.get("previous")
-        actions: list[dict[str, Any]] = []
-        if admin and row["choices"]:
-            actions.append(
-                {
-                    "kind": "form",
-                    "action": "/ui/actions/image-promote",
-                    "label": "Promote",
-                    "primary": True,
-                    "reason": "optional",
-                    "hidden": {"harness": harness},
-                    "select": {
-                        "name": "digest",
-                        "label": f"Image for {harness}",
-                        "options": [
-                            (choice["digest"], f"{choice['reference']} ({choice['version']})")
-                            for choice in row["choices"]
-                        ],
-                        "selected": (current or {}).get("digest"),
-                    },
-                }
-            )
-        if admin and previous:
-            actions.append(
-                {
-                    "kind": "form",
-                    "action": "/ui/actions/image-rollback",
-                    "label": f"Roll back to {previous['reference']}",
-                    "reason": "optional",
-                    "hidden": {"harness": harness},
-                }
-            )
-        out.append(
-            [
-                harness,
-                (
-                    {
-                        "kind": "note",
-                        "value": current["reference"],
-                        "hint": f"{harness} {current['version']}",
-                    }
-                    if current
-                    else {"kind": "status", "value": "none promoted", "tone": "warn"}
-                ),
-                _image_label(previous, harness) if previous else "none",
-                {"kind": "actions", "items": actions}
-                if actions
-                else {
-                    "kind": "note",
-                    "value": "No image to offer",
-                    "hint": (
-                        f"No provider sees a release image with {harness} "
-                        f"{row['supported_versions']}"
-                    ),
-                },
-            ]
-        )
-    return out
-
-
 CAPABILITY_OPTIONS = [("small", "small"), ("mid", "mid"), ("frontier", "frontier")]
 
 
@@ -1551,6 +813,79 @@ def _whole(form: dict[str, str], name: str, label: str) -> int:
         return int(form.get(name, "").strip())
     except ValueError:
         raise ConflictError(f"{label} must be a whole number") from None
+
+
+def _image_label(entry: dict[str, Any] | None, harness: str) -> str:
+    if not entry:
+        return "none"
+    return f"{entry['reference']} ({harness} {entry['version']})"
+
+
+def _image_rows(rows: list[dict[str, Any]], *, admin: bool) -> list[list[Any]]:
+    """One row per harness (ADR 0018): its default, the image a rollback returns to, and
+    a pulldown of the images that carry it at a supported version."""
+    out: list[list[Any]] = []
+    for row in rows:
+        harness = row["harness"]
+        current = row.get("current")
+        previous = row.get("previous")
+        actions: list[dict[str, Any]] = []
+        if admin and row["choices"]:
+            actions.append(
+                {
+                    "kind": "form",
+                    "action": "/ui/actions/image-promote",
+                    "label": "Promote",
+                    "primary": True,
+                    "reason": "optional",
+                    "hidden": {"harness": harness},
+                    "select": {
+                        "name": "digest",
+                        "label": f"Image for {harness}",
+                        "options": [
+                            (choice["digest"], f"{choice['reference']} ({choice['version']})")
+                            for choice in row["choices"]
+                        ],
+                        "selected": (current or {}).get("digest"),
+                    },
+                }
+            )
+        if admin and previous:
+            actions.append(
+                {
+                    "kind": "form",
+                    "action": "/ui/actions/image-rollback",
+                    "label": f"Roll back to {previous['reference']}",
+                    "reason": "optional",
+                    "hidden": {"harness": harness},
+                }
+            )
+        out.append(
+            [
+                harness,
+                (
+                    {
+                        "kind": "note",
+                        "value": current["reference"],
+                        "hint": f"{harness} {current['version']}",
+                    }
+                    if current
+                    else {"kind": "status", "value": "none promoted", "tone": "warn"}
+                ),
+                _image_label(previous, harness) if previous else "none",
+                {"kind": "actions", "items": actions}
+                if actions
+                else {
+                    "kind": "note",
+                    "value": "No image to offer",
+                    "hint": (
+                        f"No provider sees a release image with {harness} "
+                        f"{row['supported_versions']}"
+                    ),
+                },
+            ]
+        )
+    return out
 
 
 @router.get("/images", response_class=HTMLResponse)
@@ -2090,6 +1425,51 @@ def routing_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
         intro="What routes and limits a task: the policies in force, the gateway, and pools.",
         sections=sections,
     )
+
+
+def _milliseconds(form: dict[str, str], name: str) -> int | None:
+    raw = form.get(name, "").strip()
+    if not raw:
+        return None
+    if not raw.isdigit():
+        raise ContractValidationError(
+            f"{name} must be a whole number of milliseconds",
+            errors=[{"path": name, "message": "a whole number of milliseconds"}],
+        )
+    return int(raw)
+
+
+def _whole_number(form: dict[str, str], name: str) -> int | None:
+    raw = form.get(name, "").strip()
+    if not raw:
+        return None
+    if not raw.isdigit():
+        raise ContractValidationError(
+            f"{name} must be a whole number",
+            errors=[{"path": name, "message": "a whole number"}],
+        )
+    return int(raw)
+
+
+def _tier_order(form: dict[str, str], tier: str, shown: list[str]) -> list[str] | None:
+    """A tier's order from the Routing form. "Use the default" keeps the default only
+    while the order field still shows what was on the page: an order typed over it is
+    the administrator's, not something to discard under a ticked box."""
+    typed = routing_preference.parse_pool_order(form.get(f"prefer_{tier}", ""))
+    if form.get(f"default_{tier}") == "true" and (typed is None or typed == shown):
+        return None
+    return typed
+
+
+def _pool_order_words(rule: dict[str, Any]) -> str:
+    """One tier's pool order as the Routing page says it (ADR 0028)."""
+    pools = rule["prefer_pools"]
+    words = (
+        f"{' then '.join(pools)} first"
+        if pools
+        else f"no pool preference ({', '.join(rule['prefer'])} first by capability)"
+    )
+    return f"{words} (default)" if rule["default"] else words
 
 
 @router.get("/repositories", response_class=HTMLResponse)
@@ -2823,6 +2203,8 @@ def tasks_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
 
 
 RECENT_TASK_DAYS = 14
+
+
 RECENT_TASK_ROWS = 50
 
 
@@ -2839,6 +2221,8 @@ DELIVERY_STATES = (
     TaskState.HEAD_DIVERGED,
     TaskState.READY_FOR_MERGE,
 )
+
+
 WAIVER_FORMS = (
     (
         WAIVE_EXTERNAL_REVIEW,
@@ -3414,520 +2798,501 @@ def settings_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
     )
 
 
-def _milliseconds(form: dict[str, str], name: str) -> int | None:
-    raw = form.get(name, "").strip()
-    if not raw:
-        return None
-    if not raw.isdigit():
-        raise ContractValidationError(
-            f"{name} must be a whole number of milliseconds",
-            errors=[{"path": name, "message": "a whole number of milliseconds"}],
+async def _actions(
+    request: Request,
+    action: str,
+    ctx: Ctx,
+    uow: UoW,
+    principal: Principal,
+    csrf: str,
+    form: dict[str, str],
+    reason: str | None,
+) -> Response | None:
+    assert ctx.admin is not None
+    if action == "harness":
+        harnesses.set_enabled(
+            ctx.admin,
+            uow,
+            principal=principal.name,
+            harness=form.get("harness", ""),
+            enabled=form.get("enabled") == "true",
+            reason=reason,
         )
-    return int(raw)
-
-
-def _whole_number(form: dict[str, str], name: str) -> int | None:
-    raw = form.get(name, "").strip()
-    if not raw:
-        return None
-    if not raw.isdigit():
-        raise ContractValidationError(
-            f"{name} must be a whole number",
-            errors=[{"path": name, "message": "a whole number"}],
-        )
-    return int(raw)
-
-
-def _tier_order(form: dict[str, str], tier: str, shown: list[str]) -> list[str] | None:
-    """A tier's order from the Routing form. "Use the default" keeps the default only
-    while the order field still shows what was on the page: an order typed over it is
-    the administrator's, not something to discard under a ticked box."""
-    typed = routing_preference.parse_pool_order(form.get(f"prefer_{tier}", ""))
-    if form.get(f"default_{tier}") == "true" and (typed is None or typed == shown):
-        return None
-    return typed
-
-
-def _pool_order_words(rule: dict[str, Any]) -> str:
-    """One tier's pool order as the Routing page says it (ADR 0028)."""
-    pools = rule["prefer_pools"]
-    words = (
-        f"{' then '.join(pools)} first"
-        if pools
-        else f"no pool preference ({', '.join(rule['prefer'])} first by capability)"
-    )
-    return f"{words} (default)" if rule["default"] else words
-
-
-@router.post("/actions/{action}")
-async def action(request: Request, action: str, ctx: Ctx, uow: UoW) -> Response:
-    found = _require(request, ctx, uow)
-    if isinstance(found, RedirectResponse):
-        return found
-    principal, csrf = found
-    form = await _form(request)
-    try:
-        _csrf(form, csrf)
-        _admin(principal)
-        if ctx.admin is None:
-            raise ConflictError("the administrative surface is not configured")
-        reason = form.get("reason")
-        if action == "harness":
-            harnesses.set_enabled(
-                ctx.admin,
-                uow,
-                principal=principal.name,
-                harness=form.get("harness", ""),
-                enabled=form.get("enabled") == "true",
-                reason=reason,
-            )
-        elif action == "credential":
-            verb = form.get("verb")
-            if verb == "validate":
-                await credentials.validate(
-                    ctx.admin,
-                    uow,
-                    principal=principal.name,
-                    harness=form.get("harness", ""),
-                    reason=reason,
-                )
-            elif verb == "probe":
-                await credentials.probe(
-                    ctx.admin,
-                    uow,
-                    principal=principal.name,
-                    harness=form.get("harness", ""),
-                    reason=reason,
-                )
-            elif verb == "remove":
-                credentials.remove(
-                    ctx.admin,
-                    uow,
-                    principal=principal.name,
-                    harness=form.get("harness", ""),
-                    reason=reason,
-                )
-            elif verb == "rotate":
-                credentials.rotate(
-                    ctx.admin,
-                    uow,
-                    principal=principal.name,
-                    harness=form.get("harness", ""),
-                    new_path=form.get("new_path", ""),
-                    reason=reason,
-                )
-            else:
-                raise ConflictError("unknown credential action")
-        elif action == "gateway-save":
-            result = await gateway.save_gateway(
-                ctx.admin,
-                uow,
-                principal=principal,
-                endpoint_url=form.get("endpoint_url", ""),
-                api_key=form.get("api_key") or None,
-                reason=reason,
-            )
-            uow.commit()
-            return _redirect(
-                form,
-                f"Saved. {result['test']['summary']}",
-                kind="ok" if result["test"]["passed"] else "warn",
-            )
-        elif action == "gateway-test":
-            result = await gateway.test_gateway(ctx.admin, uow, principal=principal, reason=reason)
-            uow.commit()
-            return _redirect(
-                form,
-                result["test"]["summary"],
-                kind="ok" if result["test"]["passed"] else "warn",
-            )
-        elif action == "hermes-limits":
-            gateway.save_hermes_limits(
-                ctx.admin,
-                uow,
-                principal=principal,
-                max_turns=_whole(form, "max_turns", "Max turns"),
-                context_length=_whole(form, "context_length", "Context length"),
-                reason=reason,
-            )
-            uow.commit()
-            return _redirect(form, "Saved the Hermes run limits. The next launch uses them.")
-        elif action == "gateway-models":
-            picks = []
-            index = 0
-            while f"model.{index}.id" in form:
-                picks.append(
-                    {
-                        "id": form[f"model.{index}.id"],
-                        "enabled": form.get(f"model.{index}.enabled") == "true",
-                        "codex_enabled": form.get(f"model.{index}.codex") == "true",
-                        "enable_thinking": form.get(f"model.{index}.thinking") == "true",
-                        "capability": form.get(f"model.{index}.capability") or None,
-                    }
-                )
-                index += 1
-            saved = await gateway.save_models(
-                ctx.admin,
-                uow,
-                principal=principal,
-                models=picks,
-                max_concurrency=int(form.get("max_concurrency") or "0") or None,
-                reason=reason,
-            )
-            uow.commit()
-            enabled = ", ".join(saved["enabled"]) or "none"
-            dropped = saved["disabled_not_offered"]
-            return _redirect(
-                form,
-                f"Saved routing policy version {saved['routing_policy']['version']}. "
-                f"Enabled: {enabled}."
-                + (f" Disabled as no longer offered: {', '.join(dropped)}." if dropped else ""),
-            )
-        elif action == "github-create-app":
-            started = github_manifest.start(
-                ctx.admin,
-                uow,
-                principal=principal.name,
-                app_name=form.get("app_name"),
-                organization=form.get("organization"),
-                browser_url=_browser_url(request),
-                reason=reason,
-            )
-            uow.commit()
-            context = _base(
-                request, principal, csrf, title="Continue on GitHub", active="/ui/github"
-            )
-            context.update(
-                target_url=started["target_url"],
-                manifest=json.dumps(started["manifest"], separators=(",", ":")),
-                manifest_pretty=json.dumps(started["manifest"], indent=2),
-                app_name=started["manifest"]["name"],
-                account=started["account"],
-                permissions=", ".join(
-                    f"{name.replace('_', ' ')} {level}"
-                    for name, level in started["manifest"]["default_permissions"].items()
-                ),
-            )
-            response = templates.TemplateResponse(
-                request=request, name="github_continue.html", context=context
-            )
-            response.headers["Cache-Control"] = "no-store"
-            response.headers["Referrer-Policy"] = "no-referrer"
-            # Ties the start to this browser (crucible#168). Lax, because GitHub's
-            # redirect back is a cross-site navigation, which a Lax cookie comes with.
-            response.set_cookie(
-                github_manifest.binding_cookie(started["state"]),
-                started["browser_nonce"],
-                max_age=int(github_manifest.STATE_TTL.total_seconds()),
-                httponly=True,
-                samesite="lax",
-                secure=_browser_url(request).startswith("https://"),
-                path=github_manifest.binding_cookie_path(started["manifest"]["url"]),
-            )
-            return response
-        elif action == "github-external-url":
-            saved = github_manifest.save_external_url(
-                ctx.admin,
-                uow,
-                principal=principal.name,
-                url=form.get("external_url"),
-                reason=reason,
-            )
-            uow.commit()
-            return _redirect(
-                form,
-                f"Saved: GitHub sends the browser back to {saved['url']}."
-                if saved["url"]
-                else "Cleared: GitHub sends the browser back to the address you use.",
-            )
-        elif action == "github-add-repository":
-            added = github.add_repository(
-                ctx.admin,
-                uow,
-                principal=principal.name,
-                installation_id=int(form.get("installation_id") or "0"),
-                repository=form.get("repository", ""),
-                name=form.get("name") or None,
-                policy_name=form.get("policy_name") or "default-software",
-                attested_all_prs=form.get("attested_all_prs") == "true",
-                attested_by=None,
-                reason=reason,
-            )
-            uow.commit()
-            return _redirect(
-                form,
-                f"Registered {added['repository']} ({added['url']}, default branch "
-                f"{added['default_branch']}, installation {added['installation_id']}).",
-            )
-        elif action == "login-start":
-            login.start_login(
-                ctx.admin,
-                uow,
-                ctx.logins,
-                principal=principal.name,
-                harness=form.get("harness", ""),
-                reason=reason,
-                replace=form.get("replace") == "true",
-            )
-        elif action == "login-code":
-            login.submit_code(
-                ctx.logins,
-                form.get("harness", ""),
-                form.get("code", ""),
-                ctx=ctx.admin,
-                uow=uow,
-                principal=principal.name,
-                reason=reason,
-            )
-        elif action == "login-cancel":
-            login.cancel_login(
-                ctx.logins,
-                form.get("harness", ""),
-                ctx=ctx.admin,
-                uow=uow,
-                principal=principal.name,
-                reason=reason,
-            )
-        elif action == "login-finish":
-            login.finish_login(
-                ctx.admin,
-                uow,
-                ctx.logins,
-                principal=principal.name,
-                harness=form.get("harness", ""),
-                reason=reason,
-            )
-        elif action == "image-promote":
-            await images.promote(
-                ctx.admin,
-                uow,
-                principal=principal.name,
-                harness=form.get("harness", ""),
-                digest=form.get("digest", ""),
-                reason=reason,
-            )
-        elif action == "harness-test":
-            result = await harness_test.test_harness(
-                ctx.admin, uow, principal=principal.name, harness=form.get("harness", "")
-            )
-            uow.commit()
-            failed = result["failed_step"]
-            message = (
-                f"{result['harness']} passed every step."
-                if result["ok"]
-                else f"{result['harness']} failed at {failed}: "
-                + next(s["detail"] for s in result["steps"] if s["name"] == failed)
-            )
-            return _redirect(form, message, kind="ok" if result["ok"] else "bad")
-        elif action == "image-rollback":
-            await images.rollback(
+    elif action == "credential":
+        verb = form.get("verb")
+        if verb == "validate":
+            await credentials.validate(
                 ctx.admin,
                 uow,
                 principal=principal.name,
                 harness=form.get("harness", ""),
                 reason=reason,
             )
-        elif action == "routing-clear":
-            routing.clear_exhaustion(
-                ctx.admin, uow, principal=principal.name, pool=form.get("pool", ""), reason=reason
-            )
-        elif action == "routing-preference":
-            tiers = routing_preference.preference_view(uow)["tiers"]
-            routing_preference.save_preference(
-                ctx.admin,
-                uow,
-                principal=principal,
-                tiers={
-                    name: _tier_order(form, name, rule["prefer_pools"])
-                    for name, rule in tiers.items()
-                },
-                rotation={
-                    "quality_feedback": form.get("quality_feedback") == "true",
-                    **{
-                        key: value
-                        for key in (
-                            "quality_window",
-                            "demote_failure_percent",
-                            "demote_min_sample",
-                            "probe_after_minutes",
-                        )
-                        if (value := _whole_number(form, key)) is not None
-                    },
-                },
-                reason=reason,
-            )
-        elif action == "gate-classes":
-            gate_classes_admin.save_gate_classes(
-                ctx.admin,
-                uow,
-                principal=principal,
-                advisory=[
-                    key.removeprefix("advisory_")
-                    for key, value in form.items()
-                    if key.startswith("advisory_") and value == "true"
-                ],
-                reason=reason,
-            )
-        elif action == "command-timeout":
-            limits_admin.save_command_timeout(
-                ctx.admin,
-                uow,
-                principal=principal,
-                minimum=_milliseconds(form, "min"),
-                maximum=_milliseconds(form, "max"),
-                default=_milliseconds(form, "default"),
-                reason=reason,
-            )
-        elif action == "kubernetes-egress":
-            kubernetes_admin.save_egress(
+        elif verb == "probe":
+            await credentials.probe(
                 ctx.admin,
                 uow,
                 principal=principal.name,
-                document={
-                    "dns": {
-                        "namespace": form.get("dns_namespace", ""),
-                        "pod_labels": parse_labels(form.get("dns_labels", "")),
-                    },
-                    "local_endpoint": {
-                        "namespace": form.get("endpoint_namespace", ""),
-                        "pod_labels": parse_labels(form.get("endpoint_labels", "")),
-                        "port": int(form.get("endpoint_port") or "0"),
-                    },
-                },
+                harness=form.get("harness", ""),
                 reason=reason,
             )
-        elif action == "kubernetes-timeouts":
-            raw_seconds = form.get("role_timeout_seconds", "").strip()
-            kubernetes_admin.save_timeouts(
+        elif verb == "remove":
+            credentials.remove(
                 ctx.admin,
                 uow,
                 principal=principal.name,
-                document={
-                    "role_timeout_seconds": int(raw_seconds)
-                    if raw_seconds.lstrip("-").isdigit()
-                    else raw_seconds
-                },
+                harness=form.get("harness", ""),
                 reason=reason,
             )
-        elif action in ("routing-upload", "policy-upload"):
-            raw = form.get("document", "")
-            if scan_text(raw) is not None:
-                raise ConflictError("the policy document looks like it contains a secret")
-            document = json.loads(raw)
-            audited_reason = guard_mutation(
-                ctx.admin,
-                uow,
-                reason,
-                principal=principal.name,
-                operation=action,
-            )
-            if action == "routing-upload":
-                put_routing_policy(
-                    uow,
-                    ctx.clock,
-                    principal=principal,
-                    name=form.get("name", ""),
-                    version=int(form.get("version", "0")),
-                    document=document,
-                    reason=audited_reason,
-                )
-            else:
-                put_policy(
-                    uow,
-                    ctx.clock,
-                    principal=principal,
-                    name=form.get("name", ""),
-                    version=int(form.get("version", "0")),
-                    document=document,
-                    reason=audited_reason,
-                )
-        elif action == "repository-register":
-            repositories.register(
+        elif verb == "rotate":
+            credentials.rotate(
                 ctx.admin,
                 uow,
                 principal=principal.name,
-                name=form.get("name", ""),
-                registration=RepositoryRegistration(
-                    url=form.get("url", ""),
-                    default_branch=form.get("default_branch", "main"),
-                    policy_name=form.get("policy_name", "default-software"),
-                    installation_id=int(form["installation_id"])
-                    if form.get("installation_id")
-                    else None,
-                    external_review=ExternalReviewAttestation(
-                        attested_all_prs=form.get("attested_all_prs") == "true",
-                        attested_by=form.get("attested_by") or None,
-                    ),
-                    private=form.get("private") == "true",
-                ),
-                reason=reason,
-            )
-        elif action == "repository-remove":
-            repositories.remove(
-                ctx.admin, uow, principal=principal.name, name=form.get("name", ""), reason=reason
-            )
-        elif action == "token-create":
-            minted = tokens.create(
-                ctx.admin,
-                uow,
-                principal=principal.name,
-                name=form.get("name", ""),
-                role=form.get("role", "observer"),
-                reason=reason,
-            )
-            uow.commit()
-            context = _base(request, principal, csrf, title="Token created", active="/ui/tokens")
-            context.update(
-                token=minted.token,
-                token_name=minted.principal.name,
-                token_role=minted.principal.role.value,
-            )
-            response = templates.TemplateResponse(
-                request=request, name="token_once.html", context=context
-            )
-            response.headers["Cache-Control"] = "no-store"
-            return response
-        elif action == "token-revoke":
-            revoked = tokens.revoke(
-                ctx.admin,
-                uow,
-                principal=principal.name,
-                principal_id=form.get("principal_id", ""),
-                reason=reason,
-            )
-            uow.commit()
-            await asyncio.to_thread(tokens.after_revoke, ctx.admin, revoked)
-        elif action == "github-check":
-            github.check(ctx.admin, uow, principal=principal.name, reason=reason)
-        elif action == "bootstrap-commit":
-            bootstrap.commit(
-                ctx.admin,
-                uow,
-                principal=principal.name,
-                import_id=form.get("import_id", ""),
-                reason=reason,
-            )
-        elif action == "bootstrap-discard":
-            bootstrap.discard(
-                ctx.admin,
-                uow,
-                principal=principal.name,
-                import_id=form.get("import_id", ""),
-                reason=reason,
-            )
-        elif action == "token-rename":
-            tokens.rename(
-                ctx.admin,
-                uow,
-                principal=principal.name,
-                principal_id=form.get("principal_id", ""),
-                name=form.get("name", ""),
+                harness=form.get("harness", ""),
+                new_path=form.get("new_path", ""),
                 reason=reason,
             )
         else:
-            raise ConflictError(f"unknown UI action {action!r}")
+            raise ConflictError("unknown credential action")
+    elif action == "gateway-save":
+        result = await gateway.save_gateway(
+            ctx.admin,
+            uow,
+            principal=principal,
+            endpoint_url=form.get("endpoint_url", ""),
+            api_key=form.get("api_key") or None,
+            reason=reason,
+        )
         uow.commit()
-        return _redirect(form, f"Completed: {action}.")
-    except (ApplicationError, ValueError, json.JSONDecodeError) as exc:
-        detail = exc.detail if isinstance(exc, ApplicationError) else str(exc)
-        return _redirect(form, detail, kind="bad")
+        return _redirect(
+            form,
+            f"Saved. {result['test']['summary']}",
+            kind="ok" if result["test"]["passed"] else "warn",
+        )
+    elif action == "gateway-test":
+        result = await gateway.test_gateway(ctx.admin, uow, principal=principal, reason=reason)
+        uow.commit()
+        return _redirect(
+            form,
+            result["test"]["summary"],
+            kind="ok" if result["test"]["passed"] else "warn",
+        )
+    elif action == "hermes-limits":
+        gateway.save_hermes_limits(
+            ctx.admin,
+            uow,
+            principal=principal,
+            max_turns=_whole(form, "max_turns", "Max turns"),
+            context_length=_whole(form, "context_length", "Context length"),
+            reason=reason,
+        )
+        uow.commit()
+        return _redirect(form, "Saved the Hermes run limits. The next launch uses them.")
+    elif action == "gateway-models":
+        picks = []
+        index = 0
+        while f"model.{index}.id" in form:
+            picks.append(
+                {
+                    "id": form[f"model.{index}.id"],
+                    "enabled": form.get(f"model.{index}.enabled") == "true",
+                    "codex_enabled": form.get(f"model.{index}.codex") == "true",
+                    "enable_thinking": form.get(f"model.{index}.thinking") == "true",
+                    "capability": form.get(f"model.{index}.capability") or None,
+                }
+            )
+            index += 1
+        saved = await gateway.save_models(
+            ctx.admin,
+            uow,
+            principal=principal,
+            models=picks,
+            max_concurrency=int(form.get("max_concurrency") or "0") or None,
+            reason=reason,
+        )
+        uow.commit()
+        enabled = ", ".join(saved["enabled"]) or "none"
+        dropped = saved["disabled_not_offered"]
+        return _redirect(
+            form,
+            f"Saved routing policy version {saved['routing_policy']['version']}. "
+            f"Enabled: {enabled}."
+            + (f" Disabled as no longer offered: {', '.join(dropped)}." if dropped else ""),
+        )
+    elif action == "github-create-app":
+        started = github_manifest.start(
+            ctx.admin,
+            uow,
+            principal=principal.name,
+            app_name=form.get("app_name"),
+            organization=form.get("organization"),
+            browser_url=_browser_url(request),
+            reason=reason,
+        )
+        uow.commit()
+        context = _base(request, principal, csrf, title="Continue on GitHub", active="/ui/github")
+        context.update(
+            target_url=started["target_url"],
+            manifest=json.dumps(started["manifest"], separators=(",", ":")),
+            manifest_pretty=json.dumps(started["manifest"], indent=2),
+            app_name=started["manifest"]["name"],
+            account=started["account"],
+            permissions=", ".join(
+                f"{name.replace('_', ' ')} {level}"
+                for name, level in started["manifest"]["default_permissions"].items()
+            ),
+        )
+        response = templates.TemplateResponse(
+            request=request, name="github_continue.html", context=context
+        )
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        # Ties the start to this browser (crucible#168). Lax, because GitHub's
+        # redirect back is a cross-site navigation, which a Lax cookie comes with.
+        response.set_cookie(
+            github_manifest.binding_cookie(started["state"]),
+            started["browser_nonce"],
+            max_age=int(github_manifest.STATE_TTL.total_seconds()),
+            httponly=True,
+            samesite="lax",
+            secure=_browser_url(request).startswith("https://"),
+            path=github_manifest.binding_cookie_path(started["manifest"]["url"]),
+        )
+        return response
+    elif action == "github-external-url":
+        saved = github_manifest.save_external_url(
+            ctx.admin,
+            uow,
+            principal=principal.name,
+            url=form.get("external_url"),
+            reason=reason,
+        )
+        uow.commit()
+        return _redirect(
+            form,
+            f"Saved: GitHub sends the browser back to {saved['url']}."
+            if saved["url"]
+            else "Cleared: GitHub sends the browser back to the address you use.",
+        )
+    elif action == "github-add-repository":
+        added = github.add_repository(
+            ctx.admin,
+            uow,
+            principal=principal.name,
+            installation_id=int(form.get("installation_id") or "0"),
+            repository=form.get("repository", ""),
+            name=form.get("name") or None,
+            policy_name=form.get("policy_name") or "default-software",
+            attested_all_prs=form.get("attested_all_prs") == "true",
+            attested_by=None,
+            reason=reason,
+        )
+        uow.commit()
+        return _redirect(
+            form,
+            f"Registered {added['repository']} ({added['url']}, default branch "
+            f"{added['default_branch']}, installation {added['installation_id']}).",
+        )
+    elif action == "login-start":
+        login.start_login(
+            ctx.admin,
+            uow,
+            ctx.logins,
+            principal=principal.name,
+            harness=form.get("harness", ""),
+            reason=reason,
+            replace=form.get("replace") == "true",
+        )
+    elif action == "login-code":
+        login.submit_code(
+            ctx.logins,
+            form.get("harness", ""),
+            form.get("code", ""),
+            ctx=ctx.admin,
+            uow=uow,
+            principal=principal.name,
+            reason=reason,
+        )
+    elif action == "login-cancel":
+        login.cancel_login(
+            ctx.logins,
+            form.get("harness", ""),
+            ctx=ctx.admin,
+            uow=uow,
+            principal=principal.name,
+            reason=reason,
+        )
+    elif action == "login-finish":
+        login.finish_login(
+            ctx.admin,
+            uow,
+            ctx.logins,
+            principal=principal.name,
+            harness=form.get("harness", ""),
+            reason=reason,
+        )
+    elif action == "image-promote":
+        await images.promote(
+            ctx.admin,
+            uow,
+            principal=principal.name,
+            harness=form.get("harness", ""),
+            digest=form.get("digest", ""),
+            reason=reason,
+        )
+    elif action == "harness-test":
+        result = await harness_test.test_harness(
+            ctx.admin, uow, principal=principal.name, harness=form.get("harness", "")
+        )
+        uow.commit()
+        failed = result["failed_step"]
+        message = (
+            f"{result['harness']} passed every step."
+            if result["ok"]
+            else f"{result['harness']} failed at {failed}: "
+            + next(s["detail"] for s in result["steps"] if s["name"] == failed)
+        )
+        return _redirect(form, message, kind="ok" if result["ok"] else "bad")
+    elif action == "image-rollback":
+        await images.rollback(
+            ctx.admin,
+            uow,
+            principal=principal.name,
+            harness=form.get("harness", ""),
+            reason=reason,
+        )
+    elif action == "routing-clear":
+        routing.clear_exhaustion(
+            ctx.admin, uow, principal=principal.name, pool=form.get("pool", ""), reason=reason
+        )
+    elif action == "routing-preference":
+        tiers = routing_preference.preference_view(uow)["tiers"]
+        routing_preference.save_preference(
+            ctx.admin,
+            uow,
+            principal=principal,
+            tiers={
+                name: _tier_order(form, name, rule["prefer_pools"]) for name, rule in tiers.items()
+            },
+            rotation={
+                "quality_feedback": form.get("quality_feedback") == "true",
+                **{
+                    key: value
+                    for key in (
+                        "quality_window",
+                        "demote_failure_percent",
+                        "demote_min_sample",
+                        "probe_after_minutes",
+                    )
+                    if (value := _whole_number(form, key)) is not None
+                },
+            },
+            reason=reason,
+        )
+    elif action == "gate-classes":
+        gate_classes_admin.save_gate_classes(
+            ctx.admin,
+            uow,
+            principal=principal,
+            advisory=[
+                key.removeprefix("advisory_")
+                for key, value in form.items()
+                if key.startswith("advisory_") and value == "true"
+            ],
+            reason=reason,
+        )
+    elif action == "command-timeout":
+        limits_admin.save_command_timeout(
+            ctx.admin,
+            uow,
+            principal=principal,
+            minimum=_milliseconds(form, "min"),
+            maximum=_milliseconds(form, "max"),
+            default=_milliseconds(form, "default"),
+            reason=reason,
+        )
+    elif action == "kubernetes-egress":
+        kubernetes_admin.save_egress(
+            ctx.admin,
+            uow,
+            principal=principal.name,
+            document={
+                "dns": {
+                    "namespace": form.get("dns_namespace", ""),
+                    "pod_labels": parse_labels(form.get("dns_labels", "")),
+                },
+                "local_endpoint": {
+                    "namespace": form.get("endpoint_namespace", ""),
+                    "pod_labels": parse_labels(form.get("endpoint_labels", "")),
+                    "port": int(form.get("endpoint_port") or "0"),
+                },
+            },
+            reason=reason,
+        )
+    elif action == "kubernetes-timeouts":
+        raw_seconds = form.get("role_timeout_seconds", "").strip()
+        kubernetes_admin.save_timeouts(
+            ctx.admin,
+            uow,
+            principal=principal.name,
+            document={
+                "role_timeout_seconds": int(raw_seconds)
+                if raw_seconds.lstrip("-").isdigit()
+                else raw_seconds
+            },
+            reason=reason,
+        )
+    elif action in ("routing-upload", "policy-upload"):
+        raw = form.get("document", "")
+        if scan_text(raw) is not None:
+            raise ConflictError("the policy document looks like it contains a secret")
+        document = json.loads(raw)
+        audited_reason = guard_mutation(
+            ctx.admin,
+            uow,
+            reason,
+            principal=principal.name,
+            operation=action,
+        )
+        if action == "routing-upload":
+            put_routing_policy(
+                uow,
+                ctx.clock,
+                principal=principal,
+                name=form.get("name", ""),
+                version=int(form.get("version", "0")),
+                document=document,
+                reason=audited_reason,
+            )
+        else:
+            put_policy(
+                uow,
+                ctx.clock,
+                principal=principal,
+                name=form.get("name", ""),
+                version=int(form.get("version", "0")),
+                document=document,
+                reason=audited_reason,
+            )
+    elif action == "repository-register":
+        repositories.register(
+            ctx.admin,
+            uow,
+            principal=principal.name,
+            name=form.get("name", ""),
+            registration=RepositoryRegistration(
+                url=form.get("url", ""),
+                default_branch=form.get("default_branch", "main"),
+                policy_name=form.get("policy_name", "default-software"),
+                installation_id=int(form["installation_id"])
+                if form.get("installation_id")
+                else None,
+                external_review=ExternalReviewAttestation(
+                    attested_all_prs=form.get("attested_all_prs") == "true",
+                    attested_by=form.get("attested_by") or None,
+                ),
+                private=form.get("private") == "true",
+            ),
+            reason=reason,
+        )
+    elif action == "repository-remove":
+        repositories.remove(
+            ctx.admin, uow, principal=principal.name, name=form.get("name", ""), reason=reason
+        )
+    elif action == "token-create":
+        minted = tokens.create(
+            ctx.admin,
+            uow,
+            principal=principal.name,
+            name=form.get("name", ""),
+            role=form.get("role", "observer"),
+            reason=reason,
+        )
+        uow.commit()
+        context = _base(request, principal, csrf, title="Token created", active="/ui/tokens")
+        context.update(
+            token=minted.token,
+            token_name=minted.principal.name,
+            token_role=minted.principal.role.value,
+        )
+        response = templates.TemplateResponse(
+            request=request, name="token_once.html", context=context
+        )
+        response.headers["Cache-Control"] = "no-store"
+        return response
+    elif action == "token-revoke":
+        revoked = tokens.revoke(
+            ctx.admin,
+            uow,
+            principal=principal.name,
+            principal_id=form.get("principal_id", ""),
+            reason=reason,
+        )
+        uow.commit()
+        await asyncio.to_thread(tokens.after_revoke, ctx.admin, revoked)
+    elif action == "github-check":
+        github.check(ctx.admin, uow, principal=principal.name, reason=reason)
+    elif action == "bootstrap-commit":
+        bootstrap.commit(
+            ctx.admin,
+            uow,
+            principal=principal.name,
+            import_id=form.get("import_id", ""),
+            reason=reason,
+        )
+    elif action == "bootstrap-discard":
+        bootstrap.discard(
+            ctx.admin,
+            uow,
+            principal=principal.name,
+            import_id=form.get("import_id", ""),
+            reason=reason,
+        )
+    elif action == "token-rename":
+        tokens.rename(
+            ctx.admin,
+            uow,
+            principal=principal.name,
+            principal_id=form.get("principal_id", ""),
+            name=form.get("name", ""),
+            reason=reason,
+        )
+    return None
+
+
+register("harness", _actions)
+register("credential", _actions)
+register("gateway-save", _actions)
+register("gateway-test", _actions)
+register("hermes-limits", _actions)
+register("gateway-models", _actions)
+register("github-create-app", _actions)
+register("github-external-url", _actions)
+register("github-add-repository", _actions)
+register("login-start", _actions)
+register("login-code", _actions)
+register("login-cancel", _actions)
+register("login-finish", _actions)
+register("image-promote", _actions)
+register("harness-test", _actions)
+register("image-rollback", _actions)
+register("routing-clear", _actions)
+register("routing-preference", _actions)
+register("gate-classes", _actions)
+register("command-timeout", _actions)
+register("kubernetes-egress", _actions)
+register("kubernetes-timeouts", _actions)
+register("routing-upload", _actions)
+register("policy-upload", _actions)
+register("repository-register", _actions)
+register("repository-remove", _actions)
+register("token-create", _actions)
+register("token-revoke", _actions)
+register("github-check", _actions)
+register("bootstrap-commit", _actions)
+register("bootstrap-discard", _actions)
+register("token-rename", _actions)
+
+router.routes.extend(session.router.routes)
+router.routes.extend(actions.router.routes)

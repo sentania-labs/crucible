@@ -1,11 +1,9 @@
 """UI routes and actions frozen from origin/main before FDY-0167."""
 
-import ast
-import inspect
-
 from fastapi.routing import APIRoute
 
-from crucible.adapters.ui.router import action, router
+from crucible.adapters.ui.actions import handlers
+from crucible.adapters.ui.router import router
 
 FROZEN_ROUTES = [
     ("GET", "/ui"),
@@ -86,17 +84,4 @@ def test_ui_routes_frozen() -> None:
 
 
 def test_ui_actions_frozen() -> None:
-    tree = ast.parse(inspect.getsource(action))
-    accepted = set()
-    for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.Compare)
-            and isinstance(node.left, ast.Name)
-            and node.left.id == "action"
-        ):
-            value = node.comparators[0]
-            if isinstance(value, ast.Constant):
-                accepted.add(value.value)
-            elif isinstance(value, ast.Tuple):
-                accepted.update(item.value for item in value.elts if isinstance(item, ast.Constant))
-    assert accepted == set(FROZEN_ACTIONS)
+    assert set(handlers) == set(FROZEN_ACTIONS)
