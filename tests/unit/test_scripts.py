@@ -442,6 +442,32 @@ def test_a_clean_tree_gets_no_extra_commit(tmp_path: Path) -> None:
     assert not (output / "leftover-committed.txt").exists()
 
 
+def test_changed_files_ignore_commits_main_gained_after_the_fork(tmp_path: Path) -> None:
+    repo, output, report = tmp_path / "repo", tmp_path / "output", tmp_path / "report"
+    for path in (repo, output, report):
+        path.mkdir()
+    identity = ["-c", "user.name=test", "-c", "user.email=test@example.invalid"]
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+    (repo / "base.txt").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "base.txt"], cwd=repo, check=True)
+    subprocess.run(["git", *identity, "commit", "-q", "-m", "base"], cwd=repo, check=True)
+    subprocess.run(["git", "checkout", "-q", "-b", "crucible/test"], cwd=repo, check=True)
+    (repo / "a.txt").write_text("branch work\n", encoding="utf-8")
+    subprocess.run(["git", "add", "a.txt"], cwd=repo, check=True)
+    subprocess.run(["git", *identity, "commit", "-q", "-m", "branch work"], cwd=repo, check=True)
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=repo, check=True)
+    (repo / "b.txt").write_text("main moved on\n", encoding="utf-8")
+    subprocess.run(["git", "add", "b.txt"], cwd=repo, check=True)
+    subprocess.run(["git", *identity, "commit", "-q", "-m", "main work"], cwd=repo, check=True)
+    subprocess.run(["git", "checkout", "-q", "crucible/test"], cwd=repo, check=True)
+
+    result = _collect(repo, output, report, attempt_id="01ATTEMPT")
+
+    assert result.returncode == 0, result.stderr
+    assert set((output / "changed.txt").read_text().split()) == {"a.txt"}
+    assert set((output / "commit-paths.txt").read_text().split()) == {"a.txt"}
+
+
 def test_a_redirected_git_dir_skips_the_leftover_commit_without_a_refusal(
     tmp_path: Path,
 ) -> None:

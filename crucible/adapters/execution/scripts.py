@@ -628,7 +628,10 @@ printf '%s\\n' "$BASE" > "$OUT/base.txt"
 if [ -n "$BASE" ]; then
   {GIT} -C "$REPO" diff --stat "$BASE"..HEAD > "$OUT/diffstat.txt" || true
   {GIT} -C "$REPO" diff --no-color --no-ext-diff "$BASE"..HEAD > "$OUT/diff.patch" || true
-  {GIT} -C "$REPO" diff --name-only "$BASE"..HEAD > "$OUT/changed.txt" || true
+  # The diff uses the merge base so commits the base branch gained after the fork do
+  # not become worker changes. The log stays two-dot: it enumerates only commits
+  # reachable from HEAD and not BASE, and unions in every path those commits touched.
+  {GIT} -C "$REPO" diff --name-only "$BASE"...HEAD > "$OUT/changed.txt" || true
   {GIT} -C "$REPO" log --format='%H%x1f%s%x1f%an%x1e' "$BASE"..HEAD > "$OUT/log.txt" || true
   {GIT} -C "$REPO" log --name-only --format='' "$BASE"..HEAD \
     | LC_ALL=C sort -u | sed '/^$/d' > "$OUT/commit-paths.txt" || true
