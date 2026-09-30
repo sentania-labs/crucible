@@ -1326,10 +1326,10 @@ class Supervisor:
             return None
         provider = self._provider(execution.provider)
         key = self.checkout_key(item.contract, task.external_id, item.repository_url)
-        # 10 first, then 05b: an attempt whose checkout another attempt holds waits on
-        # the lease and says so; only a launch that could take the checkout is held back
-        # by the per-harness cap.
-        if review or await self._db(partial(self._checkout_lease_free, attempt.id, key)):
+        # Reviews have a fixed harness. Routed launches check candidate capacity in
+        # _route_pending after taking the checkout lease, so a busy first choice can
+        # fall through to an idle harness.
+        if review:
             busy = await self._db(partial(self._harness_busy, execution))
             if busy is not None:
                 await self._db(partial(self._defer_launch, attempt.id, busy))
@@ -1893,6 +1893,12 @@ class Supervisor:
             routing = load_routing(uow, execution.policy_snapshot or {})
             assert routing is not None
             candidates = copy.deepcopy(list(selection.candidates))
+            default_image = next(
+                candidate["image"]
+                for candidate in candidates
+                if candidate["model"] == selection.selected.id
+            )
+            image_override = selection.image if selection.image != default_image else None
             skipped_busy: list[dict[str, str]] = []
             chosen = None
             chosen_image = None
@@ -1903,11 +1909,11 @@ class Supervisor:
                 assert model is not None
                 execution.model = model.id
                 execution.harness = model.harness
-                execution.image = str(candidate["image"])
+                execution.image = image_override or str(candidate["image"])
                 busy = self._harness_busy_in_uow(uow, execution)
                 if busy is None:
                     chosen = model
-                    chosen_image = str(candidate["image"])
+                    chosen_image = execution.image
                     break
                 candidate["busy"] = busy
                 skipped_busy.append({"model": model.id, "harness": model.harness, "reason": busy})
