@@ -677,3 +677,49 @@ def test_commit_policy_ignores_a_worker_asserted_bundle() -> None:
     outcome = evaluate_gate(GateName.COMMIT_POLICY, _gi(evidence))
     assert outcome.result is GateResult.FAIL
     assert "no verified bundle_head" in outcome.detail
+
+
+def test_a_false_claim_is_named_in_verification_ran() -> None:
+    """hades #183 point 2: claim V1 exit 0, re-run 127 -> gate is blocking and the
+    message names V1, 0 and 127."""
+    evidence = []
+    for e in _passing_evidence():
+        if e.kind == "verification_run" and e.payload.get("id") == "V1":
+            continue
+        if e.kind == "artifact_present" and e.payload.get("role") == "completion_claim":
+            evidence.append(
+                _ev(
+                    "artifact_present",
+                    {
+                        **e.payload,
+                        "claimed_checks": [{"id": "V1", "exit": 0}],
+                    },
+                    ident=e.id,
+                )
+            )
+        else:
+            evidence.append(e)
+    evidence.append(_ev("verification_run", {"id": "V1", "exit_code": 127, "ran": True}, ident=30))
+    outcome = evaluate_gate(GateName.VERIFICATION_RAN, _gi(evidence))
+    assert outcome.result is GateResult.FAIL
+    assert outcome.always_blocks is True
+    assert "V1" in outcome.detail
+    assert "exit 0" in outcome.detail
+    assert "127" in outcome.detail
+
+
+def test_matching_exits_are_not_a_false_claim() -> None:
+    """hades #183 point 2: when the claim matches the rerun exit, there is no false
+    claim and the gate passes."""
+    evidence = [e for e in _passing_evidence() if e.kind != "verification_run"]
+    # Add all verification runs with exit 0
+    for run_id, command in [("V1", "make lint"), ("V2", "make test"), ("V3", "make scan")]:
+        evidence.append(
+            _ev(
+                "verification_run",
+                {"id": run_id, "command": command, "exit_code": 0, "ran": True},
+                ident=id(run_id),
+            )
+        )
+    outcome = evaluate_gate(GateName.VERIFICATION_RAN, _gi(evidence))
+    assert outcome.result is GateResult.PASS
