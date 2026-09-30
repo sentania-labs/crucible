@@ -3321,7 +3321,9 @@ class KubernetesProvider:
         self, spec: LaunchSpec, *, credential_mounted: bool | None = None
     ) -> LaunchContext:
         if credential_mounted is None:
-            adapter = self.harnesses.get(spec.harness)
+            adapter = self.harnesses.get(
+                "hermes" if spec.harness == "codex" and spec.endpoint == "local" else spec.harness
+            )
             credential = adapter.credential_spec() if adapter is not None else None
             credential_mounted = bool(spec.env_from_files) or (
                 self._credential_copy(spec) is not None
@@ -3571,16 +3573,20 @@ class KubernetesProvider:
     # ----- credentials (12) ---------------------------------------------
 
     def _credential_copy(self, spec: LaunchSpec) -> _CredentialCopy | None:
-        adapter = self.harnesses.get(spec.harness)
+        adapter = self.harnesses.get(
+            "hermes" if spec.harness == "codex" and spec.endpoint == "local" else spec.harness
+        )
         credential = adapter.credential_spec() if adapter is not None else None
         if credential is None:
             return None
         # An optional credential whose Secret is absent is not seeded (see
         # `_seed_credential`), which keeps the adapter's unauthenticated fallback.
-        secret_name = self.config.credential_secret_name(spec.harness)
+        secret_name = self.config.credential_secret_name(credential.harness)
         mode = credential.minimum_mode
-        if self.config.credential_modes.get(spec.harness) is MountMode.RW_NARROW:
+        if self.config.credential_modes.get(credential.harness) is MountMode.RW_NARROW:
             mode = MountMode.RW_NARROW
+        if spec.harness == "codex" and spec.endpoint == "local":
+            mode = MountMode.RO
         return _CredentialCopy(spec=credential, source_secret=secret_name, mode=mode)
 
     async def _credential_keys(self, attempt_id: str) -> list[str]:
@@ -4656,7 +4662,9 @@ def _render_identity(
     is removed before this returns; nothing of it is ever mounted."""
     scratch = Path(tempfile.mkdtemp(prefix="crucible-identity-"))
     try:
-        adapter = harnesses.get(spec.harness)
+        adapter = harnesses.get(
+            "hermes" if spec.harness == "codex" and spec.endpoint == "local" else spec.harness
+        )
         credential = adapter.credential_spec() if adapter is not None else None
         if credential is not None and credential.templates:
             template_dir = scratch / k8sspec.TEMPLATE_PREFIX
@@ -5083,9 +5091,8 @@ echo "crucible-canary.done=1"
 #   token file under the login directory, mode 0600, and replaced in the line by the
 #   note the Docker login shows;
 # - a partial line is held until its newline, except a prompt waiting for input (the
-#   same pattern as `PASTE_RE`), or, when no token pattern is set, a partial line the
-#   CLI has left unfinished for three seconds: either is shown so the operator knows to
-#   paste. A partial line that already matches the token pattern is never shown early;
+#   same pattern as `PASTE_RE`), or a partial line the CLI has left unfinished for
+#   three seconds. Complete tokens are captured and masked; partial tokens wait;
 # - the code the operator pastes arrives over exec stdin into a FIFO that is the CLI's
 #   input, ended with a carriage return, the Enter key, and is masked wherever the
 #   terminal echoes it.
@@ -5107,7 +5114,7 @@ mkdir -p "$dir" "$ctl"
 for owned in "$dir" "$ctl"; do
   if [ -O "$owned" ]; then chmod 0700 "$owned"; fi
 done
-rm -f "$ctl/in" "$ctl/pasted"
+rm -f "$ctl/in" "$ctl/pasted" "$ctl/captured-stop"
 mkfifo "$ctl/in"
 exec 3<>"$ctl/in"
 shopt -s extglob
@@ -5151,7 +5158,7 @@ show() {
   printf '%s\n' "$line"
 }
 filter() {
-  local buf='' chunk status lower idle=0
+  local buf='' chunk status lower idle=0 captured_idle=0 stopped=0 complete
   while :; do
     chunk=''
     IFS= read -r -t 1 chunk
@@ -5160,6 +5167,7 @@ filter() {
       show "$buf$chunk"
       buf=''
       idle=0
+      captured_idle=0
       continue
     fi
     [ -n "$chunk" ] && idle=0
@@ -5168,14 +5176,28 @@ filter() {
       [ -n "$buf" ] && show "$buf"
       return 0
     fi
+    # setup-token can stay open after drawing the credential. Give it five more
+    # quiet seconds, then let script terminate and reap its CLI on SIGTERM.
+    if [ -z "$chunk" ] && [ -n "$token_file" ] && [ -s "$dir/$token_file" ]; then
+      captured_idle=$((captured_idle + 1))
+      if [ "$captured_idle" -ge 5 ] && [ "$stopped" -eq 0 ]; then
+        : > "$ctl/captured-stop"
+        kill -TERM "$(cat "$ctl/script.pid")" 2>/dev/null || :
+        stopped=1
+      fi
+    else
+      captured_idle=0
+    fi
     [ -n "$buf" ] || continue
     idle=$((idle + 1))
+    complete=0
     if [ -n "$token_re" ] && [[ $buf =~ $token_re ]]; then
-      continue
+      [ "$idle" -ge 3 ] || continue
+      complete=1
     fi
     render "$buf"
     lower=${rendered,,}
-    if [[ $lower =~ $prompt_re ]]; then
+    if [ "$complete" -eq 0 ] && [[ $lower =~ $prompt_re ]]; then
       show "$buf"
       buf=''
       idle=0
@@ -5186,7 +5208,8 @@ filter() {
     # draws with cursor moves and carriage returns and ends with no newline, so the
     # rendered last segment is empty (hades #173). Every visible segment is shown. Only
     # a buffer that may hold part of a token is held back.
-    if [ "$idle" -ge 3 ] && { [ -z "$token_start" ] || [[ $buf != *"$token_start"* ]]; }; then
+    if [ "$idle" -ge 3 ] && { [ "$complete" -eq 1 ] || [ -z "$token_start" ] ||
+      [[ $buf != *"$token_start"* ]]; }; then
       local segment shown=0 segments=()
       # read splits without glob expansion: the masked code is a row of asterisks.
       IFS=$'\r' read -r -d '' -a segments <<< "$buf"
@@ -5203,8 +5226,13 @@ filter() {
 # A wide terminal, so a CLI never wraps a token or a pasted code across two lines: the
 # filter works line by line, and a wrapped tail would reach the log unmasked.
 cmd="stty cols 4096 rows 50 2>/dev/null; exec $(printf '%q ' "$@")"
-COLUMNS=4096 LINES=50 SHELL=/bin/bash script -qfec "$cmd" /dev/null < "$ctl/in" 2>&1 | filter
+(
+  echo "$BASHPID" > "$ctl/script.pid"
+  export COLUMNS=4096 LINES=50 SHELL=/bin/bash
+  exec script -qfec "$cmd" /dev/null < "$ctl/in" 2>&1
+) | filter
 code=${PIPESTATUS[0]}
+[ -f "$ctl/captured-stop" ] && [ -s "$dir/$token_file" ] && code=0
 exec 3>&-
 echo "crucible-login.exit=$code"
 while :; do sleep 5; done

@@ -183,7 +183,7 @@ def test_the_checker_needs_nothing_but_the_standard_library_for_json(tmp_path: P
             "check",
             str(report),
             "--contract",
-            str(tmp_path / "no-contract.json"),
+            str(tmp_path / "absent-contract.json"),
         ],
         capture_output=True,
         text=True,

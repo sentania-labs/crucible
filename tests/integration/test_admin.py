@@ -3277,7 +3277,7 @@ def test_hermes_run_limits_have_api_cli_and_ui_controls(
         csrf = ui_sign_in(browser, tokens["admin"])
         page = browser.get("/ui/gateway")
         assert page.status_code == 200
-        assert "Hermes run limits" in page.text
+        assert "Local run limits" in page.text
         assert 'action="/ui/actions/hermes-limits"' in page.text
         assert 'name="max_turns"' in page.text and 'name="context_length"' in page.text
         response = browser.post(

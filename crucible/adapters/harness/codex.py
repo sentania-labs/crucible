@@ -32,13 +32,16 @@ activity for the stall clock (issue 152).
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from crucible.adapters.harness import base
+from crucible.adapters.harness.hermes import HermesAdapter
 from crucible.domain.exit_class import ExitClass
+from crucible.domain.harness_settings import DEFAULT_HERMES_CONTEXT_LENGTH, hermes_run_limits
 from crucible.ports.harness import (
     CODEX_BINARY,
     AdapterLaunch,
@@ -169,9 +172,32 @@ class CodexAdapter:
             ctx.repo_mount,
         ]
         spec = self.credential_spec()
+        env = spec.env() if ctx.credential_mounted else {}
+        env_from_files: dict[str, str] = {}
+        if ctx.endpoint == "local" and ctx.endpoint_url:
+            gateway_credential = HermesAdapter().credential_spec()
+            assert gateway_credential is not None
+            limits = hermes_run_limits(ctx.harness_settings)
+            context_window = limits.context_length or DEFAULT_HERMES_CONTEXT_LENGTH
+            env = {
+                "CODEX_HOME": CONFIG_DIR,
+                "OPENAI_API_KEY": "local-no-auth",
+                "CRUCIBLE_CODEX_CONFIG": (
+                    'model_provider = "local_gateway"\n'
+                    f"model_context_window = {context_window}\n"
+                    "[model_providers.local_gateway]\n"
+                    'name = "Local gateway"\n'
+                    f"base_url = {_toml_string(ctx.endpoint_url)}\n"
+                    'env_key = "OPENAI_API_KEY"\n'
+                    'wire_api = "responses"\n'
+                ),
+            }
+            if ctx.credential_mounted:
+                env_from_files = gateway_credential.env_from_files()
         return AdapterLaunch(
             argv=tuple(argv),
-            env=spec.env() if ctx.credential_mounted else {},
+            env=env,
+            env_from_files=env_from_files,
             stdin_files=(f"{ctx.identity_mount}/IDENTITY.md",),
             stdin_text=base.POINTER_PROMPT,
             transcript_path=f"{ctx.report_mount}/{base.TRANSCRIPT_NAME}",
@@ -228,7 +254,7 @@ class CommandTracker(base.LineTracker):
 
 
 def _toml_string(value: str) -> str:
-    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return json.dumps(value, ensure_ascii=False)
 
 
 def _metrics(transcript: Path) -> tuple[ReportMetrics, int]:

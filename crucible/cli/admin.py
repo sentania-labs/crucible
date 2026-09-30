@@ -295,6 +295,7 @@ def build_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     pick = gw_sub.add_parser(
         "pick", help="enable or disable gateway models; writes a new routing policy version"
     )
+    pick.add_argument("--harness", choices=("hermes", "codex"), default="hermes")
     pick.add_argument("--enable", action="append", default=[], metavar="MODEL")
     pick.add_argument("--disable", action="append", default=[], metavar="MODEL")
     pick.add_argument(
@@ -589,7 +590,11 @@ def _picks(args: argparse.Namespace) -> list[dict[str, Any]]:
     return [
         {
             "id": model,
-            "enabled": model in args.enable and model not in args.disable,
+            **(
+                {"codex_enabled": model in args.enable and model not in args.disable}
+                if args.harness == "codex"
+                else {"enabled": model in args.enable and model not in args.disable}
+            ),
             "enable_thinking": model in args.thinking,
             "capability": capabilities.get(model),
         }
