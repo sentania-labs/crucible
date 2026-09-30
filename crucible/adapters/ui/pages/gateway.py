@@ -34,7 +34,8 @@ async def gateway_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
     assert ctx.admin is not None
     secrets = await credentials.read_secrets(ctx.admin, [credentials.HERMES])
     view = gateway.gateway_view(ctx.admin, uow, secrets.get(credentials.HERMES))
-    offered = await gateway.models_view(ctx.admin, uow)
+    _models_requested = request.query_params.get("models") == "1"
+    offered = await gateway.models_view(ctx.admin, uow, fetch=_models_requested)
     passed = view["last_outcome"] == "probe:completed"
     # crucible#115: one row in plain words; the credential's state is on Credentials.
     sections: list[dict[str, Any]] = [
@@ -64,7 +65,13 @@ async def gateway_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
             "policy version. A model the gateway no longer offers is disabled, not removed."
         ),
     }
-    if principal.role is not Role.ADMIN:
+    if not _models_requested:
+        listing["button"] = {
+            "href": "/ui/gateway?models=1",
+            "label": "List the gateway's models",
+        }
+        sections.append(listing)
+    elif principal.role is not Role.ADMIN:
         listing.update(
             columns=["Model", "Offered", "Hermes", "Codex", "Thinking", "Capability", "Note"],
             rows=[
@@ -123,7 +130,7 @@ async def gateway_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                 "label": "Test the gateway again",
                 "fields": [{"name": "reason", "label": "Reason"}],
             }
-        if offered["models"]:
+        if _models_requested and offered["models"]:
             rows = []
             for index, row in enumerate(offered["models"]):
                 rows.append(

@@ -1134,3 +1134,61 @@ def test_status_page_shows_version_as_first_row() -> None:
 
     assert "Version" in rendered
     assert crucible.__version__ in rendered
+
+
+def test_gateway_page_lists_models_only_when_asked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """models_view(fetch=False) skips the gateway network call and reports a not-asked note;
+    models_view(fetch=True) contacts the gateway once to list models."""
+    from crucible.application.admin import credentials, gateway  # noqa: PLC0415
+
+    # Patch the gateway URL
+    monkeypatch.setattr(
+        gateway, "gateway_url", lambda _uow: ("http://localhost:8000/v1", "setting")
+    )
+    # Patch local entries
+    monkeypatch.setattr(
+        gateway,
+        "_local_entries",
+        lambda _uow: (
+            [
+                {
+                    "id": "local-model",
+                    "endpoint": "local",
+                    "model_name": "local-model",
+                    "enabled": True,
+                },
+            ],
+            {"max_concurrency": 4},
+        ),
+    )
+    # Patch the API key so read_api_key doesn't fail when fetch=True
+    monkeypatch.setattr(credentials, "read_api_key", lambda *_args, **_kwargs: "fake-bearer")
+
+    # Count calls to fetch_models
+    call_count = {"n": 0}
+
+    def counting_fetch_models(endpoint: str, bearer: str, **kwargs: object) -> list[str]:
+        call_count["n"] += 1
+        return ["gpt-4o", "claude-sonnet"]
+
+    monkeypatch.setattr(gateway, "fetch_models", counting_fetch_models)
+
+    ctx_admin = SimpleNamespace(name="admin", role=SimpleNamespace(value="admin"))
+
+    # fetch=False: should NOT call fetch_models
+    call_count["n"] = 0
+    result = asyncio.run(gateway.models_view(ctx_admin, None, fetch=False))  # type: ignore[arg-type]
+    assert call_count["n"] == 0, "fetch_models must not be called when fetch=False"
+    assert result["error"] == "The gateway's models were not asked for; use the link to list them."
+    assert result["reachable"] is False
+    assert result["offered_count"] is None
+
+    # fetch=True: should call fetch_models exactly once
+    call_count["n"] = 0
+    result = asyncio.run(gateway.models_view(ctx_admin, None, fetch=True))  # type: ignore[arg-type]
+    assert call_count["n"] == 1, "fetch_models must be called once when fetch=True"
+    assert result["error"] is None
+    assert result["reachable"] is True
+    assert result["offered_count"] == 2
