@@ -27,6 +27,7 @@ class EvidenceKind(StrEnum):
     WORKSPACE_STATE = "workspace_state"
     ARTIFACT_PRESENT = "artifact_present"
     TRANSCRIPT_MATCH = "transcript_match"
+    FALSE_CLAIM = "false_claim"
 
 
 class EvidenceSource(StrEnum):
