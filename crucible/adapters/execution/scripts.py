@@ -626,12 +626,20 @@ printf '%s\\n' "$BASE" > "$OUT/base.txt"
 {GIT} -C "$REPO" rev-parse HEAD > "$OUT/head.txt"
 {GIT} -C "$REPO" rev-parse --abbrev-ref HEAD > "$OUT/branch.txt"
 if [ -n "$BASE" ]; then
-  {GIT} -C "$REPO" diff --stat "$BASE"..HEAD > "$OUT/diffstat.txt" || true
-  {GIT} -C "$REPO" diff --no-color --no-ext-diff "$BASE"..HEAD > "$OUT/diff.patch" || true
-  # The diff uses the merge base so commits the base branch gained after the fork do
-  # not become worker changes. The log stays two-dot: it enumerates only commits
+  if ! MB=$({GIT} -C "$REPO" merge-base "$BASE" HEAD); then
+    printf '%s\\n' "collection failed: cannot resolve merge base between $BASE and HEAD" \
+      > "$OUT/collection-failed.txt"
+    cat "$OUT/collection-failed.txt" >&2
+    exit 1
+  fi
+  # Resolving MB explicitly gives diff --name-only "$BASE"...HEAD semantics for
+  # all three diffs, and fails collection if the histories are unrelated. Commits
+  # the base branch gained after the fork do not become worker changes.
+  # The log stays two-dot: it enumerates only commits
   # reachable from HEAD and not BASE, and unions in every path those commits touched.
-  {GIT} -C "$REPO" diff --name-only "$BASE"...HEAD > "$OUT/changed.txt" || true
+  {GIT} -C "$REPO" diff --stat "$MB" HEAD > "$OUT/diffstat.txt" || true
+  {GIT} -C "$REPO" diff --no-color --no-ext-diff "$MB" HEAD > "$OUT/diff.patch" || true
+  {GIT} -C "$REPO" diff --name-only "$MB" HEAD > "$OUT/changed.txt" || true
   {GIT} -C "$REPO" log --format='%H%x1f%s%x1f%an%x1e' "$BASE"..HEAD > "$OUT/log.txt" || true
   {GIT} -C "$REPO" log --name-only --format='' "$BASE"..HEAD \
     | LC_ALL=C sort -u | sed '/^$/d' > "$OUT/commit-paths.txt" || true

@@ -466,6 +466,44 @@ def test_changed_files_ignore_commits_main_gained_after_the_fork(tmp_path: Path)
     assert result.returncode == 0, result.stderr
     assert set((output / "changed.txt").read_text().split()) == {"a.txt"}
     assert set((output / "commit-paths.txt").read_text().split()) == {"a.txt"}
+    for filename in ("diff.patch", "diffstat.txt"):
+        diff = (output / filename).read_text()
+        assert "a.txt" in diff
+        assert "b.txt" not in diff
+
+
+def test_collector_fails_when_branch_has_no_merge_base(tmp_path: Path) -> None:
+    repo, output, report = _work_repo(tmp_path)
+    subprocess.run(["git", "checkout", "--orphan", "unrelated"], cwd=repo, check=True)
+    subprocess.run(["git", "rm", "-rf", "."], cwd=repo, check=True)
+    (repo / "prohibited.txt").write_text("committed prohibited path\n", encoding="utf-8")
+    subprocess.run(["git", "add", "prohibited.txt"], cwd=repo, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "unrelated root",
+        ],
+        cwd=repo,
+        check=True,
+    )
+    subprocess.run(["git", "branch", "-M", "crucible/test"], cwd=repo, check=True)
+
+    result = _collect(repo, output, report, attempt_id="01ATTEMPT")
+
+    assert result.returncode != 0
+    failure = (output / "collection-failed.txt").read_text()
+    assert "cannot resolve merge base" in failure
+    assert failure in result.stderr
+    assert not (output / "collector.ok").exists()
+    for filename in ("changed.txt", "diff.patch", "diffstat.txt"):
+        assert not (output / filename).exists()
 
 
 def test_a_redirected_git_dir_skips_the_leftover_commit_without_a_refusal(
