@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import copy
+
 import pytest
 from fastapi.testclient import TestClient
 
 from crucible.adapters.execution.fake import FakeProvider
 from crucible.application.supervisor import Supervisor
+from crucible.domain.exit_class import ExitClass
+from crucible.domain.lifecycle import AttemptState
 from tests.fixtures import FakeClock
 from tests.integration.conftest import event_kinds, run_to_settled, run_until, submit_and_start
 
@@ -16,6 +20,43 @@ pytestmark = pytest.mark.integration
 def _attempts(client: TestClient, task_id: str) -> list[dict[str, object]]:
     view = client.get(f"/v1/tasks/{task_id}").json()
     return [a for e in view["executions"] for a in e["attempts"]]
+
+
+async def _finish_at_cap(
+    client: TestClient,
+    supervisor: Supervisor,
+    task_id: str,
+    *,
+    local: bool,
+    exit_class: ExitClass,
+    turn_cap_reached: bool = False,
+) -> tuple[str, str]:
+    assert await run_until(supervisor, client, task_id, {"running"}) == "running"
+    view = client.get(f"/v1/tasks/{task_id}").json()
+    execution_id = view["executions"][0]["id"]
+    attempt_id = view["latest_attempt"]["id"]
+    with supervisor._fenced() as uow:
+        execution = uow.executions.get(execution_id, for_update=True)
+        attempt = uow.attempts.get(attempt_id, for_update=True)
+        assert execution is not None and attempt is not None and attempt.selected_model is not None
+        ref = execution.policy_snapshot["routing"]["policy"]
+        routing = uow.routing_policies.get(str(ref["name"]), int(ref["version"]))
+        assert routing is not None
+        document = copy.deepcopy(routing.document)
+        entry = next(item for item in document["models"] if item["id"] == attempt.selected_model)
+        entry["endpoint"] = "local" if local else "subscription"
+        if local:
+            entry["endpoint_url"] = "http://gateway.lab.test:4000/v1"
+        else:
+            entry.pop("endpoint_url", None)
+        routing.document = document
+        uow.routing_policies.put(routing)
+        attempt.state = AttemptState.COLLECTED
+        attempt.exit_class = exit_class
+        uow.attempts.save(attempt)
+        supervisor._classify_and_finish(uow, attempt, None, turn_cap_reached=turn_cap_reached)
+        uow.commit()
+    return execution_id, attempt_id
 
 
 async def test_crash_no_retry(client: TestClient, supervisor: Supervisor) -> None:
@@ -133,6 +174,85 @@ async def test_timeout_drains_then_kills(
         < kinds.index("attempt_exited")
     )
     assert "task_retry_scheduled" not in kinds
+
+
+async def test_a_local_turn_cap_blocks_instead_of_retrying(
+    client: TestClient, supervisor: Supervisor
+) -> None:
+    task_id = submit_and_start(
+        client,
+        "crucible-worker:fake-hang",
+        lifecycle={"max_attempts": 3, "retry_on": ["timeout"], "cleanup": "policy"},
+    )
+    _, attempt_id = await _finish_at_cap(
+        client,
+        supervisor,
+        task_id,
+        local=True,
+        exit_class=ExitClass.COMPLETED_WITHOUT_REPORT,
+        turn_cap_reached=True,
+    )
+    view = client.get(f"/v1/tasks/{task_id}").json()
+    assert view["state"] == "blocked"
+    assert [attempt["id"] for attempt in _attempts(client, task_id)] == [attempt_id]
+    assert view["open_escalations"][0]["question"] == "too_big_for_local:turns"
+
+
+async def test_a_local_time_cap_blocks_instead_of_retrying(
+    client: TestClient, supervisor: Supervisor
+) -> None:
+    task_id = submit_and_start(
+        client,
+        "crucible-worker:fake-hang",
+        lifecycle={"max_attempts": 3, "retry_on": ["timeout"], "cleanup": "policy"},
+    )
+    _, attempt_id = await _finish_at_cap(
+        client,
+        supervisor,
+        task_id,
+        local=True,
+        exit_class=ExitClass.TIMEOUT,
+    )
+    view = client.get(f"/v1/tasks/{task_id}").json()
+    assert view["state"] == "blocked"
+    assert [attempt["id"] for attempt in _attempts(client, task_id)] == [attempt_id]
+    assert view["open_escalations"][0]["question"] == "too_big_for_local:time"
+
+
+async def test_a_frontier_time_cap_still_retries(
+    client: TestClient, supervisor: Supervisor
+) -> None:
+    task_id = submit_and_start(
+        client,
+        "crucible-worker:fake-hang",
+        lifecycle={"max_attempts": 3, "retry_on": ["timeout"], "cleanup": "policy"},
+    )
+    _, attempt_id = await _finish_at_cap(
+        client,
+        supervisor,
+        task_id,
+        local=False,
+        exit_class=ExitClass.TIMEOUT,
+    )
+    view = client.get(f"/v1/tasks/{task_id}").json()
+    assert view["state"] == "scheduled"
+    assert [attempt["number"] for attempt in _attempts(client, task_id)] == [1, 2]
+    assert view["latest_attempt"]["id"] != attempt_id
+
+
+async def test_the_too_big_wake_names_the_cap(client: TestClient, supervisor: Supervisor) -> None:
+    task_id = submit_and_start(client, "crucible-worker:fake-hang")
+    _, attempt_id = await _finish_at_cap(
+        client,
+        supervisor,
+        task_id,
+        local=True,
+        exit_class=ExitClass.COMPLETED_WITHOUT_REPORT,
+        turn_cap_reached=True,
+    )
+    wakes = client.get("/v1/wakes").json()["items"]
+    wake = next(item for item in wakes if item["attempt_id"] == attempt_id)
+    assert wake["summary"] == "split the task: the local attempt hit its turn cap"
 
 
 async def test_report_with_secret_is_redacted(
