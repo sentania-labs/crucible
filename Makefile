@@ -136,7 +136,7 @@ check-image-manifest: ## fail when a declared worker-image tag is stale
 	images/check-manifest.sh
 
 check-green-gate: ## fail when a CI job is missing from the `green` gate's needs
-	python3 tools/ci/check-green-gate.py
+	$(UV) run python3 tools/ci/check-green-gate.py
 
 # The worker images (13, C11). One worker image carries Claude Code, Codex, AGY and
 # Hermes; the script-harness image is the e2e tier's. Both targets build both from a
