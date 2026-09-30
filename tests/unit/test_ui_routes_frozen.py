@@ -77,7 +77,7 @@ def test_ui_routes_frozen() -> None:
             (method, route.path)
             for route in router.routes
             if isinstance(route, APIRoute)
-            for method in route.methods
+            for method in route.methods or set()
         )
         == FROZEN_ROUTES
     )
