@@ -136,24 +136,34 @@ def publish_routing(
         document=routing_document,
         reason=reason,
     )
-    policy_document = copy.deepcopy(policy.document)
-    policy_versions = uow.policies.list_versions(policy.name)
-    next_policy_version = max(item.version for item in policy_versions) + 1
-    policy_document["version"] = next_policy_version
-    policy_document["description"] = (
-        f"{policy.document.get('description', 'Software delivery policy')} "
-        f"{note} in version {next_policy_version}."
-    )
-    policy_document["routing"] = {"policy": {"name": routing.name, "version": next_routing_version}}
-    put_policy(
-        uow,
-        ctx.clock,
-        principal=principal,
-        name=policy.name,
-        version=next_policy_version,
-        document=policy_document,
-        reason=reason,
-    )
+    ref = (policy.document.get("routing") or {}).get("policy") or {}
+    pinned = ref.get("pinned") is True
+    next_policy_version = policy.version
+    if ref.get("name") == routing.name and not pinned:
+        policy_document = copy.deepcopy(policy.document)
+        policy_versions = uow.policies.list_versions(policy.name)
+        next_policy_version = max(item.version for item in policy_versions) + 1
+        policy_document["version"] = next_policy_version
+        policy_document["description"] = (
+            f"{policy.document.get('description', 'Software delivery policy')} "
+            f"{note} in version {next_policy_version}."
+        )
+        policy_document["routing"] = {
+            "policy": {
+                "name": routing.name,
+                "version": next_routing_version,
+                "pinned": False,
+            }
+        }
+        put_policy(
+            uow,
+            ctx.clock,
+            principal=principal,
+            name=policy.name,
+            version=next_policy_version,
+            document=policy_document,
+            reason=reason,
+        )
     if ctx.proxy_config_path:
         rendered = worker_proxy_config(ctx.proxy_subnet, list(ctx.proxy_hosts), [routing_document])
         install_worker_proxy_config(

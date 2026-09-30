@@ -145,8 +145,14 @@ class NamedVersion(StrictModel):
     version: int = Field(ge=1)
 
 
+class RoutingPolicyRef(NamedVersion):
+    # A delivery policy normally follows new versions of the named routing policy.
+    # Set this only when an operator deliberately wants this exact version retained.
+    pinned: bool = False
+
+
 class RoutingRef(StrictModel):
-    policy: NamedVersion
+    policy: RoutingPolicyRef
 
 
 class Images(StrictModel):

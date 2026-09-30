@@ -21,6 +21,7 @@ from crucible.adapters.persistence.migrations.versions._0008_harness_adapters im
     VERIFIED_ROUTING,
 )
 from crucible.adapters.ui import render as ui_render
+from crucible.adapters.ui.pages import routing_models as ui_routing_models
 from crucible.adapters.ui.pages import settings as ui_settings
 from crucible.adapters.ui.pages import workers as ui_workers
 from crucible.adapters.ui.pages.settings import _settings_rows
@@ -37,6 +38,7 @@ from crucible.application.admin import credentials as credentials_service
 from crucible.application.admin import github as github_service
 from crucible.application.admin import providers as providers_service
 from crucible.application.admin import routing as routing_service
+from crucible.application.admin import routing_models as routing_models_service
 from crucible.application.admin import status as status_service
 from crucible.application.queries import supervisor_view
 from crucible.domain.entities import (
@@ -1134,3 +1136,45 @@ def test_status_page_shows_version_as_first_row() -> None:
 
     assert "Version" in rendered
     assert crucible.__version__ in rendered
+
+
+def test_routing_model_and_tier_controls_are_ordinary_reasoned_forms(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        routing_models_service,
+        "routing_controls_view",
+        lambda _uow: {
+            "pinned": False,
+            "pools": ["codex", "claude"],
+            "models": [
+                {
+                    "id": "gpt",
+                    "harness": "codex",
+                    "pool": "codex",
+                    "capability": "frontier",
+                    "enabled": True,
+                }
+            ],
+            "tiers": {
+                "complex": {
+                    "plain_words": (
+                        "complex: Codex first, then Claude Code; a busy first choice waits"
+                    ),
+                    "prefer_pools": ["codex", "claude"],
+                    "allowed_capability": ["frontier"],
+                }
+            },
+        },
+    )
+
+    sections = ui_routing_models.control_sections(cast(Any, object()), admin=True)
+
+    assert sections[0]["rows"][0][1].endswith("a busy first choice waits")
+    assert sections[1]["rows"][0][4]["action"] == "/ui/actions/routing-model"
+    tier_form = sections[2]["form"]
+    assert tier_form["action"] == "/ui/actions/routing-tier"
+    assert [
+        field["value"] for field in tier_form["fields"] if field["name"].startswith("pool_")
+    ] == ["codex", "claude"]
+    assert tier_form["fields"][-1]["name"] == "reason"
