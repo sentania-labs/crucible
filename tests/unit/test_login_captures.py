@@ -142,6 +142,7 @@ def run_driver(
     *,
     code: str | None,
     login_dir: str | None = None,
+    token_pattern: str | None = None,
 ) -> tuple[str, LoginSession]:
     """The login Pod's driver with `stand_in` as the CLI, its log read the way the
     service reads it; `code` is pasted through the exec script once the session asks."""
@@ -154,7 +155,7 @@ def run_driver(
         "TERM": "xterm",
     }
     if flow.captures_token:
-        env["CRUCIBLE_LOGIN_TOKEN_PATTERN"] = flow.token_pattern
+        env["CRUCIBLE_LOGIN_TOKEN_PATTERN"] = token_pattern or flow.token_pattern
         env["CRUCIBLE_LOGIN_TOKEN_FILE"] = flow.token_file
     process = subprocess.Popen(
         ["bash", "-c", _LOGIN_DRIVER, "crucible-login", "bash", "-c", stand_in],
@@ -206,6 +207,37 @@ def run_driver(
         process.wait()
     with lock:
         return bytes(output).decode("utf-8", "replace"), session
+
+
+@needs_pty_tools
+def test_the_driver_captures_a_token_drawn_without_a_newline_and_ends_the_login(
+    tmp_path: Path,
+) -> None:
+    token = "faketok-" + "A" * 40
+    stand_in = (
+        "echo 'Visit https://claude.com/cai/oauth/authorize?code=true'; "
+        "printf ' Paste code here if prompted > '; "
+        "IFS= read -r code; "
+        "printf '\\r\\033[1A\\033[2KYour OAuth token (valid for 1 year):"
+        f"\\r\\033[1B\\033[2K{token}"
+        "\\r\\033[1B\\033[2KStore this token securely.\\r'; "
+        "sleep 60"
+    )
+    started = time.monotonic()
+    text, _session = run_driver(
+        tmp_path,
+        "claude_code",
+        stand_in,
+        code="test-code",
+        token_pattern=r"(faketok-[A-Za-z0-9]{20,})",
+    )
+    assert time.monotonic() - started < 20
+    token_path = tmp_path / "login" / "oauth-token"
+    assert token_path.read_text() == token + "\n"
+    assert token_path.stat().st_mode & 0o777 == 0o600
+    assert token not in text
+    assert "[captured to oauth-token]" in text
+    assert "crucible-login.exit=0" in text
 
 
 @needs_pty_tools
