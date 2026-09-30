@@ -19,6 +19,7 @@ from crucible.adapters.ui.pages import dashboard as dashboard_ui
 from crucible.adapters.ui.pages import gateway as gateway_ui
 from crucible.adapters.ui.pages import harnesses as harnesses_ui
 from crucible.adapters.ui.pages import images as images_ui
+from crucible.adapters.ui.pages import repositories as repositories_ui
 from crucible.adapters.ui.pages import routing as routing_ui
 from crucible.adapters.ui.render import (
     _base,
@@ -41,7 +42,6 @@ from crucible.application.admin import (
     bootstrap,
     github,
     github_manifest,
-    repositories,
     status,
     tokens,
 )
@@ -54,8 +54,6 @@ from crucible.application.errors import (
 from crucible.application.queries import pull_request_view, task_view
 from crucible.contracts.api import (
     DecisionRequest,
-    ExternalReviewAttestation,
-    RepositoryRegistration,
 )
 from crucible.domain.entities import Principal, Role
 from crucible.domain.lifecycle import TaskState
@@ -64,115 +62,6 @@ from crucible.domain.waivers import ACCEPT_NO_CI, WAIVABLE_STATES, WAIVE_EXTERNA
 from crucible.ports.repository import UnitOfWork
 
 router = APIRouter(prefix="/ui", include_in_schema=False)
-
-
-@router.get("/repositories", response_class=HTMLResponse)
-def repositories_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
-    found = _require(request, ctx, uow)
-    if isinstance(found, RedirectResponse):
-        return found
-    principal, csrf = found
-    items = list(uow.repositories.list_all())
-    sections: list[dict[str, Any]] = [
-        {
-            "title": "Registered repositories",
-            "columns": [
-                "Name",
-                "URL",
-                "Default branch",
-                "Policy",
-                "Installation",
-                "Private",
-                "External review",
-                "",
-            ],
-            "rows": [
-                [
-                    item.name,
-                    item.url,
-                    item.default_branch,
-                    item.policy_name,
-                    item.installation_id,
-                    item.private,
-                    item.external_review_attested,
-                    # The row's own removal, never a typed name (crucible#127); refused
-                    # while tasks reference it, and it asks for a reason (crucible#117).
-                    {
-                        "kind": "form",
-                        "action": "/ui/actions/repository-remove",
-                        "label": "Remove",
-                        "danger": True,
-                        "reason": True,
-                        "hidden": {"name": item.name},
-                    }
-                    if principal.role is Role.ADMIN
-                    else "",
-                ]
-                for item in items
-            ],
-        }
-    ]
-    if principal.role is Role.ADMIN:
-        sections.extend(
-            [
-                {
-                    "title": "Register or update",
-                    "note": (
-                        "For a repository the GitHub page's picker cannot show. The picker "
-                        "fills the installation ID, the default branch and whether it is "
-                        "private from GitHub. A private repository is cloned with a "
-                        "read-only token from the GitHub App, so it needs the App connected "
-                        "and the installation ID that covers it."
-                    ),
-                    "form": {
-                        "action": "/ui/actions/repository-register",
-                        "label": "Save registration",
-                        "fields": [
-                            {"name": "name", "label": "Name", "required": True},
-                            {"name": "url", "label": "Clone URL", "required": True},
-                            {
-                                "name": "default_branch",
-                                "label": "Default branch",
-                                "value": "main",
-                                "required": True,
-                            },
-                            {
-                                "name": "policy_name",
-                                "label": "Policy",
-                                "value": "default-software",
-                                "required": True,
-                            },
-                            {
-                                "name": "installation_id",
-                                "label": "GitHub installation ID",
-                                "kind": "number",
-                            },
-                            {
-                                "name": "private",
-                                "label": "Private (clone with the GitHub App's read-only token)",
-                                "kind": "checkbox",
-                            },
-                            {
-                                "name": "attested_all_prs",
-                                "label": "External reviewer covers all PRs",
-                                "kind": "checkbox",
-                            },
-                            {"name": "attested_by", "label": "Attested by"},
-                            {"name": "reason", "label": "Reason", "required": True},
-                        ],
-                    },
-                },
-            ]
-        )
-    return _page(
-        request,
-        principal,
-        csrf,
-        active="/ui/repositories",
-        heading="Repositories",
-        intro="Delivery registrations and GitHub installation binding.",
-        sections=sections,
-    )
 
 
 @router.get("/tokens", response_class=HTMLResponse)
@@ -1477,31 +1366,6 @@ async def _actions(
             f"Registered {added['repository']} ({added['url']}, default branch "
             f"{added['default_branch']}, installation {added['installation_id']}).",
         )
-    elif action == "repository-register":
-        repositories.register(
-            ctx.admin,
-            uow,
-            principal=principal.name,
-            name=form.get("name", ""),
-            registration=RepositoryRegistration(
-                url=form.get("url", ""),
-                default_branch=form.get("default_branch", "main"),
-                policy_name=form.get("policy_name", "default-software"),
-                installation_id=int(form["installation_id"])
-                if form.get("installation_id")
-                else None,
-                external_review=ExternalReviewAttestation(
-                    attested_all_prs=form.get("attested_all_prs") == "true",
-                    attested_by=form.get("attested_by") or None,
-                ),
-                private=form.get("private") == "true",
-            ),
-            reason=reason,
-        )
-    elif action == "repository-remove":
-        repositories.remove(
-            ctx.admin, uow, principal=principal.name, name=form.get("name", ""), reason=reason
-        )
     elif action == "token-create":
         minted = tokens.create(
             ctx.admin,
@@ -1566,8 +1430,6 @@ async def _actions(
 register("github-create-app", _actions)
 register("github-external-url", _actions)
 register("github-add-repository", _actions)
-register("repository-register", _actions)
-register("repository-remove", _actions)
 register("token-create", _actions)
 register("token-revoke", _actions)
 register("github-check", _actions)
@@ -1583,3 +1445,4 @@ router.routes.extend(credentials_ui.router.routes)
 router.routes.extend(gateway_ui.router.routes)
 router.routes.extend(images_ui.router.routes)
 router.routes.extend(routing_ui.router.routes)
+router.routes.extend(repositories_ui.router.routes)
