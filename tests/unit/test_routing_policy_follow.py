@@ -7,6 +7,7 @@ from typing import Any, cast
 
 import pytest
 
+from crucible.adapters.execution.docker import DockerConfig
 from crucible.application.admin import routing
 from crucible.application.admin.context import AdminContext
 from crucible.domain.entities import Principal, Role
@@ -19,24 +20,65 @@ class _Versions:
     def list_versions(self, name: str) -> list[Any]:
         return [row for row in self.rows if row.name == name]
 
+    def get(self, name: str, version: int) -> Any | None:
+        return next((row for row in self.rows if row.name == name and row.version == version), None)
 
-@pytest.mark.parametrize("pinned, expected", [(False, 4), (True, None)])
-def test_delivery_policy_follows_routing_unless_deliberately_pinned(
-    monkeypatch: pytest.MonkeyPatch, pinned: bool, expected: int | None
-) -> None:
-    policy = SimpleNamespace(
-        name="delivery",
+
+class _Repositories:
+    def __init__(self, policy_names: list[str]) -> None:
+        self.rows = [SimpleNamespace(policy_name=name) for name in policy_names]
+
+    def list_all(self) -> list[Any]:
+        return self.rows
+
+
+def _policy(name: str, *, pinned: bool) -> Any:
+    return SimpleNamespace(
+        name=name,
         version=3,
+        retired_at=None,
         document={
             "version": 3,
             "description": "Delivery policy",
-            "routing": {
-                "policy": {"name": "route", "version": 7, "pinned": pinned},
-            },
+            "routing": {"policy": {"name": "route", "version": 7, "pinned": pinned}},
         },
     )
-    route = SimpleNamespace(name="route", version=7, document={"version": 7})
-    uow = SimpleNamespace(policies=_Versions([policy]), routing_policies=_Versions([route]))
+
+
+def _context(*, docker: Any | None = None) -> AdminContext:
+    return cast(
+        AdminContext,
+        SimpleNamespace(
+            clock=SimpleNamespace(now=lambda: datetime(2026, 9, 30, tzinfo=UTC)),
+            proxy_config_path=None,
+            proxy_subnet="",
+            proxy_hosts=(),
+            providers={"docker": docker} if docker is not None else {},
+        ),
+    )
+
+
+def _principal() -> Principal:
+    return Principal(
+        id="p",
+        name="operator",
+        role=Role.ADMIN,
+        created_at=datetime(2026, 9, 30, tzinfo=UTC),
+    )
+
+
+def test_all_delivery_policies_follow_routing_unless_deliberately_pinned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    active = _policy("default-software", pinned=False)
+    assigned = _policy("repository-policy", pinned=False)
+    pinned = _policy("pinned-policy", pinned=True)
+    route = SimpleNamespace(name="route", version=7, retired_at=None, document={"version": 7})
+    uow = SimpleNamespace(
+        policies=_Versions([active, assigned, pinned]),
+        routing_policies=_Versions([route]),
+        repositories=_Repositories(["repository-policy", "pinned-policy"]),
+    )
     saved: list[dict[str, Any]] = []
     monkeypatch.setattr(routing, "put_routing_policy", lambda *args, **kwargs: None)
     monkeypatch.setattr(
@@ -44,24 +86,11 @@ def test_delivery_policy_follows_routing_unless_deliberately_pinned(
         "put_policy",
         lambda *args, **kwargs: saved.append(deepcopy(kwargs)),
     )
-    ctx = SimpleNamespace(
-        clock=SimpleNamespace(now=lambda: datetime(2026, 9, 30, tzinfo=UTC)),
-        proxy_config_path=None,
-        proxy_subnet="",
-        proxy_hosts=(),
-        providers={},
-    )
-
     policy_version, routing_version = routing.publish_routing(
-        cast(AdminContext, ctx),
+        _context(),
         uow,
-        principal=Principal(
-            id="p",
-            name="operator",
-            role=Role.ADMIN,
-            created_at=datetime(2026, 9, 30, tzinfo=UTC),
-        ),
-        policy=policy,
+        principal=_principal(),
+        policy=active,
         routing=route,
         routing_document={"version": 7},
         reason="operator choice",
@@ -69,11 +98,63 @@ def test_delivery_policy_follows_routing_unless_deliberately_pinned(
     )
 
     assert routing_version == 8
-    assert policy_version == (expected or 3)
-    assert ([item["version"] for item in saved] if saved else None) == (
-        [expected] if expected else None
+    assert policy_version == 4
+    assert {item["name"] for item in saved} == {"default-software", "repository-policy"}
+    assert {item["version"] for item in saved} == {4}
+    assert all(
+        item["document"]["routing"] == {"policy": {"name": "route", "version": 8, "pinned": False}}
+        for item in saved
     )
-    if saved:
-        assert saved[0]["document"]["routing"] == {
-            "policy": {"name": "route", "version": 8, "pinned": False}
-        }
+
+
+def test_pinned_active_policy_keeps_old_local_endpoint_authorized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    policy = _policy("default-software", pinned=True)
+    old_document = {
+        "version": 7,
+        "models": [
+            {
+                "endpoint": "local",
+                "endpoint_url": "http://old-model.internal:8080/v1",
+                "enabled": True,
+            }
+        ],
+    }
+    route = SimpleNamespace(name="route", version=7, retired_at=None, document=old_document)
+    uow = SimpleNamespace(
+        policies=_Versions([policy]),
+        routing_policies=_Versions([route]),
+        repositories=_Repositories([]),
+    )
+    docker = SimpleNamespace(
+        config=DockerConfig(
+            endpoint="unix:///docker.sock",
+            artifact_root="/artifacts",
+            proxy_allowlist=("pypi.org",),
+        )
+    )
+    monkeypatch.setattr(routing, "put_routing_policy", lambda *args, **kwargs: None)
+    monkeypatch.setattr(routing, "put_policy", lambda *args, **kwargs: None)
+
+    routing.publish_routing(
+        _context(docker=docker),
+        uow,
+        principal=_principal(),
+        policy=policy,
+        routing=route,
+        routing_document={
+            "version": 7,
+            "models": [
+                {
+                    "endpoint": "local",
+                    "endpoint_url": "http://old-model.internal:8080/v1",
+                    "enabled": False,
+                }
+            ],
+        },
+        reason="disable local model",
+        note="Model availability update",
+    )
+
+    assert "old-model.internal:8080" in docker.config.proxy_allowlist

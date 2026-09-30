@@ -1178,3 +1178,30 @@ def test_routing_model_and_tier_controls_are_ordinary_reasoned_forms(
         field["value"] for field in tier_form["fields"] if field["name"].startswith("pool_")
     ] == ["codex", "claude"]
     assert tier_form["fields"][-1]["name"] == "reason"
+
+
+def test_routing_tier_action_keeps_numeric_pool_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    saved: list[str] = []
+    monkeypatch.setattr(
+        routing_models_service,
+        "save_tier",
+        lambda *args, **kwargs: saved.extend(kwargs["prefer_pools"]),
+    )
+    form = {"tier": "complex", **{f"pool_{n}": f"pool-{n}" for n in range(11)}}
+
+    asyncio.run(
+        ui_routing_models._actions(
+            request("/ui/actions/routing-tier"),
+            "routing-tier",
+            cast(Any, SimpleNamespace(admin=object())),
+            cast(Any, object()),
+            cast(Any, object()),
+            "csrf",
+            form,
+            "reorder pools",
+        )
+    )
+
+    assert saved == [f"pool-{n}" for n in range(11)]

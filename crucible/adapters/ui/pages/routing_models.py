@@ -137,7 +137,8 @@ async def _actions(
             reason=reason,
         )
     elif action == "routing-tier":
-        pools = [value for key, value in sorted(form.items()) if key.startswith("pool_")]
+        pool_fields = ((key, value) for key, value in form.items() if key.startswith("pool_"))
+        pools = [value for key, value in sorted(pool_fields, key=lambda item: int(item[0][5:]))]
         routing_models.save_tier(
             ctx.admin,
             uow,
