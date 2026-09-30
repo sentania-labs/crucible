@@ -23,6 +23,9 @@ narrow which observed run names count; it does not require unobserved names to
 appear. Certification details report counts, such as "9 of 9 jobs succeeded
 on <sha>" or "2 of 9 jobs still running". The existing explicit `allow_no_ci`
 policy or operator `accept_no_ci` decision can skip absent CI, never pass it.
+An `accept_no_ci` waiver requires an empty policy narrowing as well as no
+non-skipped runs on the head. A narrowing that names a check that has not
+appeared keeps the empty observation pending.
 
 ## Configuration
 

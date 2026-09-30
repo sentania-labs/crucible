@@ -406,8 +406,10 @@ cycle opens on that head.
   `ci_certification.allow_no_ci: true`, an operator-recorded policy
   decision, which makes the gate `skipped` rather than passed. For one
   task, the operator's `accept_no_ci` decision (ADR 0025) does the same
-  when nothing has run on the accepted head (a run a path filter skipped
-  counts as nothing); a check that does run is still certified. On green
+  when the policy narrowing is empty and nothing has run on the accepted
+  head (a run a path filter skipped counts as nothing). A non-empty narrowing
+  with no observed runs stays pending even with this waiver; a check that
+  does run is still certified. On green
   the task moves to `ready_for_merge` and wakes Foundry.
 - Failed: any counted run concluded `failure`, `cancelled`,
   `timed_out`, `action_required`, `stale`, or `startup_failure`. Crucible captures the check name,

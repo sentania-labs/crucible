@@ -27,6 +27,7 @@ from crucible.domain.certification import (
     CheckSource,
     ObservedCheck,
     certify,
+    required_checks_from_policy,
     wait_timeout_hours,
 )
 from crucible.domain.entities import (
@@ -858,8 +859,8 @@ def certify_head(
 ) -> CICertification:
     """Compute and record the certification for the accepted head (23, ADR 0009).
 
-    Two recorded decisions shape it (hades FDY-0139): an `accept_no_ci` waiver turns an
-    empty required set with nothing at all observed on the head into `skipped`, and a
+    Two recorded decisions shape it (hades FDY-0139): an `accept_no_ci` waiver turns a
+    head with no policy narrowing and no non-skipped runs into `skipped`, and a
     `rerun` decision keeps the failure it was about from being counted again until a
     fresh result arrives."""
     checks = observed_checks(observation)
@@ -930,8 +931,9 @@ def certify_head(
             and c.source is not CheckSource.CHECK_SUITE
             and not (c.concluded and c.conclusion == "skipped")
         ]
-        # A narrowing that excludes observed runs cannot turn them into absent CI.
-        if waiver is not None and not ran and not outcome.required:
+        # A policy narrowing expects CI even before any matching run appears.
+        # Excluded observed runs also cannot be waived as absent CI.
+        if waiver is not None and not ran and not required_checks_from_policy(policy):
             state = CertificationState.SKIPPED
             detail = (
                 f"the operator accepted that this repository has no CI for this task "

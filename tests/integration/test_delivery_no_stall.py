@@ -9,12 +9,14 @@ CI log excerpt, and the rate limit.
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Iterator
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import Engine, text
 
 from crucible.adapters.api.app import create_app
 from crucible.adapters.api.deps import AppContext
@@ -333,14 +335,38 @@ async def test_accepting_no_ci_does_not_skip_a_required_check_that_never_appeare
     operator: TestClient,
     delivery_supervisor: Supervisor,
     github: FakeGitHubServer,
+    engine: Engine,
 ) -> None:
     """A configured required check that has not shown up yet is late, not absent."""
-    task_id, _ = await green(client, delivery_supervisor, github)
-    response = waive(operator, task_id, "accept_no_ci", "We thought there was no CI.")
-    assert response.status_code == 201, response.text
-    await delivery_supervisor.tick()
-    assert state(client, task_id) == "awaiting_ci_certification"
-    assert pr(client, task_id)["ci_certifications"][-1]["state"] == "pending"
+    # Expectations come from the optional policy narrowing, not branch protection.
+    with engine.begin() as connection:
+        original = connection.execute(
+            text("SELECT document FROM policies WHERE name = 'default-software' AND version = 2")
+        ).scalar_one()["ci_certification"]["required_checks"]
+        connection.execute(
+            text(
+                "UPDATE policies SET document = jsonb_set(document, "
+                "'{ci_certification,required_checks}', '[\"build\"]') "
+                "WHERE name = 'default-software' AND version = 2"
+            )
+        )
+    try:
+        task_id, _ = await green(client, delivery_supervisor, github)
+        response = waive(operator, task_id, "accept_no_ci", "We thought there was no CI.")
+        assert response.status_code == 201, response.text
+        await delivery_supervisor.tick()
+        assert state(client, task_id) == "awaiting_ci_certification"
+        assert pr(client, task_id)["ci_certifications"][-1]["state"] == "pending"
+    finally:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE policies SET document = jsonb_set(document, "
+                    "'{ci_certification,required_checks}', CAST(:checks AS jsonb)) "
+                    "WHERE name = 'default-software' AND version = 2"
+                ),
+                {"checks": json.dumps(original)},
+            )
 
 
 async def test_accepting_no_ci_counts_a_skipped_run_as_nothing(
