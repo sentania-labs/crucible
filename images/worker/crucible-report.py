@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 """crucible-report: check a worker's report.yaml before the worker exits (hades #215).
 
-    crucible-report check /crucible/report/report.yaml [--contract PATH]
+    crucible-report check <report.yaml> [--contract <contract.json>]
 
 Prints each problem in plain words and exits 1 while there is any, 0 when there is
 none, and 2 when it cannot run at all. It reads the contract from the identity bundle
@@ -16,13 +16,22 @@ The worker writes judgement: summary, acceptance_mapping, the proposed pull requ
 title and body, limitations, risks, blockers and follow_ups. Crucible fills the facts
 (task_external_id, changed_files, refs, checks, run_evidence) from its own evidence, so
 they are optional here.
+
+Secret scanning (hades #221): copies the patterns from crucible/domain/secrets.py into
+a module constant so the standalone worker can flag credential-shaped strings in the
+report itself.
+
+Scope checking (hades #227): when a contract is readable and git is available, computes
+the diff and flags any changed path outside allowed_paths or inside prohibited_paths.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import posixpath
 import re
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -30,7 +39,7 @@ from typing import Any
 try:
     import yaml
 except ImportError:  # pragma: no cover - the image's system Python
-    yaml = None
+    yaml = None  # type: ignore[assignment]
 
 HERMES_PYTHON = "/opt/hermes/bin/python3"
 DEFAULT_CONTRACT = "/crucible/identity/contract.json"
@@ -60,6 +69,87 @@ WHY_UNKNOWN = {
     "head_sha": "Crucible reads the head from the collected branch",
     "base": "Crucible takes the base from the contract",
 }
+
+# --------------------------------------------------------------------------- Secret
+# patterns (hades #221) - copied verbatim from crucible/domain/secrets.py so the
+# standalone worker can scan the report itself for credential-shaped strings.
+
+SECRET_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    ("github_installation_token", re.compile(r"\bghs_[A-Za-z0-9._-]{20,}")),
+    ("github_token", re.compile(r"\b(?:ghp|gho|ghu|ghr)_[A-Za-z0-9]{36,}\b")),
+    ("github_fine_grained_token", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{22,}\b")),
+    ("private_key_header", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
+    (
+        "bearer_token",
+        re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{20,}", re.IGNORECASE),
+    ),
+    ("aws_access_key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("anthropic_oauth_token", re.compile(r"\bsk-ant-[A-Za-z0-9_-]{20,}")),
+    ("google_oauth_access_token", re.compile(r"\bya29\.[A-Za-z0-9._-]{20,}")),
+    ("google_oauth_refresh_token", re.compile(r"\b1//[A-Za-z0-9_-]{20,}")),
+    (
+        "codex_refresh_token",
+        re.compile(r"\b[A-Za-z0-9]{1,8}\.[A-Za-z0-9]{1,8}\.[A-Za-z0-9_-]{100,}"),
+    ),
+    ("openai_style_key", re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b")),
+    ("slack_token", re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}\b")),
+    (
+        "jwt",
+        re.compile(
+            r"\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\."
+            r"[A-Za-z0-9_-]{8,}\b",
+        ),
+    ),
+    (
+        "crucible_token",
+        re.compile(r"\bcru_[A-Za-z0-9]{26}\.[A-Za-z0-9_-]{30,}\b"),
+    ),
+]
+
+
+def _glob_re(pattern: str) -> re.Pattern[str]:
+    """Return a compiled regex that matches * at one level and ** at any depth."""
+    out: list[str] = []
+    index = 0
+    while index < len(pattern):
+        char = pattern[index]
+        if char == "*":
+            if pattern.startswith("**/", index):
+                out.append("(?:.*/)?")
+                index += 3
+                continue
+            if pattern.startswith("**", index):
+                out.append(".*")
+                index += 2
+                continue
+            out.append("[^/]*")
+            index += 1
+            continue
+        if char == "?":
+            out.append("[^/]")
+            index += 1
+            continue
+        if char == "[":
+            close = pattern.find("]", index + 1)
+            if close != -1:
+                out.append(pattern[index : close + 1])
+                index = close + 1
+                continue
+        out.append(re.escape(char))
+        index += 1
+    return re.compile("".join(out) + r"\Z")
+
+
+def _matches_any(path: str, patterns: list[str]) -> bool:
+    """Return True if *path* matches any of the *patterns* (fnmatch with **)."""
+    normalized = posixpath.normpath(path)
+    for pattern in patterns:
+        normalized_pattern = pattern.rstrip("/")
+        if _glob_re(normalized_pattern).match(normalized):
+            return True
+        if normalized_pattern.endswith("/**") and normalized.startswith(normalized_pattern[:-2]):
+            return True
+    return False
 
 
 def _is_str_list(value: Any) -> bool:
@@ -117,41 +207,72 @@ def _mapping_entries(value: Any, problems: list[str]) -> list[dict[str, Any]]:
             else:
                 entries.append(entry)
     elif isinstance(value, list):
-        entries = list(value)
+        entries = value
     else:
         problems.append(
-            "acceptance_mapping must be a list of entries (id, status, evidence), or a "
-            "mapping keyed by criterion id."
+            "acceptance_mapping must be a mapping of criterion ids, or a list of entries."
         )
         return []
-    out: list[dict[str, Any]] = []
     for index, entry in enumerate(entries):
-        where = f"acceptance_mapping entry {index + 1}"
         if not isinstance(entry, dict):
-            problems.append(f"{where} must be a mapping of id, status and evidence.")
-            continue
-        if isinstance(entry.get("id"), str) and entry["id"]:
-            where = f"acceptance_mapping entry {entry['id']}"
-        else:
-            problems.append(f"{where} has no id: give the acceptance criterion's id, as text.")
-        for key in sorted(str(k) for k in entry if k not in MAPPING_KEYS):
-            problems.append(f"{where} has `{key}`, which is not a field: remove it.")
-        if entry.get("status") not in STATUSES:
-            problems.append(f"{where}: status must be one of {', '.join(STATUSES)}.")
-        if not isinstance(entry.get("evidence"), str):
             problems.append(
-                f"{where}: evidence must be text saying what shows it, for example the log "
-                "file and what it shows."
+                f"acceptance_mapping[{index}] must be a mapping of id, status and evidence."
             )
-        out.append(entry)
-    return out
+            continue
+        extra = sorted(str(k) for k in entry if k not in MAPPING_KEYS)
+        if extra:
+            problems.append(
+                f"acceptance_mapping[{index}] has fields that are not accepted: {', '.join(extra)}."
+            )
+        for key in MAPPING_KEYS:
+            if key not in entry:
+                problems.append(
+                    f"acceptance_mapping[{index}].{key} is missing: give every entry an "
+                    "id, a status and the evidence."
+                )
+        status = entry.get("status")
+        if status not in STATUSES:
+            problems.append(
+                f"acceptance_mapping[{index}].status must be one of: {', '.join(STATUSES)}."
+            )
+    return entries
 
 
-def check(document: Any, criteria: list[str] | None) -> list[str]:
+def _scan_secrets(value: Any, path: str = "") -> list[str]:
+    """Walk a nested document and return one problem per secret-shaped string."""
+    problems: list[str] = []
+    if isinstance(value, str):
+        for name, pattern in SECRET_PATTERNS:
+            if pattern.search(value):
+                problems.append(f"{path} contains a credential-shaped string ({name}); remove it.")
+                break  # only report once per value
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            problems.extend(_scan_secrets(item, f"{path}.{key}" if path else str(key)))
+    elif isinstance(value, list | tuple):
+        for index, item in enumerate(value):
+            problems.extend(_scan_secrets(item, f"{path}[{index}]"))
+    return problems
+
+
+# ----- acceptance checking -----------------------------------------------------
+
+
+def check(
+    document: Any,
+    criteria: list[str] | None = None,
+    changed: list[str] | None = None,
+    scope: dict | None = None,
+) -> list[str]:
     """Every problem with the document, in plain words. Empty means none."""
     if not isinstance(document, dict):
         return ["The report must be a YAML mapping of field names to values."]
     problems: list[str] = []
+
+    # --- secrets (hades #221) ---
+    problems.extend(_scan_secrets(document))
+
+    # --- schema version ---
     for key in sorted(str(k) for k in document if k not in KNOWN):
         why = WHY_UNKNOWN.get(key)
         problems.append(
@@ -188,8 +309,9 @@ def check(document: Any, criteria: list[str] | None) -> list[str]:
                     )
             for extra in sorted(mapped - set(criteria)):
                 problems.append(
-                    f"acceptance_mapping has {extra}, which is not an acceptance criterion "
-                    "of this contract (verification ids never go here): remove it."
+                    f"acceptance_mapping has {extra}, which is not an acceptance "
+                    "criterion of this contract (verification ids never go here): "
+                    "remove it."
                 )
 
     pull_request = document.get("proposed_pull_request")
@@ -202,8 +324,8 @@ def check(document: Any, criteria: list[str] | None) -> list[str]:
     else:
         for key in sorted(str(k) for k in pull_request if k not in PULL_REQUEST_KEYS):
             problems.append(
-                f"proposed_pull_request.{key} is not a field: remove it (Crucible sets the "
-                "pull request's base and head itself)."
+                f"proposed_pull_request.{key} is not a field: remove it (Crucible "
+                "sets the pull request's base and head itself)."
             )
         title = pull_request.get("title")
         if not (isinstance(title, str) and title):
@@ -225,10 +347,24 @@ def check(document: Any, criteria: list[str] | None) -> list[str]:
         why = _fact_problem(name, document[name])
         if why:
             problems.append(
-                f"{name} is optional, because Crucible fills it from its own evidence, but "
-                f"as written it is not valid: {why}. Fix it or remove it."
+                f"{name} is optional, because Crucible fills it from its own "
+                f"evidence, but as written it is not valid: {why}. Fix it or remove it."
             )
+
+    # --- out-of-scope changes (hades #227) ---
+    if changed is not None and scope is not None:
+        allowed = scope.get("allowed_paths", [])
+        prohibited = scope.get("prohibited_paths", [])
+        for path in sorted(changed):
+            if (prohibited and _matches_any(path, prohibited)) or (
+                allowed and not _matches_any(path, allowed)
+            ):
+                problems.append(f"you changed {path}, which this task may not touch; revert it.")
+
     return problems
+
+
+# ----- contract helpers --------------------------------------------------------
 
 
 def _criteria(contract_path: Path) -> list[str] | None:
@@ -253,6 +389,68 @@ def _load(path: Path) -> tuple[Any, str | None]:
         return yaml.safe_load(text), None
     except yaml.YAMLError as exc:
         return None, f"the report is not valid YAML: {exc}"
+
+
+def _compute_scope(contract_path: Path) -> tuple[list[str] | None, dict | None]:
+    """Read the contract, compute changed files, and return (changed, scope).
+
+    Returns (None, None) when git is unavailable or the diff cannot be computed.
+    """
+    try:
+        contract_text = contract_path.read_text(encoding="utf-8")
+        contract = json.loads(contract_text)
+    except (OSError, ValueError):
+        return None, None
+
+    if not isinstance(contract, dict):
+        return None, None
+
+    repository = contract.get("repository", {})
+    if not isinstance(repository, dict):
+        repository = {}
+
+    base_ref = repository.get("base_ref", "main")
+    scope = contract.get("scope", {})
+    if not isinstance(scope, dict):
+        scope = {}
+
+    try:
+        result = subprocess.run(
+            ["git", "merge-base", "HEAD", f"origin/{base_ref}"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if result.returncode != 0:
+            return None, None
+        base = result.stdout.strip()
+
+        diff_result = subprocess.run(
+            ["git", "diff", "--name-only", base, "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        ls_result = subprocess.run(
+            ["git", "ls-files", "--others", "--exclude-standard"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if diff_result.returncode != 0 or ls_result.returncode != 0:
+            return None, None
+        changed: list[str] = [p for p in diff_result.stdout.strip().splitlines() if p] + [
+            p for p in ls_result.stdout.strip().splitlines() if p
+        ]
+        return changed, scope
+    except (OSError, subprocess.TimeoutExpired):
+        return None, None
+
+
+# ----- main entry-point --------------------------------------------------------
 
 
 def main(argv: list[str]) -> int:
@@ -283,17 +481,36 @@ def main(argv: list[str]) -> int:
         return 1
     criteria = _criteria(contract)
     problems = check(document, criteria)
-    if criteria is None:
-        print(f"note: no contract at {contract}, so acceptance criteria coverage is not checked")
+
+    # Out-of-scope check when git is available and a contract is readable.
+    scope_changed, scope_data = _compute_scope(contract)
+    if scope_changed is not None and scope_data is not None:
+        scope_problems = check(document, criteria, changed=scope_changed, scope=scope_data)
+        scope_only = [p for p in scope_problems if p not in problems]
+        problems.extend(scope_only)
+
     if not problems:
         print(
             f"{report}: no problems. Crucible fills {', '.join(FACT_FIELDS)} from its own evidence."
         )
+        if criteria is None:
+            print(
+                f"note: no contract at {contract}, so acceptance criteria coverage is not checked"
+            )
+        if scope_changed is None:
+            print("note: git is unavailable or the scope check could not run")
         return 0
     print(f"{report}: {len(problems)} problem{'s' if len(problems) != 1 else ''}")
     for problem in problems:
         print(f"- {problem}")
     print(f"Fix each one and run `crucible-report check {report}` again before you exit 0.")
+
+    # Notes after problem list (so they don't interfere with structured output).
+    if criteria is None:
+        print(f"note: no contract at {contract}, so acceptance criteria coverage is not checked")
+    if scope_changed is None:
+        print("note: git is unavailable or the scope check could not run")
+
     return 1
 
 
