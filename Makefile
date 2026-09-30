@@ -127,9 +127,9 @@ reset: ## DESTRUCTIVE: down plus postgres, artifact, and credential volumes
 
 lint: check-image-manifest check-green-gate
 	$(UV) sync --frozen --quiet
-	$(UV) run ruff format --check crucible tests tools/release tools/smoke tools/registry tools/images
-	$(UV) run ruff check crucible tests tools/release tools/smoke tools/registry tools/images
-	$(UV) run mypy crucible tests tools/release tools/smoke tools/registry tools/images
+	$(UV) run ruff format --check crucible tests tools/release tools/smoke tools/registry tools/images tools/ci
+	$(UV) run ruff check crucible tests tools/release tools/smoke tools/registry tools/images tools/ci
+	$(UV) run mypy crucible tests tools/release tools/smoke tools/registry tools/images tools/ci
 	$(UV) run lint-imports
 
 check-image-manifest: ## fail when a declared worker-image tag is stale

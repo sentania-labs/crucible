@@ -20,7 +20,9 @@ def main() -> int:
     text = WORKFLOW.read_text()
     jobs_block = text.split("\njobs:\n", 1)[1]
     jobs = re.findall(r"^  ([A-Za-z0-9_-]+):\s*$", jobs_block, flags=re.MULTILINE)
-    gate = re.search(rf"^  {GATE}:\n(?:.*\n)*?\s+needs:\s*\[([^\]]*)\]", jobs_block, flags=re.MULTILINE)
+    gate = re.search(
+        rf"^  {GATE}:\n(?:.*\n)*?\s+needs:\s*\[([^\]]*)\]", jobs_block, flags=re.MULTILINE
+    )
     if gate is None:
         print(f"{WORKFLOW}: no `{GATE}` job with a bracketed `needs` list", file=sys.stderr)
         return 1
@@ -29,7 +31,9 @@ def main() -> int:
     missing = sorted(expected - needed)
     extra = sorted(needed - expected)
     for name in missing:
-        print(f"{WORKFLOW}: job `{name}` is not in `{GATE}.needs`; every job must be", file=sys.stderr)
+        print(
+            f"{WORKFLOW}: job `{name}` is not in `{GATE}.needs`; every job must be", file=sys.stderr
+        )
     for name in extra:
         print(f"{WORKFLOW}: `{GATE}.needs` names `{name}`, which is not a job", file=sys.stderr)
     if missing or extra:
