@@ -297,3 +297,23 @@ read every half second while a silent command ran (`make e2e-command-timeout`).
 | Codex | a `command_execution` item from `item.started` to `item.completed`, polls included. Other items do not count: a todo list stays open for the whole turn |
 | Hermes | under `-z` Hermes writes nothing while it works, so the launch wrapper reads its process registry (`CRUCIBLE_IN_FLIGHT_FILE`, the same `processes.json`) every 10 seconds and writes `crucible-launch: commands running: <n>` to stderr whenever the count changes; only the count leaves the file. The registry lists background commands only: a foreground command, which Hermes ends at `TERMINAL_TIMEOUT`, gives no live evidence, and the stall limits count it as silence |
 | AGY | none: no tracker, and the stall clock runs as for any silent worker |
+
+### Codex on the local gateway (FDY-0149, issue #249)
+
+For `endpoint: local`, Codex uses the same read-only `api-key` credential as Hermes,
+loaded into `OPENAI_API_KEY` at container start. It never mounts subscription
+`auth.json`. The launch wrapper writes a fresh per-attempt
+`/home/worker/.codex/config.toml` before invoking Codex. `model_provider` selects
+`local_gateway`; its provider table has `base_url` (including `/v1`),
+`env_key = "OPENAI_API_KEY"`, and `wire_api = "responses"`. The top-level
+`model_context_window` uses the Local gateway page's context length. A saved zero,
+which asks Hermes to discover its window, uses 131072 for Codex because Codex cannot
+use Hermes's discovery. Set a positive context length for the actual gateway model.
+
+The launch retains `--dangerously-bypass-approvals-and-sandbox`, never adds
+`--ignore-user-config`, and sends identity plus the pointer prompt through a finite
+pipe, closing stdin when those bytes are sent. CODEX_HOME is never under `/tmp`.
+Local egress adds the gateway endpoint instead of Codex's subscription hosts; policy
+package registries remain available as for Hermes. Local Codex holds no writable
+subscription credential and shares the local pool's concurrency limit. Subscription
+launch, credential synchronization, and its concurrency cap of one are unchanged.

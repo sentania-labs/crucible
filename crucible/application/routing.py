@@ -275,7 +275,15 @@ def select_model(
             reasons.append("harness does not match the operator pin")
         if not entry.enabled:
             reasons.append("model disabled")
-        if eligible_harnesses is not None and entry.harness not in eligible_harnesses:
+        if (
+            eligible_harnesses is not None
+            and entry.harness not in eligible_harnesses
+            and not (
+                entry.harness == "codex"
+                and entry.endpoint == "local"
+                and "codex:local" in eligible_harnesses
+            )
+        ):
             reasons.append("harness disabled or has no credential")
         if entry.capability not in tier_rule.allowed_capability:
             reasons.append(f"capability {entry.capability} is not allowed for tier {tier}")
@@ -329,6 +337,11 @@ def select_model(
         rank = (
             int(quality.demoted and not quality.probe),
             pool_rank,
+            0
+            if entry.endpoint == "local"
+            and entry.harness == "codex"
+            and tier in ("trivial", "standard")
+            else 1,
             cap_rank,
             0 if last is None else 1,
             -age_weight,

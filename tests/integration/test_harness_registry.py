@@ -202,11 +202,13 @@ async def test_per_harness_concurrency_defers_the_second_launch(
     )
 
 
+@pytest.mark.parametrize("local_harness", ["hermes", "codex"])
 async def test_local_pool_cap_is_independent_of_subscription_harness_caps(
     ctx: AppContext,
     client: TestClient,
     provider: FakeProvider,
     tokens: dict[str, str],
+    local_harness: str,
 ) -> None:
     supervisor = make_supervisor(ctx, provider)
     admin = {"Authorization": f"Bearer {tokens['admin']}"}
@@ -215,6 +217,7 @@ async def test_local_pool_cap_is_independent_of_subscription_harness_caps(
     hermes = next(model for model in routing["models"] if model["harness"] == "hermes")
     hermes.update(
         {
+            "harness": local_harness,
             "endpoint_url": "http://192.0.2.41:11434/v1",
             "enabled": True,
             "disabled_reason": None,
@@ -240,7 +243,7 @@ async def test_local_pool_cap_is_independent_of_subscription_harness_caps(
         document["policy"] = {"name": "default-software", "version": 41}
         document["execution_request"].update(
             {
-                "harness": "hermes",
+                "harness": local_harness,
                 "model": "gpt-oss:120b",
                 "pin_reason": "exercise the Spark pool cap",
                 "image": "crucible-worker:fake-hang",

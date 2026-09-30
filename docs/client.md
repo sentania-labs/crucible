@@ -275,3 +275,22 @@ verbs' calls (`crucible/client/orchestrator.py`), the envelope, `next`, and
 the JSON schemas `crucible schema` prints, which map onto MCP tool
 definitions. Each verb would become a tool whose result is the envelope, and
 `next` would become the tools offered from it. Nothing of it is built yet.
+
+### Codex on the Local gateway page
+
+Select Hermes, Codex, or both beside a model returned by the gateway. Saving writes
+a new routing version; disabling Codex leaves Hermes available as fallback. The
+shared key stays in the Hermes credential store and is mounted read-only for local
+Codex. The gateway must support `/v1/responses`, as LiteLLM in front of vLLM does.
+The context length under Local run limits applies to both harnesses; max turns
+applies only to Hermes. For Codex, a zero context length uses 131072.
+
+The admin API accepts `codex_enabled` alongside `enabled` (Hermes) in
+`POST /v1/admin/gateway/models`, for example
+`{"models":[{"id":"fast","enabled":true,"codex_enabled":true}],"reason":"local coding"}`.
+Omitting either flag preserves that harness's choice. The model-list response includes
+`codex_enabled`. The CLI equivalent is
+`crucible-admin --reason "local coding" gateway pick --harness codex --enable fast`;
+`--disable fast` disables it, and the default `--harness hermes` preserves existing CLI
+behavior. Pool max concurrency bounds both harnesses together. The harness must also
+be enabled and have a promoted worker image, as for other routing choices.

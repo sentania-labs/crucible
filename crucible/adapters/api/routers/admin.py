@@ -159,7 +159,7 @@ def _require_boolean_flags(models: list[dict[str, Any]]) -> None:
             "type": "bool_type",
         }
         for index, item in enumerate(models)
-        for flag in ("enabled", "enable_thinking")
+        for flag in ("enabled", "enable_thinking", "codex_enabled")
         if flag in item and not isinstance(item[flag], bool)
     ]
     if errors:

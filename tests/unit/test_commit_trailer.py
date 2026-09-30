@@ -361,6 +361,9 @@ def _run_publisher(tmp_path: Path, repo: Path, origin: Path, head: str) -> tuple
     result = subprocess.run(
         ["sh", "-c", script],
         input="a-test-token-value",
+        # A worker checkout clears credential.helper locally. The publisher runs
+        # outside that checkout, so its isolated global helper must be the one read.
+        cwd=root,
         capture_output=True,
         text=True,
         check=False,

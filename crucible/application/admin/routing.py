@@ -16,6 +16,7 @@ from crucible.application.proxy_config import (
     install_worker_proxy_config,
     worker_proxy_config,
 )
+from crucible.contracts.policy import RoutingModel
 from crucible.domain.endpoints import validate_endpoint
 from crucible.domain.entities import Policy, Principal, ProviderSetting
 from crucible.domain.events import EventKind
@@ -255,7 +256,9 @@ def save_local_endpoint(
         "policy": {"name": policy.name, "version": next_policy_version},
         "routing_policy": {"name": routing.name, "version": next_routing_version},
         "endpoint_url": endpoint_url,
-        "models": [copy.deepcopy(model) for model in local_models],
+        "models": [
+            RoutingModel.model_validate(model).model_dump(mode="json") for model in local_models
+        ],
         "pool": {"name": pool_name, **copy.deepcopy(routing_document["pools"][pool_name])},
     }
     admin_event(

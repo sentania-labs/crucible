@@ -396,6 +396,8 @@ class ChatTemplateKwargs(StrictModel):
 
 
 class RoutingModel(StrictModel):
+    # Gateway alias when two harnesses share one model but need distinct routing IDs.
+    model_name: str | None = Field(default=None, min_length=1)
     id: str = Field(min_length=1)
     harness: str = Field(min_length=1)
     endpoint: Literal["subscription", "local"]
