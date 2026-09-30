@@ -5,21 +5,20 @@ The project is Hades (the package, CLIs and images still say `crucible`).
 ## Delivery pipeline
 
 1. Branch from `main`. Nothing lands on `main` without a pull request.
-2. Lint and test with the same definitions CI uses: `make lint` (ruff format
-   and check, mypy --strict, import-linter, and the image manifest check) and
-   `make test` (the unit tier, then the integration tier against a Postgres
-   container); `make test PYTEST_WORKERS=0` runs serially. Verify every target
-   name against the Makefile and list only real ones. Run it with `make up`
-   and exercise the change against the live API or `/ui`; describe in the PR
-   what you saw working and what you could not exercise. Open the PR when the
-   work is done, not to find out whether it works.
+2. Lint and test with the same definitions CI uses: `make lint` (ruff
+   format and check, mypy --strict, import-linter, and the image manifest
+   check) and `make test` (the unit tier, then the integration tier against
+   a Postgres container); `make test PYTEST_WORKERS=0` runs serially. Run
+   it with `make up` and exercise the change against the live API or `/ui`;
+   describe in the PR what you saw working and what you could not exercise.
+   Open the PR when the work is done, not to find out whether it works.
 3. Branch CI must be green (lint, scan, test, compose-smoke are required;
-   e2e-kind runs but is not required). One internal review round happens
-   before the PR opens (the orchestrator's review of the worker's branch).
-   Codex reviews every PR once, automatically, and its findings get a
-   disposition (fix, or an explanation) before merge; Codex is not
-   re-requested after a fix. Merges go through the merge queue on `main`
-   and are squashed; do not push to `main` directly.
+   e2e-kind and images run but are not required). One internal review round
+   happens before the PR opens (the orchestrator's review of the worker's
+   branch). Codex reviews every PR once, automatically, and its findings get
+   a disposition (fix, or an explanation) before merge; Codex is not
+   re-requested after a fix. Merges go through the merge queue on `main` and
+   are squashed; do not push to `main` directly.
 
 ## Kubernetes manifests
 
@@ -32,7 +31,11 @@ with Docker, or the CI images job will report the digest it built instead.
 ## Releases
 
 Releases are annotated `vMAJOR.MINOR.PATCH` tags on `main`. The tag is the
-release; the merge is not.
+release; the merge is not. Pushing the tag runs the release workflow
+(`.github/workflows/release.yml`): it refuses a tag that is not on `main`,
+builds the service and worker images, smokes them, publishes the images and
+the bundle, and creates the GitHub release. Watch that run; the tag is not
+published until it finishes.
 
 ## Style
 
