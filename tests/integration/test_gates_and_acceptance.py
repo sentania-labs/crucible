@@ -366,7 +366,9 @@ async def test_a_correction_is_refused_at_attach_time_when_its_bundle_is_gone(
     )
     assert await run_to_settled(supervisor, client, task_id) == "pre_pr_gates_failed"
     attempt_id = latest_attempt(client, task_id)
+    assert supervisor.fenced_token is not None
     with ctx.uow_factory() as uow:
+        uow.set_fenced_token(supervisor.fenced_token)
         task = uow.tasks.get(task_id)
         assert task is not None
         uow.retention.record(

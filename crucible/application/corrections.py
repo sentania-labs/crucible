@@ -53,16 +53,21 @@ AMENDABLE_STATES = frozenset(
     {TaskState.SUBMITTED, TaskState.BLOCKED, TaskState.AWAITING_ACCEPTANCE}
 )
 PREVIOUS_BUNDLE_GONE = "previous_attempt_bundle_gone"
+PREVIOUS_BUNDLE_OTHER_PROVIDER = "previous_attempt_bundle_other_provider"
 
 
-def _unpublished_bundle_problem(uow: UnitOfWork, task: Task) -> dict[str, str] | None:
+def _unpublished_bundle_problem(
+    uow: UnitOfWork, task: Task, provider: str
+) -> dict[str, str] | None:
     """Name why an unpublished correction cannot resume, or return None when it can."""
     if uow.events.latest_for_task_kind(task.id, EventKind.PUBLISH_COMPLETED.value) is not None:
         return None
     work = latest_work_attempt(uow, task)
     if work is None:
         return {"path": "correction", "message": PREVIOUS_BUNDLE_GONE}
-    attempt = work[0]
+    attempt, execution = work
+    if execution.provider != provider:
+        return {"path": "execution_request.provider", "message": PREVIOUS_BUNDLE_OTHER_PROVIDER}
     evidence = next(
         (
             row
@@ -172,7 +177,7 @@ def attach_correction(
     )
     problems.extend(unwired_provider_problems(contract, wired_providers))
     problems.extend(correction_narrows(previous, contract))
-    bundle_problem = _unpublished_bundle_problem(uow, task)
+    bundle_problem = _unpublished_bundle_problem(uow, task, contract.execution_request.provider)
     if bundle_problem is not None:
         problems.append(bundle_problem)
     if task.state is TaskState.AWAITING_ACCEPTANCE:

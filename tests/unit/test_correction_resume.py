@@ -11,6 +11,7 @@ from typing import Any, cast
 from crucible.adapters.execution import scripts
 from crucible.application.corrections import (
     PREVIOUS_BUNDLE_GONE,
+    PREVIOUS_BUNDLE_OTHER_PROVIDER,
     _unpublished_bundle_problem,
 )
 from crucible.domain.entities import Task
@@ -115,13 +116,29 @@ def test_a_correction_whose_previous_bundle_is_gone_is_refused_with_a_named_reas
     attempt = SimpleNamespace(id="attempt", execution_id="execution", workspace_path="gone")
     uow = SimpleNamespace(
         events=SimpleNamespace(latest_for_task_kind=lambda *_args: None),
-        executions=_Rows([SimpleNamespace(id="execution", role="implement")]),
+        executions=_Rows([SimpleNamespace(id="execution", role="implement", provider="docker")]),
         attempts=_Rows([attempt]),
         evidence=SimpleNamespace(list_for_attempt=lambda _attempt_id: []),
         retention=SimpleNamespace(list_recent=lambda _limit: []),
     )
 
-    assert _unpublished_bundle_problem(uow, cast(Task, task)) == {
+    assert _unpublished_bundle_problem(uow, cast(Task, task), "docker") == {
         "path": "correction",
         "message": PREVIOUS_BUNDLE_GONE,
+    }
+
+
+def test_a_pre_pr_correction_cannot_change_the_bundle_provider() -> None:
+    task = SimpleNamespace(id="task", state=TaskState.PRE_PR_GATES_FAILED)
+    attempt = SimpleNamespace(id="attempt", execution_id="execution", workspace_path="k8s://ws")
+    execution = SimpleNamespace(id="execution", role="implement", provider="kubernetes")
+    uow = SimpleNamespace(
+        events=SimpleNamespace(latest_for_task_kind=lambda *_args: None),
+        executions=_Rows([execution]),
+        attempts=_Rows([attempt]),
+    )
+
+    assert _unpublished_bundle_problem(uow, cast(Task, task), "docker") == {
+        "path": "execution_request.provider",
+        "message": PREVIOUS_BUNDLE_OTHER_PROVIDER,
     }
