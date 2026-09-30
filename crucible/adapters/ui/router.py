@@ -4,7 +4,7 @@ import asyncio
 import json
 import os
 import tomllib
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 from typing import Any
 from urllib.parse import quote, urlsplit, urlunsplit
 
@@ -14,15 +14,14 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from crucible.adapters.api.deps import Ctx, UoW
 from crucible.adapters.ui import actions, session
 from crucible.adapters.ui.actions import register
+from crucible.adapters.ui.pages import credentials as credentials_ui
 from crucible.adapters.ui.pages import dashboard as dashboard_ui
 from crucible.adapters.ui.pages import harnesses as harnesses_ui
 from crucible.adapters.ui.render import (
-    CREDENTIAL_TONES,
     _base,
     _check_words,
     _document_section,
     _duration_words,
-    _localize,
     _page,
     _redirect,
     _state_words,
@@ -44,7 +43,6 @@ from crucible.application.admin import (
     github,
     github_manifest,
     images,
-    login,
     repositories,
     routing,
     routing_preference,
@@ -78,152 +76,6 @@ from crucible.domain.waivers import ACCEPT_NO_CI, WAIVABLE_STATES, WAIVE_EXTERNA
 from crucible.ports.repository import UnitOfWork
 
 router = APIRouter(prefix="/ui", include_in_schema=False)
-
-
-@router.get("/credentials", response_class=HTMLResponse)
-async def credentials_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
-    found = _require(request, ctx, uow)
-    if isinstance(found, RedirectResponse):
-        return found
-    principal, csrf = found
-    assert ctx.admin is not None
-    names = list(ctx.admin.harnesses.names())
-    secrets = await credentials.read_secrets(ctx.admin, names)
-    # Where the credentials are Secrets the service owns (Kubernetes, ADR 0015), rotate
-    # and remove move and shred directories and are refused, so they are not offered
-    # (crucible#125).
-    secrets_held = credentials.secret_store(ctx.admin) is not None
-    admin = principal.role is Role.ADMIN
-    rows: list[list[Any]] = []
-    compatibility: list[list[Any]] = []
-    for name in names:
-        view = credentials.state_view(ctx.admin, uow, name, secrets.get(name))
-        state = str(view.get("state") or "")
-        needed = state != "not_required"
-        actions: list[dict[str, Any]] = []
-        # Hermes has no login: its key and gateway URL are set together (#119). A harness
-        # that needs no credential has neither (crucible#125).
-        if name == credentials.HERMES:
-            actions.append({"kind": "link", "href": "/ui/gateway", "label": "Local gateway"})
-        elif needed:
-            actions.append(
-                {"kind": "link", "href": f"/ui/credentials/{name}/login", "label": "Log in"}
-            )
-        # Validate, probe and remove act on a stored credential; with none there is only
-        # the way to set one up (crucible#115).
-        if admin and needed and state != "absent":
-            for verb, label in (("validate", "Validate"), ("probe", "Probe")):
-                actions.append(
-                    {
-                        "kind": "form",
-                        "action": "/ui/actions/credential",
-                        "label": label,
-                        "hidden": {"harness": name, "verb": verb},
-                    }
-                )
-            if not secrets_held:
-                actions.append(
-                    {
-                        "kind": "form",
-                        "action": "/ui/actions/credential",
-                        "label": "Remove",
-                        "danger": True,
-                        "reason": True,
-                        "hidden": {"harness": name, "verb": "remove"},
-                    }
-                )
-        rows.append(
-            [
-                name,
-                {
-                    "kind": "status",
-                    "value": state.replace("_", " "),
-                    "tone": CREDENTIAL_TONES.get(state, "warn"),
-                },
-                gateway.plain_outcome(view.get("last_launch_outcome")),
-                {"kind": "actions", "items": actions} if actions else "",
-            ]
-        )
-        compatibility.append([name, view.get("session_compatibility")])
-    sections: list[dict[str, Any]] = [
-        {
-            "title": "Credentials",
-            "columns": ["Harness", "State", "Last test", ""],
-            "rows": rows,
-            "details": [
-                {
-                    "title": "Session compatibility",
-                    "columns": ["Harness", "Compatibility"],
-                    "rows": compatibility,
-                }
-            ],
-        }
-    ]
-    if admin and not secrets_held:
-        options = [
-            (name, name)
-            for name in names
-            if credentials.state_view(ctx.admin, uow, name, secrets.get(name)).get("state")
-            != "not_required"
-        ]
-        sections.append(
-            {
-                "title": "Rotate from a prepared directory",
-                "form": {
-                    "action": "/ui/actions/credential",
-                    "label": "Rotate",
-                    "collapsed": "Rotate a credential",
-                    "fields": [
-                        {"name": "verb", "kind": "hidden", "value": "rotate"},
-                        {
-                            "name": "harness",
-                            "label": "Harness",
-                            "kind": "select",
-                            "options": options,
-                        },
-                        {"name": "new_path", "label": "Prepared directory", "required": True},
-                        {"name": "reason", "label": "Reason"},
-                    ],
-                },
-            }
-        )
-    return _page(
-        request,
-        principal,
-        csrf,
-        active="/ui/credentials",
-        heading="Credentials",
-        intro="Each harness's credential and what to do about it. Values are never shown.",
-        sections=sections,
-    )
-
-
-@router.get("/credentials/{harness}/login", response_class=HTMLResponse)
-def login_page(request: Request, harness: str, ctx: Ctx, uow: UoW) -> Response:
-    found = _require(request, ctx, uow)
-    if isinstance(found, RedirectResponse):
-        return found
-    principal, csrf = found
-    document: dict[str, Any] = (
-        {"harness": harness, "state": "not_required", "output_tail": []}
-        if harness == "hermes"
-        else login.login_status(ctx.logins, harness, ctx.admin)
-    )
-    ends = document.get("code_wait_ends_at")
-    if ends:
-        # hades #173: a CLI that gives up on its own (AGY, 60 seconds) says when, in the
-        # operator's zone.
-        settings = getattr(ctx, "settings", None)
-        zone = settings.service.render_timezone if settings is not None else "America/Chicago"
-        moment = datetime.fromisoformat(str(ends))
-        document["code_wait_local"] = _localize(moment, zone)
-        document["code_wait_seconds_left"] = max(
-            0, round((moment - datetime.now(UTC)).total_seconds())
-        )
-    context = _base(request, principal, csrf, title=f"{harness} login", active="/ui/credentials")
-    context.update(harness=harness, login=document)
-    return templates.TemplateResponse(request=request, name="login.html", context=context)
-
 
 CAPABILITY_OPTIONS = [("small", "small"), ("mid", "mid"), ("frontier", "frontier")]
 
@@ -2446,44 +2298,7 @@ async def _actions(
     reason: str | None,
 ) -> Response | None:
     assert ctx.admin is not None
-    if action == "credential":
-        verb = form.get("verb")
-        if verb == "validate":
-            await credentials.validate(
-                ctx.admin,
-                uow,
-                principal=principal.name,
-                harness=form.get("harness", ""),
-                reason=reason,
-            )
-        elif verb == "probe":
-            await credentials.probe(
-                ctx.admin,
-                uow,
-                principal=principal.name,
-                harness=form.get("harness", ""),
-                reason=reason,
-            )
-        elif verb == "remove":
-            credentials.remove(
-                ctx.admin,
-                uow,
-                principal=principal.name,
-                harness=form.get("harness", ""),
-                reason=reason,
-            )
-        elif verb == "rotate":
-            credentials.rotate(
-                ctx.admin,
-                uow,
-                principal=principal.name,
-                harness=form.get("harness", ""),
-                new_path=form.get("new_path", ""),
-                reason=reason,
-            )
-        else:
-            raise ConflictError("unknown credential action")
-    elif action == "gateway-save":
+    if action == "gateway-save":
         result = await gateway.save_gateway(
             ctx.admin,
             uow,
@@ -2621,44 +2436,6 @@ async def _actions(
             form,
             f"Registered {added['repository']} ({added['url']}, default branch "
             f"{added['default_branch']}, installation {added['installation_id']}).",
-        )
-    elif action == "login-start":
-        login.start_login(
-            ctx.admin,
-            uow,
-            ctx.logins,
-            principal=principal.name,
-            harness=form.get("harness", ""),
-            reason=reason,
-            replace=form.get("replace") == "true",
-        )
-    elif action == "login-code":
-        login.submit_code(
-            ctx.logins,
-            form.get("harness", ""),
-            form.get("code", ""),
-            ctx=ctx.admin,
-            uow=uow,
-            principal=principal.name,
-            reason=reason,
-        )
-    elif action == "login-cancel":
-        login.cancel_login(
-            ctx.logins,
-            form.get("harness", ""),
-            ctx=ctx.admin,
-            uow=uow,
-            principal=principal.name,
-            reason=reason,
-        )
-    elif action == "login-finish":
-        login.finish_login(
-            ctx.admin,
-            uow,
-            ctx.logins,
-            principal=principal.name,
-            harness=form.get("harness", ""),
-            reason=reason,
         )
     elif action == "image-promote":
         await images.promote(
@@ -2876,7 +2653,6 @@ async def _actions(
     return None
 
 
-register("credential", _actions)
 register("gateway-save", _actions)
 register("gateway-test", _actions)
 register("hermes-limits", _actions)
@@ -2884,10 +2660,6 @@ register("gateway-models", _actions)
 register("github-create-app", _actions)
 register("github-external-url", _actions)
 register("github-add-repository", _actions)
-register("login-start", _actions)
-register("login-code", _actions)
-register("login-cancel", _actions)
-register("login-finish", _actions)
 register("image-promote", _actions)
 register("image-rollback", _actions)
 register("routing-clear", _actions)
@@ -2911,3 +2683,4 @@ router.routes.extend(session.router.routes)
 router.routes.extend(actions.router.routes)
 router.routes.extend(dashboard_ui.router.routes)
 router.routes.extend(harnesses_ui.router.routes)
+router.routes.extend(credentials_ui.router.routes)
