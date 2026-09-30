@@ -115,6 +115,7 @@ def _pick(
     result = select_model(
         _uow(rows, marks=kw.pop("marks", None), attempts=kw.pop("attempts", None)),
         routing,
+        contract={"required_verification": [{"command": "python3 -m unittest tests.test_x"}]},
         tier=tier,
         project="p",
         provider="fake",

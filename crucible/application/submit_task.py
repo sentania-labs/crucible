@@ -33,6 +33,7 @@ from crucible.domain.events import EventKind
 from crucible.domain.exit_class import ExitClass
 from crucible.domain.ids import new_id
 from crucible.domain.lifecycle import TaskState
+from crucible.domain.verification import task_specific_checks
 from crucible.ports.clock import Clock
 from crucible.ports.harness import CredentialSource, HarnessGate, HarnessUnavailableError
 from crucible.ports.repository import UnitOfWork
@@ -91,6 +92,13 @@ def _check_routing(
             harness=pinned_harness.value,
             model_id=pinned_model,
         )
+        entry = routing.model(pinned_model)
+        if (
+            entry is not None
+            and (entry.endpoint == "local" or entry.pool in routing.local_pools())
+            and not task_specific_checks(to_document(contract), policy.document)
+        ):
+            problems.append(_problem("execution_request.model", "no task-specific check"))
         quota = check_quota(uow, routing, model_id=pinned_model, now=clock.now())
         if quota is not None:
             problems.append(quota)
@@ -116,6 +124,8 @@ def _check_routing(
         project=contract.project,
         provider=request.provider.value,
         now=clock.now(),
+        contract=to_document(contract),
+        policy_document=policy.document,
         eligible_harnesses=eligible_harnesses,
         harnesses=harnesses,
         image_allowlist=[

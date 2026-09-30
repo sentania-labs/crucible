@@ -125,6 +125,7 @@ async def test_the_self_hosting_policy_routes_to_the_picked_hermes_model(
         {"id": "V1", "command": "make lint", "expect_exit": 0},
         {"id": "V2", "command": "make test-unit", "expect_exit": 0},
         {"id": "V3", "command": "make scan", "expect_exit": 0},
+        {"id": "V9", "command": "test -f made-by-the-worker", "expect_exit": 0},
     ]
     for field in ("harness", "model", "pin_reason", "image"):
         contract["execution_request"].pop(field, None)
