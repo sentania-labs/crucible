@@ -21,9 +21,11 @@ class HarnessConcurrency:
 HARNESS_CONCURRENCY: dict[str, HarnessConcurrency] = {
     # The setup token never refreshes; neither auth file syncs back.
     "claude_code": HarnessConcurrency("ro", True),
-    # OpenAI rotates refresh tokens. Parallel renewals can fail authentication;
-    # the existing retry is the safety net, and a policy cap of 1 is the rollback.
-    "codex": HarnessConcurrency("rw-narrow", True),
+    # OpenAI rotates refresh tokens on use, and two attempts syncing their refreshed
+    # auth.json back concurrently can let an older or revoked token win the last write
+    # (Codex review of PR 307). Codex stays serial until the brokered renewer lands
+    # (spec "Many Workers, One Login"); workers then hold access tokens only.
+    "codex": HarnessConcurrency("rw-narrow", False),
     # Google does not rotate refresh tokens on ordinary access-token renewal.
     "agy": HarnessConcurrency("rw-narrow", True),
     "hermes": HarnessConcurrency("ro"),

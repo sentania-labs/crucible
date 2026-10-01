@@ -201,14 +201,14 @@ remain capped at 1, even if a stored policy asks for more.
   `.claude.json` have `sync_back=False`; neither renews the credential.
 - AGY uses isolated writable copies. Google does not rotate the refresh token on
   ordinary access-token renewal, so the adapter declares parallel attempts safe.
-- Codex also declares parallel attempts safe under the operator's direction to try
-  multiple workers. OpenAI rotates refresh tokens on use: two concurrent renewals
-  can invalidate each other's login. The existing `auth_failure` classification and
-  retry-once policy remain the safety net, not a guarantee of recovery. The supervisor
-  logs each auth failure with `harness`, `attempt_id`, and `auth_failure_count`, a
+- Codex stays serial: its declaration is `parallel_attempts_safe = False`, so policy
+  refuses `per_harness.codex` above 1. OpenAI rotates refresh tokens on use, and two
+  attempts syncing refreshed copies back concurrently can let an older or revoked
+  token win the last write and break every later login. The brokered renewer (spec
+  "Many Workers, One Login": one renewer holds the refresh token, workers hold access
+  tokens and ask the host to refresh) is what lifts the cap. The supervisor still logs
+  each auth failure with `harness`, `attempt_id`, and `auth_failure_count`, a
   per-harness cumulative count for the current supervisor process (reset on restart).
-  Monitor these warnings to judge parallel operation; roll back by setting
-  `concurrency.per_harness.codex: 1` in the policy used by new executions.
 
 Copies remain isolated per attempt. There is no shared credential volume or central
 renewer. Shipped policy caps stay unchanged; Foundry sets the caps after deployment.

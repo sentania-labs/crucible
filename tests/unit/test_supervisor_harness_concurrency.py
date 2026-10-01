@@ -25,12 +25,22 @@ from tests.unit.test_policy_schema import seeded_policy
 from tests.unit.test_routing import _routing_setup
 
 
-@pytest.mark.parametrize("harness", ["claude_code", "codex", "agy", "hermes"])
+@pytest.mark.parametrize("harness", ["claude_code", "agy", "hermes"])
 def test_policy_accepts_parallel_frontier_harnesses(harness: str) -> None:
     document = seeded_policy()
     document["concurrency"]["per_harness"][harness] = 2
     policy = validate_policy(document, name=document["name"], version=document["version"])
     assert policy.concurrency.per_harness[harness] == 2
+
+
+def test_policy_keeps_codex_serial_until_the_renewer() -> None:
+    document = seeded_policy()
+    document["concurrency"]["per_harness"]["codex"] = 2
+    with pytest.raises(ContractValidationError) as caught:
+        validate_policy(document, name=document["name"], version=document["version"])
+    assert [e["path"] for e in caught.value.errors] == ["concurrency.per_harness.codex"]
+    document["concurrency"]["per_harness"]["codex"] = 1
+    validate_policy(document, name=document["name"], version=document["version"])
 
 
 @pytest.mark.parametrize("declared", [True, False])
@@ -62,13 +72,13 @@ def test_policy_still_requires_frontier_caps(harness: str) -> None:
         validate_policy(document, name=document["name"], version=document["version"])
 
 
-def test_agy_and_codex_declare_parallel_writable_copies() -> None:
-    for adapter in (AgyAdapter(), CodexAdapter()):
-        assert adapter.parallel_attempts_safe is True
+def test_agy_declares_parallel_writable_copies_and_codex_does_not() -> None:
+    for adapter, safe in ((AgyAdapter(), True), (CodexAdapter(), False)):
+        assert adapter.parallel_attempts_safe is safe
         assert adapter.credential_spec().minimum_mode is MountMode.RW_NARROW
 
 
-@pytest.mark.parametrize("harness", ["claude_code", "codex", "agy"])
+@pytest.mark.parametrize("harness", ["claude_code", "agy"])
 @pytest.mark.parametrize("state", CREDENTIAL_HOLDING_STATES)
 def test_supervisor_harness_cap_two_counts_until_collection(
     monkeypatch: pytest.MonkeyPatch, harness: str, state: AttemptState
@@ -101,7 +111,6 @@ def test_supervisor_harness_cap_two_counts_until_collection(
 def test_supervisor_keeps_unsafe_writable_adapter_serial(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("crucible.application.supervisor.load_routing", lambda *_: None)
     adapter = CodexAdapter()
-    monkeypatch.delattr(CodexAdapter, "parallel_attempts_safe")
     supervisor = Supervisor(
         MagicMock(),
         {},
@@ -124,7 +133,7 @@ def test_supervisor_keeps_unsafe_writable_adapter_serial(monkeypatch: pytest.Mon
 
 
 @pytest.mark.parametrize("running", [1, 2])
-@pytest.mark.parametrize("harness", ["claude_code", "codex"])
+@pytest.mark.parametrize("harness", ["claude_code"])
 async def test_supervisor_cap_two_uses_free_slot_then_falls_through(
     monkeypatch: pytest.MonkeyPatch, running: int, harness: str
 ) -> None:
