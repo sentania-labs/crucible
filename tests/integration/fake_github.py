@@ -412,6 +412,9 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _route(self, method: str, parts: list[str], query: dict[str, list[str]]) -> None:
         state = self.state
+        if method == "GET" and parts == ["app"]:
+            self._send(200, {"slug": "crucible-spike"})
+            return
         if parts[:2] == ["app", "installations"] and parts[-1] == "access_tokens":
             state.mint_calls += 1
             if state.mint_failure_once:
@@ -511,7 +514,10 @@ class _Handler(BaseHTTPRequestHandler):
                         login="crucible-spike[bot]",
                         body=str(body.get("body", "")),
                     )
-                    self._send(201, {"id": comment_id})
+                    comment = next(
+                        row for row in pull.issue_comments if str(row["id"]) == comment_id
+                    )
+                    self._send(201, comment)
                     return
                 self._send(200, pull.issue_comments)
                 return

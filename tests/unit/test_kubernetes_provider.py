@@ -1688,8 +1688,11 @@ async def test_an_absent_optional_auth_file_is_not_projected() -> None:
         for row in api.created
         if row["kind"] == "jobs" and str(row["name"]).startswith("worker-")
     )
-    volume = next(v for v in pod["volumes"] if v["name"] == "cred-source")
+    volume = next(v for v in pod["volumes"] if v["name"] == "cred")
     assert [item["key"] for item in volume["secret"]["items"]] == ["oauth-token"]
+
+    mount = next(m for m in pod["containers"][0]["volumeMounts"] if m["name"] == "cred")
+    assert mount["readOnly"] is True
 
 
 async def test_an_init_container_failure_is_terminal_not_running_forever() -> None:
