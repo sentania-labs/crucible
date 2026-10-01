@@ -388,30 +388,31 @@ cycle opens on that head.
 
 ## CI certification
 
-- Required-check set: the policy's `ci_certification.required_checks`,
-  or, when empty, every check the repository's branch protection or
-  ruleset marks required for the base branch, or, when that is empty too,
-  every non-skipped check run and workflow run observed on the accepted
-  head SHA.
-- Green: the set is non-empty and every member concluded `success` on the
-  accepted head. `success` and nothing else: GitHub uses `neutral` for a
-  check that ran and declined to judge and `skipped` for one a condition
-  excluded, and neither certifies. A required check with either conclusion
-  leaves the set **pending** until `wait_timeout_hours` wakes Foundry,
-  which is what the timeout is for. A repository that excludes a required
-  check on unrelated paths narrows `ci_certification.required_checks` or
-  sets `allow_no_ci`; it does not get a pass from the conclusion. **An empty set is `pending`, never green**: before GitHub
+- Count every observed non-skipped check run and workflow job on the accepted
+  head SHA. Check suites are containers and do not count. Branch protection
+  and ruleset names do not participate. The policy's
+  `ci_certification.required_checks` defaults to `[]`; a non-empty list is
+  an explicit narrowing by name of observed runs, never a source of missing
+  checks to wait for. Runs sharing a name each count.
+- Green: the counted set is non-empty and every member concluded `success`.
+  Queued or in-progress runs keep certification pending. A `neutral` result
+  also stays pending until `wait_timeout_hours` wakes Foundry; skipped runs
+  are excluded. Details report counts, such as "9 of 9 jobs succeeded on
+  <sha>" or "2 of 9 jobs still running".
+  **An empty set is `pending`, never green**: before GitHub
   has created any run, or on a repository with no CI, the task waits and
   `wait_timeout_hours` wakes Foundry with `ci_certification_overdue`. A
   repository that intentionally has no CI needs
   `ci_certification.allow_no_ci: true`, an operator-recorded policy
   decision, which makes the gate `skipped` rather than passed. For one
   task, the operator's `accept_no_ci` decision (ADR 0025) does the same
-  when nothing has run on the accepted head (a run a path filter skipped
-  counts as nothing); a check that does run is still certified. On green
+  when the policy narrowing is empty and nothing has run on the accepted
+  head (a run a path filter skipped counts as nothing). A non-empty narrowing
+  with no observed runs stays pending even with this waiver; a check that
+  does run is still certified. On green
   the task moves to `ready_for_merge` and wakes Foundry.
-- Failed: any required check concluded `failure`, `cancelled`,
-  `timed_out`, or `action_required`. Crucible captures the check name,
+- Failed: any counted run concluded `failure`, `cancelled`,
+  `timed_out`, `action_required`, `stale`, or `startup_failure`. Crucible captures the check name,
   workflow, job, head SHA, and the available log excerpt (through the
   Actions read permission), writes a `CICertification` row with state
   `failed`, moves the task to `ci_certification_failed`, and wakes Foundry.
