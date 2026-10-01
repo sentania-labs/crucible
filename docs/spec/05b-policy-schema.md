@@ -119,6 +119,8 @@ internal_review:
 
 external_review:
   provider: "codex"
+  request_on_publish: true             # post the provider trigger after opening the PR
+  trigger_comment: "@codex review"     # provider-specific; Codex is the shipped mapping
   reviewer_logins: ["chatgpt-codex-connector[bot]"]   # allowlisted identities (confirmed on sentania-labs/crucible#1)
   required_rounds: 1
   retrigger_after_correction: false
