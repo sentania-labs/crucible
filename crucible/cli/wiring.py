@@ -60,7 +60,7 @@ from crucible.application.credential_renewer import (
 )
 from crucible.application.delivery_tick import DeliveryConfig
 from crucible.application.errors import NotFoundError
-from crucible.application.harnesses import HarnessRegistry
+from crucible.application.harnesses import HarnessRegistry, effective_mount_mode
 from crucible.application.proxy_config import (
     enabled_local_endpoints,
     install_worker_proxy_config,
@@ -146,9 +146,9 @@ def credential_sources(settings: Settings) -> dict[str, CredentialSource]:
     """12: where each harness's credential directory is. Paths, never values."""
     out: dict[str, CredentialSource] = {}
     for name, entry in settings.credentials.items():
-        if entry.path:
+        if entry.path or entry.mount_mode:
             out[name] = CredentialSource(
-                path=entry.path,
+                path=entry.path or "",
                 mount_mode=MountMode(entry.mount_mode) if entry.mount_mode else None,
             )
     return out
@@ -606,8 +606,12 @@ def build_credential_renewer(
 ) -> CodexCredentialRenewer | None:
     """Build the one Codex writer from its directory or service-held Secret."""
     source = credential_sources(settings).get("codex")
+    spec = default_registry().require("codex").credential_spec()
+    assert spec is not None
+    if effective_mount_mode(spec, source) is not MountMode.RENEWER:
+        return None
     store: FileCredentialStore | KubernetesCredentialStore | None = None
-    if source is not None and (path := Path(source.path) / "auth.json").is_file():
+    if source is not None and source.path and (path := Path(source.path) / "auth.json").is_file():
         store = FileCredentialStore(path)
     elif (
         settings.kubernetes.enabled
@@ -629,6 +633,11 @@ def build_credential_renewer(
     if store is None:
         return None
 
+    try:
+        service_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        service_loop = None  # The local administrative CLI has no service loop.
+
     def record_refresh(kind: EventKind, payload: Mapping[str, Any]) -> None:
         with factory() as uow:
             record_event(
@@ -640,13 +649,24 @@ def build_credential_renewer(
             )
             uow.commit()
 
-    def propagate_refresh(document: Mapping[str, str]) -> None:
-        loop = asyncio.get_running_loop()
+    async def propagate(document: Mapping[str, str]) -> None:
         for provider in providers.values():
             update = getattr(provider, "refresh_credential_projection", None)
             if callable(update):
-                task = loop.create_task(update(document))
-                task.add_done_callback(lambda completed: completed.exception())
+                await update(document)
+
+    def propagate_refresh(document: Mapping[str, str]) -> None:
+        if service_loop is None:
+            asyncio.run(propagate(document))
+        else:
+            future = asyncio.run_coroutine_threadsafe(propagate(document), service_loop)
+            future.add_done_callback(lambda completed: completed.result())
+
+    def record_on_service_loop(kind: EventKind, payload: Mapping[str, Any]) -> None:
+        if service_loop is None:
+            record_refresh(kind, payload)
+        else:
+            service_loop.call_soon_threadsafe(record_refresh, kind, dict(payload))
 
     def wake(summary: str) -> None:
         with factory() as uow:
@@ -671,7 +691,7 @@ def build_credential_renewer(
     return CodexCredentialRenewer(
         store=store,
         clock=admin.clock,
-        record=record_refresh,
+        record=record_on_service_loop,
         propagate=propagate_refresh,
         wake=wake,
     )

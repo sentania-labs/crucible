@@ -1592,6 +1592,9 @@ class Supervisor:
                 report_mount=REPORT_MOUNT,
                 repo_mount=REPO_MOUNT,
                 credential_mounted=credential_mounted,
+                credential_mode=(
+                    effective_mount_mode(credential, source) if credential is not None else None
+                ),
                 endpoint=endpoint,
                 endpoint_url=endpoint_url,
                 command_timeout_ms=command_timeout_ms,

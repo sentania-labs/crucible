@@ -3,8 +3,7 @@
 Revision ID: 0034_credential_renewer
 Revises: 0033_ui_sessions
 
-Event kinds are stored as strings, so this migration intentionally has no DDL. The
-revision makes the domain vocabulary change visible in schema history.
+Extend the event vocabulary and credential observation mount modes.
 """
 
 from __future__ import annotations
@@ -33,11 +32,25 @@ def _replace_event_kinds(kinds: list[str]) -> None:
     op.execute(f"ALTER TABLE events ADD CONSTRAINT ck_events_kind CHECK (kind IN ({allowed}))")
 
 
+def _replace_mount_modes(*, renewer: bool) -> None:
+    modes = "'ro', 'rw-narrow', 'renewer'" if renewer else "'ro', 'rw-narrow'"
+    op.execute("ALTER TABLE harnesses DROP CONSTRAINT ck_harnesses_mount_mode")
+    op.execute(
+        "ALTER TABLE harnesses ADD CONSTRAINT ck_harnesses_mount_mode "
+        f"CHECK (mount_mode_observed IS NULL OR mount_mode_observed IN ({modes}))"
+    )
+
+
 def upgrade() -> None:
     _replace_event_kinds(_event_kinds())
+    _replace_mount_modes(renewer=True)
 
 
 def downgrade() -> None:
+    op.execute(
+        "UPDATE harnesses SET mount_mode_observed = NULL WHERE mount_mode_observed = 'renewer'"
+    )
+    _replace_mount_modes(renewer=False)
     kinds = ", ".join(f"'{kind}'" for kind in EVENT_KINDS)
     op.execute(f"DELETE FROM events WHERE kind IN ({kinds})")
     _replace_event_kinds(_previous_event_kinds())

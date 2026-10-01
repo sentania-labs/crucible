@@ -155,7 +155,8 @@ def test_kubernetes_store_refreshes_the_service_held_secret() -> None:
     assert stored["last_refresh"] == clock.now().isoformat()
 
 
-def test_wiring_uses_service_secret_when_codex_has_no_directory() -> None:
+@pytest.mark.parametrize("mode", ["renewer", "rw-narrow"])
+def test_wiring_uses_service_secret_when_codex_has_no_directory(mode: Any) -> None:
     clock = FakeClock(datetime(2026, 9, 30, tzinfo=UTC))
     login = {
         "last_refresh": (clock.now() - timedelta(hours=1)).isoformat(),
@@ -179,7 +180,7 @@ def test_wiring_uses_service_secret_when_codex_has_no_directory() -> None:
     settings = Settings(
         docker={"enabled": False},
         kubernetes={"enabled": True},
-        credentials={"codex": CredentialSettings(mount_mode="renewer")},
+        credentials={"codex": CredentialSettings(mount_mode=mode)},
     )
 
     def unused_factory() -> None:
@@ -192,8 +193,11 @@ def test_wiring_uses_service_secret_when_codex_has_no_directory() -> None:
         type("Admin", (), {"clock": clock})(),
     )
 
-    assert renewer is not None
-    assert isinstance(renewer.store, KubernetesCredentialStore)
+    if mode == "rw-narrow":
+        assert renewer is None
+    else:
+        assert renewer is not None
+        assert isinstance(renewer.store, KubernetesCredentialStore)
 
 
 def test_production_wiring_records_one_failure_event_and_one_durable_wake(

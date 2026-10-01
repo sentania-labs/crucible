@@ -19,3 +19,11 @@ workers until an operator logs in again.
 
 An explicit `rw-narrow` credential mount selects the previous `codex exec` copy and
 sync-back path for rollback. Local-endpoint Codex keeps its API-key launch path.
+
+PR 327 correction: supervisor launch specs and credential probes carry the effective
+mount mode, including a Kubernetes mode configured without a directory. Revision 0034
+accepts `renewer` credential observations and restores the original constraint on
+downgrade after clearing observations that the old schema cannot represent. Renewal
+captures the service loop when wired, dispatching projection updates and refresh
+events back to that loop from the retention thread. Explicit `rw-narrow` mode neither
+constructs nor schedules a renewer, preserving the legacy path as the sole writer.
