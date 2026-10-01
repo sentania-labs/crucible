@@ -427,6 +427,8 @@ class NamespaceProbe:
     # the retry rule covers, never a refusal, and the next launch runs the canary again.
     unavailable: bool = False
 
+    canary_node: str = ""
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "namespace_ready": self.passed,
@@ -438,6 +440,7 @@ class NamespaceProbe:
             "pod_pid_limit_source": self.pid_limit_source,
             "runtime_class": "standard",
             "detail": self.detail,
+            "canary_node": self.canary_node,
         }
 
 
@@ -845,6 +848,7 @@ class KubernetesProvider:
         namespace_run = await self._run_canary(image, scope="namespace")
         if isinstance(namespace_run, NamespaceProbe):
             return namespace_run
+        namespace_log, namespace_node = namespace_run
         endpoint_url = self.config.local_endpoint_url
         endpoint_problem: str | None = None
         try:
@@ -865,14 +869,16 @@ class KubernetesProvider:
         )
         if isinstance(rules_run, NamespaceProbe):
             return rules_run
-        probe = _read_probe(namespace_run, rules_run, override=self.config.pod_pid_limit_override)
+        rules_log, _rules_node = rules_run
+        probe = _read_probe(namespace_log, rules_log, override=self.config.pod_pid_limit_override)
         if endpoint_problem is None:
-            return probe
+            return replace(probe, canary_node=namespace_node)
         return replace(
             probe,
             detail=endpoint_problem if probe.passed else f"{probe.detail}; {endpoint_problem}",
             local_endpoint_reachable=False,
             local_endpoint_detail=endpoint_problem,
+            canary_node=namespace_node,
         )
 
     async def _canary_endpoint_plan(self, endpoint_url: str) -> EgressPlan:
@@ -895,7 +901,7 @@ class KubernetesProvider:
         scope: Literal["namespace", "worker"],
         plan: EgressPlan | None = None,
         endpoint_url: str = "",
-    ) -> str | NamespaceProbe:
+    ) -> tuple[str, str] | NamespaceProbe:
         """Run one canary Pod to its end and return its log, or the probe that says why
         it could not run. `plan` is its own NetworkPolicy; None runs it under the
         namespace's rules alone."""
@@ -985,7 +991,9 @@ class KubernetesProvider:
                 )
             except KubernetesApiError as exc:
                 return _canary_failed(f"the canary's log could not be read: {exc}", exc)
-            return b"".join(frame.payload for frame in body).decode("utf-8", "replace")
+            log = b"".join(frame.payload for frame in body).decode("utf-8", "replace")
+            pod = await self._call(self.client.get, "pods", name)
+            return log, pod["spec"].get("nodeName", "")
         finally:
             with contextlib.suppress(KubernetesApiError):
                 await self._call(self.client.delete, "pods", name, grace_period_seconds=0)
@@ -1959,6 +1967,7 @@ class KubernetesProvider:
             "job": launched.job_name if launched else "",
             "pod": (launched.pod_name if launched else "") or "",
             "node": (launched.node if launched else "") or "",
+            "canary_node": probe.canary_node if probe else "",
             # What the live Pod carried when it was seen (issue 76), else what the policy
             # asked for, and which of the two this is.
             "limits": (launched.limits if launched else self._limits(spec)).as_dict(),

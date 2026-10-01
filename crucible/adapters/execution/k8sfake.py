@@ -390,6 +390,7 @@ class FakeKubernetesApi:
         if kind == "jobs":
             self._start_job(stored)
         if kind == "pods":
+            stored.setdefault("spec", {})["nodeName"] = self.node_name
             self._start_pod(stored, owner=None)
         return stored
 
