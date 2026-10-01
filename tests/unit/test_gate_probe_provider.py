@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+import os
+import shutil
 import subprocess
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -148,7 +150,23 @@ async def test_probe_spanning_two_ticks_adopts_job_and_records_exit(
     assert len(created(api, "jobs", "gate-probe")) == 1
 
 
-def test_probe_script_checks_base_and_records_shell_127(tmp_path: Path) -> None:
+@pytest.fixture
+def probe_environment(tmp_path: Path) -> dict[str, str]:
+    # Match the script harness: shell utilities are available, Python is not.
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for name in ("sh", "git", "jq", "mktemp", "timeout", "tail", "rm", "sleep"):
+        executable = shutil.which(name)
+        assert executable is not None, name
+        (bin_dir / name).symlink_to(executable)
+    environment = dict(os.environ, PATH=str(bin_dir))
+    assert shutil.which("python3", path=environment["PATH"]) is None
+    return environment
+
+
+def test_probe_script_checks_base_and_records_shell_127(
+    tmp_path: Path, probe_environment: dict[str, str]
+) -> None:
     origin = tmp_path / "origin"
     origin.mkdir()
     for command in (
@@ -173,6 +191,12 @@ def test_probe_script_checks_base_and_records_shell_127(tmp_path: Path) -> None:
         {"id": "V4", "command": "test -f made-by-the-worker"},
         {"id": "V5", "command": "a-program-that-does-not-exist"},
         {"id": "V6", "command": 'printf \'%s\\n\' \'{"id":"forged","exit":0}\''},
+        {
+            "id": "V7",
+            "command": "i=0; while [ $i -lt 1100 ]; do printf x; i=$((i+1)); done; exit 127",
+        },
+        {"id": "V8", "command": "exit 124"},
+        {"id": "V9", "command": "exit 137"},
     ]
     result = subprocess.run(
         ["sh", "-c", scripts.gate_probe_script(str(origin), "main", checks, 5)],
@@ -180,9 +204,50 @@ def test_probe_script_checks_base_and_records_shell_127(tmp_path: Path) -> None:
         capture_output=True,
         text=True,
         timeout=15,
+        env=probe_environment,
     )
     assert result.returncode == 0, result.stderr
     rows = [json.loads(line) for line in result.stdout.splitlines()]
-    assert [row["exit"] for row in rows] == [0, 1, 127, 0]
+    assert [row["exit"] for row in rows] == [0, 1, 127, 0, 127, 124, 137]
     assert "not found" in rows[2]["detail"]
-    assert [row["id"] for row in rows] == ["V1", "V4", "V5", "V6"]
+    assert [row["id"] for row in rows] == ["V1", "V4", "V5", "V6", "V7", "V8", "V9"]
+    assert [row["command"] for row in rows] == [check["command"] for check in checks]
+    assert rows[4]["detail"] == "x" * 1000
+    assert all(rows[i]["detail"] == "" for i in (0, 1, 3))
+
+
+@pytest.mark.parametrize("command", ["sleep 30", "trap '' TERM; sleep 30"])
+def test_probe_script_bounds_each_command_without_python(
+    tmp_path: Path, probe_environment: dict[str, str], command: str
+) -> None:
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=origin, check=True, capture_output=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.org",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "base",
+        ],
+        cwd=origin,
+        check=True,
+        capture_output=True,
+    )
+    checks = [{"id": "V4", "command": command}, {"id": "V5", "command": "true"}]
+    result = subprocess.run(
+        ["sh", "-c", scripts.gate_probe_script(str(origin), "main", checks, 1)],
+        env=probe_environment,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert result.returncode in (124, 137)
+    assert "V4: command timed out" in result.stderr
+    assert result.stdout == ""

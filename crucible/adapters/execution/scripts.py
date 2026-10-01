@@ -17,7 +17,6 @@ validation is what stops it being an option.
 
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping
 from typing import Any
 
@@ -1011,44 +1010,44 @@ def gate_probe_script(
     credential_host: str = "github.com",
 ) -> str:
     """Keep command output out of the JSON log, including forged result lines."""
-    configuration = json.dumps(
-        {"url": url, "base_ref": base_ref, "checks": checks, "timeout": timeout}
-    )
+    # Never depend on an interpreter that policy required_programs does not
+    # guarantee: every worker image has sh, git, jq and Debian coreutils (timeout).
     git_config = "/tmp/gitconfig" if checkout_token is not None else "/dev/null"
-    program = """import json, os, signal, subprocess, tempfile
-config = json.loads(__PROBE_CONFIGURATION__)
-env = dict(os.environ, GIT_TERMINAL_PROMPT="0",
-           GIT_CONFIG_GLOBAL=__GIT_CONFIGURATION__, GIT_CONFIG_NOSYSTEM="1")
-root = tempfile.mkdtemp(prefix="gate-probe-")
-subprocess.run(["git", "clone", "--no-checkout", "--", config["url"], root],
-               env=env, check=True, stdout=subprocess.DEVNULL)
-subprocess.run(["git", "checkout", "--detach", config["base_ref"]],
-               cwd=root, env=env, check=True, stdout=subprocess.DEVNULL)
-for check in config["checks"]:
-    with tempfile.TemporaryFile() as output:
-        process = subprocess.Popen(["sh", "-c", check["command"]], cwd=root, env=env,
-                                   stdout=output, stderr=output, start_new_session=True)
-        try:
-            code = process.wait(timeout=config["timeout"])
-        except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.wait()
-            raise RuntimeError(check["id"] + ": command timed out")
-        finally:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-        output.seek(0, 2)
-        output.seek(max(0, output.tell() - 1000))
-        detail = output.read().decode("utf-8", "replace") if code == 127 else ""
-    print(json.dumps({
-        "id": check["id"], "command": check["command"],
-                      "exit": code, "detail": detail}), flush=True)
-""".replace("__PROBE_CONFIGURATION__", repr(configuration)).replace(
-        "__GIT_CONFIGURATION__", repr(git_config)
-    )
     credential = (
         _checkout_credential(checkout_token, credential_host) if checkout_token is not None else ""
     )
-    return credential + "python3 -c " + _quote(program)
+    drop_token = "drop_checkout_token" if checkout_token is not None else ":"
+    program = f"""set -eu
+{credential}export GIT_TERMINAL_PROMPT=0 GIT_CONFIG_NOSYSTEM=1
+export GIT_CONFIG_GLOBAL={_quote(git_config)}
+root=$(mktemp -d)
+trap '{drop_token}; rm -rf "$root"' 0
+git clone --no-checkout -- {_quote(url)} "$root/repo" >&2
+cd "$root/repo"
+git checkout --detach {_quote(base_ref)} >&2
+{drop_token}
+probe_check() {{
+  check_id=$1
+  command=$2
+  code=0
+  timeout --signal=KILL {_quote(str(timeout))} sh -c '
+    code=0
+    sh -c "$1" || code=$?
+    printf "%s\n" "$code" > "$2"
+  ' sh "$command" "$root/status" > "$root/output" 2>&1 || code=$?
+  if [ "$code" -ne 0 ]; then
+    printf '%s: command timed out or runner failed (exit %s)\n' "$check_id" "$code" >&2
+    exit "$code"
+  fi
+  read -r code < "$root/status"
+  : > "$root/detail"
+  if [ "$code" -eq 127 ]; then
+    tail -c 1000 "$root/output" > "$root/detail"
+  fi
+  jq -cn --arg id "$check_id" --arg command "$command" --argjson exit "$code" \
+    --rawfile detail "$root/detail" '{{id: $id, command: $command, exit: $exit, detail: $detail}}'
+}}
+"""
+    for check in checks:
+        program += f"probe_check {_quote(check['id'])} {_quote(check['command'])}\n"
+    return program
