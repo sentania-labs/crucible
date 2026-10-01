@@ -4,7 +4,6 @@ API client, and fake provider of one test share that database."""
 
 from __future__ import annotations
 
-import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -29,13 +28,9 @@ from crucible.contracts.api import ExternalReviewAttestation, RepositoryRegistra
 from crucible.domain.entities import Role
 from crucible.ports.notification import DeliveryResult
 from tests.fixtures import REPOSITORY_URL, FakeClock, contract_document
+from tests.integration.postgres import SERVER_URL
 
 pytestmark = pytest.mark.integration
-
-# The same digest compose.yaml pins, so the tier and the stack run one Postgres build.
-POSTGRES_IMAGE = (
-    "postgres:16@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94"
-)
 
 TRUNCATE = (
     "TRUNCATE github_deliveries, ci_decisions, ci_certifications, reactions, "
@@ -117,37 +112,23 @@ def own_database(server_url: str, name: str) -> Iterator[str]:
         with admin.connect() as conn:
             conn.execute(text(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)'))
             conn.execute(text(f'CREATE DATABASE "{name}"'))
-        yield make_url(server_url).set(database=name).render_as_string(hide_password=False)
-        with admin.connect() as conn:
-            conn.execute(text(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)'))
+        try:
+            yield make_url(server_url).set(database=name).render_as_string(hide_password=False)
+        finally:
+            with admin.connect() as conn:
+                conn.execute(text(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)'))
     finally:
         admin.dispose()
 
 
 @pytest.fixture(scope="session")
-def database_url(worker_id: str, testrun_uid: str) -> Iterator[str]:
-    # Session scope is per process, so each xdist worker (and a serial run) gets its own
-    # database, named from the worker id, on CRUCIBLE_TEST_DATABASE_URL's server or on
-    # a container of its own. No test can see another process's rows (issue 195). The
-    # URL's role needs CREATEDB.
-    name = worker_database_name(worker_id, testrun_uid)
-    url = os.environ.get("CRUCIBLE_TEST_DATABASE_URL")
-    if url:
-        with own_database(url, name) as own:
-            yield own
-        return
-    from testcontainers.postgres import PostgresContainer  # noqa: PLC0415
-
-    try:
-        import docker as _docker  # type: ignore[import-untyped]  # noqa: PLC0415
-
-        _docker.from_env().ping()
-    except Exception:
+def database_url(worker_id: str, testrun_uid: str, pytestconfig: pytest.Config) -> Iterator[str]:
+    # The URL's role needs CREATEDB. Only the server is shared: each worker still
+    # creates, migrates and drops its own database (issue 195).
+    url = pytestconfig.stash[SERVER_URL]
+    if not url:
         pytest.skip("Docker daemon not available")
-    with (
-        PostgresContainer(POSTGRES_IMAGE, driver="psycopg") as pg,
-        own_database(pg.get_connection_url(), name) as own,
-    ):
+    with own_database(url, worker_database_name(worker_id, testrun_uid)) as own:
         yield own
 
 

@@ -7,6 +7,23 @@ unavailable; it never stores or manages a Crucible credential. Another
 orchestrator or a person can administer Crucible through the same surface
 without Foundry.
 
+## Board
+
+The read-only Board is next to Tasks in the administration navigation. It leads
+with every non-terminal task, grouped by what it waits on and then by its parent
+external ID. A task row links to the full task page and shows its closing issues,
+current route, state age, newest pending wake, pull request and CI state,
+corrections, and elapsed attempt time against the attempt timeout.
+
+Routing expands the ordered candidates recorded on the current attempt, including
+busy candidates skipped before the selected route. Tokens follow with both
+per-attempt values and totals by harness, model, and pool. "Not recorded" means
+the harness adapter did not provide usage; the Board does not estimate it.
+
+The quality log covers tasks whose pull request opened in the last 14 days. It
+shows pre-PR gate failures, Codex finding severities and dispositions,
+corrections, outcome, and submit-to-merge time, with totals by harness and model.
+
 ## Shape
 
 - **Versioned admin API** under `/v1/admin`, admin role only, generated

@@ -10,6 +10,13 @@ and on failure read `error`.
 `crucible schema` prints the envelope's JSON schema and the schema of `data`
 for every `kind`.
 
+The web Routing page exposes routing tunables directly. An administrator can enable or
+disable each model, order every tier's pools, and choose its allowed capabilities. Each
+form takes an audit reason and publishes the next immutable routing version. Delivery
+policies follow new versions of the routing policy they name unless
+`routing.policy.pinned` is deliberately set; already submitted tasks retain their
+policy and routing versions.
+
 ## CI certification
 
 Certification counts every observed non-skipped check run and workflow job on
@@ -55,6 +62,20 @@ is refused, because the URL is echoed into `next`.
 (`--config`, the server TOML) unless it is given `--api-url URL` or
 `--remote` (the URL from `CRUCIBLE_URL` or the file); then it calls the API
 with the token. `migrate` is local only.
+
+### Board
+
+`GET /v1/admin/board` is an admin-only, read-only view of the same data as the
+operator page at `/ui/board`. It returns `in_flight` groups, current-attempt
+`routing`, per-attempt and rolled-up `tokens`, and the 14-day `quality` log.
+Task and attempt timestamps are RFC 3339 in JSON. The HTML page renders them in
+the configured operator timezone.
+
+Token values are reported only when a harness adapter supplied them. An attempt
+whose adapter supplied no usage has `recording: "not recorded"` and null token
+values. Totals count recorded and unrecorded attempts separately and never
+estimate missing usage. Merge queue position is null when no stored source
+reported it.
 
 ## The envelope
 

@@ -136,26 +136,57 @@ def publish_routing(
         document=routing_document,
         reason=reason,
     )
-    policy_document = copy.deepcopy(policy.document)
-    policy_versions = uow.policies.list_versions(policy.name)
-    next_policy_version = max(item.version for item in policy_versions) + 1
-    policy_document["version"] = next_policy_version
-    policy_document["description"] = (
-        f"{policy.document.get('description', 'Software delivery policy')} "
-        f"{note} in version {next_policy_version}."
-    )
-    policy_document["routing"] = {"policy": {"name": routing.name, "version": next_routing_version}}
-    put_policy(
-        uow,
-        ctx.clock,
-        principal=principal,
-        name=policy.name,
-        version=next_policy_version,
-        document=policy_document,
-        reason=reason,
-    )
+    ref = (policy.document.get("routing") or {}).get("policy") or {}
+    pinned = ref.get("pinned") is True
+    next_policy_version = policy.version
+    policy_names = {policy.name, *(repo.policy_name for repo in uow.repositories.list_all())}
+    for policy_name in sorted(policy_names):
+        policy_versions = [
+            item for item in uow.policies.list_versions(policy_name) if item.retired_at is None
+        ]
+        if not policy_versions:
+            continue
+        current = max(policy_versions, key=lambda item: item.version)
+        current_ref = (current.document.get("routing") or {}).get("policy") or {}
+        if current_ref.get("name") != routing.name or current_ref.get("pinned") is True:
+            continue
+        new_policy_version = (
+            max(item.version for item in uow.policies.list_versions(policy_name)) + 1
+        )
+        policy_document = copy.deepcopy(current.document)
+        policy_document["version"] = new_policy_version
+        policy_document["description"] = (
+            f"{current.document.get('description', 'Software delivery policy')} "
+            f"{note} in version {new_policy_version}."
+        )
+        policy_document["routing"] = {
+            "policy": {
+                "name": routing.name,
+                "version": next_routing_version,
+                "pinned": False,
+            }
+        }
+        put_policy(
+            uow,
+            ctx.clock,
+            principal=principal,
+            name=policy_name,
+            version=new_policy_version,
+            document=policy_document,
+            reason=reason,
+        )
+        if policy_name == policy.name:
+            next_policy_version = new_policy_version
+    egress_document = routing_document
+    if pinned:
+        referenced_routing = uow.routing_policies.get(
+            str(ref.get("name", "")), int(ref.get("version", 0))
+        )
+        if referenced_routing is None:
+            raise NotFoundError("the routing policy named by the pinned policy is not available")
+        egress_document = referenced_routing.document
     if ctx.proxy_config_path:
-        rendered = worker_proxy_config(ctx.proxy_subnet, list(ctx.proxy_hosts), [routing_document])
+        rendered = worker_proxy_config(ctx.proxy_subnet, list(ctx.proxy_hosts), [egress_document])
         install_worker_proxy_config(
             Path(ctx.proxy_config_path),
             rendered,
@@ -167,7 +198,7 @@ def publish_routing(
             host for host in getattr(docker.config, "proxy_allowlist", ()) if ":" not in host
         )
         enabled_destinations = []
-        for endpoint in enabled_local_endpoints([routing_document]):
+        for endpoint in enabled_local_endpoints([egress_document]):
             parsed = urlsplit(endpoint)
             port = parsed.port or (443 if parsed.scheme == "https" else 80)
             enabled_destinations.append(f"{parsed.hostname}:{port}")
