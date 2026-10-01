@@ -151,8 +151,9 @@ class ReplacedHeads:
     add-only and the comments stay on the pull request. Only a comment made before the
     accepted head appeared is settled: a reply on an old thread after the correction is
     new feedback, whatever head its thread started on. A head someone else pushed is
-    never in the set: it went through `head_diverged` and was never Crucible's to
-    settle."""
+    normally never in the set: it went through `head_diverged` and was never Crucible's
+    to settle. A recorded `recollect` decision is the exception: it explicitly adopts
+    that head, so its observation time starts the replacement."""
 
     heads: frozenset[str] = frozenset()
     since: datetime | None = None
@@ -177,12 +178,20 @@ def replaced_heads(uow: UnitOfWork, task: Task, pull_request: PullRequest) -> Re
     head = accepted_head(uow, task)
     if not head:
         return ReplacedHeads()
-    rows = [
-        row
-        for row in uow.pull_request_heads.list_for_pull_request(pull_request.id)
-        if row.pushed_by is PushedBy.CRUCIBLE
-    ]
+    all_rows = list(uow.pull_request_heads.list_for_pull_request(pull_request.id))
+    rows = [row for row in all_rows if row.pushed_by is PushedBy.CRUCIBLE]
     since = min((row.observed_at for row in rows if row.sha == head), default=None)
+    head_decision = uow.events.latest_for_task_kind(task.id, EventKind.HEAD_DECISION_RECORDED.value)
+    if (
+        since is None
+        and head_decision is not None
+        and head_decision.payload.get("action") == "recollect"
+        and head_decision.payload.get("observed_head") == head
+    ):
+        since = min(
+            (row.observed_at for row in all_rows if row.sha == head),
+            default=None,
+        )
     return ReplacedHeads(
         heads=frozenset(row.sha for row in rows if row.sha != head),
         since=since,
