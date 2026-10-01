@@ -634,46 +634,74 @@ def test_hermes_steps_name_the_real_blocker_and_the_page_that_fixes_it(
     assert all("script-harness" not in step["text"] for step in readiness["steps"])
 
 
+@pytest.mark.parametrize(
+    ("api_base", "repository_url"),
+    [
+        ("https://api.github.com", "https://github.com/o/r"),
+        ("https://API.GitHub.COM", "https://GitHub.COM/o/r"),
+        ("https://ghe.example.internal/api/v3", "https://ghe.example.internal/o/r"),
+        ("https://GHE.example.internal/api/v3", "https://ghe.EXAMPLE.internal/o/r"),
+    ],
+)
 def test_github_repository_without_connected_app_adds_readiness_step(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, api_base: str, repository_url: str
 ) -> None:
-    """Issue #141: a github.com repository with no connected App shows a readiness step."""
-
-    repo_github = SimpleNamespace(url="https://github.com/o/r")
-    repo_non_github = SimpleNamespace(url="https://gitlab.example.com/o/r")
-
-    # configured=False: step present
+    """Issue #141: repositories on the configured GitHub host need a connected App."""
     document: dict[str, Any] = {
         "supervisor": _supervisor_document(_lease(), _status()),
         "harnesses": [_harness("hermes")],
         "providers": [],
+        "github": {"configured": False, "api_base": api_base},
     }
-    document["github"] = {"configured": False}
     readiness = _readiness(
-        document, monkeypatch, repositories=[repo_github], enabled_models={"hermes"}
+        document,
+        monkeypatch,
+        repositories=[SimpleNamespace(url=repository_url)],
+        enabled_models={"hermes"},
     )
-    codes = [step["code"] for step in readiness["steps"]]
-    assert "github_app_not_connected" in codes
-    step = next(s for s in readiness["steps"] if s["code"] == "github_app_not_connected")
-    assert step["fix"] == "/ui/github"
-    assert "A GitHub repository is registered but no GitHub App is connected" in step["text"]
+    assert readiness["steps"] == [
+        {
+            "code": "github_app_not_connected",
+            "text": "A GitHub repository is registered but no GitHub App is connected.",
+            "fix": "/ui/github",
+        }
+    ]
     assert readiness["ready"] is False
 
-    # configured=True: step absent
-    document["github"] = {"configured": True}
+    document["github"]["configured"] = True
     readiness = _readiness(
-        document, monkeypatch, repositories=[repo_github], enabled_models={"hermes"}
+        document,
+        monkeypatch,
+        repositories=[SimpleNamespace(url=repository_url)],
+        enabled_models={"hermes"},
     )
-    codes = [step["code"] for step in readiness["steps"]]
-    assert "github_app_not_connected" not in codes
+    assert readiness["steps"] == []
+    assert readiness["ready"] is True
 
-    # non-GitHub URL: step absent even with configured=False
-    document["github"] = {"configured": False}
+    document["github"]["configured"] = False
+    for unrelated_url in (
+        "https://gitlab.example.com/o/r",
+        "https://github.com.example.com/o/r",
+        "https://example.com/github.com/o/r",
+    ):
+        readiness = _readiness(
+            document,
+            monkeypatch,
+            repositories=[SimpleNamespace(url=unrelated_url)],
+            enabled_models={"hermes"},
+        )
+        assert readiness["steps"] == []
+        assert readiness["ready"] is True
+
+    del document["github"]
     readiness = _readiness(
-        document, monkeypatch, repositories=[repo_non_github], enabled_models={"hermes"}
+        document,
+        monkeypatch,
+        repositories=[SimpleNamespace(url="https://github.com/o/r")],
+        enabled_models={"hermes"},
     )
-    codes = [step["code"] for step in readiness["steps"]]
-    assert "github_app_not_connected" not in codes
+    assert readiness["steps"][0]["code"] == "github_app_not_connected"
+    assert readiness["ready"] is False
 
 
 def test_a_missing_credential_and_image_are_named_per_harness(

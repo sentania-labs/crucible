@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any
+from urllib.parse import urlsplit
 
 from crucible.application.admin import audit, bootstrap, credentials, github
 from crucible.application.admin.context import AdminContext
@@ -374,17 +375,22 @@ def readiness(
                 "/ui/github",
             )
         )
-    if (
-        any("github.com" in getattr(repo, "url", "") for repo in repositories)
-        and document.get("github", {}).get("configured") is not True
-    ):
-        steps.append(
-            _step(
-                "github_app_not_connected",
-                "A GitHub repository is registered but no GitHub App is connected.",
-                "/ui/github",
+    if repositories and document.get("github", {}).get("configured") is not True:
+        github_host = urlsplit(
+            document.get("github", {}).get("api_base", "https://api.github.com")
+        ).hostname
+        if github_host == "api.github.com":
+            github_host = "github.com"
+        if github_host and any(
+            urlsplit(getattr(repo, "url", "")).hostname == github_host for repo in repositories
+        ):
+            steps.append(
+                _step(
+                    "github_app_not_connected",
+                    "A GitHub repository is registered but no GitHub App is connected.",
+                    "/ui/github",
+                )
             )
-        )
     ready_harnesses = [h["name"] for h in harnesses if h["state"] == "ready"]
     if not ready_harnesses:
         steps.append(
