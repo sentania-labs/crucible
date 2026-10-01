@@ -29,10 +29,11 @@ v0.7.1. In practice Codex has carried most of the self-development work (36 of t
 38 Hades-authored PRs to 2026-10-01, 2 on Hermes, none on Claude Code); the M1c
 Claude Code path is unproven and is recorded as such below.
 
-The public evidence does not establish completion of the real Foundry ledger
-handoff. [Readiness](readiness.md) still describes that gap. Foundry must reconcile
-it with authorized private evidence, without performing an irreversible handoff
-merely to update documentation.
+The real Foundry ledger handoff happened on 2026-09-29 on the operator's words
+(ADR 0029, #255, PR #245): the bootstrap bundle was imported, the SQLite ledger was
+frozen read-only, and Hades has been the system of record for Foundry's tasks since.
+[Readiness](readiness.md) row 18 records it; the import id lives in Foundry's private
+state, not in this repository.
 
 Persistent principal chat, independent work cards, curated agent definitions and
 durable agent routines remain product work, not capabilities implied by today's
@@ -50,7 +51,7 @@ operator's vision.
 
 | Capability | Current position | Owning tracking |
 |---|---|---|
-| Bootstrap authority and self-development proof | Import machinery exists; actual handoff and full M1 exits need evidence reconciliation | [#207](https://github.com/sentania-labs/hades/issues/207), [#85](https://github.com/sentania-labs/hades/issues/85), [#184](https://github.com/sentania-labs/hades/issues/184) |
+| Bootstrap authority and self-development proof | Handoff done 2026-09-29 (ADR 0029, #255); M1 exits still need #85 and a Claude Code run | [#207](https://github.com/sentania-labs/hades/issues/207), [#85](https://github.com/sentania-labs/hades/issues/85), [#184](https://github.com/sentania-labs/hades/issues/184) |
 | M2 persistent principal and harness continuity | Planned; dedicated conversation service and continuity spike not implemented | [#208](https://github.com/sentania-labs/hades/issues/208) |
 | M3 curated identities and skills | Partial backlog coverage; applicability, permissions and agent tests need explicit acceptance | [#199](https://github.com/sentania-labs/hades/issues/199), [#197](https://github.com/sentania-labs/hades/issues/197), [#198](https://github.com/sentania-labs/hades/issues/198) |
 | M4 brainstorm intake and independent cards | Planned; captured ideas must remain distinct from authorized execution | [#209](https://github.com/sentania-labs/hades/issues/209) |
