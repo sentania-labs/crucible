@@ -57,6 +57,20 @@ def test_an_empty_title_is_refused() -> None:
         validate_title("   ")
 
 
+def test_a_title_whose_only_newline_is_trailing_is_accepted() -> None:
+    """A title whose only newline is trailing (or leading) is accepted."""
+    assert validate_title("Fix: decide note identity\n") == "Fix: decide note identity"
+    assert validate_title("Fix: decide note identity\r\n") == "Fix: decide note identity"
+    # Also a leading newline
+    assert validate_title("\nFix: decide note identity") == "Fix: decide note identity"
+
+
+def test_a_title_with_an_embedded_newline_is_still_refused() -> None:
+    """A newline between words is still refused."""
+    with pytest.raises(TitleRefusedError, match="one line"):
+        validate_title("first line\nsecond line")
+
+
 def test_an_over_long_title_is_shortened_at_a_word_not_refused() -> None:
     """The lab, 2026-09-29: a 75-character title stopped a finished task at publication."""
     proposed = "Status page version row: test the real page (#234), Hermes via Hades now"
