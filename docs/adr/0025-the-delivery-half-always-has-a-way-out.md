@@ -27,10 +27,12 @@ escalate; neither meant a task to wait for ever.
 - **Two operator waivers, per task, as recorded Decisions.**
   `waive_external_review` waives the external review rounds still outstanding;
   the rounds gate reads `skipped` and names the decision. `accept_no_ci` accepts
-  that the repository has no CI for this task: with nothing at all run on the
-  accepted head (a skipped run counts as nothing), certification is `skipped`; a
-  check that does run is still certified. Both are operator-only (like
-  `release_authorization`), may be recorded only while a pull request is under
+  that the repository has no CI for this task: with an empty policy narrowing
+  and nothing at all run on the accepted head (a skipped run counts as nothing),
+  certification is `skipped`. A non-empty narrowing with no observed runs stays
+  pending even with this waiver; a check that does run is still certified. Both
+  are operator-only (like `release_authorization`), may be recorded only while
+  a pull request is under
   observation, need the operator's words, and are made through the API, the CLI
   (`crucible decisions --kind`), or the task page. Nothing but a recorded decision
   waives anything.
