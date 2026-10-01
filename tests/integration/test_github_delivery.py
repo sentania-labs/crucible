@@ -771,7 +771,7 @@ async def test_green_required_checks_reach_ready_for_merge_then_merged(
     client: TestClient, delivery_supervisor: Supervisor, github: FakeGitHubServer
 ) -> None:
     task_id, view = await green(client, delivery_supervisor, github)
-    github.state.repositories[REPOSITORY].required_checks = ["build"]
+    github.state.repositories[REPOSITORY].required_checks = ["never-observed"]
     github.state.set_check(REPOSITORY, view["head_sha"], name="build", conclusion="success")
     await delivery_supervisor.tick()
     assert client.get(f"/v1/tasks/{task_id}").json()["state"] == "ready_for_merge"
@@ -790,7 +790,6 @@ async def test_observation_review_ci_race(
     client: TestClient, delivery_supervisor: Supervisor, github: FakeGitHubServer
 ) -> None:
     task_id, view = await green(client, delivery_supervisor, github)
-    github.state.repositories[REPOSITORY].required_checks = ["build"]
     github.state.set_check(REPOSITORY, view["head_sha"], name="build", conclusion="success")
     github.state.add_review(
         REPOSITORY,
@@ -810,7 +809,6 @@ async def test_ready_for_merge_invalidation(
     client: TestClient, delivery_supervisor: Supervisor, github: FakeGitHubServer
 ) -> None:
     task_id, view = await green(client, delivery_supervisor, github)
-    github.state.repositories[REPOSITORY].required_checks = ["build"]
     github.state.set_check(REPOSITORY, view["head_sha"], name="build", conclusion="success")
     await delivery_supervisor.tick()
     assert client.get(f"/v1/tasks/{task_id}").json()["state"] == "ready_for_merge"
@@ -858,7 +856,6 @@ async def test_new_inline_comment_on_recorded_review_revokes_ready(
         body="Codex Review. No findings.",
     )
     await delivery_supervisor.tick()
-    github.state.repositories[REPOSITORY].required_checks = ["build"]
     github.state.set_check(REPOSITORY, view["head_sha"], name="build", conclusion="success")
     await delivery_supervisor.tick()
     assert client.get(f"/v1/tasks/{task_id}").json()["state"] == "ready_for_merge"
@@ -901,7 +898,6 @@ async def test_edited_inline_comment_invalidates_its_old_disposition(
     )
     assert response.status_code == 200, response.text
     await delivery_supervisor.tick()
-    github.state.repositories[REPOSITORY].required_checks = ["build"]
     github.state.set_check(REPOSITORY, view["head_sha"], name="build", conclusion="success")
     await delivery_supervisor.tick()
     assert client.get(f"/v1/tasks/{task_id}").json()["state"] == "ready_for_merge"
@@ -929,7 +925,6 @@ async def test_a_required_failure_lands_in_ci_certification_failed_with_evidence
 ) -> None:
     """ADR 0009: capture the check, workflow, head, and log excerpt; no retry."""
     task_id, view = await green(client, delivery_supervisor, github)
-    github.state.repositories[REPOSITORY].required_checks = ["build"]
     github.state.set_check(REPOSITORY, view["head_sha"], name="build", conclusion="failure")
     github.state.set_workflow_run(REPOSITORY, view["head_sha"], name="ci", conclusion="failure")
     await delivery_supervisor.tick()
@@ -952,7 +947,6 @@ async def test_ci_decision_rerun_records_the_intent_and_wakes_the_operator(
     client: TestClient, delivery_supervisor: Supervisor, github: FakeGitHubServer
 ) -> None:
     task_id, view = await green(client, delivery_supervisor, github)
-    github.state.repositories[REPOSITORY].required_checks = ["build"]
     github.state.set_check(REPOSITORY, view["head_sha"], name="build", conclusion="failure")
     await delivery_supervisor.tick()
     response = client.post(
@@ -1054,7 +1048,6 @@ async def test_an_out_of_band_head_moves_the_task_to_head_diverged(
     reasons = [w["reason"] for w in client.get("/v1/wakes").json()["items"]]
     assert "head_diverged" in reasons
     # Nothing about the new SHA moves the task: green CI on it changes nothing.
-    github.state.repositories[REPOSITORY].required_checks = ["build"]
     github.state.set_check(REPOSITORY, "a" * 40, name="build", conclusion="success")
     await delivery_supervisor.tick()
     assert client.get(f"/v1/tasks/{task_id}").json()["state"] == "head_diverged"
@@ -1289,7 +1282,6 @@ async def test_a_second_tick_with_nothing_new_changes_nothing(
 ) -> None:
     """10: running the tick twice with nothing happening in between changes nothing."""
     task_id, view = await green(client, delivery_supervisor, github)
-    github.state.repositories[REPOSITORY].required_checks = ["build"]
     github.state.set_check(REPOSITORY, view["head_sha"], name="build", conclusion="success")
     await delivery_supervisor.tick()
     before = client.get(f"/v1/tasks/{task_id}/events", params={"limit": 200}).json()["items"]
@@ -1347,7 +1339,6 @@ async def test_a_commit_by_another_author_without_the_trailer_publishes(
 
     github.state.add_reaction(REPOSITORY, 1, login=REVIEWER, content="+1")
     await delivery_supervisor.tick()
-    github.state.repositories[REPOSITORY].required_checks = ["build"]
     github.state.set_check(REPOSITORY, head, name="build", conclusion="success")
     await delivery_supervisor.tick()
     assert client.get(f"/v1/tasks/{task_id}").json()["state"] == "ready_for_merge"
@@ -1523,7 +1514,6 @@ async def test_a_ci_log_excerpt_is_redacted_before_it_is_stored(
     value = installation_token_value()
     github.state.workflow_log = f"the job printed {value}\n".encode()
     task_id, view = await green(client, delivery_supervisor, github)
-    github.state.repositories[REPOSITORY].required_checks = ["build"]
     github.state.set_check(REPOSITORY, view["head_sha"], name="build", conclusion="failure")
     github.state.set_workflow_run(REPOSITORY, view["head_sha"], name="ci", conclusion="failure")
     await delivery_supervisor.tick()

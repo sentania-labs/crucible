@@ -38,120 +38,120 @@ def policy(**overrides: object) -> dict[str, object]:
     return {"ci_certification": section}
 
 
-def test_the_policy_list_wins_over_branch_protection() -> None:
+def test_every_observed_non_skipped_run_is_required() -> None:
     required, source = resolve_required(
-        policy(required_checks=["build"]),
-        branch_protection=["lint", "test"],
-        observed=[check("lint")],
-    )
-    assert required == ("build",) and source == "policy"
-
-
-def test_branch_protection_is_next_then_every_observed_run() -> None:
-    required, source = resolve_required(
-        policy(), branch_protection=["lint", "test", "lint"], observed=[check("build")]
-    )
-    assert required == ("lint", "test") and source == "branch_protection"
-    required, source = resolve_required(
-        policy(),
-        branch_protection=[],
         observed=[check("build"), check("skipped-one", "skipped"), check("build")],
     )
     assert required == ("build",) and source == "observed"
 
 
+def test_policy_only_narrows_observed_runs() -> None:
+    result = certify(
+        policy(required_checks=["build", "not-observed"]),
+        head_sha=HEAD,
+        observed=[check("build"), check("scan", "failure")],
+    )
+    assert result.state is CertificationState.GREEN
+    assert result.required == ("build",)
+    assert result.source == "observed"
+    assert result.detail == f"1 of 1 jobs succeeded on {HEAD}"
+
+
+def test_narrowing_to_no_observed_runs_is_pending() -> None:
+    result = certify(policy(required_checks=["absent"]), head_sha=HEAD, observed=[check("build")])
+    assert result.state is CertificationState.PENDING
+    assert not result.required
+
+
 def test_an_empty_set_is_pending_never_green() -> None:
-    result = certify(policy(), head_sha=HEAD, branch_protection=[], observed=[])
+    result = certify(policy(), head_sha=HEAD, observed=[])
     assert result.state is CertificationState.PENDING
     assert "never green" in result.detail
 
 
 def test_allow_no_ci_makes_the_gate_skipped_not_passed() -> None:
-    result = certify(policy(allow_no_ci=True), head_sha=HEAD, branch_protection=[], observed=[])
+    result = certify(policy(allow_no_ci=True), head_sha=HEAD, observed=[])
     assert result.state is CertificationState.SKIPPED
     assert "intentionally has no CI" in result.detail
 
 
 def test_green_needs_every_required_member_successful_on_the_accepted_head() -> None:
     result = certify(
-        policy(required_checks=["build", "scan"]),
+        policy(),
         head_sha=HEAD,
-        branch_protection=[],
         observed=[check("build"), check("scan")],
     )
     assert result.state is CertificationState.GREEN
     assert result.required == ("build", "scan")
+    assert result.detail == f"2 of 2 jobs succeeded on {HEAD}"
 
 
 def test_a_required_check_only_on_another_head_leaves_the_set_pending() -> None:
     result = certify(
         policy(required_checks=["build"]),
         head_sha=HEAD,
-        branch_protection=[],
         observed=[check("build", head=OTHER)],
     )
     assert result.state is CertificationState.PENDING
-    assert result.pending == ("build",)
+    assert result.pending == ()
 
 
 def test_a_failure_conclusion_fails_and_names_the_check() -> None:
-    for conclusion in ("failure", "cancelled", "timed_out", "action_required"):
+    for conclusion in (
+        "failure",
+        "cancelled",
+        "timed_out",
+        "action_required",
+        "stale",
+        "startup_failure",
+    ):
         result = certify(
-            policy(required_checks=["build"]),
+            policy(),
             head_sha=HEAD,
-            branch_protection=[],
-            observed=[check("build", conclusion)],
+            observed=[check("scan"), check("build", conclusion)],
         )
         assert result.state is CertificationState.FAILED, conclusion
         assert result.failures[0].name == "build"
+        assert "1 of 2 jobs succeeded" in result.detail
 
 
 def test_neutral_and_skipped_are_not_green() -> None:
-    """23: green means every member concluded `success`. A required check that came back
-    `neutral` or `skipped` concluded neither successfully nor in failure, so the set is
-    pending and the timeout wakes Foundry."""
     for conclusion in ("neutral", "skipped"):
         result = certify(
             policy(required_checks=["build"]),
             head_sha=HEAD,
-            branch_protection=[],
             observed=[check("build", conclusion)],
         )
         assert result.state is CertificationState.PENDING, conclusion
-        assert result.pending == ("build",)
+        assert result.pending == (("build",) if conclusion == "neutral" else ())
         assert not result.failures
 
 
 def test_a_running_check_is_pending_not_failed() -> None:
     result = certify(
-        policy(required_checks=["build"]),
+        policy(),
         head_sha=HEAD,
-        branch_protection=[],
-        observed=[check("build", None, status="in_progress")],
+        observed=[check("scan"), check("build", None, status="in_progress")],
     )
     assert result.state is CertificationState.PENDING
 
 
-def test_a_later_run_of_the_same_name_is_what_counts() -> None:
-    """A re-run the operator performed replaces the failure it was asked to replace."""
+def test_a_success_with_the_same_name_cannot_hide_a_failure() -> None:
     result = certify(
         policy(required_checks=["build"]),
         head_sha=HEAD,
-        branch_protection=[],
         observed=[check("build", "failure"), check("build", "success")],
     )
-    assert result.state is CertificationState.GREEN
+    assert result.state is CertificationState.FAILED
 
 
 def test_a_check_suite_is_recorded_but_never_becomes_a_required_check() -> None:
     """An App that opens a suite on every head and runs nothing in it would otherwise
     hold every task in `pending` for ever (observed live on the throwaway repository)."""
     suite = check("suite:claude", None, status="queued", source=CheckSource.CHECK_SUITE)
-    required, source = resolve_required(policy(), branch_protection=[], observed=[suite])
+    required, source = resolve_required(observed=[suite])
     assert required == () and source == "observed"
-    result = certify(
-        policy(allow_no_ci=True), head_sha=HEAD, branch_protection=[], observed=[suite]
-    )
+    result = certify(policy(allow_no_ci=True), head_sha=HEAD, observed=[suite])
     assert result.state is CertificationState.SKIPPED
     # It is still recorded as something observed on the head (23).
     assert result.observed == (suite,)
@@ -161,8 +161,7 @@ def test_a_workflow_run_counts_alongside_a_check_run() -> None:
     result = certify(
         policy(),
         head_sha=HEAD,
-        branch_protection=[],
-        observed=[check("ci", source=CheckSource.WORKFLOW_RUN)],
+        observed=[check("ci", source=CheckSource.WORKFLOW_RUN), check("build")],
     )
     assert result.state is CertificationState.GREEN and result.source == "observed"
 
@@ -174,3 +173,30 @@ def test_the_wait_timeout_comes_from_the_policy_with_the_specification_default()
     )
     assert wait_timeout_hours({}, "ci_certification", 6) == 6
     assert wait_timeout_hours({}, "external_review", 24) == 24
+
+
+def test_skipped_run_and_suite_do_not_mask_a_same_named_job() -> None:
+    result = certify(
+        policy(),
+        head_sha=HEAD,
+        observed=[
+            check("build", "failure"),
+            check("build", "skipped"),
+            check("build", source=CheckSource.CHECK_SUITE),
+        ],
+    )
+    assert result.state is CertificationState.FAILED
+    assert "0 of 1 jobs succeeded" in result.detail
+
+
+def test_queued_job_keeps_successful_jobs_pending() -> None:
+    result = certify(
+        policy(),
+        head_sha=HEAD,
+        observed=[
+            check("build"),
+            check("scan", None, status="queued"),
+        ],
+    )
+    assert result.state is CertificationState.PENDING
+    assert "1 of 2 jobs still running" in result.detail

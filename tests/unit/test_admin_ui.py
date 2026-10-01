@@ -13,6 +13,7 @@ from typing import Any, cast
 import pytest
 from starlette.requests import Request
 
+import crucible
 from crucible.adapters.execution.fake import FakeProvider
 from crucible.adapters.persistence.migrations.versions._0001_walking_skeleton import (
     DEFAULT_POLICY,
@@ -21,6 +22,8 @@ from crucible.adapters.persistence.migrations.versions._0008_harness_adapters im
     VERIFIED_ROUTING,
 )
 from crucible.adapters.ui import render as ui_render
+from crucible.adapters.ui.pages import dashboard
+from crucible.adapters.ui.pages import routing_models as ui_routing_models
 from crucible.adapters.ui.pages import settings as ui_settings
 from crucible.adapters.ui.pages import workers as ui_workers
 from crucible.adapters.ui.pages.settings import _settings_rows
@@ -37,6 +40,7 @@ from crucible.application.admin import credentials as credentials_service
 from crucible.application.admin import github as github_service
 from crucible.application.admin import providers as providers_service
 from crucible.application.admin import routing as routing_service
+from crucible.application.admin import routing_models as routing_models_service
 from crucible.application.admin import status as status_service
 from crucible.application.queries import supervisor_view
 from crucible.domain.entities import (
@@ -634,6 +638,76 @@ def test_hermes_steps_name_the_real_blocker_and_the_page_that_fixes_it(
     assert all("script-harness" not in step["text"] for step in readiness["steps"])
 
 
+@pytest.mark.parametrize(
+    ("api_base", "repository_url"),
+    [
+        ("https://api.github.com", "https://github.com/o/r"),
+        ("https://API.GitHub.COM", "https://GitHub.COM/o/r"),
+        ("https://ghe.example.internal/api/v3", "https://ghe.example.internal/o/r"),
+        ("https://GHE.example.internal/api/v3", "https://ghe.EXAMPLE.internal/o/r"),
+    ],
+)
+def test_github_repository_without_connected_app_adds_readiness_step(
+    monkeypatch: pytest.MonkeyPatch, api_base: str, repository_url: str
+) -> None:
+    """Issue #141: repositories on the configured GitHub host need a connected App."""
+    document: dict[str, Any] = {
+        "supervisor": _supervisor_document(_lease(), _status()),
+        "harnesses": [_harness("hermes")],
+        "providers": [],
+        "github": {"configured": False, "api_base": api_base},
+    }
+    readiness = _readiness(
+        document,
+        monkeypatch,
+        repositories=[SimpleNamespace(url=repository_url)],
+        enabled_models={"hermes"},
+    )
+    assert readiness["steps"] == [
+        {
+            "code": "github_app_not_connected",
+            "text": "A GitHub repository is registered but no GitHub App is connected.",
+            "fix": "/ui/github",
+        }
+    ]
+    assert readiness["ready"] is False
+
+    document["github"]["configured"] = True
+    readiness = _readiness(
+        document,
+        monkeypatch,
+        repositories=[SimpleNamespace(url=repository_url)],
+        enabled_models={"hermes"},
+    )
+    assert readiness["steps"] == []
+    assert readiness["ready"] is True
+
+    document["github"]["configured"] = False
+    for unrelated_url in (
+        "https://gitlab.example.com/o/r",
+        "https://github.com.example.com/o/r",
+        "https://example.com/github.com/o/r",
+    ):
+        readiness = _readiness(
+            document,
+            monkeypatch,
+            repositories=[SimpleNamespace(url=unrelated_url)],
+            enabled_models={"hermes"},
+        )
+        assert readiness["steps"] == []
+        assert readiness["ready"] is True
+
+    del document["github"]
+    readiness = _readiness(
+        document,
+        monkeypatch,
+        repositories=[SimpleNamespace(url="https://github.com/o/r")],
+        enabled_models={"hermes"},
+    )
+    assert readiness["steps"][0]["code"] == "github_app_not_connected"
+    assert readiness["ready"] is False
+
+
 def test_a_missing_credential_and_image_are_named_per_harness(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1109,28 +1183,127 @@ def test_the_settings_page_shows_broad_egress_and_the_resolve_ttl(
     assert rows["kubernetes.resolve_ttl_seconds"][3] == ""
 
 
-def test_status_page_shows_version_as_first_row() -> None:
+def test_status_page_shows_version_as_first_row(monkeypatch: pytest.MonkeyPatch) -> None:
     """hades #214: the Status page Service table lists a Version row first, carrying
     ``crucible.__version__`` rendered as a status cell."""
-    import crucible  # noqa: PLC0415
 
-    service_section: dict[str, Any] = {
-        "title": "Service",
-        "columns": ["Part", "State", ""],
-        "rows": [
-            [
-                "Version",
-                {
-                    "kind": "status",
-                    "value": crucible.__version__,
-                    "tone": "ok",
-                },
-                "",
-            ],
-        ],
+    minimal = {
+        "readiness": {
+            "ready": True,
+            "ready_harnesses": [],
+            "steps": [],
+            "harnesses": [],
+        },
+        "supervisor": {
+            "healthy": True,
+            "health_detail": "",
+            "last_tick_at": "2026-09-30T00:00:00Z",
+        },
+        "tasks": {"lists": {}},
+        "workers": [],
+        "providers": [],
+        "wakes": {"unacked": 0},
     }
 
-    rendered = _render_documents([service_section])
+    principal = SimpleNamespace(name="reader", role=SimpleNamespace(value="observer"))
+    sections_captured: list[dict[str, Any]] = []
 
-    assert "Version" in rendered
-    assert crucible.__version__ in rendered
+    async def _fake_status(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        return minimal
+
+    status_ns = SimpleNamespace(status=_fake_status)
+    monkeypatch.setattr(dashboard, "_require", lambda *args, **kwargs: (principal, "fixture-csrf"))
+    monkeypatch.setattr(dashboard, "status", status_ns)
+    monkeypatch.setattr(
+        dashboard,
+        "_page",
+        lambda *args, sections, **kwargs: sections_captured.extend(sections),
+    )
+
+    ctx = SimpleNamespace(admin=object())
+    asyncio.run(
+        dashboard.dashboard(
+            Request({"type": "http", "method": "GET", "path": "/ui", "headers": []}),
+            cast(Any, ctx),
+            cast(Any, SimpleNamespace()),
+        )
+    )
+
+    for section in sections_captured:
+        if section["title"] == "Service":
+            rows = section["rows"]
+            break
+    else:
+        raise AssertionError("Service section not found")
+
+    assert rows[0][0] == "Version"
+    assert rows[0][1]["value"] == crucible.__version__
+
+
+def test_routing_model_and_tier_controls_are_ordinary_reasoned_forms(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        routing_models_service,
+        "routing_controls_view",
+        lambda _uow: {
+            "pinned": False,
+            "pools": ["codex", "claude"],
+            "models": [
+                {
+                    "id": "gpt",
+                    "harness": "codex",
+                    "pool": "codex",
+                    "capability": "frontier",
+                    "enabled": True,
+                }
+            ],
+            "tiers": {
+                "complex": {
+                    "plain_words": (
+                        "complex: Codex first, then Claude Code; a busy first choice waits"
+                    ),
+                    "prefer_pools": ["codex", "claude"],
+                    "allowed_capability": ["frontier"],
+                }
+            },
+        },
+    )
+
+    sections = ui_routing_models.control_sections(cast(Any, object()), admin=True)
+
+    assert sections[0]["rows"][0][1].endswith("a busy first choice waits")
+    assert sections[1]["rows"][0][4]["action"] == "/ui/actions/routing-model"
+    tier_form = sections[2]["form"]
+    assert tier_form["action"] == "/ui/actions/routing-tier"
+    assert [
+        field["value"] for field in tier_form["fields"] if field["name"].startswith("pool_")
+    ] == ["codex", "claude"]
+    assert tier_form["fields"][-1]["name"] == "reason"
+
+
+def test_routing_tier_action_keeps_numeric_pool_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    saved: list[str] = []
+    monkeypatch.setattr(
+        routing_models_service,
+        "save_tier",
+        lambda *args, **kwargs: saved.extend(kwargs["prefer_pools"]),
+    )
+    form = {"tier": "complex", **{f"pool_{n}": f"pool-{n}" for n in range(11)}}
+
+    asyncio.run(
+        ui_routing_models._actions(
+            request("/ui/actions/routing-tier"),
+            "routing-tier",
+            cast(Any, SimpleNamespace(admin=object())),
+            cast(Any, object()),
+            cast(Any, object()),
+            "csrf",
+            form,
+            "reorder pools",
+        )
+    )
+
+    assert saved == [f"pool-{n}" for n in range(11)]

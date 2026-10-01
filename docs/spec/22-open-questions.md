@@ -1,5 +1,7 @@
 # 22. Decisions taken and questions still open
 
+Status: the decisions below are the 2026-09-16 set. Later decisions are ADRs under docs/adr/ (0015 onward, through 2026-09-29) and are not folded back into this table; where an ADR and a row here differ, the ADR wins.
+
 ## Decided by the operator, 2026-09-16 (incorporated in v0.3)
 
 | # | Topic | Decision | Where |
@@ -43,10 +45,12 @@
   never closes its PR. Both are recorded, neither is reversible by Crucible.
 - **I4. Merge is observed, never performed.** Crucible has no merge
   endpoint, matching "I review and merge".
-- **I5. `required_checks` resolution order**: policy list, then the base
-  branch's protection or ruleset, then every observed check on the SHA;
-  an empty result is `pending`, never a pass, unless the policy explicitly
-  allows a repository without CI.
+- **I5. CI certification counts observed runs only**: every non-skipped
+  check run and workflow job on the accepted SHA counts. The default-empty
+  `ci_certification.required_checks` list only explicitly narrows those runs
+  by name when set. Branch protection and ruleset names do not participate.
+  All must succeed; any failure fails; running jobs or no runs are pending,
+  never a pass, unless the policy explicitly allows a repository without CI.
 - **I6. Branch-only deliverables publish before acceptance.** `branch`
   deliverables pass through `publishing` and `branch_pushed_at_head` and
   only then become `accepted`; the kind itself needs a policy allowance.

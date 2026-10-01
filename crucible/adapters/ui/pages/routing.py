@@ -8,6 +8,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
 from crucible.adapters.api.deps import Ctx, UoW
 from crucible.adapters.ui.actions import register
+from crucible.adapters.ui.pages import routing_models as routing_models_page
 from crucible.adapters.ui.render import _document_section, _duration_words, _page
 from crucible.adapters.ui.session import _require
 from crucible.application.admin import gate_classes as gate_classes_admin
@@ -91,7 +92,10 @@ def routing_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                     f"{name}: {_pool_order_words(rule)}"
                     for name, rule in preference["tiers"].items()
                 ),
-                "hint": "other allowed models are fallbacks when these are unavailable",
+                "hint": (
+                    "other allowed models are fallbacks when these are unavailable or busy; "
+                    "the task page says when a task ran on its next choice because one was busy"
+                ),
             },
             "",
         ],
@@ -210,6 +214,7 @@ def routing_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
             else [],
         },
     ]
+    sections[1:1] = routing_models_page.control_sections(uow, admin=admin)
     if admin:
         tier_fields: list[dict[str, Any]] = []
         for name, rule in preference["tiers"].items():
@@ -497,6 +502,12 @@ def routing_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                                 "rows": 12,
                                 "required": True,
                             },
+                            {
+                                "name": "routing_pinned",
+                                "label": "Deliberately pin the routing policy version",
+                                "kind": "checkbox",
+                                "value": False,
+                            },
                             {"name": "reason", "label": "Reason", "required": True},
                         ],
                     },
@@ -674,6 +685,9 @@ async def _actions(
                 reason=audited_reason,
             )
         else:
+            document.setdefault("routing", {}).setdefault("policy", {})["pinned"] = (
+                form.get("routing_pinned") == "true"
+            )
             put_policy(
                 uow,
                 ctx.clock,

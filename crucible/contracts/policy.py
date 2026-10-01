@@ -145,8 +145,14 @@ class NamedVersion(StrictModel):
     version: int = Field(ge=1)
 
 
+class RoutingPolicyRef(NamedVersion):
+    # A delivery policy normally follows new versions of the named routing policy.
+    # Set this only when an operator deliberately wants this exact version retained.
+    pinned: bool = False
+
+
 class RoutingRef(StrictModel):
-    policy: NamedVersion
+    policy: RoutingPolicyRef
 
 
 class Images(StrictModel):
@@ -282,7 +288,10 @@ class ExternalReview(StrictModel):
 
 class CiCertification(StrictModel):
     require_green_on_final_sha: bool
-    required_checks: list[str]
+    required_checks: list[str] = Field(
+        default_factory=list,
+        description="Optional explicit narrowing of observed runs by name; empty counts all runs.",
+    )
     allow_no_ci: bool
     on_failure: Literal["escalate"]
     automatic_retry: bool

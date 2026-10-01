@@ -51,6 +51,24 @@ def _gate_steps(gates: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _busy_fallthrough(attempt: Any) -> str | None:
+    if attempt is None or attempt.model is None:
+        return None
+    skipped = [
+        candidate
+        for candidate in attempt.ordered_candidates
+        if candidate.get("busy") and candidate.get("model") != attempt.model
+    ]
+    if not skipped:
+        return None
+    choices = ", ".join(f"{candidate['model']} on {candidate['harness']}" for candidate in skipped)
+    verb = "was" if len(skipped) == 1 else "were"
+    return (
+        f"Ran on {attempt.model} on {attempt.harness}, its next available choice, "
+        f"because {choices} {verb} busy."
+    )
+
+
 @router.get("/tasks", response_class=HTMLResponse)
 def tasks_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
     found = _require(request, ctx, uow)
@@ -271,6 +289,20 @@ def task_page(request: Request, task_id: str, ctx: Ctx, uow: UoW) -> Response:
             ],
         },
     ]
+    fallthroughs = [
+        (attempt.id, words)
+        for execution in view.executions
+        for attempt in execution.attempts
+        if (words := _busy_fallthrough(attempt)) is not None
+    ]
+    if fallthroughs:
+        sections.append(
+            {
+                "title": "Routing",
+                "columns": ["Attempt", "Decision"],
+                "rows": fallthroughs,
+            }
+        )
     try:
         record = pull_request_view(uow, task_id)
     except NotFoundError:

@@ -302,3 +302,9 @@ def test_tier_prefer_must_be_a_subset_of_allowed() -> None:
 @pytest.mark.parametrize(("window", "seconds"), [("5h", 18000), ("24h", 86400), ("90m", 5400)])
 def test_window_seconds(window: str, seconds: int) -> None:
     assert window_seconds(window) == seconds
+
+
+def test_ci_required_checks_defaults_to_no_narrowing() -> None:
+    document = seeded_policy()
+    del document["ci_certification"]["required_checks"]
+    assert parse_policy(document).ci_certification.required_checks == []
