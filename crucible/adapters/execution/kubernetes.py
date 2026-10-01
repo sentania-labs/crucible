@@ -3591,7 +3591,7 @@ class KubernetesProvider:
         # are the Secret items plus the identity ConfigMap template items,
         # all read-only, and mount it at `target` instead of layering a
         # file mount over the read-only Secret.
-        elif templates and identity_paths is not None:
+        elif identity_paths is not None:
             projection: dict[str, Any] = {
                 "sources": [
                     {
@@ -3617,7 +3617,7 @@ class KubernetesProvider:
                     "name": k8sspec.object_name("identity", spec.attempt_id),
                     "defaultMode": 0o444,
                     "items": [
-                        {"key": k, "path": v}
+                        {"key": k, "path": v.removeprefix(f"{k8sspec.TEMPLATE_PREFIX}/")}
                         for k, v in sorted(identity_paths.items())
                         if v.startswith(f"{k8sspec.TEMPLATE_PREFIX}/")
                     ],

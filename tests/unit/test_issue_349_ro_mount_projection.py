@@ -66,9 +66,10 @@ async def test_ro_credential_is_a_projected_volume(ro_claude_code_attempt: tuple
     secret_keys = {item["key"] for item in secret_sources[0]["secret"]["items"]}
     assert secret_keys == {"oauth-token"}
 
-    # The ConfigMap source carries the template(s) from the identity bundle.
+    # The ConfigMap source carries the template(s) from the identity bundle,
+    # projected at the credential root with leaf names (P1 fix).
     cm_items = {item["path"] for item in configmap_sources[0]["configMap"]["items"]}
-    assert "harness/settings.json" in cm_items
+    assert "settings.json" in cm_items
 
     # The mount at the credential target is read-only, from the cred volume.
     mounts = {m["mountPath"]: m for m in pod["containers"][0]["volumeMounts"]}
@@ -139,3 +140,72 @@ async def test_rw_narrow_unchanged() -> None:
     cred_volume = next(v for v in pod["volumes"] if v["name"] == "cred-source")
     assert "secret" in cred_volume
     assert "projected" not in cred_volume
+
+
+async def test_ro_without_templates_still_mounts_credential_target() -> None:
+    """P2: an ro credential with no templates still gets its mount at target.
+
+    The fixture above uses Claude Code which has templates, so this test
+    calls _credential_mounts directly with an empty template set to exercise
+    the ro-credential fix: the base ro mount must be present regardless of
+    whether any templates are declared."""
+    from crucible.adapters.execution.k8sspec import Limits  # noqa: PLC0415
+    from crucible.adapters.execution.kubernetes import _CredentialCopy  # noqa: PLC0415
+    from crucible.ports.harness import AuthFile, CredentialSpec, MountMode  # noqa: PLC0415
+    from tests.unit.kubernetes_fixtures import build, spec  # noqa: PLC0415
+
+    _, _, provider = build(
+        config=KubernetesConfig(
+            poll_interval_seconds=0,
+            credential_modes={"claude_code": MountMode.RO},
+        ),
+    )
+
+    # A credential copy with ro mode and zero templates.
+    cred_spec = CredentialSpec(
+        harness="claude_code",
+        mount_target="/home/worker/.claude",
+        auth_files=(AuthFile(name="oauth-token"),),
+        minimum_mode=MountMode.RO,
+        required_for_launch=True,
+        templates={},  # no templates
+    )
+    copy = _CredentialCopy(
+        spec=cred_spec,
+        source_secret="crucible-harness-claude-code",
+        mode=MountMode.RO,
+    )
+
+    mounts, volumes, _ = provider._credential_mounts(
+        spec=spec(harness="claude_code"),
+        copy=copy,
+        image="crucible-worker:fake",
+        limits=Limits(
+            cpus=1,
+            memory_bytes=2_147_483_648,
+            ephemeral_storage="10Gi",
+            tmpfs_bytes=536_870_912,
+            grace_seconds=30,
+        ),
+        present=["oauth-token"],
+        identity_paths={"harness/settings.json": "harness/settings.json"},
+    )
+
+    # The mount at the credential target must exist (P2: was missing in the
+    # original code when templates were empty).
+    cred_mount = next(
+        (m for m in mounts if m.path == "/home/worker/.claude"),
+        None,
+    )
+    assert cred_mount is not None
+    assert cred_mount.read_only is True
+
+    # The volume is a projection carrying the Secret items.
+    cred_vol = next((v for v in volumes if v["name"] == "cred"), None)
+    assert cred_vol is not None
+    assert "projected" in cred_vol
+    src = cred_vol["projected"]["sources"]
+    secret_src = [s for s in src if "secret" in s]
+    assert len(secret_src) == 1
+    secret_keys = {item["key"] for item in secret_src[0]["secret"]["items"]}
+    assert secret_keys == {"oauth-token"}
