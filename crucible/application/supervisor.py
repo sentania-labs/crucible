@@ -167,6 +167,34 @@ TERMINATION_CANCEL = "cancel"
 # not to try the same refusal again.
 TERMINATION_REFUSED = "harness_refused"
 
+
+def local_cap_kind(
+    endpoint: str | None, exit_class: ExitClass, turn_cap_reached: bool
+) -> Literal["turns", "time"] | None:
+    """Name a size cap only when the attempt was routed to a local endpoint."""
+    if endpoint != "local":
+        return None
+    if turn_cap_reached:
+        return "turns"
+    if exit_class is ExitClass.TIMEOUT:
+        return "time"
+    return None
+
+
+def retryable_exit(exit_class: ExitClass, retry_on: Sequence[str]) -> bool:
+    return exit_class.value in retry_on and exit_class in (
+        ExitClass.ENVIRONMENT,
+        ExitClass.LOST,
+        ExitClass.AUTH_FAILURE,
+        ExitClass.TIMEOUT,
+    )
+
+
+def too_big_wake_summary(cap: Literal["turns", "time"]) -> str:
+    cap_name = "turn" if cap == "turns" else cap
+    return f"split the task: the local attempt hit its {cap_name} cap"
+
+
 # 16 defaults, used when the policy names none.
 DEFAULT_LOG_RETENTION_DAYS = 90
 DEFAULT_WORKSPACE_RETENTION_DAYS = 14
@@ -4065,7 +4093,12 @@ class Supervisor:
                         )
                     )
             self._classify_and_finish(
-                uow, attempt, blocked_text, claim_ok=claim_ok, defer_quota=defer_quota
+                uow,
+                attempt,
+                blocked_text,
+                claim_ok=claim_ok,
+                defer_quota=defer_quota,
+                turn_cap_reached=parsed is not None and parsed.limit_reached is not None,
             )
             uow.commit()
 
@@ -4720,6 +4753,7 @@ class Supervisor:
         *,
         claim_ok: bool = False,
         defer_quota: bool = False,
+        turn_cap_reached: bool = False,
     ) -> None:
         execution = uow.executions.get(attempt.execution_id, for_update=True)
         task = uow.tasks.get(attempt.task_id, for_update=True)
@@ -4731,9 +4765,19 @@ class Supervisor:
             self._finish_failed_review(uow, attempt, execution, task)
             return
         exit_class = attempt.exit_class or ExitClass.UNKNOWN
+        local_cap = self._local_cap(uow, execution, attempt, exit_class, turn_cap_reached)
         # 10: the checkout lease is released on a terminal attempt state.
         self._release_checkout_leases(uow, attempt)
-        if exit_class is ExitClass.COMPLETED and claim_ok:
+        if local_cap is not None:
+            move_attempt(
+                uow,
+                self._clock,
+                attempt,
+                AttemptState.FAILED,
+                EventKind.ATTEMPT_FAILED,
+                payload={"exit_class": exit_class.value, "local_cap": local_cap},
+            )
+        elif exit_class is ExitClass.COMPLETED and claim_ok:
             move_attempt(
                 uow, self._clock, attempt, AttemptState.SUCCEEDED, EventKind.ATTEMPT_SUCCEEDED
             )
@@ -4780,6 +4824,26 @@ class Supervisor:
                 question=blocked_text or "the worker exited 75 without a question",
             )
             return
+        if local_cap is not None:
+            reason = f"too_big_for_local:{local_cap}"
+            move_task(
+                uow,
+                self._clock,
+                task,
+                TaskState.BLOCKED,
+                EventKind.TASK_BLOCKED,
+                payload={**common, "exit_class": exit_class.value, "blocked_md": reason},
+                **common,
+            )
+            open_escalation(
+                uow,
+                self._clock,
+                task=task,
+                attempt_id=attempt.id,
+                question=reason,
+                summary=too_big_wake_summary(local_cap),
+            )
+            return
         if exit_class is ExitClass.QUOTA_EXHAUSTED:
             # Reactive rerouting is only for a worker that actually ran. A reserve-time
             # refusal has no worktree to checkpoint and follows the established
@@ -4799,11 +4863,7 @@ class Supervisor:
                 return
             self._handle_quota_exit(uow, task, execution, attempt)
             return
-        retryable = exit_class.value in execution.retry_on and exit_class in (
-            ExitClass.ENVIRONMENT,
-            ExitClass.LOST,
-            ExitClass.AUTH_FAILURE,
-        )
+        retryable = retryable_exit(exit_class, execution.retry_on)
         if attempt.termination_reason == TERMINATION_REFUSED:
             # 07: a refused launch would be refused again; Foundry has the wake.
             retryable = False
@@ -4844,6 +4904,21 @@ class Supervisor:
             },
         )
         self._task_reported(uow, task, attempt, exit_class, common)
+
+    @staticmethod
+    def _local_cap(
+        uow: UnitOfWork,
+        execution: Execution,
+        attempt: Attempt,
+        exit_class: ExitClass,
+        turn_cap_reached: bool,
+    ) -> Literal["turns", "time"] | None:
+        routing = load_routing(uow, execution.policy_snapshot or {})
+        model = attempt.selected_model or execution.model
+        entry = routing.model(model) if routing is not None else None
+        return local_cap_kind(
+            entry.endpoint if entry is not None else None, exit_class, turn_cap_reached
+        )
 
     def _finish_failed_review(
         self, uow: UnitOfWork, attempt: Attempt, execution: Execution, task: Task
