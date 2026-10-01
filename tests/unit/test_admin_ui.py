@@ -1301,7 +1301,9 @@ def test_tasks_of_disabled_discarded_import_principals_are_hidden_unless_archive
         return [t for t in [archived_task, archived_task_2, normal_task] if t.state == state]
 
     # Fake recently_updated
-    def fake_recently_updated(since: datetime, limit: int) -> list[Any]:
+    def fake_recently_updated(
+        since: datetime, limit: int, exclude_principal_ids: set[str] | None = None
+    ) -> list[Any]:
         return [archived_task, normal_task]
 
     uow = SimpleNamespace(
@@ -1475,3 +1477,182 @@ def test_tasks_of_disabled_discarded_import_principals_are_hidden_unless_archive
     assert recently_updated is not None
     note = recently_updated.get("note", "")
     assert "archived import tasks hidden" not in note, f"Hidden note should not appear: {note}"
+
+
+def test_recently_updated_excludes_archived_before_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """hades FDY-0207: when 50 archived tasks are newer than one real task, the real
+    task still appears in the Recently updated section because archived filtering
+    happens before the limit."""
+
+    archived_principal_id = "arch001"
+    normal_principal_id = "norm001"
+
+    archived_principal = SimpleNamespace(
+        id=archived_principal_id,
+        name="discarded-import-bbb",
+        role=SimpleNamespace(value="observer"),
+        created_at=datetime(2026, 1, 1, tzinfo=UTC),
+        disabled_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+    normal_principal = SimpleNamespace(
+        id=normal_principal_id,
+        name="normal-principal-2",
+        role=SimpleNamespace(value="user"),
+        created_at=datetime(2026, 1, 1, tzinfo=UTC),
+        disabled_at=None,
+    )
+
+    # Create 50 archived tasks (all with newer timestamps than the real task)
+    archived_tasks: list[Any] = []
+    for i in range(50):
+        archived_tasks.append(
+            SimpleNamespace(
+                id=f"archived-task-{i}",
+                external_id=f"ext-arch-{i}",
+                principal_id=archived_principal_id,
+                state=TaskState.RUNNING,
+                updated_at=datetime(2026, 6, 5, tzinfo=UTC),
+            )
+        )
+
+    # One normal task with an older update time
+    normal_task = SimpleNamespace(
+        id="normal-task-2",
+        external_id="ext-real",
+        principal_id=normal_principal_id,
+        state=TaskState.SUBMITTED,
+        updated_at=datetime(2026, 6, 4, tzinfo=UTC),
+    )
+
+    def fake_list_all() -> list[Any]:
+        return [archived_principal, normal_principal]
+
+    def fake_list_by_state(state: TaskState) -> list[Any]:
+        result: list[Any] = []
+        for t in archived_tasks:
+            if t.state == state:
+                result.append(t)
+        if normal_task.state == state:
+            result.append(normal_task)
+        return result
+
+    # The key: recently_updated should return 50 archived tasks + 1 normal,
+    # but only up to limit rows. Without exclude_principal_ids, the 50 archived
+    # tasks fill the limit and the real task is never seen.
+    call_kwargs: dict[str, Any] = {}
+
+    def fake_recently_updated(
+        since: datetime, limit: int, exclude_principal_ids: set[str] | None = None
+    ) -> list[Any]:
+        call_kwargs["since"] = since
+        call_kwargs["limit"] = limit
+        call_kwargs["exclude_principal_ids"] = exclude_principal_ids
+        if exclude_principal_ids:
+            # Return only tasks whose principal is NOT in the exclude set
+            return [normal_task]
+        else:
+            # Without the filter: 50 archived fill the limit
+            return list(archived_tasks)
+
+    uow = SimpleNamespace(
+        principals=SimpleNamespace(list_all=fake_list_all),
+        tasks=SimpleNamespace(
+            list_by_state=fake_list_by_state,
+            recently_updated=fake_recently_updated,
+        ),
+    )
+
+    ctx = SimpleNamespace(clock=SimpleNamespace(now=lambda: datetime(2026, 6, 5, tzinfo=UTC)))
+
+    principal = SimpleNamespace(name="reader", role=SimpleNamespace(value="observer"))
+    sections_captured: list[dict[str, Any]] = []
+
+    fake_doc = {
+        "lists": {
+            "submitted": [
+                {
+                    "id": "normal-task-2",
+                    "external_id": "ext-real",
+                    "updated_at": "2026-06-04T00:00:00Z",
+                },
+            ],
+            "running": [
+                *[
+                    {
+                        "id": f"archived-task-{i}",
+                        "external_id": f"ext-arch-{i}",
+                        "updated_at": "2026-06-05T00:00:00Z",
+                    }
+                    for i in range(5)
+                ],
+            ],
+        },
+        "counts": {
+            "submitted": 1,
+            "running": 51,  # 50 archived + 1 normal
+        },
+        "gates": [],
+        "publishing_waiting": [],
+    }
+
+    def fake_status(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        return fake_doc
+
+    def fake_page(
+        *args: Any,
+        sections: list[dict[str, Any]],
+        **kwargs: Any,
+    ) -> str:
+        sections_captured.extend(sections)
+        return "fake response"
+
+    monkeypatch.setattr(tasks_mod, "_require", lambda *a, **k: (principal, "fixture-csrf"))
+    monkeypatch.setattr(tasks_mod, "status", SimpleNamespace(tasks=fake_status))
+    monkeypatch.setattr(tasks_mod, "_page", fake_page)
+
+    tasks_mod.tasks_page(
+        Request(
+            {
+                "type": "http",
+                "method": "GET",
+                "path": "/ui/tasks",
+                "headers": [],
+                "query_string": b"",
+            }
+        ),
+        cast(Any, ctx),
+        cast(Any, uow),
+    )
+
+    # Verify the real task still appears in the Recently updated section
+    recently_section = next(
+        (s for s in sections_captured if s["title"] == "Recently updated"), None
+    )
+    assert recently_section is not None
+    task_ids_in_recent = [
+        r[0].get("label", "") if isinstance(r[0], dict) else str(r[0])
+        for r in recently_section["rows"]
+    ]
+    assert "ext-real" in task_ids_in_recent, (
+        "The normal task should appear in Recently updated when archived tasks fill the limit"
+    )
+
+    # Verify the archive filter is passed to the query
+    assert call_kwargs.get("exclude_principal_ids") == {archived_principal_id}, (
+        "exclude_principal_ids should be passed to recently_updated"
+    )
+
+    # Verify the normal task is absent from the Needs attention section
+    attention_section = next(
+        (s for s in sections_captured if s["title"] == "Needs attention"), None
+    )
+    assert attention_section is not None
+    attention_task_ids = [
+        r[0].get("label", "") if isinstance(r[0], dict) else str(r[0])
+        for r in attention_section["rows"]
+    ]
+    for i in range(5):
+        assert f"ext-arch-{i}" not in attention_task_ids, (
+            f"Archived ext-arch-{i} should not appear in Needs attention"
+        )

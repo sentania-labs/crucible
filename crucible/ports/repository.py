@@ -156,7 +156,9 @@ class TaskRepository(Protocol):
         limit: int,
     ) -> Sequence[Task]: ...
 
-    def recently_updated(self, *, since: datetime, limit: int) -> Sequence[Task]:
+    def recently_updated(
+        self, *, since: datetime, limit: int, exclude_principal_ids: set[str] | None = None
+    ) -> Sequence[Task]:
         """The newest updates first, at most `limit` of them."""
         ...
 

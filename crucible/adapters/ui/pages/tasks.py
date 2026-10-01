@@ -113,12 +113,15 @@ def tasks_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
     ]
 
     # One bounded query, newest first: the page shows RECENT_TASK_ROWS and reads no more.
+    # Exclude archived principals from the query so the limit only applies to visible rows.
     recent = list(
         uow.tasks.recently_updated(
-            since=ctx.clock.now() - timedelta(days=RECENT_TASK_DAYS), limit=RECENT_TASK_ROWS
+            since=ctx.clock.now() - timedelta(days=RECENT_TASK_DAYS),
+            limit=RECENT_TASK_ROWS,
+            exclude_principal_ids=archived or None,
         )
     )
-    # Filter out hidden tasks from recent
+    # Double-filter: in case of stale state, keep only non-hidden tasks.
     recent = [task for task in recent if task.id not in hidden]
 
     # hades FDY-0139: every task with a pull request under observation, each linking to
