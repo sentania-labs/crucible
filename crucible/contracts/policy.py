@@ -284,7 +284,10 @@ class ExternalReview(StrictModel):
 
 class CiCertification(StrictModel):
     require_green_on_final_sha: bool
-    required_checks: list[str]
+    required_checks: list[str] = Field(
+        default_factory=list,
+        description="Optional explicit narrowing of observed runs by name; empty counts all runs.",
+    )
     allow_no_ci: bool
     on_failure: Literal["escalate"]
     automatic_retry: bool

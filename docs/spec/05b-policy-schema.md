@@ -131,7 +131,7 @@ external_review:
 
 ci_certification:
   require_green_on_final_sha: true
-  required_checks: []                  # empty: use branch protection or ruleset required checks; if that is empty too, every observed run on the SHA
+  required_checks: []                  # default empty: count every observed non-skipped run on the SHA; non-empty explicitly narrows by name
   allow_no_ci: false                   # false: zero observed runs is pending forever (wake on timeout); true only for a repository that intentionally has no CI
   on_failure: "escalate"
   automatic_retry: false

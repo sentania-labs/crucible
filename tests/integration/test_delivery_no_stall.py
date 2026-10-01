@@ -9,12 +9,14 @@ CI log excerpt, and the rate limit.
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Iterator
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import Engine, text
 
 from crucible.adapters.api.app import create_app
 from crucible.adapters.api.deps import AppContext
@@ -143,7 +145,6 @@ async def test_codex_finding_fix_correction_green_reaches_ready_for_merge(
     assert corrected["state"] == "awaiting_ci_certification"
     assert corrected["head_sha"] != first_head
 
-    github.state.repositories[REPOSITORY].required_checks = ["build"]
     github.state.set_check(REPOSITORY, corrected["head_sha"], name="build", conclusion="success")
     await delivery_supervisor.tick()
 
@@ -287,7 +288,6 @@ async def test_waiving_the_external_review_moves_on_to_certification(
     assert "Codex is not reviewing this repository." in rounds["detail"]
     assert "decision_recorded" in event_kinds(client, task_id)
 
-    github.state.repositories[REPOSITORY].required_checks = ["build"]
     github.state.set_check(REPOSITORY, view["head_sha"], name="build", conclusion="success")
     await delivery_supervisor.tick()
     assert state(client, task_id) == "ready_for_merge"
@@ -335,15 +335,38 @@ async def test_accepting_no_ci_does_not_skip_a_required_check_that_never_appeare
     operator: TestClient,
     delivery_supervisor: Supervisor,
     github: FakeGitHubServer,
+    engine: Engine,
 ) -> None:
     """A configured required check that has not shown up yet is late, not absent."""
-    task_id, _ = await green(client, delivery_supervisor, github)
-    github.state.repositories[REPOSITORY].required_checks = ["build"]
-    response = waive(operator, task_id, "accept_no_ci", "We thought there was no CI.")
-    assert response.status_code == 201, response.text
-    await delivery_supervisor.tick()
-    assert state(client, task_id) == "awaiting_ci_certification"
-    assert pr(client, task_id)["ci_certifications"][-1]["state"] == "pending"
+    # Expectations come from the optional policy narrowing, not branch protection.
+    with engine.begin() as connection:
+        original = connection.execute(
+            text("SELECT document FROM policies WHERE name = 'default-software' AND version = 2")
+        ).scalar_one()["ci_certification"]["required_checks"]
+        connection.execute(
+            text(
+                "UPDATE policies SET document = jsonb_set(document, "
+                "'{ci_certification,required_checks}', '[\"build\"]') "
+                "WHERE name = 'default-software' AND version = 2"
+            )
+        )
+    try:
+        task_id, _ = await green(client, delivery_supervisor, github)
+        response = waive(operator, task_id, "accept_no_ci", "We thought there was no CI.")
+        assert response.status_code == 201, response.text
+        await delivery_supervisor.tick()
+        assert state(client, task_id) == "awaiting_ci_certification"
+        assert pr(client, task_id)["ci_certifications"][-1]["state"] == "pending"
+    finally:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE policies SET document = jsonb_set(document, "
+                    "'{ci_certification,required_checks}', CAST(:checks AS jsonb)) "
+                    "WHERE name = 'default-software' AND version = 2"
+                ),
+                {"checks": json.dumps(original)},
+            )
 
 
 async def test_accepting_no_ci_counts_a_skipped_run_as_nothing(
@@ -427,7 +450,6 @@ async def failed_ci(
     client: TestClient, supervisor: Supervisor, github: FakeGitHubServer
 ) -> tuple[str, str]:
     task_id, view = await green(client, supervisor, github)
-    github.state.repositories[REPOSITORY].required_checks = ["build"]
     github.state.set_check(
         REPOSITORY,
         view["head_sha"],
@@ -537,7 +559,6 @@ async def test_the_reviewers_summary_edit_does_not_revoke_ready_for_merge(
         REPOSITORY, 1, login=REVIEWER, body="Codex Review Summary: in progress"
     )
     github.state.add_reaction(REPOSITORY, 1, login=REVIEWER, content="+1")
-    github.state.repositories[REPOSITORY].required_checks = ["build"]
     github.state.set_check(REPOSITORY, view["head_sha"], name="build", conclusion="success")
     await delivery_supervisor.tick()
     await delivery_supervisor.tick()
@@ -560,7 +581,6 @@ async def test_a_required_check_on_the_second_page_is_seen(
 ) -> None:
     task_id, view = await green(client, delivery_supervisor, github)
     head = view["head_sha"]
-    github.state.repositories[REPOSITORY].required_checks = ["build"]
     for index in range(120):
         github.state.set_check(REPOSITORY, head, name=f"matrix-{index}", run_id=str(8000 + index))
     github.state.set_check(REPOSITORY, head, name="build", conclusion="success", run_id="8999")
@@ -592,7 +612,6 @@ async def test_a_failed_workflow_run_logs_its_failed_job(
     client: TestClient, delivery_supervisor: Supervisor, github: FakeGitHubServer
 ) -> None:
     task_id, view = await green(client, delivery_supervisor, github)
-    github.state.repositories[REPOSITORY].required_checks = ["ci"]
     github.state.set_workflow_run(
         REPOSITORY, view["head_sha"], name="ci", conclusion="failure", run_id="5151"
     )
