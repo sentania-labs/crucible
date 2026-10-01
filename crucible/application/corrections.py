@@ -33,7 +33,13 @@ from crucible.contracts.task_contract import (
     contract_sha256,
     correction_narrows,
 )
-from crucible.domain.entities import AcceptanceVerdict, Principal, Task, TaskContract
+from crucible.domain.entities import (
+    AcceptanceVerdict,
+    EscalationState,
+    Principal,
+    Task,
+    TaskContract,
+)
 from crucible.domain.events import EventKind
 from crucible.domain.ids import new_id
 from crucible.domain.lifecycle import TaskState
@@ -47,6 +53,7 @@ CORRECTABLE_STATES = frozenset(
         TaskState.AWAITING_ACCEPTANCE,
         TaskState.EXTERNAL_FEEDBACK_RECEIVED,
         TaskState.CI_CERTIFICATION_FAILED,
+        TaskState.BLOCKED,
     }
 )
 AMENDABLE_STATES = frozenset(
@@ -217,6 +224,7 @@ def attach_correction(
             "request_internal_review": contract.correction.request_internal_review,
         },
     )
+    _from_state = task.state
     move_task(
         uow,
         clock,
@@ -240,6 +248,30 @@ def attach_correction(
             "policy": {"name": contract.policy.name, "version": contract.policy.version},
         },
     )
+    if _from_state is TaskState.BLOCKED:
+        for escalation in uow.escalations.list_for_task(task.id):
+            if escalation.state is EscalationState.OPEN:
+                for target in (EscalationState.ANSWERED, EscalationState.CLOSED):
+                    escalation.state = target
+                    if target is EscalationState.CLOSED:
+                        escalation.closed_at = clock.now()
+                    escalation.decision_id = new_id()
+                    uow.escalations.save(escalation)
+                    record_event(
+                        uow,
+                        clock,
+                        EventKind.ESCALATION_ANSWERED
+                        if target is EscalationState.ANSWERED
+                        else EventKind.ESCALATION_CLOSED,
+                        principal=principal.name,
+                        task_id=task.id,
+                        payload={
+                            "escalation_id": escalation.id,
+                            "decision_id": escalation.decision_id,
+                        },
+                    )
+                break
+
     return task
 
 
