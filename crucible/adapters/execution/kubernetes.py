@@ -1185,11 +1185,15 @@ class KubernetesProvider:
             hosts=tuple(sorted(set(plan.hosts) | set(checkout.hosts))),
             endpoints=tuple(sorted(set(plan.endpoints) | set(checkout.endpoints))),
         )
-        mounts: list[Mount] = list(token_mounts)
-        volumes: list[dict[str, Any]] = list(token_volumes)
+        checkout_mount = Mount("probe-work", WORK_MOUNT)
+        init_mounts: list[Mount] = [checkout_mount, *token_mounts]
+        volumes: list[dict[str, Any]] = [
+            {"name": "probe-work", "emptyDir": {}},
+            *token_volumes,
+        ]
         # File origins in the kind tier live on this read-only claim.
         if spec.repository_url.startswith("file:///crucible/cache/") and self.config.cache_claim:
-            mounts.append(Mount("cache", k8sspec.CACHE_MOUNT, read_only=True))
+            init_mounts.append(Mount("cache", k8sspec.CACHE_MOUNT, read_only=True))
             volumes.append(
                 {
                     "name": "cache",
@@ -1222,15 +1226,56 @@ class KubernetesProvider:
                 role=role,
                 image=image,
                 script=scripts.gate_probe_script(
-                    spec.repository_url,
-                    spec.contract["repository"]["base_ref"],
+                    f"{WORK_MOUNT}/repo",
                     list(checks),
                     command_timeout,
-                    checkout_token="file" if checkout_token is not None else None,
-                    credential_host=self.config.credential_host,
                 ),
-                mounts=mounts,
+                mounts=[checkout_mount],
                 volumes=volumes,
+                init_containers=[
+                    {
+                        "name": "checkout",
+                        "image": image,
+                        "command": [
+                            "sh",
+                            "-c",
+                            scripts.gate_probe_checkout_script(
+                                spec.repository_url,
+                                spec.contract["repository"]["base_ref"],
+                                f"{WORK_MOUNT}/repo",
+                                checkout_token="file" if checkout_token is not None else None,
+                                credential_host=self.config.credential_host,
+                            ),
+                        ],
+                        "securityContext": {
+                            "allowPrivilegeEscalation": False,
+                            "readOnlyRootFilesystem": True,
+                            "capabilities": {"drop": ["ALL"]},
+                        },
+                        "resources": {
+                            "limits": {
+                                "cpu": self._limits(spec).cpu,
+                                "memory": self._limits(spec).memory,
+                                "ephemeral-storage": self._limits(spec).ephemeral_storage,
+                            },
+                            "requests": {
+                                "cpu": self._limits(spec).cpu_request,
+                                "memory": self._limits(spec).memory_request,
+                            },
+                        },
+                        "volumeMounts": [
+                            {"name": "tmp", "mountPath": "/tmp"},
+                            *[
+                                {
+                                    "name": mount.name,
+                                    "mountPath": mount.path,
+                                    "readOnly": mount.read_only,
+                                }
+                                for mount in init_mounts
+                            ],
+                        ],
+                    }
+                ],
                 limits=self._limits(spec),
                 timeout=timeout,
                 plan=plan,
@@ -4150,6 +4195,7 @@ class KubernetesProvider:
         log_output: list[str] | None = None,
         adopt_existing: bool = False,
         preserve_on_cancel: bool = False,
+        init_containers: Sequence[Mapping[str, Any]] = (),
     ) -> int:
         """Run one single-purpose Job to completion and delete it. With `cancelled`, a
         cancel ends the wait (hades #189): the Job and its policy are deleted on the way
@@ -4186,6 +4232,7 @@ class KubernetesProvider:
                         service_account=self.config.service_account,
                         image_pull_secret=self.config.image_pull_secret,
                         host_aliases=k8sspec.host_aliases(resolved_plan),
+                        init_containers=init_containers,
                     )
                 ),
                 # The Job's own deadline counts from its start, image pull included;
@@ -4249,8 +4296,12 @@ class KubernetesProvider:
                     )
             if code != 0:
                 tail = await self._job_tail(name)
+                if role == "gate-probe":
+                    checkout_tail = await self._job_tail(name, container="checkout")
+                    if checkout_tail and checkout_tail != tail:
+                        tail = "\n".join(part for part in (checkout_tail, tail) if part)
                 self._role_error(role, spec.attempt_id, tail)
-                log.warning("%s Job exited %s", role, code, extra={"tail": tail})
+                log.warning("%s Job exited %s: %s", role, code, tail[-1000:])
             return code
         except asyncio.CancelledError:
             interrupted = True
@@ -4709,7 +4760,9 @@ class KubernetesProvider:
             f"Pods for Job {job_name!r} were still present after {timeout:g} seconds"
         )
 
-    async def _job_tail(self, job_name: str, limit: int = 4000) -> str:
+    async def _job_tail(
+        self, job_name: str, limit: int = 4000, container: str = k8sspec.CONTAINER_NAME
+    ) -> str:
         try:
             pod = await self._pod_of(job_name)
         except KubernetesApiError:
@@ -4721,7 +4774,7 @@ class KubernetesProvider:
             frames = await self._call(
                 self.client.pod_log,
                 name,
-                container=k8sspec.CONTAINER_NAME,
+                container=container,
                 timestamps=False,
                 tail_lines=JOB_TAIL_LINES,
             )

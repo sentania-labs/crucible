@@ -42,7 +42,13 @@ async def test_probe_job_is_uncredentialed_bounded_and_removed(
     assert rows is not None and rows[0].exit_code == 1
     pod = pod_of(api, "gate-probe")
     mounts = pod["containers"][0]["volumeMounts"]
-    assert {mount["mountPath"] for mount in mounts} == {"/tmp", "/home/worker"}
+    assert {mount["mountPath"] for mount in mounts} == {
+        "/tmp",
+        "/home/worker",
+        "/crucible/work",
+    }
+    checkout = pod["initContainers"][0]
+    assert "safe]\\n\\tdirectory = *" in checkout["command"][2]
     assert not created(api, "secrets") and not created(api, "persistentvolumeclaims")
     job = created(api, "jobs", "gate-probe")[0]
     assert job["spec"]["activeDeadlineSeconds"] == (
@@ -73,7 +79,9 @@ async def test_private_probe_mounts_checkout_token_and_public_probe_does_not(
     )
     private_pod = pod_of(private_api, "gate-probe")
     private_mounts = private_pod["containers"][0]["volumeMounts"]
-    assert "/run/crucible-token" in {mount["mountPath"] for mount in private_mounts}
+    private_init_mounts = private_pod["initContainers"][0]["volumeMounts"]
+    assert "/run/crucible-token" not in {mount["mountPath"] for mount in private_mounts}
+    assert "/run/crucible-token" in {mount["mountPath"] for mount in private_init_mounts}
     assert created(private_api, "secrets")
     assert not any(kind == "secrets" for kind, _ in private_api.objects)
 
@@ -85,6 +93,22 @@ async def test_private_probe_mounts_checkout_token_and_public_probe_does_not(
     public_mounts = public_pod["containers"][0]["volumeMounts"]
     assert "/run/crucible-token" not in {mount["mountPath"] for mount in public_mounts}
     assert not created(public_api, "secrets")
+
+
+async def test_probe_cache_is_mounted_only_in_checkout_init(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api, _, provider = build()
+    provider.config = replace(provider.config, cache_claim="crucible-cache")
+    monkeypatch.setattr(provider, "_require_ready", AsyncMock())
+    monkeypatch.setattr(provider, "_await_job", AsyncMock(return_value=0))
+    launch = replace(spec(), repository_url="file:///crucible/cache/example")
+    await provider.probe_checks(launch, [{"id": "V4", "command": "false"}])
+    pod = pod_of(api, "gate-probe")
+    main_paths = {mount["mountPath"] for mount in pod["containers"][0]["volumeMounts"]}
+    init_paths = {mount["mountPath"] for mount in pod["initContainers"][0]["volumeMounts"]}
+    assert "/crucible/cache" not in main_paths
+    assert "/crucible/cache" in init_paths
 
 
 async def test_probe_timeout_covers_checkout_and_each_check(
@@ -106,12 +130,24 @@ async def test_probe_timeout_covers_checkout_and_each_check(
     assert await_job.call_args.kwargs["timeout"] == expected
 
 
-async def test_probe_job_failure_names_exit(monkeypatch: pytest.MonkeyPatch) -> None:
-    _, _, provider = build()
+async def test_probe_job_failure_names_exit_and_checkout_stderr(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    api, _, provider = build()
     monkeypatch.setattr(provider, "_require_ready", AsyncMock())
     monkeypatch.setattr(provider, "_await_job", AsyncMock(return_value=1))
-    with pytest.raises(ProviderError, match="gate probe Job exit 1"):
+    monkeypatch.setattr(
+        api,
+        "pod_log",
+        lambda name, **kwargs: (
+            [LogFrame("stderr", b"detected dubious ownership")]
+            if kwargs.get("container") == "checkout"
+            else []
+        ),
+    )
+    with pytest.raises(ProviderError, match="gate probe Job exit 1: detected dubious ownership"):
         await provider.probe_checks(spec(), [{"id": "V4", "command": "true"}])
+    assert "gate-probe Job exited 1: detected dubious ownership" in caplog.text
 
 
 async def test_probe_spanning_two_ticks_adopts_job_and_records_exit(
@@ -198,8 +234,20 @@ def test_probe_script_checks_base_and_records_shell_127(
         {"id": "V8", "command": "exit 124"},
         {"id": "V9", "command": "exit 137"},
     ]
+    checkout = tmp_path / "checkout"
+    subprocess.run(
+        [
+            "sh",
+            "-c",
+            scripts.gate_probe_checkout_script(str(origin), "main", str(checkout)),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=probe_environment,
+    )
     result = subprocess.run(
-        ["sh", "-c", scripts.gate_probe_script(str(origin), "main", checks, 5)],
+        ["sh", "-c", scripts.gate_probe_script(str(checkout), checks, 5)],
         check=False,
         capture_output=True,
         text=True,
@@ -240,8 +288,20 @@ def test_probe_script_bounds_each_command_without_python(
         capture_output=True,
     )
     checks = [{"id": "V4", "command": command}, {"id": "V5", "command": "true"}]
+    checkout = tmp_path / "checkout"
+    subprocess.run(
+        [
+            "sh",
+            "-c",
+            scripts.gate_probe_checkout_script(str(origin), "main", str(checkout)),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=probe_environment,
+    )
     result = subprocess.run(
-        ["sh", "-c", scripts.gate_probe_script(str(origin), "main", checks, 1)],
+        ["sh", "-c", scripts.gate_probe_script(str(checkout), checks, 1)],
         env=probe_environment,
         capture_output=True,
         text=True,
@@ -265,8 +325,8 @@ def test_probe_script_reports_checkout_stderr_on_failure(
         [
             "sh",
             "-c",
-            scripts.gate_probe_script(
-                str(origin), "missing-ref", [{"id": "V4", "command": "true"}], 5
+            scripts.gate_probe_checkout_script(
+                str(origin), "missing-ref", str(tmp_path / "checkout")
             ),
         ],
         env=probe_environment,
@@ -295,7 +355,7 @@ def test_probe_checkout_failure_detail_keeps_only_last_1000_bytes(
         [
             "sh",
             "-c",
-            scripts.gate_probe_script("unused", "main", [{"id": "V4", "command": "true"}], 5),
+            scripts.gate_probe_checkout_script("unused", "main", str(tmp_path / "checkout")),
         ],
         env=probe_environment,
         capture_output=True,

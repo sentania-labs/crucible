@@ -44,6 +44,8 @@ __all__ = [
     "collector_script",
     "commit_msg_hook",
     "encode_check_id",
+    "gate_probe_checkout_script",
+    "gate_probe_script",
     "parse_activity",
     "preparer_script",
     "publish_leaf_script",
@@ -92,6 +94,15 @@ chmod 0600 /tmp/cred-helper.sh
 
 # The safe.directory exception every preparer and refresher needs (see the preparer).
 _SAFE_GITCONFIG = "printf '[safe]\\n\\tdirectory = *\\n' > /tmp/gitconfig"
+
+
+def _safe_git_setup() -> str:
+    """Git setup shared by every Crucible-owned checkout container."""
+    return f"""# git ignores `safe.directory` from the command line, and cache-backed
+# directories can belong to the host uid rather than this container's uid (S9 Test E).
+# Put the exception in this container's own tmpfs, from Crucible's own text.
+{_SAFE_GITCONFIG}
+export GIT_CONFIG_GLOBAL=/tmp/gitconfig"""
 
 
 def _checkout_credential(source: str, credential_host: str) -> str:
@@ -379,14 +390,9 @@ STARTED="$ACTUAL_HEAD"
     )
     return f"""set -eu
 {GIT_ENV}
-# git ignores `safe.directory` from the command line, and the directories this
-# container reads belong to whichever uid the host gave them, which is not the uid the
-# daemon runs this container as (S9 Test E). The exception therefore goes in a global
-# config file, written here, in this container's own tmpfs, from Crucible's own text.
-# Only the preparer gets it: the collector keeps GIT_CONFIG_GLOBAL=/dev/null, because
+# Checkout containers get it; the collector keeps GIT_CONFIG_GLOBAL=/dev/null because
 # what it reads is a tree a worker wrote.
-printf '[safe]\n\tdirectory = *\n' > /tmp/gitconfig
-export GIT_CONFIG_GLOBAL=/tmp/gitconfig
+{_safe_git_setup()}
 {bindings}
 OUT={WORK_MOUNT}/output
 REPO={WORK_MOUNT}/repo
@@ -1001,39 +1007,52 @@ exit 0
 """
 
 
-def gate_probe_script(
+def gate_probe_checkout_script(
     url: str,
     base_ref: str,
-    checks: list[dict[str, Any]],
-    timeout: int,
+    checkout_dir: str,
     checkout_token: str | None = None,
     credential_host: str = "github.com",
 ) -> str:
-    """Keep command output out of the JSON log, including forged result lines."""
-    # Never depend on an interpreter that policy required_programs does not
-    # guarantee: every worker image has sh, git, jq and Debian coreutils (timeout).
-    git_config = "/tmp/gitconfig" if checkout_token is not None else "/dev/null"
+    """Clone the unchanged base into an isolated handoff volume."""
     credential = (
         _checkout_credential(checkout_token, credential_host) if checkout_token is not None else ""
     )
     drop_token = "drop_checkout_token" if checkout_token is not None else ":"
-    program = f"""set -eu
-{credential}export GIT_TERMINAL_PROMPT=0 GIT_CONFIG_NOSYSTEM=1
-export GIT_CONFIG_GLOBAL={_quote(git_config)}
-root=$(mktemp -d)
-trap '{drop_token}; rm -rf "$root"' 0
+    return f"""set -eu
+{GIT_ENV}
+{_safe_git_setup()}
+{credential}export GIT_TERMINAL_PROMPT=0
+root={_quote(checkout_dir)}
+trap '{drop_token}' 0
 checkout_failed() {{
   code=$1
   printf 'gate probe checkout failed (exit %s): ' "$code" >&2
-  tail -c 1000 "$root/checkout-stderr" >&2
+  tail -c 1000 /tmp/checkout-stderr >&2
   exit "$code"
 }}
-git clone --no-checkout -- {_quote(url)} "$root/repo" \
-  > /dev/null 2> "$root/checkout-stderr" || checkout_failed $?
-cd "$root/repo" 2> "$root/checkout-stderr" || checkout_failed $?
+rm -rf "$root"
+git clone --no-checkout -- {_quote(url)} "$root" \
+  > /dev/null 2> /tmp/checkout-stderr || checkout_failed $?
+cd "$root" 2> /tmp/checkout-stderr || checkout_failed $?
 git checkout --detach {_quote(base_ref)} \
-  > /dev/null 2> "$root/checkout-stderr" || checkout_failed $?
+  > /dev/null 2> /tmp/checkout-stderr || checkout_failed $?
 {drop_token}
+"""
+
+
+def gate_probe_script(
+    checkout_dir: str,
+    checks: list[dict[str, Any]],
+    timeout: int,
+) -> str:
+    """Run checks in the isolated checkout and keep forged results out of its log."""
+    # Never depend on an interpreter that policy required_programs does not
+    # guarantee: every worker image has sh, jq and Debian coreutils (timeout).
+    program = f"""set -eu
+root=$(mktemp -d)
+trap 'rm -rf "$root"' 0
+cd {_quote(checkout_dir)}
 probe_check() {{
   check_id=$1
   command=$2

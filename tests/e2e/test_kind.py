@@ -2990,9 +2990,16 @@ async def test_gate_probe_on_unchanged_base_before_worker(
                 pytest.fail(f"gate probe did not settle: {view}")
             attempt_id = attempt["id"]
             probes = view["gate_probes"]
+            print("gate probes:", json.dumps(probes, sort_keys=True))
+            evidence = client.get(f"/v1/attempts/{attempt_id}/evidence").json()["items"]
+            print(
+                "gate probe evidence:",
+                json.dumps(
+                    [row for row in evidence if row["kind"] == "gate_probe"], sort_keys=True
+                ),
+            )
             assert len(probes) == 1 and probes[0]["id"] == "V5"
             assert probes[0]["exit"] == (0 if blocked else 1)
-            evidence = client.get(f"/v1/attempts/{attempt_id}/evidence").json()["items"]
             assert any(
                 row["kind"] == "gate_probe" and row["payload"]["exit"] == probes[0]["exit"]
                 for row in evidence
