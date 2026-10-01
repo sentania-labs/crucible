@@ -3,7 +3,7 @@
 This is the working plan that turns `docs/vision.md` into milestones with exit tests.
 The vision is the operator's directive and wins where the two disagree; this document
 is the plan Foundry is executing against it, and it changes as decisions land.
-Last revised 2026-09-28 (status and issue-traceability reconciliation; milestone order unchanged).
+Last revised 2026-10-01 (reconciliation against main d0e4bcd and the v0.7.0 lab; milestone order unchanged).
 
 ## Where we are
 
@@ -14,20 +14,20 @@ AGY and Hermes have adapters; harness images are now independently promoted
 (ADR 0018), not one mandatory combined image.
 
 This is a dated source/backlog snapshot at
-[`7b62afa`](https://github.com/sentania-labs/hades/commit/7b62afacdc4f197106a5548ae9554f88af5ee72a).
-The release observed was v0.6.3. [#202](https://github.com/sentania-labs/hades/pull/202)
-merged after that release, addressing launch cancellation, supervisor launch
-blocking/readiness, GitHub egress and completion-report instructions. Merged code,
-a published release and verification on a deployed instance are different evidence.
+[`d0e4bcd`](https://github.com/sentania-labs/hades/commit/d0e4bcd8) (2026-10-01).
+The lab runs v0.7.0; v0.7.1 was tagged 2026-10-01 and is not yet deployed. Merged
+code, a published release and verification on a deployed instance are different
+evidence, and this document says which one it has for each claim.
 
 The original lab blockers #91, #93, #95, #92, #94 and #89 are closed. The Hermes
 worker-path proof is recorded in #146. Neither fact alone establishes M1c.
-Current gaps include #85 with #184 (self-testing inside isolated workers and
-pre-PR certification), #173 (live login regressions), #203/#204 (remaining
-supervisor collection/health behavior), and #183 (truthful reports when required
-tools are missing). Foundry must classify their actual impact on M1, not declare
-every open issue a release blocker. Codex's credential-refresh proof remains
-#42; it does not change the Claude Code and Hermes M1 paths.
+#173, #203, #204 and the toolchain half of #184 are closed (PRs #224 and #223,
+2026-09-28 to 2026-09-30). The remaining M1 gaps are #85 (test-service sidecars and
+branch CI as a pre-PR gate) and #183 (truthful reports when required tools are
+missing). Codex credential refresh (#42) is implemented by PR #327 and ships in
+v0.7.1. In practice Codex has carried most of the self-development work (36 of the
+38 Hades-authored PRs to 2026-10-01, 2 on Hermes, none on Claude Code); the M1c
+Claude Code path is unproven and is recorded as such below.
 
 The public evidence does not establish completion of the real Foundry ledger
 handoff. [Readiness](readiness.md) still describes that gap. Foundry must reconcile
@@ -41,9 +41,10 @@ conversational principal, and the supervisor tick is not the M5 routine schedule
 
 ## Tracking and reconciliation
 
-[#207](https://github.com/sentania-labs/hades/issues/207) is Foundry's reconciliation
-task. It closes when findings are dispositioned and the backlog/docs are accurate,
-not when all future features ship. New issues and scope comments are for triage;
+[#207](https://github.com/sentania-labs/hades/issues/207) was Foundry's reconciliation
+task; it closed with PR #213 on 2026-09-28 and its checklist was never ticked. The
+2026-10-01 reconciliation lives in the issue bodies it touched (#208, #275, #278,
+#288, #289, #310, #319, #332, #337, #338) and in this document. New issues and scope comments are for triage;
 they do not authorize implementation, change milestone order, or supersede the
 operator's vision.
 
@@ -57,8 +58,8 @@ operator's vision.
 | M5 durable routines | Partial backlog coverage; persisted scheduling, restart and approval semantics need acceptance | [#199](https://github.com/sentania-labs/hades/issues/199) |
 | Noncoding research and content work | Current task contract still requires a repository, including artifact deliverables; place by first real use after bootstrap | [#211](https://github.com/sentania-labs/hades/issues/211) |
 | M6 optional tools and transports | Planned; select a concrete flow before implementation | [#212](https://github.com/sentania-labs/hades/issues/212) |
-| Execution visibility and independent review | Existing evidence/review primitives; proposed UI and cross-family review extensions | [#188](https://github.com/sentania-labs/hades/issues/188), [#201](https://github.com/sentania-labs/hades/issues/201); [#206](https://github.com/sentania-labs/hades/issues/206) remains optional ideas |
-| Browser and machine authentication | Token-based administration exists; OIDC/personal/service-token work and cookie remediation are tracked | [#180](https://github.com/sentania-labs/hades/issues/180), [#132](https://github.com/sentania-labs/hades/issues/132) |
+| Execution visibility and independent review | Board shipped (#188, PR #306); cross-family review proposed | [#188](https://github.com/sentania-labs/hades/issues/188), [#201](https://github.com/sentania-labs/hades/issues/201); [#206](https://github.com/sentania-labs/hades/issues/206) remains optional ideas |
+| Browser and machine authentication | Token-based administration exists; server-side UI sessions shipped (#132, PR #270); OIDC tracked | [#180](https://github.com/sentania-labs/hades/issues/180) |
 
 Foundry validates each finding as satisfied, partially covered, untracked,
 deliberately deferred, or needing an operator decision. Accepted scope belongs in
@@ -98,9 +99,10 @@ version tag.
 
 ### M0b: an honest, usable lab deployment
 
-**Status:** the original listed implementation issues are closed. #173 tracks
-subsequent login regressions. Closure is not a substitute for the combined live
-exit evidence below; Foundry reconciles that evidence in #207.
+**Status:** done and proven on the lab. The original implementation issues and
+#173 are closed (PR #224). The lab running v0.7.0 has published 38 pull requests as
+the Hades GitHub App, and the UI login from an empty Secret is in the kind CI tier
+(`tests/e2e/test_kind.py::test_login_from_an_empty_secret_to_a_probe_and_an_attempt_through_the_admin_api`).
 
 1. #91 with #58: egress allows that work under Cilium with kube-proxy replacement
    (selector or CNI-aware rules, not `ipBlock` on service addresses), and a canary
@@ -130,9 +132,10 @@ a cluster must provide (kubelet PID limit, gateway selectors) is stated in
 
 ### M0c: authority handoff
 
-**Status:** import/verification machinery exists; the real ledger handoff is not
-established by the public evidence reviewed. Verify in #207, preserving the explicit
-authorization requirement below.
+**Status:** done. The handoff ran on 2026-09-29 on the operator's words ("discard
+and import fresh", ADR 0029, #255, PR #245); Hades has been the system of record
+for Foundry's tasks since then. The authorization requirement below stays as the
+rule for any future import.
 
 Register the repositories (spec 25), then import, verify and commit the Foundry
 bootstrap ledger on the instance the deployer runs (spec 15). Commit and mark-migrated are irreversible
@@ -184,8 +187,10 @@ PostgreSQL sidecar, and an attempt whose branch CI is red cannot reach review.
 ### M1b: a deterministic model for tests
 
 **Status:** a deterministic model server already exists in
-`tests/e2e/stub_model.py`. Reuse it where appropriate; verify the gateway-alias
-acceptance path below before declaring this milestone complete (#207).
+`tests/e2e/stub_model.py`, and `tests/e2e/test_kind_self_hosting.py` drives a Hermes
+task through the `fast` alias with it. Two gaps remain: that test runs only through
+`make e2e-kind-self-hosting` and is in no CI shard, and there is no assertion that
+repeated runs are identical.
 
 A scripted OpenAI-compatible stub behind a gateway model alias, so tests of the Hermes
 path do not depend on a live model's output.
