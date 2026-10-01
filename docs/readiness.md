@@ -106,7 +106,12 @@ Docker daemon, and an isolated host-daemon Compose project.
 | lint | `make lint` | Ruff, mypy on 237 files, and 3 import contracts clean |
 | scan | `make scan` | final result recorded in the C7a report |
 
-C7a-specific evidence is `tests/unit/test_admin_ui.py`,
+C7a-specific evidence is `tests/unit/admin_ui_fixtures.py`,
+`tests/unit/test_ui_dashboard.py`,
+`tests/unit/test_ui_render.py`,
+`tests/unit/test_ui_settings.py`,
+`tests/unit/test_ui_templates.py`,
+`tests/unit/test_ui_workers.py`,
 `tests/unit/test_docker_provider.py`,
 `tests/integration/test_admin.py::test_ui_session_csrf_reader_access_and_page_walk`,
 `tests/integration/test_admin.py::test_migrate_creates_and_prints_the_first_admin_once`,
