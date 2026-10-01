@@ -32,7 +32,12 @@ def _make_uow(
     acquire_ok: bool = True,
     last_error_value: str | None = None,
 ) -> tuple[MagicMock, MagicMock, MagicMock]:
-    """Return (uow_mock, status_mock, lease_mock) configured for tick tests."""
+    """Return (uow_mock, status_mock, lease_mock) configured for tick tests.
+
+    The lease mock is prepared once and returned directly; tests must not set
+    a ``side_effect`` on ``renew_supervisor`` that calls back into the same
+    MagicMock, because that causes a RecursionError.
+    """
     lease_mock = MagicMock()
     lease_mock.fenced_token = 42
     lease_mock.expires_at = datetime(2026, 10, 1, tzinfo=UTC) + timedelta(seconds=30)
@@ -103,9 +108,14 @@ def _build_factory(uow: MagicMock) -> MagicMock:
 
 @pytest.mark.asyncio
 async def test_tick_renews_lease_between_steps() -> None:
-    """The tick calls _renew_lease between _cleanup_step and _retention_step
-    so that a long-running tick does not lose its lease."""
-    uow, _status, _lease_mock = _make_uow(renew_ok=True, acquire_ok=True)
+    """The tick calls ``_renew_lease_async`` before each long phase so that
+    a long-running tick does not lose its lease.
+    """
+    uow, _status, lease_mock = _make_uow(
+        renew_ok=True,
+        acquire_ok=True,
+        last_error_value="ConnectionRefused: the k8s resize from last night",
+    )
     factory = _build_factory(uow)
     clock = FakeClock(datetime(2026, 10, 1, tzinfo=UTC))
 
@@ -113,8 +123,7 @@ async def test_tick_renews_lease_between_steps() -> None:
 
     def capture_renew(*args: Any, **kwargs: Any) -> MagicMock | None:
         renew_calls.append(1)
-        result = uow.leases.renew_supervisor(*args, **kwargs)
-        return result  # type: ignore[no-any-return]
+        return lease_mock
 
     uow.leases.renew_supervisor.side_effect = capture_renew
 
@@ -174,8 +183,6 @@ async def test_tick_keeps_lease_when_steps_exceed_ttl() -> None:
     uow = MagicMock()
     uow.leases.get_supervisor.return_value = None
     uow.leases.renew_supervisor.side_effect = slow_renew
-    # The initial acquisition in _lease_step: first call returns a new lease,
-    # then subsequent renewals also succeed.
     uow.leases.acquire_supervisor.side_effect = slow_renew
 
     status = MagicMock()
@@ -201,8 +208,6 @@ async def test_tick_keeps_lease_when_steps_exceed_ttl() -> None:
     uow.commit.return_value = None
 
     factory = _build_factory(uow)
-
-    # Pretend we're 20 seconds into the tick when _renew_lease fires
     clock.advance(20)
 
     supervisor = Supervisor(
@@ -237,7 +242,7 @@ async def test_tick_keeps_lease_when_steps_exceed_ttl() -> None:
     ):
         result = await supervisor.tick()
 
-    assert result.held is True, "Tick should still hold lease after mid-tick renewal"
+    assert result.held is True
 
 
 # ---------------------------------------------------------------------------
@@ -246,9 +251,8 @@ async def test_tick_keeps_lease_when_steps_exceed_ttl() -> None:
 
 
 @pytest.mark.asyncio
-async def test_successful_tick_clears_last_error() -> None:
-    """A tick that completes successfully sets last_error to None,
-    preventing stale errors from blinding readiness checks."""
+async def test_successful_tick_clears_last_error_full_path() -> None:
+    """A tick that completes successfully clears last_error via _status_step."""
     uow, _status, _lease_mock = _make_uow(
         renew_ok=True,
         acquire_ok=True,
@@ -257,72 +261,6 @@ async def test_successful_tick_clears_last_error() -> None:
     factory = _build_factory(uow)
     clock = FakeClock(datetime(2026, 10, 1, tzinfo=UTC))
 
-    supervisor = Supervisor(
-        factory,
-        {},
-        clock,
-        holder="test-host:1",
-        artifact_store=MagicMock(),
-        lease_ttl_seconds=30,
-        credential_renewal=lambda: False,
-    )
-
-    with (
-        patch.object(supervisor, "_reconcile_provider_handles", return_value=0),
-        patch.object(supervisor, "_resume_quota_checkpoints"),
-        patch.object(supervisor, "_resume_quota_waits"),
-        patch.object(supervisor, "_materialize_scheduled"),
-        patch.object(supervisor, "_resume_gate_probes"),
-        patch.object(supervisor, "_launch_pending", return_value=0),
-        patch.object(supervisor, "_observe_attempts", return_value=([], [])),
-        patch.object(supervisor, "_sweep_cancellations"),
-        patch.object(supervisor, "_materialize_evidence"),
-        patch.object(supervisor, "_evaluate_pending_gates"),
-        patch.object(supervisor.delivery, "publish", return_value=0),
-        patch.object(supervisor.delivery, "observe", return_value=0),
-        patch.object(supervisor, "_cleanup_step"),
-        patch.object(supervisor, "_retention_step", return_value=0),
-        patch.object(supervisor, "_refresh_attempt_metrics"),
-        patch.object(supervisor, "_repeat_stale_escalations"),
-        patch.object(supervisor, "_deliver_wakes", return_value=0),
-        patch.object(supervisor, "_status_step", return_value={}),
-    ):
-        result = await supervisor.tick()
-
-    assert result.held is True
-    # The _status_step writes the status, but it's inside a fenced block.
-    # When we patch _status_step, it returns early without writing.
-    # Instead, check the status object directly after the tick completes,
-    # which goes through the unpatched path.  But _status_step IS the only
-    # place that writes status.  So we need to NOT patch it or verify
-    # the status changes through the real path.
-    #
-    # Actually, we can verify the write happened by inspecting the
-    # status object that was written to. But since _status_step is mocked,
-    # the write never happens. Let me verify differently: patch _renew_lease
-    # and _status_step with a real status update check.
-
-    # Better approach: verify that the _status_step method, when run, would
-    # have set last_error to None by testing _status_step in isolation.
-    # But _status_step uses self._fenced() which needs a real lease.
-    #
-    # Simplest approach: don't patch _status_step, let it run.
-
-    pass  # handled by the _status_step isolation test below
-
-
-@pytest.mark.asyncio
-async def test_successful_tick_clears_last_error_full_path() -> None:
-    """A tick that completes successfully clears last_error via _status_step."""
-    uow, status, _lease_mock = _make_uow(
-        renew_ok=True,
-        acquire_ok=True,
-        last_error_value="ConnectionRefused: the k8s resize from last night",
-    )
-    factory = _build_factory(uow)
-    clock = FakeClock(datetime(2026, 10, 1, tzinfo=UTC))
-
-    # Track what was written
     written: list[dict[str, Any]] = []
 
     def capture_write(s: MagicMock) -> None:
@@ -369,18 +307,14 @@ async def test_successful_tick_clears_last_error_full_path() -> None:
         result = await supervisor.tick()
 
     assert result.held is True
-    # _status_step is patched, so the status write never happens.
-    # Instead, verify via the unpatched _status_step directly:
-    assert status.last_error == "ConnectionRefused: the k8s resize from last night"
-
-    # Now test _status_step in isolation to confirm it clears last_error
+    # _status_step is patched, so write never happens through the normal path.
+    # Verify _status_step in isolation instead.
     supervisor.fenced_token = 42
     counts = supervisor._status_step(0.0)
-    assert isinstance(counts, dict)  # _status_step returns counts dict
+    assert isinstance(counts, dict)
 
-    # The _status_step method uses self._fenced() which creates its own uow.
-    # In our mock, self._fenced() uses self._uow_factory() which returns ctx_mgr,
-    # and ctx_mgr.__enter__() returns uow. So the write goes through uow.
+    # _status_step uses self._fenced() which yields from self._uow_factory(),
+    # whose __enter__ returns uow. So the write goes through uow.
     assert len(written) >= 1
     assert written[-1]["last_error"] is None, (
         f"Expected last_error to be cleared, got {written[-1]['last_error']!r}"
@@ -457,7 +391,8 @@ def test_renew_lease_method_exists() -> None:
 
 
 def test_renew_lease_clears_token_when_renew_fails() -> None:
-    """_renew_lease clears fenced_token when renew_supervisor returns None."""
+    """_renew_lease clears fenced_token and returns False when renew_supervisor
+    returns None."""
     uow, _status, _ = _make_uow(renew_ok=False)
     factory = _build_factory(uow)
     clock = FakeClock(datetime(2026, 10, 1, tzinfo=UTC))
@@ -472,6 +407,153 @@ def test_renew_lease_clears_token_when_renew_fails() -> None:
     )
     supervisor.fenced_token = 42
 
-    supervisor._renew_lease()
+    result = supervisor._renew_lease()
 
+    assert result is False
     assert supervisor.fenced_token is None
+
+
+# ---------------------------------------------------------------------------
+# P1 Finding #1: renewal before each long phase
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_renewal_before_publish() -> None:
+    """A mid-tick renewal runs before publish so publish cannot outlive the lease."""
+    uow, _status, _ = _make_uow(renew_ok=True, acquire_ok=True)
+    factory = _build_factory(uow)
+    clock = FakeClock(datetime(2026, 10, 1, tzinfo=UTC))
+
+    renew_count = [0]
+
+    def count_renew(*args: Any, **kwargs: Any) -> MagicMock | None:
+        renew_count[0] += 1
+        return MagicMock()
+
+    uow.leases.renew_supervisor.side_effect = count_renew
+
+    supervisor = Supervisor(
+        factory,
+        {},
+        clock,
+        holder="test-host:1",
+        artifact_store=MagicMock(),
+        lease_ttl_seconds=30,
+        credential_renewal=lambda: False,
+    )
+
+    with (
+        patch.object(supervisor, "_reconcile_provider_handles", return_value=0),
+        patch.object(supervisor, "_resume_quota_checkpoints"),
+        patch.object(supervisor, "_resume_quota_waits"),
+        patch.object(supervisor, "_materialize_scheduled"),
+        patch.object(supervisor, "_resume_gate_probes"),
+        patch.object(supervisor, "_launch_pending", return_value=0),
+        patch.object(supervisor, "_observe_attempts", return_value=([], [])),
+        patch.object(supervisor, "_sweep_cancellations"),
+        patch.object(supervisor, "_materialize_evidence"),
+        patch.object(supervisor, "_evaluate_pending_gates"),
+        patch.object(supervisor.delivery, "publish", return_value=0),
+        patch.object(supervisor.delivery, "observe", return_value=0),
+        patch.object(supervisor, "_cleanup_step"),
+        patch.object(supervisor, "_retention_step", return_value=0),
+        patch.object(supervisor, "_refresh_attempt_metrics"),
+        patch.object(supervisor, "_repeat_stale_escalations"),
+        patch.object(supervisor, "_deliver_wakes", return_value=0),
+        patch.object(supervisor, "_status_step", return_value={}),
+    ):
+        await supervisor.tick()
+
+    # Four renewals inside tick body: before publish, observe, cleanup,
+    # and retention.
+    assert renew_count[0] >= 4, f"Expected >= 4 mid-tick renewals, got {renew_count[0]}"
+
+
+# ---------------------------------------------------------------------------
+# P1 Finding #2: tick stops when lease is lost, no credential refresh
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_tick_stops_when_lease_lost_before_retention() -> None:
+    """When a mid-tick renewal loses the lease, the tick stops and does not
+    proceed to retention or credential refresh."""
+    uow, _status, _ = _make_uow(renew_ok=True, acquire_ok=True)
+    factory = _build_factory(uow)
+    clock = FakeClock(datetime(2026, 10, 1, tzinfo=UTC))
+
+    renew_count = [0]
+
+    def fail_on_third(*args: Any, **kwargs: Any) -> MagicMock | None:
+        renew_count[0] += 1
+        if renew_count[0] < 4:
+            return MagicMock()
+        return None
+
+    uow.leases.renew_supervisor.side_effect = fail_on_third
+
+    credential_refreshed = [False]
+
+    def track_credential() -> bool:
+        credential_refreshed[0] = True
+        return False
+
+    supervisor = Supervisor(
+        factory,
+        {},
+        clock,
+        holder="test-host:1",
+        artifact_store=MagicMock(),
+        lease_ttl_seconds=30,
+        credential_renewal=track_credential,
+    )
+
+    with (
+        patch.object(supervisor, "_reconcile_provider_handles", return_value=0),
+        patch.object(supervisor, "_resume_quota_checkpoints"),
+        patch.object(supervisor, "_resume_quota_waits"),
+        patch.object(supervisor, "_materialize_scheduled"),
+        patch.object(supervisor, "_resume_gate_probes"),
+        patch.object(supervisor, "_launch_pending", return_value=0),
+        patch.object(supervisor, "_observe_attempts", return_value=([], [])),
+        patch.object(supervisor, "_sweep_cancellations"),
+        patch.object(supervisor, "_materialize_evidence"),
+        patch.object(supervisor, "_evaluate_pending_gates"),
+        patch.object(supervisor.delivery, "publish", return_value=0),
+        patch.object(supervisor.delivery, "observe", return_value=0),
+        patch.object(supervisor, "_cleanup_step"),
+        patch.object(supervisor, "_retention_step", return_value=0),
+        patch.object(supervisor, "_refresh_attempt_metrics"),
+        patch.object(supervisor, "_repeat_stale_escalations"),
+        patch.object(supervisor, "_deliver_wakes", return_value=0),
+        patch.object(supervisor, "_status_step", return_value={}),
+    ):
+        result = await supervisor.tick()
+
+    assert result.held is False, "Tick should stop when lease is lost"
+    assert credential_refreshed[0] is False, "Credential refresh must not run after lease is lost"
+
+
+@pytest.mark.asyncio
+async def test_credential_refresh_checks_lease() -> None:
+    """When fenced_token is None, _retention_sweep returns immediately
+    without calling the credential renewal callback."""
+    uow, _status, _ = _make_uow()
+    factory = _build_factory(uow)
+    clock = FakeClock(datetime(2026, 10, 1, tzinfo=UTC))
+
+    supervisor = Supervisor(
+        factory,
+        {},
+        clock,
+        holder="test-host:1",
+        artifact_store=MagicMock(),
+        lease_ttl_seconds=30,
+        credential_renewal=lambda: False,
+    )
+    supervisor.fenced_token = None
+
+    applied = supervisor._retention_sweep()
+
+    assert applied == 0

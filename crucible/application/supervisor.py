@@ -662,13 +662,13 @@ class Supervisor:
             )
             return True
 
-    def _renew_lease(self) -> None:
+    def _renew_lease(self) -> bool:
         """Renew the lease outside a fenced transaction so a mid-tick renewal
         does not hold up work when the database is under load.
 
-        This is intentionally simple: it only calls ``renew_supervisor`` and
-        updates the fenced token.  Errors are logged and the lease is dropped
-        silently; the next fenced call will surface the loss via
+        Returns ``True`` when the renewal succeeded, ``False`` when the lease
+        could not be renewed (or was lost).  Errors are logged and the lease
+        is dropped silently; the next fenced call will surface the loss via
         ``LeaseLostError``.
         """
         try:
@@ -681,9 +681,18 @@ class Supervisor:
                 if lease is None:
                     self.fenced_token = None
                     log.warning("supervisor lease lost", extra={"holder": self.holder})
+                    uow.commit()
+                    return False
                 uow.commit()
+                return True
         except Exception:
             log.exception("could not renew the supervisor lease")
+            return False
+
+    async def _renew_lease_async(self) -> bool:
+        """Run ``_renew_lease`` on a thread so the UnitOfWork, row lock and
+        commit do not block the event loop."""
+        return await self._db(self._renew_lease)
 
     def _release_step(self) -> None:
         if self.fenced_token is None:
@@ -757,10 +766,25 @@ class Supervisor:
             # The delivery half (23): publish what acceptance released, then observe
             # every pull request in an observed state. Both are no-ops without a
             # configured GitHub client.
+            if not await self._renew_lease_async():
+                result.held = False
+                await self._abandon_launches()
+                raise LeaseLostError("mid-tick renewal lost lease before publish")
             result.published = await self.delivery.publish()
+            if not await self._renew_lease_async():
+                result.held = False
+                await self._abandon_launches()
+                raise LeaseLostError("mid-tick renewal lost lease before observe")
             result.pull_requests_polled = await self.delivery.observe()
+            if not await self._renew_lease_async():
+                result.held = False
+                await self._abandon_launches()
+                raise LeaseLostError("mid-tick renewal lost lease before cleanup")
             await self._cleanup_step()
-            self._renew_lease()
+            if not await self._renew_lease_async():
+                result.held = False
+                await self._abandon_launches()
+                raise LeaseLostError("mid-tick renewal lost lease before retention")
             await self._retention_step()
             await self._db(self._refresh_attempt_metrics)
             await self._db(self._repeat_stale_escalations)
@@ -3171,6 +3195,9 @@ class Supervisor:
         applied = 0
         # Credential renewal runs outside the tick's open transaction to avoid
         # holding the fence while the OAuth token refresh hits the network.
+        # A holder that lost the lease must not refresh the shared Codex login.
+        if getattr(self, "fenced_token", None) is None:
+            return 0
         credential_renewed = (
             self._credential_renewal() if self._credential_renewal is not None else False
         )
