@@ -5,6 +5,10 @@ set -euo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 # shellcheck source=tools/kind/cluster.sh
 . "$root/tools/kind/cluster.sh"
+if [ -n "${CRUCIBLE_E2E_KIND_SHARD:-}" ] && [ ! -f "$root/tools/kind/shards/${CRUCIBLE_E2E_KIND_SHARD}.txt" ]; then
+  echo "e2e-kind: unknown shard ${CRUCIBLE_E2E_KIND_SHARD}" >&2
+  exit 2
+fi
 run_id=${CRUCIBLE_KIND_RUN_ID:-$(date +%s)-$$}
 cluster="crucible-e2e-${run_id}"
 registry="${cluster}-registry"
@@ -362,5 +366,22 @@ uv sync --frozen --quiet
 # CRUCIBLE_E2E_KIND_PYTEST_ARGS narrows the run (for example `-k login -s`) when one
 # case is being proven on its own cluster; CI leaves it empty and runs the whole tier.
 read -r -a extra_args <<< "${CRUCIBLE_E2E_KIND_PYTEST_ARGS:-}"
-# CRUCIBLE_E2E_KIND_TESTS picks the file; the default is the tier CI runs.
-uv run pytest "${CRUCIBLE_E2E_KIND_TESTS:-tests/e2e/test_kind.py}" -q -m e2e "${extra_args[@]}"
+# CRUCIBLE_E2E_KIND_TESTS picks the file; the default is the tier CI runs. CI runs the
+# tier as three shards (hades #222): CRUCIBLE_E2E_KIND_SHARD=N selects the node ids
+# listed in tools/kind/shards/N.txt, one per line, each on its own cluster. An unknown
+# shard is refused before anything is built. tests/unit/test_kind_shards.py proves every
+# test is in exactly one list. --durations=0 puts each test's time in the job log.
+selection=()
+if [ -n "${CRUCIBLE_E2E_KIND_SHARD:-}" ]; then
+  shard_file="$root/tools/kind/shards/${CRUCIBLE_E2E_KIND_SHARD}.txt"
+  if [ ! -f "$shard_file" ]; then
+    echo "e2e-kind: unknown shard ${CRUCIBLE_E2E_KIND_SHARD} (no $shard_file)" >&2
+    exit 2
+  fi
+  while IFS= read -r node_id; do
+    [ -n "$node_id" ] && selection+=("$node_id")
+  done < "$shard_file"
+else
+  selection=("${CRUCIBLE_E2E_KIND_TESTS:-tests/e2e/test_kind.py}")
+fi
+uv run pytest "${selection[@]}" -q -m e2e --durations=0 "${extra_args[@]}"
