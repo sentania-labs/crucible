@@ -54,10 +54,11 @@ def test_the_workflow_runs_the_shards_and_not_main() -> None:
     shards = kind["strategy"]["matrix"]["shard"]
     assert sorted(str(s) for s in shards) == sorted(_shard_lists())
     assert kind["env"]["CRUCIBLE_E2E_KIND_SHARD"] == "${{ matrix.shard }}"
-    assert "e2e-kind" in document["jobs"]["green"]["needs"]
-    branches = document[True]["push"]["branches"]  # `on` parses as the boolean True
-    assert "!main" in branches
-    cache = yaml.safe_load((ROOT / ".github" / "workflows" / "main-cache.yml").read_text())
-    assert cache[True]["push"]["branches"] == ["main"]
-    steps = cache["jobs"]["images"]["steps"]
+    assert "green" not in document["jobs"], (
+        "no job judges the other jobs; Hades certifies every run"
+    )
+    on = document[True]  # `on` parses as the boolean True
+    assert on["push"]["branches"] == ["**"], "every branch, main included; no merge queue"
+    assert "merge_group" not in on
+    steps = document["jobs"]["images"]["steps"]
     assert any("cache/save" in str(step.get("uses")) for step in steps)

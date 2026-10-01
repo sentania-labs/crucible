@@ -11,16 +11,10 @@ name: ci
 # (operator decision, 2026-09-23).
 on:
   push:
-    # The merge queue's temporary branches are proven by the merge_group run below; a
-    # push run on the same ref would share its concurrency group and cancel it.
-    # main is excluded (hades #222): a queue merge lands exactly the merge-group commit
-    # the merge_group run below already proved, so a push run on main would repeat it.
-    branches: ["**", "!gh-readonly-queue/**", "!main"]
-  # The merge queue (operator decision, 2026-09-29): each queued pull request is tested
-  # once on top of main and the PRs ahead of it, instead of each one being brought up to
-  # date and re-run in turn. The required checks are matched by name on the group's
-  # commit, so every job runs here exactly as on a branch push.
-  merge_group:
+    # Every branch, main included. Hades merges a pull request once every job passed on
+    # its head (operator decision, 2026-10-01: no merge queue, no gate job); the run on
+    # main then proves the squashed result, and a red main gets a fix PR.
+    branches: ["**"]
   # Manual escape hatch for 114: a branch push restores main's BuildKit cache in the
   # images job, so a change to a fetch or install step is only proven fresh from that
   # layer on. Dispatching this workflow with no_cache=true builds the images job from
@@ -124,8 +118,8 @@ jobs:
   # it is proved on a machine the author does not control. GitHub-hosted, because it
   # needs a Docker daemon and buildx (github-ci skill).
   #
-  # Branch pushes import the BuildKit layer cache main-cache.yml exported from the
-  # last merge to main, so the job takes minutes. The digest is always computed from what the
+  # Branch pushes import the BuildKit layer cache the last push to main exported, so
+  # the job takes minutes. The digest is always computed from what the
   # build output, but a network step (apt, pip, ADD <url>) is cached on its instruction
   # text, not on the bytes it would fetch today, so a branch's pass is not on its own
   # proof that upstream still serves those bytes. That proof is every push to main, which
@@ -143,14 +137,13 @@ jobs:
         id: no_cache
         env:
           DISPATCH_NO_CACHE: ${{ github.event_name == 'workflow_dispatch' && inputs.no_cache }}
-          # The merge_group run builds from scratch, as the push to main used to: it is
-          # the last from-scratch proof before the commit lands (hades #222). The cache
-          # branches restore is saved by main-cache.yml on the default branch, because a
-          # cache saved from a queue ref is invisible to branches (Codex, PR 333).
-          MERGE_GROUP: ${{ github.event_name == 'merge_group' }}
+          # The push to main builds from scratch: it is the from-scratch proof that every
+          # network step still reproduces, and the cache it saves below is the one every
+          # branch restores (a cache saved on the default branch is visible to all).
+          ON_MAIN: ${{ github.ref == 'refs/heads/main' }}
         run: |
           set -euo pipefail
-          if [ "$MERGE_GROUP" = "true" ] || [ "$DISPATCH_NO_CACHE" = "true" ]; then
+          if [ "$ON_MAIN" = "true" ] || [ "$DISPATCH_NO_CACHE" = "true" ]; then
             echo "value=1" >> "$GITHUB_OUTPUT"
           else
             echo "value=" >> "$GITHUB_OUTPUT"
@@ -166,6 +159,12 @@ jobs:
         env:
           NO_CACHE: ${{ steps.no_cache.outputs.value }}
         run: make images-check CACHE_DIR="$RUNNER_TEMP/buildkit-cache" NO_CACHE="$NO_CACHE"
+      - name: keep the layer cache for branches
+        if: github.ref == 'refs/heads/main'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/buildkit-cache
+          key: worker-images-${{ hashFiles('images/**') }}
       # hades #181, #184: the image just built must carry the program each shipped
       # policy's required check starts with (make, for default-software's make lint,
       # test, scan) and every program a shipped policy declares in required_programs.
@@ -190,7 +189,7 @@ jobs:
     # Three shards (hades #222), each on its own disposable cluster, selected from
     # tools/kind/shards/<n>.txt; tests/unit/test_kind_shards.py proves every kind test
     # is in exactly one shard. One shard ran about 28 minutes as a single job; a third
-    # of it fits well inside this limit. `green` needs every shard.
+    # of it fits well inside this limit.
     strategy:
       fail-fast: false
       matrix:
@@ -307,27 +306,3 @@ jobs:
       - name: down
         if: always()
         run: make down
-
-  # The one check the ruleset on main requires. It passes only when every other job
-  # in this workflow succeeded, so "green" means all of CI, and a job added later is
-  # required the moment it is listed in `needs` below. `make lint` (tools/ci/check-green-gate.py)
-  # fails when a job exists that is not listed here, so the list cannot go stale.
-  green:
-    runs-on: ubuntu-24.04
-    if: always()
-    needs: [lint, scan, test, e2e, images, e2e-kind, registry, manifests, compose-smoke]
-    steps:
-      - name: every job succeeded
-        env:
-          RESULTS: ${{ toJSON(needs) }}
-        run: |
-          python3 - <<'PY'
-          import json, os, sys
-          needs = json.loads(os.environ["RESULTS"])
-          bad = {name: job["result"] for name, job in needs.items() if job["result"] != "success"}
-          for name, result in sorted(bad.items()):
-              print(f"{name}: {result}")
-          if bad:
-              sys.exit(1)
-          print(f"all {len(needs)} jobs succeeded")
-          PY
