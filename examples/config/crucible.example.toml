@@ -117,7 +117,7 @@ webhook_secret_path = "/var/lib/crucible/credentials/github/webhook.secret"
 [credentials.claude_code]
 source = "directory"
 path = "/var/lib/crucible/credentials/claude_code"    # oauth-token (long-lived, S1b) and .claude.json
-mount_mode = "rw-narrow"
+mount_mode = "ro"          # the setup token never refreshes and nothing syncs back (12); rw-narrow would override the adapter's read-only minimum
 
 [credentials.codex]
 source = "directory"
