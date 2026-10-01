@@ -95,6 +95,21 @@ Exit code 0 when `ok`, 1 when the operation was refused or failed, 2 on usage
 prints a short human view instead, with times in the configured zone; a person
 at a terminal uses it, an agent does not.
 
+## Attempt report
+
+`GET /v1/attempts/{attempt_id}/report` returns a `CompletionClaimView` with
+the worker's parsed report and Crucible's observations:
+
+| Field | Meaning |
+|---|---|
+| `attempt_id` | the attempt that was parsed |
+| `parsed_ok` | whether the report parsed without errors |
+| `parse_errors` | list of dicts with `file`, `line`, `message` on failure |
+| `document` | the parsed report as a dict |
+| `filled_by_crucible` | list of field names Crucible filled in |
+| `differences` | list of dicts with `field` and `detail` describing mismatches |
+
+
 ## Following `next`
 
 Each entry is one action:
