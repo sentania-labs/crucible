@@ -159,3 +159,59 @@ crucible_kind_install_calico() {
   KUBECONFIG="$kubeconfig" kubectl -n kube-system rollout status daemonset/calico-node --timeout=180s
   KUBECONFIG="$kubeconfig" kubectl wait --for=condition=Ready nodes --all --timeout=180s
 }
+
+# A readiness gate that confirms the cluster is truly operational after Calico
+# is applied. Checks four things, each with a 3-minute deadline: every node
+# Ready, the Calico DaemonSet rolled out, CoreDNS Ready, and a throwaway pod
+# that resolves kubernetes.default and connects to the API service IP.
+crucible_kind_wait_ready() {
+  local kubeconfig=$1
+  local deadline=180
+  local failures=()
+
+  # Check 1: every node Ready (3-minute deadline)
+  if ! KUBECONFIG="$kubeconfig" kubectl wait --for=condition=Ready nodes --all --timeout="${deadline}s" 2>/dev/null; then
+    failures+=("nodes not Ready")
+  fi
+
+  # Check 2: Calico DaemonSet rolled out (3-minute deadline)
+  if ! KUBECONFIG="$kubeconfig" kubectl -n kube-system rollout status daemonset/calico-node --timeout="${deadline}s" 2>/dev/null; then
+    failures+=("calico DaemonSet not rolled out")
+  fi
+
+  # Check 3: CoreDNS Ready (3-minute deadline)
+  if ! KUBECONFIG="$kubeconfig" kubectl -n kube-system rollout status deployment/coredns --timeout="${deadline}s" 2>/dev/null; then
+    failures+=("CoreDNS not Ready")
+  fi
+
+  # Check 4: a throwaway pod resolves kubernetes.default and connects to the API service IP
+  local api_ip
+  api_ip=$(KUBECONFIG="$kubeconfig" kubectl -n default get service kubernetes -o jsonpath='{.spec.clusterIP}' 2>/dev/null)
+  if [ -n "$api_ip" ]; then
+    local check_pod="crucible-readiness-$$"
+    KUBECONFIG="$kubeconfig" kubectl run "$check_pod" \
+      --image="$CRUCIBLE_BUSYBOX_IMAGE" \
+      --image-pull-policy=Never \
+      --restart=Never \
+      --timeout="${deadline}s" \
+      --attach \
+      /bin/sh -c "wget -q -O- --timeout=5 \"http://${api_ip}/version\" >/dev/null 2>&1 || exit 1" 2>/dev/null
+    local rc=$?
+    KUBECONFIG="$kubeconfig" kubectl delete pod "$check_pod" --ignore-not-found >/dev/null 2>&1 || :
+    if [ "$rc" -ne 0 ]; then
+      failures+=("readiness pod cannot reach API server")
+    fi
+  else
+    failures+=("could not find API server IP")
+  fi
+
+  if [ "${#failures[@]}" -gt 0 ]; then
+    local i
+    for i in "${!failures[@]}"; do
+      echo "kind: readiness check ${failures[$i]} failed" >&2
+    done
+    return 1
+  fi
+
+  return 0
+}
