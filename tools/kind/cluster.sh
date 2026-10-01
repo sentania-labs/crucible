@@ -189,13 +189,15 @@ crucible_kind_wait_ready() {
   # 443. The API speaks only HTTPS, so a plain http fetch can never pass; a TCP connect
   # is the reachability proof (PR 326's own kind run and Codex review). busybox nc has
   # no -z: connecting with stdin at EOF opens the socket and exits 0 once connected.
+  # The image is pulled if the node lacks it: with Never the pod could not start on a
+  # fresh cluster and the gate blamed the API server (PR 326's third kind run).
   local api_ip
   api_ip=$(KUBECONFIG="$kubeconfig" kubectl -n default get service kubernetes -o jsonpath='{.spec.clusterIP}' 2>/dev/null)
   if [ -n "$api_ip" ]; then
     local check_pod="crucible-readiness-$$"
     KUBECONFIG="$kubeconfig" kubectl run "$check_pod" \
       --image="$CRUCIBLE_BUSYBOX_IMAGE" \
-      --image-pull-policy=Never \
+      --image-pull-policy=IfNotPresent \
       --restart=Never \
       --timeout="${deadline}s" \
       --attach \
