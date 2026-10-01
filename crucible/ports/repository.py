@@ -105,6 +105,10 @@ class PolicyRepository(Protocol):
 
     def list_versions(self, name: str) -> Sequence[Policy]: ...
 
+    def list_names(self) -> Sequence[str]:
+        """Distinct policy names sorted."""
+        ...
+
     def is_referenced(self, name: str, version: int) -> bool:
         """True once a task names this version; a referenced version is immutable (05b)."""
         ...
@@ -156,7 +160,9 @@ class TaskRepository(Protocol):
         limit: int,
     ) -> Sequence[Task]: ...
 
-    def recently_updated(self, *, since: datetime, limit: int) -> Sequence[Task]:
+    def recently_updated(
+        self, *, since: datetime, limit: int, exclude_principal_ids: set[str] | None = None
+    ) -> Sequence[Task]:
         """The newest updates first, at most `limit` of them."""
         ...
 

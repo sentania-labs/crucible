@@ -68,6 +68,7 @@ def repositories_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
         }
     ]
     if principal.role is Role.ADMIN:
+        names = list(uow.policies.list_names()) or ["default-software"]
         sections.extend(
             [
                 {
@@ -94,6 +95,8 @@ def repositories_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                             {
                                 "name": "policy_name",
                                 "label": "Policy",
+                                "kind": "select",
+                                "options": [(n, n) for n in names],
                                 "value": "default-software",
                                 "required": True,
                             },
