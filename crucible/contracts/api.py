@@ -708,3 +708,5 @@ class CompletionClaimView(Response):
     parsed_ok: bool
     parse_errors: list[dict[str, Any]]
     document: dict[str, Any]
+    filled_by_crucible: list[str] = []
+    differences: list[dict[str, Any]] = []

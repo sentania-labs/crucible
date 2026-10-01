@@ -85,6 +85,11 @@ class Policies:
         ).all()
         return [self._to_entity(r) for r in rows]
 
+    def list_names(self) -> Sequence[str]:
+        """Distinct policy names sorted."""
+        rows = self._s.scalars(select(PolicyRow.name).distinct().order_by(PolicyRow.name)).all()
+        return list(rows)
+
     def is_referenced(self, name: str, version: int) -> bool:
         count = self._s.scalar(
             select(func.count())
