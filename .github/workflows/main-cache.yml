@@ -1,0 +1,30 @@
+# The BuildKit layer cache branches restore, and the from-scratch proof that every
+# network step in the worker images still reproduces (hades #222, Codex review of
+# PR 333). ci.yml no longer runs on a push to main: a queue merge lands exactly the
+# merge-group commit that run proved. But a cache saved from a merge_group run is
+# scoped to the queue's temporary ref, which feature branches cannot restore from,
+# so this small workflow is the one run main still does: build the images from
+# scratch and save the cache on the default branch, where every branch can read it.
+name: main-cache
+
+on:
+  push:
+    branches: ["main"]
+
+concurrency:
+  group: main-cache-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  images:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: build both images from scratch and compare with images/manifest.env
+        run: make images-check CACHE_DIR="$RUNNER_TEMP/buildkit-cache" NO_CACHE=1
+      - name: keep the layer cache for branches
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/buildkit-cache
+          key: worker-images-${{ hashFiles('images/**') }}
