@@ -19,7 +19,7 @@ from crucible.application.errors import (
     ConflictError,
     NotFoundError,
 )
-from crucible.application.queries import pull_request_view, task_view
+from crucible.application.queries import attempt_report, pull_request_view, task_view
 from crucible.contracts.api import (
     DecisionRequest,
 )
@@ -292,6 +292,30 @@ def task_page(request: Request, task_id: str, ctx: Ctx, uow: UoW) -> Response:
                 "title": "Routing",
                 "columns": ["Attempt", "Decision"],
                 "rows": fallthroughs,
+            }
+        )
+    # Report: show what Crucible filled and what differed per attempt.
+    report_rows: list[list[str | dict[str, Any]]] = []
+    for execution in view.executions:
+        for attempt in execution.attempts:
+            try:
+                rpt = attempt_report(uow, attempt.id)
+            except NotFoundError:
+                continue
+            filled = ", ".join(rpt.filled_by_crucible) if rpt.filled_by_crucible else "nothing"
+            if rpt.differences:
+                diffs = "; ".join(
+                    f"{d.get('field', '')} ({d.get('detail', '')})" for d in rpt.differences
+                )
+            else:
+                diffs = "none"
+            report_rows.append([attempt.id, filled, diffs])
+    if report_rows:
+        sections.append(
+            {
+                "title": "Report",
+                "columns": ["Attempt", "Crucible filled", "Differences"],
+                "rows": report_rows,
             }
         )
     try:
