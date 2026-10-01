@@ -433,16 +433,18 @@ class KubernetesClient:
         object it did not create, and the only thing it patches is the harness
         credential Secret's data on a validated sync-back (12).
 
-        ``resource_version`` is sent as an ``If-None-Match`` header so the API server
-        rejects the patch with 409 when the object has changed since the read (339).
+        ``resource_version`` is embedded in the patch body as
+        ``metadata.resourceVersion`` so the API server returns 409 Conflict when
+        the stored object has changed since the read (339).
         """
         url = f"{self._base(kind)}/{quote(name, safe='')}"
         headers = {**self._headers(), "Content-Type": "application/merge-patch+json"}
+        patch_body: dict[str, Any] = dict(body)
         if resource_version is not None:
-            headers["If-None-Match"] = resource_version
+            patch_body.setdefault("metadata", {})["resourceVersion"] = resource_version
         conn = self._connect()
         try:
-            conn.request("PATCH", url, body=json.dumps(body).encode("utf-8"), headers=headers)
+            conn.request("PATCH", url, body=json.dumps(patch_body).encode("utf-8"), headers=headers)
             response = conn.getresponse()
             raw = response.read()
             if response.status >= 400:

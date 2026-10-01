@@ -485,14 +485,20 @@ class FakeKubernetesApi:
         resource_version: str | None = None,
     ) -> dict[str, Any]:
         self._outage("patch", kind)
-        # 339: If-None-Match resource version check. If a resourceVersion is
-        # provided and the object's version differs, return 409.
+        # 339: optimistic concurrency on the patch body's metadata.resourceVersion
+        # so the API server returns 409 Conflict when the stored object has changed
+        # since the read (339).
         obj = self.objects.get((kind, name))
         if obj is None:
             raise KubernetesApiError(404, f"{kind}/{name} not found")
-        if resource_version is not None:
+        body_version = dict(body).get("metadata", {}).get("resourceVersion")
+        # resource_version keyword argument is the caller's encoding of the same
+        # information; it is checked when the body does not carry metadata.
+        if body_version is None and resource_version is not None:
+            body_version = resource_version
+        if body_version is not None:
             current_version = obj.body.get("metadata", {}).get("resourceVersion")
-            if current_version is not None and current_version != resource_version:
+            if current_version is not None and current_version != body_version:
                 raise KubernetesApiError(409, "conflict: resource version mismatch")
         _merge(obj.body, dict(body))
         return obj.body

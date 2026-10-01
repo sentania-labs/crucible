@@ -711,15 +711,21 @@ def build_credential_renewer(
 
     # 339: the renewer checks for CREDENTIAL_REFRESH_REQUESTED events so the
     # supervisor can honour a forced refresh recorded from the API.
+    # A watermark avoids re-scanning from seq=0 every tick (339).
+    _watermark: list[int | None] = [None]
+
     def _has_pending_refresh_request() -> bool:
         try:
             with factory() as uow:
+                seq = _watermark[0]
                 rows = uow.events.list_global(
-                    after_seq=0,
+                    after_seq=seq if seq is not None else 0,
                     kind=EventKind.CREDENTIAL_REFRESH_REQUESTED.value,
                     since=datetime.min.replace(tzinfo=UTC),
                     limit=1,
                 )
+                if rows:
+                    _watermark[0] = rows[-1].seq
                 return len(rows) > 0
         except Exception:  # pragma: no cover - safe fallback for test fakes
             return False
