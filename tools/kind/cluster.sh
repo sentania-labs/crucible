@@ -159,3 +159,81 @@ crucible_kind_install_calico() {
   KUBECONFIG="$kubeconfig" kubectl -n kube-system rollout status daemonset/calico-node --timeout=180s
   KUBECONFIG="$kubeconfig" kubectl wait --for=condition=Ready nodes --all --timeout=180s
 }
+
+# A readiness gate that confirms the cluster is truly operational after Calico
+# is applied. Checks four things, each with a 3-minute deadline: every node
+# Ready, the Calico DaemonSet rolled out, CoreDNS Ready, and a throwaway pod
+# that resolves kubernetes.default and connects to the API service IP.
+crucible_kind_wait_ready() {
+  local kubeconfig=$1
+  local deadline=180
+  local failures=()
+
+  # Check 1: every node Ready (3-minute deadline)
+  if ! KUBECONFIG="$kubeconfig" kubectl wait --for=condition=Ready nodes --all --timeout="${deadline}s" 2>/dev/null; then
+    failures+=("nodes not Ready")
+  fi
+
+  # Check 2: Calico DaemonSet rolled out (3-minute deadline)
+  if ! KUBECONFIG="$kubeconfig" kubectl -n kube-system rollout status daemonset/calico-node --timeout="${deadline}s" 2>/dev/null; then
+    failures+=("calico DaemonSet not rolled out")
+  fi
+
+  # Check 3: CoreDNS Ready (3-minute deadline)
+  if ! KUBECONFIG="$kubeconfig" kubectl -n kube-system rollout status deployment/coredns --timeout="${deadline}s" 2>/dev/null; then
+    failures+=("CoreDNS not Ready")
+  fi
+
+  # Check 4: a throwaway pod resolves kubernetes.default.svc.cluster.local (pod DNS
+  # works, not only CoreDNS's own pods; the full name so busybox's resolver needs no
+  # search path) and then opens a TCP connection to the API service IP on
+  # 443. The API speaks only HTTPS, so a plain http fetch can never pass; a TCP connect
+  # is the reachability proof (PR 326's own kind run and Codex review). busybox nc has
+  # no -z: connecting with stdin at EOF opens the socket and exits 0 once connected.
+  # The image is pulled if the node lacks it: with Never the pod could not start on a
+  # fresh cluster and the gate blamed the API server (PR 326's third kind run).
+  local api_ip
+  api_ip=$(KUBECONFIG="$kubeconfig" kubectl -n default get service kubernetes -o jsonpath='{.spec.clusterIP}' 2>/dev/null)
+  if [ -n "$api_ip" ]; then
+    local check_pod="crucible-readiness-$$"
+    KUBECONFIG="$kubeconfig" kubectl run "$check_pod" \
+      --image="$CRUCIBLE_BUSYBOX_IMAGE" \
+      --image-pull-policy=IfNotPresent \
+      --restart=Never \
+      -- /bin/sh -c "nslookup kubernetes.default.svc.cluster.local >/dev/null 2>&1 || exit 2; nc -w 5 ${api_ip} 443 </dev/null >/dev/null 2>&1 || exit 1" >/dev/null 2>&1
+    # Wait for the pod to finish rather than attaching: an attach to a container that
+    # has already exited reports a failure of its own. On any failure, say what the
+    # pod saw before it is deleted, so the job log explains the gate.
+    local rc=1
+    if KUBECONFIG="$kubeconfig" kubectl wait --for=jsonpath='{.status.phase}'=Succeeded \
+        "pod/$check_pod" --timeout="${deadline}s" >/dev/null 2>&1; then
+      rc=0
+    else
+      rc=$(KUBECONFIG="$kubeconfig" kubectl get "pod/$check_pod" \
+        -o jsonpath='{.status.containerStatuses[0].state.terminated.exitCode}' 2>/dev/null)
+      rc=${rc:-1}
+      echo "kind: readiness pod $check_pod did not succeed (exit ${rc}):" >&2
+      KUBECONFIG="$kubeconfig" kubectl get "pod/$check_pod" -o wide 2>&1 | sed 's/^/kind:   /' >&2
+      KUBECONFIG="$kubeconfig" kubectl logs "pod/$check_pod" 2>&1 | tail -5 | sed 's/^/kind:   /' >&2
+      KUBECONFIG="$kubeconfig" kubectl describe "pod/$check_pod" 2>&1 | grep -A8 '^Events' | sed 's/^/kind:   /' >&2
+    fi
+    KUBECONFIG="$kubeconfig" kubectl delete pod "$check_pod" --ignore-not-found >/dev/null 2>&1 || :
+    if [ "$rc" = 2 ]; then
+      failures+=("readiness pod cannot resolve kubernetes.default")
+    elif [ "$rc" != 0 ]; then
+      failures+=("readiness pod cannot reach API server")
+    fi
+  else
+    failures+=("could not find API server IP")
+  fi
+
+  if [ "${#failures[@]}" -gt 0 ]; then
+    local i
+    for i in "${!failures[@]}"; do
+      echo "kind: readiness check ${failures[$i]} failed" >&2
+    done
+    return 1
+  fi
+
+  return 0
+}

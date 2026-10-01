@@ -180,6 +180,86 @@ containerdConfigPatches:
     ${CRUCIBLE_KIND_DOCKER_HUB_MIRROR_PATCH}
 EOF
 
+# Readiness gate wrapper: calls the gate, and on failure tears down the cluster,
+# recreates it, re-runs the full setup, and retries the gate once.
+# If both attempts fail, returns 1 so the caller exits with code 75.
+crucible_kind_wait_and_retry() {
+  local attempt=0
+  while [ "$attempt" -lt 2 ]; do
+    if [ "$attempt" -gt 0 ]; then
+      echo "e2e-kind: recreating cluster (attempt 2/2)" >&2
+      kind delete cluster --name "$cluster" >/dev/null 2>&1 || :
+      node_image=$(crucible_kind_pull "$CRUCIBLE_KIND_NODE_IMAGE")
+      # Marked created before the create call so the EXIT trap deletes a cluster whose
+      # later setup step fails (Codex review of PR 326).
+      cluster_created=1
+      kind create cluster --config "$scratch/kind.yaml" --kubeconfig "$kubeconfig" --wait 0s \
+        --image "$node_image"
+      node="${cluster}-control-plane"
+      for address in 10.0.0.1 172.16.0.1 192.168.0.1 100.64.0.1 169.254.169.254; do
+        docker exec "$node" ip address add "$address/32" dev lo
+      done
+      for address in 198.51.100.10 198.51.100.20; do
+        docker exec "$node" ip address add "$address/32" dev lo
+      done
+      docker exec "$node" ip route add blackhole 198.51.100.30/32
+      crucible_kind_install_calico "$scratch" "$kubeconfig"
+      kind load docker-image "$worker_image" --name "$cluster"
+      cluster_created=1
+      # On retry we must redo the cluster setup that was already done on the
+      # first pass (namespaces, RBAC, CoreDNS tuning).  These commands are
+      # idempotent so we can re-run them safely.
+      KUBECONFIG="$kubeconfig" kubectl create namespace crucible >/dev/null || :
+      KUBECONFIG="$kubeconfig" kubectl -n crucible create serviceaccount crucible-supervisor >/dev/null || :
+      KUBECONFIG="$kubeconfig" kubectl apply -f "$root/deploy/kind/workers.yaml" >/dev/null || :
+      KUBECONFIG="$kubeconfig" kubectl apply -f "$root/deploy/kubernetes/base/workers/role.yaml" >/dev/null || :
+      KUBECONFIG="$kubeconfig" kubectl apply -f "$root/deploy/kubernetes/base/workers/rolebinding.yaml" >/dev/null || :
+      supervisor_kubeconfig="$scratch/supervisor-kubeconfig"
+      api_server=$(KUBECONFIG="$kubeconfig" kubectl config view --raw --minify -o jsonpath='{.clusters[0].cluster.server}')
+      ca_data=$(KUBECONFIG="$kubeconfig" kubectl config view --raw --minify -o jsonpath='{.clusters[0].cluster.certificate-authority-data}')
+      supervisor_token=$(KUBECONFIG="$kubeconfig" kubectl -n crucible create token crucible-supervisor)
+      ca_file="$scratch/cluster-ca.crt"
+      printf '%s' "$ca_data" | base64 -d > "$ca_file"
+      KUBECONFIG="$supervisor_kubeconfig" kubectl config set-cluster kind \
+        --server="$api_server" --certificate-authority="$ca_file" --embed-certs=true >/dev/null
+      KUBECONFIG="$supervisor_kubeconfig" kubectl config set-credentials crucible-supervisor \
+        --token="$supervisor_token" >/dev/null
+      KUBECONFIG="$supervisor_kubeconfig" kubectl config set-context crucible-supervisor \
+        --cluster=kind --user=crucible-supervisor --namespace=crucible-workers >/dev/null
+      KUBECONFIG="$supervisor_kubeconfig" kubectl config use-context crucible-supervisor >/dev/null
+      corefile=$(KUBECONFIG="$kubeconfig" kubectl -n kube-system get configmap coredns -o jsonpath='{.data.Corefile}')
+      corefile=$(printf '%s\n' "$corefile" | awk '
+        { print }
+        /^[[:space:]]*ready[[:space:]]*$/ && !done {
+          print "    hosts {"
+          print "       198.51.100.20 github.com api.github.com"
+          print "       fallthrough"
+          print "    }"
+          done = 1
+        }')
+      KUBECONFIG="$kubeconfig" kubectl -n kube-system create configmap coredns \
+        --from-literal=Corefile="$corefile" --dry-run=client -o yaml \
+        | KUBECONFIG="$kubeconfig" kubectl apply -f - >/dev/null || :
+      KUBECONFIG="$kubeconfig" kubectl -n kube-system patch deployment coredns --type=json -p='[
+        {"op":"add","path":"/spec/template/spec/volumes/-","value":{"name":"wrong-port-www","emptyDir":{}}},
+        {"op":"add","path":"/spec/template/spec/containers/-","value":{"name":"wrong-port-http","image":"busybox@sha256:9db7b59979c38555a39def84a31fb98b5296952f9e3afd4f6f11f05b07adfab0","command":["sh","-c","mkdir -p /www; echo dns-wrong-port > /www/index.html; exec httpd -f -p 18080 -h /www"],"securityContext":{"allowPrivilegeEscalation":false,"readOnlyRootFilesystem":true,"runAsNonRoot":true,"runAsUser":1000,"capabilities":{"drop":["ALL"]}},"volumeMounts":[{"name":"wrong-port-www","mountPath":"/www"}]}}
+      ]' >/dev/null || :
+      KUBECONFIG="$kubeconfig" kubectl -n kube-system patch service kube-dns --type=json \
+        -p='[{"op":"add","path":"/spec/ports/-","value":{"name":"wrong-port","port":443,"protocol":"TCP","targetPort":18080}}]' >/dev/null || :
+      KUBECONFIG="$kubeconfig" kubectl -n kube-system rollout status deployment/coredns --timeout=180s
+      KUBECONFIG="$kubeconfig" kubectl -n kube-system wait --for=condition=Ready pod/range-http --timeout=90s
+      KUBECONFIG="$kubeconfig" kubectl -n crucible-kind-peer wait --for=condition=Ready pod/peer-http --timeout=90s
+      KUBECONFIG="$kubeconfig" kubectl -n crucible-workers wait \
+        --for=jsonpath='{.status.phase}'=Bound pvc/crucible-reference-cache --timeout=90s
+    fi
+    if crucible_kind_wait_ready "$kubeconfig"; then
+      return 0
+    fi
+    attempt=$((attempt + 1))
+  done
+  return 1
+}
+
 cluster_created=1
 node_image=$(crucible_kind_pull "$CRUCIBLE_KIND_NODE_IMAGE")
 kind create cluster --config "$scratch/kind.yaml" --kubeconfig "$kubeconfig" --wait 0s \
@@ -203,6 +283,7 @@ docker exec "$node" ip route add blackhole 198.51.100.30/32
 
 crucible_kind_install_calico "$scratch" "$kubeconfig"
 
+# Cluster setup: namespaces, RBAC, CoreDNS tuning (189, 190, 191).
 KUBECONFIG="$kubeconfig" kubectl create namespace crucible >/dev/null
 KUBECONFIG="$kubeconfig" kubectl -n crucible create serviceaccount crucible-supervisor >/dev/null
 KUBECONFIG="$kubeconfig" kubectl apply -f "$root/deploy/kind/workers.yaml" >/dev/null
@@ -250,6 +331,14 @@ KUBECONFIG="$kubeconfig" kubectl -n crucible-workers wait \
 
 # Required even though the real registry path below is what proves resolution and pull.
 kind load docker-image "$worker_image" --name "$cluster"
+
+# Run the readiness gate; retry once by recreating the cluster. The call sits inside
+# the conditional on purpose: under set -e a bare call would abort the script before
+# the infrastructure exit below (Codex review of PR 326).
+if ! crucible_kind_wait_and_retry; then
+  echo "kind cluster not healthy (infrastructure)" >&2
+  exit 75
+fi
 
 dns_ip=$(KUBECONFIG="$kubeconfig" kubectl -n kube-system get service kube-dns -o jsonpath='{.spec.clusterIP}')
 peer_ip=$(KUBECONFIG="$kubeconfig" kubectl -n crucible-kind-peer get service peer-http -o jsonpath='{.spec.clusterIP}')
