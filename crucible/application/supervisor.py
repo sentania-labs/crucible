@@ -19,6 +19,7 @@ import copy
 import logging
 import stat
 import time
+from collections import Counter
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -487,6 +488,8 @@ class Supervisor:
         # starts the window again, and the workspace stays in place meanwhile).
         self._collect_failing_since: dict[str, float] = {}
         self._collect_retry_at: dict[str, float] = {}
+        # Process-lifetime counts, emitted with every authentication failure.
+        self.auth_failures_by_harness: Counter[str] = Counter()
         self.fenced_token: int | None = None
         self._handles: dict[str, Handle] = {}
         self._workspaces: dict[str, Workspace] = {}
@@ -1675,8 +1678,7 @@ class Supervisor:
         return frozenset(running)
 
     def _harness_busy(self, execution: Execution) -> str | None:
-        """05b: per-harness concurrency, which is 1 whenever the credential mounts
-        rw-narrow (12). A launch over the limit waits; it is not a failure."""
+        """05b: count credential holders against policy caps. A full harness waits."""
         with self._uow_factory() as uow:
             return self._harness_busy_in_uow(uow, execution)
 
@@ -1701,11 +1703,13 @@ class Supervisor:
             credential = None
         if credential is not None:
             source = self._credential_sources.get(execution.harness)
-            if effective_mount_mode(credential, source) is MountMode.RW_NARROW:
+            if effective_mount_mode(credential, source) is MountMode.RW_NARROW and not getattr(
+                adapter, "parallel_attempts_safe", False
+            ):
                 limit = 1
         # An attempt holds its credential copy until collect has synced it back and
-        # removed it, which is after `exited`: a second seeding before that is the
-        # refresh race 12 gives as the reason for the cap.
+        # removed it, which is after `exited`. Parallel-safe adapters use the policy
+        # cap; undeclared writable copies keep the conservative single slot.
         live = uow.attempts.list_in_states(list(CREDENTIAL_HOLDING_STATES))
         running = 0
         for other in live:
@@ -4072,6 +4076,20 @@ class Supervisor:
         booleans and reasons; never a value."""
         now = self._clock.now()
         auth_failure = attempt.exit_class is ExitClass.AUTH_FAILURE
+        if auth_failure:
+            self.auth_failures_by_harness[execution.harness] += 1
+            count = self.auth_failures_by_harness[execution.harness]
+            log.warning(
+                "harness authentication failure: harness=%s attempt=%s auth_failure_count=%s",
+                execution.harness,
+                attempt.id,
+                count,
+                extra={
+                    "harness": execution.harness,
+                    "attempt_id": attempt.id,
+                    "auth_failure_count": count,
+                },
+            )
         record_launch_outcome(
             uow,
             self._clock,

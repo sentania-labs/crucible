@@ -29,7 +29,7 @@ retry:
 
 concurrency:
   per_provider: 3
-  per_harness: { claude_code: 1, codex: 1, agy: 1 }   # all three mount rw-narrow, so all three are 1
+  per_harness: { claude_code: 1, codex: 1, agy: 1 }   # shipped defaults; all three support higher caps
 
 resources:
   cpus: 2
@@ -170,11 +170,16 @@ retention:
 - `gates.pre_pr`, `publication`, `post_pr`, and `skipped` partition the gate
   set defined in 11 and 23; a gate in none of them is an error.
 - `retry.eligible_classes` is a subset of the `ExitClass` enum (07).
-- `concurrency.per_harness` must be 1 for any harness whose credential
-  `mount_mode` is `rw-narrow`; the mount mode comes from Crucible's
-  credential configuration (12, 25), not from the policy, so the check
-  runs against the configured credential sources at upload and at launch.
-  All three real harnesses mount `rw-narrow`, so all three are capped at 1.
+- `concurrency.per_harness` may exceed 1 for read-only adapters or adapters declaring
+  `parallel_attempts_safe`. Writable adapters without that declaration are refused
+  with a reason. Claude Code's long-lived setup token is read-only and never syncs
+  back. AGY's writable copies reuse Google's refresh token. Codex does not declare
+  parallel safety: OpenAI's refresh-token rotation makes concurrent sync-backs unsafe,
+  so `per_harness.codex` above 1 is refused until the brokered renewer lands. Its
+  `auth_failure` retry-once behavior remains; supervisor warnings carry per-harness
+  `auth_failure_count` (reset on restart). Shipped caps are unchanged; Foundry sets
+  per-harness caps after deployment. Both uploads and launches use the shared adapter
+  declarations (12). Executions keep their policy snapshot.
 - The per-harness cap is checked **after** the checkout lease (10), not
   before. The lease is the older and more specific rule: an attempt whose
   checkout another attempt holds should be told that, not held back by a
