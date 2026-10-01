@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+pytest_plugins = ["tests.integration.postgres"]
+
 CGROUP_CPU_MAX = Path("/sys/fs/cgroup/cpu.max")
 
 
