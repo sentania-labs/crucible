@@ -199,14 +199,27 @@ crucible_kind_wait_ready() {
       --image="$CRUCIBLE_BUSYBOX_IMAGE" \
       --image-pull-policy=IfNotPresent \
       --restart=Never \
-      --timeout="${deadline}s" \
-      --attach \
-      /bin/sh -c "nslookup kubernetes.default >/dev/null 2>&1 || exit 2; nc -w 5 ${api_ip} 443 </dev/null >/dev/null 2>&1 || exit 1" 2>/dev/null
-    local rc=$?
+      -- /bin/sh -c "nslookup kubernetes.default >/dev/null 2>&1 || exit 2; nc -w 5 ${api_ip} 443 </dev/null >/dev/null 2>&1 || exit 1" >/dev/null 2>&1
+    # Wait for the pod to finish rather than attaching: an attach to a container that
+    # has already exited reports a failure of its own. On any failure, say what the
+    # pod saw before it is deleted, so the job log explains the gate.
+    local rc=1
+    if KUBECONFIG="$kubeconfig" kubectl wait --for=jsonpath='{.status.phase}'=Succeeded \
+        "pod/$check_pod" --timeout="${deadline}s" >/dev/null 2>&1; then
+      rc=0
+    else
+      rc=$(KUBECONFIG="$kubeconfig" kubectl get "pod/$check_pod" \
+        -o jsonpath='{.status.containerStatuses[0].state.terminated.exitCode}' 2>/dev/null)
+      rc=${rc:-1}
+      echo "kind: readiness pod $check_pod did not succeed (exit ${rc}):" >&2
+      KUBECONFIG="$kubeconfig" kubectl get "pod/$check_pod" -o wide 2>&1 | sed 's/^/kind:   /' >&2
+      KUBECONFIG="$kubeconfig" kubectl logs "pod/$check_pod" 2>&1 | tail -5 | sed 's/^/kind:   /' >&2
+      KUBECONFIG="$kubeconfig" kubectl describe "pod/$check_pod" 2>&1 | grep -A8 '^Events' | sed 's/^/kind:   /' >&2
+    fi
     KUBECONFIG="$kubeconfig" kubectl delete pod "$check_pod" --ignore-not-found >/dev/null 2>&1 || :
-    if [ "$rc" -eq 2 ]; then
+    if [ "$rc" = 2 ]; then
       failures+=("readiness pod cannot resolve kubernetes.default")
-    elif [ "$rc" -ne 0 ]; then
+    elif [ "$rc" != 0 ]; then
       failures+=("readiness pod cannot reach API server")
     fi
   else
