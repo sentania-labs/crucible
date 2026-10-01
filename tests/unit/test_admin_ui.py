@@ -1309,6 +1309,8 @@ def test_repository_form_offers_stored_policy_names_as_a_select(
         ("default-software", "default-software"),
         ("restricted", "restricted"),
     ]
+
+
 def test_routing_model_and_tier_controls_are_ordinary_reasoned_forms(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
