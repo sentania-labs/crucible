@@ -6,6 +6,7 @@ admin principal, and each is recorded as a decision."""
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 from pydantic import ValidationError
@@ -21,13 +22,10 @@ from crucible.contracts.common import to_document
 from crucible.contracts.policy import PolicyV1, RoutingPolicyV1
 from crucible.domain.entities import Decision, Policy, Principal, Role, RoutingPolicyRecord
 from crucible.domain.events import EventKind
+from crucible.domain.harness_concurrency import HARNESS_CONCURRENCY, HarnessConcurrency
 from crucible.domain.ids import new_id
 from crucible.ports.clock import Clock
 from crucible.ports.repository import UnitOfWork
-
-# Every real harness mounts its credential rw-narrow (12, 07): Claude Code and Codex from
-# the start, AGY since the C5 live run showed its token rotating.
-RW_NARROW_HARNESSES: frozenset[str] = frozenset({"claude_code", "agy"})
 
 
 def _problems(exc: ValidationError) -> list[dict[str, Any]]:
@@ -53,8 +51,12 @@ def validate_policy(
         problems.append({"path": "name", "message": f"the path says {name!r}"})
     if policy.version != version:
         problems.append({"path": "version", "message": f"the path says {version}"})
-    # 05b: concurrency must be 1 for any harness whose credential mount is rw-narrow (12).
-    for harness in sorted(RW_NARROW_HARNESSES):
+    # Preserve the required frontier caps; optional harnesses are checked when present.
+    for harness in sorted({"claude_code", "codex", "agy"} | policy.concurrency.per_harness.keys()):
+        declaration = HARNESS_CONCURRENCY.get(harness, HarnessConcurrency())
+        if harness == "codex":
+            mode = (concurrency_modes or {}).get("codex", declaration.minimum_mode)
+            declaration = replace(declaration, renewer_held=mode != "rw-narrow")
         limit = policy.concurrency.per_harness.get(harness)
         if limit is None:
             problems.append(
@@ -63,34 +65,16 @@ def validate_policy(
                     "message": "every supported harness needs a concurrency cap",
                 }
             )
-        elif limit != 1:
+        elif limit > 1 and not declaration.allows_parallel:
             problems.append(
                 {
                     "path": f"concurrency.per_harness.{harness}",
                     "message": (
-                        f"{harness} mounts its credential rw-narrow (12), so concurrency must be 1"
+                        f"{harness} has no read-only credential declaration or parallel-attempt "
+                        "safety declaration for rw-narrow copies (12), so concurrency must be 1"
                     ),
                 }
             )
-    codex_mode = (concurrency_modes or {}).get("codex", "renewer")
-    codex_limit = policy.concurrency.per_harness.get("codex")
-    if codex_limit is None:
-        problems.append(
-            {
-                "path": "concurrency.per_harness.codex",
-                "message": "every supported harness needs a concurrency cap",
-            }
-        )
-    elif codex_mode != "renewer" and codex_limit != 1:
-        problems.append(
-            {
-                "path": "concurrency.per_harness.codex",
-                "message": (
-                    "codex copy mode requires concurrency 1; select renewer mode for "
-                    "parallel workers"
-                ),
-            }
-        )
     if problems:
         raise ContractValidationError("policy failed validation", errors=problems)
     return policy
@@ -105,8 +89,11 @@ def put_policy(
     version: int,
     document: object,
     reason: str | None = None,
+    concurrency_modes: dict[str, str] | None = None,
 ) -> Policy:
-    policy = validate_policy(document, name=name, version=version)
+    policy = validate_policy(
+        document, name=name, version=version, concurrency_modes=concurrency_modes
+    )
     existing = uow.policies.get(name, version)
     if existing is not None and uow.policies.is_referenced(name, version):
         raise ConflictError(

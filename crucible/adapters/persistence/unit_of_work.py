@@ -465,13 +465,21 @@ class Tasks:
             stmt = stmt.where(TaskRow.id > after_id)
         return [self._to_entity(r) for r in self._s.scalars(stmt).all()]
 
-    def recently_updated(self, *, since: datetime, limit: int) -> Sequence[Task]:
+    def recently_updated(
+        self,
+        *,
+        since: datetime,
+        limit: int,
+        exclude_principal_ids: set[str] | None = None,
+    ) -> Sequence[Task]:
         stmt = (
             select(TaskRow)
             .where(TaskRow.updated_at >= since)
             .order_by(TaskRow.updated_at.desc(), TaskRow.id.desc())
-            .limit(limit)
         )
+        if exclude_principal_ids:
+            stmt = stmt.where(TaskRow.principal_id.notin_(exclude_principal_ids))
+        stmt = stmt.limit(limit)
         return [self._to_entity(r) for r in self._s.scalars(stmt).all()]
 
 
@@ -589,6 +597,7 @@ class Executions:
                 effort=execution.effort,
                 image=execution.image,
                 resume_from_remote=execution.resume_from_remote,
+                retry_on=list(execution.retry_on),
             )
         )
 

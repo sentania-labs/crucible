@@ -10,8 +10,9 @@ Credential: the token file under `.gemini/antigravity-cli/`, mounted at the CLI'
 config directory. 12 started it at `ro` pending evidence: AGY refreshes in memory once
 the access token is past its one-hour expiry, and S1 saw the read-only mount refuse the
 save. The C5 live run supplied the evidence: the first Crucible-side run after the
-expiry rotated the token and the copy carried a newer `token.expiry`, so the minimum is
-rw-narrow and the file syncs back by that field.
+expiry renewed the access token and the copy carried a newer `token.expiry`, so the
+minimum is rw-narrow and the file syncs back by that field. Google does not rotate
+the refresh token on ordinary renewal, so isolated copies may run concurrently.
 
 Commands (issue 128): the pinned 1.2.8 CLI has no launch-level command timeout and no
 switch for backgrounding. Its `run_command` tool takes `Blocking` and
@@ -37,6 +38,7 @@ from typing import Any
 
 from crucible.adapters.harness import base
 from crucible.domain.exit_class import ExitClass
+from crucible.domain.harness_concurrency import HARNESS_CONCURRENCY
 from crucible.ports.harness import (
     AGY_BINARY,
     AdapterLaunch,
@@ -93,6 +95,8 @@ def _provider_quota_refusal(document: Mapping[str, Any]) -> bool:
 
 class AgyAdapter:
     name = NAME
+    concurrency = HARNESS_CONCURRENCY[NAME]
+    parallel_attempts_safe = concurrency.parallel_attempts_safe
     supported_versions = VersionRange("1.2.0", "1.3.0")
 
     def quota_reset_at(self, stdout_tail: str, stderr_tail: str) -> datetime | None:
@@ -153,7 +157,7 @@ class AgyAdapter:
             # rw-narrow since the C5 live run: the first Crucible-side run after the
             # one-hour expiry refreshed the token and the copy carried a newer expiry,
             # which the sync-back wrote to the source (12: "would make it rw-narrow").
-            minimum_mode=MountMode.RW_NARROW,
+            minimum_mode=MountMode(self.concurrency.minimum_mode),
             config_dir_env=None,
             templates={},
             login_hint=(

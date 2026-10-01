@@ -9,11 +9,10 @@ container's uid and not to a host user Codex would trust (S1). `--disable plugin
 it off github.com and chatgpt.com (S6). The update opt-out is a launch flag, not image
 state (S7, S11).
 
-Credential: `auth.json`, rw-narrow from the start because the CLI writes session and
-log state beside it and fails on a read-only directory before auth is tested (S1). Only
-`auth.json` syncs back, chosen by the newer `last_refresh` (12). `config.toml` is a
-Crucible-owned template mounted read-only on top: the operator's per-project trust,
-MCP servers and hook trust hashes never reach a worker.
+Credential: Hades holds the login and refreshes it in renewer mode. Workers receive
+only access-token.json and run app-server with external authentication. Rollback uses
+rw-narrow auth.json copies with last_refresh sync-back and per_harness.codex: 1.
+config.toml is a Crucible-owned template; operator settings never reach a worker.
 
 Commands (issue 128): the pinned models run commands through unified exec
 (`shell_type: unified_exec` in the CLI's own model catalog), which returns after at most
@@ -41,7 +40,7 @@ from typing import Any
 from crucible.adapters.harness import base
 from crucible.adapters.harness.hermes import HermesAdapter
 from crucible.domain.exit_class import ExitClass
-from crucible.domain.harness_concurrency import HarnessConcurrency
+from crucible.domain.harness_concurrency import HARNESS_CONCURRENCY
 from crucible.domain.harness_settings import DEFAULT_HERMES_CONTEXT_LENGTH, hermes_run_limits
 from crucible.ports.harness import (
     CODEX_BINARY,
@@ -99,10 +98,9 @@ def _provider_quota_refusal(document: Mapping[str, Any]) -> bool:
 
 class CodexAdapter:
     name = NAME
+    concurrency = HARNESS_CONCURRENCY[NAME]
+    parallel_attempts_safe = concurrency.parallel_attempts_safe
     supported_versions = VersionRange("0.153.0", "0.157.0")
-
-    def concurrency(self) -> HarnessConcurrency:
-        return HarnessConcurrency(renewer_held=True)
 
     def quota_reset_at(self, stdout_tail: str, stderr_tail: str) -> datetime | None:
         return base.quota_reset_at(stdout_tail, stderr_tail, quota=QUOTA_PATTERNS)

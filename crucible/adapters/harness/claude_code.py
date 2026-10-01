@@ -9,7 +9,8 @@ as the file `oauth-token` in the credential directory and delivered through the 
 documented variable at container start, the one exception 07 allows to file-only
 delivery. The top-level state file `.claude.json` is seeded beside it so the CLI finds
 the state it expects, and `CLAUDE_CONFIG_DIR` points at the mounted copy so both live in
-one directory (S1). Neither file is written back: the token does not refresh, and the
+one read-only directory (S1). Parallel workers share no writable credential state.
+Neither file is written back: the token does not refresh, and the
 state file is state, not a credential. `settings.json` is a Crucible-owned template
 mounted read-only on top, so no hook, MCP server or plugin definition reaches a worker.
 
@@ -35,6 +36,7 @@ from typing import Any
 
 from crucible.adapters.harness import base
 from crucible.domain.exit_class import ExitClass
+from crucible.domain.harness_concurrency import HARNESS_CONCURRENCY
 from crucible.ports.harness import (
     CLAUDE_CODE_BINARY,
     AdapterLaunch,
@@ -104,6 +106,8 @@ def _provider_quota_refusal(document: Mapping[str, Any]) -> bool:
 
 class ClaudeCodeAdapter:
     name = NAME
+    concurrency = HARNESS_CONCURRENCY[NAME]
+    parallel_attempts_safe = concurrency.parallel_attempts_safe
     supported_versions = VersionRange("2.1.277", "2.2.0")
 
     def quota_reset_at(self, stdout_tail: str, stderr_tail: str) -> datetime | None:
@@ -143,7 +147,7 @@ class ClaudeCodeAdapter:
                 AuthFile("oauth-token", env_var=TOKEN_ENV, sync_back=False),
                 AuthFile(".claude.json", json=True, required=False, sync_back=False),
             ),
-            minimum_mode=MountMode.RW_NARROW,
+            minimum_mode=MountMode(self.concurrency.minimum_mode),
             config_dir_env="CLAUDE_CONFIG_DIR",
             templates={"settings.json": "{}\n"},
             login_hint=(

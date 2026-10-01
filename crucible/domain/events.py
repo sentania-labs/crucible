@@ -124,6 +124,7 @@ class EventKind(StrEnum):
     BRANCH_PUSHED = "branch_pushed"
     PULL_REQUEST_OPENED = "pull_request_opened"
     PULL_REQUEST_HEAD_UPDATED = "pull_request_head_updated"
+    EXTERNAL_REVIEW_REQUESTED = "external_review_requested"
     PUBLISH_COMPLETED = "publish_completed"
     TASK_PUBLISH_FAILED = "task_publish_failed"
     TASK_AWAITING_EXTERNAL_REVIEW = "task_awaiting_external_review"

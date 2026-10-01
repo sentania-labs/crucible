@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from crucible.adapters.harness.registry import default_registry
-from crucible.adapters.persistence.migrations.versions import _0034_credential_renewer as migration
+from crucible.adapters.persistence.migrations.versions import _0035_credential_renewer as migration
 from crucible.application.admin import credentials
 from crucible.application.harnesses import record_credential_observation
 from crucible.application.supervisor import Supervisor

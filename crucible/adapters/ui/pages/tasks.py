@@ -11,6 +11,7 @@ from crucible.adapters.api.deps import Ctx, UoW
 from crucible.adapters.ui.render import _page, _redirect, _state_words
 from crucible.adapters.ui.session import _admin, _csrf, _form, _require
 from crucible.application.admin import (
+    bootstrap,
     status,
 )
 from crucible.application.decisions import record_decision
@@ -24,6 +25,7 @@ from crucible.contracts.api import (
     DecisionRequest,
 )
 from crucible.domain.entities import Role
+from crucible.domain.events import EventKind
 from crucible.domain.lifecycle import TaskState
 from crucible.domain.waivers import ACCEPT_NO_CI, WAIVABLE_STATES, WAIVE_EXTERNAL_REVIEW
 
@@ -75,10 +77,31 @@ def tasks_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
         return found
     principal, csrf = found
     document = status.tasks(uow)
+    show_archived = request.query_params.get("archived") == "1"
+    if show_archived:
+        archived: set[str] = set()
+    else:
+        archived = {
+            p.id
+            for p in uow.principals.list_all()
+            if p.disabled_at is not None and p.name.startswith(bootstrap.DISCARDED_PRINCIPAL_PREFIX)
+        }
+
+    # Build hidden task ids and per-state hidden counts
+    hidden: set[str] = set()
+    hidden_by_state: dict[str, int] = {}
+    for state in TaskState:
+        for task in uow.tasks.list_by_state(state):
+            if task.principal_id in archived:
+                hidden.add(task.id)
+                hidden_by_state[state.value] = hidden_by_state.get(state.value, 0) + 1
+
+    # Filter attention list (items carry id or task_id)
     attention = [
         [_task_link(item["id"], item["external_id"]), _state_words(state), item["updated_at"]]
         for state, items in document["lists"].items()
         for item in items
+        if item["id"] not in hidden
     ] + [
         # hades FDY-0133: a task in publishing whose publication cannot start says why.
         [
@@ -87,13 +110,21 @@ def tasks_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
             item["waiting_since"],
         ]
         for item in document.get("publishing_waiting", [])
+        if item["task_id"] not in hidden
     ]
+
     # One bounded query, newest first: the page shows RECENT_TASK_ROWS and reads no more.
+    # Exclude archived principals from the query so the limit only applies to visible rows.
     recent = list(
         uow.tasks.recently_updated(
-            since=ctx.clock.now() - timedelta(days=RECENT_TASK_DAYS), limit=RECENT_TASK_ROWS
+            since=ctx.clock.now() - timedelta(days=RECENT_TASK_DAYS),
+            limit=RECENT_TASK_ROWS,
+            exclude_principal_ids=archived or None,
         )
     )
+    # Double-filter: in case of stale state, keep only non-hidden tasks.
+    recent = [task for task in recent if task.id not in hidden]
+
     # hades FDY-0139: every task with a pull request under observation, each linking to
     # its page, where the operator can waive what the task is still waiting for.
     delivering = [
@@ -104,7 +135,24 @@ def tasks_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
         ]
         for state in DELIVERY_STATES
         for task in uow.tasks.list_by_state(state)
+        if task.id not in hidden
     ]
+
+    # Filter gates: drop rows whose item id is in hidden
+    gates = [item for item in document.get("gates", []) if item["id"] not in hidden]
+
+    # Subtract hidden counts from counts section; skip states that reach zero
+    counts: dict[str, int] = {}
+    for state, count in document["counts"].items():
+        adjusted = count - hidden_by_state.get(state, 0)
+        if adjusted > 0:
+            counts[state] = adjusted
+
+    # Determine if we need the hidden note
+    hidden_total = len(hidden)
+    hidden_note: str | None = None
+    if hidden_total > 0:
+        hidden_note = f"{hidden_total} archived import tasks hidden; add ?archived=1 to show them"
     return _page(
         request,
         principal,
@@ -148,23 +196,21 @@ def tasks_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                             or "nothing",
                         },
                     ]
-                    for item in document.get("gates", [])
+                    for item in gates
                 ],
             },
             {
                 "title": "Tasks by state",
                 "empty": "No tasks yet.",
                 "columns": ["State", "Tasks"],
-                "rows": [
-                    [_state_words(state), count]
-                    for state, count in sorted(document["counts"].items())
-                ],
+                "rows": [[_state_words(state), count] for state, count in sorted(counts.items())],
             },
             {
                 "title": "Recently updated",
                 "note": (
                     f"Tasks updated in the last {RECENT_TASK_DAYS} days, newest first. Open "
                     "one for its branch, pull request and merge."
+                    + (f"\n\n{hidden_note}" if hidden_note else "")
                 ),
                 "empty": f"No task was updated in the last {RECENT_TASK_DAYS} days.",
                 "columns": ["Task", "State", "Updated"],
@@ -234,7 +280,14 @@ def task_page(request: Request, task_id: str, ctx: Ctx, uow: UoW) -> Response:
         )
     # hades FDY-0143: the task's paper trail on GitHub, beside what it is waiting for.
     delivery = view.delivery
-    not_yet = "not yet"
+    review_request = uow.events.latest_for_task_kind(
+        task_id, EventKind.EXTERNAL_REVIEW_REQUESTED.value
+    )
+    review_request_value = not_yet = "not yet"
+    if review_request is not None:
+        provider = str(review_request.payload.get("provider") or "external reviewer")
+        comment_id = str(review_request.payload.get("comment_id") or "unknown")
+        review_request_value = f"{provider}, comment {comment_id}"
     delivered_pr: Any = not_yet
     if delivery.pull_request_number is not None:
         label = f"#{delivery.pull_request_number}"
@@ -274,6 +327,7 @@ def task_page(request: Request, task_id: str, ctx: Ctx, uow: UoW) -> Response:
                 ],
                 ["Pull request", delivered_pr],
                 ["Pull request state", delivery.pull_request_state or not_yet],
+                ["External review requested", review_request_value],
                 ["Merge commit", delivery.merge_sha or not_yet],
                 ["Merged by", delivery.merged_by or not_yet],
                 ["Merged at", delivery.merged_at.isoformat() if delivery.merged_at else not_yet],

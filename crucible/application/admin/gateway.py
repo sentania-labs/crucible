@@ -164,24 +164,31 @@ def gateway_view(
     }
 
 
-async def models_view(ctx: AdminContext, uow: UnitOfWork) -> dict[str, Any]:
+async def models_view(ctx: AdminContext, uow: UnitOfWork, *, fetch: bool = True) -> dict[str, Any]:
     """What the gateway offers this key, beside the local entries in force: one row per
-    model, offered or not, with what saving would do to it."""
+    model, offered or not, with what saving would do to it.
+
+    When *fetch* is False the gateway is not contacted and a not-asked note is returned
+    instead.  This keeps the gateway page fast until the operator clicks the link.
+    """
     endpoint, source = gateway_url(uow)
     entries, pool = _local_entries(uow)
     offered: list[str] | None = None
     error: str | None = None
-    if endpoint is None:
-        error = "The gateway URL is not set. Set it and the key first."
-    else:
-        bearer = await asyncio.to_thread(credentials.read_api_key, ctx, HERMES)
-        if bearer is None:
-            error = f"No Hermes key is stored, so gateway {endpoint} was not asked."
+    if fetch:
+        if endpoint is None:
+            error = "The gateway URL is not set. Set it and the key first."
         else:
-            try:
-                offered = await asyncio.to_thread(fetch_models, endpoint, bearer)
-            except GatewayError as exc:
-                error = exc.detail
+            bearer = await asyncio.to_thread(credentials.read_api_key, ctx, HERMES)
+            if bearer is None:
+                error = f"No Hermes key is stored, so gateway {endpoint} was not asked."
+            else:
+                try:
+                    offered = await asyncio.to_thread(fetch_models, endpoint, bearer)
+                except GatewayError as exc:
+                    error = exc.detail
+    else:
+        error = "The gateway's models were not asked for; use the link to list them."
     codex = {
         str(entry.get("model_name") or entry["id"]): entry
         for entry in entries

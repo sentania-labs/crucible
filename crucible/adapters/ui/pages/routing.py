@@ -60,6 +60,9 @@ def routing_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
     dns = egress["document"].get("dns") or {}
     endpoint = egress["document"].get("local_endpoint") or {}
     local_models = ", ".join(m["id"] for m in local["models"] if m.get("enabled")) or "none"
+    per_harness = (
+        (policy.document.get("concurrency", {}).get("per_harness") or {}) if policy else {}
+    )
     # crucible#115: what is in force, one line each, in plain words; the documents behind
     # them are under Details, and each is edited from its own form below.
     in_force: list[list[Any]] = [
@@ -95,6 +98,23 @@ def routing_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                 "hint": (
                     "other allowed models are fallbacks when these are unavailable or busy; "
                     "the task page says when a task ran on its next choice because one was busy"
+                ),
+            },
+            "",
+        ],
+        [
+            "Frontier workers",
+            {
+                "kind": "note",
+                "value": "; ".join(
+                    f"{name}: {per_harness.get(name, 1)} at once"
+                    for name in ("claude_code", "codex", "agy")
+                ),
+                "hint": (
+                    "Claude Code uses a read-only token that never refreshes; AGY keeps its "
+                    "refresh token; Codex permits parallel workers in renewer mode. "
+                    "Rollback to rw-narrow copies requires per_harness.codex 1. "
+                    "Watch per-harness auth_failure_count in supervisor logs."
                 ),
             },
             "",
@@ -696,6 +716,11 @@ async def _actions(
                 version=int(form.get("version", "0")),
                 document=document,
                 reason=audited_reason,
+                concurrency_modes={
+                    name: source.mount_mode.value
+                    for name, source in ctx.credential_sources.items()
+                    if source.mount_mode is not None
+                },
             )
     return None
 
