@@ -282,6 +282,7 @@ def test_ui_session_csrf_reader_access_and_page_walk(
             "/ui/github",
             "/ui/workers",
             "/ui/tasks",
+            "/ui/board",
             "/ui/wakes",
             "/ui/retention",
             "/ui/audit",

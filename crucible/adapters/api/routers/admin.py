@@ -12,6 +12,7 @@ from fastapi.exceptions import RequestValidationError
 from crucible.adapters.api.deps import Admin, Ctx, Orchestrator, UoW
 from crucible.application.admin import (
     audit,
+    board,
     credentials,
     gateway,
     github,
@@ -35,6 +36,12 @@ from crucible.application.errors import ConflictError, ContractValidationError
 from crucible.contracts.api import ExternalReviewAttestation, RepositoryRegistration
 
 router = APIRouter()
+
+
+@router.get("/admin/board")
+def admin_board(ctx: Ctx, uow: UoW, _principal: Admin) -> dict[str, Any]:
+    """The same read-only projection rendered by the operator Board page."""
+    return board.board_view(uow, ctx.clock.now())
 
 
 def _admin(ctx: Ctx) -> AdminContext:
