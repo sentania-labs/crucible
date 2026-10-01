@@ -5,7 +5,7 @@ from __future__ import annotations
 import secrets
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import Depends, Header, Request
 from sqlalchemy import Engine
@@ -49,6 +49,7 @@ class AppContext:
     # bearer token remains the source of identity and is never copied into state.
     ui_signing_key: bytes = field(default_factory=lambda: secrets.token_bytes(32))
     settings: object | None = None
+    credential_renewer: Any | None = None
     # Where the migration left the first-run administrator token, removed from there
     # when that principal first signs in (ADR 0016). None where there is no such place.
     first_run: FirstRunDelivery | None = None

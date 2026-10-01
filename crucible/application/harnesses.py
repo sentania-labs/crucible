@@ -216,6 +216,12 @@ def effective_mount_mode(spec: CredentialSpec, source: CredentialSource | None) 
     """The stricter of the adapter's declared minimum and what the operator configured
     (25 step 7). A configuration never lowers the adapter's minimum."""
     configured = source.mount_mode if source is not None else None
+    if spec.harness == "codex" and configured is None:
+        return MountMode.RENEWER
+    if configured is MountMode.RENEWER:
+        return MountMode.RENEWER
+    if spec.minimum_mode is MountMode.RENEWER and configured is not MountMode.RW_NARROW:
+        return MountMode.RENEWER
     if spec.minimum_mode is MountMode.RW_NARROW or configured is MountMode.RW_NARROW:
         return MountMode.RW_NARROW
     return MountMode.RO

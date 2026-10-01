@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import socket
@@ -9,6 +10,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI
@@ -51,16 +53,26 @@ from crucible.adapters.storage.disk import DiskArtifactStore
 from crucible.application.admin.context import AdminContext, GitHubAppInfo
 from crucible.application.admin.credentials import sweep_retired
 from crucible.application.admin.routing import local_endpoint_view
+from crucible.application.credential_renewer import (
+    CodexCredentialRenewer,
+    FileCredentialStore,
+    KubernetesCredentialStore,
+)
 from crucible.application.delivery_tick import DeliveryConfig
 from crucible.application.errors import NotFoundError
-from crucible.application.harnesses import HarnessRegistry
+from crucible.application.harnesses import HarnessRegistry, effective_mount_mode
 from crucible.application.proxy_config import (
     enabled_local_endpoints,
     install_worker_proxy_config,
     worker_proxy_config,
 )
 from crucible.application.supervisor import Supervisor
+from crucible.application.transitions import record_event
+from crucible.application.wakes import create_wake
+from crucible.contracts.wake import WakeReason
 from crucible.domain.cluster_egress import SETTING_NAME, parse_cluster_egress
+from crucible.domain.entities import Role
+from crucible.domain.events import EventKind
 from crucible.domain.ids import new_id
 from crucible.domain.role_timeouts import SETTING_NAME as ROLE_TIMEOUTS_SETTING
 from crucible.ports.artifacts import ArtifactStore
@@ -87,6 +99,7 @@ class Wiring:
     publisher: Publisher | None = None
     harnesses: HarnessRegistry | None = None
     admin: AdminContext | None = None
+    credential_renewer: CodexCredentialRenewer | None = None
 
     def supervisor(self) -> Supervisor:
         s = self.settings.supervisor
@@ -118,6 +131,11 @@ class Wiring:
             credential_sweep=(
                 partial(sweep_retired, self.admin) if self.admin is not None else None
             ),
+            credential_renewal=(
+                self.credential_renewer.refresh_if_due
+                if self.credential_renewer is not None
+                else None
+            ),
         )
 
     def app(self) -> FastAPI:
@@ -128,9 +146,9 @@ def credential_sources(settings: Settings) -> dict[str, CredentialSource]:
     """12: where each harness's credential directory is. Paths, never values."""
     out: dict[str, CredentialSource] = {}
     for name, entry in settings.credentials.items():
-        if entry.path:
+        if entry.path or entry.mount_mode:
             out[name] = CredentialSource(
-                path=entry.path,
+                path=entry.path or "",
                 mount_mode=MountMode(entry.mount_mode) if entry.mount_mode else None,
             )
     return out
@@ -542,6 +560,11 @@ def wire(settings: Settings) -> Wiring:
         kubernetes_role_timeout_seed=settings.kubernetes.role_timeout_seconds,
         first_run=first_run,
     )
+    renewer = build_credential_renewer(settings, providers, factory, admin)
+    kubernetes = providers.get("kubernetes")
+    if renewer is not None and isinstance(kubernetes, KubernetesProvider):
+        kubernetes.set_credential_dead_check(lambda: renewer.dead)
+
     ctx = AppContext(
         uow_factory=factory,
         clock=SystemClock(),
@@ -558,6 +581,7 @@ def wire(settings: Settings) -> Wiring:
         admin=admin,
         settings=settings,
         first_run=first_run,
+        credential_renewer=renewer,
     )
     publisher = build_publisher(settings, docker, providers.get("kubernetes"), github)
     return Wiring(
@@ -570,6 +594,106 @@ def wire(settings: Settings) -> Wiring:
         publisher=publisher,
         harnesses=registry,
         admin=admin,
+        credential_renewer=renewer,
+    )
+
+
+def build_credential_renewer(
+    settings: Settings,
+    providers: Mapping[str, ExecutionProvider],
+    factory: UnitOfWorkFactory,
+    admin: AdminContext,
+) -> CodexCredentialRenewer | None:
+    """Build the one Codex writer from its directory or service-held Secret."""
+    source = credential_sources(settings).get("codex")
+    spec = default_registry().require("codex").credential_spec()
+    assert spec is not None
+    if effective_mount_mode(spec, source) is not MountMode.RENEWER:
+        return None
+    store: FileCredentialStore | KubernetesCredentialStore | None = None
+    if source is not None and source.path and (path := Path(source.path) / "auth.json").is_file():
+        store = FileCredentialStore(path)
+    elif (
+        settings.kubernetes.enabled
+        and not settings.docker.enabled
+        and isinstance((kubernetes := providers.get("kubernetes")), KubernetesProvider)
+    ):
+        candidate = KubernetesCredentialStore(
+            kubernetes.client, kubernetes.credential_secret("codex")
+        )
+        try:
+            candidate.read()
+        except KubernetesApiError as exc:
+            if exc.status != 404:
+                raise
+        except ValueError:
+            pass
+        else:
+            store = candidate
+    if store is None:
+        return None
+
+    try:
+        service_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        service_loop = None  # The local administrative CLI has no service loop.
+
+    def record_refresh(kind: EventKind, payload: Mapping[str, Any]) -> None:
+        with factory() as uow:
+            record_event(
+                uow,
+                admin.clock,
+                kind,
+                principal="credential-renewer",
+                payload=dict(payload),
+            )
+            uow.commit()
+
+    async def propagate(document: Mapping[str, str]) -> None:
+        for provider in providers.values():
+            update = getattr(provider, "refresh_credential_projection", None)
+            if callable(update):
+                await update(document)
+
+    def propagate_refresh(document: Mapping[str, str]) -> None:
+        if service_loop is None:
+            asyncio.run(propagate(document))
+        else:
+            future = asyncio.run_coroutine_threadsafe(propagate(document), service_loop)
+            future.add_done_callback(lambda completed: completed.result())
+
+    def record_on_service_loop(kind: EventKind, payload: Mapping[str, Any]) -> None:
+        if service_loop is None:
+            record_refresh(kind, payload)
+        else:
+            service_loop.call_soon_threadsafe(record_refresh, kind, dict(payload))
+
+    def wake(summary: str) -> None:
+        with factory() as uow:
+            principals = [p for p in uow.principals.list_all() if p.disabled_at is None]
+            principal = next(
+                (p for p in principals if p.role is Role.ORCHESTRATOR),
+                next((p for p in principals if p.role is Role.ADMIN), None),
+            )
+            if principal is None:
+                log.error("cannot create the Codex credential wake: no active principal")
+                return
+            create_wake(
+                uow,
+                admin.clock,
+                principal_id=principal.id,
+                reason=WakeReason.AUTH_FAILURE,
+                summary=summary,
+                extra_links={"credentials": "/ui/credentials"},
+            )
+            uow.commit()
+
+    return CodexCredentialRenewer(
+        store=store,
+        clock=admin.clock,
+        record=record_on_service_loop,
+        propagate=propagate_refresh,
+        wake=wake,
     )
 
 

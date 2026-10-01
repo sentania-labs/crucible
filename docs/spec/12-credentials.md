@@ -99,7 +99,7 @@ mount_mode = "ro"              # the long-lived setup token never refreshes
 [credentials.codex]
 source = "directory"
 path = "/var/lib/crucible/credentials/codex"
-mount_mode = "rw-narrow"       # the CLI writes session and log state beside its auth file
+mount_mode = "renewer"         # Hades refreshes; workers receive an access token only
 [credentials.agy]
 source = "directory"
 path = "/var/lib/crucible/credentials/agy"
@@ -127,7 +127,16 @@ own credential directory** (for example with `CLAUDE_CONFIG_DIR`,
 directory is what gets mounted. It is never a copy of the operator's
 daily-use directory: S1 showed Codex and AGY refresh their tokens on
 their own during a run, and a refresh from a copy races the operator's
-own session. No commercial API keys.
+own session. Codex is now the exception to CLI-owned refresh: Hades is the only writer
+of its stored login. No commercial API keys.
+
+`renewer` means that the supervisor retains Codex `auth.json`, including its refresh
+token. Each attempt receives a read-only `access-token.json` containing exactly
+`access_token`, `account_id`, and `expires_at`. The worker runs `codex app-server` with
+external authentication and never performs an OAuth grant. A refresh replaces the
+Docker file atomically or patches each live Kubernetes attempt Secret. Kubernetes
+Secret projection is eventually consistent, so the host waits and re-reads for up to
+90 seconds after a rejection. No shared read-write volume is used.
 
 Hermes is the narrow API-key exception. The admin UI and
 `crucible-admin credentials set --harness hermes` read the value from a password
@@ -201,17 +210,15 @@ remain capped at 1, even if a stored policy asks for more.
   `.claude.json` have `sync_back=False`; neither renews the credential.
 - AGY uses isolated writable copies. Google does not rotate the refresh token on
   ordinary access-token renewal, so the adapter declares parallel attempts safe.
-- Codex stays serial: its declaration is `parallel_attempts_safe = False`, so policy
-  refuses `per_harness.codex` above 1. OpenAI rotates refresh tokens on use, and two
-  attempts syncing refreshed copies back concurrently can let an older or revoked
-  token win the last write and break every later login. The brokered renewer (spec
-  "Many Workers, One Login": one renewer holds the refresh token, workers hold access
-  tokens and ask the host to refresh) is what lifts the cap. The supervisor still logs
+- Codex declares `parallel_attempts_safe = False` for writable copies and
+  `renewer_held = True` in its default renewer mode. Hades alone refreshes the login;
+  workers hold access tokens only, so renewer mode permits `per_harness.codex` above 1.
+  Rollback uses `per_harness.codex: 1` and `rw-narrow` mode. The supervisor still logs
   each auth failure with `harness`, `attempt_id`, and `auth_failure_count`, a
   per-harness cumulative count for the current supervisor process (reset on restart).
 
-Copies remain isolated per attempt. There is no shared credential volume or central
-renewer. Shipped policy caps stay unchanged; Foundry sets the caps after deployment.
+Copies remain isolated per attempt. There is no shared credential volume.
+Shipped policy caps stay unchanged; Foundry sets the caps after deployment.
 Spike S1 records what each harness actually writes and where.
 
 A login is the same race from the other side: it replaces the credential, and
@@ -294,8 +301,12 @@ which lives in a file it has no reason to cat.
 
 - A harness that logs its own token on auth failure. Mitigated by redaction
   and by the file-not-env rule.
-- Codex token refresh races under parallel renewal. Monitor auth-failure counts and
-  roll back to `per_harness.codex: 1` if parallel workers break login.
+- A revoked Codex refresh token stops new Codex launches. Running workers may continue
+  until their current access tokens expire. Hades raises one authentication wake and
+  does not retry `invalid_grant`.
+- Token refresh races remain possible for copy-mode harnesses. Codex renewer mode has
+  one writer and permits parallel workers. Rollback uses `per_harness.codex: 1`
+  and `rw-narrow` mode.
 - A harness that writes auth state outside its config directory (S1).
 - A worker misusing its own harness credential within the egress allowlist
   (above; broker is the later answer).

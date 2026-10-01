@@ -466,6 +466,7 @@ class Supervisor:
         harness_gates: Mapping[str, HarnessGate] | None = None,
         credential_sources: Mapping[str, CredentialSource] | None = None,
         credential_sweep: Callable[[UnitOfWork], int] | None = None,
+        credential_renewal: Callable[[], bool] | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._providers = providers
@@ -479,6 +480,7 @@ class Supervisor:
         # 25: rotated-out credential directories are shredded once their retention
         # window has elapsed; the retention step calls this with the fenced unit of work.
         self._credential_sweep = credential_sweep
+        self._credential_renewal = credential_renewal
         self._artifacts = artifact_store
         self._wakes = wake_deliverer
         self.holder = holder
@@ -1621,6 +1623,9 @@ class Supervisor:
                 report_mount=REPORT_MOUNT,
                 repo_mount=REPO_MOUNT,
                 credential_mounted=credential_mounted,
+                credential_mode=(
+                    effective_mount_mode(credential, source) if credential is not None else None
+                ),
                 endpoint=endpoint,
                 endpoint_url=endpoint_url,
                 command_timeout_ms=command_timeout_ms,
@@ -2950,6 +2955,8 @@ class Supervisor:
             applied = 0
             if self._credential_sweep is not None:
                 applied += self._credential_sweep(uow)
+            if self._credential_renewal is not None and self._credential_renewal():
+                applied += 1
 
             def act(
                 kind: str, subject: str, name: str, version: int, detail: dict[str, Any]

@@ -65,6 +65,7 @@ class MountMode(StrEnum):
 
     RO = "ro"
     RW_NARROW = "rw-narrow"
+    RENEWER = "renewer"
 
 
 class SessionCompatibility(StrEnum):
@@ -253,6 +254,7 @@ class LaunchContext:
     report_mount: str
     repo_mount: str
     credential_mounted: bool = False
+    credential_mode: MountMode | None = None
     endpoint: Literal["subscription", "local"] = "subscription"
     endpoint_url: str | None = None
     # A bounded probe or harness test (25, crucible#118): one prompt, no task, no report.

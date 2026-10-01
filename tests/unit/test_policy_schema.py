@@ -21,6 +21,8 @@ from crucible.adapters.persistence.migrations.versions import (
     _0009_administration as m9,
 )
 from crucible.adapters.persistence.migrations.versions import _0011_class_routing as m11
+from crucible.application.errors import ContractValidationError
+from crucible.application.policies import validate_policy
 from crucible.contracts.policy import (
     PolicyV1,
     RoutingPolicyV1,
@@ -69,6 +71,24 @@ def test_the_seeded_policy_validates() -> None:
     assert policy.external_review.request_on_publish is True
     assert policy.external_review.trigger_comment == "@codex review"
     assert policy.operator_only_settings() == []
+
+
+def test_t_auth_5_codex_parallel_policy_requires_renewer_mode() -> None:
+    document = seeded_policy()
+    document["concurrency"]["per_harness"]["codex"] = 2
+    assert (
+        validate_policy(document, name="default-software", version=1).concurrency.per_harness[
+            "codex"
+        ]
+        == 2
+    )
+    with pytest.raises(ContractValidationError, match="policy failed validation"):
+        validate_policy(
+            document,
+            name="default-software",
+            version=1,
+            concurrency_modes={"codex": "rw-narrow"},
+        )
 
 
 def test_the_seeded_policy_v2_validates() -> None:

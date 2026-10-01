@@ -68,6 +68,11 @@ from crucible.adapters.execution.create_policy import (
 from crucible.adapters.execution.dockerapi import DockerApiError, DockerClient, LogFrame
 from crucible.adapters.execution.logstream import chunks as _chunks
 from crucible.adapters.harness.registry import default_registry
+from crucible.application.credential_renewer import (
+    access_token_document,
+    atomic_write,
+    worker_credential_spec,
+)
 from crucible.application.harnesses import (
     HarnessRegistry,
     check_image_version,
@@ -742,7 +747,10 @@ class DockerProvider:
                 # 12: the copy is seeded through the daemon into the created, not yet
                 # started, container. The files land in the workspace directory the
                 # preparer made, owned by the worker's uid, mode 600.
-                tar, seeded = await asyncio.to_thread(_seed_tar, copy.spec, copy.source)
+                if copy.mode is MountMode.RENEWER:
+                    tar, seeded = await asyncio.to_thread(_seed_renewer_tar, copy)
+                else:
+                    tar, seeded = await asyncio.to_thread(_seed_tar, copy.spec, copy.source)
                 copy = replace(copy, seeded=seeded)
                 await self._call(self.client.put_archive, container_id, copy.spec.mount_target, tar)
                 seeded_on_disk = True
@@ -870,6 +878,7 @@ class DockerProvider:
         return ["bash", "-o", "pipefail", "-c", LAUNCH_WRAPPER, "crucible-launch", *argv], env
 
     def _launch_context(self, spec: LaunchSpec) -> LaunchContext:
+        copy = self._credential_copy(spec)
         return LaunchContext(
             attempt_id=spec.attempt_id,
             model=spec.model,
@@ -878,7 +887,8 @@ class DockerProvider:
             identity_mount=IDENTITY_MOUNT,
             report_mount=REPORT_MOUNT,
             repo_mount=REPO_MOUNT,
-            credential_mounted=self._credential_copy(spec) is not None,
+            credential_mounted=copy is not None,
+            credential_mode=copy.mode if copy is not None else None,
             endpoint=spec.endpoint,
             endpoint_url=spec.endpoint_url,
             command_timeout_ms=spec.command_timeout_ms,
@@ -906,6 +916,14 @@ class DockerProvider:
         if credential is None:
             return None
         source = self._credential_source(credential.harness)
+        if (
+            credential.harness == "codex"
+            and source is not None
+            and (Path(source.path) / "auth.json.dead").exists()
+        ):
+            raise HarnessRefusedError(
+                "refusing to launch: the Codex credential is dead; log in again"
+            )
         if source is not None and not credential.held_by(source.path):
             source = None
         if source is None:
@@ -915,14 +933,15 @@ class DockerProvider:
                 f"refusing to launch: no credential directory is configured for "
                 f"harness {spec.harness!r} (credentials.{spec.harness}.path)"
             )
+        mode = (
+            MountMode.RO
+            if spec.harness == "codex" and spec.endpoint == "local"
+            else effective_mount_mode(credential, source)
+        )
         return _CredentialCopy(
-            spec=credential,
+            spec=(worker_credential_spec(credential) if mode is MountMode.RENEWER else credential),
             source=source,
-            mode=(
-                MountMode.RO
-                if spec.harness == "codex" and spec.endpoint == "local"
-                else effective_mount_mode(credential, source)
-            ),
+            mode=mode,
             seeded={},
         )
 
@@ -935,7 +954,10 @@ class DockerProvider:
         target = copy.spec.mount_target
         mounts = [
             self._daemon_mount(
-                spec.attempt_id, CREDENTIAL_LEAF, target, read_only=copy.mode is MountMode.RO
+                spec.attempt_id,
+                CREDENTIAL_LEAF,
+                target,
+                read_only=copy.mode is not MountMode.RW_NARROW,
             )
         ]
         for name in sorted(copy.spec.templates):
@@ -945,6 +967,15 @@ class DockerProvider:
                 )
             )
         return mounts
+
+    async def refresh_credential_projection(self, document: Mapping[str, str]) -> None:
+        """Atomically replace the access-only file of every live Codex worker."""
+        for attempt_id, launched in tuple(self._launched.items()):
+            copy = launched.credential
+            if copy is None or copy.mode is not MountMode.RENEWER:
+                continue
+            target = self._root(attempt_id) / CREDENTIAL_LEAF / "access-token.json"
+            await asyncio.to_thread(atomic_write, target, document)
 
     async def _sync_credential(
         self, h: Handle, ws: Workspace, spec: LaunchSpec
@@ -962,8 +993,16 @@ class DockerProvider:
             return None
         files: list[CredentialFileSync] = []
         try:
-            for auth in copy.spec.auth_files:
-                files.append(await self._sync_file(h, copy, auth))
+            if copy.mode is MountMode.RENEWER:
+                files = [
+                    CredentialFileSync(
+                        auth.name, True, False, True, False, "renewer-held; nothing to sync"
+                    )
+                    for auth in copy.spec.auth_files
+                ]
+            else:
+                for auth in copy.spec.auth_files:
+                    files.append(await self._sync_file(h, copy, auth))
         finally:
             removed = await self._remove_credential_copy(h, ws, spec)
         return CredentialSync(
@@ -1938,6 +1977,20 @@ def _since_param(timestamp: str | None) -> str | None:
 
 
 # ----- the credential copy (12) --------------------------------------------
+
+
+def _seed_renewer_tar(copy: _CredentialCopy) -> tuple[bytes, dict[str, str | None]]:
+    login = json.loads((Path(copy.source.path) / "auth.json").read_text(encoding="utf-8"))
+    data = json.dumps(access_token_document(login), separators=(",", ":")).encode("utf-8")
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as tar:
+        info = tarfile.TarInfo("access-token.json")
+        info.size = len(data)
+        info.mode = 0o600
+        info.uid = info.gid = WORKER_UID
+        info.mtime = int(time.time())
+        tar.addfile(info, io.BytesIO(data))
+    return buffer.getvalue(), {"access-token.json": hashlib.sha256(data).hexdigest()}
 
 
 def _seed_tar(

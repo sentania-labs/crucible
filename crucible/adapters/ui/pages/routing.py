@@ -112,9 +112,9 @@ def routing_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                 ),
                 "hint": (
                     "Claude Code uses a read-only token that never refreshes; AGY keeps its "
-                    "refresh token; Codex stays at one worker until the brokered renewer "
-                    "lands, because OpenAI rotates refresh tokens and concurrent sync-backs "
-                    "can break login. Watch per-harness auth_failure_count in supervisor logs."
+                    "refresh token; Codex permits parallel workers in renewer mode. "
+                    "Rollback to rw-narrow copies requires per_harness.codex 1. "
+                    "Watch per-harness auth_failure_count in supervisor logs."
                 ),
             },
             "",
@@ -716,6 +716,11 @@ async def _actions(
                 version=int(form.get("version", "0")),
                 document=document,
                 reason=audited_reason,
+                concurrency_modes={
+                    name: source.mount_mode.value
+                    for name, source in ctx.credential_sources.items()
+                    if source.mount_mode is not None
+                },
             )
     return None
 

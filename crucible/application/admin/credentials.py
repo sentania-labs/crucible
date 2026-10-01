@@ -765,6 +765,7 @@ async def _probe_async(
             report_mount=REPORT_MOUNT,
             repo_mount=REPO_MOUNT,
             credential_mounted=spec is not None,
+            credential_mode=mode,
             endpoint=endpoint,
             endpoint_url=endpoint_url,
             probe=True,
