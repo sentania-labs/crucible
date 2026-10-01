@@ -163,6 +163,8 @@ class EventKind(StrEnum):
     HARNESS_ENABLED = "harness_enabled"
     HARNESS_DISABLED = "harness_disabled"
     CREDENTIAL_SYNCED = "credential_synced"
+    CREDENTIAL_REFRESHED = "credential_refreshed"
+    CREDENTIAL_REFRESH_FAILED = "credential_refresh_failed"
     WORKER_PROGRESS = "worker_progress"
     WORKER_QUIET = "worker_quiet"
     WORKER_STALLED = "worker_stalled"

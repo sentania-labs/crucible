@@ -341,6 +341,11 @@ definitions. Each verb would become a tool whose result is the envelope, and
 
 ### Codex on the Local gateway page
 
+Subscription Codex now uses the Hades credential renewer and can run workers in
+parallel up to the policy cap. The Credentials page shows renewer health and offers
+administrators a reasoned Refresh now action. Local-endpoint Codex continues to use
+the gateway API key and does not use the renewer.
+
 Select Hermes, Codex, or both beside a model returned by the gateway. Saving writes
 a new routing version; disabling Codex leaves Hermes available as fallback. The
 shared key stays in the Hermes credential store and is mounted read-only for local
@@ -363,11 +368,11 @@ be enabled and have a promoted worker image, as for other routing choices.
 The Routing page shows the active per-harness caps. Policy
 `concurrency.per_harness` can allow multiple Claude Code or AGY workers. Claude
 Code uses a read-only long-lived setup token with no sync-back. AGY uses isolated
-writable copies because Google keeps refresh tokens reusable. Codex stays at one
-worker: OpenAI rotates refresh tokens, and two copies syncing back at once can
-leave a revoked token as the source, so policy refuses `per_harness.codex` above
-1 until the brokered renewer lands. The existing `auth_failure` classification and
-retry-once behavior remain the safety net.
+writable copies because Google keeps refresh tokens reusable. Codex permits parallel
+workers in renewer mode: Hades holds and refreshes the login, while workers receive
+access tokens only. Copy mode remains serial because OpenAI rotates refresh tokens.
+Rollback uses `per_harness.codex: 1` and `rw-narrow` mode. The existing `auth_failure`
+classification and retry-once behavior remain the safety net.
 
 Watch supervisor warnings for `harness`, `attempt_id`, and `auth_failure_count`.
 The count is cumulative per harness in the current supervisor process and resets on

@@ -74,6 +74,7 @@ from crucible.adapters.execution.k8sspec import (
 from crucible.adapters.execution.logstream import RESUME_AT_BOUNDARY
 from crucible.adapters.execution.logstream import chunks as _chunks
 from crucible.adapters.harness.registry import default_registry
+from crucible.application.credential_renewer import access_token_document, worker_credential_spec
 from crucible.application.harnesses import (
     HarnessRegistry,
     check_image_version,
@@ -599,12 +600,14 @@ class KubernetesProvider:
         resolver: Resolver | None = None,
         settings_source: SettingsSource | None = None,
         timeouts_source: TimeoutsSource | None = None,
+        credential_dead: Callable[[], bool] | None = None,
     ) -> None:
         self.config = config
         # The runtime settings (the `kubernetes.egress` admin setting and the enabled
         # local endpoint), read back from the database; None in the unit tier.
         self._settings_source = settings_source
         self._timeouts_source = timeouts_source
+        self._credential_dead = credential_dead or (lambda: False)
         self._file_role_timeout = config.role_timeout_seconds
         self._settings_read_at: float | None = None
         self._file_egress = config.egress
@@ -666,6 +669,10 @@ class KubernetesProvider:
         self._listings: weakref.WeakKeyDictionary[
             asyncio.AbstractEventLoop, asyncio.Task[list[ImageInfo]]
         ] = weakref.WeakKeyDictionary()
+
+    def set_credential_dead_check(self, check: Callable[[], bool]) -> None:
+        """Install the supervisor-owned Codex credential health gate."""
+        self._credential_dead = check
 
     # ----- helpers -----------------------------------------------------
 
@@ -1142,6 +1149,7 @@ class KubernetesProvider:
         cancelled: CancelCheck | None = None,
     ) -> Workspace:
         await _stop_if_cancelled(cancelled, "before the prepare")
+        self._refuse_dead_codex(spec)
         # 26: the preparer renders its own egress policy (the DNS selector included),
         # and the supervisor calls prepare() before launch(). Refresh here too, or a
         # stale seed's policy is rendered and launch()'s own refresh is never reached.
@@ -1576,9 +1584,16 @@ class KubernetesProvider:
             )
         self._check_endpoint_ready(probe, spec)
 
+    def _refuse_dead_codex(self, spec: LaunchSpec) -> None:
+        if spec.harness == "codex" and self._credential_dead():
+            raise HarnessRefusedError(
+                "refusing to launch: the Codex credential is dead; log in again"
+            )
+
     async def launch(
         self, ws: Workspace, spec: LaunchSpec, cancelled: CancelCheck | None = None
     ) -> Handle:
+        self._refuse_dead_codex(spec)
         await self._require_ready(spec)
         gated_under = self.config
         resolved = await self._resolve_image(spec, use_backoff=True)
@@ -3417,6 +3432,7 @@ class KubernetesProvider:
                 self._credential_copy(spec) is not None
                 and bool(credential and credential.required_for_launch)
             )
+        copy = self._credential_copy(spec)
         return LaunchContext(
             attempt_id=spec.attempt_id,
             model=spec.model,
@@ -3426,6 +3442,7 @@ class KubernetesProvider:
             report_mount=REPORT_MOUNT,
             repo_mount=REPO_MOUNT,
             credential_mounted=credential_mounted,
+            credential_mode=copy.mode if copy is not None else None,
             endpoint=spec.endpoint,
             endpoint_url=spec.endpoint_url,
             command_timeout_ms=spec.command_timeout_ms,
@@ -3671,12 +3688,17 @@ class KubernetesProvider:
         # An optional credential whose Secret is absent is not seeded (see
         # `_seed_credential`), which keeps the adapter's unauthenticated fallback.
         secret_name = self.config.credential_secret_name(credential.harness)
-        mode = credential.minimum_mode
-        if self.config.credential_modes.get(credential.harness) is MountMode.RW_NARROW:
-            mode = MountMode.RW_NARROW
+        configured = self.config.credential_modes.get(credential.harness)
+        mode = configured or (
+            MountMode.RENEWER if credential.harness == "codex" else credential.minimum_mode
+        )
         if spec.harness == "codex" and spec.endpoint == "local":
             mode = MountMode.RO
-        return _CredentialCopy(spec=credential, source_secret=secret_name, mode=mode)
+        return _CredentialCopy(
+            spec=worker_credential_spec(credential) if mode is MountMode.RENEWER else credential,
+            source_secret=secret_name,
+            mode=mode,
+        )
 
     async def _credential_keys(self, attempt_id: str) -> list[str]:
         """Which auth files the per-attempt Secret actually holds, read back rather than
@@ -3719,7 +3741,13 @@ class KubernetesProvider:
                 f"refusing to launch: the credential Secret {copy.source_secret!r} for harness "
                 f"{spec.harness!r} is not readable in {self.config.namespace} ({exc.status})"
             ) from exc
-        if not _has_declared_auth_file(copy.spec, source):
+        present_spec = copy.spec
+        codex_adapter = self.harnesses.get("codex")
+        if copy.mode is MountMode.RENEWER and codex_adapter is not None:
+            original = codex_adapter.credential_spec()
+            if original is not None:
+                present_spec = original
+        if not _has_declared_auth_file(present_spec, source):
             if not copy.spec.required_for_launch:
                 return
             raise HarnessRefusedError(
@@ -3728,20 +3756,31 @@ class KubernetesProvider:
             )
         data = source.get("data") or {}
         payload: dict[str, bytes] = {}
-        for auth in copy.spec.auth_files:
-            key = _secret_key(auth.name)
-            raw = data.get(key)
-            if raw is None or len(raw) == 0:
-                if auth.required:
-                    raise HarnessRefusedError(
-                        f"refusing to launch: the credential Secret {copy.source_secret!r} is "
-                        f"missing its auth file {auth.name!r}"
-                    )
-                copy.seeded[auth.name] = None
-                continue
-            value = base64.b64decode(str(raw))
-            payload[key] = value
-            copy.seeded[auth.name] = hashlib.sha256(value).hexdigest()
+        if copy.mode is MountMode.RENEWER:
+            raw_login = data.get(_secret_key("auth.json"))
+            if raw_login is None:
+                raise HarnessRefusedError(
+                    "refusing to launch: the Codex credential Secret has no auth.json"
+                )
+            login = json.loads(base64.b64decode(str(raw_login)))
+            value = json.dumps(access_token_document(login), separators=(",", ":")).encode()
+            payload[_secret_key("access-token.json")] = value
+            copy.seeded["access-token.json"] = hashlib.sha256(value).hexdigest()
+        else:
+            for auth in copy.spec.auth_files:
+                key = _secret_key(auth.name)
+                raw = data.get(key)
+                if raw is None or len(raw) == 0:
+                    if auth.required:
+                        raise HarnessRefusedError(
+                            f"refusing to launch: the credential Secret {copy.source_secret!r} is "
+                            f"missing its auth file {auth.name!r}"
+                        )
+                    copy.seeded[auth.name] = None
+                    continue
+                value = base64.b64decode(str(raw))
+                payload[key] = value
+                copy.seeded[auth.name] = hashlib.sha256(value).hexdigest()
         create = self._create_with_backoff if use_backoff else self._create
         await create(
             "secrets",
@@ -3752,6 +3791,26 @@ class KubernetesProvider:
                 data=payload,
             ),
         )
+
+    async def refresh_credential_projection(self, document: Mapping[str, str]) -> None:
+        """Patch every live Codex attempt Secret for kubelet to project."""
+        encoded = base64.b64encode(
+            json.dumps(dict(document), separators=(",", ":")).encode("utf-8")
+        ).decode("ascii")
+        calls = []
+        for attempt_id, launched in tuple(self._launched.items()):
+            copy = launched.credential
+            if copy is not None and copy.mode is MountMode.RENEWER:
+                calls.append(
+                    self._call(
+                        self.client.patch,
+                        "secrets",
+                        k8sspec.object_name("cred", attempt_id),
+                        {"data": {_secret_key("access-token.json"): encoded}},
+                    )
+                )
+        if calls:
+            await asyncio.gather(*calls)
 
     async def _sync_credential(
         self, h: Handle, spec: LaunchSpec, limits: Limits

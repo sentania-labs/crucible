@@ -6,6 +6,7 @@ admin principal, and each is recorded as a decision."""
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 from pydantic import ValidationError
@@ -34,7 +35,13 @@ def _problems(exc: ValidationError) -> list[dict[str, Any]]:
     ]
 
 
-def validate_policy(document: object, *, name: str, version: int) -> PolicyV1:
+def validate_policy(
+    document: object,
+    *,
+    name: str,
+    version: int,
+    concurrency_modes: dict[str, str] | None = None,
+) -> PolicyV1:
     try:
         policy = PolicyV1.model_validate(document)
     except ValidationError as exc:
@@ -46,6 +53,10 @@ def validate_policy(document: object, *, name: str, version: int) -> PolicyV1:
         problems.append({"path": "version", "message": f"the path says {version}"})
     # Preserve the required frontier caps; optional harnesses are checked when present.
     for harness in sorted({"claude_code", "codex", "agy"} | policy.concurrency.per_harness.keys()):
+        declaration = HARNESS_CONCURRENCY.get(harness, HarnessConcurrency())
+        if harness == "codex":
+            mode = (concurrency_modes or {}).get("codex", declaration.minimum_mode)
+            declaration = replace(declaration, renewer_held=mode != "rw-narrow")
         limit = policy.concurrency.per_harness.get(harness)
         if limit is None:
             problems.append(
@@ -54,9 +65,7 @@ def validate_policy(document: object, *, name: str, version: int) -> PolicyV1:
                     "message": "every supported harness needs a concurrency cap",
                 }
             )
-        elif (
-            limit > 1 and not HARNESS_CONCURRENCY.get(harness, HarnessConcurrency()).allows_parallel
-        ):
+        elif limit > 1 and not declaration.allows_parallel:
             problems.append(
                 {
                     "path": f"concurrency.per_harness.{harness}",
@@ -80,8 +89,11 @@ def put_policy(
     version: int,
     document: object,
     reason: str | None = None,
+    concurrency_modes: dict[str, str] | None = None,
 ) -> Policy:
-    policy = validate_policy(document, name=name, version=version)
+    policy = validate_policy(
+        document, name=name, version=version, concurrency_modes=concurrency_modes
+    )
     existing = uow.policies.get(name, version)
     if existing is not None and uow.policies.is_referenced(name, version):
         raise ConflictError(

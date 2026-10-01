@@ -104,7 +104,7 @@ def test_subscription_launch_unchanged() -> None:
     assert launch.env_from_files == {}
     assert "--dangerously-bypass-approvals-and-sandbox" in launch.argv
     assert launch.stdin_files == ("/crucible/identity/IDENTITY.md",)
-    assert CodexAdapter().credential_spec().minimum_mode is MountMode.RW_NARROW
+    assert CodexAdapter().credential_spec().minimum_mode is MountMode.RENEWER
 
 
 def test_local_credential_mounts_only_gateway_key(tmp_path: Path) -> None:

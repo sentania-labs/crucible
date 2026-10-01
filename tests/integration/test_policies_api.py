@@ -13,6 +13,7 @@ from crucible.adapters.api.deps import AppContext
 from crucible.application.errors import ForbiddenError
 from crucible.application.policies import put_policy
 from crucible.application.supervisor import Supervisor
+from crucible.ports.harness import CredentialSource, MountMode
 from tests.fixtures import contract_document
 from tests.integration.conftest import run_to_settled, submit_and_start
 from tests.unit.test_policy_schema import seeded_policy
@@ -83,8 +84,13 @@ def test_frontier_harnesses_accept_parallel_concurrency(
     assert r.status_code == 200
 
 
-def test_codex_stays_serial_until_the_renewer(client: TestClient, tokens: dict[str, str]) -> None:
-    """12: Codex declares no parallel safety (refresh-token rotation); a cap above 1 is refused."""
+def test_codex_copy_mode_stays_serial(
+    client: TestClient, tokens: dict[str, str], ctx: AppContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """12: Codex copy mode has no parallel safety; a cap above 1 is refused."""
+    monkeypatch.setitem(
+        ctx.credential_sources, "codex", CredentialSource("/credential", MountMode.RW_NARROW)
+    )
     document = seeded_policy()
     document["version"] = 6
     document["concurrency"]["per_harness"]["codex"] = 2

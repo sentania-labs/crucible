@@ -255,7 +255,7 @@ def test_credential_specs_name_only_the_auth_files_s1_recorded() -> None:
 
     codex = CodexAdapter().credential_spec()
     assert [f.name for f in codex.auth_files] == ["auth.json"]
-    assert codex.minimum_mode is MountMode.RW_NARROW
+    assert codex.minimum_mode is MountMode.RENEWER
     assert codex.auth_files[0].issued_at == ("last_refresh",)
     assert codex.auth_files[0].json and codex.auth_files[0].sync_back
     assert set(codex.templates) == {"config.toml"}
@@ -276,9 +276,7 @@ def test_configuration_may_raise_the_mount_mode_and_never_lower_it() -> None:
         MountMode.RW_NARROW
     )
     codex = CodexAdapter().credential_spec()
-    assert effective_mount_mode(codex, CredentialSource("/x", MountMode.RO)) is (
-        MountMode.RW_NARROW
-    )
+    assert effective_mount_mode(codex, CredentialSource("/x", MountMode.RO)) is MountMode.RENEWER
 
 
 # ----- the registry (07, 25) ----------------------------------------------------

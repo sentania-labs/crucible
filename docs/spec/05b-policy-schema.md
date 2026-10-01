@@ -175,7 +175,9 @@ retention:
   with a reason. Claude Code's long-lived setup token is read-only and never syncs
   back. AGY's writable copies reuse Google's refresh token. Codex does not declare
   parallel safety: OpenAI's refresh-token rotation makes concurrent sync-backs unsafe,
-  so `per_harness.codex` above 1 is refused until the brokered renewer lands. Its
+  so `per_harness.codex` above 1 requires renewer mode. Hades alone refreshes the
+  login; workers hold access tokens only. Rollback uses `per_harness.codex: 1` and
+  `rw-narrow` mode. Its
   `auth_failure` retry-once behavior remains; supervisor warnings carry per-harness
   `auth_failure_count` (reset on restart). Shipped caps are unchanged; Foundry sets
   per-harness caps after deployment. Both uploads and launches use the shared adapter

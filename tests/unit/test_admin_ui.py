@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from starlette.requests import Request
@@ -22,6 +23,7 @@ from crucible.adapters.persistence.migrations.versions._0008_harness_adapters im
     VERIFIED_ROUTING,
 )
 from crucible.adapters.ui import render as ui_render
+from crucible.adapters.ui.pages import credentials as credentials_page_module
 from crucible.adapters.ui.pages import dashboard
 from crucible.adapters.ui.pages import gateway as gw_module
 from crucible.adapters.ui.pages import repositories as ui_repositories
@@ -1990,6 +1992,73 @@ def test_routing_tier_action_keeps_numeric_pool_order(
     )
 
     assert saved == [f"pool-{n}" for n in range(11)]
+
+
+async def test_t_auth_6_credentials_page_renewer_health_and_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    principal = SimpleNamespace(name="admin", role=Role.ADMIN)
+    monkeypatch.setattr(credentials_page_module, "_require", lambda *_: (principal, "csrf"))
+    monkeypatch.setattr(credentials, "read_secrets", AsyncMock(return_value={}))
+    monkeypatch.setattr(credentials, "secret_store", lambda *_: object())
+    monkeypatch.setattr(
+        credentials,
+        "state_view",
+        lambda *_: {
+            "state": "validated",
+            "mount_mode": "renewer",
+            "last_launch_outcome": None,
+        },
+    )
+    monkeypatch.setattr(
+        credentials_page_module,
+        "active_policy",
+        lambda *_: SimpleNamespace(
+            document={"concurrency": {"per_harness": {"codex": 2}}},
+        ),
+    )
+    uow = Mock()
+    uow.attempts.list_in_states.return_value = [SimpleNamespace(execution_id="running")]
+    uow.executions.get.return_value = SimpleNamespace(harness="codex")
+    uow.events.list_global.return_value = [
+        SimpleNamespace(
+            kind=EventKind.CREDENTIAL_REFRESH_FAILED.value,
+            ts=NOW,
+            payload={"harness": "codex", "result": "network failure"},
+        ),
+        SimpleNamespace(
+            kind=EventKind.CREDENTIAL_REFRESHED.value,
+            ts=NOW,
+            payload={"harness": "codex", "result": "refreshed"},
+        ),
+    ]
+    ctx: Any = SimpleNamespace(
+        admin=SimpleNamespace(harnesses=SimpleNamespace(names=lambda: ["codex"]))
+    )
+    req = request("/ui/credentials")
+    req.scope["query_string"] = b""
+    req.scope["app"] = SimpleNamespace(state=SimpleNamespace(ctx=SimpleNamespace()))
+    response = await credentials_page_module.credentials_page(req, ctx, uow)
+    rendered = bytes(response.body).decode()
+    for label in (
+        "Mode",
+        "renewer",
+        "Workers / cap",
+        "1 of 2",
+        "Last refresh",
+        "Refresh result",
+        "refreshed",
+        "Failures (24h)",
+        "Refresh now",
+        "Validate",
+        "Probe",
+        "Log in",
+    ):
+        assert label in rendered
+    assert 'name="reason"' in rendered
+    assert 'name="verb" value="refresh"' in rendered
+    assert "&gt;1&lt;" not in rendered
+    assert ">1</td>" in rendered
 
 
 def test_repository_form_offers_stored_policy_names_as_a_select(

@@ -9,14 +9,10 @@ container's uid and not to a host user Codex would trust (S1). `--disable plugin
 it off github.com and chatgpt.com (S6). The update opt-out is a launch flag, not image
 state (S7, S11).
 
-Credential: `auth.json`, rw-narrow from the start because the CLI writes session and
-log state beside it and fails on a read-only directory before auth is tested (S1). Only
-`auth.json` syncs back, chosen by the newer `last_refresh` (12). `config.toml` is a
-Crucible-owned template mounted read-only on top: the operator's per-project trust,
-MCP servers and hook trust hashes never reach a worker. Parallel copies are allowed,
-but OpenAI rotates refresh tokens on use, so simultaneous renewals can break login.
-Keep auth_failure and its retry-once safety net; operators can roll back with
-concurrency.per_harness.codex: 1 if the supervisor auth-failure counts rise.
+Credential: Hades holds the login and refreshes it in renewer mode. Workers receive
+only access-token.json and run app-server with external authentication. Rollback uses
+rw-narrow auth.json copies with last_refresh sync-back and per_harness.codex: 1.
+config.toml is a Crucible-owned template; operator settings never reach a worker.
 
 Commands (issue 128): the pinned models run commands through unified exec
 (`shell_type: unified_exec` in the CLI's own model catalog), which returns after at most
@@ -144,7 +140,7 @@ class CodexAdapter:
                     "auth.json", json=True, json_keys=("tokens",), issued_at=("last_refresh",)
                 ),
             ),
-            minimum_mode=MountMode(self.concurrency.minimum_mode),
+            minimum_mode=MountMode.RENEWER,
             config_dir_env="CODEX_HOME",
             templates={"config.toml": CONFIG_TEMPLATE},
             login_hint=(
@@ -153,7 +149,30 @@ class CodexAdapter:
         )
 
     def build_launch(self, ctx: LaunchContext) -> AdapterLaunch:
-        argv: list[str] = [
+        if ctx.credential_mode is MountMode.RENEWER and ctx.endpoint == "subscription":
+            argv = [
+                "/usr/local/bin/crucible-codex-host",
+                "--token-file",
+                f"{CONFIG_DIR}/access-token.json",
+                "--transcript",
+                f"{ctx.report_mount}/{base.TRANSCRIPT_NAME}",
+                "--last-message",
+                f"{ctx.report_mount}/{LAST_MESSAGE}",
+                "--cwd",
+                ctx.repo_mount,
+                "--model",
+                ctx.model,
+            ]
+            if ctx.effort:
+                argv += ["--effort", ctx.effort]
+            return AdapterLaunch(
+                argv=tuple(argv),
+                stdin_files=(f"{ctx.identity_mount}/IDENTITY.md",),
+                stdin_text=base.POINTER_PROMPT,
+                transcript_path=None,
+                workdir=ctx.repo_mount,
+            )
+        argv = [
             CODEX_BINARY,
             "exec",
             "--dangerously-bypass-approvals-and-sandbox",

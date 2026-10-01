@@ -49,7 +49,17 @@ def upload_policy(
     document: Annotated[dict[str, Any], Body()],
 ) -> PolicyView:
     policy = put_policy(
-        uow, ctx.clock, principal=principal, name=name, version=version, document=document
+        uow,
+        ctx.clock,
+        principal=principal,
+        name=name,
+        version=version,
+        document=document,
+        concurrency_modes={
+            name: source.mount_mode.value
+            for name, source in ctx.credential_sources.items()
+            if source.mount_mode is not None
+        },
     )
     uow.commit()
     return PolicyView(
@@ -123,7 +133,12 @@ def upload_routing(
     document: Annotated[dict[str, Any], Body()],
 ) -> RoutingPolicyView:
     routing = put_routing_policy(
-        uow, ctx.clock, principal=principal, name=name, version=version, document=document
+        uow,
+        ctx.clock,
+        principal=principal,
+        name=name,
+        version=version,
+        document=document,
     )
     uow.commit()
     return RoutingPolicyView(

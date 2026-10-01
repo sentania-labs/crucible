@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, Request
@@ -15,10 +15,14 @@ from crucible.application.admin import (
     gateway,
     login,
 )
+from crucible.application.admin.routing import active_policy
 from crucible.application.errors import (
     ConflictError,
+    NotFoundError,
 )
+from crucible.application.harnesses import CREDENTIAL_HOLDING_STATES
 from crucible.domain.entities import Principal, Role
+from crucible.domain.events import EventKind
 
 router = APIRouter(prefix="/ui", include_in_schema=False)
 
@@ -39,6 +43,24 @@ async def credentials_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
     admin = principal.role is Role.ADMIN
     rows: list[list[Any]] = []
     compatibility: list[list[Any]] = []
+    live_by_harness: dict[str, int] = {}
+    for attempt in uow.attempts.list_in_states(list(CREDENTIAL_HOLDING_STATES)):
+        execution = uow.executions.get(attempt.execution_id)
+        if execution is not None:
+            live_by_harness[execution.harness] = live_by_harness.get(execution.harness, 0) + 1
+    try:
+        policy = active_policy(uow).document
+    except NotFoundError:
+        policy = {}
+    per_harness = (policy.get("concurrency") or {}).get("per_harness") or {}
+    refresh_events = list(
+        uow.events.list_global(
+            after_seq=0,
+            kind=None,
+            since=datetime.now(UTC) - timedelta(hours=24),
+            limit=1000,
+        )
+    )
     for name in names:
         view = credentials.state_view(ctx.admin, uow, name, secrets.get(name))
         state = str(view.get("state") or "")
@@ -51,6 +73,16 @@ async def credentials_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
         elif needed:
             actions.append(
                 {"kind": "link", "href": f"/ui/credentials/{name}/login", "label": "Log in"}
+            )
+        if admin and name == "codex" and state != "absent":
+            actions.append(
+                {
+                    "kind": "form",
+                    "action": "/ui/actions/credential",
+                    "label": "Refresh now",
+                    "reason": True,
+                    "hidden": {"harness": name, "verb": "refresh"},
+                }
             )
         # Validate, probe and remove act on a stored credential; with none there is only
         # the way to set one up (crucible#115).
@@ -75,6 +107,19 @@ async def credentials_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                         "hidden": {"harness": name, "verb": "remove"},
                     }
                 )
+        mode = str(view.get("mount_mode") or "read-only")
+        related = [
+            event
+            for event in refresh_events
+            if event.kind
+            in (
+                EventKind.CREDENTIAL_REFRESHED.value,
+                EventKind.CREDENTIAL_REFRESH_FAILED.value,
+            )
+            and event.payload.get("harness") == name
+        ]
+        last_refresh = related[-1] if related else None
+        failures = sum(event.kind == EventKind.CREDENTIAL_REFRESH_FAILED.value for event in related)
         rows.append(
             [
                 name,
@@ -84,6 +129,11 @@ async def credentials_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                     "tone": CREDENTIAL_TONES.get(state, "warn"),
                 },
                 gateway.plain_outcome(view.get("last_launch_outcome")),
+                mode,
+                f"{live_by_harness.get(name, 0)} of {int(per_harness.get(name, 1))}",
+                last_refresh.ts.isoformat() if last_refresh is not None else "Never",
+                str(last_refresh.payload.get("result", "")) if last_refresh is not None else "",
+                failures,
                 {"kind": "actions", "items": actions} if actions else "",
             ]
         )
@@ -91,7 +141,17 @@ async def credentials_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
     sections: list[dict[str, Any]] = [
         {
             "title": "Credentials",
-            "columns": ["Harness", "State", "Last test", ""],
+            "columns": [
+                "Harness",
+                "State",
+                "Last test",
+                "Mode",
+                "Workers / cap",
+                "Last refresh",
+                "Refresh result",
+                "Failures (24h)",
+                "",
+            ],
             "rows": rows,
             "details": [
                 {
@@ -213,6 +273,11 @@ async def _action_credential(
             new_path=form.get("new_path", ""),
             reason=reason,
         )
+    elif verb == "refresh":
+        renewer = getattr(ctx, "credential_renewer", None)
+        if renewer is None:
+            raise ConflictError("the Codex credential renewer is not configured")
+        renewer.refresh(reason or "administrator requested refresh", force=True)
     else:
         raise ConflictError("unknown credential action")
     return None

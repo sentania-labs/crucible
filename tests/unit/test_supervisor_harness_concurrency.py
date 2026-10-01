@@ -33,11 +33,16 @@ def test_policy_accepts_parallel_frontier_harnesses(harness: str) -> None:
     assert policy.concurrency.per_harness[harness] == 2
 
 
-def test_policy_keeps_codex_serial_until_the_renewer() -> None:
+def test_policy_keeps_codex_copy_mode_serial() -> None:
     document = seeded_policy()
     document["concurrency"]["per_harness"]["codex"] = 2
     with pytest.raises(ContractValidationError) as caught:
-        validate_policy(document, name=document["name"], version=document["version"])
+        validate_policy(
+            document,
+            name=document["name"],
+            version=document["version"],
+            concurrency_modes={"codex": "rw-narrow"},
+        )
     assert [e["path"] for e in caught.value.errors] == ["concurrency.per_harness.codex"]
     document["concurrency"]["per_harness"]["codex"] = 1
     validate_policy(document, name=document["name"], version=document["version"])
@@ -75,7 +80,8 @@ def test_policy_still_requires_frontier_caps(harness: str) -> None:
 def test_agy_declares_parallel_writable_copies_and_codex_does_not() -> None:
     for adapter, safe in ((AgyAdapter(), True), (CodexAdapter(), False)):
         assert adapter.parallel_attempts_safe is safe
-        assert adapter.credential_spec().minimum_mode is MountMode.RW_NARROW
+        expected = MountMode.RENEWER if adapter.name == "codex" else MountMode.RW_NARROW
+        assert adapter.credential_spec().minimum_mode is expected
 
 
 @pytest.mark.parametrize("harness", ["claude_code", "agy"])
@@ -108,7 +114,10 @@ def test_supervisor_harness_cap_two_counts_until_collection(
     assert supervisor._harness_busy_in_uow(uow, execution) is None
 
 
-def test_supervisor_keeps_unsafe_writable_adapter_serial(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("mode", [MountMode.RW_NARROW, MountMode.RENEWER])
+def test_supervisor_keeps_unsafe_writable_adapter_serial(
+    monkeypatch: pytest.MonkeyPatch, mode: MountMode
+) -> None:
     monkeypatch.setattr("crucible.application.supervisor.load_routing", lambda *_: None)
     adapter = CodexAdapter()
     supervisor = Supervisor(
@@ -119,6 +128,7 @@ def test_supervisor_keeps_unsafe_writable_adapter_serial(monkeypatch: pytest.Mon
         artifact_store=MagicMock(),
         harnesses=HarnessRegistry([adapter]),
     )
+    supervisor._credential_sources = {"codex": CredentialSource("/credential", mode)}
     execution: Any = SimpleNamespace(
         harness="codex",
         model="model",
@@ -127,9 +137,8 @@ def test_supervisor_keeps_unsafe_writable_adapter_serial(monkeypatch: pytest.Mon
     uow: Any = MagicMock()
     uow.attempts.list_in_states.return_value = [SimpleNamespace(execution_id="first")]
     uow.executions.get.return_value = execution
-    assert (
-        supervisor._harness_busy_in_uow(uow, execution) == "1 of 1 codex worker(s) already running"
-    )
+    expected = "1 of 1 codex worker(s) already running" if mode is MountMode.RW_NARROW else None
+    assert supervisor._harness_busy_in_uow(uow, execution) == expected
 
 
 @pytest.mark.parametrize("running", [1, 2])
