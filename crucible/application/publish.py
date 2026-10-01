@@ -590,6 +590,19 @@ def publishing_waits(uow: UnitOfWork) -> list[dict[str, Any]]:
     return out
 
 
+def _claim_gone(step: str, detail: str) -> bool:
+    """Return True when the bundle is unrecoverable (no claim or no bundle).
+
+    The Kubernetes publisher returns step="bundle-seal" with a detail
+    mentioning the claim is gone or the bundle is missing; in that case
+    there is nothing to retry.
+    """
+    if step != "bundle-seal":
+        return False
+    lower = detail.lower()
+    return "gone" in lower or "missing" in lower or "no branch bundle" in lower
+
+
 def fail_publish(
     uow: UnitOfWork,
     clock: Clock,
@@ -643,19 +656,27 @@ def fail_publish(
     retry_max = int(retry_limit)
     retries_remaining = max(retry_max - retry_number, 0)
     links = {"events": f"/v1/tasks/{task.id}/events"}
+    claim_lost = _claim_gone(step, detail)
     started = uow.events.latest_for_task_kind(task.id, EventKind.PUBLISH_STARTED.value)
-    if retries_remaining and started is not None:
+    if not claim_lost and retries_remaining and started is not None:
         links["republish"] = f"/v1/tasks/{task.id}/republish"
+    if claim_lost:
+        summary = (
+            f"publication failed at {step} on {task.head_sha}: {detail}; "
+            f"no retry is possible (bundle seal is lost)"
+        )[:500]
+    else:
+        summary = (
+            f"publication failed at {step} on {task.head_sha}: {detail}; "
+            f"manual publication retries used {retry_number} of {retry_max}, "
+            f"{retries_remaining} remaining"
+        )[:500]
     create_wake(
         uow,
         clock,
         principal_id=task.principal_id,
         reason=WakeReason.PUBLISH_FAILED,
-        summary=(
-            f"publication failed at {step} on {task.head_sha}: {detail}; "
-            f"manual publication retries used {retry_number} of {retry_max}, "
-            f"{retries_remaining} remaining"
-        )[:500],
+        summary=summary,
         task=task,
         attempt_id=attempt_id,
         extra_links=links,
