@@ -584,12 +584,14 @@ class KubernetesProvider:
         resolver: Resolver | None = None,
         settings_source: SettingsSource | None = None,
         timeouts_source: TimeoutsSource | None = None,
+        credential_dead: Callable[[], bool] | None = None,
     ) -> None:
         self.config = config
         # The runtime settings (the `kubernetes.egress` admin setting and the enabled
         # local endpoint), read back from the database; None in the unit tier.
         self._settings_source = settings_source
         self._timeouts_source = timeouts_source
+        self._credential_dead = credential_dead or (lambda: False)
         self._file_role_timeout = config.role_timeout_seconds
         self._settings_read_at: float | None = None
         self._file_egress = config.egress
@@ -651,6 +653,10 @@ class KubernetesProvider:
         self._listings: weakref.WeakKeyDictionary[
             asyncio.AbstractEventLoop, asyncio.Task[list[ImageInfo]]
         ] = weakref.WeakKeyDictionary()
+
+    def set_credential_dead_check(self, check: Callable[[], bool]) -> None:
+        """Install the supervisor-owned Codex credential health gate."""
+        self._credential_dead = check
 
     # ----- helpers -----------------------------------------------------
 
@@ -1070,6 +1076,7 @@ class KubernetesProvider:
         cancelled: CancelCheck | None = None,
     ) -> Workspace:
         await _stop_if_cancelled(cancelled, "before the prepare")
+        self._refuse_dead_codex(spec)
         # 26: the preparer renders its own egress policy (the DNS selector included),
         # and the supervisor calls prepare() before launch(). Refresh here too, or a
         # stale seed's policy is rendered and launch()'s own refresh is never reached.
@@ -1503,9 +1510,16 @@ class KubernetesProvider:
             )
         self._check_endpoint_ready(probe, spec)
 
+    def _refuse_dead_codex(self, spec: LaunchSpec) -> None:
+        if spec.harness == "codex" and self._credential_dead():
+            raise HarnessRefusedError(
+                "refusing to launch: the Codex credential is dead; log in again"
+            )
+
     async def launch(
         self, ws: Workspace, spec: LaunchSpec, cancelled: CancelCheck | None = None
     ) -> Handle:
+        self._refuse_dead_codex(spec)
         await self._require_ready(spec)
         gated_under = self.config
         resolved = await self._resolve_image(spec)

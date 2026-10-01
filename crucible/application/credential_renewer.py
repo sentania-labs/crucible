@@ -47,6 +47,75 @@ Propagator = Callable[[Mapping[str, str]], None]
 Wake = Callable[[str], None]
 
 
+class CredentialStore(Protocol):
+    def read(self) -> dict[str, Any]: ...
+
+    def write(self, document: Mapping[str, Any]) -> None: ...
+
+    def is_dead(self) -> bool: ...
+
+    def mark_dead(self, document: Mapping[str, Any]) -> None: ...
+
+
+class FileCredentialStore:
+    def __init__(self, login_path: Path) -> None:
+        self.login_path = login_path
+        self.dead_path = login_path.with_name(login_path.name + ".dead")
+
+    def read(self) -> dict[str, Any]:
+        document = json.loads(self.login_path.read_text(encoding="utf-8"))
+        if not isinstance(document, dict):
+            raise ValueError("Codex auth.json is not an object")
+        return document
+
+    def write(self, document: Mapping[str, Any]) -> None:
+        atomic_write(self.login_path, document)
+
+    def is_dead(self) -> bool:
+        return self.dead_path.exists()
+
+    def mark_dead(self, document: Mapping[str, Any]) -> None:
+        atomic_write(self.dead_path, document)
+
+
+class KubernetesCredentialStore:
+    """The service-held Codex Secret, read and patched as one API object."""
+
+    def __init__(self, client: Any, secret_name: str = "crucible-harness-codex") -> None:
+        self.client = client
+        self.secret_name = secret_name
+
+    def _body(self) -> dict[str, Any]:
+        body = self.client.get("secrets", self.secret_name)
+        if not isinstance(body, dict):
+            raise ValueError("Codex credential Secret is not an object")
+        return body
+
+    def read(self) -> dict[str, Any]:
+        raw = (self._body().get("data") or {}).get("auth.json")
+        if not isinstance(raw, str):
+            raise ValueError("Codex credential Secret has no auth.json")
+        document = json.loads(base64.b64decode(raw))
+        if not isinstance(document, dict):
+            raise ValueError("Codex auth.json is not an object")
+        return document
+
+    def write(self, document: Mapping[str, Any]) -> None:
+        encoded = base64.b64encode(
+            json.dumps(document, separators=(",", ":")).encode("utf-8")
+        ).decode("ascii")
+        self.client.patch("secrets", self.secret_name, {"data": {"auth.json": encoded}})
+
+    def is_dead(self) -> bool:
+        return "credential-dead.json" in (self._body().get("data") or {})
+
+    def mark_dead(self, document: Mapping[str, Any]) -> None:
+        encoded = base64.b64encode(
+            json.dumps(document, separators=(",", ":")).encode("utf-8")
+        ).decode("ascii")
+        self.client.patch("secrets", self.secret_name, {"data": {"credential-dead.json": encoded}})
+
+
 def _claim(token: str, name: str) -> Any:
     parts = token.split(".")
     if len(parts) < 2:
@@ -155,16 +224,20 @@ _PROCESS_LOCK = threading.Lock()
 class CodexCredentialRenewer:
     def __init__(
         self,
-        login_path: Path,
+        login_path: Path | None = None,
         *,
+        store: CredentialStore | None = None,
         grant: Grant = oauth_refresh,
         clock: Clock | None = None,
         record: Recorder | None = None,
         propagate: Propagator | None = None,
         wake: Wake | None = None,
     ) -> None:
-        self.login_path = login_path
-        self.dead_path = login_path.with_name(login_path.name + ".dead")
+        if store is None:
+            if login_path is None:
+                raise ValueError("a Codex credential store is required")
+            store = FileCredentialStore(login_path)
+        self.store = store
         self.grant = grant
         self.clock = clock or SystemClock()
         self.record = record or (lambda _kind, _payload: None)
@@ -174,13 +247,10 @@ class CodexCredentialRenewer:
 
     @property
     def dead(self) -> bool:
-        return self.dead_path.exists()
+        return self.store.is_dead()
 
     def _read(self) -> dict[str, Any]:
-        document = json.loads(self.login_path.read_text(encoding="utf-8"))
-        if not isinstance(document, dict):
-            raise ValueError("Codex auth.json is not an object")
-        return document
+        return self.store.read()
 
     def refresh(self, reason: str, *, force: bool = False) -> bool:
         """Refresh once under the process lock. True means a grant was performed."""
@@ -217,7 +287,7 @@ class CodexCredentialRenewer:
             updated = dict(login)
             updated["tokens"] = tokens
             updated["last_refresh"] = self.clock.now().isoformat()
-            atomic_write(self.login_path, updated)
+            self.store.write(updated)
             projection = access_token_document(updated)
             self.propagate(projection)
             self.record(
@@ -245,7 +315,7 @@ class CodexCredentialRenewer:
         return self.refresh("access token reached 75 percent of its lifetime")
 
     def _die(self, reason: str) -> None:
-        atomic_write(self.dead_path, {"dead": True, "at": self.clock.now().isoformat()})
+        self.store.mark_dead({"dead": True, "at": self.clock.now().isoformat()})
         self.record(
             EventKind.CREDENTIAL_REFRESH_FAILED,
             {"harness": "codex", "reason": reason, "result": "credential_dead"},

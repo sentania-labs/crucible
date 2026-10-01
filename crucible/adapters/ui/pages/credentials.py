@@ -15,8 +15,10 @@ from crucible.application.admin import (
     gateway,
     login,
 )
+from crucible.application.admin.routing import active_policy
 from crucible.application.errors import (
     ConflictError,
+    NotFoundError,
 )
 from crucible.application.harnesses import CREDENTIAL_HOLDING_STATES
 from crucible.domain.entities import Principal, Role
@@ -46,6 +48,11 @@ async def credentials_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
         execution = uow.executions.get(attempt.execution_id)
         if execution is not None:
             live_by_harness[execution.harness] = live_by_harness.get(execution.harness, 0) + 1
+    try:
+        policy = active_policy(uow).document
+    except NotFoundError:
+        policy = {}
+    per_harness = (policy.get("concurrency") or {}).get("per_harness") or {}
     refresh_events = list(
         uow.events.list_global(
             after_seq=0,
@@ -123,7 +130,7 @@ async def credentials_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                 },
                 gateway.plain_outcome(view.get("last_launch_outcome")),
                 mode,
-                f"{live_by_harness.get(name, 0)} running",
+                f"{live_by_harness.get(name, 0)} of {int(per_harness.get(name, 1))}",
                 last_refresh.ts.isoformat() if last_refresh is not None else "Never",
                 str(last_refresh.payload.get("result", "")) if last_refresh is not None else "",
                 failures,

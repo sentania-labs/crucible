@@ -53,7 +53,11 @@ from crucible.adapters.storage.disk import DiskArtifactStore
 from crucible.application.admin.context import AdminContext, GitHubAppInfo
 from crucible.application.admin.credentials import sweep_retired
 from crucible.application.admin.routing import local_endpoint_view
-from crucible.application.credential_renewer import CodexCredentialRenewer
+from crucible.application.credential_renewer import (
+    CodexCredentialRenewer,
+    FileCredentialStore,
+    KubernetesCredentialStore,
+)
 from crucible.application.delivery_tick import DeliveryConfig
 from crucible.application.errors import NotFoundError
 from crucible.application.harnesses import HarnessRegistry
@@ -64,7 +68,10 @@ from crucible.application.proxy_config import (
 )
 from crucible.application.supervisor import Supervisor
 from crucible.application.transitions import record_event
+from crucible.application.wakes import create_wake
+from crucible.contracts.wake import WakeReason
 from crucible.domain.cluster_egress import SETTING_NAME, parse_cluster_egress
+from crucible.domain.entities import Role
 from crucible.domain.events import EventKind
 from crucible.domain.ids import new_id
 from crucible.domain.role_timeouts import SETTING_NAME as ROLE_TIMEOUTS_SETTING
@@ -553,35 +560,11 @@ def wire(settings: Settings) -> Wiring:
         kubernetes_role_timeout_seed=settings.kubernetes.role_timeout_seconds,
         first_run=first_run,
     )
-    renewer: CodexCredentialRenewer | None = None
-    codex_source = credential_sources(settings).get("codex")
-    if codex_source is not None and (Path(codex_source.path) / "auth.json").is_file():
+    renewer = build_credential_renewer(settings, providers, factory, admin)
+    kubernetes = providers.get("kubernetes")
+    if renewer is not None and isinstance(kubernetes, KubernetesProvider):
+        kubernetes.set_credential_dead_check(lambda: renewer.dead)
 
-        def record_refresh(kind: EventKind, payload: Mapping[str, Any]) -> None:
-            with factory() as uow:
-                record_event(
-                    uow,
-                    admin.clock,
-                    kind,
-                    principal="credential-renewer",
-                    payload=dict(payload),
-                )
-                uow.commit()
-
-        def propagate_refresh(document: Mapping[str, str]) -> None:
-            loop = asyncio.get_running_loop()
-            for provider in providers.values():
-                update = getattr(provider, "refresh_credential_projection", None)
-                if callable(update):
-                    task = loop.create_task(update(document))
-                    task.add_done_callback(lambda completed: completed.exception())
-
-        renewer = CodexCredentialRenewer(
-            Path(codex_source.path) / "auth.json",
-            clock=admin.clock,
-            record=record_refresh,
-            propagate=propagate_refresh,
-        )
     ctx = AppContext(
         uow_factory=factory,
         clock=SystemClock(),
@@ -612,6 +595,85 @@ def wire(settings: Settings) -> Wiring:
         harnesses=registry,
         admin=admin,
         credential_renewer=renewer,
+    )
+
+
+def build_credential_renewer(
+    settings: Settings,
+    providers: Mapping[str, ExecutionProvider],
+    factory: UnitOfWorkFactory,
+    admin: AdminContext,
+) -> CodexCredentialRenewer | None:
+    """Build the one Codex writer from its directory or service-held Secret."""
+    source = credential_sources(settings).get("codex")
+    store: FileCredentialStore | KubernetesCredentialStore | None = None
+    if source is not None and (path := Path(source.path) / "auth.json").is_file():
+        store = FileCredentialStore(path)
+    elif (
+        settings.kubernetes.enabled
+        and not settings.docker.enabled
+        and isinstance((kubernetes := providers.get("kubernetes")), KubernetesProvider)
+    ):
+        candidate = KubernetesCredentialStore(
+            kubernetes.client, kubernetes.credential_secret("codex")
+        )
+        try:
+            candidate.read()
+        except KubernetesApiError as exc:
+            if exc.status != 404:
+                raise
+        except ValueError:
+            pass
+        else:
+            store = candidate
+    if store is None:
+        return None
+
+    def record_refresh(kind: EventKind, payload: Mapping[str, Any]) -> None:
+        with factory() as uow:
+            record_event(
+                uow,
+                admin.clock,
+                kind,
+                principal="credential-renewer",
+                payload=dict(payload),
+            )
+            uow.commit()
+
+    def propagate_refresh(document: Mapping[str, str]) -> None:
+        loop = asyncio.get_running_loop()
+        for provider in providers.values():
+            update = getattr(provider, "refresh_credential_projection", None)
+            if callable(update):
+                task = loop.create_task(update(document))
+                task.add_done_callback(lambda completed: completed.exception())
+
+    def wake(summary: str) -> None:
+        with factory() as uow:
+            principals = [p for p in uow.principals.list_all() if p.disabled_at is None]
+            principal = next(
+                (p for p in principals if p.role is Role.ORCHESTRATOR),
+                next((p for p in principals if p.role is Role.ADMIN), None),
+            )
+            if principal is None:
+                log.error("cannot create the Codex credential wake: no active principal")
+                return
+            create_wake(
+                uow,
+                admin.clock,
+                principal_id=principal.id,
+                reason=WakeReason.AUTH_FAILURE,
+                summary=summary,
+                extra_links={"credentials": "/ui/credentials"},
+            )
+            uow.commit()
+
+    return CodexCredentialRenewer(
+        store=store,
+        clock=admin.clock,
+        record=record_refresh,
+        propagate=propagate_refresh,
+        wake=wake,
     )
 
 

@@ -52,6 +52,18 @@ def _auth(last_refresh: str) -> bytes:
     ).encode()
 
 
+@pytest.mark.asyncio
+async def test_dead_codex_credential_refuses_a_new_kubernetes_launch() -> None:
+    api, registry, provider = build(harness="codex")
+    registry.register(CODEX_IMAGE, harness="codex", version="0.153.4")
+    provider.set_credential_dead_check(lambda: True)
+
+    with pytest.raises(HarnessRefusedError, match="credential is dead"):
+        await provider.prepare(spec(harness="codex", image=CODEX_IMAGE))
+
+    assert api.created == []
+
+
 async def run_to_exit(provider: KubernetesProvider, handle: Handle) -> Any:
     observation = await provider.observe(handle)
     while observation.state is ObservationState.RUNNING:
