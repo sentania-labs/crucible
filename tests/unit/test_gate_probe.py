@@ -13,6 +13,7 @@ from crucible.domain.entities import ExecutionRole
 from crucible.domain.exit_class import ExitClass
 from crucible.domain.lifecycle import AttemptState, TaskState
 from crucible.ports.execution import LaunchSpec
+from tests.unit.kubernetes_fixtures import build, created
 from tests.unit.test_routing import _routing_setup
 
 
@@ -141,6 +142,16 @@ async def test_no_task_checks_is_not_probed(monkeypatch: pytest.MonkeyPatch) -> 
     assert await supervisor._probe_before_prepare(item, provider, spec)
     assert not provider.gate_probe_calls
     uow.evidence.add.assert_not_called()
+
+
+async def test_no_task_checks_creates_no_kubernetes_probe_job(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    supervisor, item, _, _, spec = _setup(monkeypatch)
+    api, _, provider = build()
+    item.contract["required_verification"] = [{"id": "V1", "command": "make lint"}]
+    assert await supervisor._probe_before_prepare(item, provider, spec)
+    assert not created(api, "jobs", "gate-probe")
 
 
 async def test_docker_unsupported_probe_has_explicit_evidence(

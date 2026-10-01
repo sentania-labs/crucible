@@ -1200,6 +1200,7 @@ class KubernetesProvider:
                 }
             )
         output: list[str] = []
+        interrupted = False
         try:
             if checkout_token is not None:
                 if not await self._delete_checkout_secret(spec.attempt_id):
@@ -1235,12 +1236,19 @@ class KubernetesProvider:
                 plan=plan,
                 cancelled=cancelled,
                 log_output=output,
+                adopt_existing=True,
+                preserve_on_cancel=True,
             )
+        except asyncio.CancelledError:
+            interrupted = True
+            raise
         except KubernetesApiError as exc:
             raise ProviderError(f"gate probe Job failed: {exc}") from exc
         finally:
-            if checkout_token is not None and not await self._delete_checkout_secret(
-                spec.attempt_id
+            if (
+                checkout_token is not None
+                and not interrupted
+                and not await self._delete_checkout_secret(spec.attempt_id)
             ):
                 raise ProviderError(
                     f"the checkout token Secret {token_name!r} could not be deleted after "
@@ -1273,6 +1281,16 @@ class KubernetesProvider:
                 )
             )
         return tuple(rows)
+
+    async def gate_probe_exists(self, attempt_id: str) -> bool:
+        name = k8sspec.object_name("gate-probe", attempt_id)
+        try:
+            await self._call(self.client.get, "jobs", name)
+        except KubernetesApiError as exc:
+            if exc.status == 404:
+                return False
+            raise ProviderError(f"could not inspect gate probe Job {name!r}: {exc}") from exc
+        return True
 
     async def prepare(
         self,
@@ -4130,6 +4148,8 @@ class KubernetesProvider:
         wait_for_quota: bool = False,
         use_backoff: bool = False,
         log_output: list[str] | None = None,
+        adopt_existing: bool = False,
+        preserve_on_cancel: bool = False,
     ) -> int:
         """Run one single-purpose Job to completion and delete it. With `cancelled`, a
         cancel ends the wait (hades #189): the Job and its policy are deleted on the way
@@ -4142,8 +4162,10 @@ class KubernetesProvider:
         operator has to retry, not a collection the supervisor tries again."""
         name = k8sspec.object_name(OBJECT_PREFIX.get(role, role), spec.attempt_id)
         policy_name: str | None = None
-        with contextlib.suppress(KubernetesApiError):
-            await self._call(self.client.delete, "jobs", name)
+        if not adopt_existing:
+            with contextlib.suppress(KubernetesApiError):
+                await self._call(self.client.delete, "jobs", name)
+        interrupted = False
         try:
             policy_name, resolved_plan = await self._apply_policy(
                 spec, role, plan, use_backoff=use_backoff
@@ -4230,19 +4252,23 @@ class KubernetesProvider:
                 self._role_error(role, spec.attempt_id, tail)
                 log.warning("%s Job exited %s", role, code, extra={"tail": tail})
             return code
+        except asyncio.CancelledError:
+            interrupted = True
+            raise
         finally:
-            with contextlib.suppress(KubernetesApiError):
-                await self._call(self.client.delete, "jobs", name)
-            try:
-                await self._await_job_pods_gone(name)
-            except (ProviderError, KubernetesApiError) as exc:
-                if not tolerate_lingering_pod:
-                    raise
-                log.warning("%s Pod outlived its Job", role, extra={"error": str(exc)})
-            finally:
-                if policy_name:
-                    with contextlib.suppress(KubernetesApiError):
-                        await self._call(self.client.delete, "networkpolicies", policy_name)
+            if not (interrupted and preserve_on_cancel):
+                with contextlib.suppress(KubernetesApiError):
+                    await self._call(self.client.delete, "jobs", name)
+                try:
+                    await self._await_job_pods_gone(name)
+                except (ProviderError, KubernetesApiError) as exc:
+                    if not tolerate_lingering_pod:
+                        raise
+                    log.warning("%s Pod outlived its Job", role, extra={"error": str(exc)})
+                finally:
+                    if policy_name:
+                        with contextlib.suppress(KubernetesApiError):
+                            await self._call(self.client.delete, "networkpolicies", policy_name)
 
     def _role_error(self, role: str, attempt_id: str, text: str, unavailable: bool = False) -> None:
         self.last_error[role] = text
@@ -4640,7 +4666,16 @@ class KubernetesProvider:
         rows = await self._call(
             self.client.list_objects, "pods", label_selector=f"job-name={job_name}"
         )
-        return rows[0] if rows else None
+        live = [row for row in rows if not (row.get("metadata") or {}).get("deletionTimestamp")]
+        candidates = live or rows
+        return (
+            max(
+                candidates,
+                key=lambda row: str((row.get("metadata") or {}).get("creationTimestamp") or ""),
+            )
+            if candidates
+            else None
+        )
 
     async def _await_pod_gone(self, name: str, *, timeout: float = 15) -> None:
         """Wait for an asynchronous Pod deletion before recording workspace state."""

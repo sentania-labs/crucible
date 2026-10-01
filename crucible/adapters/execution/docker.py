@@ -508,6 +508,9 @@ class DockerProvider:
         """Docker does not yet provide an isolated pre-preparation probe."""
         return None
 
+    async def gate_probe_exists(self, attempt_id: str) -> bool:
+        return False
+
     async def prepare(
         self,
         spec: LaunchSpec,

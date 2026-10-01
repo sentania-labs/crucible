@@ -721,6 +721,7 @@ class Supervisor:
             await self._resume_quota_checkpoints()
             await self._db(self._resume_quota_waits)
             await self._db(self._materialize_scheduled)
+            await self._resume_gate_probes()
             result.launched = await self._launch_pending()
             observed, finished = await self._observe_attempts()
             result.observed, result.finished = observed, finished
@@ -1291,12 +1292,50 @@ class Supervisor:
                     self._finish_launch(*begun), name=f"launch-{item.attempt.id}"
                 )
                 self._launches[item.attempt.id] = launch
-                started.append(launch)
+                if not task_specific_checks(item.contract, item.execution.policy_snapshot):
+                    started.append(launch)
         # Only this tick's launches are waited on: one begun earlier that is still
         # running is a slow one, and waiting on it again would slow every tick.
         if started:
             await asyncio.wait(started, timeout=self.launch_wait_seconds)
         return launched + self._harvest_launches()
+
+    async def _resume_gate_probes(self) -> None:
+        """Adopt probe Jobs left by a stopped supervisor before observe strands them."""
+        for item in await self._db(self._list_preparing):
+            if item.attempt.id in self._launches:
+                continue
+            provider = self._provider(item.execution.provider)
+            if not task_specific_checks(item.contract, item.execution.policy_snapshot):
+                continue
+            if not await provider.gate_probe_exists(item.attempt.id):
+                continue
+            self._launches[item.attempt.id] = asyncio.create_task(
+                self._finish_launch(item, provider), name=f"launch-{item.attempt.id}"
+            )
+
+    def _list_preparing(self) -> list[_Pending]:
+        out: list[_Pending] = []
+        with self._uow_factory() as uow:
+            for attempt in uow.attempts.list_in_states([AttemptState.PREPARING]):
+                execution = uow.executions.get(attempt.execution_id)
+                task = uow.tasks.get(attempt.task_id)
+                if execution is None or task is None:
+                    continue
+                stored = uow.contracts.get(task.id, execution.contract_version)
+                repository = uow.repositories.get(task.repository_id)
+                if stored is not None:
+                    out.append(
+                        _Pending(
+                            attempt,
+                            execution,
+                            task,
+                            stored.document,
+                            repository.url if repository else "",
+                            repository,
+                        )
+                    )
+        return out
 
     def _harvest_launches(self) -> int:
         return self._harvest(self._launches, "launch")

@@ -500,6 +500,10 @@ class ExecutionProvider(Protocol):
         """
         ...
 
+    async def gate_probe_exists(self, attempt_id: str) -> bool:
+        """Whether this provider has an adoptable gate-probe step for an attempt."""
+        ...
+
     async def prepare(
         self,
         spec: LaunchSpec,

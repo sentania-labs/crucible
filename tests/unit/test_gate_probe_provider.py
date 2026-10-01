@@ -1,5 +1,6 @@
 """The isolated probe Job and its real shell command exit facts."""
 
+import asyncio
 import json
 import subprocess
 from dataclasses import replace
@@ -109,6 +110,42 @@ async def test_probe_job_failure_names_exit(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setattr(provider, "_await_job", AsyncMock(return_value=1))
     with pytest.raises(ProviderError, match="gate probe Job exit 1"):
         await provider.probe_checks(spec(), [{"id": "V4", "command": "true"}])
+
+
+async def test_probe_spanning_two_ticks_adopts_job_and_records_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api, _, provider = build()
+    monkeypatch.setattr(provider, "_require_ready", AsyncMock())
+    waiting = asyncio.Event()
+
+    async def first_wait(*args: Any, **kwargs: Any) -> int:
+        await waiting.wait()
+        return 0
+
+    monkeypatch.setattr(provider, "_await_job", first_wait)
+    checks = [{"id": "V4", "command": "test -f made-by-the-worker"}]
+    first = asyncio.create_task(provider.probe_checks(spec(), checks))
+    for _ in range(20):
+        if await provider.gate_probe_exists(spec().attempt_id):
+            break
+        await asyncio.sleep(0)
+    assert await provider.gate_probe_exists(spec().attempt_id)
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+
+    monkeypatch.setattr(provider, "_await_job", AsyncMock(return_value=0))
+
+    def logs(name: str, **kwargs: Any) -> list[LogFrame]:
+        return [
+            LogFrame("stdout", b'{"id":"V4","command":"test -f made-by-the-worker","exit":1}\n')
+        ]
+
+    monkeypatch.setattr(api, "pod_log", logs)
+    rows = await provider.probe_checks(spec(), checks)
+    assert rows is not None and rows[0].exit_code == 1
+    assert len(created(api, "jobs", "gate-probe")) == 1
 
 
 def test_probe_script_checks_base_and_records_shell_127(tmp_path: Path) -> None:
