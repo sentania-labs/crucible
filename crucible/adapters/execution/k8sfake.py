@@ -256,6 +256,7 @@ class FakeKubernetesApi:
     # window before the Job controller has produced anything to observe (26).
     no_pod_yet: set[str] = field(default_factory=set)
     created: list[dict[str, Any]] = field(default_factory=list)
+    create_attempts: list[str] = field(default_factory=list)
     deleted: list[tuple[str, str]] = field(default_factory=list)
     # What the next login Pod acts out, and each login Pod's run by Pod name.
     login: FakeLogin = field(default_factory=FakeLogin)
@@ -350,20 +351,25 @@ class FakeKubernetesApi:
 
     # ----- the client surface -------------------------------------------
 
-    def fail_next(self, call: str, count: int = 1, *, kind: str = "") -> None:
-        """Make the next `count` calls of `call` (on `kind`, or any) answer 503."""
-        self.outages.append([call, kind, count])
+    def fail_next(
+        self, call: str, count: int = 1, *, kind: str = "", error: Exception | None = None
+    ) -> None:
+        """Fail the next matching calls with `error`, or a 503 by default."""
+        self.outages.append([call, kind, count, error])
 
     def _outage(self, call: str, kind: str = "") -> None:
         for entry in self.outages:
             if entry[0] == call and entry[1] in ("", kind) and entry[2] > 0:
                 entry[2] -= 1
+                if len(entry) > 3 and entry[3] is not None:
+                    raise entry[3]
                 raise KubernetesUnavailableError(503, f"the fake API server is down ({call})")
 
     def version(self) -> str:
         return "v1.31.0"
 
     def create(self, kind: str, body: Mapping[str, Any]) -> dict[str, Any]:
+        self.create_attempts.append(kind)
         self._outage("create", kind)
         metadata = dict(body.get("metadata") or {})
         name = str(metadata.get("name", ""))
@@ -390,6 +396,7 @@ class FakeKubernetesApi:
         if kind == "jobs":
             self._start_job(stored)
         if kind == "pods":
+            stored.setdefault("spec", {})["nodeName"] = self.node_name
             self._start_pod(stored, owner=None)
         return stored
 
@@ -479,9 +486,17 @@ class FakeKubernetesApi:
         timestamps: bool = True,
         timeout: float | None = None,
         limit_bytes: int | None = None,
+        tail_lines: int | None = None,
     ) -> list[LogFrame]:
         self._outage("pod_log", "pods")
-        self.log_reads.append({"name": name, "since_time": since_time, "limit_bytes": limit_bytes})
+        self.log_reads.append(
+            {
+                "name": name,
+                "since_time": since_time,
+                "limit_bytes": limit_bytes,
+                "tail_lines": tail_lines,
+            }
+        )
         lines = self.logs.get(name, [])
         if not timestamps:
             # Worker lines carry the API server's timestamp prefix in this fake. The
@@ -501,6 +516,10 @@ class FakeKubernetesApi:
             floor = parse_rfc3339(since_time).replace(microsecond=0)
             lines = [line for line in lines if _line_time(line) >= floor]
         payload = ("\n".join(lines) + "\n").encode("utf-8") if lines else b""
+        if tail_lines is not None:
+            # Keep only the last N lines before applying the byte cap.
+            lines = lines[-tail_lines:]
+            payload = ("\n".join(lines) + "\n").encode("utf-8") if lines else b""
         if limit_bytes is not None:
             # `limitBytes` stops the stream where it lands, mid-line included.
             payload = payload[:limit_bytes]

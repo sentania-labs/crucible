@@ -9,16 +9,23 @@ from __future__ import annotations
 
 import asyncio
 import json
+import socket
 import time
 from collections.abc import Mapping
 from dataclasses import replace
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from crucible.adapters.execution import k8sspec
 from crucible.adapters.execution import kubernetes as kubernetes_module
-from crucible.adapters.execution.k8sapi import ExecResult, KubernetesApiError, LogFrame
+from crucible.adapters.execution.k8sapi import (
+    ExecResult,
+    KubernetesApiError,
+    KubernetesUnavailableError,
+    LogFrame,
+)
 from crucible.adapters.execution.k8sfake import FakeKubernetesApi
 from crucible.adapters.execution.kubernetes import (
     CollectionFailedError,
@@ -41,7 +48,7 @@ from crucible.ports.execution import (
 from crucible.ports.execution import (
     CleanupPolicy as Cleanup,
 )
-from tests.unit.kubernetes_fixtures import IMAGE, build, pod_of, spec
+from tests.unit.kubernetes_fixtures import HOST_ADDRESSES, IMAGE, build, pod_of, spec
 
 CODEX_IMAGE = "crucible-worker:codex-fake-succeed-2"
 
@@ -141,6 +148,7 @@ async def test_the_probe_passes_when_the_canary_cannot_reach_the_api_server() ->
         "namespace ready",
         dns_resolves=True,
         pid_limit_source="cgroup-v2-parent",
+        canary_node="lab-node-1",
     )
     health = await provider.health()
     assert health.state == "ok"
@@ -658,6 +666,60 @@ async def test_a_second_fuller_than_the_ceiling_is_skipped_with_a_notice(
     assert all(r["limit_bytes"] <= 400 for r in api.log_reads)
 
 
+async def test_the_collection_tail_read_asks_for_bounded_lines_and_bytes() -> None:
+    """The collection path (FDY-0187) asks `pod_log` with `tailLines` only; the
+    byte cap is applied client-side, so the tail still ends with the worker's
+    last line.
+
+    This covers the Codex P2 fix: asking the API for both `tailLines` and
+    `limitBytes` can cut off the end, so we use `tailLines` only and bound
+    bytes in-process."""
+    last_line = "worker is done"
+    lines = [_stamped(0, 0, "start")]
+    lines += [_stamped(1, n, f"step {n}") for n in range(5)]
+    lines.append(_stamped(2, 0, last_line))
+    api, _registry, provider, launch, workspace = await prepared()
+    handle = await provider.launch(workspace, launch)
+    await run_to_exit(provider, handle)
+    api.log_reads.clear()
+    api.logs[f"{handle.ref}-abc12"] = lines
+    outputs = await provider.collect(handle, workspace, launch)
+    tail_entries = [r for r in api.log_reads if r["tail_lines"] is not None]
+    assert len(tail_entries) >= 1
+    for entry in tail_entries:
+        assert entry["tail_lines"] is not None
+        assert entry["limit_bytes"] is None
+    # The returned tail is at most LOG_READ_LIMIT bytes and still ends with
+    # the worker's last line.
+    assert len(outputs.stdout_tail) <= kubernetes_module.LOG_READ_LIMIT
+    assert last_line in outputs.stdout_tail
+
+
+async def test_the_collection_tail_preserves_the_last_line_when_2000_lines_exceed_the_limit() -> (
+    None
+):
+    """When the last 2000 lines (JOB_TAIL_LINES) exceed ``LOG_READ_LIMIT``,
+    the client-side bound still preserves the end of the output."""
+    last_line = "final step complete"
+    # Generate enough lines so the tail exceeds LOG_READ_LIMIT bytes.
+    # Each stamped line is roughly 40-50 bytes.
+    lines = [_stamped(0, 0, "start")]
+    for s in range(1, 100):
+        for n in range(50):
+            lines.append(_stamped(s, n, f"line {s}.{n} " + "x" * 20))
+    lines.append(_stamped(99, 49, last_line))
+    api, _registry, provider, launch, workspace = await prepared()
+    handle = await provider.launch(workspace, launch)
+    await run_to_exit(provider, handle)
+    api.log_reads.clear()
+    api.logs[f"{handle.ref}-abc12"] = lines
+    outputs = await provider.collect(handle, workspace, launch)
+    # The collected tail is bounded by LOG_READ_LIMIT bytes.
+    assert len(outputs.stdout_tail) <= kubernetes_module.LOG_READ_LIMIT
+    # The very last line survives the client-side bound.
+    assert last_line in outputs.stdout_tail
+
+
 # ----- reconcile (10, 26) --------------------------------------------------
 
 
@@ -850,6 +912,59 @@ async def test_an_adopted_attempt_records_its_node() -> None:
     document = json.loads(evidence.content)
     assert document["pod"] == f"{handle.ref}-abc12"
     assert document["node"] == "lab-node-1"
+
+
+async def test_the_launch_evidence_records_the_node_the_canary_measured() -> None:
+    """The launch evidence records the node the namespace-scope canary ran on."""
+    _api, _registry, provider, launch, workspace = await prepared()
+    # Ensure the canary probe passes so a launch can proceed.
+    await provider.ensure_ready()
+    handle = await provider.launch(workspace, launch)
+    await run_to_exit(provider, handle)
+    outputs = await provider.collect(handle, workspace, launch)
+    # Check the launch evidence artifact.
+    evidence = next(a for a in outputs.artifacts if a.name == "report/kubernetes-launch.json")
+    document = json.loads(evidence.content)
+    assert document["canary_node"] == "lab-node-1"
+    # Check the health checks.
+    health = await provider.health()
+    assert health.checks["canary_node"] == "lab-node-1"
+
+
+async def test_the_launch_evidence_records_the_node_when_endpoint_plan_fails() -> None:
+    """The endpoint-plan branch that cannot create a NetworkPolicy still records
+    canary_node from the namespace canary."""
+
+    def resolver(host: str) -> list[str]:
+        if host == "llm.example.local":
+            return []  # Force the local endpoint to not resolve
+        return HOST_ADDRESSES.get(host, [])
+
+    _, registry, provider = build(
+        resolver=resolver,
+        config=KubernetesConfig(
+            poll_interval_seconds=0,
+            launch_timeout_seconds=5,
+            local_endpoint_url="https://llm.example.local/v1",
+            local_endpoint_cidrs=("10.10.0.0/24",),
+        ),
+    )
+    image = "crucible-worker:script-harness-fake-succeed-2"
+    registry.register(image, harness="script-harness", version="1.0.0")
+    launch = spec(
+        harness="script-harness",
+        image=image,
+        endpoint="subscription",
+    )
+    workspace = await provider.prepare(launch)
+    handle = await provider.launch(workspace, launch)
+    await run_to_exit(provider, handle)
+    outputs = await provider.collect(handle, workspace, launch)
+    evidence = next(a for a in outputs.artifacts if a.name == "report/kubernetes-launch.json")
+    document = json.loads(evidence.content)
+    assert document["canary_node"] == "lab-node-1"
+    health = await provider.health()
+    assert health.checks["canary_node"] == "lab-node-1"
 
 
 def _record_deletes(api: FakeKubernetesApi) -> list[tuple[str, str, int | None]]:
@@ -1876,3 +1991,190 @@ async def test_attempts_of_one_repository_prepared_together_share_one_refresh() 
     jobs = [c["name"] for c in api.created if c["kind"] == "jobs"]
     assert len([n for n in jobs if n.startswith("refresh-cache-")]) == 1
     assert len([n for n in jobs if n.startswith("prepare-")]) == 2
+
+
+@pytest.fixture
+def retry_clock(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    now = 0.0
+    sleeps: list[float] = []
+
+    async def sleep(seconds: float) -> None:
+        nonlocal now
+        sleeps.append(seconds)
+        now += seconds
+
+    monkeypatch.setattr(kubernetes_module, "time", SimpleNamespace(monotonic=lambda: now))
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    return sleeps
+
+
+def refused_connection() -> KubernetesApiError:
+    error = KubernetesUnavailableError(0, "connection failed")
+    error.__cause__ = ConnectionRefusedError(111, "refused")
+    return error
+
+
+async def test_a_refused_connection_at_prepare_is_retried_then_succeeds(
+    retry_clock: list[float],
+) -> None:
+    api, _, provider = build()
+    api.fail_next("create", 2, kind="persistentvolumeclaims", error=refused_connection())
+    workspace = await provider.prepare(spec())
+    assert workspace.started_from
+    assert api.create_attempts.count("persistentvolumeclaims") == 3
+    assert retry_clock == [1, 2]
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 409, 422, 429])
+async def test_a_4xx_at_prepare_is_not_retried(
+    retry_clock: list[float],
+    status: int,
+) -> None:
+    api, _, provider = build()
+    error = KubernetesApiError(status, "refusal")
+    api.fail_next("create", kind="persistentvolumeclaims", error=error)
+    with pytest.raises(KubernetesApiError) as caught:
+        await provider.prepare(spec())
+    assert caught.value is error
+    assert api.create_attempts.count("persistentvolumeclaims") == 1
+    assert retry_clock == []
+
+
+async def test_the_retry_deadline_reraises_the_last_transport_error(
+    retry_clock: list[float],
+) -> None:
+    api, _, provider = build()
+    provider.config = replace(provider.config, api_retry_seconds=40)
+    first, last = refused_connection(), refused_connection()
+    api.fail_next("get", error=first)
+    api.fail_next("get", 20, error=last)
+    with pytest.raises(KubernetesApiError) as caught:
+        await provider._call_with_backoff(api.get, "pods", "missing")
+    assert caught.value is last
+    assert retry_clock == [1, 2, 4, 8, 16, 9]
+
+
+async def test_launch_retries_the_worker_job_create_on_a_503(
+    retry_clock: list[float],
+) -> None:
+    api, _, provider = build()
+    launch = spec()
+    workspace = await provider.prepare(launch)
+    before = api.create_attempts.count("jobs")
+    api.fail_next("create", kind="jobs")
+    handle = await provider.launch(workspace, launch)
+    assert handle.ref.startswith("worker-")
+    assert api.create_attempts.count("jobs") - before == 2
+    assert retry_clock == [1]
+
+
+@pytest.mark.parametrize("operation,kind", [("create", "pods"), ("pod_exec", "")])
+async def test_prepared_head_reader_retries_transport_failures(
+    retry_clock: list[float],
+    operation: str,
+    kind: str,
+) -> None:
+    api, _, provider = build()
+    await provider._resolve_image(spec())
+    assert (await provider.ensure_ready()).passed
+    api.fail_next(operation, 2, kind=kind, error=refused_connection())
+    workspace = await provider.prepare(spec())
+    assert workspace.started_from
+    assert retry_clock == [1, 2]
+
+
+@pytest.mark.parametrize("kind", ["secrets", "pods", "jobs", "networkpolicies"])
+async def test_a_lost_create_response_is_verified_before_accepting_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+    retry_clock: list[float],
+    kind: str,
+) -> None:
+    api, _, provider = build()
+    original = FakeKubernetesApi.create
+    lost = False
+
+    def create(self: FakeKubernetesApi, resource: str, body: Mapping[str, Any]) -> dict[str, Any]:
+        nonlocal lost
+        result = original(self, resource, body)
+        if not lost:
+            lost = True
+            raise refused_connection()
+        return result
+
+    monkeypatch.setattr(FakeKubernetesApi, "create", create)
+    await provider._create_with_backoff(kind, {"metadata": {"name": "ambiguous"}})
+    assert api.create_attempts == [kind, kind]
+    assert retry_clock == [1]
+
+
+async def test_a_transport_failure_does_not_make_a_stale_object_acceptable(
+    retry_clock: list[float],
+) -> None:
+    api, _, provider = build()
+    body = {"metadata": {"name": "stale"}, "data": {"key": "old"}}
+    api.create("secrets", body)
+    api.fail_next("create", kind="secrets", error=refused_connection())
+    with pytest.raises(KubernetesApiError) as caught:
+        await provider._create_with_backoff("secrets", body)
+    assert caught.value.status == 409
+    assert retry_clock == [1]
+
+
+@pytest.mark.parametrize(
+    "status,expected",
+    [(0, False), (403, False), (429, False), (500, False), (502, True), (503, True), (504, True)],
+)
+def test_transport_classification_uses_status_not_error_text(status: int, expected: bool) -> None:
+    assert (
+        kubernetes_module.is_transport(KubernetesApiError(status, "Connection refused")) is expected
+    )
+
+
+async def test_canary_transport_exhaustion_keeps_unavailable_classification(
+    retry_clock: list[float],
+) -> None:
+    api, _, provider = build()
+    provider.config = replace(provider.config, api_retry_seconds=3)
+    await provider._resolve_image(spec())
+    api.fail_next("create", 10, kind="pods", error=refused_connection())
+    probe = await provider.ensure_ready()
+    assert not probe.passed
+    assert probe.unavailable
+    assert retry_clock == [1, 2]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ConnectionRefusedError(),
+        ConnectionResetError(),
+        socket.gaierror(),
+        TimeoutError(),
+    ],
+)
+@pytest.mark.parametrize("wrapped", [False, True])
+async def test_socket_transport_types_are_retried(
+    retry_clock: list[float],
+    error: Exception,
+    wrapped: bool,
+) -> None:
+    api, _, provider = build()
+    if wrapped:
+        outer = KubernetesUnavailableError(0, "wrapped transport")
+        outer.__cause__ = error
+        error = outer
+    api.fail_next("get", error=error)
+    api.create("secrets", {"metadata": {"name": "test"}})
+    result = await provider._call_with_backoff(api.get, "secrets", "test")
+    assert result["metadata"]["name"] == "test"
+    assert retry_clock == [1]
+
+
+async def test_explicit_zero_retry_deadline_overrides_config(retry_clock: list[float]) -> None:
+    api, _, provider = build()
+    error = refused_connection()
+    api.fail_next("get", error=error)
+    with pytest.raises(KubernetesApiError) as caught:
+        await provider._call_with_backoff(api.get, "secrets", "test", deadline_seconds=0)
+    assert caught.value is error
+    assert retry_clock == []
