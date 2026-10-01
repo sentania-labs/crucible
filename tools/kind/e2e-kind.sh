@@ -189,8 +189,10 @@ crucible_kind_wait_and_retry() {
     if [ "$attempt" -gt 0 ]; then
       echo "e2e-kind: recreating cluster (attempt 2/2)" >&2
       kind delete cluster --name "$cluster" >/dev/null 2>&1 || :
-      cluster_created=0
       node_image=$(crucible_kind_pull "$CRUCIBLE_KIND_NODE_IMAGE")
+      # Marked created before the create call so the EXIT trap deletes a cluster whose
+      # later setup step fails (Codex review of PR 326).
+      cluster_created=1
       kind create cluster --config "$scratch/kind.yaml" --kubeconfig "$kubeconfig" --wait 0s \
         --image "$node_image"
       node="${cluster}-control-plane"
@@ -330,9 +332,10 @@ KUBECONFIG="$kubeconfig" kubectl -n crucible-workers wait \
 # Required even though the real registry path below is what proves resolution and pull.
 kind load docker-image "$worker_image" --name "$cluster"
 
-# Run the full cluster setup and readiness gate; retry once if the gate fails.
-crucible_kind_wait_and_retry
-if [ $? -ne 0 ]; then
+# Run the readiness gate; retry once by recreating the cluster. The call sits inside
+# the conditional on purpose: under set -e a bare call would abort the script before
+# the infrastructure exit below (Codex review of PR 326).
+if ! crucible_kind_wait_and_retry; then
   echo "kind cluster not healthy (infrastructure)" >&2
   exit 75
 fi

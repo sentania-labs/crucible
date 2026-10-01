@@ -91,3 +91,17 @@ def test_e2e_kind_sh_has_infrastructure_message(e2e_kind_sh: Path) -> None:
     """The failure message identifies the problem as infrastructure."""
     content = e2e_kind_sh.read_text()
     assert "kind cluster not healthy (infrastructure)" in content
+
+
+def test_the_gate_call_survives_errexit(e2e_kind_sh: Path) -> None:
+    """Codex review of PR 326: a bare call under set -e never reaches exit 75."""
+    content = e2e_kind_sh.read_text()
+    assert "if ! crucible_kind_wait_and_retry; then" in content
+
+
+def test_the_gate_resolves_a_name_and_connects_on_443(cluster_sh: Path) -> None:
+    """The API serves HTTPS only, so the proof is DNS plus a TCP connect to 443."""
+    content = cluster_sh.read_text()
+    assert "nslookup kubernetes.default" in content
+    assert "443" in content
+    assert "http://${api_ip}" not in content
