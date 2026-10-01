@@ -338,6 +338,7 @@ tests/          unit (no I/O) and integration (PostgreSQL in a container, fake p
 docs/spec/      the specification, one concern per file
 docs/adr/       architectural decision records
 docs/implementation-notes/  what each phase decided where the spec was open
+docs/README.md            documentation index
 examples/       sanitized example task and release contracts, policies, and configuration
 ```
 
