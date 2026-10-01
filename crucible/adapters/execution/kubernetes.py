@@ -3457,7 +3457,7 @@ class KubernetesProvider:
         init_containers: list[dict[str, Any]] = []
         if copy is not None:
             credential_mounts, credential_volumes, init_containers = self._credential_mounts(
-                spec, copy, resolved, limits, credential_keys
+                spec, copy, resolved, limits, credential_keys, identity_paths
             )
             mounts.extend(credential_mounts)
             volumes.extend(credential_volumes)
@@ -3486,6 +3486,7 @@ class KubernetesProvider:
         image: str,
         limits: Limits,
         present: Sequence[str],
+        identity_paths: Mapping[str, str] | None = None,
     ) -> tuple[list[Mount], list[dict[str, Any]], list[dict[str, Any]]]:
         """The per-attempt credential, mounted per the adapter's declaration (12, 26).
 
@@ -3570,23 +3571,63 @@ class KubernetesProvider:
                     ],
                 }
             )
-            volumes.append(source_volume)
-        else:
-            mounts.append(Mount("cred", target, read_only=True))
-            volumes.append(source_volume)
-        for name in templates:
             # 12, 13: the Crucible-owned templates, read-only, each at its own path
             # inside the credential directory, so a worker cannot plant a hook or a
             # server definition a later worker would inherit. They come from the
             # identity bundle, so the bundle hash covers them.
-            mounts.append(
-                Mount(
-                    "identity",
-                    f"{target}/{name}",
-                    read_only=True,
-                    sub_path=f"{k8sspec.TEMPLATE_PREFIX}/{name}",
+            for name in templates:
+                mounts.append(
+                    Mount(
+                        "identity",
+                        f"{target}/{name}",
+                        read_only=True,
+                        sub_path=f"{k8sspec.TEMPLATE_PREFIX}/{name}",
+                    )
                 )
-            )
+            volumes.append(source_volume)
+        # 349: in `ro` mode the credential directory is the Secret itself,
+        # read-only. A subPath file mount inside that directory cannot be
+        # created by runc, so we build one projected volume whose sources
+        # are the Secret items plus the identity ConfigMap template items,
+        # all read-only, and mount it at `target` instead of layering a
+        # file mount over the read-only Secret.
+        elif templates and identity_paths is not None:
+            projection: dict[str, Any] = {
+                "sources": [
+                    {
+                        "secret": {
+                            "name": k8sspec.object_name("cred", spec.attempt_id),
+                            "optional": False,
+                            "items": [
+                                {
+                                    "key": _secret_key(auth.name),
+                                    "path": auth.name,
+                                    "mode": 0o400,
+                                }
+                                for auth in copy.spec.auth_files
+                                if _secret_key(auth.name) in set(present)
+                            ],
+                        }
+                    }
+                ]
+            }
+            # Add the template entries from the identity ConfigMap.
+            cm_source: dict[str, Any] = {
+                "configMap": {
+                    "name": k8sspec.object_name("identity", spec.attempt_id),
+                    "defaultMode": 0o444,
+                    "items": [
+                        {"key": k, "path": v}
+                        for k, v in sorted(identity_paths.items())
+                        if v.startswith(f"{k8sspec.TEMPLATE_PREFIX}/")
+                    ],
+                }
+            }
+            projection["sources"].append(cm_source)
+            volumes.append({"name": "cred", "projected": projection})
+            mounts.append(Mount("cred", target, read_only=True))
+        else:
+            volumes.append(source_volume)
         return mounts, volumes, init
 
     def _command(self, spec: LaunchSpec) -> tuple[list[str], dict[str, str]]:

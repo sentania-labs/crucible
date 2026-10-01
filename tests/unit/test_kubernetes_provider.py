@@ -1687,7 +1687,11 @@ async def test_a_truncated_collected_output_fails_the_attempt(monkeypatch: Any) 
 async def test_an_absent_optional_auth_file_is_not_projected() -> None:
     """A Secret projection naming a key the Secret does not carry is a Pod the kubelet
     refuses to start. Claude Code declares `.claude.json` optional, so a harness Secret
-    with only the required file is an ordinary deployment, not a broken one."""
+    with only the required file is an ordinary deployment, not a broken one.
+
+    349: in `ro` mode the credential volume is a projection that includes both the
+    Secret items (only the present key) and the identity ConfigMap template entries;
+    no subPath file mount is layered under another mount's target."""
     api, registry, provider = build(harness="claude_code")
     image = "crucible-worker:claude-fake-succeed-2"
     registry.register(image, harness="claude_code", version="2.1.277")
@@ -1701,7 +1705,12 @@ async def test_an_absent_optional_auth_file_is_not_projected() -> None:
         if row["kind"] == "jobs" and str(row["name"]).startswith("worker-")
     )
     volume = next(v for v in pod["volumes"] if v["name"] == "cred")
-    assert [item["key"] for item in volume["secret"]["items"]] == ["oauth-token"]
+    # 349: ro mode uses a projected volume; check that only the present Secret key
+    # is projected, and no absent optional key (`.claude.json`) appears.
+    src_secrets = [s for s in volume["projected"]["sources"] if "secret" in s]
+    assert len(src_secrets) == 1
+    secret_keys = [item["key"] for item in src_secrets[0]["secret"]["items"]]
+    assert secret_keys == ["oauth-token"]
 
     mount = next(m for m in pod["containers"][0]["volumeMounts"] if m["name"] == "cred")
     assert mount["readOnly"] is True
