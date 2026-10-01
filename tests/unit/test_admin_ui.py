@@ -24,6 +24,7 @@ from crucible.adapters.persistence.migrations.versions._0008_harness_adapters im
 from crucible.adapters.ui import render as ui_render
 from crucible.adapters.ui.pages import dashboard
 from crucible.adapters.ui.pages import gateway as gw_module
+from crucible.adapters.ui.pages import repositories as ui_repositories
 from crucible.adapters.ui.pages import routing_models as ui_routing_models
 from crucible.adapters.ui.pages import settings as ui_settings
 from crucible.adapters.ui.pages import tasks as tasks_mod
@@ -1989,3 +1990,72 @@ def test_routing_tier_action_keeps_numeric_pool_order(
     )
 
     assert saved == [f"pool-{n}" for n in range(11)]
+
+
+def test_repository_form_offers_stored_policy_names_as_a_select(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """hades #144: the Repositories register form renders policy_name as a select of
+    stored policy names defaulting to ``default-software``."""
+
+    sections_captured: list[dict[str, Any]] = []
+
+    def _fake_require(*args: Any, **kwargs: Any) -> tuple[Any, str]:
+        principal = SimpleNamespace(name="admin", role=Role.ADMIN)
+        return principal, "fixture-csrf"
+
+    monkeypatch.setattr(ui_repositories, "_require", _fake_require)
+
+    def _fake_page(*args: Any, sections: list[dict[str, Any]], **kwargs: Any) -> Any:
+        sections_captured.extend(sections)
+        return None
+
+    monkeypatch.setattr(ui_repositories, "_page", _fake_page)
+
+    repo_ns = SimpleNamespace(
+        name="example/repo",
+        url="https://github.com/example/repo",
+        default_branch="main",
+        policy_name="default-software",
+        installation_id=42,
+        private=False,
+        external_review_attested=False,
+    )
+
+    uow = SimpleNamespace(
+        repositories=SimpleNamespace(list_all=lambda: [repo_ns]),
+        policies=SimpleNamespace(list_names=lambda: ["audit", "default-software", "restricted"]),
+    )
+
+    ctx = SimpleNamespace(admin=object())
+
+    ui_repositories.repositories_page(
+        Request({"type": "http", "method": "GET", "path": "/ui/repositories", "headers": []}),
+        cast(Any, ctx),
+        cast(Any, uow),
+    )
+
+    # Find the "Register or update" section
+    for section in sections_captured:
+        if section.get("title") == "Register or update":
+            break
+    else:
+        raise AssertionError("Register or update section not found")
+
+    fields = section["form"]["fields"]
+
+    # Find the policy_name field
+    policy_field = None
+    for f in fields:
+        if f.get("name") == "policy_name":
+            policy_field = f
+            break
+
+    assert policy_field is not None, "policy_name field not found"
+    assert policy_field["kind"] == "select"
+    assert policy_field["value"] == "default-software"
+    assert policy_field["options"] == [
+        ("audit", "audit"),
+        ("default-software", "default-software"),
+        ("restricted", "restricted"),
+    ]
