@@ -3,7 +3,8 @@
 # worker-side timeouts: the disposable registry and the local-path provisioner are slower
 # than a lab cluster on the first pull, and a task that is still pulling is not a stall.
 # The kind tier drives the script harness, a test fixture a real deployment never shows or
-# routes to (crucible#124), so this overlay turns the fixtures on.
+# routes to (crucible#124), so this overlay turns the fixtures on. Times on the kind
+# proofs are read in the lab's local zone, so this overlay renders America/Chicago.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -16,3 +17,4 @@ data:
   CRUCIBLE_SUPERVISOR__TICK_SECONDS: "2"
   CRUCIBLE_SUPERVISOR__HOLDER: crucible-kind
   CRUCIBLE_TEST_FIXTURES: "true"
+  CRUCIBLE_SERVICE__RENDER_TIMEZONE: America/Chicago
