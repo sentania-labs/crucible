@@ -8,6 +8,7 @@ from crucible.adapters.ui.router import router
 FROZEN_ROUTES = [
     ("GET", "/ui"),
     ("GET", "/ui/audit"),
+    ("GET", "/ui/board"),
     ("GET", "/ui/bootstrap"),
     ("GET", "/ui/bootstrap/{import_id}"),
     ("GET", "/ui/credentials"),

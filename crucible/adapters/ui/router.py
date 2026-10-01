@@ -5,6 +5,7 @@ from fastapi import APIRouter
 from crucible.adapters.ui import actions, session
 from crucible.adapters.ui.pages import (
     audit,
+    board,
     bootstrap,
     credentials,
     dashboard,
@@ -27,6 +28,7 @@ router = APIRouter(prefix="/ui", include_in_schema=False)
 # Keep the prefixed APIRoutes flat, including the dashboard at exactly /ui.
 router.routes.extend(session.router.routes)
 router.routes.extend(dashboard.router.routes)
+router.routes.extend(board.router.routes)
 router.routes.extend(harnesses.router.routes)
 router.routes.extend(credentials.router.routes)
 router.routes.extend(gateway.router.routes)

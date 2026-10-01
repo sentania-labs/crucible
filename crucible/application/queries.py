@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -66,6 +67,82 @@ from crucible.ports.repository import UnitOfWork
 
 DEFAULT_LIMIT = 50
 MAX_LIMIT = 200
+
+
+def board_batch_records(
+    uow: UnitOfWork,
+    task_versions: dict[str, int],
+    pull_request_ids: list[str],
+) -> tuple[dict[str, dict[str, Any]], dict[str, list[dict[str, str]]], dict[str, str]]:
+    """Board-only bulk reads for records whose repository ports expose only per-parent reads.
+
+    SQL unit-of-work implementations expose their transaction session. Unit fakes do not,
+    so the fallback deliberately uses the public repositories. Keeping this here makes the
+    production page three reads regardless of its row count without adding a write-side port.
+    """
+    session = getattr(uow, "session", None)
+    if session is None:
+        contracts = {}
+        for task_id, version in task_versions.items():
+            row = uow.contracts.get(task_id, version)
+            contracts[task_id] = row.document if row else {}
+        comment_groups = {
+            pr_id: [
+                {
+                    "id": row.id,
+                    "login": row.login,
+                    "body": row.body,
+                    "body_sha256": row.body_sha256,
+                }
+                for row in uow.review_comments.list_for_pull_request(pr_id)
+            ]
+            for pr_id in pull_request_ids
+        }
+        all_comments = [row for rows in comment_groups.values() for row in rows]
+        dispositions = {
+            row.review_comment_id: row.disposition.value
+            for row in uow.dispositions.list_for_comments(
+                [row["id"] for row in all_comments],
+                {row["id"]: row["body_sha256"] for row in all_comments},
+            )
+        }
+        return contracts, comment_groups, dispositions
+    connection = session.connection()
+    contract_rows = connection.exec_driver_sql(
+        "SELECT task_id, version, document FROM task_contracts WHERE task_id = ANY(%(task_ids)s)",
+        {"task_ids": list(task_versions)},
+    ).mappings()
+    contracts = {
+        str(row["task_id"]): dict(row["document"])
+        for row in contract_rows
+        if row["version"] == task_versions.get(str(row["task_id"]))
+    }
+    comment_rows = list(
+        connection.exec_driver_sql(
+            "SELECT id, pull_request_id, login, body, body_sha256 FROM review_comments "
+            "WHERE pull_request_id = ANY(%(pull_request_ids)s)",
+            {"pull_request_ids": pull_request_ids},
+        ).mappings()
+    )
+    comments: dict[str, list[dict[str, str]]] = defaultdict(list)
+    for row in comment_rows:
+        comments[str(row["pull_request_id"])].append(
+            {key: str(row[key]) for key in ("id", "login", "body", "body_sha256")}
+        )
+    comment_ids = [str(row["id"]) for row in comment_rows]
+    disposition_rows = (
+        connection.exec_driver_sql(
+            "SELECT review_comment_id, disposition FROM review_dispositions "
+            "WHERE review_comment_id = ANY(%(comment_ids)s)",
+            {"comment_ids": comment_ids},
+        ).mappings()
+        if comment_ids
+        else []
+    )
+    dispositions = {
+        str(row["review_comment_id"]): str(row["disposition"]) for row in disposition_rows
+    }
+    return contracts, dict(comments), dispositions
 
 
 def encode_cursor(value: str) -> str:
