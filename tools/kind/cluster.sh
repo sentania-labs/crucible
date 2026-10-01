@@ -187,7 +187,8 @@ crucible_kind_wait_ready() {
   # Check 4: a throwaway pod resolves the name kubernetes.default (pod DNS works, not
   # only CoreDNS's own pods) and then opens a TCP connection to the API service IP on
   # 443. The API speaks only HTTPS, so a plain http fetch can never pass; a TCP connect
-  # is the reachability proof (PR 326's own kind run and Codex review).
+  # is the reachability proof (PR 326's own kind run and Codex review). busybox nc has
+  # no -z: connecting with stdin at EOF opens the socket and exits 0 once connected.
   local api_ip
   api_ip=$(KUBECONFIG="$kubeconfig" kubectl -n default get service kubernetes -o jsonpath='{.spec.clusterIP}' 2>/dev/null)
   if [ -n "$api_ip" ]; then
@@ -198,7 +199,7 @@ crucible_kind_wait_ready() {
       --restart=Never \
       --timeout="${deadline}s" \
       --attach \
-      /bin/sh -c "nslookup kubernetes.default >/dev/null 2>&1 || exit 2; nc -z -w 5 ${api_ip} 443 >/dev/null 2>&1 || exit 1" 2>/dev/null
+      /bin/sh -c "nslookup kubernetes.default >/dev/null 2>&1 || exit 2; nc -w 5 ${api_ip} 443 </dev/null >/dev/null 2>&1 || exit 1" 2>/dev/null
     local rc=$?
     KUBECONFIG="$kubeconfig" kubectl delete pod "$check_pod" --ignore-not-found >/dev/null 2>&1 || :
     if [ "$rc" -eq 2 ]; then
