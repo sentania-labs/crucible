@@ -52,35 +52,35 @@
 
 | File | Purpose |
 | --- | --- |
-| [`0001-modular-monolith-python.md`](adr/0001-modular-monolith-python.md) | ADR 0001: Modular monolith in typed Python |
-| [`0002-fastapi-pydantic-sqlalchemy-alembic.md`](adr/0002-fastapi-pydantic-sqlalchemy-alembic.md) | ADR 0002: FastAPI, Pydantic v2, SQLAlchemy 2, Alembic, pytest |
-| [`0003-postgres-authoritative.md`](adr/0003-postgres-authoritative.md) | ADR 0003: PostgreSQL is the only authoritative state |
-| [`0004-docker-socket-proxy.md`](adr/0004-docker-socket-proxy.md) | ADR 0004: Rootless Docker daemon preferred; restricted socket proxy in front of whichever daemon is used |
-| [`0005-container-is-the-boundary.md`](adr/0005-container-is-the-boundary.md) | ADR 0005: The execution environment is the security boundary; harness sandboxes are defense in depth |
-| [`0006-sqlite-bootstrap-ledger.md`](adr/0006-sqlite-bootstrap-ledger.md) | ADR 0006: SQLite bootstrap ledger for Foundry until handoff |
-| [`0007-github-app-and-crucible-owned-mutations.md`](adr/0007-github-app-and-crucible-owned-mutations.md) | ADR 0007: GitHub App authentication; Crucible owns all routine GitHub mutations; workers hold no GitHub credential |
-| [`0008-external-review-bounded.md`](adr/0008-external-review-bounded.md) | ADR 0008: External review is a bounded quality input, not a consensus loop |
-| [`0009-ci-certification-escalates.md`](adr/0009-ci-certification-escalates.md) | ADR 0009: Pre-PR verification is the proof; PR CI is certification; a required failure escalates |
-| [`0010-release-by-contract-and-tag.md`](adr/0010-release-by-contract-and-tag.md) | ADR 0010: Releases happen only through an operator-authorized release contract; Crucible tags, the repository's workflow releases |
-| [`0011-harness-version-pinning-and-promotion.md`](adr/0011-harness-version-pinning-and-promotion.md) | ADR 0011: Harness versions are pinned per image, recorded per attempt, and promoted explicitly |
-| [`0012-admin-api-and-cli-share-services.md`](adr/0012-admin-api-and-cli-share-services.md) | ADR 0012: Administration is a versioned admin API and a CLI on the same application services; no web UI before readiness |
-| [`0013-postgresql-only-transport.md`](adr/0013-postgresql-only-transport.md) | ADR 0013: PostgreSQL is the only transport; no Redis or broker until measured need |
-| [`0014-quota-observation.md`](adr/0014-quota-observation.md) | ADR 0014: Subscription quota is observed through a pinned third-party reader, and is advisory only |
-| [`0015-service-owns-harness-credential-secrets.md`](adr/0015-service-owns-harness-credential-secrets.md) | ADR 0015: On Kubernetes the service owns the harness credential Secrets, and the UI logs the harnesses in |
-| [`0016-first-run-token-never-logged.md`](adr/0016-first-run-token-never-logged.md) | ADR 0016: The first-run administrator token is delivered to a Secret or a private file, never to a log |
-| [`0017-service-owns-the-github-app-credential.md`](adr/0017-service-owns-the-github-app-credential.md) | ADR 0017: The service owns the GitHub App credential, and the UI connects the App |
-| [`0018-per-harness-image-promotion.md`](adr/0018-per-harness-image-promotion.md) | ADR 0018: Each harness has its own default worker image |
-| [`0019-private-checkout-through-the-github-app.md`](adr/0019-private-checkout-through-the-github-app.md) | ADR 0019: A private repository is cloned with a read-only GitHub App token |
-| [`0020-project-toolchain-in-the-worker-image.md`](adr/0020-project-toolchain-in-the-worker-image.md) | ADR 0020: A project's check toolchain rides in the worker image; its dependencies come from PyPI at run time |
-| [`0021-enabling-a-harness-is-an-administrators-decision.md`](adr/0021-enabling-a-harness-is-an-administrators-decision.md) | ADR 0021: Enabling a harness is an administrator's decision; configuration is the default |
-| [`0022-kubernetes-publisher.md`](adr/0022-kubernetes-publisher.md) | ADR 0022: On Kubernetes, the publisher is a Job and its token a per-push Secret |
-| [`0024-review-is-the-enforcement.md`](adr/0024-review-is-the-enforcement.md) | ADR 0024: The review is the enforcement; paperwork gates are advisory |
-| [`0025-the-delivery-half-always-has-a-way-out.md`](adr/0025-the-delivery-half-always-has-a-way-out.md) | ADR 0025: The delivery half always has a way out |
-| [`0028-hermes-first-routing.md`](adr/0028-hermes-first-routing.md) | ADR 0028: Hermes first in routing; frontier by intent; demotion that recovers |
-| [`0029-discard-an-import-and-rename-a-principal.md`](adr/0029-discard-an-import-and-rename-a-principal.md) | ADR 0029: Discard a verified import, skip native tasks, rename a principal |
-| [`0030-ui-sessions-server-side.md`](adr/0030-ui-sessions-server-side.md) | ADR 0030: UI sessions are server-side |
+| [`0001-modular-monolith-python.md`](adr/0001-modular-monolith-python.md) | ADR 0001: Modular monolith in typed Python. Status: proposed. |
+| [`0002-fastapi-pydantic-sqlalchemy-alembic.md`](adr/0002-fastapi-pydantic-sqlalchemy-alembic.md) | ADR 0002: FastAPI, Pydantic v2, SQLAlchemy 2, Alembic, pytest. Status: proposed. |
+| [`0003-postgres-authoritative.md`](adr/0003-postgres-authoritative.md) | ADR 0003: PostgreSQL is the only authoritative state. Status: proposed. |
+| [`0004-docker-socket-proxy.md`](adr/0004-docker-socket-proxy.md) | ADR 0004: Rootless Docker daemon preferred; restricted socket proxy in front of whichever daemon is used. Status: accepted. |
+| [`0005-container-is-the-boundary.md`](adr/0005-container-is-the-boundary.md) | ADR 0005: The execution environment is the security boundary; harness sandboxes are defense in depth. Status: proposed. |
+| [`0006-sqlite-bootstrap-ledger.md`](adr/0006-sqlite-bootstrap-ledger.md) | ADR 0006: SQLite bootstrap ledger for Foundry until handoff. Status: accepted. |
+| [`0007-github-app-and-crucible-owned-mutations.md`](adr/0007-github-app-and-crucible-owned-mutations.md) | ADR 0007: GitHub App authentication; Crucible owns all routine GitHub mutations; workers hold no GitHub credential. Status: accepted. |
+| [`0008-external-review-bounded.md`](adr/0008-external-review-bounded.md) | ADR 0008: External review is a bounded quality input, not a consensus loop. Status: accepted. |
+| [`0009-ci-certification-escalates.md`](adr/0009-ci-certification-escalates.md) | ADR 0009: Pre-PR verification is the proof; PR CI is certification; a required failure escalates. Status: accepted. |
+| [`0010-release-by-contract-and-tag.md`](adr/0010-release-by-contract-and-tag.md) | ADR 0010: Releases happen only through an operator-authorized release contract; Crucible tags, the repository's workflow releases. Status: accepted. |
+| [`0011-harness-version-pinning-and-promotion.md`](adr/0011-harness-version-pinning-and-promotion.md) | ADR 0011: Harness versions are pinned per image, recorded per attempt, and promoted explicitly. Status: accepted. |
+| [`0012-admin-api-and-cli-share-services.md`](adr/0012-admin-api-and-cli-share-services.md) | ADR 0012: Administration is a versioned admin API and a CLI on the same application services; no web UI before readiness. Status: accepted. |
+| [`0013-postgresql-only-transport.md`](adr/0013-postgresql-only-transport.md) | ADR 0013: PostgreSQL is the only transport; no Redis or broker until measured need. Status: accepted. |
+| [`0014-quota-observation.md`](adr/0014-quota-observation.md) | ADR 0014: Subscription quota is observed through a pinned third-party reader, and is advisory only. Status: rejected. |
+| [`0015-service-owns-harness-credential-secrets.md`](adr/0015-service-owns-harness-credential-secrets.md) | ADR 0015: On Kubernetes the service owns the harness credential Secrets, and the UI logs the harnesses in. Status: accepted. |
+| [`0016-first-run-token-never-logged.md`](adr/0016-first-run-token-never-logged.md) | ADR 0016: The first-run administrator token is delivered to a Secret or a private file, never to a log. Status: accepted. |
+| [`0017-service-owns-the-github-app-credential.md`](adr/0017-service-owns-the-github-app-credential.md) | ADR 0017: The service owns the GitHub App credential, and the UI connects the App. Status: accepted. |
+| [`0018-per-harness-image-promotion.md`](adr/0018-per-harness-image-promotion.md) | ADR 0018: Each harness has its own default worker image. Status: accepted. |
+| [`0019-private-checkout-through-the-github-app.md`](adr/0019-private-checkout-through-the-github-app.md) | ADR 0019: A private repository is cloned with a read-only GitHub App token. Status: accepted. |
+| [`0020-project-toolchain-in-the-worker-image.md`](adr/0020-project-toolchain-in-the-worker-image.md) | ADR 0020: A project's check toolchain rides in the worker image; its dependencies come from PyPI at run time. Status: accepted. |
+| [`0021-enabling-a-harness-is-an-administrators-decision.md`](adr/0021-enabling-a-harness-is-an-administrators-decision.md) | ADR 0021: Enabling a harness is an administrator's decision; configuration is the default. Status: accepted. |
+| [`0022-kubernetes-publisher.md`](adr/0022-kubernetes-publisher.md) | ADR 0022: On Kubernetes, the publisher is a Job and its token a per-push Secret. Status: accepted. |
+| [`0024-review-is-the-enforcement.md`](adr/0024-review-is-the-enforcement.md) | ADR 0024: The review is the enforcement; paperwork gates are advisory. Status: accepted. |
+| [`0025-the-delivery-half-always-has-a-way-out.md`](adr/0025-the-delivery-half-always-has-a-way-out.md) | ADR 0025: The delivery half always has a way out. Status: accepted. |
+| [`0028-hermes-first-routing.md`](adr/0028-hermes-first-routing.md) | ADR 0028: Hermes first in routing; frontier by intent; demotion that recovers. Status: accepted. |
+| [`0029-discard-an-import-and-rename-a-principal.md`](adr/0029-discard-an-import-and-rename-a-principal.md) | ADR 0029: Discard a verified import, skip native tasks, rename a principal. Status: accepted. |
+| [`0030-ui-sessions-server-side.md`](adr/0030-ui-sessions-server-side.md) | ADR 0030: UI sessions are server-side. Status: accepted. |
 
-**History** -- Implementation notes and spikes.
+**History** -- Phase notes, the closest thing to a changelog, and spikes.
 
 | File | Purpose |
 | --- | --- |
