@@ -480,9 +480,17 @@ class FakeKubernetesApi:
         timestamps: bool = True,
         timeout: float | None = None,
         limit_bytes: int | None = None,
+        tail_lines: int | None = None,
     ) -> list[LogFrame]:
         self._outage("pod_log", "pods")
-        self.log_reads.append({"name": name, "since_time": since_time, "limit_bytes": limit_bytes})
+        self.log_reads.append(
+            {
+                "name": name,
+                "since_time": since_time,
+                "limit_bytes": limit_bytes,
+                "tail_lines": tail_lines,
+            }
+        )
         lines = self.logs.get(name, [])
         if not timestamps:
             # Worker lines carry the API server's timestamp prefix in this fake. The
@@ -502,6 +510,10 @@ class FakeKubernetesApi:
             floor = parse_rfc3339(since_time).replace(microsecond=0)
             lines = [line for line in lines if _line_time(line) >= floor]
         payload = ("\n".join(lines) + "\n").encode("utf-8") if lines else b""
+        if tail_lines is not None:
+            # Keep only the last N lines before applying the byte cap.
+            lines = lines[-tail_lines:]
+            payload = ("\n".join(lines) + "\n").encode("utf-8") if lines else b""
         if limit_bytes is not None:
             # `limitBytes` stops the stream where it lands, mid-line included.
             payload = payload[:limit_bytes]

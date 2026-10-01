@@ -659,6 +659,60 @@ async def test_a_second_fuller_than_the_ceiling_is_skipped_with_a_notice(
     assert all(r["limit_bytes"] <= 400 for r in api.log_reads)
 
 
+async def test_the_collection_tail_read_asks_for_bounded_lines_and_bytes() -> None:
+    """The collection path (FDY-0187) asks `pod_log` with `tailLines` only; the
+    byte cap is applied client-side, so the tail still ends with the worker's
+    last line.
+
+    This covers the Codex P2 fix: asking the API for both `tailLines` and
+    `limitBytes` can cut off the end, so we use `tailLines` only and bound
+    bytes in-process."""
+    last_line = "worker is done"
+    lines = [_stamped(0, 0, "start")]
+    lines += [_stamped(1, n, f"step {n}") for n in range(5)]
+    lines.append(_stamped(2, 0, last_line))
+    api, _registry, provider, launch, workspace = await prepared()
+    handle = await provider.launch(workspace, launch)
+    await run_to_exit(provider, handle)
+    api.log_reads.clear()
+    api.logs[f"{handle.ref}-abc12"] = lines
+    outputs = await provider.collect(handle, workspace, launch)
+    tail_entries = [r for r in api.log_reads if r["tail_lines"] is not None]
+    assert len(tail_entries) >= 1
+    for entry in tail_entries:
+        assert entry["tail_lines"] is not None
+        assert entry["limit_bytes"] is None
+    # The returned tail is at most LOG_READ_LIMIT bytes and still ends with
+    # the worker's last line.
+    assert len(outputs.stdout_tail) <= kubernetes_module.LOG_READ_LIMIT
+    assert last_line in outputs.stdout_tail
+
+
+async def test_the_collection_tail_preserves_the_last_line_when_2000_lines_exceed_the_limit() -> (
+    None
+):
+    """When the last 2000 lines (JOB_TAIL_LINES) exceed ``LOG_READ_LIMIT``,
+    the client-side bound still preserves the end of the output."""
+    last_line = "final step complete"
+    # Generate enough lines so the tail exceeds LOG_READ_LIMIT bytes.
+    # Each stamped line is roughly 40-50 bytes.
+    lines = [_stamped(0, 0, "start")]
+    for s in range(1, 100):
+        for n in range(50):
+            lines.append(_stamped(s, n, f"line {s}.{n} " + "x" * 20))
+    lines.append(_stamped(99, 49, last_line))
+    api, _registry, provider, launch, workspace = await prepared()
+    handle = await provider.launch(workspace, launch)
+    await run_to_exit(provider, handle)
+    api.log_reads.clear()
+    api.logs[f"{handle.ref}-abc12"] = lines
+    outputs = await provider.collect(handle, workspace, launch)
+    # The collected tail is bounded by LOG_READ_LIMIT bytes.
+    assert len(outputs.stdout_tail) <= kubernetes_module.LOG_READ_LIMIT
+    # The very last line survives the client-side bound.
+    assert last_line in outputs.stdout_tail
+
+
 # ----- reconcile (10, 26) --------------------------------------------------
 
 
