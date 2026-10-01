@@ -57,9 +57,8 @@ def test_the_workflow_runs_the_shards_and_not_main() -> None:
     assert "green" not in document["jobs"], (
         "no job judges the other jobs; Hades certifies every run"
     )
-    branches = document[True]["push"]["branches"]  # `on` parses as the boolean True
-    assert "!main" in branches
-    cache = yaml.safe_load((ROOT / ".github" / "workflows" / "main-cache.yml").read_text())
-    assert cache[True]["push"]["branches"] == ["main"]
-    steps = cache["jobs"]["images"]["steps"]
+    on = document[True]  # `on` parses as the boolean True
+    assert on["push"]["branches"] == ["**"], "every branch, main included; no merge queue"
+    assert "merge_group" not in on
+    steps = document["jobs"]["images"]["steps"]
     assert any("cache/save" in str(step.get("uses")) for step in steps)

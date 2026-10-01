@@ -18,8 +18,8 @@ The project is Hades (the package, CLIs and images still say `crucible`).
    happens before the PR opens (the orchestrator's review of the worker's
    branch). Codex reviews every PR once, automatically, and its findings get
    a disposition (fix, or an explanation) before merge; Codex is not
-   re-requested after a fix. Merges go through the merge queue on `main` and
-   are squashed; do not push to `main` directly.
+   re-requested after a fix. Hades squash-merges the certified head; there is no
+   merge queue. Do not push to `main` directly.
 
 ## Kubernetes manifests
 
@@ -73,5 +73,6 @@ line). A new kind test goes into one of those files, balanced by how long it run
 `tests/unit/test_kind_shards.py` fails when a test is in no shard or in two. Locally
 `make e2e-kind` still runs the whole file; `CRUCIBLE_E2E_KIND_SHARD=2 make e2e-kind`
 runs one shard. Every test's time is in the job log (`--durations=0`), which is the
-data for rebalancing. A queue merge lands the exact commit the merge-group run proved,
-so main itself does not run CI on push; `main-cache.yml` is the one run main keeps, building the images from scratch and saving the BuildKit cache branches restore.
+data for rebalancing. CI runs on every push, main included: the run on main proves the
+squashed result and builds the images from scratch, saving the BuildKit cache branches
+restore.
