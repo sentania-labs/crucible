@@ -46,6 +46,7 @@ from crucible.contracts.api import (
     WakeList,
     WakeView,
 )
+from crucible.contracts.evidence import ROLE_COMPLETION_CLAIM
 from crucible.domain.entities import (
     AcceptanceResult,
     Artifact,
@@ -836,11 +837,21 @@ def attempt_report(uow: UnitOfWork, attempt_id: str) -> CompletionClaimView:
     claim = uow.claims.get(attempt_id)
     if claim is None:
         raise NotFoundError(f"attempt {attempt_id} has no parsed report")
+    # Find the completion_claim evidence to carry filled_by_crucible and differences.
+    filled_by_crucible: list[str] = []
+    differences: list[dict[str, Any]] = []
+    for rec in uow.evidence.list_for_attempt(attempt_id):
+        if rec.payload.get("role") == ROLE_COMPLETION_CLAIM:
+            filled_by_crucible = list(rec.payload.get("filled_by_crucible", []))
+            differences = [dict(d) for d in rec.payload.get("differences", [])]
+            break
     return CompletionClaimView(
         attempt_id=attempt_id,
         parsed_ok=claim.parsed_ok,
         parse_errors=claim.parse_errors,
         document=claim.document,
+        filled_by_crucible=filled_by_crucible,
+        differences=differences,
     )
 
 
