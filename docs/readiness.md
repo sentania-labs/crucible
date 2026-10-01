@@ -8,9 +8,9 @@ is **proven** only when a run of the named tests exists and its result can be na
 here. A row whose asked-for proof does not exist, or exists only as a test nobody has
 run, is **unproven**, and the gap is named exactly in the section below the tables.
 
-One of the twenty-four rows is unproven. Row 18 is deliberately held back for
-the operator's explicit go because it transfers authority from the real Foundry
-ledger.
+Every row is proven. Row 18 was held back until the operator's explicit go, because
+it transfers authority from the real Foundry ledger; that go came on 2026-09-29 and
+item 6 below records the handoff.
 
 ## What was run for this report
 
