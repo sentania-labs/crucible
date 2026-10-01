@@ -105,6 +105,10 @@ class PolicyRepository(Protocol):
 
     def list_versions(self, name: str) -> Sequence[Policy]: ...
 
+    def list_names(self) -> Sequence[str]:
+        """Distinct policy names sorted."""
+        ...
+
     def is_referenced(self, name: str, version: int) -> bool:
         """True once a task names this version; a referenced version is immutable (05b)."""
         ...
