@@ -4,8 +4,11 @@ that is full, without losing an attempt or waiting in silence (lab findings of
 
 from __future__ import annotations
 
+import asyncio
 import json
+import ssl
 import time
+from http.client import BadStatusLine
 from typing import Any
 
 import pytest
@@ -53,6 +56,38 @@ async def _codex(**build_kwargs: Any) -> Any:
 
 
 # ----- one failed look is not an answer ------------------------------------
+
+
+@pytest.mark.parametrize(
+    "cause",
+    [ssl.SSLError("handshake failed"), BadStatusLine("malformed response")],
+    ids=["wrapped_ssl_error", "wrapped_http_parsing_error"],
+)
+async def test_a_wrapped_transport_error_at_prepare_retries_under_the_budget(
+    monkeypatch: pytest.MonkeyPatch, cause: Exception
+) -> None:
+    elapsed = 0.0
+    sleeps: list[float] = []
+
+    async def sleep(seconds: float) -> None:
+        nonlocal elapsed
+        sleeps.append(seconds)
+        elapsed += seconds
+
+    monkeypatch.setattr(time, "monotonic", lambda: elapsed)
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    api, _registry, provider = build(
+        config=KubernetesConfig(poll_interval_seconds=0, api_retry_seconds=4)
+    )
+    error = KubernetesUnavailableError(0, "the API server connection failed")
+    error.__cause__ = cause
+    api.fail_next("create", 2, kind="persistentvolumeclaims", error=error)
+
+    workspace = await provider.prepare(spec())
+
+    assert workspace.started_from
+    assert api.create_attempts.count("persistentvolumeclaims") == 3
+    assert sleeps == [1, 2]
 
 
 async def test_a_reader_pod_that_the_api_server_hiccups_on_still_comes_up() -> None:

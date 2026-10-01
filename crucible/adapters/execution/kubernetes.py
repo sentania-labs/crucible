@@ -51,6 +51,7 @@ from crucible.adapters.execution import k8sspec, scripts, workspace
 from crucible.adapters.execution.collected import read_outputs, read_verifications
 from crucible.adapters.execution.create_policy import image_allowed
 from crucible.adapters.execution.k8sapi import (
+    _TRANSPORT_ERRORS,
     ExecResult,
     KubernetesApiError,
     KubernetesClient,
@@ -138,9 +139,7 @@ def is_transport(exc: BaseException) -> bool:
         if exc.status:
             return exc.status in (502, 503, 504)
         return exc.__cause__ is not None and is_transport(exc.__cause__)
-    return isinstance(
-        exc, (ConnectionRefusedError, ConnectionResetError, socket.gaierror, TimeoutError)
-    )
+    return isinstance(exc, _TRANSPORT_ERRORS)
 
 
 def _inside_declared_network(
