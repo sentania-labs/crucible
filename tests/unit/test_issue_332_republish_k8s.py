@@ -14,6 +14,8 @@ from typing import Any
 
 import pytest
 
+from crucible.application.errors import TransitionNotAllowedError
+from crucible.application.publish import _claim_gone
 from crucible.application.republish import republish_task
 from crucible.contracts.api import PublishRetryRequest
 from crucible.contracts.evidence import EvidenceKind
@@ -455,3 +457,67 @@ def test_k8s_republish_increments_retry_number() -> None:
     publishing_event = uow._events[-1]
     assert publishing_event.kind == EventKind.TASK_PUBLISHING.value
     assert publishing_event.payload["retry_number"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Tests: claim-gone fail_publish path (correction)
+# ---------------------------------------------------------------------------
+
+
+def test_claim_gone_fail_publish_no_republish_link() -> None:
+    """When the failure step is bundle-seal and the claim is gone,
+    fail_publish must not create a republish link."""
+
+    assert _claim_gone("bundle-seal", "the workspace claim is gone")
+    assert _claim_gone("bundle-seal", "no branch bundle on the workspace claim")
+    assert not _claim_gone("bundle-seal", "the branch bundle has no recorded sha256 seal")
+    assert not _claim_gone("publish-leaf", "the workspace claim is gone")
+    assert not _claim_gone("plan", "some other failure")
+
+
+def test_claim_gone_republish_refused_without_retry_consumption() -> None:
+    """When the previous failure was a bundle-seal / claim-gone failure,
+    republish must refuse immediately without consuming a retry.
+
+    This confirms the correction: republish does not decrement the retry
+    budget when the bundle is genuinely gone.
+    """
+    uow = _MockUow()
+    _add_k8s_task(uow)
+    # Mark the publish_failed event as a bundle-seal / claim-gone failure.
+    uow._events[0].payload["step"] = "bundle-seal"
+    uow._events[0].payload["detail"] = (
+        "the workspace claim 'ws-01attempts00000000000000000a' that holds the branch bundle is gone"
+    )
+    principal = Principal(
+        id="p-01",
+        name="operator",
+        role=Role.OPERATOR,
+        created_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+    with pytest.raises(
+        TransitionNotAllowedError,
+        match="republish is not possible: the workspace claim",
+    ):
+        _republish(uow, principal)
+
+    # Task should still be in PUBLISH_FAILED (no retry consumed).
+    task = uow._tasks[_TASK_ID]
+    assert task.state is TaskState.PUBLISH_FAILED
+
+
+def test_transient_failure_still_advertises_retries() -> None:
+    """An ordinary transient failure (not bundle-seal) should still
+    advertise retries normally.
+
+    This confirms the correction does not affect the ordinary transient
+    failure path.
+    """
+    assert not _claim_gone("publish", "HTTP 503 on the remote")
+    assert not _claim_gone("github", "rate limited")
+    # A bundle-seal failure without 'gone' / 'missing' is not claim-gone.
+    assert not _claim_gone(
+        "bundle-seal",
+        "the branch bundle has no recorded sha256 seal",
+    )
