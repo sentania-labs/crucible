@@ -84,7 +84,7 @@ def test_frontier_harnesses_accept_parallel_concurrency(
 
 
 def test_codex_stays_serial_until_the_renewer(client: TestClient, tokens: dict[str, str]) -> None:
-    """12: Codex declares no parallel safety (refresh-token rotation), so a cap above 1 is refused."""
+    """12: Codex declares no parallel safety (refresh-token rotation); a cap above 1 is refused."""
     document = seeded_policy()
     document["version"] = 6
     document["concurrency"]["per_harness"]["codex"] = 2
