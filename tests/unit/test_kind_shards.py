@@ -57,3 +57,7 @@ def test_the_workflow_runs_the_shards_and_not_main() -> None:
     assert "e2e-kind" in document["jobs"]["green"]["needs"]
     branches = document[True]["push"]["branches"]  # `on` parses as the boolean True
     assert "!main" in branches
+    cache = yaml.safe_load((ROOT / ".github" / "workflows" / "main-cache.yml").read_text())
+    assert cache[True]["push"]["branches"] == ["main"]
+    steps = cache["jobs"]["images"]["steps"]
+    assert any("cache/save" in str(step.get("uses")) for step in steps)

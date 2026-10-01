@@ -73,4 +73,4 @@ line). A new kind test goes into one of those files, balanced by how long it run
 `make e2e-kind` still runs the whole file; `CRUCIBLE_E2E_KIND_SHARD=2 make e2e-kind`
 runs one shard. Every test's time is in the job log (`--durations=0`), which is the
 data for rebalancing. A queue merge lands the exact commit the merge-group run proved,
-so main itself does not run CI on push.
+so main itself does not run CI on push; `main-cache.yml` is the one run main keeps, building the images from scratch and saving the BuildKit cache branches restore.

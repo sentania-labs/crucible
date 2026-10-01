@@ -6,3 +6,5 @@ tests/e2e/test_kind.py::test_a_bounded_log_read_brings_every_line_once_through_t
 tests/e2e/test_kind.py::test_a_failed_attempts_rotated_token_is_written_back_on_a_real_cluster
 tests/e2e/test_kind.py::test_per_attempt_secret_is_removed_under_every_cleanup_policy
 tests/e2e/test_kind.py::test_row_23_a_harness_the_image_does_not_declare_is_refused
+tests/e2e/test_kind.py::test_hades_191_git_pods_reach_the_address_their_policy_permits
+tests/e2e/test_kind.py::test_isolation_probes_are_refused_on_kubernetes
