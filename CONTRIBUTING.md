@@ -12,8 +12,9 @@ The project is Hades (the package, CLIs and images still say `crucible`).
    it with `make up` and exercise the change against the live API or `/ui`;
    describe in the PR what you saw working and what you could not exercise.
    Open the PR when the work is done, not to find out whether it works.
-3. Branch CI must be green (lint, scan, test, compose-smoke are required;
-   e2e-kind and images run but are not required). One internal review round
+3. Every job in the branch's CI run must succeed. Hades certifies that itself
+   from the check runs on the head; there is no gate job and the ruleset on
+   main names no required check. One internal review round
    happens before the PR opens (the orchestrator's review of the worker's
    branch). Codex reviews every PR once, automatically, and its findings get
    a disposition (fix, or an explanation) before merge; Codex is not
