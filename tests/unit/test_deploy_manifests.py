@@ -650,6 +650,16 @@ def test_the_base_config_carries_no_lab_local_endpoint_address(
         assert settings["CRUCIBLE_KUBERNETES__LOCAL_ENDPOINT_NAMESPACE"] == "", target
 
 
+def test_the_kind_overlay_renders_times_in_america_chicago(
+    rendered: dict[str, list[dict[str, Any]]],
+) -> None:
+    """hades#148: the kind proofs are read in the lab's local zone; the base stays UTC."""
+    kind = _named(rendered["overlays/kind"], "ConfigMap", "crucible-settings")["data"]
+    base = _named(rendered["base"], "ConfigMap", "crucible-settings")["data"]
+    assert kind["CRUCIBLE_SERVICE__RENDER_TIMEZONE"] == "America/Chicago"
+    assert base["CRUCIBLE_SERVICE__RENDER_TIMEZONE"] == "UTC"
+
+
 def test_every_config_allows_dns_by_the_resolvers_pods(
     rendered: dict[str, list[dict[str, Any]]],
 ) -> None:
