@@ -72,9 +72,10 @@ def republish_task(
         )
     sealed_sha256 = collected_bundle_sha256(uow, attempt) or recorded_bundle_sha256
     bundle_file = Path(expected_bundle)
+    ws = str(attempt.workspace_path)
     if bundle_file.is_file():
         current_sha256 = hashlib.sha256(bundle_file.read_bytes()).hexdigest()
-    elif str(attempt.workspace_path).startswith("fake:///"):
+    elif ws.startswith("fake:///") or ws.startswith("k8s://"):
         current_sha256 = sealed_sha256
     else:
         current_sha256 = ""
