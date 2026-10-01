@@ -184,8 +184,9 @@ crucible_kind_wait_ready() {
     failures+=("CoreDNS not Ready")
   fi
 
-  # Check 4: a throwaway pod resolves the name kubernetes.default (pod DNS works, not
-  # only CoreDNS's own pods) and then opens a TCP connection to the API service IP on
+  # Check 4: a throwaway pod resolves kubernetes.default.svc.cluster.local (pod DNS
+  # works, not only CoreDNS's own pods; the full name so busybox's resolver needs no
+  # search path) and then opens a TCP connection to the API service IP on
   # 443. The API speaks only HTTPS, so a plain http fetch can never pass; a TCP connect
   # is the reachability proof (PR 326's own kind run and Codex review). busybox nc has
   # no -z: connecting with stdin at EOF opens the socket and exits 0 once connected.
@@ -199,7 +200,7 @@ crucible_kind_wait_ready() {
       --image="$CRUCIBLE_BUSYBOX_IMAGE" \
       --image-pull-policy=IfNotPresent \
       --restart=Never \
-      -- /bin/sh -c "nslookup kubernetes.default >/dev/null 2>&1 || exit 2; nc -w 5 ${api_ip} 443 </dev/null >/dev/null 2>&1 || exit 1" >/dev/null 2>&1
+      -- /bin/sh -c "nslookup kubernetes.default.svc.cluster.local >/dev/null 2>&1 || exit 2; nc -w 5 ${api_ip} 443 </dev/null >/dev/null 2>&1 || exit 1" >/dev/null 2>&1
     # Wait for the pod to finish rather than attaching: an attach to a container that
     # has already exited reports a failure of its own. On any failure, say what the
     # pod saw before it is deleted, so the job log explains the gate.

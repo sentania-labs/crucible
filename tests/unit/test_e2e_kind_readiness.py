@@ -102,6 +102,6 @@ def test_the_gate_call_survives_errexit(e2e_kind_sh: Path) -> None:
 def test_the_gate_resolves_a_name_and_connects_on_443(cluster_sh: Path) -> None:
     """The API serves HTTPS only, so the proof is DNS plus a TCP connect to 443."""
     content = cluster_sh.read_text()
-    assert "nslookup kubernetes.default" in content
+    assert "nslookup kubernetes.default.svc.cluster.local" in content
     assert "443" in content
     assert "http://${api_ip}" not in content
