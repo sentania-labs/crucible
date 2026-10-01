@@ -63,3 +63,14 @@ Each worker creates and drops its own database using `worker_database_name`;
 a serial run uses one container and one database. `CRUCIBLE_TEST_DATABASE_URL`
 uses an existing server instead, with the same database isolation and without
 starting or stopping a container.
+
+## The kind tier runs as shards
+
+CI runs `tests/e2e/test_kind.py` as three jobs, each on its own disposable cluster,
+selected from `tools/kind/shards/1.txt`, `2.txt` and `3.txt` (one pytest node id per
+line). A new kind test goes into one of those files, balanced by how long it runs;
+`tests/unit/test_kind_shards.py` fails when a test is in no shard or in two. Locally
+`make e2e-kind` still runs the whole file; `CRUCIBLE_E2E_KIND_SHARD=2 make e2e-kind`
+runs one shard. Every test's time is in the job log (`--durations=0`), which is the
+data for rebalancing. A queue merge lands the exact commit the merge-group run proved,
+so main itself does not run CI on push.

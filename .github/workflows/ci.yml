@@ -13,7 +13,9 @@ on:
   push:
     # The merge queue's temporary branches are proven by the merge_group run below; a
     # push run on the same ref would share its concurrency group and cancel it.
-    branches: ["**", "!gh-readonly-queue/**"]
+    # main is excluded (hades #222): a queue merge lands exactly the merge-group commit
+    # the merge_group run below already proved, so a push run on main would repeat it.
+    branches: ["**", "!gh-readonly-queue/**", "!main"]
   # The merge queue (operator decision, 2026-09-29): each queued pull request is tested
   # once on top of main and the PRs ahead of it, instead of each one being brought up to
   # date and re-run in turn. The required checks are matched by name on the group's
@@ -141,10 +143,12 @@ jobs:
         id: no_cache
         env:
           DISPATCH_NO_CACHE: ${{ github.event_name == 'workflow_dispatch' && inputs.no_cache }}
-          REF: ${{ github.ref }}
+          # The merge_group run is main's run now (hades #222): it builds fresh and saves
+          # the cache the branches restore.
+          MERGE_GROUP: ${{ github.event_name == 'merge_group' }}
         run: |
           set -euo pipefail
-          if [ "$REF" = "refs/heads/main" ] || [ "$DISPATCH_NO_CACHE" = "true" ]; then
+          if [ "$MERGE_GROUP" = "true" ] || [ "$DISPATCH_NO_CACHE" = "true" ]; then
             echo "value=1" >> "$GITHUB_OUTPUT"
           else
             echo "value=" >> "$GITHUB_OUTPUT"
@@ -169,7 +173,7 @@ jobs:
       - name: the worker image carries the programs the shipped policies' checks need
         run: make images-policy-check
       - name: keep the layer cache for branches
-        if: github.ref == 'refs/heads/main'
+        if: github.event_name == 'merge_group'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/buildkit-cache
@@ -188,9 +192,17 @@ jobs:
   # daemon but no lab access (github-ci skill).
   e2e-kind:
     runs-on: ubuntu-24.04
-    # The tier runs about 28 minutes in one job; sharding it is hades #222. Until
-    # then the limit leaves room, so a run is not cancelled at the edge.
-    timeout-minutes: 40
+    # Three shards (hades #222), each on its own disposable cluster, selected from
+    # tools/kind/shards/<n>.txt; tests/unit/test_kind_shards.py proves every kind test
+    # is in exactly one shard. One shard ran about 28 minutes as a single job; a third
+    # of it fits well inside this limit. `green` needs every shard.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    timeout-minutes: 20
+    env:
+      CRUCIBLE_E2E_KIND_SHARD: ${{ matrix.shard }}
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
       - uses: astral-sh/setup-uv@eb1897b8dc4b5d5bfe39a428a8f2304605e0983c # v7.0.0
