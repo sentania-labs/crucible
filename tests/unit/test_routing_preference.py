@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
+from crucible.application.admin.routing_models import tier_plain_words
 from crucible.application.admin.routing_preference import parse_pool_order
 from crucible.application.routing import count_blocking_failures, quality_state, select_model
 from crucible.contracts.policy import RoutingPolicyV1
@@ -133,6 +134,15 @@ def test_hermes_is_the_default_doer_for_trivial_and_standard(tier: str) -> None:
 def test_complex_goes_to_frontier() -> None:
     chosen = _pick(_routing(), "complex")
     assert chosen in {"claude-fable-5-1", "gemini-3.1-pro-high"}
+
+
+def test_plain_words_says_pool_harness_order_and_busy_behavior() -> None:
+    routing = _routing()
+    routing.tiers["complex"].prefer_pools = ["anthropic-sub", "google-sub"]
+
+    assert tier_plain_words(routing, "complex") == (
+        "complex: Claude Code first, then AGY, then Hermes; a busy first choice waits"
+    )
 
 
 def test_hermes_stays_first_after_other_models_ran_and_it_did_not() -> None:

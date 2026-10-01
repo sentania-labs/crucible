@@ -24,6 +24,7 @@ from crucible.adapters.persistence.migrations.versions._0008_harness_adapters im
 from crucible.adapters.ui import render as ui_render
 from crucible.adapters.ui.pages import dashboard
 from crucible.adapters.ui.pages import gateway as gw_module
+from crucible.adapters.ui.pages import routing_models as ui_routing_models
 from crucible.adapters.ui.pages import settings as ui_settings
 from crucible.adapters.ui.pages import workers as ui_workers
 from crucible.adapters.ui.pages.settings import _settings_rows
@@ -41,6 +42,7 @@ from crucible.application.admin import credentials as credentials_service
 from crucible.application.admin import github as github_service
 from crucible.application.admin import providers as providers_service
 from crucible.application.admin import routing as routing_service
+from crucible.application.admin import routing_models as routing_models_service
 from crucible.application.admin import status as status_service
 from crucible.application.admin.credentials import HERMES
 from crucible.application.queries import supervisor_view
@@ -1498,3 +1500,72 @@ def test_gateway_page_unfetched_shows_admin_forms(monkeypatch: pytest.MonkeyPatc
     grid_field = next(f for f in listing_fetched["form"]["fields"] if f["kind"] == "grid")
     rows_text = str(grid_field["rows"])
     assert "gpt-4o" in rows_text
+
+
+def test_routing_model_and_tier_controls_are_ordinary_reasoned_forms(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        routing_models_service,
+        "routing_controls_view",
+        lambda _uow: {
+            "pinned": False,
+            "pools": ["codex", "claude"],
+            "models": [
+                {
+                    "id": "gpt",
+                    "harness": "codex",
+                    "pool": "codex",
+                    "capability": "frontier",
+                    "enabled": True,
+                }
+            ],
+            "tiers": {
+                "complex": {
+                    "plain_words": (
+                        "complex: Codex first, then Claude Code; a busy first choice waits"
+                    ),
+                    "prefer_pools": ["codex", "claude"],
+                    "allowed_capability": ["frontier"],
+                }
+            },
+        },
+    )
+
+    sections = ui_routing_models.control_sections(cast(Any, object()), admin=True)
+
+    assert sections[0]["rows"][0][1].endswith("a busy first choice waits")
+    assert sections[1]["rows"][0][4]["action"] == "/ui/actions/routing-model"
+    tier_form = sections[2]["form"]
+    assert tier_form["action"] == "/ui/actions/routing-tier"
+    assert [
+        field["value"] for field in tier_form["fields"] if field["name"].startswith("pool_")
+    ] == ["codex", "claude"]
+    assert tier_form["fields"][-1]["name"] == "reason"
+
+
+def test_routing_tier_action_keeps_numeric_pool_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    saved: list[str] = []
+    monkeypatch.setattr(
+        routing_models_service,
+        "save_tier",
+        lambda *args, **kwargs: saved.extend(kwargs["prefer_pools"]),
+    )
+    form = {"tier": "complex", **{f"pool_{n}": f"pool-{n}" for n in range(11)}}
+
+    asyncio.run(
+        ui_routing_models._actions(
+            request("/ui/actions/routing-tier"),
+            "routing-tier",
+            cast(Any, SimpleNamespace(admin=object())),
+            cast(Any, object()),
+            cast(Any, object()),
+            "csrf",
+            form,
+            "reorder pools",
+        )
+    )
+
+    assert saved == [f"pool-{n}" for n in range(11)]
