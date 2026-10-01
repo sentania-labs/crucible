@@ -256,6 +256,7 @@ class FakeKubernetesApi:
     # window before the Job controller has produced anything to observe (26).
     no_pod_yet: set[str] = field(default_factory=set)
     created: list[dict[str, Any]] = field(default_factory=list)
+    create_attempts: list[str] = field(default_factory=list)
     deleted: list[tuple[str, str]] = field(default_factory=list)
     # What the next login Pod acts out, and each login Pod's run by Pod name.
     login: FakeLogin = field(default_factory=FakeLogin)
@@ -350,20 +351,25 @@ class FakeKubernetesApi:
 
     # ----- the client surface -------------------------------------------
 
-    def fail_next(self, call: str, count: int = 1, *, kind: str = "") -> None:
-        """Make the next `count` calls of `call` (on `kind`, or any) answer 503."""
-        self.outages.append([call, kind, count])
+    def fail_next(
+        self, call: str, count: int = 1, *, kind: str = "", error: Exception | None = None
+    ) -> None:
+        """Fail the next matching calls with `error`, or a 503 by default."""
+        self.outages.append([call, kind, count, error])
 
     def _outage(self, call: str, kind: str = "") -> None:
         for entry in self.outages:
             if entry[0] == call and entry[1] in ("", kind) and entry[2] > 0:
                 entry[2] -= 1
+                if len(entry) > 3 and entry[3] is not None:
+                    raise entry[3]
                 raise KubernetesUnavailableError(503, f"the fake API server is down ({call})")
 
     def version(self) -> str:
         return "v1.31.0"
 
     def create(self, kind: str, body: Mapping[str, Any]) -> dict[str, Any]:
+        self.create_attempts.append(kind)
         self._outage("create", kind)
         metadata = dict(body.get("metadata") or {})
         name = str(metadata.get("name", ""))
