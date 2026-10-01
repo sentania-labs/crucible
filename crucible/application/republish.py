@@ -70,11 +70,21 @@ def republish_task(
         raise TransitionNotAllowedError(
             "republish requires the same sealed bundle and implementing attempt"
         )
+    # If the previous failure was a bundle-seal / claim-gone failure, refuse
+    # without consuming a retry.
+    failure_step = str(failure.payload.get("step") or "")
+    failure_detail = str(failure.payload.get("detail") or "")
+    if failure_step == "bundle-seal":
+        lower = failure_detail.lower()
+        if "gone" in lower or "missing" in lower or "no branch bundle" in lower:
+            raise TransitionNotAllowedError(f"republish is not possible: {failure_detail}")
+
     sealed_sha256 = collected_bundle_sha256(uow, attempt) or recorded_bundle_sha256
     bundle_file = Path(expected_bundle)
+    ws = str(attempt.workspace_path)
     if bundle_file.is_file():
         current_sha256 = hashlib.sha256(bundle_file.read_bytes()).hexdigest()
-    elif str(attempt.workspace_path).startswith("fake:///"):
+    elif ws.startswith("fake:///") or ws.startswith("k8s://"):
         current_sha256 = sealed_sha256
     else:
         current_sha256 = ""
