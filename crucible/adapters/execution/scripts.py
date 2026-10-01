@@ -17,6 +17,7 @@ validation is what stops it being an option.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from typing import Any
 
@@ -999,3 +1000,41 @@ drop_token
 chmod 0644 "$OUT"/* 2>/dev/null || true
 exit 0
 """
+
+
+def gate_probe_script(url: str, base_ref: str, checks: list[dict[str, Any]], timeout: int) -> str:
+    """Keep command output out of the JSON log, including forged result lines."""
+    configuration = json.dumps(
+        {"url": url, "base_ref": base_ref, "checks": checks, "timeout": timeout}
+    )
+    program = """import json, os, signal, subprocess, tempfile
+config = json.loads(CONFIGURATION)
+env = dict(os.environ, GIT_TERMINAL_PROMPT="0",
+           GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1")
+root = tempfile.mkdtemp(prefix="gate-probe-")
+subprocess.run(["git", "clone", "--no-checkout", "--", config["url"], root],
+               env=env, check=True, stdout=subprocess.DEVNULL)
+subprocess.run(["git", "checkout", "--detach", config["base_ref"]],
+               cwd=root, env=env, check=True, stdout=subprocess.DEVNULL)
+for check in config["checks"]:
+    with tempfile.TemporaryFile() as output:
+        process = subprocess.Popen(["sh", "-c", check["command"]], cwd=root, env=env,
+                                   stdout=output, stderr=output, start_new_session=True)
+        try:
+            code = process.wait(timeout=config["timeout"])
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+            raise RuntimeError(check["id"] + ": command timed out")
+        finally:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        output.seek(0, 2)
+        output.seek(max(0, output.tell() - 1000))
+        detail = output.read().decode("utf-8", "replace") if code == 127 else ""
+    print(json.dumps({"id": check["id"], "command": check["command"],
+                      "exit": code, "detail": detail}), flush=True)
+""".replace("CONFIGURATION", repr(configuration))
+    return "python3 -c " + _quote(program)

@@ -498,6 +498,15 @@ class DockerProvider:
         credential = adapter.credential_spec() if adapter is not None else None
         return source is not None and (credential is None or credential.held_by(source.path))
 
+    async def probe_checks(
+        self,
+        spec: LaunchSpec,
+        checks: Sequence[dict[str, Any]],
+        cancelled: CancelCheck | None = None,
+    ) -> tuple[VerificationRun, ...] | None:
+        """Docker does not yet provide an isolated pre-preparation probe."""
+        return None
+
     async def prepare(
         self,
         spec: LaunchSpec,

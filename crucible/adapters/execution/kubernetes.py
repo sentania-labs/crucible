@@ -82,6 +82,7 @@ from crucible.application.harnesses import (
 )
 from crucible.contracts.completion_claim import CompletionClaimV1
 from crucible.domain.cluster_egress import ClusterEgress, parse_cluster_egress
+from crucible.domain.command_timeout import effective_command_timeout_ms
 from crucible.domain.exit_class import ExitClass
 from crucible.domain.ids import new_id
 from crucible.domain.role_timeouts import DEFAULT_ROLE_TIMEOUT_SECONDS, parse_role_timeouts
@@ -180,7 +181,9 @@ ANNOTATION_IDENTITY_PATHS = "crucible.io/identity-paths"
 JOB_API_ERROR = -1
 JOB_TIMED_OUT = -2
 
-# One attempt may create a preparer, worker, collector, bundle-verifier and verifier Job.
+# One attempt may create a gate-probe, preparer, worker, collector, bundle-verifier
+# and verifier Job. The probe is deleted before preparation and never overlaps this
+# attempt's other Jobs, so its addition does not increase the five-Job capacity count.
 # A ResourceQuota's Job count therefore needs this conversion before it can truthfully be
 # shown as attempt capacity.
 JOBS_PER_ATTEMPT = 5
@@ -1141,6 +1144,91 @@ class KubernetesProvider:
                 f"{harness!r} is not readable in {self.config.namespace} ({exc.status})"
             ) from exc
         return _has_declared_auth_file(credential, source)
+
+    async def probe_checks(
+        self,
+        spec: LaunchSpec,
+        checks: Sequence[dict[str, Any]],
+        cancelled: CancelCheck | None = None,
+    ) -> tuple[VerificationRun, ...] | None:
+        """An uncredentialed, disposable checkout of base_ref, before any preparer."""
+        await _stop_if_cancelled(cancelled, "before the gate probe")
+        await self._require_ready(spec)
+        image = await self._resolve_image(spec)
+        role = "gate-probe"
+        timeout = max(
+            1,
+            (effective_command_timeout_ms(spec.policy, spec.contract, spec.timeout_seconds) + 999)
+            // 1000,
+        )
+        plan = self._egress_plan(spec, k8sspec.ROLE_WORKER)
+        checkout = self._checkout_plan(spec, k8sspec.ROLE_PREPARER, False)
+        # The same enforced policy machinery as the worker, with checkout egress
+        # needed to fetch base_ref. There is no credential or report volume.
+        plan = replace(
+            plan,
+            hosts=tuple(sorted(set(plan.hosts) | set(checkout.hosts))),
+            endpoints=tuple(sorted(set(plan.endpoints) | set(checkout.endpoints))),
+        )
+        mounts: list[Mount] = []
+        volumes: list[dict[str, Any]] = []
+        # File origins in the kind tier live on this read-only claim.
+        if spec.repository_url.startswith("file:///crucible/cache/") and self.config.cache_claim:
+            mounts.append(Mount("cache", k8sspec.CACHE_MOUNT, read_only=True))
+            volumes.append(
+                {
+                    "name": "cache",
+                    "persistentVolumeClaim": {
+                        "claimName": self.config.cache_claim,
+                        "readOnly": True,
+                    },
+                }
+            )
+        output: list[str] = []
+        try:
+            code = await self._run_role_job(
+                spec,
+                role=role,
+                image=image,
+                script=scripts.gate_probe_script(
+                    spec.repository_url,
+                    spec.contract["repository"]["base_ref"],
+                    list(checks),
+                    timeout,
+                ),
+                mounts=mounts,
+                volumes=volumes,
+                limits=self._limits(spec),
+                timeout=timeout,
+                plan=plan,
+                cancelled=cancelled,
+                log_output=output,
+            )
+        except KubernetesApiError as exc:
+            raise ProviderError(f"gate probe Job failed: {exc}") from exc
+        if code != 0:
+            detail = self.role_errors.get((role, spec.attempt_id), ("", False))[0]
+            raise ProviderError(f"gate probe Job exit {code}: {detail}")
+        rows: list[VerificationRun] = []
+        for line in "".join(output).splitlines():
+            try:
+                result = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(result, dict) or not {"id", "command", "exit"} <= result.keys():
+                continue
+            if not isinstance(result["exit"], int):
+                raise ProviderError("gate probe returned an invalid exit")
+            rows.append(
+                VerificationRun(
+                    id=result["id"],
+                    command=result["command"],
+                    exit_code=result["exit"],
+                    expect_exit=0,
+                    log_tail=str(result.get("detail", "")),
+                )
+            )
+        return tuple(rows)
 
     async def prepare(
         self,
@@ -3997,6 +4085,7 @@ class KubernetesProvider:
         tolerate_lingering_pod: bool = False,
         wait_for_quota: bool = False,
         use_backoff: bool = False,
+        log_output: list[str] | None = None,
     ) -> int:
         """Run one single-purpose Job to completion and delete it. With `cancelled`, a
         cancel ends the wait (hades #189): the Job and its policy are deleted on the way
@@ -4044,6 +4133,13 @@ class KubernetesProvider:
             self._role_error(
                 role, spec.attempt_id, str(exc), isinstance(exc, KubernetesUnavailableError)
             )
+            # A failed create may have reached the server. In particular, a probe
+            # refusal has no later workspace cleanup to remove this Job or policy.
+            with contextlib.suppress(KubernetesApiError):
+                await self._call(self.client.delete, "jobs", name)
+            if policy_name:
+                with contextlib.suppress(KubernetesApiError):
+                    await self._call(self.client.delete, "networkpolicies", policy_name)
             return JOB_API_ERROR
         self.role_errors.pop((role, spec.attempt_id), None)
         try:
@@ -4073,6 +4169,18 @@ class KubernetesProvider:
                 # A full namespace is a wait, not a verdict on the attempt.
                 self._role_error(role, spec.attempt_id, refusal, True)
                 return JOB_API_ERROR
+            if log_output is not None:
+                pod = await self._pod_of(name)
+                if pod is not None:
+                    frames = await self._call(
+                        self.client.pod_log,
+                        str(pod["metadata"]["name"]),
+                        container=k8sspec.CONTAINER_NAME,
+                        timestamps=False,
+                    )
+                    log_output.append(
+                        b"".join(frame.payload for frame in frames).decode("utf-8", "replace")
+                    )
             if code != 0:
                 tail = await self._job_tail(name)
                 self._role_error(role, spec.attempt_id, tail)

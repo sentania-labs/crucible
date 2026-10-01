@@ -119,6 +119,7 @@ from crucible.domain.lifecycle import (
     TaskState,
 )
 from crucible.domain.secrets import find_secrets, redact
+from crucible.domain.verification import task_specific_checks
 from crucible.logs import log_context
 from crucible.ports.artifacts import ArtifactStore
 from crucible.ports.clock import Clock
@@ -140,6 +141,7 @@ from crucible.ports.execution import (
     ObservationState,
     ProviderError,
     ProviderUnavailableError,
+    VerificationRun,
     Workspace,
 )
 from crucible.ports.github import GitHubClient
@@ -1400,6 +1402,8 @@ class Supervisor:
                 spec = await self._build_spec(
                     attempt, execution, task, item.contract, item.repository_url
                 )
+                if not await self._probe_before_prepare(item, provider, spec):
+                    return False
                 ws = await self._prepare(provider, spec, item.repository)
             except LaunchCancelledError as exc:
                 log.info("launch stopped for a cancel", extra={"detail": str(exc)})
@@ -2085,6 +2089,147 @@ class Supervisor:
             )
         else:
             self._task_reported(uow, task, attempt, ExitClass.ENVIRONMENT, {}, wake_summary=detail)
+
+    def _needs_gate_probe(self, item: _Pending) -> bool:
+        if item.execution.role is ExecutionRole.REVIEW:
+            return False
+        with self._uow_factory() as uow:
+            # A probe refusal never launched a worker. A rescheduled refusal must
+            # prove its checks again, even when the operator kept the same contract.
+            previous = [
+                (attempt, execution)
+                for execution in uow.executions.list_for_task(item.task.id)
+                if execution.role is not ExecutionRole.REVIEW
+                for attempt in uow.attempts.list_for_execution(execution.id)
+                if attempt.id != item.attempt.id and attempt.started_at is not None
+            ]
+            if not previous:
+                return True
+            _, execution = max(previous, key=lambda pair: pair[0].created_at)
+            contract = uow.contracts.get(item.task.id, execution.contract_version)
+            return contract is None or contract.document.get("required_verification") != (
+                item.contract.get("required_verification")
+            )
+
+    async def _probe_before_prepare(
+        self, item: _Pending, provider: ExecutionProvider, spec: LaunchSpec
+    ) -> bool:
+        commands = task_specific_checks(item.contract, spec.policy)
+        checks = [
+            check
+            for check in item.contract.get("required_verification", [])
+            if check.get("kind", "command") == "command"
+            and " ".join(check.get("command", "").split()) in commands
+        ]
+        if not checks or not await self._db(partial(self._needs_gate_probe, item)):
+            return True
+        error = ""
+        rows: tuple[VerificationRun, ...] | None = ()
+        try:
+            rows = await provider.probe_checks(
+                spec, checks, cancelled=self._cancel_check(item.task.id)
+            )
+            if rows is not None and (
+                len(rows) != len(checks)
+                or any(
+                    row.id != check["id"] or row.command != check["command"] or not row.ran
+                    for row, check in zip(rows, checks, strict=False)
+                )
+            ):
+                error = "probe returned incomplete or invalid results"
+        except LaunchCancelledError:
+            raise
+        except ProviderError as exc:
+            error = str(exc)
+        if await self._db(partial(self._settle_if_cancelled, item.attempt.id, "gate_probe")):
+            return False
+        return await self._db(
+            partial(self._record_gate_probe, item.attempt.id, checks, rows, error)
+        )
+
+    def _record_gate_probe(
+        self,
+        attempt_id: str,
+        checks: list[dict[str, Any]],
+        rows: tuple[VerificationRun, ...] | None,
+        error: str,
+    ) -> bool:
+        with self._fenced() as uow:
+            attempt = uow.attempts.get(attempt_id, for_update=True)
+            assert attempt is not None
+            task = uow.tasks.get(attempt.task_id, for_update=True)
+            assert task is not None
+            reason = ""
+            detail = ""
+            if error:
+                reason = "check_cannot_run"
+                detail = f"{', '.join(check['id'] for check in checks)}: {error}"
+            elif rows is not None:
+                missing = [row for row in rows if row.exit_code == 127]
+                if missing:
+                    reason = "check_cannot_run"
+                    detail = "; ".join(
+                        f"{row.id}: exit 127: {row.log_tail or 'program not found'}"
+                        for row in missing
+                    )
+                elif all(row.exit_code == 0 for row in rows):
+                    reason = "gate_proves_nothing"
+                    detail = "; ".join(f"{row.id} passes on the unchanged repo" for row in rows)
+            by_id = {row.id: row for row in rows or ()}
+            for check in checks:
+                row = by_id.get(check["id"])
+                payload = {
+                    "id": check["id"],
+                    "command": check["command"],
+                    "exit": row.exit_code if row else None,
+                    "detail": error or (row.log_tail if row else "probe not supported, skipped"),
+                }
+                uow.evidence.add(
+                    EvidenceRecord(
+                        id=None,
+                        attempt_id=attempt.id,
+                        task_id=task.id,
+                        kind=EvidenceKind.GATE_PROBE.value,
+                        source=EvidenceSource.CRUCIBLE.value,
+                        observed_at=self._clock.now(),
+                        verified=True,
+                        payload=payload,
+                    )
+                )
+            if reason:
+                attempt.termination_reason = reason
+                attempt.ended_at = self._clock.now()
+                attempt.logs_drained_at = attempt.ended_at
+                # No workspace exists, and no worker budget or quota has been spent.
+                attempt.cleaned_up_at = attempt.ended_at
+                attempt.exit_class = ExitClass.BLOCKED
+                move_attempt(
+                    uow, self._clock, attempt, AttemptState.COLLECTED, EventKind.ATTEMPT_COLLECTED
+                )
+                move_attempt(
+                    uow, self._clock, attempt, AttemptState.BLOCKED, EventKind.ATTEMPT_BLOCKED
+                )
+                self._release_checkout_leases(uow, attempt)
+                move_task(
+                    uow,
+                    self._clock,
+                    task,
+                    TaskState.BLOCKED,
+                    EventKind.TASK_BLOCKED,
+                    attempt_id=attempt.id,
+                    execution_id=attempt.execution_id,
+                    payload={"reason": reason, "detail": detail},
+                )
+                open_escalation(
+                    uow,
+                    self._clock,
+                    task=task,
+                    attempt_id=attempt.id,
+                    question=detail,
+                    summary=f"{reason}: {detail}",
+                )
+            uow.commit()
+            return not reason
 
     async def _prepare(
         self, provider: ExecutionProvider, spec: LaunchSpec, repository: Repository | None
@@ -4876,6 +5021,7 @@ class Supervisor:
             retryable = False
         ordinary_attempts = sum(
             prior.exit_class is not ExitClass.QUOTA_EXHAUSTED
+            and prior.termination_reason not in {"gate_proves_nothing", "check_cannot_run"}
             for prior in uow.attempts.list_for_execution(execution.id)
             if prior.state in ATTEMPT_TERMINAL
         )

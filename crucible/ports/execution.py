@@ -486,6 +486,18 @@ class ExecutionProvider(Protocol):
 
     async def credential_available(self, harness: str) -> bool: ...
 
+    async def probe_checks(
+        self,
+        spec: LaunchSpec,
+        checks: Sequence[dict[str, Any]],
+        cancelled: CancelCheck | None = None,
+    ) -> tuple[VerificationRun, ...] | None:
+        """Run task checks on the unchanged base before preparation.
+
+        None explicitly means unsupported; failures raise ProviderError.
+        """
+        ...
+
     async def prepare(
         self,
         spec: LaunchSpec,
