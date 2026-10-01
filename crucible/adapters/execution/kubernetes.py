@@ -878,6 +878,7 @@ class KubernetesProvider:
             detail=endpoint_problem if probe.passed else f"{probe.detail}; {endpoint_problem}",
             local_endpoint_reachable=False,
             local_endpoint_detail=endpoint_problem,
+            canary_node=namespace_node,
         )
 
     async def _canary_endpoint_plan(self, endpoint_url: str) -> EgressPlan:

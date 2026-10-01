@@ -41,7 +41,7 @@ from crucible.ports.execution import (
 from crucible.ports.execution import (
     CleanupPolicy as Cleanup,
 )
-from tests.unit.kubernetes_fixtures import IMAGE, build, pod_of, spec
+from tests.unit.kubernetes_fixtures import HOST_ADDRESSES, IMAGE, build, pod_of, spec
 
 CODEX_IMAGE = "crucible-worker:codex-fake-succeed-2"
 
@@ -866,6 +866,42 @@ async def test_the_launch_evidence_records_the_node_the_canary_measured() -> Non
     document = json.loads(evidence.content)
     assert document["canary_node"] == "lab-node-1"
     # Check the health checks.
+    health = await provider.health()
+    assert health.checks["canary_node"] == "lab-node-1"
+
+
+async def test_the_launch_evidence_records_the_node_when_endpoint_plan_fails() -> None:
+    """The endpoint-plan branch that cannot create a NetworkPolicy still records
+    canary_node from the namespace canary."""
+
+    def resolver(host: str) -> list[str]:
+        if host == "llm.example.local":
+            return []  # Force the local endpoint to not resolve
+        return HOST_ADDRESSES.get(host, [])
+
+    _, registry, provider = build(
+        resolver=resolver,
+        config=KubernetesConfig(
+            poll_interval_seconds=0,
+            launch_timeout_seconds=5,
+            local_endpoint_url="https://llm.example.local/v1",
+            local_endpoint_cidrs=("10.10.0.0/24",),
+        ),
+    )
+    image = "crucible-worker:script-harness-fake-succeed-2"
+    registry.register(image, harness="script-harness", version="1.0.0")
+    launch = spec(
+        harness="script-harness",
+        image=image,
+        endpoint="subscription",
+    )
+    workspace = await provider.prepare(launch)
+    handle = await provider.launch(workspace, launch)
+    await run_to_exit(provider, handle)
+    outputs = await provider.collect(handle, workspace, launch)
+    evidence = next(a for a in outputs.artifacts if a.name == "report/kubernetes-launch.json")
+    document = json.loads(evidence.content)
+    assert document["canary_node"] == "lab-node-1"
     health = await provider.health()
     assert health.checks["canary_node"] == "lab-node-1"
 
