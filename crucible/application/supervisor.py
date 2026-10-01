@@ -662,6 +662,29 @@ class Supervisor:
             )
             return True
 
+    def _renew_lease(self) -> None:
+        """Renew the lease outside a fenced transaction so a mid-tick renewal
+        does not hold up work when the database is under load.
+
+        This is intentionally simple: it only calls ``renew_supervisor`` and
+        updates the fenced token.  Errors are logged and the lease is dropped
+        silently; the next fenced call will surface the loss via
+        ``LeaseLostError``.
+        """
+        try:
+            now = self._clock.now()
+            assert self.fenced_token is not None
+            with self._uow_factory() as uow:
+                lease = uow.leases.renew_supervisor(
+                    self.holder, self.fenced_token, now, self.lease_ttl_seconds
+                )
+                if lease is None:
+                    self.fenced_token = None
+                    log.warning("supervisor lease lost", extra={"holder": self.holder})
+                uow.commit()
+        except Exception:
+            log.exception("could not renew the supervisor lease")
+
     def _release_step(self) -> None:
         if self.fenced_token is None:
             return
@@ -737,6 +760,7 @@ class Supervisor:
             result.published = await self.delivery.publish()
             result.pull_requests_polled = await self.delivery.observe()
             await self._cleanup_step()
+            self._renew_lease()
             await self._retention_step()
             await self._db(self._refresh_attempt_metrics)
             await self._db(self._repeat_stale_escalations)
@@ -3143,13 +3167,18 @@ class Supervisor:
         return section, task.policy_name, task.policy_version
 
     def _retention_sweep(self) -> int:
+        now = self._clock.now()
+        applied = 0
+        # Credential renewal runs outside the tick's open transaction to avoid
+        # holding the fence while the OAuth token refresh hits the network.
+        credential_renewed = (
+            self._credential_renewal() if self._credential_renewal is not None else False
+        )
+        if credential_renewed:
+            applied += 1
         with self._fenced() as uow:
-            now = self._clock.now()
-            applied = 0
             if self._credential_sweep is not None:
                 applied += self._credential_sweep(uow)
-            if self._credential_renewal is not None and self._credential_renewal():
-                applied += 1
 
             def act(
                 kind: str, subject: str, name: str, version: int, detail: dict[str, Any]
@@ -5362,6 +5391,8 @@ class Supervisor:
             status.holder = self.holder
             status.last_tick_at = self._clock.now()
             status.last_success_at = status.last_tick_at
+            status.last_error = None
+            status.last_error_at = None
             status.tick_ms = int((time.monotonic() - started) * 1000)
             status.counts = counts
             uow.supervisor_status.write(status)
