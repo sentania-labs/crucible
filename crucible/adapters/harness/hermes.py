@@ -27,6 +27,7 @@ from typing import Any
 
 from crucible.adapters.harness import base
 from crucible.domain.exit_class import EXIT_CODE_BLOCKED, ExitClass, classify_exit
+from crucible.domain.harness_concurrency import HARNESS_CONCURRENCY
 from crucible.domain.harness_settings import hermes_run_limits
 from crucible.ports.harness import (
     HERMES_BINARY,
@@ -128,6 +129,8 @@ def _limit_reached(document: Mapping[str, Any] | None) -> str | None:
 
 class HermesAdapter:
     name = NAME
+    concurrency = HARNESS_CONCURRENCY[NAME]
+    parallel_attempts_safe = concurrency.parallel_attempts_safe
     supported_versions = VersionRange("0.19.0", "0.20.0")
 
     def quota_reset_at(self, stdout_tail: str, stderr_tail: str) -> datetime | None:
@@ -159,7 +162,7 @@ class HermesAdapter:
             harness=NAME,
             mount_target=AUTH_DIR,
             auth_files=(AuthFile("api-key", env_var="OPENAI_API_KEY", sync_back=False),),
-            minimum_mode=MountMode.RO,
+            minimum_mode=MountMode(self.concurrency.minimum_mode),
             required_for_launch=False,
             login_hint="Paste the LiteLLM virtual key in the Crucible admin credential panel",
         )

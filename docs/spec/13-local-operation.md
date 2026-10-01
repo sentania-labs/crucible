@@ -245,7 +245,7 @@ that authority. The model, in order of preference:
    user, not root. Costs: one daemon to install, some feature loss (no
    privileged ports, slower overlay, cgroup limits depend on the host's
    cgroup v2 delegation). Spike S9 passed on the development workstation
-   on 2026-09-16 (`docs/spikes/S9.md`): limits enforced, internal network
+   on 2026-09-16 (`docs/history/spikes/S9.md`): limits enforced, internal network
    egress only through the proxy, performance on par with rootful. This is
    the default local arrangement from C3; socket `/run/user/<uid>/docker.sock`
    of the `crucible` service user, proxied.

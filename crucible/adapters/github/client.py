@@ -1,10 +1,9 @@
 """The GitHub client (23, ADR 0007).
 
 Every call the delivery half makes, and no others. What is deliberately absent is as much
-of the design as what is here: there is no merge, no force push, no ref write other than
-the delete used at test cleanup, and the issue-comment write refuses unless the operator
-turned it on, because the trigger comment is posted under a person's account, never under
-Crucible's App identity (S12 run 1).
+of the design as what is here: there is no merge, no force push, and no ref write other
+than the delete used at test cleanup. The issue-comment write is used for the configured
+external-review trigger under the App's identity.
 """
 
 from __future__ import annotations
@@ -81,6 +80,13 @@ class RestGitHubClient:
 
     def revoke_token(self, token: InstallationToken) -> bool:
         return self._auth.revoke(token)
+
+    def authenticated_login(self, token: InstallationToken) -> str:
+        del token
+        payload = self._http.get("/app", bearer=self._auth.app_jwt())
+        if not isinstance(payload, dict) or not isinstance(payload.get("slug"), str):
+            raise GitHubError(502, "authenticated App response has no slug", path="/app")
+        return f"{payload['slug']}[bot]"
 
     # ----- reads --------------------------------------------------------
 
@@ -263,13 +269,7 @@ class RestGitHubClient:
             )
             if isinstance(row, dict)
         )
-        issue_comments = tuple(
-            normalize.issue_comment(row)
-            for row in self._http.paginate(
-                f"/repos/{repository}/issues/{number}/comments", bearer=token.reveal()
-            )
-            if isinstance(row, dict)
-        )
+        issue_comments = self.issue_comments(token, repository=repository, number=number)
         reactions: tuple[ReactionRecord, ...] = ()
         observable = True
         detail = ""
@@ -304,6 +304,17 @@ class RestGitHubClient:
             observed_at=datetime.now(UTC),
             rate_limit_remaining=self._http.rate_limit_remaining,
             notes=tuple(notes),
+        )
+
+    def issue_comments(
+        self, token: InstallationToken, *, repository: str, number: int
+    ) -> tuple[CommentRecord, ...]:
+        return tuple(
+            normalize.issue_comment(row)
+            for row in self._http.paginate(
+                f"/repos/{repository}/issues/{number}/comments", bearer=token.reveal()
+            )
+            if isinstance(row, dict)
         )
 
     def _checks_for(
@@ -461,19 +472,8 @@ class RestGitHubClient:
 
     def post_issue_comment(
         self, token: InstallationToken, *, repository: str, number: int, body: str
-    ) -> str:
-        """23: off by default. The external-review trigger is posted by the orchestrator
-        under the operator's account, and an App-authored trigger comment is refused by
-        the provider anyway (S12 run 1). This exists for a repository that configures
-        Crucible to post something else, and it refuses until that is turned on."""
-        if not self.allow_issue_comments:
-            raise GitHubError(
-                403,
-                "posting an issue comment is disabled; the external-review trigger is the "
-                "orchestrator's act under the operator's account (23)",
-                path=f"/repos/{repository}/issues/{number}/comments",
-                response_class="disabled",
-            )
+    ) -> CommentRecord:
+        """Post the configured external-review trigger under the App's identity."""
         status, payload, _ = self._http.request(
             "POST",
             f"/repos/{repository}/issues/{number}/comments",
@@ -484,7 +484,7 @@ class RestGitHubClient:
             raise GitHubError(
                 status, _message(payload), path=f"/repos/{repository}/issues/{number}/comments"
             )
-        return str(payload.get("id", ""))
+        return normalize.issue_comment(payload)
 
     def delete_ref(self, token: InstallationToken, *, repository: str, ref: str) -> None:
         """Cleanup only (the live test tier). A default branch is refused here as well as

@@ -8,6 +8,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
 from crucible.adapters.api.deps import Ctx, UoW
 from crucible.adapters.ui.actions import register
+from crucible.adapters.ui.pages import routing_models as routing_models_page
 from crucible.adapters.ui.render import _document_section, _duration_words, _page
 from crucible.adapters.ui.session import _require
 from crucible.application.admin import gate_classes as gate_classes_admin
@@ -59,6 +60,9 @@ def routing_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
     dns = egress["document"].get("dns") or {}
     endpoint = egress["document"].get("local_endpoint") or {}
     local_models = ", ".join(m["id"] for m in local["models"] if m.get("enabled")) or "none"
+    per_harness = (
+        (policy.document.get("concurrency", {}).get("per_harness") or {}) if policy else {}
+    )
     # crucible#115: what is in force, one line each, in plain words; the documents behind
     # them are under Details, and each is edited from its own form below.
     in_force: list[list[Any]] = [
@@ -94,6 +98,23 @@ def routing_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                 "hint": (
                     "other allowed models are fallbacks when these are unavailable or busy; "
                     "the task page says when a task ran on its next choice because one was busy"
+                ),
+            },
+            "",
+        ],
+        [
+            "Frontier workers",
+            {
+                "kind": "note",
+                "value": "; ".join(
+                    f"{name}: {per_harness.get(name, 1)} at once"
+                    for name in ("claude_code", "codex", "agy")
+                ),
+                "hint": (
+                    "Claude Code uses a read-only token that never refreshes; AGY keeps its "
+                    "refresh token; Codex stays at one worker until the brokered renewer "
+                    "lands, because OpenAI rotates refresh tokens and concurrent sync-backs "
+                    "can break login. Watch per-harness auth_failure_count in supervisor logs."
                 ),
             },
             "",
@@ -213,6 +234,7 @@ def routing_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
             else [],
         },
     ]
+    sections[1:1] = routing_models_page.control_sections(uow, admin=admin)
     if admin:
         tier_fields: list[dict[str, Any]] = []
         for name, rule in preference["tiers"].items():
@@ -500,6 +522,12 @@ def routing_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                                 "rows": 12,
                                 "required": True,
                             },
+                            {
+                                "name": "routing_pinned",
+                                "label": "Deliberately pin the routing policy version",
+                                "kind": "checkbox",
+                                "value": False,
+                            },
                             {"name": "reason", "label": "Reason", "required": True},
                         ],
                     },
@@ -677,6 +705,9 @@ async def _actions(
                 reason=audited_reason,
             )
         else:
+            document.setdefault("routing", {}).setdefault("policy", {})["pinned"] = (
+                form.get("routing_pinned") == "true"
+            )
             put_policy(
                 uow,
                 ctx.clock,

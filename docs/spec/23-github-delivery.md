@@ -240,7 +240,7 @@ Foundry is not required to remain connected for any of this.
 
 ## Triggering the external reviewer
 
-S12's rerun (docs/spikes/S12.md, 2026-09-16) settled it: with the
+S12's rerun (docs/history/spikes/S12.md, 2026-09-16) settled it: with the
 repository's Codex setting "review all pull requests" enabled, an
 App-authored PR is reviewed automatically (pickup 11 s after open,
 completion 101 s) with no human comment. **Repository onboarding
@@ -256,27 +256,24 @@ external review; a registration without it is accepted only with
 PR, waits for a reviewer signal, closes it, and records the observed
 result; the first real task's reviewer signal also updates the record,
 and a repository whose PRs get none is reported by the admin status. The
-provider's trigger comment, posted by the orchestrator under the
-operator's account, remains the fallback for a repository where automatic
-review is not enabled and for an explicit re-review after a correction,
-both recorded as events. Crucible never posts it: the client's
-`post_issue_comment` exists for a repository that configures something
-else and refuses unless `github.allow_issue_comments` is on, and a
-retrigger opens a new cycle and wakes the orchestrator with reason
-`external_review_trigger_needed` instead.
+provider's configured trigger comment is posted by Crucible under the App
+identity after the pull request is recorded when required rounds remain and
+`external_review.request_on_publish` is true. The returned comment id is
+recorded in `external_review_requested`. Republish checks the pull request's
+issue comments and the event before posting, so the request is once per pull
+request. A correction never posts another trigger.
 
-**Crucible never authors the trigger phrase, in any text it writes.** The
+**Crucible authors the trigger phrase only as the configured issue comment.** The
 provider's trigger is an at-mention of its own name, and the provider acts
 on the raw text: a PR body, a commit message, or a comment Crucible
 authored that contained it would perform the trigger under the App's
-identity rather than the operator's, which is exactly the act 23 reserves
-for the orchestrator. So the phrase in its at-sign form never appears in a
-body Crucible renders, a commit message it writes, or a comment it posts,
+identity. So the phrase in its at-sign form never appears in a
+body Crucible renders or a commit message it writes,
 and the renderer defangs every at-mention in worker-asserted text for the
 same reason (a limitation or risk quoting the phrase would otherwise
 trigger a review). Quoting it in backticks is not protection; the provider
-reads the body, not the rendered HTML. The phrase is described, never
-written, in this specification for the same reason.
+reads the body, not the rendered HTML. Outside the policy field and the
+single trigger comment, the phrase is described rather than repeated.
 
 What the reviewer emits, as observed: a clean result is **reactions on
 the PR only**: `eyes` on pickup (deleted on completion, so it lives about
@@ -375,8 +372,7 @@ cycle opens on that head.
   Other repositories may set `required_rounds`,
   `retrigger_after_correction` (on each corrected head Crucible opens a new
   cycle and wakes the orchestrator with reason
-  `external_review_trigger_needed`; the orchestrator posts the trigger
-  under the operator's account, because Crucible never posts it), and
+  `external_review_trigger_needed`; publication does not post again), and
   `require_review_on_final_sha` (the last accepted signal must name the
   accepted head) differently.
 - Nothing received is overdue silently: `wait_timeout_hours` produces a

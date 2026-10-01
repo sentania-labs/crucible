@@ -23,6 +23,8 @@ from crucible.adapters.persistence.migrations.versions._0008_harness_adapters im
 )
 from crucible.adapters.ui import render as ui_render
 from crucible.adapters.ui.pages import dashboard
+from crucible.adapters.ui.pages import gateway as gw_module
+from crucible.adapters.ui.pages import routing_models as ui_routing_models
 from crucible.adapters.ui.pages import settings as ui_settings
 from crucible.adapters.ui.pages import tasks as tasks_mod
 from crucible.adapters.ui.pages import workers as ui_workers
@@ -36,21 +38,27 @@ from crucible.adapters.ui.render import (
 )
 from crucible.application.admin import audit as audit_service
 from crucible.application.admin import bootstrap as bootstrap_service
+from crucible.application.admin import credentials, gateway
 from crucible.application.admin import credentials as credentials_service
 from crucible.application.admin import github as github_service
 from crucible.application.admin import providers as providers_service
 from crucible.application.admin import routing as routing_service
+from crucible.application.admin import routing_models as routing_models_service
 from crucible.application.admin import status as status_service
+from crucible.application.admin.credentials import HERMES
 from crucible.application.queries import supervisor_view
 from crucible.domain.entities import (
     BootstrapImport,
     Event,
     Lease,
     PoolExhaustion,
+    Principal,
     RetentionAction,
+    Role,
     SupervisorStatus,
 )
 from crucible.domain.events import EventKind
+from crucible.domain.harness_settings import HermesRunLimits, setting_name
 from crucible.domain.lifecycle import TaskState
 from crucible.settings import Settings
 
@@ -1656,3 +1664,328 @@ def test_recently_updated_excludes_archived_before_limit(monkeypatch: pytest.Mon
         assert f"ext-arch-{i}" not in attention_task_ids, (
             f"Archived ext-arch-{i} should not appear in Needs attention"
         )
+
+
+def test_gateway_page_lists_models_only_when_asked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """models_view(fetch=False) skips the gateway network call and reports a not-asked note;
+    models_view(fetch=True) contacts the gateway once to list models."""
+
+    # Patch the gateway URL
+    monkeypatch.setattr(
+        gateway, "gateway_url", lambda _uow: ("http://localhost:8000/v1", "setting")
+    )
+    # Patch local entries
+    monkeypatch.setattr(
+        gateway,
+        "_local_entries",
+        lambda _uow: (
+            [
+                {
+                    "id": "local-model",
+                    "endpoint": "local",
+                    "model_name": "local-model",
+                    "enabled": True,
+                },
+            ],
+            {"max_concurrency": 4},
+        ),
+    )
+    # Patch the API key so read_api_key doesn't fail when fetch=True
+    monkeypatch.setattr(credentials, "read_api_key", lambda *_args, **_kwargs: "fake-bearer")
+
+    # Count calls to fetch_models
+    call_count = {"n": 0}
+
+    def counting_fetch_models(endpoint: str, bearer: str, **kwargs: object) -> list[str]:
+        call_count["n"] += 1
+        return ["gpt-4o", "claude-sonnet"]
+
+    monkeypatch.setattr(gateway, "fetch_models", counting_fetch_models)
+
+    ctx_admin = SimpleNamespace(name="admin", role=SimpleNamespace(value="admin"))
+
+    # fetch=False: should NOT call fetch_models
+    call_count["n"] = 0
+    result = asyncio.run(gateway.models_view(ctx_admin, None, fetch=False))  # type: ignore[arg-type]
+    assert call_count["n"] == 0, "fetch_models must not be called when fetch=False"
+    assert result["error"] == "The gateway's models were not asked for; use the link to list them."
+    assert result["reachable"] is False
+    assert result["offered_count"] is None
+
+    # fetch=True: should call fetch_models exactly once
+    call_count["n"] = 0
+    result = asyncio.run(gateway.models_view(ctx_admin, None, fetch=True))  # type: ignore[arg-type]
+    assert call_count["n"] == 1, "fetch_models must be called once when fetch=True"
+    assert result["error"] is None
+    assert result["reachable"] is True
+    assert result["offered_count"] == 2
+
+
+def test_gateway_page_unfetched_shows_admin_forms(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The Local gateway page renders the URL/key form and test form even when models
+    were not asked for, so an operator can still configure the gateway (PR 291 fix)."""
+
+    monkeypatch.setattr(
+        gateway, "gateway_url", lambda _uow: ("http://localhost:8000/v1", "setting")
+    )
+    monkeypatch.setattr(
+        gateway,
+        "_local_entries",
+        lambda _uow: (
+            [
+                {
+                    "id": "local-model",
+                    "endpoint": "local",
+                    "model_name": "local-model",
+                    "enabled": True,
+                },
+            ],
+            {"max_concurrency": 4},
+        ),
+    )
+    monkeypatch.setattr(credentials, "read_api_key", lambda *_args, **_kwargs: "fake-bearer")
+
+    def counting_fetch_models(endpoint: str, bearer: str, **kwargs: object) -> list[str]:
+        return ["gpt-4o"]
+
+    monkeypatch.setattr(gateway, "fetch_models", counting_fetch_models)
+
+    now = datetime(2025, 1, 1, tzinfo=UTC)
+
+    class _FakeSettingsRepo:
+        def get(self, name: str) -> SimpleNamespace | None:
+            if name == setting_name(HERMES):
+                limits = HermesRunLimits()
+                return SimpleNamespace(
+                    document=limits.as_dict(),
+                    updated_at=now,
+                    updated_by="admin",
+                )
+            return None
+
+    class FakeUoW:
+        def __enter__(self) -> FakeUoW:
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            pass
+
+        def commit(self) -> None:
+            pass
+
+        @property
+        def provider_settings(self) -> _FakeSettingsRepo:
+            return _FakeSettingsRepo()
+
+        @property
+        def harnesses(self) -> None:
+            return None
+
+    fake_uow = FakeUoW()
+
+    monkeypatch.setattr(
+        gateway,
+        "gateway_view",
+        lambda *args: {
+            "endpoint_url": "http://localhost:8000/v1",
+            "url_source": "setting",
+            "key_set": True,
+            "credential_state": "validated",
+            "last_tested_at": "2025-01-01T00:00:00Z",
+            "last_test": "the last test passed",
+            "last_outcome": "probe:completed",
+            "models": [],
+            "pool": {"max_concurrency": 4},
+        },
+    )
+
+    # Patch credentials.read_secrets to avoid needing real credential stores.
+    async def fake_read_secrets(*args: object, **kwargs: object) -> dict[str, SimpleNamespace]:
+        return {HERMES: SimpleNamespace(value="fake")}
+
+    monkeypatch.setattr(credentials, "read_secrets", fake_read_secrets)
+
+    ctx = SimpleNamespace(
+        admin=SimpleNamespace(
+            name="admin",
+            role=SimpleNamespace(value="admin"),
+            clock=SimpleNamespace(now=lambda: now),
+            providers={},
+        ),
+        settings=SimpleNamespace(service=SimpleNamespace(render_timezone="UTC")),
+    )
+
+    principal = Principal(
+        id="test-admin",
+        name="admin",
+        role=Role.ADMIN,
+        created_at=now,
+    )
+
+    # Bypass session check.
+    monkeypatch.setattr(
+        gw_module, "_require", lambda *_args, **_kwargs: (principal, "fixture-csrf")
+    )
+    monkeypatch.setattr(gw_module, "_without_migration", lambda x: x)
+
+    captured_sections: list[dict[str, Any]] = []
+
+    def fake_page(*args: Any, sections: list[dict[str, Any]], **kwargs: Any) -> Any:
+        captured_sections.clear()
+        captured_sections.extend(sections)
+        from crucible.adapters.ui.render import templates  # noqa: PLC0415
+
+        class FakeResponse:
+            body = templates.get_template("page.html").render(
+                request=args[0] if args else {},
+                title="Local gateway",
+                active="/ui/gateway",
+                nav=(),
+                heading="Local gateway",
+                intro="The gateway Hermes uses.",
+                sections=sections,
+                badge="tested",
+                badge_kind="ok",
+                csrf="fixture-csrf",
+                hidden=frozenset(),
+                principal=principal,
+                message=None,
+            )
+
+        return FakeResponse()
+
+    monkeypatch.setattr(gw_module, "_page", fake_page)
+
+    # Unfetched page (no ?models=1 query)
+    req = Request(
+        {"type": "http", "method": "GET", "path": "/ui/gateway", "query_string": b"", "headers": []}
+    )
+    asyncio.run(gw_module.gateway_page(req, ctx, fake_uow))  # type: ignore[arg-type]
+    assert captured_sections, "sections must be populated"
+
+    section_titles = [s["title"] for s in captured_sections]
+
+    # The URL and key save form must appear on the unfetched page.
+    assert "Set the gateway URL and key" in section_titles
+    form_section = next(s for s in captured_sections if s["title"] == "Set the gateway URL and key")
+    assert "form" in form_section
+    fields = [f["name"] for f in form_section["form"]["fields"]]
+    assert "endpoint_url" in fields
+    assert "api_key" in fields
+    assert "reason" in fields
+    assert form_section["form"]["label"] == "Save and test"
+
+    # The test form must also appear (on the gateway section).
+    gateway_section = next(s for s in captured_sections if s["title"] == "Gateway")
+    assert "form" in gateway_section
+    assert gateway_section["form"]["label"] == "Test the gateway again"
+
+    # The listing section must have the "List the gateway's models" button.
+    listing_section = next(s for s in captured_sections if s["title"] == "Models the key can see")
+    assert listing_section.get("button", {}).get("label") == "List the gateway's models"
+    assert "rows" not in listing_section, "no model rows when not fetched"
+    assert "form" not in listing_section, "no model choice form when not fetched"
+
+    # Local run limits section must be present.
+    assert "Local run limits" in section_titles
+
+    # Model choice form must NOT be present when not fetched.
+    assert all(
+        "form" not in s or s["form"]["label"] != "Save model choices" for s in captured_sections
+    ), "model choice form should not be present when models are not fetched"
+
+    # Fetched page (with ?models=1 query)
+    req_fetched = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/ui/gateway",
+            "query_string": b"models=1",
+            "headers": [],
+        }
+    )
+    captured_sections.clear()
+    asyncio.run(gw_module.gateway_page(req_fetched, ctx, fake_uow))  # type: ignore[arg-type]
+    assert captured_sections
+
+    listing_fetched = next(s for s in captured_sections if s["title"] == "Models the key can see")
+
+    # Model choice form must appear when fetched.
+    assert "form" in listing_fetched
+    assert listing_fetched["form"]["label"] == "Save model choices"
+
+    # The listing rows must be present (gpt-4o from fetch_models).
+    grid_field = next(f for f in listing_fetched["form"]["fields"] if f["kind"] == "grid")
+    rows_text = str(grid_field["rows"])
+    assert "gpt-4o" in rows_text
+
+
+def test_routing_model_and_tier_controls_are_ordinary_reasoned_forms(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        routing_models_service,
+        "routing_controls_view",
+        lambda _uow: {
+            "pinned": False,
+            "pools": ["codex", "claude"],
+            "models": [
+                {
+                    "id": "gpt",
+                    "harness": "codex",
+                    "pool": "codex",
+                    "capability": "frontier",
+                    "enabled": True,
+                }
+            ],
+            "tiers": {
+                "complex": {
+                    "plain_words": (
+                        "complex: Codex first, then Claude Code; a busy first choice waits"
+                    ),
+                    "prefer_pools": ["codex", "claude"],
+                    "allowed_capability": ["frontier"],
+                }
+            },
+        },
+    )
+
+    sections = ui_routing_models.control_sections(cast(Any, object()), admin=True)
+
+    assert sections[0]["rows"][0][1].endswith("a busy first choice waits")
+    assert sections[1]["rows"][0][4]["action"] == "/ui/actions/routing-model"
+    tier_form = sections[2]["form"]
+    assert tier_form["action"] == "/ui/actions/routing-tier"
+    assert [
+        field["value"] for field in tier_form["fields"] if field["name"].startswith("pool_")
+    ] == ["codex", "claude"]
+    assert tier_form["fields"][-1]["name"] == "reason"
+
+
+def test_routing_tier_action_keeps_numeric_pool_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    saved: list[str] = []
+    monkeypatch.setattr(
+        routing_models_service,
+        "save_tier",
+        lambda *args, **kwargs: saved.extend(kwargs["prefer_pools"]),
+    )
+    form = {"tier": "complex", **{f"pool_{n}": f"pool-{n}" for n in range(11)}}
+
+    asyncio.run(
+        ui_routing_models._actions(
+            request("/ui/actions/routing-tier"),
+            "routing-tier",
+            cast(Any, SimpleNamespace(admin=object())),
+            cast(Any, object()),
+            cast(Any, object()),
+            "csrf",
+            form,
+            "reorder pools",
+        )
+    )
+
+    assert saved == [f"pool-{n}" for n in range(11)]

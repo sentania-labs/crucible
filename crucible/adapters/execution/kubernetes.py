@@ -51,6 +51,7 @@ from crucible.adapters.execution import k8sspec, scripts, workspace
 from crucible.adapters.execution.collected import read_outputs, read_verifications
 from crucible.adapters.execution.create_policy import image_allowed
 from crucible.adapters.execution.k8sapi import (
+    _TRANSPORT_ERRORS,
     ExecResult,
     KubernetesApiError,
     KubernetesClient,
@@ -126,6 +127,19 @@ from crucible.ports.github import InstallationToken
 from crucible.ports.harness import AuthFile, CredentialSpec, ExitInfo, LaunchContext, MountMode
 
 log = logging.getLogger("crucible.provider.kubernetes")
+
+
+def is_transport(exc: BaseException) -> bool:
+    """Classify the client boundary by status and preserved socket cause.
+
+    k8sapi._unreachable chains the original socket exception with status zero.
+    Zero alone also covers local configuration errors, which must not be retried.
+    """
+    if isinstance(exc, KubernetesApiError):
+        if exc.status:
+            return exc.status in (502, 503, 504)
+        return exc.__cause__ is not None and is_transport(exc.__cause__)
+    return isinstance(exc, _TRANSPORT_ERRORS)
 
 
 def _inside_declared_network(
@@ -232,6 +246,7 @@ LIST_IMAGES_SKIP_PREFIX = "ci-"
 # the cap logged inside it) is retried larger, up to the ceiling; past the ceiling the
 # rest of that second is skipped with a notice line, never read unbounded.
 LOG_READ_LIMIT = 4 * 1024 * 1024
+JOB_TAIL_LINES = 2000
 LOG_READ_CEILING = 64 * 1024 * 1024
 # How much of a collected output tar is accepted. The tree is excluded from it, so this
 # is the diff, the bundle, the report copy and the verifier logs.
@@ -320,6 +335,7 @@ class KubernetesConfig:
     max_concurrency: int = 3
     poll_interval_seconds: float = 2.0
     api_timeout_seconds: float = 30.0
+    api_retry_seconds: float = 60.0
     # The cluster's DNS service address. 26 allows port 53 on this address and nothing
     # else on it; every other destination inside the cluster stays denied.
     cluster_dns_ip: str = "10.96.0.10"
@@ -427,6 +443,8 @@ class NamespaceProbe:
     # the retry rule covers, never a refusal, and the next launch runs the canary again.
     unavailable: bool = False
 
+    canary_node: str = ""
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "namespace_ready": self.passed,
@@ -438,6 +456,7 @@ class NamespaceProbe:
             "pod_pid_limit_source": self.pid_limit_source,
             "runtime_class": "standard",
             "detail": self.detail,
+            "canary_node": self.canary_node,
         }
 
 
@@ -653,6 +672,62 @@ class KubernetesProvider:
     async def _call(self, fn: Any, *args: Any, **kwargs: Any) -> Any:
         return await asyncio.to_thread(fn, *args, **kwargs)
 
+    async def _call_with_backoff(
+        self, fn: Any, *args: Any, deadline_seconds: float | None = None, **kwargs: Any
+    ) -> Any:
+        """Retry pre-worker transport failures within a monotonic time budget."""
+        budget = self.config.api_retry_seconds if deadline_seconds is None else deadline_seconds
+        deadline = time.monotonic() + max(0.0, budget)
+        delay = 1.0
+        attempt = 1
+        while True:
+            try:
+                return await self._call(fn, *args, **kwargs)
+            except (KubernetesApiError, OSError) as exc:
+                if not is_transport(exc):
+                    raise
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise
+                log.info(
+                    "API transport failure on attempt %d (%s); backing off",
+                    attempt,
+                    type(exc).__name__,
+                )
+                await asyncio.sleep(min(delay, remaining))
+                if time.monotonic() >= deadline:
+                    raise
+                delay = min(delay * 2, 16.0)
+                attempt += 1
+
+    async def _create_with_backoff(self, kind: str, body: Mapping[str, Any]) -> None:
+        # A unique marker survives server defaulting and controller mutations. A
+        # conflict after a lost response is success only for this exact request.
+        marker = "crucible.io/create-request"
+        request_id = new_id()
+        metadata = dict(body.get("metadata") or {})
+        metadata["annotations"] = {**metadata.get("annotations", {}), marker: request_id}
+        request = {**body, "metadata": metadata}
+        ambiguous = False
+
+        def create() -> Any:
+            nonlocal ambiguous
+            try:
+                return self.client.create(kind, request)
+            except KubernetesApiError as exc:
+                if exc.status == 409 and ambiguous:
+                    existing = self.client.get(kind, str(metadata["name"]))
+                    annotations = (existing.get("metadata") or {}).get("annotations") or {}
+                    if annotations.get(marker) == request_id:
+                        return existing
+                ambiguous = ambiguous or is_transport(exc)
+                raise
+            except OSError as exc:
+                ambiguous = ambiguous or is_transport(exc)
+                raise
+
+        await self._call_with_backoff(create)
+
     async def _registry_call(self, fn: Any, *args: Any, **kwargs: Any) -> Any:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
@@ -678,7 +753,7 @@ class KubernetesProvider:
 
     # ----- images ------------------------------------------------------
 
-    async def _resolve_image(self, spec: LaunchSpec) -> str:
+    async def _resolve_image(self, spec: LaunchSpec, *, use_backoff: bool = False) -> str:
         """Resolve the tag to a digest through the registry and refuse what the policy
         or the adapter's tested range does not allow (07, 13, 26).
 
@@ -689,7 +764,7 @@ class KubernetesProvider:
         that."""
         cached = self._images.get(spec.image)
         if cached is None:
-            await self._load_pull_auths()
+            await self._load_pull_auths(use_backoff=use_backoff)
             try:
                 cached = await self._registry_call(self.registry.resolve, spec.image)
             except RegistryError as exc:
@@ -702,7 +777,7 @@ class KubernetesProvider:
             raise HarnessRefusedError(f"refusing to launch: {check.detail}")
         return cached.reference
 
-    async def _load_pull_auths(self) -> None:
+    async def _load_pull_auths(self, *, use_backoff: bool = False) -> None:
         """The registry credential is the cluster's own image pull Secret, read once.
 
         Nothing about it is configuration: the deployment already has to give the
@@ -715,7 +790,8 @@ class KubernetesProvider:
         if auths is None or not isinstance(auths, dict):
             return
         try:
-            body = await self._call(self.client.get, "secrets", self.config.image_pull_secret)
+            call = self._call_with_backoff if use_backoff else self._call
+            body = await call(self.client.get, "secrets", self.config.image_pull_secret)
         except KubernetesApiError as exc:
             log.warning("image pull secret unreadable", extra={"error": str(exc)})
             return
@@ -845,6 +921,7 @@ class KubernetesProvider:
         namespace_run = await self._run_canary(image, scope="namespace")
         if isinstance(namespace_run, NamespaceProbe):
             return namespace_run
+        namespace_log, namespace_node = namespace_run
         endpoint_url = self.config.local_endpoint_url
         endpoint_problem: str | None = None
         try:
@@ -865,14 +942,16 @@ class KubernetesProvider:
         )
         if isinstance(rules_run, NamespaceProbe):
             return rules_run
-        probe = _read_probe(namespace_run, rules_run, override=self.config.pod_pid_limit_override)
+        rules_log, _rules_node = rules_run
+        probe = _read_probe(namespace_log, rules_log, override=self.config.pod_pid_limit_override)
         if endpoint_problem is None:
-            return probe
+            return replace(probe, canary_node=namespace_node)
         return replace(
             probe,
             detail=endpoint_problem if probe.passed else f"{probe.detail}; {endpoint_problem}",
             local_endpoint_reachable=False,
             local_endpoint_detail=endpoint_problem,
+            canary_node=namespace_node,
         )
 
     async def _canary_endpoint_plan(self, endpoint_url: str) -> EgressPlan:
@@ -895,7 +974,7 @@ class KubernetesProvider:
         scope: Literal["namespace", "worker"],
         plan: EgressPlan | None = None,
         endpoint_url: str = "",
-    ) -> str | NamespaceProbe:
+    ) -> tuple[str, str] | NamespaceProbe:
         """Run one canary Pod to its end and return its log, or the probe that says why
         it could not run. `plan` is its own NetworkPolicy; None runs it under the
         namespace's rules alone."""
@@ -956,11 +1035,11 @@ class KubernetesProvider:
         )
         if policy_name is not None:
             try:
-                await self._call(self.client.create, "networkpolicies", policy)
+                await self._create_with_backoff("networkpolicies", policy)
             except KubernetesApiError as exc:
                 return _canary_failed(f"the canary NetworkPolicy was refused: {exc}", exc)
         try:
-            await self._call(self.client.create, "pods", pod)
+            await self._create_with_backoff("pods", pod)
         except KubernetesApiError as exc:
             if policy_name is not None:
                 with contextlib.suppress(KubernetesApiError):
@@ -977,7 +1056,7 @@ class KubernetesProvider:
             # not, and a real API server prefixes every line when timestamps are left
             # enabled.
             try:
-                body = await self._call(
+                body = await self._call_with_backoff(
                     self.client.pod_log,
                     name,
                     container=k8sspec.CONTAINER_NAME,
@@ -985,7 +1064,9 @@ class KubernetesProvider:
                 )
             except KubernetesApiError as exc:
                 return _canary_failed(f"the canary's log could not be read: {exc}", exc)
-            return b"".join(frame.payload for frame in body).decode("utf-8", "replace")
+            log = b"".join(frame.payload for frame in body).decode("utf-8", "replace")
+            pod = await self._call(self.client.get, "pods", name)
+            return log, pod["spec"].get("nodeName", "")
         finally:
             with contextlib.suppress(KubernetesApiError):
                 await self._call(self.client.delete, "pods", name, grace_period_seconds=0)
@@ -1073,7 +1154,7 @@ class KubernetesProvider:
             workspace.require_checkout_url(url, self.config.credential_host)
         base_ref = str(repository.get("base_ref", "main"))
         work_branch = str(repository.get("work_branch") or f"crucible/{spec.external_id}")
-        resolved = await self._resolve_image(spec)
+        resolved = await self._resolve_image(spec, use_backoff=True)
         limits = self._limits(spec)
         # 26, issue 59: the preparer is a Pod with GitHub egress and the per-attempt
         # Secret is a credential copy, so neither is made in a namespace whose egress
@@ -1083,7 +1164,7 @@ class KubernetesProvider:
 
         # 26: the PVC, the ConfigMap and the per-attempt Secret, then the preparer Job.
         await self._delete_attempt_objects(spec.attempt_id)
-        await self._create(
+        await self._create_with_backoff(
             "persistentvolumeclaims",
             k8sspec.workspace_claim(
                 name=k8sspec.object_name("ws", spec.attempt_id),
@@ -1096,7 +1177,7 @@ class KubernetesProvider:
         bundle, identity_paths, identity_sha = await asyncio.to_thread(
             _render_identity, spec, work_branch, self.harnesses
         )
-        await self._create(
+        await self._create_with_backoff(
             "configmaps",
             k8sspec.config_map(
                 name=k8sspec.object_name("identity", spec.attempt_id),
@@ -1108,7 +1189,7 @@ class KubernetesProvider:
         )
         copy = self._credential_copy(spec)
         if copy is not None:
-            await self._seed_credential(spec, copy)
+            await self._seed_credential(spec, copy, use_backoff=True)
             self._seeded[spec.attempt_id] = dict(copy.seeded)
         try:
             return await self._prepare_checkout(
@@ -1171,8 +1252,7 @@ class KubernetesProvider:
                     f"the checkout token Secret {name!r} left by an earlier try could not "
                     "be removed"
                 )
-            await self._call(
-                self.client.create,
+            await self._create_with_backoff(
                 "secrets",
                 k8sspec.secret(
                     name=name,
@@ -1338,6 +1418,7 @@ class KubernetesProvider:
             exit_code = await self._run_role_job(
                 spec,
                 role=k8sspec.ROLE_PREPARER,
+                use_backoff=True,
                 image=resolved,
                 script=scripts.preparer_script(
                     url=url,
@@ -1385,7 +1466,7 @@ class KubernetesProvider:
                 f"{redact(self.last_error.get(k8sspec.ROLE_PREPARER, ''))}"
             )
         prepared = await self._read_files(
-            spec, ["output/prepared-head.txt", "output/started-from.txt"], limits
+            spec, ["output/prepared-head.txt", "output/started-from.txt"], limits, use_backoff=True
         )
         head = (prepared.get("output/prepared-head.txt") or b"").decode("utf-8", "replace").strip()
         if not head:
@@ -1433,6 +1514,7 @@ class KubernetesProvider:
         code = await self._run_role_job(
             spec,
             role=k8sspec.ROLE_CACHE_REFRESHER,
+            use_backoff=True,
             image=image,
             script=scripts.cache_refresh_script(
                 url=url,
@@ -1499,7 +1581,7 @@ class KubernetesProvider:
     ) -> Handle:
         await self._require_ready(spec)
         gated_under = self.config
-        resolved = await self._resolve_image(spec)
+        resolved = await self._resolve_image(spec, use_backoff=True)
         limits = self._limits(spec)
         self._last_limits = limits
         copy = self._credential_copy(spec)
@@ -1536,7 +1618,9 @@ class KubernetesProvider:
             # hades #189: the readiness gate and the image resolution above can take a
             # while; a cancel that landed during them creates nothing.
             await _stop_if_cancelled(cancelled, "before the worker was created")
-            policy_name, plan = await self._apply_policy(spec, k8sspec.ROLE_WORKER, plan)
+            policy_name, plan = await self._apply_policy(
+                spec, k8sspec.ROLE_WORKER, plan, use_backoff=True
+            )
             body = k8sspec.job(
                 name=job_name,
                 namespace=self.config.namespace,
@@ -1553,7 +1637,7 @@ class KubernetesProvider:
                 ),
                 active_deadline_seconds=max(60, spec.timeout_seconds + limits.grace_seconds),
             )
-            await self._create("jobs", body)
+            await self._create_with_backoff("jobs", body)
         except (KubernetesApiError, SpecError) as exc:
             with contextlib.suppress(Exception):
                 await self._call(self.client.delete, "jobs", job_name)
@@ -1959,6 +2043,7 @@ class KubernetesProvider:
             "job": launched.job_name if launched else "",
             "pod": (launched.pod_name if launched else "") or "",
             "node": (launched.node if launched else "") or "",
+            "canary_node": probe.canary_node if probe else "",
             # What the live Pod carried when it was seen (issue 76), else what the policy
             # asked for, and which of the two this is.
             "limits": (launched.limits if launched else self._limits(spec)).as_dict(),
@@ -3045,11 +3130,14 @@ class KubernetesProvider:
         await asyncio.to_thread(self.write_credential_files, flow.harness, files)
         session.credential_written = True
 
-    async def _exec_read(self, pod: str, path: str, limit: int = CREDENTIAL_READ_LIMIT) -> Any:
+    async def _exec_read(
+        self, pod: str, path: str, limit: int = CREDENTIAL_READ_LIMIT, *, use_backoff: bool = False
+    ) -> Any:
         """One file off a running Pod over exec: its bytes, None when it is absent, or
         `_TRUNCATED` / `_UNREADABLE`. Never through a log (12)."""
         try:
-            result: ExecResult = await self._call(
+            call = self._call_with_backoff if use_backoff else self._call
+            result: ExecResult = await call(
                 self.client.pod_exec,
                 pod,
                 ["sh", "-c", _read_one_script(path, limit)],
@@ -3100,7 +3188,7 @@ class KubernetesProvider:
         }
 
     async def _identity_paths(self, attempt_id: str) -> dict[str, str]:
-        body = await self._call(
+        body = await self._call_with_backoff(
             self.client.get, "configmaps", k8sspec.object_name("identity", attempt_id)
         )
         annotations = (body.get("metadata") or {}).get("annotations") or {}
@@ -3459,7 +3547,7 @@ class KubernetesProvider:
         )
 
     async def _apply_policy(
-        self, spec: LaunchSpec, role: str, plan: EgressPlan
+        self, spec: LaunchSpec, role: str, plan: EgressPlan, *, use_backoff: bool = False
     ) -> tuple[str | None, EgressPlan]:
         """One NetworkPolicy per attempt per role that needs egress.
 
@@ -3477,7 +3565,8 @@ class KubernetesProvider:
         plan = await self._resolve_plan(plan)
         name = k8sspec.object_name(f"np-{role}", spec.attempt_id)
         body = self._policy_body(name, self._labels(spec, role), spec.attempt_id, role, plan)
-        await self._create("networkpolicies", body)
+        create = self._create_with_backoff if use_backoff else self._create
+        await create("networkpolicies", body)
         return name, plan
 
     async def _resolve_plan(self, plan: EgressPlan) -> EgressPlan:
@@ -3597,7 +3686,7 @@ class KubernetesProvider:
         raised rather than folded into absence, so a required credential does not
         read a transient API error as "no keys" and launch unauthenticated."""
         try:
-            body = await self._call(
+            body = await self._call_with_backoff(
                 self.client.get, "secrets", k8sspec.object_name("cred", attempt_id)
             )
         except KubernetesApiError as exc:
@@ -3606,7 +3695,9 @@ class KubernetesProvider:
             raise
         return [str(key) for key in (body.get("data") or {})]
 
-    async def _seed_credential(self, spec: LaunchSpec, copy: _CredentialCopy) -> None:
+    async def _seed_credential(
+        self, spec: LaunchSpec, copy: _CredentialCopy, *, use_backoff: bool = False
+    ) -> None:
         """26: per attempt, copy the harness Secret into `cred-<attempt>`.
 
         Only the named auth files, never the whole Secret: a harness Secret can hold
@@ -3619,7 +3710,8 @@ class KubernetesProvider:
         holds a copy of the credential as it stands, which the login then declines to
         replace (12). Nothing an attempt holds is ever mixed with a new session."""
         try:
-            source = await self._call(self.client.get, "secrets", copy.source_secret)
+            call = self._call_with_backoff if use_backoff else self._call
+            source = await call(self.client.get, "secrets", copy.source_secret)
         except KubernetesApiError as exc:
             if not copy.spec.required_for_launch and exc.status == 404:
                 return
@@ -3650,7 +3742,8 @@ class KubernetesProvider:
             value = base64.b64decode(str(raw))
             payload[key] = value
             copy.seeded[auth.name] = hashlib.sha256(value).hexdigest()
-        await self._create(
+        create = self._create_with_backoff if use_backoff else self._create
+        await create(
             "secrets",
             k8sspec.secret(
                 name=k8sspec.object_name("cred", spec.attempt_id),
@@ -3844,6 +3937,7 @@ class KubernetesProvider:
         cancelled: CancelCheck | None = None,
         tolerate_lingering_pod: bool = False,
         wait_for_quota: bool = False,
+        use_backoff: bool = False,
     ) -> int:
         """Run one single-purpose Job to completion and delete it. With `cancelled`, a
         cancel ends the wait (hades #189): the Job and its policy are deleted on the way
@@ -3859,7 +3953,9 @@ class KubernetesProvider:
         with contextlib.suppress(KubernetesApiError):
             await self._call(self.client.delete, "jobs", name)
         try:
-            policy_name, resolved_plan = await self._apply_policy(spec, role, plan)
+            policy_name, resolved_plan = await self._apply_policy(
+                spec, role, plan, use_backoff=use_backoff
+            )
             body = k8sspec.job(
                 name=name,
                 namespace=self.config.namespace,
@@ -3882,7 +3978,8 @@ class KubernetesProvider:
                 # Crucible's wait counts the role's time from Running (lab findings of 2026-09-29).
                 active_deadline_seconds=timeout + self.config.launch_timeout_seconds,
             )
-            await self._create("jobs", body)
+            create = self._create_with_backoff if use_backoff else self._create
+            await create("jobs", body)
         except (KubernetesApiError, SpecError) as exc:
             log.warning("%s Job failed", role, extra={"error": str(exc)})
             self._role_error(
@@ -3984,7 +4081,7 @@ class KubernetesProvider:
     # ----- the reader Pod ------------------------------------------------
 
     @contextlib.asynccontextmanager
-    async def _reader(self, spec: LaunchSpec, limits: Limits) -> Any:
+    async def _reader(self, spec: LaunchSpec, limits: Limits, *, use_backoff: bool = False) -> Any:
         """A short-lived Pod with the workspace claim mounted read-only (26).
 
         The Crucible pods never mount a claim, so this is how everything a role wrote
@@ -4013,7 +4110,8 @@ class KubernetesProvider:
                 )
             ),
         )
-        await self._create("pods", body)
+        create = self._create_with_backoff if use_backoff else self._create
+        await create("pods", body)
         try:
             if not await self._await_running(name, timeout=self.config.launch_timeout_seconds):
                 raise CollectionUnavailableError(
@@ -4032,6 +4130,7 @@ class KubernetesProvider:
         limits: Limits,
         *,
         limit: int = CREDENTIAL_READ_LIMIT,
+        use_backoff: bool = False,
     ) -> dict[str, bytes]:
         """Read named files off the workspace claim through the reader Pod.
 
@@ -4040,12 +4139,14 @@ class KubernetesProvider:
         12 forbids. Each file is checked for being a regular file and bounded before it
         is read, because a worker owns what it left at that path."""
         out: dict[str, bytes] = {}
-        async with self._reader(spec, limits) as pod:
+        async with self._reader(spec, limits, use_backoff=use_backoff) as pod:
             for path in paths:
                 # A stream that ended before the command reported a status is
                 # `_UNREADABLE`: "could not read" is not "the file was absent", and 12
                 # records the difference.
-                data = await self._exec_read(pod, f"{WORK_MOUNT}/{path}", limit)
+                data = await self._exec_read(
+                    pod, f"{WORK_MOUNT}/{path}", limit, use_backoff=use_backoff
+                )
                 if data is not None:
                     out[path] = data
         return out
@@ -4372,7 +4473,11 @@ class KubernetesProvider:
         name = str((pod.get("metadata") or {}).get("name") or "")
         try:
             frames = await self._call(
-                self.client.pod_log, name, container=k8sspec.CONTAINER_NAME, timestamps=False
+                self.client.pod_log,
+                name,
+                container=k8sspec.CONTAINER_NAME,
+                timestamps=False,
+                tail_lines=JOB_TAIL_LINES,
             )
         except KubernetesApiError:
             return ""

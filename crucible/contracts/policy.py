@@ -145,8 +145,14 @@ class NamedVersion(StrictModel):
     version: int = Field(ge=1)
 
 
+class RoutingPolicyRef(NamedVersion):
+    # A delivery policy normally follows new versions of the named routing policy.
+    # Set this only when an operator deliberately wants this exact version retained.
+    pinned: bool = False
+
+
 class RoutingRef(StrictModel):
-    policy: NamedVersion
+    policy: RoutingPolicyRef
 
 
 class Images(StrictModel):
@@ -258,7 +264,9 @@ class InternalReview(StrictModel):
 
 
 class ExternalReview(StrictModel):
-    provider: str = Field(min_length=1)
+    provider: str | None = None
+    request_on_publish: bool = True
+    trigger_comment: str | None = None
     reviewer_logins: list[str]
     required_rounds: int = Field(ge=0)
     retrigger_after_correction: bool
@@ -273,6 +281,13 @@ class ExternalReview(StrictModel):
     def _logins_when_required(self) -> ExternalReview:
         if self.required_rounds > 0 and not self.reviewer_logins:
             raise ValueError("reviewer_logins must be non-empty when required_rounds is above 0")
+        if self.trigger_comment is None and self.provider == "codex":
+            self.trigger_comment = "@codex review"
+        if self.provider and self.request_on_publish and not self.trigger_comment:
+            raise ValueError(
+                f"external review provider {self.provider!r} requires trigger_comment "
+                "when request_on_publish is true"
+            )
         return self
 
 

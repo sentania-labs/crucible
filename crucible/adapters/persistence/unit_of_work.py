@@ -597,6 +597,7 @@ class Executions:
                 effort=execution.effort,
                 image=execution.image,
                 resume_from_remote=execution.resume_from_remote,
+                retry_on=list(execution.retry_on),
             )
         )
 

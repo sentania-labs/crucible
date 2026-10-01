@@ -34,7 +34,8 @@ async def gateway_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
     assert ctx.admin is not None
     secrets = await credentials.read_secrets(ctx.admin, [credentials.HERMES])
     view = gateway.gateway_view(ctx.admin, uow, secrets.get(credentials.HERMES))
-    offered = await gateway.models_view(ctx.admin, uow)
+    _models_requested = request.query_params.get("models") == "1"
+    offered = await gateway.models_view(ctx.admin, uow, fetch=_models_requested)
     passed = view["last_outcome"] == "probe:completed"
     # crucible#115: one row in plain words; the credential's state is on Credentials.
     sections: list[dict[str, Any]] = [
@@ -64,24 +65,89 @@ async def gateway_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
             "policy version. A model the gateway no longer offers is disabled, not removed."
         ),
     }
-    if principal.role is not Role.ADMIN:
-        listing.update(
-            columns=["Model", "Offered", "Hermes", "Codex", "Thinking", "Capability", "Note"],
-            rows=[
-                [
-                    row["id"],
-                    row["offered"],
-                    row["enabled"],
-                    row["codex_enabled"],
-                    row["enable_thinking"],
-                    row["capability"],
-                    _without_migration(row["note"]),
-                ]
-                for row in offered["models"]
-            ],
-        )
+    if _models_requested:
+        # Build rows and model-choice form only when the operator asked for models.
+        if principal.role is not Role.ADMIN:
+            listing.update(
+                columns=["Model", "Offered", "Hermes", "Codex", "Thinking", "Capability", "Note"],
+                rows=[
+                    [
+                        row["id"],
+                        row["offered"],
+                        row["enabled"],
+                        row["codex_enabled"],
+                        row["enable_thinking"],
+                        row["capability"],
+                        _without_migration(row["note"]),
+                    ]
+                    for row in offered["models"]
+                ],
+            )
+        else:
+            rows: list[list[Any]] = []
+            for index, row in enumerate(offered["models"]):
+                rows.append(
+                    [
+                        {"kind": "hidden", "name": f"model.{index}.id", "value": row["id"]},
+                        {
+                            "kind": "checkbox",
+                            "name": f"model.{index}.enabled",
+                            "value": row["enabled"],
+                            "label": f"use {row['id']}",
+                        },
+                        {
+                            "kind": "checkbox",
+                            "name": f"model.{index}.codex",
+                            "value": row["codex_enabled"],
+                            "label": f"use Codex for {row['id']}",
+                        },
+                        {
+                            "kind": "checkbox",
+                            "name": f"model.{index}.thinking",
+                            "value": row["enable_thinking"],
+                            "label": f"thinking for {row['id']}",
+                        },
+                        {
+                            "kind": "select",
+                            "name": f"model.{index}.capability",
+                            "value": row["capability"],
+                            "options": CAPABILITY_OPTIONS,
+                            "label": f"capability of {row['id']}",
+                        },
+                        {"value": _without_migration(row["note"])},
+                    ]
+                )
+            listing["form"] = {
+                "action": "/ui/actions/gateway-models",
+                "label": "Save model choices",
+                "fields": [
+                    {
+                        "kind": "grid",
+                        "label": "",
+                        "columns": ["Model", "Hermes", "Codex", "Thinking", "Capability", "Note"],
+                        "rows": rows,
+                    },
+                    {
+                        "name": "max_concurrency",
+                        "label": "Pool max concurrency",
+                        "kind": "number",
+                        "value": (offered["pool"] or {}).get("max_concurrency") or 4,
+                        "required": True,
+                    },
+                    {"name": "reason", "label": "Reason", "required": True},
+                ],
+            }
         sections.append(listing)
     else:
+        # Not fetched: show a note so the operator can list the models on demand.
+        listing["button"] = {
+            "href": "/ui/gateway?models=1",
+            "label": "List the gateway's models",
+        }
+        sections.append(listing)
+
+    # Admin controls are always built regardless of fetch state.
+    if principal.role is Role.ADMIN:
         sections.append(
             {
                 "title": "Set the gateway URL and key",
@@ -123,62 +189,6 @@ async def gateway_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                 "label": "Test the gateway again",
                 "fields": [{"name": "reason", "label": "Reason"}],
             }
-        if offered["models"]:
-            rows = []
-            for index, row in enumerate(offered["models"]):
-                rows.append(
-                    [
-                        {"kind": "hidden", "name": f"model.{index}.id", "value": row["id"]},
-                        {
-                            "kind": "checkbox",
-                            "name": f"model.{index}.enabled",
-                            "value": row["enabled"],
-                            "label": f"use {row['id']}",
-                        },
-                        {
-                            "kind": "checkbox",
-                            "name": f"model.{index}.codex",
-                            "value": row["codex_enabled"],
-                            "label": f"use Codex for {row['id']}",
-                        },
-                        {
-                            "kind": "checkbox",
-                            "name": f"model.{index}.thinking",
-                            "value": row["enable_thinking"],
-                            "label": f"thinking for {row['id']}",
-                        },
-                        {
-                            "kind": "select",
-                            "name": f"model.{index}.capability",
-                            "value": row["capability"],
-                            "options": CAPABILITY_OPTIONS,
-                            "label": f"capability of {row['id']}",
-                        },
-                        # The note without the migration that wrote it (crucible#115).
-                        {"value": _without_migration(row["note"])},
-                    ]
-                )
-            listing["form"] = {
-                "action": "/ui/actions/gateway-models",
-                "label": "Save model choices",
-                "fields": [
-                    {
-                        "kind": "grid",
-                        "label": "",
-                        "columns": ["Model", "Hermes", "Codex", "Thinking", "Capability", "Note"],
-                        "rows": rows,
-                    },
-                    {
-                        "name": "max_concurrency",
-                        "label": "Pool max concurrency",
-                        "kind": "number",
-                        "value": (offered["pool"] or {}).get("max_concurrency") or 4,
-                        "required": True,
-                    },
-                    {"name": "reason", "label": "Reason", "required": True},
-                ],
-            }
-        sections.append(listing)
     sections.append(_hermes_limits_section(gateway.hermes_limits_view(uow), principal))
     return _page(
         request,

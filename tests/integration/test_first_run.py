@@ -310,7 +310,11 @@ def test_the_gateway_is_set_tested_and_its_models_picked(
     stubs.stubs.config["models"] = ["coder-large"]
     with TestClient(create_app(ctx)) as browser:
         csrf = ui_sign_in(browser, tokens["admin"])
-        page = browser.get("/ui/gateway").text
+        # Plain GET: no gateway call, but admin form and link are present.
+        plain_page = browser.get("/ui/gateway").text
+        assert "Set the gateway URL and key" in plain_page
+        assert "List the gateway" in plain_page
+        page = browser.get("/ui/gateway?models=1").text
         assert "not offered by the gateway; saving disables it" in page
         shown_rows = re.findall(r'name="model\.(\d+)\.id" value="([^"]+)"', page)
         form = {"csrf": csrf, "reason": "saved as shown", "return_to": "/ui/gateway"}
@@ -380,7 +384,7 @@ def test_the_gateway_is_set_tested_and_its_models_picked(
     # The UI page shows the URL, the result and the pick form, never the key.
     with TestClient(create_app(ctx)) as browser:
         ui_sign_in(browser, tokens["admin"])
-        page = browser.get("/ui/gateway")
+        page = browser.get("/ui/gateway?models=1")
         assert page.status_code == 200
         assert "http://127.0.0.1:9/v1" in page.text and GATEWAY_KEY not in page.text
         assert "the last test was inconclusive" in page.text
@@ -1012,7 +1016,7 @@ def test_local_codex_models_api_ui_and_cli(
     assert refused.status_code == 422
     with TestClient(create_app(ctx)) as browser:
         csrf = ui_sign_in(browser, tokens["admin"])
-        page = browser.get("/ui/gateway").text
+        page = browser.get("/ui/gateway?models=1").text
         assert "use Codex for fast" in page
         rows = re.findall(r'name="model\.(\d+)\.id" value="([^"]+)"', page)
         index = next(i for i, model in rows if model == "fast")

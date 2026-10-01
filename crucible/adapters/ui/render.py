@@ -40,6 +40,7 @@ NAV = (
     ("/ui/github", "GitHub"),
     ("", "Work"),
     ("/ui/tasks", "Tasks"),
+    ("/ui/board", "Board"),
     ("/ui/workers", "Workers"),
     ("/ui/wakes", "Wakes"),
     ("", "Admin"),
