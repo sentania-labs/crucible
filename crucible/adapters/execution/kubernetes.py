@@ -4378,7 +4378,6 @@ class KubernetesProvider:
                 container=k8sspec.CONTAINER_NAME,
                 timestamps=False,
                 tail_lines=JOB_TAIL_LINES,
-                limit_bytes=LOG_READ_LIMIT,
             )
         except KubernetesApiError:
             return ""
