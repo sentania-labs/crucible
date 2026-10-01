@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 from collections import defaultdict
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 
 from crucible.application.errors import NotFoundError
@@ -67,6 +68,74 @@ from crucible.ports.repository import UnitOfWork
 
 DEFAULT_LIMIT = 50
 MAX_LIMIT = 200
+
+
+def board_imported_attempts(uow: UnitOfWork, task_ids: set[str]) -> list[Any]:
+    """Return bootstrap-imported attempts for Board's active tasks in one SQL read."""
+    if not task_ids:
+        return []
+    session = getattr(uow, "session", None)
+    if session is None:
+        return [
+            attempt
+            for task_id in task_ids
+            for attempt in uow.attempts.list_for_task(task_id)
+            if getattr(attempt, "unsupervised", False)
+        ]
+    rows = (
+        session.connection()
+        .exec_driver_sql(
+            "SELECT id, execution_id, task_id, state, created_at, started_at, ended_at, "
+            "selected_harness, selected_model, selected_pool, ordered_candidates "
+            "FROM attempts WHERE unsupervised IS TRUE AND task_id = ANY(%(task_ids)s)",
+            {"task_ids": list(task_ids)},
+        )
+        .mappings()
+    )
+    return [SimpleNamespace(**dict(row)) for row in rows]
+
+
+def board_latest_unacked_wakes(
+    uow: UnitOfWork, task_ids: set[str], principal_ids: set[str]
+) -> list[Any]:
+    """Return only the newest unacknowledged wake for each active task."""
+    if not task_ids:
+        return []
+    session = getattr(uow, "session", None)
+    if session is not None:
+        rows = (
+            session.connection()
+            .exec_driver_sql(
+                "SELECT DISTINCT ON (task_id) task_id, reason, payload, created_at "
+                "FROM wakes WHERE acked_at IS NULL AND task_id = ANY(%(task_ids)s) "
+                "ORDER BY task_id, created_at DESC, id DESC",
+                {"task_ids": list(task_ids)},
+            )
+            .mappings()
+        )
+        return [SimpleNamespace(**dict(row)) for row in rows]
+
+    wakes: list[Any] = []
+    for principal_id in principal_ids:
+        limit = MAX_LIMIT
+        while True:
+            page = list(
+                uow.wakes.list_for_principal(
+                    principal_id, since=None, include_acked=False, limit=limit
+                )
+            )
+            if len(page) < limit:
+                wakes.extend(page)
+                break
+            limit *= 2
+    newest: dict[str, Any] = {}
+    for wake in wakes:
+        if wake.task_id not in task_ids:
+            continue
+        previous = newest.get(wake.task_id)
+        if previous is None or wake.created_at > previous.created_at:
+            newest[wake.task_id] = wake
+    return list(newest.values())
 
 
 def board_batch_records(

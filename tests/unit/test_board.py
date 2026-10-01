@@ -46,7 +46,10 @@ class Repo:
     def list_for_principal(self, principal_id: str, **kwargs: Any) -> list[Any]:
         return [
             row for row in self.rows if row.principal_id == principal_id and row.acked_at is None
-        ]
+        ][: int(kwargs["limit"])]
+
+    def list_for_task(self, task_id: str) -> list[Any]:
+        return [row for row in self.rows if row.task_id == task_id]
 
     def list_for_pull_request(self, pull_request_id: str) -> list[Any]:
         return [row for row in self.rows if row.pull_request_id == pull_request_id]
@@ -212,6 +215,63 @@ def test_quality_totals_and_findings_dispositions() -> None:
         }
     ]
     assert quality_totals([]) == []
+
+
+def test_quality_outcome_uses_cancelled_task_state_after_pr_opened() -> None:
+    uow = fake_uow()
+    uow.tasks.rows[0].state = TaskState.CANCELLED
+
+    quality = board_view(uow, NOW)["quality"]
+
+    assert quality["tasks"][0]["outcome"] == "cancelled"
+    assert quality["totals"][0]["cancelled"] == 1
+
+
+def test_board_includes_imported_running_attempt() -> None:
+    uow = fake_uow()
+    imported = uow.attempts.rows[0]
+    imported.unsupervised = True
+    uow.attempts.list_in_states = lambda _states: []
+
+    document = board_view(uow, NOW)
+    item = document["in_flight"][6]["parents"][0]["tasks"][0]
+
+    assert (item["harness"], item["model"], item["pool"]) == (
+        "codex",
+        "gpt-5",
+        "priority",
+    )
+    assert item["eta"]["label"] == "600s / 3600s"
+    assert document["routing"][0]["attempt_id"] == "a1"
+
+
+def test_board_uses_newest_unacked_wake_beyond_first_two_hundred() -> None:
+    uow = fake_uow()
+    old_wakes = [
+        row(
+            task_id="t1",
+            principal_id="p1",
+            acked_at=None,
+            created_at=NOW - timedelta(minutes=300 - index),
+            payload={"summary": f"old {index}"},
+            reason="old",
+        )
+        for index in range(200)
+    ]
+    newest = row(
+        task_id="t1",
+        principal_id="p1",
+        acked_at=None,
+        created_at=NOW,
+        payload={"summary": "newest wake"},
+        reason="newest",
+    )
+    uow.wakes = Repo([*old_wakes, newest])
+
+    document = board_view(uow, NOW)
+    item = document["in_flight"][6]["parents"][0]["tasks"][0]
+
+    assert item["waiting_on"] == "newest wake"
 
 
 def test_board_empty_database() -> None:

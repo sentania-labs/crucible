@@ -8,7 +8,11 @@ from collections.abc import Iterable
 from datetime import datetime, timedelta
 from typing import Any
 
-from crucible.application.queries import board_batch_records
+from crucible.application.queries import (
+    board_batch_records,
+    board_imported_attempts,
+    board_latest_unacked_wakes,
+)
 from crucible.domain.entities import PullRequestState
 from crucible.domain.lifecycle import TASK_TERMINAL, AttemptState, ExecutionState, TaskState
 from crucible.ports.repository import UnitOfWork
@@ -259,6 +263,7 @@ def board_view(uow: UnitOfWork, now: datetime) -> dict[str, Any]:
     task_by_id = {task.id: task for task in tasks}
     active = [task for task in tasks if task.state not in TASK_TERMINAL]
     attempts = list(uow.attempts.list_in_states(list(AttemptState)))
+    attempts.extend(board_imported_attempts(uow, {task.id for task in active}))
     executions = list(uow.executions.list_by_state(state) for state in ExecutionState)
     execution_rows = [row for group in executions for row in group]
     execution_by_id = {row.id: row for row in execution_rows}
@@ -278,11 +283,11 @@ def board_view(uow: UnitOfWork, now: datetime) -> dict[str, Any]:
     metrics = list(uow.attempt_metrics.list_since(since=None, model=None, task_ids=None))
     metric_by_attempt = {row.attempt_id: row for row in metrics}
     open_escalations = {row.task_id for row in uow.escalations.list_open()}
-    wakes: list[Any] = []
-    for principal_id in {task.principal_id for task in active}:
-        wakes.extend(
-            uow.wakes.list_for_principal(principal_id, since=None, include_acked=False, limit=200)
-        )
+    wakes = board_latest_unacked_wakes(
+        uow,
+        {task.id for task in active},
+        {task.principal_id for task in active},
+    )
     wake_by_task = _latest_by(
         (wake for wake in wakes if wake.task_id),
         lambda row: row.task_id,
@@ -335,11 +340,13 @@ def board_view(uow: UnitOfWork, now: datetime) -> dict[str, Any]:
         task = task_by_id.get(pr.task_id)
         attempt = current_attempt.get(pr.task_id)
         metric = metric_by_attempt.get(attempt.id) if attempt else None
-        outcome = (
-            "merged"
-            if pr.state is PullRequestState.MERGED
-            else ("cancelled" if pr.cancelled_at else "open")
-        )
+        outcome = "open"
+        if task and task.state in {TaskState.CANCELLED, TaskState.REJECTED}:
+            outcome = "cancelled"
+        elif pr.state is PullRequestState.MERGED:
+            outcome = "merged"
+        elif pr.cancelled_at:
+            outcome = "cancelled"
         findings: dict[str, dict[str, int]] = {}
         for comment in comments_by_pr.get(pr.id, []):
             if "codex" not in comment["login"].lower():
