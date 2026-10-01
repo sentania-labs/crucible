@@ -52,3 +52,14 @@ first tagged release the initial revision may be squashed, only together with a
 existing database is wrong after a squash. Readiness compares the live schema to
 the ORM and reports "schema drift" when they differ; that check exists because
 revision 0001 was once rewritten in place after it had been applied.
+
+Integration tier: `make test-integration` runs `tests/integration` with `-n auto`
+by default. The pytest controller starts one Postgres container before tests run
+(so a cold image pull is outside individual test timeouts), passes its URL to all
+xdist workers through hooks registered in `tests/conftest.py` (including broad
+`pytest tests -n auto` and `pytest -n auto` invocations), and stops it at controller
+shutdown after the workers finish.
+Each worker creates and drops its own database using `worker_database_name`;
+a serial run uses one container and one database. `CRUCIBLE_TEST_DATABASE_URL`
+uses an existing server instead, with the same database isolation and without
+starting or stopping a container.

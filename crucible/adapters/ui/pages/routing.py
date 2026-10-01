@@ -91,7 +91,10 @@ def routing_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                     f"{name}: {_pool_order_words(rule)}"
                     for name, rule in preference["tiers"].items()
                 ),
-                "hint": "other allowed models are fallbacks when these are unavailable",
+                "hint": (
+                    "other allowed models are fallbacks when these are unavailable or busy; "
+                    "the task page says when a task ran on its next choice because one was busy"
+                ),
             },
             "",
         ],

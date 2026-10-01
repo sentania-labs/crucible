@@ -642,6 +642,76 @@ def test_hermes_steps_name_the_real_blocker_and_the_page_that_fixes_it(
     assert all("script-harness" not in step["text"] for step in readiness["steps"])
 
 
+@pytest.mark.parametrize(
+    ("api_base", "repository_url"),
+    [
+        ("https://api.github.com", "https://github.com/o/r"),
+        ("https://API.GitHub.COM", "https://GitHub.COM/o/r"),
+        ("https://ghe.example.internal/api/v3", "https://ghe.example.internal/o/r"),
+        ("https://GHE.example.internal/api/v3", "https://ghe.EXAMPLE.internal/o/r"),
+    ],
+)
+def test_github_repository_without_connected_app_adds_readiness_step(
+    monkeypatch: pytest.MonkeyPatch, api_base: str, repository_url: str
+) -> None:
+    """Issue #141: repositories on the configured GitHub host need a connected App."""
+    document: dict[str, Any] = {
+        "supervisor": _supervisor_document(_lease(), _status()),
+        "harnesses": [_harness("hermes")],
+        "providers": [],
+        "github": {"configured": False, "api_base": api_base},
+    }
+    readiness = _readiness(
+        document,
+        monkeypatch,
+        repositories=[SimpleNamespace(url=repository_url)],
+        enabled_models={"hermes"},
+    )
+    assert readiness["steps"] == [
+        {
+            "code": "github_app_not_connected",
+            "text": "A GitHub repository is registered but no GitHub App is connected.",
+            "fix": "/ui/github",
+        }
+    ]
+    assert readiness["ready"] is False
+
+    document["github"]["configured"] = True
+    readiness = _readiness(
+        document,
+        monkeypatch,
+        repositories=[SimpleNamespace(url=repository_url)],
+        enabled_models={"hermes"},
+    )
+    assert readiness["steps"] == []
+    assert readiness["ready"] is True
+
+    document["github"]["configured"] = False
+    for unrelated_url in (
+        "https://gitlab.example.com/o/r",
+        "https://github.com.example.com/o/r",
+        "https://example.com/github.com/o/r",
+    ):
+        readiness = _readiness(
+            document,
+            monkeypatch,
+            repositories=[SimpleNamespace(url=unrelated_url)],
+            enabled_models={"hermes"},
+        )
+        assert readiness["steps"] == []
+        assert readiness["ready"] is True
+
+    del document["github"]
+    readiness = _readiness(
+        document,
+        monkeypatch,
+        repositories=[SimpleNamespace(url="https://github.com/o/r")],
+        enabled_models={"hermes"},
+    )
+    assert readiness["steps"][0]["code"] == "github_app_not_connected"
+    assert readiness["ready"] is False
+
+
 def test_a_missing_credential_and_image_are_named_per_harness(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
