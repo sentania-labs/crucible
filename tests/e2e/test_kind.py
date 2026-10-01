@@ -682,6 +682,8 @@ async def test_rows_5_7_11_23_supervisor_restart_and_full_gate_lifecycle(
             [
                 {"id": "check/one", "command": "sh checks/lint.sh", "expect_exit": 0},
                 {"id": "check_one", "command": "exit 3", "expect_exit": 3},
+                # hades #250: a task whose checks all pass on the base is blocked before launch.
+                {"id": "V9", "command": "test -f src/e2e_change.txt", "expect_exit": 0},
             ]
         )
         detached_task = submit_and_start(client, detached_document)
@@ -2733,6 +2735,10 @@ async def test_lab_findings_a_long_collect_blocks_no_launch_and_the_sweep_frees_
         document["policy"]["version"] = 21
         document["required_verification"].append(
             {"id": "V5", "command": "sleep 25", "expect_exit": 0}
+        )
+        # hades #250: a task whose checks all pass on the base is blocked before launch.
+        document["required_verification"].append(
+            {"id": "V9", "command": "test -f src/e2e_change.txt", "expect_exit": 0}
         )
         slow = submit_and_start(client, document)
         deadline = time.monotonic() + LAUNCH_DEADLINE_SECONDS + 120
