@@ -141,6 +141,7 @@ async def test_the_probe_passes_when_the_canary_cannot_reach_the_api_server() ->
         "namespace ready",
         dns_resolves=True,
         pid_limit_source="cgroup-v2-parent",
+        canary_node="lab-node-1",
     )
     health = await provider.health()
     assert health.state == "ok"
@@ -850,6 +851,23 @@ async def test_an_adopted_attempt_records_its_node() -> None:
     document = json.loads(evidence.content)
     assert document["pod"] == f"{handle.ref}-abc12"
     assert document["node"] == "lab-node-1"
+
+
+async def test_the_launch_evidence_records_the_node_the_canary_measured() -> None:
+    """The launch evidence records the node the namespace-scope canary ran on."""
+    _api, _registry, provider, launch, workspace = await prepared()
+    # Ensure the canary probe passes so a launch can proceed.
+    await provider.ensure_ready()
+    handle = await provider.launch(workspace, launch)
+    await run_to_exit(provider, handle)
+    outputs = await provider.collect(handle, workspace, launch)
+    # Check the launch evidence artifact.
+    evidence = next(a for a in outputs.artifacts if a.name == "report/kubernetes-launch.json")
+    document = json.loads(evidence.content)
+    assert document["canary_node"] == "lab-node-1"
+    # Check the health checks.
+    health = await provider.health()
+    assert health.checks["canary_node"] == "lab-node-1"
 
 
 def _record_deletes(api: FakeKubernetesApi) -> list[tuple[str, str, int | None]]:
