@@ -29,6 +29,10 @@ def _replace_event_kinds(kinds: list[str]) -> None:
     op.execute(f"ALTER TABLE events ADD CONSTRAINT ck_events_kind CHECK (kind IN ({allowed}))")
 
 
+def _event_kinds() -> list[str]:
+    return [*_previous_event_kinds(), NEW_KIND]
+
+
 def upgrade() -> None:
     kinds = [*_previous_event_kinds(), NEW_KIND]
     _replace_event_kinds(kinds)
