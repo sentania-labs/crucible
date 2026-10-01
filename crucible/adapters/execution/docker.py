@@ -502,6 +502,7 @@ class DockerProvider:
         self,
         spec: LaunchSpec,
         checks: Sequence[dict[str, Any]],
+        checkout_token: InstallationToken | None = None,
         cancelled: CancelCheck | None = None,
     ) -> tuple[VerificationRun, ...] | None:
         """Docker does not yet provide an isolated pre-preparation probe."""

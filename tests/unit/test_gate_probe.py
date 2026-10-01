@@ -29,6 +29,7 @@ def _setup(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, Any, Any, FakeProvider
     monkeypatch.setattr(supervisor, "_settle_if_cancelled", lambda *_: False)
     monkeypatch.setattr(supervisor, "_cancel_check", lambda *_: AsyncMock(return_value=False))
     monkeypatch.setattr(supervisor, "_release_checkout_leases", MagicMock())
+    supervisor._github = None
     provider = FakeProvider()
     spec = LaunchSpec(
         attempt_id=item.attempt.id,
@@ -53,6 +54,26 @@ async def test_probe_passes_when_a_check_fails_on_the_base(monkeypatch: pytest.M
     assert uow.evidence.add.call_count == 1  # Generic policy checks are not probed.
     assert item.task.state is TaskState.RUNNING
     assert provider.gate_probe_calls == [item.attempt.id]
+
+
+async def test_probe_passes_when_exit_differs_from_nonzero_expectation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    supervisor, item, _, provider, spec = _setup(monkeypatch)
+    item.contract["required_verification"][1]["expect_exit"] = 1
+    provider.gate_probe_exits = {"V4": 0}
+    assert await supervisor._probe_before_prepare(item, provider, spec)
+
+
+async def test_probe_blocks_when_exit_matches_nonzero_expectation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    supervisor, item, uow, provider, spec = _setup(monkeypatch)
+    item.contract["required_verification"][1]["expect_exit"] = 1
+    provider.gate_probe_exits = {"V4": 1}
+    assert not await supervisor._probe_before_prepare(item, provider, spec)
+    assert item.attempt.termination_reason == "gate_proves_nothing"
+    assert "V4 passes on the unchanged repo" in uow.escalations.add.call_args.args[0].question
 
 
 async def test_all_checks_passing_blocks_as_gate_proves_nothing(

@@ -490,11 +490,13 @@ class ExecutionProvider(Protocol):
         self,
         spec: LaunchSpec,
         checks: Sequence[dict[str, Any]],
+        checkout_token: InstallationToken | None = None,
         cancelled: CancelCheck | None = None,
     ) -> tuple[VerificationRun, ...] | None:
         """Run task checks on the unchanged base before preparation.
 
-        None explicitly means unsupported; failures raise ProviderError.
+        None explicitly means unsupported; failures raise ProviderError. A private
+        repository's read-only `checkout_token` is available only to this step.
         """
         ...
 

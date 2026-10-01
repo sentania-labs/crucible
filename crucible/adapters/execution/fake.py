@@ -444,16 +444,24 @@ class FakeProvider:
         self,
         spec: LaunchSpec,
         checks: Sequence[dict[str, Any]],
+        checkout_token: InstallationToken | None = None,
         cancelled: CancelCheck | None = None,
     ) -> tuple[VerificationRun, ...] | None:
         self.gate_probe_calls.append(spec.attempt_id)
+        if checkout_token is not None:
+            self.checkout_tokens[f"probe:{spec.attempt_id}"] = CheckoutTokenSeen(
+                repository=checkout_token.repository,
+                permissions=dict(checkout_token.permissions),
+                had_value=bool(checkout_token.reveal()),
+                token=checkout_token,
+            )
         if self.gate_probe_error:
             raise ProviderError(self.gate_probe_error)
         return tuple(
             VerificationRun(
                 id=check["id"],
                 command=check["command"],
-                expect_exit=0,
+                expect_exit=int(check.get("expect_exit", 0)),
                 exit_code=self.gate_probe_exits.get(check["id"], 1),
                 log_tail="program: not found"
                 if self.gate_probe_exits.get(check["id"]) == 127

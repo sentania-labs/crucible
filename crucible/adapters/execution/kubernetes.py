@@ -1149,20 +1149,35 @@ class KubernetesProvider:
         self,
         spec: LaunchSpec,
         checks: Sequence[dict[str, Any]],
+        checkout_token: InstallationToken | None = None,
         cancelled: CancelCheck | None = None,
     ) -> tuple[VerificationRun, ...] | None:
-        """An uncredentialed, disposable checkout of base_ref, before any preparer."""
+        """A disposable checkout of base_ref, before any preparer or worker."""
         await _stop_if_cancelled(cancelled, "before the gate probe")
         await self._require_ready(spec)
         image = await self._resolve_image(spec)
         role = "gate-probe"
-        timeout = max(
+        command_timeout = max(
             1,
             (effective_command_timeout_ms(spec.policy, spec.contract, spec.timeout_seconds) + 999)
             // 1000,
         )
+        timeout = max(
+            1,
+            min(
+                spec.timeout_seconds,
+                self.config.prepare_timeout_seconds + command_timeout * len(checks),
+            ),
+        )
+        url = spec.repository_url or str(spec.contract.get("repository", {}).get("url", ""))
+        if checkout_token is not None:
+            workspace.require_checkout_url(url, self.config.credential_host)
+        token_name = (
+            k8sspec.object_name("checkout", spec.attempt_id) if checkout_token is not None else None
+        )
+        token_mounts, token_volumes = self._checkout_token_mounts(token_name)
         plan = self._egress_plan(spec, k8sspec.ROLE_WORKER)
-        checkout = self._checkout_plan(spec, k8sspec.ROLE_PREPARER, False)
+        checkout = self._checkout_plan(spec, k8sspec.ROLE_PREPARER, checkout_token is not None)
         # The same enforced policy machinery as the worker, with checkout egress
         # needed to fetch base_ref. There is no credential or report volume.
         plan = replace(
@@ -1170,8 +1185,8 @@ class KubernetesProvider:
             hosts=tuple(sorted(set(plan.hosts) | set(checkout.hosts))),
             endpoints=tuple(sorted(set(plan.endpoints) | set(checkout.endpoints))),
         )
-        mounts: list[Mount] = []
-        volumes: list[dict[str, Any]] = []
+        mounts: list[Mount] = list(token_mounts)
+        volumes: list[dict[str, Any]] = list(token_volumes)
         # File origins in the kind tier live on this read-only claim.
         if spec.repository_url.startswith("file:///crucible/cache/") and self.config.cache_claim:
             mounts.append(Mount("cache", k8sspec.CACHE_MOUNT, read_only=True))
@@ -1186,6 +1201,21 @@ class KubernetesProvider:
             )
         output: list[str] = []
         try:
+            if checkout_token is not None:
+                if not await self._delete_checkout_secret(spec.attempt_id):
+                    raise ProviderError(
+                        f"the checkout token Secret {token_name!r} left by an earlier try "
+                        "could not be removed"
+                    )
+                await self._create_with_backoff(
+                    "secrets",
+                    k8sspec.secret(
+                        name=str(token_name),
+                        namespace=self.config.namespace,
+                        object_labels=self._labels(spec, role),
+                        data={CHECKOUT_TOKEN_KEY: checkout_token.reveal().encode("utf-8")},
+                    ),
+                )
             code = await self._run_role_job(
                 spec,
                 role=role,
@@ -1194,7 +1224,9 @@ class KubernetesProvider:
                     spec.repository_url,
                     spec.contract["repository"]["base_ref"],
                     list(checks),
-                    timeout,
+                    command_timeout,
+                    checkout_token="file" if checkout_token is not None else None,
+                    credential_host=self.config.credential_host,
                 ),
                 mounts=mounts,
                 volumes=volumes,
@@ -1206,6 +1238,14 @@ class KubernetesProvider:
             )
         except KubernetesApiError as exc:
             raise ProviderError(f"gate probe Job failed: {exc}") from exc
+        finally:
+            if checkout_token is not None and not await self._delete_checkout_secret(
+                spec.attempt_id
+            ):
+                raise ProviderError(
+                    f"the checkout token Secret {token_name!r} could not be deleted after "
+                    "the gate probe"
+                )
         if code != 0:
             detail = self.role_errors.get((role, spec.attempt_id), ("", False))[0]
             raise ProviderError(f"gate probe Job exit {code}: {detail}")
@@ -1224,7 +1264,11 @@ class KubernetesProvider:
                     id=result["id"],
                     command=result["command"],
                     exit_code=result["exit"],
-                    expect_exit=0,
+                    expect_exit=next(
+                        int(check.get("expect_exit", 0))
+                        for check in checks
+                        if check["id"] == result["id"]
+                    ),
                     log_tail=str(result.get("detail", "")),
                 )
             )

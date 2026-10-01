@@ -1002,15 +1002,23 @@ exit 0
 """
 
 
-def gate_probe_script(url: str, base_ref: str, checks: list[dict[str, Any]], timeout: int) -> str:
+def gate_probe_script(
+    url: str,
+    base_ref: str,
+    checks: list[dict[str, Any]],
+    timeout: int,
+    checkout_token: str | None = None,
+    credential_host: str = "github.com",
+) -> str:
     """Keep command output out of the JSON log, including forged result lines."""
     configuration = json.dumps(
         {"url": url, "base_ref": base_ref, "checks": checks, "timeout": timeout}
     )
+    git_config = "/tmp/gitconfig" if checkout_token is not None else "/dev/null"
     program = """import json, os, signal, subprocess, tempfile
-config = json.loads(CONFIGURATION)
+config = json.loads(__PROBE_CONFIGURATION__)
 env = dict(os.environ, GIT_TERMINAL_PROMPT="0",
-           GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1")
+           GIT_CONFIG_GLOBAL=__GIT_CONFIGURATION__, GIT_CONFIG_NOSYSTEM="1")
 root = tempfile.mkdtemp(prefix="gate-probe-")
 subprocess.run(["git", "clone", "--no-checkout", "--", config["url"], root],
                env=env, check=True, stdout=subprocess.DEVNULL)
@@ -1034,7 +1042,13 @@ for check in config["checks"]:
         output.seek(0, 2)
         output.seek(max(0, output.tell() - 1000))
         detail = output.read().decode("utf-8", "replace") if code == 127 else ""
-    print(json.dumps({"id": check["id"], "command": check["command"],
+    print(json.dumps({
+        "id": check["id"], "command": check["command"],
                       "exit": code, "detail": detail}), flush=True)
-""".replace("CONFIGURATION", repr(configuration))
-    return "python3 -c " + _quote(program)
+""".replace("__PROBE_CONFIGURATION__", repr(configuration)).replace(
+        "__GIT_CONFIGURATION__", repr(git_config)
+    )
+    credential = (
+        _checkout_credential(checkout_token, credential_host) if checkout_token is not None else ""
+    )
+    return credential + "python3 -c " + _quote(program)

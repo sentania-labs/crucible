@@ -2125,9 +2125,13 @@ class Supervisor:
             return True
         error = ""
         rows: tuple[VerificationRun, ...] | None = ()
+        token = await checkout_token_for(self._github, item.repository)
         try:
             rows = await provider.probe_checks(
-                spec, checks, cancelled=self._cancel_check(item.task.id)
+                spec,
+                checks,
+                checkout_token=token,
+                cancelled=self._cancel_check(item.task.id),
             )
             if rows is not None and (
                 len(rows) != len(checks)
@@ -2141,6 +2145,8 @@ class Supervisor:
             raise
         except ProviderError as exc:
             error = str(exc)
+        finally:
+            await release_checkout_token(self._github, token)
         if await self._db(partial(self._settle_if_cancelled, item.attempt.id, "gate_probe")):
             return False
         return await self._db(
@@ -2172,7 +2178,10 @@ class Supervisor:
                         f"{row.id}: exit 127: {row.log_tail or 'program not found'}"
                         for row in missing
                     )
-                elif all(row.exit_code == 0 for row in rows):
+                elif all(
+                    row.exit_code == int(check.get("expect_exit", 0))
+                    for row, check in zip(rows, checks, strict=True)
+                ):
                     reason = "gate_proves_nothing"
                     detail = "; ".join(f"{row.id} passes on the unchanged repo" for row in rows)
             by_id = {row.id: row for row in rows or ()}

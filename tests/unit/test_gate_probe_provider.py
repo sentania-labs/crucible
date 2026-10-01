@@ -2,6 +2,8 @@
 
 import json
 import subprocess
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
@@ -11,6 +13,7 @@ import pytest
 from crucible.adapters.execution import scripts
 from crucible.adapters.execution.k8sapi import LogFrame
 from crucible.ports.execution import ProviderError
+from crucible.ports.github import InstallationToken
 from tests.unit.kubernetes_fixtures import build, created, pod_of, spec
 
 
@@ -18,7 +21,7 @@ async def test_probe_job_is_uncredentialed_bounded_and_removed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     api, _, provider = build()
-    launch = spec()
+    launch = replace(spec(), timeout_seconds=2000)
     launch.policy["limits"]["command_timeout_ms"] = {"default": 1200}
     checks = [{"id": "V4", "command": "test -f made-by-the-worker"}]
     monkeypatch.setattr(provider, "_require_ready", AsyncMock())
@@ -39,12 +42,65 @@ async def test_probe_job_is_uncredentialed_bounded_and_removed(
     assert {mount["mountPath"] for mount in mounts} == {"/tmp", "/home/worker"}
     assert not created(api, "secrets") and not created(api, "persistentvolumeclaims")
     job = created(api, "jobs", "gate-probe")[0]
-    assert job["spec"]["activeDeadlineSeconds"] == provider.config.launch_timeout_seconds + 2
+    assert job["spec"]["activeDeadlineSeconds"] == (
+        provider.config.launch_timeout_seconds + provider.config.prepare_timeout_seconds + 2
+    )
     await_job.assert_awaited_once()
-    assert await_job.call_args.kwargs["timeout"] == 2
+    assert await_job.call_args.kwargs["timeout"] == provider.config.prepare_timeout_seconds + 2
     assert created(api, "networkpolicies", "np-gate-probe")
     assert not any(kind == "jobs" for kind, _ in api.objects)
     assert not any(kind == "networkpolicies" for kind, _ in api.objects)
+
+
+async def test_private_probe_mounts_checkout_token_and_public_probe_does_not(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "ghs_" + "Q" * 36
+    token = InstallationToken(
+        secret,
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+        repository="acme/example",
+        permissions={"contents": "read"},
+    )
+    private_api, _, private_provider = build()
+    monkeypatch.setattr(private_provider, "_require_ready", AsyncMock())
+    monkeypatch.setattr(private_provider, "_await_job", AsyncMock(return_value=0))
+    await private_provider.probe_checks(
+        spec(), [{"id": "V4", "command": "false"}], checkout_token=token
+    )
+    private_pod = pod_of(private_api, "gate-probe")
+    private_mounts = private_pod["containers"][0]["volumeMounts"]
+    assert "/run/crucible-token" in {mount["mountPath"] for mount in private_mounts}
+    assert created(private_api, "secrets")
+    assert not any(kind == "secrets" for kind, _ in private_api.objects)
+
+    public_api, _, public_provider = build()
+    monkeypatch.setattr(public_provider, "_require_ready", AsyncMock())
+    monkeypatch.setattr(public_provider, "_await_job", AsyncMock(return_value=0))
+    await public_provider.probe_checks(spec(), [{"id": "V4", "command": "false"}])
+    public_pod = pod_of(public_api, "gate-probe")
+    public_mounts = public_pod["containers"][0]["volumeMounts"]
+    assert "/run/crucible-token" not in {mount["mountPath"] for mount in public_mounts}
+    assert not created(public_api, "secrets")
+
+
+async def test_probe_timeout_covers_checkout_and_each_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api, _, provider = build()
+    launch = replace(spec(), timeout_seconds=1000)
+    launch.policy["limits"]["command_timeout_ms"] = {"default": 10_000}
+    checks = [{"id": f"V{i}", "command": "true"} for i in range(3)]
+    monkeypatch.setattr(provider, "_require_ready", AsyncMock())
+    await_job = AsyncMock(return_value=0)
+    monkeypatch.setattr(provider, "_await_job", await_job)
+    await provider.probe_checks(launch, checks)
+    expected = provider.config.prepare_timeout_seconds + 3 * 10
+    job = created(api, "jobs", "gate-probe")[0]
+    assert job["spec"]["activeDeadlineSeconds"] == (
+        provider.config.launch_timeout_seconds + expected
+    )
+    assert await_job.call_args.kwargs["timeout"] == expected
 
 
 async def test_probe_job_failure_names_exit(monkeypatch: pytest.MonkeyPatch) -> None:
