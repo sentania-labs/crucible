@@ -219,7 +219,7 @@ class CredentialSettings(BaseModel):
 
     source: Literal["directory"] = "directory"
     path: str | None = None
-    mount_mode: Literal["ro", "rw-narrow"] | None = None
+    mount_mode: Literal["ro", "rw-narrow", "renewer"] | None = None
 
 
 class HarnessSettings(BaseModel):

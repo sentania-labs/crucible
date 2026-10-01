@@ -29,7 +29,7 @@ retry:
 
 concurrency:
   per_provider: 3
-  per_harness: { claude_code: 1, codex: 1, agy: 1 }   # all three mount rw-narrow, so all three are 1
+  per_harness: { claude_code: 1, codex: 2, agy: 1 }   # Codex renewer permits parallel workers
 
 resources:
   cpus: 2
@@ -172,7 +172,9 @@ retention:
   `mount_mode` is `rw-narrow`; the mount mode comes from Crucible's
   credential configuration (12, 25), not from the policy, so the check
   runs against the configured credential sources at upload and at launch.
-  All three real harnesses mount `rw-narrow`, so all three are capped at 1.
+  Claude Code and AGY mount `rw-narrow`, so they are capped at 1. Codex was serial
+  until the credential renewer. In `renewer` mode its policy cap may be above 1; the
+  rollback `rw-narrow` copy mode still requires 1.
 - The per-harness cap is checked **after** the checkout lease (10), not
   before. The lease is the older and more specific rule: an attempt whose
   checkout another attempt holds should be told that, not held back by a

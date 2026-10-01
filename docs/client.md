@@ -316,6 +316,11 @@ definitions. Each verb would become a tool whose result is the envelope, and
 
 ### Codex on the Local gateway page
 
+Subscription Codex now uses the Hades credential renewer and can run workers in
+parallel up to the policy cap. The Credentials page shows renewer health and offers
+administrators a reasoned Refresh now action. Local-endpoint Codex continues to use
+the gateway API key and does not use the renewer.
+
 Select Hermes, Codex, or both beside a model returned by the gateway. Saving writes
 a new routing version; disabling Codex leaves Hermes available as fallback. The
 shared key stays in the Hermes credential store and is mounted read-only for local

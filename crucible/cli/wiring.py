@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import socket
@@ -9,6 +10,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI
@@ -51,6 +53,7 @@ from crucible.adapters.storage.disk import DiskArtifactStore
 from crucible.application.admin.context import AdminContext, GitHubAppInfo
 from crucible.application.admin.credentials import sweep_retired
 from crucible.application.admin.routing import local_endpoint_view
+from crucible.application.credential_renewer import CodexCredentialRenewer
 from crucible.application.delivery_tick import DeliveryConfig
 from crucible.application.errors import NotFoundError
 from crucible.application.harnesses import HarnessRegistry
@@ -60,7 +63,9 @@ from crucible.application.proxy_config import (
     worker_proxy_config,
 )
 from crucible.application.supervisor import Supervisor
+from crucible.application.transitions import record_event
 from crucible.domain.cluster_egress import SETTING_NAME, parse_cluster_egress
+from crucible.domain.events import EventKind
 from crucible.domain.ids import new_id
 from crucible.domain.role_timeouts import SETTING_NAME as ROLE_TIMEOUTS_SETTING
 from crucible.ports.artifacts import ArtifactStore
@@ -87,6 +92,7 @@ class Wiring:
     publisher: Publisher | None = None
     harnesses: HarnessRegistry | None = None
     admin: AdminContext | None = None
+    credential_renewer: CodexCredentialRenewer | None = None
 
     def supervisor(self) -> Supervisor:
         s = self.settings.supervisor
@@ -117,6 +123,11 @@ class Wiring:
             credential_sources=credential_sources(self.settings),
             credential_sweep=(
                 partial(sweep_retired, self.admin) if self.admin is not None else None
+            ),
+            credential_renewal=(
+                self.credential_renewer.refresh_if_due
+                if self.credential_renewer is not None
+                else None
             ),
         )
 
@@ -542,6 +553,35 @@ def wire(settings: Settings) -> Wiring:
         kubernetes_role_timeout_seed=settings.kubernetes.role_timeout_seconds,
         first_run=first_run,
     )
+    renewer: CodexCredentialRenewer | None = None
+    codex_source = credential_sources(settings).get("codex")
+    if codex_source is not None and (Path(codex_source.path) / "auth.json").is_file():
+
+        def record_refresh(kind: EventKind, payload: Mapping[str, Any]) -> None:
+            with factory() as uow:
+                record_event(
+                    uow,
+                    admin.clock,
+                    kind,
+                    principal="credential-renewer",
+                    payload=dict(payload),
+                )
+                uow.commit()
+
+        def propagate_refresh(document: Mapping[str, str]) -> None:
+            loop = asyncio.get_running_loop()
+            for provider in providers.values():
+                update = getattr(provider, "refresh_credential_projection", None)
+                if callable(update):
+                    task = loop.create_task(update(document))
+                    task.add_done_callback(lambda completed: completed.exception())
+
+        renewer = CodexCredentialRenewer(
+            Path(codex_source.path) / "auth.json",
+            clock=admin.clock,
+            record=record_refresh,
+            propagate=propagate_refresh,
+        )
     ctx = AppContext(
         uow_factory=factory,
         clock=SystemClock(),
@@ -558,6 +598,7 @@ def wire(settings: Settings) -> Wiring:
         admin=admin,
         settings=settings,
         first_run=first_run,
+        credential_renewer=renewer,
     )
     publisher = build_publisher(settings, docker, providers.get("kubernetes"), github)
     return Wiring(
@@ -570,6 +611,7 @@ def wire(settings: Settings) -> Wiring:
         publisher=publisher,
         harnesses=registry,
         admin=admin,
+        credential_renewer=renewer,
     )
 
 

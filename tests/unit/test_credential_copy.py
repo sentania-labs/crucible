@@ -80,6 +80,8 @@ class StubClient:
 
 
 def config(tmp_path: Path, **credentials: CredentialSource) -> DockerConfig:
+    if "codex" in credentials and credentials["codex"].mount_mode is None:
+        credentials["codex"] = CredentialSource(credentials["codex"].path, MountMode.RW_NARROW)
     return DockerConfig(
         endpoint="tcp://127.0.0.1:1",
         artifact_root=str(tmp_path),

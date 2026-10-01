@@ -7,6 +7,7 @@ from typing import Any
 from crucible.adapters.execution.k8sfake import FakeKubernetesApi, FakeRegistry
 from crucible.adapters.execution.kubernetes import KubernetesConfig, KubernetesProvider
 from crucible.ports.execution import LaunchSpec
+from crucible.ports.harness import MountMode
 from tests.fixtures import contract_document
 
 ATTEMPT = "01ATTEMPT0000000000000000A"
@@ -53,6 +54,7 @@ def build(
             launch_timeout_seconds=5,
             storage_class="lab-ssd",
             image_pull_secret="ghcr-pull",
+            credential_modes={"codex": MountMode.RW_NARROW},
         ),
         api,  # type: ignore[arg-type]
         registry,

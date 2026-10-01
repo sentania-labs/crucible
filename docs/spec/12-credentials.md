@@ -99,7 +99,7 @@ mount_mode = "rw-narrow"       # the CLI refreshes tokens in place
 [credentials.codex]
 source = "directory"
 path = "/var/lib/crucible/credentials/codex"
-mount_mode = "rw-narrow"       # the CLI writes session and log state beside its auth file
+mount_mode = "renewer"         # Hades refreshes; workers receive an access token only
 [credentials.agy]
 source = "directory"
 path = "/var/lib/crucible/credentials/agy"
@@ -128,7 +128,16 @@ own credential directory** (for example with `CLAUDE_CONFIG_DIR`,
 directory is what gets mounted. It is never a copy of the operator's
 daily-use directory: S1 showed Codex and AGY refresh their tokens on
 their own during a run, and a refresh from a copy races the operator's
-own session. No commercial API keys.
+own session. Codex is now the exception to CLI-owned refresh: Hades is the only writer
+of its stored login. No commercial API keys.
+
+`renewer` means that the supervisor retains Codex `auth.json`, including its refresh
+token. Each attempt receives a read-only `access-token.json` containing exactly
+`access_token`, `account_id`, and `expires_at`. The worker runs `codex app-server` with
+external authentication and never performs an OAuth grant. A refresh replaces the
+Docker file atomically or patches each live Kubernetes attempt Secret. Kubernetes
+Secret projection is eventually consistent, so the host waits and re-reads for up to
+90 seconds after a rejection. No shared read-write volume is used.
 
 Hermes is the narrow API-key exception. The admin UI and
 `crucible-admin credentials set --harness hermes` read the value from a password
@@ -277,8 +286,11 @@ which lives in a file it has no reason to cat.
 
 - A harness that logs its own token on auth failure. Mitigated by redaction
   and by the file-not-env rule.
-- Token refresh races when two workers of the same harness run concurrently
-  (why per-harness concurrency is 1).
+- A revoked Codex refresh token stops new Codex launches. Running workers may continue
+  until their current access tokens expire. Hades raises one authentication wake and
+  does not retry `invalid_grant`.
+- Token refresh races remain possible for copy-mode harnesses. Codex renewer mode has
+  one writer and permits parallel workers.
 - A harness that writes auth state outside its config directory (S1).
 - A worker misusing its own harness credential within the egress allowlist
   (above; broker is the later answer).

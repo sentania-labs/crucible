@@ -41,6 +41,7 @@ from typing import Any
 from crucible.adapters.harness import base
 from crucible.adapters.harness.hermes import HermesAdapter
 from crucible.domain.exit_class import ExitClass
+from crucible.domain.harness_concurrency import HarnessConcurrency
 from crucible.domain.harness_settings import DEFAULT_HERMES_CONTEXT_LENGTH, hermes_run_limits
 from crucible.ports.harness import (
     CODEX_BINARY,
@@ -100,6 +101,9 @@ class CodexAdapter:
     name = NAME
     supported_versions = VersionRange("0.153.0", "0.157.0")
 
+    def concurrency(self) -> HarnessConcurrency:
+        return HarnessConcurrency(renewer_held=True)
+
     def quota_reset_at(self, stdout_tail: str, stderr_tail: str) -> datetime | None:
         return base.quota_reset_at(stdout_tail, stderr_tail, quota=QUOTA_PATTERNS)
 
@@ -138,7 +142,7 @@ class CodexAdapter:
                     "auth.json", json=True, json_keys=("tokens",), issued_at=("last_refresh",)
                 ),
             ),
-            minimum_mode=MountMode.RW_NARROW,
+            minimum_mode=MountMode.RENEWER,
             config_dir_env="CODEX_HOME",
             templates={"config.toml": CONFIG_TEMPLATE},
             login_hint=(
@@ -147,7 +151,30 @@ class CodexAdapter:
         )
 
     def build_launch(self, ctx: LaunchContext) -> AdapterLaunch:
-        argv: list[str] = [
+        if ctx.credential_mode is MountMode.RENEWER and ctx.endpoint == "subscription":
+            argv = [
+                "/usr/local/bin/crucible-codex-host",
+                "--token-file",
+                f"{CONFIG_DIR}/access-token.json",
+                "--transcript",
+                f"{ctx.report_mount}/{base.TRANSCRIPT_NAME}",
+                "--last-message",
+                f"{ctx.report_mount}/{LAST_MESSAGE}",
+                "--cwd",
+                ctx.repo_mount,
+                "--model",
+                ctx.model,
+            ]
+            if ctx.effort:
+                argv += ["--effort", ctx.effort]
+            return AdapterLaunch(
+                argv=tuple(argv),
+                stdin_files=(f"{ctx.identity_mount}/IDENTITY.md",),
+                stdin_text=base.POINTER_PROMPT,
+                transcript_path=None,
+                workdir=ctx.repo_mount,
+            )
+        argv = [
             CODEX_BINARY,
             "exec",
             "--dangerously-bypass-approvals-and-sandbox",

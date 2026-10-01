@@ -27,7 +27,7 @@ from crucible.ports.repository import UnitOfWork
 
 # Every real harness mounts its credential rw-narrow (12, 07): Claude Code and Codex from
 # the start, AGY since the C5 live run showed its token rotating.
-RW_NARROW_HARNESSES: frozenset[str] = frozenset({"claude_code", "codex", "agy"})
+RW_NARROW_HARNESSES: frozenset[str] = frozenset({"claude_code", "agy"})
 
 
 def _problems(exc: ValidationError) -> list[dict[str, Any]]:
@@ -37,7 +37,13 @@ def _problems(exc: ValidationError) -> list[dict[str, Any]]:
     ]
 
 
-def validate_policy(document: object, *, name: str, version: int) -> PolicyV1:
+def validate_policy(
+    document: object,
+    *,
+    name: str,
+    version: int,
+    concurrency_modes: dict[str, str] | None = None,
+) -> PolicyV1:
     try:
         policy = PolicyV1.model_validate(document)
     except ValidationError as exc:
@@ -66,6 +72,25 @@ def validate_policy(document: object, *, name: str, version: int) -> PolicyV1:
                     ),
                 }
             )
+    codex_mode = (concurrency_modes or {}).get("codex", "renewer")
+    codex_limit = policy.concurrency.per_harness.get("codex")
+    if codex_limit is None:
+        problems.append(
+            {
+                "path": "concurrency.per_harness.codex",
+                "message": "every supported harness needs a concurrency cap",
+            }
+        )
+    elif codex_mode != "renewer" and codex_limit != 1:
+        problems.append(
+            {
+                "path": "concurrency.per_harness.codex",
+                "message": (
+                    "codex copy mode requires concurrency 1; select renewer mode for "
+                    "parallel workers"
+                ),
+            }
+        )
     if problems:
         raise ContractValidationError("policy failed validation", errors=problems)
     return policy

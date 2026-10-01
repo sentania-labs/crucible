@@ -229,6 +229,7 @@ RUN ln -s /opt/hermes/bin/hermes /usr/local/bin/hermes
 # only; it re-executes under the Hermes venv's Python for PyYAML, by path, for its own
 # process alone, so PATH is unchanged. No network.
 COPY --chmod=0755 worker/crucible-report.py /usr/local/bin/crucible-report
+COPY --chmod=0755 worker/crucible-codex-host.py /usr/local/bin/crucible-codex-host
 COPY --from=fetch-claude-code /fetch/claude /usr/local/bin/claude
 COPY --from=fetch-codex /fetch/codex /usr/local/bin/codex
 COPY --from=fetch-codex /fetch/codex-code-mode-host /usr/local/bin/codex-code-mode-host
