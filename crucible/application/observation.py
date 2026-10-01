@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
 
-from crucible.application.publish import open_review_cycle
+from crucible.application.publish import external_review_trigger, open_review_cycle
 from crucible.application.transitions import move_task, record_event
 from crucible.application.wakes import create_wake
 from crucible.contracts.wake import WakeReason
@@ -480,6 +480,7 @@ def record_comments(
     allowlist: frozenset[str],
     result: ObservationResult,
     replaced: ReplacedHeads | None = None,
+    policy: dict[str, Any] | None = None,
 ) -> list[Signal]:
     """Store review comments and issue comments, updating one edited in place.
 
@@ -492,7 +493,22 @@ def record_comments(
     signals: list[Signal] = []
     now = clock.now()
     settled = replaced or ReplacedHeads()
+    request = uow.events.latest_for_task_kind(task.id, EventKind.EXTERNAL_REVIEW_REQUESTED.value)
+    request_payload = request.payload if request is not None else {}
+    request_id = str(request_payload.get("comment_id") or "")
+    request_login = str(request_payload.get("comment_login") or "")
+    trigger = external_review_trigger(policy or {})
     for comment in (*observation.review_comments, *observation.issue_comments):
+        if comment.kind == "issue_comment" and (
+            (request_id and comment.github_id == request_id)
+            or (
+                trigger is not None
+                and request_login
+                and comment.login == request_login
+                and comment.body == trigger
+            )
+        ):
+            continue
         existing = uow.review_comments.get_by_github(
             pull_request.id, comment.kind, comment.github_id
         )
@@ -1800,6 +1816,7 @@ def apply_observation(
         allowlist=allowlist,
         result=result,
         replaced=replaced_heads(uow, task, pull_request),
+        policy=policy,
     )
     if with_reactions:
         signals += record_reactions(

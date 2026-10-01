@@ -17,6 +17,7 @@ from typing import Any
 
 from crucible.adapters.harness import base
 from crucible.domain.exit_class import ExitClass
+from crucible.domain.harness_concurrency import HARNESS_CONCURRENCY
 from crucible.ports.harness import (
     AdapterLaunch,
     CommandTracker,
@@ -68,6 +69,8 @@ def _probe_launch(ctx: LaunchContext) -> AdapterLaunch:
 
 class ScriptHarnessAdapter:
     name = NAME
+    concurrency = HARNESS_CONCURRENCY[NAME]
+    parallel_attempts_safe = concurrency.parallel_attempts_safe
     supported_versions = VersionRange("1.0.0", "2.0.0")
     # The e2e tiers' harness, never a prerequisite for real work: the Status page's
     # readiness list leaves it out (crucible#123).

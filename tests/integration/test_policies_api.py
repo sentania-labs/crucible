@@ -71,16 +71,26 @@ def test_the_path_and_the_document_must_agree(client: TestClient, tokens: dict[s
     assert any(e["path"] == "version" for e in r.json()["errors"])
 
 
-def test_rw_narrow_harnesses_must_have_concurrency_one(
-    client: TestClient, tokens: dict[str, str]
+@pytest.mark.parametrize("harness", ["claude_code", "agy"])
+def test_frontier_harnesses_accept_parallel_concurrency(
+    client: TestClient, tokens: dict[str, str], harness: str
 ) -> None:
-    """05b: concurrency.per_harness must be 1 where the credential mount is rw-narrow (12)."""
+    """05b: read-only credentials or declared parallel safety permit higher caps."""
+    document = seeded_policy()
+    document["version"] = 6
+    document["concurrency"]["per_harness"][harness] = 2
+    r = client.put("/v1/policies/default-software/6", json=document, headers=admin(tokens))
+    assert r.status_code == 200
+
+
+def test_codex_stays_serial_until_the_renewer(client: TestClient, tokens: dict[str, str]) -> None:
+    """12: Codex declares no parallel safety (refresh-token rotation); a cap above 1 is refused."""
     document = seeded_policy()
     document["version"] = 6
     document["concurrency"]["per_harness"]["codex"] = 2
     r = client.put("/v1/policies/default-software/6", json=document, headers=admin(tokens))
     assert r.status_code == 422
-    assert any("rw-narrow" in e["message"] for e in r.json()["errors"])
+    assert any(e["path"] == "concurrency.per_harness.codex" for e in r.json()["errors"])
 
 
 @pytest.mark.parametrize(

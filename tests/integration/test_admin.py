@@ -1060,7 +1060,7 @@ def test_local_endpoint_and_hermes_key_are_saved_without_exposing_the_key(
         assert routing_page.status_code == 200
         assert 'href="/ui/gateway"' in routing_page.text
         assert "routing-local" not in routing_page.text
-        gateway_page = browser.get("/ui/gateway")
+        gateway_page = browser.get("/ui/gateway?models=1")
         assert gateway_page.status_code == 200
         assert 'action="/ui/actions/gateway-save"' in gateway_page.text
         assert 'name="api_key"' in gateway_page.text
@@ -1086,7 +1086,7 @@ def test_local_endpoint_and_hermes_key_are_saved_without_exposing_the_key(
         assert ui_key not in message
 
         # #121: the model is picked from the gateway's own list, not typed.
-        gateway_page = browser.get("/ui/gateway")
+        gateway_page = browser.get("/ui/gateway?models=1")
         assert 'name="model.0.id" value="coder"' in gateway_page.text
         assert 'name="model.0.enabled"' in gateway_page.text
         ui_models = browser.post(

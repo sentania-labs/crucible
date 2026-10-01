@@ -39,7 +39,7 @@ egress allowlist. Initial mitigations:
   sync and on every path that skips it (16);
 - secret redaction on logs and scanning on artifacts;
 - no cross-harness credential access;
-- per-harness concurrency of one.
+- policy-controlled per-harness concurrency, with adapter declarations for parallel copies.
 
 A credential broker or authentication proxy that keeps the token outside
 the container is a possible later hardening (ADR 0007), not an initial
@@ -95,7 +95,7 @@ directories.
 [credentials.claude_code]
 source = "directory"
 path = "/var/lib/crucible/credentials/claude_code"   # contains the CLI's auth state
-mount_mode = "rw-narrow"       # the CLI refreshes tokens in place
+mount_mode = "ro"              # the long-lived setup token never refreshes
 [credentials.codex]
 source = "directory"
 path = "/var/lib/crucible/credentials/codex"
@@ -103,9 +103,8 @@ mount_mode = "rw-narrow"       # the CLI writes session and log state beside its
 [credentials.agy]
 source = "directory"
 path = "/var/lib/crucible/credentials/agy"
-mount_mode = "rw-narrow"       # the first Crucible-side run past the one-hour expiry rotated the
-                               # token and the copy carried a newer expiry, which is the evidence
-                               # S1 left open; the token file syncs back by that field
+mount_mode = "rw-narrow"       # access-token renewal updates the expiry; the refresh token
+                               # remains reusable, and the file syncs back by expiry
 
 [credentials.hermes]
 source = "directory"
@@ -192,10 +191,28 @@ Cleanup removes it under every retention policy, `keep` included, so 08's
 "keep or delete the workspace per policy" never keeps the credential copy.
 A harness counts against its concurrency cap until its copy has been synced
 back and removed, which is after the attempt is `exited`: a second seeding
-from the source before that is the refresh race below. Per-harness concurrency is 1 whenever `rw-narrow` is in effect
-(05b enforces this), because refresh tokens rotate and two concurrent
-refreshes leave one worker with a revoked token and every later worker
-locked out. Spike S1 records what each harness actually writes and where.
+from the source before that can race with refresh. Each adapter shares a declaration
+with policy validation: its minimum mount mode and `parallel_attempts_safe` flag.
+Read-only adapters or adapters declaring parallel safety may use
+`concurrency.per_harness.<harness>` above 1. Writable adapters without the declaration
+remain capped at 1, even if a stored policy asks for more.
+
+- Claude Code uses a read-only long-lived setup token. Both `oauth-token` and
+  `.claude.json` have `sync_back=False`; neither renews the credential.
+- AGY uses isolated writable copies. Google does not rotate the refresh token on
+  ordinary access-token renewal, so the adapter declares parallel attempts safe.
+- Codex stays serial: its declaration is `parallel_attempts_safe = False`, so policy
+  refuses `per_harness.codex` above 1. OpenAI rotates refresh tokens on use, and two
+  attempts syncing refreshed copies back concurrently can let an older or revoked
+  token win the last write and break every later login. The brokered renewer (spec
+  "Many Workers, One Login": one renewer holds the refresh token, workers hold access
+  tokens and ask the host to refresh) is what lifts the cap. The supervisor still logs
+  each auth failure with `harness`, `attempt_id`, and `auth_failure_count`, a
+  per-harness cumulative count for the current supervisor process (reset on restart).
+
+Copies remain isolated per attempt. There is no shared credential volume or central
+renewer. Shipped policy caps stay unchanged; Foundry sets the caps after deployment.
+Spike S1 records what each harness actually writes and where.
 
 A login is the same race from the other side: it replaces the credential, and
 an attempt holding a copy of the one it replaced would sync a refresh of a
@@ -277,8 +294,8 @@ which lives in a file it has no reason to cat.
 
 - A harness that logs its own token on auth failure. Mitigated by redaction
   and by the file-not-env rule.
-- Token refresh races when two workers of the same harness run concurrently
-  (why per-harness concurrency is 1).
+- Codex token refresh races under parallel renewal. Monitor auth-failure counts and
+  roll back to `per_harness.codex: 1` if parallel workers break login.
 - A harness that writes auth state outside its config directory (S1).
 - A worker misusing its own harness credential within the egress allowlist
   (above; broker is the later answer).

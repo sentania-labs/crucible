@@ -21,13 +21,10 @@ from crucible.contracts.common import to_document
 from crucible.contracts.policy import PolicyV1, RoutingPolicyV1
 from crucible.domain.entities import Decision, Policy, Principal, Role, RoutingPolicyRecord
 from crucible.domain.events import EventKind
+from crucible.domain.harness_concurrency import HARNESS_CONCURRENCY, HarnessConcurrency
 from crucible.domain.ids import new_id
 from crucible.ports.clock import Clock
 from crucible.ports.repository import UnitOfWork
-
-# Every real harness mounts its credential rw-narrow (12, 07): Claude Code and Codex from
-# the start, AGY since the C5 live run showed its token rotating.
-RW_NARROW_HARNESSES: frozenset[str] = frozenset({"claude_code", "codex", "agy"})
 
 
 def _problems(exc: ValidationError) -> list[dict[str, Any]]:
@@ -47,8 +44,8 @@ def validate_policy(document: object, *, name: str, version: int) -> PolicyV1:
         problems.append({"path": "name", "message": f"the path says {name!r}"})
     if policy.version != version:
         problems.append({"path": "version", "message": f"the path says {version}"})
-    # 05b: concurrency must be 1 for any harness whose credential mount is rw-narrow (12).
-    for harness in sorted(RW_NARROW_HARNESSES):
+    # Preserve the required frontier caps; optional harnesses are checked when present.
+    for harness in sorted({"claude_code", "codex", "agy"} | policy.concurrency.per_harness.keys()):
         limit = policy.concurrency.per_harness.get(harness)
         if limit is None:
             problems.append(
@@ -57,12 +54,15 @@ def validate_policy(document: object, *, name: str, version: int) -> PolicyV1:
                     "message": "every supported harness needs a concurrency cap",
                 }
             )
-        elif limit != 1:
+        elif (
+            limit > 1 and not HARNESS_CONCURRENCY.get(harness, HarnessConcurrency()).allows_parallel
+        ):
             problems.append(
                 {
                     "path": f"concurrency.per_harness.{harness}",
                     "message": (
-                        f"{harness} mounts its credential rw-narrow (12), so concurrency must be 1"
+                        f"{harness} has no read-only credential declaration or parallel-attempt "
+                        "safety declaration for rw-narrow copies (12), so concurrency must be 1"
                     ),
                 }
             )

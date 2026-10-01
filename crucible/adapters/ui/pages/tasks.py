@@ -24,6 +24,7 @@ from crucible.contracts.api import (
     DecisionRequest,
 )
 from crucible.domain.entities import Role
+from crucible.domain.events import EventKind
 from crucible.domain.lifecycle import TaskState
 from crucible.domain.waivers import ACCEPT_NO_CI, WAIVABLE_STATES, WAIVE_EXTERNAL_REVIEW
 
@@ -234,7 +235,14 @@ def task_page(request: Request, task_id: str, ctx: Ctx, uow: UoW) -> Response:
         )
     # hades FDY-0143: the task's paper trail on GitHub, beside what it is waiting for.
     delivery = view.delivery
-    not_yet = "not yet"
+    review_request = uow.events.latest_for_task_kind(
+        task_id, EventKind.EXTERNAL_REVIEW_REQUESTED.value
+    )
+    review_request_value = not_yet = "not yet"
+    if review_request is not None:
+        provider = str(review_request.payload.get("provider") or "external reviewer")
+        comment_id = str(review_request.payload.get("comment_id") or "unknown")
+        review_request_value = f"{provider}, comment {comment_id}"
     delivered_pr: Any = not_yet
     if delivery.pull_request_number is not None:
         label = f"#{delivery.pull_request_number}"
@@ -274,6 +282,7 @@ def task_page(request: Request, task_id: str, ctx: Ctx, uow: UoW) -> Response:
                 ],
                 ["Pull request", delivered_pr],
                 ["Pull request state", delivery.pull_request_state or not_yet],
+                ["External review requested", review_request_value],
                 ["Merge commit", delivery.merge_sha or not_yet],
                 ["Merged by", delivery.merged_by or not_yet],
                 ["Merged at", delivery.merged_at.isoformat() if delivery.merged_at else not_yet],
