@@ -445,12 +445,12 @@ async def test_a_launch_after_a_settings_change_is_gated_again() -> None:
     real_resolve = provider._resolve_image
     changed_egress = replace(IN_CLUSTER, dns_namespace="kube-system-alt")
 
-    async def resolve_and_change(launch_spec: Any) -> str:
+    async def resolve_and_change(launch_spec: Any, *, use_backoff: bool = False) -> str:
         # The endpoint URL is unchanged; what changes is the cluster's own egress
         # settings (a different DNS selector), which forces the re-gate.
         provider.apply_settings(changed_egress.as_document(), LITELLM)
         api.canary_endpoint = "unreachable"
-        return await real_resolve(launch_spec)
+        return await real_resolve(launch_spec, use_backoff=use_backoff)
 
     provider._resolve_image = resolve_and_change  # type: ignore[method-assign,assignment]
     with pytest.raises(LaunchRefusedError, match="local endpoint check failed"):
