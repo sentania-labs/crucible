@@ -73,11 +73,15 @@ def test_operator_pin_cannot_bypass_task_specific_check() -> None:
 
 
 def _routing_setup(
-    monkeypatch: pytest.MonkeyPatch, *, all_busy: bool, image: str | None = None
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    all_busy: bool,
+    image: str | None = None,
+    first_harness: str = "codex",
 ) -> tuple[Any, Any, Any]:
     routing = _routing(
         [
-            _model("a-first", harness="codex"),
+            _model("a-first", harness=first_harness),
             _model("b-second", harness="agy"),
         ]
     )
@@ -117,7 +121,7 @@ def _routing_setup(
     uow: Any = MagicMock()
     uow.tasks.get.return_value = task
     live_executions = [
-        replace(execution, id="live-codex", model="a-first", harness="codex"),
+        replace(execution, id="live-codex", model="a-first", harness=first_harness),
     ]
     if all_busy:
         live_executions.append(replace(execution, id="live-agy", model="b-second", harness="agy"))

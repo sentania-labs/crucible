@@ -171,7 +171,7 @@ async def test_per_harness_concurrency_defers_the_second_launch(
     provider: FakeProvider,
     tokens: dict[str, str],
 ) -> None:
-    """05b and 12: concurrency 1 for a harness whose credential is rw-narrow."""
+    """05b and 12: a policy cap of 1 defers a second credential holder."""
     supervisor = make_supervisor(ctx, provider)
     first = _submit_pinned(client, tokens, "crucible-worker:fake-hang", "EX-0001")
     second = _submit_pinned(client, tokens, "crucible-worker:fake-succeed", "EX-0002")

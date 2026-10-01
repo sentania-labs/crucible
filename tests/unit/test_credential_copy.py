@@ -212,7 +212,7 @@ async def test_the_create_request_names_the_variable_and_the_path_never_the_valu
     assert body["Cmd"][6:] == list(launch_shape.argv)
     mounts = {m["Target"]: m for m in body["HostConfig"]["Mounts"]}
     copy = mounts["/home/worker/.claude"]
-    assert copy["ReadOnly"] is False and copy["Source"].endswith("/credential")
+    assert copy["ReadOnly"] is True and copy["Source"].endswith("/credential")
     template = mounts["/home/worker/.claude/settings.json"]
     assert template["ReadOnly"] is True and template["Source"].endswith(
         "identity/harness/settings.json"
@@ -577,20 +577,18 @@ def test_the_archive_stat_header_is_decoded_and_a_regular_file_recognized() -> N
     assert _path_stat("not base64!!") == {}
 
 
-def test_rw_narrow_policy_set_matches_the_adapters_declared_minimums() -> None:
-    """policies.py validates the concurrency cap from a static set; the launch-time cap
-    comes from each adapter's minimum. The two must agree or a harness could be
-    validated at a cap its credential handling does not allow."""
+def test_policy_concurrency_declarations_match_every_adapter() -> None:
     from crucible.adapters.harness.registry import default_registry  # noqa: PLC0415
-    from crucible.application.policies import RW_NARROW_HARNESSES  # noqa: PLC0415
+    from crucible.domain.harness_concurrency import HARNESS_CONCURRENCY  # noqa: PLC0415
 
-    declared = {
-        adapter.name
-        for adapter in default_registry()
-        if (credential := adapter.credential_spec()) is not None
-        and credential.minimum_mode is MountMode.RW_NARROW
-    }
-    assert declared == RW_NARROW_HARNESSES
+    for adapter in default_registry(test_fixtures=True):
+        declaration = HARNESS_CONCURRENCY[adapter.name]
+        credential = adapter.credential_spec()
+        if credential is not None:
+            assert credential.minimum_mode.value == declaration.minimum_mode
+        assert (
+            getattr(adapter, "parallel_attempts_safe", None) == declaration.parallel_attempts_safe
+        )
 
 
 # ----- a launch that fails after seeding leaves no copy behind (review I1) --------

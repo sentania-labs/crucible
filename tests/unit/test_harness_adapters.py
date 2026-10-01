@@ -245,7 +245,8 @@ def test_without_a_credential_mounted_no_config_env_is_set() -> None:
 def test_credential_specs_name_only_the_auth_files_s1_recorded() -> None:
     claude = ClaudeCodeAdapter().credential_spec()
     assert [f.name for f in claude.auth_files] == ["oauth-token", ".claude.json"]
-    assert claude.minimum_mode is MountMode.RW_NARROW
+    assert claude.minimum_mode is MountMode.RO
+    assert effective_mount_mode(claude, None) is MountMode.RO
     assert claude.config_dir_env == "CLAUDE_CONFIG_DIR"
     assert set(claude.templates) == {"settings.json"}
     # Neither file is written back: the long-lived token never refreshes (S1b) and the

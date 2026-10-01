@@ -311,3 +311,20 @@ Omitting either flag preserves that harness's choice. The model-list response in
 `--disable fast` disables it, and the default `--harness hermes` preserves existing CLI
 behavior. Pool max concurrency bounds both harnesses together. The harness must also
 be enabled and have a promoted worker image, as for other routing choices.
+
+### Parallel frontier workers
+
+The Routing page shows the active per-harness caps. Policy
+`concurrency.per_harness` can allow multiple Claude Code, AGY, or Codex workers.
+Claude Code uses a read-only long-lived setup token with no sync-back. AGY uses
+isolated writable copies because Google keeps refresh tokens reusable. Codex also
+allows parallel copies, but OpenAI rotates refresh tokens: simultaneous renewals
+can break each other's login. The existing `auth_failure` classification and
+retry-once behavior remain the safety net.
+
+Watch supervisor warnings for `harness`, `attempt_id`, and `auth_failure_count`.
+The count is cumulative per harness in the current supervisor process and resets on
+restart. If Codex proves unreliable in parallel, set `per_harness.codex: 1` under
+`concurrency` in the policy used by new executions. Existing executions keep their
+snapshot. Shipped caps stay unchanged; Foundry sets them after deploy. Writable
+adapters without an explicit parallel-safety declaration remain limited to one.

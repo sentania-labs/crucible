@@ -13,7 +13,10 @@ Credential: `auth.json`, rw-narrow from the start because the CLI writes session
 log state beside it and fails on a read-only directory before auth is tested (S1). Only
 `auth.json` syncs back, chosen by the newer `last_refresh` (12). `config.toml` is a
 Crucible-owned template mounted read-only on top: the operator's per-project trust,
-MCP servers and hook trust hashes never reach a worker.
+MCP servers and hook trust hashes never reach a worker. Parallel copies are allowed,
+but OpenAI rotates refresh tokens on use, so simultaneous renewals can break login.
+Keep auth_failure and its retry-once safety net; operators can roll back with
+concurrency.per_harness.codex: 1 if the supervisor auth-failure counts rise.
 
 Commands (issue 128): the pinned models run commands through unified exec
 (`shell_type: unified_exec` in the CLI's own model catalog), which returns after at most
@@ -41,6 +44,7 @@ from typing import Any
 from crucible.adapters.harness import base
 from crucible.adapters.harness.hermes import HermesAdapter
 from crucible.domain.exit_class import ExitClass
+from crucible.domain.harness_concurrency import HARNESS_CONCURRENCY
 from crucible.domain.harness_settings import DEFAULT_HERMES_CONTEXT_LENGTH, hermes_run_limits
 from crucible.ports.harness import (
     CODEX_BINARY,
@@ -98,6 +102,8 @@ def _provider_quota_refusal(document: Mapping[str, Any]) -> bool:
 
 class CodexAdapter:
     name = NAME
+    concurrency = HARNESS_CONCURRENCY[NAME]
+    parallel_attempts_safe = concurrency.parallel_attempts_safe
     supported_versions = VersionRange("0.153.0", "0.157.0")
 
     def quota_reset_at(self, stdout_tail: str, stderr_tail: str) -> datetime | None:
@@ -138,7 +144,7 @@ class CodexAdapter:
                     "auth.json", json=True, json_keys=("tokens",), issued_at=("last_refresh",)
                 ),
             ),
-            minimum_mode=MountMode.RW_NARROW,
+            minimum_mode=MountMode(self.concurrency.minimum_mode),
             config_dir_env="CODEX_HOME",
             templates={"config.toml": CONFIG_TEMPLATE},
             login_hint=(
