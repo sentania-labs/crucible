@@ -13,6 +13,7 @@ from crucible.contracts.common import SCHEMA_VERSION, Rfc3339, StrictModel, chec
 
 
 class EvidenceKind(StrEnum):
+    GATE_PROBE = "gate_probe"
     EXIT_INFO = "exit_info"
     DIFF_PATHS = "diff_paths"
     BUNDLE_HEAD = "bundle_head"

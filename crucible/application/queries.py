@@ -332,6 +332,11 @@ def task_view(uow: UnitOfWork, task_id: str) -> TaskView:
             for v in versions
         ],
         contract=current.document if current else {},
+        gate_probes=[
+            {"attempt_id": row.attempt_id, **row.payload}
+            for row in uow.evidence.list_for_task(task.id)
+            if row.kind == "gate_probe"
+        ],
         executions=summaries,
         latest_attempt=latest,
         head_sha=task.head_sha,

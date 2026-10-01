@@ -486,6 +486,24 @@ class ExecutionProvider(Protocol):
 
     async def credential_available(self, harness: str) -> bool: ...
 
+    async def probe_checks(
+        self,
+        spec: LaunchSpec,
+        checks: Sequence[dict[str, Any]],
+        checkout_token: InstallationToken | None = None,
+        cancelled: CancelCheck | None = None,
+    ) -> tuple[VerificationRun, ...] | None:
+        """Run task checks on the unchanged base before preparation.
+
+        None explicitly means unsupported; failures raise ProviderError. A private
+        repository's read-only `checkout_token` is available only to this step.
+        """
+        ...
+
+    async def gate_probe_exists(self, attempt_id: str) -> bool:
+        """Whether this provider has an adoptable gate-probe step for an attempt."""
+        ...
+
     async def prepare(
         self,
         spec: LaunchSpec,

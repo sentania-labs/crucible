@@ -335,6 +335,9 @@ class FakeProvider:
 
     def __init__(self) -> None:
         # Attempts whose credential copy the supervisor asked to discard (12).
+        self.gate_probe_calls: list[str] = []
+        self.gate_probe_exits: dict[str, int] = {}
+        self.gate_probe_error: str | None = None
         self.discarded: list[str] = []
         # Harnesses the administrative probe was run for (25).
         self.probes: list[str] = []
@@ -435,6 +438,39 @@ class FakeProvider:
         )
 
     async def credential_available(self, harness: str) -> bool:
+        return False
+
+    async def probe_checks(
+        self,
+        spec: LaunchSpec,
+        checks: Sequence[dict[str, Any]],
+        checkout_token: InstallationToken | None = None,
+        cancelled: CancelCheck | None = None,
+    ) -> tuple[VerificationRun, ...] | None:
+        self.gate_probe_calls.append(spec.attempt_id)
+        if checkout_token is not None:
+            self.checkout_tokens[f"probe:{spec.attempt_id}"] = CheckoutTokenSeen(
+                repository=checkout_token.repository,
+                permissions=dict(checkout_token.permissions),
+                had_value=bool(checkout_token.reveal()),
+                token=checkout_token,
+            )
+        if self.gate_probe_error:
+            raise ProviderError(self.gate_probe_error)
+        return tuple(
+            VerificationRun(
+                id=check["id"],
+                command=check["command"],
+                expect_exit=int(check.get("expect_exit", 0)),
+                exit_code=self.gate_probe_exits.get(check["id"], 1),
+                log_tail="program: not found"
+                if self.gate_probe_exits.get(check["id"]) == 127
+                else "",
+            )
+            for check in checks
+        )
+
+    async def gate_probe_exists(self, attempt_id: str) -> bool:
         return False
 
     async def prepare(

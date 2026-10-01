@@ -682,6 +682,8 @@ async def test_rows_5_7_11_23_supervisor_restart_and_full_gate_lifecycle(
             [
                 {"id": "check/one", "command": "sh checks/lint.sh", "expect_exit": 0},
                 {"id": "check_one", "command": "exit 3", "expect_exit": 3},
+                # hades #250: a task whose checks all pass on the base is blocked before launch.
+                {"id": "V9", "command": "test -f src/e2e_change.txt", "expect_exit": 0},
             ]
         )
         detached_task = submit_and_start(client, detached_document)
@@ -2734,6 +2736,10 @@ async def test_lab_findings_a_long_collect_blocks_no_launch_and_the_sweep_frees_
         document["required_verification"].append(
             {"id": "V5", "command": "sleep 25", "expect_exit": 0}
         )
+        # hades #250: a task whose checks all pass on the base is blocked before launch.
+        document["required_verification"].append(
+            {"id": "V9", "command": "test -f src/e2e_change.txt", "expect_exit": 0}
+        )
         slow = submit_and_start(client, document)
         deadline = time.monotonic() + LAUNCH_DEADLINE_SECONDS + 120
         while time.monotonic() < deadline and not supervisor._collects:
@@ -2944,3 +2950,93 @@ async def test_fdy_0140_a_silent_worker_is_not_stalled_and_uncommitted_edits_are
         events = client.get(f"/v1/tasks/{uncommitted}/events", params={"limit": 200}).json()
         collected = [e for e in events["items"] if e["kind"] == "attempt_collected"]
         assert collected[-1]["payload"].get("uncommitted_work_committed") is True, collected
+
+
+@pytest.mark.parametrize("command,blocked", [("true", True), ("test -f made-by-the-worker", False)])
+async def test_gate_probe_on_unchanged_base_before_worker(
+    engine: Engine,
+    migrated: str,
+    artifact_root: Path,
+    registry: CraneRegistryClient,
+    command: str,
+    blocked: bool,
+) -> None:
+    """AC1/AC3: real probe logs and Job ordering, through the script harness API."""
+    api = _recording_client()
+    provider = _provider(api, registry)
+    ctx, tokens, app, harnesses = _kind_app(engine, migrated, artifact_root, provider, registry)
+    supervisor = Supervisor(
+        ctx.uow_factory,
+        {"kubernetes": provider},
+        ctx.clock,
+        holder="e2e-gate-probe",
+        artifact_store=ctx.artifact_store,
+        harnesses=harnesses,
+    )
+    with TestClient(app, headers={"Authorization": f"Bearer {tokens['operator']}"}) as client:
+        name = "gate-probe-true" if blocked else "gate-probe-file"
+        register(ctx, name, _origin(name, "hang"))
+        document = e2e_contract(
+            f"E2E-{name.upper()}", name, os.environ["CRUCIBLE_E2E_KIND_REGISTRY"]
+        )
+        document["execution_request"]["provider"] = "kubernetes"
+        document["policy"]["version"] = 21
+        document["required_verification"].append({"id": "V5", "command": command, "expect_exit": 0})
+        task_id = submit_and_start(client, document)
+        try:
+            deadline = time.monotonic() + LAUNCH_DEADLINE_SECONDS
+            while time.monotonic() < deadline:
+                await supervisor.tick()
+                view = client.get(f"/v1/tasks/{task_id}").json()
+                attempt = view["latest_attempt"]
+                if view["state"] == "blocked" or (attempt and attempt["started_at"]):
+                    break
+                await asyncio.sleep(0.25)
+            else:
+                pytest.fail(f"gate probe did not settle: {view}")
+            attempt_id = attempt["id"]
+            probes = view["gate_probes"]
+            print("gate probes:", json.dumps(probes, sort_keys=True))
+            evidence = client.get(f"/v1/attempts/{attempt_id}/evidence").json()["items"]
+            print(
+                "gate probe evidence:",
+                json.dumps(
+                    [row for row in evidence if row["kind"] == "gate_probe"], sort_keys=True
+                ),
+            )
+            assert len(probes) == 1 and probes[0]["id"] == "V5"
+            assert probes[0]["exit"] == (0 if blocked else 1)
+            assert any(
+                row["kind"] == "gate_probe" and row["payload"]["exit"] == probes[0]["exit"]
+                for row in evidence
+            )
+            roles = [
+                body["metadata"]["labels"][k8sspec.LABEL_ROLE] for _, body in _jobs(api, attempt_id)
+            ]
+            assert roles[0] == "gate-probe"
+            if blocked:
+                assert view["state"] == "blocked" and attempt["started_at"] is None
+                assert roles == ["gate-probe"]
+                assert "V5 passes on the unchanged repo" in view["open_escalations"][0]["question"]
+                with ctx.uow_factory() as uow:
+                    row = uow.attempts.get(attempt_id)
+                    assert row is not None and row.termination_reason == "gate_proves_nothing"
+                assert view["unacked_wakes"] > 0
+            else:
+                assert "preparer" in roles and "worker" in roles
+                assert roles.index("gate-probe") < roles.index("preparer") < roles.index("worker")
+            assert not api.list_objects(
+                "jobs",
+                label_selector=f"{k8sspec.LABEL_ATTEMPT}={attempt_id},{k8sspec.LABEL_ROLE}=gate-probe",
+            )
+        finally:
+            client.post(
+                f"/v1/tasks/{task_id}/cancel",
+                json={
+                    "reason": "gate probe proof complete",
+                    "verbatim": "stop",
+                    "decided_by": "tests",
+                },
+            )
+            await run_until(supervisor, client, task_id, {"cancelled"})
+            await supervisor.stop()

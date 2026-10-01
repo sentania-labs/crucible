@@ -82,6 +82,7 @@ from crucible.application.harnesses import (
 )
 from crucible.contracts.completion_claim import CompletionClaimV1
 from crucible.domain.cluster_egress import ClusterEgress, parse_cluster_egress
+from crucible.domain.command_timeout import effective_command_timeout_ms
 from crucible.domain.exit_class import ExitClass
 from crucible.domain.ids import new_id
 from crucible.domain.role_timeouts import DEFAULT_ROLE_TIMEOUT_SECONDS, parse_role_timeouts
@@ -180,7 +181,9 @@ ANNOTATION_IDENTITY_PATHS = "crucible.io/identity-paths"
 JOB_API_ERROR = -1
 JOB_TIMED_OUT = -2
 
-# One attempt may create a preparer, worker, collector, bundle-verifier and verifier Job.
+# One attempt may create a gate-probe, preparer, worker, collector, bundle-verifier
+# and verifier Job. The probe is deleted before preparation and never overlaps this
+# attempt's other Jobs, so its addition does not increase the five-Job capacity count.
 # A ResourceQuota's Job count therefore needs this conversion before it can truthfully be
 # shown as attempt capacity.
 JOBS_PER_ATTEMPT = 5
@@ -1141,6 +1144,198 @@ class KubernetesProvider:
                 f"{harness!r} is not readable in {self.config.namespace} ({exc.status})"
             ) from exc
         return _has_declared_auth_file(credential, source)
+
+    async def probe_checks(
+        self,
+        spec: LaunchSpec,
+        checks: Sequence[dict[str, Any]],
+        checkout_token: InstallationToken | None = None,
+        cancelled: CancelCheck | None = None,
+    ) -> tuple[VerificationRun, ...] | None:
+        """A disposable checkout of base_ref, before any preparer or worker."""
+        await _stop_if_cancelled(cancelled, "before the gate probe")
+        await self._require_ready(spec)
+        image = await self._resolve_image(spec)
+        role = "gate-probe"
+        command_timeout = max(
+            1,
+            (effective_command_timeout_ms(spec.policy, spec.contract, spec.timeout_seconds) + 999)
+            // 1000,
+        )
+        timeout = max(
+            1,
+            min(
+                spec.timeout_seconds,
+                self.config.prepare_timeout_seconds + command_timeout * len(checks),
+            ),
+        )
+        url = spec.repository_url or str(spec.contract.get("repository", {}).get("url", ""))
+        if checkout_token is not None:
+            workspace.require_checkout_url(url, self.config.credential_host)
+        token_name = (
+            k8sspec.object_name("checkout", spec.attempt_id) if checkout_token is not None else None
+        )
+        token_mounts, token_volumes = self._checkout_token_mounts(token_name)
+        plan = self._egress_plan(spec, k8sspec.ROLE_WORKER)
+        checkout = self._checkout_plan(spec, k8sspec.ROLE_PREPARER, checkout_token is not None)
+        # The same enforced policy machinery as the worker, with checkout egress
+        # needed to fetch base_ref. There is no credential or report volume.
+        plan = replace(
+            plan,
+            hosts=tuple(sorted(set(plan.hosts) | set(checkout.hosts))),
+            endpoints=tuple(sorted(set(plan.endpoints) | set(checkout.endpoints))),
+        )
+        checkout_mount = Mount("probe-work", WORK_MOUNT)
+        init_mounts: list[Mount] = [checkout_mount, *token_mounts]
+        volumes: list[dict[str, Any]] = [
+            {"name": "probe-work", "emptyDir": {}},
+            *token_volumes,
+        ]
+        # File origins in the kind tier live on this read-only claim.
+        if spec.repository_url.startswith("file:///crucible/cache/") and self.config.cache_claim:
+            init_mounts.append(Mount("cache", k8sspec.CACHE_MOUNT, read_only=True))
+            volumes.append(
+                {
+                    "name": "cache",
+                    "persistentVolumeClaim": {
+                        "claimName": self.config.cache_claim,
+                        "readOnly": True,
+                    },
+                }
+            )
+        output: list[str] = []
+        interrupted = False
+        try:
+            if checkout_token is not None:
+                if not await self._delete_checkout_secret(spec.attempt_id):
+                    raise ProviderError(
+                        f"the checkout token Secret {token_name!r} left by an earlier try "
+                        "could not be removed"
+                    )
+                await self._create_with_backoff(
+                    "secrets",
+                    k8sspec.secret(
+                        name=str(token_name),
+                        namespace=self.config.namespace,
+                        object_labels=self._labels(spec, role),
+                        data={CHECKOUT_TOKEN_KEY: checkout_token.reveal().encode("utf-8")},
+                    ),
+                )
+            code = await self._run_role_job(
+                spec,
+                role=role,
+                image=image,
+                script=scripts.gate_probe_script(
+                    f"{WORK_MOUNT}/repo",
+                    list(checks),
+                    command_timeout,
+                ),
+                mounts=[checkout_mount],
+                volumes=volumes,
+                init_containers=[
+                    {
+                        "name": "checkout",
+                        "image": image,
+                        "command": [
+                            "sh",
+                            "-c",
+                            scripts.gate_probe_checkout_script(
+                                spec.repository_url,
+                                spec.contract["repository"]["base_ref"],
+                                f"{WORK_MOUNT}/repo",
+                                checkout_token="file" if checkout_token is not None else None,
+                                credential_host=self.config.credential_host,
+                            ),
+                        ],
+                        "securityContext": {
+                            "allowPrivilegeEscalation": False,
+                            "readOnlyRootFilesystem": True,
+                            "capabilities": {"drop": ["ALL"]},
+                        },
+                        "resources": {
+                            "limits": {
+                                "cpu": self._limits(spec).cpu,
+                                "memory": self._limits(spec).memory,
+                                "ephemeral-storage": self._limits(spec).ephemeral_storage,
+                            },
+                            "requests": {
+                                "cpu": self._limits(spec).cpu_request,
+                                "memory": self._limits(spec).memory_request,
+                            },
+                        },
+                        "volumeMounts": [
+                            {"name": "tmp", "mountPath": "/tmp"},
+                            *[
+                                {
+                                    "name": mount.name,
+                                    "mountPath": mount.path,
+                                    "readOnly": mount.read_only,
+                                }
+                                for mount in init_mounts
+                            ],
+                        ],
+                    }
+                ],
+                limits=self._limits(spec),
+                timeout=timeout,
+                plan=plan,
+                cancelled=cancelled,
+                log_output=output,
+                adopt_existing=True,
+                preserve_on_cancel=True,
+            )
+        except asyncio.CancelledError:
+            interrupted = True
+            raise
+        except KubernetesApiError as exc:
+            raise ProviderError(f"gate probe Job failed: {exc}") from exc
+        finally:
+            if (
+                checkout_token is not None
+                and not interrupted
+                and not await self._delete_checkout_secret(spec.attempt_id)
+            ):
+                raise ProviderError(
+                    f"the checkout token Secret {token_name!r} could not be deleted after "
+                    "the gate probe"
+                )
+        if code != 0:
+            detail = self.role_errors.get((role, spec.attempt_id), ("", False))[0]
+            raise ProviderError(f"gate probe Job exit {code}: {detail}")
+        rows: list[VerificationRun] = []
+        for line in "".join(output).splitlines():
+            try:
+                result = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(result, dict) or not {"id", "command", "exit"} <= result.keys():
+                continue
+            if not isinstance(result["exit"], int):
+                raise ProviderError("gate probe returned an invalid exit")
+            rows.append(
+                VerificationRun(
+                    id=result["id"],
+                    command=result["command"],
+                    exit_code=result["exit"],
+                    expect_exit=next(
+                        int(check.get("expect_exit", 0))
+                        for check in checks
+                        if check["id"] == result["id"]
+                    ),
+                    log_tail=str(result.get("detail", "")),
+                )
+            )
+        return tuple(rows)
+
+    async def gate_probe_exists(self, attempt_id: str) -> bool:
+        name = k8sspec.object_name("gate-probe", attempt_id)
+        try:
+            await self._call(self.client.get, "jobs", name)
+        except KubernetesApiError as exc:
+            if exc.status == 404:
+                return False
+            raise ProviderError(f"could not inspect gate probe Job {name!r}: {exc}") from exc
+        return True
 
     async def prepare(
         self,
@@ -3997,6 +4192,10 @@ class KubernetesProvider:
         tolerate_lingering_pod: bool = False,
         wait_for_quota: bool = False,
         use_backoff: bool = False,
+        log_output: list[str] | None = None,
+        adopt_existing: bool = False,
+        preserve_on_cancel: bool = False,
+        init_containers: Sequence[Mapping[str, Any]] = (),
     ) -> int:
         """Run one single-purpose Job to completion and delete it. With `cancelled`, a
         cancel ends the wait (hades #189): the Job and its policy are deleted on the way
@@ -4009,8 +4208,10 @@ class KubernetesProvider:
         operator has to retry, not a collection the supervisor tries again."""
         name = k8sspec.object_name(OBJECT_PREFIX.get(role, role), spec.attempt_id)
         policy_name: str | None = None
-        with contextlib.suppress(KubernetesApiError):
-            await self._call(self.client.delete, "jobs", name)
+        if not adopt_existing:
+            with contextlib.suppress(KubernetesApiError):
+                await self._call(self.client.delete, "jobs", name)
+        interrupted = False
         try:
             policy_name, resolved_plan = await self._apply_policy(
                 spec, role, plan, use_backoff=use_backoff
@@ -4031,6 +4232,7 @@ class KubernetesProvider:
                         service_account=self.config.service_account,
                         image_pull_secret=self.config.image_pull_secret,
                         host_aliases=k8sspec.host_aliases(resolved_plan),
+                        init_containers=init_containers,
                     )
                 ),
                 # The Job's own deadline counts from its start, image pull included;
@@ -4044,6 +4246,13 @@ class KubernetesProvider:
             self._role_error(
                 role, spec.attempt_id, str(exc), isinstance(exc, KubernetesUnavailableError)
             )
+            # A failed create may have reached the server. In particular, a probe
+            # refusal has no later workspace cleanup to remove this Job or policy.
+            with contextlib.suppress(KubernetesApiError):
+                await self._call(self.client.delete, "jobs", name)
+            if policy_name:
+                with contextlib.suppress(KubernetesApiError):
+                    await self._call(self.client.delete, "networkpolicies", policy_name)
             return JOB_API_ERROR
         self.role_errors.pop((role, spec.attempt_id), None)
         try:
@@ -4073,24 +4282,44 @@ class KubernetesProvider:
                 # A full namespace is a wait, not a verdict on the attempt.
                 self._role_error(role, spec.attempt_id, refusal, True)
                 return JOB_API_ERROR
+            if log_output is not None:
+                pod = await self._pod_of(name)
+                if pod is not None:
+                    frames = await self._call(
+                        self.client.pod_log,
+                        str(pod["metadata"]["name"]),
+                        container=k8sspec.CONTAINER_NAME,
+                        timestamps=False,
+                    )
+                    log_output.append(
+                        b"".join(frame.payload for frame in frames).decode("utf-8", "replace")
+                    )
             if code != 0:
                 tail = await self._job_tail(name)
+                if role == "gate-probe":
+                    checkout_tail = await self._job_tail(name, container="checkout")
+                    if checkout_tail and checkout_tail != tail:
+                        tail = "\n".join(part for part in (checkout_tail, tail) if part)
                 self._role_error(role, spec.attempt_id, tail)
-                log.warning("%s Job exited %s", role, code, extra={"tail": tail})
+                log.warning("%s Job exited %s: %s", role, code, tail[-1000:])
             return code
+        except asyncio.CancelledError:
+            interrupted = True
+            raise
         finally:
-            with contextlib.suppress(KubernetesApiError):
-                await self._call(self.client.delete, "jobs", name)
-            try:
-                await self._await_job_pods_gone(name)
-            except (ProviderError, KubernetesApiError) as exc:
-                if not tolerate_lingering_pod:
-                    raise
-                log.warning("%s Pod outlived its Job", role, extra={"error": str(exc)})
-            finally:
-                if policy_name:
-                    with contextlib.suppress(KubernetesApiError):
-                        await self._call(self.client.delete, "networkpolicies", policy_name)
+            if not (interrupted and preserve_on_cancel):
+                with contextlib.suppress(KubernetesApiError):
+                    await self._call(self.client.delete, "jobs", name)
+                try:
+                    await self._await_job_pods_gone(name)
+                except (ProviderError, KubernetesApiError) as exc:
+                    if not tolerate_lingering_pod:
+                        raise
+                    log.warning("%s Pod outlived its Job", role, extra={"error": str(exc)})
+                finally:
+                    if policy_name:
+                        with contextlib.suppress(KubernetesApiError):
+                            await self._call(self.client.delete, "networkpolicies", policy_name)
 
     def _role_error(self, role: str, attempt_id: str, text: str, unavailable: bool = False) -> None:
         self.last_error[role] = text
@@ -4488,7 +4717,16 @@ class KubernetesProvider:
         rows = await self._call(
             self.client.list_objects, "pods", label_selector=f"job-name={job_name}"
         )
-        return rows[0] if rows else None
+        live = [row for row in rows if not (row.get("metadata") or {}).get("deletionTimestamp")]
+        candidates = live or rows
+        return (
+            max(
+                candidates,
+                key=lambda row: str((row.get("metadata") or {}).get("creationTimestamp") or ""),
+            )
+            if candidates
+            else None
+        )
 
     async def _await_pod_gone(self, name: str, *, timeout: float = 15) -> None:
         """Wait for an asynchronous Pod deletion before recording workspace state."""
@@ -4522,7 +4760,9 @@ class KubernetesProvider:
             f"Pods for Job {job_name!r} were still present after {timeout:g} seconds"
         )
 
-    async def _job_tail(self, job_name: str, limit: int = 4000) -> str:
+    async def _job_tail(
+        self, job_name: str, limit: int = 4000, container: str = k8sspec.CONTAINER_NAME
+    ) -> str:
         try:
             pod = await self._pod_of(job_name)
         except KubernetesApiError:
@@ -4534,7 +4774,7 @@ class KubernetesProvider:
             frames = await self._call(
                 self.client.pod_log,
                 name,
-                container=k8sspec.CONTAINER_NAME,
+                container=container,
                 timestamps=False,
                 tail_lines=JOB_TAIL_LINES,
             )
