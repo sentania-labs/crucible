@@ -21,7 +21,7 @@ adapters, credential handling, and the Docker Compose and Kubernetes
 deployment shapes shipped in this repository.
 
 Out of scope: vulnerabilities in the worker harnesses themselves (Claude Code,
-Codex, AGY) or in the models behind them. Report those upstream.
+Codex, AGY, Hermes) or in the models behind them. Report those upstream.
 
 ## Never in this repository
 

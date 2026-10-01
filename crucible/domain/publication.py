@@ -167,7 +167,7 @@ def validate_title(proposed: str) -> str:
             "the proposed title carries an at-mention; a mention notifies people and can "
             "trigger the external reviewer under Crucible's identity (23)"
         )
-    if "\n" in proposed or "\r" in proposed:
+    if "\n" in proposed.strip() or "\r" in proposed.strip():
         raise TitleRefusedError("a pull request title is one line")
     return title
 
