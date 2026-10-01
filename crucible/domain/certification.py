@@ -20,11 +20,7 @@ SKIPPED = "skipped"
 FAILING_CONCLUSIONS: frozenset[str] = frozenset(
     {"failure", "cancelled", "timed_out", "action_required", "stale", "startup_failure"}
 )
-# 23: "green means the set is non-empty and every member concluded `success`". A member
-# that concluded `neutral` or `skipped` is neither a success nor a failure, so it leaves
-# the set pending and the timeout wakes Foundry. A `skipped` run is still excluded from
-# the *observed* fallback set (23), which is a different question: it cannot make a set
-# out of nothing, but once a check is required, skipping it is not passing it.
+# Only success certifies; neutral stays pending and skipped runs are excluded.
 PASSING_CONCLUSIONS: frozenset[str] = frozenset({SUCCESS})
 
 
@@ -105,42 +101,32 @@ def wait_timeout_hours(policy: dict[str, object], section_name: str, default: in
 
 
 def resolve_required(
-    policy: dict[str, object],
     *,
-    branch_protection: Sequence[str],
     observed: Sequence[ObservedCheck],
 ) -> tuple[tuple[str, ...], str]:
-    """23's resolution order: the policy's list, else branch protection or the ruleset,
-    else every non-skipped run observed on the head."""
-    from_policy = required_checks_from_policy(policy)
-    if from_policy:
-        return from_policy, "policy"
-    protected = tuple(dict.fromkeys(str(name) for name in branch_protection if str(name)))
-    if protected:
-        return protected, "branch_protection"
-    names = tuple(
-        dict.fromkeys(
-            check.name
-            for check in observed
-            if check.source is not CheckSource.CHECK_SUITE
-            and not (check.concluded and check.conclusion == SKIPPED)
-        )
+    """Name every observed non-skipped run; suites are only containers."""
+    return tuple(dict.fromkeys(check.name for check in observed if _counts(check))), "observed"
+
+
+def _counts(check: ObservedCheck) -> bool:
+    return check.source is not CheckSource.CHECK_SUITE and not (
+        check.concluded and check.conclusion == SKIPPED
     )
-    return names, "observed"
 
 
 def certify(
     policy: dict[str, object],
     *,
     head_sha: str,
-    branch_protection: Sequence[str],
     observed: Sequence[ObservedCheck],
 ) -> Certification:
     """Green, failed, pending, or skipped for one head. Never green on an empty set."""
     on_head = tuple(check for check in observed if check.head_sha == head_sha)
-    required, source = resolve_required(
-        policy, branch_protection=branch_protection, observed=on_head
+    narrowing = required_checks_from_policy(policy)
+    counted = tuple(
+        check for check in on_head if _counts(check) and (not narrowing or check.name in narrowing)
     )
+    required, source = resolve_required(observed=counted)
     if not required:
         if allow_no_ci(policy):
             return Certification(
@@ -152,31 +138,21 @@ def certify(
             )
         return Certification(
             CertificationState.PENDING,
-            f"no check run or workflow run has been observed on {head_sha}; an empty "
+            f"no eligible check run or workflow job has been observed on {head_sha}; an empty "
             "required-check set is pending, never green (23)",
             source=source,
             observed=on_head,
         )
-    by_name: dict[str, list[ObservedCheck]] = {}
-    for check in on_head:
-        by_name.setdefault(check.name, []).append(check)
-    failures: list[ObservedCheck] = []
-    pending: list[str] = []
-    for name in required:
-        runs = by_name.get(name, [])
-        if not runs:
-            pending.append(name)
-            continue
-        latest = runs[-1]
-        if latest.failed:
-            failures.append(latest)
-        elif not latest.succeeded:
-            pending.append(name)
+    failures = [check for check in counted if check.failed]
+    pending = [check.name for check in counted if not check.failed and not check.succeeded]
+    total = len(counted)
+    succeeded = sum(check.succeeded for check in counted)
+    progress = f"{succeeded} of {total} jobs succeeded on {head_sha}"
     if failures:
         names = ", ".join(sorted({check.name for check in failures}))
         return Certification(
             CertificationState.FAILED,
-            f"required check(s) failed on {head_sha}: {names}",
+            f"{progress}; {len(failures)} of {total} jobs failed: {names}",
             required=required,
             source=source,
             failures=tuple(failures),
@@ -186,7 +162,7 @@ def certify(
     if pending:
         return Certification(
             CertificationState.PENDING,
-            f"waiting on {len(pending)} required check(s) on {head_sha}: "
+            f"{progress}; {len(pending)} of {total} jobs still running or awaiting success: "
             f"{', '.join(sorted(pending))}",
             required=required,
             source=source,
@@ -195,8 +171,7 @@ def certify(
         )
     return Certification(
         CertificationState.GREEN,
-        f"every required check concluded successfully on {head_sha} "
-        f"({len(required)} check(s), set from {source})",
+        progress,
         required=required,
         source=source,
         observed=on_head,
