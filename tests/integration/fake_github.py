@@ -412,6 +412,9 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _route(self, method: str, parts: list[str], query: dict[str, list[str]]) -> None:
         state = self.state
+        if method == "GET" and parts == ["app"]:
+            self._send(200, {"slug": "crucible-spike"})
+            return
         if parts[:2] == ["app", "installations"] and parts[-1] == "access_tokens":
             state.mint_calls += 1
             if state.mint_failure_once:

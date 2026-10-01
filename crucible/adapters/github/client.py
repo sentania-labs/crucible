@@ -81,6 +81,13 @@ class RestGitHubClient:
     def revoke_token(self, token: InstallationToken) -> bool:
         return self._auth.revoke(token)
 
+    def authenticated_login(self, token: InstallationToken) -> str:
+        del token
+        payload = self._http.get("/app", bearer=self._auth.app_jwt())
+        if not isinstance(payload, dict) or not isinstance(payload.get("slug"), str):
+            raise GitHubError(502, "authenticated App response has no slug", path="/app")
+        return f"{payload['slug']}[bot]"
+
     # ----- reads --------------------------------------------------------
 
     def remote_head(self, token: InstallationToken, *, repository: str, ref: str) -> str | None:

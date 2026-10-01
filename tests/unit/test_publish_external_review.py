@@ -33,6 +33,9 @@ class FakeGitHub:
     def issue_comments(self, *_args: object, **_kwargs: object) -> tuple[CommentRecord, ...]:
         return tuple(self.comments)
 
+    def authenticated_login(self, _token: InstallationToken) -> str:
+        return "crucible-spike[bot]"
+
     def post_issue_comment(self, *_args: object, **kwargs: object) -> CommentRecord:
         self.posts.append(str(kwargs["body"]))
         now = datetime(2026, 9, 30, tzinfo=UTC)
@@ -146,4 +149,32 @@ def test_republish_does_not_request_the_apps_trigger_again() -> None:
             "comment_login": "crucible-spike[bot]",
         }
     )
-    assert external_review_request_exists(previous, (comment,), "@codex review", 7)
+    assert external_review_request_exists(
+        previous, (comment,), "@codex review", 7, "crucible-spike[bot]"
+    )
+
+
+def test_republish_recovers_the_apps_trigger_when_the_event_was_not_committed() -> None:
+    github = FakeGitHub()
+    now = datetime(2026, 9, 30, tzinfo=UTC)
+    github.comments.append(
+        CommentRecord(
+            github_id="42",
+            login="crucible-spike[bot]",
+            body="@codex review",
+            created_at=now,
+            updated_at=now,
+            kind="issue_comment",
+        )
+    )
+
+    comment = request_external_review(
+        github,  # type: ignore[arg-type]
+        _token(),
+        plan=_plan(_policy()),
+        pull_request_number=7,
+        previous=None,
+    )
+
+    assert comment is github.comments[0]
+    assert github.posts == []

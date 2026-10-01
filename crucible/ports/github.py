@@ -211,6 +211,10 @@ class GitHubClient(Protocol):
         """End a token before it expires. True when GitHub says it is gone."""
         ...
 
+    def authenticated_login(self, token: InstallationToken) -> str:
+        """Login GitHub attributes to this installation token."""
+        ...
+
     def remote_head(self, token: InstallationToken, *, repository: str, ref: str) -> str | None:
         """The SHA at `refs/heads/<ref>`, or None when the ref does not exist."""
         ...

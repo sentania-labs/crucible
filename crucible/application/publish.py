@@ -87,13 +87,12 @@ def external_review_request_exists(
     comments: tuple[CommentRecord, ...],
     trigger: str,
     pull_request_number: int,
+    app_login: str,
 ) -> bool:
     """Whether this PR already carries the App-authored request recorded by Crucible."""
-    if previous is None:
-        return False
+    if previous is None or int(previous.payload.get("pull_request") or 0) != pull_request_number:
+        return any(comment.login == app_login and comment.body == trigger for comment in comments)
     payload = previous.payload
-    if int(payload.get("pull_request") or 0) != pull_request_number:
-        return False
     comment_id = str(payload.get("comment_id") or "")
     comment_login = str(payload.get("comment_login") or "")
     return any(
@@ -119,7 +118,17 @@ def request_external_review(
     comments = github.issue_comments(
         token, repository=plan.repository_name, number=pull_request_number
     )
-    if external_review_request_exists(previous, comments, trigger, pull_request_number):
+    app_login = github.authenticated_login(token)
+    recover_event = (
+        previous is None or int(previous.payload.get("pull_request") or 0) != pull_request_number
+    )
+    if external_review_request_exists(previous, comments, trigger, pull_request_number, app_login):
+        if recover_event:
+            return next(
+                comment
+                for comment in comments
+                if comment.login == app_login and comment.body == trigger
+            )
         return None
     return github.post_issue_comment(
         token,

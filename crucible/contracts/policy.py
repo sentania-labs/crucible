@@ -283,6 +283,11 @@ class ExternalReview(StrictModel):
             raise ValueError("reviewer_logins must be non-empty when required_rounds is above 0")
         if self.trigger_comment is None and self.provider == "codex":
             self.trigger_comment = "@codex review"
+        if self.provider and self.request_on_publish and not self.trigger_comment:
+            raise ValueError(
+                f"external review provider {self.provider!r} requires trigger_comment "
+                "when request_on_publish is true"
+            )
         return self
 
 

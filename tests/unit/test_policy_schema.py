@@ -210,6 +210,21 @@ def test_reviewer_logins_required_above_zero_rounds() -> None:
     assert any("reviewer_logins" in e for e in _errors(document))
 
 
+def test_requested_provider_without_a_trigger_comment_is_refused() -> None:
+    document = seeded_policy()
+    document["external_review"]["provider"] = "other-reviewer"
+    document["external_review"].pop("trigger_comment", None)
+    errors = _errors(document)
+    assert any("other-reviewer" in error and "trigger_comment" in error for error in errors)
+
+
+def test_codex_provider_supplies_its_builtin_trigger_comment() -> None:
+    document = seeded_policy()
+    document["external_review"]["provider"] = "codex"
+    document["external_review"].pop("trigger_comment", None)
+    assert parse_policy(document).external_review.trigger_comment == "@codex review"
+
+
 def test_operator_only_settings_are_reported() -> None:
     document = seeded_policy()
     document["ci_certification"]["allow_no_ci"] = True
