@@ -151,7 +151,13 @@ def test_wiring_constructs_only_the_effective_renewer(
     service = wiring.Wiring(settings, Mock(), {}, Mock(), Mock(), credential_renewer=renewer)
     service.supervisor()
     scheduled = constructor.call_args.kwargs["credential_renewal"]
-    assert scheduled == (renewer.refresh_if_due if renewer is not None else None)
+    # The renewal callable now covers both pending requests and timer-based
+    # renewal (339); it is a bound method that internally calls refresh_on_
+    # request and refresh_if_due.  Check it is the wiring method.
+    if renewer is not None:
+        assert scheduled == service._credential_renewal
+    else:
+        assert scheduled is None
     if mode == "rw-narrow":
         assert wiring.credential_sources(settings)["codex"].mount_mode is MountMode.RW_NARROW
 

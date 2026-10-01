@@ -8,6 +8,7 @@ import os
 import socket
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -132,11 +133,16 @@ class Wiring:
                 partial(sweep_retired, self.admin) if self.admin is not None else None
             ),
             credential_renewal=(
-                self.credential_renewer.refresh_if_due
-                if self.credential_renewer is not None
-                else None
+                self._credential_renewal if self.credential_renewer is not None else None
             ),
         )
+
+    def _credential_renewal(self) -> bool:
+        """Both timer renewal and pending-request refresh (339)."""
+        if self.credential_renewer is None:
+            return False
+        self.credential_renewer.refresh_on_request()
+        return self.credential_renewer.refresh_if_due()
 
     def app(self) -> FastAPI:
         return create_app(self.ctx)
@@ -565,6 +571,13 @@ def wire(settings: Settings) -> Wiring:
     if renewer is not None and isinstance(kubernetes, KubernetesProvider):
         kubernetes.set_credential_dead_check(lambda: renewer.dead)
 
+    # 339: the API process must not hold a grant-capable renewer.  The credentials
+    # page records a CREDENTIAL_REFRESH_REQUESTED event and the supervisor performs
+    # the refresh on its next tick.  The API context only carries a dead-check.
+    api_renewer: CodexCredentialRenewer | None = None
+    if renewer is not None:
+        api_renewer = _build_readonly_renewer(renewer)
+
     ctx = AppContext(
         uow_factory=factory,
         clock=SystemClock(),
@@ -581,7 +594,7 @@ def wire(settings: Settings) -> Wiring:
         admin=admin,
         settings=settings,
         first_run=first_run,
-        credential_renewer=renewer,
+        credential_renewer=api_renewer,
     )
     publisher = build_publisher(settings, docker, providers.get("kubernetes"), github)
     return Wiring(
@@ -688,13 +701,63 @@ def build_credential_renewer(
             )
             uow.commit()
 
-    return CodexCredentialRenewer(
+    renewer = CodexCredentialRenewer(
         store=store,
         clock=admin.clock,
         record=record_on_service_loop,
         propagate=propagate_refresh,
         wake=wake,
     )
+
+    # 339: the renewer checks for CREDENTIAL_REFRESH_REQUESTED events so the
+    # supervisor can honour a forced refresh recorded from the API.
+    def _has_pending_refresh_request() -> bool:
+        try:
+            with factory() as uow:
+                rows = uow.events.list_global(
+                    after_seq=0,
+                    kind=EventKind.CREDENTIAL_REFRESH_REQUESTED.value,
+                    since=datetime.min.replace(tzinfo=UTC),
+                    limit=1,
+                )
+                return len(rows) > 0
+        except Exception:  # pragma: no cover - safe fallback for test fakes
+            return False
+
+    renewer.set_pending_request_checker(_has_pending_refresh_request)
+
+    return renewer
+
+
+def _build_readonly_renewer(full_renewer: CodexCredentialRenewer) -> CodexCredentialRenewer:
+    """Return a copy that only has dead-check capability (339).
+
+    The read-only renewer shares the same store so ``dead`` is accurate,
+    but ``grant`` is a no-op so the API process can never mutate the secret.
+    The ``_pending_request_checker`` is left unset so ``refresh_on_request``
+    is a no-op; only the supervisor's full renewer handles pending events.
+    """
+
+    ro_store = full_renewer.store
+
+    def noop_grant(_token: str) -> dict[str, str]:
+        return {}
+
+    def noop_propagate(_document: Mapping[str, str]) -> None:
+        pass
+
+    def noop_wake(_summary: str) -> None:
+        pass
+
+    ro = CodexCredentialRenewer(
+        store=ro_store,
+        grant=noop_grant,
+        clock=full_renewer.clock,
+        record=full_renewer.record,
+        propagate=noop_propagate,
+        wake=noop_wake,
+    )
+    return ro
 
 
 def build_publisher(

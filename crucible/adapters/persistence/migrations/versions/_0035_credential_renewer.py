@@ -19,7 +19,7 @@ down_revision = "0034_external_review_requested"
 branch_labels = None
 depends_on = None
 
-EVENT_KINDS = ("credential_refreshed", "credential_refresh_failed")
+EVENT_KINDS = ("credential_refreshed", "credential_refresh_failed", "credential_refresh_requested")
 
 
 def _event_kinds() -> list[str]:
