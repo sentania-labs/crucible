@@ -23,8 +23,8 @@ from crucible.adapters.persistence.migrations.versions._0008_harness_adapters im
 )
 from crucible.adapters.ui import render as ui_render
 from crucible.adapters.ui.pages import dashboard
-from crucible.adapters.ui.pages import repositories as ui_repositories
 from crucible.adapters.ui.pages import gateway as gw_module
+from crucible.adapters.ui.pages import repositories as ui_repositories
 from crucible.adapters.ui.pages import routing_models as ui_routing_models
 from crucible.adapters.ui.pages import settings as ui_settings
 from crucible.adapters.ui.pages import workers as ui_workers
