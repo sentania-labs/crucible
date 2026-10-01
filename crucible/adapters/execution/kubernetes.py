@@ -232,6 +232,7 @@ LIST_IMAGES_SKIP_PREFIX = "ci-"
 # the cap logged inside it) is retried larger, up to the ceiling; past the ceiling the
 # rest of that second is skipped with a notice line, never read unbounded.
 LOG_READ_LIMIT = 4 * 1024 * 1024
+JOB_TAIL_LINES = 2000
 LOG_READ_CEILING = 64 * 1024 * 1024
 # How much of a collected output tar is accepted. The tree is excluded from it, so this
 # is the diff, the bundle, the report copy and the verifier logs.
@@ -4372,7 +4373,12 @@ class KubernetesProvider:
         name = str((pod.get("metadata") or {}).get("name") or "")
         try:
             frames = await self._call(
-                self.client.pod_log, name, container=k8sspec.CONTAINER_NAME, timestamps=False
+                self.client.pod_log,
+                name,
+                container=k8sspec.CONTAINER_NAME,
+                timestamps=False,
+                tail_lines=JOB_TAIL_LINES,
+                limit_bytes=LOG_READ_LIMIT,
             )
         except KubernetesApiError:
             return ""

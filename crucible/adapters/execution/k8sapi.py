@@ -452,6 +452,7 @@ class KubernetesClient:
         timestamps: bool = True,
         timeout: float | None = None,
         limit_bytes: int | None = None,
+        tail_lines: int | None = None,
     ) -> list[LogFrame]:
         """`pods/log` with timestamps and an RFC 3339 `sinceTime` bound (26).
 
@@ -470,6 +471,8 @@ class KubernetesClient:
             params["sinceTime"] = since_time
         if limit_bytes is not None:
             params["limitBytes"] = str(limit_bytes)
+        if tail_lines is not None:
+            params["tailLines"] = str(tail_lines)
         path = f"{self._base('pods')}/{quote(name, safe='')}/log"
         try:
             with self._request("GET", path, params=params, timeout=timeout) as response:

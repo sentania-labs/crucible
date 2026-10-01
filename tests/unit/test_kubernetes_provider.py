@@ -658,6 +658,28 @@ async def test_a_second_fuller_than_the_ceiling_is_skipped_with_a_notice(
     assert all(r["limit_bytes"] <= 400 for r in api.log_reads)
 
 
+async def test_the_collection_tail_read_asks_for_bounded_lines_and_bytes() -> None:
+    """The collection path (FDY-0187) asks `pod_log` with both `tailLines` and
+    `limitBytes`, so the tail read is bounded in lines and bytes while the tail
+    still ends with the worker's last line."""
+    last_line = "worker is done"
+    lines = [_stamped(0, 0, "start")]
+    lines += [_stamped(1, n, f"step {n}") for n in range(5)]
+    lines.append(_stamped(2, 0, last_line))
+    api, _registry, provider, launch, workspace = await prepared()
+    handle = await provider.launch(workspace, launch)
+    await run_to_exit(provider, handle)
+    api.log_reads.clear()
+    api.logs[f"{handle.ref}-abc12"] = lines
+    outputs = await provider.collect(handle, workspace, launch)
+    tail_entries = [r for r in api.log_reads if r["tail_lines"] is not None]
+    assert len(tail_entries) >= 1
+    for entry in tail_entries:
+        assert entry["limit_bytes"] is not None
+    # The tail read should end with the worker's last line.
+    assert last_line in outputs.stdout_tail
+
+
 # ----- reconcile (10, 26) --------------------------------------------------
 
 
