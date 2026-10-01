@@ -1022,9 +1022,17 @@ def gate_probe_script(
 export GIT_CONFIG_GLOBAL={_quote(git_config)}
 root=$(mktemp -d)
 trap '{drop_token}; rm -rf "$root"' 0
-git clone --no-checkout -- {_quote(url)} "$root/repo" >&2
-cd "$root/repo"
-git checkout --detach {_quote(base_ref)} >&2
+checkout_failed() {{
+  code=$1
+  printf 'gate probe checkout failed (exit %s): ' "$code" >&2
+  tail -c 1000 "$root/checkout-stderr" >&2
+  exit "$code"
+}}
+git clone --no-checkout -- {_quote(url)} "$root/repo" \
+  > /dev/null 2> "$root/checkout-stderr" || checkout_failed $?
+cd "$root/repo" 2> "$root/checkout-stderr" || checkout_failed $?
+git checkout --detach {_quote(base_ref)} \
+  > /dev/null 2> "$root/checkout-stderr" || checkout_failed $?
 {drop_token}
 probe_check() {{
   check_id=$1

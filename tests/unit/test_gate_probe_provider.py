@@ -251,3 +251,58 @@ def test_probe_script_bounds_each_command_without_python(
     assert result.returncode in (124, 137)
     assert "V4: command timed out" in result.stderr
     assert result.stdout == ""
+
+
+@pytest.mark.parametrize("failure", ["clone", "checkout"])
+def test_probe_script_reports_checkout_stderr_on_failure(
+    tmp_path: Path, probe_environment: dict[str, str], failure: str
+) -> None:
+    origin = tmp_path / "origin"
+    if failure == "checkout":
+        origin.mkdir()
+        subprocess.run(["git", "init", "-b", "main"], cwd=origin, check=True, capture_output=True)
+    result = subprocess.run(
+        [
+            "sh",
+            "-c",
+            scripts.gate_probe_script(
+                str(origin), "missing-ref", [{"id": "V4", "command": "true"}], 5
+            ),
+        ],
+        env=probe_environment,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert "gate probe checkout failed" in result.stderr
+    assert ("does not exist" if failure == "clone" else "missing-ref") in result.stderr
+
+
+def test_probe_checkout_failure_detail_keeps_only_last_1000_bytes(
+    tmp_path: Path, probe_environment: dict[str, str]
+) -> None:
+    git = tmp_path / "bin" / "git"
+    git.unlink()
+    git.write_text(
+        "#!/bin/sh\nprintf 'discard this prefix' >&2\n"
+        "i=0; while [ $i -lt 1000 ]; do printf x >&2; i=$((i+1)); done\nexit 23\n"
+    )
+    git.chmod(0o755)
+    result = subprocess.run(
+        [
+            "sh",
+            "-c",
+            scripts.gate_probe_script("unused", "main", [{"id": "V4", "command": "true"}], 5),
+        ],
+        env=probe_environment,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert result.returncode == 23
+    assert result.stdout == ""
+    assert result.stderr == "gate probe checkout failed (exit 23): " + "x" * 1000
