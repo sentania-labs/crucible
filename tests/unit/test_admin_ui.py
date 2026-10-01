@@ -24,6 +24,7 @@ from crucible.adapters.persistence.migrations.versions._0008_harness_adapters im
 from crucible.adapters.ui import render as ui_render
 from crucible.adapters.ui.pages import dashboard
 from crucible.adapters.ui.pages import settings as ui_settings
+from crucible.adapters.ui.pages import tasks as tasks_mod
 from crucible.adapters.ui.pages import workers as ui_workers
 from crucible.adapters.ui.pages.settings import _settings_rows
 from crucible.adapters.ui.render import (
@@ -1236,3 +1237,241 @@ def test_status_page_shows_version_as_first_row(monkeypatch: pytest.MonkeyPatch)
 
     assert rows[0][0] == "Version"
     assert rows[0][1]["value"] == crucible.__version__
+
+
+def test_tasks_of_disabled_discarded_import_principals_are_hidden_unless_archived(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """hades FDY-0207: tasks owned by disabled discarded-import principals are absent from
+    every Tasks page section and from the counts by default, present with ?archived=1, and
+    a note says how many are hidden."""
+
+    archived_principal_id = "abc123"
+    normal_principal_id = "normal456"
+
+    # A principal that looks like a discarded import
+    archived_principal = SimpleNamespace(
+        id=archived_principal_id,
+        name="discarded-import-aaa",
+        role=SimpleNamespace(value="observer"),
+        created_at=datetime(2026, 1, 1, tzinfo=UTC),
+        disabled_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+    # A normal principal
+    normal_principal = SimpleNamespace(
+        id=normal_principal_id,
+        name="normal-principal",
+        role=SimpleNamespace(value="user"),
+        created_at=datetime(2026, 1, 1, tzinfo=UTC),
+        disabled_at=None,
+    )
+
+    # Archived tasks
+    archived_task = SimpleNamespace(
+        id="archived-task-1",
+        external_id="ext-1",
+        principal_id=archived_principal_id,
+        state=TaskState.SUBMITTED,
+        updated_at=datetime(2026, 6, 1, tzinfo=UTC),
+    )
+    archived_task_2 = SimpleNamespace(
+        id="archived-task-2",
+        external_id="ext-2",
+        principal_id=archived_principal_id,
+        state=TaskState.RUNNING,
+        updated_at=datetime(2026, 6, 2, tzinfo=UTC),
+    )
+
+    # Normal task
+    normal_task = SimpleNamespace(
+        id="normal-task-1",
+        external_id="ext-3",
+        principal_id=normal_principal_id,
+        state=TaskState.SUBMITTED,
+        updated_at=datetime(2026, 6, 3, tzinfo=UTC),
+    )
+
+    # Fake principals list (returns both archived and normal)
+    def fake_list_all() -> list[Any]:
+        return [archived_principal, normal_principal]
+
+    # Fake list_by_state
+    def fake_list_by_state(state: TaskState) -> list[Any]:
+        return [t for t in [archived_task, archived_task_2, normal_task] if t.state == state]
+
+    # Fake recently_updated
+    def fake_recently_updated(since: datetime, limit: int) -> list[Any]:
+        return [archived_task, normal_task]
+
+    uow = SimpleNamespace(
+        principals=SimpleNamespace(list_all=fake_list_all),
+        tasks=SimpleNamespace(
+            list_by_state=fake_list_by_state,
+            recently_updated=fake_recently_updated,
+        ),
+    )
+
+    ctx = SimpleNamespace(clock=SimpleNamespace(now=lambda: datetime(2026, 6, 5, tzinfo=UTC)))
+
+    principal = SimpleNamespace(name="reader", role=SimpleNamespace(value="observer"))
+    sections_captured: list[dict[str, Any]] = []
+
+    # Fake status.tasks to return a minimal document
+    fake_doc = {
+        "lists": {
+            "submitted": [
+                {
+                    "id": "archived-task-1",
+                    "external_id": "ext-1",
+                    "updated_at": "2026-06-01T00:00:00Z",
+                },
+                {
+                    "id": "normal-task-1",
+                    "external_id": "ext-3",
+                    "updated_at": "2026-06-03T00:00:00Z",
+                },
+            ],
+            "running": [
+                {
+                    "id": "archived-task-2",
+                    "external_id": "ext-2",
+                    "updated_at": "2026-06-02T00:00:00Z",
+                },
+            ],
+        },
+        "counts": {
+            "submitted": 2,
+            "running": 1,
+        },
+        "gates": [],
+        "publishing_waiting": [],
+    }
+
+    def fake_status(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        return fake_doc
+
+    status_ns = SimpleNamespace(tasks=fake_status)
+
+    def fake_page(
+        *args: Any,
+        sections: list[dict[str, Any]],
+        **kwargs: Any,
+    ) -> str:
+        sections_captured.extend(sections)
+        return "fake response"
+
+    monkeypatch.setattr(tasks_mod, "_require", lambda *a, **k: (principal, "fixture-csrf"))
+    monkeypatch.setattr(tasks_mod, "status", status_ns)
+    monkeypatch.setattr(tasks_mod, "_page", fake_page)
+
+    def _get_archived_false() -> Any:
+        return tasks_mod.tasks_page(
+            Request(
+                {
+                    "type": "http",
+                    "method": "GET",
+                    "path": "/ui/tasks",
+                    "headers": [],
+                    "query_string": b"",
+                }
+            ),
+            cast(Any, ctx),
+            cast(Any, uow),
+        )
+
+    def _get_archived_true() -> Any:
+        return tasks_mod.tasks_page(
+            Request(
+                {
+                    "type": "http",
+                    "method": "GET",
+                    "path": "/ui/tasks",
+                    "headers": [],
+                    "query_string": b"archived=1",
+                }
+            ),
+            cast(Any, ctx),
+            cast(Any, uow),
+        )
+
+    _get_archived_false()
+
+    # Default (archived=false): archived tasks must be absent
+    for section in sections_captured:
+        title = section["title"]
+        rows = section.get("rows", [])
+
+        if title == "Needs attention":
+            task_ids_in_rows = [
+                r[0].get("label", "") if isinstance(r[0], dict) else str(r[0]) for r in rows
+            ]
+            assert "ext-1" not in task_ids_in_rows, f"archived ext-1 in {title}"
+            assert "ext-2" not in task_ids_in_rows, f"archived ext-2 in {title}"
+            assert "ext-3" in task_ids_in_rows, f"normal ext-3 missing from {title}"
+
+        elif title == "Tasks by state":
+            total_visible = sum(r[1] for r in rows if isinstance(r[1], int))
+            assert total_visible == 1, f"expected 1 task in counts, got {total_visible}"
+
+        elif title == "Recently updated":
+            task_ids_in_rows = [
+                r[0].get("label", "") if isinstance(r[0], dict) else str(r[0]) for r in rows
+            ]
+            assert "ext-1" not in task_ids_in_rows, f"archived ext-1 in {title}"
+            assert "ext-3" in task_ids_in_rows, f"normal ext-3 missing from {title}"
+
+        elif title == "Gates by task":
+            pass  # no gates in our test
+
+    # Check the hidden note exists
+    recently_updated = next(
+        (s for s in sections_captured if s["title"] == "Recently updated"), None
+    )
+    assert recently_updated is not None, "Recently updated section not found"
+    note = recently_updated.get("note", "")
+    assert "archived import tasks hidden" in note, f"Hidden note missing from: {note}"
+    assert "2 archived import tasks hidden" in note, f"Wrong count in note: {note}"
+
+    # Reset
+    sections_captured.clear()
+
+    # With ?archived=1: archived tasks must be present
+    _get_archived_true()
+
+    for section in sections_captured:
+        title = section["title"]
+        rows = section.get("rows", [])
+
+        if title == "Needs attention":
+            task_ids_in_rows = [
+                r[0].get("label", "") if isinstance(r[0], dict) else str(r[0]) for r in rows
+            ]
+            assert "ext-1" in task_ids_in_rows, (
+                f"ext-1 should be visible with archived=1 in {title}"
+            )
+            assert "ext-2" in task_ids_in_rows, (
+                f"ext-2 should be visible with archived=1 in {title}"
+            )
+            assert "ext-3" in task_ids_in_rows, f"ext-3 missing from {title}"
+
+        elif title == "Tasks by state":
+            total_visible = sum(r[1] for r in rows if isinstance(r[1], int))
+            assert total_visible == 3, f"expected 3 tasks with archived=1, got {total_visible}"
+
+        elif title == "Recently updated":
+            task_ids_in_rows = [
+                r[0].get("label", "") if isinstance(r[0], dict) else str(r[0]) for r in rows
+            ]
+            assert "ext-1" in task_ids_in_rows, (
+                f"ext-1 should be visible with archived=1 in {title}"
+            )
+            assert "ext-3" in task_ids_in_rows, f"ext-3 missing from {title}"
+
+    # The hidden note should NOT appear with archived=1
+    recently_updated = next(
+        (s for s in sections_captured if s["title"] == "Recently updated"), None
+    )
+    assert recently_updated is not None
+    note = recently_updated.get("note", "")
+    assert "archived import tasks hidden" not in note, f"Hidden note should not appear: {note}"
