@@ -10,6 +10,13 @@ and on failure read `error`.
 `crucible schema` prints the envelope's JSON schema and the schema of `data`
 for every `kind`.
 
+The web Routing page exposes routing tunables directly. An administrator can enable or
+disable each model, order every tier's pools, and choose its allowed capabilities. Each
+form takes an audit reason and publishes the next immutable routing version. Delivery
+policies follow new versions of the routing policy they name unless
+`routing.policy.pinned` is deliberately set; already submitted tasks retain their
+policy and routing versions.
+
 ## CI certification
 
 Certification counts every observed non-skipped check run and workflow job on

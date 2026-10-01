@@ -70,8 +70,11 @@ timeout (#151) and security (#130). The branch merged main rather than rebasing:
   ready.
 - **Routing:** one "In force" table (delivery and routing policy versions, the gateway,
   the per-command timeout in hours or minutes, the Kubernetes egress in plain words); the
-  documents behind Details; exhausted pools listed with a Clear button on each row,
-  replacing the typed pool field; the edit and upload forms collapsed.
+  documents behind Details; one plain sentence per tier saying where a task submitted
+  now will go; model Enabled controls, numbered pool selectors and allowed-capability
+  checkboxes; exhausted pools listed with a Clear button on each row, replacing the
+  typed pool field; the edit and upload forms collapsed. Delivery policies follow a
+  routing policy by name unless an operator deliberately pins the version.
 - **GitHub:** a Connection table (App, key fingerprint, webhook, each repository's
   coverage and last check); the stored document behind Details; the connectivity check is
   a button on that table with no reason asked; Replace the App is collapsed once one is
