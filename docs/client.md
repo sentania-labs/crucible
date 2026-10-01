@@ -104,7 +104,7 @@ the worker's parsed report and Crucible's observations:
 |---|---|
 | `attempt_id` | the attempt that was parsed |
 | `parsed_ok` | whether the report parsed without errors |
-| `parse_errors` | list of dicts with `file`, `line`, `message` on failure |
+| `parse_errors` | list of dicts with `loc` (path into the document, a list of strings), `msg` and `type` on failure, the pydantic shape; a YAML failure has `loc: []`, `type: "yaml"` and the line inside `msg`. Example: `{"loc": ["risks"], "msg": "Field required", "type": "missing"}` |
 | `document` | the parsed report as a dict |
 | `filled_by_crucible` | list of field names Crucible filled in |
 | `differences` | list of dicts with `field` and `detail` describing mismatches |
