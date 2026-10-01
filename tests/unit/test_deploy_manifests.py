@@ -650,6 +650,16 @@ def test_the_base_config_carries_no_lab_local_endpoint_address(
         assert settings["CRUCIBLE_KUBERNETES__LOCAL_ENDPOINT_NAMESPACE"] == "", target
 
 
+def test_every_config_mounts_the_claude_code_credential_read_only(
+    rendered: dict[str, list[dict[str, Any]]],
+) -> None:
+    """hades#308: the adapter's minimum is read-only (PR 307); a configured rw-narrow
+    would override it, so no rendered config may say rw-narrow for Claude Code."""
+    for target in ("base", "overlays/lab", "overlays/kind"):
+        settings = _named(rendered[target], "ConfigMap", "crucible-settings")["data"]
+        assert settings["CRUCIBLE_CREDENTIALS__CLAUDE_CODE__MOUNT_MODE"] == "ro", target
+
+
 def test_the_kind_overlay_renders_times_in_america_chicago(
     rendered: dict[str, list[dict[str, Any]]],
 ) -> None:

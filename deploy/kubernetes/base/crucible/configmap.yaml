@@ -99,7 +99,7 @@ data:
   # mode is `rw-narrow` and the provider's init container copies the named auth files off
   # the Secret's read-only projection into the attempt's own claim (C8a). No `path` here:
   # on the cluster a harness credential is a Secret, not a directory.
-  CRUCIBLE_CREDENTIALS__CLAUDE_CODE__MOUNT_MODE: rw-narrow
+  CRUCIBLE_CREDENTIALS__CLAUDE_CODE__MOUNT_MODE: ro   # the setup token never refreshes (12); rw-narrow would override the adapter minimum
   CRUCIBLE_CREDENTIALS__CODEX__MOUNT_MODE: rw-narrow
   CRUCIBLE_CREDENTIALS__AGY__MOUNT_MODE: rw-narrow
   CRUCIBLE_CREDENTIALS__HERMES__MOUNT_MODE: ro
