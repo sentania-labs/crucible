@@ -139,7 +139,8 @@ class _RootedShell:
         if command.startswith(GREP_HEAD) and operand in command:
             before, _, after = command.rpartition(operand)
             command = (
-                f"set -o pipefail; (cd -- {self._root} >/dev/null 2>&1 && exec grep -rnH "
+                f"set -o pipefail; (CDPATH= cd -- {self._root} >/dev/null || exit 2; "
+                "exec grep -rnH "
                 f"{before[len(GREP_HEAD):]}) | head -n {after}"
             )
         return self._ops._exec(command, *args, **kwargs)

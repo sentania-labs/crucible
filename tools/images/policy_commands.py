@@ -141,7 +141,7 @@ def resolve(docker: list[str], image: str, programs: Iterable[str]) -> dict[str,
 
 
 def self_test(docker: list[str], image: str) -> list[str]:
-    """The SELF_TEST commands that did not exit 0 inside the image."""
+    """Run SELF_TEST, print successes, and return commands that did not exit 0."""
     failed = []
     for command in SELF_TEST:
         result = subprocess.run(
@@ -156,6 +156,8 @@ def self_test(docker: list[str], image: str) -> list[str]:
         )
         if result.returncode != 0:
             failed.append(f"{shlex.join(command)} exited {result.returncode}")
+        else:
+            print(f"ok       {shlex.join(command)}")
     return failed
 
 

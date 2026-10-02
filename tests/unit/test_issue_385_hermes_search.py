@@ -144,6 +144,26 @@ def test_an_absolute_or_hidden_root_without_ripgrep_is_searched_too(tmp_path: Pa
 
 
 @needs_hermes
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can enter directories without execute bits")
+def test_an_unenterable_root_without_ripgrep_surfaces_the_error(tmp_path: Path) -> None:
+    checkout = _tree(tmp_path)
+    locked = checkout / "locked"
+    locked.mkdir()
+    (locked / "source.md").write_text("AGENTS\n", encoding="utf-8")
+    locked.chmod(0o600)
+    try:
+        outcome = _search(checkout, _path_with(tmp_path, ["grep", "head"]), "locked")
+    finally:
+        locked.chmod(0o700)
+
+    content = outcome["content"]
+    assert isinstance(content, dict)
+    assert content["total_count"] == 0
+    assert "Search failed:" in content["error"]
+    assert "Permission denied" in content["error"]
+
+
+@needs_hermes
 @pytest.mark.skipif(shutil.which("rg") is None, reason="no ripgrep on this host")
 def test_a_relative_root_with_ripgrep_finds_the_file_and_skips_the_hidden_one(
     tmp_path: Path,

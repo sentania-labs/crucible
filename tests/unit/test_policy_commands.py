@@ -188,6 +188,7 @@ def test_main_passes_when_the_image_carries_every_program(tmp_path: Path) -> Non
         _executable(bin_dir, program)
     result = _run_main(_fake_docker(tmp_path, bin_dir))
     assert result.returncode == 0, result.stdout + result.stderr
+    assert "ok       rg --version" in result.stdout
     assert f"ok       make -> {bin_dir / 'make'}" in result.stdout
     assert f"ok       uv -> {bin_dir / 'uv'}" in result.stdout
 
