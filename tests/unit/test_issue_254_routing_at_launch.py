@@ -53,7 +53,7 @@ class _RoutingVersions:
 
 
 def _model(model_id: str, *, enabled: bool = True) -> dict[str, Any]:
-    entry = copy.deepcopy(_routing().document["models"][0])
+    entry: dict[str, Any] = copy.deepcopy(_routing().document["models"][0])
     entry["id"] = model_id
     entry["enabled"] = enabled
     return entry

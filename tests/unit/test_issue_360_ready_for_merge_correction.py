@@ -203,6 +203,9 @@ class _RoutingPolicies:
         same = (name, version) == (self.record.name, self.record.version)
         return self.record if same else None
 
+    def list_versions(self, name: str) -> list[RoutingPolicyRecord]:
+        return [self.record] if name == self.record.name else []
+
 
 class _PullRequests:
     def __init__(self) -> None:
