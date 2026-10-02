@@ -104,6 +104,53 @@ def _limit(name: str) -> int:
         return 0
 
 
+def _column(row: sqlite3.Row, name: str) -> object:
+    """A column of a Hermes session row, None when this Hermes has no such column."""
+    try:
+        return row[name]
+    except (IndexError, KeyError):
+        return None
+
+
+def _fill_from_session(usage: dict[str, object], row: sqlite3.Row) -> None:
+    """#387: fill what the usage record lacks from Hermes's saved session row.
+
+    Hermes 0.19 writes its usage file from the agent's result, which is empty when the
+    agent raised, so a failed run reports no model, session or tokens though the
+    session row holds them. Only missing fields are filled: a value Hermes wrote is
+    never replaced or added to. `failed`, `completed` and `failure` are left alone.
+    """
+    usage["duration_ms"] = _milliseconds(_column(row, "started_at"), _column(row, "ended_at"))
+    calls = _column(row, "tool_call_count")
+    usage["tool_calls"] = calls if isinstance(calls, int) else None
+    # usage field -> sessions column (hermes_state.py SCHEMA_VERSION 22).
+    for field, column in (
+        ("session_id", "id"),
+        ("model", "model"),
+        ("provider", "billing_provider"),
+        ("input_tokens", "input_tokens"),
+        ("output_tokens", "output_tokens"),
+        ("cache_read_tokens", "cache_read_tokens"),
+        ("cache_write_tokens", "cache_write_tokens"),
+        ("reasoning_tokens", "reasoning_tokens"),
+        ("estimated_cost_usd", "estimated_cost_usd"),
+    ):
+        value = _column(row, column)
+        if usage.get(field) is None and value is not None:
+            usage[field] = value
+    if usage.get("total_tokens") is None:
+        # Hermes's own session_total_tokens: prompt (input, cache read and cache
+        # write) plus output. The row has no total column.
+        parts = [
+            usage.get(k)
+            for k in ("input_tokens", "cache_read_tokens", "cache_write_tokens", "output_tokens")
+        ]
+        if usage.get("input_tokens") is not None or usage.get("output_tokens") is not None:
+            usage["total_tokens"] = sum(
+                p for p in parts if isinstance(p, int) and not isinstance(p, bool)
+            )
+
+
 def _enrich_usage(usage_path: Path, home: Path, max_turns: int = 0) -> None:
     try:
         usage = json.loads(usage_path.read_text(encoding="utf-8"))
@@ -126,24 +173,20 @@ def _enrich_usage(usage_path: Path, home: Path, max_turns: int = 0) -> None:
                         (session_id,),
                     ).fetchone()
                 else:
+                    # Hermes writes no session_id when its agent raised (#387). The
+                    # run's own session is the newest top-level one in its fresh home.
                     row = database.execute(
-                        "SELECT * FROM sessions ORDER BY started_at DESC LIMIT 1"
+                        "SELECT * FROM sessions WHERE parent_session_id IS NULL "
+                        "ORDER BY started_at DESC LIMIT 1"
                     ).fetchone()
         except sqlite3.Error:
             row = None
         if row is not None:
-            usage["duration_ms"] = _milliseconds(row["started_at"], row["ended_at"])
-            usage["tool_calls"] = row["tool_call_count"] if isinstance(row["tool_call_count"], int) else None
-            keys = row.keys()
-            for k in ("model", "provider", "input_tokens", "output_tokens", "reasoning_tokens", "total_tokens"):
-                if usage.get(k) is None and k in keys and row[k] is not None:
-                    usage[k] = row[k]
-            if usage.get("session_id") is None and "id" in keys and row["id"] is not None:
-                usage["session_id"] = row["id"]
+            _fill_from_session(usage, row)
         temporary = usage_path.with_suffix(".tmp")
         temporary.write_text(json.dumps(usage, sort_keys=True) + "\n", encoding="utf-8")
         temporary.replace(usage_path)
-    except (OSError, ValueError, AttributeError):
+    except (OSError, ValueError, AttributeError, TypeError):
         # The adapter records the original usage file or its parse anomaly. Enrichment
         # is secondary evidence and must not hide Hermes's own outcome.
         return
