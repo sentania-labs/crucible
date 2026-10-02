@@ -20,7 +20,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from crucible.domain.gates import injected_shim_text
+from crucible.domain.gates import INJECTED_NAMES, injected_shim_text
 from crucible.ports.execution import (
     OUTPUT_MOUNT,
     PACKAGE_CACHE_LEAF,
@@ -504,6 +504,11 @@ _LEFTOVER_EXCLUDES = " ".join(f"':(exclude,glob){pattern}'" for pattern in _LEFT
 _LEFTOVER_EXCLUDED_PATHS = " ".join(f"':(glob){pattern}'" for pattern in _LEFTOVER_EXCLUDED)
 
 
+def _injected_pathspecs() -> str:
+    """A pathspec per injected name, at any depth (hades #369)."""
+    return " ".join(_quote(f":(glob)**/{name}") for name in sorted(INJECTED_NAMES))
+
+
 def collector_script(
     *,
     base_ref: str,
@@ -648,14 +653,23 @@ if [ -n "$BASE" ]; then
   {GIT} -C "$REPO" diff --no-color --no-ext-diff "$MB" HEAD > "$OUT/diff.patch" || true
   {GIT} -C "$REPO" diff --name-only "$MB" HEAD > "$OUT/changed.txt" || true
   # hades #369: the status and new blob of each path, so a shim the branch adds is told
-  # from the repository's own CLAUDE.md or AGENTS.md it edits or deletes.
-  {GIT} -C "$REPO" diff --raw --no-renames --no-abbrev "$MB" HEAD \
+  # from the repository's own CLAUDE.md or AGENTS.md it edits or deletes. -z keeps a
+  # non-ASCII path as its bytes instead of git's quoted form.
+  {GIT} -C "$REPO" diff --raw -z --no-renames --no-abbrev "$MB" HEAD \
     > "$OUT/diff-raw.txt" || true
+  # The injected-name paths the merge base has: a CLAUDE.md a merge of the base brings
+  # in shows as an add against the merge's first parent, and is still the repository's.
+  EMPTY_TREE=$({GIT} -C "$REPO" hash-object -t tree /dev/null)
+  {GIT} -C "$REPO" diff --name-only -z --no-renames "$EMPTY_TREE" "$MB" \
+    -- {_injected_pathspecs()} > "$OUT/base-injected.txt" || true
   {GIT} -C "$REPO" log --format='%H%x1f%s%x1f%an%x1e' "$BASE"..HEAD > "$OUT/log.txt" || true
   {GIT} -C "$REPO" log --name-only --format='' "$BASE"..HEAD \
     | LC_ALL=C sort -u | sed '/^$/d' > "$OUT/commit-paths.txt" || true
-  {GIT} -C "$REPO" log --raw --no-renames --no-abbrev --format='' "$BASE"..HEAD \
-    > "$OUT/commit-raw.txt" || true
+  # -m prints a merge's own changes, once per parent, which plain --raw leaves out;
+  # --topo-order prints every commit before its parents whatever its date, so the last
+  # record of a path is the oldest and says whether the base had it.
+  {GIT} -C "$REPO" log -m --topo-order --raw -z --no-renames --no-abbrev --format='' \
+    "$BASE"..HEAD > "$OUT/commit-raw.txt" || true
   {GIT} -C "$REPO" bundle create "$OUT/work_branch.bundle" \
     "$BASE..$WORK_BRANCH" > "$OUT/bundle.log" 2>&1 || true
   {GIT} -C "$REPO" rev-list --count "$BASE"..HEAD > "$OUT/commits.txt" \
@@ -673,7 +687,7 @@ if [ -n "$BASE" ]; then
 else
   : > "$OUT/diffstat.txt"; : > "$OUT/diff.patch"; : > "$OUT/changed.txt"
   : > "$OUT/log.txt"; : > "$OUT/commit-paths.txt"; echo 0 > "$OUT/commits.txt"
-  : > "$OUT/diff-raw.txt"; : > "$OUT/commit-raw.txt"
+  : > "$OUT/diff-raw.txt"; : > "$OUT/commit-raw.txt"; : > "$OUT/base-injected.txt"
 fi
 # A fresh tree from the collected state, which is what the verifier runs against (11).
 rm -rf "$OUT/tree"

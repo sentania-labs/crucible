@@ -31,6 +31,7 @@ from crucible.ports.execution import (
 
 __all__ = [
     "Outputs",
+    "read_base_paths",
     "read_commit_policy",
     "read_outputs",
     "read_path_changes",
@@ -57,6 +58,7 @@ class Outputs:
     leftover_committed: bool = False
     leftover_note: str | None = None
     diff_changes: tuple[PathChange, ...] | None = None
+    base_paths: tuple[str, ...] | None = None
 
 
 def text(path: Path, limit: int = 8 * 1024 * 1024) -> str:
@@ -107,6 +109,7 @@ def read_outputs(
     commit_paths = tuple(p for p in text(output / "commit-paths.txt").splitlines() if p.strip())
     diff_changes = read_path_changes(output / "diff-raw.txt")
     commit_changes = read_path_changes(output / "commit-raw.txt")
+    base_paths = read_base_paths(output / "base-injected.txt")
     commit_policy = read_commit_policy(output / "commit-policy")
     messages: list[str] = []
     for record in text(output / "log.txt").split("\x1e"):
@@ -174,6 +177,7 @@ def read_outputs(
         diff_paths=changed,
         diff_text=diff_text,
         diff_changes=diff_changes,
+        base_paths=base_paths,
         bundle=bundle,
         artifacts=tuple(artifacts),
         verifications=verifications,
@@ -184,23 +188,44 @@ def read_outputs(
     )
 
 
-_RAW_LINE = re.compile(r":[0-7]{6} [0-7]{6} ([0-9a-f]{40,64}) ([0-9a-f]{40,64}) ([A-Z])[0-9]*")
+_RAW_META = re.compile(r":[0-7]{6} [0-7]{6} ([0-9a-f]{40,64}) ([0-9a-f]{40,64}) ([A-Z])[0-9]*")
+# Larger than this and the records are not read at all: `git log` prints the oldest
+# records last, and a cut tail would hide the add that says the base lacked a path.
+_RAW_LIMIT = 8 * 1024 * 1024
 
 
 def read_path_changes(path: Path) -> tuple[PathChange, ...] | None:
-    """`git diff --raw` or `git log --raw` lines as PathChange records (hades #369), or
-    None when the collector wrote no such file (an older collector script). A line that
-    does not parse is skipped; the gate then treats its path as before #369."""
-    if not path.is_file():
+    """`git diff --raw -z` or `git log -m --raw -z` records as PathChange records (hades
+    #369), in the order git printed them, or None when the collector wrote no such file
+    (an older collector script) or wrote more than is read. A record that does not parse
+    is skipped; the gate then treats its path as before #369. `-z` keeps each path as its
+    bytes, so a non-ASCII directory is not hidden behind git's quoting."""
+    try:
+        if not path.is_file() or path.stat().st_size > _RAW_LIMIT:
+            return None
+    except OSError:
         return None
     out: list[PathChange] = []
-    for line in text(path).splitlines():
-        meta, tab, name = line.partition("\t")
-        match = _RAW_LINE.fullmatch(meta)
-        if not tab or match is None or not name:
+    fields = text(path, _RAW_LIMIT).split("\0")
+    at = 0
+    while at < len(fields) - 1:
+        match = _RAW_META.fullmatch(fields[at].lstrip("\n"))
+        if match is None:
+            at += 1
             continue
-        out.append(PathChange(path=name, status=match.group(3), blob=match.group(2)))
+        # The path is the next field, whatever it looks like: never read as a record.
+        if fields[at + 1]:
+            out.append(PathChange(path=fields[at + 1], status=match.group(3), blob=match.group(2)))
+        at += 2
     return tuple(out)
+
+
+def read_base_paths(path: Path) -> tuple[str, ...] | None:
+    """The injected-name paths the merge base already has, NUL-separated as the collector
+    lists them (hades #369), or None when it wrote no such file."""
+    if not path.is_file():
+        return None
+    return tuple(p for p in text(path).split("\0") if p.strip())
 
 
 def read_commit_policy(directory: Path) -> CommitPolicyCheck | None:

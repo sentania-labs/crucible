@@ -460,6 +460,8 @@ def record_collection_evidence(
         diff_payload: dict[str, Any] = {"paths": list(outputs.diff_paths)}
         if outputs.diff_changes is not None:
             diff_payload["changes"] = _changes_payload(outputs.diff_changes)
+        if outputs.base_paths is not None:
+            diff_payload["base_paths"] = [p for p in outputs.base_paths if injected_name(p)]
         _add(
             uow,
             clock,

@@ -2225,6 +2225,7 @@ class KubernetesProvider:
             diff_paths=outputs.diff_paths,
             diff_text=outputs.diff_text,
             diff_changes=outputs.diff_changes,
+            base_paths=outputs.base_paths,
             bundle=outputs.bundle,
             artifacts=(*outputs.artifacts, self._launch_evidence(spec, observation)),
             verifications=outputs.verifications,

@@ -451,32 +451,43 @@ def _changes(raw: Any) -> list[tuple[str, str, str]] | None:
     return out
 
 
+def _base_paths(raw: Any) -> frozenset[str]:
+    """The injected-name paths the merge base has; none for evidence that did not record
+    them, which leaves the decision to the commits' order alone."""
+    return frozenset(str(p) for p in raw) if isinstance(raw, list) else frozenset()
+
+
 def _injected_hits(
     paths: Sequence[str],
     diff_changes: list[tuple[str, str, str]] | None,
     commit_paths: Sequence[str],
     commit_changes: list[tuple[str, str, str]] | None,
+    base_paths: frozenset[str] = frozenset(),
 ) -> set[str]:
     """hades #369: an injected-name path fails when the branch adds it relative to the
     base ref, or commits the shim's content into it. Deleting or editing a file the base
-    already has is the repository's own work. A path under an injected prefix always
-    fails, and so does any path the evidence carries no status for, as before #369."""
+    already has is the repository's own work. A file turned into a symlink or back (T)
+    counts as an add, since a link to the identity mount is a shim by another name. A
+    path under an injected prefix always fails, and so does any path the evidence carries
+    no status for, as before #369."""
     shim = _shim_blob_ids()
     hits: set[str] = set()
     diff_status: dict[str, str] = {}
     for path, status, blob in diff_changes or []:
         diff_status[path] = status
-        if _injected(path) and (status not in ("M", "D", "T") or blob in shim):
+        if _injected(path) and (status not in ("M", "D") or blob in shim):
             hits.add(path)
-    # Commits in `git log` order, newest first: the oldest record of a path says whether
-    # the base had it, since only a path the base lacks starts with an add.
-    first_status: dict[str, str] = {}
+    # Commits in `git log -m --topo-order` order, every commit before its parents and a
+    # merge once per parent: the last record of a path is the oldest, and says whether
+    # the base had it, since only a path the base lacks starts with an add. The order is
+    # the graph's, never the commit dates, which the worker sets.
+    oldest_status: dict[str, str] = {}
     for path, status, blob in commit_changes or []:
-        first_status[path] = status
-        if _injected(path) and blob in shim:
+        oldest_status[path] = status
+        if _injected(path) and (status == "T" or blob in shim):
             hits.add(path)
-    for path, status in first_status.items():
-        existed = diff_status.get(path) in ("M", "D", "T") or status in ("M", "D", "T")
+    for path, status in oldest_status.items():
+        existed = diff_status.get(path) in ("M", "D") or status in ("M", "D") or path in base_paths
         if _injected(path) and not existed:
             hits.add(path)
     for path in paths:
@@ -486,10 +497,10 @@ def _injected_hits(
             hits.add(path)
     for path in commit_paths:
         if _injected(path) and (
-            _injected_prefix(path) or commit_changes is None or path not in first_status
+            _injected_prefix(path) or commit_changes is None or path not in oldest_status
         ):
             hits.add(path)
-    for path in (*diff_status, *first_status):
+    for path in (*diff_status, *oldest_status):
         if _injected_prefix(path):
             hits.add(path)
     return hits
@@ -511,6 +522,7 @@ def no_injected_files(gi: GateInput) -> GateOutcome:
             _changes(diff.payload.get("changes")),
             [str(p) for p in bundle.payload.get("commit_paths", [])],
             _changes(bundle.payload.get("commit_changes")),
+            _base_paths(diff.payload.get("base_paths")),
         )
     )
     if hits:
