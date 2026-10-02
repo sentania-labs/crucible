@@ -16,7 +16,7 @@ from pydantic import ValidationError
 
 from crucible.adapters.execution import k8sspec
 from crucible.adapters.execution import kubernetes as kubernetes_module
-from crucible.adapters.execution.k8sapi import KubernetesUnavailableError
+from crucible.adapters.execution.k8sapi import KubernetesApiError, KubernetesUnavailableError
 from crucible.adapters.execution.k8sfake import FakeKubernetesApi
 from crucible.adapters.execution.kubernetes import KubernetesProvider
 from crucible.application import supervisor as supervisor_module
@@ -30,6 +30,7 @@ from crucible.ports.execution import (
     Handle,
     LaunchSpec,
     ObservationState,
+    ProviderError,
     Workspace,
 )
 from crucible.settings import SupervisorSettings
@@ -310,17 +311,10 @@ async def test_collection_retry_ticks_are_bounded_and_preserve_the_reason(
     await supervisor._observe_attempts()
     finish.assert_called_once()
     assert not supervisor._collect_pending_ticks
-    # Cleanup must remain retryable instead of forgetting Pods that still exist.
-    with pytest.raises(CollectionPendingError):
-        await provider.cleanup(workspace, CleanupPolicy.DELETE, launch)
-    assert api.claims
-    assert provider._collection_role_exits
-    # The fake API eventually completes already requested deletion, as Kubernetes does.
-    for name in delayed.pending:
-        delayed.pending[name] = 1
+    # Cleanup does not wait on the lingering Pod: it asks for it to go and moves on.
     await provider.cleanup(workspace, CleanupPolicy.DELETE, launch)
-    assert not api.list_objects("pods")
     assert not api.list_objects("jobs")
+    assert all(row["metadata"].get("deletionTimestamp") for row in api.list_objects("pods"))
     await supervisor.stop()
 
 
@@ -347,9 +341,9 @@ async def test_wait_uses_the_observed_pod_grace_period_plus_a_margin(
     api.delete("pods", "long-grace")
     with pytest.raises(CollectionPendingError, match="65 seconds"):
         if job_wait:
-            await provider._await_job_pods_gone("long-grace-job")
+            await provider._await_job_pods_gone("long-grace-job", collection=True)
         else:
-            await provider._await_pod_gone("long-grace")
+            await provider._await_pod_gone("long-grace", collection=True)
     assert delayed.elapsed == 65
 
 
@@ -377,9 +371,9 @@ async def test_an_unavailable_api_never_confirms_deletion(
     monkeypatch.setattr(kubernetes_module, "time", SimpleNamespace(monotonic=lambda: elapsed))
     with pytest.raises(CollectionPendingError, match="API was unavailable"):
         if job_wait:
-            await provider._await_job_pods_gone("unreachable-job")
+            await provider._await_job_pods_gone("unreachable-job", collection=True)
         else:
-            await provider._await_pod_gone("unreachable-pod")
+            await provider._await_pod_gone("unreachable-pod", collection=True)
     assert elapsed == 35
 
 
@@ -393,13 +387,15 @@ async def test_ticks_do_not_start_a_second_collection_while_deletion_is_in_fligh
     release = asyncio.Event()
     wait_for_deletion = provider._await_job_pods_gone
 
-    async def held_deletion(name: str, *, timeout: float = 35, force: bool = False) -> None:
+    async def held_deletion(
+        name: str, *, timeout: float = 15, force: bool = False, collection: bool = False
+    ) -> None:
         if name.startswith("verifier") and any(
             row["kind"] == "jobs" and row["name"] == name for row in api.created
         ):
             entered.set()
             await release.wait()
-        await wait_for_deletion(name, timeout=timeout, force=force)
+        await wait_for_deletion(name, timeout=timeout, force=force, collection=collection)
 
     monkeypatch.setattr(provider, "_await_job_pods_gone", held_deletion)
     collection = AsyncMock(wraps=provider.collect)
@@ -423,3 +419,93 @@ async def test_ticks_do_not_start_a_second_collection_while_deletion_is_in_fligh
         assert not api.list_objects("jobs")
     finally:
         await supervisor.stop()
+
+
+async def test_cleanup_never_waits_on_a_collector_pod_that_ignores_delete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api, provider, launch, workspace, _handle = await finished_worker()
+    collector = k8sspec.object_name("collect", launch.attempt_id)
+    secret = k8sspec.object_name("cred", launch.attempt_id)
+    labels = {k8sspec.LABEL_ATTEMPT: launch.attempt_id}
+    api.create("secrets", {"metadata": {"name": secret, "labels": labels}})
+    api.create(
+        "pods",
+        {
+            "metadata": {
+                "name": f"{collector}-stuck",
+                "labels": {
+                    **labels,
+                    "job-name": collector,
+                    k8sspec.LABEL_ROLE: k8sspec.ROLE_COLLECTOR,
+                },
+            }
+        },
+    )
+    assert api.list_objects("jobs")
+    delayed = DelayedPods(api, role=k8sspec.ROLE_COLLECTOR, polls=1000, unavailable_at=None)
+    delayed.install(monkeypatch)
+
+    await asyncio.wait_for(provider.cleanup(workspace, CleanupPolicy.DELETE, launch), timeout=5)
+
+    assert not api.secret_exists(secret)
+    assert not api.list_objects("jobs")
+    assert not api.list_objects("networkpolicies")
+    assert not api.claims
+    # The Pod was asked to go and is Terminating; cleanup did not wait it out.
+    assert [row["metadata"]["name"] for row in api.list_objects("pods")] == [f"{collector}-stuck"]
+    assert delayed.elapsed < 5
+
+
+async def test_a_real_read_error_is_not_replaced_by_the_lingering_reader_pod(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api, provider, launch, _workspace, _handle = await finished_worker()
+    delayed = DelayedPods(api, role=k8sspec.ROLE_READER, polls=1000, unavailable_at=None)
+    delayed.install(monkeypatch)
+
+    class DiskFullError(OSError):
+        pass
+
+    with pytest.raises(DiskFullError):
+        async with provider._reader(launch, k8sspec.limits_from_policy({})):
+            raise DiskFullError("no space left on device")
+    assert delayed.pending  # The reader Pod still lingers; it is only logged.
+
+
+async def test_collection_cleanup_logs_a_refused_delete_instead_of_failing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api, provider, launch, _workspace, _handle = await finished_worker()
+    real_delete = api.delete
+
+    def refusing_delete(kind: str, name: str, **kwargs: Any) -> None:
+        if kind == "jobs":
+            raise KubernetesApiError(403, "forbidden")
+        real_delete(kind, name, **kwargs)
+
+    monkeypatch.setattr(api, "delete", refusing_delete)
+    await provider._clear_collection_pods(launch.attempt_id)
+
+
+@pytest.mark.parametrize("job_wait", [False, True])
+async def test_other_pods_keep_the_short_wait_and_fail_as_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    job_wait: bool,
+) -> None:
+    api, _registry, provider = build()
+    api.create("pods", {"metadata": {"name": "preparer", "labels": {"job-name": "prepare-job"}}})
+    elapsed = 0.0
+
+    def tick() -> float:
+        nonlocal elapsed
+        elapsed += 1
+        return elapsed
+
+    monkeypatch.setattr(kubernetes_module, "time", SimpleNamespace(monotonic=tick))
+    with pytest.raises(ProviderError, match="still present after 15 seconds") as raised:
+        if job_wait:
+            await provider._await_job_pods_gone("prepare-job")
+        else:
+            await provider._await_pod_gone("preparer")
+    assert not isinstance(raised.value, CollectionPendingError)
