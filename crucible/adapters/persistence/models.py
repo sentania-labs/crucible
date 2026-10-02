@@ -169,6 +169,7 @@ class AttemptRow(Base):
     selected_harness: Mapped[str | None] = mapped_column(String(32), nullable=True)
     selected_image: Mapped[str | None] = mapped_column(Text, nullable=True)
     selected_pool: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    routing_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     ordered_candidates: Mapped[list[Any]] = mapped_column(JSONB, default=list)
     routing_excluded_pools: Mapped[list[str]] = mapped_column(JSONB, default=list)
     resume_from_remote: Mapped[bool] = mapped_column(Boolean, default=False)

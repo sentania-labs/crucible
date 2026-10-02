@@ -2079,6 +2079,7 @@ class Supervisor:
             attempt.selected_harness = chosen.harness
             attempt.selected_image = chosen_image
             attempt.selected_pool = chosen.pool
+            attempt.routing_version = routing.version
             execution.model = chosen.id
             execution.harness = chosen.harness
             execution.image = chosen_image
@@ -2116,6 +2117,7 @@ class Supervisor:
                     "harness": chosen.harness,
                     "image": chosen_image,
                     "pool": chosen.pool,
+                    "routing_version": routing.version,
                     "ordered_candidates": candidates,
                     "skipped_busy": skipped_busy,
                 },
@@ -2432,6 +2434,15 @@ class Supervisor:
             )
             if attempt.state is not AttemptState.PENDING or task.state not in allowed:
                 return False
+            routing = load_routing(uow, execution.policy_snapshot or {})
+            selected = routing.model(execution.model) if routing is not None else None
+            if selected is not None:
+                assert routing is not None
+                attempt.selected_model = selected.id
+                attempt.selected_harness = selected.harness
+                attempt.selected_image = execution.image
+                attempt.selected_pool = selected.pool
+                attempt.routing_version = routing.version
             move_attempt(
                 uow, self._clock, attempt, AttemptState.PREPARING, EventKind.ATTEMPT_PREPARING
             )
