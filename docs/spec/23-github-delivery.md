@@ -451,7 +451,13 @@ merger login, and time, moves the task to `merged`, and wakes Foundry
 (informational). It does so from any delivery state, not only
 `ready_for_merge`: a person can merge before review or CI is done, and a
 merged pull request is never polled again, so the task would otherwise wait
-for ever. The wake says which state the task was in. A PR closed without
+for ever. The wake says which state the task was in. A correction against
+an open PR (from `ready_for_merge` or any other correctable delivery state)
+takes the task back through `scheduled`, `running`, and the pre-PR gates
+while the PR stays open, so the PR is still polled then, for its merged flag
+alone: a merge observed while the correction is scheduled, running, or
+gated moves the task to `merged` too, and the supervisor ends the
+correction's attempt as it ends a cancelled one (hades #360). A PR closed without
 merge moves the task to `rejected` from any delivery state, `head_diverged`
 included, with the closer recorded, and wakes Foundry with
 `pull_request_closed`. The closer is not on the PR itself: `GET

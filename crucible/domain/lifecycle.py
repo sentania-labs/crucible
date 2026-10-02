@@ -94,6 +94,23 @@ _CANCELLABLE_AT_ONCE: tuple[TaskState, ...] = (
     _S.HEAD_DIVERGED,
     _S.READY_FOR_MERGE,
 )
+# hades #360: the states a correction passes through on its way back to the same pull
+# request: scheduled, running, and the pre-PR gates. The PR stays open on GitHub the
+# whole time, and a person can still merge it; the merge is observed from these states
+# too.
+CORRECTION_STATES: frozenset[TaskState] = frozenset(
+    {
+        _S.SCHEDULED,
+        _S.AWAITING_QUOTA,
+        _S.RUNNING,
+        _S.BLOCKED,
+        _S.REPORTED,
+        _S.PRE_PR_GATES_FAILED,
+        _S.AWAITING_INTERNAL_REVIEW,
+        _S.GATES_PASSED,
+        _S.AWAITING_ACCEPTANCE,
+    }
+)
 
 # (from, to) pairs. The whole table from 09 is data here even though C1 only
 # drives the supervision half; the delivery half is reachable only from C2 on.
@@ -143,6 +160,7 @@ TASK_TRANSITIONS: frozenset[tuple[TaskState, TaskState]] = frozenset(
         (_S.READY_FOR_MERGE, _S.HEAD_DIVERGED),
         (_S.READY_FOR_MERGE, _S.CI_CERTIFICATION_FAILED),
         (_S.READY_FOR_MERGE, _S.EXTERNAL_FEEDBACK_RECEIVED),
+        (_S.READY_FOR_MERGE, _S.SCHEDULED),
         (_S.HEAD_DIVERGED, _S.REPORTED),
         # A `recollect` decision puts the task back into supervision against the remote
         # work branch, which is where the divergent head is. 09 draws this edge to
@@ -162,6 +180,9 @@ TASK_TRANSITIONS: frozenset[tuple[TaskState, TaskState]] = frozenset(
         (_S.AWAITING_CI_CERTIFICATION, _S.MERGED),
         (_S.CI_CERTIFICATION_FAILED, _S.MERGED),
         (_S.HEAD_DIVERGED, _S.MERGED),
+        # hades #360: and from a correction against the open PR. A running attempt is
+        # then ended by the supervisor, as for a cancel.
+        *((s, _S.MERGED) for s in CORRECTION_STATES),
         # hades FDY-0139: the operator waived the outstanding external review rounds, so
         # the task stops waiting for a reviewer and goes on to certification.
         (_S.AWAITING_EXTERNAL_REVIEW, _S.AWAITING_CI_CERTIFICATION),

@@ -156,7 +156,7 @@ Each entry is one action:
 
 What `next` offers follows the API's own checks: the lifecycle table (09) and
 each endpoint's state guard (an acceptance only in `awaiting_acceptance`, a
-correction only in the four correctable states, and so on), filtered by the
+correction only in a correctable state, and so on), filtered by the
 role the route admits. What a state cannot show is still the API's to decide:
 a live supervisor lease for the admin mutations that need one, a review comment that exists,
 a prepared directory for a rotation, an import already authoritative when

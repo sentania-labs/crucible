@@ -72,7 +72,7 @@ from crucible.domain.gates import (
     evaluate_delivery,
 )
 from crucible.domain.ids import new_id
-from crucible.domain.lifecycle import TaskState
+from crucible.domain.lifecycle import CORRECTION_STATES, TaskState
 from crucible.domain.waivers import (
     ACCEPT_NO_CI,
     WAIVE_EXTERNAL_REVIEW,
@@ -99,6 +99,9 @@ OBSERVED_STATES: frozenset[TaskState] = frozenset(
         TaskState.HEAD_DIVERGED,
     }
 )
+# hades #360: the PR of a task in any of these is polled, a correction's included, so a
+# merge made while the correction runs is seen. Only an open PR is polled at all.
+POLLED_STATES: frozenset[TaskState] = OBSERVED_STATES | CORRECTION_STATES
 # The states a head change moves to `head_diverged` from (09).
 DIVERGENCE_STATES: frozenset[TaskState] = frozenset(
     {
@@ -1074,8 +1077,15 @@ def settle_pull_request_state(
     hades FDY-0139: from any delivery state, not only `ready_for_merge`. A person can
     merge or close at any point after the PR opens, and a merged or closed PR is never
     polled again, so a task left behind here waited for ever. Also called on every tick
-    for a task already stranded that way. True when the task moved."""
-    if task.state not in OBSERVED_STATES:
+    for a task already stranded that way. True when the task moved.
+
+    hades #360: a merge also moves a task whose correction is under way against the
+    PR. A close does not: the correction publishes to the PR again, and what to do with
+    a closed one is decided there."""
+    correcting = task.state in CORRECTION_STATES
+    if task.state not in OBSERVED_STATES and not (
+        correcting and pull_request.state is PullRequestState.MERGED
+    ):
         return False
     now = clock.now()
     if pull_request.state is PullRequestState.MERGED:
@@ -1099,7 +1109,9 @@ def settle_pull_request_state(
             f"pull request #{pull_request.number} was merged by "
             f"{pull_request.merged_by or 'someone'} as {pull_request.merge_sha}"
         )
-        if early:
+        if correcting:
+            summary += f" while a correction was under way (the task was {merged_from})"
+        elif early:
             summary += f", before Crucible saw it ready for merge (the task was {merged_from})"
         create_wake(
             uow,
@@ -1792,6 +1804,10 @@ def apply_observation(
     if with_reactions:
         pull_request.last_reactions_polled_at = now
     uow.pull_requests.save(pull_request)
+    if task.state in CORRECTION_STATES:
+        return _observe_during_correction(
+            uow, clock, task=task, pull_request=pull_request, observation=observation
+        )
     record_event(
         uow,
         clock,
@@ -1901,5 +1917,43 @@ def apply_observation(
             result=result,
         )
         repeat_overdue_wakes(uow, clock, task=task, pull_request=pull_request, policy=policy)
+    result.state = task.state.value
+    return result
+
+
+def _observe_during_correction(
+    uow: UnitOfWork,
+    clock: Clock,
+    *,
+    task: Task,
+    pull_request: PullRequest,
+    observation: Observation,
+) -> ObservationResult:
+    """hades #360: a poll while a correction runs against the open PR looks for one fact,
+    the merge. Comments, checks and the head belong to the corrected head, which the
+    correction publishes; the poll after that takes them in."""
+    result = ObservationResult()
+    record_event(
+        uow,
+        clock,
+        EventKind.PULL_REQUEST_POLLED,
+        principal=PRINCIPAL_CRUCIBLE,
+        task_id=task.id,
+        payload={
+            "pull_request": pull_request.number,
+            "head_sha": observation.pull_request.head_sha,
+            "state": observation.pull_request.state,
+            "during_correction": task.state.value,
+        },
+    )
+    if observation.pull_request.merged:
+        observe_state(
+            uow,
+            clock,
+            task=task,
+            pull_request=pull_request,
+            observation=observation,
+            result=result,
+        )
     result.state = task.state.value
     return result

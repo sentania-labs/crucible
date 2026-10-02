@@ -22,6 +22,7 @@ from typing import Any, Protocol, TypeVar
 
 from crucible.application.observation import (
     OBSERVED_STATES,
+    POLLED_STATES,
     ObservationResult,
     advance_delivery,
     apply_observation,
@@ -53,7 +54,7 @@ from crucible.domain.entities import PullRequestState, Task
 from crucible.domain.events import PRINCIPAL_CRUCIBLE, EventKind
 from crucible.domain.exit_class import ExitClass
 from crucible.domain.external_review import completed_rounds
-from crucible.domain.lifecycle import TaskState
+from crucible.domain.lifecycle import CORRECTION_STATES, TaskState
 from crucible.domain.publication import body_sha256
 from crucible.domain.secrets import redact
 from crucible.domain.waivers import WAIVER_KINDS
@@ -690,7 +691,7 @@ class DeliveryCoordinator:
         out: list[PollPlan] = []
         with self._host._fenced() as uow:
             forced = self._forced_pull_requests(uow)
-            for state in sorted(OBSERVED_STATES, key=lambda s: s.value):
+            for state in sorted(POLLED_STATES, key=lambda s: s.value):
                 for task in uow.tasks.list_by_state(state):
                     pull_request = uow.pull_requests.get_for_task(task.id)
                     if pull_request is None or pull_request.state in (
@@ -720,6 +721,9 @@ class DeliveryCoordinator:
                         )
                     if not due:
                         continue
+                    # hades #360: a correction's poll only looks for the merge, so it
+                    # fetches neither reactions nor a failed check's log.
+                    correcting = task.state in CORRECTION_STATES
                     work = latest_work_attempt(uow, task)
                     if work is None:
                         continue
@@ -735,8 +739,12 @@ class DeliveryCoordinator:
                             installation_id=repository.installation_id,
                             base_ref=pull_request.base_ref,
                             attempt_id=work[0].id,
-                            with_reactions=with_reactions,
-                            failed_check=self._failed_check(uow, pull_request.id, task),
+                            with_reactions=with_reactions and not correcting,
+                            failed_check=(
+                                None
+                                if correcting
+                                else self._failed_check(uow, pull_request.id, task)
+                            ),
                         )
                     )
             uow.commit()
@@ -757,7 +765,7 @@ class DeliveryCoordinator:
             uow.github_deliveries.mark_processed(delivery.delivery_id, now)
             if not number:
                 continue
-            for state in OBSERVED_STATES:
+            for state in POLLED_STATES:
                 for task in uow.tasks.list_by_state(state):
                     pull_request = uow.pull_requests.get_for_task(task.id)
                     if pull_request is not None and pull_request.number == number:
@@ -902,8 +910,16 @@ class DeliveryCoordinator:
         This is also what turns a disposition recorded through the API into progress
         without waiting for the next poll. A task whose pull request is already recorded
         merged or closed is moved here, because such a pull request is never polled again
-        (hades FDY-0139)."""
+        (hades FDY-0139), and so is a task whose correction was under way when its pull
+        request was recorded merged (hades #360)."""
         with self._host._fenced() as uow:
+            for state in sorted(CORRECTION_STATES, key=lambda s: s.value):
+                for task in uow.tasks.list_by_state(state, for_update=True):
+                    pull_request = uow.pull_requests.get_for_task(task.id, for_update=True)
+                    if pull_request is not None:
+                        settle_pull_request_state(
+                            uow, self._clock, task=task, pull_request=pull_request
+                        )
             for state in sorted(OBSERVED_STATES, key=lambda s: s.value):
                 for task in uow.tasks.list_by_state(state, for_update=True):
                     pull_request = uow.pull_requests.get_for_task(task.id, for_update=True)
