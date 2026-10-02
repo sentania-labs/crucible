@@ -613,8 +613,12 @@ def fail_publish(
     response_class: str = "",
     attempt_id: str | None = None,
     extra: dict[str, Any] | None = None,
+    retryable: bool = True,
 ) -> None:
-    """23 step 7: the step and the API response class, never the token."""
+    """23 step 7: the step and the API response class, never the token.
+
+    `retryable` False when a republish can only fail the same way (hades #379: the
+    task's pull request is closed), so the wake offers none."""
     payload: dict[str, Any] = {
         "step": step,
         "detail": detail,
@@ -658,9 +662,14 @@ def fail_publish(
     links = {"events": f"/v1/tasks/{task.id}/events"}
     claim_lost = _claim_gone(step, detail)
     started = uow.events.latest_for_task_kind(task.id, EventKind.PUBLISH_STARTED.value)
-    if not claim_lost and retries_remaining and started is not None:
+    if retryable and not claim_lost and retries_remaining and started is not None:
         links["republish"] = f"/v1/tasks/{task.id}/republish"
-    if claim_lost:
+    if not retryable:
+        summary = (
+            f"publication failed at {step} on {task.head_sha}: {detail}; "
+            "a republish would fail the same way, so none is offered"
+        )[:500]
+    elif claim_lost:
         summary = (
             f"publication failed at {step} on {task.head_sha}: {detail}; "
             f"no retry is possible (bundle seal is lost)"

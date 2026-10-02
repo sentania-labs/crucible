@@ -9,7 +9,7 @@ container are stood in for. The store is the in-memory one the #360 tests use.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
@@ -21,11 +21,11 @@ from crucible.adapters.storage.disk import DiskArtifactStore
 from crucible.application.errors import ContractValidationError
 from crucible.application.supervisor import Supervisor
 from crucible.application.transitions import move_task, record_event
-from crucible.domain.entities import PullRequestState, Task
+from crucible.domain.entities import CICertification, PullRequestHead, PullRequestState, Task
 from crucible.domain.events import PRINCIPAL_CRUCIBLE, EventKind
 from crucible.domain.exit_class import ExitClass
 from crucible.domain.lifecycle import TaskState
-from crucible.ports.github import GitHubClient, InstallationToken, PullRequestRef
+from crucible.ports.github import GitHubClient, InstallationToken, Observation, PullRequestRef
 from crucible.ports.publish import PublishOutcome, PublishRequest
 from tests.fixtures import REPOSITORY_URL, FakeClock
 from tests.unit.test_issue_360_ready_for_merge_correction import (
@@ -40,22 +40,29 @@ from tests.unit.test_issue_360_ready_for_merge_correction import (
     _correction,
     _correction_attempt,
     _GitHub,
+    _NothingOnThePullRequest,
     _ready_for_merge,
     _Store,
     _Tasks,
 )
 
 MERGED_AT = datetime(2026, 10, 2, 12, 30, tzinfo=UTC)
+# A head someone else pushed to the branch before merging it.
+OTHER_HEAD = "d" * 40
 
 
 class _PublishGitHub(_GitHub):
-    """The calls a publication makes after the push. `lookup` is what GitHub returns for
-    the work branch; opening or updating a pull request is recorded."""
+    """The calls a publication makes. `lookups` are what successive lookups of the work
+    branch return (the last one again once the rest are used); `known` is the task's own
+    pull request read by its number; `polled`, when set, is what a poll observes.
+    Opening or updating a pull request is recorded."""
 
     def __init__(self) -> None:
         super().__init__()
         self.remote = NEW_HEAD
-        self.lookup: PullRequestRef | None = None
+        self.lookups: list[PullRequestRef | None] = [_open(OLD_HEAD)]
+        self.known: PullRequestRef = _open(OLD_HEAD)
+        self.polled: PullRequestRef | None = None
         self.created: list[str] = []
         self.updated: list[int] = []
 
@@ -65,7 +72,36 @@ class _PublishGitHub(_GitHub):
     def find_pull_request(
         self, token: InstallationToken, *, repository: str, head_branch: str
     ) -> PullRequestRef | None:
-        return self.lookup
+        return self.lookups.pop(0) if len(self.lookups) > 1 else self.lookups[0]
+
+    def get_pull_request(
+        self, token: InstallationToken, *, repository: str, number: int
+    ) -> PullRequestRef:
+        assert number == PR_NUMBER, "only the task's own pull request is read by number"
+        return self.known
+
+    def closed_by(self, token: InstallationToken, *, repository: str, number: int) -> str | None:
+        return "maintainer"
+
+    def observe(
+        self,
+        token: InstallationToken,
+        *,
+        repository: str,
+        number: int,
+        base_ref: str,
+        with_reactions: bool,
+    ) -> Observation:
+        if self.polled is None:
+            return super().observe(
+                token,
+                repository=repository,
+                number=number,
+                base_ref=base_ref,
+                with_reactions=with_reactions,
+            )
+        self.observed.append(number)
+        return Observation(pull_request=self.polled)
 
     def create_pull_request(
         self,
@@ -79,13 +115,7 @@ class _PublishGitHub(_GitHub):
         draft: bool = False,
     ) -> PullRequestRef:
         self.created.append(head_branch)
-        return PullRequestRef(
-            number=PR_NUMBER + 1,
-            url=f"{REPOSITORY_URL}/pull/{PR_NUMBER + 1}",
-            head_sha=NEW_HEAD,
-            base_ref=base_ref,
-            state="open",
-        )
+        return _open(NEW_HEAD, number=PR_NUMBER + 1)
 
     def update_pull_request(
         self,
@@ -98,21 +128,38 @@ class _PublishGitHub(_GitHub):
         base_ref: str | None = None,
     ) -> PullRequestRef:
         self.updated.append(number)
-        raise AssertionError("a pull request that is not open is never updated")
+        return _open(NEW_HEAD, number=number)
 
 
 class _Publisher:
-    """The publisher container: pushes the bundle's head without force."""
+    """The publisher container: pushes the bundle's head without force. `during_push`,
+    when set, runs while the push is under way, as a concurrent poll would."""
 
     def __init__(self) -> None:
         self.pushes: list[str] = []
+        self.outcome: PublishOutcome | None = None
+        self.during_push: Callable[[], None] | None = None
 
     async def push(self, request: PublishRequest, token: InstallationToken) -> PublishOutcome:
         self.pushes.append(request.expected_head)
+        if self.during_push is not None:
+            self.during_push()
+        if self.outcome is not None:
+            return self.outcome
         return PublishOutcome(pushed=True, head_sha=request.expected_head, step="push")
 
     async def cleanup(self, attempt_ids: Sequence[str]) -> int:
         return 0
+
+
+def _open(head: str, *, number: int = PR_NUMBER) -> PullRequestRef:
+    return PullRequestRef(
+        number=number,
+        url=f"{REPOSITORY_URL}/pull/{number}",
+        head_sha=head,
+        base_ref="main",
+        state="open",
+    )
 
 
 def _merged(head: str) -> PullRequestRef:
@@ -129,7 +176,7 @@ def _merged(head: str) -> PullRequestRef:
     )
 
 
-def _closed() -> PullRequestRef:
+def _closed(*, closed_by: str | None = "maintainer") -> PullRequestRef:
     return PullRequestRef(
         number=PR_NUMBER,
         url=f"{REPOSITORY_URL}/pull/{PR_NUMBER}",
@@ -137,7 +184,7 @@ def _closed() -> PullRequestRef:
         base_ref="main",
         state="closed",
         closed_at=MERGED_AT,
-        closed_by="maintainer",
+        closed_by=closed_by,
     )
 
 
@@ -200,6 +247,10 @@ def _wakes(store: _Store, reason: str) -> list[str]:
     return [str(w.payload["summary"]) for w in store.wakes.rows if w.reason == reason]
 
 
+def _wake_links(store: _Store, reason: str) -> list[dict[str, str]]:
+    return [dict(w.payload.get("links", {})) for w in store.wakes.rows if w.reason == reason]
+
+
 def _merged_event_payload(store: _Store) -> dict[str, object]:
     merged = store.events.latest_for_task_kind(TASK_ID, EventKind.TASK_MERGED.value)
     assert merged is not None
@@ -209,13 +260,46 @@ def _merged_event_payload(store: _Store) -> dict[str, object]:
 # ----- a merge seen by the publication's lookup -------------------------------
 
 
+def test_a_merge_before_the_corrected_head_is_pushed_skips_the_push(tmp_path: Path) -> None:
+    store, _clock, supervisor, github, publisher = _correcting(tmp_path)
+    # A person merged the PR at the head Crucible had pushed before the correction; the
+    # publication looks the PR up before it pushes anything.
+    github.lookups = [_merged(OLD_HEAD)]
+
+    assert _publish(supervisor) == 0
+
+    # The corrected head never reaches the merged branch.
+    assert publisher.pushes == []
+    assert EventKind.BRANCH_PUSHED.value not in store.events.kinds()
+    assert github.created == []
+    assert github.updated == []
+    task = _task(store)
+    assert task.state is TaskState.MERGED
+    # The merged task's head is the merged head, not the collected corrected head.
+    assert task.head_sha == OLD_HEAD
+    pull_request = store.pull_requests.get(PR_ID)
+    assert pull_request is not None
+    assert pull_request.state is PullRequestState.MERGED
+    assert pull_request.merge_sha == MERGE_SHA
+    payload = _merged_event_payload(store)
+    assert payload["merged_from"] == "publishing"
+    assert payload["merged_head"] == OLD_HEAD
+    assert payload["last_pushed_head"] == OLD_HEAD
+    assert payload["merged_head_matches"] is True
+    assert store.escalations.list_for_task(TASK_ID) == []
+    merged = _wakes(store, "merged")
+    assert len(merged) == 1
+    assert f"the merged head {OLD_HEAD} is the last head Crucible pushed" in merged[0]
+    assert _wakes(store, "publish_failed") == []
+
+
 def test_a_merge_of_the_pushed_head_during_publishing_is_recorded_and_no_pr_is_opened(
     tmp_path: Path,
 ) -> None:
     store, _clock, supervisor, github, publisher = _correcting(tmp_path)
-    # The corrected head was pushed and a person merged the PR at that head before the
-    # publication looked the PR up.
-    github.lookup = _merged(NEW_HEAD)
+    # The PR was open when the publication started; the corrected head was pushed and a
+    # person merged the PR at that head before the publication looked it up again.
+    github.lookups = [_open(OLD_HEAD), _merged(NEW_HEAD)]
 
     assert _publish(supervisor) == 0
 
@@ -234,6 +318,7 @@ def test_a_merge_of_the_pushed_head_during_publishing_is_recorded_and_no_pr_is_o
     assert payload["merged_from"] == "publishing"
     assert payload["merged_head"] == NEW_HEAD
     assert payload["last_pushed_head"] == NEW_HEAD
+    assert payload["last_push_was_checkpoint"] is False
     assert payload["merged_head_matches"] is True
     merged = _wakes(store, "merged")
     assert len(merged) == 1
@@ -248,40 +333,43 @@ def test_a_merge_of_the_pushed_head_during_publishing_is_recorded_and_no_pr_is_o
 def test_a_merged_head_that_is_not_the_pushed_head_is_recorded_and_escalated(
     tmp_path: Path,
 ) -> None:
-    store, _clock, supervisor, github, _publisher = _correcting(tmp_path)
-    # The PR was merged at the old head before the corrected head reached the branch.
-    github.lookup = _merged(OLD_HEAD)
+    store, _clock, supervisor, github, publisher = _correcting(tmp_path)
+    # While the corrected head was pushed, someone else moved the branch and merged it.
+    github.lookups = [_open(OLD_HEAD), _merged(OTHER_HEAD)]
 
     assert _publish(supervisor) == 0
 
+    assert publisher.pushes == [NEW_HEAD]
     assert github.created == []
     assert _task(store).state is TaskState.MERGED
     payload = _merged_event_payload(store)
-    assert payload["merged_head"] == OLD_HEAD
+    assert payload["merged_head"] == OTHER_HEAD
     assert payload["last_pushed_head"] == NEW_HEAD
     assert payload["merged_head_matches"] is False
     escalations = store.escalations.list_for_task(TASK_ID)
     assert len(escalations) == 1
-    assert OLD_HEAD in escalations[0].question and NEW_HEAD in escalations[0].question
+    assert OTHER_HEAD in escalations[0].question and NEW_HEAD in escalations[0].question
     merged = _wakes(store, "merged")
     assert len(merged) == 1
-    assert f"the merged head {OLD_HEAD} is not {NEW_HEAD}" in merged[0]
+    assert f"the merged head {OTHER_HEAD} is not {NEW_HEAD}" in merged[0]
 
 
 def test_a_closed_pull_request_during_a_correction_fails_the_publication(
     tmp_path: Path,
 ) -> None:
-    store, _clock, supervisor, github, _publisher = _correcting(tmp_path)
-    github.lookup = _closed()
+    store, _clock, supervisor, github, publisher = _correcting(tmp_path)
+    github.lookups = [_closed(closed_by=None)]
 
     assert _publish(supervisor) == 0
 
+    assert publisher.pushes == []
     assert github.created == []
     assert github.updated == []
     assert _task(store).state is TaskState.PUBLISH_FAILED
     pull_request = store.pull_requests.get(PR_ID)
     assert pull_request is not None
     assert pull_request.state is PullRequestState.CLOSED
+    # The lookup carries no closer; it is read from GitHub as a poll reads it.
     assert pull_request.closed_by == "maintainer"
     changed = store.events.latest_for_task_kind(TASK_ID, EventKind.PULL_REQUEST_STATE_CHANGED.value)
     assert changed is not None and changed.payload["state"] == "closed"
@@ -291,28 +379,108 @@ def test_a_closed_pull_request_during_a_correction_fails_the_publication(
     assert failed.payload["pull_request_state"] == "closed"
     wakes = _wakes(store, "publish_failed")
     assert len(wakes) == 1
-    assert f"pull request #{PR_NUMBER} is closed" in wakes[0]
+    assert f"pull request #{PR_NUMBER} is closed by maintainer" in wakes[0]
+    # A republish can only meet the same closed PR, so none is offered.
+    assert "republish" not in _wake_links(store, "publish_failed")[0]
+    assert "a republish would fail the same way" in wakes[0]
 
-    # A republish meets the same closed PR and fails again; it never opens a second one.
+    # A republish forced anyway meets the same closed PR and fails again; it never opens
+    # a second one.
     task = _task(store)
     move_task(store.uow(), _clock, task, TaskState.PUBLISHING, EventKind.TASK_PUBLISHING)
     assert _publish(supervisor) == 0
     assert github.created == []
+    assert publisher.pushes == []
     assert _task(store).state is TaskState.PUBLISH_FAILED
 
 
 def test_a_lookup_that_finds_no_pull_request_does_not_open_a_second_one(
     tmp_path: Path,
 ) -> None:
-    store, _clock, supervisor, github, _publisher = _correcting(tmp_path)
-    github.lookup = None
+    store, _clock, supervisor, github, publisher = _correcting(tmp_path)
+    github.lookups = [None]
+    github.known = _closed()
 
     assert _publish(supervisor) == 0
 
+    assert publisher.pushes == []
     assert github.created == []
     assert _task(store).state is TaskState.PUBLISH_FAILED
+    pull_request = store.pull_requests.get(PR_ID)
+    assert pull_request is not None and pull_request.state is PullRequestState.CLOSED
     wakes = _wakes(store, "publish_failed")
     assert len(wakes) == 1 and f"#{PR_NUMBER}" in wakes[0]
+
+
+def test_another_open_pull_request_on_the_branch_is_not_adopted(tmp_path: Path) -> None:
+    store, _clock, supervisor, github, publisher = _correcting(tmp_path)
+    # The task's PR was closed and someone opened a new one from the same branch.
+    github.lookups = [_open(OLD_HEAD, number=PR_NUMBER + 1)]
+    github.known = _closed()
+    cycles_before = list(store.review_cycles.rows)
+
+    assert _publish(supervisor) == 0
+
+    assert publisher.pushes == []
+    assert github.created == []
+    assert github.updated == []
+    assert _task(store).state is TaskState.PUBLISH_FAILED
+    pull_request = store.pull_requests.get(PR_ID)
+    assert pull_request is not None
+    # The task's own PR record keeps its number and records the close.
+    assert pull_request.number == PR_NUMBER
+    assert pull_request.state is PullRequestState.CLOSED
+    assert pull_request.closed_by == "maintainer"
+    # The counted external round stays on the task's PR; nothing is inherited.
+    assert store.review_cycles.rows == cycles_before
+    failed = store.events.latest_for_task_kind(TASK_ID, EventKind.TASK_PUBLISH_FAILED.value)
+    assert failed is not None
+    assert failed.payload["pull_request"] == PR_NUMBER
+    assert failed.payload["other_pull_request"] == PR_NUMBER + 1
+    wakes = _wakes(store, "publish_failed")
+    assert len(wakes) == 1
+    assert f"#{PR_NUMBER + 1}" in wakes[0] and "not adopted" in wakes[0]
+
+
+def test_another_pull_request_on_the_branch_with_the_own_one_merged_settles_merged(
+    tmp_path: Path,
+) -> None:
+    store, _clock, supervisor, github, publisher = _correcting(tmp_path)
+    github.lookups = [_open(OLD_HEAD, number=PR_NUMBER + 1)]
+    github.known = _merged(OLD_HEAD)
+
+    assert _publish(supervisor) == 0
+
+    assert publisher.pushes == []
+    assert github.updated == []
+    task = _task(store)
+    assert task.state is TaskState.MERGED
+    assert task.head_sha == OLD_HEAD
+    pull_request = store.pull_requests.get(PR_ID)
+    assert pull_request is not None and pull_request.number == PR_NUMBER
+    assert pull_request.state is PullRequestState.MERGED
+    assert store.escalations.list_for_task(TASK_ID) == []
+
+
+def test_a_publication_failure_after_a_merge_settled_the_task_wakes_nobody(
+    tmp_path: Path,
+) -> None:
+    store, clock, supervisor, _github, publisher = _correcting(tmp_path)
+
+    def poll_settles_merged() -> None:
+        # A poll observes the merge while the publisher container is pushing.
+        move_task(store.uow(), clock, _task(store), TaskState.MERGED, EventKind.TASK_MERGED)
+
+    publisher.during_push = poll_settles_merged
+    publisher.outcome = PublishOutcome(
+        pushed=False, head_sha=NEW_HEAD, step="push", detail="the push was rejected"
+    )
+
+    assert _publish(supervisor) == 0
+
+    assert _task(store).state is TaskState.MERGED
+    assert _wakes(store, "publish_failed") == []
+    assert EventKind.TASK_PUBLISH_FAILED.value not in store.events.kinds()
 
 
 # ----- a merge seen by the poll while publishing or after a failed publish -----
@@ -359,6 +527,121 @@ def test_a_merge_after_collection_leaves_the_last_pushed_head_on_the_task(
     assert task.head_sha == OLD_HEAD
 
 
+@pytest.mark.parametrize("by", ["maintainer", None])
+def test_a_close_polled_after_the_corrected_heads_publication_failed_is_recorded(
+    tmp_path: Path, by: str | None
+) -> None:
+    store, clock, supervisor, github, _publisher = _correcting(tmp_path)
+    move_task(
+        store.uow(), clock, _task(store), TaskState.PUBLISH_FAILED, EventKind.TASK_PUBLISH_FAILED
+    )
+    github.polled = _closed(closed_by=by)
+    clock.advance(300)
+
+    assert asyncio.run(supervisor.delivery.observe()) == 1
+
+    pull_request = store.pull_requests.get(PR_ID)
+    assert pull_request is not None
+    assert pull_request.state is PullRequestState.CLOSED
+    changed = store.events.latest_for_task_kind(TASK_ID, EventKind.PULL_REQUEST_STATE_CHANGED.value)
+    assert changed is not None and changed.payload["state"] == "closed"
+    assert _task(store).state is TaskState.PUBLISH_FAILED
+    wakes = _wakes(store, "pull_request_closed")
+    assert len(wakes) == 1
+    assert f"pull request #{PR_NUMBER} was closed without being merged" in wakes[0]
+    assert "publish_failed" in wakes[0]
+
+    # The closed PR is not polled again, and the wake is not repeated.
+    clock.advance(3600)
+    asyncio.run(supervisor.delivery.observe())
+    assert github.observed == [PR_NUMBER]
+    assert len(_wakes(store, "pull_request_closed")) == 1
+
+
+class _Certifications:
+    def __init__(self) -> None:
+        self.rows: list[CICertification] = []
+
+    def get_for_head(self, pull_request_id: str, head_sha: str) -> CICertification | None:
+        return next(
+            (
+                c
+                for c in reversed(self.rows)
+                if (c.pull_request_id, c.head_sha) == (pull_request_id, head_sha)
+            ),
+            None,
+        )
+
+    def put(self, certification: CICertification) -> CICertification:
+        self.rows.append(certification)
+        return certification
+
+
+class _Heads:
+    def __init__(self) -> None:
+        self.rows: list[PullRequestHead] = []
+
+    def add(self, head: PullRequestHead) -> None:
+        self.rows.append(head)
+
+    def list_for_pull_request(self, pull_request_id: str) -> list[PullRequestHead]:
+        return [h for h in self.rows if h.pull_request_id == pull_request_id]
+
+
+def _first_publication_failed(
+    tmp_path: Path,
+) -> tuple[_Store, FakeClock, Supervisor, _PublishGitHub]:
+    """A first publication that opened the PR and then failed: nothing was published to
+    the task before, and no correction is under way."""
+    store, clock, supervisor, github, _publisher = _correcting(tmp_path)
+    store.events.rows = [
+        e for e in store.events.rows if e.kind != EventKind.PUBLISH_COMPLETED.value
+    ]
+    store.ci_certifications = _Certifications()  # type: ignore[attr-defined]
+    store.reactions = _NothingOnThePullRequest()  # type: ignore[attr-defined]
+    store.pull_request_heads = _Heads()  # type: ignore[assignment]
+    task = _task(store)
+    task.head_sha = OLD_HEAD
+    move_task(store.uow(), clock, task, TaskState.PUBLISH_FAILED, EventKind.TASK_PUBLISH_FAILED)
+    clock.advance(300)
+    return store, clock, supervisor, github
+
+
+def test_a_first_publications_pr_is_polled_normally_after_its_publication_failed(
+    tmp_path: Path,
+) -> None:
+    store, _clock, supervisor, github = _first_publication_failed(tmp_path)
+
+    assert asyncio.run(supervisor.delivery.observe()) == 1
+
+    assert github.observed == [PR_NUMBER]
+    polled = store.events.latest_for_task_kind(TASK_ID, EventKind.PULL_REQUEST_POLLED.value)
+    assert polled is not None
+    # The whole poll: reviews, comments and checks are counted, not only the merge.
+    assert "during_correction" not in polled.payload
+    assert "reviews" in polled.payload and "checks" in polled.payload
+    assert _task(store).state is TaskState.PUBLISH_FAILED
+
+
+def test_a_merge_of_a_first_publications_pr_is_a_plain_early_merge(tmp_path: Path) -> None:
+    store, _clock, supervisor, github = _first_publication_failed(tmp_path)
+    # Even a merged head Crucible did not push is no correction's business here.
+    github.polled = _merged(OTHER_HEAD)
+
+    asyncio.run(supervisor.delivery.observe())
+
+    task = _task(store)
+    assert task.state is TaskState.MERGED
+    payload = _merged_event_payload(store)
+    assert payload["merged_from"] == "publish_failed"
+    assert "merged_head_matches" not in payload
+    assert store.escalations.list_for_task(TASK_ID) == []
+    merged = _wakes(store, "merged")
+    assert len(merged) == 1
+    assert "before Crucible saw it ready for merge" in merged[0]
+    assert "correction" not in merged[0]
+
+
 # ----- the quota checkpoint after a merge -------------------------------------
 
 
@@ -383,6 +666,38 @@ def test_a_quota_checkpoint_is_not_pushed_once_the_task_is_merged(tmp_path: Path
     assert "merged" in detail
     assert publisher.pushes == []
     assert EventKind.BRANCH_PUSHED.value not in store.events.kinds()
+
+
+def test_a_merge_of_a_quota_checkpoint_is_escalated_and_named(tmp_path: Path) -> None:
+    store, clock, supervisor, github, publisher = _correcting(tmp_path, until=TaskState.REPORTED)
+    _execution, attempt = _correction_attempt(store)
+    attempt.exit_class = ExitClass.QUOTA_EXHAUSTED
+    _task(store).head_sha = NEW_HEAD
+
+    outcome = asyncio.run(supervisor.delivery.push_quota_checkpoint(attempt.id, required=True))
+
+    assert outcome == (True, "checkpoint pushed")
+    assert publisher.pushes == [NEW_HEAD]
+    pushed = store.events.latest_for_task_kind(TASK_ID, EventKind.BRANCH_PUSHED.value)
+    assert pushed is not None and pushed.payload["checkpoint"] is True
+
+    # A person merges the partial, ungated checkpoint head.
+    github.polled = _merged(NEW_HEAD)
+    clock.advance(300)
+    asyncio.run(supervisor.delivery.observe())
+
+    task = _task(store)
+    assert task.state is TaskState.MERGED
+    assert task.head_sha == NEW_HEAD
+    payload = _merged_event_payload(store)
+    assert payload["merged_head_matches"] is True
+    assert payload["last_push_was_checkpoint"] is True
+    escalations = store.escalations.list_for_task(TASK_ID)
+    assert len(escalations) == 1
+    assert "quota checkpoint" in escalations[0].question
+    assert "passed no gate" in escalations[0].question
+    merged = _wakes(store, "merged")
+    assert len(merged) == 1 and "quota checkpoint" in merged[0]
 
 
 # ----- the gate pass locks only a merged correction ---------------------------

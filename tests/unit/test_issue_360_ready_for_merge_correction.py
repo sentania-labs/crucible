@@ -992,6 +992,10 @@ def test_a_merge_already_recorded_settles_a_failed_correction(tmp_path: Path) ->
     supervisor.delivery._evaluate_gates()
 
     assert _task(store).state is TaskState.MERGED
-    # hades #379: no merged head was recorded with this merge, so it cannot be shown to
-    # be the head Crucible pushed, and Foundry is asked.
-    assert len(store.escalations.list_for_task(TASK_ID)) == 1
+    # hades #379: a merge recorded before #379 carries no head; GitHub merged what was on
+    # the branch, the last head Crucible pushed, so the merge is not escalated.
+    assert store.escalations.list_for_task(TASK_ID) == []
+    merged = store.events.latest_for_task_kind(TASK_ID, EventKind.TASK_MERGED.value)
+    assert merged is not None
+    assert merged.payload["merged_head_recorded"] is False
+    assert merged.payload["last_pushed_head"] == OLD_HEAD
