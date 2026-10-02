@@ -157,6 +157,9 @@ class Observation:
     # S5: 137 with the kernel's OOM kill is an environment failure, not a crash and not
     # a kill Crucible sent. Carried as a flag so classification never parses `detail`.
     oom_killed: bool = False
+    never_started: bool = False
+    container_message: str | None = None
+    pod_events: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

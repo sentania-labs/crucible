@@ -74,6 +74,33 @@ def _unpublished_bundle_problem(
     if work is None:
         return {"path": "correction", "message": PREVIOUS_BUNDLE_GONE}
     attempt, execution = work
+    exited = uow.events.latest_for_task_kind(task.id, EventKind.ATTEMPT_EXITED.value)
+    if (
+        exited is not None
+        and exited.attempt_id == attempt.id
+        and (
+            exited.payload.get("never_started") is True or exited.payload.get("no_commits") is True
+        )
+    ):
+        if not task.head_sha:
+            return None
+        # A subsequent start failure does not invalidate the last sealed worker head.
+        previous = [
+            candidate
+            for candidate in uow.attempts.list_for_task(task.id)
+            if any(
+                row.kind == "bundle_head"
+                and row.verified
+                and row.payload.get("bundle_verified")
+                and row.payload.get("head_sha") == task.head_sha
+                for row in uow.evidence.list_for_attempt(candidate.id)
+            )
+        ]
+        if previous:
+            attempt = max(previous, key=lambda candidate: candidate.id)
+            source_execution = uow.executions.get(attempt.execution_id)
+            if source_execution is not None:
+                execution = source_execution
     if execution.provider != provider:
         return {"path": "execution_request.provider", "message": PREVIOUS_BUNDLE_OTHER_PROVIDER}
     evidence = next(

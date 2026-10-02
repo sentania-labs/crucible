@@ -16,6 +16,7 @@ from typing import Any
 
 from crucible.contracts.completion_claim import load_report, parse_claim
 from crucible.domain.exit_class import ExitClass, classify_exit
+from crucible.domain.infrastructure import model_interruption
 from crucible.ports.execution import IDENTITY_MOUNT, REPORT_MOUNT
 from crucible.ports.harness import ExitInfo, ParsedReport, ProviderQuotaEvent, ReportMetrics
 
@@ -79,7 +80,8 @@ def classify_with_patterns(
         return ExitClass.AUTH_FAILURE
     if first_match(tails, quota) is not None:
         return ExitClass.QUOTA_EXHAUSTED
-    return base
+    interruption = model_interruption(exit.exit_code, *tails)
+    return interruption.exit_class if interruption is not None else base
 
 
 def with_in_flight(exit_class: ExitClass, in_flight: Sequence[str]) -> ExitClass:

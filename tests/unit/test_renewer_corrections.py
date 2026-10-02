@@ -42,6 +42,7 @@ async def test_supervisor_persists_effective_credential_command(
     supervisor._credential_sources = {"codex": CredentialSource("", mode)}
     attempt: Any = SimpleNamespace(
         id="attempt",
+        number=1,
         selected_harness="codex",
         selected_model="model",
         selected_image="image",

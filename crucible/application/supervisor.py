@@ -109,6 +109,7 @@ from crucible.domain.exit_class import CLEAN_EXIT_CLASSES, ExitClass, classify_e
 from crucible.domain.gates import GateName, GateResult, evaluate_gate
 from crucible.domain.harness_settings import setting_name
 from crucible.domain.ids import new_id
+from crucible.domain.infrastructure import model_interruption
 from crucible.domain.lifecycle import (
     ATTEMPT_TERMINAL,
     EXECUTION_TERMINAL,
@@ -174,7 +175,7 @@ def local_cap_kind(
     endpoint: str | None, exit_class: ExitClass, turn_cap_reached: bool
 ) -> Literal["turns", "time"] | None:
     """Name a size cap only when the attempt was routed to a local endpoint."""
-    if endpoint != "local":
+    if endpoint != "local" or exit_class in {ExitClass.INFRASTRUCTURE, ExitClass.QUOTA_EXHAUSTED}:
         return None
     if turn_cap_reached:
         return "turns"
@@ -407,6 +408,11 @@ def workspace_release_reason(
     ):
         return None
     published = uow.events.latest_for_task_kind(task.id, EventKind.PUBLISH_COMPLETED.value)
+    if attempt.exit_class in {ExitClass.INFRASTRUCTURE, ExitClass.QUOTA_EXHAUSTED} and (
+        published is None or published.ts < attempt.created_at
+    ):
+        # Keep the sealed source through retries and start failures until publication.
+        return None
     work = latest_work_attempt(uow, task)
     if (
         work is not None
@@ -752,6 +758,7 @@ class Supervisor:
             result.orphans = await self._reconcile_provider_handles()
             await self._resume_quota_checkpoints()
             await self._db(self._resume_quota_waits)
+            await self._resume_infrastructure_waits()
             await self._db(self._materialize_scheduled)
             await self._resume_gate_probes()
             result.launched = await self._launch_pending()
@@ -1301,6 +1308,8 @@ class Supervisor:
                         continue
                 elif task.state not in (TaskState.SCHEDULED, TaskState.RUNNING):
                     continue
+                if task.resume_at is not None and task.resume_at > self._clock.now():
+                    continue
                 stored = uow.contracts.get(task.id, execution.contract_version)
                 assert stored is not None
                 repository = uow.repositories.get(task.repository_id)
@@ -1607,24 +1616,37 @@ class Supervisor:
                 else None
             )
             resume_bundle: dict[str, str] = {}
-            # Only a correction reads the task's events: an ordinary launch has no
-            # previous attempt to resume from (#258).
+            interruption_retry = attempt.number > 1 and any(
+                prior.exit_class in {ExitClass.INFRASTRUCTURE, ExitClass.QUOTA_EXHAUSTED}
+                for prior in route_uow.attempts.list_for_execution(execution.id)
+            )
+            # Corrections and interrupted workers resume a verified, sealed workspace.
             if (
-                execution.role is ExecutionRole.CORRECT
+                (execution.role is ExecutionRole.CORRECT or interruption_retry)
                 and not attempt.resume_from_remote
-                and route_uow.events.latest_for_task_kind(
-                    task.id, EventKind.PUBLISH_COMPLETED.value
+                and (
+                    interruption_retry
+                    or route_uow.events.latest_for_task_kind(
+                        task.id, EventKind.PUBLISH_COMPLETED.value
+                    )
+                    is None
                 )
-                is None
             ):
                 previous_attempt = max(
                     (
                         candidate
                         for candidate_execution in route_uow.executions.list_for_task(task.id)
-                        if candidate_execution.id != execution.id
-                        and candidate_execution.role is not ExecutionRole.REVIEW
+                        if candidate_execution.role is not ExecutionRole.REVIEW
                         for candidate in route_uow.attempts.list_for_execution(
                             candidate_execution.id
+                        )
+                        if candidate.id < attempt.id
+                        and candidate.workspace_path
+                        and any(
+                            row.kind == EvidenceKind.BUNDLE_HEAD.value
+                            and row.verified
+                            and row.payload.get("bundle_verified")
+                            for row in route_uow.evidence.list_for_attempt(candidate.id)
                         )
                     ),
                     key=lambda candidate: candidate.id,
@@ -1957,6 +1979,12 @@ class Supervisor:
                 .get("allowlist", [])
             ],
             excluded_pools={pool for pool in (excluded_pools or set()) if pool is not None},
+            excluded_models={
+                str(event.payload["excluded_model"])
+                for event in self._all_task_events(uow, item.task.id)
+                if event.payload.get("next_attempt_id") == item.attempt.id
+                and event.payload.get("excluded_model")
+            },
             pinned_model=request.pinned_model,
             pinned_harness=request.pinned_harness.value if request.pinned_harness else None,
         )
@@ -2142,7 +2170,23 @@ class Supervisor:
         if reasons:
             detail += ": " + "; ".join(reasons)
         now = self._clock.now()
-        attempt.exit_class = ExitClass.ENVIRONMENT
+        capacity_refusal = "model refused capacity for this retry" in reasons
+        attempt.exit_class = ExitClass.INFRASTRUCTURE if capacity_refusal else ExitClass.ENVIRONMENT
+        if capacity_refusal:
+            record_event(
+                uow,
+                self._clock,
+                EventKind.ATTEMPT_EXITED,
+                principal=PRINCIPAL_CRUCIBLE,
+                task_id=task.id,
+                execution_id=execution.id,
+                attempt_id=attempt.id,
+                payload={
+                    "exit_class": ExitClass.INFRASTRUCTURE.value,
+                    "never_started": True,
+                    "interruption_message": detail,
+                },
+            )
         attempt.ended_at = now
         attempt.ordered_candidates = list(selection.candidates) if selection else []
         uow.attempts.save(attempt)
@@ -2175,7 +2219,7 @@ class Supervisor:
                 uow, self._clock, task=task, attempt_id=attempt.id, question=detail, summary=detail
             )
         else:
-            self._task_reported(uow, task, attempt, ExitClass.ENVIRONMENT, {}, wake_summary=detail)
+            self._task_reported(uow, task, attempt, attempt.exit_class, {}, wake_summary=detail)
 
     def _needs_gate_probe(self, item: _Pending) -> bool:
         if item.execution.role is ExecutionRole.REVIEW:
@@ -2971,6 +3015,13 @@ class Supervisor:
                 execution = uow.executions.get(attempt.execution_id)
                 if execution is None:
                     continue
+                if (
+                    attempt.exit_class is ExitClass.INFRASTRUCTURE
+                    and attempt.ended_at is not None
+                    and self._clock.now()
+                    < attempt.ended_at + timedelta(seconds=self.attempt_lease_ttl_seconds)
+                ):
+                    continue
                 cleanup = (execution.policy_snapshot or {}).get("cleanup", {})
                 succeeded = attempt.state is AttemptState.SUCCEEDED
                 choice = str(
@@ -2983,7 +3034,10 @@ class Supervisor:
                     and event.payload.get("step") == "quota_checkpoint"
                     for event in self._all_task_events(uow, attempt.task_id)
                 )
-                if checkpoint_push_failed:
+                if checkpoint_push_failed or attempt.exit_class in {
+                    ExitClass.INFRASTRUCTURE,
+                    ExitClass.QUOTA_EXHAUSTED,
+                }:
                     choice = "keep"
                 out.append((attempt, execution.provider, choice))
         return out
@@ -3435,6 +3489,7 @@ class Supervisor:
                     collection_error,
                     observation.oom_killed,
                     defer_quota=True,
+                    final_observation=observation,
                 )
             )
             if await self._db(partial(self._quota_checkpoint_pending, attempt.id)):
@@ -4082,6 +4137,7 @@ class Supervisor:
         oom_killed: bool = False,
         *,
         defer_quota: bool = False,
+        final_observation: Observation | None = None,
     ) -> None:
         with self._fenced() as uow:
             attempt = uow.attempts.get(attempt_id, for_update=True)
@@ -4126,6 +4182,21 @@ class Supervisor:
                 )
                 if oom_killed and not (timed_out or killed):
                     attempt.exit_class = ExitClass.ENVIRONMENT
+            interruption = model_interruption(exit_code, outputs.stdout_tail, outputs.stderr_tail)
+            never_started = final_observation is not None and final_observation.never_started
+            if not (timed_out or killed or oom_killed):
+                if never_started:
+                    attempt.exit_class = ExitClass.INFRASTRUCTURE
+                elif interruption is not None:
+                    attempt.exit_class = interruption.exit_class
+            interruption_detail = (
+                f"the worker never started: {final_observation.container_message}"
+                if never_started and final_observation is not None
+                else interruption.message
+                if interruption is not None
+                else (outputs.stderr_tail or outputs.stdout_tail)[-2000:]
+                or "provider quota exhausted"
+            )
             if (
                 attempt.termination_reason == TERMINATION_STALL
                 and attempt.exit_class is ExitClass.TIMEOUT
@@ -4148,8 +4219,9 @@ class Supervisor:
                 parsed = adapter.parse_report(report_dir, exit_info)
             self._record_credential_sync(uow, attempt, execution, outputs)
             if collection_error is not None:
-                # Whatever the worker's own exit said, Crucible has no outputs from it.
-                attempt.exit_class = ExitClass.ENVIRONMENT
+                # Preserve the original interruption even if sealing also failed.
+                if attempt.exit_class not in {ExitClass.INFRASTRUCTURE, ExitClass.QUOTA_EXHAUSTED}:
+                    attempt.exit_class = ExitClass.ENVIRONMENT
                 record_event(
                     uow,
                     self._clock,
@@ -4175,6 +4247,30 @@ class Supervisor:
                         "checkpoint_refusal": True,
                     },
                 )
+            interruption_payload: dict[str, Any] = {}
+            if attempt.exit_class in {ExitClass.INFRASTRUCTURE, ExitClass.QUOTA_EXHAUSTED}:
+                routing = load_routing(uow, execution.policy_snapshot or {})
+                model = (
+                    routing.model(attempt.selected_model or execution.model) if routing else None
+                )
+                interruption_payload = {
+                    "interruption_message": redact(interruption_detail),
+                    "endpoint_url": model.endpoint_url if model is not None else None,
+                    "capacity_refused": interruption is not None and interruption.capacity,
+                    "never_started": never_started,
+                    "no_commits": collection_error is None
+                    and outputs.checkpoint_refusal is None
+                    and (outputs.bundle is None or outputs.bundle.commits == 0),
+                    "container_message": redact(final_observation.container_message or "")
+                    if final_observation
+                    else None,
+                    "pod_events": [
+                        {**row, "message": redact(str(row.get("message") or ""))}
+                        for row in final_observation.pod_events
+                    ]
+                    if final_observation
+                    else [],
+                }
             move_attempt(
                 uow,
                 self._clock,
@@ -4186,8 +4282,30 @@ class Supervisor:
                     "exit_class": attempt.exit_class.value,
                     "termination_reason": attempt.termination_reason,
                     "oom_killed": oom_killed,
+                    **interruption_payload,
                 },
             )
+            if never_started and final_observation is not None:
+                uow.evidence.add(
+                    EvidenceRecord(
+                        id=None,
+                        attempt_id=attempt.id,
+                        task_id=attempt.task_id,
+                        kind=EvidenceKind.EXIT_INFO.value,
+                        observed_at=self._clock.now(),
+                        source=EvidenceSource.CRUCIBLE.value,
+                        verified=True,
+                        payload={
+                            "exit_class": ExitClass.INFRASTRUCTURE.value,
+                            "never_started": True,
+                            "container_message": redact(final_observation.container_message or ""),
+                            "pod_events": [
+                                {**row, "message": redact(str(row.get("message") or ""))}
+                                for row in final_observation.pod_events
+                            ],
+                        },
+                    )
+                )
             if execution.role is ExecutionRole.REVIEW:
                 self._finish_review_attempt(uow, attempt, outputs)
                 uow.leases.release_attempt_lease(attempt.id)
@@ -4355,6 +4473,7 @@ class Supervisor:
                 claim_ok=claim_ok,
                 defer_quota=defer_quota,
                 turn_cap_reached=parsed is not None and parsed.limit_reached is not None,
+                has_commits=outputs.bundle is not None and outputs.bundle.commits > 0,
             )
             uow.commit()
 
@@ -4825,6 +4944,9 @@ class Supervisor:
         *,
         source: str = "worker",
     ) -> None:
+        if source == "worker":
+            task.resume_at = self._clock.now() + timedelta(minutes=3)
+            uow.tasks.save(task)
         context = self._routing_context(uow, task, execution)
         if context is None:
             move_execution(
@@ -5010,6 +5132,7 @@ class Supervisor:
         claim_ok: bool = False,
         defer_quota: bool = False,
         turn_cap_reached: bool = False,
+        has_commits: bool = True,
     ) -> None:
         execution = uow.executions.get(attempt.execution_id, for_update=True)
         task = uow.tasks.get(attempt.task_id, for_update=True)
@@ -5100,6 +5223,11 @@ class Supervisor:
                 summary=too_big_wake_summary(local_cap),
             )
             return
+        if exit_class is ExitClass.INFRASTRUCTURE or (
+            exit_class is ExitClass.QUOTA_EXHAUSTED and not has_commits
+        ):
+            self._retry_interruption(uow, task, execution, attempt)
+            return
         if exit_class is ExitClass.QUOTA_EXHAUSTED:
             # Reactive rerouting is only for a worker that actually ran. A reserve-time
             # refusal has no worktree to checkpoint and follows the established
@@ -5124,7 +5252,7 @@ class Supervisor:
             # 07: a refused launch would be refused again; Foundry has the wake.
             retryable = False
         ordinary_attempts = sum(
-            prior.exit_class is not ExitClass.QUOTA_EXHAUSTED
+            prior.exit_class not in {ExitClass.QUOTA_EXHAUSTED, ExitClass.INFRASTRUCTURE}
             and prior.termination_reason not in {"gate_proves_nothing", "check_cannot_run"}
             for prior in uow.attempts.list_for_execution(execution.id)
             if prior.state in ATTEMPT_TERMINAL
@@ -5161,6 +5289,140 @@ class Supervisor:
             },
         )
         self._task_reported(uow, task, attempt, exit_class, common)
+
+    def _infrastructure_waits(self) -> list[tuple[str, str, str]]:
+        pending: list[tuple[str, str, str]] = []
+        with self._uow_factory() as uow:
+            for task in uow.tasks.list_by_state(TaskState.BLOCKED):
+                event = uow.events.latest_for_task_kind(task.id, EventKind.TASK_BLOCKED.value)
+                if event is None or event.payload.get("reason") != "model_endpoint_unavailable":
+                    continue
+                if event.payload.get("never_started") or not event.payload.get("endpoint_url"):
+                    continue
+                if task.resume_at is not None and task.resume_at > self._clock.now():
+                    continue
+                execution = uow.executions.get(event.execution_id or "")
+                if execution is not None and execution.state is ExecutionState.ACTIVE:
+                    pending.append(
+                        (task.id, execution.provider, str(event.payload["endpoint_url"]))
+                    )
+        return pending
+
+    async def _resume_infrastructure_waits(self) -> None:
+        for task_id, provider_name, endpoint in await self._db(self._infrastructure_waits):
+            probe = getattr(self._provider(provider_name), "probe_model_endpoint", None)
+            if probe is None:
+                continue
+            healthy = await probe(endpoint)
+            await self._db(partial(self._record_endpoint_health, task_id, healthy))
+
+    def _record_endpoint_health(self, task_id: str, healthy: bool) -> None:
+        with self._fenced() as uow:
+            task = uow.tasks.get(task_id, for_update=True)
+            if task is None or task.state is not TaskState.BLOCKED:
+                return
+            event = uow.events.latest_for_task_kind(task.id, EventKind.TASK_BLOCKED.value)
+            if event is None or event.payload.get("reason") != "model_endpoint_unavailable":
+                return
+            task.resume_at = None if healthy else self._clock.now() + timedelta(minutes=3)
+            uow.tasks.save(task)
+            if healthy:
+                move_task(
+                    uow,
+                    self._clock,
+                    task,
+                    TaskState.SCHEDULED,
+                    EventKind.TASK_RETRY_SCHEDULED,
+                    payload={
+                        "health_recovered": True,
+                        "endpoint_url": event.payload.get("endpoint_url"),
+                    },
+                )
+            uow.commit()
+
+    def _retry_interruption(
+        self, uow: UnitOfWork, task: Task, execution: Execution, attempt: Attempt
+    ) -> None:
+        event = uow.events.latest_for_task_kind(task.id, EventKind.ATTEMPT_EXITED.value)
+        detail = event.payload if event is not None and event.attempt_id == attempt.id else {}
+        message = str(detail.get("interruption_message") or "model endpoint unavailable")
+        recovered_at = max(
+            (
+                event.ts
+                for event in self._all_task_events(uow, task.id)
+                if event.kind == EventKind.TASK_RETRY_SCHEDULED.value
+                and event.payload.get("health_recovered")
+            ),
+            default=task.created_at,
+        )
+        failures = sum(
+            row.exit_class in {ExitClass.INFRASTRUCTURE, ExitClass.QUOTA_EXHAUSTED}
+            and row.created_at >= recovered_at
+            for row in uow.attempts.list_for_task(task.id)
+        )
+        if failures >= 3:
+            routing = load_routing(uow, execution.policy_snapshot or {})
+            model = routing.model(attempt.selected_model or execution.model) if routing else None
+            endpoint_url = model.endpoint_url if model is not None else None
+            task.resume_at = self._clock.now() + timedelta(minutes=3)
+            uow.tasks.save(task)
+            move_task(
+                uow,
+                self._clock,
+                task,
+                TaskState.BLOCKED,
+                EventKind.TASK_BLOCKED,
+                execution_id=execution.id,
+                attempt_id=attempt.id,
+                payload={
+                    "reason": "model_endpoint_unavailable",
+                    "cause": message,
+                    "never_started": bool(detail.get("never_started")),
+                    "endpoint_url": endpoint_url
+                    if attempt.exit_class is ExitClass.INFRASTRUCTURE
+                    and not detail.get("capacity_refused")
+                    else None,
+                },
+            )
+            create_wake(
+                uow,
+                self._clock,
+                principal_id=task.principal_id,
+                reason=WakeReason.ATTEMPT_FAILED,
+                task=task,
+                attempt_id=attempt.id,
+                summary=message,
+            )
+            return
+        task.resume_at = self._clock.now() + timedelta(minutes=3)
+        uow.tasks.save(task)
+        nxt = self._create_attempt(uow, execution, number=attempt.number + 1)
+        if any(
+            row.kind == EvidenceKind.BUNDLE_HEAD.value
+            and row.verified
+            and row.payload.get("bundle_verified")
+            for row in uow.evidence.list_for_attempt(attempt.id)
+        ):
+            nxt.resume_from_remote = False
+            uow.attempts.save(nxt)
+        move_task(
+            uow,
+            self._clock,
+            task,
+            TaskState.SCHEDULED,
+            EventKind.TASK_RETRY_SCHEDULED,
+            execution_id=execution.id,
+            attempt_id=attempt.id,
+            payload={
+                "exit_class": str(attempt.exit_class),
+                "cause": message,
+                "next_attempt_id": nxt.id,
+                "resume_at": task.resume_at.isoformat(),
+                "excluded_model": (attempt.selected_model or execution.model)
+                if detail.get("capacity_refused")
+                else None,
+            },
+        )
 
     @staticmethod
     def _local_cap(
@@ -5239,6 +5501,34 @@ class Supervisor:
         common: dict[str, str],
         wake_summary: str | None = None,
     ) -> None:
+        if exit_class in {ExitClass.INFRASTRUCTURE, ExitClass.QUOTA_EXHAUSTED}:
+            event = uow.events.latest_for_task_kind(task.id, EventKind.ATTEMPT_EXITED.value)
+            cause = (
+                str(event.payload.get("interruption_message") or "provider quota exhausted")
+                if event
+                else "provider quota exhausted"
+            )
+
+            move_task(
+                uow,
+                self._clock,
+                task,
+                TaskState.BLOCKED,
+                EventKind.TASK_BLOCKED,
+                execution_id=attempt.execution_id,
+                attempt_id=attempt.id,
+                payload={"reason": "model_endpoint_unavailable", "exit_class": exit_class.value},
+            )
+            create_wake(
+                uow,
+                self._clock,
+                principal_id=task.principal_id,
+                reason=self._FAILURE_WAKE_REASONS.get(exit_class, WakeReason.ATTEMPT_FAILED),
+                summary=wake_summary or f"{cause}; retry budget exhausted",
+                task=task,
+                attempt_id=attempt.id,
+            )
+            return
         stored = uow.contracts.get(task.id, task.contract_version)
         tier = (
             stored.document.get("execution_request", {}).get("tier") if stored is not None else None

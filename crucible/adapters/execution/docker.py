@@ -66,6 +66,7 @@ from crucible.adapters.execution.create_policy import (
     check as check_create,
 )
 from crucible.adapters.execution.dockerapi import DockerApiError, DockerClient, LogFrame
+from crucible.adapters.execution.endpoint_health import probe_model_endpoint
 from crucible.adapters.execution.logstream import chunks as _chunks
 from crucible.adapters.harness.registry import default_registry
 from crucible.application.credential_renewer import (
@@ -82,6 +83,7 @@ from crucible.application.harnesses import (
 from crucible.contracts.completion_claim import CompletionClaimV1
 from crucible.domain.exit_class import ExitClass
 from crucible.domain.ids import new_id
+from crucible.domain.infrastructure import model_interruption
 from crucible.domain.secrets import redact
 from crucible.domain.time import parse_rfc3339
 from crucible.ports.execution import (
@@ -1110,6 +1112,9 @@ class DockerProvider:
             raise ProviderError(f"log pull failed: {exc}") from exc
         return _chunks(frames, since)
 
+    async def probe_model_endpoint(self, endpoint_url: str) -> bool:
+        return await probe_model_endpoint(endpoint_url)
+
     async def collect(
         self, h: Handle, ws: Workspace, spec: LaunchSpec | None = None
     ) -> CollectedOutputs:
@@ -1200,7 +1205,12 @@ class DockerProvider:
                 )
                 == 0
             )
-        verifications = await self._run_verifier(spec)
+        interrupted = (
+            observation.never_started
+            or quota_checkpoint
+            or model_interruption(observation.exit_code, stdout_tail, stderr_tail) is not None
+        )
+        verifications = () if interrupted else await self._run_verifier(spec)
         outputs = _read_outputs(
             output,
             root / "verify",
