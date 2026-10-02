@@ -273,10 +273,20 @@ class CodexCredentialRenewer:
         self.wake = wake or (lambda _summary: None)
         self._dead_wake_raised = False
         self._pending_request_checker: Callable[[], bool] | None = None
+        self._pending_request_ack: Callable[[], None] | None = None
 
     def set_pending_request_checker(self, checker: Callable[[], bool] | None) -> None:
         """Attach a callback that returns True when a refresh is pending."""
         self._pending_request_checker = checker
+
+    def set_pending_request_ack(self, ack: Callable[[], None] | None) -> None:
+        """Attach a callback that durably advances the pending-request cursor.
+
+        Called only once the request has reached a terminal outcome: the refresh
+        succeeded, or the login is now dead. A transient failure leaves the cursor
+        where it is so the next tick retries the same request (339).
+        """
+        self._pending_request_ack = ack
 
     @property
     def dead(self) -> bool:
@@ -351,13 +361,23 @@ class CodexCredentialRenewer:
         """Check for a pending refresh request (339). Returns True if one was processed.
 
         The API records a CREDENTIAL_REFRESH_REQUESTED event; this method checks
-        via ``_pending_request_checker`` and performs the refresh if pending.
+        via ``_pending_request_checker`` and performs the refresh if pending. The
+        cursor is acknowledged only on a terminal outcome (success or dead), so a
+        transient OAuth, Secret, or projection error retries on the next tick.
         """
         if self._pending_request_checker is None:
             return False
-        if self._pending_request_checker():
-            return self.refresh("pending administrator request", force=True)
-        return False
+        if not self._pending_request_checker():
+            return False
+        try:
+            performed = self.refresh("pending administrator request", force=True)
+        except Exception:
+            if self._pending_request_ack is not None and self.dead:
+                self._pending_request_ack()
+            raise
+        if self._pending_request_ack is not None:
+            self._pending_request_ack()
+        return performed
 
     def _die(self, reason: str) -> None:
         self.store.mark_dead({"dead": True, "at": self.clock.now().isoformat()})

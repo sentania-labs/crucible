@@ -275,6 +275,8 @@ async def _action_credential(
             reason=reason,
         )
     elif verb == "refresh":
+        if ctx.credential_renewer is None:
+            raise ConflictError("the Codex credential renewer is not configured")
         record_event(
             uow,
             ctx.admin.clock,

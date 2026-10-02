@@ -263,6 +263,10 @@ class SupervisorStatusRow(Base):
     last_success_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
     last_error_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 339: the seq of the last CREDENTIAL_REFRESH_REQUESTED event the renewer has
+    # handled, persisted so a supervisor restart does not replay every historical
+    # request as pending.
+    refresh_request_cursor: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
 
 class IdempotencyKeyRow(Base):

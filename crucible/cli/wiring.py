@@ -710,27 +710,45 @@ def build_credential_renewer(
     )
 
     # 339: the renewer checks for CREDENTIAL_REFRESH_REQUESTED events so the
-    # supervisor can honour a forced refresh recorded from the API.
-    # A watermark avoids re-scanning from seq=0 every tick (339).
-    _watermark: list[int | None] = [None]
+    # supervisor can honour a forced refresh recorded from the API. The cursor
+    # lives on the supervisor_status row, not in process memory, so a supervisor
+    # restart does not replay every historical request as pending (0037).
+    _pending_seq: list[int | None] = [None]
 
     def _has_pending_refresh_request() -> bool:
         try:
             with factory() as uow:
-                seq = _watermark[0]
+                cursor = uow.supervisor_status.get().refresh_request_cursor or 0
                 rows = uow.events.list_global(
-                    after_seq=seq if seq is not None else 0,
+                    after_seq=cursor,
                     kind=EventKind.CREDENTIAL_REFRESH_REQUESTED.value,
                     since=datetime.min.replace(tzinfo=UTC),
                     limit=1,
                 )
-                if rows:
-                    _watermark[0] = rows[-1].seq
-                return len(rows) > 0
+                if not rows:
+                    return False
+                _pending_seq[0] = rows[-1].seq
+                return True
         except Exception:  # pragma: no cover - safe fallback for test fakes
             return False
 
+    def _ack_pending_refresh_request() -> None:
+        seq = _pending_seq[0]
+        if seq is None:
+            return
+        try:
+            with factory() as uow:
+                status = uow.supervisor_status.get()
+                status.refresh_request_cursor = seq
+                uow.supervisor_status.write(status)
+                uow.commit()
+        except Exception:  # pragma: no cover - safe fallback for test fakes
+            log.exception("could not persist the credential refresh cursor")
+            return
+        _pending_seq[0] = None
+
     renewer.set_pending_request_checker(_has_pending_refresh_request)
+    renewer.set_pending_request_ack(_ack_pending_refresh_request)
 
     return renewer
 
