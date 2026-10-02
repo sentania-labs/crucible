@@ -15,6 +15,14 @@ FDY-0140:
 - While Hermes works, a line goes to stderr each time its session store changes: `-z`
   writes nothing else until it ends, and a quiet worker is otherwise indistinguishable
   from a stuck one.
+
+Hades #385: Hermes's content search falls back to `grep -r --exclude-dir='.*' ... ROOT`
+when there is no ripgrep, and GNU grep applies that pattern to ROOT itself, so a search
+of `.` (or of any root whose last component starts with a dot) finds nothing. The image
+now carries ripgrep, and the bootstrap also runs that grep from inside the root with no
+file operand, which grep never excludes, so only hidden directories below the root are
+skipped. Both patches are for Hermes 0.19.0 alone: the bootstrap refuses to start any
+other version rather than patch code it was not written against.
 """
 
 from __future__ import annotations
@@ -34,15 +42,33 @@ HERMES_PYTHON = "/opt/hermes/bin/python"
 PROGRESS_SECONDS = 15.0
 PROGRESS_LINE = "crucible-hermes: working, session updated"
 
-# Run inside the Hermes virtual environment. It changes nothing but the turn budget an
-# agent is built with when the caller named none, and only once `run_agent` is imported
+# The Hermes release the patches below were written against. Any other version stops the
+# bootstrap before Hermes starts (hades #385).
+HERMES_VERSION = "0.19.0"
+
+# Run inside the Hermes virtual environment, ahead of Hermes itself. It changes the turn
+# budget an agent is built with when the caller named none, and the root of the grep
+# fallback of content search (hades #385). Each applies only once its module is imported
 # the ordinary way, so Hermes's own import order (its approval mode is read at import)
 # is untouched.
-BOOTSTRAP = r"""
+PATCHES = r"""
 import importlib.abc
+import importlib.metadata
 import importlib.util
+import inspect
 import os
 import sys
+
+EXPECTED = "@HERMES_VERSION@"
+try:
+    FOUND = importlib.metadata.version("hermes-agent")
+except importlib.metadata.PackageNotFoundError:
+    FOUND = "none"
+if FOUND != EXPECTED:
+    raise SystemExit(
+        f"crucible-hermes: its patches are for hermes-agent {EXPECTED}, found {FOUND}; "
+        "refusing to start Hermes unpatched (hades #385)"
+    )
 
 LIMIT = int(os.environ.get("CRUCIBLE_HERMES_MAX_TURNS") or 0)
 # `max_iterations` is the tenth parameter of AIAgent.__init__ after self (0.19).
@@ -75,13 +101,108 @@ class _TurnBudget(importlib.abc.MetaPathFinder):
         return spec
 
 
+# Hades #385. The 0.19.0 fallback, exactly: these lines are what the patch replaces the
+# effect of, so a Hermes whose fallback reads differently fails here, at import.
+GREP_SHAPE = (
+    "cmd_parts = [\"grep\", \"-rnH\"]",
+    "cmd_parts.append(\"--exclude-dir='.*'\")",
+    "cmd_parts.append(self._escape_shell_arg(path))",
+    "cmd_parts.extend([\"|\", \"head\", \"-n\", str(fetch_limit)])",
+    "cmd = \"set -o pipefail; \" + \" \".join(cmd_parts)",
+)
+GREP_HEAD = "set -o pipefail; grep -rnH "
+
+
+class _RootedShell:
+    # The file operations object as the fallback sees it, except that its grep command
+    # runs from inside the root with no file operand. GNU grep applies --exclude-dir to
+    # every operand it is given, `.` and `./` included, but never to the `.` it searches
+    # when it is given none; that `.` is also left out of the names it prints.
+    def __init__(self, ops, root):
+        self._ops = ops
+        self._root = ops._escape_shell_arg(root)
+
+    def __getattr__(self, name):
+        return getattr(self._ops, name)
+
+    def _exec(self, command, *args, **kwargs):
+        operand = f" {self._root} | head -n "
+        if command.startswith(GREP_HEAD) and operand in command:
+            before, _, after = command.rpartition(operand)
+            command = (
+                f"set -o pipefail; cd -- {self._root} >/dev/null 2>&1 && grep -rnH "
+                f"{before[len(GREP_HEAD):]} | head -n {after}"
+            )
+        return self._ops._exec(command, *args, **kwargs)
+
+
+def _rooted(root, name):
+    return (root if root.endswith("/") else root + "/") + name
+
+
+def _patch_grep(module):
+    shell = module.ShellFileOperations
+    original = shell._search_with_grep
+    source = inspect.getsource(original)
+    missing = [line for line in GREP_SHAPE if line not in source]
+    if missing:
+        raise RuntimeError(
+            "crucible-hermes: Hermes's grep fallback is not the one hades #385 patches; "
+            f"missing {missing}"
+        )
+
+    def _search_with_grep(self, pattern, path, file_glob, limit, offset, output_mode, context):
+        probe = self._exec(f"test -d {self._escape_shell_arg(path)} && echo directory")
+        if probe.stdout.strip() != "directory":
+            return original(self, pattern, path, file_glob, limit, offset, output_mode, context)
+        result = original(
+            _RootedShell(self, path), pattern, path, file_glob, limit, offset, output_mode,
+            context,
+        )
+        # Grep printed names relative to the root; give them back the root, as grep
+        # does for an operand, so they read as they would have with ripgrep.
+        for match in result.matches:
+            match.path = _rooted(path, match.path)
+        result.files = [_rooted(path, name) for name in result.files]
+        result.counts = {_rooted(path, name): count for name, count in result.counts.items()}
+        return result
+
+    shell._search_with_grep = _search_with_grep
+
+
+class _GrepRoot(importlib.abc.MetaPathFinder):
+    def find_spec(self, name, path, target=None):
+        if name != "tools.file_operations":
+            return None
+        sys.meta_path.remove(self)
+        spec = importlib.util.find_spec(name)
+        if spec is None or spec.loader is None:
+            return spec
+        loader = spec.loader
+        execute = loader.exec_module
+
+        def exec_module(module):
+            execute(module)
+            _patch_grep(module)
+
+        loader.exec_module = exec_module
+        return spec
+
+
 if LIMIT > 0:
     sys.meta_path.insert(0, _TurnBudget())
+sys.meta_path.insert(0, _GrepRoot())
+""".replace("@HERMES_VERSION@", HERMES_VERSION)
+
+BOOTSTRAP = (
+    PATCHES
+    + r"""
 sys.argv = ["hermes", *sys.argv[1:]]
 from hermes_cli.main import main
 
 sys.exit(main())
 """
+)
 
 
 def _milliseconds(started: object, ended: object) -> int | None:

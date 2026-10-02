@@ -145,9 +145,22 @@ def _run_main(docker: Path) -> subprocess.CompletedProcess[str]:
     )
 
 
+def test_main_fails_when_rg_does_not_run_in_the_image(tmp_path: Path) -> None:
+    """hades #385: Hermes's search tool needs ripgrep, which no policy names."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for program in {"make"} | SELF_HOSTING_PROGRAMS:
+        _executable(bin_dir, program)
+    result = _run_main(_fake_docker(tmp_path, bin_dir))
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "FAILED   rg --version exited 127" in result.stderr
+    assert "fails its self-test" in result.stderr
+
+
 def test_main_fails_and_names_the_policy_when_make_is_missing(tmp_path: Path) -> None:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
+    _executable(bin_dir, "rg")
     result = _run_main(_fake_docker(tmp_path, bin_dir))
     assert result.returncode == 1, result.stdout + result.stderr
     assert "MISSING  make" in result.stderr
@@ -160,7 +173,7 @@ def test_main_fails_and_names_the_policy_when_a_declared_program_is_missing(
 ) -> None:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    for program in {"make"} | SELF_HOSTING_PROGRAMS - {"gitleaks"}:
+    for program in {"make", "rg"} | SELF_HOSTING_PROGRAMS - {"gitleaks"}:
         _executable(bin_dir, program)
     result = _run_main(_fake_docker(tmp_path, bin_dir))
     assert result.returncode == 1, result.stdout + result.stderr
@@ -171,7 +184,7 @@ def test_main_fails_and_names_the_policy_when_a_declared_program_is_missing(
 def test_main_passes_when_the_image_carries_every_program(tmp_path: Path) -> None:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    for program in {"make"} | SELF_HOSTING_PROGRAMS:
+    for program in {"make", "rg"} | SELF_HOSTING_PROGRAMS:
         _executable(bin_dir, program)
     result = _run_main(_fake_docker(tmp_path, bin_dir))
     assert result.returncode == 0, result.stdout + result.stderr
