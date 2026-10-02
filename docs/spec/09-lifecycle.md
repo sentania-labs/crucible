@@ -57,6 +57,7 @@ awaiting_ci_certification --required checks green on the accepted head--> ready_
 awaiting_ci_certification --a required check failed on the accepted head--> ci_certification_failed --wake-->
 ready_for_merge --a required check on the accepted head turns red--> ci_certification_failed --wake-->
 ready_for_merge --new review signal from allowlisted login--> external_feedback_received --wake-->
+ready_for_merge --correction attached--> scheduled
 ci_certification_failed --ci-decision rerun--> awaiting_ci_certification
 ci_certification_failed --green certification observed on the accepted head--> awaiting_ci_certification
 ci_certification_failed --ci-decision correct, correction attached--> scheduled

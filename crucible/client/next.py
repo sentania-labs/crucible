@@ -53,19 +53,20 @@ CANCELLABLE = frozenset(
         "awaiting_internal_review",
         "awaiting_acceptance",
         "pre_pr_gates_failed",
+        "ready_for_merge",
         "publish_failed",
         "awaiting_external_review",
         "external_feedback_received",
         "awaiting_ci_certification",
         "ci_certification_failed",
         "head_diverged",
-        "ready_for_merge",
     }
 )
 # crucible/application/corrections.py CORRECTABLE_STATES.
 CORRECTABLE = frozenset(
     {
         "pre_pr_gates_failed",
+        "ready_for_merge",
         "awaiting_acceptance",
         "external_feedback_received",
         "ci_certification_failed",

@@ -54,6 +54,7 @@ CORRECTABLE_STATES = frozenset(
         TaskState.AWAITING_ACCEPTANCE,
         TaskState.EXTERNAL_FEEDBACK_RECEIVED,
         TaskState.CI_CERTIFICATION_FAILED,
+        TaskState.READY_FOR_MERGE,
         TaskState.BLOCKED,
     }
 )
