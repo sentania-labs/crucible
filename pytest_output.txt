@@ -1,0 +1,57 @@
+........................................................................ [  3%]
+........................................................................ [  6%]
+.......F................................................................ [  9%]
+........................................................................ [ 13%]
+........................................................................ [ 16%]
+........................................................................ [ 19%]
+........................................................................ [ 23%]
+........................................................................ [ 26%]
+........................................................................ [ 29%]
+..ssssssssssss.ssssss..s.ssssssssssssssssss............................. [ 32%]
+........................................................................ [ 36%]
+........................................................................ [ 39%]
+........................................................................ [ 42%]
+........................................................................ [ 46%]
+........................................................................ [ 49%]
+............s........................................................... [ 52%]
+........................................................................ [ 55%]
+........................................................................ [ 59%]
+........................................................................ [ 62%]
+........................................................................ [ 65%]
+........................................................................ [ 69%]
+........................................................................ [ 72%]
+........................................................................ [ 75%]
+........................................................................ [ 78%]
+..................................................ss.................... [ 82%]
+........................................................................ [ 85%]
+........................................................................ [ 88%]
+........................................................................ [ 92%]
+........................................................................ [ 95%]
+........................................................................ [ 98%]
+...............................                                          [100%]
+=================================== FAILURES ===================================
+_____________ test_the_state_sets_are_the_domain_and_service_sets ______________
+tests/unit/test_cli_envelope.py:51: in test_the_state_sets_are_the_domain_and_service_sets
+    assert {s.value for s in CORRECTABLE_STATES} == nx.CORRECTABLE
+E   AssertionError: assert {'awaiting_ac...dy_for_merge'} == frozenset({'a...ates_failed'})
+E     
+E     Extra items in the left set:
+E     'ready_for_merge'
+E     Use -v to get more diff
+=============================== warnings summary ===============================
+.venv/lib/python3.12/site-packages/fastapi/testclient.py:1
+  /crucible/repo/.venv/lib/python3.12/site-packages/fastapi/testclient.py:1: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead.
+    from starlette.testclient import TestClient as TestClient  # noqa
+
+.venv/lib/python3.12/site-packages/starlette/testclient.py:53
+  /crucible/repo/.venv/lib/python3.12/site-packages/starlette/testclient.py:53: DeprecationWarning: The anyio.abc.BlockingPortal alias is deprecated, use anyio.from_thread.BlockingPortal instead.
+    _PortalFactoryType = Callable[[], AbstractContextManager[anyio.abc.BlockingPortal]]
+
+tests/unit/test_integration_fixtures.py::test_controller_owns_container_until_shutdown[0]
+  /opt/python3.12/lib/python3.12/importlib/__init__.py:90: DeprecationWarning: testcontainers.postgres is deprecated, use testcontainers.community.postgres instead
+    return _bootstrap._gcd_import(name[level:], package, level)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/unit/test_cli_envelope.py::test_the_state_sets_are_the_domain_and_service_sets
+1 failed, 2150 passed, 40 skipped, 3 warnings in 151.85s (0:02:31)
