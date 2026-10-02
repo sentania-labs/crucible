@@ -13,9 +13,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
-import pytest
-
-from crucible.adapters.execution import collected, scripts
+from crucible.adapters.execution import scripts
 from crucible.adapters.execution.collected import read_outputs, read_path_changes
 from crucible.application.evidence import record_collection_evidence
 from crucible.domain.entities import Attempt, EvidenceRecord, Task
@@ -215,6 +213,7 @@ def _evidence(tmp_path: Path, repo: Path) -> tuple[EvidenceItem, ...]:
         diff_text=read.diff_text,
         diff_changes=read.diff_changes,
         base_paths=read.base_paths,
+        over_limit=read.over_limit,
         bundle=read.bundle,
         artifacts=read.artifacts,
     )
@@ -421,23 +420,93 @@ def test_a_worker_set_log_diff_merges_does_not_change_the_verdict(tmp_path: Path
     assert result is GateResult.FAIL
 
 
-def test_an_inflated_listing_with_a_non_ascii_shim_fails(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Past the raw records' read limit the gate falls back to changed.txt and
-    commit-paths.txt, which keep a non-ASCII path as its bytes. The limit is lowered so
-    a few hundred long-named files stand in for the 8 MiB a worker could commit."""
-    monkeypatch.setattr(collected, "_RAW_LIMIT", 64 * 1024)
+def test_an_inflated_listing_with_a_shim_past_the_read_limit_fails(tmp_path: Path) -> None:
+    """40,000 long-named files make changed.txt and commit-paths.txt larger than what is
+    read of them, sorted so zzz/CLAUDE.md falls past the cut. The raw records name only
+    injected-name paths and still carry the shim, and the gate fails on the cut lists."""
     repo = _repo(tmp_path)
-    for n in range(400):
-        _write(repo, f"pad/{n:04d}-{'x' * 200}", "")
-    _write(repo, "dï/CLAUDE.md", SHIM)
-    _commit(repo, "inflate")
+    empty = _git(repo, "hash-object", "-w", "--stdin").strip()
+    shim = subprocess.run(
+        ["git", "-C", str(repo), "hash-object", "-w", "--stdin"],
+        input=SHIM,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    entries = "".join(f"100644 {empty}\tpad/{n:05d}-{'x' * 240}\n" for n in range(40_000))
+    entries += f"100644 {shim}\tzzz/CLAUDE.md\n"
+    subprocess.run(
+        ["git", "-C", str(repo), "update-index", "--index-info"],
+        input=entries,
+        text=True,
+        check=True,
+    )
+    _git(repo, "commit", "-q", "--no-verify", "-m", "inflate")
     result, diff, bundle = _collected(tmp_path, repo)
-    assert "changes" not in diff
-    assert "commit_changes" not in bundle
-    assert "dï/CLAUDE.md" in diff["paths"]
-    assert "dï/CLAUDE.md" in bundle["commit_paths"]
+    assert set(diff["over_limit"]) == {"changed.txt", "commit-paths.txt"}
+    assert "zzz/CLAUDE.md" not in diff["paths"]
+    assert "zzz/CLAUDE.md" not in bundle["commit_paths"]
+    assert [(c["path"], c["blob"]) for c in diff["changes"]] == [("zzz/CLAUDE.md", shim)]
+    assert result is GateResult.FAIL
+
+
+def test_lists_over_their_read_limit_fail_the_gate() -> None:
+    changes = [_change("src/a.py", "M")]
+    diff = {"paths": ["src/a.py"], "changes": [], "over_limit": ["changed.txt"]}
+    assert _outcome(diff, ["src/a.py"], changes) is GateResult.FAIL
+    del diff["over_limit"]
+    assert _outcome(diff, ["src/a.py"], []) is GateResult.PASS
+
+
+def test_a_shim_in_an_orphan_root_hidden_by_log_show_root_fails(tmp_path: Path) -> None:
+    """log.showRoot=false hides a root commit's adds; an orphan root holding the shim,
+    merged and deleted in the merge, would show only the deletion as if the base had it."""
+    repo = _repo(tmp_path, agents_md=False)
+    _git(repo, "config", "log.showRoot", "false")
+    _git(repo, "checkout", "-q", "--orphan", "orphan")
+    _git(repo, "rm", "-rq", "--cached", ".")
+    (repo / "CLAUDE.md").unlink()
+    _write(repo, "AGENTS.md", SHIM)
+    _git(repo, "add", "AGENTS.md")
+    _git(repo, "commit", "-q", "--no-verify", "-m", "orphan root")
+    _git(repo, "checkout", "-q", "-f", "crucible/test")
+    _git(repo, "merge", "-q", "--no-commit", "--allow-unrelated-histories", "orphan")
+    _git(repo, "rm", "-q", "-f", "AGENTS.md")
+    _commit(repo, "merge orphan")
+    result, _, bundle = _collected(tmp_path, repo)
+    assert ("AGENTS.md", "A") in {(c["path"], c["status"]) for c in bundle["commit_changes"]}
+    assert result is GateResult.FAIL
+
+
+def _replace_with_fake(repo: Path, real: str, tree_of: str) -> None:
+    """`git replace` the commit `real` with one carrying the tree of `tree_of` and the
+    same parents, as a worker hiding a commit from the collector would."""
+    parents = _git(repo, "rev-parse", f"{real}^@").split()
+    args = [arg for parent in parents for arg in ("-p", parent)]
+    fake = _git(repo, "commit-tree", f"{tree_of}^{{tree}}", *args, "-m", "fake").strip()
+    _git(repo, "replace", real, fake)
+
+
+def test_a_replaced_tip_hiding_a_shim_fails(tmp_path: Path) -> None:
+    repo = _repo(tmp_path, agents_md=False)
+    _write(repo, "AGENTS.md", SHIM)
+    _commit(repo, "shim")
+    _replace_with_fake(repo, _git(repo, "rev-parse", "HEAD").strip(), "main")
+    result, diff, _ = _collected(tmp_path, repo)
+    assert "AGENTS.md" in diff["paths"]
+    assert result is GateResult.FAIL
+
+
+def test_a_replaced_commit_hiding_a_shim_in_the_history_fails(tmp_path: Path) -> None:
+    repo = _repo(tmp_path, agents_md=False)
+    _write(repo, "AGENTS.md", SHIM)
+    _commit(repo, "shim")
+    shim_commit = _git(repo, "rev-parse", "HEAD").strip()
+    _git(repo, "rm", "-q", "AGENTS.md")
+    _commit(repo, "drop it")
+    _replace_with_fake(repo, shim_commit, "main")
+    result, _, bundle = _collected(tmp_path, repo)
+    assert "AGENTS.md" in bundle["commit_paths"]
     assert result is GateResult.FAIL
 
 

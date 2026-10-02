@@ -20,7 +20,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from crucible.domain.gates import INJECTED_NAMES, injected_shim_text
+from crucible.domain.gates import INJECTED_NAMES, INJECTED_PREFIXES, injected_shim_text
 from crucible.ports.execution import (
     OUTPUT_MOUNT,
     PACKAGE_CACHE_LEAF,
@@ -205,8 +205,10 @@ CHECKPOINT_GIT = (
     "git -c core.fsmonitor= -c diff.external= -c core.pager=cat "
     "-c core.hooksPath=\"$EMPTY_HOOKS\" -c 'safe.directory=*'"
 )
+# GIT_NO_REPLACE_OBJECTS (hades #369): a worker-made refs/replace/ entry would show every
+# read here a commit or tree other than the one the bundle carries.
 GIT_ENV = (
-    "export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 "
+    "export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_NO_REPLACE_OBJECTS=1 "
     "GIT_TERMINAL_PROMPT=0 GIT_ASKPASS= HOME=/home/worker LC_ALL=C"
 )
 
@@ -509,6 +511,13 @@ def _injected_pathspecs() -> str:
     return " ".join(_quote(f":(glob)**/{name}") for name in sorted(INJECTED_NAMES))
 
 
+def _injected_path_pathspecs() -> str:
+    """Every path `no_injected_files` reads records for: an injected name at any depth or
+    anything under an injected prefix (hades #369)."""
+    prefixes = " ".join(_quote(f":(glob){prefix}**") for prefix in INJECTED_PREFIXES)
+    return f"{_injected_pathspecs()} {prefixes}"
+
+
 def collector_script(
     *,
     base_ref: str,
@@ -651,30 +660,35 @@ if [ -n "$BASE" ]; then
   # reachable from HEAD and not BASE, and unions in every path those commits touched.
   {GIT} -C "$REPO" diff --stat "$MB" HEAD > "$OUT/diffstat.txt" || true
   {GIT} -C "$REPO" diff --no-color --no-ext-diff "$MB" HEAD > "$OUT/diff.patch" || true
-  # -z on both path lists (hades #369): read_path_changes skips its records past 8 MiB
-  # and the gate falls back to these lists, which must then still carry a non-ASCII
-  # path as its bytes instead of git's quoted form.
+  # -z on both path lists (hades #369), so a non-ASCII path is its bytes instead of
+  # git's quoted form.
   {GIT} -C "$REPO" diff --name-only -z "$MB" HEAD > "$OUT/changed.txt" || true
-  # hades #369: the status and new blob of each path, so a shim the branch adds is told
-  # from the repository's own CLAUDE.md or AGENTS.md it edits or deletes. -z keeps a
-  # non-ASCII path as its bytes instead of git's quoted form.
+  # hades #369: the status and new blob of each injected-name path, so a shim the branch
+  # adds is told from the repository's own CLAUDE.md or AGENTS.md it edits or deletes.
+  # Only those paths, so the records stay small however many other files the branch
+  # has. -z keeps a non-ASCII path as its bytes instead of git's quoted form.
   {GIT} -C "$REPO" diff --raw -z --no-renames --no-abbrev "$MB" HEAD \
-    > "$OUT/diff-raw.txt" || true
+    -- {_injected_path_pathspecs()} > "$OUT/diff-raw.txt" || true
   # The injected-name paths the merge base has: a CLAUDE.md a merge of the base brings
   # in shows as an add against the merge's first parent, and is still the repository's.
   EMPTY_TREE=$({GIT} -C "$REPO" hash-object -t tree /dev/null)
   {GIT} -C "$REPO" diff --name-only -z --no-renames "$EMPTY_TREE" "$MB" \
     -- {_injected_pathspecs()} > "$OUT/base-injected.txt" || true
   {GIT} -C "$REPO" log --format='%H%x1f%s%x1f%an%x1e' "$BASE"..HEAD > "$OUT/log.txt" || true
-  {GIT} -C "$REPO" log --name-only -z --format='' "$BASE"..HEAD \
+  # --root (hades #369): a root commit's files are listed whatever log.showRoot the
+  # worker-writable .git/config sets.
+  {GIT} -C "$REPO" log --root --name-only -z --format='' "$BASE"..HEAD \
     | LC_ALL=C sort -zu > "$OUT/commit-paths.txt" || true
   # --diff-merges=separate prints a merge's own changes, once per parent, which plain
   # --raw leaves out. Not -m: that follows log.diffMerges from the worker-writable
   # .git/config, and `combined` prints records read_path_changes does not parse;
   # --topo-order prints every commit before its parents whatever its date, so the last
-  # record of a path is the oldest and says whether the base had it.
-  {GIT} -C "$REPO" log --diff-merges=separate --topo-order --raw -z --no-renames \
-    --no-abbrev --format='' "$BASE"..HEAD > "$OUT/commit-raw.txt" || true
+  # record of a path is the oldest and says whether the base had it. --root prints an
+  # orphan root commit's adds, which log.showRoot=false would hide. --full-history keeps
+  # the pathspec from following only one parent of a merge and skipping the other side.
+  {GIT} -C "$REPO" log --root --full-history --diff-merges=separate --topo-order --raw -z \
+    --no-renames --no-abbrev --format='' "$BASE"..HEAD \
+    -- {_injected_path_pathspecs()} > "$OUT/commit-raw.txt" || true
   {GIT} -C "$REPO" bundle create "$OUT/work_branch.bundle" \
     "$BASE..$WORK_BRANCH" > "$OUT/bundle.log" 2>&1 || true
   {GIT} -C "$REPO" rev-list --count "$BASE"..HEAD > "$OUT/commits.txt" \

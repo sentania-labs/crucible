@@ -301,6 +301,9 @@ class CollectedOutputs:
     # hades #369: the injected-name paths the merge base has, so a CLAUDE.md or AGENTS.md
     # a merge of the base brings in is the repository's own. None when not recorded.
     base_paths: tuple[str, ...] | None = None
+    # hades #369: the collected path lists larger than their read limit, whose tail the
+    # gates cannot see; `no_injected_files` fails when there is any.
+    over_limit: tuple[str, ...] = ()
     bundle: BranchBundle | None = None
     artifacts: tuple[CollectedArtifact, ...] = ()
     # The verifier container's re-run of every required_verification command, and the

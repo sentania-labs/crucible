@@ -1221,6 +1221,7 @@ class DockerProvider:
             diff_text=outputs.diff_text,
             diff_changes=outputs.diff_changes,
             base_paths=outputs.base_paths,
+            over_limit=outputs.over_limit,
             bundle=outputs.bundle,
             artifacts=outputs.artifacts,
             verifications=outputs.verifications,

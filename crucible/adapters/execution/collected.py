@@ -31,6 +31,7 @@ from crucible.ports.execution import (
 
 __all__ = [
     "Outputs",
+    "lists_over_limit",
     "read_base_paths",
     "read_commit_policy",
     "read_outputs",
@@ -60,9 +61,13 @@ class Outputs:
     leftover_note: str | None = None
     diff_changes: tuple[PathChange, ...] | None = None
     base_paths: tuple[str, ...] | None = None
+    over_limit: tuple[str, ...] = ()
 
 
-def text(path: Path, limit: int = 8 * 1024 * 1024) -> str:
+TEXT_LIMIT = 8 * 1024 * 1024
+
+
+def text(path: Path, limit: int = TEXT_LIMIT) -> str:
     try:
         with path.open("rb") as handle:
             return handle.read(limit).decode("utf-8", "replace")
@@ -111,6 +116,7 @@ def read_outputs(
     diff_changes = read_path_changes(output / "diff-raw.txt")
     commit_changes = read_path_changes(output / "commit-raw.txt")
     base_paths = read_base_paths(output / "base-injected.txt")
+    over_limit = lists_over_limit(output)
     commit_policy = read_commit_policy(output / "commit-policy")
     messages: list[str] = []
     for record in text(output / "log.txt").split("\x1e"):
@@ -179,6 +185,7 @@ def read_outputs(
         diff_text=diff_text,
         diff_changes=diff_changes,
         base_paths=base_paths,
+        over_limit=over_limit,
         bundle=bundle,
         artifacts=tuple(artifacts),
         verifications=verifications,
@@ -191,7 +198,9 @@ def read_outputs(
 
 _RAW_META = re.compile(r":[0-7]{6} [0-7]{6} ([0-9a-f]{40,64}) ([0-9a-f]{40,64}) ([A-Z])[0-9]*")
 # Larger than this and the records are not read at all: `git log` prints the oldest
-# records last, and a cut tail would hide the add that says the base lacked a path.
+# records last, and a cut tail would hide the add that says the base lacked a path. The
+# collector writes only injected-name records, and lists_over_limit makes the gate fail
+# on a list this large.
 _RAW_LIMIT = 8 * 1024 * 1024
 
 
@@ -220,6 +229,29 @@ def read_path_changes(path: Path) -> tuple[PathChange, ...] | None:
             out.append(PathChange(path=fields[at + 1], status=match.group(3), blob=match.group(2)))
         at += 2
     return tuple(out)
+
+
+# The path lists `no_injected_files` reads and how much of each is read (hades #369).
+_PATH_LISTS: tuple[tuple[str, int], ...] = (
+    ("changed.txt", TEXT_LIMIT),
+    ("commit-paths.txt", TEXT_LIMIT),
+    ("diff-raw.txt", _RAW_LIMIT),
+    ("commit-raw.txt", _RAW_LIMIT),
+    ("base-injected.txt", TEXT_LIMIT),
+)
+
+
+def lists_over_limit(output: Path) -> tuple[str, ...]:
+    """The path lists larger than what is read of them (hades #369): their tail is cut
+    or they are not read at all, so the gate cannot see every path and fails closed."""
+    over: list[str] = []
+    for name, limit in _PATH_LISTS:
+        try:
+            if (output / name).stat().st_size > limit:
+                over.append(name)
+        except OSError:
+            continue
+    return tuple(over)
 
 
 def read_path_list(path: Path) -> tuple[str, ...]:

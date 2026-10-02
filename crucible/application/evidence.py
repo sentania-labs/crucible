@@ -464,6 +464,8 @@ def record_collection_evidence(
             diff_payload["changes"] = _changes_payload(kept)
         if outputs.base_paths is not None:
             diff_payload["base_paths"] = [p for p in outputs.base_paths if injected_name(p)]
+        if outputs.over_limit:
+            diff_payload["over_limit"] = list(outputs.over_limit)
         _add(
             uow,
             clock,

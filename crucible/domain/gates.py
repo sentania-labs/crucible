@@ -524,6 +524,12 @@ def no_injected_files(gi: GateInput) -> GateOutcome:
         # gate has only half its evidence.
         return _missing("bundle_head")
     ids = tuple(e.id for e in (diff, bundle) if e is not None)
+    over = [str(name) for name in diff.payload.get("over_limit", [])]
+    if over:
+        # hades #369: a list read only in part may hide a shim past its cut.
+        return GateOutcome(
+            GateResult.FAIL, f"path lists over their read limit, not fully read: {over}", ids
+        )
     hits = sorted(
         _injected_hits(
             [str(p) for p in diff.payload.get("paths", [])],
