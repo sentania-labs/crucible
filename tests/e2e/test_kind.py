@@ -70,6 +70,7 @@ from crucible.ports.harness import (
     HarnessCapabilities,
     LaunchContext,
     MountMode,
+    TranscriptFormat,
 )
 from tests.e2e.conftest import (
     e2e_contract,
@@ -3040,3 +3041,90 @@ async def test_gate_probe_on_unchanged_base_before_worker(
             )
             await run_until(supervisor, client, task_id, {"cancelled"})
             await supervisor.stop()
+
+
+class _RoboScriptAdapter(ScriptHarnessAdapter):
+    """A script harness with a ro credential and a settings template (FDY-0223 / #349)."""
+
+    name = "script-harness"
+
+    def capabilities(self) -> HarnessCapabilities:
+        return HarnessCapabilities(
+            prompt_on_stdin=False,
+            model_flag=False,
+            effort_flag=False,
+            transcript_format=TranscriptFormat.NONE,
+            endpoints=(),
+            shim=None,
+        )
+
+    def credential_spec(self) -> CredentialSpec:
+        return CredentialSpec(
+            harness=self.name,
+            mount_target="/home/worker/.script-harness",
+            auth_files=(AuthFile("auth.json", json=True),),
+            minimum_mode=MountMode.RO,
+            templates={"settings.json": '{"ro": true}\n'},
+        )
+
+
+async def test_fdy_0223_ro_credential_with_template_starts_on_kubernetes(
+    provider: KubernetesProvider,
+    api: KubernetesClient,
+    registry: CraneRegistryClient,
+) -> None:
+    """349 / FDY-0223: a templated harness in `ro` mode reaches the worker process.
+
+    The credential directory is a projected read-only volume (Secret items + identity
+    ConfigMap template); no mount targets a path under another mount's target. The
+    worker starts without an OCI runtime error."""
+    harnesses = HarnessRegistry((_RoboScriptAdapter(),))
+    provider_ro = _provider(api, registry, harnesses=harnesses)
+
+    # Seed the harness Secret.
+    try:
+        api.create(
+            "secrets",
+            {
+                "apiVersion": "v1",
+                "kind": "Secret",
+                "metadata": {
+                    "name": "crucible-harness-script-harness",
+                    "namespace": "crucible-workers",
+                },
+                "type": "Opaque",
+                "stringData": {"auth.json": json.dumps({"ro": True})},
+            },
+        )
+    except KubernetesApiError as exc:
+        if exc.status != 409:
+            raise
+
+    spec = _spec(99, _origin("ro-script"), harness="script-harness")
+    workspace = await provider_ro.prepare(spec)
+    handle = await provider_ro.launch(workspace, spec)
+
+    # Verify the worker Pod shape: cred volume is projected, not a plain Secret.
+    jobs = api.list_objects(
+        "jobs",
+        label_selector=(f"{k8sspec.LABEL_ATTEMPT}={spec.attempt_id},{k8sspec.LABEL_ROLE}=worker"),
+    )
+    pod_spec = jobs[0]["spec"]["template"]["spec"]
+    cred_volume = next(v for v in pod_spec["volumes"] if v["name"] == "cred")
+    assert "projected" in cred_volume
+    assert cred_volume["projected"]["sources"]
+    # No subPath mount under the credential directory.
+    mounts_list = pod_spec["containers"][0]["volumeMounts"]
+    cred_path = "/home/worker/.script-harness"
+    for m in mounts_list:
+        if m["name"] == "cred":
+            assert m["mountPath"] == cred_path
+            assert m["readOnly"] is True
+        assert not m["mountPath"].startswith(cred_path + "/") or m["name"] != "identity"
+
+    # The worker should start and reach the terminal state.
+    observed = await _terminal(provider_ro, handle)
+    assert observed.state is ObservationState.EXITED
+    assert observed.exit_code == 0
+
+    await provider_ro.cleanup(workspace, CleanupPolicy.DELETE, spec)
