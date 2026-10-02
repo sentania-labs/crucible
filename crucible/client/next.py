@@ -70,6 +70,7 @@ CORRECTABLE = frozenset(
         "external_feedback_received",
         "ci_certification_failed",
         "blocked",
+        "ready_for_merge",
     }
 )
 CLOSABLE = frozenset({"accepted", "merged", "released"})

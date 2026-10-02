@@ -61,6 +61,7 @@ ci_certification_failed --ci-decision rerun--> awaiting_ci_certification
 ci_certification_failed --green certification observed on the accepted head--> awaiting_ci_certification
 ci_certification_failed --ci-decision correct, correction attached--> scheduled
 ci_certification_failed --ci-decision reject--> rejected
+ready_for_merge --correction attached--> scheduled
 
 {awaiting_external_review, external_feedback_received, awaiting_ci_certification, ready_for_merge}
     --PR head changed out of band--> head_diverged --wake-->
