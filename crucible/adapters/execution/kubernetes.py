@@ -103,6 +103,7 @@ from crucible.ports.execution import (
     CleanupPolicy,
     CollectedArtifact,
     CollectedOutputs,
+    CollectionPendingError,
     CredentialFileSync,
     CredentialSync,
     Handle,
@@ -187,6 +188,10 @@ JOB_TIMED_OUT = -2
 # A ResourceQuota's Job count therefore needs this conversion before it can truthfully be
 # shown as attempt capacity.
 JOBS_PER_ATTEMPT = 5
+
+POD_DELETION_MARGIN_SECONDS = 5
+DEFAULT_POD_GRACE_SECONDS = 30
+COLLECTION_ROLES = (k8sspec.ROLE_COLLECTOR, k8sspec.ROLE_BUNDLE, k8sspec.ROLE_VERIFIER)
 
 # Deleting a Pod is the only way to signal one. Kubernetes sends SIGTERM, waits the
 # grace period and then SIGKILLs, and the Pod object is gone either way, so the exit
@@ -633,6 +638,9 @@ class KubernetesProvider:
         # until cleanup, so a collection that runs again records that outcome and not
         # "absent after the run" (in memory: a restart records the second reading).
         self._credential_syncs: dict[str, CredentialSync] = {}
+        # A completed collection Job must not run again just because its Pod took
+        # another tick to disappear. Cleanup forgets these process-local results.
+        self._collection_role_exits: dict[tuple[str, str], int] = {}
         # Why `_await_job` ended a wait early, by Job name (a quota refusal, a Pod that
         # never started); `_run_role_job` moves it into `last_error`.
         self._job_refusals: dict[str, str] = {}
@@ -2127,6 +2135,7 @@ class KubernetesProvider:
         spec = spec or (launched.spec if launched else None)
         if spec is None:
             raise ProviderError("collect needs the launch spec and the provider has none")
+        await self._clear_collection_pods(spec.attempt_id)
         # The stored launch spec is authoritative after a supervisor restart. An
         # adopted provider only has the live Pod shape until the supervisor supplies
         # this spec again for collection.
@@ -2339,6 +2348,7 @@ class KubernetesProvider:
         claim carries a retention label the sweep honours."""
         launched = self._launched.get(ws.attempt_id)
         spec = spec or (launched.spec if launched else None)
+        await self._clear_collection_pods(ws.attempt_id)
         await self._delete_by_label(("jobs", "networkpolicies", "pods"), attempt_id=ws.attempt_id)
         await self._delete_credential_secret(ws.attempt_id)
         await self._delete_checkout_secret(ws.attempt_id)
@@ -2384,6 +2394,8 @@ class KubernetesProvider:
         self._launched.pop(attempt_id, None)
         self._seeded.pop(attempt_id, None)
         self._credential_syncs.pop(attempt_id, None)
+        for key in [key for key in self._collection_role_exits if key[1] == attempt_id]:
+            del self._collection_role_exits[key]
         for key in [key for key in self.role_errors if key[1] == attempt_id]:
             del self.role_errors[key]
 
@@ -4247,11 +4259,20 @@ class KubernetesProvider:
         Pod the namespace quota refuses waits for room until its deadline rather than
         ending at once: the publisher's Jobs, where giving up is a failed publication an
         operator has to retry, not a collection the supervisor tries again."""
+        key = (role, spec.attempt_id)
         name = k8sspec.object_name(OBJECT_PREFIX.get(role, role), spec.attempt_id)
+        if key in self._collection_role_exits:
+            await self._await_job_pods_gone(name, force=role == k8sspec.ROLE_VERIFIER)
+            return self._collection_role_exits[key]
         policy_name: str | None = None
         if not adopt_existing:
             with contextlib.suppress(KubernetesApiError):
-                await self._call(self.client.delete, "jobs", name)
+                await self._call(
+                    self.client.delete,
+                    "jobs",
+                    name,
+                    grace_period_seconds=0 if role == k8sspec.ROLE_VERIFIER else None,
+                )
         interrupted = False
         try:
             policy_name, resolved_plan = await self._apply_policy(
@@ -4343,6 +4364,8 @@ class KubernetesProvider:
                         tail = "\n".join(part for part in (checkout_tail, tail) if part)
                 self._role_error(role, spec.attempt_id, tail)
                 log.warning("%s Job exited %s: %s", role, code, tail[-1000:])
+            if role in COLLECTION_ROLES and code >= 0:
+                self._collection_role_exits[key] = code
             return code
         except asyncio.CancelledError:
             interrupted = True
@@ -4350,9 +4373,14 @@ class KubernetesProvider:
         finally:
             if not (interrupted and preserve_on_cancel):
                 with contextlib.suppress(KubernetesApiError):
-                    await self._call(self.client.delete, "jobs", name)
+                    await self._call(
+                        self.client.delete,
+                        "jobs",
+                        name,
+                        grace_period_seconds=0 if role == k8sspec.ROLE_VERIFIER else None,
+                    )
                 try:
-                    await self._await_job_pods_gone(name)
+                    await self._await_job_pods_gone(name, force=role == k8sspec.ROLE_VERIFIER)
                 except (ProviderError, KubernetesApiError) as exc:
                     if not tolerate_lingering_pod:
                         raise
@@ -4769,36 +4797,103 @@ class KubernetesProvider:
             else None
         )
 
-    async def _await_pod_gone(self, name: str, *, timeout: float = 15) -> None:
-        """Wait for an asynchronous Pod deletion before recording workspace state."""
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
+    async def _clear_collection_pods(self, attempt_id: str) -> None:
+        """Finish earlier cleanup before any collection step touches the workspace.
+
+        Listing by attempt also covers reader Pods and a provider restart, when the
+        process has forgotten which deletion was pending.
+        """
+        try:
+            for role in COLLECTION_ROLES:
+                name = k8sspec.object_name(OBJECT_PREFIX[role], attempt_id)
+                await self._call(
+                    self.client.delete,
+                    "jobs",
+                    name,
+                    grace_period_seconds=0 if role == k8sspec.ROLE_VERIFIER else None,
+                )
+                await self._await_job_pods_gone(name, force=role == k8sspec.ROLE_VERIFIER)
+            rows = await self._call(
+                self.client.list_objects,
+                "pods",
+                label_selector=k8sspec.selector(
+                    **{
+                        k8sspec.LABEL_ATTEMPT: attempt_id,
+                        k8sspec.LABEL_ROLE: k8sspec.ROLE_READER,
+                    }
+                ),
+            )
+            for row in rows:
+                name = str(row["metadata"]["name"])
+                await self._call(self.client.delete, "pods", name, grace_period_seconds=0)
+                await self._await_pod_gone(name)
+        except KubernetesUnavailableError as exc:
+            raise CollectionUnavailableError(
+                f"collection cleanup could not reach the API: {exc}"
+            ) from exc
+
+    @staticmethod
+    def _deletion_timeout(pod: Mapping[str, Any]) -> float:
+        grace = (pod.get("spec") or {}).get("terminationGracePeriodSeconds")
+        return (
+            float(grace if grace is not None else DEFAULT_POD_GRACE_SECONDS)
+            + POD_DELETION_MARGIN_SECONDS
+        )
+
+    async def _await_pod_gone(self, name: str, *, timeout: float = 35) -> None:
+        """Wait at least the Pod's grace plus a margin before deferring collection."""
+        started = time.monotonic()
+        timeout = max(timeout, self._deletion_timeout({}))
+        unavailable = False
+        while time.monotonic() < started + timeout:
             try:
-                await self._call(self.client.get, "pods", name)
+                pod = await self._call(self.client.get, "pods", name)
+                timeout = max(timeout, self._deletion_timeout(pod))
+                unavailable = False
             except KubernetesUnavailableError:
-                pass
+                unavailable = True
             except KubernetesApiError as exc:
                 if exc.status == 404:
                     return
                 raise
             await asyncio.sleep(self.config.poll_interval_seconds)
-        raise ProviderError(f"Pod {name!r} was still present after {timeout:g} seconds")
+        reason = "the API was unavailable" if unavailable else "it was still present"
+        raise CollectionPendingError(
+            f"Pod {name!r} deletion was not confirmed after {timeout:g} seconds: {reason}"
+        )
 
-    async def _await_job_pods_gone(self, job_name: str, *, timeout: float = 15) -> None:
-        """Wait for background Job propagation to remove its Pod."""
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
+    async def _await_job_pods_gone(
+        self, job_name: str, *, timeout: float = 35, force: bool = False
+    ) -> None:
+        """Wait for background propagation; stateless verifier Pods need no grace."""
+        started = time.monotonic()
+        timeout = max(timeout, self._deletion_timeout({}))
+        unavailable = False
+        while time.monotonic() < started + timeout:
             try:
                 rows = await self._call(
                     self.client.list_objects, "pods", label_selector=f"job-name={job_name}"
                 )
+                if not rows:
+                    return
+                for row in rows:
+                    timeout = max(timeout, self._deletion_timeout(row))
+                    if force:
+                        # A Job's DeleteOptions do not set its dependent Pods' grace.
+                        await self._call(
+                            self.client.delete,
+                            "pods",
+                            str(row["metadata"]["name"]),
+                            grace_period_seconds=0,
+                        )
+                unavailable = False
             except KubernetesUnavailableError:
-                rows = [{}]
-            if not rows:
-                return
+                unavailable = True
             await asyncio.sleep(self.config.poll_interval_seconds)
-        raise ProviderError(
-            f"Pods for Job {job_name!r} were still present after {timeout:g} seconds"
+        reason = "the API was unavailable" if unavailable else "Pods were still present"
+        raise CollectionPendingError(
+            f"Pods for Job {job_name!r} deletion was not confirmed "
+            f"after {timeout:g} seconds: {reason}"
         )
 
     async def _job_tail(

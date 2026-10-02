@@ -800,21 +800,29 @@ async def test_job_cleanup_waits_for_background_pod_deletion() -> None:
     assert polls == 1
 
 
-async def test_waits_fail_when_a_deleted_pod_survives_the_timeout() -> None:
+async def test_waits_fail_when_a_deleted_pod_survives_the_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     api, _registry, provider = build()
     api.create("pods", {"metadata": {"name": "surviving-pod"}})
 
+    ticks = iter((0.0, 36.0))
+    monkeypatch.setattr(kubernetes_module, "time", SimpleNamespace(monotonic=lambda: next(ticks)))
     with pytest.raises(ProviderError, match=r"surviving-pod.*still present"):
         await provider._await_pod_gone("surviving-pod", timeout=0)
 
 
-async def test_waits_fail_when_a_deleted_job_pod_survives_the_timeout() -> None:
+async def test_waits_fail_when_a_deleted_job_pod_survives_the_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     api, _registry, provider = build()
     api.create(
         "pods",
         {"metadata": {"name": "surviving-job-pod", "labels": {"job-name": "surviving-job"}}},
     )
 
+    ticks = iter((0.0, 36.0))
+    monkeypatch.setattr(kubernetes_module, "time", SimpleNamespace(monotonic=lambda: next(ticks)))
     with pytest.raises(ProviderError, match=r"surviving-job.*still present"):
         await provider._await_job_pods_gone("surviving-job", timeout=0)
 
@@ -825,7 +833,7 @@ async def test_role_policy_is_removed_when_the_pod_deletion_wait_fails(
     api, _registry, provider = build()
     launch = spec()
 
-    async def pod_wait_fails(_job_name: str, *, timeout: float = 15) -> None:
+    async def pod_wait_fails(_job_name: str, *, timeout: float = 35, force: bool = False) -> None:
         del timeout
         raise ProviderError("Pod was still present")
 
