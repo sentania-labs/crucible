@@ -66,21 +66,34 @@ def load_routing(uow: UnitOfWork, policy_document: dict[str, Any]) -> RoutingPol
 
 def current_routing_version(uow: UnitOfWork, policy_document: dict[str, Any]) -> int | None:
     """hades #254: the routing version an attempt routes with now. A pinned reference
-    keeps its version; an unpinned one follows the newest live version of the routing
-    policy it names, so a correction or retry never routes with a model the routing
-    policy has since removed or disabled. The policy snapshot itself is not changed."""
+    keeps its version; an unpinned one follows the newest published version of the
+    routing policy it names, so a correction or retry never routes with a model the
+    routing policy has since removed or disabled. The policy snapshot is not changed.
+
+    A version counts as published when it is not retired and some policy references
+    it, as `publish_routing` always writes: a version only uploaded with
+    PUT /routing/{name}/{version} has no egress set for it yet and is never chosen.
+    Only versions newer than the referenced one are considered, so when the referenced
+    version is retired and nothing newer is published the attempt keeps the referenced
+    version rather than falling back to an older one."""
     ref = routing_ref(policy_document)
     if ref is None:
         return None
     name, version = ref
     if (policy_document.get("routing") or {}).get("policy", {}).get("pinned") is True:
         return version
-    live = [
-        record.version
-        for record in uow.routing_policies.list_versions(name)
-        if record.retired_at is None
-    ]
-    return max(live, default=version)
+    newer = sorted(
+        (
+            record.version
+            for record in uow.routing_policies.list_versions(name)
+            if record.version > version and record.retired_at is None
+        ),
+        reverse=True,
+    )
+    return next(
+        (candidate for candidate in newer if uow.routing_policies.is_referenced(name, candidate)),
+        version,
+    )
 
 
 def load_attempt_routing(

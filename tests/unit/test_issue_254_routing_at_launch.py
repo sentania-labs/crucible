@@ -14,21 +14,39 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Sequence
+from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
+from crucible.application.errors import ConflictError
+from crucible.application.policies import put_routing_policy
 from crucible.application.routing import current_routing_version, load_attempt_routing
 from crucible.application.supervisor import _Pending
-from crucible.domain.entities import Attempt, Execution, RoutingPolicyRecord
+from crucible.domain.entities import (
+    Attempt,
+    AttemptMetrics,
+    Execution,
+    ExecutionRole,
+    Principal,
+    Role,
+    RoutingPolicyRecord,
+)
 from crucible.domain.events import EventKind
-from crucible.domain.lifecycle import AttemptState
+from crucible.domain.exit_class import ExitClass
+from crucible.domain.lifecycle import AttemptState, ExecutionState, TaskState
+from crucible.ports.execution import Workspace
 from tests.fixtures import FakeClock
 from tests.unit.test_issue_360_ready_for_merge_correction import (
     NOW,
+    TASK_ID,
     _attach,
     _correction,
     _correction_attempt,
+    _NoHistory,
     _ready_for_merge,
     _routing,
     _Store,
@@ -37,10 +55,18 @@ from tests.unit.test_issue_360_ready_for_merge_correction import (
 
 
 class _RoutingVersions:
-    """The routing policy repository over every stored version of every routing policy."""
+    """The routing policy repository over every stored version of every routing policy.
+    Every version is referenced by a policy, as `publish_routing` leaves it, unless it
+    is named in `unpublished` (uploaded with PUT /routing/{name}/{version} only)."""
 
-    def __init__(self, records: Sequence[RoutingPolicyRecord]) -> None:
+    def __init__(
+        self, records: Sequence[RoutingPolicyRecord], unpublished: Sequence[int] = ()
+    ) -> None:
         self.records = list(records)
+        self.unpublished = set(unpublished)
+
+    def is_referenced(self, name: str, version: int) -> bool:
+        return version not in self.unpublished and self.get(name, version) is not None
 
     def get(self, name: str, version: int) -> RoutingPolicyRecord | None:
         return next(
@@ -182,3 +208,189 @@ def test_a_routed_attempt_keeps_the_version_it_was_routed_with() -> None:
     assert routing.model("gpt-test") is not None
     current = load_attempt_routing(store.uow(), policy)
     assert current is not None and current.version == 4
+
+
+def test_a_version_only_uploaded_is_not_the_current_one(tmp_path: Path) -> None:
+    """A version no policy references was never published: publish_routing has not set
+    the egress for it, so an unpinned correction keeps routing with the published one."""
+    store = _store(_version(4, [_model("gpt-new")]))
+    store.routing_policies.unpublished = {4}  # type: ignore[attr-defined]
+
+    assert current_routing_version(store.uow(), store.policies.policy.document) == 3
+    _execution, attempt = _route_correction(store, tmp_path)
+    assert attempt.selected_model == "gpt-test"
+    assert attempt.routing_version == 3
+
+
+def test_a_retired_reference_never_falls_back_to_an_older_version() -> None:
+    """The referenced version retired with nothing newer published: the attempt keeps the
+    referenced version, not an older live one."""
+    store = _store(_version(4, [_model("gpt-new")]))
+    store.routing_policies.records.insert(  # type: ignore[attr-defined]
+        0, _version(2, [_model("gpt-old")])
+    )
+    store.routing_policies.records = [  # type: ignore[attr-defined]
+        replace(r, retired_at=NOW) if r.version in (3, 4) else r
+        for r in store.routing_policies.records  # type: ignore[attr-defined]
+    ]
+
+    assert current_routing_version(store.uow(), store.policies.policy.document) == 3
+
+
+class _Metrics(_NoHistory):
+    """Routing's empty history, keeping the metrics row the reservation writes."""
+
+    def __init__(self, rows: list[AttemptMetrics]) -> None:
+        self.rows = rows
+
+    def put(self, metrics: AttemptMetrics) -> None:
+        self.rows.append(metrics)
+
+
+def _local(version: int) -> RoutingPolicyRecord:
+    """A routing version that moved gpt-new to a local endpoint in a pool of its own."""
+    model = _model("gpt-new")
+    model.update(endpoint="local", endpoint_url="http://gateway:4000/v1", pool="gateway")
+    record = _version(version, [model])
+    record.document["pools"]["gateway"] = dict(record.document["pools"]["openai-sub"])
+    return record
+
+
+@pytest.mark.asyncio
+async def test_the_launch_reservation_and_exit_read_the_version_routed_with(
+    tmp_path: Path,
+) -> None:
+    """Routed at v4, then v5 moves the model to a local endpoint in another pool: the
+    spec, the pool reservation and the local cap check all still use v4."""
+    store = _store(_version(4, [_model("gpt-test", enabled=False), _model("gpt-new")]))
+    execution, attempt = _route_correction(store, tmp_path)
+    assert attempt.routing_version == 4
+    store.routing_policies.records.append(_local(5))  # type: ignore[attr-defined]
+    assert current_routing_version(store.uow(), execution.policy_snapshot) == 5
+    supervisor, _provider = _supervisor(store, FakeClock(NOW), tmp_path)
+
+    requested: list[str] = []
+
+    def setting(name: str) -> None:
+        requested.append(name)
+
+    store.provider_settings = SimpleNamespace(get=setting)  # type: ignore[attr-defined]
+    task = store.tasks.get(attempt.task_id)
+    stored = store.contracts.get(attempt.task_id, execution.contract_version)
+    assert task is not None and stored is not None
+    await supervisor._build_spec(attempt, execution, task, stored.document)
+    # A local codex endpoint would read the Hermes settings instead.
+    assert requested == ["harness.codex"]
+
+    metrics: list[AttemptMetrics] = []
+    store.attempt_metrics = _Metrics(metrics)
+    root = tmp_path / "ws"
+    workspace = Workspace(
+        attempt_id=attempt.id,
+        checkout_path=str(root / "repo"),
+        identity_path=str(root / "identity"),
+        report_path=str(root / "report"),
+    )
+    assert supervisor._mark_launching(attempt.id, workspace)
+    reserved = next(
+        e.payload
+        for e in store.events.rows
+        if e.kind == EventKind.QUOTA_RESERVED.value and e.attempt_id == attempt.id
+    )
+    assert reserved["pool"] == "openai-sub"
+    assert [(m.endpoint_kind, m.pool) for m in metrics] == [("subscription", "openai-sub")]
+
+    launched = store.attempts.get(attempt.id)
+    assert launched is not None
+    assert (
+        supervisor._local_cap(
+            store.uow(), execution, launched, ExitClass.TIMEOUT, turn_cap_reached=True
+        )
+        is None
+    )
+    # The v5 entry would have named the local turn cap.
+    assert (
+        supervisor._local_cap(
+            store.uow(), execution, replace(launched, routing_version=5), ExitClass.TIMEOUT, True
+        )
+        == "turns"
+    )
+
+
+def _review(store: _Store) -> Attempt:
+    """A pending internal review of the task: reviews are never routed."""
+    task = store.tasks.get(TASK_ID)
+    assert task is not None
+    task.state = TaskState.AWAITING_INTERNAL_REVIEW
+    implement = store.executions.list_for_task(TASK_ID)[0]
+    review = replace(
+        implement,
+        id="01EXEC254REVIEW0000000001",
+        role=ExecutionRole.REVIEW,
+        state=ExecutionState.CREATED,
+    )
+    store.executions.add(review)
+    attempt = Attempt(
+        id="01ATTEMPT254REVIEW0000001",
+        execution_id=review.id,
+        task_id=TASK_ID,
+        number=1,
+        state=AttemptState.PENDING,
+        created_at=NOW,
+    )
+    store.attempts.add(attempt)
+    return attempt
+
+
+def test_a_review_records_the_routing_version_it_launches_with(tmp_path: Path) -> None:
+    store = _store(_version(4, [_model("gpt-test")]))
+    attempt = _review(store)
+    supervisor, _provider = _supervisor(store, FakeClock(NOW), tmp_path)
+
+    assert supervisor._mark_preparing(attempt.id)
+
+    preparing = store.attempts.get(attempt.id)
+    assert preparing is not None and preparing.state is AttemptState.PREPARING
+    assert preparing.routing_version == 4
+    assert supervisor._review_model_refusal(attempt.id) is None
+
+
+def test_a_review_whose_model_is_disabled_now_is_refused(tmp_path: Path) -> None:
+    store = _store(_version(4, [_model("gpt-test", enabled=False), _model("gpt-new")]))
+    attempt = _review(store)
+    supervisor, _provider = _supervisor(store, FakeClock(NOW), tmp_path)
+
+    assert supervisor._mark_preparing(attempt.id)
+
+    refusal = supervisor._review_model_refusal(attempt.id)
+    assert refusal is not None and "gpt-test is disabled in routing policy" in refusal
+    assert "default-routing/4" in refusal
+
+
+def test_a_version_an_attempt_routed_with_cannot_be_rewritten() -> None:
+    record = _version(4, [_model("gpt-new")])
+    uow: Any = SimpleNamespace(
+        routing_policies=SimpleNamespace(
+            get=lambda name, version: record, is_referenced=lambda name, version: False
+        ),
+        attempts=SimpleNamespace(
+            routes_with=lambda name, version: (
+                (name, version)
+                == (
+                    "default-routing",
+                    4,
+                )
+            )
+        ),
+    )
+    principal = Principal(id="op", name="operator", role=Role.OPERATOR, created_at=NOW)
+
+    with pytest.raises(ConflictError, match="routed with by an attempt"):
+        put_routing_policy(
+            uow,
+            FakeClock(NOW),
+            principal=principal,
+            name="default-routing",
+            version=4,
+            document=copy.deepcopy(record.document),
+        )

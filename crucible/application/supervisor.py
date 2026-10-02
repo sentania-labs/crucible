@@ -61,6 +61,7 @@ from crucible.application.review import (
 )
 from crucible.application.routing import (
     count_blocking_failures,
+    current_routing_version,
     load_attempt_routing,
     reserve,
     select_model,
@@ -1480,6 +1481,11 @@ class Supervisor:
                 return None
         elif not await self._db(partial(self._mark_preparing, attempt.id)):
             return None
+        else:
+            refusal = await self._db(partial(self._review_model_refusal, attempt.id))
+            if refusal is not None:
+                await self._db(partial(self._refuse_launch, attempt.id, "routing", refusal))
+                return None
         return item, provider
 
     async def _finish_launch(self, item: _Pending, provider: ExecutionProvider) -> bool:
@@ -2456,6 +2462,13 @@ class Supervisor:
             )
             if attempt.state is not AttemptState.PENDING or task.state not in allowed:
                 return False
+            if review and attempt.routing_version is None:
+                # hades #254: a review is not routed, so the routing version it launches
+                # with is recorded here; the spec, the reservation, the harness count
+                # and the exit then read this version, not a newer one.
+                attempt.routing_version = current_routing_version(
+                    uow, execution.policy_snapshot or {}
+                )
             move_attempt(
                 uow, self._clock, attempt, AttemptState.PREPARING, EventKind.ATTEMPT_PREPARING
             )
@@ -2476,6 +2489,26 @@ class Supervisor:
                 )
             uow.commit()
             return True
+
+    def _review_model_refusal(self, attempt_id: str) -> str | None:
+        """hades #254: a review whose model is disabled in the routing version recorded
+        on it is refused rather than launched."""
+        with self._uow_factory() as uow:
+            attempt = uow.attempts.get(attempt_id)
+            assert attempt is not None
+            execution = uow.executions.get(attempt.execution_id)
+            assert execution is not None
+            routing = load_attempt_routing(
+                uow, execution.policy_snapshot or {}, attempt.routing_version
+            )
+            model = routing.model(execution.model) if routing is not None else None
+            if routing is None or model is None or model.enabled:
+                return None
+            reason = f": {model.disabled_reason}" if model.disabled_reason else ""
+            return (
+                f"model {model.id} is disabled in routing policy "
+                f"{routing.name}/{routing.version}{reason}"
+            )
 
     def _release_attempt_checkout(self, attempt_id: str) -> None:
         with self._fenced() as uow:
