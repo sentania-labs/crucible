@@ -70,18 +70,32 @@ async def test_local_attempt_records_pool_and_routing_version(
 
 
 @pytest.mark.parametrize("holding_state", CREDENTIAL_HOLDING_STATES)
+@pytest.mark.parametrize("review", [False, True])
 async def test_third_local_launch_waits_until_a_pool_slot_is_released(
-    monkeypatch: pytest.MonkeyPatch, holding_state: AttemptState
+    monkeypatch: pytest.MonkeyPatch, holding_state: AttemptState, review: bool
 ) -> None:
     supervisor, first, uow = _setup(monkeypatch)
     items = [
         replace(
             first,
-            attempt=replace(first.attempt, id=f"attempt-{i}", execution_id=f"execution-{i}"),
-            execution=replace(first.execution, id=f"execution-{i}"),
+            attempt=replace(
+                first.attempt, id=f"attempt-{i}", execution_id=f"execution-{i}", task_id=f"task-{i}"
+            ),
+            execution=replace(first.execution, id=f"execution-{i}", task_id=f"task-{i}"),
+            task=replace(first.task, id=f"task-{i}"),
         )
         for i in range(3)
     ]
+    if review:
+        for item, harness in zip(items, ["codex", "hermes", "codex"], strict=True):
+            item.execution.role = ExecutionRole.REVIEW
+            item.execution.harness = harness
+            item.execution.model = f"{harness}-local"
+            item.execution.image = "review-image"
+            item.task.state = TaskState.AWAITING_INTERNAL_REVIEW
+    uow.tasks.get.side_effect = lambda task_id, **_: next(
+        item.task for item in items if item.task.id == task_id
+    )
     uow.executions.get.side_effect = lambda execution_id, **_: next(
         item.execution for item in items if item.execution.id == execution_id
     )
