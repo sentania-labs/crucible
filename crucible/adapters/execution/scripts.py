@@ -250,6 +250,13 @@ CACHE_REFRESH_CONNECT_SECONDS = 20
 # review diff within that existing ingestion bound as well as the configured report cap.
 DIFF_ARTIFACT_CAP_BYTES = 4 * 1024 * 1024
 
+# hades #344: the collector's own output directory for the review diff. It is outside
+# `report/`, which holds the worker's copied files, so neither can overwrite the other.
+REVIEW_DIFF_DIR = "crucible-review"
+
+# Every diff the collector runs: no textconv, no external diff driver, binary as text.
+_DIFF_FLAGS = "--no-ext-diff --no-textconv --text"
+
 
 def _cache_refresh(cache_dir: str) -> str:
     """Fetch into the bare mirror, or clone it when it is absent or will not fetch; and
@@ -550,6 +557,7 @@ QUOTA={_quote("1" if quota_checkpoint else "")}
 POLICY_AUTHOR_EMAIL={_quote(author_email)}
 TRAILER={_quote(commit_trailer)}
 TRAILER_VALUE={_quote(trailer_value or attempt_id)}
+REVIEW_DIFF_ERROR=
 mkdir -p "$OUT"
 : > "$OUT/copy-rejections.tsv"
 {_COPY_REPORT}
@@ -648,9 +656,14 @@ if [ -n "$BASE" ]; then
   # the base branch gained after the fork do not become worker changes.
   # The log stays two-dot: it enumerates only commits
   # reachable from HEAD and not BASE, and unions in every path those commits touched.
-  {GIT} -C "$REPO" diff --stat "$MB" HEAD > "$OUT/diffstat.txt" || true
-  {GIT} -C "$REPO" diff --no-color --no-ext-diff "$MB" HEAD > "$OUT/diff.patch" || true
-  {GIT} -C "$REPO" diff --name-only "$MB" HEAD > "$OUT/changed.txt" || true
+  # `--no-textconv --text --no-ext-diff`: the worker's own .git/config is back in
+  # place, so a diff.<driver>.textconv or external command it set with a matching
+  # .gitattributes would otherwise run here and could hide hunks from every diff.
+  {GIT} -C "$REPO" diff {_DIFF_FLAGS} --stat "$MB" HEAD > "$OUT/diffstat.txt" \
+    || REVIEW_DIFF_ERROR="git diff --stat failed"
+  {GIT} -C "$REPO" diff {_DIFF_FLAGS} --no-color "$MB" HEAD > "$OUT/diff.patch" \
+    || REVIEW_DIFF_ERROR="git diff failed"
+  {GIT} -C "$REPO" diff {_DIFF_FLAGS} --name-only "$MB" HEAD > "$OUT/changed.txt" || true
   {GIT} -C "$REPO" log --format='%H%x1f%s%x1f%an%x1e' "$BASE"..HEAD > "$OUT/log.txt" || true
   {GIT} -C "$REPO" log --name-only --format='' "$BASE"..HEAD \
     | LC_ALL=C sort -u | sed '/^$/d' > "$OUT/commit-paths.txt" || true
@@ -669,6 +682,7 @@ if [ -n "$BASE" ]; then
     echo done > "$OUT/commit-policy/checked"
   fi
 else
+  REVIEW_DIFF_ERROR="the base ref could not be resolved"
   : > "$OUT/diffstat.txt"; : > "$OUT/diff.patch"; : > "$OUT/changed.txt"
   : > "$OUT/log.txt"; : > "$OUT/commit-paths.txt"; echo 0 > "$OUT/commits.txt"
 fi
@@ -676,31 +690,41 @@ fi
 rm -rf "$OUT/tree"
 {GIT} clone --no-hardlinks --quiet "$REPO" "$OUT/tree" > "$OUT/clone.log" 2>&1 || true
 copy_report "{REPORT_MOUNT}" "$OUT/report" "$SIZE_CAP"
-# This is separate from the raw diff above, whose content and location are inputs to
-# existing gates. The review artifact begins with the stat and has an explicit marker
-# when its bounded copy cannot contain the complete patch.
-DIFF_REVIEW=/tmp/crucible-review-diff.$$
-{{
-  cat "$OUT/diffstat.txt"
-  printf '\n'
-  cat "$OUT/diff.patch"
-}} > "$DIFF_REVIEW"
-DIFF_REVIEW_SIZE=$(wc -c < "$DIFF_REVIEW")
-if [ "$DIFF_REVIEW_SIZE" -le "$DIFF_ARTIFACT_CAP" ]; then
-  cat "$DIFF_REVIEW" > "$OUT/report/diff.patch"
-else
-  TRUNCATION_MARKER='[crucible: diff truncated]'
-  MARKER_SIZE=$(printf '\n%s\n' "$TRUNCATION_MARKER" | wc -c)
-  KEEP=$((DIFF_ARTIFACT_CAP - MARKER_SIZE))
-  if [ "$KEEP" -gt 0 ]; then
-    head -c "$KEEP" "$DIFF_REVIEW" > "$OUT/report/diff.patch"
-    printf '\n%s\n' "$TRUNCATION_MARKER" >> "$OUT/report/diff.patch"
-  else
-    printf '%s\n' "$TRUNCATION_MARKER" | head -c "$DIFF_ARTIFACT_CAP" \
-      > "$OUT/report/diff.patch"
+# hades #344: the review diff, written where only the collector writes (never under the
+# worker's report directory) and separate from the raw diff above, whose content and
+# location are inputs to existing gates. It streams the stat and the patch already on
+# disk into a bounded copy with an explicit marker when it cannot hold the whole patch,
+# and any failure leaves a short marker rather than failing the collection.
+build_review_diff() {{
+  target="$OUT/{REVIEW_DIFF_DIR}/diff.patch"
+  rm -rf "$OUT/{REVIEW_DIFF_DIR}" || return 1
+  mkdir -p "$OUT/{REVIEW_DIFF_DIR}" || return 1
+  if [ -n "$REVIEW_DIFF_ERROR" ]; then
+    printf 'diff unavailable: %s\n' "$REVIEW_DIFF_ERROR" > "$target" || return 1
+    return 0
   fi
+  stat_size=$(wc -c < "$OUT/diffstat.txt") || return 1
+  patch_size=$(wc -c < "$OUT/diff.patch") || return 1
+  marker='[crucible: diff truncated]'
+  if [ $((stat_size + 1 + patch_size)) -le "$DIFF_ARTIFACT_CAP" ]; then
+    {{ cat "$OUT/diffstat.txt"; printf '\n'; cat "$OUT/diff.patch"; }} > "$target" || return 1
+    return 0
+  fi
+  keep=$((DIFF_ARTIFACT_CAP - $(printf '\n%s\n' "$marker" | wc -c)))
+  if [ "$keep" -gt 0 ]; then
+    {{ cat "$OUT/diffstat.txt"; printf '\n'; cat "$OUT/diff.patch"; }} \
+      | head -c "$keep" > "$target" || return 1
+    printf '\n%s\n' "$marker" >> "$target" || return 1
+  else
+    printf '%s\n' "$marker" | head -c "$DIFF_ARTIFACT_CAP" > "$target" || return 1
+  fi
+}}
+if ! build_review_diff 2>/dev/null; then
+  rm -rf "$OUT/{REVIEW_DIFF_DIR}" 2>/dev/null || true
+  mkdir -p "$OUT/{REVIEW_DIFF_DIR}" 2>/dev/null || true
+  printf 'diff unavailable: %s\n' "the review diff could not be written" \
+    > "$OUT/{REVIEW_DIFF_DIR}/diff.patch" 2>/dev/null || true
 fi
-rm -f "$DIFF_REVIEW"
 echo done > "$OUT/collector.ok"
 """
 

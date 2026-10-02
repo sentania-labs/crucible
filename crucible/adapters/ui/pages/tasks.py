@@ -25,8 +25,9 @@ from crucible.application.queries import attempt_report, pull_request_view, task
 from crucible.contracts.api import (
     DecisionRequest,
 )
-from crucible.domain.entities import Role
-from crucible.domain.events import EventKind
+from crucible.contracts.evidence import REVIEW_DIFF_NAME, REVIEW_DIFF_TYPE
+from crucible.domain.entities import Artifact, Role
+from crucible.domain.events import PRINCIPAL_CRUCIBLE, EventKind
 from crucible.domain.lifecycle import TaskState
 from crucible.domain.waivers import ACCEPT_NO_CI, WAIVABLE_STATES, WAIVE_EXTERNAL_REVIEW
 
@@ -238,9 +239,19 @@ def _task_link(task_id: str, external_id: str | None) -> dict[str, str]:
     return {"kind": "link", "href": f"/ui/tasks/{quote(task_id)}", "label": external_id or task_id}
 
 
+def _is_review_diff(artifact: Artifact) -> bool:
+    """hades #344: only the collector's own diff, never an artifact a principal uploaded,
+    whose type, name, and content type are the uploader's to choose."""
+    return (
+        artifact.created_by == PRINCIPAL_CRUCIBLE
+        and artifact.type == REVIEW_DIFF_TYPE
+        and artifact.filename == REVIEW_DIFF_NAME
+    )
+
+
 def _attempt_diff_link(uow: UoW, attempt_id: str) -> dict[str, str] | str:
     for artifact in uow.artifacts.list_for_attempt(attempt_id):
-        if artifact.type == "diff" and artifact.filename == "report/diff.patch":
+        if _is_review_diff(artifact):
             return {
                 "kind": "link",
                 "href": f"/ui/artifacts/{quote(artifact.id)}/content",
@@ -439,7 +450,6 @@ def task_page(request: Request, task_id: str, ctx: Ctx, uow: UoW) -> Response:
             ],
         }
     )
-
     if principal.role is Role.ADMIN and view.state in WAIVABLE_STATES:
         for kind, title, note, resolves in WAIVER_FORMS:
             sections.append(
@@ -476,14 +486,22 @@ def task_page(request: Request, task_id: str, ctx: Ctx, uow: UoW) -> Response:
 
 @router.get("/artifacts/{artifact_id}/content")
 def artifact_content(request: Request, artifact_id: str, ctx: Ctx, uow: UoW) -> Response:
+    """The collector's review diff (hades #344), as inert text on the UI's origin: any
+    other artifact is refused here, and the bytes are never rendered as markup."""
     found = _require(request, ctx, uow)
     if isinstance(found, RedirectResponse):
         return found
+    artifact = uow.artifacts.get(artifact_id)
+    if artifact is None or not _is_review_diff(artifact):
+        return Response("not found\n", status_code=404, media_type="text/plain; charset=utf-8")
     artifact, content = read_artifact(uow, ctx.artifact_store, artifact_id)
     return Response(
         content=content,
-        media_type=artifact.content_type,
+        media_type="text/plain; charset=utf-8",
         headers={
+            "X-Content-Type-Options": "nosniff",
+            "Content-Security-Policy": "sandbox; default-src 'none'",
+            "Content-Disposition": 'inline; filename="diff.patch"',
             "X-Crucible-Artifact-Sha256": artifact.sha256,
         },
     )

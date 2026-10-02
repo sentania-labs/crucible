@@ -20,6 +20,7 @@ from typing import Any
 import yaml
 
 from crucible.adapters.execution import scripts
+from crucible.contracts.evidence import REVIEW_DIFF_NAME, REVIEW_DIFF_TYPE
 from crucible.ports.execution import (
     BranchBundle,
     CollectedArtifact,
@@ -140,11 +141,23 @@ def read_outputs(
             artifacts.append(
                 CollectedArtifact(
                     name=name,
-                    type="diff" if name == "report/diff.patch" else "run_evidence",
+                    type="run_evidence",
                     content=path.read_bytes()[: 4 * 1024 * 1024],
-                    content_type=("text/x-diff" if name == "report/diff.patch" else "text/plain"),
+                    content_type="text/plain",
                 )
             )
+    # hades #344: the collector's review diff, from its own directory, never a file the
+    # worker wrote under report/.
+    review_diff = output / scripts.REVIEW_DIFF_DIR / "diff.patch"
+    if review_diff.is_file() and not review_diff.is_symlink():
+        artifacts.append(
+            CollectedArtifact(
+                name=REVIEW_DIFF_NAME,
+                type=REVIEW_DIFF_TYPE,
+                content=review_diff.read_bytes()[: 4 * 1024 * 1024],
+                content_type="text/x-diff",
+            )
+        )
     for run in verifications:
         artifacts.append(
             CollectedArtifact(

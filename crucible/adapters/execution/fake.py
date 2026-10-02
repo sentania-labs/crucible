@@ -41,6 +41,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from crucible.contracts.evidence import REVIEW_DIFF_NAME, REVIEW_DIFF_TYPE
 from crucible.ports.execution import (
     BranchBundle,
     CancelCheck,
@@ -663,8 +664,8 @@ class FakeProvider:
             ]
             artifacts.append(
                 CollectedArtifact(
-                    name="report/diff.patch",
-                    type="diff",
+                    name=REVIEW_DIFF_NAME,
+                    type=REVIEW_DIFF_TYPE,
                     content=synthetic_review_diff(paths, behavior).encode(),
                     content_type="text/x-diff",
                 )
