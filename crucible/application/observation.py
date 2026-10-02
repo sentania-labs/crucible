@@ -1095,18 +1095,32 @@ def observe_state(
         settle_pull_request_state(uow, clock, task=task, pull_request=pull_request)
 
 
-def last_push(uow: UnitOfWork, task: Task, pull_request: PullRequest) -> tuple[str | None, bool]:
-    """The last head Crucible pushed to the work branch and confirmed on the remote
-    (hades #379), and whether that push was a quota checkpoint: the latest
-    `branch_pushed`, or the PR's recorded head when there is none. A correction's
-    collected head that never reached the remote is not it. A checkpoint is pushed
-    before the attempt finishes, so it passed no gate and nobody accepted it."""
-    pushed = uow.events.latest_for_task_kind(task.id, EventKind.BRANCH_PUSHED.value)
-    payload = pushed.payload if pushed else {}
-    head = str(payload.get("head_sha") or "")
-    if head:
-        return head, bool(payload.get("checkpoint"))
-    return pull_request.head_sha or None, False
+def pushed_heads(
+    uow: UnitOfWork, task: Task, pull_request: PullRequest
+) -> tuple[dict[str, bool], str | None]:
+    """Heads Crucible confirmed on the work branch and the latest recorded one.
+
+    The PR's original head predates branch_pushed records and is included as a pushed
+    head. The bool records whether a head was only pushed as a quota checkpoint.
+    """
+    heads: dict[str, bool] = {}
+    if pull_request.head_sha:
+        heads[pull_request.head_sha] = False
+    after = 0
+    latest = pull_request.head_sha or None
+    while True:
+        events = uow.events.list_for_task(task.id, after_seq=after, limit=1000)
+        if not events:
+            break
+        for event in events:
+            if event.kind != EventKind.BRANCH_PUSHED.value:
+                continue
+            head = str(event.payload.get("head_sha") or "")
+            if head:
+                heads[head] = bool(event.payload.get("checkpoint"))
+                latest = head
+        after = int(events[-1].seq or after)
+    return heads, latest
 
 
 def recorded_merged_head(uow: UnitOfWork, task: Task) -> str | None:
@@ -1168,11 +1182,13 @@ def settle_pull_request_state(
         head_matches = True
         checkpoint = False
         if correcting:
-            pushed, checkpoint = last_push(uow, task, pull_request)
+            heads, pushed = pushed_heads(uow, task, pull_request)
             merged = merged_head or recorded_merged_head(uow, task)
             # A merge recorded before #379 carries no head: GitHub merged what was on
             # the branch then, and that is the last head Crucible pushed.
-            head_matches = merged is None or merged == pushed
+            head_matches = merged is None or merged in heads
+            matched_head = merged or pushed
+            checkpoint = bool(matched_head and heads.get(matched_head, False))
             payload.update(
                 {
                     "merged_head": merged,
@@ -1184,17 +1200,17 @@ def settle_pull_request_state(
             )
             # The merged task's head is what is on the remote, not a corrected head that
             # was collected and never pushed.
-            task.head_sha = pushed
+            task.head_sha = matched_head
             if merged is None:
                 head_check = (
                     f"; the merge was recorded without its head, so the merged head is "
                     f"taken to be {pushed}, the last head Crucible pushed"
                 )
             elif head_matches:
-                head_check = f"; the merged head {merged} is the last head Crucible pushed"
+                head_check = f"; the merged head {merged} is a head Crucible pushed"
             else:
                 head_check = (
-                    f"; the merged head {merged} is not {pushed}, the last head Crucible pushed"
+                    f"; the merged head {merged} is not among the heads Crucible pushed"
                 )
             if head_matches and checkpoint:
                 head_check += (

@@ -292,7 +292,7 @@ def test_a_merge_before_the_corrected_head_is_pushed_skips_the_push(tmp_path: Pa
     assert store.escalations.list_for_task(TASK_ID) == []
     merged = _wakes(store, "merged")
     assert len(merged) == 1
-    assert f"the merged head {OLD_HEAD} is the last head Crucible pushed" in merged[0]
+    assert f"the merged head {OLD_HEAD} is a head Crucible pushed" in merged[0]
     assert _wakes(store, "publish_failed") == []
 
 
@@ -325,7 +325,7 @@ def test_a_merge_of_the_pushed_head_during_publishing_is_recorded_and_no_pr_is_o
     assert payload["merged_head_matches"] is True
     merged = _wakes(store, "merged")
     assert len(merged) == 1
-    assert f"the merged head {NEW_HEAD} is the last head Crucible pushed" in merged[0]
+    assert f"the merged head {NEW_HEAD} is a head Crucible pushed" in merged[0]
     assert store.escalations.list_for_task(TASK_ID) == []
     failed = store.events.latest_for_task_kind(TASK_ID, EventKind.TASK_PUBLISH_FAILED.value)
     assert failed is not None and failed.payload["pull_request"] == PR_NUMBER
@@ -351,7 +351,8 @@ def test_a_merged_head_that_is_not_the_pushed_head_is_recorded_and_escalated(
     assert payload["merged_head_matches"] is False
     escalations = store.escalations.list_for_task(TASK_ID)
     assert len(escalations) == 1
-    assert OTHER_HEAD in escalations[0].question and NEW_HEAD in escalations[0].question
+    assert OTHER_HEAD in escalations[0].question
+    assert "not among the heads Crucible pushed" in escalations[0].question
     merged = _wakes(store, "merged")
     assert len(merged) == 1
     assert f"the merged head {OTHER_HEAD} is not among the heads Crucible pushed" in merged[0]
@@ -745,6 +746,31 @@ def test_a_merge_of_a_quota_checkpoint_is_escalated_and_named(tmp_path: Path) ->
     assert "passed no gate" in escalations[0].question
     merged = _wakes(store, "merged")
     assert len(merged) == 1 and "quota checkpoint" in merged[0]
+
+
+def test_an_unseen_merge_of_an_earlier_pushed_head_ignores_a_later_checkpoint(
+    tmp_path: Path,
+) -> None:
+    store, clock, supervisor, github, publisher = _correcting(
+        tmp_path, until=TaskState.REPORTED
+    )
+    _execution, attempt = _correction_attempt(store)
+    attempt.exit_class = ExitClass.QUOTA_EXHAUSTED
+    _task(store).head_sha = NEW_HEAD
+
+    assert asyncio.run(
+        supervisor.delivery.push_quota_checkpoint(attempt.id, required=True)
+    ) == (True, "checkpoint pushed")
+
+    github.polled = _merged(OLD_HEAD)
+    clock.advance(300)
+    asyncio.run(supervisor.delivery.observe())
+
+    assert publisher.pushes == [NEW_HEAD]
+    assert _task(store).state is TaskState.MERGED
+    assert _task(store).head_sha == OLD_HEAD
+    assert _merged_event_payload(store)["merged_head_matches"] is True
+    assert store.escalations.list_for_task(TASK_ID) == []
 
 
 # ----- the gate pass locks only a merged correction ---------------------------
