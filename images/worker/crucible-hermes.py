@@ -21,8 +21,13 @@ when there is no ripgrep, and GNU grep applies that pattern to ROOT itself, so a
 of `.` (or of any root whose last component starts with a dot) finds nothing. The image
 now carries ripgrep, and the bootstrap also runs that grep from inside the root with no
 file operand, which grep never excludes, so only hidden directories below the root are
-skipped. Both patches are for Hermes 0.19.0 alone: the bootstrap refuses to start any
-other version rather than patch code it was not written against.
+skipped. The `cd` runs in a subshell: Hermes records the shell's directory after every
+command as the session's, and a search must not move the agent. Both patches are for
+Hermes 0.19.0 alone: the bootstrap refuses to start any other version rather than patch
+code it was not written against, and before Hermes starts, main() imports the patched
+module once on its own and stops the attempt if the fallback is not the 0.19.0 one.
+That check cannot be left to the import inside Hermes: Hermes's tool discovery catches
+every exception and only logs it, and would start without its file tools.
 """
 
 from __future__ import annotations
@@ -102,7 +107,9 @@ class _TurnBudget(importlib.abc.MetaPathFinder):
 
 
 # Hades #385. The 0.19.0 fallback, exactly: these lines are what the patch replaces the
-# effect of, so a Hermes whose fallback reads differently fails here, at import.
+# effect of, so a Hermes whose fallback reads differently fails here, at import. Inside
+# Hermes that failure would only be logged, so PREFLIGHT (below) imports the module on
+# its own first, where it stops the attempt.
 GREP_SHAPE = (
     "cmd_parts = [\"grep\", \"-rnH\"]",
     "cmd_parts.append(\"--exclude-dir='.*'\")",
@@ -117,7 +124,9 @@ class _RootedShell:
     # The file operations object as the fallback sees it, except that its grep command
     # runs from inside the root with no file operand. GNU grep applies --exclude-dir to
     # every operand it is given, `.` and `./` included, but never to the `.` it searches
-    # when it is given none; that `.` is also left out of the names it prints.
+    # when it is given none; that `.` is also left out of the names it prints. The cd is
+    # in a subshell: Hermes takes the shell's `pwd -P` after each command as the
+    # session's working directory, so a top-level cd would move the agent for good.
     def __init__(self, ops, root):
         self._ops = ops
         self._root = ops._escape_shell_arg(root)
@@ -130,8 +139,8 @@ class _RootedShell:
         if command.startswith(GREP_HEAD) and operand in command:
             before, _, after = command.rpartition(operand)
             command = (
-                f"set -o pipefail; cd -- {self._root} >/dev/null 2>&1 && grep -rnH "
-                f"{before[len(GREP_HEAD):]} | head -n {after}"
+                f"set -o pipefail; (cd -- {self._root} >/dev/null 2>&1 && exec grep -rnH "
+                f"{before[len(GREP_HEAD):]}) | head -n {after}"
             )
         return self._ops._exec(command, *args, **kwargs)
 
@@ -193,6 +202,23 @@ if LIMIT > 0:
     sys.meta_path.insert(0, _TurnBudget())
 sys.meta_path.insert(0, _GrepRoot())
 """.replace("@HERMES_VERSION@", HERMES_VERSION)
+
+# Run by main() before Hermes starts: the version check above, then the patched module
+# imported on its own, so a fallback of another shape exits non-zero here instead of
+# being swallowed by Hermes's tool discovery (hades #385).
+PREFLIGHT = (
+    PATCHES
+    + r"""
+try:
+    import tools.file_operations
+except RuntimeError as error:
+    raise SystemExit(str(error))
+"""
+)
+PREFLIGHT_FAILED = (
+    "crucible-hermes: the Hermes in this image is not the one its patches were written "
+    "for (hades #385); not starting it"
+)
 
 BOOTSTRAP = (
     PATCHES
@@ -321,6 +347,10 @@ def main() -> int:
     max_turns = _limit("CRUCIBLE_HERMES_MAX_TURNS")
     write_settings(home, _limit("CRUCIBLE_HERMES_CONTEXT_LENGTH"))
     argv = inline_identity(sys.argv[1:], os.environ.get("CRUCIBLE_HERMES_IDENTITY"))
+    # Hades #385: the patches are checked before Hermes starts; the reason is on stderr.
+    if subprocess.run([HERMES_PYTHON, "-P", "-c", PREFLIGHT], check=False).returncode != 0:
+        print(PREFLIGHT_FAILED, file=sys.stderr, flush=True)
+        return 2
     # Stdout stays inherited. Crucible's launch wrapper is the sole transcript writer.
     # -P: the working directory is the task's checkout, and a module there named like
     # one of Hermes's own (`cli`, `tools`, `agent`) must never be imported in its place.

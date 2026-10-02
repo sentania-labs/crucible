@@ -211,3 +211,136 @@ def test_the_patch_refuses_a_grep_fallback_it_was_not_written_for(tmp_path: Path
     assert result.returncode != 0
     assert "not the one hades #385 patches" in result.stderr
     assert "imported" not in result.stdout
+
+
+# Runs under the Hermes venv's Python after the wrapper's patches, with a terminal that
+# keeps its working directory the way Hermes's own environments do: the command runs in
+# bash from that directory, and the shell's `pwd -P` afterwards becomes the new one.
+_TRACKED = r"""
+import json
+import subprocess
+
+import tools.file_operations as file_operations
+
+checkout, search_path = sys.argv[1:3]
+MARKER = "__crucible_cwd__"
+
+
+class Terminal:
+    cwd = checkout
+
+    def execute(self, command, cwd=None, timeout=None, **_):
+        done = subprocess.run(
+            ["/bin/bash", "-c", f'cd -- "$0" || exit 126\n{command}\n__s=$?\n'
+             f'printf "\\n{MARKER}%s\\n" "$(pwd -P)"\nexit $__s', cwd or self.cwd],
+            env={"PATH": search_path},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        output, _, moved = done.stdout.rpartition(f"\n{MARKER}")
+        if moved.strip():
+            self.cwd = moved.strip()
+        return {"output": output + done.stderr, "returncode": done.returncode}
+
+
+terminal = Terminal()
+operations = file_operations.ShellFileOperations(terminal)
+searches = []
+for root in ("docs", "docs", "."):
+    searches.append(operations.search("AGENTS", path=root, output_mode="files_only").to_dict())
+print(json.dumps({"cwd": terminal.cwd, "searches": searches}))
+"""
+
+
+@needs_hermes
+def test_a_search_without_ripgrep_leaves_the_working_directory_where_it_was(
+    tmp_path: Path,
+) -> None:
+    """Hermes records `pwd -P` after each command as the session's directory, so a cd
+    at the top level of the fallback would move the agent into every root it searched."""
+    checkout = _tree(tmp_path)
+    script = _wrapper().PATCHES + _TRACKED
+    result = subprocess.run(
+        [
+            str(HERMES_PYTHON),
+            "-P",
+            "-c",
+            script,
+            str(checkout.resolve()),
+            _path_with(tmp_path, ["grep", "head"]),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=checkout,
+        env={"PATH": os.environ.get("PATH", ""), "HOME": str(checkout.parent)},
+    )
+    assert result.returncode == 0, result.stderr
+    outcome = json.loads(result.stdout.strip().splitlines()[-1])
+    assert outcome["cwd"] == str(checkout.resolve())
+    assert outcome["searches"] == [
+        {"total_count": 1, "files": ["docs/architecture.md"]},
+        {"total_count": 1, "files": ["docs/architecture.md"]},
+        {"total_count": 1, "files": ["./docs/architecture.md"]},
+    ]
+
+
+def test_a_grep_fallback_of_another_shape_stops_the_attempt_before_hermes_starts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """Hermes's tool discovery swallows an import error, so the wrapper checks first."""
+    changed = _FALLBACK_0_19_0.replace("--exclude-dir='.*'", "--exclude-dir='.?*'")
+    hermes = _stand_in(tmp_path, "0.19.0", changed)
+    # Were Hermes started, this stand-in entry point would say so.
+    (hermes / "hermes_cli").mkdir()
+    (hermes / "hermes_cli" / "__init__.py").write_text("", encoding="utf-8")
+    (hermes / "hermes_cli" / "main.py").write_text(
+        "def main():\n    print('hermes started')\n    return 0\n", encoding="utf-8"
+    )
+    wrapper = _wrapper()
+    monkeypatch.setattr(wrapper, "HERMES_PYTHON", sys.executable)
+    monkeypatch.setenv("PYTHONPATH", str(hermes))
+    monkeypatch.setenv("CRUCIBLE_HERMES_USAGE", str(tmp_path / "usage.json"))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(sys, "argv", ["crucible-hermes", "-z", "prompt"])
+    monkeypatch.chdir(tmp_path)
+
+    assert wrapper.main() == 2
+    captured = capfd.readouterr()
+    assert "hermes started" not in captured.out
+    assert "not the one hades #385 patches" in captured.err
+    assert wrapper.PREFLIGHT_FAILED in captured.err
+
+
+def test_the_preflight_passes_against_hermes_0_19_0_and_hermes_then_starts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
+) -> None:
+    hermes = _stand_in(tmp_path, "0.19.0", _FALLBACK_0_19_0)
+    (hermes / "hermes_cli").mkdir()
+    (hermes / "hermes_cli" / "__init__.py").write_text("", encoding="utf-8")
+    (hermes / "hermes_cli" / "main.py").write_text(
+        "def main():\n    print('hermes started')\n    return 0\n", encoding="utf-8"
+    )
+    wrapper = _wrapper()
+    monkeypatch.setattr(wrapper, "HERMES_PYTHON", sys.executable)
+    monkeypatch.setenv("PYTHONPATH", str(hermes))
+    monkeypatch.setenv("CRUCIBLE_HERMES_USAGE", str(tmp_path / "usage.json"))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(sys, "argv", ["crucible-hermes", "-z", "prompt"])
+    monkeypatch.chdir(tmp_path)
+
+    assert wrapper.main() == 0
+    assert "hermes started" in capfd.readouterr().out
+
+
+def test_the_patched_hermes_version_is_the_one_the_image_installs() -> None:
+    """A Dockerfile bump without the wrapper would build green and then refuse every
+    Hermes task; every HARNESS_HERMES_VERSION the Dockerfile declares must match."""
+    dockerfile = (WRAPPER.parent / "Dockerfile").read_text(encoding="utf-8")
+    declared = {
+        line.split("=", 1)[1].strip()
+        for line in dockerfile.splitlines()
+        if line.startswith("ARG HARNESS_HERMES_VERSION=")
+    }
+    assert declared == {_wrapper().HERMES_VERSION}
