@@ -428,7 +428,9 @@ async def test_a_pod_slow_to_be_removed_does_not_fail_a_finished_push(
     api, provider, publisher = _setup()
     gone = provider._await_job_pods_gone
 
-    async def lingering(name: str, *, timeout: float = 15) -> None:
+    async def lingering(
+        name: str, *, timeout: float = 15, force: bool = False, collection: bool = False
+    ) -> None:
         if name != job_name(ATTEMPT) and not name.startswith("cleaner"):
             return await gone(name)
         raise ProviderError(f"Pods for Job {name!r} were still present after {timeout:g} seconds")
