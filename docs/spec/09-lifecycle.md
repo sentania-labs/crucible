@@ -61,6 +61,7 @@ ci_certification_failed --ci-decision rerun--> awaiting_ci_certification
 ci_certification_failed --green certification observed on the accepted head--> awaiting_ci_certification
 ci_certification_failed --ci-decision correct, correction attached--> scheduled
 ci_certification_failed --ci-decision reject--> rejected
+ready_for_merge --correction attached--> scheduled
 
 {awaiting_external_review, external_feedback_received, awaiting_ci_certification, ready_for_merge}
     --PR head changed out of band--> head_diverged --wake-->
@@ -70,6 +71,10 @@ head_diverged --cancel--> cancelled
 
 {awaiting_external_review, external_feedback_received, awaiting_ci_certification,
  ci_certification_failed, head_diverged, ready_for_merge} --PR merged (observed)--> merged --wake-->
+{scheduled, awaiting_quota, running, blocked, reported, pre_pr_gates_failed,
+ awaiting_internal_review, gates_passed, awaiting_acceptance}
+    --PR merged (observed) while a correction runs against it--> merged --wake-->
+    (a live attempt is ended as a cancel ends it; the task stays merged)
 {awaiting_external_review, external_feedback_received, awaiting_ci_certification,
  ci_certification_failed, head_diverged, ready_for_merge} --PR closed unmerged (observed)--> rejected --wake-->
 merged --included in a release contract--> release_candidate
@@ -106,6 +111,14 @@ architectural risk) or the policy sets
 policy has `retrigger_after_correction: false` and `required_rounds: 1`,
 the second pass through `publishing` lands in `awaiting_ci_certification`,
 never back in `awaiting_external_review`.
+
+That includes a correction attached in `ready_for_merge`, after Foundry's
+own review of the full diff found a defect (hades #360). The round already
+counted on the PR stays counted, so the corrected head goes through the
+pre-PR gates, is published to the same PR, is certified on its own CI, and
+returns to `ready_for_merge` without a new external review request. The PR
+stays open while the correction runs and is still polled for a merge: a
+merge observed in any state of the correction moves the task to `merged`.
 
 Once the corrected head is the accepted head, review feedback made on the
 heads Crucible pushed before it, before the corrected head appeared, is
