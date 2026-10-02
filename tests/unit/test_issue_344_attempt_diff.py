@@ -201,6 +201,123 @@ def test_a_textconv_attribute_neither_runs_nor_hides_a_hunk(tmp_path: Path) -> N
     assert "work.txt | 1 +" in (output / "diffstat.txt").read_text()
 
 
+SECRET = "gh" + "p_" + "b" * 36
+
+
+def _scan(tmp_path: Path, output: Path) -> list[dict[str, str]]:
+    collected = _read(tmp_path, output)
+    return _scanner_findings(
+        CollectedOutputs(
+            report=None,
+            report_raw=None,
+            blocked_md=None,
+            diff_paths=collected.diff_paths,
+            diff_text=collected.diff_text,
+            artifacts=collected.artifacts,
+        ),
+        None,
+    )
+
+
+def _branch(tmp_path: Path) -> Path:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+    (repo / "work.txt").write_text("base\n")
+    _commit(repo, "base")
+    _git(repo, "checkout", "-qb", "crucible/test")
+    return repo
+
+
+def test_a_large_binary_does_not_push_a_later_secret_past_the_scanner(tmp_path: Path) -> None:
+    repo = _branch(tmp_path)
+    (repo / "a.bin").write_bytes(b"\0" * (9 * 1024 * 1024))
+    (repo / "z.txt").write_text(f"token={SECRET}\n")
+    _commit(repo, "binary then secret")
+    output = _collect(tmp_path, repo)
+    raw = (output / "diff.patch").read_bytes()
+    assert b"Binary files" in raw and len(raw) < 64 * 1024
+    assert {"where": "diff", "pattern": "github_token"} in _scan(tmp_path, output)
+    assert len((output / REVIEW_DIFF_DIR / "diff.patch").read_bytes()) < 64 * 1024
+
+
+def test_a_text_file_the_worker_marks_binary_is_text_in_the_review_copy(tmp_path: Path) -> None:
+    repo = _branch(tmp_path)
+    (repo / ".gitattributes").write_text("hidden.txt binary\n")
+    (repo / "hidden.txt").write_text("hidden-by-attribute\n")
+    (repo / "plain.txt").write_text("plain-line\n")
+    _commit(repo, "attribute")
+    output = _collect(tmp_path, repo)
+    assert "Binary files /dev/null and b/hidden.txt differ" in (output / "diff.patch").read_text()
+    review = _review_diff(output)
+    assert "+hidden-by-attribute" in review and "+plain-line" in review
+    assert review.index("+hidden-by-attribute") < review.index("[crucible: full diff]")
+    assert not (output / "attr-text.patch").exists()
+
+
+def test_a_replace_ref_changes_neither_the_diff_nor_the_scanned_content(tmp_path: Path) -> None:
+    repo = _branch(tmp_path)
+    (repo / "evil.txt").write_text(f"token={SECRET}\n")
+    _commit(repo, "evil")
+    evil_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=True
+    ).stdout.strip()
+    benign = subprocess.run(
+        ["git", "hash-object", "-w", "--stdin"],
+        cwd=repo,
+        input="benign\n",
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    _git(repo, "replace", "HEAD:evil.txt", benign)
+    # And a whole fabricated head commit, which would otherwise rewrite the diff.
+    _git(repo, "checkout", "-q", "main")
+    _git(repo, "checkout", "-qb", "decoy")
+    (repo / "decoy.txt").write_text("nothing to see\n")
+    _commit(repo, "decoy")
+    _git(repo, "checkout", "-q", "crucible/test")
+    _git(repo, "replace", "-f", evil_head, "decoy")
+    output = _collect(tmp_path, repo)
+    raw = (output / "diff.patch").read_text()
+    assert f"+token={SECRET}" in raw and "benign" not in raw and "decoy" not in raw
+    assert f"+token={SECRET}" in _review_diff(output)
+    assert {"where": "diff", "pattern": "github_token"} in _scan(tmp_path, output)
+    assert (output / "head.txt").read_text().strip() == evil_head
+
+
+def test_a_graft_does_not_change_the_merge_base(tmp_path: Path) -> None:
+    repo = _branch(tmp_path)
+    (repo / "z.txt").write_text("grafted\n")
+    _commit(repo, "change")
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=True
+    ).stdout.strip()
+    (repo / ".git" / "info").mkdir(exist_ok=True)
+    (repo / ".git" / "info" / "grafts").write_text(f"{head}\n")
+    output = _collect(tmp_path, repo)
+    assert "+grafted" in (output / "diff.patch").read_text()
+    assert "work.txt" not in (output / "changed.txt").read_text()
+
+
+def test_a_second_collection_leaves_nothing_from_the_first(tmp_path: Path) -> None:
+    repo = _repository(tmp_path, changed="changed\n")
+    report = tmp_path / "worker-report"
+    report.mkdir()
+    (report / "first.txt").write_text("from the first run\n")
+    output = _collect(tmp_path, repo)
+    assert (output / "report" / "first.txt").is_file()
+    (report / "first.txt").unlink()
+    (output / "collection-failed.txt").write_text("stale\n")
+    (output / "leftover-committed.txt").write_text("stale\n")
+    (output / "prepared-head.txt").write_text("kept\n")
+    output = _collect(tmp_path, repo)
+    assert not (output / "report" / "first.txt").exists()
+    assert not (output / "collection-failed.txt").exists()
+    assert not (output / "leftover-committed.txt").exists()
+    assert (output / "prepared-head.txt").read_text() == "kept\n"
+
+
 # Evidence and the gate.
 
 

@@ -204,9 +204,13 @@ CHECKPOINT_GIT = (
     "git -c core.fsmonitor= -c diff.external= -c core.pager=cat "
     "-c core.hooksPath=\"$EMPTY_HOOKS\" -c 'safe.directory=*'"
 )
+# hades #344: `GIT_NO_REPLACE_OBJECTS=1` and an empty `GIT_GRAFT_FILE`, so a replace
+# ref or a graft the worker wrote cannot make the collected diff, the scanned content or
+# the merge base show anything other than the objects the bundle and the tree carry.
 GIT_ENV = (
     "export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 "
-    "GIT_TERMINAL_PROMPT=0 GIT_ASKPASS= HOME=/home/worker LC_ALL=C"
+    "GIT_TERMINAL_PROMPT=0 GIT_ASKPASS= HOME=/home/worker LC_ALL=C "
+    "GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/dev/null"
 )
 
 # 08: the copy step rejects symlinks, hard links, devices, and files above the policy
@@ -254,8 +258,25 @@ DIFF_ARTIFACT_CAP_BYTES = 4 * 1024 * 1024
 # `report/`, which holds the worker's copied files, so neither can overwrite the other.
 REVIEW_DIFF_DIR = "crucible-review"
 
-# Every diff the collector runs: no textconv, no external diff driver, binary as text.
-_DIFF_FLAGS = "--no-ext-diff --no-textconv --text"
+# Every diff the collector runs: no textconv, no external diff driver. Never `--text`
+# on the raw diff: a binary must stay "Binary files differ" there, or its bytes push the
+# text after it past the secret scanner's window and fill the output.
+_DIFF_FLAGS = "--no-ext-diff --no-textconv"
+
+# Paths whose `diff` attribute is unset (`-diff`, the `binary` macro) or names a driver:
+# the worker's .gitattributes can make such a text file read as binary, so the review
+# copy shows these, and only these, with `--text`.
+_ATTR_DIFF_PATHSPEC = "-- . ':(exclude,attr:!diff)' ':(exclude,attr:diff)'"
+
+# What the collector writes into its output directory. It is cleared before each run so
+# nothing an earlier collection of the same attempt left is read as this one's.
+_COLLECTOR_OUTPUTS = (
+    "base.txt head.txt branch.txt diffstat.txt diff.patch changed.txt log.txt "
+    "commit-paths.txt work_branch.bundle bundle.log commits.txt commit-policy tree "
+    "clone.log report copy-rejections.tsv collection-failed.txt checkpoint-refusal.txt "
+    "leftover-committed.txt leftover-refusal.txt collector.ok attr-text.patch "
+    f"{REVIEW_DIFF_DIR}"
+)
 
 
 def _cache_refresh(cache_dir: str) -> str:
@@ -559,6 +580,7 @@ TRAILER={_quote(commit_trailer)}
 TRAILER_VALUE={_quote(trailer_value or attempt_id)}
 REVIEW_DIFF_ERROR=
 mkdir -p "$OUT"
+for stale in {_COLLECTOR_OUTPUTS}; do rm -rf "$OUT/$stale"; done
 : > "$OUT/copy-rejections.tsv"
 {_COPY_REPORT}
 {_commit_policy_check(GIT + ' -C "$REPO"')}LEFTOVER=0
@@ -656,9 +678,11 @@ if [ -n "$BASE" ]; then
   # the base branch gained after the fork do not become worker changes.
   # The log stays two-dot: it enumerates only commits
   # reachable from HEAD and not BASE, and unions in every path those commits touched.
-  # `--no-textconv --text --no-ext-diff`: the worker's own .git/config is back in
-  # place, so a diff.<driver>.textconv or external command it set with a matching
-  # .gitattributes would otherwise run here and could hide hunks from every diff.
+  # `--no-textconv --no-ext-diff`: the worker's own .git/config is back in place, so
+  # a diff.<driver>.textconv or external command it set with a matching .gitattributes
+  # would otherwise run here and could hide hunks from every diff. A path the worker's
+  # attributes mark binary still reads "Bin" in the stat (git's --stat ignores --text);
+  # the review copy shows its hunks, see build_review_diff.
   {GIT} -C "$REPO" diff {_DIFF_FLAGS} --stat "$MB" HEAD > "$OUT/diffstat.txt" \
     || REVIEW_DIFF_ERROR="git diff --stat failed"
   {GIT} -C "$REPO" diff {_DIFF_FLAGS} --no-color "$MB" HEAD > "$OUT/diff.patch" \
@@ -703,24 +727,49 @@ build_review_diff() {{
     printf 'diff unavailable: %s\n' "$REVIEW_DIFF_ERROR" > "$target" || return 1
     return 0
   fi
+  # Paths the worker's attributes keep out of a text diff, as text, ahead of the whole
+  # patch so a large diff cannot push them out of the bounded copy. `head -c` bounds
+  # what is read, so a large binary marked this way costs no more than the cap.
+  attr_text="$OUT/attr-text.patch"
+  {{ {GIT} -C "$REPO" diff {_DIFF_FLAGS} --text --no-color "$MB" HEAD \
+      {_ATTR_DIFF_PATHSPEC} || echo "[crucible: attribute-marked paths unavailable]"; }} \
+    | head -c "$DIFF_ARTIFACT_CAP" > "$attr_text" || return 1
+  attr_heading=''
+  if [ -s "$attr_text" ]; then
+    attr_heading='[crucible: paths .gitattributes marks binary or gives a diff driver, as text]'
+  fi
+  review_body() {{
+    cat "$OUT/diffstat.txt"; printf '\n'
+    if [ -n "$attr_heading" ]; then
+      printf '%s\n' "$attr_heading"; cat "$attr_text"; printf '\n[crucible: full diff]\n'
+    fi
+    cat "$OUT/diff.patch"
+  }}
+  marker='[crucible: diff truncated]'
   stat_size=$(wc -c < "$OUT/diffstat.txt") || return 1
   patch_size=$(wc -c < "$OUT/diff.patch") || return 1
-  marker='[crucible: diff truncated]'
-  if [ $((stat_size + 1 + patch_size)) -le "$DIFF_ARTIFACT_CAP" ]; then
-    {{ cat "$OUT/diffstat.txt"; printf '\n'; cat "$OUT/diff.patch"; }} > "$target" || return 1
+  body_size=$((stat_size + 1 + patch_size))
+  if [ -n "$attr_heading" ]; then
+    attr_size=$(wc -c < "$attr_text") || return 1
+    framing=$(printf '%s\n\n[crucible: full diff]\n' "$attr_heading" | wc -c)
+    body_size=$((body_size + attr_size + framing))
+  fi
+  if [ "$body_size" -le "$DIFF_ARTIFACT_CAP" ]; then
+    review_body > "$target" || return 1
+    rm -f "$attr_text"
     return 0
   fi
   keep=$((DIFF_ARTIFACT_CAP - $(printf '\n%s\n' "$marker" | wc -c)))
   if [ "$keep" -gt 0 ]; then
-    {{ cat "$OUT/diffstat.txt"; printf '\n'; cat "$OUT/diff.patch"; }} \
-      | head -c "$keep" > "$target" || return 1
+    review_body | head -c "$keep" > "$target" || return 1
     printf '\n%s\n' "$marker" >> "$target" || return 1
   else
     printf '%s\n' "$marker" | head -c "$DIFF_ARTIFACT_CAP" > "$target" || return 1
   fi
+  rm -f "$attr_text"
 }}
 if ! build_review_diff 2>/dev/null; then
-  rm -rf "$OUT/{REVIEW_DIFF_DIR}" 2>/dev/null || true
+  rm -rf "$OUT/{REVIEW_DIFF_DIR}" "$OUT/attr-text.patch" 2>/dev/null || true
   mkdir -p "$OUT/{REVIEW_DIFF_DIR}" 2>/dev/null || true
   printf 'diff unavailable: %s\n' "the review diff could not be written" \
     > "$OUT/{REVIEW_DIFF_DIR}/diff.patch" 2>/dev/null || true
