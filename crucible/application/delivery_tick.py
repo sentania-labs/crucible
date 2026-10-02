@@ -20,6 +20,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from typing import Any, Protocol, TypeVar
 
+from crucible.application.decisions import open_escalation
 from crucible.application.observation import (
     OBSERVED_STATES,
     POLLED_STATES,
@@ -52,6 +53,7 @@ from crucible.application.publish import (
 )
 from crucible.application.review import latest_work_attempt
 from crucible.application.transitions import record_event
+from crucible.contracts.wake import WakeReason
 from crucible.domain.entities import PullRequestState, Task
 from crucible.domain.events import PRINCIPAL_CRUCIBLE, EventKind
 from crucible.domain.exit_class import ExitClass
@@ -256,7 +258,11 @@ class DeliveryCoordinator:
             )
             if remote != plan.head_sha:
                 return False, f"remote branch is at {remote}, expected {plan.head_sha}"
-            await self._host._db(lambda: self._record_pushed(plan, remote, checkpoint=True))
+            recorded = await self._host._db(
+                lambda: self._record_pushed(plan, remote, checkpoint=True)
+            )
+            if not recorded:
+                return False, "the task moved on while the checkpoint was pushed"
             return True, "checkpoint pushed"
         except GitHubError as exc:
             if exc.response_class == "rate_limited":
@@ -607,8 +613,34 @@ class DeliveryCoordinator:
 
     def _record_pushed(
         self, plan: PublishPlan, remote: str | None, *, checkpoint: bool = False
-    ) -> None:
+    ) -> bool:
         with self._host._fenced() as uow:
+            task = uow.tasks.get(plan.task_id, for_update=True)
+            push_is_current = task is not None and (
+                (checkpoint and task.state is not TaskState.MERGED)
+                or (not checkpoint and task.state is TaskState.PUBLISHING)
+            )
+            if not push_is_current:
+                if task is not None:
+                    head = remote or plan.head_sha
+                    summary = (
+                        f"head {head} was pushed after the task left publishing and is "
+                        f"already {task.state.value}"
+                    )
+                    open_escalation(
+                        uow,
+                        self._clock,
+                        task=task,
+                        attempt_id=plan.attempt_id,
+                        question=(
+                            f"{summary}. The push is not recorded as the merged head; "
+                            "decide whether the merge and branch state stand."
+                        ),
+                        wake_reason=WakeReason.MERGED,
+                        summary=summary,
+                    )
+                    uow.commit()
+                return False
             record_event(
                 uow,
                 self._clock,
@@ -626,6 +658,7 @@ class DeliveryCoordinator:
                 },
             )
             uow.commit()
+            return True
 
     def _record_pull_request(self, plan: PublishPlan, ref: Any) -> None:
         with self._host._fenced() as uow:

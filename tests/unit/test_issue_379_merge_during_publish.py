@@ -9,7 +9,8 @@ container are stood in for. The store is the in-memory one the #360 tests use.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Sequence
+import inspect
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
@@ -138,12 +139,14 @@ class _Publisher:
     def __init__(self) -> None:
         self.pushes: list[str] = []
         self.outcome: PublishOutcome | None = None
-        self.during_push: Callable[[], None] | None = None
+        self.during_push: Callable[[], Awaitable[object] | None] | None = None
 
     async def push(self, request: PublishRequest, token: InstallationToken) -> PublishOutcome:
         self.pushes.append(request.expected_head)
         if self.during_push is not None:
-            self.during_push()
+            during = self.during_push()
+            if inspect.isawaitable(during):
+                await during
         if self.outcome is not None:
             return self.outcome
         return PublishOutcome(pushed=True, head_sha=request.expected_head, step="push")
@@ -351,7 +354,51 @@ def test_a_merged_head_that_is_not_the_pushed_head_is_recorded_and_escalated(
     assert OTHER_HEAD in escalations[0].question and NEW_HEAD in escalations[0].question
     merged = _wakes(store, "merged")
     assert len(merged) == 1
-    assert f"the merged head {OTHER_HEAD} is not {NEW_HEAD}" in merged[0]
+    assert f"the merged head {OTHER_HEAD} is not among the heads Crucible pushed" in merged[0]
+
+
+def test_a_poll_winning_the_push_race_refuses_to_record_the_post_merge_push(
+    tmp_path: Path,
+) -> None:
+    store, clock, supervisor, github, publisher = _correcting(tmp_path)
+    github.polled = _merged(OLD_HEAD)
+    clock.advance(300)
+
+    async def poll_during_push() -> object:
+        return await supervisor.delivery.observe()
+
+    publisher.during_push = poll_during_push
+
+    assert _publish(supervisor) == 1
+
+    assert publisher.pushes == [NEW_HEAD]
+    assert _task(store).state is TaskState.MERGED
+    assert _task(store).head_sha == OLD_HEAD
+    assert EventKind.BRANCH_PUSHED.value not in store.events.kinds()
+    escalations = store.escalations.list_for_task(TASK_ID)
+    assert len(escalations) == 1
+    assert NEW_HEAD in escalations[0].question
+    assert "after the task left publishing" in escalations[0].question
+    merged_wakes = _wakes(store, "merged")
+    assert any(f"merged head {OLD_HEAD} is a head Crucible pushed" in wake for wake in merged_wakes)
+    assert any(f"head {NEW_HEAD} was pushed after" in wake for wake in merged_wakes)
+
+
+def test_the_lookup_race_accepts_an_earlier_crucible_head_without_escalation(
+    tmp_path: Path,
+) -> None:
+    store, _clock, supervisor, github, publisher = _correcting(tmp_path)
+    github.lookups = [_open(OLD_HEAD), _merged(OLD_HEAD)]
+
+    assert _publish(supervisor) == 0
+
+    assert publisher.pushes == [NEW_HEAD]
+    assert _task(store).state is TaskState.MERGED
+    assert _task(store).head_sha == OLD_HEAD
+    payload = _merged_event_payload(store)
+    assert payload["last_pushed_head"] == NEW_HEAD
+    assert payload["merged_head_matches"] is True
+    assert store.escalations.list_for_task(TASK_ID) == []
 
 
 def test_a_closed_pull_request_during_a_correction_fails_the_publication(
