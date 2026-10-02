@@ -457,7 +457,14 @@ takes the task back through `scheduled`, `running`, and the pre-PR gates
 while the PR stays open, so the PR is still polled then, for its merged flag
 alone: a merge observed while the correction is scheduled, running, or
 gated moves the task to `merged` too, and the supervisor ends the
-correction's attempt as it ends a cancelled one (hades #360). A PR closed without
+correction's attempt as it ends a cancelled one (hades #360). The same holds
+while the corrected head is publishing or its publication failed (hades #379).
+A task that already has a pull request never gets a second one: when the
+publication step's lookup finds that pull request merged or closed (or finds
+none), the merge or close is recorded and the publication fails with a
+`publish_failed` wake naming it, except that a merge settles the task as
+`merged`. The merge wake on this path says whether the head GitHub merged is
+the last head Crucible pushed, and is an escalation when it is not. A PR closed without
 merge moves the task to `rejected` from any delivery state, `head_diverged`
 included, with the closer recorded, and wakes Foundry with
 `pull_request_closed`. The closer is not on the PR itself: `GET

@@ -3540,6 +3540,10 @@ class Supervisor:
                 )
             )
             return
+        if await self._db(partial(self._task_merged, attempt.task_id)):
+            # hades #379: the pull request was merged while the attempt ran. Nothing is
+            # pushed to the merged branch; the attempt is ended as a cancel ends it.
+            return
         provider_name = await self._db(partial(self._execution_provider_name, attempt))
         provider = self._provider(provider_name)
         local_push = getattr(provider, "push_quota_checkpoint", None)
@@ -3555,6 +3559,11 @@ class Supervisor:
                 # it, rather than the tick sleeping (hades FDY-0139).
                 return
         await self._db(partial(self._finish_deferred_quota, attempt_id, *outcome))
+
+    def _task_merged(self, task_id: str) -> bool:
+        with self._uow_factory() as uow:
+            task = uow.tasks.get(task_id)
+            return task is not None and task.state is TaskState.MERGED
 
     def _attempt_by_id(self, attempt_id: str) -> Attempt | None:
         with self._uow_factory() as uow:

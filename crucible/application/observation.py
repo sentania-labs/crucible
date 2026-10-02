@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
 
+from crucible.application.decisions import open_escalation
 from crucible.application.publish import external_review_trigger, open_review_cycle
 from crucible.application.transitions import move_task, record_event
 from crucible.application.wakes import create_wake
@@ -1043,10 +1044,15 @@ def observe_state(
                 "state": "merged",
                 "merge_sha": pull_request.merge_sha,
                 "merged_by": pull_request.merged_by,
+                # hades #379: the head GitHub merged, compared with the last head
+                # Crucible pushed when a correction was under way.
+                "head_sha": ref.head_sha,
             },
         )
         result.changed = True
-        settle_pull_request_state(uow, clock, task=task, pull_request=pull_request)
+        settle_pull_request_state(
+            uow, clock, task=task, pull_request=pull_request, merged_head=ref.head_sha
+        )
         return
     if ref.state == "closed" and not ref.merged and pull_request.state is PullRequestState.OPEN:
         pull_request.state = PullRequestState.CLOSED
@@ -1069,8 +1075,30 @@ def observe_state(
         settle_pull_request_state(uow, clock, task=task, pull_request=pull_request)
 
 
+def last_pushed_head(uow: UnitOfWork, task: Task, pull_request: PullRequest) -> str | None:
+    """The last head Crucible pushed to the work branch and confirmed on the remote
+    (hades #379): the latest `branch_pushed`, or the PR's recorded head when there is
+    none. A correction's collected head that never reached the remote is not it."""
+    pushed = uow.events.latest_for_task_kind(task.id, EventKind.BRANCH_PUSHED.value)
+    head = str((pushed.payload if pushed else {}).get("head_sha") or "")
+    return head or pull_request.head_sha or None
+
+
+def recorded_merged_head(uow: UnitOfWork, task: Task) -> str | None:
+    """The head GitHub reported merged, as the merge was recorded (hades #379)."""
+    changed = uow.events.latest_for_task_kind(task.id, EventKind.PULL_REQUEST_STATE_CHANGED.value)
+    if changed is None or changed.payload.get("state") != "merged":
+        return None
+    return str(changed.payload.get("head_sha") or "") or None
+
+
 def settle_pull_request_state(
-    uow: UnitOfWork, clock: Clock, *, task: Task, pull_request: PullRequest
+    uow: UnitOfWork,
+    clock: Clock,
+    *,
+    task: Task,
+    pull_request: PullRequest,
+    merged_head: str | None = None,
 ) -> bool:
     """Move a task whose pull request is merged or closed, and wake Foundry (23).
 
@@ -1081,7 +1109,13 @@ def settle_pull_request_state(
 
     hades #360: a merge also moves a task whose correction is under way against the
     PR. A close does not: the correction publishes to the PR again, and what to do with
-    a closed one is decided there."""
+    a closed one is decided there.
+
+    hades #379: when a correction was under way, the head GitHub merged (`merged_head`,
+    or the one recorded with the merge) is compared with the last head Crucible pushed.
+    The task's head becomes that pushed head, never a collected head that went nowhere,
+    and the wake says whether the two agree; when they do not, or the merged head is not
+    known, an escalation is opened instead of the plain wake."""
     correcting = task.state in CORRECTION_STATES
     if task.state not in OBSERVED_STATES and not (
         correcting and pull_request.state is PullRequestState.MERGED
@@ -1091,28 +1125,64 @@ def settle_pull_request_state(
     if pull_request.state is PullRequestState.MERGED:
         merged_from = task.state.value
         early = task.state is not TaskState.READY_FOR_MERGE
-        move_task(
-            uow,
-            clock,
-            task,
-            TaskState.MERGED,
-            EventKind.TASK_MERGED,
-            payload={
-                "pull_request": pull_request.number,
-                "merge_sha": pull_request.merge_sha,
-                "merged_by": pull_request.merged_by,
-                "merged_at": (pull_request.merged_at or now).isoformat(),
-                "merged_from": merged_from,
-            },
-        )
+        payload: dict[str, Any] = {
+            "pull_request": pull_request.number,
+            "merge_sha": pull_request.merge_sha,
+            "merged_by": pull_request.merged_by,
+            "merged_at": (pull_request.merged_at or now).isoformat(),
+            "merged_from": merged_from,
+        }
+        head_check = ""
+        head_matches = True
+        if correcting:
+            pushed = last_pushed_head(uow, task, pull_request)
+            merged = merged_head or recorded_merged_head(uow, task)
+            head_matches = merged is not None and merged == pushed
+            payload.update(
+                {
+                    "merged_head": merged,
+                    "last_pushed_head": pushed,
+                    "merged_head_matches": head_matches,
+                }
+            )
+            # The merged task's head is what is on the remote, not a corrected head that
+            # was collected and never pushed.
+            task.head_sha = pushed
+            if merged is None:
+                head_check = (
+                    f"; the merged head is not known, so it is not confirmed to be "
+                    f"{pushed}, the last head Crucible pushed"
+                )
+            elif head_matches:
+                head_check = f"; the merged head {merged} is the last head Crucible pushed"
+            else:
+                head_check = (
+                    f"; the merged head {merged} is not {pushed}, the last head Crucible pushed"
+                )
+        move_task(uow, clock, task, TaskState.MERGED, EventKind.TASK_MERGED, payload=payload)
         summary = (
             f"pull request #{pull_request.number} was merged by "
             f"{pull_request.merged_by or 'someone'} as {pull_request.merge_sha}"
         )
         if correcting:
             summary += f" while a correction was under way (the task was {merged_from})"
+            summary += head_check
         elif early:
             summary += f", before Crucible saw it ready for merge (the task was {merged_from})"
+        if not head_matches:
+            open_escalation(
+                uow,
+                clock,
+                task=task,
+                attempt_id=None,
+                question=(
+                    f"{summary}. What was merged is not what Crucible last pushed; "
+                    "decide whether the merge stands."
+                )[:2000],
+                wake_reason=WakeReason.MERGED,
+                summary=summary[:500],
+            )
+            return True
         create_wake(
             uow,
             clock,

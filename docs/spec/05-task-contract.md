@@ -110,7 +110,7 @@ contract always says what ran) plus:
 ```yaml
 correction:
   of_version: 1
-  reason: "external_review"        # external_review | ci_certification | needs_more_work | pre_pr_gates
+  reason: "external_review"        # external_review | ci_certification | needs_more_work | pre_pr_gates | internal_review
   addresses:                       # what this version responds to
     - { kind: "review_comment", id: "2101", disposition_id: "01J..." }
   instructions: >
@@ -118,6 +118,10 @@ correction:
   resume_from: "remote_branch"     # the worker starts from the current remote work_branch head
   request_internal_review: false   # true when Foundry judges the correction substantial (09)
 ```
+
+A correction attached in `ready_for_merge` gives reason `needs_more_work` or
+`internal_review` (hades #379): the external round and CI are already done,
+so what it answers is Foundry's own judgement of the full diff.
 
 A correction version may narrow `scope` and `objective` and may not widen
 them; validation rejects a correction whose `allowed_paths` is not a subset

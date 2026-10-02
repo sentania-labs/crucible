@@ -97,7 +97,7 @@ _CANCELLABLE_AT_ONCE: tuple[TaskState, ...] = (
 # hades #360: the states a correction passes through on its way back to the same pull
 # request: scheduled, running, and the pre-PR gates. The PR stays open on GitHub the
 # whole time, and a person can still merge it; the merge is observed from these states
-# too.
+# too. hades #379: and while the corrected head is publishing, or its publication failed.
 CORRECTION_STATES: frozenset[TaskState] = frozenset(
     {
         _S.SCHEDULED,
@@ -109,6 +109,8 @@ CORRECTION_STATES: frozenset[TaskState] = frozenset(
         _S.AWAITING_INTERNAL_REVIEW,
         _S.GATES_PASSED,
         _S.AWAITING_ACCEPTANCE,
+        _S.PUBLISHING,
+        _S.PUBLISH_FAILED,
     }
 )
 

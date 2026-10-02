@@ -72,9 +72,11 @@ head_diverged --cancel--> cancelled
 {awaiting_external_review, external_feedback_received, awaiting_ci_certification,
  ci_certification_failed, head_diverged, ready_for_merge} --PR merged (observed)--> merged --wake-->
 {scheduled, awaiting_quota, running, blocked, reported, pre_pr_gates_failed,
- awaiting_internal_review, gates_passed, awaiting_acceptance}
+ awaiting_internal_review, gates_passed, awaiting_acceptance, publishing,
+ publish_failed}
     --PR merged (observed) while a correction runs against it--> merged --wake-->
-    (a live attempt is ended as a cancel ends it; the task stays merged)
+    (a live attempt is ended as a cancel ends it; the task stays merged; the merged
+    head is compared with the last head Crucible pushed, and a mismatch escalates)
 {awaiting_external_review, external_feedback_received, awaiting_ci_certification,
  ci_certification_failed, head_diverged, ready_for_merge} --PR closed unmerged (observed)--> rejected --wake-->
 merged --included in a release contract--> release_candidate
@@ -118,7 +120,17 @@ counted on the PR stays counted, so the corrected head goes through the
 pre-PR gates, is published to the same PR, is certified on its own CI, and
 returns to `ready_for_merge` without a new external review request. The PR
 stays open while the correction runs and is still polled for a merge: a
-merge observed in any state of the correction moves the task to `merged`.
+merge observed in any state of the correction moves the task to `merged`,
+publishing and publish_failed included (hades #379). Such a correction
+gives reason `needs_more_work` or `internal_review`.
+
+When a merge wins over a correction, the task's head is the last head
+Crucible pushed and confirmed on the remote, not a corrected head that was
+collected and never pushed. The `task_merged` event records the head GitHub
+merged, that last pushed head, and whether they are equal; the wake says
+which. When they differ, or the merged head is not known, the wake is an
+escalation instead. A quota checkpoint is not pushed once the task is
+merged.
 
 Once the corrected head is the accepted head, review feedback made on the
 heads Crucible pushed before it, before the corrected head appeared, is
