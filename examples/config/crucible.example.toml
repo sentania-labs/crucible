@@ -73,6 +73,9 @@ reconcile_interval_seconds = 60
 attempt_lease_ttl_seconds = 60
 checkout_lease_ttl_seconds = 21600    # one attempt per repository url and work branch (10)
 grace_seconds = 60                    # drain before kill (05b limits.grace_seconds)
+# Fail collection as environment after this many ticks whose Pod cleanup wait expires.
+# An in-flight collection is never started twice. A supervisor restart resets the count.
+collection_retry_ticks = 5
 
 [skills]
 root = "/var/lib/crucible/skills"     # only skills a contract names are copied into a bundle

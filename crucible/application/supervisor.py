@@ -131,6 +131,7 @@ from crucible.ports.execution import (
     CancelCheck,
     CleanupPolicy,
     CollectedOutputs,
+    CollectionPendingError,
     ExecutionProvider,
     Handle,
     LaunchCancelledError,
@@ -473,6 +474,7 @@ class Supervisor:
         grace_seconds: int = 60,
         launch_wait_seconds: float | None = None,
         collect_wait_seconds: float | None = None,
+        collection_retry_ticks: int = 5,
         harnesses: HarnessRegistry | None = None,
         harness_gates: Mapping[str, HarnessGate] | None = None,
         credential_sources: Mapping[str, CredentialSource] | None = None,
@@ -524,6 +526,10 @@ class Supervisor:
         # The collections in flight, by attempt id, and the same rule: an attempt in
         # here is its collection's until it ends (lab findings of 2026-09-29).
         self._collects: dict[str, asyncio.Task[bool]] = {}
+        if collection_retry_ticks < 1:
+            raise ValueError("collection_retry_ticks must be at least 1")
+        self.collection_retry_ticks = collection_retry_ticks
+        self._collect_pending_ticks: dict[str, int] = {}
         # A collection the provider could not finish is tried again after an interval,
         # for a bounded window counted from its first failure (in memory: a restart
         # starts the window again, and the workspace stays in place meanwhile).
@@ -737,6 +743,7 @@ class Supervisor:
         self._launches.clear()
         self._collects.clear()
         # A later holder, this process included, starts the retry window afresh.
+        self._collect_pending_ticks.clear()
         self._collect_failing_since.clear()
         self._collect_retry_at.clear()
         for task in running:
@@ -3071,6 +3078,7 @@ class Supervisor:
                 log.exception("cleanup failed; the next tick tries again")
                 continue
             await self._db(partial(self._mark_cleaned, attempt.id, choice))
+            self._collect_pending_ticks.pop(attempt.id, None)
             self._collect_failing_since.pop(attempt.id, None)
             self._collect_retry_at.pop(attempt.id, None)
             self._workspaces.pop(attempt.id, None)
@@ -3457,6 +3465,22 @@ class Supervisor:
             collection_error: str | None = None
             try:
                 outputs = await provider.collect(handle, self._workspace_for(attempt), spec)
+            except CollectionPendingError as exc:
+                ticks = self._collect_pending_ticks.get(attempt.id, 0) + 1
+                self._collect_pending_ticks[attempt.id] = ticks
+                if ticks < self.collection_retry_ticks:
+                    # Also marks the attempt as collecting for stall detection. Zero
+                    # makes it eligible on the next tick, without an outage backoff.
+                    self._collect_retry_at[attempt.id] = 0.0
+                    log.warning("collection is pending (%s); it runs again next tick", exc)
+                    return False
+                collection_error = (
+                    f"{exc} (collection cleanup remained pending for {ticks} collection ticks)"
+                )
+                outputs = CollectedOutputs(report=None, report_raw=None, blocked_md=None)
+                log.warning(
+                    "collection failed (%s); the attempt fails as environment", collection_error
+                )
             except ProviderUnavailableError as exc:
                 # The cluster could not answer or take a step right now. The workspace
                 # still holds the work, so the attempt is collected again rather than
@@ -3482,6 +3506,7 @@ class Supervisor:
                 collection_error = str(exc)
                 outputs = CollectedOutputs(report=None, report_raw=None, blocked_md=None)
                 log.warning("collection failed (%s); the attempt fails as environment", exc)
+            self._collect_pending_ticks.pop(attempt.id, None)
             self._collect_failing_since.pop(attempt.id, None)
             self._collect_retry_at.pop(attempt.id, None)
             await self._db(
