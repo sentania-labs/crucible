@@ -490,6 +490,22 @@ def test_another_open_pull_request_on_the_branch_is_not_adopted(tmp_path: Path) 
     assert f"#{PR_NUMBER + 1}" in wakes[0] and "not adopted" in wakes[0]
 
 
+def test_the_tasks_open_pull_request_wins_over_another_open_pr_on_the_branch(
+    tmp_path: Path,
+) -> None:
+    store, _clock, supervisor, github, publisher = _correcting(tmp_path)
+    github.known = _open(OLD_HEAD)
+    github.lookups = [_open(OLD_HEAD, number=PR_NUMBER + 1)]
+    store.pull_request_heads = _Heads()  # type: ignore[assignment]
+
+    assert _publish(supervisor) == 1
+
+    assert publisher.pushes == [NEW_HEAD]
+    assert github.created == []
+    assert github.updated == [PR_NUMBER]
+    assert _task(store).state is not TaskState.PUBLISH_FAILED
+
+
 def test_another_pull_request_on_the_branch_with_the_own_one_merged_settles_merged(
     tmp_path: Path,
 ) -> None:

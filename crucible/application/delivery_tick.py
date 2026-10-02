@@ -545,25 +545,23 @@ class DeliveryCoordinator:
         none), the task's own is read by its number, and the other is never adopted."""
         assert self._github is not None
         number = plan.existing_pr_number
+        known = await asyncio.to_thread(
+            self._github.get_pull_request,
+            token,
+            repository=plan.repository_name,
+            number=number or 0,
+        )
         found = await asyncio.to_thread(
             self._github.find_pull_request,
             token,
             repository=plan.repository_name,
             head_branch=plan.work_branch,
         )
-        if found is not None and found.number == number and found.state == "open":
-            return found
-        known = found if found is not None and found.number == number else None
+        if found is not None and found.number == number:
+            known = found
         other = found if found is not None and found.number != number else None
-        if known is None:
-            known = await asyncio.to_thread(
-                self._github.get_pull_request,
-                token,
-                repository=plan.repository_name,
-                number=number or 0,
-            )
-            if known.state == "open" and other is None:
-                return known
+        if known.state == "open":
+            return known
         if known.state == "closed" and not known.merged and not known.closed_by:
             closer = await asyncio.to_thread(
                 self._github.closed_by,
