@@ -3046,7 +3046,7 @@ async def test_gate_probe_on_unchanged_base_before_worker(
 class _RoboScriptAdapter(ScriptHarnessAdapter):
     """A script harness with a ro credential and a settings template (FDY-0223 / #349)."""
 
-    name = "ro-script"
+    name = "script-harness"
 
     def capabilities(self) -> HarnessCapabilities:
         return HarnessCapabilities(
@@ -3061,7 +3061,7 @@ class _RoboScriptAdapter(ScriptHarnessAdapter):
     def credential_spec(self) -> CredentialSpec:
         return CredentialSpec(
             harness=self.name,
-            mount_target="/home/worker/.ro-script",
+            mount_target="/home/worker/.script-harness",
             auth_files=(AuthFile("auth.json", json=True),),
             minimum_mode=MountMode.RO,
             templates={"settings.json": '{"ro": true}\n'},
@@ -3089,7 +3089,7 @@ async def test_fdy_0223_ro_credential_with_template_starts_on_kubernetes(
                 "apiVersion": "v1",
                 "kind": "Secret",
                 "metadata": {
-                    "name": "crucible-harness-ro-script",
+                    "name": "crucible-harness-script-harness",
                     "namespace": "crucible-workers",
                 },
                 "type": "Opaque",
@@ -3100,7 +3100,7 @@ async def test_fdy_0223_ro_credential_with_template_starts_on_kubernetes(
         if exc.status != 409:
             raise
 
-    spec = _spec(99, _origin("ro-script"), harness="ro-script")
+    spec = _spec(99, _origin("ro-script"), harness="script-harness")
     workspace = await provider_ro.prepare(spec)
     handle = await provider_ro.launch(workspace, spec)
 
@@ -3115,7 +3115,7 @@ async def test_fdy_0223_ro_credential_with_template_starts_on_kubernetes(
     assert cred_volume["projected"]["sources"]
     # No subPath mount under the credential directory.
     mounts_list = pod_spec["containers"][0]["volumeMounts"]
-    cred_path = "/home/worker/.ro-script"
+    cred_path = "/home/worker/.script-harness"
     for m in mounts_list:
         if m["name"] == "cred":
             assert m["mountPath"] == cred_path
