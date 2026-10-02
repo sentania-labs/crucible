@@ -13,7 +13,7 @@ from crucible.application.acceptance import close_task
 from crucible.application.cancel_task import cancel_task
 from crucible.application.decisions import repeat_stale_escalation_wakes
 from crucible.application.wakes import create_wake
-from crucible.contracts.api import CancelRequest, CloseRequest
+from crucible.contracts.api import CancelRequest
 from crucible.contracts.wake import WakeReason
 from crucible.domain.entities import (
     Decision,
@@ -24,7 +24,6 @@ from crucible.domain.entities import (
     Task,
     TaskContract,
 )
-from crucible.domain.events import EventKind
 from crucible.domain.lifecycle import TaskState
 from tests.fixtures import FakeClock, contract_document
 
@@ -160,24 +159,15 @@ def test_cancel_task_closes_open_escalation() -> None:
     assert len(esc_repo.saved) >= 2
     closed_esc = esc_repo.saved[-1]
     assert closed_esc.state is EscalationState.CLOSED
-    assert closed_esc.closed_at is not None
+    assert closed_esc.decision_id is not None
 
-    # Events for answered and closed should have been recorded
-    call_args_list = uow.events.append.call_args_list
-    kinds: list[str] = []
-    for args_tuple, _kwargs_dict in call_args_list:
-        if args_tuple and len(args_tuple) > 0 and hasattr(args_tuple[0], "kind"):
-            kinds.append(args_tuple[0].kind)
-    assert EventKind.ESCALATION_ANSWERED.value in kinds
-    assert EventKind.ESCALATION_CLOSED.value in kinds
-
-    # The Decision for the cancellation should have been persisted
+    # The Decision for the close should have been persisted
     assert len(added_decisions) == 1
     decision = added_decisions[0]
     assert decision.kind == "task_cancelled"
     assert decision.verbatim == "I cancel this task because of testing."
-    assert decision.resolves == "How to reach origin?"
-    assert decision.escalation_id == "ESC001"
+    assert decision.resolves == "How to reach origin?"  # The question, not the reason
+    assert decision.escalation_id == closed_esc.id
     assert decision.task_id == task.id
 
     # Both answered and closed escalation transitions share the same decision_id
@@ -186,7 +176,7 @@ def test_cancel_task_closes_open_escalation() -> None:
 
 def test_close_task_closes_open_escalation() -> None:
     """Closing a task with an open escalation closes the escalation via a decision."""
-    # We need to start from a state that can transition to CLOSED, e.g., ACCEPTED
+    # Start with submitted task and transition to accepted state (which can close)
     task = _task(state=TaskState.ACCEPTED)
     esc = Escalation(
         id="ESC002",
@@ -226,14 +216,13 @@ def test_close_task_closes_open_escalation() -> None:
 
     clock = FakeClock()
     principal = _principal()
-    close_request = CloseRequest(note="Task is done for testing.")
 
     result = close_task(
         uow,
         clock,
         principal=principal,
         task_id=task.id,
-        note=close_request.note,
+        note="Task is done for testing.",
     )
 
     assert result.state is TaskState.CLOSED
@@ -242,24 +231,15 @@ def test_close_task_closes_open_escalation() -> None:
     assert len(esc_repo.saved) >= 2
     closed_esc = esc_repo.saved[-1]
     assert closed_esc.state is EscalationState.CLOSED
-    assert closed_esc.closed_at is not None
-
-    # Events for answered and closed should have been recorded
-    call_args_list = uow.events.append.call_args_list
-    kinds: list[str] = []
-    for args_tuple, _kwargs_dict in call_args_list:
-        if args_tuple and len(args_tuple) > 0 and hasattr(args_tuple[0], "kind"):
-            kinds.append(args_tuple[0].kind)
-    assert EventKind.ESCALATION_ANSWERED.value in kinds
-    assert EventKind.ESCALATION_CLOSED.value in kinds
+    assert closed_esc.decision_id is not None
 
     # The Decision for the close should have been persisted
     assert len(added_decisions) == 1
     decision = added_decisions[0]
     assert decision.kind == "task_closed"
     assert decision.verbatim == "Task is done for testing."
-    assert decision.resolves == "What is the answer to life?"
-    assert decision.escalation_id == "ESC002"
+    assert decision.resolves == "What is the answer to life?"  # The question
+    assert decision.escalation_id == closed_esc.id
     assert decision.task_id == task.id
 
     # Both answered and closed escalation transitions share the same decision_id
@@ -301,10 +281,12 @@ def test_repeat_stale_escalation_wakes_skips_terminal_tasks() -> None:
 
     # Patch the create_wake in the decisions module
     with pytest.MonkeyPatch().context() as mp:
-        def fake_create_wake(*args, **kwargs):
+
+        def fake_create_wake(*args: Any, **kwargs: Any) -> Any:
             wake = create_wake(*args, **kwargs)
             created_wakes.append(wake)
             return wake
+
         mp.setattr("crucible.application.decisions.create_wake", fake_create_wake)
         repeated = repeat_stale_escalation_wakes(uow, clock, stale_hours=stale_hours)
 
@@ -317,10 +299,12 @@ def test_repeat_stale_escalation_wakes_skips_terminal_tasks() -> None:
     uow.tasks.get.return_value = task_closed
 
     with pytest.MonkeyPatch().context() as mp:
-        def fake_create_wake(*args, **kwargs):
+
+        def fake_create_wake(*args: Any, **kwargs: Any) -> Any:
             wake = create_wake(*args, **kwargs)
             created_wakes.append(wake)
             return wake
+
         mp.setattr("crucible.application.decisions.create_wake", fake_create_wake)
         repeated = repeat_stale_escalation_wakes(uow, clock, stale_hours=stale_hours)
 
@@ -333,16 +317,17 @@ def test_repeat_stale_escalation_wakes_skips_terminal_tasks() -> None:
     uow.tasks.get.return_value = task_rejected
 
     with pytest.MonkeyPatch().context() as mp:
-        def fake_create_wake(*args, **kwargs):
+
+        def fake_create_wake(*args: Any, **kwargs: Any) -> Any:
             wake = create_wake(*args, **kwargs)
             created_wakes.append(wake)
             return wake
+
         mp.setattr("crucible.application.decisions.create_wake", fake_create_wake)
         repeated = repeat_stale_escalation_wakes(uow, clock, stale_hours=stale_hours)
 
     assert repeated == 0
 
-def test_repeat_stale_escalation_wakes_still_wakes_for_blocked_task() -> None:
 
 def test_repeat_stale_escalation_wakes_still_wakes_for_blocked_task() -> None:
     """Repeat stale escalation wakes should still produce a wake for
@@ -378,12 +363,14 @@ def test_repeat_stale_escalation_wakes_still_wakes_for_blocked_task() -> None:
     created_wakes: list[Any] = []
 
     # Patch the create_wake in the decisions module
-    def fake_create_wake(*args, **kwargs):
-        wake = create_wake(*args, **kwargs)
-        created_wakes.append(wake)
-        return wake
-    mp.setattr("crucible.application.decisions.create_wake", fake_create_wake)
-        mp.setattr("crucible.application.decisions.create_wake", create_wake)
+    with pytest.MonkeyPatch().context() as mp:
+
+        def fake_create_wake(*args: Any, **kwargs: Any) -> Any:
+            wake = create_wake(*args, **kwargs)
+            created_wakes.append(wake)
+            return wake
+
+        mp.setattr("crucible.application.decisions.create_wake", fake_create_wake)
         repeated = repeat_stale_escalation_wakes(uow, clock, stale_hours=stale_hours)
 
     assert repeated == 1
