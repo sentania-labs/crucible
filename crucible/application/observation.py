@@ -1020,7 +1020,7 @@ def observe_state(
     observation: Observation,
     result: ObservationResult,
 ) -> None:
-    """Merged, or closed unmerged. Crucible has no merge endpoint; it only observes (23)."""
+    """Record a merge by Hades or a person, or a pull request closed unmerged (23)."""
     ref = observation.pull_request
     now = clock.now()
     if ref.merged and pull_request.state is not PullRequestState.MERGED:
@@ -1649,12 +1649,18 @@ def ready_summary(
         [c.id for c in comments], {c.id: c.body_sha256 for c in comments}
     )
     checks = ", ".join(str(name) for name in certification.required_checks) or "none required"
+    auto_merge = bool(policy_for(uow, task).get("delivery", {}).get("auto_merge", True))
+    merge_action = (
+        "Hades will squash-merge this certified head and will name any refusal."
+        if auto_merge
+        else "Automatic merge is disabled by policy; the operator performs the merge."
+    )
     return (
         f"{pull_request.url} is ready for merge at {pull_request.head_sha}. "
         f"External review: {gates.get('completed_rounds', 0)} of "
         f"{gates.get('required_rounds', 0)} round(s), {len(comments)} comment(s), "
         f"{len(dispositions)} disposition(s). CI: {certification.state} "
-        f"({checks}). Merging is the operator's act; Crucible has no merge endpoint."
+        f"({checks}). {merge_action}"
     )[:1000]
 
 
@@ -1789,6 +1795,9 @@ def apply_observation(
     result = ObservationResult()
     now = clock.now()
     pull_request.last_polled_at = now
+    pull_request.observed_head_sha = observation.pull_request.head_sha
+    pull_request.observed_base_ref = observation.pull_request.base_ref
+    pull_request.mergeable_state = observation.pull_request.mergeable_state
     if with_reactions:
         pull_request.last_reactions_polled_at = now
     uow.pull_requests.save(pull_request)

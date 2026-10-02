@@ -445,9 +445,16 @@ cycle opens on that head.
 
 ## Merge
 
-Merging is the operator's act on GitHub. Crucible observes
-`pull_request.closed` with `merged: true`, records the merge SHA, the
-merger login, and time, moves the task to `merged`, and wakes Foundry
+With `delivery.auto_merge` enabled (the default), Hades squash-merges the certified
+head at `ready_for_merge` through the GitHub App and records the merge SHA, merger,
+and time from GitHub. It compares the live head and base immediately before the merge
+and supplies the certified head as GitHub's SHA precondition. A refusal is recorded and
+wakes Foundry with its cause. Refusals retry with bounded backoff and only produce a new
+wake when the cause changes. `delivery.auto_merge: false` leaves the task ready for an
+operator to merge.
+
+Crucible also observes `pull_request.closed` with `merged: true`, records the merge SHA,
+the merger login, and time, moves the task to `merged`, and wakes Foundry
 (informational). It does so from any delivery state, not only
 `ready_for_merge`: a person can merge before review or CI is done, and a
 merged pull request is never polled again, so the task would otherwise wait
@@ -459,7 +466,7 @@ included, with the closer recorded, and wakes Foundry with
 from the issue events timeline (`GET /issues/{n}/events`, the last `closed`
 entry). That second call is **best effort**: a repository whose timeline
 the App cannot read records the close with no actor rather than failing the
-observation. Crucible has no merge endpoint.
+observation.
 
 ## Ready-for-merge report
 

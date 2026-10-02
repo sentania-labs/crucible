@@ -132,6 +132,7 @@ class EventKind(StrEnum):
     # observation (23)
     PULL_REQUEST_POLLED = "pull_request_polled"
     PULL_REQUEST_STATE_CHANGED = "pull_request_state_changed"
+    PULL_REQUEST_MERGE_RESULT_IGNORED = "pull_request_merge_result_ignored"
     PULL_REQUEST_HEAD_OBSERVED = "pull_request_head_observed"
     REACTIONS_UNOBSERVABLE = "reactions_unobservable"
     REACTION_RECEIVED = "reaction_received"

@@ -92,6 +92,16 @@ def setup() -> tuple[DeliveryCoordinator, FakeGitHub, MagicMock, Any, MergePlan]
         merge_sha=None,
         merged_at=None,
         merged_by=None,
+        base_ref="main",
+        observed_head_sha=HEAD,
+        observed_base_ref="main",
+        mergeable_state="clean",
+        merge_refusal_cause=None,
+        merge_refusal_head_sha=None,
+        merge_refusal_base_ref=None,
+        merge_refusal_mergeable_state=None,
+        merge_refusal_count=0,
+        merge_retry_at=None,
     )
     uow = MagicMock()
     uow.tasks.get.return_value = task
@@ -105,6 +115,7 @@ def setup() -> tuple[DeliveryCoordinator, FakeGitHub, MagicMock, Any, MergePlan]
         repository_name="org/repo",
         installation_id=42,
         certified_head_sha=HEAD,
+        base_ref="main",
     )
     return coordinator, github, uow, task, plan
 

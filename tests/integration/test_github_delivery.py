@@ -774,14 +774,12 @@ async def test_green_required_checks_reach_ready_for_merge_then_merged(
     github.state.repositories[REPOSITORY].required_checks = ["never-observed"]
     github.state.set_check(REPOSITORY, view["head_sha"], name="build", conclusion="success")
     await delivery_supervisor.tick()
-    assert client.get(f"/v1/tasks/{task_id}").json()["state"] == "ready_for_merge"
+    assert client.get(f"/v1/tasks/{task_id}").json()["state"] == "merged"
     ready = [w for w in client.get("/v1/wakes").json()["items"] if w["reason"] == "ready_for_merge"]
     assert ready and "ready for merge" in ready[0]["summary"]
-    github.state.merge(REPOSITORY, 1, by="sentania", sha="f" * 40)
-    await delivery_supervisor.tick()
-    assert client.get(f"/v1/tasks/{task_id}").json()["state"] == "merged"
     record = pr(client, task_id)
-    assert record["merged_by"] == "sentania" and record["merge_sha"] == "f" * 40
+    assert record["merged_by"] == "crucible-spike[bot]" and record["merge_sha"] == "f" * 40
+    assert github.state.merge_calls == [(REPOSITORY, 1, "squash")]
     reasons = [w["reason"] for w in client.get("/v1/wakes").json()["items"]]
     assert "merged" in reasons
 
@@ -1290,6 +1288,61 @@ async def test_a_second_tick_with_nothing_new_changes_nothing(
     new = [e["kind"] for e in after[len(before) :]]
     # The poll itself is an event; nothing else about the task changes.
     assert set(new) <= {"pull_request_polled"}
+    assert client.get(f"/v1/tasks/{task_id}").json()["state"] == "merged"
+
+
+async def test_persistent_merge_refusal_wakes_once_without_retry_storm(
+    client: TestClient, delivery_supervisor: Supervisor, github: FakeGitHubServer
+) -> None:
+    task_id, view = await green(client, delivery_supervisor, github)
+    github.state.set_check(REPOSITORY, view["head_sha"], name="build", conclusion="success")
+    github.state.merge_refusal = (409, "base branch has conflicts")
+
+    await delivery_supervisor.tick()
+    calls_after_refusal = list(github.state.merge_calls)
+    mints_after_refusal = github.state.mint_calls
+    await delivery_supervisor.tick()
+
+    assert client.get(f"/v1/tasks/{task_id}").json()["state"] == "ready_for_merge"
+    assert github.state.merge_calls == calls_after_refusal
+    assert github.state.mint_calls == mints_after_refusal
+    refused = [
+        wake
+        for wake in client.get("/v1/wakes").json()["items"]
+        if "base branch has conflicts" in wake["summary"]
+    ]
+    assert len(refused) == 1
+
+
+async def test_retargeted_base_is_not_auto_merged(
+    client: TestClient, delivery_supervisor: Supervisor, github: FakeGitHubServer
+) -> None:
+    task_id, view = await green(client, delivery_supervisor, github)
+    github.state.set_check(REPOSITORY, view["head_sha"], name="build", conclusion="success")
+    github.state.repositories[REPOSITORY].pulls[1].base_ref = "release"
+
+    await delivery_supervisor.tick()
+
+    assert client.get(f"/v1/tasks/{task_id}").json()["state"] == "ready_for_merge"
+    assert github.state.merge_calls == []
+    summaries = [wake["summary"] for wake in client.get("/v1/wakes").json()["items"]]
+    assert any("base changed from main to release" in summary for summary in summaries)
+
+
+async def test_failed_merge_response_is_recovered_from_live_pull_request(
+    client: TestClient, delivery_supervisor: Supervisor, github: FakeGitHubServer
+) -> None:
+    task_id, view = await green(client, delivery_supervisor, github)
+    github.state.set_check(REPOSITORY, view["head_sha"], name="build", conclusion="success")
+    github.state.merge_response_failure_once = True
+
+    await delivery_supervisor.tick()
+
+    assert client.get(f"/v1/tasks/{task_id}").json()["state"] == "merged"
+    record = pr(client, task_id)
+    assert record["merge_sha"] == "f" * 40
+    assert record["merged_by"] == "crucible-spike[bot]"
+    assert github.state.merge_calls == [(REPOSITORY, 1, "squash")]
 
 
 # ----- the C4 correction round ------------------------------------------

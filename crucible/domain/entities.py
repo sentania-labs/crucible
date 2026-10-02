@@ -623,6 +623,15 @@ class PullRequest:
     last_reactions_polled_at: datetime | None = None
     reactions_observable: bool = True
     cancelled_at: datetime | None = None
+    observed_head_sha: str = ""
+    observed_base_ref: str = ""
+    mergeable_state: str = ""
+    merge_refusal_cause: str | None = None
+    merge_refusal_head_sha: str | None = None
+    merge_refusal_base_ref: str | None = None
+    merge_refusal_mergeable_state: str | None = None
+    merge_refusal_count: int = 0
+    merge_retry_at: datetime | None = None
 
 
 @dataclass(slots=True)
