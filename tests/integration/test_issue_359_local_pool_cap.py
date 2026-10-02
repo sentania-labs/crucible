@@ -17,7 +17,7 @@ from tests.integration.conftest import rebuild, reset, submit_and_start
 pytestmark = pytest.mark.integration
 
 PREVIOUS = "0035_credential_renewer"
-COLUMNS = {"routing_policy_name", "routing_policy_version"}
+COLUMNS = {"routing_version"}
 
 
 @pytest.fixture(autouse=True)
@@ -79,7 +79,7 @@ async def test_0036_backfills_existing_attempts_from_the_execution_snapshot(
         with engine.connect() as conn:
             rows = conn.execute(
                 text(
-                    "SELECT a.task_id, a.routing_policy_name, a.routing_policy_version, "
+                    "SELECT a.task_id, a.routing_version, "
                     "x.policy_snapshot->'routing'->'policy'->>'name' AS snapshot_name, "
                     "x.policy_snapshot->'routing'->'policy'->>'version' AS snapshot_version "
                     "FROM attempts a JOIN executions x ON x.id = a.execution_id "
@@ -93,11 +93,8 @@ async def test_0036_backfills_existing_attempts_from_the_execution_snapshot(
             for row in routed:
                 assert row.snapshot_name is not None
                 assert row.routing_policy_name == row.snapshot_name
-                assert row.routing_policy_version == int(row.snapshot_version)
-            assert all(
-                (row.routing_policy_name, row.routing_policy_version) == (None, None)
-                for row in bare
-            )
+                assert row.routing_version == int(row.snapshot_version)
+            assert all(row.routing_version is None for row in bare)
             # The fenced trigger is back on after the backfill.
             enabled = conn.execute(
                 text(
@@ -109,7 +106,7 @@ async def test_0036_backfills_existing_attempts_from_the_execution_snapshot(
             assert enabled == "O"
         with engine.begin() as conn, pytest.raises(Exception, match="fenced_token"):
             conn.execute(
-                text("UPDATE attempts SET routing_policy_version = 0 WHERE task_id = :task"),
+                text("UPDATE attempts SET routing_version = 0 WHERE task_id = :task"),
                 {"task": routed_task},
             )
         assert migrate.schema_drift(engine) is None

@@ -263,10 +263,7 @@ async def test_attempts_record_the_routing_version_they_launched_under(
     for pending in (implement, review):
         attempt = world.attempts[pending.attempt.id]
         assert attempt.state is AttemptState.PREPARING
-        assert (attempt.routing_policy_name, attempt.routing_policy_version) == (
-            "test-routing",
-            1,
-        )
+        assert (attempt.routing_version) == 1
     assert world.attempts[implement.attempt.id].selected_pool == POOL
 
 
@@ -279,11 +276,11 @@ def test_a_created_attempt_records_its_executions_routing(
 
     created = supervisor._create_attempt(world.uow, execution, number=2)
 
-    assert (created.routing_policy_name, created.routing_policy_version) == ("test-routing", 3)
+    assert (created.routing_version) == 3
     unrouted = world.add("unrouted").execution
     unrouted.policy_snapshot = {}
     bare = supervisor._create_attempt(world.uow, unrouted, number=2)
-    assert (bare.routing_policy_name, bare.routing_policy_version) == (None, None)
+    assert bare.routing_version is None
 
 
 @pytest.mark.parametrize(

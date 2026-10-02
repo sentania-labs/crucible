@@ -988,7 +988,9 @@ class Supervisor:
             resume_from_remote=execution.resume_from_remote,
             routing_excluded_pools=sorted(excluded_pools or set()),
         )
-        self._record_routing_ref(attempt, execution)
+
+        ref = routing_ref(execution.policy_snapshot or {})
+        attempt.routing_version = ref[1] if ref else None
         uow.attempts.add(attempt)
         record_event(
             uow,
@@ -1001,13 +1003,6 @@ class Supervisor:
             payload={"number": number},
         )
         return attempt
-
-    @staticmethod
-    def _record_routing_ref(attempt: Attempt, execution: Execution) -> None:
-        """Hades #359: the routing policy name and version the attempt launches under,
-        which is the one in its execution's policy snapshot."""
-        ref = routing_ref(execution.policy_snapshot or {})
-        attempt.routing_policy_name, attempt.routing_policy_version = ref or (None, None)
 
     def _materialize_review_executions(self, uow: UnitOfWork) -> None:
         """A `review` execution the API asked for (04). Execution rows are fenced to the
@@ -2116,7 +2111,9 @@ class Supervisor:
             attempt.selected_harness = chosen.harness
             attempt.selected_image = chosen_image
             attempt.selected_pool = chosen.pool
-            self._record_routing_ref(attempt, execution)
+            ref = routing_ref(execution.policy_snapshot or {})
+            attempt.routing_version = ref[1] if ref else None
+
             execution.model = chosen.id
             execution.harness = chosen.harness
             execution.image = chosen_image
@@ -2485,7 +2482,9 @@ class Supervisor:
             attempt.selected_harness = execution.harness
             attempt.selected_image = execution.image
             attempt.selected_pool = entry.pool if entry is not None else None
-            self._record_routing_ref(attempt, execution)
+            ref = routing_ref(execution.policy_snapshot or {})
+            attempt.routing_version = ref[1] if ref else None
+
             uow.attempts.save(attempt)
             self._move_to_preparing(uow, attempt, task, execution)
             uow.commit()

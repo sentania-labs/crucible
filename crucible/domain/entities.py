@@ -172,8 +172,7 @@ class Attempt:
     routing_excluded_pools: list[str] = field(default_factory=list)
     resume_from_remote: bool = False
     # Hades #359: the routing policy the attempt was launched under.
-    routing_policy_name: str | None = None
-    routing_policy_version: int | None = None
+    routing_version: int | None = None
 
 
 @dataclass(slots=True)
