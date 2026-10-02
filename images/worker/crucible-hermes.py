@@ -119,21 +119,27 @@ def _enrich_usage(usage_path: Path, home: Path, max_turns: int = 0) -> None:
         row = None
         try:
             with sqlite3.connect(home / "state.db") as database:
+                database.row_factory = sqlite3.Row
                 if isinstance(session_id, str):
                     row = database.execute(
-                        "SELECT started_at, ended_at, tool_call_count FROM sessions WHERE id = ?",
+                        "SELECT * FROM sessions WHERE id = ?",
                         (session_id,),
                     ).fetchone()
                 else:
                     row = database.execute(
-                        "SELECT started_at, ended_at, tool_call_count FROM sessions "
-                        "ORDER BY started_at DESC LIMIT 1"
+                        "SELECT * FROM sessions ORDER BY started_at DESC LIMIT 1"
                     ).fetchone()
         except sqlite3.Error:
             row = None
         if row is not None:
-            usage["duration_ms"] = _milliseconds(row[0], row[1])
-            usage["tool_calls"] = row[2] if isinstance(row[2], int) else None
+            usage["duration_ms"] = _milliseconds(row["started_at"], row["ended_at"])
+            usage["tool_calls"] = row["tool_call_count"] if isinstance(row["tool_call_count"], int) else None
+            keys = row.keys()
+            for k in ("model", "provider", "input_tokens", "output_tokens", "reasoning_tokens", "total_tokens"):
+                if usage.get(k) is None and k in keys and row[k] is not None:
+                    usage[k] = row[k]
+            if usage.get("session_id") is None and "id" in keys and row["id"] is not None:
+                usage["session_id"] = row["id"]
         temporary = usage_path.with_suffix(".tmp")
         temporary.write_text(json.dumps(usage, sort_keys=True) + "\n", encoding="utf-8")
         temporary.replace(usage_path)
