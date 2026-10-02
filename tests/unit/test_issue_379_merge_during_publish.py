@@ -614,12 +614,30 @@ def test_a_close_polled_after_the_corrected_heads_publication_failed_is_recorded
     assert len(wakes) == 1
     assert f"pull request #{PR_NUMBER} was closed without being merged" in wakes[0]
     assert "publish_failed" in wakes[0]
+    assert "cancel it, or reopen the pull request and then republish" in wakes[0]
 
     # The closed PR is not polled again, and the wake is not repeated.
     clock.advance(3600)
     asyncio.run(supervisor.delivery.observe())
     assert github.observed == [PR_NUMBER]
     assert len(_wakes(store, "pull_request_closed")) == 1
+
+
+def test_a_close_while_a_correction_runs_explains_reopen_or_cancel(tmp_path: Path) -> None:
+    store, clock, supervisor, github, _publisher = _correcting(
+        tmp_path, until=TaskState.RUNNING
+    )
+    github.polled = _closed()
+    clock.advance(300)
+
+    assert asyncio.run(supervisor.delivery.observe()) == 1
+
+    assert _task(store).state is TaskState.RUNNING
+    wakes = _wakes(store, "pull_request_closed")
+    assert len(wakes) == 1
+    assert "the correction continues" in wakes[0]
+    assert "publication will fail unless the pull request is reopened" in wakes[0]
+    assert "cancelling the task is the usual answer" in wakes[0]
 
 
 class _Certifications:

@@ -1229,7 +1229,7 @@ def settle_pull_request_state(
             summary += f", before Crucible saw it ready for merge (the task was {merged_from})"
         if not head_matches or checkpoint:
             problem = (
-                "What was merged is not what Crucible last pushed"
+                "What was merged is not a head Crucible pushed"
                 if not head_matches
                 else "What was merged is an ungated quota checkpoint"
             )
@@ -1300,15 +1300,25 @@ def _wake_closed_during_correction(
         clock,
         principal_id=task.principal_id,
         reason=WakeReason.PULL_REQUEST_CLOSED,
-        summary=(
-            f"pull request #{pull_request.number} was closed without being merged by "
-            f"{pull_request.closed_by or 'someone'} while the task was {task.state.value}; "
-            "the task stays there, nothing is published to a closed pull request and no "
-            "new one is opened"
-        )[:500],
+        summary=_closed_correction_summary(task, pull_request),
         task=task,
         extra_links={"pull_request": f"/v1/tasks/{task.id}/pull-request"},
     )
+
+
+def _closed_correction_summary(task: Task, pull_request: PullRequest) -> str:
+    start = (
+        f"pull request #{pull_request.number} was closed without being merged by "
+        f"{pull_request.closed_by or 'someone'} while the task was {task.state.value}; "
+    )
+    if task.state is TaskState.PUBLISH_FAILED:
+        action = "the task stays there; cancel it, or reopen the pull request and then republish"
+    else:
+        action = (
+            "the correction continues, but publication will fail unless the pull request "
+            "is reopened; cancelling the task is the usual answer"
+        )
+    return (start + action)[:500]
 
 
 def evaluate_delivery_gates(
