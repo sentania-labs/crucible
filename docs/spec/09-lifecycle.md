@@ -121,27 +121,33 @@ pre-PR gates, is published to the same PR, is certified on its own CI, and
 returns to `ready_for_merge` without a new external review request. The PR
 stays open while the correction runs and is still polled for a merge: a
 merge observed in any state of the correction moves the task to `merged`,
-publishing and publish_failed included (hades #379). Such a correction
-gives reason `needs_more_work` or `internal_review`.
+publishing and publish_failed included (hades #379).
+
+Only `needs_more_work` or `internal_review` can start a correction from
+`ready_for_merge`.
 
 Publishing and publish_failed count as correction states only when an
 earlier publication of the task completed; a first publication that fails
 after opening its PR is polled in full, and a merge of it is an early merge.
 
-When a merge wins over a correction, the task's head is the last head
-Crucible pushed and confirmed on the remote, not a corrected head that was
-collected and never pushed. The `task_merged` event records the head GitHub
-merged, that last pushed head, whether that push was a quota checkpoint,
-and whether the two heads are equal; the wake says which. When they differ,
-or the head merged was only a quota checkpoint (which passed no gate and
-was never accepted), the wake is an escalation instead. A merge recorded
-without its head (before hades #379) is taken to be of the last pushed
-head. A quota checkpoint is not pushed once the task is merged.
+When a merge wins over a correction, the task's head is the merged head when
+it is among the heads Crucible pushed and confirmed on the remote, not a
+corrected head that was collected and never pushed. The `task_merged` event
+records the head GitHub merged, the latest recorded pushed head, whether the
+merged head was a quota checkpoint, and whether the merged head is among the
+pushed heads; the wake says which. When it is not, or the head merged was only
+a quota checkpoint (which passed no gate and was never accepted), the wake is
+an escalation instead. A merge recorded without its head (before hades #379)
+is taken to be of the latest recorded pushed head. A quota checkpoint is not
+pushed once the task is merged.
 
 A PR closed unmerged while a correction is under way, or after a first
 publication failed, is recorded on the PR (which is then no longer polled)
 and wakes Foundry with `pull_request_closed`; the task stays where it is,
-because a correction state has no edge to `rejected`.
+because a correction state has no edge to `rejected`. In `publish_failed`,
+the operator can cancel, or reopen the PR and then republish. In running,
+gates, or `awaiting_acceptance`, the correction continues but publication
+will fail unless the PR is reopened, so cancellation is the usual answer.
 
 Once the corrected head is the accepted head, review feedback made on the
 heads Crucible pushed before it, before the corrected head appeared, is

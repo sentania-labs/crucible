@@ -468,8 +468,9 @@ other pull request is not adopted, and nothing more is pushed. The
 publication then fails with a `publish_failed` wake naming it, which offers
 no republish because a retry meets the same pull request, except that a
 merge settles the task as `merged`. A publication failure that finds the
-task already moved on (a poll settled it as `merged`) is not reported. The merge wake on this path says whether the head GitHub merged is
-the last head Crucible pushed, and is an escalation when it is not. A PR closed without
+task already moved on (a poll settled it as `merged`) is not reported. The
+merge wake on this path says whether the head GitHub merged is among the
+heads Crucible pushed, and is an escalation when it is not. A PR closed without
 merge moves the task to `rejected` from any delivery state, `head_diverged`
 included, with the closer recorded, and wakes Foundry with
 `pull_request_closed`. The closer is not on the PR itself: `GET
