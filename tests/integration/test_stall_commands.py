@@ -376,6 +376,21 @@ async def test_the_saved_hermes_run_limits_reach_the_launch(
     env = worker.spec.env
     assert env["CRUCIBLE_HERMES_MAX_TURNS"] == "420"
     assert env["CRUCIBLE_HERMES_CONTEXT_LENGTH"] == "98304"
+    # Issue 388: the allowance not saved is the default; thinking is the entry's.
+    assert env["CRUCIBLE_HERMES_MAX_OUTPUT_TOKENS"] == "32000"
+    assert env["CRUCIBLE_HERMES_THINKING"] == "off"
     assert env["CRUCIBLE_HERMES_IDENTITY"] == "/crucible/identity/IDENTITY.md"
     assert "PATH" not in env
-    assert worker.spec.harness_settings == {"max_turns": 420, "context_length": 98304}
+    effective = {
+        "max_turns": 420,
+        "context_length": 98304,
+        "max_output_tokens": 32000,
+        "enable_thinking": False,
+    }
+    assert worker.spec.harness_settings == effective
+    recorded = [
+        row
+        for row in client.get(f"/v1/attempts/{attempt_id}/evidence").json()["items"]
+        if row["kind"] == "launch_settings"
+    ]
+    assert [row["payload"]["settings"] for row in recorded] == [effective]

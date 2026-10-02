@@ -280,7 +280,10 @@ def build_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     gw_sub.add_parser("test", help="test the saved URL and key again")
     limits = gw_sub.add_parser(
         "limits",
-        help="show the Hermes run limits, or set them with --max-turns and --context-length",
+        help=(
+            "show the Hermes run limits, or set them with --max-turns, --context-length "
+            "and --max-output-tokens"
+        ),
     )
     limits.add_argument(
         "--max-turns", type=int, default=None, help="model turns one Hermes run may take"
@@ -290,6 +293,12 @@ def build_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="the context window Hermes is told, in tokens; 0 lets Hermes find it",
+    )
+    limits.add_argument(
+        "--max-output-tokens",
+        type=int,
+        default=None,
+        help="the response allowance every Hermes request carries, in tokens",
     )
     gw_sub.add_parser("models", help="the models the key can see, beside the entries in force")
     pick = gw_sub.add_parser(
@@ -704,7 +713,7 @@ def _remote(args: argparse.Namespace, remote: Api) -> Any:
             return remote.call("POST", "/v1/admin/gateway/test", reason)
         if verb == "limits":
             current = remote.call("GET", "/v1/admin/gateway/hermes-limits")
-            if args.max_turns is None and args.context_length is None:
+            if _no_limit_flags(args):
                 return current
             return remote.call(
                 "POST",
@@ -1130,15 +1139,18 @@ def _local(args: argparse.Namespace, wiring: Wiring) -> Any:
     raise UsageError(f"unknown command: {command}")
 
 
+LIMIT_FLAGS = ("max_turns", "context_length", "max_output_tokens")
+
+
+def _no_limit_flags(args: argparse.Namespace) -> bool:
+    return all(getattr(args, name) is None for name in LIMIT_FLAGS)
+
+
 def _limits(args: argparse.Namespace, current: Mapping[str, Any]) -> dict[str, int]:
     """`gateway limits` flags over the limits in force: a flag not given keeps its value."""
     return {
-        "max_turns": args.max_turns if args.max_turns is not None else int(current["max_turns"]),
-        "context_length": (
-            args.context_length
-            if args.context_length is not None
-            else int(current["context_length"])
-        ),
+        name: getattr(args, name) if getattr(args, name) is not None else int(current[name])
+        for name in LIMIT_FLAGS
     }
 
 
@@ -1152,7 +1164,7 @@ def _local_gateway(args: argparse.Namespace, wiring: Wiring, admin: AdminContext
             return gateway.gateway_view(admin, uow)
         if verb == "models":
             return asyncio.run(gateway.models_view(admin, uow))
-        if verb == "limits" and args.max_turns is None and args.context_length is None:
+        if verb == "limits" and _no_limit_flags(args):
             return gateway.hermes_limits_view(uow)
         if verb == "test":
             result = asyncio.run(

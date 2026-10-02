@@ -86,6 +86,15 @@ def test_a_progress_line_follows_each_change_to_the_session_store(
     assert lines == [wrapper.PROGRESS_LINE]
 
 
+def stand_in_release(hermes: Path, version: str = "0.19.0") -> None:
+    """The installed-package record the bootstrap's version check reads."""
+    info = hermes / f"hermes_agent-{version}.dist-info"
+    info.mkdir()
+    (info / "METADATA").write_text(
+        f"Metadata-Version: 2.1\nName: hermes-agent\nVersion: {version}\n", encoding="utf-8"
+    )
+
+
 _STAND_IN_AGENT = """
 class AIAgent:
     def __init__(self, base_url=None, api_key=None, provider=None, api_mode=None,
@@ -120,6 +129,7 @@ def test_the_bootstrap_sets_the_turn_budget_only_where_none_was_named(
     (hermes / "run_agent.py").write_text(_STAND_IN_AGENT, encoding="utf-8")
     (hermes / "hermes_cli" / "__init__.py").write_text("", encoding="utf-8")
     (hermes / "hermes_cli" / "main.py").write_text(_STAND_IN_MAIN, encoding="utf-8")
+    stand_in_release(hermes)
     # The working directory is the task's checkout. Modules there named like Hermes's
     # own must never be imported in their place.
     checkout = tmp_path / "checkout"

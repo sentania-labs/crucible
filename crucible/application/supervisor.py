@@ -107,7 +107,7 @@ from crucible.domain.entities import (
 from crucible.domain.events import PRINCIPAL_CRUCIBLE, EventKind
 from crucible.domain.exit_class import CLEAN_EXIT_CLASSES, ExitClass, classify_exit
 from crucible.domain.gates import GateName, GateResult, evaluate_gate
-from crucible.domain.harness_settings import setting_name
+from crucible.domain.harness_settings import THINKING_KEY, hermes_run_limits, setting_name
 from crucible.domain.ids import new_id
 from crucible.domain.lifecycle import (
     ATTEMPT_TERMINAL,
@@ -1621,6 +1621,14 @@ class Supervisor:
                 if selected_harness
                 else None
             )
+            harness_settings = self._launch_settings(
+                route_uow,
+                attempt,
+                task,
+                selected_harness,
+                dict(saved.document) if saved is not None else {},
+                enable_thinking=route is not None and route.chat_template_kwargs.enable_thinking,
+            )
             resume_bundle: dict[str, str] = {}
             # Only a correction reads the task's events: an ordinary launch has no
             # previous attempt to resume from (#258).
@@ -1665,8 +1673,6 @@ class Supervisor:
                             "head": str(bundle.payload.get("head_sha") or ""),
                             "sha256": str(bundle.payload.get("bundle_sha256") or ""),
                         }
-        # FDY-0140: the harness's run settings as saved now, read at every launch.
-        harness_settings = dict(saved.document) if saved is not None else {}
         # Issue 128: the policy default, narrowed by the contract, capped at the attempt.
         command_timeout_ms = effective_command_timeout_ms(
             execution.policy_snapshot, contract, execution.timeout_seconds
@@ -1747,6 +1753,50 @@ class Supervisor:
             stdin_text=launch.stdin_text,
             transcript_path=launch.transcript_path,
         )
+
+    def _launch_settings(
+        self,
+        uow: UnitOfWork,
+        attempt: Attempt,
+        task: Task,
+        harness: str | None,
+        saved: dict[str, Any],
+        *,
+        enable_thinking: bool,
+    ) -> dict[str, Any]:
+        """FDY-0140: the harness's run settings as saved now, read at launch.
+
+        Issue 388: for Hermes they are made whole (the defaults for anything not saved,
+        and the routing entry's thinking setting) and recorded on the attempt the first
+        time its launch spec is built. That record is what every later build of the same
+        attempt's spec reads, so one attempt keeps the context length, response
+        allowance and thinking setting it started with; a new attempt reads the
+        settings saved then, a lower allowance included."""
+        if harness != "hermes":
+            return saved
+        for row in uow.evidence.list_for_attempt(attempt.id):
+            recorded = row.payload.get("settings")
+            if (
+                row.kind == EvidenceKind.LAUNCH_SETTINGS.value
+                and row.verified
+                and isinstance(recorded, dict)
+            ):
+                return dict(recorded)
+        settings = hermes_run_limits({**saved, THINKING_KEY: enable_thinking}).effective()
+        uow.evidence.add(
+            EvidenceRecord(
+                id=None,
+                attempt_id=attempt.id,
+                task_id=task.id,
+                kind=EvidenceKind.LAUNCH_SETTINGS.value,
+                observed_at=self._clock.now(),
+                source=EvidenceSource.CRUCIBLE.value,
+                verified=True,
+                payload={"harness": harness, "settings": settings},
+            )
+        )
+        uow.commit()
+        return settings
 
     async def _spec_for(self, attempt: Attempt) -> LaunchSpec | None:
         """Rebuild the launch spec from the database, for a collect after a restart."""

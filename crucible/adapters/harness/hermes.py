@@ -209,6 +209,11 @@ class HermesAdapter:
                 # FDY-0140: the run limits the Local gateway page sets.
                 "CRUCIBLE_HERMES_MAX_TURNS": str(limits.max_turns),
                 "CRUCIBLE_HERMES_CONTEXT_LENGTH": str(limits.context_length),
+                # Issue 388: the response allowance the gateway enforces, so Hermes's
+                # compressor reserves it and its requests carry it, and the routing
+                # entry's thinking setting. Both as the attempt recorded them.
+                "CRUCIBLE_HERMES_MAX_OUTPUT_TOKENS": str(limits.max_output_tokens),
+                "CRUCIBLE_HERMES_THINKING": "on" if limits.enable_thinking else "off",
                 "OPENAI_BASE_URL": ctx.endpoint_url,
                 "OPENAI_API_KEY": "local-no-auth",
                 "CRUCIBLE_HERMES_USAGE": usage_path,

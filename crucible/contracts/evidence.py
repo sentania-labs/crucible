@@ -29,6 +29,10 @@ class EvidenceKind(StrEnum):
     ARTIFACT_PRESENT = "artifact_present"
     TRANSCRIPT_MATCH = "transcript_match"
     FALSE_CLAIM = "false_claim"
+    # Issue 388: the run settings one launch was given (for Hermes the context length,
+    # the response allowance and the thinking setting). Recorded once per attempt; a
+    # rebuild of the attempt's launch spec reads them back rather than the settings now.
+    LAUNCH_SETTINGS = "launch_settings"
 
 
 class EvidenceSource(StrEnum):

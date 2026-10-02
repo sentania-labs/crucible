@@ -351,7 +351,10 @@ a new routing version; disabling Codex leaves Hermes available as fallback. The
 shared key stays in the Hermes credential store and is mounted read-only for local
 Codex. The gateway must support `/v1/responses`, as LiteLLM in front of vLLM does.
 The context length under Local run limits applies to both harnesses; max turns
-applies only to Hermes. For Codex, a zero context length uses 131072.
+and max output tokens apply only to Hermes. For Codex, a zero context length uses
+131072. Set max output tokens to the response allowance the gateway enforces
+(32000 by default): Hermes asks for it on every request and reserves it when it
+decides when to compress.
 
 The admin API accepts `codex_enabled` alongside `enabled` (Hermes) in
 `POST /v1/admin/gateway/models`, for example

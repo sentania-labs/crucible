@@ -406,8 +406,9 @@ class RoutingTier(StrictModel):
 class ChatTemplateKwargs(StrictModel):
     """Request options retained with one routing entry.
 
-    Hermes 0.19 cannot receive this option from its non-interactive CLI. Keeping the
-    value in the entry makes the operator's intent durable until that transport exists.
+    Hermes 0.19 cannot receive this option from its non-interactive CLI; the worker
+    image's Hermes wrapper adds it to the requests Hermes sends (issue 388), and the
+    attempt records the value it launched with.
     """
 
     enable_thinking: bool = False

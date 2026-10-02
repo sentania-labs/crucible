@@ -3240,10 +3240,11 @@ def test_hermes_run_limits_have_api_cli_and_ui_controls(
 ) -> None:
     """FDY-0140: every tunable has a UI. The turn and context limits are shown and set
     from the admin API, `crucible-admin gateway limits` and the Local gateway page, and
-    each change is audited."""
+    each change is audited. Issue 388: so is the response allowance."""
     asyncio.run(live_supervisor.tick())
     shown = admin_client.get("/v1/admin/gateway/hermes-limits").json()
     assert (shown["max_turns"], shown["context_length"], shown["saved"]) == (300, 131072, False)
+    assert shown["max_output_tokens"] == 32000
 
     saved = admin_client.post(
         "/v1/admin/gateway/hermes-limits",
@@ -3255,6 +3256,8 @@ def test_hermes_run_limits_have_api_cli_and_ui_controls(
         {"max_turns": 5, "context_length": 0},
         {"max_turns": 300, "context_length": 1000},
         {"max_turns": "many", "context_length": 0},
+        {"max_turns": 300, "context_length": 0, "max_output_tokens": 10},
+        {"max_turns": 300, "context_length": 131072, "max_output_tokens": 100000},
     ):
         refused = admin_client.post("/v1/admin/gateway/hermes-limits", json=body)
         assert refused.status_code in (409, 422), (body, refused.text)
@@ -3270,10 +3273,13 @@ def test_hermes_run_limits_have_api_cli_and_ui_controls(
         "limits",
         "--context-length",
         "200000",
+        "--max-output-tokens",
+        "16000",
         capsys=capsys,
     )
     # A flag not given keeps its value.
     assert (changed["max_turns"], changed["context_length"]) == (500, 200000)
+    assert changed["max_output_tokens"] == 16000
 
     with TestClient(create_app(ctx)) as browser:
         csrf = ui_sign_in(browser, tokens["admin"])
@@ -3282,12 +3288,14 @@ def test_hermes_run_limits_have_api_cli_and_ui_controls(
         assert "Local run limits" in page.text
         assert 'action="/ui/actions/hermes-limits"' in page.text
         assert 'name="max_turns"' in page.text and 'name="context_length"' in page.text
+        assert 'name="max_output_tokens"' in page.text
         response = browser.post(
             "/ui/actions/hermes-limits",
             data={
                 "csrf": csrf,
                 "max_turns": "250",
                 "context_length": "131072",
+                "max_output_tokens": "24000",
                 "reason": "ui: back to normal",
                 "return_to": "/ui/gateway",
             },
@@ -3297,6 +3305,7 @@ def test_hermes_run_limits_have_api_cli_and_ui_controls(
         assert "kind=ok" in unquote(response.headers["location"])
     final = admin_client.get("/v1/admin/gateway/hermes-limits").json()
     assert (final["max_turns"], final["context_length"], final["saved"]) == (250, 131072, True)
+    assert final["max_output_tokens"] == 24000
     events = admin_client.get("/v1/admin/audit", params={"limit": 200}).json()["items"]
     changes = [
         e["payload"]["after"]

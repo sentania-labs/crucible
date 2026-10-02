@@ -355,11 +355,14 @@ def admin_save_hermes_limits(
     principal: Admin,
     body: Annotated[dict[str, Any], Body()],
 ) -> dict[str, Any]:
-    """`max_turns` and `context_length`, whole numbers; `context_length` 0 lets Hermes
-    find the window itself. Applies from the next launch."""
-    values = {}
-    for name in ("max_turns", "context_length"):
+    """`max_turns`, `context_length` and optionally `max_output_tokens`, whole numbers;
+    `context_length` 0 lets Hermes find the window itself, and no `max_output_tokens`
+    keeps the allowance in force. Applies from the next launch."""
+    values: dict[str, int] = {}
+    for name in ("max_turns", "context_length", "max_output_tokens"):
         value = body.get(name)
+        if name == "max_output_tokens" and value is None:
+            continue
         if isinstance(value, bool) or not isinstance(value, int):
             raise ConflictError(f"{name} must be a whole number")
         values[name] = value
@@ -369,6 +372,7 @@ def admin_save_hermes_limits(
         principal=principal,
         max_turns=values["max_turns"],
         context_length=values["context_length"],
+        max_output_tokens=values.get("max_output_tokens"),
         reason=_reason(body),
     )
     uow.commit()

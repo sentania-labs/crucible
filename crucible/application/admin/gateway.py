@@ -37,6 +37,7 @@ from crucible.domain.entities import Principal, ProviderSetting
 from crucible.domain.events import EventKind
 from crucible.domain.harness_settings import (
     CONTEXT_LENGTH_RANGE,
+    MAX_OUTPUT_TOKENS_RANGE,
     MAX_TURNS_RANGE,
     HermesRunLimits,
     hermes_limit_problems,
@@ -589,6 +590,7 @@ def hermes_limits_view(uow: UnitOfWork) -> dict[str, Any]:
         "defaults": HermesRunLimits().as_dict(),
         "max_turns_range": list(MAX_TURNS_RANGE),
         "context_length_range": list(CONTEXT_LENGTH_RANGE),
+        "max_output_tokens_range": list(MAX_OUTPUT_TOKENS_RANGE),
     }
 
 
@@ -600,20 +602,25 @@ def save_hermes_limits(
     max_turns: int,
     context_length: int,
     reason: str | None,
+    max_output_tokens: int | None = None,
 ) -> dict[str, Any]:
     """Save the Hermes run limits. They apply from the next launch; a run already going
-    keeps the limits it started with."""
+    keeps the limits it started with. No `max_output_tokens` keeps the one in force."""
     reason = guard_mutation(
         ctx, uow, reason, principal=principal.name, operation="hermes limits set"
     )
-    problems = hermes_limit_problems(max_turns, context_length)
+    before = hermes_limits_view(uow)
+    if max_output_tokens is None:
+        max_output_tokens = int(before["max_output_tokens"])
+    problems = hermes_limit_problems(max_turns, context_length, max_output_tokens)
     if problems:
         raise ContractValidationError(
             "; ".join(problems),
             errors=[{"path": "hermes_limits", "message": problem} for problem in problems],
         )
-    before = hermes_limits_view(uow)
-    after = HermesRunLimits(max_turns=max_turns, context_length=context_length).as_dict()
+    after = HermesRunLimits(
+        max_turns=max_turns, context_length=context_length, max_output_tokens=max_output_tokens
+    ).as_dict()
     uow.provider_settings.put(
         ProviderSetting(
             name=setting_name(HERMES),
@@ -629,7 +636,7 @@ def save_hermes_limits(
         EventKind.LOCAL_GATEWAY_UPDATED,
         principal=principal.name,
         reason=reason,
-        before={"max_turns": before["max_turns"], "context_length": before["context_length"]},
+        before={name: before[name] for name in after},
         after=after,
         change="hermes_limits",
     )
