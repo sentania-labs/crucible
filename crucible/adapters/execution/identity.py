@@ -89,6 +89,9 @@ def render_identity_md(
         f"`{repository.get('name', '(unnamed)')}`, checked out at `{REPO_MOUNT}` on "
         f"branch `{work_branch}` from `{repository.get('base_ref', 'main')}`. Do the task "
         "yourself; do not redefine, widen or delegate it.",
+        "The workspace origin is the `crucible-no-remote` helper; `git fetch origin` "
+        "will fail. `origin/main` is main as of workspace preparation, so a worker "
+        "told to bring in main should merge that ref rather than fetching it.",
         f"## Objective\n\n{str(contract.get('objective', '')).strip()}",
     ]
     if correction:

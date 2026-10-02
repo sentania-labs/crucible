@@ -205,6 +205,7 @@ async def test_due_renewer_sweep_from_thread_projects_and_records_on_service_loo
     sweep_uow.logs.attempts_with_logs_before.return_value = []
     sweep_uow.wakes.list_acked_before.return_value = []
     supervisor._fenced = Mock(side_effect=lambda: nullcontext(sweep_uow))  # type: ignore[method-assign]
+    supervisor.fenced_token = 42
     assert await asyncio.to_thread(supervisor._retention_sweep) == 1
     await asyncio.wait_for(event_seen.wait(), 2)
     await asyncio.wait_for(projection_seen.wait(), 2)
