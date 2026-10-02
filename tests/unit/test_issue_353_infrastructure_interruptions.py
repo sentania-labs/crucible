@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import replace
 from datetime import timedelta
+from http.client import BadStatusLine
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from crucible.adapters.execution import k8sspec
+from crucible.adapters.execution import endpoint_health, k8sspec
 from crucible.application.corrections import _unpublished_bundle_problem
 from crucible.application.supervisor import _Pending
 from crucible.domain.events import EventKind
@@ -350,3 +352,49 @@ async def test_runtime_status_is_classified_before_collection(
 )
 def test_tool_output_and_recovered_calls_do_not_mask_worker_failure(tail: str) -> None:
     assert model_interruption(1, tail) is None
+
+
+@pytest.mark.parametrize("scheme", ["http", "https"])
+@pytest.mark.parametrize("status", [200, 204, 302, 429, 503])
+async def test_readiness_probe_status_and_timeout(
+    monkeypatch: pytest.MonkeyPatch, scheme: str, status: int
+) -> None:
+    event_loop_thread = threading.get_ident()
+    connection = MagicMock()
+    connection.getresponse.return_value.__enter__.return_value.status = status
+
+    def connect(host: str, port: int, *, timeout: int) -> Any:
+        assert threading.get_ident() != event_loop_thread
+        assert (host, port, timeout) == ("gateway.example", 4000, 5)
+        return connection
+
+    monkeypatch.setattr(
+        endpoint_health, "HTTPSConnection" if scheme == "https" else "HTTPConnection", connect
+    )
+    assert await endpoint_health.probe_model_endpoint(
+        f"{scheme}://gateway.example:4000/v1?ignored=true#fragment"
+    ) is (status == 200)
+    connection.request.assert_called_once_with("GET", "/health/readiness")
+    connection.getresponse.assert_called_once_with()
+    connection.close.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    "error", [ConnectionRefusedError(), ConnectionResetError(), TimeoutError()]
+)
+async def test_readiness_probe_connection_failure(
+    monkeypatch: pytest.MonkeyPatch, error: OSError
+) -> None:
+    connection = MagicMock()
+    connection.request.side_effect = error
+    monkeypatch.setattr(endpoint_health, "HTTPConnection", MagicMock(return_value=connection))
+    assert not await endpoint_health.probe_model_endpoint("http://gateway.example/v1")
+    connection.close.assert_called_once_with()
+
+
+async def test_readiness_probe_invalid_response(monkeypatch: pytest.MonkeyPatch) -> None:
+    connection = MagicMock()
+    connection.getresponse.side_effect = BadStatusLine("invalid response")
+    monkeypatch.setattr(endpoint_health, "HTTPConnection", MagicMock(return_value=connection))
+    assert not await endpoint_health.probe_model_endpoint("http://gateway.example/v1")
+    connection.close.assert_called_once_with()

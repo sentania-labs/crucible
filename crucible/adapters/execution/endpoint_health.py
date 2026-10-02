@@ -2,17 +2,29 @@
 
 from __future__ import annotations
 
-from urllib.parse import urlsplit, urlunsplit
+import asyncio
+from http.client import HTTPConnection, HTTPException, HTTPSConnection
+from urllib.parse import urlsplit
 
-import httpx
+
+def _probe_model_endpoint(endpoint_url: str) -> bool:
+    connection: HTTPConnection | None = None
+    try:
+        parts = urlsplit(endpoint_url)
+        if parts.scheme not in {"http", "https"} or parts.hostname is None:
+            return False
+        connection_type = HTTPSConnection if parts.scheme == "https" else HTTPConnection
+        connection = connection_type(parts.hostname, parts.port, timeout=5)
+        connection.request("GET", "/health/readiness")
+        with connection.getresponse() as response:
+            return response.status == 200
+    except (OSError, HTTPException, ValueError):
+        return False
+    finally:
+        if connection is not None:
+            connection.close()
 
 
 async def probe_model_endpoint(endpoint_url: str) -> bool:
-    parts = urlsplit(endpoint_url)
-    url = urlunsplit((parts.scheme, parts.netloc, "/health/readiness", "", ""))
-    try:
-        async with httpx.AsyncClient(timeout=5, follow_redirects=False) as client:
-            response = await client.get(url)
-        return response.status_code == 200
-    except httpx.HTTPError:
-        return False
+    # Network I/O must not stall the supervisor's event loop during an outage.
+    return await asyncio.to_thread(_probe_model_endpoint, endpoint_url)
