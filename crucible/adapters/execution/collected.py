@@ -140,9 +140,9 @@ def read_outputs(
             artifacts.append(
                 CollectedArtifact(
                     name=name,
-                    type="run_evidence",
+                    type="diff" if name == "report/diff.patch" else "run_evidence",
                     content=path.read_bytes()[: 4 * 1024 * 1024],
-                    content_type="text/plain",
+                    content_type=("text/x-diff" if name == "report/diff.patch" else "text/plain"),
                 )
             )
     for run in verifications:

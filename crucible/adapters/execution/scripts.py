@@ -246,6 +246,10 @@ copy_report() {
 # seconds, once for the fetch and once more for the clone.
 CACHE_REFRESH_CONNECT_SECONDS = 20
 
+# Collected artifacts are read into memory before they enter artifact storage. Keep the
+# review diff within that existing ingestion bound as well as the configured report cap.
+DIFF_ARTIFACT_CAP_BYTES = 4 * 1024 * 1024
+
 
 def _cache_refresh(cache_dir: str) -> str:
     """Fetch into the bare mirror, or clone it when it is absent or will not fetch; and
@@ -540,6 +544,7 @@ REPO={REPO_MOUNT}
 WORK_BRANCH={_quote(work_branch)}
 BASE_REF={_quote(base_ref)}
 SIZE_CAP={_quote(str(size_cap_bytes))}
+DIFF_ARTIFACT_CAP={_quote(str(min(size_cap_bytes, DIFF_ARTIFACT_CAP_BYTES)))}
 COMMIT_ATTEMPT={_quote(attempt_id)}
 QUOTA={_quote("1" if quota_checkpoint else "")}
 POLICY_AUTHOR_EMAIL={_quote(author_email)}
@@ -671,6 +676,31 @@ fi
 rm -rf "$OUT/tree"
 {GIT} clone --no-hardlinks --quiet "$REPO" "$OUT/tree" > "$OUT/clone.log" 2>&1 || true
 copy_report "{REPORT_MOUNT}" "$OUT/report" "$SIZE_CAP"
+# This is separate from the raw diff above, whose content and location are inputs to
+# existing gates. The review artifact begins with the stat and has an explicit marker
+# when its bounded copy cannot contain the complete patch.
+DIFF_REVIEW=/tmp/crucible-review-diff.$$
+{{
+  cat "$OUT/diffstat.txt"
+  printf '\n'
+  cat "$OUT/diff.patch"
+}} > "$DIFF_REVIEW"
+DIFF_REVIEW_SIZE=$(wc -c < "$DIFF_REVIEW")
+if [ "$DIFF_REVIEW_SIZE" -le "$DIFF_ARTIFACT_CAP" ]; then
+  cat "$DIFF_REVIEW" > "$OUT/report/diff.patch"
+else
+  TRUNCATION_MARKER='[crucible: diff truncated]'
+  MARKER_SIZE=$(printf '\n%s\n' "$TRUNCATION_MARKER" | wc -c)
+  KEEP=$((DIFF_ARTIFACT_CAP - MARKER_SIZE))
+  if [ "$KEEP" -gt 0 ]; then
+    head -c "$KEEP" "$DIFF_REVIEW" > "$OUT/report/diff.patch"
+    printf '\n%s\n' "$TRUNCATION_MARKER" >> "$OUT/report/diff.patch"
+  else
+    printf '%s\n' "$TRUNCATION_MARKER" | head -c "$DIFF_ARTIFACT_CAP" \
+      > "$OUT/report/diff.patch"
+  fi
+fi
+rm -f "$DIFF_REVIEW"
 echo done > "$OUT/collector.ok"
 """
 

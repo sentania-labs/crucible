@@ -14,6 +14,7 @@ from crucible.application.admin import (
     bootstrap,
     status,
 )
+from crucible.application.artifacts import read_artifact
 from crucible.application.decisions import record_decision
 from crucible.application.errors import (
     ApplicationError,
@@ -237,6 +238,17 @@ def _task_link(task_id: str, external_id: str | None) -> dict[str, str]:
     return {"kind": "link", "href": f"/ui/tasks/{quote(task_id)}", "label": external_id or task_id}
 
 
+def _attempt_diff_link(uow: UoW, attempt_id: str) -> dict[str, str] | str:
+    for artifact in uow.artifacts.list_for_attempt(attempt_id):
+        if artifact.type == "diff" and artifact.filename == "report/diff.patch":
+            return {
+                "kind": "link",
+                "href": f"/ui/artifacts/{quote(artifact.id)}/content",
+                "label": "diff.patch",
+            }
+    return "not collected"
+
+
 # The states a task page offers the operator's waivers from, in the order a PR moves.
 DELIVERY_STATES = (
     TaskState.AWAITING_EXTERNAL_REVIEW,
@@ -363,12 +375,12 @@ def task_page(request: Request, task_id: str, ctx: Ctx, uow: UoW) -> Response:
                 )
             else:
                 diffs = "none"
-            report_rows.append([attempt.id, filled, diffs])
+            report_rows.append([attempt.id, filled, diffs, _attempt_diff_link(uow, attempt.id)])
     if report_rows:
         sections.append(
             {
                 "title": "Report",
-                "columns": ["Attempt", "Crucible filled", "Differences"],
+                "columns": ["Attempt", "Crucible filled", "Differences", "Diff"],
                 "rows": report_rows,
             }
         )
@@ -427,6 +439,7 @@ def task_page(request: Request, task_id: str, ctx: Ctx, uow: UoW) -> Response:
             ],
         }
     )
+
     if principal.role is Role.ADMIN and view.state in WAIVABLE_STATES:
         for kind, title, note, resolves in WAIVER_FORMS:
             sections.append(
@@ -458,6 +471,21 @@ def task_page(request: Request, task_id: str, ctx: Ctx, uow: UoW) -> Response:
         heading=f"Task {view.external_id}",
         intro="The task, its pull request, and what it is waiting for.",
         sections=sections,
+    )
+
+
+@router.get("/artifacts/{artifact_id}/content")
+def artifact_content(request: Request, artifact_id: str, ctx: Ctx, uow: UoW) -> Response:
+    found = _require(request, ctx, uow)
+    if isinstance(found, RedirectResponse):
+        return found
+    artifact, content = read_artifact(uow, ctx.artifact_store, artifact_id)
+    return Response(
+        content=content,
+        media_type=artifact.content_type,
+        headers={
+            "X-Crucible-Artifact-Sha256": artifact.sha256,
+        },
     )
 
 

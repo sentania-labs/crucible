@@ -214,6 +214,14 @@ def synthetic_diff(paths: tuple[str, ...], behavior: str) -> str:
     return "".join(chunks)
 
 
+def synthetic_review_diff(paths: tuple[str, ...], behavior: str) -> str:
+    """The collector-owned review artifact: a stat header followed by the patch."""
+    stat = "".join(f" {path} | 1 +\n" for path in paths)
+    if paths:
+        stat += f" {len(paths)} file(s) changed, {len(paths)} insertion(s)(+)\n"
+    return stat + "\n" + synthetic_diff(paths, behavior)
+
+
 def verification_runs(contract: dict[str, Any], behavior: str) -> tuple[VerificationRun, ...]:
     """Crucible's own re-run of every required command (11). The fake verifier agrees
     with the contract unless the behavior asks it not to."""
@@ -653,6 +661,14 @@ class FakeProvider:
                     content_type="application/json",
                 )
             ]
+            artifacts.append(
+                CollectedArtifact(
+                    name="report/diff.patch",
+                    type="diff",
+                    content=synthetic_review_diff(paths, behavior).encode(),
+                    content_type="text/x-diff",
+                )
+            )
             for verification in spec.contract.get("required_verification", []):
                 if verification.get("kind") == "artifact":
                     artifacts.append(

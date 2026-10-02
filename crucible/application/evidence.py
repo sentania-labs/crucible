@@ -444,7 +444,7 @@ def record_collection_evidence(
             payload={"paths": list(outputs.diff_paths)},
         )
     for collected in outputs.artifacts:
-        if collected.type != "run_evidence":
+        if collected.type not in ("run_evidence", "diff"):
             continue
         artifact_id: str | None = None
         try:
