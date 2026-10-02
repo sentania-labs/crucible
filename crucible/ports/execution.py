@@ -459,6 +459,11 @@ class ProviderUnavailableError(ProviderError):
     than failing the attempt."""
 
 
+class CollectionPendingError(ProviderUnavailableError):
+    """Collection is waiting for backend cleanup. Retry on the next supervisor tick,
+    up to the configured collection retry limit, while keeping the workspace intact."""
+
+
 class LaunchRefusedError(ProviderError):
     """A launch the provider refused on purpose (07, 13): the image's harness version is
     outside the adapter's tested range, or the harness has no credential to run with.
