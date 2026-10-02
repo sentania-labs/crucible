@@ -17,6 +17,7 @@ def upgrade() -> None:
     op.add_column("attempts", sa.Column("routing_version", sa.Integer(), nullable=True))
     # Use the execution's immutable snapshot, never today's routing policy. Pending
     # attempts have not selected a route yet; imported attempts were not supervised.
+    # After a reroute, the execution model can only stand in for its latest attempt.
     op.execute(
         """
         UPDATE attempts AS a
@@ -29,6 +30,10 @@ def upgrade() -> None:
         CROSS JOIN LATERAL jsonb_array_elements(r.document->'models') AS model
         WHERE a.execution_id = e.id
           AND a.state <> 'pending' AND NOT a.unsupervised
+          AND (a.selected_model IS NOT NULL OR NOT EXISTS (
+              SELECT 1 FROM attempts AS newer
+              WHERE newer.execution_id = a.execution_id AND newer.number > a.number
+          ))
           AND model->>'id' = COALESCE(a.selected_model, e.model)
           AND model->>'harness' = COALESCE(a.selected_harness, e.harness)
         """

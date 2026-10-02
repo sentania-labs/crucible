@@ -61,10 +61,27 @@ async def test_attempt_route_round_trip_and_migration_recovery(
         uow.attempts.add(attempt)
         attempt.routing_version = 80
         uow.attempts.save(attempt)
-        pending = replace(attempt, id="pending-route", number=2, state=AttemptState.PENDING)
+        pending_execution = replace(execution, id="pending-route-execution")
+        uow.executions.add(pending_execution)
+        pending = replace(
+            attempt,
+            id="pending-route",
+            execution_id=pending_execution.id,
+            number=2,
+            state=AttemptState.PENDING,
+        )
         pending.selected_pool = None
         pending.routing_version = None
         uow.attempts.add(pending)
+        older = replace(
+            pending,
+            id="older-unknown-route",
+            number=1,
+            state=AttemptState.SUCCEEDED,
+            selected_model=None,
+            selected_harness=None,
+        )
+        uow.attempts.add(older)
         uow.commit()
     with ctx.uow_factory() as uow:
         saved = uow.attempts.get(attempt.id)
@@ -77,7 +94,10 @@ async def test_attempt_route_round_trip_and_migration_recovery(
         migrate.downgrade(database_url, "0035_credential_renewer")
         with ctx.engine.begin() as conn:
             conn.execute(
-                text("UPDATE attempts SET selected_pool = NULL WHERE id = :id"),
+                text(
+                    "UPDATE attempts SET selected_pool = NULL, selected_model = NULL, "
+                    "selected_harness = NULL WHERE id = :id"
+                ),
                 {"id": attempt.id},
             )
         migrate.upgrade(database_url)
@@ -86,6 +106,9 @@ async def test_attempt_route_round_trip_and_migration_recovery(
             assert saved is not None
             assert (saved.selected_pool, saved.routing_version) == ("lab-local", 80)
             saved = uow.attempts.get(pending.id)
+            assert saved is not None
+            assert (saved.selected_pool, saved.routing_version) == (None, None)
+            saved = uow.attempts.get(older.id)
             assert saved is not None
             assert (saved.selected_pool, saved.routing_version) == (None, None)
         current, detail = migrate.is_current(ctx.engine, database_url)
