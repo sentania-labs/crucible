@@ -13,7 +13,9 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
-from crucible.adapters.execution import scripts
+import pytest
+
+from crucible.adapters.execution import collected, scripts
 from crucible.adapters.execution.collected import read_outputs, read_path_changes
 from crucible.application.evidence import record_collection_evidence
 from crucible.domain.entities import Attempt, EvidenceRecord, Task
@@ -401,3 +403,50 @@ def test_the_raw_reader_never_reads_a_path_as_a_record(tmp_path: Path) -> None:
     changes = read_path_changes(raw)
     assert changes is not None
     assert [c.path for c in changes] == [meta, "CLAUDE.md"]
+
+
+def test_a_worker_set_log_diff_merges_does_not_change_the_verdict(tmp_path: Path) -> None:
+    """`git log -m` follows log.diffMerges from the worker-writable .git/config, and
+    `combined` prints a merge as `::` records the reader skips; the collector names its
+    merge format, so the shim the merge wrote still fails."""
+    repo = _repo(tmp_path, agents_md=False)
+    _git(repo, "config", "log.diffMerges", "combined")
+    _side_merge(repo)
+    _write(repo, "AGENTS.md", SHIM)
+    _commit(repo, "merge side")
+    _git(repo, "rm", "-q", "AGENTS.md")
+    _commit(repo, "drop it")
+    result, _, bundle = _collected(tmp_path, repo)
+    assert {c["status"] for c in bundle["commit_changes"]} == {"A", "D"}
+    assert result is GateResult.FAIL
+
+
+def test_an_inflated_listing_with_a_non_ascii_shim_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Past the raw records' read limit the gate falls back to changed.txt and
+    commit-paths.txt, which keep a non-ASCII path as its bytes. The limit is lowered so
+    a few hundred long-named files stand in for the 8 MiB a worker could commit."""
+    monkeypatch.setattr(collected, "_RAW_LIMIT", 64 * 1024)
+    repo = _repo(tmp_path)
+    for n in range(400):
+        _write(repo, f"pad/{n:04d}-{'x' * 200}", "")
+    _write(repo, "dï/CLAUDE.md", SHIM)
+    _commit(repo, "inflate")
+    result, diff, bundle = _collected(tmp_path, repo)
+    assert "changes" not in diff
+    assert "commit_changes" not in bundle
+    assert "dï/CLAUDE.md" in diff["paths"]
+    assert "dï/CLAUDE.md" in bundle["commit_paths"]
+    assert result is GateResult.FAIL
+
+
+def test_the_diff_evidence_keeps_only_injected_name_records(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    _write(repo, "CLAUDE.md", "# edited\n")
+    _write(repo, "src/a.py", "a = 1\n")
+    _commit(repo, "edit")
+    result, diff, _ = _collected(tmp_path, repo)
+    assert [c["path"] for c in diff["changes"]] == ["CLAUDE.md"]
+    assert set(diff["paths"]) == {"CLAUDE.md", "src/a.py"}
+    assert result is GateResult.PASS

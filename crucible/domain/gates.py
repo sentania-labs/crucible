@@ -477,10 +477,10 @@ def _injected_hits(
         diff_status[path] = status
         if _injected(path) and (status not in ("M", "D") or blob in shim):
             hits.add(path)
-    # Commits in `git log -m --topo-order` order, every commit before its parents and a
-    # merge once per parent: the last record of a path is the oldest, and says whether
-    # the base had it, since only a path the base lacks starts with an add. The order is
-    # the graph's, never the commit dates, which the worker sets.
+    # Commits in `git log --diff-merges=separate --topo-order` order, every commit before
+    # its parents and a merge once per parent: the last record of a path is the oldest,
+    # and says whether the base had it, since only a path the base lacks starts with an
+    # add. The order is the graph's, never the commit dates, which the worker sets.
     oldest_status: dict[str, str] = {}
     for path, status, blob in commit_changes or []:
         oldest_status[path] = status
@@ -507,6 +507,14 @@ def _injected_hits(
 
 
 def no_injected_files(gi: GateInput) -> GateOutcome:
+    """Fail on a shim, .crucible or identity path the branch leaves, read from the diff
+    against the merge base and from every commit on the branch (11, hades #369).
+
+    Known limit: a base ancestor older than the merge base that once had an injected-name
+    file excuses a history-only add of that path that is not the shim's content (a merge
+    with that ancestor as its last parent, or a branch built from it), since the oldest
+    record is then an edit or deletion. The shim's content is still caught by its blob id,
+    and such a branch does not merge cleanly into the base."""
     diff = gi.one("diff_paths")
     bundle = gi.one("bundle_head")
     if diff is None:

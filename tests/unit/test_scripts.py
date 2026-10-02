@@ -406,7 +406,7 @@ def test_edits_left_uncommitted_are_committed_as_the_policy_author_with_the_trai
         trailer_value="EX-0001",
     )
     assert result.returncode == 0, result.stderr
-    changed = set((output / "changed.txt").read_text().split())
+    changed = set((output / "changed.txt").read_text().replace("\0", " ").split())
     assert {"committed.txt", "tracked.txt", "new.txt"} <= changed
     assert (output / "commits.txt").read_text().strip() == "2"
     assert (output / "leftover-committed.txt").read_text().strip() == "01ATTEMPT"
@@ -464,8 +464,8 @@ def test_changed_files_ignore_commits_main_gained_after_the_fork(tmp_path: Path)
     result = _collect(repo, output, report, attempt_id="01ATTEMPT")
 
     assert result.returncode == 0, result.stderr
-    assert set((output / "changed.txt").read_text().split()) == {"a.txt"}
-    assert set((output / "commit-paths.txt").read_text().split()) == {"a.txt"}
+    assert set((output / "changed.txt").read_text().replace("\0", " ").split()) == {"a.txt"}
+    assert set((output / "commit-paths.txt").read_text().replace("\0", " ").split()) == {"a.txt"}
     for filename in ("diff.patch", "diffstat.txt"):
         diff = (output / filename).read_text()
         assert "a.txt" in diff
@@ -531,7 +531,7 @@ def test_build_output_is_never_swept_into_the_leftover_commit(tmp_path: Path) ->
         (repo / junk).write_text("junk\n", encoding="utf-8")
     result = _collect(repo, output, report, attempt_id="01ATTEMPT")
     assert result.returncode == 0, result.stderr
-    changed = set((output / "changed.txt").read_text().split())
+    changed = set((output / "changed.txt").read_text().replace("\0", " ").split())
     assert "tracked.txt" in changed
     assert not any(
         "__pycache__" in path or "node_modules" in path or path == ".coverage" for path in changed
@@ -551,7 +551,7 @@ def test_build_output_the_worker_already_staged_stays_out_of_the_leftover_commit
     subprocess.run(["git", "add", "-A", "-f", "."], cwd=repo, check=True)
     result = _collect(repo, output, report, attempt_id="01ATTEMPT")
     assert result.returncode == 0, result.stderr
-    changed = set((output / "changed.txt").read_text().split())
+    changed = set((output / "changed.txt").read_text().replace("\0", " ").split())
     assert "tracked.txt" in changed
     assert not any(
         "node_modules" in path or ".venv" in path or path == ".coverage" for path in changed

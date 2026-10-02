@@ -651,7 +651,10 @@ if [ -n "$BASE" ]; then
   # reachable from HEAD and not BASE, and unions in every path those commits touched.
   {GIT} -C "$REPO" diff --stat "$MB" HEAD > "$OUT/diffstat.txt" || true
   {GIT} -C "$REPO" diff --no-color --no-ext-diff "$MB" HEAD > "$OUT/diff.patch" || true
-  {GIT} -C "$REPO" diff --name-only "$MB" HEAD > "$OUT/changed.txt" || true
+  # -z on both path lists (hades #369): read_path_changes skips its records past 8 MiB
+  # and the gate falls back to these lists, which must then still carry a non-ASCII
+  # path as its bytes instead of git's quoted form.
+  {GIT} -C "$REPO" diff --name-only -z "$MB" HEAD > "$OUT/changed.txt" || true
   # hades #369: the status and new blob of each path, so a shim the branch adds is told
   # from the repository's own CLAUDE.md or AGENTS.md it edits or deletes. -z keeps a
   # non-ASCII path as its bytes instead of git's quoted form.
@@ -663,13 +666,15 @@ if [ -n "$BASE" ]; then
   {GIT} -C "$REPO" diff --name-only -z --no-renames "$EMPTY_TREE" "$MB" \
     -- {_injected_pathspecs()} > "$OUT/base-injected.txt" || true
   {GIT} -C "$REPO" log --format='%H%x1f%s%x1f%an%x1e' "$BASE"..HEAD > "$OUT/log.txt" || true
-  {GIT} -C "$REPO" log --name-only --format='' "$BASE"..HEAD \
-    | LC_ALL=C sort -u | sed '/^$/d' > "$OUT/commit-paths.txt" || true
-  # -m prints a merge's own changes, once per parent, which plain --raw leaves out;
+  {GIT} -C "$REPO" log --name-only -z --format='' "$BASE"..HEAD \
+    | LC_ALL=C sort -zu > "$OUT/commit-paths.txt" || true
+  # --diff-merges=separate prints a merge's own changes, once per parent, which plain
+  # --raw leaves out. Not -m: that follows log.diffMerges from the worker-writable
+  # .git/config, and `combined` prints records read_path_changes does not parse;
   # --topo-order prints every commit before its parents whatever its date, so the last
   # record of a path is the oldest and says whether the base had it.
-  {GIT} -C "$REPO" log -m --topo-order --raw -z --no-renames --no-abbrev --format='' \
-    "$BASE"..HEAD > "$OUT/commit-raw.txt" || true
+  {GIT} -C "$REPO" log --diff-merges=separate --topo-order --raw -z --no-renames \
+    --no-abbrev --format='' "$BASE"..HEAD > "$OUT/commit-raw.txt" || true
   {GIT} -C "$REPO" bundle create "$OUT/work_branch.bundle" \
     "$BASE..$WORK_BRANCH" > "$OUT/bundle.log" 2>&1 || true
   {GIT} -C "$REPO" rev-list --count "$BASE"..HEAD > "$OUT/commits.txt" \

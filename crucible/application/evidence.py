@@ -459,7 +459,9 @@ def record_collection_evidence(
     if outputs.diff_paths or outputs.bundle is not None:
         diff_payload: dict[str, Any] = {"paths": list(outputs.diff_paths)}
         if outputs.diff_changes is not None:
-            diff_payload["changes"] = _changes_payload(outputs.diff_changes)
+            # Only the injected-name records the gate reads, as for the commits (#369).
+            kept = tuple(c for c in outputs.diff_changes if injected_name(c.path))
+            diff_payload["changes"] = _changes_payload(kept)
         if outputs.base_paths is not None:
             diff_payload["base_paths"] = [p for p in outputs.base_paths if injected_name(p)]
         _add(

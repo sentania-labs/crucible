@@ -35,6 +35,7 @@ __all__ = [
     "read_commit_policy",
     "read_outputs",
     "read_path_changes",
+    "read_path_list",
     "read_verifications",
     "tail",
     "text",
@@ -104,9 +105,9 @@ def read_outputs(
     blocked = report_dir / "blocked.md"
     blocked_md = text(blocked) if blocked.is_file() else None
 
-    changed = tuple(p for p in text(output / "changed.txt").splitlines() if p.strip())
+    changed = read_path_list(output / "changed.txt")
     diff_text = text(output / "diff.patch") if (output / "diff.patch").is_file() else None
-    commit_paths = tuple(p for p in text(output / "commit-paths.txt").splitlines() if p.strip())
+    commit_paths = read_path_list(output / "commit-paths.txt")
     diff_changes = read_path_changes(output / "diff-raw.txt")
     commit_changes = read_path_changes(output / "commit-raw.txt")
     base_paths = read_base_paths(output / "base-injected.txt")
@@ -195,11 +196,12 @@ _RAW_LIMIT = 8 * 1024 * 1024
 
 
 def read_path_changes(path: Path) -> tuple[PathChange, ...] | None:
-    """`git diff --raw -z` or `git log -m --raw -z` records as PathChange records (hades
-    #369), in the order git printed them, or None when the collector wrote no such file
-    (an older collector script) or wrote more than is read. A record that does not parse
-    is skipped; the gate then treats its path as before #369. `-z` keeps each path as its
-    bytes, so a non-ASCII directory is not hidden behind git's quoting."""
+    """`git diff --raw -z` or `git log --diff-merges=separate --raw -z` records as
+    PathChange records (hades #369), in the order git printed them, or None when the
+    collector wrote no such file (an older collector script) or wrote more than is read.
+    A record that does not parse is skipped; the gate then treats its path as before
+    #369. `-z` keeps each path as its bytes, so a non-ASCII directory is not hidden
+    behind git's quoting."""
     try:
         if not path.is_file() or path.stat().st_size > _RAW_LIMIT:
             return None
@@ -218,6 +220,15 @@ def read_path_changes(path: Path) -> tuple[PathChange, ...] | None:
             out.append(PathChange(path=fields[at + 1], status=match.group(3), blob=match.group(2)))
         at += 2
     return tuple(out)
+
+
+def read_path_list(path: Path) -> tuple[str, ...]:
+    """A path list the collector wrote with `-z` (hades #369), so a non-ASCII path is its
+    bytes and not git's quoted form; a list without a NUL is read one path per line, as
+    an older collector script and the fake cluster write it."""
+    content = text(path)
+    paths = content.split("\0") if "\0" in content else content.splitlines()
+    return tuple(p for p in paths if p.strip())
 
 
 def read_base_paths(path: Path) -> tuple[str, ...] | None:

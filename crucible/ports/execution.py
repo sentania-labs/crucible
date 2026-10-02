@@ -206,10 +206,10 @@ class CollectedArtifact:
 
 @dataclass(frozen=True, slots=True)
 class PathChange:
-    """One record of `git diff --raw` or `git log -m --raw` (hades #369): the path, its
-    status letter (A, M, D, T), and the blob id it has after the change, all zeros for a
-    deletion. `no_injected_files` reads it to tell a shim the branch adds from the
-    repository's own file the branch edits or deletes."""
+    """One record of `git diff --raw` or `git log --diff-merges=separate --raw` (hades
+    #369): the path, its status letter (A, M, D, T), and the blob id it has after the
+    change, all zeros for a deletion. `no_injected_files` reads it to tell a shim the
+    branch adds from the repository's own file the branch edits or deletes."""
 
     path: str
     status: str
@@ -231,9 +231,9 @@ class BranchBundle:
     sha256: str = ""
     commit_paths: tuple[str, ...] = ()
     commit_messages: tuple[str, ...] = ()
-    # hades #369: every commit's `git log -m --topo-order --raw` records, children before
-    # parents and one block per parent of a merge. None when the collector did not
-    # record them, which the gate judges as before #369.
+    # hades #369: every commit's `git log --diff-merges=separate --topo-order --raw`
+    # records, children before parents and one block per parent of a merge. None when
+    # the collector did not record them, which the gate judges as before #369.
     commit_changes: tuple[PathChange, ...] | None = None
     # hades FDY-0135: the collector's author check. None when the collector did not
     # finish it; otherwise the commits whose author email is not the policy's, as
