@@ -660,6 +660,8 @@ class Attempts:
             ordered_candidates=list(row.ordered_candidates or []),
             routing_excluded_pools=list(row.routing_excluded_pools or []),
             resume_from_remote=bool(row.resume_from_remote),
+            routing_policy_name=row.routing_policy_name,
+            routing_policy_version=row.routing_policy_version,
         )
 
     def add(self, attempt: Attempt) -> None:
@@ -696,6 +698,8 @@ class Attempts:
                 ordered_candidates=list(attempt.ordered_candidates),
                 routing_excluded_pools=list(attempt.routing_excluded_pools),
                 resume_from_remote=attempt.resume_from_remote,
+                routing_policy_name=attempt.routing_policy_name,
+                routing_policy_version=attempt.routing_policy_version,
             )
         )
         self._s.flush()
@@ -737,6 +741,8 @@ class Attempts:
                 ordered_candidates=list(attempt.ordered_candidates),
                 routing_excluded_pools=list(attempt.routing_excluded_pools),
                 resume_from_remote=attempt.resume_from_remote,
+                routing_policy_name=attempt.routing_policy_name,
+                routing_policy_version=attempt.routing_policy_version,
             )
         )
 

@@ -63,6 +63,7 @@ from crucible.application.routing import (
     count_blocking_failures,
     load_routing,
     reserve,
+    routing_ref,
     select_model,
 )
 from crucible.application.transitions import (
@@ -85,7 +86,7 @@ from crucible.contracts.completion_claim import (
     parse_claim,
 )
 from crucible.contracts.evidence import ROLE_RUN_EVIDENCE, EvidenceKind, EvidenceSource
-from crucible.contracts.policy import window_seconds
+from crucible.contracts.policy import RoutingPolicyV1, window_seconds
 from crucible.contracts.task_contract import TaskContractV1
 from crucible.contracts.wake import WakeReason
 from crucible.domain.command_timeout import effective_command_timeout_ms
@@ -987,6 +988,7 @@ class Supervisor:
             resume_from_remote=execution.resume_from_remote,
             routing_excluded_pools=sorted(excluded_pools or set()),
         )
+        self._record_routing_ref(attempt, execution)
         uow.attempts.add(attempt)
         record_event(
             uow,
@@ -999,6 +1001,13 @@ class Supervisor:
             payload={"number": number},
         )
         return attempt
+
+    @staticmethod
+    def _record_routing_ref(attempt: Attempt, execution: Execution) -> None:
+        """Hades #359: the routing policy name and version the attempt launches under,
+        which is the one in its execution's policy snapshot."""
+        ref = routing_ref(execution.policy_snapshot or {})
+        attempt.routing_policy_name, attempt.routing_policy_version = ref or (None, None)
 
     def _materialize_review_executions(self, uow: UnitOfWork) -> None:
         """A `review` execution the API asked for (04). Execution rows are fenced to the
@@ -1456,29 +1465,27 @@ class Supervisor:
             return None
         provider = self._provider(execution.provider)
         key = self.checkout_key(item.contract, task.external_id, item.repository_url)
-        # Reviews have a fixed harness. Routed launches check candidate capacity in
+        # Reviews have a fixed harness: the cap check and the pool slot it takes are one
+        # transaction (hades #359). Routed launches check candidate capacity in
         # _route_pending after taking the checkout lease, so a busy first choice can
         # fall through to an idle harness.
         if review:
-            busy = await self._db(partial(self._harness_busy, execution))
+            started, busy = await self._db(partial(self._mark_review_preparing, attempt.id))
             if busy is not None:
                 await self._db(partial(self._defer_launch, attempt.id, busy))
-                return None
-        if not review and not await self._db(partial(self._take_checkout_lease, attempt.id, key)):
+            return (replace(item, attempt=started), provider) if started else None
+        if not await self._db(partial(self._take_checkout_lease, attempt.id, key)):
             # A second attempt on the same repository and branch waits; it is not a
             # failure, and nothing of the holder's checkout is disturbed (10).
             return None
-        if not review:
-            routed = await self._db(partial(self._route_pending, item))
-            if routed is None:
-                await self._db(partial(self._release_attempt_checkout, attempt.id))
-                return None
-            item = routed
-            refusal = await self._db(partial(self._harness_gate, item.execution))
-            if refusal is not None:
-                await self._db(partial(self._refuse_launch, item.attempt.id, "registry", refusal))
-                return None
-        elif not await self._db(partial(self._mark_preparing, attempt.id)):
+        routed = await self._db(partial(self._route_pending, item))
+        if routed is None:
+            await self._db(partial(self._release_attempt_checkout, attempt.id))
+            return None
+        item = routed
+        refusal = await self._db(partial(self._harness_gate, item.execution))
+        if refusal is not None:
+            await self._db(partial(self._refuse_launch, item.attempt.id, "registry", refusal))
             return None
         return item, provider
 
@@ -1862,7 +1869,7 @@ class Supervisor:
             return f"{running} of {limit} {execution.harness} worker(s) already running"
         if selected is not None:
             assert routing is not None
-            pool_limit = routing.pools[selected.pool].max_concurrency
+            pool_limit = self._pool_limit(uow, routing, selected.pool)
             if pool_limit is not None:
                 pool_running = sum(1 for other in live if other.selected_pool == selected.pool)
                 if pool_running >= pool_limit:
@@ -1871,6 +1878,28 @@ class Supervisor:
                         "already running"
                     )
         return None
+
+    @staticmethod
+    def _pool_limit(uow: UnitOfWork, routing: RoutingPolicyV1, pool: str) -> int | None:
+        """Hades #359: the strictest of the pool's max_concurrency in the task's routing
+        snapshot and in the newest active version of the same routing policy, so a cap
+        an operator lowers binds for tasks that carry an older routing version."""
+        limits = [routing.pools[pool].max_concurrency]
+        newest = max(
+            (
+                record
+                for record in uow.routing_policies.list_versions(routing.name)
+                if record.retired_at is None
+            ),
+            key=lambda record: record.version,
+            default=None,
+        )
+        if newest is not None and newest.version != routing.version:
+            current = RoutingPolicyV1.model_validate(newest.document)
+            if pool in current.pools:
+                limits.append(current.pools[pool].max_concurrency)
+        caps = [limit for limit in limits if limit is not None]
+        return min(caps) if caps else None
 
     def _checkout_lease_free(self, attempt_id: str, key: str) -> bool:
         with self._uow_factory() as uow:
@@ -2087,6 +2116,7 @@ class Supervisor:
             attempt.selected_harness = chosen.harness
             attempt.selected_image = chosen_image
             attempt.selected_pool = chosen.pool
+            self._record_routing_ref(attempt, execution)
             execution.model = chosen.id
             execution.harness = chosen.harness
             execution.image = chosen_image
@@ -2427,39 +2457,78 @@ class Supervisor:
     def _mark_preparing(self, attempt_id: str) -> bool:
         """Begin the launch, unless the task was cancelled after the attempt was listed."""
         with self._fenced() as uow:
-            attempt = uow.attempts.get(attempt_id, for_update=True)
-            assert attempt is not None
-            task = uow.tasks.get(attempt.task_id, for_update=True)
-            execution = uow.executions.get(attempt.execution_id, for_update=True)
-            assert task is not None and execution is not None
-            review = execution.role is ExecutionRole.REVIEW
-            allowed = (
-                (TaskState.AWAITING_INTERNAL_REVIEW,)
-                if review
-                else (TaskState.SCHEDULED, TaskState.RUNNING)
-            )
-            if attempt.state is not AttemptState.PENDING or task.state not in allowed:
+            loaded = self._pending_for_preparing(uow, attempt_id)
+            if loaded is None:
                 return False
-            move_attempt(
-                uow, self._clock, attempt, AttemptState.PREPARING, EventKind.ATTEMPT_PREPARING
-            )
-            if execution.state is ExecutionState.CREATED:
-                move_execution(
-                    uow, self._clock, execution, ExecutionState.ACTIVE, EventKind.EXECUTION_ACTIVE
-                )
-            if not review and task.state is TaskState.SCHEDULED:
-                move_task(
-                    uow,
-                    self._clock,
-                    task,
-                    TaskState.RUNNING,
-                    EventKind.TASK_RUNNING,
-                    execution_id=execution.id,
-                    attempt_id=attempt.id,
-                    payload={"attempt_number": attempt.number},
-                )
+            self._move_to_preparing(uow, *loaded)
             uow.commit()
             return True
+
+    def _mark_review_preparing(self, attempt_id: str) -> tuple[Attempt | None, str | None]:
+        """Begin a review launch, holding its pool slot (hades #359). The caps are
+        checked in the same fenced transaction that records the pool and moves the
+        attempt to preparing, so the next launch counts this one. Returns the attempt
+        when the launch began and, when a cap held it back, why."""
+        with self._fenced() as uow:
+            loaded = self._pending_for_preparing(uow, attempt_id)
+            if loaded is None:
+                return None, None
+            attempt, task, execution = loaded
+            busy = self._harness_busy_in_uow(uow, execution)
+            if busy is not None:
+                return None, busy
+            routing = load_routing(uow, execution.policy_snapshot or {})
+            entry = routing.model(execution.model) if routing is not None else None
+            # The harness the review launches is the one the request named, which the
+            # routing entry for its model may pair differently.
+            attempt.selected_model = execution.model
+            attempt.selected_harness = execution.harness
+            attempt.selected_image = execution.image
+            attempt.selected_pool = entry.pool if entry is not None else None
+            self._record_routing_ref(attempt, execution)
+            uow.attempts.save(attempt)
+            self._move_to_preparing(uow, attempt, task, execution)
+            uow.commit()
+            return attempt, None
+
+    @staticmethod
+    def _pending_for_preparing(
+        uow: UnitOfWork, attempt_id: str
+    ) -> tuple[Attempt, Task, Execution] | None:
+        """The attempt, task and execution locked, if the attempt may still begin."""
+        attempt = uow.attempts.get(attempt_id, for_update=True)
+        assert attempt is not None
+        task = uow.tasks.get(attempt.task_id, for_update=True)
+        execution = uow.executions.get(attempt.execution_id, for_update=True)
+        assert task is not None and execution is not None
+        allowed = (
+            (TaskState.AWAITING_INTERNAL_REVIEW,)
+            if execution.role is ExecutionRole.REVIEW
+            else (TaskState.SCHEDULED, TaskState.RUNNING)
+        )
+        if attempt.state is not AttemptState.PENDING or task.state not in allowed:
+            return None
+        return attempt, task, execution
+
+    def _move_to_preparing(
+        self, uow: UnitOfWork, attempt: Attempt, task: Task, execution: Execution
+    ) -> None:
+        move_attempt(uow, self._clock, attempt, AttemptState.PREPARING, EventKind.ATTEMPT_PREPARING)
+        if execution.state is ExecutionState.CREATED:
+            move_execution(
+                uow, self._clock, execution, ExecutionState.ACTIVE, EventKind.EXECUTION_ACTIVE
+            )
+        if execution.role is not ExecutionRole.REVIEW and task.state is TaskState.SCHEDULED:
+            move_task(
+                uow,
+                self._clock,
+                task,
+                TaskState.RUNNING,
+                EventKind.TASK_RUNNING,
+                execution_id=execution.id,
+                attempt_id=attempt.id,
+                payload={"attempt_number": attempt.number},
+            )
 
     def _release_attempt_checkout(self, attempt_id: str) -> None:
         with self._fenced() as uow:
