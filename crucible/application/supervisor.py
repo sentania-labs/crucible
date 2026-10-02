@@ -166,6 +166,14 @@ T = TypeVar("T")
 TERMINATION_TIMEOUT = "timeout"
 TERMINATION_STALL = "stall"
 TERMINATION_CANCEL = "cancel"
+# The task states in which a live attempt is ended as a cancel ends it. A merge observed
+# while a correction runs is one (hades #360): the PR is merged, so the corrected head has
+# nowhere to go, and the task stays `merged` rather than becoming `cancelled`.
+ENDS_ATTEMPTS: tuple[TaskState, ...] = (
+    TaskState.CANCELLING,
+    TaskState.CANCELLED,
+    TaskState.MERGED,
+)
 # A launch the registry or the provider refused (07): recorded so the retry rule knows
 # not to try the same refusal again.
 TERMINATION_REFUSED = "harness_refused"
@@ -2368,7 +2376,7 @@ class Supervisor:
     def _task_cancelled(self, task_id: str) -> bool:
         with self._uow_factory() as uow:
             task = uow.tasks.get(task_id)
-            return task is None or task.state in (TaskState.CANCELLING, TaskState.CANCELLED)
+            return task is None or task.state in ENDS_ATTEMPTS
 
     def _settle_if_cancelled(self, attempt_id: str, stage: str) -> bool:
         """hades #189: when the attempt's task was cancelled, end the attempt here, before
@@ -2378,7 +2386,7 @@ class Supervisor:
             assert attempt is not None
             task = uow.tasks.get(attempt.task_id, for_update=True)
             assert task is not None
-            if task.state not in (TaskState.CANCELLING, TaskState.CANCELLED):
+            if task.state not in ENDS_ATTEMPTS:
                 return False
             if attempt.state in (AttemptState.PREPARING, AttemptState.LAUNCHING):
                 self._end_cancelled_launch(uow, attempt, task, stage)
@@ -2482,7 +2490,7 @@ class Supervisor:
                 return False
             current = uow.tasks.get(attempt.task_id, for_update=True)
             assert current is not None
-            if current.state in (TaskState.CANCELLING, TaskState.CANCELLED):
+            if current.state in ENDS_ATTEMPTS:
                 # hades #189: the last look before a worker starts.
                 self._end_cancelled_launch(uow, attempt, current, "launch")
                 uow.commit()
@@ -2603,7 +2611,7 @@ class Supervisor:
             assert execution is not None
             task = uow.tasks.get(attempt.task_id, for_update=True)
             assert task is not None
-            if task.state in (TaskState.CANCELLING, TaskState.CANCELLED):
+            if task.state in ENDS_ATTEMPTS:
                 if attempt.state is AttemptState.LAUNCHING:
                     self._end_cancelled_launch(uow, attempt, task, "launch")
                 uow.commit()
@@ -3724,7 +3732,7 @@ class Supervisor:
                 return True
             task = uow.tasks.get(attempt.task_id, for_update=True)
             assert task is not None
-            if task.state in (TaskState.CANCELLING, TaskState.CANCELLED):
+            if task.state in ENDS_ATTEMPTS:
                 self._end_cancelled_launch(uow, attempt, task, "launch")
                 uow.commit()
                 return False
@@ -4348,7 +4356,9 @@ class Supervisor:
                 completed=completed,
                 unparsed_errors=unparsed_errors,
             )
-            if head:
+            # hades #360: a correction ended by a merge never reaches the PR, so its head
+            # is evidence on the attempt and not the merged task's head.
+            if head and task.state is not TaskState.MERGED:
                 task.head_sha = head
                 task.updated_at = self._clock.now()
                 uow.tasks.save(task)
@@ -5077,7 +5087,7 @@ class Supervisor:
                 payload={"exit_class": exit_class.value},
             )
         common = {"execution_id": execution.id, "attempt_id": attempt.id}
-        if task.state in (TaskState.CANCELLING, TaskState.CANCELLED):
+        if task.state in ENDS_ATTEMPTS:
             self._finish_cancelling(uow, task)
             return
         if attempt.state is AttemptState.SUCCEEDED:
@@ -5229,7 +5239,7 @@ class Supervisor:
                 EventKind.EXECUTION_FAILED,
                 payload={"role": "review", "exit_class": exit_class.value},
             )
-        if task.state in (TaskState.CANCELLING, TaskState.CANCELLED):
+        if task.state in ENDS_ATTEMPTS:
             self._finish_cancelling(uow, task)
             return
         create_wake(
@@ -5302,7 +5312,8 @@ class Supervisor:
             )
 
     def _finish_cancelling(self, uow: UnitOfWork, task: Task) -> None:
-        """Once no attempt is live, close open executions; a cancelling task becomes cancelled."""
+        """Once no attempt is live, close open executions; a cancelling task becomes cancelled.
+        A merged task stays merged (hades #360)."""
         attempts = uow.attempts.list_for_task(task.id)
         # An unsupervised attempt (15) has no worker to wait for; it stays as the record
         # of a run Crucible never observed, and the cancellation settles around it.
@@ -5319,10 +5330,11 @@ class Supervisor:
     # ----- step: cancellations -----------------------------------------
 
     def _list_cancel_work(self) -> list[_CancelWork]:
-        """Live attempts of cancelling or cancelled tasks, plus tasks whose executions can close."""
+        """Live attempts of cancelling, cancelled or merged tasks, plus tasks whose
+        executions can close."""
         out: list[_CancelWork] = []
         with self._uow_factory() as uow:
-            for state in (TaskState.CANCELLING, TaskState.CANCELLED):
+            for state in ENDS_ATTEMPTS:
                 for task in uow.tasks.list_by_state(state):
                     attempts = uow.attempts.list_for_task(task.id)
                     live = [
@@ -5412,7 +5424,7 @@ class Supervisor:
     def _settle_cancelled_task(self, task_id: str) -> None:
         with self._fenced() as uow:
             task = uow.tasks.get(task_id, for_update=True)
-            if task is None or task.state not in (TaskState.CANCELLING, TaskState.CANCELLED):
+            if task is None or task.state not in ENDS_ATTEMPTS:
                 return
             self._finish_cancelling(uow, task)
             uow.commit()
