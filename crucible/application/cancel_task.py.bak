@@ -3,12 +3,11 @@ runs (the supervisor terminates it), cancelled at once otherwise."""
 
 from __future__ import annotations
 
-from crucible.application.decisions import record_decision
 from crucible.application.errors import NotFoundError
 from crucible.application.task_access import require_task_principal
 from crucible.application.transitions import move_task, record_event
-from crucible.contracts.api import CancelRequest, DecisionRequest
-from crucible.domain.entities import EscalationState, Principal, Task
+from crucible.contracts.api import CancelRequest
+from crucible.domain.entities import Principal, Task
 from crucible.domain.events import EventKind
 from crucible.domain.lifecycle import TaskState
 from crucible.ports.clock import Clock
@@ -54,24 +53,5 @@ def cancel_task(
             EventKind.TASK_CANCELLED,
             principal=principal.name,
             payload=payload,
-        )
-    # Close any open escalations with the cancel reason as the decision.
-    for escalation in uow.escalations.list_for_task(task.id):
-        if escalation.state is not EscalationState.OPEN:
-            continue
-        # Create a decision to answer and close the escalation.
-        decision_request = DecisionRequest(
-            kind="task_cancelled",
-            verbatim=request.verbatim,
-            resolves=escalation.question,
-            escalation_id=escalation.id,
-            reschedule=False,
-        )
-        record_decision(
-            uow,
-            clock,
-            principal=principal,
-            task_id=task.id,
-            request=decision_request,
         )
     return task

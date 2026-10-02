@@ -6,7 +6,6 @@ here; a `branch` or `pull_request` deliverable records the AcceptanceResult and 
 
 from __future__ import annotations
 
-from crucible.application.decisions import record_decision
 from crucible.application.errors import (
     ForbiddenError,
     NotFoundError,
@@ -15,16 +14,9 @@ from crucible.application.errors import (
 from crucible.application.task_access import require_task_principal
 from crucible.application.transitions import move_task, record_event, require_contract
 from crucible.application.wakes import create_wake
-from crucible.contracts.api import AcceptRequest, DecisionRequest
+from crucible.contracts.api import AcceptRequest
 from crucible.contracts.wake import WakeReason
-from crucible.domain.entities import (
-    AcceptanceResult,
-    AcceptanceVerdict,
-    EscalationState,
-    Principal,
-    Role,
-    Task,
-)
+from crucible.domain.entities import AcceptanceResult, AcceptanceVerdict, Principal, Role, Task
 from crucible.domain.events import EventKind
 from crucible.domain.ids import new_id
 from crucible.domain.lifecycle import TaskState
@@ -154,23 +146,4 @@ def close_task(
         principal=principal.name,
         payload={"note": note},
     )
-    # Close any open escalations with the close note as the decision.
-    for escalation in uow.escalations.list_for_task(task.id):
-        if escalation.state is not EscalationState.OPEN:
-            continue
-        # Create a decision to answer and close the escalation.
-        decision_request = DecisionRequest(
-            kind="task_closed",
-            verbatim=note,
-            resolves=escalation.question,
-            escalation_id=escalation.id,
-            reschedule=False,
-        )
-        record_decision(
-            uow,
-            clock,
-            principal=principal,
-            task_id=task.id,
-            request=decision_request,
-        )
     return task
