@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 from crucible.adapters.execution.identity import render_identity_md
 from crucible.application.corrections import CORRECTABLE_STATES, attach_correction
 from crucible.domain.entities import (
+    Decision,
     Escalation,
     EscalationState,
     Principal,
@@ -154,6 +155,9 @@ def test_a_blocked_correction_closes_the_open_escalation() -> None:
 
     esc_repo = _MockEscRepo([esc])
 
+    # Track Decision objects added via uow.decisions.add
+    added_decisions: list[Decision] = []
+
     # Build a minimal UoW mock
     uow = MagicMock()
     uow.tasks.get.return_value = task
@@ -168,6 +172,7 @@ def test_a_blocked_correction_closes_the_open_escalation() -> None:
     uow.acceptance.list_for_task.return_value = []
     uow.retention = MagicMock()
     uow.retention.list_recent.return_value = []
+    uow.decisions.add = MagicMock(side_effect=added_decisions.append)
 
     clock = FakeClock()
     principal = _principal()
@@ -213,3 +218,15 @@ def test_a_blocked_correction_closes_the_open_escalation() -> None:
             kinds.append(args_tuple[0].kind)
     assert EventKind.ESCALATION_ANSWERED.value in kinds
     assert EventKind.ESCALATION_CLOSED.value in kinds
+
+    # The Decision for the correction should have been persisted
+    assert len(added_decisions) == 1
+    decision = added_decisions[0]
+    assert decision.kind == "correction"
+    assert decision.verbatim == "Merge origin/main instead of fetching it."
+    assert decision.resolves == "How to reach origin/main?"
+    assert decision.escalation_id == "ESC001"
+    assert decision.task_id == task.id
+
+    # Both answered and closed escalation transitions share the same decision_id
+    assert closed_esc.decision_id == decision.id

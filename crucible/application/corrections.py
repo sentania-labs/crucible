@@ -35,6 +35,7 @@ from crucible.contracts.task_contract import (
 )
 from crucible.domain.entities import (
     AcceptanceVerdict,
+    Decision,
     EscalationState,
     Principal,
     Task,
@@ -251,11 +252,36 @@ def attach_correction(
     if _from_state is TaskState.BLOCKED:
         for escalation in uow.escalations.list_for_task(task.id):
             if escalation.state is EscalationState.OPEN:
+                decision = Decision(
+                    id=new_id(),
+                    task_id=task.id,
+                    escalation_id=escalation.id,
+                    principal_id=principal.id,
+                    kind="correction",
+                    verbatim=contract.correction.instructions,
+                    resolves=escalation.question,
+                    created_at=clock.now(),
+                )
+                uow.decisions.add(decision)
+                record_event(
+                    uow,
+                    clock,
+                    EventKind.DECISION_RECORDED,
+                    principal=principal.name,
+                    task_id=task.id,
+                    payload={
+                        "decision_id": decision.id,
+                        "kind": "correction",
+                        "escalation_id": decision.escalation_id,
+                        "resolves": decision.resolves,
+                        "verbatim": decision.verbatim,
+                    },
+                )
                 for target in (EscalationState.ANSWERED, EscalationState.CLOSED):
                     escalation.state = target
                     if target is EscalationState.CLOSED:
                         escalation.closed_at = clock.now()
-                    escalation.decision_id = new_id()
+                    escalation.decision_id = decision.id
                     uow.escalations.save(escalation)
                     record_event(
                         uow,
@@ -267,7 +293,7 @@ def attach_correction(
                         task_id=task.id,
                         payload={
                             "escalation_id": escalation.id,
-                            "decision_id": escalation.decision_id,
+                            "decision_id": decision.id,
                         },
                     )
                 break
