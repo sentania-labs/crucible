@@ -624,9 +624,7 @@ def test_a_close_polled_after_the_corrected_heads_publication_failed_is_recorded
 
 
 def test_a_close_while_a_correction_runs_explains_reopen_or_cancel(tmp_path: Path) -> None:
-    store, clock, supervisor, github, _publisher = _correcting(
-        tmp_path, until=TaskState.RUNNING
-    )
+    store, clock, supervisor, github, _publisher = _correcting(tmp_path, until=TaskState.RUNNING)
     github.polled = _closed()
     clock.advance(300)
 
@@ -785,16 +783,15 @@ def test_a_merge_of_a_quota_checkpoint_is_escalated_and_named(tmp_path: Path) ->
 def test_an_unseen_merge_of_an_earlier_pushed_head_ignores_a_later_checkpoint(
     tmp_path: Path,
 ) -> None:
-    store, clock, supervisor, github, publisher = _correcting(
-        tmp_path, until=TaskState.REPORTED
-    )
+    store, clock, supervisor, github, publisher = _correcting(tmp_path, until=TaskState.REPORTED)
     _execution, attempt = _correction_attempt(store)
     attempt.exit_class = ExitClass.QUOTA_EXHAUSTED
     _task(store).head_sha = NEW_HEAD
 
-    assert asyncio.run(
-        supervisor.delivery.push_quota_checkpoint(attempt.id, required=True)
-    ) == (True, "checkpoint pushed")
+    assert asyncio.run(supervisor.delivery.push_quota_checkpoint(attempt.id, required=True)) == (
+        True,
+        "checkpoint pushed",
+    )
 
     github.polled = _merged(OLD_HEAD)
     clock.advance(300)

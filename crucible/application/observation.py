@@ -1209,9 +1209,7 @@ def settle_pull_request_state(
             elif head_matches:
                 head_check = f"; the merged head {merged} is a head Crucible pushed"
             else:
-                head_check = (
-                    f"; the merged head {merged} is not among the heads Crucible pushed"
-                )
+                head_check = f"; the merged head {merged} is not among the heads Crucible pushed"
             if head_matches and checkpoint:
                 head_check += (
                     ", and that push was a quota checkpoint of an unfinished attempt, "
