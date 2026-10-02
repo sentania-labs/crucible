@@ -20,6 +20,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
+from crucible.domain.gates import injected_shim_text
 from crucible.ports.execution import (
     OUTPUT_MOUNT,
     PACKAGE_CACHE_LEAF,
@@ -438,7 +439,7 @@ fi
 # writes them because the checkout belongs to container uid 1000, which is not the
 # uid the Crucible process runs as in every arrangement (S9 Test E).
 mkdir -p "$REPO/.git/info"
-SHIM_TEXT="Read $IDENTITY_MOUNT/IDENTITY.md first; it is the task contract for this run."
+SHIM_TEXT={_quote(injected_shim_text(identity_mount))}
 for shim in {shim_list}; do
   # Claude Code uses AGENTS.md only when the project has no own CLAUDE.md.
   # CLAUDE.md wins under its default instructionFiles setting. Other harnesses
@@ -646,9 +647,15 @@ if [ -n "$BASE" ]; then
   {GIT} -C "$REPO" diff --stat "$MB" HEAD > "$OUT/diffstat.txt" || true
   {GIT} -C "$REPO" diff --no-color --no-ext-diff "$MB" HEAD > "$OUT/diff.patch" || true
   {GIT} -C "$REPO" diff --name-only "$MB" HEAD > "$OUT/changed.txt" || true
+  # hades #369: the status and new blob of each path, so a shim the branch adds is told
+  # from the repository's own CLAUDE.md or AGENTS.md it edits or deletes.
+  {GIT} -C "$REPO" diff --raw --no-renames --no-abbrev "$MB" HEAD \
+    > "$OUT/diff-raw.txt" || true
   {GIT} -C "$REPO" log --format='%H%x1f%s%x1f%an%x1e' "$BASE"..HEAD > "$OUT/log.txt" || true
   {GIT} -C "$REPO" log --name-only --format='' "$BASE"..HEAD \
     | LC_ALL=C sort -u | sed '/^$/d' > "$OUT/commit-paths.txt" || true
+  {GIT} -C "$REPO" log --raw --no-renames --no-abbrev --format='' "$BASE"..HEAD \
+    > "$OUT/commit-raw.txt" || true
   {GIT} -C "$REPO" bundle create "$OUT/work_branch.bundle" \
     "$BASE..$WORK_BRANCH" > "$OUT/bundle.log" 2>&1 || true
   {GIT} -C "$REPO" rev-list --count "$BASE"..HEAD > "$OUT/commits.txt" \
@@ -666,6 +673,7 @@ if [ -n "$BASE" ]; then
 else
   : > "$OUT/diffstat.txt"; : > "$OUT/diff.patch"; : > "$OUT/changed.txt"
   : > "$OUT/log.txt"; : > "$OUT/commit-paths.txt"; echo 0 > "$OUT/commits.txt"
+  : > "$OUT/diff-raw.txt"; : > "$OUT/commit-raw.txt"
 fi
 # A fresh tree from the collected state, which is what the verifier runs against (11).
 rm -rf "$OUT/tree"

@@ -9,11 +9,13 @@ from enum import StrEnum
 from typing import Any, Literal, Protocol
 
 from crucible.domain.endpoints import validate_endpoint
+from crucible.domain.gates import SHIM_IDENTITY_MOUNT
 from crucible.ports.github import InstallationToken
 
 # Where the workspace appears inside every Crucible-created container (06, 08).
 REPO_MOUNT = "/crucible/repo"
-IDENTITY_MOUNT = "/crucible/identity"
+# The preparer's shim text names it, and `no_injected_files` knows that text (#369).
+IDENTITY_MOUNT = SHIM_IDENTITY_MOUNT
 REPORT_MOUNT = "/crucible/report"
 OUTPUT_MOUNT = "/crucible/out"
 # The whole workspace, mounted only into the preparer so git itself creates the
@@ -203,6 +205,18 @@ class CollectedArtifact:
 
 
 @dataclass(frozen=True, slots=True)
+class PathChange:
+    """One line of `git diff --raw` or `git log --raw` (hades #369): the path, its
+    status letter (A, M, D, T), and the blob id it has after the change, all zeros for a
+    deletion. `no_injected_files` reads it to tell a shim the branch adds from the
+    repository's own file the branch edits or deletes."""
+
+    path: str
+    status: str
+    blob: str
+
+
+@dataclass(frozen=True, slots=True)
 class BranchBundle:
     """What `git bundle create base_ref..work_branch` plus `git bundle verify` produced.
 
@@ -217,6 +231,9 @@ class BranchBundle:
     sha256: str = ""
     commit_paths: tuple[str, ...] = ()
     commit_messages: tuple[str, ...] = ()
+    # hades #369: every commit's `git log --raw` records, newest first. None when the
+    # collector did not record them, which the gate judges as before #369.
+    commit_changes: tuple[PathChange, ...] | None = None
     # hades FDY-0135: the collector's author check. None when the collector did not
     # finish it; otherwise the commits whose author email is not the policy's, as
     # (sha, email). Information for the reviewer, not a refusal (FDY-0143).
@@ -277,6 +294,9 @@ class CollectedOutputs:
     # path list (11), so a collector that cannot produce it leaves this None and the
     # no_secrets gate refuses to report `pass`.
     diff_text: str | None = None
+    # hades #369: `git diff --raw` against the same merge base as diff_paths. None when
+    # the collector did not record it.
+    diff_changes: tuple[PathChange, ...] | None = None
     bundle: BranchBundle | None = None
     artifacts: tuple[CollectedArtifact, ...] = ()
     # The verifier container's re-run of every required_verification command, and the

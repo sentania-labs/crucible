@@ -21,11 +21,17 @@ from crucible.contracts.evidence import (
 )
 from crucible.domain.entities import Artifact, Attempt, EvidenceRecord, Task
 from crucible.domain.events import PRINCIPAL_CRUCIBLE, EventKind
+from crucible.domain.gates import injected_name
 from crucible.domain.ids import new_id
 from crucible.domain.secrets import find_secrets, redact, scan_text
 from crucible.ports.artifacts import ArtifactStore, SecretInArtifactError
 from crucible.ports.clock import Clock
-from crucible.ports.execution import BranchBundle, CollectedOutputs, VerificationRun
+from crucible.ports.execution import (
+    BranchBundle,
+    CollectedOutputs,
+    PathChange,
+    VerificationRun,
+)
 from crucible.ports.harness import ParsedReport
 from crucible.ports.repository import UnitOfWork
 
@@ -55,6 +61,21 @@ def _add(
         artifact_id=artifact_id,
     )
     return uow.evidence.add(record)
+
+
+def _changes_payload(changes: tuple[PathChange, ...]) -> list[dict[str, str]]:
+    return [{"path": c.path, "status": c.status, "blob": c.blob} for c in changes]
+
+
+def _commit_changes_payload(bundle: BranchBundle) -> dict[str, Any]:
+    """hades #369: the commits' status records for injected-name paths, the only ones
+    `no_injected_files` reads, so a long branch does not carry every path of every
+    commit twice. Absent when the collector recorded none, which the gate judges as
+    before #369."""
+    if bundle.commit_changes is None:
+        return {}
+    kept = tuple(c for c in bundle.commit_changes if injected_name(c.path))
+    return {"commit_changes": _changes_payload(kept)}
 
 
 def _commit_policy_payload(bundle: BranchBundle) -> dict[str, Any]:
@@ -432,16 +453,20 @@ def record_collection_evidence(
                 "commit_messages": list(bundle.commit_messages),
                 "claimed_head_sha": claimed,
                 "commit_policy": _commit_policy_payload(bundle),
+                **_commit_changes_payload(bundle),
             },
         )
     if outputs.diff_paths or outputs.bundle is not None:
+        diff_payload: dict[str, Any] = {"paths": list(outputs.diff_paths)}
+        if outputs.diff_changes is not None:
+            diff_payload["changes"] = _changes_payload(outputs.diff_changes)
         _add(
             uow,
             clock,
             attempt=attempt,
             kind=EvidenceKind.DIFF_PATHS,
             source=EvidenceSource.CRUCIBLE,
-            payload={"paths": list(outputs.diff_paths)},
+            payload=diff_payload,
         )
     for collected in outputs.artifacts:
         if collected.type != "run_evidence":

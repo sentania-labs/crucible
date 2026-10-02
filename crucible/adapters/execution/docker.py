@@ -1219,6 +1219,7 @@ class DockerProvider:
             stderr_tail=stderr_tail,
             diff_paths=outputs.diff_paths,
             diff_text=outputs.diff_text,
+            diff_changes=outputs.diff_changes,
             bundle=outputs.bundle,
             artifacts=outputs.artifacts,
             verifications=outputs.verifications,

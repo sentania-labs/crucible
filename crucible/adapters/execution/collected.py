@@ -25,6 +25,7 @@ from crucible.ports.execution import (
     CollectedArtifact,
     CommitPolicyCheck,
     LaunchSpec,
+    PathChange,
     VerificationRun,
 )
 
@@ -32,6 +33,7 @@ __all__ = [
     "Outputs",
     "read_commit_policy",
     "read_outputs",
+    "read_path_changes",
     "read_verifications",
     "tail",
     "text",
@@ -54,6 +56,7 @@ class Outputs:
     checkpoint_refusal: str | None
     leftover_committed: bool = False
     leftover_note: str | None = None
+    diff_changes: tuple[PathChange, ...] | None = None
 
 
 def text(path: Path, limit: int = 8 * 1024 * 1024) -> str:
@@ -102,6 +105,8 @@ def read_outputs(
     changed = tuple(p for p in text(output / "changed.txt").splitlines() if p.strip())
     diff_text = text(output / "diff.patch") if (output / "diff.patch").is_file() else None
     commit_paths = tuple(p for p in text(output / "commit-paths.txt").splitlines() if p.strip())
+    diff_changes = read_path_changes(output / "diff-raw.txt")
+    commit_changes = read_path_changes(output / "commit-raw.txt")
     commit_policy = read_commit_policy(output / "commit-policy")
     messages: list[str] = []
     for record in text(output / "log.txt").split("\x1e"):
@@ -129,6 +134,7 @@ def read_outputs(
             commit_paths=commit_paths,
             commit_messages=tuple(messages),
             commit_policy=commit_policy,
+            commit_changes=commit_changes,
         )
 
     artifacts: list[CollectedArtifact] = []
@@ -167,6 +173,7 @@ def read_outputs(
         stderr_tail=tail(output / "bundle.log", tail_bytes),
         diff_paths=changed,
         diff_text=diff_text,
+        diff_changes=diff_changes,
         bundle=bundle,
         artifacts=tuple(artifacts),
         verifications=verifications,
@@ -175,6 +182,25 @@ def read_outputs(
         leftover_committed=(output / "leftover-committed.txt").is_file(),
         leftover_note=text(output / "leftover-refusal.txt").strip() or None,
     )
+
+
+_RAW_LINE = re.compile(r":[0-7]{6} [0-7]{6} ([0-9a-f]{40,64}) ([0-9a-f]{40,64}) ([A-Z])[0-9]*")
+
+
+def read_path_changes(path: Path) -> tuple[PathChange, ...] | None:
+    """`git diff --raw` or `git log --raw` lines as PathChange records (hades #369), or
+    None when the collector wrote no such file (an older collector script). A line that
+    does not parse is skipped; the gate then treats its path as before #369."""
+    if not path.is_file():
+        return None
+    out: list[PathChange] = []
+    for line in text(path).splitlines():
+        meta, tab, name = line.partition("\t")
+        match = _RAW_LINE.fullmatch(meta)
+        if not tab or match is None or not name:
+            continue
+        out.append(PathChange(path=name, status=match.group(3), blob=match.group(2)))
+    return tuple(out)
 
 
 def read_commit_policy(directory: Path) -> CommitPolicyCheck | None:
