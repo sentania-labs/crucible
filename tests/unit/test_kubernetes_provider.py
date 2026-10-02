@@ -825,8 +825,10 @@ async def test_role_policy_is_removed_when_the_pod_deletion_wait_fails(
     api, _registry, provider = build()
     launch = spec()
 
-    async def pod_wait_fails(_job_name: str, *, timeout: float = 15) -> None:
-        del timeout
+    async def pod_wait_fails(
+        _job_name: str, *, timeout: float = 15, force: bool = False, collection: bool = False
+    ) -> None:
+        del timeout, force, collection
         raise ProviderError("Pod was still present")
 
     monkeypatch.setattr(provider, "_await_job_pods_gone", pod_wait_fails)
