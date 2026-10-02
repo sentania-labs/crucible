@@ -94,6 +94,9 @@ def repeat_stale_escalation_wakes(uow: UnitOfWork, clock: Clock, *, stale_hours:
         task = uow.tasks.get(escalation.task_id)
         if task is None:
             continue
+        # Skip escalations on tasks that are in a terminal state.
+        if task.state in (TaskState.CANCELLED, TaskState.REJECTED, TaskState.CLOSED):
+            continue
         create_wake(
             uow,
             clock,
