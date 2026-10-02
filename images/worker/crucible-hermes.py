@@ -15,6 +15,14 @@ FDY-0140:
 - While Hermes works, a line goes to stderr each time its session store changes: `-z`
   writes nothing else until it ends, and a quiet worker is otherwise indistinguishable
   from a stuck one.
+
+Hades #386: Hermes 0.19's verification guard files an edit to a path with no project of
+its own (the report, /crucible/report/report.yaml) under the session's workspace root, so
+writing the report turned the checkout's passed verification stale and the guard asked
+for it all again before finishing. The bootstrap wraps
+`agent.verification_evidence.mark_workspace_edited` so that a path outside the root it
+resolves never marks that root edited; any path inside the root still does. The patch is
+written against 0.19.0 only and Hermes refuses to start under any other version.
 """
 
 from __future__ import annotations
@@ -34,19 +42,44 @@ HERMES_PYTHON = "/opt/hermes/bin/python"
 PROGRESS_SECONDS = 15.0
 PROGRESS_LINE = "crucible-hermes: working, session updated"
 
-# Run inside the Hermes virtual environment. It changes nothing but the turn budget an
-# agent is built with when the caller named none, and only once `run_agent` is imported
-# the ordinary way, so Hermes's own import order (its approval mode is read at import)
-# is untouched.
+# The hermes-agent release the bootstrap's patches are written against.
+HERMES_VERSION = "0.19.0"
+
+# Run inside the Hermes virtual environment. It changes the turn budget an agent is built
+# with when the caller named none, and which edits count against verification (#386).
+# Each patch is applied only once its module is imported the ordinary way, so Hermes's
+# own import order (its approval mode is read at import) is untouched.
 BOOTSTRAP = r"""
 import importlib.abc
+import importlib.metadata
 import importlib.util
+import inspect
 import os
 import sys
+from pathlib import Path
 
+HERMES_VERSION = "@HERMES_VERSION@"
 LIMIT = int(os.environ.get("CRUCIBLE_HERMES_MAX_TURNS") or 0)
 # `max_iterations` is the tenth parameter of AIAgent.__init__ after self (0.19).
 POSITION = 9
+GUARD = "agent.verification_evidence"
+
+
+def _refuse(reason):
+    print(f"crucible-hermes: {reason}", file=sys.stderr, flush=True)
+    # Hermes swallows exceptions around its verification imports, so exit outright.
+    os._exit(70)
+
+
+try:
+    FOUND = importlib.metadata.version("hermes-agent")
+except importlib.metadata.PackageNotFoundError:
+    FOUND = None
+if FOUND != HERMES_VERSION:
+    _refuse(
+        f"the wrapper patches hermes-agent {HERMES_VERSION}, found {FOUND}; "
+        "update images/worker/crucible-hermes.py for the new release"
+    )
 
 
 class _TurnBudget(importlib.abc.MetaPathFinder):
@@ -75,13 +108,66 @@ class _TurnBudget(importlib.abc.MetaPathFinder):
         return spec
 
 
+def _inside(path, root, cwd):
+    try:
+        candidate = Path(path).expanduser()
+        if not candidate.is_absolute():
+            candidate = Path(cwd or ".") / candidate
+        candidate = candidate.resolve()
+        return candidate == root or root in candidate.parents
+    except (OSError, RuntimeError, ValueError):
+        # Unknown: count it, as Hermes would.
+        return True
+
+
+class _ReportWriteGuard(importlib.abc.MetaPathFinder):
+    # #386: an edit outside a verification root never invalidates that root's checks.
+    def find_spec(self, name, path, target=None):
+        if name != GUARD:
+            return None
+        sys.meta_path.remove(self)
+        spec = importlib.util.find_spec(name)
+        if spec is None or spec.loader is None:
+            _refuse(f"{GUARD} is missing from hermes-agent {HERMES_VERSION}")
+        loader = spec.loader
+        execute = loader.exec_module
+
+        def exec_module(module):
+            execute(module)
+            original = getattr(module, "mark_workspace_edited", None)
+            expected = ["session_id", "cwd", "paths"]
+            if original is None or list(inspect.signature(original).parameters) != expected:
+                _refuse(f"{GUARD}.mark_workspace_edited is not the 0.19.0 shape")
+
+            def mark_workspace_edited(*, session_id, cwd, paths=None):
+                if paths:
+                    from agent.coding_context import project_facts_for
+
+                    facts = project_facts_for(cwd)
+                    if facts:
+                        # The root Hermes's own function resolves.
+                        root = Path(str(facts.get("root") or Path(cwd or ".").resolve()))
+                        root = root.expanduser().resolve()
+                        paths = [p for p in paths if p and _inside(str(p), root, cwd)]
+                        if not paths:
+                            return None
+                return original(session_id=session_id, cwd=cwd, paths=paths)
+
+            mark_workspace_edited.__wrapped__ = original
+            module.mark_workspace_edited = mark_workspace_edited
+
+        loader.exec_module = exec_module
+        return spec
+
+
 if LIMIT > 0:
     sys.meta_path.insert(0, _TurnBudget())
+sys.meta_path.insert(0, _ReportWriteGuard())
 sys.argv = ["hermes", *sys.argv[1:]]
 from hermes_cli.main import main
 
 sys.exit(main())
-"""
+""".replace("@HERMES_VERSION@", HERMES_VERSION)
 
 
 def _milliseconds(started: object, ended: object) -> int | None:
