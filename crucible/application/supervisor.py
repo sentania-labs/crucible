@@ -4460,7 +4460,7 @@ class Supervisor:
                 )
             interruption_payload: dict[str, Any] = {}
             if attempt.exit_class in {ExitClass.INFRASTRUCTURE, ExitClass.QUOTA_EXHAUSTED}:
-                routing = load_routing(uow, execution.policy_snapshot or {})
+                routing = load_attempt_routing(uow, execution.policy_snapshot or {})
                 model = (
                     routing.model(attempt.selected_model or execution.model) if routing else None
                 )
@@ -5567,7 +5567,7 @@ class Supervisor:
             for row in uow.attempts.list_for_task(task.id)
         )
         if failures >= INFRASTRUCTURE_RETRY_BUDGET:
-            routing = load_routing(uow, execution.policy_snapshot or {})
+            routing = load_attempt_routing(uow, execution.policy_snapshot or {})
             model = routing.model(attempt.selected_model or execution.model) if routing else None
             endpoint_url = model.endpoint_url if model is not None else None
             # The first block waits for the endpoint's health probe and may resume on
