@@ -18,6 +18,7 @@ from typing import Any
 from crucible.adapters.harness import base
 from crucible.domain.exit_class import ExitClass
 from crucible.domain.harness_concurrency import HARNESS_CONCURRENCY
+from crucible.domain.infrastructure import Interruption
 from crucible.ports.harness import (
     AdapterLaunch,
     CommandTracker,
@@ -135,3 +136,13 @@ class ScriptHarnessAdapter:
             auth=(),
             quota=QUOTA_PATTERNS,
         )
+
+    def interruption(
+        self,
+        exit: ExitInfo,
+        stdout_tail: str,
+        stderr_tail: str,
+        report_dir: Path | None = None,
+    ) -> Interruption | None:
+        # The scripted harness calls no model, so no model call can fail under it.
+        return None

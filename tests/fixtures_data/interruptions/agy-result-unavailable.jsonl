@@ -1,0 +1,2 @@
+{"event":"init","init":{"model":"gemini-3-pro","session_id":"agy-01"}}
+{"event":"result","result":{"status":"ERROR","error":"UNAVAILABLE: The service is currently unavailable.","usage":{"input_tokens":120,"output_tokens":0}}}

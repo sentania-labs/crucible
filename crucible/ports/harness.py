@@ -19,6 +19,7 @@ from typing import Any, Literal, Protocol
 from crucible.domain.command_timeout import DEFAULT_COMMAND_TIMEOUT_MS
 from crucible.domain.endpoints import validate_endpoint
 from crucible.domain.exit_class import ExitClass
+from crucible.domain.infrastructure import Interruption
 
 _VERSION = re.compile(r"^(\d+)\.(\d+)\.(\d+)")
 
@@ -401,6 +402,18 @@ class HarnessAdapter(Protocol):
         stderr_tail: str,
         report_dir: Path | None = None,
     ) -> ExitClass: ...
+
+    def interruption(
+        self,
+        exit: ExitInfo,
+        stdout_tail: str,
+        stderr_tail: str,
+        report_dir: Path | None = None,
+    ) -> Interruption | None:
+        """Hades #353: the model call that ended the run failed for a reason outside the
+        worker (a gateway 5xx, a refused connection, capacity, quota), read from this
+        harness's own error events; None for any other ending."""
+        ...
 
     def quota_reset_at(self, stdout_tail: str, stderr_tail: str) -> datetime | None: ...
 

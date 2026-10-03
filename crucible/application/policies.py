@@ -208,6 +208,11 @@ def put_routing_policy(
         raise ConflictError(
             f"routing policy {name}/{version} is referenced by a policy and is immutable (05b)"
         )
+    if existing is not None and uow.attempts.routes_with(name, version):
+        raise ConflictError(
+            f"routing policy {name}/{version} was routed with by an attempt and is immutable "
+            "(hades #254)"
+        )
     now = clock.now()
     stored = uow.routing_policies.put(
         RoutingPolicyRecord(

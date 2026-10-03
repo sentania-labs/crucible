@@ -1,10 +1,12 @@
-"""Hades #359: a review attempt holds a pool slot, every attempt records the routing
-version it was launched under, and the strictest pool cap across routing versions binds."""
+"""Hades #359: a review attempt holds a pool slot on the route its routing entry
+verifies, every attempt records the routing version it was launched under, and the
+strictest pool cap across routing versions binds."""
 
 from __future__ import annotations
 
 from contextlib import nullcontext
 from datetime import timedelta
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -28,13 +30,13 @@ from tests.unit.test_class_routing import NOW, _model, _routing
 POOL = "shared"
 
 
-def _routing_version(version: int, cap: int | None) -> RoutingPolicyV1:
+def _routing_version(
+    version: int, cap: int | None, *, review_harness: str = "claude_code"
+) -> RoutingPolicyV1:
     routing = _routing(
         [
             _model("impl-model", harness="codex", pool=POOL),
-            # The routing entry pairs the review model with agy; the review asks for
-            # claude_code, and the attempt must say claude_code ran.
-            _model("review-model", harness="agy", pool=POOL),
+            _model("review-model", harness=review_harness, pool=POOL),
         ]
     )
     routing.version = version
@@ -56,10 +58,18 @@ class _World:
     """The rows one supervisor tick reads, behind the MagicMock unit of work the
     supervisor tests use."""
 
-    def __init__(self, routings: list[RoutingPolicyRecord], snapshot_version: int = 1) -> None:
+    def __init__(
+        self,
+        routings: list[RoutingPolicyRecord],
+        snapshot_version: int = 1,
+        *,
+        pinned: bool = False,
+    ) -> None:
         self.routings = routings
         self.policy: dict[str, Any] = {
-            "routing": {"policy": {"name": "test-routing", "version": snapshot_version}},
+            "routing": {
+                "policy": {"name": "test-routing", "version": snapshot_version, "pinned": pinned}
+            },
             "concurrency": {"per_harness": {"codex": 5, "agy": 5, "claude_code": 5}},
         }
         self.tasks: dict[str, Task] = {}
@@ -86,6 +96,9 @@ class _World:
         uow.routing_policies.list_versions.side_effect = lambda name: sorted(
             (r for r in self.routings if r.name == name), key=lambda r: r.version
         )
+        # Every version in these tests is published: some policy references it.
+        uow.routing_policies.is_referenced.return_value = True
+        uow.contracts.get.return_value = SimpleNamespace(document=contract_document())
 
     def add(
         self,
@@ -198,7 +211,6 @@ async def test_a_review_attempt_holds_a_pool_slot_and_a_third_attempt_waits(
     assert attempt.state is AttemptState.PREPARING
     assert launched[0].attempt.selected_pool == POOL
     assert attempt.selected_pool == POOL
-    # The harness the review launched, not the agy the routing entry names.
     assert attempt.selected_harness == "claude_code"
     assert attempt.selected_model == "review-model"
 
@@ -260,27 +272,92 @@ async def test_attempts_record_the_routing_version_they_launched_under(
     assert await supervisor._begin_launch(implement) is not None
     assert await supervisor._begin_launch(review) is not None
 
+    # The snapshot references version 1 unpinned, so both launch under version 2,
+    # the version in force (hades #254), and say so.
     for pending in (implement, review):
         attempt = world.attempts[pending.attempt.id]
         assert attempt.state is AttemptState.PREPARING
-        assert (attempt.routing_version) == 1
+        assert attempt.routing_version == 2
     assert world.attempts[implement.attempt.id].selected_pool == POOL
+    assert world.attempts[review.attempt.id].selected_pool == POOL
 
 
-def test_a_created_attempt_records_its_executions_routing(
+async def test_a_pinned_review_records_its_pinned_routing_version(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    world = _World([_record(_routing_version(3, cap=None))], snapshot_version=3)
+    world = _World(
+        [_record(_routing_version(1, cap=None)), _record(_routing_version(2, cap=None))],
+        pinned=True,
+    )
     supervisor = _supervisor(monkeypatch, world)
-    execution = world.add("implement").execution
+    review = world.add(
+        "review", role=ExecutionRole.REVIEW, harness="claude_code", model="review-model"
+    )
 
-    created = supervisor._create_attempt(world.uow, execution, number=2)
+    assert await supervisor._begin_launch(review) is not None
 
-    assert (created.routing_version) == 3
-    unrouted = world.add("unrouted").execution
-    unrouted.policy_snapshot = {}
-    bare = supervisor._create_attempt(world.uow, unrouted, number=2)
-    assert bare.routing_version is None
+    assert world.attempts[review.attempt.id].routing_version == 1
+
+
+async def test_a_review_whose_harness_its_routing_entry_does_not_pair_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The routing entry pairs the review model with agy; a review that asks for
+    claude_code with it is refused, holds no pool slot and leaves the pool to others."""
+    world = _World([_record(_routing_version(1, cap=2, review_harness="agy"))])
+    supervisor = _supervisor(monkeypatch, world)
+    world.running_implement("first")
+    review = world.add(
+        "review", role=ExecutionRole.REVIEW, harness="claude_code", model="review-model"
+    )
+    second = world.add("second")
+
+    assert await supervisor._begin_launch(review) is None
+
+    attempt = world.attempts[review.attempt.id]
+    assert attempt.state is AttemptState.FAILED
+    assert attempt.selected_pool is None
+    refused = world.events(EventKind.HARNESS_REFUSED)
+    assert [event.attempt_id for event in refused] == [attempt.id]
+    assert refused[0].payload["stage"] == "routing"
+    assert refused[0].payload["detail"] == (
+        "model review-model is paired with harness agy in routing policy test-routing/1, "
+        "not with claude_code"
+    )
+    # The refused review took no slot: the second implement attempt launches.
+    assert await supervisor._begin_launch(second) is not None
+    assert world.attempts[second.attempt.id].state is AttemptState.PREPARING
+
+
+@pytest.mark.parametrize(
+    ("selected_harness", "selected_pool", "marked"),
+    [("codex", POOL, True), ("claude_code", POOL, False), ("codex", "other", False)],
+)
+def test_only_the_verified_route_is_marked_exhausted(
+    monkeypatch: pytest.MonkeyPatch,
+    selected_harness: str,
+    selected_pool: str,
+    marked: bool,
+) -> None:
+    world = _World([_record(_routing_version(1, cap=None))])
+    supervisor = _supervisor(monkeypatch, world)
+    pending = world.add(
+        "quota",
+        state=AttemptState.RUNNING,
+        harness=selected_harness,
+        model="impl-model",
+        selected_pool=selected_pool,
+    )
+    attempt = world.attempts[pending.attempt.id]
+    attempt.selected_model = "impl-model"
+    attempt.selected_harness = selected_harness
+    attempt.routing_version = 1
+
+    supervisor._mark_pool_exhausted(world.uow, attempt, pending.execution, None)
+
+    assert world.uow.pool_exhaustions.put.called is marked
+    if marked:
+        assert world.uow.pool_exhaustions.put.call_args.args[0].pool == POOL
 
 
 @pytest.mark.parametrize(
@@ -293,11 +370,14 @@ async def test_the_strictest_pool_cap_across_routing_versions_wins(
     newest_cap: int | None,
     expected: int,
 ) -> None:
+    """A task pinned to version 1 still routes with it (hades #254); the cap that binds
+    is the smaller of version 1's and the newest active version's."""
     world = _World(
         [
             _record(_routing_version(1, cap=snapshot_cap)),
             _record(_routing_version(2, cap=newest_cap)),
-        ]
+        ],
+        pinned=True,
     )
     supervisor = _supervisor(monkeypatch, world)
     world.running_implement("first")

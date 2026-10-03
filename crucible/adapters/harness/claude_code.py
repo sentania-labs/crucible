@@ -35,8 +35,10 @@ from pathlib import Path
 from typing import Any
 
 from crucible.adapters.harness import base
+from crucible.adapters.harness.interruption import ProviderFailure, interruption_from, tail_lines
 from crucible.domain.exit_class import ExitClass
 from crucible.domain.harness_concurrency import HARNESS_CONCURRENCY
+from crucible.domain.infrastructure import Interruption
 from crucible.ports.harness import (
     CLAUDE_CODE_BINARY,
     AdapterLaunch,
@@ -204,13 +206,86 @@ class ClaudeCodeAdapter:
         self, exit: ExitInfo, stdout_tail: str, stderr_tail: str, report_dir: Path | None = None
     ) -> ExitClass:
         exit_class = base.classify_with_patterns(
-            exit, stdout_tail, stderr_tail, auth=AUTH_PATTERNS, quota=QUOTA_PATTERNS
+            exit,
+            stdout_tail,
+            stderr_tail,
+            auth=AUTH_PATTERNS,
+            quota=QUOTA_PATTERNS,
+            interruption=self.interruption(exit, stdout_tail, stderr_tail, report_dir),
         )
         pending = in_flight(report_dir / base.TRANSCRIPT_NAME) if report_dir else ()
         return base.with_in_flight(exit_class, pending)
 
+    def interruption(
+        self,
+        exit: ExitInfo,
+        stdout_tail: str,
+        stderr_tail: str,
+        report_dir: Path | None = None,
+    ) -> Interruption | None:
+        if (
+            exit.exit_code in (None, 0)
+            or exit.lost
+            or exit.timed_out
+            or exit.killed
+            or exit.oom_killed
+        ):
+            return None
+        return interruption_from(_last_api_failure(stdout_tail, stderr_tail))
+
     def command_tracker(self) -> CommandTracker:
         return CommandTracker()
+
+
+# `api_retry` error categories that are the request's own fault: a retry of the same
+# request cannot succeed, so an absent status there is not a connection failure.
+_REQUEST_ERRORS = frozenset(
+    {"authentication_failed", "billing_error", "invalid_request", "max_output_tokens"}
+)
+
+
+def _api_retry_failure(event: Mapping[str, Any]) -> ProviderFailure:
+    """The CLI's `{"type":"system","subtype":"api_retry","attempt":n,"max_retries":m,
+    "retry_delay_ms":d,"error_status":503,"error":"server_error"}`. `error_status` is the
+    HTTP status of the failed call, null when no response came (a connection error);
+    529 is Anthropic's overloaded answer, the model at capacity."""
+    raw_status = event.get("error_status")
+    status = (
+        raw_status if isinstance(raw_status, int) and not isinstance(raw_status, bool) else None
+    )
+    category = event.get("error")
+    message = (
+        f"api_retry {event.get('attempt')}/{event.get('max_retries')}: "
+        f"status {status if status is not None else 'none'}, error {category}"
+    )
+    return ProviderFailure(
+        message,
+        status=status,
+        transport=status is None and category not in _REQUEST_ERRORS,
+        quota=category == "rate_limit" and status != 529,
+    )
+
+
+def _last_api_failure(*tails: str) -> ProviderFailure | None:
+    """The retry event of the model call the run ended on. Read last first: the CLI's
+    synthetic error message and error result after the last retry are its report of that
+    failure, while a real assistant message or a successful result means a later call
+    worked and the retries before it are not why the run ended."""
+    for line in tail_lines(*tails):
+        event = base.json_object(line.strip())
+        if event is None:
+            continue
+        kind = event.get("type")
+        if kind == "system" and event.get("subtype") == "api_retry":
+            return _api_retry_failure(event)
+        if kind == "result" and event.get("is_error") is not True:
+            return None
+        if kind == "assistant":
+            message = event.get("message")
+            synthetic = isinstance(message, dict) and message.get("model") == "<synthetic>"
+            if not synthetic and "error" not in event:
+                return None
+    return None
 
 
 def in_flight(transcript: Path) -> tuple[str, ...]:

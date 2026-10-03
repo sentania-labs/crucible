@@ -1,5 +1,7 @@
-"""Hades #359: 0036 adds the routing policy name and version to attempts and backfills
-existing rows from their execution's policy snapshot, with the fenced trigger back on."""
+"""Hades #359: every attempt records the routing version it was launched under.
+0038_attempt_routing_version (hades #254) adds the column; upgrading a database that
+already holds attempts backfills them from their execution's policy snapshot, with the
+fenced trigger back on afterwards."""
 
 from __future__ import annotations
 
@@ -44,7 +46,7 @@ def _attempt_columns(url: str) -> set[str]:
         engine.dispose()
 
 
-async def test_0036_backfills_existing_attempts_from_the_execution_snapshot(
+async def test_0038_backfills_existing_attempts_from_the_execution_snapshot(
     client: TestClient, supervisor: Supervisor, migrated: str
 ) -> None:
     routed_task = submit_and_start(client, "crucible-worker:fake-succeed", "MIG-0359-A")
@@ -92,7 +94,6 @@ async def test_0036_backfills_existing_attempts_from_the_execution_snapshot(
             assert routed and bare
             for row in routed:
                 assert row.snapshot_name is not None
-                assert row.routing_policy_name == row.snapshot_name
                 assert row.routing_version == int(row.snapshot_version)
             assert all(row.routing_version is None for row in bare)
             # The fenced trigger is back on after the backfill.

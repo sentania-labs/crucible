@@ -125,6 +125,7 @@ class Wiring:
             attempt_lease_ttl_seconds=s.attempt_lease_ttl_seconds,
             checkout_lease_ttl_seconds=s.checkout_lease_ttl_seconds,
             grace_seconds=s.grace_seconds,
+            collection_retry_ticks=s.collection_retry_ticks,
             harnesses=self.harnesses,
             harness_gates=harness_gates(self.settings),
             credential_sources=credential_sources(self.settings),

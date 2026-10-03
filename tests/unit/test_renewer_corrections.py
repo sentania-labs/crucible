@@ -33,7 +33,7 @@ from tests.unit.test_credential_renewer import FakeClock, _jwt, _login
 async def test_supervisor_persists_effective_credential_command(
     mode: MountMode, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr("crucible.application.supervisor.load_routing", lambda *_: None)
+    monkeypatch.setattr("crucible.application.supervisor.load_attempt_routing", lambda *_: None)
     uow = Mock()
     uow.provider_settings.get.return_value = None
     supervisor = object.__new__(Supervisor)
@@ -42,10 +42,12 @@ async def test_supervisor_persists_effective_credential_command(
     supervisor._credential_sources = {"codex": CredentialSource("", mode)}
     attempt: Any = SimpleNamespace(
         id="attempt",
+        number=1,
         selected_harness="codex",
         selected_model="model",
         selected_image="image",
         resume_from_remote=False,
+        routing_version=None,
     )
     execution: Any = SimpleNamespace(
         role=ExecutionRole.IMPLEMENT,

@@ -72,9 +72,11 @@ head_diverged --cancel--> cancelled
 {awaiting_external_review, external_feedback_received, awaiting_ci_certification,
  ci_certification_failed, head_diverged, ready_for_merge} --PR merged (observed)--> merged --wake-->
 {scheduled, awaiting_quota, running, blocked, reported, pre_pr_gates_failed,
- awaiting_internal_review, gates_passed, awaiting_acceptance}
+ awaiting_internal_review, gates_passed, awaiting_acceptance, publishing,
+ publish_failed}
     --PR merged (observed) while a correction runs against it--> merged --wake-->
-    (a live attempt is ended as a cancel ends it; the task stays merged)
+    (a live attempt is ended as a cancel ends it; the task stays merged; the merged
+    head is compared with the last head Crucible pushed, and a mismatch escalates)
 {awaiting_external_review, external_feedback_received, awaiting_ci_certification,
  ci_certification_failed, head_diverged, ready_for_merge} --PR closed unmerged (observed)--> rejected --wake-->
 merged --included in a release contract--> release_candidate
@@ -118,7 +120,49 @@ counted on the PR stays counted, so the corrected head goes through the
 pre-PR gates, is published to the same PR, is certified on its own CI, and
 returns to `ready_for_merge` without a new external review request. The PR
 stays open while the correction runs and is still polled for a merge: a
-merge observed in any state of the correction moves the task to `merged`.
+merge observed in any state of the correction moves the task to `merged`,
+publishing and publish_failed included (hades #379).
+
+Only `needs_more_work` or `internal_review` can start a correction from
+`ready_for_merge`.
+
+Publishing and publish_failed count as correction states only when an
+earlier publication of the task completed; a first publication that fails
+after opening its PR is polled in full, and a merge of it is an early merge.
+
+When a merge wins over a correction, the task's head is the merged head when
+it is among the heads Crucible pushed and confirmed on the remote, not a
+corrected head that was collected and never pushed; when the merged head is
+not among them, the task keeps the latest head Crucible pushed. The pushed
+heads are the PR's head records marked as pushed by Crucible and the
+`branch_pushed` events, never the PR's current head, which a poll sets to a
+head someone else pushed (hades #379). The
+`task_merged` event records the head GitHub merged, the latest recorded pushed
+head, whether the merged head was a quota checkpoint, whether the merged head
+is among the pushed heads, and any head Crucible pushed after the merged one;
+the wake says which. When the merged head is not a pushed head, or the head
+merged was only a quota checkpoint (which passed no gate and was never
+accepted), or Crucible pushed a later head after it, the wake is an escalation
+instead. A head pushed after the merge is escalated the same way whichever
+record comes first: a poll that records the merge before the push is
+confirmed, a lookup that records it after, or a quota checkpoint pushed after
+a merge nobody had seen yet. A push confirmed after the task is already merged
+is not recorded as a pushed head, and the publication that made it stops
+there. A merge recorded without its head (before hades #379) is taken to be of
+the latest recorded pushed head. A quota checkpoint is not pushed, nor
+recorded, once the task is merged or otherwise finished (`release_candidate`,
+`released`, `rejected`, `cancelled`, `closed`); one that lands while the task
+finishes is escalated with `checkpoint_after_finish`, which says nothing was
+merged by it.
+
+A PR closed unmerged while a correction is under way, or after a first
+publication failed, is recorded on the PR (which is then no longer polled)
+and wakes Foundry with `pull_request_closed`; the task stays where it is,
+because a correction state has no edge to `rejected`. In `publish_failed`,
+the operator can reopen the PR and then republish, or cancel; a publication
+that finds the PR closed itself says the same. In running,
+gates, or `awaiting_acceptance`, the correction continues but publication
+will fail unless the PR is reopened, so cancellation is the usual answer.
 
 Once the corrected head is the accepted head, review feedback made on the
 heads Crucible pushed before it, before the corrected head appeared, is

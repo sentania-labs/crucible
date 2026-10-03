@@ -1,0 +1,2 @@
+{"method":"turn/started","params":{"threadId":"019a0f3c-6d1e-7a52-9a5e-1f2c3b4d5e61","turn":{"id":"0","items":[],"status":"inProgress","error":null}},"type":"turn.started"}
+{"method":"turn/failed","params":{"threadId":"019a0f3c-6d1e-7a52-9a5e-1f2c3b4d5e61","turnId":"0","error":{"message":"unexpected status 503 Service Unavailable: upstream connect error or disconnect/reset before headers","codexErrorInfo":{"httpConnectionFailed":{"httpStatusCode":503}},"additionalDetails":null}},"type":"turn.failed"}
