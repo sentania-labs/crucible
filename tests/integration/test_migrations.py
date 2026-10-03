@@ -1265,3 +1265,270 @@ def test_0027_decides_only_an_administrators_disable_and_comes_back_off(
     ok, detail = migrate.is_current(engine, database_url)
     assert ok, detail
     engine.dispose()
+
+
+# Placeholders for a NOT NULL column without a default that a seed row does not name,
+# by Postgres type, so the seed follows the 0035 schema instead of restating it.
+_PLACEHOLDERS = {
+    "character varying": "seed",
+    "text": "seed",
+    "integer": 0,
+    "bigint": 0,
+    "boolean": False,
+    "timestamp with time zone": "2026-01-01T00:00:00+00:00",
+    "jsonb": "{}",
+    "bytea": b"\x00",
+}
+
+
+def _seed(conn: Connection, table: str, row: dict[str, Any]) -> None:
+    """Insert `row`, filling every other required column of `table` as it is now."""
+    required = conn.execute(
+        text(
+            "SELECT column_name, data_type FROM information_schema.columns "
+            "WHERE table_schema = 'public' AND table_name = :table "
+            "AND is_nullable = 'NO' AND column_default IS NULL"
+        ),
+        {"table": table},
+    ).all()
+    values = dict(row)
+    for name, data_type in required:
+        if name not in values:
+            values[name] = _PLACEHOLDERS[data_type]
+    columns = ", ".join(f'"{name}"' for name in values)
+    params = ", ".join(f":{name}" for name in values)
+    conn.execute(text(f"INSERT INTO {table} ({columns}) VALUES ({params})"), values)
+
+
+def test_0035_to_head_upgrades_a_populated_database(database_url: str) -> None:
+    """Issue 409: a migration runs with no supervisor lease and no fenced token, so a
+    backfill of a fenced table has to stand its trigger down (0038 for `attempts`, 0039
+    for `pull_requests`). The other migration tests upgrade empty tables, where an
+    UPDATE matches no row and the trigger never fires. This one seeds a row in every
+    fenced table at 0035, as a live 0.7.3 database has, and upgrades it to head: a
+    migration that writes a fenced table without disabling its trigger fails here."""
+    migrate.downgrade(database_url, "0035_credential_renewer")
+    engine = make_engine(database_url)
+    task, execution, attempt = (
+        "01MIG4090000000000000TASK1",
+        "01MIG4090000000000000EXEC1",
+        "01MIG40900000000000ATTEMPT",
+    )
+    pending = "01MIG40900000000000PENDING"
+    pull_request = "01MIG40900000000000000PR01"
+    try:
+        with engine.begin() as conn:
+            # The seed writes as the supervisor would: holding the lease, presenting its
+            # token for this transaction only. The migrations run on their own
+            # connection afterwards, with neither.
+            conn.execute(
+                text(
+                    "INSERT INTO leases (id, kind, key, holder, fenced_token, expires_at) "
+                    "VALUES ('01MIG409000000000000LEASE1', 'supervisor', 'supervisor', "
+                    "'migration-test', 409, now() + interval '1 hour')"
+                )
+            )
+            conn.execute(text("SELECT set_config('crucible.fenced_token', '409', true)"))
+            _seed(
+                conn,
+                "principals",
+                {"id": "01MIG409000000000PRINCIPAL", "name": "mig-409", "role": "orchestrator"},
+            )
+            _seed(
+                conn,
+                "repositories",
+                {
+                    "id": "01MIG40900000000000000REPO",
+                    "name": "migration/409",
+                    "url": "https://github.com/migration/409",
+                },
+            )
+            _seed(
+                conn,
+                "tasks",
+                {
+                    "id": task,
+                    "external_id": "MIG-409",
+                    "principal_id": "01MIG409000000000PRINCIPAL",
+                    "repository_id": "01MIG40900000000000000REPO",
+                    "state": "awaiting_external_review",
+                    "contract_version": 1,
+                    "policy_name": "default-software",
+                    "policy_version": 1,
+                },
+            )
+            _seed(
+                conn,
+                "executions",
+                {
+                    "id": execution,
+                    "task_id": task,
+                    "role": "implement",
+                    "contract_version": 1,
+                    "state": "succeeded",
+                    "policy_snapshot": json.dumps(
+                        {"routing": {"policy": {"name": "default-routing", "version": 3}}}
+                    ),
+                    "retry_on": "[]",
+                },
+            )
+            _seed(
+                conn,
+                "attempts",
+                {
+                    "id": attempt,
+                    "execution_id": execution,
+                    "task_id": task,
+                    "number": 1,
+                    "state": "succeeded",
+                    "selected_model": "claude-opus-5-5",
+                    "ordered_candidates": "[]",
+                    "routing_excluded_pools": "[]",
+                },
+            )
+            _seed(
+                conn,
+                "attempts",
+                {
+                    "id": pending,
+                    "execution_id": execution,
+                    "task_id": task,
+                    "number": 2,
+                    "state": "pending",
+                    "ordered_candidates": "[]",
+                    "routing_excluded_pools": "[]",
+                },
+            )
+            _seed(
+                conn,
+                "pull_requests",
+                {
+                    "id": pull_request,
+                    "task_id": task,
+                    "repository_id": "01MIG40900000000000000REPO",
+                    "number": 409,
+                    "url": "https://github.com/migration/409/pull/409",
+                    "base_ref": "release/0.8",
+                    "work_branch": "crucible/MIG-409",
+                    "state": "open",
+                    "head_sha": "4" * 40,
+                },
+            )
+            _seed(
+                conn,
+                "evidence",
+                {
+                    "attempt_id": attempt,
+                    "task_id": task,
+                    "pull_request_id": pull_request,
+                    "kind": "ci",
+                    "source": "crucible",
+                    "verified": True,
+                },
+            )
+            _seed(
+                conn,
+                "wakes",
+                {
+                    "id": "01MIG40900000000000000WAKE",
+                    "principal_id": "01MIG409000000000PRINCIPAL",
+                    "task_id": task,
+                    "reason": "task_state_changed",
+                },
+            )
+            # `principal = 'crucible'` is the fenced form of an event (0001).
+            _seed(
+                conn,
+                "events",
+                {
+                    "ts": "2026-01-01T00:00:00+00:00",
+                    "kind": "task_submitted",
+                    "task_id": task,
+                    "execution_id": execution,
+                    "attempt_id": attempt,
+                    "principal": "crucible",
+                    "verified": True,
+                },
+            )
+            conn.execute(text("DELETE FROM leases WHERE kind = 'supervisor'"))
+
+        migrate.upgrade(database_url)
+
+        with engine.connect() as conn:
+            observed = conn.execute(
+                text(
+                    "SELECT observed_head_sha, observed_base_ref, mergeable_state, "
+                    "merge_refusal_count FROM pull_requests WHERE id = :id"
+                ),
+                {"id": pull_request},
+            ).one()
+            routed = {
+                row.id: row.routing_version
+                for row in conn.execute(
+                    text("SELECT id, routing_version FROM attempts WHERE task_id = :task"),
+                    {"task": task},
+                )
+            }
+            assert (
+                conn.execute(
+                    text("SELECT count(*) FROM evidence WHERE task_id = :task"), {"task": task}
+                ).scalar_one()
+                == 1
+            )
+            assert (
+                conn.execute(
+                    text("SELECT count(*) FROM events WHERE task_id = :task"), {"task": task}
+                ).scalar_one()
+                == 1
+            )
+        assert tuple(observed) == ("4" * 40, "release/0.8", "", 0)
+        # 0038: a routed attempt takes its snapshot's routing version; a pending one stays NULL.
+        assert routed == {attempt: 3, pending: None}
+        ok, detail = migrate.is_current(engine, database_url)
+        assert ok, detail
+
+        # And back down past 0039 with an event of the kind it added: `events` is
+        # append-only, so its downgrade archives the row and its upgrade restores it.
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO events (ts, kind, task_id, principal, verified, payload) "
+                    "VALUES (now(), 'auto_merge_updated', :task, 'tests', true, "
+                    '\'{"marker": "0039-downgrade-test"}\')'
+                ),
+                {"task": task},
+            )
+        migrate.downgrade(database_url, "0038_attempt_routing_version")
+        with engine.connect() as conn:
+            assert (
+                conn.execute(
+                    text("SELECT count(*) FROM events WHERE kind = 'auto_merge_updated'")
+                ).scalar_one()
+                == 0
+            )
+            assert (
+                conn.execute(
+                    text(
+                        "SELECT count(*) FROM events_0039_archive "
+                        "WHERE payload->>'marker' = '0039-downgrade-test'"
+                    )
+                ).scalar_one()
+                == 1
+            )
+        migrate.upgrade(database_url)
+        with engine.connect() as conn:
+            assert (
+                conn.execute(
+                    text(
+                        "SELECT count(*) FROM events WHERE kind = 'auto_merge_updated' "
+                        "AND payload->>'marker' = '0039-downgrade-test'"
+                    )
+                ).scalar_one()
+                == 1
+            )
+            assert (
+                conn.execute(text("SELECT to_regclass('public.events_0039_archive')")).scalar()
+                is None
+            )
+    finally:
+        engine.dispose()

@@ -19,6 +19,7 @@ branch_labels = None
 depends_on = None
 
 EVENT_KINDS = ("auto_merge_updated",)
+EVENT_ARCHIVE = "events_0039_archive"
 
 
 def _event_kinds() -> list[str]:
@@ -40,9 +41,13 @@ def upgrade() -> None:
         "pull_requests",
         sa.Column("observed_base_ref", sa.String(length=255), nullable=False, server_default=""),
     )
+    # A migration holds no supervisor lease and `pull_requests` is fenced (0007), so the
+    # trigger is stood down for exactly the backfill, as 0038 does for `attempts`.
+    op.execute("ALTER TABLE pull_requests DISABLE TRIGGER trg_pull_requests_fenced")
     op.execute(
         "UPDATE pull_requests SET observed_head_sha = head_sha, observed_base_ref = base_ref"
     )
+    op.execute("ALTER TABLE pull_requests ENABLE TRIGGER trg_pull_requests_fenced")
     op.add_column(
         "pull_requests",
         sa.Column("mergeable_state", sa.String(length=32), nullable=False, server_default=""),
@@ -70,11 +75,30 @@ def upgrade() -> None:
     op.alter_column("pull_requests", "observed_head_sha", server_default=None)
     op.alter_column("pull_requests", "merge_refusal_count", server_default=None)
     _replace_event_kinds(_event_kinds())
+    connection = op.get_bind()
+    archive = connection.execute(
+        sa.text("SELECT to_regclass(:name)"), {"name": f"public.{EVENT_ARCHIVE}"}
+    ).scalar()
+    if archive:
+        op.execute("ALTER TABLE events DISABLE TRIGGER trg_events_append_only")
+        op.execute("ALTER TABLE events DISABLE TRIGGER trg_events_fenced")
+        op.execute(f"INSERT INTO events SELECT * FROM {EVENT_ARCHIVE}")
+        op.execute("ALTER TABLE events ENABLE TRIGGER trg_events_append_only")
+        op.execute("ALTER TABLE events ENABLE TRIGGER trg_events_fenced")
+        op.execute(f"DROP TABLE {EVENT_ARCHIVE}")
 
 
 def downgrade() -> None:
     kinds = ", ".join(f"'{kind}'" for kind in EVENT_KINDS)
+    # `events` is append-only, so its rows of the new kinds are archived, not discarded,
+    # with the triggers stood down for exactly these statements; upgrade() restores them.
+    op.execute(f"CREATE TABLE IF NOT EXISTS {EVENT_ARCHIVE} (LIKE events)")
+    op.execute("ALTER TABLE events DISABLE TRIGGER trg_events_append_only")
+    op.execute("ALTER TABLE events DISABLE TRIGGER trg_events_fenced")
+    op.execute(f"INSERT INTO {EVENT_ARCHIVE} SELECT * FROM events WHERE kind IN ({kinds})")
     op.execute(f"DELETE FROM events WHERE kind IN ({kinds})")
+    op.execute("ALTER TABLE events ENABLE TRIGGER trg_events_append_only")
+    op.execute("ALTER TABLE events ENABLE TRIGGER trg_events_fenced")
     _replace_event_kinds(_previous_event_kinds())
     for column in (
         "merge_retry_at",
