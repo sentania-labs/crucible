@@ -50,6 +50,7 @@ from crucible.adapters.execution import identity as identity_bundle
 from crucible.adapters.execution import k8sspec, scripts, workspace
 from crucible.adapters.execution.collected import read_outputs, read_verifications
 from crucible.adapters.execution.create_policy import image_allowed
+from crucible.adapters.execution.endpoint_health import probe_model_endpoint
 from crucible.adapters.execution.k8sapi import (
     _TRANSPORT_ERRORS,
     ExecResult,
@@ -85,6 +86,7 @@ from crucible.domain.cluster_egress import ClusterEgress, parse_cluster_egress
 from crucible.domain.command_timeout import effective_command_timeout_ms
 from crucible.domain.exit_class import ExitClass
 from crucible.domain.ids import new_id
+from crucible.domain.infrastructure import START_FAILURES
 from crucible.domain.role_timeouts import DEFAULT_ROLE_TIMEOUT_SECONDS, parse_role_timeouts
 from crucible.domain.secrets import redact
 from crucible.domain.time import parse_rfc3339
@@ -1932,6 +1934,10 @@ class KubernetesProvider:
                 launched.exit_code = code
             oom = str(terminated.get("reason", "")) == "OOMKilled"
             detail = str(terminated.get("reason", "")) or phase
+            if detail in START_FAILURES:
+                return await self._start_failure_observation(
+                    pod, code, detail, str(terminated.get("message") or detail)
+                )
             return Observation(
                 ObservationState.EXITED,
                 exit_code=code,
@@ -1964,9 +1970,46 @@ class KubernetesProvider:
                 exit_code=70,
                 detail=f"the Pod failed before the worker started: {detail or phase}",
             )
+        for entry in status.get("containerStatuses") or []:
+            if entry.get("name") != k8sspec.CONTAINER_NAME:
+                continue
+            waiting = (entry.get("state") or {}).get("waiting") or {}
+            reason = str(waiting.get("reason") or "")
+            if reason in START_FAILURES and (
+                reason not in {"ImagePullBackOff", "ErrImagePull"}
+                or self._pending_too_long(launched)
+            ):
+                return await self._start_failure_observation(
+                    pod, 70, reason, str(waiting.get("message") or reason)
+                )
         if phase in _PENDING_PHASES and self._pending_too_long(launched):
             return self._pending_failure(pod)
         return Observation(ObservationState.RUNNING, detail=phase or "Pending")
+
+    async def _start_failure_observation(
+        self, pod: Mapping[str, Any], code: int, reason: str, message: str
+    ) -> Observation:
+        metadata = pod.get("metadata") or {}
+        selector = f"involvedObject.uid={metadata.get('uid', '')}"
+        try:
+            events = await self._call(self.client.list_objects, "events", field_selector=selector)
+        except KubernetesApiError as exc:
+            events = [{"reason": "EventsUnavailable", "message": str(exc), "count": 1}]
+        return Observation(
+            ObservationState.EXITED,
+            exit_code=code,
+            detail=reason,
+            never_started=True,
+            container_message=message,
+            pod_events=tuple(
+                {
+                    "reason": row.get("reason"),
+                    "message": row.get("message"),
+                    "count": row.get("count", 1),
+                }
+                for row in events
+            ),
+        )
 
     def _observation_without_pod(
         self, h: Handle, launched: _Launched | None, job: Mapping[str, Any]
@@ -2131,6 +2174,9 @@ class KubernetesProvider:
             return None
         return scripts.parse_activity(result.stdout)
 
+    async def probe_model_endpoint(self, endpoint_url: str) -> bool:
+        return await probe_model_endpoint(endpoint_url)
+
     async def collect(
         self, h: Handle, ws: Workspace, spec: LaunchSpec | None = None
     ) -> CollectedOutputs:
@@ -2152,6 +2198,16 @@ class KubernetesProvider:
         credential_sync = await self._sync_credential(h, spec, limits)
         stdout_tail, stderr_tail = await self._worker_tails(h)
         observation = await self.observe(h)
+        if observation.never_started:
+            return CollectedOutputs(
+                report=None,
+                report_raw=None,
+                blocked_md=None,
+                stdout_tail=stdout_tail,
+                stderr_tail=stderr_tail,
+                artifacts=(self._launch_evidence(spec, observation),),
+                credential_sync=credential_sync,
+            )
         adapter = self.harnesses.get(spec.harness)
         quota_checkpoint = bool(
             adapter is not None
@@ -2213,7 +2269,18 @@ class KubernetesProvider:
             )
             self._raise_if_unavailable(k8sspec.ROLE_BUNDLE, spec.attempt_id, bundle_exit)
             bundle_ok = bundle_exit == 0
-        verifications = await self._run_verifier(spec, limits)
+        interruption = (
+            adapter.interruption(
+                ExitInfo(exit_code=observation.exit_code, oom_killed=observation.oom_killed),
+                stdout_tail,
+                stderr_tail,
+                None,
+            )
+            if adapter is not None and observation.state is ObservationState.EXITED
+            else None
+        )
+        interrupted = observation.never_started or quota_checkpoint or interruption is not None
+        verifications = () if interrupted else await self._run_verifier(spec, limits)
         with tempfile.TemporaryDirectory(prefix="crucible-k8s-") as scratch:
             root = Path(scratch)
             await self._read_workspace(spec, root, limits)
@@ -2235,6 +2302,7 @@ class KubernetesProvider:
             blocked_md=outputs.blocked_md,
             stdout_tail=stdout_tail,
             stderr_tail=stderr_tail,
+            interruption=interruption,
             diff_paths=outputs.diff_paths,
             diff_text=outputs.diff_text,
             bundle=outputs.bundle,
@@ -2280,6 +2348,9 @@ class KubernetesProvider:
                 "state": observation.state.value,
                 "exit_code": observation.exit_code,
                 "detail": observation.detail,
+                "never_started": observation.never_started,
+                "container_message": observation.container_message,
+                "pod_events": list(observation.pod_events),
             },
         }
         return CollectedArtifact(
