@@ -12,7 +12,7 @@ HOST = Path(__file__).parents[2] / "images/worker/crucible-codex-host.py"
 FAKE = r"""#!/usr/bin/env python3
 import json, sys
 thread = "thread-fixture"
-marker = "__MARKER_PATH__"
+marker = __MARKER_PATH__
 for line in sys.stdin:
     request = json.loads(line)
     method = request.get("method")
@@ -81,7 +81,7 @@ def _command(tmp_path: Path, fake: Path, wait: float) -> list[str]:
 def test_t_auth_3_host_re_reads_access_token_and_writes_transcript(tmp_path: Path) -> None:
     fake = tmp_path / "fake-codex"
     marker = tmp_path / "refresh-requested"
-    fake.write_text(FAKE.replace("__MARKER_PATH__", str(marker)))
+    fake.write_text(FAKE.replace("__MARKER_PATH__", repr(str(marker))))
     fake.chmod(0o755)
     _token(tmp_path / "token.json", "access-old")
     process = subprocess.Popen(_command(tmp_path, fake, 3), stdin=subprocess.PIPE, text=True)
@@ -101,7 +101,7 @@ def test_t_auth_3_host_re_reads_access_token_and_writes_transcript(tmp_path: Pat
 
 def test_codex_host_bounded_refresh_wait_is_auth_failure(tmp_path: Path) -> None:
     fake = tmp_path / "fake-codex"
-    fake.write_text(FAKE.replace("__MARKER_PATH__", str(tmp_path / "refresh-requested")))
+    fake.write_text(FAKE.replace("__MARKER_PATH__", repr(str(tmp_path / "refresh-requested"))))
     fake.chmod(0o755)
     _token(tmp_path / "token.json", "access-old")
     result = subprocess.run(
