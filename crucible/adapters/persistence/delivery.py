@@ -74,6 +74,15 @@ class PullRequests:
             last_reactions_polled_at=_dt(row.last_reactions_polled_at),
             reactions_observable=row.reactions_observable,
             cancelled_at=_dt(row.cancelled_at),
+            observed_head_sha=row.observed_head_sha,
+            observed_base_ref=row.observed_base_ref,
+            mergeable_state=row.mergeable_state,
+            merge_refusal_cause=row.merge_refusal_cause,
+            merge_refusal_head_sha=row.merge_refusal_head_sha,
+            merge_refusal_base_ref=row.merge_refusal_base_ref,
+            merge_refusal_mergeable_state=row.merge_refusal_mergeable_state,
+            merge_refusal_count=row.merge_refusal_count,
+            merge_retry_at=_dt(row.merge_retry_at),
         )
 
     def add(self, pull_request: PullRequest) -> None:
@@ -100,6 +109,15 @@ class PullRequests:
                 last_reactions_polled_at=pull_request.last_reactions_polled_at,
                 reactions_observable=pull_request.reactions_observable,
                 cancelled_at=pull_request.cancelled_at,
+                observed_head_sha=pull_request.observed_head_sha,
+                observed_base_ref=pull_request.observed_base_ref,
+                mergeable_state=pull_request.mergeable_state,
+                merge_refusal_cause=pull_request.merge_refusal_cause,
+                merge_refusal_head_sha=pull_request.merge_refusal_head_sha,
+                merge_refusal_base_ref=pull_request.merge_refusal_base_ref,
+                merge_refusal_mergeable_state=pull_request.merge_refusal_mergeable_state,
+                merge_refusal_count=pull_request.merge_refusal_count,
+                merge_retry_at=pull_request.merge_retry_at,
             )
         )
         self._s.flush()
@@ -138,6 +156,15 @@ class PullRequests:
         row.last_reactions_polled_at = pull_request.last_reactions_polled_at
         row.reactions_observable = pull_request.reactions_observable
         row.cancelled_at = pull_request.cancelled_at
+        row.observed_head_sha = pull_request.observed_head_sha
+        row.observed_base_ref = pull_request.observed_base_ref
+        row.mergeable_state = pull_request.mergeable_state
+        row.merge_refusal_cause = pull_request.merge_refusal_cause
+        row.merge_refusal_head_sha = pull_request.merge_refusal_head_sha
+        row.merge_refusal_base_ref = pull_request.merge_refusal_base_ref
+        row.merge_refusal_mergeable_state = pull_request.merge_refusal_mergeable_state
+        row.merge_refusal_count = pull_request.merge_refusal_count
+        row.merge_retry_at = pull_request.merge_retry_at
         self._s.flush()
 
     def list_in_states(self, states: Sequence[PullRequestState]) -> Sequence[PullRequest]:

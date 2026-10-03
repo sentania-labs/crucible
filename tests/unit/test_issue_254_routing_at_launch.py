@@ -277,7 +277,7 @@ async def test_the_launch_reservation_and_exit_read_the_version_routed_with(
     def setting(name: str) -> None:
         requested.append(name)
 
-    store.provider_settings = SimpleNamespace(get=setting)  # type: ignore[attr-defined]
+    store.provider_settings = SimpleNamespace(get=setting)  # type: ignore[assignment]
     task = store.tasks.get(attempt.task_id)
     stored = store.contracts.get(attempt.task_id, execution.contract_version)
     assert task is not None and stored is not None
@@ -350,12 +350,12 @@ def test_a_review_records_the_routing_version_it_launches_with(tmp_path: Path) -
     attempt = _review(store)
     supervisor, _provider = _supervisor(store, FakeClock(NOW), tmp_path)
 
-    assert supervisor._mark_preparing(attempt.id)
+    started, busy, refusal = supervisor._mark_review_preparing(attempt.id)
 
+    assert started is not None and busy is None and refusal is None
     preparing = store.attempts.get(attempt.id)
     assert preparing is not None and preparing.state is AttemptState.PREPARING
     assert preparing.routing_version == 4
-    assert supervisor._review_model_refusal(attempt.id) is None
 
 
 def test_a_review_whose_model_is_disabled_now_is_refused(tmp_path: Path) -> None:
@@ -363,9 +363,8 @@ def test_a_review_whose_model_is_disabled_now_is_refused(tmp_path: Path) -> None
     attempt = _review(store)
     supervisor, _provider = _supervisor(store, FakeClock(NOW), tmp_path)
 
-    assert supervisor._mark_preparing(attempt.id)
+    _started, _busy, refusal = supervisor._mark_review_preparing(attempt.id)
 
-    refusal = supervisor._review_model_refusal(attempt.id)
     assert refusal is not None and "gpt-test is disabled in routing policy" in refusal
     assert "default-routing/4" in refusal
 

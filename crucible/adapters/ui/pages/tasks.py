@@ -54,6 +54,16 @@ def _gate_steps(gates: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _effective_words(settings: dict[str, Any]) -> str:
+    """Hades #388: what the harness was told about the model, in words."""
+    context = settings.get("context_length")
+    return (
+        f"Launched with context length {context or 'found by Hermes'}, "
+        f"max output tokens {settings.get('max_output_tokens')}, "
+        f"thinking {'on' if settings.get('thinking') else 'off'}"
+    )
+
+
 def _busy_fallthrough(attempt: Any) -> str | None:
     if attempt is None or attempt.model is None:
         return None
@@ -370,6 +380,13 @@ def task_page(request: Request, task_id: str, ctx: Ctx, uow: UoW) -> Response:
         for execution in view.executions
         for attempt in execution.attempts
         if attempt.routing_version is not None
+    ]
+    # hades #388: the window, response allowance and thinking the harness was told.
+    fallthroughs += [
+        (attempt.id, _effective_words(attempt.effective_settings))
+        for execution in view.executions
+        for attempt in execution.attempts
+        if attempt.effective_settings
     ]
     if fallthroughs:
         sections.append(

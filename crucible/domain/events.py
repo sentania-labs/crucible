@@ -169,6 +169,7 @@ class EventKind(StrEnum):
     WORKER_QUIET = "worker_quiet"
     WORKER_STALLED = "worker_stalled"
     # administration (25): every mutation, with principal, reason, before and after
+    AUTO_MERGE_UPDATED = "auto_merge_updated"
     CREDENTIAL_VALIDATED = "credential_validated"
     CREDENTIAL_PROBED = "credential_probed"
     CREDENTIAL_SET = "credential_set"
@@ -178,6 +179,7 @@ class EventKind(StrEnum):
     CREDENTIAL_LOGIN_FINISHED = "credential_login_finished"
     CREDENTIAL_ROTATED = "credential_rotated"
     CREDENTIAL_REMOVED = "credential_removed"
+    CREDENTIAL_REFRESH_REQUESTED = "credential_refresh_requested"
     CREDENTIAL_RETIRED_SHREDDED = "credential_retired_shredded"
     IMAGE_PROMOTED = "image_promoted"
     GITHUB_CHECKED = "github_checked"

@@ -204,20 +204,26 @@ async def gateway_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
 
 
 def _hermes_limits_section(limits: dict[str, Any], principal: Principal) -> dict[str, Any]:
-    """FDY-0140: how far one Hermes run may go, and the window it is told the model has."""
+    """FDY-0140: how far one Hermes run may go, and the window it is told the model has.
+    Hades #388: and the response allowance the gateway reserves out of that window."""
     context = limits["context_length"]
     section: dict[str, Any] = {
         "title": "Local run limits",
         "note": (
-            "Applied from the next launch. Max turns applies to Hermes only. "
+            "Applied from the next launch; an attempt keeps the values it started with. "
+            "Max turns applies to Hermes only. "
             "Context length is the model's window in tokens for Hermes and local Codex; "
-            "0 lets Hermes find it from the gateway and uses 131072 for Codex."
+            "0 lets Hermes find it from the gateway and uses 131072 for Codex. "
+            "Max output tokens is the response allowance the gateway reserves out of the "
+            "window on every request; Hermes sends it and keeps its input below the "
+            "window less this allowance."
         ),
-        "columns": ["Max turns", "Context length", "Source"],
+        "columns": ["Max turns", "Context length", "Max output tokens", "Source"],
         "rows": [
             [
                 limits["max_turns"],
                 context or "found by Hermes",
+                limits["max_output_tokens"],
                 f"saved by {limits['updated_by']}" if limits["saved"] else "default",
             ]
         ],
@@ -225,6 +231,7 @@ def _hermes_limits_section(limits: dict[str, Any], principal: Principal) -> dict
     if principal.role is Role.ADMIN:
         low_turns, high_turns = limits["max_turns_range"]
         low_context, high_context = limits["context_length_range"]
+        low_output, high_output = limits["max_output_tokens_range"]
         section["form"] = {
             "action": "/ui/actions/hermes-limits",
             "label": "Save limits",
@@ -242,6 +249,13 @@ def _hermes_limits_section(limits: dict[str, Any], principal: Principal) -> dict
                     "label": f"Context length (0, or {low_context} to {high_context})",
                     "kind": "number",
                     "value": context,
+                    "required": True,
+                },
+                {
+                    "name": "max_output_tokens",
+                    "label": f"Max output tokens ({low_output} to {high_output})",
+                    "kind": "number",
+                    "value": limits["max_output_tokens"],
                     "required": True,
                 },
                 {"name": "reason", "label": "Reason", "required": True},
@@ -327,6 +341,7 @@ async def _action_hermes_limits(
         principal=principal,
         max_turns=_whole(form, "max_turns", "Max turns"),
         context_length=_whole(form, "context_length", "Context length"),
+        max_output_tokens=_whole(form, "max_output_tokens", "Max output tokens"),
         reason=reason,
     )
     uow.commit()

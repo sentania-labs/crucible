@@ -248,6 +248,10 @@ class Deliverables(StrictModel):
     on_out_of_band_head: Literal["block"]
 
 
+class Delivery(StrictModel):
+    auto_merge: bool = True
+
+
 class PullRequestRules(StrictModel):
     require_pre_pr_verification: bool
     open_only_after_pre_pr_gates_pass: bool
@@ -345,6 +349,7 @@ class PolicyV1(StrictModel):
     repository: RepositoryRules
     gates: Gates
     deliverables: Deliverables
+    delivery: Delivery = Field(default_factory=Delivery)
     pull_request: PullRequestRules
     internal_review: InternalReview
     external_review: ExternalReview
@@ -407,8 +412,9 @@ class RoutingTier(StrictModel):
 class ChatTemplateKwargs(StrictModel):
     """Request options retained with one routing entry.
 
-    Hermes 0.19 cannot receive this option from its non-interactive CLI. Keeping the
-    value in the entry makes the operator's intent durable until that transport exists.
+    Hermes 0.19 cannot receive this option from its non-interactive CLI. Hades #388: the
+    Hermes adapter passes it to the image wrapper, whose bootstrap puts it on each
+    request, and the attempt records the value it was launched with.
     """
 
     enable_thinking: bool = False

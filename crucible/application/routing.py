@@ -308,6 +308,7 @@ def select_model(
     harnesses: HarnessRegistry | None = None,
     image_allowlist: list[str] | None = None,
     excluded_pools: set[str] | None = None,
+    excluded_models: set[str] | None = None,
     pinned_model: str | None = None,
     pinned_harness: str | None = None,
 ) -> Selection:
@@ -350,6 +351,8 @@ def select_model(
             reasons.append("pool is at its soft limit")
         if usage.exhausted_until is not None:
             reasons.append(f"pool exhausted until {usage.exhausted_until.isoformat()}")
+        if excluded_models and entry.id in excluded_models:
+            reasons.append("model refused capacity for this retry")
         if excluded_pools and entry.pool in excluded_pools:
             reasons.append("pool excluded for the current quota reroute")
         image = image_for_harness(uow, entry.harness, provider)
@@ -416,6 +419,7 @@ def select_model(
             "image": image or None,
             "eligible": not reasons,
             "excluded": reasons,
+            "capacity_refused": bool(excluded_models and entry.id in excluded_models),
             "preferred_pool": entry.pool in preferred,
             "quality": quality.as_dict(),
         }

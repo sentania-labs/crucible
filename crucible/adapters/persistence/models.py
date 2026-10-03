@@ -173,6 +173,7 @@ class AttemptRow(Base):
     routing_excluded_pools: Mapped[list[str]] = mapped_column(JSONB, default=list)
     resume_from_remote: Mapped[bool] = mapped_column(Boolean, default=False)
     routing_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    effective_settings: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
 
 
 class LogChunkRow(Base):
@@ -264,6 +265,10 @@ class SupervisorStatusRow(Base):
     last_success_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
     last_error_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 339: the seq of the last CREDENTIAL_REFRESH_REQUESTED event the renewer has
+    # handled, persisted so a supervisor restart does not replay every historical
+    # request as pending.
+    refresh_request_cursor: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
 
 class IdempotencyKeyRow(Base):
@@ -519,6 +524,15 @@ class PullRequestRow(Base):
     last_reactions_polled_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
     reactions_observable: Mapped[bool] = mapped_column(Boolean, default=True)
     cancelled_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
+    observed_head_sha: Mapped[str] = mapped_column(String(64), default="")
+    observed_base_ref: Mapped[str] = mapped_column(String(255), default="")
+    mergeable_state: Mapped[str] = mapped_column(String(32), default="")
+    merge_refusal_cause: Mapped[str | None] = mapped_column(Text, nullable=True)
+    merge_refusal_head_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    merge_refusal_base_ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    merge_refusal_mergeable_state: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    merge_refusal_count: Mapped[int] = mapped_column(Integer, default=0)
+    merge_retry_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
 
 
 class PullRequestHeadRow(Base):

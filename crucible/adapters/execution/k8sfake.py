@@ -293,6 +293,7 @@ class FakeKubernetesApi:
     # Every event recorded, which outlives the object it names, as on an API server.
     events: list[dict[str, Any]] = field(default_factory=list)
     _uids: int = 0
+    _rv_counter: int = 1
 
     # ----- test controls ------------------------------------------------
 
@@ -359,6 +360,11 @@ class FakeKubernetesApi:
         """Fail the next matching calls with `error`, or a 503 by default."""
         self.outages.append([call, kind, count, error])
 
+    def _next_rv(self) -> int:
+        rv = self._rv_counter
+        self._rv_counter += 1
+        return rv
+
     def _outage(self, call: str, kind: str = "") -> None:
         for entry in self.outages:
             if entry[0] == call and entry[1] in ("", kind) and entry[2] > 0:
@@ -383,6 +389,7 @@ class FakeKubernetesApi:
         if (kind, name) in self.objects:
             raise KubernetesApiError(409, f"{kind}/{name} already exists")
         stored: dict[str, Any] = json.loads(json.dumps(dict(body)))
+        stored.setdefault("metadata", {})["resourceVersion"] = str(self._next_rv())
         if kind == "jobs" or (
             kind == "configmaps"
             and (stored.get("metadata") or {}).get("labels", {}).get(LABEL_ROLE) == ROLE_LOGIN_LOCK
@@ -471,11 +478,30 @@ class FakeKubernetesApi:
         if kind == "persistentvolumeclaims":
             self.claims.pop(name, None)
 
-    def patch(self, kind: str, name: str, body: Mapping[str, Any]) -> dict[str, Any]:
+    def patch(
+        self,
+        kind: str,
+        name: str,
+        body: Mapping[str, Any],
+        *,
+        resource_version: str | None = None,
+    ) -> dict[str, Any]:
         self._outage("patch", kind)
+        # 339: optimistic concurrency on the patch body's metadata.resourceVersion
+        # so the API server returns 409 Conflict when the stored object has changed
+        # since the read (339).
         obj = self.objects.get((kind, name))
         if obj is None:
             raise KubernetesApiError(404, f"{kind}/{name} not found")
+        body_version = dict(body).get("metadata", {}).get("resourceVersion")
+        # resource_version keyword argument is the caller's encoding of the same
+        # information; it is checked when the body does not carry metadata.
+        if body_version is None and resource_version is not None:
+            body_version = resource_version
+        if body_version is not None:
+            current_version = obj.body.get("metadata", {}).get("resourceVersion")
+            if current_version is not None and current_version != body_version:
+                raise KubernetesApiError(409, "conflict: resource version mismatch")
         _merge(obj.body, dict(body))
         return obj.body
 

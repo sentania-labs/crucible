@@ -66,6 +66,7 @@ from crucible.adapters.execution.create_policy import (
     check as check_create,
 )
 from crucible.adapters.execution.dockerapi import DockerApiError, DockerClient, LogFrame
+from crucible.adapters.execution.endpoint_health import probe_model_endpoint
 from crucible.adapters.execution.logstream import chunks as _chunks
 from crucible.adapters.harness.registry import default_registry
 from crucible.application.credential_renewer import (
@@ -118,6 +119,7 @@ from crucible.ports.execution import (
     ProviderError,
     ProviderHealth,
     VerificationRun,
+    WorkerStartError,
     Workspace,
     WorkspaceState,
     image_harnesses,
@@ -754,6 +756,7 @@ class DockerProvider:
         copy = self._credential_copy(spec)
         container_id = ""
         seeded_on_disk = False
+        starting = False
         try:
             container_id = await self._call(self.client.create_container, name, body)
             if copy is not None:
@@ -767,8 +770,14 @@ class DockerProvider:
                 copy = replace(copy, seeded=seeded)
                 await self._call(self.client.put_archive, container_id, copy.spec.mount_target, tar)
                 seeded_on_disk = True
+            starting = True
             await self._call(self.client.start_container, container_id)
         except (DockerApiError, ProviderError) as exc:
+            failure = (
+                await self._start_failure(container_id, exc)
+                if starting and isinstance(exc, DockerApiError)
+                else None
+            )
             if container_id:
                 with contextlib.suppress(Exception):
                     await self._call(self.client.remove_container, container_id, force=True)
@@ -777,6 +786,8 @@ class DockerProvider:
                 # and nothing later would visit an attempt that never ran (12).
                 with contextlib.suppress(Exception):
                     await self._remove_through_daemon(ws, spec, [CREDENTIAL_LEAF])
+            if failure is not None:
+                raise WorkerStartError(failure) from exc
             if isinstance(exc, ProviderError):
                 raise
             raise ProviderError(f"could not start the worker: {exc}") from exc
@@ -787,6 +798,28 @@ class DockerProvider:
             attempt_id=spec.attempt_id,
             image_digest=resolved,
             name=name,
+        )
+
+    async def _start_failure(self, container_id: str, exc: DockerApiError) -> Observation | None:
+        """Hades #346: the daemon refused `/start` for the created container. Its answer
+        is the runtime's reason (OCI runtime create failed: ...), and the container's
+        state, read before it is removed, has the exit code the runtime recorded. A
+        daemon that could not be reached is not a start failure; nor is a container
+        that vanished (404)."""
+        if exc.status == 404 or exc.status < 400:
+            return None
+        message = exc.message or str(exc)
+        exit_code = 128
+        with contextlib.suppress(Exception):
+            state = (await self._call(self.client.inspect_container, container_id)).get("State", {})
+            message = str(state.get("Error") or message)
+            exit_code = int(state.get("ExitCode") or exit_code)
+        return Observation(
+            ObservationState.EXITED,
+            exit_code=exit_code,
+            detail="StartError",
+            container_message=message[:2000],
+            never_started=True,
         )
 
     def _network_and_env(self, spec: LaunchSpec) -> tuple[str, dict[str, str]]:
@@ -1085,6 +1118,17 @@ class DockerProvider:
             raise ProviderError(f"inspect failed: {exc}") from exc
         state = data.get("State", {})
         status = str(state.get("Status", ""))
+        message = str(state.get("Error") or "")
+        started = str(state.get("StartedAt") or "")
+        never_started = bool(message) and (not started or started.startswith("0001-01-01"))
+        if never_started:
+            return Observation(
+                ObservationState.EXITED,
+                exit_code=int(state.get("ExitCode", 128)),
+                detail="StartError",
+                container_message=message,
+                never_started=True,
+            )
         if status in ("created", "running", "restarting", "paused", "removing"):
             return Observation(ObservationState.RUNNING, detail=status)
         detail = status
@@ -1110,6 +1154,9 @@ class DockerProvider:
             raise ProviderError(f"log pull failed: {exc}") from exc
         return _chunks(frames, since)
 
+    async def probe_model_endpoint(self, endpoint_url: str) -> bool:
+        return await probe_model_endpoint(endpoint_url)
+
     async def collect(
         self, h: Handle, ws: Workspace, spec: LaunchSpec | None = None
     ) -> CollectedOutputs:
@@ -1132,6 +1179,15 @@ class DockerProvider:
             if hasattr(self.client, "inspect_container")
             else Observation(ObservationState.EXITED, exit_code=1)
         )
+        if observation.never_started:
+            return CollectedOutputs(
+                report=None,
+                report_raw=None,
+                blocked_md=None,
+                stdout_tail=stdout_tail,
+                stderr_tail=stderr_tail,
+                credential_sync=credential_sync,
+            )
         adapter = self.harnesses.get(spec.harness)
         quota_checkpoint = bool(
             adapter is not None
@@ -1200,7 +1256,24 @@ class DockerProvider:
                 )
                 == 0
             )
-        verifications = await self._run_verifier(spec)
+        report = root / "report"
+        interruption = (
+            adapter.interruption(
+                ExitInfo(
+                    exit_code=observation.exit_code,
+                    report_present=(report / "report.yaml").is_file(),
+                    blocked_present=(report / "blocked.md").is_file(),
+                    oom_killed=observation.oom_killed,
+                ),
+                stdout_tail,
+                stderr_tail,
+                report,
+            )
+            if adapter is not None and observation.state is ObservationState.EXITED
+            else None
+        )
+        interrupted = observation.never_started or quota_checkpoint or interruption is not None
+        verifications = () if interrupted else await self._run_verifier(spec)
         outputs = _read_outputs(
             output,
             root / "verify",
@@ -1217,6 +1290,7 @@ class DockerProvider:
             blocked_md=outputs.blocked_md,
             stdout_tail=stdout_tail,
             stderr_tail=stderr_tail,
+            interruption=interruption,
             diff_paths=outputs.diff_paths,
             diff_text=outputs.diff_text,
             diff_changes=outputs.diff_changes,

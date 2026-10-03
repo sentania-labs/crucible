@@ -24,8 +24,12 @@ dir, user, resource limits, network mode, expected exit semantics.
 
 `ExitClass` is the one enum used by contracts, policies, and 16:
 `completed`, `completed_without_report`, `blocked`, `environment`,
-`auth_failure`, `provider_error`, `quota_exhausted`, `timeout`, `stalled`, `killed`, `crashed`, `lost`,
-`incomplete`, `unknown`. Which classes may retry is a policy decision (05b
+`auth_failure`, `infrastructure`, `provider_error`, `quota_exhausted`, `timeout`, `stalled`,
+`killed`, `crashed`, `lost`, `incomplete`, `unknown`. `infrastructure` (hades #353, #346) is
+a model call the gateway or provider failed (502, 503, 504, refused, reset, at capacity)
+as each adapter reads it from its own CLI's error events, or a worker whose container
+never started; it is retried under its own budget, never consumes an attempt, and is
+never gated. Which classes may retry is a policy decision (05b
 `retry.eligible_classes`), narrowed by the contract's `retry_on`; a retry
 happens only when the class is in both. Gate failures are never a class and
 never retry.
@@ -203,7 +207,22 @@ never retry.
   (default 300; Hermes 0.19's `-z` fixes 90 and reads no setting, so a bootstrap
   sets the budget an agent is built with when its caller named none) and
   `CRUCIBLE_HERMES_CONTEXT_LENGTH` (default 131072, 0 to let Hermes find it),
-  written as Hermes's own `model.context_length` in its home. It writes
+  written as Hermes's own `model.context_length` in its home, and (hades #388)
+  `CRUCIBLE_HERMES_MAX_OUTPUT_TOKENS` (default 32000, the response allowance the
+  gateway reserves out of the window), written as Hermes's own `model.max_tokens`,
+  so every request carries it and the context compressor takes its trigger from
+  the window less it (74304 rather than 98304 input tokens for 131072 and 32000).
+  `CRUCIBLE_HERMES_THINKING` carries the routing entry's
+  `chat_template_kwargs.enable_thinking`, which the bootstrap puts on each request
+  as `extra_body.chat_template_kwargs`, the only request override it adds: a
+  `max_tokens` override would replace the lower cap Hermes retries with after the
+  gateway reports less room. The bootstrap caps Hermes's own retry boosts at the
+  allowance and leaves lower caps as Hermes set them; before Hermes starts, the
+  preflight stops the attempt unless Hermes 0.19.0 still reads `model.max_tokens`,
+  boosts the way that cap expects, and computes the same compression trigger as
+  the wrapper. The context length, allowance and thinking setting are resolved
+  once per attempt and recorded as the attempt's `effective_settings`; a later
+  spec of the same attempt reuses the record. It writes
   `crucible-hermes: working, session updated` to stderr whenever the session store
   changes, which is log activity (10). A run that ends on its turn budget is marked
   in the usage record (`turn_limit_reached`) and recorded as `harness_limit_reached`
@@ -216,8 +235,11 @@ never retry.
   text, then report presence. `blocked.md` on exit 0 is `blocked` (FDY-0140),
   checked before the usage record, so it wins over `failed: true`; otherwise
   `failed: true` overrides exit 0. Exit 75 is Hermes's own and is
-  `provider_error` unless explicit quota text makes it `quota_exhausted`; a local
-  5xx or connection refusal is always `provider_error` and never marks the pool.
+  `provider_error` unless explicit quota text makes it `quota_exhausted`. When the
+  usage record or exit 75 says the provider failed and Hermes's client reports a 502,
+  503 or 504 or no answer at all (refused, reset, timed out), the exit is
+  `infrastructure` (hades #353) and is retried under the interruption budget; any
+  other 5xx stays `provider_error`. Neither marks the pool from text.
 - Crucible's launch wrapper is the sole transcript writer. The Hermes image wrapper
   inherits stdout and only enriches the usage record after the child exits.
 

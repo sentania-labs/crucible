@@ -39,9 +39,17 @@ from typing import Any
 
 from crucible.adapters.harness import base
 from crucible.adapters.harness.hermes import HermesAdapter
+from crucible.adapters.harness.interruption import (
+    ProviderFailure,
+    file_tail,
+    interruption_from,
+    status_line,
+    tail_lines,
+)
 from crucible.domain.exit_class import ExitClass
 from crucible.domain.harness_concurrency import HARNESS_CONCURRENCY
 from crucible.domain.harness_settings import DEFAULT_HERMES_CONTEXT_LENGTH, hermes_run_limits
+from crucible.domain.infrastructure import Interruption
 from crucible.ports.harness import (
     CODEX_BINARY,
     AdapterLaunch,
@@ -242,9 +250,37 @@ class CodexAdapter:
     def classify_exit(
         self, exit: ExitInfo, stdout_tail: str, stderr_tail: str, report_dir: Path | None = None
     ) -> ExitClass:
+        interruption = self.interruption(exit, stdout_tail, stderr_tail, report_dir)
+        if exit.exit_code == 0 and interruption is not None and not exit.blocked_present:
+            # The app-server host exits 0 after a turn that ended `failed`; with no
+            # report the failed turn, not the exit code, says how the run ended.
+            return interruption.exit_class
         return base.classify_with_patterns(
-            exit, stdout_tail, stderr_tail, auth=AUTH_PATTERNS, quota=QUOTA_PATTERNS
+            exit,
+            stdout_tail,
+            stderr_tail,
+            auth=AUTH_PATTERNS,
+            quota=QUOTA_PATTERNS,
+            interruption=interruption,
         )
+
+    def interruption(
+        self,
+        exit: ExitInfo,
+        stdout_tail: str,
+        stderr_tail: str,
+        report_dir: Path | None = None,
+    ) -> Interruption | None:
+        if exit.lost or exit.timed_out or exit.killed or exit.oom_killed:
+            return None
+        # The app-server host writes the transcript itself and nothing to stdout; `codex
+        # exec --json` writes its events to stdout, which the launch also keeps as the
+        # transcript.
+        transcript = file_tail(report_dir / base.TRANSCRIPT_NAME if report_dir else None)
+        failure, turn_failed = _last_failure(transcript, stdout_tail, stderr_tail)
+        if exit.exit_code == 0 and not (turn_failed and not exit.report_present):
+            return None
+        return interruption_from(failure)
 
     def command_tracker(self) -> CommandTracker:
         return CommandTracker()
@@ -276,6 +312,128 @@ class CommandTracker(base.LineTracker):
     @property
     def running(self) -> tuple[tuple[str, str], ...]:
         return tuple(self._started.items())
+
+
+# Codex app-server `codexErrorInfo` variants that carry the HTTP status of the call that
+# failed; with no status the request got no answer at all.
+_STATUS_ERRORS = frozenset(
+    {
+        "httpConnectionFailed",
+        "responseStreamConnectionFailed",
+        "responseStreamDisconnected",
+        "responseTooManyFailedAttempts",
+    }
+)
+_TURN_ENDS = frozenset({"turn.completed", "turn.failed", "turn/completed", "turn/failed"})
+
+
+def _app_server_failure(error: Any) -> ProviderFailure | None:
+    """An app-server `TurnError`: `message`, and `codexErrorInfo` either a unit variant
+    (`"serverOverloaded"`) or a struct variant (`{"responseStreamDisconnected":
+    {"httpStatusCode": 503}}`)."""
+    if not isinstance(error, dict):
+        return None
+    message = str(error.get("message") or "")
+    info = error.get("codexErrorInfo")
+    status: int | None = None
+    transport = False
+    if isinstance(info, dict) and len(info) == 1:
+        name, body = next(iter(info.items()))
+        code = body.get("httpStatusCode") if isinstance(body, dict) else None
+        if name in _STATUS_ERRORS:
+            status = code if isinstance(code, int) and not isinstance(code, bool) else None
+            transport = status is None and name != "responseTooManyFailedAttempts"
+    return ProviderFailure(
+        message,
+        status=status or status_line(message),
+        transport=transport,
+        capacity=info == "serverOverloaded",
+        quota=info == "usageLimitExceeded",
+    )
+
+
+def _exec_failure(message: Any, code: Any = None) -> ProviderFailure:
+    """A `codex exec --json` error: `turn.failed` carries `{"message": ...}` and the
+    `error` event a bare `message`, the CLI's own rendering of the error. The status is
+    the HTTP status line it renders ("unexpected status 503 Service Unavailable: ...",
+    "exceeded retry limit, last status: 503 Service Unavailable"); a request that got no
+    answer is "stream disconnected before completion" or reqwest's "error sending
+    request"; capacity is its fixed `ServerOverloaded` text."""
+    text = str(message or "")
+    return ProviderFailure(
+        text,
+        status=status_line(text),
+        transport=text.startswith("stream disconnected before completion")
+        or "error sending request for url" in text,
+        capacity=text.startswith("Selected model is at capacity"),
+        quota=code in {"usage_limit_reached", "insufficient_quota", "rate_limit_exceeded"},
+    )
+
+
+def _event_failure(event: Mapping[str, Any]) -> tuple[str, ProviderFailure | None, bool]:
+    """(kind, failure, the turn failed) for one transcript event. The app-server host
+    keeps each notification as it came, with `type` added from its `method`."""
+    method = event.get("method")
+    kind = str(method if isinstance(method, str) else event.get("type") or "")
+    params = event.get("params")
+    body: Mapping[str, Any] = params if isinstance(params, dict) else {}
+    if kind == "turn/completed":
+        turn = body.get("turn")
+        if isinstance(turn, dict) and turn.get("status") == "failed":
+            return kind, _app_server_failure(turn.get("error")), True
+        return kind, None, False
+    if kind == "turn/failed":
+        return kind, _app_server_failure(body.get("error")), True
+    if kind == "error" and isinstance(method, str):
+        return kind, _app_server_failure(body.get("error")), False
+    if kind == "turn.failed":
+        error = event.get("error")
+        if isinstance(error, dict):
+            return kind, _exec_failure(error.get("message"), error.get("code")), True
+        return kind, _exec_failure(error), True
+    if kind == "error":
+        return kind, _exec_failure(event.get("message")), False
+    item = event.get("item")
+    if kind == "item.completed" and isinstance(item, dict) and item.get("type") == "error":
+        # exec reports a non-fatal error (a stream retry, a warning) as an error item.
+        return "error", _exec_failure(item.get("message")), False
+    return kind, None, False
+
+
+def _last_failure(*tails: str) -> tuple[ProviderFailure | None, bool]:
+    """The failure that ended the last turn, and whether a turn ended `failed`.
+
+    Read last first. A turn that completed ends the search: whatever failed before it
+    was retried and succeeded. A failed turn whose own error names no status takes the
+    status from the `error` events that came before it in the same turn, which is where
+    the app-server and exec both put the retried call's HTTP status. An item after an
+    error means the model answered again, so that error did not end the run."""
+    for source in tails:
+        failure: ProviderFailure | None = None
+        turn_failed = False
+        for line in tail_lines(source):
+            event = base.json_object(line.strip())
+            if event is None:
+                continue
+            kind, found, failed = _event_failure(event)
+            if kind in _TURN_ENDS:
+                if turn_failed or not failed:
+                    break
+                turn_failed = True
+                failure = found
+                if interruption_from(found) is not None:
+                    break
+                continue
+            if kind == "error" and found is not None:
+                if interruption_from(found) is not None:
+                    failure = found
+                    break
+                continue
+            if kind.startswith("item"):
+                break
+        if failure is not None or turn_failed:
+            return failure, turn_failed
+    return None, False
 
 
 def _toml_string(value: str) -> str:

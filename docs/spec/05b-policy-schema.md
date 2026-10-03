@@ -309,7 +309,12 @@ answered 5xx) and the previous finished attempt on that pool did too, the
 pool is marked for its `default_cooldown_seconds`, with that reason; the
 mark is listed and cleared like a quota mark. One provider error marks
 nothing, and a subscription model's provider error marks nothing. A pool
-at its `max_concurrency` is not excluded: the launch waits for a slot. (Decided 2026-09-29 on the operator's direction: "Hermes is not
+at its `max_concurrency` is not excluded: the launch waits for a slot. A
+review attempt holds a slot of its model's pool like an implement attempt
+(hades #359), and the cap that binds is the smaller of the pool's
+`max_concurrency` in the routing version the attempt routes with and in the
+newest version of the same routing policy that is not retired, so a cap an
+operator lowers binds for tasks pinned to an older version. (Decided 2026-09-29 on the operator's direction: "Hermes is not
 the anti-route. It should probably be close to our default doer with
 frontier being hard structural problems for scoping of items for
 hermes/qwen.")
@@ -413,8 +418,10 @@ disabled `coder` entry in pool `lab-local`. The endpoint comes from
 only as a compatibility seed. The entry stores
 `chat_template_kwargs.enable_thinking`, false by default, and the pool starts with
 `max_concurrency: 4`. Hermes 0.19 has no safe non-interactive flag that can pass this
-request option, so C10 retains the operator's choice in immutable routing state but does
-not claim it reached the server. Runtime edits create later immutable versions through
+request option, so C10 retains the operator's choice in immutable routing state. Since
+hades #388 the Hermes adapter passes it to the image wrapper, whose bootstrap sends it on
+each request as `extra_body.chat_template_kwargs`, and the attempt records it with its
+other effective settings. Runtime edits create later immutable versions through
 the admin surface. The database value is authoritative over the environment after the
 migration.
 
@@ -442,7 +449,10 @@ attempt's spec, pool reservation, harness count and exit read that version, not 
 newer one. A routing version an attempt recorded is immutable: `PUT
 /routing/{name}/{version}` refuses to rewrite it with 409, as it does for a version a
 policy references. A review is not routed; it records the current version when it
-starts preparing and is refused if its model is disabled there. The Codex pool in version 2 is exactly the
+starts preparing and is refused if its model is disabled there or the
+entry pairs the model with a harness other than the one the review launches; a
+refused review holds no pool slot. A pool is marked exhausted only for an attempt
+whose recorded pool and harness match its model's entry in its routing version. The Codex pool in version 2 is exactly the
 operator's roster decision: `gpt-5.6-luna` small, `gpt-5.6-terra` mid, `gpt-5.6-sol` and
 `gpt-6-astra` frontier. Nothing older and no mini; `gpt-5.5` is a recorded
 fallback outside the pool. The ids come from the CLI's own listing, the cost

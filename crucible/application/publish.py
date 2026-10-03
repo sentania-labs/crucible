@@ -603,6 +603,13 @@ def _claim_gone(step: str, detail: str) -> bool:
     return "gone" in lower or "missing" in lower or "no branch bundle" in lower
 
 
+def reopen_or_cancel(number: int) -> str:
+    """hades #379: what to do with a task whose pull request was closed unmerged while a
+    correction was under way; the poll's close wake and the publication's own failure
+    say the same."""
+    return f"reopen pull request #{number} and then republish, or cancel the task"
+
+
 def fail_publish(
     uow: UnitOfWork,
     clock: Clock,
@@ -613,8 +620,16 @@ def fail_publish(
     response_class: str = "",
     attempt_id: str | None = None,
     extra: dict[str, Any] | None = None,
+    closed_pull_request: int | None = None,
+    retryable: bool = True,
 ) -> None:
-    """23 step 7: the step and the API response class, never the token."""
+    """23 step 7: the step and the API response class, never the token.
+
+    `closed_pull_request` names the task's pull request when the publication found it
+    closed (hades #379): a republish meets the same closed pull request until someone
+    reopens it, so the wake says to reopen it and then republish, or to cancel.
+    `retryable` False when a republish can only fail the same way (the task's pull
+    request is merged), so the wake offers none."""
     payload: dict[str, Any] = {
         "step": step,
         "detail": detail,
@@ -658,9 +673,20 @@ def fail_publish(
     links = {"events": f"/v1/tasks/{task.id}/events"}
     claim_lost = _claim_gone(step, detail)
     started = uow.events.latest_for_task_kind(task.id, EventKind.PUBLISH_STARTED.value)
-    if not claim_lost and retries_remaining and started is not None:
+    if retryable and not claim_lost and retries_remaining and started is not None:
         links["republish"] = f"/v1/tasks/{task.id}/republish"
-    if claim_lost:
+    if not retryable:
+        summary = (
+            f"publication failed at {step} on {task.head_sha}: {detail}; "
+            "a republish would fail the same way, so none is offered"
+        )[:500]
+    elif closed_pull_request is not None:
+        summary = (
+            f"publication failed at {step} on {task.head_sha}: {detail}; "
+            f"{reopen_or_cancel(closed_pull_request)}; manual publication retries used "
+            f"{retry_number} of {retry_max}, {retries_remaining} remaining"
+        )[:500]
+    elif claim_lost:
         summary = (
             f"publication failed at {step} on {task.head_sha}: {detail}; "
             f"no retry is possible (bundle seal is lost)"
@@ -703,10 +729,12 @@ def upsert_pull_request(
             repository_id=plan.repository_id,
             number=ref.number,
             url=ref.url,
-            base_ref=ref.base_ref or plan.base_ref,
+            base_ref=plan.base_ref,
+            observed_base_ref=ref.base_ref or plan.base_ref,
             work_branch=plan.work_branch,
             state=PullRequestState.OPEN,
             head_sha=plan.head_sha,
+            observed_head_sha=plan.head_sha,
             title=ref.title or plan.title,
             body_sha256=body_hash,
             opened_at=now,
@@ -717,6 +745,8 @@ def upsert_pull_request(
         pull_request.number = ref.number
         pull_request.url = ref.url
         pull_request.head_sha = plan.head_sha
+        pull_request.observed_head_sha = plan.head_sha
+        pull_request.observed_base_ref = ref.base_ref or pull_request.base_ref
         pull_request.title = ref.title or plan.title
         pull_request.body_sha256 = body_hash
         pull_request.state = PullRequestState.OPEN
