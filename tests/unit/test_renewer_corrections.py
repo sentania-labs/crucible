@@ -38,6 +38,8 @@ async def test_supervisor_persists_effective_credential_command(
     uow.provider_settings.get.return_value = None
     supervisor = object.__new__(Supervisor)
     supervisor._uow_factory = lambda: nullcontext(uow)  # type: ignore[assignment]
+    supervisor._fenced = lambda: nullcontext(uow)  # type: ignore[method-assign, assignment, return-value]
+    supervisor.fenced_token = 1
     supervisor._harnesses = default_registry()
     supervisor._credential_sources = {"codex": CredentialSource("", mode)}
     attempt: Any = SimpleNamespace(

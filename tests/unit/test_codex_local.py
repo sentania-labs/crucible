@@ -232,6 +232,8 @@ async def test_supervisor_launch_uses_gateway_alias_limits_and_key(
     uow: Any = SimpleNamespace(provider_settings=SimpleNamespace(get=setting))
     supervisor = object.__new__(Supervisor)
     supervisor._uow_factory = lambda: nullcontext(uow)  # type: ignore[assignment]
+    supervisor._fenced = lambda: nullcontext(uow)  # type: ignore[method-assign, assignment, return-value]
+    supervisor.fenced_token = 1
     supervisor._harnesses = default_registry()
     (tmp_path / "api-key").write_text("test-key")
     supervisor._credential_sources = {"hermes": CredentialSource(str(tmp_path))}
