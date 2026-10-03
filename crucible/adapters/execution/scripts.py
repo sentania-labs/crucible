@@ -196,9 +196,10 @@ def _commit_policy_check(git: str) -> str:
 
 # `log.showSignature=false`: a worker-written `.git/config` could otherwise have `git
 # show` verify a planted signature with a `gpg.program` of its choosing.
+# Keep text visible even when the worker lowers its binary detection threshold.
 GIT = (
     "git -c core.fsmonitor= -c diff.external= -c core.pager=cat "
-    "-c core.hooksPath=/dev/null -c log.showSignature=false -c 'safe.directory=*'"
+    "-c core.bigFileThreshold=512m -c core.hooksPath=/dev/null -c log.showSignature=false -c 'safe.directory=*'"
 )
 CHECKPOINT_GIT = (
     "git -c core.fsmonitor= -c diff.external= -c core.pager=cat "

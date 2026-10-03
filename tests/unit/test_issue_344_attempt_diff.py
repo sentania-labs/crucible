@@ -229,6 +229,17 @@ def _branch(tmp_path: Path) -> Path:
     return repo
 
 
+def test_a_worker_binary_threshold_cannot_hide_a_secret(tmp_path: Path) -> None:
+    repo = _branch(tmp_path)
+    _git(repo, "config", "core.bigFileThreshold", "1")
+    (repo / "z.txt").write_text(f"token={SECRET}\n")
+    _commit(repo, "secret with lowered binary threshold")
+    output = _collect(tmp_path, repo)
+    assert f"+token={SECRET}" in (output / "diff.patch").read_text()
+    assert f"+token={SECRET}" in _review_diff(output)
+    assert {"where": "diff", "pattern": "github_token"} in _scan(tmp_path, output)
+
+
 def test_a_large_binary_does_not_push_a_later_secret_past_the_scanner(tmp_path: Path) -> None:
     repo = _branch(tmp_path)
     (repo / "a.bin").write_bytes(b"\0" * (9 * 1024 * 1024))
