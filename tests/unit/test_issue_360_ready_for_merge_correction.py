@@ -31,6 +31,7 @@ from crucible.contracts.task_contract import contract_sha256
 from crucible.domain.entities import (
     Artifact,
     Attempt,
+    Escalation,
     Event,
     EvidenceRecord,
     Execution,
@@ -41,7 +42,9 @@ from crucible.domain.entities import (
     Policy,
     Principal,
     PullRequest,
+    PullRequestHead,
     PullRequestState,
+    PushedBy,
     Repository,
     Role,
     RoutingPolicyRecord,
@@ -179,6 +182,13 @@ class _Events:
             (e for e in reversed(self.rows) if e.task_id == task_id and e.kind == kind), None
         )
 
+    def list_for_task(self, task_id: str, *, after_seq: int, limit: int) -> list[Event]:
+        return [
+            event
+            for event in self.rows
+            if event.task_id == task_id and int(event.seq or 0) > after_seq
+        ][:limit]
+
     def kinds(self) -> list[str]:
         return [e.kind for e in self.rows]
 
@@ -258,6 +268,27 @@ class _NothingOnThePullRequest:
 
     def list_for_pull_request(self, pull_request_id: str) -> list[Any]:
         return []
+
+
+class _CrucibleHeads:
+    """The heads recorded on the PR: the first publication's, pushed by Crucible."""
+
+    def __init__(self) -> None:
+        self.rows: list[PullRequestHead] = [
+            PullRequestHead(
+                id="01HEAD3600000000000000001",
+                pull_request_id=PR_ID,
+                sha=OLD_HEAD,
+                pushed_by=PushedBy.CRUCIBLE,
+                observed_at=NOW,
+            )
+        ]
+
+    def add(self, head: PullRequestHead) -> None:
+        self.rows.append(head)
+
+    def list_for_pull_request(self, pull_request_id: str) -> list[PullRequestHead]:
+        return [h for h in self.rows if h.pull_request_id == pull_request_id]
 
 
 class _NoDecisions:
@@ -355,6 +386,24 @@ class _Wakes:
         self.rows.append(wake)
 
 
+class _NoClaims:
+    """No completion claim was parsed: publication falls back to the default title."""
+
+    def get(self, attempt_id: str) -> None:
+        return None
+
+
+class _Escalations:
+    def __init__(self) -> None:
+        self.rows: list[Escalation] = []
+
+    def add(self, escalation: Escalation) -> None:
+        self.rows.append(escalation)
+
+    def list_for_task(self, task_id: str) -> list[Escalation]:
+        return [e for e in self.rows if e.task_id == task_id]
+
+
 class _NoHistory:
     """Routing's history: no attempt metrics, no promoted image, no exhausted pool."""
 
@@ -399,6 +448,9 @@ class _Store:
         self.evidence = _Evidence()
         self.artifacts = _Artifacts()
         self.wakes = _Wakes()
+        self.escalations = _Escalations()
+        self.claims = _NoClaims()
+        self.review_reports = _NoDecisions()
         self.attempt_metrics = _NoHistory()
         self.harness_images = _NoHistory()
         self.pool_exhaustions = _NoHistory()
@@ -631,6 +683,7 @@ def _ready_for_merge() -> _Store:
             opened_at=NOW,
         )
     )
+    store.pull_request_heads = _CrucibleHeads()  # type: ignore[assignment]
     store.review_cycles.add(
         ExternalReviewCycle(
             id="01CYCLE360000000000000001",
@@ -672,7 +725,7 @@ def _correction(*, of_version: int = 1, **overrides: Any) -> dict[str, Any]:
     document = contract_document(**overrides)
     document["correction"] = {
         "of_version": of_version,
-        "reason": "external_review",
+        "reason": "needs_more_work",
         "addresses": [],
         "instructions": "Foundry's full-diff review found a defect; correct it.",
         "resume_from": "remote_branch",
@@ -941,7 +994,8 @@ def test_a_merge_while_the_correction_runs_ends_its_attempt(tmp_path: Path) -> N
     closed = store.executions.get(execution.id)
     assert closed is not None and closed.state is ExecutionState.CANCELLED
     assert _task(store).state is TaskState.MERGED
-    assert _task(store).head_sha is None
+    # hades #379: the merged task's head is the last head Crucible pushed.
+    assert _task(store).head_sha == OLD_HEAD
 
 
 def test_a_correction_that_fails_gates_after_the_merge_does_not_stay_failed(
@@ -980,3 +1034,10 @@ def test_a_merge_already_recorded_settles_a_failed_correction(tmp_path: Path) ->
     supervisor.delivery._evaluate_gates()
 
     assert _task(store).state is TaskState.MERGED
+    # hades #379: a merge recorded before #379 carries no head; GitHub merged what was on
+    # the branch, the last head Crucible pushed, so the merge is not escalated.
+    assert store.escalations.list_for_task(TASK_ID) == []
+    merged = store.events.latest_for_task_kind(TASK_ID, EventKind.TASK_MERGED.value)
+    assert merged is not None
+    assert merged.payload["merged_head_recorded"] is False
+    assert merged.payload["last_pushed_head"] == OLD_HEAD

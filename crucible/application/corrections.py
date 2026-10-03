@@ -58,6 +58,10 @@ CORRECTABLE_STATES = frozenset(
         TaskState.READY_FOR_MERGE,
     }
 )
+# hades #379: a task ready for merge has passed its external round and CI. A correction
+# there answers Foundry's own judgement of the full diff, a needs_more_work or an
+# internal review finding; an external review or CI finding has its own state.
+READY_FOR_MERGE_REASONS = frozenset({"needs_more_work", "internal_review"})
 AMENDABLE_STATES = frozenset(
     {TaskState.SUBMITTED, TaskState.BLOCKED, TaskState.AWAITING_ACCEPTANCE}
 )
@@ -189,6 +193,20 @@ def attach_correction(
     bundle_problem = _unpublished_bundle_problem(uow, task, contract.execution_request.provider)
     if bundle_problem is not None:
         problems.append(bundle_problem)
+    if (
+        task.state is TaskState.READY_FOR_MERGE
+        and contract.correction.reason not in READY_FOR_MERGE_REASONS
+    ):
+        problems.append(
+            {
+                "path": "correction.reason",
+                "message": (
+                    "a correction from ready_for_merge gives reason "
+                    f"{' or '.join(sorted(READY_FOR_MERGE_REASONS))}; "
+                    f"this one gives {contract.correction.reason}"
+                ),
+            }
+        )
     if task.state is TaskState.AWAITING_ACCEPTANCE:
         # The current verdict only. A needs_more_work that a later accept superseded is
         # not a standing request for more work.

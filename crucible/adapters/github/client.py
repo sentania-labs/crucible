@@ -130,6 +130,22 @@ class RestGitHubClient:
         payload = self._http.get(f"/repos/{repository}/pulls/{number}", bearer=token.reveal())
         return normalize.pull_request(payload)
 
+    def open_pull_requests(
+        self, token: InstallationToken, *, repository: str, head_branch: str
+    ) -> Sequence[PullRequestRef]:
+        owner = repository.split("/", maxsplit=1)[0]
+        rows = self._http.paginate(
+            f"/repos/{repository}/pulls",
+            bearer=token.reveal(),
+            params={"state": "open", "head": f"{owner}:{head_branch}"},
+        )
+        found = [
+            normalize.pull_request(row)
+            for row in rows or []
+            if isinstance(row, dict) and row.get("state") == "open"
+        ]
+        return sorted(found, key=lambda ref: ref.number)
+
     def list_required_checks(
         self, token: InstallationToken, *, repository: str, branch: str
     ) -> Sequence[str]:
