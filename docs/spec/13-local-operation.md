@@ -94,9 +94,11 @@ harness; now `images/worker/Dockerfile` builds a single image with Claude
 Code, Codex, AGY and Hermes, each CLI at its own pinned version and each
 downloaded by URL and verified against a sha256 computed when the pin was
 taken. It is Debian slim, non-root `worker` (uid 1000), git, curl, jq,
-make (the shipped policy's required checks start with it, hades #181), the
-lab root CA, the Python runtime and hash-locked virtual environment Hermes
-needs, the four CLIs, the toolchain a uv project's own checks call (`uv`,
+make (the shipped policy's required checks start with it, hades #181),
+ripgrep (Hermes's search tool runs it, and its grep fallback missed matches
+under a relative root, hades #385), the lab root CA, the Python runtime and
+hash-locked virtual environment Hermes needs, the four CLIs, the toolchain a
+uv project's own checks call (`uv`,
 CPython 3.12 as `python3.12` only, and `gitleaks`, each pinned in
 `images/pins.env`; hades #184, ADR 0020), `crucible-report` (the worker's report checker, a
 standard-library script that borrows the Hermes environment's PyYAML for its
