@@ -79,20 +79,39 @@ class FileCredentialStore:
 
 
 class KubernetesCredentialStore:
-    """The service-held Codex Secret, read and patched as one API object."""
+    """The service-held Codex Secret, read and patched as one API object.
+
+    ``write`` sends the read ``resourceVersion`` as an ``If-None-Match`` header
+    so the API server rejects stale patches with 409 Conflict (339).
+    """
 
     def __init__(self, client: Any, secret_name: str = "crucible-harness-codex") -> None:
         self.client = client
         self.secret_name = secret_name
+        self._resource_version: str | None = None
 
-    def _body(self) -> dict[str, Any]:
+    def _refresh_meta(self) -> str:
+        """Return the current resourceVersion, caching it."""
         body = self.client.get("secrets", self.secret_name)
         if not isinstance(body, dict):
             raise ValueError("Codex credential Secret is not an object")
+        meta = body.get("metadata") or {}
+        rv: str | None = meta.get("resourceVersion")
+        if rv is None:
+            raise ValueError("Codex credential Secret has no resourceVersion")
+        self._resource_version = rv
+        return rv
+
+    def _body(self) -> dict[str, Any]:
+        if self._resource_version is None:
+            self._refresh_meta()
+        body = self.client.get("secrets", self.secret_name)
+        assert isinstance(body, dict)
         return body
 
     def read(self) -> dict[str, Any]:
-        raw = (self._body().get("data") or {}).get("auth.json")
+        self._refresh_meta()
+        raw = (self.client.get("secrets", self.secret_name).get("data") or {}).get("auth.json")
         if not isinstance(raw, str):
             raise ValueError("Codex credential Secret has no auth.json")
         document = json.loads(base64.b64decode(raw))
@@ -104,10 +123,19 @@ class KubernetesCredentialStore:
         encoded = base64.b64encode(
             json.dumps(document, separators=(",", ":")).encode("utf-8")
         ).decode("ascii")
-        self.client.patch("secrets", self.secret_name, {"data": {"auth.json": encoded}})
+        self.client.patch(
+            "secrets",
+            self.secret_name,
+            {"data": {"auth.json": encoded}},
+            resource_version=self._resource_version,
+        )
+        self._refresh_meta()
 
     def is_dead(self) -> bool:
-        return "credential-dead.json" in (self._body().get("data") or {})
+        body = self.client.get("secrets", self.secret_name)
+        if not isinstance(body, dict):
+            raise ValueError("Codex credential Secret is not an object")
+        return "credential-dead.json" in (body.get("data") or {})
 
     def mark_dead(self, document: Mapping[str, Any]) -> None:
         encoded = base64.b64encode(
@@ -244,6 +272,21 @@ class CodexCredentialRenewer:
         self.propagate = propagate or (lambda _document: None)
         self.wake = wake or (lambda _summary: None)
         self._dead_wake_raised = False
+        self._pending_request_checker: Callable[[], bool] | None = None
+        self._pending_request_ack: Callable[[], None] | None = None
+
+    def set_pending_request_checker(self, checker: Callable[[], bool] | None) -> None:
+        """Attach a callback that returns True when a refresh is pending."""
+        self._pending_request_checker = checker
+
+    def set_pending_request_ack(self, ack: Callable[[], None] | None) -> None:
+        """Attach a callback that durably advances the pending-request cursor.
+
+        Called only once the request has reached a terminal outcome: the refresh
+        succeeded, or the login is now dead. A transient failure leaves the cursor
+        where it is so the next tick retries the same request (339).
+        """
+        self._pending_request_ack = ack
 
     @property
     def dead(self) -> bool:
@@ -313,6 +356,28 @@ class CodexCredentialRenewer:
         if self.dead or self.clock.now() < self.due_at():
             return False
         return self.refresh("access token reached 75 percent of its lifetime")
+
+    def refresh_on_request(self) -> bool:
+        """Check for a pending refresh request (339). Returns True if one was processed.
+
+        The API records a CREDENTIAL_REFRESH_REQUESTED event; this method checks
+        via ``_pending_request_checker`` and performs the refresh if pending. The
+        cursor is acknowledged only on a terminal outcome (success or dead), so a
+        transient OAuth, Secret, or projection error retries on the next tick.
+        """
+        if self._pending_request_checker is None:
+            return False
+        if not self._pending_request_checker():
+            return False
+        try:
+            performed = self.refresh("pending administrator request", force=True)
+        except Exception:
+            if self._pending_request_ack is not None and self.dead:
+                self._pending_request_ack()
+            raise
+        if self._pending_request_ack is not None:
+            self._pending_request_ack()
+        return performed
 
     def _die(self, reason: str) -> None:
         self.store.mark_dead({"dead": True, "at": self.clock.now().isoformat()})

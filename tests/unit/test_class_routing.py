@@ -7,7 +7,12 @@ from typing import Any
 from crucible.application.routing import select_model
 from crucible.application.supervisor import Supervisor
 from crucible.contracts.policy import RoutingPolicyV1
-from crucible.domain.entities import AttemptMetrics, HarnessImage, PoolExhaustion
+from crucible.domain.entities import (
+    AttemptMetrics,
+    HarnessImage,
+    PoolExhaustion,
+    RoutingPolicyRecord,
+)
 
 NOW = datetime(2026, 9, 20, 12, 0, tzinfo=UTC)
 
@@ -71,11 +76,23 @@ class _Tasks:
         return SimpleNamespace(id=task_id, project="p")
 
 
+class _RoutingPolicies:
+    def __init__(self, rows: list[RoutingPolicyRecord]) -> None:
+        self.rows = rows
+
+    def get(self, name: str, version: int) -> RoutingPolicyRecord | None:
+        return next((r for r in self.rows if (r.name, r.version) == (name, version)), None)
+
+    def list_versions(self, name: str) -> list[RoutingPolicyRecord]:
+        return sorted((r for r in self.rows if r.name == name), key=lambda r: r.version)
+
+
 def _uow(
     rows: list[AttemptMetrics] | None = None,
     marks: list[PoolExhaustion] | None = None,
     images: list[Any] | None = None,
     attempts: list[Any] | None = None,
+    routings: list[RoutingPolicyRecord] | None = None,
 ) -> Any:
     return SimpleNamespace(
         attempt_metrics=_Metrics(rows or []),
@@ -83,6 +100,7 @@ def _uow(
         harness_images=_Images(images),
         attempts=_Attempts(attempts or []),
         tasks=_Tasks(),
+        routing_policies=_RoutingPolicies(routings or []),
     )
 
 

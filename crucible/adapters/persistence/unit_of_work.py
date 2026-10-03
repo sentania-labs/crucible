@@ -1359,6 +1359,7 @@ class SupervisorStatuses:
             last_success_at=_dt(row.last_success_at),
             last_error_at=_dt(row.last_error_at),
             last_error=row.last_error,
+            refresh_request_cursor=row.refresh_request_cursor,
         )
 
     def write(self, status: SupervisorStatus) -> None:
@@ -1373,6 +1374,7 @@ class SupervisorStatuses:
         row.last_success_at = status.last_success_at
         row.last_error_at = status.last_error_at
         row.last_error = status.last_error
+        row.refresh_request_cursor = status.refresh_request_cursor
         self._s.flush()
 
 

@@ -24,8 +24,12 @@ dir, user, resource limits, network mode, expected exit semantics.
 
 `ExitClass` is the one enum used by contracts, policies, and 16:
 `completed`, `completed_without_report`, `blocked`, `environment`,
-`auth_failure`, `provider_error`, `quota_exhausted`, `timeout`, `stalled`, `killed`, `crashed`, `lost`,
-`incomplete`, `unknown`. Which classes may retry is a policy decision (05b
+`auth_failure`, `infrastructure`, `provider_error`, `quota_exhausted`, `timeout`, `stalled`,
+`killed`, `crashed`, `lost`, `incomplete`, `unknown`. `infrastructure` (hades #353, #346) is
+a model call the gateway or provider failed (502, 503, 504, refused, reset, at capacity)
+as each adapter reads it from its own CLI's error events, or a worker whose container
+never started; it is retried under its own budget, never consumes an attempt, and is
+never gated. Which classes may retry is a policy decision (05b
 `retry.eligible_classes`), narrowed by the contract's `retry_on`; a retry
 happens only when the class is in both. Gate failures are never a class and
 never retry.
@@ -231,8 +235,11 @@ never retry.
   text, then report presence. `blocked.md` on exit 0 is `blocked` (FDY-0140),
   checked before the usage record, so it wins over `failed: true`; otherwise
   `failed: true` overrides exit 0. Exit 75 is Hermes's own and is
-  `provider_error` unless explicit quota text makes it `quota_exhausted`; a local
-  5xx or connection refusal is always `provider_error` and never marks the pool.
+  `provider_error` unless explicit quota text makes it `quota_exhausted`. When the
+  usage record or exit 75 says the provider failed and Hermes's client reports a 502,
+  503 or 504 or no answer at all (refused, reset, timed out), the exit is
+  `infrastructure` (hades #353) and is retried under the interruption budget; any
+  other 5xx stays `provider_error`. Neither marks the pool from text.
 - Crucible's launch wrapper is the sole transcript writer. The Hermes image wrapper
   inherits stdout and only enriches the usage record after the child exits.
 

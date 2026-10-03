@@ -248,6 +248,7 @@ async def test_supervisor_launch_uses_gateway_alias_limits_and_key(
     supervisor._credential_sources = {"hermes": CredentialSource(str(tmp_path))}
     attempt: Any = SimpleNamespace(
         id="attempt",
+        number=1,
         selected_harness="codex",
         selected_model="z-codex",
         selected_image="image",

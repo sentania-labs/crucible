@@ -308,10 +308,15 @@ def test_hermes_usage_and_provider_failures_precede_report_classification(tmp_pa
     assert adapter.classify_exit(ExitInfo(exit_code=0, report_present=True), "", "", tmp_path) is (
         ExitClass.CRASHED
     )
+    # Hades #353: Hermes said the provider failed and the gateway did not answer.
     assert (
         adapter.classify_exit(
             ExitInfo(exit_code=0, report_present=True), "", "connection refused", tmp_path
         )
+        is ExitClass.INFRASTRUCTURE
+    )
+    assert (
+        adapter.classify_exit(ExitInfo(exit_code=0, report_present=True), "", "HTTP 500", tmp_path)
         is ExitClass.PROVIDER_ERROR
     )
     usage.write_text('{"completed":true,"failed":false}', encoding="utf-8")
@@ -364,15 +369,23 @@ def test_hermes_completed_usage_then_report_and_missing_usage_order(tmp_path: Pa
     assert parsed.run_evidence_error == "missing hermes-usage.json"
 
 
-@pytest.mark.parametrize("stderr", ["HTTP 500", "bad gateway", "connection refused"])
-def test_hermes_local_provider_failures_never_mark_quota(tmp_path: Path, stderr: str) -> None:
+@pytest.mark.parametrize(
+    ("stderr", "exit_class"),
+    [
+        ("HTTP 500", ExitClass.PROVIDER_ERROR),
+        # Hades #353: a gateway that answered 502 or did not answer is infrastructure.
+        ("bad gateway", ExitClass.INFRASTRUCTURE),
+        ("connection refused", ExitClass.INFRASTRUCTURE),
+    ],
+)
+def test_hermes_local_provider_failures_never_mark_quota(
+    tmp_path: Path, stderr: str, exit_class: ExitClass
+) -> None:
     (tmp_path / "hermes-usage.json").write_text(
         '{"completed":false,"failed":true}', encoding="utf-8"
     )
     adapter = HermesAdapter()
-    assert adapter.classify_exit(ExitInfo(exit_code=75), "", stderr, tmp_path) is (
-        ExitClass.PROVIDER_ERROR
-    )
+    assert adapter.classify_exit(ExitInfo(exit_code=75), "", stderr, tmp_path) is exit_class
     assert adapter.provider_quota_event("", stderr) is None
     assert not adapter.provider_quota_exhausted("", stderr)
 

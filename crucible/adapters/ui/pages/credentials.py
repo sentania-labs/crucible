@@ -21,6 +21,7 @@ from crucible.application.errors import (
     NotFoundError,
 )
 from crucible.application.harnesses import CREDENTIAL_HOLDING_STATES
+from crucible.application.transitions import record_event
 from crucible.domain.entities import Principal, Role
 from crucible.domain.events import EventKind
 
@@ -274,10 +275,19 @@ async def _action_credential(
             reason=reason,
         )
     elif verb == "refresh":
-        renewer = getattr(ctx, "credential_renewer", None)
-        if renewer is None:
+        if ctx.credential_renewer is None:
             raise ConflictError("the Codex credential renewer is not configured")
-        renewer.refresh(reason or "administrator requested refresh", force=True)
+        record_event(
+            uow,
+            ctx.admin.clock,
+            EventKind.CREDENTIAL_REFRESH_REQUESTED,
+            principal=principal.name,
+            payload={
+                "harness": "codex",
+                "reason": reason or "administrator requested refresh",
+            },
+        )
+        uow.commit()
     else:
         raise ConflictError("unknown credential action")
     return None

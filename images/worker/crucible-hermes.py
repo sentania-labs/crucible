@@ -55,23 +55,25 @@ import sqlite3
 import subprocess
 import sys
 import threading
+from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 
 HERMES_PYTHON = "/opt/hermes/bin/python"
+# The Hermes the image pins (images/worker/Dockerfile). The usage patches in PATCHES
+# and the session columns below are written against it; another version fails loudly.
+HERMES_VERSION = "0.19.0"
+
 # How often the session store is looked at for progress.
 PROGRESS_SECONDS = 15.0
 PROGRESS_LINE = "crucible-hermes: working, session updated"
-
-# The Hermes release the patches below were written against. Any other version stops the
-# bootstrap before Hermes starts (hades #385).
-HERMES_VERSION = "0.19.0"
 
 # Run inside the Hermes virtual environment, ahead of Hermes itself. It changes the turn
 # budget an agent is built with when the caller named none, and the root of the grep
 # fallback of content search (hades #385). Each applies only once its module is imported
 # the ordinary way, so Hermes's own import order (its approval mode is read at import)
-# is untouched.
+# is untouched. #387: it also gives Hermes's usage file the failure cause an early
+# return from the agent reports only in its result's `error`.
 PATCHES = r"""
 import importlib.abc
 import importlib.metadata
@@ -163,6 +165,43 @@ class _TurnBudget(importlib.abc.MetaPathFinder):
         loader.exec_module = exec_module
         return spec
 
+
+class _FailureCause(importlib.abc.MetaPathFinder):
+    # #387: when the agent returns failed rather than raising (a provider error it gave
+    # up on, for example), hermes_cli.oneshot writes the usage file with no `failure`
+    # and the cause is lost with the result's `error`. Pass that error on as the
+    # failure. Written against 0.19.0's _write_usage_file(path, result, failure=None).
+    def find_spec(self, name, path, target=None):
+        if name != "hermes_cli.oneshot":
+            return None
+        sys.meta_path.remove(self)
+        installed = importlib.metadata.version("hermes-agent")
+        if installed != EXPECTED:
+            raise RuntimeError(
+                f"crucible-hermes: the usage-file patch is for hermes-agent "
+                f"{EXPECTED}, and {installed} is installed"
+            )
+
+        spec = importlib.util.find_spec(name)
+        if spec is None or spec.loader is None:
+            return spec
+        loader = spec.loader
+        execute = loader.exec_module
+
+        def exec_module(module):
+            execute(module)
+            original = module._write_usage_file
+
+            def _write_usage_file(path, result, failure=None):
+                error = result.get("error") if isinstance(result, dict) else None
+                if failure is None and result.get("failed") and isinstance(error, str) and error:
+                    failure = error
+                original(path, result, failure)
+
+            module._write_usage_file = _write_usage_file
+
+        loader.exec_module = exec_module
+        return spec
 
 # Hades #385. The 0.19.0 fallback, exactly: these lines are what the patch replaces the
 # effect of, so a Hermes whose fallback reads differently fails here, at import. Inside
@@ -256,7 +295,7 @@ class _GrepRoot(importlib.abc.MetaPathFinder):
         loader.exec_module = exec_module
         return spec
 
-
+sys.meta_path.insert(0, _FailureCause())
 if LIMIT > 0 or ALLOWANCE > 0 or THINKING is not None:
     sys.meta_path.insert(0, _TurnBudget())
 sys.meta_path.insert(0, _GrepRoot())
@@ -337,7 +376,7 @@ sys.argv = ["hermes", *sys.argv[1:]]
 from hermes_cli.main import main
 
 sys.exit(main())
-"""
+""".replace("@HERMES_VERSION@", HERMES_VERSION)
 )
 
 
@@ -388,7 +427,139 @@ def _limit(name: str) -> int:
         return 0
 
 
+class SessionSchemaChanged(RuntimeError):
+    """Hermes's session table lacks a column the usage enrichment reads (#387)."""
+
+
+# usage field -> sessions column (hermes_state.py SCHEMA_VERSION 22 in HERMES_VERSION).
+SESSION_FIELDS = (
+    ("model", "model"),
+    ("provider", "billing_provider"),
+    ("estimated_cost_usd", "estimated_cost_usd"),
+)
+TOKEN_FIELDS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "reasoning_tokens",
+)
+# Hermes's own session_total_tokens: prompt (input, cache read and cache write) plus
+# output. The row has no total column.
+TOTAL_PARTS = ("input_tokens", "cache_read_tokens", "cache_write_tokens", "output_tokens")
+SESSION_COLUMNS = frozenset(
+    {"id", "parent_session_id", "started_at", "ended_at", "tool_call_count"}
+    | {column for _, column in SESSION_FIELDS}
+    | set(TOKEN_FIELDS)
+)
+
+
+def _integer(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _check_columns(database: sqlite3.Connection) -> None:
+    tables = {row[0] for row in database.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if "sessions" not in tables:
+        raise SessionSchemaChanged(
+            f"crucible-hermes: Hermes's state.db has no sessions table"
+        )
+    present = {row[1] for row in database.execute("PRAGMA table_info(sessions)")}
+    missing = sorted(SESSION_COLUMNS - present)
+    if missing:
+        raise SessionSchemaChanged(
+            f"crucible-hermes: Hermes's sessions table has no {', '.join(missing)} "
+            f"column; the usage enrichment is written against hermes-agent {HERMES_VERSION}"
+        )
+
+
+def _run_sessions(database: sqlite3.Connection) -> dict[str, object] | None:
+    """#387: the whole run's session state when Hermes wrote no session id.
+
+    The home is fresh for every launch, so every row in it is this run's. After context
+    compression Hermes ends the row and opens a child (parent_session_id), and every
+    later call's tokens go to the child, so the run's totals are the sum of all rows.
+    The session id is the run's top-level row; model and provider are the newest row's.
+    """
+    root = database.execute(
+        "SELECT id FROM sessions WHERE parent_session_id IS NULL "
+        "ORDER BY started_at DESC LIMIT 1"
+    ).fetchone()
+    if root is None:
+        return None
+    newest = database.execute(
+        "SELECT model, billing_provider FROM sessions ORDER BY started_at DESC LIMIT 1"
+    ).fetchone()
+    totals = database.execute(
+        "SELECT MIN(started_at), MAX(ended_at), SUM(tool_call_count), "
+        "SUM(estimated_cost_usd), "
+        + ", ".join(f"SUM({column})" for column in TOKEN_FIELDS)
+        + " FROM sessions"
+    ).fetchone()
+    started, ended, calls, cost, *tokens = totals
+    return {
+        "id": root[0],
+        "model": newest[0],
+        "billing_provider": newest[1],
+        "started_at": started,
+        "ended_at": ended,
+        "tool_call_count": calls,
+        "estimated_cost_usd": cost,
+        **dict(zip(TOKEN_FIELDS, tokens, strict=True)),
+    }
+
+
+def _one_session(database: sqlite3.Connection, session_id: str) -> dict[str, object] | None:
+    database.row_factory = sqlite3.Row
+    row = database.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
+    return dict(row) if row is not None else None
+
+
+def _fill_from_session(usage: dict[str, object], session: dict[str, object]) -> None:
+    """#387: fill what the usage record lacks from Hermes's saved session state.
+
+    Hermes 0.19 writes its usage file from the agent's result, which is empty when the
+    agent raised and carries no tokens on an early failed return, so a failed run
+    reports no model, session or tokens though the session rows hold them. A value
+    Hermes wrote is never replaced or added to, and the tokens come from one source:
+    when Hermes wrote any token count, all of them and the total are Hermes's.
+    `failed` and `failure` are left alone; a `completed` Hermes left null on a failed
+    run is false, so the adapter can read the record.
+    """
+    usage["duration_ms"] = _milliseconds(session["started_at"], session["ended_at"])
+    usage["tool_calls"] = _integer(session["tool_call_count"])
+    if usage.get("session_id") is None and session["id"] is not None:
+        usage["session_id"] = session["id"]
+    for field, column in SESSION_FIELDS:
+        if usage.get(field) is None and session[column] is not None:
+            usage[field] = session[column]
+    if all(usage.get(field) is None for field in TOKEN_FIELDS):
+        for field in TOKEN_FIELDS:
+            usage[field] = _integer(session[field])
+    if usage.get("total_tokens") is None:
+        parts = [_integer(usage.get(field)) for field in TOTAL_PARTS]
+        if any(part is not None for part in parts):
+            usage["total_tokens"] = sum(part for part in parts if part is not None)
+
+
+def _session(home: Path, session_id: object) -> dict[str, object] | None:
+    path = home / "state.db"
+    if not path.is_file():
+        return None
+    try:
+        with closing(sqlite3.connect(path)) as database:
+            _check_columns(database)
+            if isinstance(session_id, str):
+                return _one_session(database, session_id)
+            return _run_sessions(database)
+    except sqlite3.Error:
+        return None
+
+
 def _enrich_usage(usage_path: Path, home: Path, max_turns: int = 0) -> None:
+    """Add the run's duration, tool calls and, where Hermes left them out, its session,
+    model and tokens to the usage record. A session table without the columns this was
+    written against raises SessionSchemaChanged rather than writing silent nulls."""
     try:
         usage = json.loads(usage_path.read_text(encoding="utf-8"))
         if max_turns > 0:
@@ -399,29 +570,19 @@ def _enrich_usage(usage_path: Path, home: Path, max_turns: int = 0) -> None:
             usage["turn_limit_reached"] = (
                 isinstance(calls, int) and calls >= max_turns and usage.get("completed") is not True
             )
-        session_id = usage.get("session_id")
-        row = None
+        if usage.get("failed") is True and usage.get("completed") is None:
+            # #387: Hermes 0.19 writes `completed: null` when its agent raised.
+            usage["completed"] = False
         try:
-            with sqlite3.connect(home / "state.db") as database:
-                if isinstance(session_id, str):
-                    row = database.execute(
-                        "SELECT started_at, ended_at, tool_call_count FROM sessions WHERE id = ?",
-                        (session_id,),
-                    ).fetchone()
-                else:
-                    row = database.execute(
-                        "SELECT started_at, ended_at, tool_call_count FROM sessions "
-                        "ORDER BY started_at DESC LIMIT 1"
-                    ).fetchone()
-        except sqlite3.Error:
-            row = None
-        if row is not None:
-            usage["duration_ms"] = _milliseconds(row[0], row[1])
-            usage["tool_calls"] = row[2] if isinstance(row[2], int) else None
+            session = _session(home, usage.get("session_id"))
+            if session is not None:
+                _fill_from_session(usage, session)
+        except SessionSchemaChanged as error:
+            print(error, file=sys.stderr, flush=True)
         temporary = usage_path.with_suffix(".tmp")
         temporary.write_text(json.dumps(usage, sort_keys=True) + "\n", encoding="utf-8")
         temporary.replace(usage_path)
-    except (OSError, ValueError, AttributeError):
+    except (OSError, ValueError, AttributeError, TypeError):
         # The adapter records the original usage file or its parse anomaly. Enrichment
         # is secondary evidence and must not hide Hermes's own outcome.
         return

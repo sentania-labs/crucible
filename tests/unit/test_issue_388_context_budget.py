@@ -185,6 +185,10 @@ class _Attempts:
     def save(self, attempt: Any) -> None:
         self.saved.append(attempt.effective_settings)
 
+    def list_for_execution(self, execution_id: str) -> list[Any]:
+        assert execution_id == self.attempt.execution_id
+        return [self.attempt]
+
 
 class _Uow:
     def __init__(self, saved: dict[str, Any], attempt: Any) -> None:
@@ -204,11 +208,13 @@ class _Uow:
         return None
 
 
-def _attempt(attempt_id: str = "attempt-1") -> Any:
+def _attempt(attempt_id: str = "attempt-1", *, number: int = 1) -> Any:
     return SimpleNamespace(
         id=attempt_id,
         task_id="task",
         execution_id="execution",
+        number=number,
+        exit_class=None,
         selected_harness="hermes",
         selected_model="a-hermes",
         selected_image="image",
@@ -239,6 +245,7 @@ def _supervisor(
 
 
 _EXECUTION: Any = SimpleNamespace(
+    id="execution",
     role=ExecutionRole.IMPLEMENT,
     harness="hermes",
     model="a-hermes",
@@ -309,7 +316,7 @@ async def test_a_retry_attempt_with_a_lower_allowance_gets_it(
     }
     uow = _Uow({"max_turns": 300, "context_length": WINDOW, "max_output_tokens": 16_000}, first)
     supervisor = _supervisor(monkeypatch, tmp_path, uow, thinking=False)
-    retry = _attempt("attempt-2")
+    retry = _attempt("attempt-2", number=2)
     spec = await supervisor._build_spec(retry, _EXECUTION, _TASK, {})
     assert spec.effective_settings == {
         "context_length": WINDOW,

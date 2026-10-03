@@ -178,6 +178,7 @@ class EventKind(StrEnum):
     CREDENTIAL_LOGIN_FINISHED = "credential_login_finished"
     CREDENTIAL_ROTATED = "credential_rotated"
     CREDENTIAL_REMOVED = "credential_removed"
+    CREDENTIAL_REFRESH_REQUESTED = "credential_refresh_requested"
     CREDENTIAL_RETIRED_SHREDDED = "credential_retired_shredded"
     IMAGE_PROMOTED = "image_promoted"
     GITHUB_CHECKED = "github_checked"
