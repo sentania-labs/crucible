@@ -1447,7 +1447,9 @@ class Supervisor:
         if not review:
             selection = await self._db(partial(self._preview_route, item))
             if selection is None or selection.selected is None or selection.image is None:
-                await self._db(partial(self._route_pending, item))
+                # Only refuse or wait here: this attempt holds no checkout lease, so it
+                # must never be moved to preparing on this path.
+                await self._db(partial(self._route_pending, item, launch=False))
                 return None
             execution = replace(
                 execution,
@@ -1999,9 +2001,26 @@ class Supervisor:
             selection = replace(selection, image=request.image)
         return selection
 
+    def _launch_selection(
+        self, uow: UnitOfWork, item: _Pending
+    ) -> tuple[RoutingPolicyV1 | None, Any]:
+        """hades #254: how a pending attempt routes, shared by the launch preview and
+        _route_pending so the two never disagree. The routing version is the one in force
+        now (a pinned reference keeps its version), never one recorded on an earlier
+        attempt, and the pools the attempt excludes, as a quota reroute leaves them, stay
+        excluded."""
+        routing = load_attempt_routing(uow, item.execution.policy_snapshot or {})
+        selection = self._selection_for(
+            uow,
+            item,
+            excluded_pools=set(item.attempt.routing_excluded_pools),
+            routing=routing,
+        )
+        return routing, selection
+
     def _preview_route(self, item: _Pending) -> Any:
         with self._uow_factory() as uow:
-            return self._selection_for(uow, item)
+            return self._launch_selection(uow, item)[1]
 
     @staticmethod
     def _selection_is_quota_blocked(selection: Any) -> bool:
@@ -2031,7 +2050,7 @@ class Supervisor:
             for reasons in relevant
         )
 
-    def _route_pending(self, item: _Pending) -> _Pending | None:
+    def _route_pending(self, item: _Pending, *, launch: bool = True) -> _Pending | None:
         with self._fenced() as uow:
             attempt = uow.attempts.get(item.attempt.id, for_update=True)
             task = uow.tasks.get(item.task.id, for_update=True)
@@ -2043,18 +2062,15 @@ class Supervisor:
             ):
                 return None
             current = replace(item, attempt=attempt, execution=execution, task=task)
-            routing = load_attempt_routing(
-                uow, execution.policy_snapshot or {}, attempt.routing_version
-            )
-            selection = self._selection_for(
-                uow, current, excluded_pools=set(attempt.routing_excluded_pools), routing=routing
-            )
+            routing, selection = self._launch_selection(uow, current)
             if selection is None or selection.selected is None or selection.image is None:
                 if self._selection_is_quota_blocked(selection):
                     self._enter_quota_wait(uow, task, attempt, execution, selection)
                 else:
                     self._refuse_unroutable(uow, task, attempt, execution, selection)
                 uow.commit()
+                return None
+            if not launch:
                 return None
             assert routing is not None
             candidates = copy.deepcopy(list(selection.candidates))

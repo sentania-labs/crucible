@@ -15,7 +15,7 @@ from __future__ import annotations
 import copy
 from collections.abc import Sequence
 from dataclasses import replace
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -31,6 +31,7 @@ from crucible.domain.entities import (
     AttemptMetrics,
     Execution,
     ExecutionRole,
+    Lease,
     Principal,
     Role,
     RoutingPolicyRecord,
@@ -46,6 +47,7 @@ from tests.unit.test_issue_360_ready_for_merge_correction import (
     _attach,
     _correction,
     _correction_attempt,
+    _Leases,
     _NoHistory,
     _ready_for_merge,
     _routing,
@@ -396,12 +398,14 @@ def test_a_version_an_attempt_routed_with_cannot_be_rewritten() -> None:
         )
 
 
-def _two_pools(version: int, *, fallback_enabled: bool = True) -> RoutingPolicyRecord:
+def _two_pools(
+    version: int, *, fallback_enabled: bool = True, first_enabled: bool = True
+) -> RoutingPolicyRecord:
     """gpt-test in openai-sub and gpt-z-fallback in a pool of its own."""
     fallback = _model("gpt-z-fallback", enabled=fallback_enabled)
     fallback["harness"] = "script-harness"
     fallback["pool"] = "fallback-pool"
-    first = _model("gpt-test")
+    first = _model("gpt-test", enabled=first_enabled)
     first["harness"] = "script-harness"
     record = _version(version, [first, fallback])
     record.document["pools"]["fallback-pool"] = dict(record.document["pools"]["openai-sub"])
@@ -483,3 +487,105 @@ def test_a_quota_reroute_uses_the_current_version_when_it_still_allows_the_fallb
     assert routed.selected_model == "gpt-z-fallback"
     assert routed.routing_version == 5
 
+
+class _CheckoutLeases(_Leases):
+    """The checkout leases _begin_launch takes and releases, held in memory."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.checkout: dict[str, Lease] = {}
+
+    def acquire_checkout_lease(
+        self, key: str, holder: str, fenced_token: int, now: datetime, ttl_seconds: int
+    ) -> Lease | None:
+        held = self.checkout.get(key)
+        if held is not None and held.holder != holder:
+            return None
+        lease = Lease(
+            id=key,
+            kind="checkout",
+            key=key,
+            holder=holder,
+            fenced_token=fenced_token,
+            expires_at=now + timedelta(seconds=ttl_seconds),
+        )
+        self.checkout[key] = lease
+        return lease
+
+    def get_checkout_lease(self, key: str) -> Lease | None:
+        return self.checkout.get(key)
+
+    def list_checkout_leases(self) -> list[Any]:
+        return list(self.checkout.values())
+
+    def release_checkout_lease(self, key: str, holder: str) -> bool:
+        if (held := self.checkout.get(key)) is None or held.holder != holder:
+            return False
+        del self.checkout[key]
+        return True
+
+
+def _pending_successor(store: _Store, tmp_path: Path) -> tuple[Any, _Pending]:
+    """The correction routed at v4 on gpt-test exited on quota in openai-sub, which is
+    still cooling: its pending successor excludes that pool."""
+    store.pool_exhaustions = _NoExhaustions()
+    store.leases = _CheckoutLeases()
+    execution, attempt = _route_correction(store, tmp_path)
+    attempt.state = AttemptState.FAILED
+    store.attempts.save(attempt)
+    supervisor, _provider = _supervisor(store, FakeClock(NOW), tmp_path)
+    successor = supervisor._create_attempt(
+        store.uow(), execution, number=attempt.number + 1, excluded_pools={"openai-sub"}
+    )
+    task = store.tasks.get(attempt.task_id)
+    stored = store.contracts.get(attempt.task_id, execution.contract_version)
+    assert task is not None and stored is not None
+    return supervisor, _Pending(successor, execution, task, stored.document)
+
+
+@pytest.mark.asyncio
+async def test_the_launch_preview_and_routing_agree_on_a_cooling_pool(tmp_path: Path) -> None:
+    """Through _begin_launch: the preview excludes the cooling pool as routing does, and
+    the successor launches on the fallback under the current version."""
+    store = _store(_two_pools(4))
+    supervisor, pending = _pending_successor(store, tmp_path)
+    store.routing_policies.records.append(_two_pools(5))  # type: ignore[attr-defined]
+
+    result = await supervisor._begin_launch(pending)
+
+    assert result is not None
+    launched = store.attempts.get(pending.attempt.id)
+    assert launched is not None and launched.state is AttemptState.PREPARING
+    assert launched.selected_model == "gpt-z-fallback"
+    assert launched.routing_version == 5
+    assert [lease.holder for lease in store.leases.list_checkout_leases()] == [launched.id]
+
+
+@pytest.mark.asyncio
+async def test_a_pending_attempt_is_never_stranded_when_the_current_version_refuses(
+    tmp_path: Path,
+) -> None:
+    """The successor carries a stale recorded version under which gpt-z-fallback was
+    enabled; v5 disables both models and openai-sub is cooling. The preview and routing both use
+    v5, so _begin_launch refuses the attempt rather than moving it to preparing with no
+    lease and no launch."""
+    store = _store(_two_pools(4))
+    supervisor, pending = _pending_successor(store, tmp_path)
+    pending.attempt.routing_version = 4
+    store.attempts.save(pending.attempt)
+    store.routing_policies.records.append(  # type: ignore[attr-defined]
+        _two_pools(5, fallback_enabled=False, first_enabled=False)
+    )
+
+    result = await supervisor._begin_launch(pending)
+
+    assert result is None
+    ended = store.attempts.get(pending.attempt.id)
+    assert ended is not None
+    assert ended.selected_model is None
+    assert ended.state not in (AttemptState.PREPARING, AttemptState.PENDING)
+    assert store.leases.list_checkout_leases() == []
+    assert not any(
+        e.kind == EventKind.ATTEMPT_PREPARING.value and e.attempt_id == pending.attempt.id
+        for e in store.events.rows
+    )
