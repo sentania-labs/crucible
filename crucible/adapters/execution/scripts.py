@@ -279,6 +279,7 @@ _ATTR_DIFF_PATHSPEC = "-- . ':(exclude,attr:!diff)' ':(exclude,attr:diff)'"
 # nothing an earlier collection of the same attempt left is read as this one's.
 _COLLECTOR_OUTPUTS = (
     "base.txt head.txt branch.txt diffstat.txt diff.patch changed.txt log.txt "
+    "diff-raw.txt commit-raw.txt base-injected.txt "
     "commit-paths.txt work_branch.bundle bundle.log commits.txt commit-policy tree "
     "clone.log report copy-rejections.tsv collection-failed.txt checkpoint-refusal.txt "
     "leftover-committed.txt leftover-refusal.txt collector.ok attr-text.patch "
@@ -442,6 +443,14 @@ rm -rf "$REPO"
 # shellcheck disable=SC2086
 {GIT} clone --no-hardlinks --no-checkout $REFERENCE -- "$CLONE_URL" "$REPO"
 {drop}cd "$REPO"
+# Record the trusted base before the worker can move refs. Output is mounted only
+# into Crucible-owned containers, never into the worker.
+if ! PREPARED_BASE=$({GIT} rev-parse --verify --quiet "refs/remotes/origin/$BASE_REF^{{commit}}" \
+  || {GIT} rev-parse --verify --quiet "$BASE_REF^{{commit}}"); then
+  printf 'base ref %s does not exist in the clone\\n' "$BASE_REF" >&2
+  exit 3
+fi
+printf '%s\\n' "$PREPARED_BASE" > "$OUT/prepared-base.txt"
 STARTED=""
 if [ -n {_quote(resume_bundle or "")} ]; then
   :
@@ -679,9 +688,15 @@ EOF
   trap - EXIT HUP INT TERM
 fi
 rm -rf "$OUT/commit-policy"
-BASE=$({GIT} -C "$REPO" rev-parse --verify --quiet "$BASE_REF" \
-  || {GIT} -C "$REPO" rev-parse --verify --quiet "origin/$BASE_REF" \
-  || echo "")
+# Never resolve the base from refs in the worker-controlled checkout.
+BASE=$(cat "$OUT/prepared-base.txt" 2>/dev/null || true)
+if ! printf '%s\\n' "$BASE" | grep -Eq '^([0-9a-f]{{40}}|[0-9a-f]{{64}})$' \
+  || [ "$({GIT} -C "$REPO" cat-file -t "$BASE" 2>/dev/null || true)" != "commit" ]; then
+  printf '%s\\n' "collection failed: prepared base commit is missing or invalid" \
+    > "$OUT/collection-failed.txt"
+  cat "$OUT/collection-failed.txt" >&2
+  exit 1
+fi
 printf '%s\\n' "$BASE" > "$OUT/base.txt"
 {GIT} -C "$REPO" rev-parse HEAD > "$OUT/head.txt"
 {GIT} -C "$REPO" rev-parse --abbrev-ref HEAD > "$OUT/branch.txt"

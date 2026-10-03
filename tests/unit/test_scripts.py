@@ -241,6 +241,14 @@ def test_quota_checkpoint_ignores_worker_filter_and_signing_programs(tmp_path: P
         cwd=repo,
         check=True,
     )
+    (output / "prepared-base.txt").write_text(
+        subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "main"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+    )
     subprocess.run(["git", "checkout", "-q", "-b", "crucible/test"], cwd=repo, check=True)
     filter_sentinel = tmp_path / "filter-ran"
     signing_sentinel = tmp_path / "signing-ran"
@@ -315,6 +323,14 @@ def test_quota_checkpoint_refuses_a_worker_commondir_redirect(tmp_path: Path) ->
         cwd=repo,
         check=True,
     )
+    (output / "prepared-base.txt").write_text(
+        subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "main"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+    )
     subprocess.run(["git", "checkout", "-q", "-b", "crucible/test"], cwd=repo, check=True)
     filter_sentinel = tmp_path / "redirect-filter-ran"
     hook_sentinel = tmp_path / "redirect-hook-ran"
@@ -366,6 +382,14 @@ def _work_repo(tmp_path: Path) -> tuple[Path, Path, Path]:
     (repo / "tracked.txt").write_text("base\n", encoding="utf-8")
     subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
     subprocess.run(["git", *identity, "commit", "-q", "-m", "base"], cwd=repo, check=True)
+    (output / "prepared-base.txt").write_text(
+        subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "main"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+    )
     subprocess.run(["git", "checkout", "-q", "-b", "crucible/test"], cwd=repo, check=True)
     (repo / "committed.txt").write_text("committed by the worker\n", encoding="utf-8")
     subprocess.run(["git", "add", "committed.txt"], cwd=repo, check=True)
@@ -451,6 +475,14 @@ def test_changed_files_ignore_commits_main_gained_after_the_fork(tmp_path: Path)
     (repo / "base.txt").write_text("base\n", encoding="utf-8")
     subprocess.run(["git", "add", "base.txt"], cwd=repo, check=True)
     subprocess.run(["git", *identity, "commit", "-q", "-m", "base"], cwd=repo, check=True)
+    (output / "prepared-base.txt").write_text(
+        subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "main"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+    )
     subprocess.run(["git", "checkout", "-q", "-b", "crucible/test"], cwd=repo, check=True)
     (repo / "a.txt").write_text("branch work\n", encoding="utf-8")
     subprocess.run(["git", "add", "a.txt"], cwd=repo, check=True)

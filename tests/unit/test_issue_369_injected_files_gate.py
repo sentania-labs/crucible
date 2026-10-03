@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
+import pytest
+
 from crucible.adapters.execution import scripts
 from crucible.adapters.execution.collected import read_outputs, read_path_changes
 from crucible.application.evidence import record_collection_evidence
@@ -30,6 +32,7 @@ from crucible.ports.execution import (
     IDENTITY_MOUNT,
     OUTPUT_MOUNT,
     REPORT_MOUNT,
+    WORK_MOUNT,
     CollectedOutputs,
     LaunchSpec,
 )
@@ -165,16 +168,19 @@ def _repo(tmp_path: Path, *, agents_md: bool = True) -> Path:
     if agents_md:
         _write(repo, "AGENTS.md", "# also the project's own\n")
     _commit(repo, "base")
+    output = tmp_path / "output"
+    output.mkdir()
+    (output / "prepared-base.txt").write_text(_git(repo, "rev-parse", "HEAD"))
     _git(repo, "checkout", "-q", "-b", "crucible/test")
     return repo
 
 
-def _evidence(tmp_path: Path, repo: Path) -> tuple[EvidenceItem, ...]:
+def _evidence(tmp_path: Path, repo: Path, *, expected_exit: int = 0) -> tuple[EvidenceItem, ...]:
     """Collect `repo` with the collector script, read it back as the providers do, and
     record it as the supervisor does; the gate reads what was recorded."""
     output, report = tmp_path / "output", tmp_path / "report"
-    output.mkdir()
-    report.mkdir()
+    output.mkdir(exist_ok=True)
+    report.mkdir(exist_ok=True)
     generated = scripts.collector_script(
         base_ref="main", work_branch="crucible/test", size_cap_bytes=1024
     )
@@ -182,7 +188,7 @@ def _evidence(tmp_path: Path, repo: Path) -> tuple[EvidenceItem, ...]:
     generated = generated.replace(OUTPUT_MOUNT, str(output))
     generated = generated.replace(REPORT_MOUNT, str(report))
     result = subprocess.run(["sh", "-c", generated], capture_output=True, text=True, check=False)
-    assert result.returncode == 0, result.stderr
+    assert result.returncode == expected_exit, result.stderr
     spec = LaunchSpec(
         attempt_id="01ATTEMPT",
         task_id="01TASK",
@@ -199,7 +205,7 @@ def _evidence(tmp_path: Path, repo: Path) -> tuple[EvidenceItem, ...]:
         tmp_path / "verify",
         spec=spec,
         bundle_verified=True,
-        collector_exit=0,
+        collector_exit=result.returncode,
         verifications=(),
         tail_bytes=1024,
     )
@@ -307,6 +313,8 @@ def test_merging_a_base_that_added_agents_md_passes(tmp_path: Path) -> None:
     _git(repo, "checkout", "-q", "main")
     _write(repo, "AGENTS.md", "# the project's new own\n")
     _commit(repo, "base adds AGENTS.md")
+    # Model a preparation that sees the newer upstream base.
+    (tmp_path / "output/prepared-base.txt").write_text(_git(repo, "rev-parse", "HEAD"))
     _git(repo, "checkout", "-q", "crucible/test")
     _git(repo, "merge", "-q", "--no-edit", "main")
     assert _collected(tmp_path, repo)[0] is GateResult.PASS
@@ -534,3 +542,66 @@ def test_a_graft_cannot_hide_a_committed_shim(tmp_path: Path) -> None:
     assert "AGENTS.md" in diff["paths"]
     assert "AGENTS.md" in bundle["commit_paths"]
     assert result is GateResult.FAIL
+
+
+@pytest.mark.parametrize("resume", [False, True])
+def test_moving_main_cannot_hide_a_shim_after_real_preparation(
+    tmp_path: Path, resume: bool
+) -> None:
+    origin_dir = tmp_path / "origin"
+    origin_dir.mkdir()
+    origin = _repo(origin_dir, agents_md=False)
+    base = _git(origin, "rev-parse", "main").strip()
+    work = tmp_path / "work"
+    script = scripts.preparer_script(
+        url=str(origin),
+        base_ref="main",
+        work_branch="crucible/test",
+        from_remote_branch=resume,
+        cache_name=None,
+        author_name="crucible-worker",
+        author_email="crucible-worker@users.noreply.github.com",
+        origin_placeholder="crucible-no-remote://nowhere",
+        claude_md_wins=False,
+        shims=("AGENTS.md",),
+        exclude_entries=("/AGENTS.md",),
+        identity_mount=IDENTITY_MOUNT,
+    ).replace(WORK_MOUNT, str(work))
+    prepared = subprocess.run(["sh", "-c", script], capture_output=True, text=True, check=False)
+    assert prepared.returncode == 0, prepared.stderr
+    assert (work / "output/prepared-base.txt").read_text().strip() == base
+    repo = work / "repo"
+    assert (repo / "AGENTS.md").read_text() == SHIM
+    _git(repo, "add", "-f", "AGENTS.md")
+    _commit(repo, "shim")
+    _git(repo, "branch", "-f", "main", "HEAD")
+    _git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+    _write(repo, "w", "work\n")
+    _commit(repo, "work")
+    result, diff, bundle = _collected(work, repo)
+    assert result is GateResult.FAIL
+    assert "AGENTS.md" in diff["paths"]
+    assert "AGENTS.md" in bundle["commit_paths"]
+    assert (work / "output/base.txt").read_text().strip() == base
+
+
+@pytest.mark.parametrize("record", [None, "", "main", "0" * 40, "tree"])
+def test_missing_or_invalid_prepared_base_fails_closed(tmp_path: Path, record: str | None) -> None:
+    repo = _repo(tmp_path)
+    _write(repo, "w", "work\n")
+    _commit(repo, "work")
+    assert _collected(tmp_path, repo)[0] is GateResult.PASS
+    prepared_base = tmp_path / "output/prepared-base.txt"
+    if record is None:
+        prepared_base.unlink()
+    else:
+        prepared_base.write_text(
+            _git(repo, "rev-parse", "main^{tree}") if record == "tree" else record
+        )
+    evidence = _evidence(tmp_path, repo, expected_exit=1)
+    gi = GateInput(contract=contract_document(), policy={}, head_sha="a" * 40, evidence=evidence)
+    assert evaluate_gate(GateName.NO_INJECTED_FILES, gi).result is GateResult.FAIL
+    assert "prepared base commit" in (tmp_path / "output/collection-failed.txt").read_text()
+    assert not (tmp_path / "output/collector.ok").exists()
+    for name in ("diff-raw.txt", "commit-raw.txt", "base-injected.txt"):
+        assert not (tmp_path / "output" / name).exists()
