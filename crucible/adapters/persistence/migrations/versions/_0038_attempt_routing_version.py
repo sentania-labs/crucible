@@ -1,11 +1,7 @@
 """Record the routing policy version each attempt was routed with.
 
 Revision ID: 0038_attempt_routing_version
-Revises: 0035_credential_renewer
-
-Numbered 0038 because PR 358 adds 0036_cred_refresh_request and
-0037_cred_refresh_cursor on 0035_credential_renewer. Until that lands this revises
-0035; whichever of the two merges second points its first revision at the other's head.
+Revises: 0037_cred_refresh_cursor
 
 hades #254: an attempt routes with the routing version in force when it is routed
 (an unpinned policy reference follows the newest version), so the version used is
@@ -22,7 +18,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "0038_attempt_routing_version"
-down_revision = "0035_credential_renewer"
+down_revision = "0037_cred_refresh_cursor"
 branch_labels = None
 depends_on = None
 
