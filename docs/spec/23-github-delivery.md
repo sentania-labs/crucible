@@ -460,17 +460,29 @@ gated moves the task to `merged` too, and the supervisor ends the
 correction's attempt as it ends a cancelled one (hades #360). The same holds
 while the corrected head is publishing or its publication failed (hades #379).
 A task that already has a pull request never gets a second one, and its pull
-request is looked up before the corrected head is pushed and again after:
-when that pull request is merged or closed, or the lookup for the work
-branch finds another pull request (or none) in its place, the task's own
-pull request is read by its number, its merge or close is recorded, the
-other pull request is not adopted, and nothing more is pushed. The
-publication then fails with a `publish_failed` wake naming it, which offers
-no republish because a retry meets the same pull request, except that a
-merge settles the task as `merged`. A publication failure that finds the
-task already moved on (a poll settled it as `merged`) is not reported. The
-merge wake on this path says whether the head GitHub merged is among the
-heads Crucible pushed, and is an escalation when it is not. A PR closed without
+request is looked up before the corrected head is pushed and again after.
+When the lookup for the work branch finds another pull request (or none),
+the task's own pull request is read by its number, and the other pull
+request is never adopted. When the task's own pull request is open, the
+publication goes on to it; another pull request open on the work branch is
+recorded on the `publish_completed` event (`other_pull_request`) and named
+in an `other_pull_request_open` wake, or, when the publication fails, in its
+`publish_failed` event and wake. When the task's own pull request is merged
+or closed, its merge or close is recorded and nothing more is pushed: a
+merge settles the task as `merged`, and a close fails the publication with
+a `publish_failed` wake naming the pull request (and any other one on the
+branch) that says to reopen the pull request and then republish, or to
+cancel, as the poll's close wake in `publish_failed` does; a republish
+while the pull request is still closed fails the same way. A publication
+failure that finds the task already moved on (a poll settled it as
+`merged`) is not reported. A head pushed after the task left `publishing`
+(a poll settled it as `merged` while the push ran) is not recorded as a
+pushed head; it is escalated, and the publication stops there without
+editing the merged pull request or counting itself published. The merge
+wake on this path says whether the head GitHub merged is among the heads
+Crucible pushed, and is an escalation when it is not, when it was only a
+quota checkpoint, or when Crucible pushed a later head after it (a push
+that landed after the merge, however the merge was first recorded). A PR closed without
 merge moves the task to `rejected` from any delivery state, `head_diverged`
 included, with the closer recorded, and wakes Foundry with
 `pull_request_closed`. The closer is not on the PR itself: `GET

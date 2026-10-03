@@ -132,14 +132,23 @@ after opening its PR is polled in full, and a merge of it is an early merge.
 
 When a merge wins over a correction, the task's head is the merged head when
 it is among the heads Crucible pushed and confirmed on the remote, not a
-corrected head that was collected and never pushed. The `task_merged` event
-records the head GitHub merged, the latest recorded pushed head, whether the
-merged head was a quota checkpoint, and whether the merged head is among the
-pushed heads; the wake says which. When it is not, or the head merged was only
-a quota checkpoint (which passed no gate and was never accepted), the wake is
-an escalation instead. A merge recorded without its head (before hades #379)
-is taken to be of the latest recorded pushed head. A quota checkpoint is not
-pushed once the task is merged.
+corrected head that was collected and never pushed; when the merged head is
+not among them, the task keeps the latest head Crucible pushed. The
+`task_merged` event records the head GitHub merged, the latest recorded pushed
+head, whether the merged head was a quota checkpoint, whether the merged head
+is among the pushed heads, and any head Crucible pushed after the merged one;
+the wake says which. When the merged head is not a pushed head, or the head
+merged was only a quota checkpoint (which passed no gate and was never
+accepted), or Crucible pushed a later head after it, the wake is an escalation
+instead. A head pushed after the merge is escalated the same way whichever
+record comes first: a poll that records the merge before the push is
+confirmed, a lookup that records it after, or a quota checkpoint pushed after
+a merge nobody had seen yet. A push confirmed after the task is already merged
+is not recorded as a pushed head, and the publication that made it stops
+there. A merge recorded without its head (before hades #379) is taken to be of
+the latest recorded pushed head. A quota checkpoint is not pushed, nor
+recorded, once the task is merged or otherwise finished (`release_candidate`,
+`released`, `rejected`, `cancelled`, `closed`).
 
 A PR closed unmerged while a correction is under way, or after a first
 publication failed, is recorded on the PR (which is then no longer polled)

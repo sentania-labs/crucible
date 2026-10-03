@@ -1155,10 +1155,12 @@ def settle_pull_request_state(
     a closed one is decided there.
 
     hades #379: when a correction was under way, the head GitHub merged (`merged_head`,
-    or the one recorded with the merge) is compared with the last head Crucible pushed.
-    The task's head becomes that pushed head, never a collected head that went nowhere,
-    and the wake says whether the two agree; when they do not, or the head merged was
-    only a quota checkpoint, an escalation is opened instead of the plain wake. A merge
+    or the one recorded with the merge) is compared with every head Crucible pushed and
+    confirmed on the remote. When it is one of them, it becomes the task's head; when it
+    is not, the task keeps the last head Crucible pushed, never a collected head that went
+    nowhere. The wake says which; an escalation is opened instead of the plain wake when
+    the merged head is not a pushed head, when it was only a quota checkpoint, or when
+    Crucible pushed a later head after it (a push that landed after the merge). A merge
     recorded before #379 carries no head; the last pushed head is taken for it. A merge
     seen while a first publication is publishing or failed moves the task as an early
     merge does. A close seen in a correction state is woken about and leaves the task
