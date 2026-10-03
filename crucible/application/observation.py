@@ -1202,9 +1202,12 @@ def settle_pull_request_state(
                     "merged_head_matches": head_matches,
                 }
             )
-            # The merged task's head is what is on the remote, not a corrected head that
-            # was collected and never pushed.
-            task.head_sha = matched_head
+            # The merged task's head is a head Crucible pushed, not a corrected head that
+            # was collected and never pushed, nor a head someone else merged.
+            if head_matches:
+                task.head_sha = matched_head
+            elif pushed:
+                task.head_sha = pushed
             if merged is None:
                 head_check = (
                     f"; the merge was recorded without its head, so the merged head is "

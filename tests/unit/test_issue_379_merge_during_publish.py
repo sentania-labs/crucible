@@ -345,6 +345,8 @@ def test_a_merged_head_that_is_not_the_pushed_head_is_recorded_and_escalated(
     assert publisher.pushes == [NEW_HEAD]
     assert github.created == []
     assert _task(store).state is TaskState.MERGED
+    # The foreign head is not taken as the task's head; the last head pushed is kept.
+    assert _task(store).head_sha == NEW_HEAD
     payload = _merged_event_payload(store)
     assert payload["merged_head"] == OTHER_HEAD
     assert payload["last_pushed_head"] == NEW_HEAD
