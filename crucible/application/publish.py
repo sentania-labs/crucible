@@ -603,6 +603,13 @@ def _claim_gone(step: str, detail: str) -> bool:
     return "gone" in lower or "missing" in lower or "no branch bundle" in lower
 
 
+def reopen_or_cancel(number: int) -> str:
+    """hades #379: what to do with a task whose pull request was closed unmerged while a
+    correction was under way; the poll's close wake and the publication's own failure
+    say the same."""
+    return f"reopen pull request #{number} and then republish, or cancel the task"
+
+
 def fail_publish(
     uow: UnitOfWork,
     clock: Clock,
@@ -613,12 +620,16 @@ def fail_publish(
     response_class: str = "",
     attempt_id: str | None = None,
     extra: dict[str, Any] | None = None,
+    closed_pull_request: int | None = None,
     retryable: bool = True,
 ) -> None:
     """23 step 7: the step and the API response class, never the token.
 
-    `retryable` False when a republish can only fail the same way (hades #379: the
-    task's pull request is closed), so the wake offers none."""
+    `closed_pull_request` names the task's pull request when the publication found it
+    closed (hades #379): a republish meets the same closed pull request until someone
+    reopens it, so the wake says to reopen it and then republish, or to cancel.
+    `retryable` False when a republish can only fail the same way (the task's pull
+    request is merged), so the wake offers none."""
     payload: dict[str, Any] = {
         "step": step,
         "detail": detail,
@@ -668,6 +679,12 @@ def fail_publish(
         summary = (
             f"publication failed at {step} on {task.head_sha}: {detail}; "
             "a republish would fail the same way, so none is offered"
+        )[:500]
+    elif closed_pull_request is not None:
+        summary = (
+            f"publication failed at {step} on {task.head_sha}: {detail}; "
+            f"{reopen_or_cancel(closed_pull_request)}; manual publication retries used "
+            f"{retry_number} of {retry_max}, {retries_remaining} remaining"
         )[:500]
     elif claim_lost:
         summary = (

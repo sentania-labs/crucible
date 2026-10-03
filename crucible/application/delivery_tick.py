@@ -725,8 +725,9 @@ class DeliveryCoordinator:
         """hades #379: the task's pull request, `known`, is merged or closed, or the
         lookup for the work branch found `other` in its place. The merge or close is
         recorded on the PR row as a poll would record it. A merge settles the task as
-        merged (merge wins); anything else fails the publication with a wake naming the
-        pull request, and no republish is offered, because a retry meets the same PR."""
+        merged (merge wins); a close fails the publication with a wake naming the pull
+        request that says to reopen it and then republish, or to cancel, as the poll's
+        close wake does. A merge this row does not record offers no republish."""
         with self._host._fenced() as uow:
             task = uow.tasks.get(plan.task_id, for_update=True)
             if task is None or task.state is not TaskState.PUBLISHING:
@@ -788,7 +789,8 @@ class DeliveryCoordinator:
                 detail=detail,
                 attempt_id=plan.attempt_id,
                 extra=extra,
-                retryable=False,
+                closed_pull_request=known.number if state == "closed" else None,
+                retryable=state == "closed",
             )
             uow.commit()
 

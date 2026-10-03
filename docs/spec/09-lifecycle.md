@@ -145,7 +145,8 @@ A PR closed unmerged while a correction is under way, or after a first
 publication failed, is recorded on the PR (which is then no longer polled)
 and wakes Foundry with `pull_request_closed`; the task stays where it is,
 because a correction state has no edge to `rejected`. In `publish_failed`,
-the operator can cancel, or reopen the PR and then republish. In running,
+the operator can reopen the PR and then republish, or cancel; a publication
+that finds the PR closed itself says the same. In running,
 gates, or `awaiting_acceptance`, the correction continues but publication
 will fail unless the PR is reopened, so cancellation is the usual answer.
 

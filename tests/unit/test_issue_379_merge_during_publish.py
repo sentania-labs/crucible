@@ -433,18 +433,30 @@ def test_a_closed_pull_request_during_a_correction_fails_the_publication(
     wakes = _wakes(store, "publish_failed")
     assert len(wakes) == 1
     assert f"pull request #{PR_NUMBER} is closed by maintainer" in wakes[0]
-    # A republish can only meet the same closed PR, so none is offered.
-    assert "republish" not in _wake_links(store, "publish_failed")[0]
-    assert "a republish would fail the same way" in wakes[0]
+    # The same guidance as the poll's close wake: reopen, then republish; or cancel.
+    assert f"reopen pull request #{PR_NUMBER} and then republish, or cancel the task" in wakes[0]
+    assert "republish" in _wake_links(store, "publish_failed")[0]
 
-    # A republish forced anyway meets the same closed PR and fails again; it never opens
-    # a second one.
+    # A republish while the PR is still closed meets it again and fails again; it never
+    # opens a second one.
     task = _task(store)
     move_task(store.uow(), _clock, task, TaskState.PUBLISHING, EventKind.TASK_PUBLISHING)
     assert _publish(supervisor) == 0
     assert github.created == []
     assert publisher.pushes == []
     assert _task(store).state is TaskState.PUBLISH_FAILED
+
+    # Reopened on GitHub, the republish publishes the corrected head to the same PR.
+    github.lookups = [_open(OLD_HEAD)]
+    github.known = _open(OLD_HEAD)
+    store.pull_request_heads = _Heads()  # type: ignore[assignment]
+    move_task(store.uow(), _clock, _task(store), TaskState.PUBLISHING, EventKind.TASK_PUBLISHING)
+    assert _publish(supervisor) == 1
+    assert publisher.pushes == [NEW_HEAD]
+    assert github.created == []
+    assert github.updated == [PR_NUMBER]
+    pull_request = store.pull_requests.get(PR_ID)
+    assert pull_request is not None and pull_request.state is PullRequestState.OPEN
 
 
 def test_a_lookup_that_finds_no_pull_request_does_not_open_a_second_one(
@@ -648,7 +660,7 @@ def test_a_close_polled_after_the_corrected_heads_publication_failed_is_recorded
     assert len(wakes) == 1
     assert f"pull request #{PR_NUMBER} was closed without being merged" in wakes[0]
     assert "publish_failed" in wakes[0]
-    assert "cancel it, or reopen the pull request and then republish" in wakes[0]
+    assert f"reopen pull request #{PR_NUMBER} and then republish, or cancel the task" in wakes[0]
 
     # The closed PR is not polled again, and the wake is not repeated.
     clock.advance(3600)

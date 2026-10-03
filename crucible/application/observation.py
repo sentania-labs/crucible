@@ -19,7 +19,11 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from crucible.application.decisions import open_escalation
-from crucible.application.publish import external_review_trigger, open_review_cycle
+from crucible.application.publish import (
+    external_review_trigger,
+    open_review_cycle,
+    reopen_or_cancel,
+)
 from crucible.application.transitions import move_task, record_event
 from crucible.application.wakes import create_wake
 from crucible.contracts.wake import WakeReason
@@ -1310,7 +1314,7 @@ def _closed_correction_summary(task: Task, pull_request: PullRequest) -> str:
         f"{pull_request.closed_by or 'someone'} while the task was {task.state.value}; "
     )
     if task.state is TaskState.PUBLISH_FAILED:
-        action = "the task stays there; cancel it, or reopen the pull request and then republish"
+        action = f"the task stays there; {reopen_or_cancel(pull_request.number)}"
     else:
         action = (
             "the correction continues, but publication will fail unless the pull request "
