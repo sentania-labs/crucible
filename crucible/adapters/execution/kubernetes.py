@@ -74,7 +74,6 @@ from crucible.adapters.execution.k8sspec import (
 )
 from crucible.adapters.execution.logstream import RESUME_AT_BOUNDARY
 from crucible.adapters.execution.logstream import chunks as _chunks
-from crucible.adapters.harness.interruption import model_interruption
 from crucible.adapters.harness.registry import default_registry
 from crucible.application.credential_renewer import access_token_document, worker_credential_spec
 from crucible.application.harnesses import (
@@ -2270,7 +2269,16 @@ class KubernetesProvider:
             )
             self._raise_if_unavailable(k8sspec.ROLE_BUNDLE, spec.attempt_id, bundle_exit)
             bundle_ok = bundle_exit == 0
-        interruption = model_interruption(observation.exit_code, stdout_tail, stderr_tail)
+        interruption = (
+            adapter.interruption(
+                ExitInfo(exit_code=observation.exit_code, oom_killed=observation.oom_killed),
+                stdout_tail,
+                stderr_tail,
+                None,
+            )
+            if adapter is not None and observation.state is ObservationState.EXITED
+            else None
+        )
         interrupted = observation.never_started or quota_checkpoint or interruption is not None
         verifications = () if interrupted else await self._run_verifier(spec, limits)
         with tempfile.TemporaryDirectory(prefix="crucible-k8s-") as scratch:

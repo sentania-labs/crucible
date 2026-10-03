@@ -4218,6 +4218,13 @@ class Supervisor:
                 if oom_killed and not (timed_out or killed):
                     attempt.exit_class = ExitClass.ENVIRONMENT
             interruption = outputs.interruption
+            if interruption is None and adapter is not None:
+                # The provider read the tails before collection; the adapter reads its
+                # own transcript in the collected report too (the app-server host
+                # writes its events only there).
+                interruption = adapter.interruption(
+                    exit_info, outputs.stdout_tail, outputs.stderr_tail, report_dir
+                )
             never_started = final_observation is not None and final_observation.never_started
             if not (timed_out or killed or oom_killed):
                 if never_started:

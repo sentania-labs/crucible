@@ -68,7 +68,6 @@ from crucible.adapters.execution.create_policy import (
 from crucible.adapters.execution.dockerapi import DockerApiError, DockerClient, LogFrame
 from crucible.adapters.execution.endpoint_health import probe_model_endpoint
 from crucible.adapters.execution.logstream import chunks as _chunks
-from crucible.adapters.harness.interruption import model_interruption
 from crucible.adapters.harness.registry import default_registry
 from crucible.application.credential_renewer import (
     access_token_document,
@@ -1225,7 +1224,22 @@ class DockerProvider:
                 )
                 == 0
             )
-        interruption = model_interruption(observation.exit_code, stdout_tail, stderr_tail)
+        report = root / "report"
+        interruption = (
+            adapter.interruption(
+                ExitInfo(
+                    exit_code=observation.exit_code,
+                    report_present=(report / "report.yaml").is_file(),
+                    blocked_present=(report / "blocked.md").is_file(),
+                    oom_killed=observation.oom_killed,
+                ),
+                stdout_tail,
+                stderr_tail,
+                report,
+            )
+            if adapter is not None and observation.state is ObservationState.EXITED
+            else None
+        )
         interrupted = observation.never_started or quota_checkpoint or interruption is not None
         verifications = () if interrupted else await self._run_verifier(spec)
         outputs = _read_outputs(

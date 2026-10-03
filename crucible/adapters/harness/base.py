@@ -14,9 +14,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from crucible.adapters.harness.interruption import model_interruption
 from crucible.contracts.completion_claim import load_report, parse_claim
 from crucible.domain.exit_class import ExitClass, classify_exit
+from crucible.domain.infrastructure import Interruption
 from crucible.ports.execution import IDENTITY_MOUNT, REPORT_MOUNT
 from crucible.ports.harness import ExitInfo, ParsedReport, ProviderQuotaEvent, ReportMetrics
 
@@ -57,10 +57,15 @@ def classify_with_patterns(
     *,
     auth: Sequence[Pattern],
     quota: Sequence[Pattern],
+    interruption: Interruption | None = None,
 ) -> ExitClass:
     """The confirmed table of S5: the deterministic code first, then the auth and quota
     patterns from both tails on a non-zero exit only. A pattern never turns a clean exit
-    into a failure, and a termination Crucible performed is never reclassified."""
+    into a failure, and a termination Crucible performed is never reclassified.
+
+    `interruption` is the adapter's reading of its own provider error event (hades
+    #353): on a non-zero exit it makes a gateway, transport or capacity failure
+    `infrastructure` and a quota refusal `quota_exhausted` instead of a crash."""
     base = classify_exit(
         exit_code=exit.exit_code,
         report_present=exit.report_present,
@@ -80,7 +85,6 @@ def classify_with_patterns(
         return ExitClass.AUTH_FAILURE
     if first_match(tails, quota) is not None:
         return ExitClass.QUOTA_EXHAUSTED
-    interruption = model_interruption(exit.exit_code, *tails)
     return interruption.exit_class if interruption is not None else base
 
 

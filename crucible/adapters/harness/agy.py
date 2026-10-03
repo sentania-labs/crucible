@@ -31,14 +31,22 @@ tracker (issue 152): a silent AGY command counts against the stall limits.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from crucible.adapters.harness import base
+from crucible.adapters.harness.interruption import (
+    ProviderFailure,
+    interruption_from,
+    status_line,
+    tail_lines,
+)
 from crucible.domain.exit_class import ExitClass
 from crucible.domain.harness_concurrency import HARNESS_CONCURRENCY
+from crucible.domain.infrastructure import Interruption
 from crucible.ports.harness import (
     AGY_BINARY,
     AdapterLaunch,
@@ -85,12 +93,66 @@ QUOTA_PATTERNS = base.patterns(
 )
 
 
+# The Google RPC status a Cloud Code error carries, as the HTTP status it maps to.
+GOOGLE_STATUSES = {"UNAVAILABLE": 503, "DEADLINE_EXCEEDED": 504, "RESOURCE_EXHAUSTED": 429}
+# Cloud Code's reason when the model, not the account, is out of capacity: a 429
+# RESOURCE_EXHAUSTED that is not the account's quota.
+CAPACITY_REASON = "MODEL_CAPACITY_EXHAUSTED"
+_LEADING_STATUS = re.compile(r"^\s*([A-Z][A-Z_]{3,})\b")
+
+
 def _provider_quota_refusal(document: Mapping[str, Any]) -> bool:
+    error = str(document.get("error", ""))
     return (
         document.get("type") == "result"
         and document.get("status") == "ERROR"
-        and "RESOURCE_EXHAUSTED" in str(document.get("error", ""))
+        and "RESOURCE_EXHAUSTED" in error
+        and CAPACITY_REASON not in error
     )
+
+
+def _result_failure(body: Mapping[str, Any]) -> ProviderFailure:
+    """The `result` line of a run that ended `ERROR`. Its `error` is the Cloud Code error,
+    either the API's JSON (`{"code": 503, "status": "UNAVAILABLE", "message": ...}`) or the
+    CLI's text of it, which starts with the RPC status name."""
+    error = body.get("error")
+    status: int | None = None
+    if isinstance(error, dict):
+        code = error.get("code")
+        if isinstance(code, int) and not isinstance(code, bool):
+            status = code
+        else:
+            status = GOOGLE_STATUSES.get(str(error.get("status") or ""))
+        text = str(error.get("message") or "")
+        raw = str(error)
+    else:
+        text = raw = str(error or "")
+        leading = _LEADING_STATUS.match(text)
+        status = GOOGLE_STATUSES.get(leading.group(1)) if leading else None
+    status = status or status_line(text)
+    capacity = CAPACITY_REASON in raw
+    return ProviderFailure(
+        raw[:2000],
+        status=None if capacity else status,
+        capacity=capacity,
+        quota=status == 429 and not capacity,
+    )
+
+
+def _last_result_failure(*tails: str) -> ProviderFailure | None:
+    """The final `result` line decides: one that is not `ERROR` ended a run whose model
+    calls worked, whatever was retried before it."""
+    for line in tail_lines(*tails):
+        event = base.json_object(line.strip())
+        if event is None:
+            continue
+        kind = str(event.get("event") or event.get("type") or "")
+        if kind != "result":
+            continue
+        nested = event.get(kind)
+        body: Mapping[str, Any] = nested if isinstance(nested, dict) else event
+        return _result_failure(body) if body.get("status") == "ERROR" else None
+    return None
 
 
 class AgyAdapter:
@@ -201,9 +263,35 @@ class AgyAdapter:
     ) -> ExitClass:
         # S5: AGY exits 1 for an auth failure and still emits a well-formed `result`
         # line; the class comes from its text, not from the line's presence.
+        interruption = self.interruption(exit, stdout_tail, stderr_tail, report_dir)
+        if interruption is not None and interruption.capacity:
+            # MODEL_CAPACITY_EXHAUSTED says RESOURCE_EXHAUSTED too; it is not quota.
+            return interruption.exit_class
         return base.classify_with_patterns(
-            exit, stdout_tail, stderr_tail, auth=AUTH_PATTERNS, quota=QUOTA_PATTERNS
+            exit,
+            stdout_tail,
+            stderr_tail,
+            auth=AUTH_PATTERNS,
+            quota=QUOTA_PATTERNS,
+            interruption=interruption,
         )
+
+    def interruption(
+        self,
+        exit: ExitInfo,
+        stdout_tail: str,
+        stderr_tail: str,
+        report_dir: Path | None = None,
+    ) -> Interruption | None:
+        if (
+            exit.exit_code in (None, 0)
+            or exit.lost
+            or exit.timed_out
+            or exit.killed
+            or exit.oom_killed
+        ):
+            return None
+        return interruption_from(_last_result_failure(stdout_tail, stderr_tail))
 
 
 def _usage(event: dict[str, Any]) -> tuple[int | None, int | None]:
