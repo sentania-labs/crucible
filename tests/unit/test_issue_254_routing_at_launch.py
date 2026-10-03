@@ -394,3 +394,44 @@ def test_a_version_an_attempt_routed_with_cannot_be_rewritten() -> None:
             version=4,
             document=copy.deepcopy(record.document),
         )
+
+
+def test_a_quota_exit_reschedules_under_the_recorded_routing_version(tmp_path: Path) -> None:
+    """A quota exit reroute routes with the recorded routing version, even if a newer one exists."""
+    fallback = _model("gpt-z-fallback")
+    fallback["harness"] = "script-harness"
+    fallback["pool"] = "fallback-pool"
+    m1 = _model("gpt-test")
+    m1["harness"] = "script-harness"
+    rec = _version(4, [m1, fallback])
+    rec.document["pools"]["fallback-pool"] = rec.document["pools"]["openai-sub"]
+    store = _store(rec)
+    execution, attempt = _route_correction(store, tmp_path)
+    assert attempt.routing_version == 4
+    assert attempt.selected_model == "gpt-test"
+
+    # Now a newer version is published that removes the fallback model.
+    store.routing_policies.records.append(_version(5, [_model("gpt-test")]))  # type: ignore[attr-defined]
+
+    task = store.tasks.get(attempt.task_id)
+    assert task is not None
+
+    supervisor, _provider = _supervisor(store, FakeClock(NOW), tmp_path)
+    # The quota exit handler should use version 4 and find gpt-z-fallback.
+    supervisor._handle_quota_exit(store.uow(), task, execution, attempt, source="worker")
+
+    nxt = store.attempts.list_for_task(task.id)[-1]
+    assert nxt.number == attempt.number + 1
+
+    attempt.state = AttemptState.FAILED
+    store.attempts.save(attempt)
+    task = store.tasks.get(nxt.task_id)
+    assert task is not None
+    stored = store.contracts.get(nxt.task_id, execution.contract_version)
+    assert stored is not None
+    supervisor._route_pending(_Pending(nxt, execution, task, stored.document))
+
+    nxt_updated = store.attempts.get(nxt.id)
+    assert nxt_updated is not None
+    assert nxt_updated.selected_model == "gpt-z-fallback"
+    assert nxt.routing_version == 4

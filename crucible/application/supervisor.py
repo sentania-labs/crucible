@@ -984,6 +984,7 @@ class Supervisor:
         *,
         number: int,
         excluded_pools: set[str] | None = None,
+        routing_version: int | None = None,
     ) -> Attempt:
         attempt = Attempt(
             id=new_id(),
@@ -994,6 +995,7 @@ class Supervisor:
             created_at=self._clock.now(),
             resume_from_remote=execution.resume_from_remote,
             routing_excluded_pools=sorted(excluded_pools or set()),
+            routing_version=routing_version,
         )
         uow.attempts.add(attempt)
         record_event(
@@ -2043,7 +2045,9 @@ class Supervisor:
             ):
                 return None
             current = replace(item, attempt=attempt, execution=execution, task=task)
-            routing = load_attempt_routing(uow, execution.policy_snapshot or {})
+            routing = load_attempt_routing(
+                uow, execution.policy_snapshot or {}, attempt.routing_version
+            )
             selection = self._selection_for(
                 uow, current, excluded_pools=set(attempt.routing_excluded_pools), routing=routing
             )
@@ -4959,13 +4963,16 @@ class Supervisor:
         stored = uow.contracts.get(task.id, execution.contract_version)
         assert stored is not None
         item = _Pending(attempt, execution, task, stored.document)
-        selection = self._selection_for(uow, item, excluded_pools={attempt.selected_pool})
+        selection = self._selection_for(
+            uow, item, excluded_pools={attempt.selected_pool}, routing=routing
+        )
         if selection is not None and selection.selected is not None and selection.image is not None:
             nxt = self._create_attempt(
                 uow,
                 execution,
                 number=attempt.number + 1,
                 excluded_pools={attempt.selected_pool} if attempt.selected_pool else None,
+                routing_version=attempt.routing_version,
             )
             move_task(
                 uow,
