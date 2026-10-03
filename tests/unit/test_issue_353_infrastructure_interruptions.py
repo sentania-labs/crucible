@@ -540,3 +540,28 @@ async def test_docker_never_started_records_runtime_message(monkeypatch: pytest.
     _finish(supervisor, pending.attempt, "", final_observation=observation)
     assert pending.attempt.exit_class is ExitClass.INFRASTRUCTURE
     assert pending.task.state is TaskState.SCHEDULED
+
+
+async def test_endpoint_health_retains_proxy_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
+    connection = MagicMock()
+    connection.getresponse.return_value.__enter__.return_value.status = 200
+    monkeypatch.setattr(endpoint_health, "HTTPConnection", MagicMock(return_value=connection))
+    assert await endpoint_health.probe_model_endpoint("http://gateway.example/proxy/v1")
+    connection.request.assert_called_once_with("GET", "/proxy/health/readiness")
+
+
+async def test_endpoint_health_deduplicates_waiting_tasks(monkeypatch: pytest.MonkeyPatch) -> None:
+    supervisor, _pending, _uow, _events = _running(monkeypatch)
+    monkeypatch.setattr(supervisor, "_infrastructure_waits", lambda: [
+        ("one", "fake", "http://gateway"), ("two", "fake", "http://gateway")])
+    provider = MagicMock()
+    provider.probe_model_endpoint = AsyncMock(return_value=True)
+    monkeypatch.setattr(supervisor, "_provider", lambda _: provider)
+    recorded = MagicMock()
+    monkeypatch.setattr(supervisor, "_record_endpoint_health", recorded)
+    async def db(call: Any) -> Any:
+        return call()
+    monkeypatch.setattr(supervisor, "_db", db)
+    await supervisor._resume_infrastructure_waits()
+    provider.probe_model_endpoint.assert_awaited_once_with("http://gateway")
+    assert recorded.call_count == 2

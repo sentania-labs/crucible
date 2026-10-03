@@ -5347,12 +5347,15 @@ class Supervisor:
         return pending
 
     async def _resume_infrastructure_waits(self) -> None:
+        results: dict[tuple[str, str], bool] = {}
         for task_id, provider_name, endpoint in await self._db(self._infrastructure_waits):
             probe = getattr(self._provider(provider_name), "probe_model_endpoint", None)
             if probe is None:
                 continue
-            healthy = await probe(endpoint)
-            await self._db(partial(self._record_endpoint_health, task_id, healthy))
+            key = (provider_name, endpoint)
+            if key not in results:
+                results[key] = await probe(endpoint)
+            await self._db(partial(self._record_endpoint_health, task_id, results[key]))
 
     def _record_endpoint_health(self, task_id: str, healthy: bool) -> None:
         with self._fenced() as uow:

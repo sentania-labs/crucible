@@ -15,7 +15,10 @@ def _probe_model_endpoint(endpoint_url: str) -> bool:
             return False
         connection_type = HTTPSConnection if parts.scheme == "https" else HTTPConnection
         connection = connection_type(parts.hostname, parts.port, timeout=5)
-        connection.request("GET", "/health/readiness")
+        prefix = parts.path.rstrip("/")
+        if prefix.endswith("/v1"):
+            prefix = prefix[:-3]
+        connection.request("GET", prefix + "/health/readiness")
         with connection.getresponse() as response:
             return response.status == 200
     except (OSError, HTTPException, ValueError):
@@ -27,4 +30,8 @@ def _probe_model_endpoint(endpoint_url: str) -> bool:
 
 async def probe_model_endpoint(endpoint_url: str) -> bool:
     # Network I/O must not stall the supervisor's event loop during an outage.
-    return await asyncio.to_thread(_probe_model_endpoint, endpoint_url)
+    try:
+        async with asyncio.timeout(5):
+            return await asyncio.to_thread(_probe_model_endpoint, endpoint_url)
+    except TimeoutError:
+        return False
