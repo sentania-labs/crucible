@@ -234,6 +234,9 @@ COMMAND_LOG_PAGE = 500
 # A command still reported this long past its command timeout no longer counts: the
 # command timeout, not the stall limit, bounds a command, and it bounds it here too.
 COMMAND_OVERRUN_SECONDS = 60
+# Hades #353: infrastructure interruptions retried per contract version before the task
+# blocks for the endpoint.
+INFRASTRUCTURE_RETRY_BUDGET = 3
 
 
 def worker_stall_action(
@@ -5406,7 +5409,7 @@ class Supervisor:
             for row in self._all_task_events(uow, task.id)
             if row.payload.get("contract_version") == execution.contract_version
         ]
-        already_blocked = any(
+        earlier_blocks = sum(
             row.kind == EventKind.TASK_BLOCKED.value
             and row.payload.get("reason") == "model_endpoint_unavailable"
             for row in version_events
@@ -5420,7 +5423,10 @@ class Supervisor:
             routing = load_routing(uow, execution.policy_snapshot or {})
             model = routing.model(attempt.selected_model or execution.model) if routing else None
             endpoint_url = model.endpoint_url if model is not None else None
-            task.resume_at = self._clock.now() + timedelta(minutes=3)
+            # The first block waits for the endpoint's health probe and may resume on
+            # its own once; the second needs a person and opens the one escalation.
+            first_block = earlier_blocks == 0
+            task.resume_at = self._clock.now() + timedelta(minutes=3) if first_block else None
             uow.tasks.save(task)
             move_task(
                 uow,
@@ -5433,7 +5439,7 @@ class Supervisor:
                 payload={
                     "reason": "model_endpoint_unavailable",
                     "contract_version": execution.contract_version,
-                    "health_retry_allowed": not already_blocked,
+                    "health_retry_allowed": first_block,
                     "cause": message,
                     "never_started": bool(detail.get("never_started")),
                     "endpoint_url": endpoint_url
@@ -5442,14 +5448,28 @@ class Supervisor:
                     else None,
                 },
             )
-            if not already_blocked:
+            summary = (
+                f"blocked: model_endpoint_unavailable after {failures} infrastructure "
+                f"interruptions; {message}"
+            )[:2000]
+            if first_block:
+                create_wake(
+                    uow,
+                    self._clock,
+                    principal_id=task.principal_id,
+                    reason=WakeReason.ATTEMPT_FAILED,
+                    summary=summary,
+                    task=task,
+                    attempt_id=attempt.id,
+                )
+            else:
                 open_escalation(
                     uow,
                     self._clock,
                     task=task,
                     attempt_id=attempt.id,
                     question=message,
-                    summary=message,
+                    summary=summary,
                     wake_reason=WakeReason.ATTEMPT_FAILED,
                 )
             return
