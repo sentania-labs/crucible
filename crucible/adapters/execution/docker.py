@@ -1087,6 +1087,14 @@ class DockerProvider:
             raise ProviderError(f"inspect failed: {exc}") from exc
         state = data.get("State", {})
         status = str(state.get("Status", ""))
+        message = str(state.get("Error") or "")
+        started = str(state.get("StartedAt") or "")
+        never_started = bool(message) and (not started or started.startswith("0001-01-01"))
+        if never_started:
+            return Observation(
+                ObservationState.EXITED, exit_code=int(state.get("ExitCode", 128)),
+                detail="StartError", container_message=message, never_started=True,
+            )
         if status in ("created", "running", "restarting", "paused", "removing"):
             return Observation(ObservationState.RUNNING, detail=status)
         detail = status
@@ -1137,6 +1145,12 @@ class DockerProvider:
             if hasattr(self.client, "inspect_container")
             else Observation(ObservationState.EXITED, exit_code=1)
         )
+        if observation.never_started:
+            return CollectedOutputs(
+                report=None, report_raw=None, blocked_md=None,
+                stdout_tail=stdout_tail, stderr_tail=stderr_tail,
+                credential_sync=credential_sync,
+            )
         adapter = self.harnesses.get(spec.harness)
         quota_checkpoint = bool(
             adapter is not None

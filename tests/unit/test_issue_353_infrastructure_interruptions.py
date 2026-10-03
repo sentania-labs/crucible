@@ -327,6 +327,12 @@ def test_budget_blocks_once_and_health_recovery_reschedules(
     "reason,terminated",
     [
         ("StartError", True),
+        ("RunContainerError", True),
+        ("ContainerCannotRun", True),
+        ("InvalidImageName", False),
+        ("ErrImageNeverPull", False),
+        ("ImageInspectError", False),
+        ("PostStartHookError", False),
         ("CreateContainerError", False),
         ("CreateContainerConfigError", False),
         ("ImagePullBackOff", False),
@@ -515,3 +521,22 @@ def test_terminal_quota_is_reported_with_quota_wake(monkeypatch: pytest.MonkeyPa
     assert pending.task.state is TaskState.REPORTED
     assert not any(row.kind == EventKind.TASK_BLOCKED.value for row in events)
     assert any(row.kind == EventKind.WAKE_CREATED.value for row in events)
+
+
+async def test_docker_never_started_records_runtime_message(monkeypatch: pytest.MonkeyPatch) -> None:
+    from crucible.adapters.execution.docker import DockerProvider
+    from crucible.ports.execution import Handle
+
+    provider = object.__new__(DockerProvider)
+    provider.client = MagicMock()
+    monkeypatch.setattr(provider, "_call", AsyncMock(return_value={"State": {
+        "Status": "created", "StartedAt": "0001-01-01T00:00:00Z",
+        "Error": "exec format error", "ExitCode": 128,
+    }}))
+    observation = await provider.observe(Handle("docker", "container", "attempt"))
+    assert observation.never_started
+    assert observation.container_message == "exec format error"
+    supervisor, pending, _uow, _events = _running(monkeypatch)
+    _finish(supervisor, pending.attempt, "", final_observation=observation)
+    assert pending.attempt.exit_class is ExitClass.INFRASTRUCTURE
+    assert pending.task.state is TaskState.SCHEDULED

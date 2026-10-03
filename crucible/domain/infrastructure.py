@@ -9,6 +9,12 @@ from crucible.domain.exit_class import ExitClass
 START_FAILURES = frozenset(
     {
         "StartError",
+        "RunContainerError",
+        "ContainerCannotRun",
+        "InvalidImageName",
+        "ErrImageNeverPull",
+        "ImageInspectError",
+        "PostStartHookError",
         "CreateContainerError",
         "CreateContainerConfigError",
         "ImagePullBackOff",
