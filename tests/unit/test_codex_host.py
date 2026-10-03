@@ -12,6 +12,7 @@ HOST = Path(__file__).parents[2] / "images/worker/crucible-codex-host.py"
 FAKE = r"""#!/usr/bin/env python3
 import json, sys
 thread = "thread-fixture"
+marker = __MARKER_PATH__
 for line in sys.stdin:
     request = json.loads(line)
     method = request.get("method")
@@ -30,6 +31,7 @@ for line in sys.stdin:
         refresh = {"id": 99, "method": "account/chatgptAuthTokens/refresh",
                    "params": {"reason": "unauthorized",
                               "previousAccountId": "account-fixture"}}
+        open(marker, "w").close()
         print(json.dumps(refresh), flush=True)
     elif request.get("id") == 99:
         assert request["result"]["accessToken"] == "access-new"
@@ -78,14 +80,18 @@ def _command(tmp_path: Path, fake: Path, wait: float) -> list[str]:
 
 def test_t_auth_3_host_re_reads_access_token_and_writes_transcript(tmp_path: Path) -> None:
     fake = tmp_path / "fake-codex"
-    fake.write_text(FAKE)
+    marker = tmp_path / "refresh-requested"
+    fake.write_text(FAKE.replace("__MARKER_PATH__", repr(str(marker))))
     fake.chmod(0o755)
     _token(tmp_path / "token.json", "access-old")
     process = subprocess.Popen(_command(tmp_path, fake, 3), stdin=subprocess.PIPE, text=True)
     assert process.stdin is not None
     process.stdin.write("identity and pointer")
     process.stdin.close()
-    time.sleep(0.25)
+    deadline = time.monotonic() + 5
+    while not marker.exists():
+        assert time.monotonic() < deadline, "fake codex never requested an access token refresh"
+        time.sleep(0.01)
     _token(tmp_path / "token.json", "access-new")
     assert process.wait(timeout=5) == 0
     lines = [json.loads(line) for line in (tmp_path / "transcript.jsonl").read_text().splitlines()]
@@ -95,7 +101,7 @@ def test_t_auth_3_host_re_reads_access_token_and_writes_transcript(tmp_path: Pat
 
 def test_codex_host_bounded_refresh_wait_is_auth_failure(tmp_path: Path) -> None:
     fake = tmp_path / "fake-codex"
-    fake.write_text(FAKE)
+    fake.write_text(FAKE.replace("__MARKER_PATH__", repr(str(tmp_path / "refresh-requested"))))
     fake.chmod(0o755)
     _token(tmp_path / "token.json", "access-old")
     result = subprocess.run(
