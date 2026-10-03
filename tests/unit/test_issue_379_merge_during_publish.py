@@ -392,10 +392,13 @@ def test_a_poll_winning_the_push_race_refuses_to_record_the_post_merge_push(
     assert any(f"head {NEW_HEAD} was pushed after" in wake for wake in merged_wakes)
 
 
-def test_the_lookup_race_accepts_an_earlier_crucible_head_without_escalation(
+def test_the_lookup_race_escalates_a_corrected_head_pushed_after_the_merge(
     tmp_path: Path,
 ) -> None:
     store, _clock, supervisor, github, publisher = _correcting(tmp_path)
+    # GitHub merged the earlier head; the corrected head reached the branch after it.
+    # The lookup records the merge after the push, where the poll in the race above
+    # records it before; the same event is escalated the same way.
     github.lookups = [_open(OLD_HEAD), _merged(OLD_HEAD)]
 
     assert _publish(supervisor) == 0
@@ -406,7 +409,15 @@ def test_the_lookup_race_accepts_an_earlier_crucible_head_without_escalation(
     payload = _merged_event_payload(store)
     assert payload["last_pushed_head"] == NEW_HEAD
     assert payload["merged_head_matches"] is True
-    assert store.escalations.list_for_task(TASK_ID) == []
+    assert payload["pushed_after_merge"] == NEW_HEAD
+    escalations = store.escalations.list_for_task(TASK_ID)
+    assert len(escalations) == 1
+    assert f"Head {NEW_HEAD} was pushed after the merge" in escalations[0].question
+    assert "decide whether the merge and branch state stand" in escalations[0].question
+    merged = _wakes(store, "merged")
+    assert len(merged) == 1
+    assert f"the merged head {OLD_HEAD} is a head Crucible pushed" in merged[0]
+    assert f"head {NEW_HEAD} was pushed after the merge" in merged[0]
 
 
 def test_a_closed_pull_request_during_a_correction_fails_the_publication(
@@ -880,7 +891,7 @@ def test_a_merge_of_a_quota_checkpoint_is_escalated_and_named(tmp_path: Path) ->
     assert len(merged) == 1 and "quota checkpoint" in merged[0]
 
 
-def test_an_unseen_merge_of_an_earlier_pushed_head_ignores_a_later_checkpoint(
+def test_an_unseen_merge_of_an_earlier_pushed_head_escalates_a_later_checkpoint(
     tmp_path: Path,
 ) -> None:
     store, clock, supervisor, github, publisher = _correcting(tmp_path, until=TaskState.REPORTED)
@@ -900,8 +911,16 @@ def test_an_unseen_merge_of_an_earlier_pushed_head_ignores_a_later_checkpoint(
     assert publisher.pushes == [NEW_HEAD]
     assert _task(store).state is TaskState.MERGED
     assert _task(store).head_sha == OLD_HEAD
-    assert _merged_event_payload(store)["merged_head_matches"] is True
-    assert store.escalations.list_for_task(TASK_ID) == []
+    payload = _merged_event_payload(store)
+    assert payload["merged_head_matches"] is True
+    assert payload["pushed_after_merge"] == NEW_HEAD
+    # The checkpoint was pushed after a merge nobody had seen yet: escalated like any
+    # push that landed after the merge.
+    escalations = store.escalations.list_for_task(TASK_ID)
+    assert len(escalations) == 1
+    assert f"Head {NEW_HEAD} was pushed after the merge" in escalations[0].question
+    merged = _wakes(store, "merged")
+    assert len(merged) == 1 and f"head {NEW_HEAD} was pushed after the merge" in merged[0]
 
 
 # ----- the gate pass locks only a merged correction ---------------------------

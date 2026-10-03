@@ -1185,6 +1185,7 @@ def settle_pull_request_state(
         head_check = ""
         head_matches = True
         checkpoint = False
+        later_push: str | None = None
         if correcting:
             heads, pushed = pushed_heads(uow, task, pull_request)
             merged = merged_head or recorded_merged_head(uow, task)
@@ -1193,6 +1194,10 @@ def settle_pull_request_state(
             head_matches = merged is None or merged in heads
             matched_head = merged or pushed
             checkpoint = bool(matched_head and heads.get(matched_head, False))
+            if head_matches and merged is not None and pushed and pushed != merged:
+                # Crucible pushed `pushed` after the head GitHub merged: the push landed
+                # on the branch after the merge, whichever record of it came first.
+                later_push = pushed
             payload.update(
                 {
                     "merged_head": merged,
@@ -1200,6 +1205,7 @@ def settle_pull_request_state(
                     "last_pushed_head": pushed,
                     "last_push_was_checkpoint": checkpoint,
                     "merged_head_matches": head_matches,
+                    "pushed_after_merge": later_push,
                 }
             )
             # The merged task's head is a head Crucible pushed, not a corrected head that
@@ -1222,6 +1228,10 @@ def settle_pull_request_state(
                     ", and that push was a quota checkpoint of an unfinished attempt, "
                     "which passed no gate and was never accepted"
                 )
+            if later_push is not None:
+                head_check += (
+                    f"; head {later_push} was pushed after the merge and is not the merged head"
+                )
         move_task(uow, clock, task, TaskState.MERGED, EventKind.TASK_MERGED, payload=payload)
         summary = (
             f"pull request #{pull_request.number} was merged by "
@@ -1232,18 +1242,26 @@ def settle_pull_request_state(
             summary += head_check
         elif early:
             summary += f", before Crucible saw it ready for merge (the task was {merged_from})"
-        if not head_matches or checkpoint:
-            problem = (
-                "What was merged is not a head Crucible pushed"
-                if not head_matches
-                else "What was merged is an ungated quota checkpoint"
-            )
+        if not head_matches or checkpoint or later_push is not None:
+            if not head_matches:
+                problem = "What was merged is not a head Crucible pushed"
+                decide = "decide whether the merge stands"
+            elif checkpoint:
+                problem = "What was merged is an ungated quota checkpoint"
+                decide = "decide whether the merge stands"
+            else:
+                # The same escalation as a push refused after a recorded merge.
+                problem = (
+                    f"Head {later_push} was pushed after the merge; it is not recorded as "
+                    "the merged head"
+                )
+                decide = "decide whether the merge and branch state stand"
             open_escalation(
                 uow,
                 clock,
                 task=task,
                 attempt_id=None,
-                question=f"{summary}. {problem}; decide whether the merge stands."[:2000],
+                question=f"{summary}. {problem}; {decide}."[:2000],
                 wake_reason=WakeReason.MERGED,
                 summary=summary[:500],
             )
