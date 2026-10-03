@@ -340,9 +340,9 @@ def test_a_missing_session_column_fails_loudly(tmp_path: Path) -> None:
     wrapper = _wrapper()
     path = tmp_path / USAGE_NAME
     path.write_text(json.dumps(RAISED_USAGE), encoding="utf-8")
-    with pytest.raises(wrapper.SessionSchemaChanged, match=r"reasoning_tokens.*0[.]19[.]0"):
-        wrapper._enrich_usage(path, home)
-    assert json.loads(path.read_text(encoding="utf-8")) == RAISED_USAGE
+    wrapper._enrich_usage(path, home)
+    written = json.loads(path.read_text(encoding="utf-8"))
+    assert written == {**RAISED_USAGE, "completed": False}
 
 
 def test_without_a_session_database_only_completed_is_settled(tmp_path: Path) -> None:
@@ -483,5 +483,50 @@ def test_the_usage_patch_changes_nothing_else(
 def test_the_usage_patch_refuses_another_hermes_version(tmp_path: Path) -> None:
     run = _bootstrap(tmp_path, RETURNED_RESULT, version="0.20.0")
     assert run.returncode != 0
-    assert "hermes-agent 0.19.0, and 0.20.0 is installed" in run.stderr
+    assert "its patches are for hermes-agent 0.19.0, found 0.20.0" in run.stderr
     assert not (tmp_path / USAGE_NAME).exists()
+
+def test_no_sessions_table_through_main(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    hermes = tmp_path / "hermes"
+    (hermes / "hermes_cli").mkdir(parents=True)
+    (hermes / "hermes_cli" / "__init__.py").write_text("", encoding="utf-8")
+    (hermes / "hermes_cli" / "main.py").write_text("def main(): return 0\n", encoding="utf-8")
+    (hermes / "hermes_cli" / "oneshot.py").write_text(_STAND_IN_ONESHOT, encoding="utf-8")
+    (hermes / "tools").mkdir(parents=True)
+    (hermes / "tools" / "__init__.py").write_text("", encoding="utf-8")
+    (hermes / "tools" / "file_operations.py").write_text('''
+class ShellFileOperations:
+    def _search_with_grep(self, pattern, path, file_glob, limit, offset, output_mode, context):
+        cmd_parts = ["grep", "-rnH"]
+        cmd_parts.append("--exclude-dir='.*'")
+        cmd_parts.append(self._escape_shell_arg(path))
+        cmd_parts.extend(["|", "head", "-n", str(fetch_limit)])
+        cmd = "set -o pipefail; " + " ".join(cmd_parts)
+''', encoding="utf-8")
+    metadata = hermes / "hermes_agent-0.19.0.dist-info"
+    metadata.mkdir()
+    (metadata / "METADATA").write_text("Metadata-Version: 2.1\nName: hermes-agent\nVersion: 0.19.0\n", encoding="utf-8")
+    
+    home = tmp_path / "home"
+    home.mkdir()
+    with sqlite3.connect(home / "state.db") as db:
+        pass
+        
+    path = tmp_path / USAGE_NAME
+    path.write_text(json.dumps(RAISED_USAGE), encoding="utf-8")
+    
+    wrapper = _wrapper()
+    wrapper.HERMES_PYTHON = sys.executable
+    
+    monkeypatch.setenv("CRUCIBLE_HERMES_USAGE", str(path))
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("PYTHONPATH", str(hermes))
+    monkeypatch.setenv("CRUCIBLE_HERMES_MAX_TURNS", "0")
+    monkeypatch.setattr(sys, "argv", ["crucible-hermes.py"])
+    
+    assert wrapper.main() == 0
+    
+    written = json.loads(path.read_text(encoding="utf-8"))
+    assert written == {**RAISED_USAGE, "completed": False}
+    
+    assert "crucible-hermes: Hermes's state.db has no sessions table" in capsys.readouterr().err
