@@ -186,7 +186,7 @@ def test_local_codex_uses_pool_limit_subscription_still_serial(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     route = routing()
-    monkeypatch.setattr("crucible.application.supervisor.load_routing", lambda *_: route)
+    monkeypatch.setattr("crucible.application.supervisor.load_attempt_routing", lambda *_: route)
     supervisor = object.__new__(Supervisor)
     supervisor._harnesses = default_registry()
     supervisor._credential_sources = {}
@@ -195,19 +195,30 @@ def test_local_codex_uses_pool_limit_subscription_still_serial(
     subscription: Any = SimpleNamespace(harness="codex", model="subscription", policy_snapshot={})
     executions = {"local": local, "subscription": subscription}
     live = [
-        SimpleNamespace(state=AttemptState.RUNNING, execution_id="local", selected_pool="lab-local")
+        SimpleNamespace(
+            routing_version=None,
+            state=AttemptState.RUNNING,
+            execution_id="local",
+            selected_pool="lab-local",
+        )
     ]
     uow = _uow(attempts=live)
     uow.executions = SimpleNamespace(get=executions.get)
     assert supervisor._harness_busy_in_uow(uow, local) is None
     assert supervisor._harness_busy_in_uow(uow, subscription) is None
     live.append(
-        SimpleNamespace(state=AttemptState.RUNNING, execution_id="local", selected_pool="lab-local")
+        SimpleNamespace(
+            routing_version=None,
+            state=AttemptState.RUNNING,
+            execution_id="local",
+            selected_pool="lab-local",
+        )
     )
     assert "2 of 2 lab-local" in str(supervisor._harness_busy_in_uow(uow, local))
     live[:] = [
         SimpleNamespace(
             state=AttemptState.EXITED,
+            routing_version=None,
             execution_id="subscription",
             selected_pool="pool-subscription",
         )
@@ -222,7 +233,7 @@ async def test_supervisor_launch_uses_gateway_alias_limits_and_key(
 ) -> None:
     route = routing()
     route.models[1].model_name = "coder"
-    monkeypatch.setattr("crucible.application.supervisor.load_routing", lambda *_: route)
+    monkeypatch.setattr("crucible.application.supervisor.load_attempt_routing", lambda *_: route)
     requested: list[str] = []
 
     def setting(name: str) -> Any:
@@ -241,6 +252,7 @@ async def test_supervisor_launch_uses_gateway_alias_limits_and_key(
         selected_model="z-codex",
         selected_image="image",
         resume_from_remote=False,
+        routing_version=None,
     )
     execution: Any = SimpleNamespace(
         role=ExecutionRole.IMPLEMENT,

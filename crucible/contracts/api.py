@@ -45,6 +45,7 @@ class AttemptSummary(Response):
     harness: str | None = None
     image: str | None = None
     pool: str | None = None
+    routing_version: int | None = None
     reroute_from_attempt_id: str | None = None
     resume_from_remote: bool = False
 
@@ -193,6 +194,7 @@ class AttemptView(Response):
     harness: str | None = None
     image: str | None = None
     pool: str | None = None
+    routing_version: int | None = None
     ordered_candidates: list[dict[str, Any]] = Field(default_factory=list)
     resume_from_remote: bool = False
 

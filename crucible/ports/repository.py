@@ -200,6 +200,11 @@ class AttemptRepository(Protocol):
 
     def list_for_task(self, task_id: str) -> Sequence[Attempt]: ...
 
+    def routes_with(self, routing_name: str, routing_version: int) -> bool:
+        """hades #254: True once an attempt recorded this routing policy version as the
+        one it was routed with; such a version is immutable."""
+        ...
+
     def list_in_states(
         self, states: Sequence[AttemptState], *, for_update: bool = False
     ) -> Sequence[Attempt]:

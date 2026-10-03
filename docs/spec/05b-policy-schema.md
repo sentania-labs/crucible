@@ -426,7 +426,23 @@ contract, the compose smoke, the fixtures, and the tiers all reference, so
 the verified roster is what a fresh deployment routes with. Version 1 stays
 beside it naming `default-routing` version 1, because a policy version is
 immutable once referenced. Where a caller names no version, the newest
-version of the policy is the one that applies. The Codex pool in version 2 is exactly the
+version of the policy is the one that applies.
+
+`routing.policy.pinned` (a strict boolean, default false) decides which routing
+version an attempt routes with (hades #254). Unpinned, every attempt, including a
+correction or retry inside an existing execution, routes with the newest version of
+the named routing policy at the moment it is routed: the newest version above the
+referenced one that is not retired and that some policy references, as publishing
+leaves it. A version only uploaded and never published is not chosen, and a retired
+reference never falls back to an older version. Pinned, the referenced version is
+used. A quota reroute and a resumed quota wait follow the same rule, with the
+exhausted pool excluded from the reroute. The task's policy snapshot is never
+rewritten. The version used is recorded on the attempt as `routing_version`, and the
+attempt's spec, pool reservation, harness count and exit read that version, not a
+newer one. A routing version an attempt recorded is immutable: `PUT
+/routing/{name}/{version}` refuses to rewrite it with 409, as it does for a version a
+policy references. A review is not routed; it records the current version when it
+starts preparing and is refused if its model is disabled there. The Codex pool in version 2 is exactly the
 operator's roster decision: `gpt-5.6-luna` small, `gpt-5.6-terra` mid, `gpt-5.6-sol` and
 `gpt-6-astra` frontier. Nothing older and no mini; `gpt-5.5` is a recorded
 fallback outside the pool. The ids come from the CLI's own listing, the cost

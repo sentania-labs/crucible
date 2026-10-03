@@ -166,6 +166,14 @@ class _Events:
         self.rows.append(stored)
         return stored
 
+    def list_for_task(self, task_id: str, *, after_seq: int = 0, limit: int = 1000) -> list[Event]:
+        matches = [
+            e
+            for e in self.rows
+            if getattr(e, "task_id", None) == task_id and getattr(e, "seq", 0) > after_seq
+        ]
+        return matches[:limit]
+
     def latest_for_task_kind(self, task_id: str, kind: str) -> Event | None:
         return next(
             (e for e in reversed(self.rows) if e.task_id == task_id and e.kind == kind), None
@@ -202,6 +210,9 @@ class _RoutingPolicies:
     def get(self, name: str, version: int) -> RoutingPolicyRecord | None:
         same = (name, version) == (self.record.name, self.record.version)
         return self.record if same else None
+
+    def list_versions(self, name: str) -> list[RoutingPolicyRecord]:
+        return [self.record] if name == self.record.name else []
 
 
 class _PullRequests:
