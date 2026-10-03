@@ -497,6 +497,12 @@ def test_main_keeps_child_exit_and_basic_usage_without_sessions_table(
     (hermes / "hermes_cli" / "__init__.py").write_text("", encoding="utf-8")
     (hermes / "hermes_cli" / "main.py").write_text("def main(): return 0\n", encoding="utf-8")
     (hermes / "hermes_cli" / "oneshot.py").write_text(_STAND_IN_ONESHOT, encoding="utf-8")
+    (hermes / "agent").mkdir()
+    (hermes / "agent" / "__init__.py").write_text("", encoding="utf-8")
+    (hermes / "agent" / "verification_evidence.py").write_text(
+        "def mark_workspace_edited(*, session_id, cwd, paths=None): pass\n",
+        encoding="utf-8",
+    )
     (hermes / "tools").mkdir(parents=True)
     (hermes / "tools" / "__init__.py").write_text("", encoding="utf-8")
     (hermes / "tools" / "file_operations.py").write_text(

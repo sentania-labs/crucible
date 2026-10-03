@@ -16,6 +16,14 @@ FDY-0140:
   writes nothing else until it ends, and a quiet worker is otherwise indistinguishable
   from a stuck one.
 
+Hades #386: Hermes 0.19's verification guard files an edit to a path with no project of
+its own (the report, /crucible/report/report.yaml) under the session's workspace root, so
+writing the report turned the checkout's passed verification stale and the guard asked
+for it all again before finishing. The bootstrap wraps
+`agent.verification_evidence.mark_workspace_edited` so that a path outside the root it
+resolves never marks that root edited; any path inside the root still does. The patch is
+written against 0.19.0 only and Hermes refuses to start under any other version.
+
 Hades #385: Hermes's content search falls back to `grep -r --exclude-dir='.*' ... ROOT`
 when there is no ripgrep, and GNU grep applies that pattern to ROOT itself, so a search
 of `.` (or of any root whose last component starts with a dot) finds nothing. The image
@@ -81,6 +89,15 @@ import importlib.util
 import inspect
 import os
 import sys
+from pathlib import Path
+
+GUARD = "agent.verification_evidence"
+
+def _refuse(reason):
+    print(f"crucible-hermes: {reason}", file=sys.stderr, flush=True)
+    # Hermes swallows exceptions around its verification imports, so exit outright.
+    os._exit(70)
+
 
 EXPECTED = "@HERMES_VERSION@"
 try:
@@ -161,6 +178,58 @@ class _TurnBudget(importlib.abc.MetaPathFinder):
             module.AIAgent.__init__ = __init__
             if ALLOWANCE > 0:
                 _cap_retries(module.AIAgent)
+
+        loader.exec_module = exec_module
+        return spec
+
+
+def _inside(path, root, cwd):
+    try:
+        candidate = Path(path).expanduser()
+        if not candidate.is_absolute():
+            candidate = Path(cwd or ".") / candidate
+        candidate = candidate.resolve()
+        return candidate == root or root in candidate.parents
+    except (OSError, RuntimeError, ValueError):
+        # Unknown: count it, as Hermes would.
+        return True
+
+
+class _ReportWriteGuard(importlib.abc.MetaPathFinder):
+    # #386: an edit outside a verification root never invalidates that root's checks.
+    def find_spec(self, name, path, target=None):
+        if name != GUARD:
+            return None
+        sys.meta_path.remove(self)
+        spec = importlib.util.find_spec(name)
+        if spec is None or spec.loader is None:
+            _refuse(f"{GUARD} is missing from hermes-agent {EXPECTED}")
+        loader = spec.loader
+        execute = loader.exec_module
+
+        def exec_module(module):
+            execute(module)
+            original = getattr(module, "mark_workspace_edited", None)
+            expected = ["session_id", "cwd", "paths"]
+            if original is None or list(inspect.signature(original).parameters) != expected:
+                _refuse(f"{GUARD}.mark_workspace_edited is not the 0.19.0 shape")
+
+            def mark_workspace_edited(*, session_id, cwd, paths=None):
+                if paths:
+                    from agent.coding_context import project_facts_for
+
+                    facts = project_facts_for(cwd)
+                    if facts:
+                        # The root Hermes's own function resolves.
+                        root = Path(str(facts.get("root") or Path(cwd or ".").resolve()))
+                        root = root.expanduser().resolve()
+                        paths = [p for p in paths if p and _inside(str(p), root, cwd)]
+                        if not paths:
+                            return None
+                return original(session_id=session_id, cwd=cwd, paths=paths)
+
+            mark_workspace_edited.__wrapped__ = original
+            module.mark_workspace_edited = mark_workspace_edited
 
         loader.exec_module = exec_module
         return spec
@@ -295,6 +364,7 @@ class _GrepRoot(importlib.abc.MetaPathFinder):
         loader.exec_module = exec_module
         return spec
 
+sys.meta_path.insert(0, _ReportWriteGuard())
 sys.meta_path.insert(0, _FailureCause())
 if LIMIT > 0 or ALLOWANCE > 0 or THINKING is not None:
     sys.meta_path.insert(0, _TurnBudget())
@@ -358,6 +428,7 @@ PREFLIGHT = (
     + r"""
 try:
     import tools.file_operations
+    import agent.verification_evidence
 except RuntimeError as error:
     raise SystemExit(str(error))
 """
@@ -366,7 +437,7 @@ except RuntimeError as error:
 )
 PREFLIGHT_FAILED = (
     "crucible-hermes: the Hermes in this image is not the one its patches were written "
-    "for (hades #385, #388); not starting it"
+    "for (hades #385, #386, #388); not starting it"
 )
 
 BOOTSTRAP = (

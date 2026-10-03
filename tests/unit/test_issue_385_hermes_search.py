@@ -187,6 +187,12 @@ def _stand_in(tmp_path: Path, version: str, fallback: str) -> Path:
     (hermes / "tools" / "file_operations.py").write_text(
         f"class ShellFileOperations:\n{fallback}", encoding="utf-8"
     )
+    (hermes / "agent").mkdir()
+    (hermes / "agent" / "__init__.py").write_text("", encoding="utf-8")
+    (hermes / "agent" / "verification_evidence.py").write_text(
+        "def mark_workspace_edited(*, session_id, cwd, paths=None): pass\n",
+        encoding="utf-8",
+    )
     return hermes
 
 
