@@ -41,6 +41,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from crucible.contracts.evidence import REVIEW_DIFF_NAME, REVIEW_DIFF_TYPE
 from crucible.ports.execution import (
     BranchBundle,
     CancelCheck,
@@ -212,6 +213,14 @@ def synthetic_diff(paths: tuple[str, ...], behavior: str) -> str:
             f"--- a/{path}\n+++ b/{path}\n@@ -0,0 +1,{body.count(chr(10))} @@\n{body}"
         )
     return "".join(chunks)
+
+
+def synthetic_review_diff(paths: tuple[str, ...], behavior: str) -> str:
+    """The collector-owned review artifact: a stat header followed by the patch."""
+    stat = "".join(f" {path} | 1 +\n" for path in paths)
+    if paths:
+        stat += f" {len(paths)} file(s) changed, {len(paths)} insertion(s)(+)\n"
+    return stat + "\n" + synthetic_diff(paths, behavior)
 
 
 def verification_runs(contract: dict[str, Any], behavior: str) -> tuple[VerificationRun, ...]:
@@ -653,6 +662,14 @@ class FakeProvider:
                     content_type="application/json",
                 )
             ]
+            artifacts.append(
+                CollectedArtifact(
+                    name=REVIEW_DIFF_NAME,
+                    type=REVIEW_DIFF_TYPE,
+                    content=synthetic_review_diff(paths, behavior).encode(),
+                    content_type="text/x-diff",
+                )
+            )
             for verification in spec.contract.get("required_verification", []):
                 if verification.get("kind") == "artifact":
                     artifacts.append(

@@ -37,6 +37,7 @@ from crucible.adapters.execution.fake import (
     fake_commit_policy,
     synthetic_diff,
     synthetic_head_sha,
+    synthetic_review_diff,
 )
 from crucible.adapters.execution.k8sapi import (
     ExecResult,
@@ -68,6 +69,7 @@ from crucible.adapters.execution.scripts import (
     PUBLISH_BUNDLE_LEAF,
     PUBLISH_LEAF,
     PUBLISH_LEAF_MARKER,
+    REVIEW_DIFF_DIR,
 )
 from crucible.domain.time import parse_rfc3339
 from crucible.ports.execution import ImageInfo
@@ -849,6 +851,9 @@ class FakeKubernetesApi:
         claim["output/commits.txt"] = b"0\n" if behavior == "no-commits" else b"1\n"
         claim["output/changed.txt"] = ("\n".join(paths) + "\n").encode()
         claim["output/diff.patch"] = synthetic_diff(paths, behavior).encode()
+        claim[f"output/{REVIEW_DIFF_DIR}/diff.patch"] = synthetic_review_diff(
+            paths, behavior
+        ).encode()
         claim["output/commit-paths.txt"] = ("\n".join(paths) + "\n").encode()
         claim["output/log.txt"] = (
             b"" if behavior == "no-commits" else f"{head}\x1fa fake commit\x1ffake\x1e".encode()
