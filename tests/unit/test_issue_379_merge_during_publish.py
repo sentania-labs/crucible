@@ -578,7 +578,10 @@ def test_another_open_pull_request_on_the_branch_is_not_adopted(tmp_path: Path) 
     failed = store.events.latest_for_task_kind(TASK_ID, EventKind.TASK_PUBLISH_FAILED.value)
     assert failed is not None
     assert failed.payload["pull_request"] == PR_NUMBER
+    assert failed.payload["pull_request_state"] == "closed"
+    # Both the other pull request's number and state, as every other failure records.
     assert failed.payload["other_pull_request"] == PR_NUMBER + 1
+    assert failed.payload["other_pull_request_state"] == "open"
     wakes = _wakes(store, "publish_failed")
     assert len(wakes) == 1
     assert f"#{PR_NUMBER + 1}" in wakes[0] and "not adopted" in wakes[0]
