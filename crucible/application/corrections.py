@@ -83,25 +83,28 @@ def _unpublished_bundle_problem(
             exited.payload.get("never_started") is True or exited.payload.get("no_commits") is True
         )
     ):
-        if exited.payload.get("never_started") is True or not task.head_sha:
-            return None
-        # A subsequent start failure does not invalidate the last sealed worker head.
-        previous = [
+        # Hades #346: an attempt that never started (or ended before committing) left
+        # no bundle of its own, and it does not discard the work before it. The checks
+        # below run against the last attempt that did start and seal a bundle.
+        sealed = [
             candidate
             for candidate in uow.attempts.list_for_task(task.id)
             if any(
-                row.kind == "bundle_head"
-                and row.verified
-                and row.payload.get("bundle_verified")
-                and row.payload.get("head_sha") == task.head_sha
+                row.kind == "bundle_head" and row.verified and row.payload.get("bundle_verified")
                 for row in uow.evidence.list_for_attempt(candidate.id)
             )
         ]
-        if previous:
-            attempt = max(previous, key=lambda candidate: candidate.id)
-            source_execution = uow.executions.get(attempt.execution_id)
-            if source_execution is not None:
-                execution = source_execution
+        if not sealed:
+            # Nothing was ever sealed: with no head the correction starts from the base
+            # like the first attempt did; a head with no bundle anywhere cannot resume.
+            return (
+                {"path": "correction", "message": PREVIOUS_BUNDLE_GONE} if task.head_sha else None
+            )
+        attempt = max(sealed, key=lambda candidate: candidate.id)
+        source_execution = uow.executions.get(attempt.execution_id)
+        if source_execution is None:
+            return {"path": "correction", "message": PREVIOUS_BUNDLE_GONE}
+        execution = source_execution
     if execution.provider != provider:
         return {"path": "execution_request.provider", "message": PREVIOUS_BUNDLE_OTHER_PROVIDER}
     evidence = next(
