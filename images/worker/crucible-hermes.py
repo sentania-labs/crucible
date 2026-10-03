@@ -22,7 +22,9 @@ Issue 388:
   when to compress (131072 and 32000 trigger at 74304 input tokens, not 98304) and every
   request carries it as max_tokens. When Hermes retries one call with a lower cap after
   the gateway refuses the allowance, its one-call cap outranks `model.max_tokens`, so the
-  lower figure is what is sent; nothing here sends max_tokens any other way.
+  lower figure is what is sent; nothing here sends max_tokens any other way, with two
+  exceptions: Hermes retries a reply cut off at its length limit with min(base*2, max(32768, cap)),
+  and the compressor's own summary call sends neither max_tokens nor request overrides.
 - `-z` has no way to pass the routing entry's thinking setting. The bootstrap adds it to
   the request overrides an agent is built with, as `chat_template_kwargs.enable_thinking`,
   unless the caller already named one.
@@ -86,22 +88,11 @@ if FOUND != EXPECTED:
         f"crucible-hermes: its patches are for hermes-agent {EXPECTED}, found {FOUND}; "
         "refusing to start Hermes unpatched (hades #385)"
     )
+
 LIMIT = int(os.environ.get("CRUCIBLE_HERMES_MAX_TURNS") or 0)
 THINKING = {"on": True, "off": False}.get(os.environ.get("CRUCIBLE_HERMES_THINKING") or "")
 # `max_iterations` is the tenth parameter of AIAgent.__init__ after self (0.19).
 POSITION = 9
-
-
-def _check_version():
-    try:
-        found = importlib.metadata.version("hermes-agent")
-    except importlib.metadata.PackageNotFoundError:
-        found = None
-    if found != HERMES_VERSION:
-        sys.exit(
-            f"crucible-hermes: the bootstrap is written for hermes-agent {HERMES_VERSION} "
-            f"and found {found}; review its patches against that release first"
-        )
 
 
 def _with_thinking(overrides):
@@ -153,8 +144,99 @@ class _AgentDefaults(importlib.abc.MetaPathFinder):
         loader.exec_module = exec_module
         return spec
 
+# Hades #385. The 0.19.0 fallback, exactly: these lines are what the patch replaces the
+# effect of, so a Hermes whose fallback reads differently fails here, at import. Inside
+# Hermes that failure would only be logged, so PREFLIGHT (below) imports the module on
+# its own first, where it stops the attempt.
+GREP_SHAPE = (
+    "cmd_parts = [\"grep\", \"-rnH\"]",
+    "cmd_parts.append(\"--exclude-dir='.*'\")",
+    "cmd_parts.append(self._escape_shell_arg(path))",
+    "cmd_parts.extend([\"|\", \"head\", \"-n\", str(fetch_limit)])",
+    "cmd = \"set -o pipefail; \" + \" \".join(cmd_parts)",
+)
+GREP_HEAD = "set -o pipefail; grep -rnH "
 
-_check_version()
+
+class _RootedShell:
+    # The file operations object as the fallback sees it, except that its grep command
+    # runs from inside the root with no file operand. GNU grep applies --exclude-dir to
+    # every operand it is given, `.` and `./` included, but never to the `.` it searches
+    # when it is given none; that `.` is also left out of the names it prints. The cd is
+    # in a subshell: Hermes takes the shell's `pwd -P` after each command as the
+    # session's working directory, so a top-level cd would move the agent for good.
+    def __init__(self, ops, root):
+        self._ops = ops
+        self._root = ops._escape_shell_arg(root)
+
+    def __getattr__(self, name):
+        return getattr(self._ops, name)
+
+    def _exec(self, command, *args, **kwargs):
+        operand = f" {self._root} | head -n "
+        if command.startswith(GREP_HEAD) and operand in command:
+            before, _, after = command.rpartition(operand)
+            command = (
+                f"set -o pipefail; (CDPATH= cd -- {self._root} >/dev/null || exit 2; "
+                "exec grep -rnH "
+                f"{before[len(GREP_HEAD):]}) | head -n {after}"
+            )
+        return self._ops._exec(command, *args, **kwargs)
+
+
+def _rooted(root, name):
+    return (root if root.endswith("/") else root + "/") + name
+
+
+def _patch_grep(module):
+    shell = module.ShellFileOperations
+    original = shell._search_with_grep
+    source = inspect.getsource(original)
+    missing = [line for line in GREP_SHAPE if line not in source]
+    if missing:
+        raise RuntimeError(
+            "crucible-hermes: Hermes's grep fallback is not the one hades #385 patches; "
+            f"missing {missing}"
+        )
+
+    def _search_with_grep(self, pattern, path, file_glob, limit, offset, output_mode, context):
+        probe = self._exec(f"test -d {self._escape_shell_arg(path)} && echo directory")
+        if probe.stdout.strip() != "directory":
+            return original(self, pattern, path, file_glob, limit, offset, output_mode, context)
+        result = original(
+            _RootedShell(self, path), pattern, path, file_glob, limit, offset, output_mode,
+            context,
+        )
+        # Grep printed names relative to the root; give them back the root, as grep
+        # does for an operand, so they read as they would have with ripgrep.
+        for match in result.matches:
+            match.path = _rooted(path, match.path)
+        result.files = [_rooted(path, name) for name in result.files]
+        result.counts = {_rooted(path, name): count for name, count in result.counts.items()}
+        return result
+
+    shell._search_with_grep = _search_with_grep
+
+
+class _GrepRoot(importlib.abc.MetaPathFinder):
+    def find_spec(self, name, path, target=None):
+        if name != "tools.file_operations":
+            return None
+        sys.meta_path.remove(self)
+        spec = importlib.util.find_spec(name)
+        if spec is None or spec.loader is None:
+            return spec
+        loader = spec.loader
+        execute = loader.exec_module
+
+        def exec_module(module):
+            execute(module)
+            _patch_grep(module)
+
+        loader.exec_module = exec_module
+        return spec
+
+
 if LIMIT > 0 or THINKING is not None:
     sys.meta_path.insert(0, _AgentDefaults())
 sys.meta_path.insert(0, _GrepRoot())
@@ -185,7 +267,7 @@ from hermes_cli.main import main
 
 sys.exit(main())
 """
-))
+)
 
 
 def _milliseconds(started: object, ended: object) -> int | None:
@@ -343,3 +425,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

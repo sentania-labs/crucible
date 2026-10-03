@@ -214,7 +214,9 @@ def _hermes_limits_section(limits: dict[str, Any], principal: Principal) -> dict
             "0 lets Hermes find it from the gateway and uses 131072 for Codex. "
             "Max output tokens is the response allowance Hermes asks for on every request "
             "and reserves out of the window when it decides when to compress; set it to "
-            "the allowance the gateway enforces."
+            "the allowance the gateway enforces (except that Hermes retries a reply cut off "
+            "at its length limit with min(base*2, max(32768, cap)), and its summary call "
+            "sends no limit)."
         ),
         "columns": ["Max turns", "Context length", "Max output tokens", "Source"],
         "rows": [

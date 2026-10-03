@@ -207,8 +207,10 @@ never retry.
   `CRUCIBLE_HERMES_MAX_OUTPUT_TOKENS` (default 32000, the response allowance the
   gateway applies), written as `model.max_tokens`, so Hermes's compressor reserves
   the allowance out of the window (131072 and 32000 compress at 74304 input tokens,
-  not 98304) and every request carries it; Hermes's own lower one-call cap on a
-  retry still outranks it. `CRUCIBLE_HERMES_THINKING` (`on` or `off`) is the routing
+  not 98304) and every request carries it, with two exceptions: Hermes retries a reply
+  cut off at its length limit with min(base*2, max(32768, cap)), and the compressor's own
+  summary call sends neither max_tokens nor request overrides. Hermes's own lower one-call
+  cap on a retry still outranks it. `CRUCIBLE_HERMES_THINKING` (`on` or `off`) is the routing
   entry's `chat_template_kwargs.enable_thinking`, which `-z` cannot pass; the
   bootstrap adds it to the agent's request overrides unless the caller named one.
   The bootstrap refuses any Hermes release but 0.19.0. The supervisor records the

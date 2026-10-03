@@ -45,7 +45,7 @@ class HermesRunLimits:
     context_length: int = DEFAULT_HERMES_CONTEXT_LENGTH
     max_output_tokens: int = DEFAULT_HERMES_MAX_OUTPUT_TOKENS
     # From the routing entry at launch, not saved with the limits.
-    enable_thinking: bool = False
+    enable_thinking: bool | None = None
 
     def as_dict(self) -> dict[str, int]:
         """The saved document: the limits an administrator sets."""
@@ -72,7 +72,7 @@ def hermes_run_limits(document: Mapping[str, Any] | None) -> HermesRunLimits:
         max_turns=whole("max_turns", DEFAULT_HERMES_MAX_TURNS),
         context_length=whole("context_length", DEFAULT_HERMES_CONTEXT_LENGTH),
         max_output_tokens=whole("max_output_tokens", DEFAULT_HERMES_MAX_OUTPUT_TOKENS),
-        enable_thinking=values.get(THINKING_KEY) is True,
+        enable_thinking=values.get(THINKING_KEY),
     )
 
 

@@ -176,6 +176,32 @@ class HermesAdapter:
         seconds = str(max(1, -(-ctx.command_timeout // 1000)))
         spec = self.credential_spec()
         assert spec is not None
+        env = {
+            # FDY-0140: no PATH of its own. The wrapper starts Hermes with the venv's
+            # Python by path, so the commands the model runs find the image's
+            # `python3`, `pytest` and `uv`, never the Hermes venv's.
+            "HERMES_HOME": HERMES_HOME,
+            # FDY-0140: the instructions go in the prompt, not only a pointer.
+            "CRUCIBLE_HERMES_IDENTITY": f"{ctx.identity_mount}/IDENTITY.md",
+            # FDY-0140: the run limits the Local gateway page sets.
+            "CRUCIBLE_HERMES_MAX_TURNS": str(limits.max_turns),
+            "CRUCIBLE_HERMES_CONTEXT_LENGTH": str(limits.context_length),
+            # Issue 388: the response allowance the gateway enforces, so Hermes's
+            # compressor reserves it and its requests carry it, and the routing
+            # entry's thinking setting. Both as the attempt recorded them.
+            "CRUCIBLE_HERMES_MAX_OUTPUT_TOKENS": str(limits.max_output_tokens),
+            "OPENAI_BASE_URL": ctx.endpoint_url,
+            "OPENAI_API_KEY": "local-no-auth",
+            "CRUCIBLE_HERMES_USAGE": usage_path,
+            # Issue 128: Hermes reads both in whole seconds.
+            "TERMINAL_TIMEOUT": seconds,
+            "TERMINAL_MAX_FOREGROUND_TIMEOUT": seconds,
+            # Issue 152: the process registry, counted while Hermes runs.
+            "CRUCIBLE_IN_FLIGHT_FILE": PROCESSES_FILE,
+        }
+        if limits.enable_thinking is not None:
+            env["CRUCIBLE_HERMES_THINKING"] = "on" if limits.enable_thinking else "off"
+
         return AdapterLaunch(
             argv=(
                 HERMES_BINARY,
@@ -199,30 +225,7 @@ class HermesAdapter:
                 "-z",
                 base.POINTER_PROMPT,
             ),
-            env={
-                # FDY-0140: no PATH of its own. The wrapper starts Hermes with the venv's
-                # Python by path, so the commands the model runs find the image's
-                # `python3`, `pytest` and `uv`, never the Hermes venv's.
-                "HERMES_HOME": HERMES_HOME,
-                # FDY-0140: the instructions go in the prompt, not only a pointer.
-                "CRUCIBLE_HERMES_IDENTITY": f"{ctx.identity_mount}/IDENTITY.md",
-                # FDY-0140: the run limits the Local gateway page sets.
-                "CRUCIBLE_HERMES_MAX_TURNS": str(limits.max_turns),
-                "CRUCIBLE_HERMES_CONTEXT_LENGTH": str(limits.context_length),
-                # Issue 388: the response allowance the gateway enforces, so Hermes's
-                # compressor reserves it and its requests carry it, and the routing
-                # entry's thinking setting. Both as the attempt recorded them.
-                "CRUCIBLE_HERMES_MAX_OUTPUT_TOKENS": str(limits.max_output_tokens),
-                "CRUCIBLE_HERMES_THINKING": "on" if limits.enable_thinking else "off",
-                "OPENAI_BASE_URL": ctx.endpoint_url,
-                "OPENAI_API_KEY": "local-no-auth",
-                "CRUCIBLE_HERMES_USAGE": usage_path,
-                # Issue 128: Hermes reads both in whole seconds.
-                "TERMINAL_TIMEOUT": seconds,
-                "TERMINAL_MAX_FOREGROUND_TIMEOUT": seconds,
-                # Issue 152: the process registry, counted while Hermes runs.
-                "CRUCIBLE_IN_FLIGHT_FILE": PROCESSES_FILE,
-            },
+            env=env,
             env_from_files=spec.env_from_files() if ctx.credential_mounted else {},
             transcript_path=f"{ctx.report_mount}/{base.TRANSCRIPT_NAME}",
             workdir=ctx.repo_mount,

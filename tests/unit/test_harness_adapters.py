@@ -18,6 +18,7 @@ from crucible.adapters.harness.registry import default_adapters, default_registr
 from crucible.adapters.harness.script import ScriptHarnessAdapter
 from crucible.application.harnesses import effective_mount_mode
 from crucible.domain.entities import HarnessState
+from crucible.domain.harness_settings import HermesRunLimits
 from crucible.domain.secrets import scan_text
 from crucible.ports.harness import (
     CredentialSource,
@@ -148,7 +149,6 @@ def test_hermes_launch_matches_07_and_uses_the_optional_api_key() -> None:
         "CRUCIBLE_HERMES_MAX_TURNS": "300",
         "CRUCIBLE_HERMES_CONTEXT_LENGTH": "131072",
         "CRUCIBLE_HERMES_MAX_OUTPUT_TOKENS": "32000",
-        "CRUCIBLE_HERMES_THINKING": "off",
         "OPENAI_BASE_URL": "http://spark.example.internal:11434/v1",
         "OPENAI_API_KEY": "local-no-auth",
         "CRUCIBLE_HERMES_USAGE": "/crucible/report/hermes-usage.json",
@@ -371,3 +371,32 @@ def test_the_fixture_harness_makes_one_model_call_when_tested_behind_a_local_end
     assert local.env["CRUCIBLE_TEST_ENDPOINT"] == "https://stub.example.invalid/v1"
     assert '"model": "stub-model"' in local.env["CRUCIBLE_TEST_BODY"]
     assert adapter.build_launch(context()).argv == ("sh", "-c", "exit 0")
+
+
+def test_hermes_thinking_setting() -> None:
+
+    adapter = HermesAdapter()
+
+    # Unset
+    ctx_unset = context(
+        endpoint="local",
+        endpoint_url="http://x/v1",
+        harness_settings=HermesRunLimits(enable_thinking=None).effective(),
+    )
+    assert "CRUCIBLE_HERMES_THINKING" not in adapter.build_launch(ctx_unset).env
+
+    # True
+    ctx_on = context(
+        endpoint="local",
+        endpoint_url="http://x/v1",
+        harness_settings=HermesRunLimits(enable_thinking=True).effective(),
+    )
+    assert adapter.build_launch(ctx_on).env["CRUCIBLE_HERMES_THINKING"] == "on"
+
+    # False
+    ctx_off = context(
+        endpoint="local",
+        endpoint_url="http://x/v1",
+        harness_settings=HermesRunLimits(enable_thinking=False).effective(),
+    )
+    assert adapter.build_launch(ctx_off).env["CRUCIBLE_HERMES_THINKING"] == "off"
