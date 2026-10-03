@@ -344,7 +344,7 @@ async def admin_save_gateway_models(
 
 @router.get("/admin/gateway/hermes-limits")
 def admin_hermes_limits(ctx: Ctx, uow: UoW, _principal: Admin) -> dict[str, Any]:
-    """FDY-0140: the turn and context limits the next Hermes launch gets."""
+    """FDY-0140: the turn, context and response limits the next Hermes launch gets."""
     return gateway.hermes_limits_view(uow)
 
 
@@ -356,19 +356,25 @@ def admin_save_hermes_limits(
     body: Annotated[dict[str, Any], Body()],
 ) -> dict[str, Any]:
     """`max_turns` and `context_length`, whole numbers; `context_length` 0 lets Hermes
-    find the window itself. Applies from the next launch."""
+    find the window itself. `max_output_tokens` (hades #388), optional, is the response
+    allowance the gateway reserves; absent keeps the saved one. Applies from the next
+    launch."""
     values = {}
     for name in ("max_turns", "context_length"):
         value = body.get(name)
         if isinstance(value, bool) or not isinstance(value, int):
             raise ConflictError(f"{name} must be a whole number")
         values[name] = value
+    allowance = body.get("max_output_tokens")
+    if allowance is not None and (isinstance(allowance, bool) or not isinstance(allowance, int)):
+        raise ConflictError("max_output_tokens must be a whole number")
     result = gateway.save_hermes_limits(
         _admin(ctx),
         uow,
         principal=principal,
         max_turns=values["max_turns"],
         context_length=values["context_length"],
+        max_output_tokens=allowance,
         reason=_reason(body),
     )
     uow.commit()

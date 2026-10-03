@@ -108,7 +108,7 @@ from crucible.domain.entities import (
 from crucible.domain.events import PRINCIPAL_CRUCIBLE, EventKind
 from crucible.domain.exit_class import CLEAN_EXIT_CLASSES, ExitClass, classify_exit
 from crucible.domain.gates import GateName, GateResult, evaluate_gate
-from crucible.domain.harness_settings import setting_name
+from crucible.domain.harness_settings import effective_settings, setting_name
 from crucible.domain.ids import new_id
 from crucible.domain.lifecycle import (
     ATTEMPT_TERMINAL,
@@ -1539,7 +1539,7 @@ class Supervisor:
             self._workspaces[attempt.id] = ws
             if getattr(provider, "activity", None) is None:
                 self._workspace_fingerprints[attempt.id] = workspace_fingerprint(ws)
-            await self._db(partial(self._record_prepared, attempt.id, ws))
+            await self._db(partial(self._record_prepared, attempt.id, ws, spec.effective_settings))
             if not await self._db(partial(self._mark_launching, attempt.id, ws)):
                 await self._discard(provider, ws, spec)
                 self._forget_workspace(attempt.id)
@@ -1620,14 +1620,13 @@ class Supervisor:
             if route is not None:
                 endpoint = route.endpoint
                 endpoint_url = route.endpoint_url
+            settings_harness = (
+                "hermes"
+                if endpoint == "local" and selected_harness == "codex"
+                else selected_harness
+            )
             saved = (
-                route_uow.provider_settings.get(
-                    setting_name(
-                        "hermes"
-                        if endpoint == "local" and selected_harness == "codex"
-                        else selected_harness
-                    )
-                )
+                route_uow.provider_settings.get(setting_name(settings_harness))
                 if selected_harness
                 else None
             )
@@ -1677,6 +1676,18 @@ class Supervisor:
                         }
         # FDY-0140: the harness's run settings as saved now, read at every launch.
         harness_settings = dict(saved.document) if saved is not None else {}
+        # Hades #388: the window, response allowance and thinking setting are fixed for
+        # the attempt. The first spec resolves them from the saved limits and the routing
+        # entry; the launch records them, and every later spec of the attempt reuses
+        # that record rather than a value saved since.
+        effective: dict[str, Any] | None = None
+        if settings_harness == "hermes":
+            effective = attempt.effective_settings or effective_settings(
+                harness_settings,
+                thinking=route.chat_template_kwargs.enable_thinking if route else False,
+            )
+        if effective is not None:
+            harness_settings.update(effective)
         # Issue 128: the policy default, narrowed by the contract, capped at the attempt.
         command_timeout_ms = effective_command_timeout_ms(
             execution.policy_snapshot, contract, execution.timeout_seconds
@@ -1701,6 +1712,7 @@ class Supervisor:
             endpoint_url=endpoint_url,
             command_timeout_ms=command_timeout_ms,
             harness_settings=harness_settings,
+            effective_settings=dict(effective) if effective is not None else None,
             resume_bundle_path=resume_bundle.get("path"),
             resume_bundle_attempt_id=resume_bundle.get("attempt_id"),
             resume_bundle_head=resume_bundle.get("head"),
@@ -2902,11 +2914,18 @@ class Supervisor:
                     payload={"key": lease.key},
                 )
 
-    def _record_prepared(self, attempt_id: str, ws: Workspace) -> None:
-        """08 wants it recorded as an event which branch the checkout started from."""
+    def _record_prepared(
+        self, attempt_id: str, ws: Workspace, effective: dict[str, Any] | None = None
+    ) -> None:
+        """08 wants it recorded as an event which branch the checkout started from.
+        Hades #388: the effective model settings the worker is launched with are recorded
+        on the attempt here, once; a value already recorded is never replaced."""
         with self._fenced() as uow:
             attempt = uow.attempts.get(attempt_id)
             assert attempt is not None
+            if effective is not None and attempt.effective_settings is None:
+                attempt.effective_settings = dict(effective)
+                uow.attempts.save(attempt)
             record_event(
                 uow,
                 self._clock,

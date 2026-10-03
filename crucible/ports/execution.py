@@ -105,6 +105,10 @@ class LaunchSpec:
     # FDY-0140: the harness's saved run settings (`harness.<name>`), handed to the
     # adapter's launch as LaunchContext.harness_settings.
     harness_settings: dict[str, Any] = field(default_factory=dict)
+    # Hades #388: the context length, response allowance and thinking setting this
+    # attempt runs with (also in harness_settings), for the supervisor to record on the
+    # attempt. None when the harness reads none of them.
+    effective_settings: dict[str, Any] | None = None
     # An unpublished correction starts from the preceding attempt's sealed bundle.
     # The provider mounts this one file into the preparer; the worker never sees the
     # preceding workspace.

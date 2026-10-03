@@ -173,6 +173,7 @@ class AttemptRow(Base):
     routing_excluded_pools: Mapped[list[str]] = mapped_column(JSONB, default=list)
     resume_from_remote: Mapped[bool] = mapped_column(Boolean, default=False)
     routing_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    effective_settings: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
 
 
 class LogChunkRow(Base):

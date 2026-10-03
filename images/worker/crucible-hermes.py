@@ -28,6 +28,22 @@ code it was not written against, and before Hermes starts, main() imports the pa
 module once on its own and stops the attempt if the fallback is not the 0.19.0 one.
 That check cannot be left to the import inside Hermes: Hermes's tool discovery catches
 every exception and only logs it, and would start without its file tools.
+
+Hades #388: the gateway reserves a response allowance (32000 tokens in the lab) out of
+the window on every request, whether or not the request names one. Hermes was told the
+window but not the allowance, so its requests carried no `max_tokens` and its compressor
+budgeted against the whole window: with a 131072 window it compressed at 98304 input
+tokens, while the gateway refuses input above 99072. The allowance Crucible passes is
+written as Hermes's own `model.max_tokens`, which 0.19.0 sends on every request and
+subtracts from the window before taking its trigger (74304 for the same window). The
+routing entry's thinking setting goes on each request as `chat_template_kwargs`, through
+the agent's request overrides, which carry nothing else here: `max_tokens` there would
+replace the lower allowance Hermes retries with after the gateway says the input leaves
+less room. Hermes's own retry boosts can ask for more than the allowance (its cap is
+32768); the bootstrap caps those at the allowance and leaves lower values as they are.
+Before Hermes starts, the preflight checks that 0.19.0 still reads `model.max_tokens`,
+still boosts the way the cap is written for, and still computes the trigger the way
+`compression_trigger` below does, and stops the attempt otherwise.
 """
 
 from __future__ import annotations
@@ -78,9 +94,47 @@ if FOUND != EXPECTED:
 LIMIT = int(os.environ.get("CRUCIBLE_HERMES_MAX_TURNS") or 0)
 # `max_iterations` is the tenth parameter of AIAgent.__init__ after self (0.19).
 POSITION = 9
+# Hades #388: the gateway's response allowance (0: none given) and the routing entry's
+# thinking setting (None: none given).
+ALLOWANCE = int(os.environ.get("CRUCIBLE_HERMES_MAX_OUTPUT_TOKENS") or 0)
+THINKING = {"true": True, "false": False}.get(os.environ.get("CRUCIBLE_HERMES_THINKING", ""))
+
+
+def _capped(value):
+    # Hades #388: a response cap Hermes sets for its next request, never above the
+    # allowance the gateway enforces. A lower one (Hermes retrying after the gateway
+    # said the input leaves less room) is kept exactly as Hermes set it.
+    if ALLOWANCE > 0 and isinstance(value, int) and not isinstance(value, bool):
+        return min(value, ALLOWANCE)
+    return value
+
+
+def _cap_retries(agent_class):
+    # 0.19.0 keeps the cap for one request in `_ephemeral_max_output_tokens`, set by its
+    # output-cap retry (lower) and its truncation and length retries (boosted up to
+    # 32768), and read and cleared when the request is built.
+    def get(self):
+        return self.__dict__.get("_crucible_ephemeral_out")
+
+    def put(self, value):
+        self.__dict__["_crucible_ephemeral_out"] = _capped(value)
+
+    agent_class._ephemeral_max_output_tokens = property(get, put)
+
+
+def _thinking(overrides):
+    # Hades #388: the routing entry's thinking setting on every request, unless the
+    # caller already named one. Only `extra_body` is touched.
+    merged = dict(overrides or {})
+    extra = dict(merged.get("extra_body") or {})
+    extra.setdefault("chat_template_kwargs", {"enable_thinking": THINKING})
+    merged["extra_body"] = extra
+    return merged
 
 
 class _TurnBudget(importlib.abc.MetaPathFinder):
+    # The agent as -z builds it: the turn budget (FDY-0140), and the thinking setting and
+    # the retry cap of hades #388, each only when Crucible gave a value.
     def find_spec(self, name, path, target=None):
         if name != "run_agent":
             return None
@@ -96,11 +150,15 @@ class _TurnBudget(importlib.abc.MetaPathFinder):
             original = module.AIAgent.__init__
 
             def __init__(self, *args, **kwargs):
-                if len(args) <= POSITION and "max_iterations" not in kwargs:
+                if LIMIT > 0 and len(args) <= POSITION and "max_iterations" not in kwargs:
                     kwargs["max_iterations"] = LIMIT
+                if THINKING is not None:
+                    kwargs["request_overrides"] = _thinking(kwargs.get("request_overrides"))
                 original(self, *args, **kwargs)
 
             module.AIAgent.__init__ = __init__
+            if ALLOWANCE > 0:
+                _cap_retries(module.AIAgent)
 
         loader.exec_module = exec_module
         return spec
@@ -199,10 +257,59 @@ class _GrepRoot(importlib.abc.MetaPathFinder):
         return spec
 
 
-if LIMIT > 0:
+if LIMIT > 0 or ALLOWANCE > 0 or THINKING is not None:
     sys.meta_path.insert(0, _TurnBudget())
 sys.meta_path.insert(0, _GrepRoot())
 """.replace("@HERMES_VERSION@", HERMES_VERSION)
+
+# Hades #388: what the allowance relies on in 0.19.0, read from the source files without
+# importing them. `agent_init` makes `model.max_tokens` the agent's response cap and hands
+# it to the compressor; `conversation_loop` boosts its retries with these lines, which
+# the cap in PATCHES is written for.
+BUDGET_SHAPE = {
+    "agent.agent_init": (
+        '_config_max_tokens = _model_cfg.get("max_tokens")',
+        "agent.max_tokens = _parsed_max_tokens",
+        "max_tokens=agent.max_tokens,",
+    ),
+    "agent.conversation_loop": (
+        "agent._ephemeral_max_output_tokens = min(_tc_boost, _tc_boost_cap)",
+        "agent._ephemeral_max_output_tokens = safe_out",
+        "agent._ephemeral_max_output_tokens = min(_boost, _boost_cap)",
+    ),
+}
+
+# Run by the preflight when an allowance is given: the source shape above, then the
+# compression trigger Hermes computes for the window and allowance, which must be the
+# one `compression_trigger` gives (passed in CRUCIBLE_HERMES_EXPECTED_TRIGGER).
+BUDGET_CHECK = (
+    "\nBUDGET_SHAPE = "
+    + repr(BUDGET_SHAPE)
+    + r"""
+if ALLOWANCE > 0:
+    for _module, _lines in BUDGET_SHAPE.items():
+        _found = importlib.util.find_spec(_module)
+        _source = open(_found.origin, encoding="utf-8").read() if _found else ""
+        _missing = [line for line in _lines if line not in _source]
+        if _missing:
+            raise SystemExit(
+                f"crucible-hermes: {_module} is not the one hades #388 relies on; "
+                f"missing {_missing}"
+            )
+    _window = int(os.environ.get("CRUCIBLE_HERMES_CONTEXT_LENGTH") or 0)
+    _expected = int(os.environ.get("CRUCIBLE_HERMES_EXPECTED_TRIGGER") or 0)
+    if _window > 0:
+        from agent.context_compressor import ContextCompressor as _Compressor
+
+        _percent = _Compressor._effective_threshold_percent(_window, THRESHOLD_PERCENT)
+        _trigger = _Compressor._compute_threshold_tokens(_window, _percent, ALLOWANCE)
+        if _trigger != _expected:
+            raise SystemExit(
+                f"crucible-hermes: Hermes compresses at {_trigger} input tokens for a "
+                f"{_window} window less {ALLOWANCE}, not {_expected} (hades #388)"
+            )
+"""
+)
 
 # Run by main() before Hermes starts: the version check above, then the patched module
 # imported on its own, so a fallback of another shape exits non-zero here instead of
@@ -215,10 +322,12 @@ try:
 except RuntimeError as error:
     raise SystemExit(str(error))
 """
+    + "\nTHRESHOLD_PERCENT = @THRESHOLD@\n"
+    + BUDGET_CHECK
 )
 PREFLIGHT_FAILED = (
     "crucible-hermes: the Hermes in this image is not the one its patches were written "
-    "for (hades #385); not starting it"
+    "for (hades #385, #388); not starting it"
 )
 
 BOOTSTRAP = (
@@ -230,6 +339,33 @@ from hermes_cli.main import main
 sys.exit(main())
 """
 )
+
+
+# Hades #388: Hermes 0.19.0's compression trigger (agent/context_compressor.py): its
+# default 50% trigger, raised to 75% for a window under 512000 tokens, taken of the window
+# less the response allowance, never below 64000; where that floor would reach the
+# budget, 85% of the budget instead.
+THRESHOLD_PERCENT = 0.50
+SMALL_WINDOW = 512_000
+SMALL_WINDOW_PERCENT = 0.75
+MINIMUM_CONTEXT = 64_000
+MINIMUM_TRIGGER_RATIO = 0.85
+PREFLIGHT = PREFLIGHT.replace("@THRESHOLD@", repr(THRESHOLD_PERCENT))
+
+
+def compression_trigger(context_length: int, max_output_tokens: int = 0) -> int:
+    """The input tokens at which Hermes 0.19.0 compresses, for this window and response
+    allowance (0: none), computed the way its compressor does."""
+    percent = THRESHOLD_PERCENT
+    if context_length and context_length < SMALL_WINDOW:
+        percent = max(percent, SMALL_WINDOW_PERCENT)
+    budget = context_length - max(0, max_output_tokens)
+    if budget <= 0:
+        budget = context_length
+    floored = max(int(budget * percent), MINIMUM_CONTEXT)
+    if budget > 0 and floored >= budget:
+        return max(1, min(int(budget * MINIMUM_TRIGGER_RATIO), budget - 1))
+    return floored
 
 
 def _milliseconds(started: object, ended: object) -> int | None:
@@ -309,14 +445,29 @@ def inline_identity(argv: list[str], identity: str | None) -> list[str]:
     return [*argv[:index], prompt, *argv[index + 1 :]]
 
 
-def write_settings(home: Path, context_length: int) -> None:
-    """Hermes's own `model.context_length`, in the per-run home it reads config from.
-    Only written when a limit was given; the home starts empty on every launch."""
-    if context_length <= 0:
+def write_settings(home: Path, context_length: int, max_output_tokens: int = 0) -> None:
+    """Hermes's own `model.context_length` and `model.max_tokens` (hades #388), in the
+    per-run home it reads config from. Each is written only when a value was given; the
+    home starts empty on every launch."""
+    lines = []
+    if context_length > 0:
+        lines.append(f"  context_length: {context_length}\n")
+    if max_output_tokens > 0:
+        lines.append(f"  max_tokens: {max_output_tokens}\n")
+    if not lines:
         return
     home.mkdir(parents=True, exist_ok=True)
     config = home / "config.yaml"
-    config.write_text(f"model:\n  context_length: {context_length}\n", encoding="utf-8")
+    config.write_text("model:\n" + "".join(lines), encoding="utf-8")
+
+
+def settings_from_env(home: Path) -> tuple[int, int]:
+    """The context length and response allowance Crucible passed, written to Hermes's
+    config in `home`."""
+    context_length = _limit("CRUCIBLE_HERMES_CONTEXT_LENGTH")
+    allowance = _limit("CRUCIBLE_HERMES_MAX_OUTPUT_TOKENS")
+    write_settings(home, context_length, allowance)
+    return context_length, allowance
 
 
 def _session_stamp(home: Path) -> tuple[int, ...]:
@@ -346,10 +497,16 @@ def main() -> int:
     usage_path = Path(os.environ["CRUCIBLE_HERMES_USAGE"])
     home = Path(os.environ["HERMES_HOME"])
     max_turns = _limit("CRUCIBLE_HERMES_MAX_TURNS")
-    write_settings(home, _limit("CRUCIBLE_HERMES_CONTEXT_LENGTH"))
+    context_length, allowance = settings_from_env(home)
     argv = inline_identity(sys.argv[1:], os.environ.get("CRUCIBLE_HERMES_IDENTITY"))
-    # Hades #385: the patches are checked before Hermes starts; the reason is on stderr.
-    if subprocess.run([HERMES_PYTHON, "-P", "-c", PREFLIGHT], check=False).returncode != 0:
+    # Hades #385, #388: the patches are checked before Hermes starts; the reason is on
+    # stderr.
+    preflight_env = {
+        **os.environ,
+        "CRUCIBLE_HERMES_EXPECTED_TRIGGER": str(compression_trigger(context_length, allowance)),
+    }
+    preflight = [HERMES_PYTHON, "-P", "-c", PREFLIGHT]
+    if subprocess.run(preflight, check=False, env=preflight_env).returncode != 0:
         print(PREFLIGHT_FAILED, file=sys.stderr, flush=True)
         return 2
     # Stdout stays inherited. Crucible's launch wrapper is the sole transcript writer.

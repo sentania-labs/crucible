@@ -253,6 +253,7 @@ async def test_supervisor_launch_uses_gateway_alias_limits_and_key(
         selected_image="image",
         resume_from_remote=False,
         routing_version=None,
+        effective_settings=None,
     )
     execution: Any = SimpleNamespace(
         role=ExecutionRole.IMPLEMENT,

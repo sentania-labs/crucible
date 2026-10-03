@@ -413,8 +413,10 @@ disabled `coder` entry in pool `lab-local`. The endpoint comes from
 only as a compatibility seed. The entry stores
 `chat_template_kwargs.enable_thinking`, false by default, and the pool starts with
 `max_concurrency: 4`. Hermes 0.19 has no safe non-interactive flag that can pass this
-request option, so C10 retains the operator's choice in immutable routing state but does
-not claim it reached the server. Runtime edits create later immutable versions through
+request option, so C10 retains the operator's choice in immutable routing state. Since
+hades #388 the Hermes adapter passes it to the image wrapper, whose bootstrap sends it on
+each request as `extra_body.chat_template_kwargs`, and the attempt records it with its
+other effective settings. Runtime edits create later immutable versions through
 the admin surface. The database value is authoritative over the environment after the
 migration.
 

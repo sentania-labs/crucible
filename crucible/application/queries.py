@@ -251,6 +251,7 @@ def _attempt_summary(a: Attempt, reroute_from_attempt_id: str | None = None) -> 
         image=a.selected_image,
         pool=a.selected_pool,
         routing_version=a.routing_version,
+        effective_settings=a.effective_settings,
         ordered_candidates=a.ordered_candidates,
         reroute_from_attempt_id=reroute_from_attempt_id,
         resume_from_remote=a.resume_from_remote,
@@ -575,6 +576,7 @@ def attempt_view(uow: UnitOfWork, attempt_id: str) -> AttemptView:
         image=a.selected_image,
         pool=a.selected_pool,
         routing_version=a.routing_version,
+        effective_settings=a.effective_settings,
         ordered_candidates=a.ordered_candidates,
         resume_from_remote=a.resume_from_remote,
     )

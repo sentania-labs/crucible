@@ -203,7 +203,22 @@ never retry.
   (default 300; Hermes 0.19's `-z` fixes 90 and reads no setting, so a bootstrap
   sets the budget an agent is built with when its caller named none) and
   `CRUCIBLE_HERMES_CONTEXT_LENGTH` (default 131072, 0 to let Hermes find it),
-  written as Hermes's own `model.context_length` in its home. It writes
+  written as Hermes's own `model.context_length` in its home, and (hades #388)
+  `CRUCIBLE_HERMES_MAX_OUTPUT_TOKENS` (default 32000, the response allowance the
+  gateway reserves out of the window), written as Hermes's own `model.max_tokens`,
+  so every request carries it and the context compressor takes its trigger from
+  the window less it (74304 rather than 98304 input tokens for 131072 and 32000).
+  `CRUCIBLE_HERMES_THINKING` carries the routing entry's
+  `chat_template_kwargs.enable_thinking`, which the bootstrap puts on each request
+  as `extra_body.chat_template_kwargs`, the only request override it adds: a
+  `max_tokens` override would replace the lower cap Hermes retries with after the
+  gateway reports less room. The bootstrap caps Hermes's own retry boosts at the
+  allowance and leaves lower caps as Hermes set them; before Hermes starts, the
+  preflight stops the attempt unless Hermes 0.19.0 still reads `model.max_tokens`,
+  boosts the way that cap expects, and computes the same compression trigger as
+  the wrapper. The context length, allowance and thinking setting are resolved
+  once per attempt and recorded as the attempt's `effective_settings`; a later
+  spec of the same attempt reuses the record. It writes
   `crucible-hermes: working, session updated` to stderr whenever the session store
   changes, which is log activity (10). A run that ends on its turn budget is marked
   in the usage record (`turn_limit_reached`) and recorded as `harness_limit_reached`
