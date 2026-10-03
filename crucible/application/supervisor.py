@@ -61,7 +61,8 @@ from crucible.application.review import (
 )
 from crucible.application.routing import (
     count_blocking_failures,
-    load_routing,
+    current_routing_version,
+    load_attempt_routing,
     reserve,
     select_model,
 )
@@ -85,7 +86,7 @@ from crucible.contracts.completion_claim import (
     parse_claim,
 )
 from crucible.contracts.evidence import ROLE_RUN_EVIDENCE, EvidenceKind, EvidenceSource
-from crucible.contracts.policy import window_seconds
+from crucible.contracts.policy import RoutingPolicyV1, window_seconds
 from crucible.contracts.task_contract import TaskContractV1
 from crucible.contracts.wake import WakeReason
 from crucible.domain.command_timeout import effective_command_timeout_ms
@@ -1446,7 +1447,9 @@ class Supervisor:
         if not review:
             selection = await self._db(partial(self._preview_route, item))
             if selection is None or selection.selected is None or selection.image is None:
-                await self._db(partial(self._route_pending, item))
+                # Only refuse or wait here: this attempt holds no checkout lease, so it
+                # must never be moved to preparing on this path.
+                await self._db(partial(self._route_pending, item, launch=False))
                 return None
             execution = replace(
                 execution,
@@ -1487,6 +1490,11 @@ class Supervisor:
                 return None
         elif not await self._db(partial(self._mark_preparing, attempt.id)):
             return None
+        else:
+            refusal = await self._db(partial(self._review_model_refusal, attempt.id))
+            if refusal is not None:
+                await self._db(partial(self._refuse_launch, attempt.id, "routing", refusal))
+                return None
         return item, provider
 
     async def _finish_launch(self, item: _Pending, provider: ExecutionProvider) -> bool:
@@ -1605,7 +1613,9 @@ class Supervisor:
         endpoint: Literal["subscription", "local"] = "subscription"
         endpoint_url = None
         with self._uow_factory() as route_uow:
-            routing = load_routing(route_uow, execution.policy_snapshot or {})
+            routing = load_attempt_routing(
+                route_uow, execution.policy_snapshot or {}, attempt.routing_version
+            )
             route = routing.model(selected_model) if routing is not None else None
             if route is not None:
                 endpoint = route.endpoint
@@ -1816,14 +1826,16 @@ class Supervisor:
                 log.warning("the running logins could not be listed: %s", exc)
         return frozenset(running)
 
-    def _harness_busy(self, execution: Execution) -> str | None:
+    def _harness_busy(self, execution: Execution, routing_version: int | None = None) -> str | None:
         """05b: count credential holders against policy caps. A full harness waits."""
         with self._uow_factory() as uow:
-            return self._harness_busy_in_uow(uow, execution)
+            return self._harness_busy_in_uow(uow, execution, routing_version)
 
-    def _harness_busy_in_uow(self, uow: UnitOfWork, execution: Execution) -> str | None:
+    def _harness_busy_in_uow(
+        self, uow: UnitOfWork, execution: Execution, routing_version: int | None = None
+    ) -> str | None:
         policy = execution.policy_snapshot or {}
-        routing = load_routing(uow, policy)
+        routing = load_attempt_routing(uow, policy, routing_version)
         selected = routing.model(execution.model) if routing is not None else None
         local_codex = (
             execution.harness == "codex" and selected is not None and selected.endpoint == "local"
@@ -1854,7 +1866,9 @@ class Supervisor:
         for other in live:
             other_execution = uow.executions.get(other.execution_id)
             if other_execution is not None and other_execution.harness == execution.harness:
-                other_routing = load_routing(uow, other_execution.policy_snapshot or {})
+                other_routing = load_attempt_routing(
+                    uow, other_execution.policy_snapshot or {}, other.routing_version
+                )
                 other_model = other_routing.model(other_execution.model) if other_routing else None
                 if execution.harness == "codex" and other_model and other_model.endpoint == "local":
                     continue
@@ -1939,9 +1953,17 @@ class Supervisor:
         return eligible
 
     def _selection_for(
-        self, uow: UnitOfWork, item: _Pending, *, excluded_pools: set[str | None] | None = None
+        self,
+        uow: UnitOfWork,
+        item: _Pending,
+        *,
+        excluded_pools: set[str | None] | None = None,
+        routing: RoutingPolicyV1 | None = None,
     ) -> Any:
-        routing = load_routing(uow, item.execution.policy_snapshot or {})
+        # hades #254: every attempt, a correction's or a retry's included, routes with
+        # the routing version in force now unless the policy pins it.
+        if routing is None:
+            routing = load_attempt_routing(uow, item.execution.policy_snapshot or {})
         if routing is None:
             return None
         contract = TaskContractV1.model_validate(item.contract)
@@ -1979,9 +2001,26 @@ class Supervisor:
             selection = replace(selection, image=request.image)
         return selection
 
+    def _launch_selection(
+        self, uow: UnitOfWork, item: _Pending
+    ) -> tuple[RoutingPolicyV1 | None, Any]:
+        """hades #254: how a pending attempt routes, shared by the launch preview and
+        _route_pending so the two never disagree. The routing version is the one in force
+        now (a pinned reference keeps its version), never one recorded on an earlier
+        attempt, and the pools the attempt excludes, as a quota reroute leaves them, stay
+        excluded."""
+        routing = load_attempt_routing(uow, item.execution.policy_snapshot or {})
+        selection = self._selection_for(
+            uow,
+            item,
+            excluded_pools=set(item.attempt.routing_excluded_pools),
+            routing=routing,
+        )
+        return routing, selection
+
     def _preview_route(self, item: _Pending) -> Any:
         with self._uow_factory() as uow:
-            return self._selection_for(uow, item)
+            return self._launch_selection(uow, item)[1]
 
     @staticmethod
     def _selection_is_quota_blocked(selection: Any) -> bool:
@@ -2011,7 +2050,7 @@ class Supervisor:
             for reasons in relevant
         )
 
-    def _route_pending(self, item: _Pending) -> _Pending | None:
+    def _route_pending(self, item: _Pending, *, launch: bool = True) -> _Pending | None:
         with self._fenced() as uow:
             attempt = uow.attempts.get(item.attempt.id, for_update=True)
             task = uow.tasks.get(item.task.id, for_update=True)
@@ -2023,9 +2062,7 @@ class Supervisor:
             ):
                 return None
             current = replace(item, attempt=attempt, execution=execution, task=task)
-            selection = self._selection_for(
-                uow, current, excluded_pools=set(attempt.routing_excluded_pools)
-            )
+            routing, selection = self._launch_selection(uow, current)
             if selection is None or selection.selected is None or selection.image is None:
                 if self._selection_is_quota_blocked(selection):
                     self._enter_quota_wait(uow, task, attempt, execution, selection)
@@ -2033,7 +2070,8 @@ class Supervisor:
                     self._refuse_unroutable(uow, task, attempt, execution, selection)
                 uow.commit()
                 return None
-            routing = load_routing(uow, execution.policy_snapshot or {})
+            if not launch:
+                return None
             assert routing is not None
             candidates = copy.deepcopy(list(selection.candidates))
             default_image = next(
@@ -2053,7 +2091,7 @@ class Supervisor:
                 execution.model = model.id
                 execution.harness = model.harness
                 execution.image = image_override or str(candidate["image"])
-                busy = self._harness_busy_in_uow(uow, execution)
+                busy = self._harness_busy_in_uow(uow, execution, routing.version)
                 if busy is None:
                     chosen = model
                     chosen_image = execution.image
@@ -2094,6 +2132,7 @@ class Supervisor:
             attempt.selected_harness = chosen.harness
             attempt.selected_image = chosen_image
             attempt.selected_pool = chosen.pool
+            attempt.routing_version = routing.version
             execution.model = chosen.id
             execution.harness = chosen.harness
             execution.image = chosen_image
@@ -2131,6 +2170,7 @@ class Supervisor:
                     "harness": chosen.harness,
                     "image": chosen_image,
                     "pool": chosen.pool,
+                    "routing_policy": {"name": routing.name, "version": routing.version},
                     "ordered_candidates": candidates,
                     "skipped_busy": skipped_busy,
                 },
@@ -2447,6 +2487,13 @@ class Supervisor:
             )
             if attempt.state is not AttemptState.PENDING or task.state not in allowed:
                 return False
+            if review and attempt.routing_version is None:
+                # hades #254: a review is not routed, so the routing version it launches
+                # with is recorded here; the spec, the reservation, the harness count
+                # and the exit then read this version, not a newer one.
+                attempt.routing_version = current_routing_version(
+                    uow, execution.policy_snapshot or {}
+                )
             move_attempt(
                 uow, self._clock, attempt, AttemptState.PREPARING, EventKind.ATTEMPT_PREPARING
             )
@@ -2467,6 +2514,26 @@ class Supervisor:
                 )
             uow.commit()
             return True
+
+    def _review_model_refusal(self, attempt_id: str) -> str | None:
+        """hades #254: a review whose model is disabled in the routing version recorded
+        on it is refused rather than launched."""
+        with self._uow_factory() as uow:
+            attempt = uow.attempts.get(attempt_id)
+            assert attempt is not None
+            execution = uow.executions.get(attempt.execution_id)
+            assert execution is not None
+            routing = load_attempt_routing(
+                uow, execution.policy_snapshot or {}, attempt.routing_version
+            )
+            model = routing.model(execution.model) if routing is not None else None
+            if routing is None or model is None or model.enabled:
+                return None
+            reason = f": {model.disabled_reason}" if model.disabled_reason else ""
+            return (
+                f"model {model.id} is disabled in routing policy "
+                f"{routing.name}/{routing.version}{reason}"
+            )
 
     def _release_attempt_checkout(self, attempt_id: str) -> None:
         with self._fenced() as uow:
@@ -2501,6 +2568,7 @@ class Supervisor:
                 harness=execution.harness,
                 model_id=execution.model,
                 now=self._clock.now(),
+                routing_version=attempt.routing_version,
             )
             if not reservation.ok:
                 task = uow.tasks.get(attempt.task_id, for_update=True)
@@ -4589,10 +4657,14 @@ class Supervisor:
     # ----- reactive quota routing -----------------------------------------
 
     def _routing_context(
-        self, uow: UnitOfWork, task: Task, execution: Execution
+        self,
+        uow: UnitOfWork,
+        task: Task,
+        execution: Execution,
+        routing_version: int | None = None,
     ) -> tuple[Any, TaskContractV1] | None:
         stored = uow.contracts.get(task.id, execution.contract_version)
-        routing = load_routing(uow, execution.policy_snapshot or {})
+        routing = load_attempt_routing(uow, execution.policy_snapshot or {}, routing_version)
         if stored is None or routing is None:
             return None
         return routing, TaskContractV1.model_validate(stored.document)
@@ -4758,7 +4830,7 @@ class Supervisor:
         error leaves routing as it was."""
         task = uow.tasks.get(attempt.task_id)
         assert task is not None
-        context = self._routing_context(uow, task, execution)
+        context = self._routing_context(uow, task, execution, attempt.routing_version)
         if context is None:
             return
         routing = context[0]
@@ -4805,7 +4877,7 @@ class Supervisor:
     ) -> None:
         task = uow.tasks.get(attempt.task_id)
         assert task is not None
-        context = self._routing_context(uow, task, execution)
+        context = self._routing_context(uow, task, execution, attempt.routing_version)
         if context is None or attempt.selected_pool is None:
             return
         routing, _ = context
@@ -4860,6 +4932,8 @@ class Supervisor:
         *,
         source: str = "worker",
     ) -> None:
+        # hades #254: the reroute routes with the version in force now, not the one the
+        # exhausted attempt recorded, so a model disabled since is never launched again.
         context = self._routing_context(uow, task, execution)
         if context is None:
             move_execution(
@@ -4905,7 +4979,9 @@ class Supervisor:
         stored = uow.contracts.get(task.id, execution.contract_version)
         assert stored is not None
         item = _Pending(attempt, execution, task, stored.document)
-        selection = self._selection_for(uow, item, excluded_pools={attempt.selected_pool})
+        selection = self._selection_for(
+            uow, item, excluded_pools={attempt.selected_pool}, routing=routing
+        )
         if selection is not None and selection.selected is not None and selection.image is not None:
             nxt = self._create_attempt(
                 uow,
@@ -5205,7 +5281,9 @@ class Supervisor:
         exit_class: ExitClass,
         turn_cap_reached: bool,
     ) -> Literal["turns", "time"] | None:
-        routing = load_routing(uow, execution.policy_snapshot or {})
+        routing = load_attempt_routing(
+            uow, execution.policy_snapshot or {}, attempt.routing_version
+        )
         model = attempt.selected_model or execution.model
         entry = routing.model(model) if routing is not None else None
         return local_cap_kind(

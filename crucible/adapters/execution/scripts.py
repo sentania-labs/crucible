@@ -197,19 +197,27 @@ def _commit_policy_check(git: str) -> str:
 
 # `log.showSignature=false`: a worker-written `.git/config` could otherwise have `git
 # show` verify a planted signature with a `gpg.program` of its choosing.
+# Keep text visible even when the worker lowers its binary detection threshold.
 GIT = (
-    "git -c core.fsmonitor= -c diff.external= -c core.pager=cat "
-    "-c core.hooksPath=/dev/null -c log.showSignature=false -c 'safe.directory=*'"
+    "git -c advice.graftFileDeprecated=false "
+    "-c core.fsmonitor= -c diff.external= -c core.pager=cat "
+    "-c core.bigFileThreshold=512m -c core.hooksPath=/dev/null "
+    "-c log.showSignature=false -c 'safe.directory=*'"
 )
 CHECKPOINT_GIT = (
-    "git -c core.fsmonitor= -c diff.external= -c core.pager=cat "
+    "git -c advice.graftFileDeprecated=false "
+    "-c core.fsmonitor= -c diff.external= -c core.pager=cat "
     "-c core.hooksPath=\"$EMPTY_HOOKS\" -c 'safe.directory=*'"
 )
-# GIT_NO_REPLACE_OBJECTS (hades #369): a worker-made refs/replace/ entry would show every
-# read here a commit or tree other than the one the bundle carries.
+# hades #344: `GIT_NO_REPLACE_OBJECTS=1` and an empty `GIT_GRAFT_FILE`, so a replace
+# ref or a graft the worker wrote cannot make the collected diff, the scanned content or
+# the merge base show anything other than the objects the bundle and the tree carry.
+# An empty path avoids opening a graft file at all: older Git bundle commands emit
+# its deprecation hint even with advice.graftFileDeprecated=false.
 GIT_ENV = (
-    "export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_NO_REPLACE_OBJECTS=1 "
-    "GIT_TERMINAL_PROMPT=0 GIT_ASKPASS= HOME=/home/worker LC_ALL=C"
+    "export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 "
+    "GIT_TERMINAL_PROMPT=0 GIT_ASKPASS= HOME=/home/worker LC_ALL=C "
+    "GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE="
 )
 
 # 08: the copy step rejects symlinks, hard links, devices, and files above the policy
@@ -248,6 +256,34 @@ copy_report() {
 # seconds: an unanswered connect otherwise waits out the kernel's SYN retries, about 135
 # seconds, once for the fetch and once more for the clone.
 CACHE_REFRESH_CONNECT_SECONDS = 20
+
+# Collected artifacts are read into memory before they enter artifact storage. Keep the
+# review diff within that existing ingestion bound as well as the configured report cap.
+DIFF_ARTIFACT_CAP_BYTES = 4 * 1024 * 1024
+
+# hades #344: the collector's own output directory for the review diff. It is outside
+# `report/`, which holds the worker's copied files, so neither can overwrite the other.
+REVIEW_DIFF_DIR = "crucible-review"
+
+# Every diff the collector runs: no textconv, no external diff driver. Never `--text`
+# on the raw diff: a binary must stay "Binary files differ" there, or its bytes push the
+# text after it past the secret scanner's window and fill the output.
+_DIFF_FLAGS = "--no-ext-diff --no-textconv"
+
+# Paths whose `diff` attribute is unset (`-diff`, the `binary` macro) or names a driver:
+# the worker's .gitattributes can make such a text file read as binary, so the review
+# copy shows these, and only these, with `--text`.
+_ATTR_DIFF_PATHSPEC = "-- . ':(exclude,attr:!diff)' ':(exclude,attr:diff)'"
+
+# What the collector writes into its output directory. It is cleared before each run so
+# nothing an earlier collection of the same attempt left is read as this one's.
+_COLLECTOR_OUTPUTS = (
+    "base.txt head.txt branch.txt diffstat.txt diff.patch changed.txt log.txt "
+    "commit-paths.txt work_branch.bundle bundle.log commits.txt commit-policy tree "
+    "clone.log report copy-rejections.tsv collection-failed.txt checkpoint-refusal.txt "
+    "leftover-committed.txt leftover-refusal.txt collector.ok attr-text.patch "
+    f"{REVIEW_DIFF_DIR}"
+)
 
 
 def _cache_refresh(cache_dir: str) -> str:
@@ -555,12 +591,15 @@ REPO={REPO_MOUNT}
 WORK_BRANCH={_quote(work_branch)}
 BASE_REF={_quote(base_ref)}
 SIZE_CAP={_quote(str(size_cap_bytes))}
+DIFF_ARTIFACT_CAP={_quote(str(min(size_cap_bytes, DIFF_ARTIFACT_CAP_BYTES)))}
 COMMIT_ATTEMPT={_quote(attempt_id)}
 QUOTA={_quote("1" if quota_checkpoint else "")}
 POLICY_AUTHOR_EMAIL={_quote(author_email)}
 TRAILER={_quote(commit_trailer)}
 TRAILER_VALUE={_quote(trailer_value or attempt_id)}
+REVIEW_DIFF_ERROR=
 mkdir -p "$OUT"
+for stale in {_COLLECTOR_OUTPUTS}; do rm -rf "$OUT/$stale"; done
 : > "$OUT/copy-rejections.tsv"
 {_COPY_REPORT}
 {_commit_policy_check(GIT + ' -C "$REPO"')}LEFTOVER=0
@@ -658,11 +697,16 @@ if [ -n "$BASE" ]; then
   # the base branch gained after the fork do not become worker changes.
   # The log stays two-dot: it enumerates only commits
   # reachable from HEAD and not BASE, and unions in every path those commits touched.
-  {GIT} -C "$REPO" diff --stat "$MB" HEAD > "$OUT/diffstat.txt" || true
-  {GIT} -C "$REPO" diff --no-color --no-ext-diff "$MB" HEAD > "$OUT/diff.patch" || true
-  # -z on both path lists (hades #369), so a non-ASCII path is its bytes instead of
-  # git's quoted form.
-  {GIT} -C "$REPO" diff --name-only -z "$MB" HEAD > "$OUT/changed.txt" || true
+  # `--no-textconv --no-ext-diff`: the worker's own .git/config is back in place, so
+  # a diff.<driver>.textconv or external command it set with a matching .gitattributes
+  # would otherwise run here and could hide hunks from every diff. A path the worker's
+  # attributes mark binary still reads "Bin" in the stat (git's --stat ignores --text);
+  # the review copy shows its hunks, see build_review_diff.
+  {GIT} -C "$REPO" diff {_DIFF_FLAGS} --stat "$MB" HEAD > "$OUT/diffstat.txt" \
+    || REVIEW_DIFF_ERROR="git diff --stat failed"
+  {GIT} -C "$REPO" diff {_DIFF_FLAGS} --no-color "$MB" HEAD > "$OUT/diff.patch" \
+    || REVIEW_DIFF_ERROR="git diff failed"
+  {GIT} -C "$REPO" diff {_DIFF_FLAGS} --name-only -z "$MB" HEAD > "$OUT/changed.txt" || true
   # hades #369: the status and new blob of each injected-name path, so a shim the branch
   # adds is told from the repository's own CLAUDE.md or AGENTS.md it edits or deletes.
   # Only those paths, so the records stay small however many other files the branch
@@ -674,6 +718,7 @@ if [ -n "$BASE" ]; then
   EMPTY_TREE=$({GIT} -C "$REPO" hash-object -t tree /dev/null)
   {GIT} -C "$REPO" diff --name-only -z --no-renames "$EMPTY_TREE" "$MB" \
     -- {_injected_pathspecs()} > "$OUT/base-injected.txt" || true
+
   {GIT} -C "$REPO" log --format='%H%x1f%s%x1f%an%x1e' "$BASE"..HEAD > "$OUT/log.txt" || true
   # --root (hades #369): a root commit's files are listed whatever log.showRoot the
   # worker-writable .git/config sets.
@@ -704,6 +749,7 @@ if [ -n "$BASE" ]; then
     echo done > "$OUT/commit-policy/checked"
   fi
 else
+  REVIEW_DIFF_ERROR="the base ref could not be resolved"
   : > "$OUT/diffstat.txt"; : > "$OUT/diff.patch"; : > "$OUT/changed.txt"
   : > "$OUT/log.txt"; : > "$OUT/commit-paths.txt"; echo 0 > "$OUT/commits.txt"
   : > "$OUT/diff-raw.txt"; : > "$OUT/commit-raw.txt"; : > "$OUT/base-injected.txt"
@@ -712,6 +758,66 @@ fi
 rm -rf "$OUT/tree"
 {GIT} clone --no-hardlinks --quiet "$REPO" "$OUT/tree" > "$OUT/clone.log" 2>&1 || true
 copy_report "{REPORT_MOUNT}" "$OUT/report" "$SIZE_CAP"
+# hades #344: the review diff, written where only the collector writes (never under the
+# worker's report directory) and separate from the raw diff above, whose content and
+# location are inputs to existing gates. It streams the stat and the patch already on
+# disk into a bounded copy with an explicit marker when it cannot hold the whole patch,
+# and any failure leaves a short marker rather than failing the collection.
+build_review_diff() {{
+  target="$OUT/{REVIEW_DIFF_DIR}/diff.patch"
+  rm -rf "$OUT/{REVIEW_DIFF_DIR}" || return 1
+  mkdir -p "$OUT/{REVIEW_DIFF_DIR}" || return 1
+  if [ -n "$REVIEW_DIFF_ERROR" ]; then
+    printf 'diff unavailable: %s\n' "$REVIEW_DIFF_ERROR" > "$target" || return 1
+    return 0
+  fi
+  # Paths the worker's attributes keep out of a text diff, as text, ahead of the whole
+  # patch so a large diff cannot push them out of the bounded copy. `head -c` bounds
+  # what is read, so a large binary marked this way costs no more than the cap.
+  attr_text="$OUT/attr-text.patch"
+  {{ {GIT} -C "$REPO" diff {_DIFF_FLAGS} --text --no-color "$MB" HEAD \
+      {_ATTR_DIFF_PATHSPEC} || echo "[crucible: attribute-marked paths unavailable]"; }} \
+    | head -c "$DIFF_ARTIFACT_CAP" > "$attr_text" || return 1
+  attr_heading=''
+  if [ -s "$attr_text" ]; then
+    attr_heading='[crucible: paths .gitattributes marks binary or gives a diff driver, as text]'
+  fi
+  review_body() {{
+    cat "$OUT/diffstat.txt"; printf '\n'
+    if [ -n "$attr_heading" ]; then
+      printf '%s\n' "$attr_heading"; cat "$attr_text"; printf '\n[crucible: full diff]\n'
+    fi
+    cat "$OUT/diff.patch"
+  }}
+  marker='[crucible: diff truncated]'
+  stat_size=$(wc -c < "$OUT/diffstat.txt") || return 1
+  patch_size=$(wc -c < "$OUT/diff.patch") || return 1
+  body_size=$((stat_size + 1 + patch_size))
+  if [ -n "$attr_heading" ]; then
+    attr_size=$(wc -c < "$attr_text") || return 1
+    framing=$(printf '%s\n\n[crucible: full diff]\n' "$attr_heading" | wc -c)
+    body_size=$((body_size + attr_size + framing))
+  fi
+  if [ "$body_size" -le "$DIFF_ARTIFACT_CAP" ]; then
+    review_body > "$target" || return 1
+    rm -f "$attr_text"
+    return 0
+  fi
+  keep=$((DIFF_ARTIFACT_CAP - $(printf '\n%s\n' "$marker" | wc -c)))
+  if [ "$keep" -gt 0 ]; then
+    review_body | head -c "$keep" > "$target" || return 1
+    printf '\n%s\n' "$marker" >> "$target" || return 1
+  else
+    printf '%s\n' "$marker" | head -c "$DIFF_ARTIFACT_CAP" > "$target" || return 1
+  fi
+  rm -f "$attr_text"
+}}
+if ! build_review_diff 2>/dev/null; then
+  rm -rf "$OUT/{REVIEW_DIFF_DIR}" "$OUT/attr-text.patch" 2>/dev/null || true
+  mkdir -p "$OUT/{REVIEW_DIFF_DIR}" 2>/dev/null || true
+  printf 'diff unavailable: %s\n' "the review diff could not be written" \
+    > "$OUT/{REVIEW_DIFF_DIR}/diff.patch" 2>/dev/null || true
+fi
 echo done > "$OUT/collector.ok"
 """
 

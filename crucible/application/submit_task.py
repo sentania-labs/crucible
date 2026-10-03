@@ -21,7 +21,7 @@ from crucible.application.routing import (
     check_quota,
     check_selection,
     image_for_harness,
-    load_routing,
+    load_attempt_routing,
     select_model,
 )
 from crucible.application.transitions import record_event
@@ -73,7 +73,7 @@ def _check_routing(
     harnesses: HarnessRegistry | None,
 ) -> list[Problem]:
     """The class must have a candidate now; an operator pin is validated exactly."""
-    routing = load_routing(uow, policy.document)
+    routing = load_attempt_routing(uow, policy.document)
     if routing is None:
         ref = policy.document.get("routing", {}).get("policy", {})
         return [

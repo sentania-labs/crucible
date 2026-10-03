@@ -14,8 +14,12 @@ The web Routing page exposes routing tunables directly. An administrator can ena
 disable each model, order every tier's pools, and choose its allowed capabilities. Each
 form takes an audit reason and publishes the next immutable routing version. Delivery
 policies follow new versions of the routing policy they name unless
-`routing.policy.pinned` is deliberately set; already submitted tasks retain their
-policy and routing versions.
+`routing.policy.pinned` is deliberately set. A submitted task keeps its policy
+snapshot as recorded, but with an unpinned reference every attempt, a correction's
+or a retry's included, routes with the newest published routing version at the
+time it is routed, so a model disabled or removed since is never selected. Each
+attempt records the routing version it routed with. A pinned reference keeps
+its version.
 
 ## CI certification
 

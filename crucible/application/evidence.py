@@ -13,7 +13,10 @@ from typing import Any
 from crucible.application.transitions import record_event
 from crucible.contracts.completion_claim import ClaimFacts, CompletedClaim
 from crucible.contracts.evidence import (
+    REVIEW_DIFF_NAME,
+    REVIEW_DIFF_TYPE,
     ROLE_COMPLETION_CLAIM,
+    ROLE_REVIEW_DIFF,
     ROLE_RUN_EVIDENCE,
     ROLE_WORKER_CLAIM,
     EvidenceKind,
@@ -475,7 +478,11 @@ def record_collection_evidence(
             payload=diff_payload,
         )
     for collected in outputs.artifacts:
-        if collected.type != "run_evidence":
+        if collected.type == REVIEW_DIFF_TYPE and collected.name == REVIEW_DIFF_NAME:
+            role = ROLE_REVIEW_DIFF
+        elif collected.type == "run_evidence":
+            role = ROLE_RUN_EVIDENCE
+        else:
             continue
         artifact_id: str | None = None
         try:
@@ -499,7 +506,7 @@ def record_collection_evidence(
             kind=EvidenceKind.ARTIFACT_PRESENT,
             source=EvidenceSource.CRUCIBLE,
             payload={
-                "role": ROLE_RUN_EVIDENCE,
+                "role": role,
                 "path": collected.name,
                 "size": len(collected.content),
             },
