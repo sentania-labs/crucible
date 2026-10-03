@@ -89,7 +89,7 @@ def test_agy_declares_parallel_writable_copies_and_codex_does_not() -> None:
 def test_supervisor_harness_cap_two_counts_until_collection(
     monkeypatch: pytest.MonkeyPatch, harness: str, state: AttemptState
 ) -> None:
-    monkeypatch.setattr("crucible.application.supervisor.load_routing", lambda *_: None)
+    monkeypatch.setattr("crucible.application.supervisor.load_attempt_routing", lambda *_: None)
     supervisor = Supervisor(
         MagicMock(), {}, FakeClock(NOW), holder="test", artifact_store=MagicMock()
     )
@@ -101,12 +101,12 @@ def test_supervisor_harness_cap_two_counts_until_collection(
         model="model",
         policy_snapshot={"concurrency": {"per_harness": {harness: 2}}},
     )
-    live = [SimpleNamespace(execution_id="first", state=state)]
+    live = [SimpleNamespace(routing_version=None, execution_id="first", state=state)]
     uow: Any = MagicMock()
     uow.attempts.list_in_states.side_effect = lambda states: [a for a in live if a.state in states]
     uow.executions.get.side_effect = lambda _: execution
     assert supervisor._harness_busy_in_uow(uow, execution) is None
-    live.append(SimpleNamespace(execution_id="second", state=state))
+    live.append(SimpleNamespace(routing_version=None, execution_id="second", state=state))
     assert supervisor._harness_busy_in_uow(uow, execution) == (
         f"2 of 2 {harness} worker(s) already running"
     )
@@ -118,7 +118,7 @@ def test_supervisor_harness_cap_two_counts_until_collection(
 def test_supervisor_keeps_unsafe_writable_adapter_serial(
     monkeypatch: pytest.MonkeyPatch, mode: MountMode
 ) -> None:
-    monkeypatch.setattr("crucible.application.supervisor.load_routing", lambda *_: None)
+    monkeypatch.setattr("crucible.application.supervisor.load_attempt_routing", lambda *_: None)
     adapter = CodexAdapter()
     supervisor = Supervisor(
         MagicMock(),
@@ -135,7 +135,9 @@ def test_supervisor_keeps_unsafe_writable_adapter_serial(
         policy_snapshot={"concurrency": {"per_harness": {"codex": 2}}},
     )
     uow: Any = MagicMock()
-    uow.attempts.list_in_states.return_value = [SimpleNamespace(execution_id="first")]
+    uow.attempts.list_in_states.return_value = [
+        SimpleNamespace(routing_version=None, execution_id="first")
+    ]
     uow.executions.get.return_value = execution
     expected = "1 of 1 codex worker(s) already running" if mode is MountMode.RW_NARROW else None
     assert supervisor._harness_busy_in_uow(uow, execution) == expected

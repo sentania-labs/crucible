@@ -226,6 +226,61 @@ async def test_quota_exit_commits_wip_marks_pool_and_reroutes_to_another_pool(
     assert attempts[1]["state"] == "succeeded"
 
 
+async def test_a_quota_reroute_never_launches_a_model_disabled_in_the_current_version(
+    client: TestClient,
+    ctx: AppContext,
+    clock: FakeClock,
+    supervisor: Supervisor,
+) -> None:
+    """hades #254: v80 has a and b; the first attempt exits on quota in pool-a; v81,
+    published before the successor launches, disables b. The successor routes with v81
+    and pool-a excluded, so it is refused rather than launched on b."""
+    _install_policy(
+        ctx,
+        clock,
+        version=80,
+        models=[
+            _model("a-quota-model", "codex", "pool-a"),
+            _model("b-success-model", "agy", "pool-b"),
+        ],
+    )
+    _promote(ctx, clock, "codex", "crucible-worker:fake-quota")
+    _promote(ctx, clock, "agy", "crucible-worker:fake-succeed")
+    task_id = _submit(client, "C6B-REROUTE-254", 80)
+
+    await supervisor.tick()
+    midway = client.get(f"/v1/tasks/{task_id}").json()
+    assert midway["state"] == "scheduled", midway
+    attempts = midway["executions"][0]["attempts"]
+    assert [item["pool"] for item in attempts] == ["pool-a", None]
+
+    disabled = _model("b-success-model", "agy", "pool-b")
+    disabled["enabled"] = False
+    _install_policy(
+        ctx,
+        clock,
+        version=81,
+        models=[_model("a-quota-model", "codex", "pool-a"), disabled],
+    )
+
+    await supervisor.tick()
+    final = client.get(f"/v1/tasks/{task_id}").json()
+    attempts = final["executions"][0]["attempts"]
+    assert all(item["model"] != "b-success-model" for item in attempts), attempts
+    assert attempts[1]["state"] != "succeeded"
+    assert not any(
+        event["kind"] == "attempt_routed" and event["payload"]["model"] == "b-success-model"
+        for event in _events(client, task_id)
+    )
+    with ctx.uow_factory() as uow:
+        successor = uow.attempts.get(attempts[1]["id"])
+        assert successor is not None
+        assert successor.selected_model is None
+        execution = uow.executions.get(successor.execution_id)
+        assert execution is not None
+        assert execution.policy_snapshot["routing"]["policy"]["version"] == 80
+
+
 async def test_all_pools_wait_and_a_restarted_supervisor_resumes_on_schedule(
     client: TestClient,
     ctx: AppContext,

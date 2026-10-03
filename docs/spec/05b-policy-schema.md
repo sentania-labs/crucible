@@ -309,7 +309,12 @@ answered 5xx) and the previous finished attempt on that pool did too, the
 pool is marked for its `default_cooldown_seconds`, with that reason; the
 mark is listed and cleared like a quota mark. One provider error marks
 nothing, and a subscription model's provider error marks nothing. A pool
-at its `max_concurrency` is not excluded: the launch waits for a slot. (Decided 2026-09-29 on the operator's direction: "Hermes is not
+at its `max_concurrency` is not excluded: the launch waits for a slot. A
+review attempt holds a slot of its model's pool like an implement attempt
+(hades #359), and the cap that binds is the smaller of the pool's
+`max_concurrency` in the routing version the attempt routes with and in the
+newest version of the same routing policy that is not retired, so a cap an
+operator lowers binds for tasks pinned to an older version. (Decided 2026-09-29 on the operator's direction: "Hermes is not
 the anti-route. It should probably be close to our default doer with
 frontier being hard structural problems for scoping of items for
 hermes/qwen.")
@@ -426,7 +431,26 @@ contract, the compose smoke, the fixtures, and the tiers all reference, so
 the verified roster is what a fresh deployment routes with. Version 1 stays
 beside it naming `default-routing` version 1, because a policy version is
 immutable once referenced. Where a caller names no version, the newest
-version of the policy is the one that applies. The Codex pool in version 2 is exactly the
+version of the policy is the one that applies.
+
+`routing.policy.pinned` (a strict boolean, default false) decides which routing
+version an attempt routes with (hades #254). Unpinned, every attempt, including a
+correction or retry inside an existing execution, routes with the newest version of
+the named routing policy at the moment it is routed: the newest version above the
+referenced one that is not retired and that some policy references, as publishing
+leaves it. A version only uploaded and never published is not chosen, and a retired
+reference never falls back to an older version. Pinned, the referenced version is
+used. A quota reroute and a resumed quota wait follow the same rule, with the
+exhausted pool excluded from the reroute. The task's policy snapshot is never
+rewritten. The version used is recorded on the attempt as `routing_version`, and the
+attempt's spec, pool reservation, harness count and exit read that version, not a
+newer one. A routing version an attempt recorded is immutable: `PUT
+/routing/{name}/{version}` refuses to rewrite it with 409, as it does for a version a
+policy references. A review is not routed; it records the current version when it
+starts preparing and is refused if its model is disabled there or the
+entry pairs the model with a harness other than the one the review launches; a
+refused review holds no pool slot. A pool is marked exhausted only for an attempt
+whose recorded pool and harness match its model's entry in its routing version. The Codex pool in version 2 is exactly the
 operator's roster decision: `gpt-5.6-luna` small, `gpt-5.6-terra` mid, `gpt-5.6-sol` and
 `gpt-6-astra` frontier. Nothing older and no mini; `gpt-5.5` is a recorded
 fallback outside the pool. The ids come from the CLI's own listing, the cost

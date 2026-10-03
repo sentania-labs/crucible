@@ -67,7 +67,7 @@ def _finish_at_cap(*, local: bool, turns: bool) -> tuple[Task, Execution, Attemp
     )
     routing = MagicMock()
     routing.model.return_value = SimpleNamespace(endpoint="local" if local else "subscription")
-    with patch("crucible.application.supervisor.load_routing", return_value=routing):
+    with patch("crucible.application.supervisor.load_attempt_routing", return_value=routing):
         supervisor._classify_and_finish(uow, attempt, None, turn_cap_reached=turns)
     return task, execution, attempt, uow
 

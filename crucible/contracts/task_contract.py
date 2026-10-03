@@ -235,7 +235,9 @@ class CorrectionAddress(StrictModel):
 
 class Correction(StrictModel):
     of_version: int = Field(ge=1)
-    reason: Literal["external_review", "ci_certification", "needs_more_work", "pre_pr_gates"]
+    reason: Literal[
+        "external_review", "ci_certification", "needs_more_work", "pre_pr_gates", "internal_review"
+    ]
     addresses: list[CorrectionAddress]
     instructions: str = Field(min_length=1)
     resume_from: Literal["remote_branch"]
