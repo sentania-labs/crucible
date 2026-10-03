@@ -14,6 +14,7 @@ from crucible.application.admin import (
     audit,
     board,
     credentials,
+    delivery,
     gateway,
     github,
     github_manifest,
@@ -901,3 +902,22 @@ def admin_audit(
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
 ) -> dict[str, Any]:
     return audit.tail(uow, cursor=cursor, limit=limit)
+
+
+@router.get("/admin/delivery/auto-merge")
+def admin_auto_merge(ctx: Ctx, uow: UoW, _principal: Admin) -> dict[str, Any]:
+    return delivery.auto_merge_view(uow)
+
+
+@router.post("/admin/delivery/auto-merge")
+def admin_save_auto_merge(
+    ctx: Ctx,
+    uow: UoW,
+    principal: Admin,
+    body: Annotated[dict[str, Any], Body()],
+) -> dict[str, Any]:
+    result = delivery.save_auto_merge(
+        _admin(ctx), uow, principal=principal, enabled=body.get("enabled"), reason=_reason(body)
+    )
+    uow.commit()
+    return result

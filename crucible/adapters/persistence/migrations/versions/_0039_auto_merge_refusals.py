@@ -1,7 +1,7 @@
 """Persist auto-merge refusals and retry state.
 
-Revision ID: 0036_auto_merge_refusals
-Revises: 0035_credential_renewer
+Revision ID: 0039_auto_merge_refusals
+Revises: 0037_cred_refresh_cursor, 0038_attempt_routing_version
 """
 
 from __future__ import annotations
@@ -9,16 +9,16 @@ from __future__ import annotations
 import sqlalchemy as sa
 from alembic import op
 
-from crucible.adapters.persistence.migrations.versions._0035_credential_renewer import (
+from crucible.adapters.persistence.migrations.versions._0036_cred_refresh_request import (
     _event_kinds as _previous_event_kinds,
 )
 
-revision = "0036_auto_merge_refusals"
-down_revision = "0035_credential_renewer"
+revision = "0039_auto_merge_refusals"
+down_revision = ("0037_cred_refresh_cursor", "0038_attempt_routing_version")
 branch_labels = None
 depends_on = None
 
-EVENT_KINDS = ("pull_request_merge_result_ignored",)
+EVENT_KINDS = ("auto_merge_updated",)
 
 
 def _event_kinds() -> list[str]:

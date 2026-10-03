@@ -234,6 +234,13 @@ class GitHubClient(Protocol):
         self, token: InstallationToken, *, repository: str, number: int
     ) -> PullRequestRef: ...
 
+    def open_pull_requests(
+        self, token: InstallationToken, *, repository: str, head_branch: str
+    ) -> Sequence[PullRequestRef]:
+        """Every open pull request from the work branch, lowest number first (hades
+        #379): a reopened older one beside the task's own is seen too."""
+        ...
+
     def create_pull_request(
         self,
         token: InstallationToken,

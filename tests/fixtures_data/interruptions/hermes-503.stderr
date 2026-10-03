@@ -1,0 +1,2 @@
+crucible-hermes: working, session updated
+openai.InternalServerError: Error code: 503 - {'error': {'message': 'Service Unavailable', 'type': 'service_unavailable'}}

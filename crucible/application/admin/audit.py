@@ -9,6 +9,7 @@ from crucible.ports.repository import UnitOfWork
 
 ADMIN_KINDS: frozenset[str] = frozenset(
     {
+        EventKind.AUTO_MERGE_UPDATED.value,
         EventKind.HARNESS_ENABLED.value,
         EventKind.HARNESS_DISABLED.value,
         EventKind.CREDENTIAL_VALIDATED.value,

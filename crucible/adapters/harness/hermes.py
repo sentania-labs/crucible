@@ -26,9 +26,16 @@ from pathlib import Path
 from typing import Any
 
 from crucible.adapters.harness import base
+from crucible.adapters.harness.interruption import (
+    ProviderFailure,
+    interruption_from,
+    status_line,
+    tail_lines,
+)
 from crucible.domain.exit_class import EXIT_CODE_BLOCKED, ExitClass, classify_exit
 from crucible.domain.harness_concurrency import HARNESS_CONCURRENCY
 from crucible.domain.harness_settings import hermes_run_limits
+from crucible.domain.infrastructure import Interruption
 from crucible.ports.harness import (
     HERMES_BINARY,
     AdapterLaunch,
@@ -66,6 +73,25 @@ PROVIDER_PATTERNS = base.patterns(
     "HTTP 502",
     "HTTP 503",
     "HTTP 504",
+)
+# Hades #353: what Hermes's OpenAI client writes for the call it failed on. The client
+# renders a status error as "Error code: 503 - {...}" and a call with no answer as
+# "Connection error." or "Request timed out."; the gateway's own page names its status.
+_CLIENT_STATUS = re.compile(r"\bError code: (\d{3})\b")
+_GATEWAY_WORDS = (
+    ("bad gateway", 502),
+    ("service unavailable", 503),
+    ("gateway timeout", 504),
+    ("http 502", 502),
+    ("http 503", 503),
+    ("http 504", 504),
+)
+TRANSPORT_PATTERNS = base.patterns(
+    "connection refused",
+    "connection reset",
+    "connection error",
+    "failed to connect",
+    "request timed out",
 )
 QUOTA_PATTERNS = base.patterns(
     "quota exceeded",
@@ -125,6 +151,21 @@ def _limit_reached(document: Mapping[str, Any] | None) -> str | None:
         f"Hermes reached its turn limit of {document.get('max_turns')} "
         f"after {calls} model calls and stopped before finishing"
     )
+
+
+def _client_failure(*tails: str) -> ProviderFailure | None:
+    """The last line in which Hermes's client reported the model call it failed on."""
+    for line in tail_lines(*tails):
+        text = line.strip()
+        lowered = text.lower()
+        client = _CLIENT_STATUS.search(text)
+        status = int(client.group(1)) if client else status_line(text)
+        if status is None:
+            status = next((code for words, code in _GATEWAY_WORDS if words in lowered), None)
+        transport = base.first_match((text,), TRANSPORT_PATTERNS) is not None
+        if status is not None or transport:
+            return ProviderFailure(text[:2000], status=status, transport=transport)
+    return None
 
 
 class HermesAdapter:
@@ -270,12 +311,17 @@ class HermesAdapter:
         tails = (stdout_tail[-base.TAIL_LIMIT :], stderr_tail[-base.TAIL_LIMIT :])
         quota = base.first_match(tails, QUOTA_PATTERNS) is not None
         provider_error = base.first_match(tails, PROVIDER_PATTERNS) is not None
+        interruption = self.interruption(exit, stdout_tail, stderr_tail, report_dir)
         if usage is not None and usage.get("failed") is True:
             if quota:
                 return ExitClass.QUOTA_EXHAUSTED
+            if interruption is not None:
+                return interruption.exit_class
             return ExitClass.PROVIDER_ERROR if provider_error else ExitClass.CRASHED
         if exit.exit_code == EXIT_CODE_BLOCKED:
-            return ExitClass.QUOTA_EXHAUSTED if quota else ExitClass.PROVIDER_ERROR
+            if quota:
+                return ExitClass.QUOTA_EXHAUSTED
+            return interruption.exit_class if interruption is not None else ExitClass.PROVIDER_ERROR
         if provider_error:
             return ExitClass.PROVIDER_ERROR
         if usage is not None and usage.get("completed") is True:
@@ -291,6 +337,27 @@ class HermesAdapter:
             report_present=exit.report_present,
             blocked_present=exit.blocked_present,
         )
+
+    def interruption(
+        self,
+        exit: ExitInfo,
+        stdout_tail: str,
+        stderr_tail: str,
+        report_dir: Path | None = None,
+    ) -> Interruption | None:
+        """Hermes 0.19 writes no error event. Its own word that the provider failed is
+        the usage record's `failed: true` or its exit 75; the client's message for the
+        failed call then says whether the gateway answered 502, 503 or 504 or did not
+        answer at all. A 500 or a 4xx stays `provider_error`."""
+        if exit.lost or exit.timed_out or exit.killed or exit.oom_killed:
+            return None
+        if exit.blocked_present and exit.exit_code == 0:
+            return None
+        usage, _ = _usage(report_dir)
+        failed = usage is not None and usage.get("failed") is True
+        if not failed and exit.exit_code != EXIT_CODE_BLOCKED:
+            return None
+        return interruption_from(_client_failure(stdout_tail, stderr_tail))
 
 
 class CommandTracker(base.LineTracker):

@@ -55,8 +55,13 @@ CORRECTABLE_STATES = frozenset(
         TaskState.EXTERNAL_FEEDBACK_RECEIVED,
         TaskState.CI_CERTIFICATION_FAILED,
         TaskState.BLOCKED,
+        TaskState.READY_FOR_MERGE,
     }
 )
+# hades #379: a task ready for merge has passed its external round and CI. A correction
+# there answers Foundry's own judgement of the full diff, a needs_more_work or an
+# internal review finding; an external review or CI finding has its own state.
+READY_FOR_MERGE_REASONS = frozenset({"needs_more_work", "internal_review"})
 AMENDABLE_STATES = frozenset(
     {TaskState.SUBMITTED, TaskState.BLOCKED, TaskState.AWAITING_ACCEPTANCE}
 )
@@ -74,6 +79,36 @@ def _unpublished_bundle_problem(
     if work is None:
         return {"path": "correction", "message": PREVIOUS_BUNDLE_GONE}
     attempt, execution = work
+    exited = uow.events.latest_for_task_kind(task.id, EventKind.ATTEMPT_EXITED.value)
+    if (
+        exited is not None
+        and exited.attempt_id == attempt.id
+        and (
+            exited.payload.get("never_started") is True or exited.payload.get("no_commits") is True
+        )
+    ):
+        # Hades #346: an attempt that never started (or ended before committing) left
+        # no bundle of its own, and it does not discard the work before it. The checks
+        # below run against the last attempt that did start and seal a bundle.
+        sealed = [
+            candidate
+            for candidate in uow.attempts.list_for_task(task.id)
+            if any(
+                row.kind == "bundle_head" and row.verified and row.payload.get("bundle_verified")
+                for row in uow.evidence.list_for_attempt(candidate.id)
+            )
+        ]
+        if not sealed:
+            # Nothing was ever sealed: with no head the correction starts from the base
+            # like the first attempt did; a head with no bundle anywhere cannot resume.
+            return (
+                {"path": "correction", "message": PREVIOUS_BUNDLE_GONE} if task.head_sha else None
+            )
+        attempt = max(sealed, key=lambda candidate: candidate.id)
+        source_execution = uow.executions.get(attempt.execution_id)
+        if source_execution is None:
+            return {"path": "correction", "message": PREVIOUS_BUNDLE_GONE}
+        execution = source_execution
     if execution.provider != provider:
         return {"path": "execution_request.provider", "message": PREVIOUS_BUNDLE_OTHER_PROVIDER}
     evidence = next(
@@ -188,6 +223,20 @@ def attach_correction(
     bundle_problem = _unpublished_bundle_problem(uow, task, contract.execution_request.provider)
     if bundle_problem is not None:
         problems.append(bundle_problem)
+    if (
+        task.state is TaskState.READY_FOR_MERGE
+        and contract.correction.reason not in READY_FOR_MERGE_REASONS
+    ):
+        problems.append(
+            {
+                "path": "correction.reason",
+                "message": (
+                    "a correction from ready_for_merge gives reason "
+                    f"{' or '.join(sorted(READY_FOR_MERGE_REASONS))}; "
+                    f"this one gives {contract.correction.reason}"
+                ),
+            }
+        )
     if task.state is TaskState.AWAITING_ACCEPTANCE:
         # The current verdict only. A needs_more_work that a later accept superseded is
         # not a standing request for more work.

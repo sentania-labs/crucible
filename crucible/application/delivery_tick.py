@@ -16,17 +16,22 @@ import asyncio
 import logging
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from functools import partial
 from typing import Any, Protocol, TypeVar
 
+from crucible.application.auto_merge import auto_merge_enabled, certified_jobs_green
+from crucible.application.decisions import open_escalation
 from crucible.application.observation import (
     OBSERVED_STATES,
+    POLLED_STATES,
     ObservationResult,
     advance_delivery,
     apply_observation,
+    correction_in_flight,
     evaluate_delivery_gates,
+    observe_state,
     policy_for,
     poll_due,
     settle_pull_request_state,
@@ -56,18 +61,63 @@ from crucible.domain.entities import PullRequestState, Task
 from crucible.domain.events import PRINCIPAL_CRUCIBLE, EventKind
 from crucible.domain.exit_class import ExitClass
 from crucible.domain.external_review import completed_rounds
-from crucible.domain.lifecycle import TaskState
+from crucible.domain.lifecycle import CORRECTION_STATES, TaskState
 from crucible.domain.publication import body_sha256
 from crucible.domain.secrets import redact
 from crucible.domain.waivers import WAIVER_KINDS
 from crucible.ports.clock import Clock
-from crucible.ports.github import GitHubClient, GitHubError, InstallationToken, MergeResult
+from crucible.ports.github import (
+    GitHubClient,
+    GitHubError,
+    InstallationToken,
+    MergeResult,
+    Observation,
+    PullRequestRef,
+)
 from crucible.ports.publish import Publisher, PublishRequest
 from crucible.ports.repository import UnitOfWork
 
 log = logging.getLogger("crucible.delivery")
 
+
+def _other_pull_request_note(others: tuple[PullRequestRef, ...]) -> str:
+    named = " and ".join(f"#{other.number} ({other.state})" for other in others)
+    if len(others) == 1:
+        return (
+            f"pull request {named} is also on the work branch; it is not the task's and "
+            "is not adopted"
+        )
+    return (
+        f"pull requests {named} are also on the work branch; they are not the task's and "
+        "are not adopted"
+    )
+
+
+def _other_pull_request_fields(others: tuple[PullRequestRef, ...]) -> dict[str, Any]:
+    """The first other pull request by number and state, and every one of them."""
+    if not others:
+        return {}
+    return {
+        "other_pull_request": others[0].number,
+        "other_pull_request_state": others[0].state,
+        "other_pull_requests": [{"number": other.number, "state": other.state} for other in others],
+    }
+
+
 T = TypeVar("T")
+
+# hades #379: a task in one of these is done with its branch; a quota checkpoint is never
+# pushed to it or recorded against it.
+FINISHED_STATES: frozenset[TaskState] = frozenset(
+    {
+        TaskState.MERGED,
+        TaskState.RELEASE_CANDIDATE,
+        TaskState.RELEASED,
+        TaskState.REJECTED,
+        TaskState.CANCELLED,
+        TaskState.CLOSED,
+    }
+)
 
 
 class FencedHost(Protocol):
@@ -232,6 +282,11 @@ class DeliveryCoordinator:
             if required:
                 return False, "the GitHub publisher is not configured"
             return True, "a publisher is not required for this repository"
+        finished = await self._host._db(lambda: self._task_finished(attempt_id))
+        if finished is not None:
+            # hades #379: the task is merged or otherwise finished; a checkpoint pushed now
+            # would move its branch on with work nobody reviewed.
+            return False, f"the task is {finished.value}; the checkpoint is not pushed"
         plan = await self._host._db(lambda: self._checkpoint_plan(attempt_id))
         if plan is None:
             return True, "the attempt has no checkpoint to push"
@@ -257,7 +312,11 @@ class DeliveryCoordinator:
             )
             if remote != plan.head_sha:
                 return False, f"remote branch is at {remote}, expected {plan.head_sha}"
-            await self._host._db(lambda: self._record_pushed(plan, remote))
+            recorded = await self._host._db(
+                lambda: self._record_pushed(plan, remote, checkpoint=True)
+            )
+            if not recorded:
+                return False, "the task moved on while the checkpoint was pushed"
             return True, "checkpoint pushed"
         except GitHubError as exc:
             if exc.response_class == "rate_limited":
@@ -280,6 +339,14 @@ class DeliveryCoordinator:
             if task is None or execution is None or not task.head_sha:
                 return None
             return build_plan(uow, task, (attempt, execution))
+
+    def _task_finished(self, attempt_id: str) -> TaskState | None:
+        with self._host._fenced() as uow:
+            attempt = uow.attempts.get(attempt_id)
+            task = uow.tasks.get(attempt.task_id) if attempt is not None else None
+            if task is None or task.state not in FINISHED_STATES:
+                return None
+            return task.state
 
     def _publish_request(self, plan: PublishPlan) -> PublishRequest:
         return PublishRequest(
@@ -369,6 +436,9 @@ class DeliveryCoordinator:
         assert self._github is not None and self._publisher is not None
         token: InstallationToken | None = None
         github_step = "installation_token"
+        # hades #379: every other pull request found open on the work branch beside the
+        # task's own; none is adopted, and each is recorded and named in the wake.
+        others: tuple[PullRequestRef, ...] = ()
         try:
             token = await asyncio.to_thread(
                 self._github.installation_token,
@@ -376,6 +446,15 @@ class DeliveryCoordinator:
                 repository=plan.repository_name,
             )
             await self._host._db(lambda: self._record_minted(plan, token))
+            if plan.existing_pr_number is not None and plan.deliverable_kind != "branch":
+                # hades #379: the task's pull request is looked up before anything is
+                # pushed. One merged or closed meanwhile gets no corrected head on its
+                # branch, which a merge would leave behind the merged head (or a deleted
+                # branch would get back).
+                github_step = "github"
+                known, others = await self._known_pull_request(token, plan)
+                if known is None:
+                    return False
             github_step = "branch_pushed_at_head"
             if plan.resume_step not in ("branch_pushed_at_head", "github"):
                 outcome = await self._publisher.push(self._publish_request(plan), token)
@@ -387,6 +466,7 @@ class DeliveryCoordinator:
                             step=outcome.step,
                             detail=outcome.detail or f"the publisher exited {outcome.exit_code}",
                             extra={"remote_head_before": outcome.remote_head_before},
+                            others=others,
                         )
                     )
                     return False
@@ -405,20 +485,32 @@ class DeliveryCoordinator:
                             f"the remote branch is at {remote}, not the accepted head "
                             f"{plan.head_sha}"
                         ),
+                        others=others,
                     )
                 )
                 return False
-            await self._host._db(lambda: self._record_pushed(plan, remote))
+            if not await self._host._db(lambda: self._record_pushed(plan, remote)):
+                # hades #379: the task left publishing while the head was pushed (a poll
+                # settled it as merged); the push is escalated, and nothing more of this
+                # publication runs.
+                return False
             if plan.deliverable_kind == "branch":
                 await self._host._db(lambda: self._finish(plan, ref=None))
                 return True
             github_step = "github"
-            ref = await asyncio.to_thread(
-                self._github.find_pull_request,
-                token,
-                repository=plan.repository_name,
-                head_branch=plan.work_branch,
-            )
+            ref: PullRequestRef | None
+            if plan.existing_pr_number is not None:
+                # Looked up again: a merge or close can land while the head is pushed.
+                ref, others = await self._known_pull_request(token, plan)
+                if ref is None:
+                    return False
+            else:
+                ref = await asyncio.to_thread(
+                    self._github.find_pull_request,
+                    token,
+                    repository=plan.repository_name,
+                    head_branch=plan.work_branch,
+                )
             if ref is None or ref.state != "open":
                 ref = await asyncio.to_thread(
                     self._github.create_pull_request,
@@ -462,6 +554,7 @@ class DeliveryCoordinator:
                             f"contract: {'; '.join(mismatch)}"
                         ),
                         extra={"pull_request": resolved.number},
+                        others=others,
                     )
                 )
                 return False
@@ -482,7 +575,7 @@ class DeliveryCoordinator:
                     await self._host._db(
                         lambda: self._record_external_review_request(plan, resolved, comment)
                     )
-            await self._host._db(lambda: self._finish(plan, ref=resolved))
+            await self._host._db(lambda: self._finish(plan, ref=resolved, others=others))
             return True
         except GitHubError as exc:
             failure = exc
@@ -498,17 +591,58 @@ class DeliveryCoordinator:
                     step=github_step,
                     detail=failure.message,
                     response_class=failure.response_class,
+                    others=others,
                 )
             )
             return False
         except Exception as exc:  # the publisher or the transport, not a state change
             detail = f"{type(exc).__name__}: {exc}"
             log.warning("publication failed", extra={"task_id": plan.task_id, "error": detail})
-            await self._host._db(lambda: self._fail(plan, step="publish", detail=detail))
+            await self._host._db(
+                lambda: self._fail(plan, step="publish", detail=detail, others=others)
+            )
             return False
         finally:
             if token is not None:
                 token.discard()
+
+    async def _known_pull_request(
+        self, token: InstallationToken, plan: PublishPlan
+    ) -> tuple[PullRequestRef | None, tuple[PullRequestRef, ...]]:
+        """hades #379: the task's own pull request, open, to publish to; None when it is
+        merged or closed, which is then recorded. A task that has a pull request never
+        gets a second one: the task's own is read by its number, and every other pull
+        request open on the work branch (a reopened older one included) is never
+        adopted. Those come second, for the publication to record and name in its
+        wake."""
+        assert self._github is not None
+        number = plan.existing_pr_number
+        known = await asyncio.to_thread(
+            self._github.get_pull_request,
+            token,
+            repository=plan.repository_name,
+            number=number or 0,
+        )
+        listed = await asyncio.to_thread(
+            self._github.open_pull_requests,
+            token,
+            repository=plan.repository_name,
+            head_branch=plan.work_branch,
+        )
+        others = tuple(ref for ref in listed if ref.number != number)
+        if known.state == "open":
+            return known, others
+        if known.state == "closed" and not known.merged and not known.closed_by:
+            closer = await asyncio.to_thread(
+                self._github.closed_by,
+                token,
+                repository=plan.repository_name,
+                number=known.number,
+            )
+            known = replace(known, closed_by=closer)
+        gone = known
+        await self._host._db(lambda: self._record_pull_request_gone(plan, gone, others))
+        return None, others
 
     def _record_minted(self, plan: PublishPlan, token: InstallationToken | None) -> None:
         assert token is not None
@@ -545,8 +679,51 @@ class DeliveryCoordinator:
             )
             uow.commit()
 
-    def _record_pushed(self, plan: PublishPlan, remote: str | None) -> None:
+    def _record_pushed(
+        self, plan: PublishPlan, remote: str | None, *, checkpoint: bool = False
+    ) -> bool:
         with self._host._fenced() as uow:
+            task = uow.tasks.get(plan.task_id, for_update=True)
+            push_is_current = task is not None and (
+                (checkpoint and task.state not in FINISHED_STATES)
+                or (not checkpoint and task.state is TaskState.PUBLISHING)
+            )
+            if not push_is_current:
+                if task is not None:
+                    head = remote or plan.head_sha
+                    if checkpoint:
+                        # A checkpoint task was never publishing, and its push merged
+                        # nothing; the branch now carries an ungated head.
+                        summary = (
+                            f"a quota checkpoint was pushed to the branch of a task that is "
+                            f"already {task.state.value}; nothing was merged"
+                        )
+                        question = (
+                            f"{summary}. Head {head} is on the work branch and is not "
+                            "recorded; decide what becomes of the branch."
+                        )
+                        reason = WakeReason.CHECKPOINT_AFTER_FINISH
+                    else:
+                        summary = (
+                            f"head {head} was pushed after the task left publishing and is "
+                            f"already {task.state.value}"
+                        )
+                        question = (
+                            f"{summary}. The push is not recorded as the merged head; "
+                            "decide whether the merge and branch state stand."
+                        )
+                        reason = WakeReason.MERGED
+                    open_escalation(
+                        uow,
+                        self._clock,
+                        task=task,
+                        attempt_id=plan.attempt_id,
+                        question=question,
+                        wake_reason=reason,
+                        summary=summary,
+                    )
+                    uow.commit()
+                return False
             record_event(
                 uow,
                 self._clock,
@@ -558,9 +735,13 @@ class DeliveryCoordinator:
                     "work_branch": plan.work_branch,
                     "head_sha": remote,
                     "repository": plan.repository_name,
+                    # hades #379: a quota checkpoint is pushed before any gate ran; a
+                    # merge of it is escalated, never taken as a gated publication.
+                    "checkpoint": checkpoint,
                 },
             )
             uow.commit()
+            return True
 
     def _record_pull_request(self, plan: PublishPlan, ref: Any) -> None:
         with self._host._fenced() as uow:
@@ -574,6 +755,97 @@ class DeliveryCoordinator:
                 plan=plan,
                 ref=ref,
                 body_hash=body_sha256(plan.body),
+            )
+            uow.commit()
+
+    def _record_pull_request_gone(
+        self, plan: PublishPlan, known: PullRequestRef, others: tuple[PullRequestRef, ...]
+    ) -> None:
+        """hades #379: the task's pull request, `known`, is merged or closed. The merge
+        or close is recorded on the PR row as a poll would record it. A merge settles the
+        task as merged (merge wins); a close fails the publication with a wake naming the
+        pull request that says to reopen it and then republish, or to cancel, as the
+        poll's close wake does. A merge this row does not record offers no republish.
+        `others`, the pull requests open on the work branch beside it, are recorded
+        either way and named in a wake."""
+        with self._host._fenced() as uow:
+            task = uow.tasks.get(plan.task_id, for_update=True)
+            if task is None or task.state is not TaskState.PUBLISHING:
+                return
+            pull_request = uow.pull_requests.get_for_task(task.id, for_update=True)
+            number = plan.existing_pr_number
+            if pull_request is not None and known.number == pull_request.number:
+                observe_state(
+                    uow,
+                    self._clock,
+                    task=task,
+                    pull_request=pull_request,
+                    observation=Observation(pull_request=known),
+                    result=ObservationResult(),
+                )
+            if pull_request is not None and pull_request.state is PullRequestState.MERGED:
+                # Settled just now by the observation, or here for a merge recorded
+                # before this lookup; settling a task already merged does nothing.
+                settle_pull_request_state(uow, self._clock, task=task, pull_request=pull_request)
+                detail = (
+                    f"pull request #{number} was merged before the corrected head "
+                    f"{plan.head_sha} was published to it; no new pull request is opened"
+                )
+                if others:
+                    detail += f"; {_other_pull_request_note(others)}"
+                record_event(
+                    uow,
+                    self._clock,
+                    EventKind.TASK_PUBLISH_FAILED,
+                    principal=PRINCIPAL_CRUCIBLE,
+                    task_id=task.id,
+                    attempt_id=plan.attempt_id,
+                    payload={
+                        "step": "github",
+                        "detail": detail,
+                        "head_sha": plan.head_sha,
+                        "pull_request": number,
+                        "pull_request_state": "merged",
+                        **_other_pull_request_fields(others),
+                    },
+                )
+                if others:
+                    # The merge wake is about the task's own pull request; the others
+                    # on its branch are Foundry's to decide.
+                    create_wake(
+                        uow,
+                        self._clock,
+                        principal_id=task.principal_id,
+                        reason=WakeReason.OTHER_PULL_REQUEST_OPEN,
+                        summary=(
+                            f"pull request #{number} was merged; {_other_pull_request_note(others)}"
+                        )[:500],
+                        task=task,
+                        attempt_id=plan.attempt_id,
+                        extra_links={"pull_request": f"/v1/tasks/{task.id}/pull-request"},
+                    )
+                uow.commit()
+                return
+            state = "merged" if known.merged else known.state
+            closer = f" by {known.closed_by}" if known.closed_by else ""
+            detail = (
+                f"pull request #{known.number} is {state}{closer}; the corrected head "
+                f"{plan.head_sha} is not published to it and no new pull request is opened"
+            )
+            extra: dict[str, Any] = {"pull_request": number, "pull_request_state": state}
+            if others:
+                detail += f"; {_other_pull_request_note(others)}"
+                extra.update(_other_pull_request_fields(others))
+            fail_publish(
+                uow,
+                self._clock,
+                task,
+                step="github",
+                detail=detail,
+                attempt_id=plan.attempt_id,
+                extra=extra,
+                closed_pull_request=known.number if state == "closed" else None,
+                retryable=state == "closed",
             )
             uow.commit()
 
@@ -602,11 +874,17 @@ class DeliveryCoordinator:
         detail: str,
         response_class: str = "",
         extra: dict[str, Any] | None = None,
+        others: tuple[PullRequestRef, ...] = (),
     ) -> None:
         with self._host._fenced() as uow:
             task = uow.tasks.get(plan.task_id, for_update=True)
-            if task is None:
+            if task is None or task.state is not TaskState.PUBLISHING:
+                # hades #379: a poll moved the task on (a merge settles it as merged)
+                # while the publication ran; its failure no longer describes the task.
                 return
+            if others:
+                detail = f"{detail}; {_other_pull_request_note(others)}"
+                extra = {**(extra or {}), **_other_pull_request_fields(others)}
             fail_publish(
                 uow,
                 self._clock,
@@ -619,7 +897,9 @@ class DeliveryCoordinator:
             )
             uow.commit()
 
-    def _finish(self, plan: PublishPlan, *, ref: Any) -> None:
+    def _finish(
+        self, plan: PublishPlan, *, ref: Any, others: tuple[PullRequestRef, ...] = ()
+    ) -> None:
         with self._host._fenced() as uow:
             task = uow.tasks.get(plan.task_id, for_update=True)
             if task is None or task.state is not TaskState.PUBLISHING:
@@ -644,6 +924,7 @@ class DeliveryCoordinator:
                     "pull_request": pull_request.number if pull_request else None,
                     "url": pull_request.url if pull_request else None,
                     "body_sha256": body_hash,
+                    **_other_pull_request_fields(others),
                 },
             )
             rounds = 0
@@ -680,6 +961,22 @@ class DeliveryCoordinator:
                     head_sha=plan.head_sha,
                     policy=plan.policy,
                 )
+            if others and pull_request is not None:
+                # hades #379: published to the task's own pull request; the others on the
+                # work branch are not the task's, and Foundry decides what becomes of them.
+                create_wake(
+                    uow,
+                    self._clock,
+                    principal_id=task.principal_id,
+                    reason=WakeReason.OTHER_PULL_REQUEST_OPEN,
+                    summary=(
+                        f"head {plan.head_sha} was published to pull request "
+                        f"#{pull_request.number}; {_other_pull_request_note(others)}"
+                    )[:500],
+                    task=task,
+                    attempt_id=plan.attempt_id,
+                    extra_links={"pull_request": f"/v1/tasks/{task.id}/pull-request"},
+                )
             uow.commit()
 
     # ----- observation --------------------------------------------------
@@ -708,17 +1005,23 @@ class DeliveryCoordinator:
     def _ready_merges(self) -> list[MergePlan]:
         out: list[MergePlan] = []
         with self._host._fenced() as uow:
+            if not auto_merge_enabled(uow):
+                return out
             for task in uow.tasks.list_by_state(TaskState.READY_FOR_MERGE):
                 policy = policy_for(uow, task)
                 if not bool(policy.get("delivery", {}).get("auto_merge", True)):
                     continue
                 pull_request = uow.pull_requests.get_for_task(task.id)
-                if pull_request is None or pull_request.state is not PullRequestState.OPEN:
+                if (
+                    pull_request is None
+                    or pull_request.state is not PullRequestState.OPEN
+                    or pull_request.head_sha != task.head_sha
+                ):
                     continue
                 certification = uow.ci_certifications.get_for_head(
                     pull_request.id, task.head_sha or ""
                 )
-                if certification is None or certification.state not in ("green", "skipped"):
+                if not certified_jobs_green(certification):
                     continue
                 repository = uow.repositories.get(task.repository_id)
                 if repository is None or not task.head_sha:
@@ -798,6 +1101,10 @@ class DeliveryCoordinator:
                     )
                 )
                 return False
+            # Re-read the switch, accepted head and certification after GitHub I/O.
+            # A correction or an administrator may have changed them during the read.
+            if not await self._host._db(lambda: self._merge_still_allowed(plan)):
+                return False
             try:
                 result = await asyncio.to_thread(
                     self._github.merge_pull_request,
@@ -841,6 +1148,28 @@ class DeliveryCoordinator:
         await self._host._db(lambda: self._record_merge(plan, result))
         return True
 
+    def _merge_still_allowed(self, plan: MergePlan) -> bool:
+        with self._host._fenced() as uow:
+            if not auto_merge_enabled(uow):
+                return False
+            task = uow.tasks.get(plan.task_id)
+            pull_request = uow.pull_requests.get(plan.pull_request_id)
+            if (
+                task is None
+                or pull_request is None
+                or task.state is not TaskState.READY_FOR_MERGE
+                or task.head_sha != plan.certified_head_sha
+                or pull_request.head_sha != plan.certified_head_sha
+                or pull_request.base_ref != plan.base_ref
+                or pull_request.state is not PullRequestState.OPEN
+                or not policy_for(uow, task).get("delivery", {}).get("auto_merge", True)
+            ):
+                return False
+            certification = uow.ci_certifications.get_for_head(
+                pull_request.id, plan.certified_head_sha
+            )
+            return certified_jobs_green(certification)
+
     @staticmethod
     def _merge_result_from_ref(ref: Any) -> MergeResult | None:
         if not ref.merged or ref.merged_at is None or not ref.merged_by or not ref.merge_commit_sha:
@@ -855,6 +1184,7 @@ class DeliveryCoordinator:
             pull_request = uow.pull_requests.get(plan.pull_request_id, for_update=True)
             if task is None or pull_request is None or task.state is not TaskState.READY_FOR_MERGE:
                 return
+            cause = redact(cause)
             previous_cause = pull_request.merge_refusal_cause
             head = current.head_sha if current is not None else pull_request.head_sha
             base = current.base_ref if current is not None else pull_request.base_ref
@@ -895,38 +1225,31 @@ class DeliveryCoordinator:
         with self._host._fenced() as uow:
             task = uow.tasks.get(plan.task_id, for_update=True)
             pull_request = uow.pull_requests.get(plan.pull_request_id, for_update=True)
-            if (
-                task is None
-                or pull_request is None
-                or task.state is not TaskState.READY_FOR_MERGE
-                or task.head_sha != plan.certified_head_sha
-                or pull_request.head_sha != plan.certified_head_sha
-            ):
-                if task is not None:
-                    record_event(
-                        uow,
-                        self._clock,
-                        EventKind.PULL_REQUEST_MERGE_RESULT_IGNORED,
-                        principal=PRINCIPAL_CRUCIBLE,
-                        task_id=task.id,
-                        payload={
-                            "pull_request": plan.number,
-                            "certified_head_sha": plan.certified_head_sha,
-                            "merge_sha": result.sha,
-                            "task_state": task.state.value,
-                            "task_head_sha": task.head_sha,
-                            "pull_request_head_sha": (
-                                pull_request.head_sha if pull_request is not None else None
-                            ),
-                        },
-                    )
-                    uow.commit()
+            if task is None or pull_request is None or pull_request.number != plan.number:
                 return
-            pull_request.state = PullRequestState.MERGED
-            pull_request.merge_sha = result.sha
-            pull_request.merged_at = result.merged_at
-            pull_request.merged_by = result.merged_by
-            uow.pull_requests.save(pull_request)
+            # A response describes a merge that already happened. Record it even if a
+            # correction started while the request was in flight, using the same
+            # merge-wins settlement as observation (hades #379).
+            observe_state(
+                uow,
+                self._clock,
+                task=task,
+                pull_request=pull_request,
+                observation=Observation(
+                    pull_request=PullRequestRef(
+                        number=plan.number,
+                        url=pull_request.url,
+                        head_sha=plan.certified_head_sha,
+                        base_ref=plan.base_ref,
+                        state="closed",
+                        merged=True,
+                        merged_at=result.merged_at,
+                        merged_by=result.merged_by,
+                        merge_commit_sha=result.sha,
+                    )
+                ),
+                result=ObservationResult(),
+            )
             settle_pull_request_state(uow, self._clock, task=task, pull_request=pull_request)
             uow.commit()
 
@@ -935,7 +1258,7 @@ class DeliveryCoordinator:
         out: list[PollPlan] = []
         with self._host._fenced() as uow:
             forced = self._forced_pull_requests(uow)
-            for state in sorted(OBSERVED_STATES, key=lambda s: s.value):
+            for state in sorted(POLLED_STATES, key=lambda s: s.value):
                 for task in uow.tasks.list_by_state(state):
                     pull_request = uow.pull_requests.get_for_task(task.id)
                     if pull_request is None or pull_request.state in (
@@ -965,6 +1288,9 @@ class DeliveryCoordinator:
                         )
                     if not due:
                         continue
+                    # hades #360: a correction's poll only looks for the merge, so it
+                    # fetches neither reactions nor a failed check's log.
+                    correcting = correction_in_flight(uow, task)
                     work = latest_work_attempt(uow, task)
                     if work is None:
                         continue
@@ -980,8 +1306,12 @@ class DeliveryCoordinator:
                             installation_id=repository.installation_id,
                             base_ref=pull_request.base_ref,
                             attempt_id=work[0].id,
-                            with_reactions=with_reactions,
-                            failed_check=self._failed_check(uow, pull_request.id, task),
+                            with_reactions=with_reactions and not correcting,
+                            failed_check=(
+                                None
+                                if correcting
+                                else self._failed_check(uow, pull_request.id, task)
+                            ),
                         )
                     )
             uow.commit()
@@ -1002,7 +1332,7 @@ class DeliveryCoordinator:
             uow.github_deliveries.mark_processed(delivery.delivery_id, now)
             if not number:
                 continue
-            for state in OBSERVED_STATES:
+            for state in POLLED_STATES:
                 for task in uow.tasks.list_by_state(state):
                     pull_request = uow.pull_requests.get_for_task(task.id)
                     if pull_request is not None and pull_request.number == number:
@@ -1147,7 +1477,30 @@ class DeliveryCoordinator:
         This is also what turns a disposition recorded through the API into progress
         without waiting for the next poll. A task whose pull request is already recorded
         merged or closed is moved here, because such a pull request is never polled again
-        (hades FDY-0139)."""
+        (hades FDY-0139), and so is a task whose correction was under way when its pull
+        request was recorded merged (hades #360)."""
+        # hades #379: a correction's tasks are read without a lock, and only one whose
+        # pull request is recorded merged is locked, in a transaction of its own that
+        # reads it again. Locking every scheduled or running task each tick held rows
+        # the supervisor was about to write, for nothing.
+        with self._host._fenced() as uow:
+            merged = [
+                task.id
+                for state in sorted(CORRECTION_STATES, key=lambda s: s.value)
+                for task in uow.tasks.list_by_state(state)
+                if (pull_request := uow.pull_requests.get_for_task(task.id)) is not None
+                and pull_request.state is PullRequestState.MERGED
+            ]
+        for task_id in merged:
+            with self._host._fenced() as uow:
+                task = uow.tasks.get(task_id, for_update=True)
+                if task is None or task.state not in CORRECTION_STATES:
+                    continue
+                pull_request = uow.pull_requests.get_for_task(task.id, for_update=True)
+                if pull_request is None or pull_request.state is not PullRequestState.MERGED:
+                    continue
+                settle_pull_request_state(uow, self._clock, task=task, pull_request=pull_request)
+                uow.commit()
         with self._host._fenced() as uow:
             for state in sorted(OBSERVED_STATES, key=lambda s: s.value):
                 for task in uow.tasks.list_by_state(state, for_update=True):

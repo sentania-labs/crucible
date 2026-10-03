@@ -44,6 +44,7 @@ class SupervisorSettings(BaseModel):
     attempt_lease_ttl_seconds: int = 60
     checkout_lease_ttl_seconds: int = 21600
     grace_seconds: int = 60
+    collection_retry_ticks: int = Field(default=5, ge=1)
     holder: str | None = None
 
 

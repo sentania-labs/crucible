@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, StrictBool, field_validator, model_validator
 
 from crucible.contracts.common import StrictModel, check_major_version
 from crucible.domain.command_timeout import DEFAULT_COMMAND_TIMEOUT_BOUNDS
@@ -148,7 +148,8 @@ class NamedVersion(StrictModel):
 class RoutingPolicyRef(NamedVersion):
     # A delivery policy normally follows new versions of the named routing policy.
     # Set this only when an operator deliberately wants this exact version retained.
-    pinned: bool = False
+    # Strict, so a string such as "true" is refused rather than read as unpinned.
+    pinned: StrictBool = False
 
 
 class RoutingRef(StrictModel):

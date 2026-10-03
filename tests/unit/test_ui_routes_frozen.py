@@ -7,6 +7,7 @@ from crucible.adapters.ui.router import router
 
 FROZEN_ROUTES = [
     ("GET", "/ui"),
+    ("GET", "/ui/artifacts/{artifact_id}/content"),
     ("GET", "/ui/audit"),
     ("GET", "/ui/board"),
     ("GET", "/ui/bootstrap"),
@@ -39,6 +40,7 @@ FROZEN_ROUTES = [
 ]
 
 FROZEN_ACTIONS = [
+    "auto-merge",
     "bootstrap-commit",
     "bootstrap-discard",
     "command-timeout",

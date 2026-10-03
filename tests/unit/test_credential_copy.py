@@ -626,7 +626,8 @@ async def test_a_start_that_fails_after_seeding_removes_the_copy_through_the_dae
     )
     launch = spec()
     ws = workspace(tmp_path, launch.attempt_id)
-    with pytest.raises(ProviderError, match="could not start the worker"):
+    # Hades #346: a refused /start is a start failure, still a ProviderError.
+    with pytest.raises(ProviderError, match="the worker never started: no such image layer"):
         await provider.launch(ws, launch)
     assert len(client.archives) == 1, "the copy was seeded before the start failed"
     assert client.removed and client.removed[0] == "container-1"
