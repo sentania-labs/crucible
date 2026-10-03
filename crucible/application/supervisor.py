@@ -5476,15 +5476,10 @@ class Supervisor:
             return
         task.resume_at = self._clock.now() + timedelta(minutes=3)
         uow.tasks.save(task)
+        # The same resume rule as any further attempt (_create_attempt): a checkpoint
+        # already pushed to the work branch is where the retry starts; otherwise the
+        # launch resumes from the last sealed bundle.
         nxt = self._create_attempt(uow, execution, number=attempt.number + 1)
-        if any(
-            row.kind == EvidenceKind.BUNDLE_HEAD.value
-            and row.verified
-            and row.payload.get("bundle_verified")
-            for row in uow.evidence.list_for_attempt(attempt.id)
-        ):
-            nxt.resume_from_remote = False
-            uow.attempts.save(nxt)
         move_task(
             uow,
             self._clock,
