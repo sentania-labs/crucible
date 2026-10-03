@@ -69,3 +69,8 @@ if ! $docker run "${pod[@]}" "${in_repo[@]}" --network none -e UV_OFFLINE=1 --en
     echo "unit tier fails inside the worker image ($image)" >&2
     exit 1
 fi
+
+if $docker run "${pod[@]}" "${in_repo[@]}" --network none -e UV_OFFLINE=1 --entrypoint uv "$image" run pytest -p no:cacheprovider -rs tests/unit/test_issue_388_context_budget.py::test_hermes_itself_agrees_where_it_is_installed | grep -q "SKIPPED"; then
+    echo "test_hermes_itself_agrees_where_it_is_installed skipped in image" >&2
+    exit 1
+fi
