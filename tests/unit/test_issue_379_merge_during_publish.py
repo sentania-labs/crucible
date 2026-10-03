@@ -509,6 +509,35 @@ def test_the_tasks_open_pull_request_wins_over_another_open_pr_on_the_branch(
     assert github.created == []
     assert github.updated == [PR_NUMBER]
     assert _task(store).state is not TaskState.PUBLISH_FAILED
+    # The other open PR is recorded with its number and named in a wake.
+    completed = store.events.latest_for_task_kind(TASK_ID, EventKind.PUBLISH_COMPLETED.value)
+    assert completed is not None
+    assert completed.payload["pull_request"] == PR_NUMBER
+    assert completed.payload["other_pull_request"] == PR_NUMBER + 1
+    assert completed.payload["other_pull_request_state"] == "open"
+    wakes = _wakes(store, "other_pull_request_open")
+    assert len(wakes) == 1
+    assert f"published to pull request #{PR_NUMBER}" in wakes[0]
+    assert f"pull request #{PR_NUMBER + 1} (open) is also on the work branch" in wakes[0]
+    assert "not adopted" in wakes[0]
+
+
+def test_another_open_pr_is_named_when_the_publication_then_fails(tmp_path: Path) -> None:
+    store, _clock, supervisor, github, publisher = _correcting(tmp_path)
+    github.known = _open(OLD_HEAD)
+    github.lookups = [_open(OLD_HEAD, number=PR_NUMBER + 1)]
+    publisher.outcome = PublishOutcome(
+        pushed=False, head_sha=NEW_HEAD, step="push", detail="the push was rejected"
+    )
+
+    assert _publish(supervisor) == 0
+
+    assert _task(store).state is TaskState.PUBLISH_FAILED
+    failed = store.events.latest_for_task_kind(TASK_ID, EventKind.TASK_PUBLISH_FAILED.value)
+    assert failed is not None and failed.payload["other_pull_request"] == PR_NUMBER + 1
+    wakes = _wakes(store, "publish_failed")
+    assert len(wakes) == 1 and f"pull request #{PR_NUMBER + 1} (open)" in wakes[0]
+    assert _wakes(store, "other_pull_request_open") == []
 
 
 def test_another_pull_request_on_the_branch_with_the_own_one_merged_settles_merged(

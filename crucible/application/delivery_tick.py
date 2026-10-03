@@ -53,6 +53,7 @@ from crucible.application.publish import (
 )
 from crucible.application.review import latest_work_attempt
 from crucible.application.transitions import record_event
+from crucible.application.wakes import create_wake
 from crucible.contracts.wake import WakeReason
 from crucible.domain.entities import PullRequestState, Task
 from crucible.domain.events import PRINCIPAL_CRUCIBLE, EventKind
@@ -74,6 +75,18 @@ from crucible.ports.publish import Publisher, PublishRequest
 from crucible.ports.repository import UnitOfWork
 
 log = logging.getLogger("crucible.delivery")
+
+
+def _other_pull_request_note(other: PullRequestRef) -> str:
+    return (
+        f"pull request #{other.number} ({other.state}) is also on the work branch; it is "
+        "not the task's and is not adopted"
+    )
+
+
+def _other_pull_request_fields(other: PullRequestRef) -> dict[str, Any]:
+    return {"other_pull_request": other.number, "other_pull_request_state": other.state}
+
 
 T = TypeVar("T")
 
@@ -396,6 +409,9 @@ class DeliveryCoordinator:
         assert self._github is not None and self._publisher is not None
         token: InstallationToken | None = None
         github_step = "installation_token"
+        # hades #379: another pull request found open on the work branch beside the
+        # task's own; it is never adopted, and is recorded and named in the wake.
+        other: PullRequestRef | None = None
         try:
             token = await asyncio.to_thread(
                 self._github.installation_token,
@@ -409,7 +425,8 @@ class DeliveryCoordinator:
                 # branch, which a merge would leave behind the merged head (or a deleted
                 # branch would get back).
                 github_step = "github"
-                if await self._known_pull_request(token, plan) is None:
+                known, other = await self._known_pull_request(token, plan)
+                if known is None:
                     return False
             github_step = "branch_pushed_at_head"
             if plan.resume_step not in ("branch_pushed_at_head", "github"):
@@ -422,6 +439,7 @@ class DeliveryCoordinator:
                             step=outcome.step,
                             detail=outcome.detail or f"the publisher exited {outcome.exit_code}",
                             extra={"remote_head_before": outcome.remote_head_before},
+                            other=other,
                         )
                     )
                     return False
@@ -440,6 +458,7 @@ class DeliveryCoordinator:
                             f"the remote branch is at {remote}, not the accepted head "
                             f"{plan.head_sha}"
                         ),
+                        other=other,
                     )
                 )
                 return False
@@ -455,7 +474,8 @@ class DeliveryCoordinator:
             ref: PullRequestRef | None
             if plan.existing_pr_number is not None:
                 # Looked up again: a merge or close can land while the head is pushed.
-                ref = await self._known_pull_request(token, plan)
+                ref, also = await self._known_pull_request(token, plan)
+                other = also or other
                 if ref is None:
                     return False
             else:
@@ -508,6 +528,7 @@ class DeliveryCoordinator:
                             f"contract: {'; '.join(mismatch)}"
                         ),
                         extra={"pull_request": resolved.number},
+                        other=other,
                     )
                 )
                 return False
@@ -528,7 +549,7 @@ class DeliveryCoordinator:
                     await self._host._db(
                         lambda: self._record_external_review_request(plan, resolved, comment)
                     )
-            await self._host._db(lambda: self._finish(plan, ref=resolved))
+            await self._host._db(lambda: self._finish(plan, ref=resolved, other=other))
             return True
         except GitHubError as exc:
             failure = exc
@@ -544,13 +565,16 @@ class DeliveryCoordinator:
                     step=github_step,
                     detail=failure.message,
                     response_class=failure.response_class,
+                    other=other,
                 )
             )
             return False
         except Exception as exc:  # the publisher or the transport, not a state change
             detail = f"{type(exc).__name__}: {exc}"
             log.warning("publication failed", extra={"task_id": plan.task_id, "error": detail})
-            await self._host._db(lambda: self._fail(plan, step="publish", detail=detail))
+            await self._host._db(
+                lambda: self._fail(plan, step="publish", detail=detail, other=other)
+            )
             return False
         finally:
             if token is not None:
@@ -558,11 +582,13 @@ class DeliveryCoordinator:
 
     async def _known_pull_request(
         self, token: InstallationToken, plan: PublishPlan
-    ) -> PullRequestRef | None:
+    ) -> tuple[PullRequestRef | None, PullRequestRef | None]:
         """hades #379: the task's own pull request, open, to publish to; None when it is
         merged or closed, which is then recorded. A task that has a pull request never
         gets a second one: when the lookup for the work branch finds another number (or
-        none), the task's own is read by its number, and the other is never adopted."""
+        none), the task's own is read by its number, and the other is never adopted.
+        The other pull request, when there is one, comes second, for the publication to
+        record and name in its wake."""
         assert self._github is not None
         number = plan.existing_pr_number
         known = await asyncio.to_thread(
@@ -581,7 +607,7 @@ class DeliveryCoordinator:
             known = found
         other = found if found is not None and found.number != number else None
         if known.state == "open":
-            return known
+            return known, (other if other is not None and other.state == "open" else None)
         if known.state == "closed" and not known.merged and not known.closed_by:
             closer = await asyncio.to_thread(
                 self._github.closed_by,
@@ -592,7 +618,7 @@ class DeliveryCoordinator:
             known = replace(known, closed_by=closer)
         gone = known
         await self._host._db(lambda: self._record_pull_request_gone(plan, gone, other))
-        return None
+        return None, other
 
     def _record_minted(self, plan: PublishPlan, token: InstallationToken | None) -> None:
         assert token is not None
@@ -791,6 +817,7 @@ class DeliveryCoordinator:
         detail: str,
         response_class: str = "",
         extra: dict[str, Any] | None = None,
+        other: PullRequestRef | None = None,
     ) -> None:
         with self._host._fenced() as uow:
             task = uow.tasks.get(plan.task_id, for_update=True)
@@ -798,6 +825,9 @@ class DeliveryCoordinator:
                 # hades #379: a poll moved the task on (a merge settles it as merged)
                 # while the publication ran; its failure no longer describes the task.
                 return
+            if other is not None:
+                detail = f"{detail}; {_other_pull_request_note(other)}"
+                extra = {**(extra or {}), **_other_pull_request_fields(other)}
             fail_publish(
                 uow,
                 self._clock,
@@ -810,7 +840,7 @@ class DeliveryCoordinator:
             )
             uow.commit()
 
-    def _finish(self, plan: PublishPlan, *, ref: Any) -> None:
+    def _finish(self, plan: PublishPlan, *, ref: Any, other: PullRequestRef | None = None) -> None:
         with self._host._fenced() as uow:
             task = uow.tasks.get(plan.task_id, for_update=True)
             if task is None or task.state is not TaskState.PUBLISHING:
@@ -835,6 +865,7 @@ class DeliveryCoordinator:
                     "pull_request": pull_request.number if pull_request else None,
                     "url": pull_request.url if pull_request else None,
                     "body_sha256": body_hash,
+                    **(_other_pull_request_fields(other) if other is not None else {}),
                 },
             )
             rounds = 0
@@ -870,6 +901,22 @@ class DeliveryCoordinator:
                     pull_request=pull_request,
                     head_sha=plan.head_sha,
                     policy=plan.policy,
+                )
+            if other is not None and pull_request is not None:
+                # hades #379: published to the task's own pull request; the other one on
+                # the work branch is not the task's, and Foundry decides what becomes of it.
+                create_wake(
+                    uow,
+                    self._clock,
+                    principal_id=task.principal_id,
+                    reason=WakeReason.OTHER_PULL_REQUEST_OPEN,
+                    summary=(
+                        f"head {plan.head_sha} was published to pull request "
+                        f"#{pull_request.number}; {_other_pull_request_note(other)}"
+                    )[:500],
+                    task=task,
+                    attempt_id=plan.attempt_id,
+                    extra_links={"pull_request": f"/v1/tasks/{task.id}/pull-request"},
                 )
             uow.commit()
 

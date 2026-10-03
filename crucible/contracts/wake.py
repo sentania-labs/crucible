@@ -42,6 +42,9 @@ class WakeReason(StrEnum):
     # hades FDY-0139: a pull request closed without merge rejects the task, and Foundry
     # hears about it rather than finding the task terminal on its next read.
     PULL_REQUEST_CLOSED = "pull_request_closed"
+    # hades #379: a publication to the task's own pull request found another pull request
+    # open on the work branch; it is not adopted, and Foundry decides what becomes of it.
+    OTHER_PULL_REQUEST_OPEN = "other_pull_request_open"
     # 07 and 25: a launch refused because the harness is unknown, disabled, or its image
     # carries a version outside the adapter's tested range.
     HARNESS_UNAVAILABLE = "harness_unavailable"
