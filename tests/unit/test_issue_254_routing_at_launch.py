@@ -396,42 +396,90 @@ def test_a_version_an_attempt_routed_with_cannot_be_rewritten() -> None:
         )
 
 
-def test_a_quota_exit_reschedules_under_the_recorded_routing_version(tmp_path: Path) -> None:
-    """A quota exit reroute routes with the recorded routing version, even if a newer one exists."""
-    fallback = _model("gpt-z-fallback")
+def _two_pools(version: int, *, fallback_enabled: bool = True) -> RoutingPolicyRecord:
+    """gpt-test in openai-sub and gpt-z-fallback in a pool of its own."""
+    fallback = _model("gpt-z-fallback", enabled=fallback_enabled)
     fallback["harness"] = "script-harness"
     fallback["pool"] = "fallback-pool"
-    m1 = _model("gpt-test")
-    m1["harness"] = "script-harness"
-    rec = _version(4, [m1, fallback])
-    rec.document["pools"]["fallback-pool"] = rec.document["pools"]["openai-sub"]
-    store = _store(rec)
+    first = _model("gpt-test")
+    first["harness"] = "script-harness"
+    record = _version(version, [first, fallback])
+    record.document["pools"]["fallback-pool"] = dict(record.document["pools"]["openai-sub"])
+    return record
+
+
+class _NoExhaustions(_NoHistory):
+    """No pool is marked exhausted."""
+
+    def list_all(self) -> list[Any]:
+        return []
+
+
+def _quota_exit(store: _Store, tmp_path: Path) -> tuple[Any, Execution, Attempt, Attempt]:
+    """Route the correction at v4, publish v5 disabling gpt-z-fallback, and let the
+    correction's attempt exit on quota. Returns the supervisor, the execution, the
+    exhausted attempt and the reroute's successor."""
     execution, attempt = _route_correction(store, tmp_path)
     assert attempt.routing_version == 4
     assert attempt.selected_model == "gpt-test"
-
-    # Now a newer version is published that removes the fallback model.
-    store.routing_policies.records.append(_version(5, [_model("gpt-test")]))  # type: ignore[attr-defined]
-
+    store.routing_policies.records.append(  # type: ignore[attr-defined]
+        _two_pools(5, fallback_enabled=False)
+    )
+    store.pool_exhaustions = _NoExhaustions()
     task = store.tasks.get(attempt.task_id)
     assert task is not None
-
     supervisor, _provider = _supervisor(store, FakeClock(NOW), tmp_path)
-    # The quota exit handler should use version 4 and find gpt-z-fallback.
     supervisor._handle_quota_exit(store.uow(), task, execution, attempt, source="worker")
-
-    nxt = store.attempts.list_for_task(task.id)[-1]
-    assert nxt.number == attempt.number + 1
-
     attempt.state = AttemptState.FAILED
     store.attempts.save(attempt)
-    task = store.tasks.get(nxt.task_id)
+    later = [a for a in store.attempts.list_for_task(task.id) if a.number > attempt.number]
+    return supervisor, execution, attempt, later[0] if later else attempt
+
+
+def test_a_quota_exit_never_reroutes_to_a_model_disabled_in_the_current_version(
+    tmp_path: Path,
+) -> None:
+    """The reroute routes with the version in force now, with the exhausted pool
+    excluded: gpt-z-fallback, disabled in v5, is never selected."""
+    store = _store(_two_pools(4))
+
+    supervisor, execution, attempt, nxt = _quota_exit(store, tmp_path)
+
+    assert all(a.selected_model != "gpt-z-fallback" for a in store.attempts.rows.values())
+    if nxt.id != attempt.id:
+        assert nxt.routing_version is None
+        task = store.tasks.get(nxt.task_id)
+        stored = store.contracts.get(nxt.task_id, execution.contract_version)
+        assert task is not None and stored is not None
+        assert supervisor._route_pending(_Pending(nxt, execution, task, stored.document)) is None
+        routed = store.attempts.get(nxt.id)
+        assert routed is not None and routed.selected_model is None
+        assert routed.state is not AttemptState.PREPARING
+    assert execution.policy_snapshot["routing"]["policy"]["version"] == 3
+
+
+def test_a_quota_reroute_uses_the_current_version_when_it_still_allows_the_fallback(
+    tmp_path: Path,
+) -> None:
+    store = _store(_two_pools(4))
+    store.routing_policies.records.append(_two_pools(5))  # type: ignore[attr-defined]
+    execution, attempt = _route_correction(store, tmp_path)
+    assert attempt.routing_version == 5
+    task = store.tasks.get(attempt.task_id)
     assert task is not None
+    supervisor, _provider = _supervisor(store, FakeClock(NOW), tmp_path)
+    supervisor._handle_quota_exit(store.uow(), task, execution, attempt, source="worker")
+    attempt.state = AttemptState.FAILED
+    store.attempts.save(attempt)
+    (nxt,) = [a for a in store.attempts.list_for_task(task.id) if a.number > attempt.number]
+    assert nxt.number == attempt.number + 1
+    assert nxt.routing_version is None
+    assert nxt.routing_excluded_pools == ["openai-sub"]
     stored = store.contracts.get(nxt.task_id, execution.contract_version)
     assert stored is not None
-    supervisor._route_pending(_Pending(nxt, execution, task, stored.document))
+    assert supervisor._route_pending(_Pending(nxt, execution, task, stored.document)) is not None
+    routed = store.attempts.get(nxt.id)
+    assert routed is not None
+    assert routed.selected_model == "gpt-z-fallback"
+    assert routed.routing_version == 5
 
-    nxt_updated = store.attempts.get(nxt.id)
-    assert nxt_updated is not None
-    assert nxt_updated.selected_model == "gpt-z-fallback"
-    assert nxt.routing_version == 4

@@ -984,7 +984,6 @@ class Supervisor:
         *,
         number: int,
         excluded_pools: set[str] | None = None,
-        routing_version: int | None = None,
     ) -> Attempt:
         attempt = Attempt(
             id=new_id(),
@@ -995,7 +994,6 @@ class Supervisor:
             created_at=self._clock.now(),
             resume_from_remote=execution.resume_from_remote,
             routing_excluded_pools=sorted(excluded_pools or set()),
-            routing_version=routing_version,
         )
         uow.attempts.add(attempt)
         record_event(
@@ -4918,7 +4916,9 @@ class Supervisor:
         *,
         source: str = "worker",
     ) -> None:
-        context = self._routing_context(uow, task, execution, attempt.routing_version)
+        # hades #254: the reroute routes with the version in force now, not the one the
+        # exhausted attempt recorded, so a model disabled since is never launched again.
+        context = self._routing_context(uow, task, execution)
         if context is None:
             move_execution(
                 uow, self._clock, execution, ExecutionState.FAILED, EventKind.EXECUTION_FAILED
@@ -4972,7 +4972,6 @@ class Supervisor:
                 execution,
                 number=attempt.number + 1,
                 excluded_pools={attempt.selected_pool} if attempt.selected_pool else None,
-                routing_version=attempt.routing_version,
             )
             move_task(
                 uow,
