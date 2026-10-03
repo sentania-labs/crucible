@@ -22,8 +22,8 @@ from typing import Any
 
 import pytest
 
-from crucible.application.errors import ConflictError
-from crucible.application.policies import put_routing_policy
+from crucible.application.errors import ConflictError, ContractValidationError
+from crucible.application.policies import put_routing_policy, validate_policy
 from crucible.application.routing import current_routing_version, load_attempt_routing
 from crucible.application.supervisor import _Pending
 from crucible.domain.entities import (
@@ -620,3 +620,14 @@ def test_a_quota_wait_resumes_on_the_current_routing_version(tmp_path: Path) -> 
     task = store.tasks.get(attempt.task_id)
     assert task is not None and task.state is TaskState.SCHEDULED
     assert execution.policy_snapshot["routing"]["policy"]["version"] == 3
+
+
+@pytest.mark.parametrize("pinned", ["true", 1])
+def test_pinned_must_be_a_strict_bool(pinned: object) -> None:
+    """A string or number for pinned is refused, not read as unpinned."""
+    document = copy.deepcopy(_ready_for_merge().policies.policy.document)
+    document["routing"]["policy"]["pinned"] = pinned
+
+    with pytest.raises(ContractValidationError) as raised:
+        validate_policy(document, name=document["name"], version=document["version"])
+    assert any("pinned" in problem["path"] for problem in raised.value.errors)
