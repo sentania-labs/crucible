@@ -83,7 +83,7 @@ from crucible.application.harnesses import (
 from crucible.contracts.completion_claim import CompletionClaimV1
 from crucible.domain.exit_class import ExitClass
 from crucible.domain.ids import new_id
-from crucible.domain.infrastructure import model_interruption
+from crucible.adapters.harness.interruption import model_interruption
 from crucible.domain.secrets import redact
 from crucible.domain.time import parse_rfc3339
 from crucible.ports.execution import (
@@ -1205,10 +1205,11 @@ class DockerProvider:
                 )
                 == 0
             )
+        interruption = model_interruption(observation.exit_code, stdout_tail, stderr_tail)
         interrupted = (
             observation.never_started
             or quota_checkpoint
-            or model_interruption(observation.exit_code, stdout_tail, stderr_tail) is not None
+            or interruption is not None
         )
         verifications = () if interrupted else await self._run_verifier(spec)
         outputs = _read_outputs(
@@ -1227,6 +1228,7 @@ class DockerProvider:
             blocked_md=outputs.blocked_md,
             stdout_tail=stdout_tail,
             stderr_tail=stderr_tail,
+            interruption=interruption,
             diff_paths=outputs.diff_paths,
             diff_text=outputs.diff_text,
             bundle=outputs.bundle,

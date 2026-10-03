@@ -86,7 +86,8 @@ from crucible.domain.cluster_egress import ClusterEgress, parse_cluster_egress
 from crucible.domain.command_timeout import effective_command_timeout_ms
 from crucible.domain.exit_class import ExitClass
 from crucible.domain.ids import new_id
-from crucible.domain.infrastructure import START_FAILURES, model_interruption
+from crucible.adapters.harness.interruption import model_interruption
+from crucible.domain.infrastructure import START_FAILURES
 from crucible.domain.role_timeouts import DEFAULT_ROLE_TIMEOUT_SECONDS, parse_role_timeouts
 from crucible.domain.secrets import redact
 from crucible.domain.time import parse_rfc3339
@@ -2269,10 +2270,11 @@ class KubernetesProvider:
             )
             self._raise_if_unavailable(k8sspec.ROLE_BUNDLE, spec.attempt_id, bundle_exit)
             bundle_ok = bundle_exit == 0
+        interruption = model_interruption(observation.exit_code, stdout_tail, stderr_tail)
         interrupted = (
             observation.never_started
             or quota_checkpoint
-            or model_interruption(observation.exit_code, stdout_tail, stderr_tail) is not None
+            or interruption is not None
         )
         verifications = () if interrupted else await self._run_verifier(spec, limits)
         with tempfile.TemporaryDirectory(prefix="crucible-k8s-") as scratch:
@@ -2296,6 +2298,7 @@ class KubernetesProvider:
             blocked_md=outputs.blocked_md,
             stdout_tail=stdout_tail,
             stderr_tail=stderr_tail,
+            interruption=interruption,
             diff_paths=outputs.diff_paths,
             diff_text=outputs.diff_text,
             bundle=outputs.bundle,

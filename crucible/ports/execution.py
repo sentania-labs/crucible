@@ -9,6 +9,7 @@ from enum import StrEnum
 from typing import Any, Literal, Protocol
 
 from crucible.domain.endpoints import validate_endpoint
+from crucible.domain.infrastructure import Interruption
 from crucible.ports.github import InstallationToken
 
 # Where the workspace appears inside every Crucible-created container (06, 08).
@@ -298,6 +299,7 @@ class CollectedOutputs:
     # it did not.
     leftover_committed: bool = False
     leftover_note: str | None = None
+    interruption: Interruption | None = None
 
 
 @dataclass(frozen=True, slots=True)

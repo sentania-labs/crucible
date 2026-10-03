@@ -16,7 +16,7 @@ from typing import Any
 
 from crucible.contracts.completion_claim import load_report, parse_claim
 from crucible.domain.exit_class import ExitClass, classify_exit
-from crucible.domain.infrastructure import model_interruption
+from crucible.adapters.harness.interruption import model_interruption
 from crucible.ports.execution import IDENTITY_MOUNT, REPORT_MOUNT
 from crucible.ports.harness import ExitInfo, ParsedReport, ProviderQuotaEvent, ReportMetrics
 

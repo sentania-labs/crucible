@@ -368,6 +368,7 @@ def select_model(
             "image": image or None,
             "eligible": not reasons,
             "excluded": reasons,
+            "capacity_refused": bool(excluded_models and entry.id in excluded_models),
             "preferred_pool": entry.pool in preferred,
             "quality": quality.as_dict(),
         }

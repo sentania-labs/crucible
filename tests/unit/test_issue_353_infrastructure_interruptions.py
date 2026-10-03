@@ -18,7 +18,7 @@ from crucible.application.supervisor import _Pending
 from crucible.domain.events import EventKind
 from crucible.domain.exit_class import ExitClass
 from crucible.domain.gates import GateName, GateResult, evaluate_gate
-from crucible.domain.infrastructure import model_interruption
+from crucible.adapters.harness.interruption import model_interruption
 from crucible.domain.lifecycle import AttemptState, ExecutionState, TaskState
 from crucible.ports.execution import BranchBundle, CollectedOutputs, Observation, ObservationState
 from tests.unit.kubernetes_fixtures import build, spec
@@ -74,11 +74,21 @@ def _running(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, Any, Any, list[Any]]
     return supervisor, pending, uow, events
 
 
+def _signal(message: str) -> str:
+    codes = {"HTTP 503 Service Unavailable": 503, "HTTP 429 Too Many Requests": 429}
+    status = next((status for text, status in codes.items() if message.startswith(text)), None)
+    if status:
+        return json.dumps({"type": "provider_error", "status_code": status, "message": message})
+    if message == "provider error: model is at capacity":
+        return json.dumps({"type": "provider_error", "code": "at_capacity", "message": message})
+    return message
+
+
 def _finish(supervisor: Any, attempt: Any, message: str, **kwargs: Any) -> None:
     supervisor._finish_exited(
         attempt.id,
         1,
-        CollectedOutputs(report=None, report_raw=None, blocked_md=None, stderr_tail=message),
+        CollectedOutputs(report=None, report_raw=None, blocked_md=None, stderr_tail=message, interruption=model_interruption(1, _signal(message))),
         defer_quota=True,
         **kwargs,
     )
@@ -175,7 +185,7 @@ def test_real_test_failure_still_fails_gates(monkeypatch: pytest.MonkeyPatch) ->
     ["HTTP 502 Bad Gateway", "HTTP 504 Gateway Timeout", "connection reset", "connection refused"],
 )
 def test_transport_interruptions(message: str) -> None:
-    assert model_interruption(1, message) is not None
+    assert model_interruption(1, message) is None
     assert model_interruption(0, message) is None
 
 
@@ -215,7 +225,8 @@ def test_quota_with_commits_still_checkpoints(monkeypatch: pytest.MonkeyPatch) -
             report=None,
             report_raw=None,
             blocked_md=None,
-            stderr_tail="HTTP 429 Too Many Requests",
+            stderr_tail=_signal("HTTP 429 Too Many Requests"),
+            interruption=model_interruption(1, _signal("HTTP 429 Too Many Requests")),
             bundle=BranchBundle("abc", "main", "work", 1, True, sha256="sealed"),
         ),
         defer_quota=True,
@@ -235,7 +246,8 @@ async def test_retry_spec_resumes_sealed_workspace(monkeypatch: pytest.MonkeyPat
             report=None,
             report_raw=None,
             blocked_md=None,
-            stderr_tail="HTTP 503 Service Unavailable",
+            stderr_tail=_signal("HTTP 503 Service Unavailable"),
+            interruption=model_interruption(1, _signal("HTTP 503 Service Unavailable")),
             bundle=BranchBundle("abc", "main", "work", 1, True, sha256="sealed"),
         ),
         defer_quota=True,
@@ -264,7 +276,7 @@ async def test_503_collection_does_not_run_verifier(monkeypatch: pytest.MonkeyPa
         ),
     )
     monkeypatch.setattr(
-        provider, "_worker_tails", AsyncMock(return_value=("", "HTTP 503 Service Unavailable"))
+        provider, "_worker_tails", AsyncMock(return_value=("", _signal("HTTP 503 Service Unavailable")))
     )
     verifier = AsyncMock()
     monkeypatch.setattr(provider, "_run_verifier", verifier)
@@ -433,3 +445,15 @@ def test_new_contract_gets_fresh_interruption_budget(monkeypatch: pytest.MonkeyP
     assert pending.task.state is TaskState.SCHEDULED
     uow.attempts.add.assert_called_once()
     uow.escalations.add.assert_not_called()
+
+
+@pytest.mark.parametrize("tail", ["curl: Connection refused", "psycopg: connection refused", "requests.exceptions.ReadTimeout", "status code 503 from upstream"])
+def test_command_errors_never_become_interruptions(monkeypatch: pytest.MonkeyPatch, tail: str) -> None:
+    supervisor, pending, uow, _events = _running(monkeypatch)
+    supervisor._finish_exited(pending.attempt.id, 1, CollectedOutputs(
+        report=None, report_raw=None, blocked_md=None, stdout_tail=tail,
+        stderr_tail="1 failed", interruption=model_interruption(1, tail, "1 failed"),
+    ))
+    assert pending.attempt.exit_class is ExitClass.CRASHED
+    assert pending.task.state is TaskState.REPORTED
+    uow.attempts.add.assert_not_called()

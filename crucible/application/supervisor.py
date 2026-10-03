@@ -109,7 +109,6 @@ from crucible.domain.exit_class import CLEAN_EXIT_CLASSES, ExitClass, classify_e
 from crucible.domain.gates import GateName, GateResult, evaluate_gate
 from crucible.domain.harness_settings import setting_name
 from crucible.domain.ids import new_id
-from crucible.domain.infrastructure import model_interruption
 from crucible.domain.lifecycle import (
     ATTEMPT_TERMINAL,
     EXECUTION_TERMINAL,
@@ -2185,7 +2184,10 @@ class Supervisor:
         if reasons:
             detail += ": " + "; ".join(reasons)
         now = self._clock.now()
-        capacity_refusal = "model refused capacity for this retry" in reasons
+        capacity_refusal = any(
+            candidate.get("capacity_refused") is True
+            for candidate in (selection.candidates if selection else ())
+        )
         attempt.exit_class = ExitClass.INFRASTRUCTURE if capacity_refusal else ExitClass.ENVIRONMENT
         if capacity_refusal:
             record_event(
@@ -4215,7 +4217,7 @@ class Supervisor:
                 )
                 if oom_killed and not (timed_out or killed):
                     attempt.exit_class = ExitClass.ENVIRONMENT
-            interruption = model_interruption(exit_code, outputs.stdout_tail, outputs.stderr_tail)
+            interruption = outputs.interruption
             never_started = final_observation is not None and final_observation.never_started
             if not (timed_out or killed or oom_killed):
                 if never_started:
