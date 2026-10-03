@@ -475,6 +475,17 @@ class LaunchRefusedError(ProviderError):
     The supervisor turns this into a wake, not a retry."""
 
 
+class WorkerStartError(ProviderError):
+    """Hades #346: the runtime accepted the worker but could not start its process (a
+    mount that is not a directory, an executable not found, an exec format error). The
+    harness never ran, so this is an infrastructure interruption, not an environment
+    failure of the attempt; `observation` carries the runtime's own message."""
+
+    def __init__(self, observation: Observation) -> None:
+        super().__init__(f"the worker never started: {observation.container_message}")
+        self.observation = observation
+
+
 class LaunchCancelledError(ProviderError):
     """The task was cancelled while its attempt was being prepared or launched (hades
     #189). The provider stopped at the step it was on, removed that step's Job or

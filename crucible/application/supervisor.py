@@ -143,6 +143,7 @@ from crucible.ports.execution import (
     ProviderError,
     ProviderUnavailableError,
     VerificationRun,
+    WorkerStartError,
     Workspace,
 )
 from crucible.ports.github import GitHubClient
@@ -1559,6 +1560,12 @@ class Supervisor:
                 await self._discard(provider, ws, spec)
                 await self._db(partial(self._refuse_launch, attempt.id, "launch", str(exc)))
                 return False
+            except WorkerStartError as exc:
+                # Hades #346: the runtime could not start the worker's process. Nothing
+                # ran, so it is retried as an infrastructure interruption.
+                await self._discard(provider, ws, spec)
+                await self._db(partial(self._start_failure, attempt.id, exc.observation))
+                return False
             except ProviderError as exc:
                 detail = str(exc)
                 await self._discard(provider, ws, spec)
@@ -2723,6 +2730,82 @@ class Supervisor:
             self._record_bare_evidence(uow, attempt)
             self._classify_and_finish(uow, attempt, None)
             uow.commit()
+
+    def _start_failure(self, attempt_id: str, observation: Observation) -> None:
+        """The launch's runtime refused to start the worker (hades #346). The attempt is
+        an infrastructure interruption with the runtime's message on its exit event and
+        an evidence row, and the retry budget decides what happens next."""
+        with self._fenced() as uow:
+            attempt = uow.attempts.get(attempt_id, for_update=True)
+            assert attempt is not None
+            attempt.exit_class = ExitClass.INFRASTRUCTURE
+            attempt.exit_code = observation.exit_code
+            attempt.ended_at = self._clock.now()
+            message = redact(observation.container_message or "")
+            events = self._pod_event_rows(observation)
+            record_event(
+                uow,
+                self._clock,
+                EventKind.ATTEMPT_EXITED,
+                principal=PRINCIPAL_CRUCIBLE,
+                task_id=attempt.task_id,
+                execution_id=attempt.execution_id,
+                attempt_id=attempt.id,
+                payload={
+                    "exit_code": observation.exit_code,
+                    "exit_class": ExitClass.INFRASTRUCTURE.value,
+                    "never_started": True,
+                    "no_commits": True,
+                    "interruption_message": f"the worker never started: {message}",
+                    "container_message": message,
+                    "pod_events": events,
+                },
+            )
+            move_attempt(
+                uow,
+                self._clock,
+                attempt,
+                AttemptState.COLLECTED,
+                EventKind.ATTEMPT_COLLECTED,
+                payload={
+                    "stage": "launch",
+                    "detail": f"the worker never started: {message}"[:1000],
+                    "exit_class": ExitClass.INFRASTRUCTURE,
+                },
+            )
+            self._record_start_failure_evidence(uow, attempt, observation)
+            self._record_bare_evidence(uow, attempt)
+            self._classify_and_finish(uow, attempt, None)
+            uow.commit()
+
+    @staticmethod
+    def _pod_event_rows(observation: Observation) -> list[dict[str, Any]]:
+        return [
+            {**row, "message": redact(str(row.get("message") or ""))}
+            for row in observation.pod_events
+        ]
+
+    def _record_start_failure_evidence(
+        self, uow: UnitOfWork, attempt: Attempt, observation: Observation
+    ) -> None:
+        uow.evidence.add(
+            EvidenceRecord(
+                id=None,
+                attempt_id=attempt.id,
+                task_id=attempt.task_id,
+                kind=EvidenceKind.EXIT_INFO.value,
+                observed_at=self._clock.now(),
+                source=EvidenceSource.CRUCIBLE.value,
+                verified=True,
+                payload={
+                    "exit_class": ExitClass.INFRASTRUCTURE.value,
+                    "never_started": True,
+                    "detail": observation.detail,
+                    "container_message": redact(observation.container_message or ""),
+                    "pod_events": self._pod_event_rows(observation),
+                },
+            )
+        )
 
     def _defer_launch(self, attempt_id: str, detail: str) -> None:
         """The attempt stays pending; one event says why it did not launch this tick."""
@@ -4315,10 +4398,7 @@ class Supervisor:
                     "container_message": redact(final_observation.container_message or "")
                     if final_observation
                     else None,
-                    "pod_events": [
-                        {**row, "message": redact(str(row.get("message") or ""))}
-                        for row in final_observation.pod_events
-                    ]
+                    "pod_events": self._pod_event_rows(final_observation)
                     if final_observation
                     else [],
                 }
@@ -4337,26 +4417,7 @@ class Supervisor:
                 },
             )
             if never_started and final_observation is not None:
-                uow.evidence.add(
-                    EvidenceRecord(
-                        id=None,
-                        attempt_id=attempt.id,
-                        task_id=attempt.task_id,
-                        kind=EvidenceKind.EXIT_INFO.value,
-                        observed_at=self._clock.now(),
-                        source=EvidenceSource.CRUCIBLE.value,
-                        verified=True,
-                        payload={
-                            "exit_class": ExitClass.INFRASTRUCTURE.value,
-                            "never_started": True,
-                            "container_message": redact(final_observation.container_message or ""),
-                            "pod_events": [
-                                {**row, "message": redact(str(row.get("message") or ""))}
-                                for row in final_observation.pod_events
-                            ],
-                        },
-                    )
-                )
+                self._record_start_failure_evidence(uow, attempt, final_observation)
             if execution.role is ExecutionRole.REVIEW:
                 self._finish_review_attempt(uow, attempt, outputs)
                 uow.leases.release_attempt_lease(attempt.id)

@@ -119,6 +119,7 @@ from crucible.ports.execution import (
     ProviderError,
     ProviderHealth,
     VerificationRun,
+    WorkerStartError,
     Workspace,
     WorkspaceState,
     image_harnesses,
@@ -755,6 +756,7 @@ class DockerProvider:
         copy = self._credential_copy(spec)
         container_id = ""
         seeded_on_disk = False
+        starting = False
         try:
             container_id = await self._call(self.client.create_container, name, body)
             if copy is not None:
@@ -768,8 +770,14 @@ class DockerProvider:
                 copy = replace(copy, seeded=seeded)
                 await self._call(self.client.put_archive, container_id, copy.spec.mount_target, tar)
                 seeded_on_disk = True
+            starting = True
             await self._call(self.client.start_container, container_id)
         except (DockerApiError, ProviderError) as exc:
+            failure = (
+                await self._start_failure(container_id, exc)
+                if starting and isinstance(exc, DockerApiError)
+                else None
+            )
             if container_id:
                 with contextlib.suppress(Exception):
                     await self._call(self.client.remove_container, container_id, force=True)
@@ -778,6 +786,8 @@ class DockerProvider:
                 # and nothing later would visit an attempt that never ran (12).
                 with contextlib.suppress(Exception):
                     await self._remove_through_daemon(ws, spec, [CREDENTIAL_LEAF])
+            if failure is not None:
+                raise WorkerStartError(failure) from exc
             if isinstance(exc, ProviderError):
                 raise
             raise ProviderError(f"could not start the worker: {exc}") from exc
@@ -788,6 +798,28 @@ class DockerProvider:
             attempt_id=spec.attempt_id,
             image_digest=resolved,
             name=name,
+        )
+
+    async def _start_failure(self, container_id: str, exc: DockerApiError) -> Observation | None:
+        """Hades #346: the daemon refused `/start` for the created container. Its answer
+        is the runtime's reason (OCI runtime create failed: ...), and the container's
+        state, read before it is removed, has the exit code the runtime recorded. A
+        daemon that could not be reached is not a start failure; nor is a container
+        that vanished (404)."""
+        if exc.status == 404 or exc.status < 400:
+            return None
+        message = exc.message or str(exc)
+        exit_code = 128
+        with contextlib.suppress(Exception):
+            state = (await self._call(self.client.inspect_container, container_id)).get("State", {})
+            message = str(state.get("Error") or message)
+            exit_code = int(state.get("ExitCode") or exit_code)
+        return Observation(
+            ObservationState.EXITED,
+            exit_code=exit_code,
+            detail="StartError",
+            container_message=message[:2000],
+            never_started=True,
         )
 
     def _network_and_env(self, spec: LaunchSpec) -> tuple[str, dict[str, str]]:
