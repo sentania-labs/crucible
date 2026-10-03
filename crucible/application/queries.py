@@ -801,9 +801,13 @@ def _evidence_view(e: EvidenceRecord) -> EvidenceView:
 def attempt_evidence(uow: UnitOfWork, attempt_id: str) -> EvidenceList:
     if uow.attempts.get(attempt_id) is None:
         raise NotFoundError(f"attempt {attempt_id} not found")
-    return EvidenceList(
-        items=[_evidence_view(e) for e in uow.evidence.list_for_attempt(attempt_id)]
-    )
+    items = []
+    for e in uow.evidence.list_for_attempt(attempt_id):
+        view = _evidence_view(e)
+        if e.kind in ("toolsets", "launch_settings"):
+            view.payload = {**view.payload, "recorded_at_collect": True}
+        items.append(view)
+    return EvidenceList(items=items)
 
 
 def _artifact_view(a: Artifact) -> ArtifactView:

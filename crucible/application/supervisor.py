@@ -1604,7 +1604,7 @@ class Supervisor:
             effective_contract.setdefault("repository", {})["resume_from_work_branch"] = True
         endpoint: Literal["subscription", "local"] = "subscription"
         endpoint_url = None
-        with self._uow_factory() as route_uow:
+        with self._fenced() as route_uow:
             routing = load_routing(route_uow, execution.policy_snapshot or {})
             route = routing.model(selected_model) if routing is not None else None
             if route is not None:
@@ -1774,35 +1774,35 @@ class Supervisor:
         settings saved then, a lower allowance included."""
         if harness != "hermes":
             return saved
+        has_record = False
         for row in uow.evidence.list_for_attempt(attempt.id):
-            recorded = row.payload.get("settings")
-            if (
-                row.kind == EvidenceKind.LAUNCH_SETTINGS.value
-                and row.verified
-                and isinstance(recorded, dict)
-            ):
-                return dict(recorded)
+            if row.kind == EvidenceKind.LAUNCH_SETTINGS.value:
+                has_record = True
+                recorded = row.payload.get("settings")
+                if row.verified and isinstance(recorded, dict):
+                    return dict(recorded)
         settings = hermes_run_limits({**saved, THINKING_KEY: enable_thinking}).effective()
-        uow.evidence.add(
-            EvidenceRecord(
-                id=None,
-                attempt_id=attempt.id,
-                task_id=task.id,
-                kind=EvidenceKind.LAUNCH_SETTINGS.value,
-                observed_at=self._clock.now(),
-                source=EvidenceSource.CRUCIBLE.value,
-                verified=True,
-                payload={"harness": harness, "settings": settings},
+        if not has_record:
+            uow.evidence.add(
+                EvidenceRecord(
+                    id=None,
+                    attempt_id=attempt.id,
+                    task_id=task.id,
+                    kind=EvidenceKind.LAUNCH_SETTINGS.value,
+                    observed_at=self._clock.now(),
+                    source=EvidenceSource.CRUCIBLE.value,
+                    verified=True,
+                    payload={"harness": harness, "settings": settings},
+                )
             )
-        )
-        uow.commit()
+            uow.commit()
         return settings
 
     async def _spec_for(self, attempt: Attempt) -> LaunchSpec | None:
         """Rebuild the launch spec from the database, for a collect after a restart."""
 
         def _fetch() -> tuple[Any, Any, Any, Any]:
-            with self._uow_factory() as uow:
+            with self._fenced() as uow:
                 execution = uow.executions.get(attempt.execution_id)
                 task = uow.tasks.get(attempt.task_id)
                 if execution is None or task is None:
