@@ -4245,8 +4245,10 @@ class Supervisor:
                 if attempt.exit_class is ExitClass.QUOTA_EXHAUSTED and adapter is not None
                 else None
             )
-            if provider_quota is not None:
-                self._mark_pool_exhausted(uow, attempt, execution, provider_quota.reset_at)
+            if attempt.exit_class is ExitClass.QUOTA_EXHAUSTED:
+                self._mark_pool_exhausted(
+                    uow, attempt, execution, provider_quota.reset_at if provider_quota else None
+                )
             # A collection failure makes this exit `environment` below, whatever the
             # harness said, so it is not a gateway failure and marks nothing.
             if attempt.exit_class is ExitClass.PROVIDER_ERROR and collection_error is None:
@@ -5262,9 +5264,7 @@ class Supervisor:
                 summary=too_big_wake_summary(local_cap),
             )
             return
-        if exit_class is ExitClass.INFRASTRUCTURE or (
-            exit_class is ExitClass.QUOTA_EXHAUSTED and not has_commits
-        ):
+        if exit_class is ExitClass.INFRASTRUCTURE:
             self._retry_interruption(uow, task, execution, attempt)
             return
         if exit_class is ExitClass.QUOTA_EXHAUSTED:
@@ -5282,7 +5282,7 @@ class Supervisor:
                 )
                 self._task_reported(uow, task, attempt, exit_class, common)
                 return
-            if defer_quota:
+            if defer_quota and has_commits:
                 return
             self._handle_quota_exit(uow, task, execution, attempt)
             return

@@ -34,6 +34,7 @@ def _running(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, Any, Any, list[Any]]
     pending.attempt.state = AttemptState.RUNNING
     pending.attempt.started_at = supervisor._clock.now()
     pending.attempt.selected_model = "a-first"
+    pending.attempt.selected_pool = "pool-a-first"
     attempts = [pending.attempt]
     events: list[Any] = []
     evidence: list[Any] = []
@@ -109,11 +110,30 @@ def test_503_mid_run_retries_without_gates(monkeypatch: pytest.MonkeyPatch) -> N
 
 
 def test_429_without_commits_skips_checkpoint_and_waits(monkeypatch: pytest.MonkeyPatch) -> None:
-    supervisor, pending, _uow, _events = _running(monkeypatch)
+    supervisor, pending, uow, _events = _running(monkeypatch)
+    routing = uow.routing_policies.get.return_value.document
+    routing["pools"]["pool-a-first"]["default_cooldown_seconds"] = 900
+    routing["models"][1]["enabled"] = False
+    marks: dict[str, Any] = {}
+    def put(mark: Any) -> Any:
+        marks[mark.pool] = mark
+        return mark
+    uow.pool_exhaustions.put.side_effect = put
+    uow.pool_exhaustions.get.side_effect = marks.get
+    uow.pool_exhaustions.list_all.side_effect = lambda: list(marks.values())
+    # The adapter knows quota, but has no structured reset event.
+    adapter = MagicMock()
+    adapter.classify_exit.return_value = ExitClass.QUOTA_EXHAUSTED
+    adapter.provider_quota_event.return_value = None
+    supervisor._harnesses = MagicMock()
+    supervisor._harnesses.get.return_value = adapter
     _finish(supervisor, pending.attempt, "HTTP 429 Too Many Requests")
     assert pending.attempt.exit_class is ExitClass.QUOTA_EXHAUSTED
     assert not supervisor._quota_checkpoint_pending(pending.attempt.id)
-    assert pending.task.state is TaskState.SCHEDULED
+    assert pending.task.state is TaskState.AWAITING_QUOTA
+    reset = supervisor._clock.now() + timedelta(seconds=900)
+    assert marks["pool-a-first"].reset_at == reset
+    assert pending.task.resume_at == reset
     assert supervisor._list_pending() == []
 
 
