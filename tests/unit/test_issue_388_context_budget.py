@@ -48,7 +48,7 @@ SMALL_WINDOW_PERCENT = 0.75
 MIN_TRIGGER_RATIO = 0.85
 
 
-def compression_trigger(context_length: int, max_tokens: int | None) -> int:
+def compression_trigger_copy(context_length: int, max_tokens: int | None) -> int:
     """ContextCompressor._compute_threshold_tokens with _effective_threshold_percent,
     as Hermes 0.19.0 has them: the trigger is a share of the window less the output
     reservation, and no max_tokens means no reservation."""
@@ -144,6 +144,9 @@ def main():
     agent._ephemeral_max_output_tokens = 20000
     retry = agent.request()
     after = agent.request()
+    # The length-retry boost: Hermes retries a cut-off reply with a boosted cap.
+    agent._ephemeral_max_output_tokens = 32768
+    boost = agent.request()
     template = {"chat_template_kwargs": {"enable_thinking": False}}
     named = run_agent.AIAgent(model="m", request_overrides={"extra_body": template})
     with open(os.environ["STAND_IN_OUT"], "w", encoding="utf-8") as handle:
@@ -154,6 +157,7 @@ def main():
                 "first": first,
                 "retry": retry,
                 "after": after,
+                "boost": boost,
                 "named": named.request(),
             },
             handle,
@@ -165,9 +169,30 @@ def main():
 def _stand_in_hermes(root: Path, version: str = "0.19.0") -> Path:
     hermes = root / "hermes"
     (hermes / "hermes_cli").mkdir(parents=True)
+    (hermes / "tools").mkdir(parents=True)
     (hermes / "run_agent.py").write_text(_STAND_IN_AGENT, encoding="utf-8")
     (hermes / "hermes_cli" / "__init__.py").write_text("", encoding="utf-8")
     (hermes / "hermes_cli" / "main.py").write_text(_STAND_IN_MAIN, encoding="utf-8")
+    (hermes / "tools" / "__init__.py").write_text("", encoding="utf-8")
+    (hermes / "tools" / "file_operations.py").write_text(
+        "class ShellFileOperations:\n"
+        "    def _search_with_grep(\n"
+        "        self, pattern, path, file_glob, limit, offset, output_mode, context\n"
+        "    ):\n"
+        '        cmd_parts = ["grep", "-rnH"]\n'
+        '        cmd_parts.append("--exclude-dir=\x27.*\x27")\n'
+        "        cmd_parts.append(self._escape_shell_arg(path))\n"
+        '        cmd_parts.extend(["|", "head", "-n", str(fetch_limit)])\n'
+        '        cmd = "set -o pipefail; " + " ".join(cmd_parts)\n'
+        "        pass\n"
+        "\n"
+        "    def _exec(self, command, *args, **kwargs):\n"
+        "        pass\n"
+        "\n"
+        "    def _escape_shell_arg(self, arg):\n"
+        "        pass\n",
+        encoding="utf-8",
+    )
     stand_in_release(hermes, version)
     return hermes
 
@@ -208,7 +233,7 @@ def test_the_wrapper_config_carries_max_tokens_from_the_adapter_env(
     launch = HermesAdapter().build_launch(_context())
     assert launch.env["CRUCIBLE_HERMES_CONTEXT_LENGTH"] == str(WINDOW)
     assert launch.env["CRUCIBLE_HERMES_MAX_OUTPUT_TOKENS"] == str(ALLOWANCE)
-    assert launch.env["CRUCIBLE_HERMES_THINKING"] == "off"
+    assert "CRUCIBLE_HERMES_THINKING" not in launch.env
     code, home = _run_wrapper(tmp_path, monkeypatch, dict(launch.env))
     assert code == 0
     assert _config(home) == {"context_length": WINDOW, "max_tokens": ALLOWANCE}
@@ -218,7 +243,6 @@ def test_the_wrapper_config_carries_max_tokens_from_the_adapter_env(
     # Every request carries the allowance, and the routing entry's thinking setting.
     assert out["first"] == {
         "max_tokens": ALLOWANCE,
-        "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
     }
 
 
@@ -228,10 +252,10 @@ def test_the_compressor_trigger_reserves_the_allowance() -> None:
     at 74304."""
     ceiling = WINDOW - ALLOWANCE
     assert ceiling == 99_072
-    assert compression_trigger(WINDOW, None) == 98_304
-    assert ceiling - compression_trigger(WINDOW, None) == 768
-    assert compression_trigger(WINDOW, ALLOWANCE) == 74_304
-    assert ceiling - compression_trigger(WINDOW, ALLOWANCE) == 24_768
+    assert compression_trigger_copy(WINDOW, None) == 98_304
+    assert ceiling - compression_trigger_copy(WINDOW, None) == 768
+    assert compression_trigger_copy(WINDOW, ALLOWANCE) == 74_304
+    assert ceiling - compression_trigger_copy(WINDOW, ALLOWANCE) == 24_768
 
 
 def test_the_trigger_from_the_written_config_is_the_lower_one(
@@ -246,11 +270,11 @@ def test_the_trigger_from_the_written_config_is_the_lower_one(
         wrapper._limit("CRUCIBLE_HERMES_MAX_OUTPUT_TOKENS"),
     )
     config = _config(tmp_path)
-    assert compression_trigger(config["context_length"], config.get("max_tokens")) == 74_304
+    assert compression_trigger_copy(config["context_length"], config.get("max_tokens")) == 74_304
 
 
-@pytest.mark.skipif(not HERMES_PYTHON.exists(), reason="Hermes 0.19.0 is not installed here")
 def test_hermes_itself_agrees_where_it_is_installed(tmp_path: Path) -> None:
+    assert HERMES_PYTHON.exists(), "This test must run where Hermes is installed (in-image tier)"
     """In the worker image (or anywhere the Hermes venv is), Hermes's own compressor
     built from the written config gives the same trigger, and its requests carry the
     allowance, then the lower one-call cap on a retry."""
@@ -308,6 +332,7 @@ def test_a_lower_allowance_on_retry_is_what_hermes_sends(
     assert out["first"] == {"max_tokens": 24000, "extra_body": thinking}
     assert out["retry"] == {"max_tokens": 20000, "extra_body": thinking}
     assert out["after"] == {"max_tokens": 24000, "extra_body": thinking}
+    assert out["boost"] == {"max_tokens": 32768, "extra_body": thinking}
     assert out["named"] == {"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}}
 
 
@@ -317,7 +342,7 @@ def test_another_hermes_release_stops_the_run(
     launch = HermesAdapter().build_launch(_context())
     code, _ = _run_wrapper(tmp_path, monkeypatch, dict(launch.env), version="0.20.0")
     assert code != 0
-    assert "written for hermes-agent 0.19.0 and found 0.20.0" in capfd.readouterr().err
+    assert "refusing to start Hermes unpatched" in capfd.readouterr().err
     assert not (tmp_path / "out.json").exists()
 
 
@@ -358,6 +383,8 @@ def _supervisor(
     )
     supervisor = object.__new__(Supervisor)
     supervisor._uow_factory = lambda: nullcontext(uow)  # type: ignore[assignment]
+    supervisor._fenced = lambda: nullcontext(uow)  # type: ignore[method-assign, assignment, return-value]
+    supervisor.fenced_token = 1
     supervisor._harnesses = default_registry()
     supervisor._clock = SimpleNamespace(now=lambda: NOW)
     (tmp_path / "api-key").write_text("test-key")

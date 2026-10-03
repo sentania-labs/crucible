@@ -133,10 +133,7 @@ def test_the_bootstrap_sets_the_turn_budget_only_where_none_was_named(
     # The bootstrap starts only the Hermes version its patches were written for (#385).
     (hermes / "hermes_agent-0.19.0.dist-info").mkdir(exist_ok=True)
     (hermes / "hermes_agent-0.19.0.dist-info" / "METADATA").write_text(
-        "Metadata-Version: 2.1
-Name: hermes-agent
-Version: 0.19.0
-", encoding="utf-8"
+        "Metadata-Version: 2.1\nName: hermes-agent\nVersion: 0.19.0\n", encoding="utf-8"
     )
     # The working directory is the task's checkout. Modules there named like Hermes's
     # own must never be imported in their place.
@@ -160,3 +157,27 @@ Version: 0.19.0
 def test_hermes_is_started_so_the_checkout_cannot_shadow_its_modules() -> None:
     source = WRAPPER.read_text(encoding="utf-8")
     assert '[HERMES_PYTHON, "-P", "-c", BOOTSTRAP,' in source
+
+
+def test_another_hermes_release_stops_the_bootstrap(tmp_path: Path) -> None:
+    hermes = tmp_path / "hermes"
+    (hermes / "hermes_cli").mkdir(parents=True)
+    (hermes / "run_agent.py").write_text("raise SystemExit('no')\n", encoding="utf-8")
+    (hermes / "hermes_cli" / "__init__.py").write_text("", encoding="utf-8")
+    (hermes / "hermes_cli" / "main.py").write_text("raise SystemExit('no')\n", encoding="utf-8")
+    stand_in_release(hermes, "0.20.0")
+
+    wrapper = _wrapper()
+    result = subprocess.run(
+        [sys.executable, "-P", "-c", wrapper.BOOTSTRAP, "-z", "prompt"],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=tmp_path,
+        env={"PYTHONPATH": str(hermes), "CRUCIBLE_HERMES_MAX_TURNS": "300"},
+    )
+    assert result.returncode != 0
+    assert (
+        "crucible-hermes: its patches are for hermes-agent 0.19.0, found 0.20.0; "
+        "refusing to start Hermes unpatched (hades #385)"
+    ) in result.stderr
