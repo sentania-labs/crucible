@@ -418,3 +418,18 @@ def test_fourth_interruption_after_recovery_stays_blocked(monkeypatch: pytest.Mo
     assert supervisor._infrastructure_waits() == []
     assert sum(row.kind == EventKind.WAKE_CREATED.value for row in events) == 1
     uow.escalations.add.assert_called_once()
+
+
+def test_new_contract_gets_fresh_interruption_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    supervisor, pending, uow, _events = _running(monkeypatch)
+    old = [replace(pending.attempt, id=str(i), exit_class=ExitClass.INFRASTRUCTURE) for i in range(3)]
+    attached = pending.task.created_at + timedelta(seconds=1)
+    uow.contracts.get.return_value.submitted_at = attached
+    pending.execution.contract_version = 2
+    pending.task.contract_version = 2
+    pending.attempt.created_at = attached
+    uow.attempts.list_for_task.side_effect = lambda *_: [*old, pending.attempt]
+    _finish(supervisor, pending.attempt, "HTTP 503 Service Unavailable")
+    assert pending.task.state is TaskState.SCHEDULED
+    uow.attempts.add.assert_called_once()
+    uow.escalations.add.assert_not_called()
