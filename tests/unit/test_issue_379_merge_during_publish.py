@@ -818,6 +818,9 @@ def test_a_close_polled_after_the_corrected_heads_publication_failed_is_recorded
     assert f"pull request #{PR_NUMBER} was closed without being merged" in wakes[0]
     assert "publish_failed" in wakes[0]
     assert f"reopen pull request #{PR_NUMBER} and then republish, or cancel the task" in wakes[0]
+    links = _wake_links(store, "pull_request_closed")[0]
+    assert links["pull_request"] == f"/v1/tasks/{TASK_ID}/pull-request"
+    assert links["republish"] == f"/v1/tasks/{TASK_ID}/republish"
 
     # The closed PR is not polled again, and the wake is not repeated.
     clock.advance(3600)
@@ -839,6 +842,8 @@ def test_a_close_while_a_correction_runs_explains_reopen_or_cancel(tmp_path: Pat
     assert "the correction continues" in wakes[0]
     assert "publication will fail unless the pull request is reopened" in wakes[0]
     assert "cancelling the task is the usual answer" in wakes[0]
+    # Nothing here says to republish, so no republish link is offered.
+    assert "republish" not in _wake_links(store, "pull_request_closed")[0]
 
 
 class _Certifications:

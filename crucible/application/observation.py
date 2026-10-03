@@ -1324,6 +1324,10 @@ def _wake_closed_during_correction(
     and fails with a wake that names it."""
     if task.state is TaskState.PUBLISHING:
         return
+    links = {"pull_request": f"/v1/tasks/{task.id}/pull-request"}
+    if task.state is TaskState.PUBLISH_FAILED:
+        # The wake says to reopen and then republish; it carries the way to do so.
+        links["republish"] = f"/v1/tasks/{task.id}/republish"
     create_wake(
         uow,
         clock,
@@ -1331,7 +1335,7 @@ def _wake_closed_during_correction(
         reason=WakeReason.PULL_REQUEST_CLOSED,
         summary=_closed_correction_summary(task, pull_request),
         task=task,
-        extra_links={"pull_request": f"/v1/tasks/{task.id}/pull-request"},
+        extra_links=links,
     )
 
 
