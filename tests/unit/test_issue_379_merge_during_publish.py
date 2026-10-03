@@ -753,6 +753,58 @@ def test_a_quota_checkpoint_is_not_pushed_once_the_task_is_merged(tmp_path: Path
     assert EventKind.BRANCH_PUSHED.value not in store.events.kinds()
 
 
+FINISHED = [
+    TaskState.MERGED,
+    TaskState.RELEASE_CANDIDATE,
+    TaskState.RELEASED,
+    TaskState.REJECTED,
+    TaskState.CANCELLED,
+    TaskState.CLOSED,
+]
+
+
+@pytest.mark.parametrize("state", FINISHED)
+def test_a_quota_checkpoint_is_not_pushed_to_a_finished_task(
+    tmp_path: Path, state: TaskState
+) -> None:
+    store, _clock, supervisor, _github, publisher = _correcting(tmp_path, until=TaskState.REPORTED)
+    _execution, attempt = _correction_attempt(store)
+    attempt.exit_class = ExitClass.QUOTA_EXHAUSTED
+    task = _task(store)
+    task.head_sha = NEW_HEAD
+    task.state = state
+
+    outcome = asyncio.run(supervisor.delivery.push_quota_checkpoint(attempt.id, required=True))
+
+    assert outcome == (False, f"the task is {state.value}; the checkpoint is not pushed")
+    assert publisher.pushes == []
+    assert EventKind.BRANCH_PUSHED.value not in store.events.kinds()
+
+
+@pytest.mark.parametrize("state", FINISHED)
+def test_a_checkpoint_landing_on_a_finished_task_is_not_recorded(
+    tmp_path: Path, state: TaskState
+) -> None:
+    store, _clock, supervisor, _github, publisher = _correcting(tmp_path, until=TaskState.REPORTED)
+    _execution, attempt = _correction_attempt(store)
+    attempt.exit_class = ExitClass.QUOTA_EXHAUSTED
+    _task(store).head_sha = NEW_HEAD
+
+    def finish_during_push() -> None:
+        _task(store).state = state
+
+    publisher.during_push = finish_during_push
+
+    outcome = asyncio.run(supervisor.delivery.push_quota_checkpoint(attempt.id, required=True))
+
+    assert outcome == (False, "the task moved on while the checkpoint was pushed")
+    assert publisher.pushes == [NEW_HEAD]
+    assert EventKind.BRANCH_PUSHED.value not in store.events.kinds()
+    escalations = store.escalations.list_for_task(TASK_ID)
+    assert len(escalations) == 1
+    assert f"is already {state.value}" in escalations[0].question
+
+
 def test_a_merge_of_a_quota_checkpoint_is_escalated_and_named(tmp_path: Path) -> None:
     store, clock, supervisor, github, publisher = _correcting(tmp_path, until=TaskState.REPORTED)
     _execution, attempt = _correction_attempt(store)

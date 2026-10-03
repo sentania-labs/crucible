@@ -77,6 +77,19 @@ log = logging.getLogger("crucible.delivery")
 
 T = TypeVar("T")
 
+# hades #379: a task in one of these is done with its branch; a quota checkpoint is never
+# pushed to it or recorded against it.
+FINISHED_STATES: frozenset[TaskState] = frozenset(
+    {
+        TaskState.MERGED,
+        TaskState.RELEASE_CANDIDATE,
+        TaskState.RELEASED,
+        TaskState.REJECTED,
+        TaskState.CANCELLED,
+        TaskState.CLOSED,
+    }
+)
+
 
 class FencedHost(Protocol):
     """What the coordinator needs of the supervisor: a fenced transaction and a thread."""
@@ -229,10 +242,11 @@ class DeliveryCoordinator:
             if required:
                 return False, "the GitHub publisher is not configured"
             return True, "a publisher is not required for this repository"
-        if await self._host._db(lambda: self._task_merged(attempt_id)):
-            # hades #379: the pull request is merged; a checkpoint pushed now would move
-            # the merged branch on with work nobody reviewed.
-            return False, "the task is merged; the checkpoint is not pushed"
+        finished = await self._host._db(lambda: self._task_finished(attempt_id))
+        if finished is not None:
+            # hades #379: the task is merged or otherwise finished; a checkpoint pushed now
+            # would move its branch on with work nobody reviewed.
+            return False, f"the task is {finished.value}; the checkpoint is not pushed"
         plan = await self._host._db(lambda: self._checkpoint_plan(attempt_id))
         if plan is None:
             return True, "the attempt has no checkpoint to push"
@@ -286,11 +300,13 @@ class DeliveryCoordinator:
                 return None
             return build_plan(uow, task, (attempt, execution))
 
-    def _task_merged(self, attempt_id: str) -> bool:
+    def _task_finished(self, attempt_id: str) -> TaskState | None:
         with self._host._fenced() as uow:
             attempt = uow.attempts.get(attempt_id)
             task = uow.tasks.get(attempt.task_id) if attempt is not None else None
-            return task is not None and task.state is TaskState.MERGED
+            if task is None or task.state not in FINISHED_STATES:
+                return None
+            return task.state
 
     def _publish_request(self, plan: PublishPlan) -> PublishRequest:
         return PublishRequest(
@@ -619,7 +635,7 @@ class DeliveryCoordinator:
         with self._host._fenced() as uow:
             task = uow.tasks.get(plan.task_id, for_update=True)
             push_is_current = task is not None and (
-                (checkpoint and task.state is not TaskState.MERGED)
+                (checkpoint and task.state not in FINISHED_STATES)
                 or (not checkpoint and task.state is TaskState.PUBLISHING)
             )
             if not push_is_current:
