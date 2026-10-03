@@ -297,6 +297,12 @@ def test_a_replace_ref_changes_neither_the_diff_nor_the_scanned_content(tmp_path
     assert (output / "head.txt").read_text().strip() == evil_head
 
 
+def test_collection_does_not_log_graft_deprecation_hints(tmp_path: Path) -> None:
+    output = _collect(tmp_path, _repository(tmp_path, changed="changed\n"))
+    log = (output / "bundle.log").read_text()
+    assert not any("graft" in line.lower() for line in log.splitlines()), log
+
+
 def test_a_graft_does_not_change_the_merge_base(tmp_path: Path) -> None:
     repo = _branch(tmp_path)
     (repo / "z.txt").write_text("grafted\n")
