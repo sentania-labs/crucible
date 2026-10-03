@@ -4985,9 +4985,6 @@ class Supervisor:
         *,
         source: str = "worker",
     ) -> None:
-        if source == "worker":
-            task.resume_at = self._clock.now() + timedelta(minutes=3)
-            uow.tasks.save(task)
         context = self._routing_context(uow, task, execution)
         if context is None:
             move_execution(
@@ -5546,34 +5543,6 @@ class Supervisor:
         common: dict[str, str],
         wake_summary: str | None = None,
     ) -> None:
-        if exit_class in {ExitClass.INFRASTRUCTURE, ExitClass.QUOTA_EXHAUSTED}:
-            event = uow.events.latest_for_task_kind(task.id, EventKind.ATTEMPT_EXITED.value)
-            cause = (
-                str(event.payload.get("interruption_message") or "provider quota exhausted")
-                if event
-                else "provider quota exhausted"
-            )
-
-            move_task(
-                uow,
-                self._clock,
-                task,
-                TaskState.BLOCKED,
-                EventKind.TASK_BLOCKED,
-                execution_id=attempt.execution_id,
-                attempt_id=attempt.id,
-                payload={"reason": "model_endpoint_unavailable", "exit_class": exit_class.value},
-            )
-            create_wake(
-                uow,
-                self._clock,
-                principal_id=task.principal_id,
-                reason=self._FAILURE_WAKE_REASONS.get(exit_class, WakeReason.ATTEMPT_FAILED),
-                summary=wake_summary or f"{cause}; retry budget exhausted",
-                task=task,
-                attempt_id=attempt.id,
-            )
-            return
         stored = uow.contracts.get(task.id, task.contract_version)
         tier = (
             stored.document.get("execution_request", {}).get("tier") if stored is not None else None

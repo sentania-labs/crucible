@@ -495,3 +495,23 @@ def test_specific_adapter_classification_wins(monkeypatch: pytest.MonkeyPatch, c
         mark_down.assert_called_once()
     if classification is ExitClass.BLOCKED:
         assert pending.task.state is TaskState.BLOCKED
+
+
+
+def test_quota_reroutes_without_infrastructure_delay(monkeypatch: pytest.MonkeyPatch) -> None:
+    supervisor, pending, uow, events = _running(monkeypatch)
+    uow.pool_exhaustions.put.side_effect = lambda mark: mark
+    _finish(supervisor, pending.attempt, "HTTP 429 Too Many Requests")
+    assert pending.task.state is TaskState.SCHEDULED
+    assert pending.task.resume_at is None
+    assert any(row.kind == EventKind.TASK_REROUTED.value for row in events)
+
+
+def test_terminal_quota_is_reported_with_quota_wake(monkeypatch: pytest.MonkeyPatch) -> None:
+    supervisor, pending, uow, events = _running(monkeypatch)
+    uow.routing_policies.get.return_value.document["reroute"]["reroute_max"] = 0
+    uow.pool_exhaustions.put.side_effect = lambda mark: mark
+    _finish(supervisor, pending.attempt, "HTTP 429 Too Many Requests")
+    assert pending.task.state is TaskState.REPORTED
+    assert not any(row.kind == EventKind.TASK_BLOCKED.value for row in events)
+    assert any(row.kind == EventKind.WAKE_CREATED.value for row in events)
