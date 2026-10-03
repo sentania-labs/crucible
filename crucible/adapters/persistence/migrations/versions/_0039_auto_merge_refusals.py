@@ -40,9 +40,13 @@ def upgrade() -> None:
         "pull_requests",
         sa.Column("observed_base_ref", sa.String(length=255), nullable=False, server_default=""),
     )
+    # A migration holds no supervisor lease and `pull_requests` is fenced (0007), so the
+    # trigger is stood down for exactly the backfill, as 0038 does for `attempts`.
+    op.execute("ALTER TABLE pull_requests DISABLE TRIGGER trg_pull_requests_fenced")
     op.execute(
         "UPDATE pull_requests SET observed_head_sha = head_sha, observed_base_ref = base_ref"
     )
+    op.execute("ALTER TABLE pull_requests ENABLE TRIGGER trg_pull_requests_fenced")
     op.add_column(
         "pull_requests",
         sa.Column("mergeable_state", sa.String(length=32), nullable=False, server_default=""),
@@ -74,7 +78,10 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     kinds = ", ".join(f"'{kind}'" for kind in EVENT_KINDS)
+    # `events` is append-only, so the trigger is stood down for exactly this statement.
+    op.execute("ALTER TABLE events DISABLE TRIGGER trg_events_append_only")
     op.execute(f"DELETE FROM events WHERE kind IN ({kinds})")
+    op.execute("ALTER TABLE events ENABLE TRIGGER trg_events_append_only")
     _replace_event_kinds(_previous_event_kinds())
     for column in (
         "merge_retry_at",
