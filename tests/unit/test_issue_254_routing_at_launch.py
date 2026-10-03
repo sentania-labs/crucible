@@ -277,7 +277,7 @@ async def test_the_launch_reservation_and_exit_read_the_version_routed_with(
     def setting(name: str) -> None:
         requested.append(name)
 
-    store.provider_settings = SimpleNamespace(get=setting)  # type: ignore[attr-defined]
+    store.provider_settings = SimpleNamespace(get=setting)  # type: ignore[assignment]
     task = store.tasks.get(attempt.task_id)
     stored = store.contracts.get(attempt.task_id, execution.contract_version)
     assert task is not None and stored is not None

@@ -2,8 +2,8 @@
 
 Crucible performs every routine GitHub mutation through this one interface: mint a
 repository-scoped installation token, read everything observation needs, create the pull
-request and update it, post the configured external-review trigger, and delete a ref at
-cleanup. There is deliberately no merge call: merging is the operator's act.
+request and update it, merge a certified head, post the configured external-review
+trigger, and delete a ref at cleanup.
 
 Nothing here returns a token. `installation_token` hands back an opaque object whose
 value is readable exactly once by the publisher's hand-over, and whose `__repr__` and
@@ -123,6 +123,13 @@ class PullRequestRef:
     mergeable_state: str = ""
     title: str = ""
     draft: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class MergeResult:
+    sha: str
+    merged_at: datetime
+    merged_by: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -256,6 +263,17 @@ class GitHubClient(Protocol):
         body: str | None = None,
         base_ref: str | None = None,
     ) -> PullRequestRef: ...
+
+    def merge_pull_request(
+        self,
+        token: InstallationToken,
+        *,
+        repository: str,
+        number: int,
+        expected_head_sha: str,
+    ) -> MergeResult:
+        """Squash-merge only when the pull request still has the expected head."""
+        ...
 
     def observe(
         self,

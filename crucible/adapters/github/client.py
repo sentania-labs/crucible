@@ -1,9 +1,8 @@
 """The GitHub client (23, ADR 0007).
 
-Every call the delivery half makes, and no others. What is deliberately absent is as much
-of the design as what is here: there is no merge, no force push, and no ref write other
-than the delete used at test cleanup. The issue-comment write is used for the configured
-external-review trigger under the App's identity.
+Every call the delivery half makes, and no others. There is no force push and no ref
+write other than the delete used at test cleanup. The issue-comment write is used for
+the configured external-review trigger under the App's identity.
 """
 
 from __future__ import annotations
@@ -23,6 +22,7 @@ from crucible.ports.github import (
     CommentRecord,
     GitHubError,
     InstallationToken,
+    MergeResult,
     Observation,
     PullRequestRef,
     ReactionRecord,
@@ -129,6 +129,40 @@ class RestGitHubClient:
     ) -> PullRequestRef:
         payload = self._http.get(f"/repos/{repository}/pulls/{number}", bearer=token.reveal())
         return normalize.pull_request(payload)
+
+    def merge_pull_request(
+        self,
+        token: InstallationToken,
+        *,
+        repository: str,
+        number: int,
+        expected_head_sha: str,
+    ) -> MergeResult:
+        path = f"/repos/{repository}/pulls/{number}/merge"
+        status, payload, _ = self._http.request(
+            "PUT",
+            path,
+            bearer=token.reveal(),
+            body={"merge_method": "squash", "sha": expected_head_sha},
+        )
+        if status >= 400:
+            message = payload.get("message") if isinstance(payload, dict) else None
+            raise GitHubError(status, str(message or "merge refused"), path=path)
+        if not isinstance(payload, dict) or not payload.get("merged") or not payload.get("sha"):
+            message = payload.get("message") if isinstance(payload, dict) else None
+            raise GitHubError(409, str(message or "merge refused"), path=path)
+
+        # GitHub's merge response supplies the merge SHA but not its actor or time. Read
+        # the resulting PR as part of this operation so callers record GitHub's values,
+        # rather than waiting for a later observation.
+        merged = self.get_pull_request(token, repository=repository, number=number)
+        if not merged.merged or merged.merged_at is None or not merged.merged_by:
+            raise GitHubError(502, "merged pull request response is incomplete", path=path)
+        return MergeResult(
+            sha=str(payload["sha"]),
+            merged_at=merged.merged_at,
+            merged_by=merged.merged_by,
+        )
 
     def open_pull_requests(
         self, token: InstallationToken, *, repository: str, head_branch: str

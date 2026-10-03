@@ -9,8 +9,11 @@ from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
 from crucible.adapters.api.deps import Ctx, UoW
-from crucible.adapters.ui.render import _page
+from crucible.adapters.ui.actions import register
+from crucible.adapters.ui.render import _page, _redirect
 from crucible.adapters.ui.session import _require
+from crucible.application.admin import delivery
+from crucible.domain.entities import Principal, Role
 
 router = APIRouter(prefix="/ui", include_in_schema=False)
 
@@ -131,6 +134,14 @@ def settings_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
     if isinstance(found, RedirectResponse):
         return found
     principal, csrf = found
+    enabled = delivery.auto_merge_view(uow)["enabled"]
+    merge_action = {
+        "kind": "form",
+        "action": "/ui/actions/auto-merge",
+        "label": "Disable auto-merge" if enabled else "Enable auto-merge",
+        "reason": "optional",
+        "hidden": {"enabled": "false" if enabled else "true"},
+    }
     rows = _settings_rows(ctx.settings)
     # Lead with what this deployment set; the defaults it left alone go behind a click
     # (crucible#115).
@@ -145,11 +156,25 @@ def settings_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
         active="/ui/settings",
         heading="Settings",
         intro=(
-            "Read when the service starts: change one in the settings file or the "
+            "Auto-merge changes immediately. Other settings below are "
+            "read when the service starts: change one in the settings file or the "
             "environment and restart. What can change while running is on Routing, "
             "Harnesses and Images."
         ),
         sections=[
+            {
+                "title": "Automatic squash merge",
+                "columns": ["Status", "Action"],
+                "rows": [
+                    [
+                        "Enabled" if enabled else "Disabled",
+                        merge_action if principal.role is Role.ADMIN else "Administrator only",
+                    ]
+                ],
+                "intro": (
+                    "Applies to every repository without a restart. Repository policy may opt out."
+                ),
+            },
             {
                 "title": "Set on this deployment",
                 "empty": "Every setting is at its default.",
@@ -159,6 +184,30 @@ def settings_page(request: Request, ctx: Ctx, uow: UoW) -> Response:
                 "details": [
                     {"title": "Defaults", "columns": ["Setting", "Value", "Note"], "rows": defaults}
                 ],
-            }
+            },
         ],
     )
+
+
+async def _action_auto_merge(
+    request: Request,
+    action: str,
+    ctx: Ctx,
+    uow: UoW,
+    principal: Principal,
+    csrf: str,
+    form: dict[str, str],
+    reason: str | None,
+) -> Response | None:
+    assert ctx.admin is not None
+    value = form.get("enabled")
+    if value not in ("true", "false"):
+        raise ValueError("enabled must be true or false")
+    delivery.save_auto_merge(
+        ctx.admin, uow, principal=principal, enabled=value == "true", reason=reason
+    )
+    uow.commit()
+    return _redirect(form, "Auto-merge enabled." if value == "true" else "Auto-merge disabled.")
+
+
+register("auto-merge", _action_auto_merge)

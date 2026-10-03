@@ -729,10 +729,12 @@ def upsert_pull_request(
             repository_id=plan.repository_id,
             number=ref.number,
             url=ref.url,
-            base_ref=ref.base_ref or plan.base_ref,
+            base_ref=plan.base_ref,
+            observed_base_ref=ref.base_ref or plan.base_ref,
             work_branch=plan.work_branch,
             state=PullRequestState.OPEN,
             head_sha=plan.head_sha,
+            observed_head_sha=plan.head_sha,
             title=ref.title or plan.title,
             body_sha256=body_hash,
             opened_at=now,
@@ -743,6 +745,8 @@ def upsert_pull_request(
         pull_request.number = ref.number
         pull_request.url = ref.url
         pull_request.head_sha = plan.head_sha
+        pull_request.observed_head_sha = plan.head_sha
+        pull_request.observed_base_ref = ref.base_ref or pull_request.base_ref
         pull_request.title = ref.title or plan.title
         pull_request.body_sha256 = body_hash
         pull_request.state = PullRequestState.OPEN

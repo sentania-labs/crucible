@@ -1,9 +1,9 @@
 """Foundry's decisions on the delivery half (04, 09, 23).
 
 `ci-decision` and `head-decision` are the two places where Crucible has recorded facts,
-stopped, and needs judgment. Crucible records the judgment, performs the mechanical
-consequence, and does nothing else: it never re-runs a workflow (that needs Actions
-write, which the App does not hold), never closes a pull request, and never merges.
+stopped, and needs judgment. Crucible records the judgment and performs its mechanical
+consequence. It never re-runs a workflow (that needs Actions write, which the App does
+not hold) or closes a pull request. Hades merges a certified head when policy enables it.
 """
 
 from __future__ import annotations

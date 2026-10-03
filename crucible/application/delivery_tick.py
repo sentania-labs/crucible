@@ -18,8 +18,10 @@ from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
+from functools import partial
 from typing import Any, Protocol, TypeVar
 
+from crucible.application.auto_merge import auto_merge_enabled, certified_jobs_green
 from crucible.application.decisions import open_escalation
 from crucible.application.observation import (
     OBSERVED_STATES,
@@ -68,6 +70,7 @@ from crucible.ports.github import (
     GitHubClient,
     GitHubError,
     InstallationToken,
+    MergeResult,
     Observation,
     PullRequestRef,
 )
@@ -146,6 +149,17 @@ class PollPlan:
     with_reactions: bool
     # The failed check whose log excerpt is still to be fetched: (source, GitHub id).
     failed_check: tuple[str, str] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MergePlan:
+    task_id: str
+    pull_request_id: str
+    number: int
+    repository_name: str
+    installation_id: int | None
+    certified_head_sha: str
+    base_ref: str
 
 
 @dataclass(slots=True)
@@ -980,7 +994,264 @@ class DeliveryCoordinator:
                 if await self._observe_one(plan):
                     polled += 1
         await self._host._db(self._evaluate_gates)
+        if not self._rate_limited():
+            merge_plans = await self._host._db(self._ready_merges)
+            for merge_plan in merge_plans:
+                if self._rate_limited():
+                    break
+                await self._merge_one(merge_plan)
         return polled
+
+    def _ready_merges(self) -> list[MergePlan]:
+        out: list[MergePlan] = []
+        with self._host._fenced() as uow:
+            if not auto_merge_enabled(uow):
+                return out
+            for task in uow.tasks.list_by_state(TaskState.READY_FOR_MERGE):
+                policy = policy_for(uow, task)
+                if not bool(policy.get("delivery", {}).get("auto_merge", True)):
+                    continue
+                pull_request = uow.pull_requests.get_for_task(task.id)
+                if (
+                    pull_request is None
+                    or pull_request.state is not PullRequestState.OPEN
+                    or pull_request.head_sha != task.head_sha
+                ):
+                    continue
+                certification = uow.ci_certifications.get_for_head(
+                    pull_request.id, task.head_sha or ""
+                )
+                if not certified_jobs_green(certification):
+                    continue
+                repository = uow.repositories.get(task.repository_id)
+                if repository is None or not task.head_sha:
+                    continue
+                refusal_matches = (
+                    pull_request.merge_refusal_cause is not None
+                    and pull_request.merge_refusal_head_sha
+                    == (pull_request.observed_head_sha or pull_request.head_sha)
+                    and pull_request.merge_refusal_base_ref
+                    == (pull_request.observed_base_ref or pull_request.base_ref)
+                    and pull_request.merge_refusal_mergeable_state == pull_request.mergeable_state
+                )
+                if (
+                    refusal_matches
+                    and pull_request.merge_retry_at is not None
+                    and pull_request.merge_retry_at > self._clock.now()
+                ):
+                    continue
+                out.append(
+                    MergePlan(
+                        task_id=task.id,
+                        pull_request_id=pull_request.id,
+                        number=pull_request.number,
+                        repository_name=repository_slug(repository),
+                        installation_id=repository.installation_id,
+                        certified_head_sha=task.head_sha,
+                        base_ref=pull_request.base_ref,
+                    )
+                )
+            uow.commit()
+        return out
+
+    async def _merge_one(self, plan: MergePlan) -> bool:
+        """Compare the live head, then immediately merge with the same SHA precondition."""
+        assert self._github is not None
+        token: InstallationToken | None = None
+        try:
+            token = await asyncio.to_thread(
+                self._github.installation_token,
+                installation_id=plan.installation_id or 0,
+                repository=plan.repository_name,
+            )
+            current = await asyncio.to_thread(
+                self._github.get_pull_request,
+                token,
+                repository=plan.repository_name,
+                number=plan.number,
+            )
+            if current.merged and current.head_sha == plan.certified_head_sha:
+                recovered = self._merge_result_from_ref(current)
+                if recovered is not None:
+                    await self._host._db(partial(self._record_merge, plan, recovered))
+                    return True
+            if current.head_sha != plan.certified_head_sha:
+                await self._host._db(
+                    lambda: self._record_merge_refusal(
+                        plan,
+                        f"head moved from certified {plan.certified_head_sha} "
+                        f"to {current.head_sha or 'unknown'}",
+                        current,
+                    )
+                )
+                return False
+            if current.base_ref != plan.base_ref:
+                await self._host._db(
+                    lambda: self._record_merge_refusal(
+                        plan,
+                        f"base changed from {plan.base_ref} to {current.base_ref or 'unknown'}",
+                        current,
+                    )
+                )
+                return False
+            if current.state != "open":
+                await self._host._db(
+                    lambda: self._record_merge_refusal(
+                        plan, f"pull request state is {current.state}", current
+                    )
+                )
+                return False
+            # Re-read the switch, accepted head and certification after GitHub I/O.
+            # A correction or an administrator may have changed them during the read.
+            if not await self._host._db(lambda: self._merge_still_allowed(plan)):
+                return False
+            try:
+                result = await asyncio.to_thread(
+                    self._github.merge_pull_request,
+                    token,
+                    repository=plan.repository_name,
+                    number=plan.number,
+                    expected_head_sha=plan.certified_head_sha,
+                )
+            except GitHubError as merge_error:
+                if merge_error.response_class == "rate_limited":
+                    self._defer_for_rate_limit(merge_error)
+                    return False
+                try:
+                    after = await asyncio.to_thread(
+                        self._github.get_pull_request,
+                        token,
+                        repository=plan.repository_name,
+                        number=plan.number,
+                    )
+                except GitHubError:
+                    after = current
+                recovered = self._merge_result_from_ref(after)
+                if after.head_sha == plan.certified_head_sha and recovered is not None:
+                    await self._host._db(lambda: self._record_merge(plan, recovered))
+                    return True
+                cause = (
+                    f"GitHub refused the squash merge: {merge_error.message} ({merge_error.status})"
+                )
+                await self._host._db(lambda: self._record_merge_refusal(plan, cause, after))
+                return False
+        except GitHubError as exc:
+            if exc.response_class == "rate_limited":
+                self._defer_for_rate_limit(exc)
+                return False
+            cause = f"GitHub could not prepare the squash merge: {exc.message} ({exc.status})"
+            await self._host._db(lambda: self._record_merge_refusal(plan, cause, None))
+            return False
+        finally:
+            if token is not None:
+                token.discard()
+        await self._host._db(lambda: self._record_merge(plan, result))
+        return True
+
+    def _merge_still_allowed(self, plan: MergePlan) -> bool:
+        with self._host._fenced() as uow:
+            if not auto_merge_enabled(uow):
+                return False
+            task = uow.tasks.get(plan.task_id)
+            pull_request = uow.pull_requests.get(plan.pull_request_id)
+            if (
+                task is None
+                or pull_request is None
+                or task.state is not TaskState.READY_FOR_MERGE
+                or task.head_sha != plan.certified_head_sha
+                or pull_request.head_sha != plan.certified_head_sha
+                or pull_request.base_ref != plan.base_ref
+                or pull_request.state is not PullRequestState.OPEN
+                or not policy_for(uow, task).get("delivery", {}).get("auto_merge", True)
+            ):
+                return False
+            certification = uow.ci_certifications.get_for_head(
+                pull_request.id, plan.certified_head_sha
+            )
+            return certified_jobs_green(certification)
+
+    @staticmethod
+    def _merge_result_from_ref(ref: Any) -> MergeResult | None:
+        if not ref.merged or ref.merged_at is None or not ref.merged_by or not ref.merge_commit_sha:
+            return None
+        return MergeResult(
+            sha=ref.merge_commit_sha, merged_at=ref.merged_at, merged_by=ref.merged_by
+        )
+
+    def _record_merge_refusal(self, plan: MergePlan, cause: str, current: Any | None) -> None:
+        with self._host._fenced() as uow:
+            task = uow.tasks.get(plan.task_id, for_update=True)
+            pull_request = uow.pull_requests.get(plan.pull_request_id, for_update=True)
+            if task is None or pull_request is None or task.state is not TaskState.READY_FOR_MERGE:
+                return
+            cause = redact(cause)
+            previous_cause = pull_request.merge_refusal_cause
+            head = current.head_sha if current is not None else pull_request.head_sha
+            base = current.base_ref if current is not None else pull_request.base_ref
+            mergeable = (
+                current.mergeable_state if current is not None else pull_request.mergeable_state
+            )
+            if current is not None:
+                pull_request.observed_head_sha = current.head_sha
+                pull_request.observed_base_ref = current.base_ref
+                pull_request.mergeable_state = current.mergeable_state
+            same_refusal_state = (
+                pull_request.merge_refusal_head_sha == head
+                and pull_request.merge_refusal_base_ref == base
+                and pull_request.merge_refusal_mergeable_state == mergeable
+            )
+            count = pull_request.merge_refusal_count + 1 if same_refusal_state else 1
+            delay = min(60 * (2 ** min(count - 1, 5)), 30 * 60)
+            pull_request.merge_refusal_cause = cause
+            pull_request.merge_refusal_head_sha = head
+            pull_request.merge_refusal_base_ref = base
+            pull_request.merge_refusal_mergeable_state = mergeable
+            pull_request.merge_refusal_count = count
+            pull_request.merge_retry_at = self._clock.now() + timedelta(seconds=delay)
+            uow.pull_requests.save(pull_request)
+            if cause != previous_cause:
+                create_wake(
+                    uow,
+                    self._clock,
+                    principal_id=task.principal_id,
+                    reason=WakeReason.READY_FOR_MERGE,
+                    summary=f"pull request #{plan.number} was not auto-merged: {cause}",
+                    task=task,
+                    extra_links={"pull_request": f"/v1/tasks/{task.id}/pull-request"},
+                )
+            uow.commit()
+
+    def _record_merge(self, plan: MergePlan, result: MergeResult) -> None:
+        with self._host._fenced() as uow:
+            task = uow.tasks.get(plan.task_id, for_update=True)
+            pull_request = uow.pull_requests.get(plan.pull_request_id, for_update=True)
+            if task is None or pull_request is None or pull_request.number != plan.number:
+                return
+            # A response describes a merge that already happened. Record it even if a
+            # correction started while the request was in flight, using the same
+            # merge-wins settlement as observation (hades #379).
+            observe_state(
+                uow,
+                self._clock,
+                task=task,
+                pull_request=pull_request,
+                observation=Observation(
+                    pull_request=PullRequestRef(
+                        number=plan.number,
+                        url=pull_request.url,
+                        head_sha=plan.certified_head_sha,
+                        base_ref=plan.base_ref,
+                        state="closed",
+                        merged=True,
+                        merged_at=result.merged_at,
+                        merged_by=result.merged_by,
+                        merge_commit_sha=result.sha,
+                    )
+                ),
+                result=ObservationResult(),
+            )
+            settle_pull_request_state(uow, self._clock, task=task, pull_request=pull_request)
+            uow.commit()
 
     def _due_polls(self) -> list[PollPlan]:
         now = self._clock.now()

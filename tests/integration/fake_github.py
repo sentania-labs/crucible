@@ -53,6 +53,7 @@ class PullRequestState:
     merged_by: str | None = None
     closed_at: str | None = None
     draft: bool = False
+    mergeable_state: str = "clean"
     reviews: list[dict[str, Any]] = field(default_factory=list)
     review_comments: list[dict[str, Any]] = field(default_factory=list)
     issue_comments: list[dict[str, Any]] = field(default_factory=list)
@@ -88,6 +89,9 @@ class FakeGitHub:
         self.rate_limit_once = False
         self.mint_failure_once = False
         self.mint_calls = 0
+        self.merge_calls: list[tuple[str, int, str]] = []
+        self.merge_refusal: tuple[int, str] | None = None
+        self.merge_response_failure_once = False
         self.workflow_log = b"fake workflow log: the required check failed\n"
         # The signed log URLs GitHub redirects to, and whether any request for one carried
         # an Authorization header (it must not: the URL is its own credential).
@@ -371,6 +375,9 @@ class _Handler(BaseHTTPRequestHandler):
     def do_PATCH(self) -> None:
         self._dispatch("PATCH")
 
+    def do_PUT(self) -> None:
+        self._dispatch("PUT")
+
     def do_DELETE(self) -> None:
         self._dispatch("DELETE")
 
@@ -478,6 +485,33 @@ class _Handler(BaseHTTPRequestHandler):
             number = int(rest[1])
             pull = repo.pulls[number]
             tail = rest[2:]
+            if tail == ["merge"] and method == "PUT":
+                body = self._body() or {}
+                expected_sha = str(body.get("sha", ""))
+                merge_method = str(body.get("merge_method", ""))
+                state.merge_calls.append((full_name, number, merge_method))
+                if expected_sha != pull.head_sha:
+                    self._send(409, {"message": "Head branch was modified"})
+                    return
+                if state.merge_refusal is not None:
+                    status, message = state.merge_refusal
+                    self._send(status, {"message": message})
+                    return
+                merge_sha = "f" * 40
+                state.merge(full_name, number, by="crucible-spike[bot]", sha=merge_sha)
+                if state.merge_response_failure_once:
+                    state.merge_response_failure_once = False
+                    self._send(502, {"message": "response lost after merge"})
+                    return
+                self._send(
+                    200,
+                    {
+                        "merged": True,
+                        "message": "Pull Request successfully merged",
+                        "sha": merge_sha,
+                    },
+                )
+                return
             if not tail and method == "GET":
                 self._send(200, self._pull_json(repo, pull))
                 return
@@ -634,7 +668,7 @@ class _Handler(BaseHTTPRequestHandler):
             "merge_commit_sha": pull.merge_commit_sha,
             "merged_by": {"login": pull.merged_by} if pull.merged_by else None,
             "closed_at": pull.closed_at,
-            "mergeable_state": "clean",
+            "mergeable_state": pull.mergeable_state,
             "head": {"sha": pull.head_sha, "ref": pull.head_branch},
             "base": {"ref": pull.base_ref},
         }

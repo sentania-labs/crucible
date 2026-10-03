@@ -445,9 +445,39 @@ cycle opens on that head.
 
 ## Merge
 
-Merging is the operator's act on GitHub. Crucible observes
-`pull_request.closed` with `merged: true`, records the merge SHA, the
-merger login, and time, moves the task to `merged`, and wakes Foundry
+With `delivery.auto_merge` enabled (the default), Hades squash-merges the certified
+and accepted head at `ready_for_merge` through the GitHub App installation token.
+There is no hold window: the merge runs on the same observation tick that passes the
+post-PR gates, including the external review round and finding dispositions. Automatic
+merge requires a green certification with every observed eligible job successful, even
+if policy narrows the CI gate. Check suites and completed skipped jobs are excluded as
+in certification. A skipped no-CI certification does not authorize automatic merge.
+
+Immediately before merging, Hades reads the live PR and compares its head and base with
+the accepted head and persisted contract target, and requires the PR to be open. Polling
+never adopts a retargeted base. It then re-reads the task state, accepted head,
+certification, policy opt-out and live global switch before the call. The merge request
+specifies squash and the certified head as GitHub's SHA precondition. GitHub has no base
+precondition on this endpoint, so the fresh base comparison cannot atomically prevent
+a retarget between the read and the merge call.
+
+The merge result records the SHA from the merge response and the merger and time from
+an immediate PR read. An ambiguous failed response is checked for a completed merge
+before a refusal is recorded. A refusal wakes Foundry naming its cause. Persisted
+refusals retry after 60 seconds, doubling to a maximum of 30 minutes. A changed observed
+head, base or mergeability state allows an earlier retry; only a changed refusal cause
+produces another wake. These are failure retries, not a hold on newly ready heads.
+
+`delivery.auto_merge: false` leaves the task ready for an operator. Administrators can
+also disable automatic merges globally through `GET` or `POST
+/v1/admin/delivery/auto-merge` with `{"enabled": false}` or the switch on `/ui/settings`.
+The deployment switch defaults to enabled, is persisted as `delivery.auto_merge` in
+provider settings, and is read for each merge without a restart. Enabling it again does
+not override a policy opt-out. A switch change cannot cancel a merge request already
+sent to GitHub. Observation of a person's merge continues with either switch disabled.
+
+Crucible also observes `pull_request.closed` with `merged: true`, records the merge SHA,
+the merger login, and time, moves the task to `merged`, and wakes Foundry
 (informational). It does so from any delivery state, not only
 `ready_for_merge`: a person can merge before review or CI is done, and a
 merged pull request is never polled again, so the task would otherwise wait
@@ -493,7 +523,7 @@ included, with the closer recorded, and wakes Foundry with
 from the issue events timeline (`GET /issues/{n}/events`, the last `closed`
 entry). That second call is **best effort**: a repository whose timeline
 the App cannot read records the close with no actor rather than failing the
-observation. Crucible has no merge endpoint.
+observation.
 
 ## Ready-for-merge report
 

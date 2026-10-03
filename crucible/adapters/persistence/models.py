@@ -524,6 +524,15 @@ class PullRequestRow(Base):
     last_reactions_polled_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
     reactions_observable: Mapped[bool] = mapped_column(Boolean, default=True)
     cancelled_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
+    observed_head_sha: Mapped[str] = mapped_column(String(64), default="")
+    observed_base_ref: Mapped[str] = mapped_column(String(255), default="")
+    mergeable_state: Mapped[str] = mapped_column(String(32), default="")
+    merge_refusal_cause: Mapped[str | None] = mapped_column(Text, nullable=True)
+    merge_refusal_head_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    merge_refusal_base_ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    merge_refusal_mergeable_state: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    merge_refusal_count: Mapped[int] = mapped_column(Integer, default=0)
+    merge_retry_at: Mapped[datetime | None] = mapped_column(TZ, nullable=True)
 
 
 class PullRequestHeadRow(Base):

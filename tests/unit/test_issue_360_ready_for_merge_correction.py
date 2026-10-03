@@ -41,6 +41,7 @@ from crucible.domain.entities import (
     HarnessState,
     Policy,
     Principal,
+    ProviderSetting,
     PullRequest,
     PullRequestHead,
     PullRequestState,
@@ -425,6 +426,7 @@ class _Store:
         self.attempts = _Attempts()
         self.events = _Events()
         self.repositories = _Repositories(repository)
+        self.provider_settings: dict[str, ProviderSetting] = {}
         self.policies = _Policies(policy)
         self.routing_policies = _RoutingPolicies(routing)
         self.pull_requests = _PullRequests()

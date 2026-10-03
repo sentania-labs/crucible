@@ -248,6 +248,10 @@ class Deliverables(StrictModel):
     on_out_of_band_head: Literal["block"]
 
 
+class Delivery(StrictModel):
+    auto_merge: bool = True
+
+
 class PullRequestRules(StrictModel):
     require_pre_pr_verification: bool
     open_only_after_pre_pr_gates_pass: bool
@@ -345,6 +349,7 @@ class PolicyV1(StrictModel):
     repository: RepositoryRules
     gates: Gates
     deliverables: Deliverables
+    delivery: Delivery = Field(default_factory=Delivery)
     pull_request: PullRequestRules
     internal_review: InternalReview
     external_review: ExternalReview
