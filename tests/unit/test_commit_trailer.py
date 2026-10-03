@@ -206,6 +206,15 @@ def _collect(tmp_path: Path, repo: Path) -> Path:
     report = tmp_path / "report"
     output.mkdir()
     report.mkdir()
+    # Stand in for the trusted record left by preparation in these collector fixtures.
+    (output / "prepared-base.txt").write_text(
+        subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "main"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+    )
     generated = scripts.collector_script(
         base_ref="main",
         work_branch="crucible/test",

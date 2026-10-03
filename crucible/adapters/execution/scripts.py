@@ -20,6 +20,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
+from crucible.domain.gates import INJECTED_NAMES, INJECTED_PREFIXES, injected_shim_text
 from crucible.ports.execution import (
     OUTPUT_MOUNT,
     PACKAGE_CACHE_LEAF,
@@ -198,25 +199,25 @@ def _commit_policy_check(git: str) -> str:
 # show` verify a planted signature with a `gpg.program` of its choosing.
 # Keep text visible even when the worker lowers its binary detection threshold.
 GIT = (
-    "git -c advice.graftFileDeprecated=false "
+    "git -c advice.graftFileDeprecated=false -c core.commitGraph=false "
     "-c core.fsmonitor= -c diff.external= -c core.pager=cat "
     "-c core.bigFileThreshold=512m -c core.hooksPath=/dev/null "
     "-c log.showSignature=false -c 'safe.directory=*'"
 )
 CHECKPOINT_GIT = (
-    "git -c advice.graftFileDeprecated=false "
+    "git -c advice.graftFileDeprecated=false -c core.commitGraph=false "
     "-c core.fsmonitor= -c diff.external= -c core.pager=cat "
     "-c core.hooksPath=\"$EMPTY_HOOKS\" -c 'safe.directory=*'"
 )
-# hades #344: `GIT_NO_REPLACE_OBJECTS=1` and an empty `GIT_GRAFT_FILE`, so a replace
+# hades #344 and #369: disable replace objects, grafts and commit graphs, so a replace
 # ref or a graft the worker wrote cannot make the collected diff, the scanned content or
 # the merge base show anything other than the objects the bundle and the tree carry.
-# An empty path avoids opening a graft file at all: older Git bundle commands emit
-# its deprecation hint even with advice.graftFileDeprecated=false.
+# A nonexistent file also avoids older Git bundle commands emitting graft advice
+# before reading advice.graftFileDeprecated.
 GIT_ENV = (
     "export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 "
     "GIT_TERMINAL_PROMPT=0 GIT_ASKPASS= HOME=/home/worker LC_ALL=C "
-    "GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE="
+    "GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/nonexistent"
 )
 
 # 08: the copy step rejects symlinks, hard links, devices, and files above the policy
@@ -278,6 +279,7 @@ _ATTR_DIFF_PATHSPEC = "-- . ':(exclude,attr:!diff)' ':(exclude,attr:diff)'"
 # nothing an earlier collection of the same attempt left is read as this one's.
 _COLLECTOR_OUTPUTS = (
     "base.txt head.txt branch.txt diffstat.txt diff.patch changed.txt log.txt "
+    "diff-raw.txt commit-raw.txt base-injected.txt "
     "commit-paths.txt work_branch.bundle bundle.log commits.txt commit-policy tree "
     "clone.log report copy-rejections.tsv collection-failed.txt checkpoint-refusal.txt "
     "leftover-committed.txt leftover-refusal.txt collector.ok attr-text.patch "
@@ -441,6 +443,14 @@ rm -rf "$REPO"
 # shellcheck disable=SC2086
 {GIT} clone --no-hardlinks --no-checkout $REFERENCE -- "$CLONE_URL" "$REPO"
 {drop}cd "$REPO"
+# Record the trusted base before the worker can move refs. Output is mounted only
+# into Crucible-owned containers, never into the worker.
+if ! PREPARED_BASE=$({GIT} rev-parse --verify --quiet "refs/remotes/origin/$BASE_REF^{{commit}}" \
+  || {GIT} rev-parse --verify --quiet "$BASE_REF^{{commit}}"); then
+  printf 'base ref %s does not exist in the clone\\n' "$BASE_REF" >&2
+  exit 3
+fi
+printf '%s\\n' "$PREPARED_BASE" > "$OUT/prepared-base.txt"
 STARTED=""
 if [ -n {_quote(resume_bundle or "")} ]; then
   :
@@ -476,7 +486,7 @@ fi
 # writes them because the checkout belongs to container uid 1000, which is not the
 # uid the Crucible process runs as in every arrangement (S9 Test E).
 mkdir -p "$REPO/.git/info"
-SHIM_TEXT="Read $IDENTITY_MOUNT/IDENTITY.md first; it is the task contract for this run."
+SHIM_TEXT={_quote(injected_shim_text(identity_mount))}
 for shim in {shim_list}; do
   # Claude Code uses AGENTS.md only when the project has no own CLAUDE.md.
   # CLAUDE.md wins under its default instructionFiles setting. Other harnesses
@@ -539,6 +549,18 @@ _LEFTOVER_EXCLUDES = " ".join(f"':(exclude,glob){pattern}'" for pattern in _LEFT
 # The same paths as positive pathspecs, to unstage what the worker already added: an
 # exclusion only stops `git add` from adding, it does not take an entry out of the index.
 _LEFTOVER_EXCLUDED_PATHS = " ".join(f"':(glob){pattern}'" for pattern in _LEFTOVER_EXCLUDED)
+
+
+def _injected_pathspecs() -> str:
+    """A pathspec per injected name, at any depth (hades #369)."""
+    return " ".join(_quote(f":(glob)**/{name}") for name in sorted(INJECTED_NAMES))
+
+
+def _injected_path_pathspecs() -> str:
+    """Every path `no_injected_files` reads records for: an injected name at any depth or
+    anything under an injected prefix (hades #369)."""
+    prefixes = " ".join(_quote(f":(glob){prefix}**") for prefix in INJECTED_PREFIXES)
+    return f"{_injected_pathspecs()} {prefixes}"
 
 
 def collector_script(
@@ -666,9 +688,15 @@ EOF
   trap - EXIT HUP INT TERM
 fi
 rm -rf "$OUT/commit-policy"
-BASE=$({GIT} -C "$REPO" rev-parse --verify --quiet "$BASE_REF" \
-  || {GIT} -C "$REPO" rev-parse --verify --quiet "origin/$BASE_REF" \
-  || echo "")
+# Never resolve the base from refs in the worker-controlled checkout.
+BASE=$(cat "$OUT/prepared-base.txt" 2>/dev/null || true)
+if ! printf '%s\\n' "$BASE" | grep -Eq '^([0-9a-f]{{40}}|[0-9a-f]{{64}})$' \
+  || [ "$({GIT} -C "$REPO" cat-file -t "$BASE" 2>/dev/null || true)" != "commit" ]; then
+  printf '%s\\n' "collection failed: prepared base commit is missing or invalid" \
+    > "$OUT/collection-failed.txt"
+  cat "$OUT/collection-failed.txt" >&2
+  exit 1
+fi
 printf '%s\\n' "$BASE" > "$OUT/base.txt"
 {GIT} -C "$REPO" rev-parse HEAD > "$OUT/head.txt"
 {GIT} -C "$REPO" rev-parse --abbrev-ref HEAD > "$OUT/branch.txt"
@@ -693,10 +721,34 @@ if [ -n "$BASE" ]; then
     || REVIEW_DIFF_ERROR="git diff --stat failed"
   {GIT} -C "$REPO" diff {_DIFF_FLAGS} --no-color "$MB" HEAD > "$OUT/diff.patch" \
     || REVIEW_DIFF_ERROR="git diff failed"
-  {GIT} -C "$REPO" diff {_DIFF_FLAGS} --name-only "$MB" HEAD > "$OUT/changed.txt" || true
+  {GIT} -C "$REPO" diff {_DIFF_FLAGS} --name-only -z "$MB" HEAD > "$OUT/changed.txt" || true
+  # hades #369: the status and new blob of each injected-name path, so a shim the branch
+  # adds is told from the repository's own CLAUDE.md or AGENTS.md it edits or deletes.
+  # Only those paths, so the records stay small however many other files the branch
+  # has. -z keeps a non-ASCII path as its bytes instead of git's quoted form.
+  {GIT} -C "$REPO" diff --raw -z --no-renames --no-abbrev "$MB" HEAD \
+    -- {_injected_path_pathspecs()} > "$OUT/diff-raw.txt" || true
+  # The injected-name paths the merge base has: a CLAUDE.md a merge of the base brings
+  # in shows as an add against the merge's first parent, and is still the repository's.
+  EMPTY_TREE=$({GIT} -C "$REPO" hash-object -t tree /dev/null)
+  {GIT} -C "$REPO" diff --name-only -z --no-renames "$EMPTY_TREE" "$MB" \
+    -- {_injected_pathspecs()} > "$OUT/base-injected.txt" || true
+
   {GIT} -C "$REPO" log --format='%H%x1f%s%x1f%an%x1e' "$BASE"..HEAD > "$OUT/log.txt" || true
-  {GIT} -C "$REPO" log --name-only --format='' "$BASE"..HEAD \
-    | LC_ALL=C sort -u | sed '/^$/d' > "$OUT/commit-paths.txt" || true
+  # --root (hades #369): a root commit's files are listed whatever log.showRoot the
+  # worker-writable .git/config sets.
+  {GIT} -C "$REPO" log --root --name-only -z --format='' "$BASE"..HEAD \
+    | LC_ALL=C sort -zu > "$OUT/commit-paths.txt" || true
+  # --diff-merges=separate prints a merge's own changes, once per parent, which plain
+  # --raw leaves out. Not -m: that follows log.diffMerges from the worker-writable
+  # .git/config, and `combined` prints records read_path_changes does not parse;
+  # --topo-order prints every commit before its parents whatever its date, so the last
+  # record of a path is the oldest and says whether the base had it. --root prints an
+  # orphan root commit's adds, which log.showRoot=false would hide. --full-history keeps
+  # the pathspec from following only one parent of a merge and skipping the other side.
+  {GIT} -C "$REPO" log --root --full-history --diff-merges=separate --topo-order --raw -z \
+    --no-renames --no-abbrev --format='' "$BASE"..HEAD \
+    -- {_injected_path_pathspecs()} > "$OUT/commit-raw.txt" || true
   {GIT} -C "$REPO" bundle create "$OUT/work_branch.bundle" \
     "$BASE..$WORK_BRANCH" > "$OUT/bundle.log" 2>&1 || true
   {GIT} -C "$REPO" rev-list --count "$BASE"..HEAD > "$OUT/commits.txt" \
@@ -715,6 +767,7 @@ else
   REVIEW_DIFF_ERROR="the base ref could not be resolved"
   : > "$OUT/diffstat.txt"; : > "$OUT/diff.patch"; : > "$OUT/changed.txt"
   : > "$OUT/log.txt"; : > "$OUT/commit-paths.txt"; echo 0 > "$OUT/commits.txt"
+  : > "$OUT/diff-raw.txt"; : > "$OUT/commit-raw.txt"; : > "$OUT/base-injected.txt"
 fi
 # A fresh tree from the collected state, which is what the verifier runs against (11).
 rm -rf "$OUT/tree"

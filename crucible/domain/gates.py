@@ -11,6 +11,7 @@ an advisory one is recorded and carried in front of the internal reviewer, who d
 
 from __future__ import annotations
 
+import hashlib
 import posixpath
 import re
 from collections.abc import Callable, Sequence
@@ -132,6 +133,8 @@ _HEX = re.compile(r"[0-9a-f]{7,64}")
 _EMAIL = re.compile(r"[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,190}")
 
 # Shims and identity paths a worker must never leave behind (11).
+# Where the identity bundle is mounted; the shim text names it (ports.execution).
+SHIM_IDENTITY_MOUNT = "/crucible/identity"
 INJECTED_PREFIXES: tuple[str, ...] = (".crucible/", "crucible/identity/", ".crucible-shims/")
 INJECTED_NAMES: frozenset[str] = frozenset(
     {
@@ -403,7 +406,115 @@ def _injected(path: str) -> bool:
     return any(normalized.startswith(prefix) for prefix in INJECTED_PREFIXES)
 
 
+def injected_name(path: str) -> bool:
+    """A path named like a shim (INJECTED_NAMES) or under an injected prefix."""
+    return _injected(path)
+
+
+def _injected_prefix(path: str) -> bool:
+    normalized = posixpath.normpath(path)
+    return any(normalized.startswith(prefix) for prefix in INJECTED_PREFIXES)
+
+
+def injected_shim_text(identity_mount: str = SHIM_IDENTITY_MOUNT) -> str:
+    """The line the preparer writes into every shim it creates (06), without the newline
+    `printf '%s\\n'` adds."""
+    return f"Read {identity_mount}/IDENTITY.md first; it is the task contract for this run."
+
+
+@lru_cache(maxsize=1)
+def _shim_blob_ids() -> frozenset[str]:
+    """The git blob ids of the shim as the preparer writes it, for SHA-1 and SHA-256
+    repositories, so a committed file is compared by id without its content."""
+    body = (injected_shim_text() + "\n").encode("utf-8")
+    header = f"blob {len(body)}\0".encode()
+    return frozenset(
+        {hashlib.sha1(header + body).hexdigest(), hashlib.sha256(header + body).hexdigest()}
+    )
+
+
+def _changes(raw: Any) -> list[tuple[str, str, str]] | None:
+    """(path, status letter, new blob id) records, or None for evidence collected before
+    hades #369, which carried no status."""
+    if not isinstance(raw, list):
+        return None
+    out: list[tuple[str, str, str]] = []
+    for item in raw:
+        if isinstance(item, dict):
+            out.append(
+                (
+                    str(item.get("path", "")),
+                    str(item.get("status", ""))[:1].upper(),
+                    str(item.get("blob", "")).lower(),
+                )
+            )
+    return out
+
+
+def _base_paths(raw: Any) -> frozenset[str]:
+    """The injected-name paths the merge base has; none for evidence that did not record
+    them, which leaves the decision to the commits' order alone."""
+    return frozenset(str(p) for p in raw) if isinstance(raw, list) else frozenset()
+
+
+def _injected_hits(
+    paths: Sequence[str],
+    diff_changes: list[tuple[str, str, str]] | None,
+    commit_paths: Sequence[str],
+    commit_changes: list[tuple[str, str, str]] | None,
+    base_paths: frozenset[str] = frozenset(),
+) -> set[str]:
+    """hades #369: an injected-name path fails when the branch adds it relative to the
+    base ref, or commits the shim's content into it. Deleting or editing a file the base
+    already has is the repository's own work. A file turned into a symlink or back (T)
+    counts as an add, since a link to the identity mount is a shim by another name. A
+    path under an injected prefix always fails, and so does any path the evidence carries
+    no status for, as before #369."""
+    shim = _shim_blob_ids()
+    hits: set[str] = set()
+    diff_status: dict[str, str] = {}
+    for path, status, blob in diff_changes or []:
+        diff_status[path] = status
+        if _injected(path) and (status not in ("M", "D") or blob in shim):
+            hits.add(path)
+    # Commits in `git log --diff-merges=separate --topo-order` order, every commit before
+    # its parents and a merge once per parent: the last record of a path is the oldest,
+    # and says whether the base had it, since only a path the base lacks starts with an
+    # add. The order is the graph's, never the commit dates, which the worker sets.
+    oldest_status: dict[str, str] = {}
+    for path, status, blob in commit_changes or []:
+        oldest_status[path] = status
+        if _injected(path) and (status == "T" or blob in shim):
+            hits.add(path)
+    for path, status in oldest_status.items():
+        existed = diff_status.get(path) in ("M", "D") or status in ("M", "D") or path in base_paths
+        if _injected(path) and not existed:
+            hits.add(path)
+    for path in paths:
+        if _injected(path) and (
+            _injected_prefix(path) or diff_changes is None or path not in diff_status
+        ):
+            hits.add(path)
+    for path in commit_paths:
+        if _injected(path) and (
+            _injected_prefix(path) or commit_changes is None or path not in oldest_status
+        ):
+            hits.add(path)
+    for path in (*diff_status, *oldest_status):
+        if _injected_prefix(path):
+            hits.add(path)
+    return hits
+
+
 def no_injected_files(gi: GateInput) -> GateOutcome:
+    """Fail on a shim, .crucible or identity path the branch leaves, read from the diff
+    against the merge base and from every commit on the branch (11, hades #369).
+
+    Known limit: a base ancestor older than the merge base that once had an injected-name
+    file excuses a history-only add of that path that is not the shim's content (a merge
+    with that ancestor as its last parent, or a branch built from it), since the oldest
+    record is then an edit or deletion. The shim's content is still caught by its blob id,
+    and such a branch does not merge cleanly into the base."""
     diff = gi.one("diff_paths")
     bundle = gi.one("bundle_head")
     if diff is None:
@@ -413,11 +524,21 @@ def no_injected_files(gi: GateInput) -> GateOutcome:
         # gate has only half its evidence.
         return _missing("bundle_head")
     ids = tuple(e.id for e in (diff, bundle) if e is not None)
-    paths = [str(p) for p in diff.payload.get("paths", [])]
-    if bundle is not None:
-        for commit in bundle.payload.get("commit_paths", []):
-            paths.append(str(commit))
-    hits = sorted({p for p in paths if _injected(p)})
+    over = [str(name) for name in diff.payload.get("over_limit", [])]
+    if over:
+        # hades #369: a list read only in part may hide a shim past its cut.
+        return GateOutcome(
+            GateResult.FAIL, f"path lists over their read limit, not fully read: {over}", ids
+        )
+    hits = sorted(
+        _injected_hits(
+            [str(p) for p in diff.payload.get("paths", [])],
+            _changes(diff.payload.get("changes")),
+            [str(p) for p in bundle.payload.get("commit_paths", [])],
+            _changes(bundle.payload.get("commit_changes")),
+            _base_paths(diff.payload.get("base_paths")),
+        )
+    )
     if hits:
         return GateOutcome(GateResult.FAIL, f"injected paths in the branch: {hits[:10]}", ids)
     return GateOutcome(GateResult.PASS, "no shim, .crucible, or identity path in the branch", ids)

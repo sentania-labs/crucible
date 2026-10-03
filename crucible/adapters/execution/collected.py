@@ -26,13 +26,18 @@ from crucible.ports.execution import (
     CollectedArtifact,
     CommitPolicyCheck,
     LaunchSpec,
+    PathChange,
     VerificationRun,
 )
 
 __all__ = [
     "Outputs",
+    "lists_over_limit",
+    "read_base_paths",
     "read_commit_policy",
     "read_outputs",
+    "read_path_changes",
+    "read_path_list",
     "read_verifications",
     "tail",
     "text",
@@ -55,9 +60,15 @@ class Outputs:
     checkpoint_refusal: str | None
     leftover_committed: bool = False
     leftover_note: str | None = None
+    diff_changes: tuple[PathChange, ...] | None = None
+    base_paths: tuple[str, ...] | None = None
+    over_limit: tuple[str, ...] = ()
 
 
-def text(path: Path, limit: int = 8 * 1024 * 1024) -> str:
+TEXT_LIMIT = 8 * 1024 * 1024
+
+
+def text(path: Path, limit: int = TEXT_LIMIT) -> str:
     try:
         with path.open("rb") as handle:
             return handle.read(limit).decode("utf-8", "replace")
@@ -100,9 +111,13 @@ def read_outputs(
     blocked = report_dir / "blocked.md"
     blocked_md = text(blocked) if blocked.is_file() else None
 
-    changed = tuple(p for p in text(output / "changed.txt").splitlines() if p.strip())
+    changed = read_path_list(output / "changed.txt")
     diff_text = text(output / "diff.patch") if (output / "diff.patch").is_file() else None
-    commit_paths = tuple(p for p in text(output / "commit-paths.txt").splitlines() if p.strip())
+    commit_paths = read_path_list(output / "commit-paths.txt")
+    diff_changes = read_path_changes(output / "diff-raw.txt")
+    commit_changes = read_path_changes(output / "commit-raw.txt")
+    base_paths = read_base_paths(output / "base-injected.txt")
+    over_limit = lists_over_limit(output)
     commit_policy = read_commit_policy(output / "commit-policy")
     messages: list[str] = []
     for record in text(output / "log.txt").split("\x1e"):
@@ -130,6 +145,7 @@ def read_outputs(
             commit_paths=commit_paths,
             commit_messages=tuple(messages),
             commit_policy=commit_policy,
+            commit_changes=commit_changes,
         )
 
     artifacts: list[CollectedArtifact] = []
@@ -180,6 +196,9 @@ def read_outputs(
         stderr_tail=tail(output / "bundle.log", tail_bytes),
         diff_paths=changed,
         diff_text=diff_text,
+        diff_changes=diff_changes,
+        base_paths=base_paths,
+        over_limit=over_limit,
         bundle=bundle,
         artifacts=tuple(artifacts),
         verifications=verifications,
@@ -188,6 +207,81 @@ def read_outputs(
         leftover_committed=(output / "leftover-committed.txt").is_file(),
         leftover_note=text(output / "leftover-refusal.txt").strip() or None,
     )
+
+
+_RAW_META = re.compile(r":[0-7]{6} [0-7]{6} ([0-9a-f]{40,64}) ([0-9a-f]{40,64}) ([A-Z])[0-9]*")
+# Larger than this and the records are not read at all: `git log` prints the oldest
+# records last, and a cut tail would hide the add that says the base lacked a path. The
+# collector writes only injected-name records, and lists_over_limit makes the gate fail
+# on a list this large.
+_RAW_LIMIT = 8 * 1024 * 1024
+
+
+def read_path_changes(path: Path) -> tuple[PathChange, ...] | None:
+    """`git diff --raw -z` or `git log --diff-merges=separate --raw -z` records as
+    PathChange records (hades #369), in the order git printed them, or None when the
+    collector wrote no such file (an older collector script) or wrote more than is read.
+    A record that does not parse is skipped; the gate then treats its path as before
+    #369. `-z` keeps each path as its bytes, so a non-ASCII directory is not hidden
+    behind git's quoting."""
+    try:
+        if not path.is_file() or path.stat().st_size > _RAW_LIMIT:
+            return None
+    except OSError:
+        return None
+    out: list[PathChange] = []
+    fields = text(path, _RAW_LIMIT).split("\0")
+    at = 0
+    while at < len(fields) - 1:
+        match = _RAW_META.fullmatch(fields[at].lstrip("\n"))
+        if match is None:
+            at += 1
+            continue
+        # The path is the next field, whatever it looks like: never read as a record.
+        if fields[at + 1]:
+            out.append(PathChange(path=fields[at + 1], status=match.group(3), blob=match.group(2)))
+        at += 2
+    return tuple(out)
+
+
+# The path lists `no_injected_files` reads and how much of each is read (hades #369).
+_PATH_LISTS: tuple[tuple[str, int], ...] = (
+    ("changed.txt", TEXT_LIMIT),
+    ("commit-paths.txt", TEXT_LIMIT),
+    ("diff-raw.txt", _RAW_LIMIT),
+    ("commit-raw.txt", _RAW_LIMIT),
+    ("base-injected.txt", TEXT_LIMIT),
+)
+
+
+def lists_over_limit(output: Path) -> tuple[str, ...]:
+    """The path lists larger than what is read of them (hades #369): their tail is cut
+    or they are not read at all, so the gate cannot see every path and fails closed."""
+    over: list[str] = []
+    for name, limit in _PATH_LISTS:
+        try:
+            if (output / name).stat().st_size > limit:
+                over.append(name)
+        except OSError:
+            continue
+    return tuple(over)
+
+
+def read_path_list(path: Path) -> tuple[str, ...]:
+    """A path list the collector wrote with `-z` (hades #369), so a non-ASCII path is its
+    bytes and not git's quoted form; a list without a NUL is read one path per line, as
+    an older collector script and the fake cluster write it."""
+    content = text(path)
+    paths = content.split("\0") if "\0" in content else content.splitlines()
+    return tuple(p for p in paths if p.strip())
+
+
+def read_base_paths(path: Path) -> tuple[str, ...] | None:
+    """The injected-name paths the merge base already has, NUL-separated as the collector
+    lists them (hades #369), or None when it wrote no such file."""
+    if not path.is_file():
+        return None
+    return tuple(p for p in text(path).split("\0") if p.strip())
 
 
 def read_commit_policy(directory: Path) -> CommitPolicyCheck | None:
