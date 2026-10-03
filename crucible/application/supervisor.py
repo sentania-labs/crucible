@@ -5332,6 +5332,8 @@ class Supervisor:
                 event = uow.events.latest_for_task_kind(task.id, EventKind.TASK_BLOCKED.value)
                 if event is None or event.payload.get("reason") != "model_endpoint_unavailable":
                     continue
+                if not event.payload.get("health_retry_allowed"):
+                    continue
                 if event.payload.get("never_started") or not event.payload.get("endpoint_url"):
                     continue
                 if task.resume_at is not None and task.resume_at > self._clock.now():
@@ -5359,6 +5361,8 @@ class Supervisor:
             event = uow.events.latest_for_task_kind(task.id, EventKind.TASK_BLOCKED.value)
             if event is None or event.payload.get("reason") != "model_endpoint_unavailable":
                 return
+            if not event.payload.get("health_retry_allowed"):
+                return
             task.resume_at = None if healthy else self._clock.now() + timedelta(minutes=3)
             uow.tasks.save(task)
             if healthy:
@@ -5370,6 +5374,7 @@ class Supervisor:
                     EventKind.TASK_RETRY_SCHEDULED,
                     payload={
                         "health_recovered": True,
+                        "contract_version": task.contract_version,
                         "endpoint_url": event.payload.get("endpoint_url"),
                     },
                 )
@@ -5381,18 +5386,20 @@ class Supervisor:
         event = uow.events.latest_for_task_kind(task.id, EventKind.ATTEMPT_EXITED.value)
         detail = event.payload if event is not None and event.attempt_id == attempt.id else {}
         message = str(detail.get("interruption_message") or "model endpoint unavailable")
-        recovered_at = max(
-            (
-                event.ts
-                for event in self._all_task_events(uow, task.id)
-                if event.kind == EventKind.TASK_RETRY_SCHEDULED.value
-                and event.payload.get("health_recovered")
-            ),
-            default=task.created_at,
+        contract = uow.contracts.get(task.id, execution.contract_version)
+        assert contract is not None
+        version_events = [
+            row for row in self._all_task_events(uow, task.id)
+            if row.payload.get("contract_version") == execution.contract_version
+        ]
+        already_blocked = any(
+            row.kind == EventKind.TASK_BLOCKED.value
+            and row.payload.get("reason") == "model_endpoint_unavailable"
+            for row in version_events
         )
         failures = sum(
             row.exit_class in {ExitClass.INFRASTRUCTURE, ExitClass.QUOTA_EXHAUSTED}
-            and row.created_at >= recovered_at
+            and row.created_at >= contract.submitted_at
             for row in uow.attempts.list_for_task(task.id)
         )
         if failures >= 3:
@@ -5411,6 +5418,8 @@ class Supervisor:
                 attempt_id=attempt.id,
                 payload={
                     "reason": "model_endpoint_unavailable",
+                    "contract_version": execution.contract_version,
+                    "health_retry_allowed": not already_blocked,
                     "cause": message,
                     "never_started": bool(detail.get("never_started")),
                     "endpoint_url": endpoint_url
@@ -5419,15 +5428,12 @@ class Supervisor:
                     else None,
                 },
             )
-            create_wake(
-                uow,
-                self._clock,
-                principal_id=task.principal_id,
-                reason=WakeReason.ATTEMPT_FAILED,
-                task=task,
-                attempt_id=attempt.id,
-                summary=message,
-            )
+            if not already_blocked:
+                open_escalation(
+                    uow, self._clock, task=task, attempt_id=attempt.id,
+                    question=message, summary=message,
+                    wake_reason=WakeReason.ATTEMPT_FAILED,
+                )
             return
         task.resume_at = self._clock.now() + timedelta(minutes=3)
         uow.tasks.save(task)

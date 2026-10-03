@@ -61,7 +61,7 @@ def _running(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, Any, Any, list[Any]]
     uow.tasks.list_by_state.side_effect = lambda state, **_: (
         [pending.task] if pending.task.state is state else []
     )
-    uow.contracts.get.return_value = MagicMock(document=pending.contract)
+    uow.contracts.get.return_value = MagicMock(document=pending.contract, submitted_at=pending.task.created_at)
     uow.evidence.add.side_effect = append_evidence
     uow.evidence.list_for_attempt.side_effect = lambda attempt_id: [
         row for row in evidence if row.attempt_id == attempt_id
@@ -398,3 +398,23 @@ async def test_readiness_probe_invalid_response(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(endpoint_health, "HTTPConnection", MagicMock(return_value=connection))
     assert not await endpoint_health.probe_model_endpoint("http://gateway.example/v1")
     connection.close.assert_called_once_with()
+
+
+def test_fourth_interruption_after_recovery_stays_blocked(monkeypatch: pytest.MonkeyPatch) -> None:
+    supervisor, pending, uow, events = _running(monkeypatch)
+    attempts = [replace(pending.attempt, id=str(i), exit_class=ExitClass.INFRASTRUCTURE) for i in range(2)]
+    attempts.append(pending.attempt)
+    uow.attempts.list_for_task.side_effect = lambda *_: attempts
+    _finish(supervisor, pending.attempt, "HTTP 503 Service Unavailable")
+    supervisor._record_endpoint_health(pending.task.id, True)
+    pending.task.state = TaskState.RUNNING
+    fourth = replace(pending.attempt, id="fourth", state=AttemptState.RUNNING, exit_class=None)
+    attempts.append(fourth)
+    uow.attempts.get.return_value = fourth
+    _finish(supervisor, fourth, "HTTP 503 Service Unavailable")
+    assert pending.task.state is TaskState.BLOCKED
+    supervisor._record_endpoint_health(pending.task.id, True)
+    assert pending.task.state is TaskState.BLOCKED
+    assert supervisor._infrastructure_waits() == []
+    assert sum(row.kind == EventKind.WAKE_CREATED.value for row in events) == 1
+    uow.escalations.add.assert_called_once()
