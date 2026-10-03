@@ -5414,12 +5414,13 @@ class Supervisor:
             and row.payload.get("reason") == "model_endpoint_unavailable"
             for row in version_events
         )
+        # Quota exits reroute under their own budget (reroute_max); only interruptions
+        # of the infrastructure itself count against this one.
         failures = sum(
-            row.exit_class in {ExitClass.INFRASTRUCTURE, ExitClass.QUOTA_EXHAUSTED}
-            and row.created_at >= contract.submitted_at
+            row.exit_class is ExitClass.INFRASTRUCTURE and row.created_at >= contract.submitted_at
             for row in uow.attempts.list_for_task(task.id)
         )
-        if failures >= 3:
+        if failures >= INFRASTRUCTURE_RETRY_BUDGET:
             routing = load_routing(uow, execution.policy_snapshot or {})
             model = routing.model(attempt.selected_model or execution.model) if routing else None
             endpoint_url = model.endpoint_url if model is not None else None
