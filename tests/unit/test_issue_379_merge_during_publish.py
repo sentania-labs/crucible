@@ -19,10 +19,12 @@ import pytest
 
 from crucible.adapters.execution.fake import FakeProvider
 from crucible.adapters.storage.disk import DiskArtifactStore
+from crucible.application.delivery_decisions import record_head_decision
 from crucible.application.errors import ContractValidationError
 from crucible.application.supervisor import Supervisor
 from crucible.application.transitions import move_task, record_event
-from crucible.domain.entities import CICertification, PullRequestHead, PullRequestState, Task
+from crucible.contracts.api import HeadAction, HeadDecisionRequest
+from crucible.domain.entities import CICertification, PullRequestState, Task
 from crucible.domain.events import PRINCIPAL_CRUCIBLE, EventKind
 from crucible.domain.exit_class import ExitClass
 from crucible.domain.lifecycle import TaskState
@@ -42,6 +44,7 @@ from tests.unit.test_issue_360_ready_for_merge_correction import (
     _correction_attempt,
     _GitHub,
     _NothingOnThePullRequest,
+    _principal,
     _ready_for_merge,
     _Store,
     _Tasks,
@@ -360,6 +363,62 @@ def test_a_merged_head_that_is_not_the_pushed_head_is_recorded_and_escalated(
     assert f"the merged head {OTHER_HEAD} is not among the heads Crucible pushed" in merged[0]
 
 
+def test_a_merged_foreign_head_seen_by_an_earlier_poll_is_not_a_pushed_head(
+    tmp_path: Path,
+) -> None:
+    store = _ready_for_merge()
+    clock = FakeClock(NOW)
+    github = _PublishGitHub()
+    supervisor = _supervisor(store, clock, tmp_path, github, _Publisher())
+    store.ci_certifications = _Certifications()  # type: ignore[attr-defined]
+    store.reactions = _NothingOnThePullRequest()  # type: ignore[attr-defined]
+    store.acceptance = _NothingToSupersede()  # type: ignore[attr-defined]
+    store.review_reports = _NothingToSupersede()  # type: ignore[attr-defined]
+    store.ci_decisions = _NothingToSupersede()  # type: ignore[attr-defined]
+    # A poll in ready_for_merge sees a head someone else pushed; the PR row takes it.
+    github.polled = _open(OTHER_HEAD)
+    clock.advance(300)
+    asyncio.run(supervisor.delivery.observe())
+    assert _task(store).state is TaskState.HEAD_DIVERGED
+    pull_request = store.pull_requests.get(PR_ID)
+    assert pull_request is not None and pull_request.head_sha == OTHER_HEAD
+    # Foundry recollects: the task goes back through a correction from the branch.
+    record_head_decision(
+        store.uow(),
+        clock,
+        principal=_principal(),
+        task_id=TASK_ID,
+        request=HeadDecisionRequest(action=HeadAction.RECOLLECT, reasoning="take it again"),
+    )
+    supervisor._materialize_scheduled()
+    move_task(store.uow(), clock, _task(store), TaskState.RUNNING, EventKind.TASK_RUNNING)
+
+    # Someone merges the foreign head while the correction runs.
+    github.polled = _merged(OTHER_HEAD)
+    clock.advance(300)
+    asyncio.run(supervisor.delivery.observe())
+
+    task = _task(store)
+    assert task.state is TaskState.MERGED
+    # The foreign head is not taken as a head Crucible pushed; the last one it did push is.
+    assert task.head_sha == OLD_HEAD
+    payload = _merged_event_payload(store)
+    assert payload["merged_head"] == OTHER_HEAD
+    assert payload["last_pushed_head"] == OLD_HEAD
+    assert payload["merged_head_matches"] is False
+    assert payload["pushed_after_merge"] is None
+    escalations = store.escalations.list_for_task(TASK_ID)
+    assert len(escalations) == 1
+    assert "What was merged is not a head Crucible pushed" in escalations[0].question
+    assert f"the merged head {OTHER_HEAD} is not among the heads Crucible pushed" in (
+        escalations[0].question
+    )
+    assert "was pushed after the merge" not in escalations[0].question
+    merged = _wakes(store, "merged")
+    assert len(merged) == 1
+    assert f"{OTHER_HEAD} is a head Crucible pushed" not in merged[0]
+
+
 def test_a_poll_winning_the_push_race_refuses_to_record_the_post_merge_push(
     tmp_path: Path,
 ) -> None:
@@ -462,7 +521,6 @@ def test_a_closed_pull_request_during_a_correction_fails_the_publication(
     # Reopened on GitHub, the republish publishes the corrected head to the same PR.
     github.lookups = [_open(OLD_HEAD)]
     github.known = _open(OLD_HEAD)
-    store.pull_request_heads = _Heads()  # type: ignore[assignment]
     move_task(store.uow(), _clock, _task(store), TaskState.PUBLISHING, EventKind.TASK_PUBLISHING)
     assert _publish(supervisor) == 1
     assert publisher.pushes == [NEW_HEAD]
@@ -526,7 +584,6 @@ def test_the_tasks_open_pull_request_wins_over_another_open_pr_on_the_branch(
     store, _clock, supervisor, github, publisher = _correcting(tmp_path)
     github.known = _open(OLD_HEAD)
     github.lookups = [_open(OLD_HEAD, number=PR_NUMBER + 1)]
-    store.pull_request_heads = _Heads()  # type: ignore[assignment]
 
     assert _publish(supervisor) == 1
 
@@ -716,15 +773,17 @@ class _Certifications:
         return certification
 
 
-class _Heads:
-    def __init__(self) -> None:
-        self.rows: list[PullRequestHead] = []
+class _NothingToSupersede:
+    """No acceptance, review report or CI decision is recorded for the task."""
 
-    def add(self, head: PullRequestHead) -> None:
-        self.rows.append(head)
+    def supersede_for_task(self, task_id: str, at: datetime) -> None:
+        return None
 
-    def list_for_pull_request(self, pull_request_id: str) -> list[PullRequestHead]:
-        return [h for h in self.rows if h.pull_request_id == pull_request_id]
+    def list_for_task(self, task_id: str) -> list[object]:
+        return []
+
+    def supersede(self, row_id: str, at: datetime) -> None:
+        return None
 
 
 def _first_publication_failed(
@@ -738,7 +797,6 @@ def _first_publication_failed(
     ]
     store.ci_certifications = _Certifications()  # type: ignore[attr-defined]
     store.reactions = _NothingOnThePullRequest()  # type: ignore[attr-defined]
-    store.pull_request_heads = _Heads()  # type: ignore[assignment]
     task = _task(store)
     task.head_sha = OLD_HEAD
     move_task(store.uow(), clock, task, TaskState.PUBLISH_FAILED, EventKind.TASK_PUBLISH_FAILED)

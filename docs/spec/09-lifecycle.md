@@ -133,7 +133,10 @@ after opening its PR is polled in full, and a merge of it is an early merge.
 When a merge wins over a correction, the task's head is the merged head when
 it is among the heads Crucible pushed and confirmed on the remote, not a
 corrected head that was collected and never pushed; when the merged head is
-not among them, the task keeps the latest head Crucible pushed. The
+not among them, the task keeps the latest head Crucible pushed. The pushed
+heads are the PR's head records marked as pushed by Crucible and the
+`branch_pushed` events, never the PR's current head, which a poll sets to a
+head someone else pushed (hades #379). The
 `task_merged` event records the head GitHub merged, the latest recorded pushed
 head, whether the merged head was a quota checkpoint, whether the merged head
 is among the pushed heads, and any head Crucible pushed after the merged one;

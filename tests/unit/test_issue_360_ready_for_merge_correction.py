@@ -42,7 +42,9 @@ from crucible.domain.entities import (
     Policy,
     Principal,
     PullRequest,
+    PullRequestHead,
     PullRequestState,
+    PushedBy,
     Repository,
     Role,
     RoutingPolicyRecord,
@@ -255,6 +257,27 @@ class _NothingOnThePullRequest:
 
     def list_for_pull_request(self, pull_request_id: str) -> list[Any]:
         return []
+
+
+class _CrucibleHeads:
+    """The heads recorded on the PR: the first publication's, pushed by Crucible."""
+
+    def __init__(self) -> None:
+        self.rows: list[PullRequestHead] = [
+            PullRequestHead(
+                id="01HEAD3600000000000000001",
+                pull_request_id=PR_ID,
+                sha=OLD_HEAD,
+                pushed_by=PushedBy.CRUCIBLE,
+                observed_at=NOW,
+            )
+        ]
+
+    def add(self, head: PullRequestHead) -> None:
+        self.rows.append(head)
+
+    def list_for_pull_request(self, pull_request_id: str) -> list[PullRequestHead]:
+        return [h for h in self.rows if h.pull_request_id == pull_request_id]
 
 
 class _NoDecisions:
@@ -649,6 +672,7 @@ def _ready_for_merge() -> _Store:
             opened_at=NOW,
         )
     )
+    store.pull_request_heads = _CrucibleHeads()  # type: ignore[assignment]
     store.review_cycles.add(
         ExternalReviewCycle(
             id="01CYCLE360000000000000001",

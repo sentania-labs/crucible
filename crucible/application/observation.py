@@ -1104,14 +1104,18 @@ def pushed_heads(
 ) -> tuple[dict[str, bool], str | None]:
     """Heads Crucible confirmed on the work branch and the latest recorded one.
 
-    The PR's original head predates branch_pushed records and is included as a pushed
-    head. The bool records whether a head was only pushed as a quota checkpoint.
+    The heads recorded on the PR as pushed by Crucible, which include the PR's first
+    head from before branch_pushed records, and every branch_pushed head. Never the PR
+    row's current head: a poll sets that to a head someone else pushed (hades #379).
+    The bool records whether a head was only pushed as a quota checkpoint.
     """
     heads: dict[str, bool] = {}
-    if pull_request.head_sha:
-        heads[pull_request.head_sha] = False
+    latest: str | None = None
+    for row in uow.pull_request_heads.list_for_pull_request(pull_request.id):
+        if row.pushed_by is PushedBy.CRUCIBLE and row.sha:
+            heads[row.sha] = False
+            latest = row.sha
     after = 0
-    latest = pull_request.head_sha or None
     while True:
         events = uow.events.list_for_task(task.id, after_seq=after, limit=1000)
         if not events:
