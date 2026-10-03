@@ -125,7 +125,6 @@ TASK_TRANSITIONS: frozenset[tuple[TaskState, TaskState]] = frozenset(
         (_S.RUNNING, _S.AWAITING_QUOTA),
         (_S.AWAITING_QUOTA, _S.SCHEDULED),
         (_S.AWAITING_QUOTA, _S.REPORTED),
-        (_S.AWAITING_QUOTA, _S.BLOCKED),
         (_S.BLOCKED, _S.SCHEDULED),
         (_S.REPORTED, _S.PRE_PR_GATES_FAILED),
         (_S.REPORTED, _S.AWAITING_INTERNAL_REVIEW),
