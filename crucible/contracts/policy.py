@@ -412,8 +412,9 @@ class RoutingTier(StrictModel):
 class ChatTemplateKwargs(StrictModel):
     """Request options retained with one routing entry.
 
-    Hermes 0.19 cannot receive this option from its non-interactive CLI. Keeping the
-    value in the entry makes the operator's intent durable until that transport exists.
+    Hermes 0.19 cannot receive this option from its non-interactive CLI. Hades #388: the
+    Hermes adapter passes it to the image wrapper, whose bootstrap puts it on each
+    request, and the attempt records the value it was launched with.
     """
 
     enable_thinking: bool = False

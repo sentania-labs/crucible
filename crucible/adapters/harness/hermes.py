@@ -115,6 +115,10 @@ def _usage(report_dir: Path | None) -> tuple[dict[str, Any] | None, str | None]:
         return None, f"unparsable {USAGE_NAME}: root is not an object"
     completed = document.get("completed")
     failed = document.get("failed")
+    if completed is None and failed is True:
+        # #387: Hermes 0.19 writes `completed: null` when its agent raised. The run did
+        # not complete, and the record still carries its model, session and tokens.
+        completed = document["completed"] = False
     if not isinstance(completed, bool) or not isinstance(failed, bool):
         return None, f"unparsable {USAGE_NAME}: completed and failed must be booleans"
     return document, None
@@ -250,6 +254,12 @@ class HermesAdapter:
                 # FDY-0140: the run limits the Local gateway page sets.
                 "CRUCIBLE_HERMES_MAX_TURNS": str(limits.max_turns),
                 "CRUCIBLE_HERMES_CONTEXT_LENGTH": str(limits.context_length),
+                # Hades #388: the response allowance the gateway reserves out of that
+                # window, and the routing entry's thinking setting. The wrapper writes
+                # the allowance as Hermes's `model.max_tokens`, so the compressor
+                # budgets input against the window less it and each request carries it.
+                "CRUCIBLE_HERMES_MAX_OUTPUT_TOKENS": str(limits.max_output_tokens),
+                "CRUCIBLE_HERMES_THINKING": "true" if limits.thinking else "false",
                 "OPENAI_BASE_URL": ctx.endpoint_url,
                 "OPENAI_API_KEY": "local-no-auth",
                 "CRUCIBLE_HERMES_USAGE": usage_path,
