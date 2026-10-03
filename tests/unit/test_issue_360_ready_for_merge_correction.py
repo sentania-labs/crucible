@@ -182,13 +182,6 @@ class _Events:
             (e for e in reversed(self.rows) if e.task_id == task_id and e.kind == kind), None
         )
 
-    def list_for_task(self, task_id: str, *, after_seq: int, limit: int) -> list[Event]:
-        return [
-            event
-            for event in self.rows
-            if event.task_id == task_id and int(event.seq or 0) > after_seq
-        ][:limit]
-
     def kinds(self) -> list[str]:
         return [e.kind for e in self.rows]
 
