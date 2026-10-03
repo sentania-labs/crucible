@@ -4222,7 +4222,9 @@ class Supervisor:
             if not (timed_out or killed or oom_killed):
                 if never_started:
                     attempt.exit_class = ExitClass.INFRASTRUCTURE
-                elif interruption is not None:
+                elif interruption is not None and attempt.exit_class in {
+                    ExitClass.CRASHED, ExitClass.UNKNOWN, ExitClass.INFRASTRUCTURE
+                }:
                     attempt.exit_class = interruption.exit_class
             interruption_detail = (
                 f"the worker never started: {final_observation.container_message}"

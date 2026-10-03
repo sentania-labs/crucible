@@ -457,3 +457,21 @@ def test_command_errors_never_become_interruptions(monkeypatch: pytest.MonkeyPat
     assert pending.attempt.exit_class is ExitClass.CRASHED
     assert pending.task.state is TaskState.REPORTED
     uow.attempts.add.assert_not_called()
+
+
+@pytest.mark.parametrize("classification", [ExitClass.BLOCKED, ExitClass.PROVIDER_ERROR, ExitClass.AUTH_FAILURE, ExitClass.QUOTA_EXHAUSTED])
+def test_specific_adapter_classification_wins(monkeypatch: pytest.MonkeyPatch, classification: ExitClass) -> None:
+    supervisor, pending, _uow, _events = _running(monkeypatch)
+    adapter = MagicMock()
+    adapter.classify_exit.return_value = classification
+    adapter.provider_quota_event.return_value = None
+    supervisor._harnesses = MagicMock()
+    supervisor._harnesses.get.return_value = adapter
+    mark_down = MagicMock()
+    monkeypatch.setattr(supervisor, "_mark_local_endpoint_down", mark_down)
+    _finish(supervisor, pending.attempt, "HTTP 503 Service Unavailable")
+    assert pending.attempt.exit_class is classification
+    if classification is ExitClass.PROVIDER_ERROR:
+        mark_down.assert_called_once()
+    if classification is ExitClass.BLOCKED:
+        assert pending.task.state is TaskState.BLOCKED
