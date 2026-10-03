@@ -18,13 +18,16 @@ from typing import cast
 import pytest
 
 from crucible.adapters.execution.fake import FakeProvider
+from crucible.adapters.github.appauth import AppAuthenticator
+from crucible.adapters.github.client import RestGitHubClient
+from crucible.adapters.github.transport import RestTransport
 from crucible.adapters.storage.disk import DiskArtifactStore
 from crucible.application.delivery_decisions import record_head_decision
 from crucible.application.errors import ContractValidationError
 from crucible.application.supervisor import Supervisor
 from crucible.application.transitions import move_task, record_event
-from crucible.contracts.api import HeadAction, HeadDecisionRequest
-from crucible.domain.entities import CICertification, PullRequestState, Task
+from crucible.contracts.api import HeadDecisionRequest
+from crucible.domain.entities import CICertification, HeadAction, PullRequestState, Task
 from crucible.domain.events import PRINCIPAL_CRUCIBLE, EventKind
 from crucible.domain.exit_class import ExitClass
 from crucible.domain.lifecycle import TaskState
@@ -56,16 +59,16 @@ OTHER_HEAD = "d" * 40
 
 
 class _PublishGitHub(_GitHub):
-    """The calls a publication makes. `lookups` are what successive lookups of the work
-    branch return (the last one again once the rest are used); `known` is the task's own
-    pull request read by its number; `polled`, when set, is what a poll observes.
-    Opening or updating a pull request is recorded."""
+    """The calls a publication makes. `lookups` are what successive reads of the task's
+    own pull request by its number return (the last one again once the rest are used);
+    `others` are the other pull requests open on the work branch; `polled`, when set, is
+    what a poll observes. Opening or updating a pull request is recorded."""
 
     def __init__(self) -> None:
         super().__init__()
         self.remote = NEW_HEAD
-        self.lookups: list[PullRequestRef | None] = [_open(OLD_HEAD)]
-        self.known: PullRequestRef = _open(OLD_HEAD)
+        self.lookups: list[PullRequestRef] = [_open(OLD_HEAD)]
+        self.others: list[PullRequestRef] = []
         self.polled: PullRequestRef | None = None
         self.created: list[str] = []
         self.updated: list[int] = []
@@ -76,13 +79,19 @@ class _PublishGitHub(_GitHub):
     def find_pull_request(
         self, token: InstallationToken, *, repository: str, head_branch: str
     ) -> PullRequestRef | None:
-        return self.lookups.pop(0) if len(self.lookups) > 1 else self.lookups[0]
+        raise AssertionError("a task with a pull request never looks for another one")
 
     def get_pull_request(
         self, token: InstallationToken, *, repository: str, number: int
     ) -> PullRequestRef:
         assert number == PR_NUMBER, "only the task's own pull request is read by number"
-        return self.known
+        return self.lookups.pop(0) if len(self.lookups) > 1 else self.lookups[0]
+
+    def open_pull_requests(
+        self, token: InstallationToken, *, repository: str, head_branch: str
+    ) -> list[PullRequestRef]:
+        own = [ref for ref in self.lookups[:1] if ref.state == "open"]
+        return sorted(own + self.others, key=lambda ref: ref.number)
 
     def closed_by(self, token: InstallationToken, *, repository: str, number: int) -> str | None:
         return "maintainer"
@@ -373,7 +382,6 @@ def test_a_merged_foreign_head_seen_by_an_earlier_poll_is_not_a_pushed_head(
     store.ci_certifications = _Certifications()  # type: ignore[attr-defined]
     store.reactions = _NothingOnThePullRequest()  # type: ignore[attr-defined]
     store.acceptance = _NothingToSupersede()  # type: ignore[attr-defined]
-    store.review_reports = _NothingToSupersede()  # type: ignore[attr-defined]
     store.ci_decisions = _NothingToSupersede()  # type: ignore[attr-defined]
     # A poll in ready_for_merge sees a head someone else pushed; the PR row takes it.
     github.polled = _open(OTHER_HEAD)
@@ -520,7 +528,6 @@ def test_a_closed_pull_request_during_a_correction_fails_the_publication(
 
     # Reopened on GitHub, the republish publishes the corrected head to the same PR.
     github.lookups = [_open(OLD_HEAD)]
-    github.known = _open(OLD_HEAD)
     move_task(store.uow(), _clock, _task(store), TaskState.PUBLISHING, EventKind.TASK_PUBLISHING)
     assert _publish(supervisor) == 1
     assert publisher.pushes == [NEW_HEAD]
@@ -530,12 +537,11 @@ def test_a_closed_pull_request_during_a_correction_fails_the_publication(
     assert pull_request is not None and pull_request.state is PullRequestState.OPEN
 
 
-def test_a_lookup_that_finds_no_pull_request_does_not_open_a_second_one(
+def test_a_closed_pull_request_alone_on_the_branch_does_not_get_a_second_one(
     tmp_path: Path,
 ) -> None:
     store, _clock, supervisor, github, publisher = _correcting(tmp_path)
-    github.lookups = [None]
-    github.known = _closed()
+    github.lookups = [_closed()]
 
     assert _publish(supervisor) == 0
 
@@ -551,8 +557,8 @@ def test_a_lookup_that_finds_no_pull_request_does_not_open_a_second_one(
 def test_another_open_pull_request_on_the_branch_is_not_adopted(tmp_path: Path) -> None:
     store, _clock, supervisor, github, publisher = _correcting(tmp_path)
     # The task's PR was closed and someone opened a new one from the same branch.
-    github.lookups = [_open(OLD_HEAD, number=PR_NUMBER + 1)]
-    github.known = _closed()
+    github.lookups = [_closed()]
+    github.others = [_open(OLD_HEAD, number=PR_NUMBER + 1)]
     cycles_before = list(store.review_cycles.rows)
 
     assert _publish(supervisor) == 0
@@ -582,8 +588,7 @@ def test_the_tasks_open_pull_request_wins_over_another_open_pr_on_the_branch(
     tmp_path: Path,
 ) -> None:
     store, _clock, supervisor, github, publisher = _correcting(tmp_path)
-    github.known = _open(OLD_HEAD)
-    github.lookups = [_open(OLD_HEAD, number=PR_NUMBER + 1)]
+    github.others = [_open(OLD_HEAD, number=PR_NUMBER + 1)]
 
     assert _publish(supervisor) == 1
 
@@ -606,8 +611,7 @@ def test_the_tasks_open_pull_request_wins_over_another_open_pr_on_the_branch(
 
 def test_another_open_pr_is_named_when_the_publication_then_fails(tmp_path: Path) -> None:
     store, _clock, supervisor, github, publisher = _correcting(tmp_path)
-    github.known = _open(OLD_HEAD)
-    github.lookups = [_open(OLD_HEAD, number=PR_NUMBER + 1)]
+    github.others = [_open(OLD_HEAD, number=PR_NUMBER + 1)]
     publisher.outcome = PublishOutcome(
         pushed=False, head_sha=NEW_HEAD, step="push", detail="the push was rejected"
     )
@@ -626,13 +630,14 @@ def test_another_pull_request_on_the_branch_with_the_own_one_merged_settles_merg
     tmp_path: Path,
 ) -> None:
     store, _clock, supervisor, github, publisher = _correcting(tmp_path)
-    github.lookups = [_open(OLD_HEAD, number=PR_NUMBER + 1)]
-    github.known = _merged(OLD_HEAD)
+    github.lookups = [_merged(OLD_HEAD)]
+    github.others = [_open(OLD_HEAD, number=PR_NUMBER + 1)]
 
     assert _publish(supervisor) == 0
 
     assert publisher.pushes == []
     assert github.updated == []
+    assert github.created == []
     task = _task(store)
     assert task.state is TaskState.MERGED
     assert task.head_sha == OLD_HEAD
@@ -640,6 +645,85 @@ def test_another_pull_request_on_the_branch_with_the_own_one_merged_settles_merg
     assert pull_request is not None and pull_request.number == PR_NUMBER
     assert pull_request.state is PullRequestState.MERGED
     assert store.escalations.list_for_task(TASK_ID) == []
+    # The other open pull request is recorded with its state and named in a wake.
+    failed = store.events.latest_for_task_kind(TASK_ID, EventKind.TASK_PUBLISH_FAILED.value)
+    assert failed is not None
+    assert failed.payload["pull_request_state"] == "merged"
+    assert failed.payload["other_pull_request"] == PR_NUMBER + 1
+    assert failed.payload["other_pull_request_state"] == "open"
+    assert f"pull request #{PR_NUMBER + 1} (open) is also on the work branch" in str(
+        failed.payload["detail"]
+    )
+    wakes = _wakes(store, "other_pull_request_open")
+    assert len(wakes) == 1
+    assert f"pull request #{PR_NUMBER} was merged" in wakes[0]
+    assert f"pull request #{PR_NUMBER + 1} (open) is also on the work branch" in wakes[0]
+    assert "not adopted" in wakes[0]
+    assert len(_wakes(store, "merged")) == 1
+
+
+def test_every_other_open_pull_request_on_the_branch_is_named(tmp_path: Path) -> None:
+    store, _clock, supervisor, github, publisher = _correcting(tmp_path)
+    # An older pull request from the same branch was reopened beside the task's own, and
+    # a newer one was opened too.
+    github.others = [
+        _open(OLD_HEAD, number=PR_NUMBER + 1),
+        _open(OLD_HEAD, number=PR_NUMBER - 1),
+    ]
+
+    assert _publish(supervisor) == 1
+
+    assert publisher.pushes == [NEW_HEAD]
+    assert github.created == []
+    assert github.updated == [PR_NUMBER]
+    completed = store.events.latest_for_task_kind(TASK_ID, EventKind.PUBLISH_COMPLETED.value)
+    assert completed is not None
+    assert completed.payload["other_pull_requests"] == [
+        {"number": PR_NUMBER - 1, "state": "open"},
+        {"number": PR_NUMBER + 1, "state": "open"},
+    ]
+    wakes = _wakes(store, "other_pull_request_open")
+    assert len(wakes) == 1
+    assert (
+        f"pull requests #{PR_NUMBER - 1} (open) and #{PR_NUMBER + 1} (open) are also on the "
+        "work branch; they are not the task's and are not adopted"
+    ) in wakes[0]
+
+
+class _Pages:
+    """The REST transport, answering the listing of pull requests from a branch."""
+
+    def __init__(self, rows: list[dict[str, object]]) -> None:
+        self.rows = rows
+        self.params: list[dict[str, str]] = []
+
+    def paginate(
+        self, path: str, *, bearer: str, params: dict[str, str] | None = None
+    ) -> list[dict[str, object]]:
+        assert path == "/repos/o/r/pulls"
+        self.params.append(dict(params or {}))
+        return self.rows
+
+
+def test_the_client_lists_every_open_pull_request_from_the_branch() -> None:
+    def row(number: int, state: str) -> dict[str, object]:
+        return {
+            "number": number,
+            "state": state,
+            "html_url": f"https://github.com/o/r/pull/{number}",
+            "head": {"sha": OLD_HEAD},
+            "base": {"ref": "main"},
+        }
+
+    transport = _Pages([row(12, "open"), row(3, "open"), row(7, "closed")])
+    client = RestGitHubClient(cast(AppAuthenticator, None), cast(RestTransport, transport))
+    token = InstallationToken("t", expires_at=NOW, repository="o/r")
+
+    found = client.open_pull_requests(token, repository="o/r", head_branch="crucible/EX-0001")
+
+    # The reopened older pull request is listed beside the newest; a closed one is not.
+    assert [ref.number for ref in found] == [3, 12]
+    assert transport.params == [{"state": "open", "head": "o:crucible/EX-0001"}]
 
 
 def test_a_publication_failure_after_a_merge_settled_the_task_wakes_nobody(
@@ -774,16 +858,13 @@ class _Certifications:
 
 
 class _NothingToSupersede:
-    """No acceptance, review report or CI decision is recorded for the task."""
+    """No acceptance or CI decision is recorded for the task."""
 
     def supersede_for_task(self, task_id: str, at: datetime) -> None:
         return None
 
     def list_for_task(self, task_id: str) -> list[object]:
         return []
-
-    def supersede(self, row_id: str, at: datetime) -> None:
-        return None
 
 
 def _first_publication_failed(
