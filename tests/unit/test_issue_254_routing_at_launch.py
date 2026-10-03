@@ -24,6 +24,7 @@ import pytest
 
 from crucible.application.errors import ConflictError, ContractValidationError
 from crucible.application.policies import put_routing_policy, validate_policy
+from crucible.application.queries import _attempt_summary
 from crucible.application.routing import current_routing_version, load_attempt_routing
 from crucible.application.supervisor import _Pending
 from crucible.domain.entities import (
@@ -631,3 +632,13 @@ def test_pinned_must_be_a_strict_bool(pinned: object) -> None:
     with pytest.raises(ContractValidationError) as raised:
         validate_policy(document, name=document["name"], version=document["version"])
     assert any("pinned" in problem["path"] for problem in raised.value.errors)
+
+
+def test_the_attempt_view_shows_the_routing_version(tmp_path: Path) -> None:
+    store = _store(_version(4, [_model("gpt-new")]))
+    _execution, attempt = _route_correction(store, tmp_path)
+
+    summary = _attempt_summary(attempt)
+
+    assert summary.routing_version == 4
+    assert summary.model_dump(mode="json")["routing_version"] == 4

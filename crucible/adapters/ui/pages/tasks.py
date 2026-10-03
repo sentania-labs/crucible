@@ -340,6 +340,14 @@ def task_page(request: Request, task_id: str, ctx: Ctx, uow: UoW) -> Response:
         for attempt in execution.attempts
         if (words := _busy_fallthrough(attempt)) is not None
     ]
+    # hades #254: the routing version each attempt routed with, which can be newer than
+    # the one the task's policy names.
+    fallthroughs += [
+        (attempt.id, f"Routed with routing version {attempt.routing_version}")
+        for execution in view.executions
+        for attempt in execution.attempts
+        if attempt.routing_version is not None
+    ]
     if fallthroughs:
         sections.append(
             {
