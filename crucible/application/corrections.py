@@ -83,7 +83,7 @@ def _unpublished_bundle_problem(
             exited.payload.get("never_started") is True or exited.payload.get("no_commits") is True
         )
     ):
-        if not task.head_sha:
+        if exited.payload.get("never_started") is True or not task.head_sha:
             return None
         # A subsequent start failure does not invalidate the last sealed worker head.
         previous = [

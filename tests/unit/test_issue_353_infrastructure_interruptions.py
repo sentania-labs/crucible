@@ -565,3 +565,14 @@ async def test_endpoint_health_deduplicates_waiting_tasks(monkeypatch: pytest.Mo
     await supervisor._resume_infrastructure_waits()
     provider.probe_model_endpoint.assert_awaited_once_with("http://gateway")
     assert recorded.call_count == 2
+
+
+
+def test_start_failure_with_checkpoint_head_stays_correctable(monkeypatch: pytest.MonkeyPatch) -> None:
+    supervisor, pending, uow, _events = _running(monkeypatch)
+    pending.task.head_sha = "checkpoint-without-bundle"
+    _finish(supervisor, pending.attempt, "", final_observation=Observation(
+        ObservationState.EXITED, exit_code=128, never_started=True,
+        detail="StartError", container_message="bad mount",
+    ))
+    assert _unpublished_bundle_problem(uow, pending.task, "fake") is None
