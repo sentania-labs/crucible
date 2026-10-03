@@ -427,7 +427,11 @@ class DeliveryCoordinator:
                     )
                 )
                 return False
-            await self._host._db(lambda: self._record_pushed(plan, remote))
+            if not await self._host._db(lambda: self._record_pushed(plan, remote)):
+                # hades #379: the task left publishing while the head was pushed (a poll
+                # settled it as merged); the push is escalated, and nothing more of this
+                # publication runs.
+                return False
             if plan.deliverable_kind == "branch":
                 await self._host._db(lambda: self._finish(plan, ref=None))
                 return True

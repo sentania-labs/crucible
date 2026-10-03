@@ -370,9 +370,14 @@ def test_a_poll_winning_the_push_race_refuses_to_record_the_post_merge_push(
 
     publisher.during_push = poll_during_push
 
-    assert _publish(supervisor) == 1
+    # The refused push ends the publication: it is not counted as published, and the
+    # merged pull request is neither looked up again nor edited.
+    assert _publish(supervisor) == 0
 
     assert publisher.pushes == [NEW_HEAD]
+    assert github.updated == []
+    assert github.created == []
+    assert store.events.kinds().count(EventKind.PUBLISH_COMPLETED.value) == 1
     assert _task(store).state is TaskState.MERGED
     assert _task(store).head_sha == OLD_HEAD
     assert EventKind.BRANCH_PUSHED.value not in store.events.kinds()
