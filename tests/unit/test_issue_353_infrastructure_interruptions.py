@@ -61,7 +61,7 @@ from crucible.ports.execution import (
 )
 from crucible.ports.harness import ExitInfo, HarnessAdapter
 from tests.unit.kubernetes_fixtures import build, spec
-from tests.unit.test_class_routing import NOW
+from tests.unit.test_class_routing import NOW, _model, _routing
 from tests.unit.test_docker_provider import StubClient, workspace_for
 from tests.unit.test_docker_provider import provider as docker_provider
 from tests.unit.test_docker_provider import spec as docker_spec
@@ -575,6 +575,37 @@ def test_new_contract_gets_fresh_interruption_budget(monkeypatch: pytest.MonkeyP
     assert pending.task.state is TaskState.SCHEDULED
     uow.attempts.add.assert_called_once()
     uow.escalations.add.assert_not_called()
+
+
+def test_the_endpoint_probe_and_the_block_use_the_version_that_routed_this_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """hades #406 (Codex): the attempt routed with the model a pinned or since-retired
+    routing version selected. Both the exit's endpoint probe and, once the retry budget
+    is spent, the blocked-task event must look that version up, not whatever is newest
+    now, or they will probe or report the wrong endpoint."""
+    supervisor, pending, uow, attempts = _running(monkeypatch)
+    attempts[:0] = _infrastructure(pending.attempt, 2, ExitClass.INFRASTRUCTURE)
+    pending.attempt.routing_version = 9
+
+    def _local_doc(url: str) -> dict[str, Any]:
+        routing = _routing(
+            [{**_model("a-first"), "endpoint": "local", "endpoint_url": url}, _model("b-second")]
+        )
+        return routing.model_dump(mode="json")
+
+    pinned_doc = _local_doc("http://pinned:4000/v1")
+    newest_doc = _local_doc("http://newest:4000/v1")
+    uow.routing_policies.get.side_effect = lambda name, version: MagicMock(
+        document=pinned_doc if version == 9 else newest_doc
+    )
+
+    _finish(supervisor, pending.attempt, _fixture("codex-exec-turn-failed-503.jsonl"))
+
+    exited = next(e for e in _events(uow) if e.kind == EventKind.ATTEMPT_EXITED.value)
+    assert exited.payload["endpoint_url"] == "http://pinned:4000/v1"
+    blocked = next(e for e in _events(uow) if e.kind == EventKind.TASK_BLOCKED.value)
+    assert blocked.payload["endpoint_url"] == "http://pinned:4000/v1"
 
 
 # ----- item 3: quota reroutes do not spend the infrastructure budget --------------
