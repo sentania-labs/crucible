@@ -1,7 +1,7 @@
 """Persist auto-merge refusals and retry state.
 
 Revision ID: 0039_auto_merge_refusals
-Revises: 0037_cred_refresh_cursor, 0038_attempt_routing_version
+Revises: 0038_attempt_routing_version
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from crucible.adapters.persistence.migrations.versions._0036_cred_refresh_reques
 )
 
 revision = "0039_auto_merge_refusals"
-down_revision = ("0037_cred_refresh_cursor", "0038_attempt_routing_version")
+down_revision = "0038_attempt_routing_version"
 branch_labels = None
 depends_on = None
 
