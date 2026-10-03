@@ -1,0 +1,3 @@
+crucible-hermes: working, session updated
+FAILED tests/unit/test_client.py::test_retry - httpx.HTTPStatusError: 503 Service Unavailable
+1 failed in 0.42s
