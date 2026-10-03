@@ -173,6 +173,9 @@ class Attempt:
     resume_from_remote: bool = False
     # hades #254: the routing policy version this attempt was routed with.
     routing_version: int | None = None
+    # hades #388: the context length, response allowance and thinking setting the
+    # harness was launched with, recorded once and reused by every later spec of it.
+    effective_settings: dict[str, Any] | None = None
 
 
 @dataclass(slots=True)

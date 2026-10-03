@@ -661,6 +661,9 @@ class Attempts:
             routing_excluded_pools=list(row.routing_excluded_pools or []),
             resume_from_remote=bool(row.resume_from_remote),
             routing_version=row.routing_version,
+            effective_settings=(
+                dict(row.effective_settings) if row.effective_settings is not None else None
+            ),
         )
 
     def add(self, attempt: Attempt) -> None:
@@ -698,6 +701,7 @@ class Attempts:
                 routing_excluded_pools=list(attempt.routing_excluded_pools),
                 resume_from_remote=attempt.resume_from_remote,
                 routing_version=attempt.routing_version,
+                effective_settings=attempt.effective_settings,
             )
         )
         self._s.flush()
@@ -740,6 +744,7 @@ class Attempts:
                 routing_excluded_pools=list(attempt.routing_excluded_pools),
                 resume_from_remote=attempt.resume_from_remote,
                 routing_version=attempt.routing_version,
+                effective_settings=attempt.effective_settings,
             )
         )
 
