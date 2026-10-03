@@ -589,3 +589,34 @@ async def test_a_pending_attempt_is_never_stranded_when_the_current_version_refu
         e.kind == EventKind.ATTEMPT_PREPARING.value and e.attempt_id == pending.attempt.id
         for e in store.events.rows
     )
+
+
+def test_a_quota_wait_resumes_on_the_current_routing_version(tmp_path: Path) -> None:
+    """Routed at v4 and then waiting for quota: v5, published during the wait, disables
+    gpt-test and adds gpt-new, so the wait resumes on gpt-new under v5."""
+    store = _store(_version(4, [_model("gpt-test")]))
+    execution, attempt = _route_correction(store, tmp_path)
+    assert attempt.routing_version == 4
+    store.routing_policies.records.append(  # type: ignore[attr-defined]
+        _version(5, [_model("gpt-test", enabled=False), _model("gpt-new")])
+    )
+    store.pool_exhaustions = _NoExhaustions()
+    task = store.tasks.get(attempt.task_id)
+    assert task is not None
+    task.state = TaskState.AWAITING_QUOTA
+    task.quota_wait_started_at = NOW
+    task.resume_at = NOW
+    store.tasks.save(task)
+    execution.state = ExecutionState.ACTIVE
+    store.executions.save(execution)
+    supervisor, _provider = _supervisor(store, FakeClock(NOW + timedelta(seconds=1)), tmp_path)
+
+    supervisor._resume_quota_waits()
+
+    resumed = next(
+        e.payload for e in store.events.rows if e.kind == EventKind.TASK_QUOTA_RESUMED.value
+    )
+    assert resumed["model"] == "gpt-new"
+    task = store.tasks.get(attempt.task_id)
+    assert task is not None and task.state is TaskState.SCHEDULED
+    assert execution.policy_snapshot["routing"]["policy"]["version"] == 3
