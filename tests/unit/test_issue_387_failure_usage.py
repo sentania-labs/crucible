@@ -486,7 +486,12 @@ def test_the_usage_patch_refuses_another_hermes_version(tmp_path: Path) -> None:
     assert "its patches are for hermes-agent 0.19.0, found 0.20.0" in run.stderr
     assert not (tmp_path / USAGE_NAME).exists()
 
-def test_no_sessions_table_through_main(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+
+def test_main_keeps_child_exit_and_basic_usage_without_sessions_table(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     hermes = tmp_path / "hermes"
     (hermes / "hermes_cli").mkdir(parents=True)
     (hermes / "hermes_cli" / "__init__.py").write_text("", encoding="utf-8")
@@ -494,7 +499,8 @@ def test_no_sessions_table_through_main(tmp_path: Path, monkeypatch: pytest.Monk
     (hermes / "hermes_cli" / "oneshot.py").write_text(_STAND_IN_ONESHOT, encoding="utf-8")
     (hermes / "tools").mkdir(parents=True)
     (hermes / "tools" / "__init__.py").write_text("", encoding="utf-8")
-    (hermes / "tools" / "file_operations.py").write_text('''
+    (hermes / "tools" / "file_operations.py").write_text(
+        """
 class ShellFileOperations:
     def _search_with_grep(self, pattern, path, file_glob, limit, offset, output_mode, context):
         cmd_parts = ["grep", "-rnH"]
@@ -502,31 +508,40 @@ class ShellFileOperations:
         cmd_parts.append(self._escape_shell_arg(path))
         cmd_parts.extend(["|", "head", "-n", str(fetch_limit)])
         cmd = "set -o pipefail; " + " ".join(cmd_parts)
-''', encoding="utf-8")
+""",
+        encoding="utf-8",
+    )
     metadata = hermes / "hermes_agent-0.19.0.dist-info"
     metadata.mkdir()
-    (metadata / "METADATA").write_text("Metadata-Version: 2.1\nName: hermes-agent\nVersion: 0.19.0\n", encoding="utf-8")
-    
+    (metadata / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: hermes-agent\nVersion: 0.19.0\n",
+        encoding="utf-8",
+    )
+
     home = tmp_path / "home"
     home.mkdir()
-    with sqlite3.connect(home / "state.db") as db:
-        pass
-        
+    sqlite3.connect(home / "state.db").close()
+
     path = tmp_path / USAGE_NAME
-    path.write_text(json.dumps(RAISED_USAGE), encoding="utf-8")
-    
+    usage = {**RAISED_USAGE, "api_calls": 104}
+    path.write_text(json.dumps(usage), encoding="utf-8")
+
     wrapper = _wrapper()
-    wrapper.HERMES_PYTHON = sys.executable
-    
+    wrapper.__dict__["HERMES_PYTHON"] = sys.executable
+
     monkeypatch.setenv("CRUCIBLE_HERMES_USAGE", str(path))
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("PYTHONPATH", str(hermes))
-    monkeypatch.setenv("CRUCIBLE_HERMES_MAX_TURNS", "0")
+    monkeypatch.setenv("CRUCIBLE_HERMES_MAX_TURNS", "100")
     monkeypatch.setattr(sys, "argv", ["crucible-hermes.py"])
-    
+
     assert wrapper.main() == 0
-    
+
     written = json.loads(path.read_text(encoding="utf-8"))
-    assert written == {**RAISED_USAGE, "completed": False}
-    
+    assert written == {
+        **usage,
+        "completed": False,
+        "max_turns": 100,
+        "turn_limit_reached": True,
+    }
     assert "crucible-hermes: Hermes's state.db has no sessions table" in capsys.readouterr().err
