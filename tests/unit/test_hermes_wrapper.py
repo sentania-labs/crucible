@@ -130,6 +130,14 @@ def test_the_bootstrap_sets_the_turn_budget_only_where_none_was_named(
     (hermes / "hermes_cli" / "__init__.py").write_text("", encoding="utf-8")
     (hermes / "hermes_cli" / "main.py").write_text(_STAND_IN_MAIN, encoding="utf-8")
     stand_in_release(hermes)
+    # The bootstrap starts only the Hermes version its patches were written for (#385).
+    (hermes / "hermes_agent-0.19.0.dist-info").mkdir(exist_ok=True)
+    (hermes / "hermes_agent-0.19.0.dist-info" / "METADATA").write_text(
+        "Metadata-Version: 2.1
+Name: hermes-agent
+Version: 0.19.0
+", encoding="utf-8"
+    )
     # The working directory is the task's checkout. Modules there named like Hermes's
     # own must never be imported in their place.
     checkout = tmp_path / "checkout"

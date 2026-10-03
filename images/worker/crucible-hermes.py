@@ -26,8 +26,19 @@ Issue 388:
 - `-z` has no way to pass the routing entry's thinking setting. The bootstrap adds it to
   the request overrides an agent is built with, as `chat_template_kwargs.enable_thinking`,
   unless the caller already named one.
-- The bootstrap's patches are written against one Hermes release and refuse to run
-  under another.
+
+Hades #385: Hermes's content search falls back to `grep -r --exclude-dir='.*' ... ROOT`
+when there is no ripgrep, and GNU grep applies that pattern to ROOT itself, so a search
+of `.` (or of any root whose last component starts with a dot) finds nothing. The image
+now carries ripgrep, and the bootstrap also runs that grep from inside the root with no
+file operand, which grep never excludes, so only hidden directories below the root are
+skipped. The `cd` runs in a subshell: Hermes records the shell's directory after every
+command as the session's, and a search must not move the agent. Both patches are for
+Hermes 0.19.0 alone: the bootstrap refuses to start any other version rather than patch
+code it was not written against, and before Hermes starts, main() imports the patched
+module once on its own and stops the attempt if the fallback is not the 0.19.0 one.
+That check cannot be left to the import inside Hermes: Hermes's tool discovery catches
+every exception and only logs it, and would start without its file tools.
 """
 
 from __future__ import annotations
@@ -47,11 +58,17 @@ HERMES_PYTHON = "/opt/hermes/bin/python"
 PROGRESS_SECONDS = 15.0
 PROGRESS_LINE = "crucible-hermes: working, session updated"
 
-# Run inside the Hermes virtual environment. It changes nothing but the turn budget an
-# agent is built with when the caller named none, and the thinking setting its requests
-# carry when the caller named none, and only once `run_agent` is imported the ordinary
-# way, so Hermes's own import order (its approval mode is read at import) is untouched.
-BOOTSTRAP = r"""
+# The Hermes release the patches below were written against. Any other version stops the
+# bootstrap before Hermes starts (hades #385).
+HERMES_VERSION = "0.19.0"
+
+# Run inside the Hermes virtual environment, ahead of Hermes itself. It changes the turn
+# budget an agent is built with when the caller named none, and the root of the grep
+# fallback of content search (hades #385), and the thinking setting its requests
+# carry when the caller named none. Each applies only once its module is imported
+# the ordinary way, so Hermes's own import order (its approval mode is read at import)
+# is untouched.
+PATCHES = r"""
 import importlib.abc
 import importlib.metadata
 import importlib.util
@@ -59,9 +76,16 @@ import inspect
 import os
 import sys
 
-# The release the patches below are written against: the parameter positions and the
-# way request overrides reach a request are 0.19.0's. Any other release stops the run.
-HERMES_VERSION = "0.19.0"
+EXPECTED = "@HERMES_VERSION@"
+try:
+    FOUND = importlib.metadata.version("hermes-agent")
+except importlib.metadata.PackageNotFoundError:
+    FOUND = "none"
+if FOUND != EXPECTED:
+    raise SystemExit(
+        f"crucible-hermes: its patches are for hermes-agent {EXPECTED}, found {FOUND}; "
+        "refusing to start Hermes unpatched (hades #385)"
+    )
 LIMIT = int(os.environ.get("CRUCIBLE_HERMES_MAX_TURNS") or 0)
 THINKING = {"on": True, "off": False}.get(os.environ.get("CRUCIBLE_HERMES_THINKING") or "")
 # `max_iterations` is the tenth parameter of AIAgent.__init__ after self (0.19).
@@ -133,11 +157,35 @@ class _AgentDefaults(importlib.abc.MetaPathFinder):
 _check_version()
 if LIMIT > 0 or THINKING is not None:
     sys.meta_path.insert(0, _AgentDefaults())
+sys.meta_path.insert(0, _GrepRoot())
+""".replace("@HERMES_VERSION@", HERMES_VERSION)
+
+# Run by main() before Hermes starts: the version check above, then the patched module
+# imported on its own, so a fallback of another shape exits non-zero here instead of
+# being swallowed by Hermes's tool discovery (hades #385).
+PREFLIGHT = (
+    PATCHES
+    + r"""
+try:
+    import tools.file_operations
+except RuntimeError as error:
+    raise SystemExit(str(error))
+"""
+)
+PREFLIGHT_FAILED = (
+    "crucible-hermes: the Hermes in this image is not the one its patches were written "
+    "for (hades #385); not starting it"
+)
+
+BOOTSTRAP = (
+    PATCHES
+    + r"""
 sys.argv = ["hermes", *sys.argv[1:]]
 from hermes_cli.main import main
 
 sys.exit(main())
 """
+))
 
 
 def _milliseconds(started: object, ended: object) -> int | None:
@@ -266,6 +314,10 @@ def main() -> int:
         _limit("CRUCIBLE_HERMES_MAX_OUTPUT_TOKENS"),
     )
     argv = inline_identity(sys.argv[1:], os.environ.get("CRUCIBLE_HERMES_IDENTITY"))
+    # Hades #385: the patches are checked before Hermes starts; the reason is on stderr.
+    if subprocess.run([HERMES_PYTHON, "-P", "-c", PREFLIGHT], check=False).returncode != 0:
+        print(PREFLIGHT_FAILED, file=sys.stderr, flush=True)
+        return 2
     # Stdout stays inherited. Crucible's launch wrapper is the sole transcript writer.
     # -P: the working directory is the task's checkout, and a module there named like
     # one of Hermes's own (`cli`, `tools`, `agent`) must never be imported in its place.
