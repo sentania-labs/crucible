@@ -519,3 +519,18 @@ def test_the_diff_evidence_keeps_only_injected_name_records(tmp_path: Path) -> N
     assert [c["path"] for c in diff["changes"]] == ["CLAUDE.md"]
     assert set(diff["paths"]) == {"CLAUDE.md", "src/a.py"}
     assert result is GateResult.PASS
+
+
+def test_a_graft_cannot_hide_a_committed_shim(tmp_path: Path) -> None:
+    repo = _repo(tmp_path, agents_md=False)
+    base = _git(repo, "rev-parse", "main").strip()
+    _write(repo, "AGENTS.md", SHIM)
+    _commit(repo, "shim")
+    shim = _git(repo, "rev-parse", "HEAD").strip()
+    _write(repo, "w", "work\n")
+    _commit(repo, "work")
+    _write(repo, ".git/info/grafts", f"{base} {shim}\n")
+    result, diff, bundle = _collected(tmp_path, repo)
+    assert "AGENTS.md" in diff["paths"]
+    assert "AGENTS.md" in bundle["commit_paths"]
+    assert result is GateResult.FAIL

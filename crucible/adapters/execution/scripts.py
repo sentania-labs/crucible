@@ -199,25 +199,25 @@ def _commit_policy_check(git: str) -> str:
 # show` verify a planted signature with a `gpg.program` of its choosing.
 # Keep text visible even when the worker lowers its binary detection threshold.
 GIT = (
-    "git -c advice.graftFileDeprecated=false "
+    "git -c advice.graftFileDeprecated=false -c core.commitGraph=false "
     "-c core.fsmonitor= -c diff.external= -c core.pager=cat "
     "-c core.bigFileThreshold=512m -c core.hooksPath=/dev/null "
     "-c log.showSignature=false -c 'safe.directory=*'"
 )
 CHECKPOINT_GIT = (
-    "git -c advice.graftFileDeprecated=false "
+    "git -c advice.graftFileDeprecated=false -c core.commitGraph=false "
     "-c core.fsmonitor= -c diff.external= -c core.pager=cat "
     "-c core.hooksPath=\"$EMPTY_HOOKS\" -c 'safe.directory=*'"
 )
-# hades #344: `GIT_NO_REPLACE_OBJECTS=1` and an empty `GIT_GRAFT_FILE`, so a replace
+# hades #344 and #369: disable replace objects, grafts and commit graphs, so a replace
 # ref or a graft the worker wrote cannot make the collected diff, the scanned content or
 # the merge base show anything other than the objects the bundle and the tree carry.
-# An empty path avoids opening a graft file at all: older Git bundle commands emit
-# its deprecation hint even with advice.graftFileDeprecated=false.
+# A nonexistent file also avoids older Git bundle commands emitting graft advice
+# before reading advice.graftFileDeprecated.
 GIT_ENV = (
     "export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 "
     "GIT_TERMINAL_PROMPT=0 GIT_ASKPASS= HOME=/home/worker LC_ALL=C "
-    "GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE="
+    "GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/nonexistent"
 )
 
 # 08: the copy step rejects symlinks, hard links, devices, and files above the policy
