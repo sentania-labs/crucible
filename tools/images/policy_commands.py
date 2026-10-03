@@ -16,6 +16,10 @@ A policy may also name, in `repository.required_programs`, the programs its chec
 call beyond their first word (hades #184: `uv` and `gitleaks` behind `make lint` and
 `make scan`); each of those must resolve the same way.
 
+It also runs the image's own programs no policy names but a harness depends on, and
+fails unless each one works: `rg --version`, because Hermes's search tool runs ripgrep
+and its grep fallback missed every match under a relative root (hades #385).
+
 What this does not prove: that the check succeeds. `make lint` runs whatever the target
 repository's Makefile says, and the tools those recipes call are the repository's
 business, not the policy's, unless the policy declares them. A wrapper such as
@@ -65,6 +69,9 @@ for program; do
     printf '%s\t%s\n' "$program" "$found"
 done
 """
+
+# Commands the image must run successfully whatever the policies say (hades #385).
+SELF_TEST: tuple[tuple[str, ...], ...] = (("rg", "--version"),)
 
 
 def shipped_policies() -> list[tuple[str, Mapping[str, Any]]]:
@@ -133,6 +140,27 @@ def resolve(docker: list[str], image: str, programs: Iterable[str]) -> dict[str,
     return found
 
 
+def self_test(docker: list[str], image: str) -> list[str]:
+    """Run SELF_TEST, print successes, and return commands that did not exit 0."""
+    failed = []
+    for command in SELF_TEST:
+        result = subprocess.run(
+            [
+                *docker,
+                *("run", "--rm", "--network", "none", "--entrypoint", "/bin/sh", image),
+                *("-c", 'exec "$@"', "sh", *command),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            failed.append(f"{shlex.join(command)} exited {result.returncode}")
+        else:
+            print(f"ok       {shlex.join(command)}")
+    return failed
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--image", default=None, help="default: WORKER in images/manifest.env")
@@ -140,12 +168,18 @@ def main(argv: list[str]) -> int:
     image = args.image or worker_image()
     docker = shlex.split(os.environ.get("DOCKER") or "docker")
 
+    missing = False
+    for failure in self_test(docker, image):
+        missing = True
+        print(f"FAILED   {failure}", file=sys.stderr)
+    if missing:
+        print(f"policy_commands.py: {image} fails its self-test", file=sys.stderr)
+        return 1
     programs = required_programs(shipped_policies())
     if not programs:
         print("policy_commands.py: no shipped policy requires a check; nothing to prove")
         return 0
     found = resolve(docker, image, programs)
-    missing = False
     for program in sorted(programs):
         if found[program]:
             print(f"ok       {program} -> {found[program]}")

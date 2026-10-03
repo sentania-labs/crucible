@@ -2,10 +2,12 @@
 # CLIs, Claude Code, Codex, AGY and Hermes, each at its pinned version. The operator
 # chose one image over one per harness on 2026-09-22 at 3:09 PM (C11): one digest
 # to build, publish, promote and roll back. Debian slim by digest, uid 1000 worker,
-# git, curl, jq, make, the lab root CA, the Python runtime Hermes needs, the four CLIs,
-# and the toolchain a Python project's own checks call (uv, CPython 3.12 and gitleaks,
-# hades #184, ADR 0020), nothing else. Shared pins mirror images/pins.env; build with
-# images/build.sh.
+# git, curl, jq, make, ripgrep, the lab root CA, the Python runtime Hermes needs, the
+# four CLIs, and the toolchain a Python project's own checks call (uv, CPython 3.12 and
+# gitleaks, hades #184, ADR 0020), nothing else. Shared pins mirror images/pins.env;
+# build with images/build.sh. ripgrep is what Hermes's search tool runs; without it,
+# its grep fallback missed every match under a relative root (hades #385), and the
+# build fails unless `rg --version` runs.
 #
 # Every harness pin is an `ARG HARNESS_<NAME>_VERSION` here. build.sh reads those
 # lines and labels the image `crucible.harness.<name>.version` for each, which is
@@ -145,6 +147,7 @@ ARG CA_CERTIFICATES_VERSION=20250419~deb12u1
 ARG LAB_CA_SHA256=567f110bb80bb2179b44995c78c7a49a4149085a59f6acb73cf37c6503a0481a
 ARG PYTHON3_VERSION=3.11.2-1+b1
 ARG PYTHON3_VENV_VERSION=3.11.2-1+b1
+ARG RIPGREP_VERSION=13.0.0-4+b2
 RUN set -eu; \
     printf '%s\n' \
         'Types: deb' \
@@ -169,7 +172,9 @@ RUN set -eu; \
         "make=${MAKE_VERSION}" \
         "ca-certificates=${CA_CERTIFICATES_VERSION}" \
         "python3=${PYTHON3_VERSION}" \
-        "python3-venv=${PYTHON3_VENV_VERSION}"; \
+        "python3-venv=${PYTHON3_VENV_VERSION}" \
+        "ripgrep=${RIPGREP_VERSION}"; \
+    rg --version; \
     rm -rf /var/lib/apt/lists/* /var/cache/apt /var/log/apt /var/log/dpkg.log /var/log/alternatives.log; \
     rm -f /var/cache/ldconfig/aux-cache; \
     groupadd --gid 1000 worker; \
