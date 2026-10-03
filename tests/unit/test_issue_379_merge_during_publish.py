@@ -914,7 +914,17 @@ def test_a_checkpoint_landing_on_a_finished_task_is_not_recorded(
     assert EventKind.BRANCH_PUSHED.value not in store.events.kinds()
     escalations = store.escalations.list_for_task(TASK_ID)
     assert len(escalations) == 1
-    assert f"is already {state.value}" in escalations[0].question
+    expected = (
+        f"a quota checkpoint was pushed to the branch of a task that is already "
+        f"{state.value}; nothing was merged"
+    )
+    assert escalations[0].question.startswith(expected)
+    assert NEW_HEAD in escalations[0].question
+    # A checkpoint task was never publishing, and its push merged nothing.
+    assert "left publishing" not in escalations[0].question
+    assert "merge stands" not in escalations[0].question
+    assert _wakes(store, "merged") == []
+    assert _wakes(store, "checkpoint_after_finish") == [expected]
 
 
 def test_a_merge_of_a_quota_checkpoint_is_escalated_and_named(tmp_path: Path) -> None:

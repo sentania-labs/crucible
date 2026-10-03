@@ -151,7 +151,9 @@ is not recorded as a pushed head, and the publication that made it stops
 there. A merge recorded without its head (before hades #379) is taken to be of
 the latest recorded pushed head. A quota checkpoint is not pushed, nor
 recorded, once the task is merged or otherwise finished (`release_candidate`,
-`released`, `rejected`, `cancelled`, `closed`).
+`released`, `rejected`, `cancelled`, `closed`); one that lands while the task
+finishes is escalated with `checkpoint_after_finish`, which says nothing was
+merged by it.
 
 A PR closed unmerged while a correction is under way, or after a first
 publication failed, is recorded on the PR (which is then no longer polled)

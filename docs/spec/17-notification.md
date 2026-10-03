@@ -23,6 +23,7 @@ Only when judgment is required or work has stopped needing it:
 | `merged` | `merged` (informational), from any delivery state; the summary names the state when it was not `ready_for_merge` |
 | `pull_request_closed` | `rejected`: the pull request was closed without merge, from any delivery state |
 | `other_pull_request_open` | after a publication to the task's own pull request that found another pull request open on the work branch; it is not adopted, and Foundry decides what becomes of it (23) |
+| `checkpoint_after_finish` | an escalation: a quota checkpoint was pushed to the branch of a task that finished while it was pushed (merged, rejected, cancelled or closed); nothing was merged by it, and the push is not recorded (23) |
 | `release_gates_failed`, `release_succeeded`, `release_workflow_failed` | release lifecycle (24) |
 | `attempt_failed`, `timed_out`, `lost` with no retry remaining | `reported` |
 | `quota_exhausted`, `auth_failure` | any |

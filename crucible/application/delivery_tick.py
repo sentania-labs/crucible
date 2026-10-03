@@ -667,20 +667,35 @@ class DeliveryCoordinator:
             if not push_is_current:
                 if task is not None:
                     head = remote or plan.head_sha
-                    summary = (
-                        f"head {head} was pushed after the task left publishing and is "
-                        f"already {task.state.value}"
-                    )
+                    if checkpoint:
+                        # A checkpoint task was never publishing, and its push merged
+                        # nothing; the branch now carries an ungated head.
+                        summary = (
+                            f"a quota checkpoint was pushed to the branch of a task that is "
+                            f"already {task.state.value}; nothing was merged"
+                        )
+                        question = (
+                            f"{summary}. Head {head} is on the work branch and is not "
+                            "recorded; decide what becomes of the branch."
+                        )
+                        reason = WakeReason.CHECKPOINT_AFTER_FINISH
+                    else:
+                        summary = (
+                            f"head {head} was pushed after the task left publishing and is "
+                            f"already {task.state.value}"
+                        )
+                        question = (
+                            f"{summary}. The push is not recorded as the merged head; "
+                            "decide whether the merge and branch state stand."
+                        )
+                        reason = WakeReason.MERGED
                     open_escalation(
                         uow,
                         self._clock,
                         task=task,
                         attempt_id=plan.attempt_id,
-                        question=(
-                            f"{summary}. The push is not recorded as the merged head; "
-                            "decide whether the merge and branch state stand."
-                        ),
-                        wake_reason=WakeReason.MERGED,
+                        question=question,
+                        wake_reason=reason,
                         summary=summary,
                     )
                     uow.commit()
