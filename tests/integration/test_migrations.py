@@ -1488,16 +1488,17 @@ def test_0035_to_head_upgrades_a_populated_database(database_url: str) -> None:
         assert ok, detail
 
         # And back down past 0039 with an event of the kind it added: `events` is
-        # append-only, so its downgrade has to stand that trigger down to remove it.
+        # append-only, so its downgrade archives the row and its upgrade restores it.
         with engine.begin() as conn:
             conn.execute(
                 text(
                     "INSERT INTO events (ts, kind, task_id, principal, verified, payload) "
-                    "VALUES (now(), 'auto_merge_updated', :task, 'tests', true, '{}')"
+                    "VALUES (now(), 'auto_merge_updated', :task, 'tests', true, "
+                    '\'{"marker": "0039-downgrade-test"}\')'
                 ),
                 {"task": task},
             )
-        migrate.downgrade(database_url, "0035_credential_renewer")
+        migrate.downgrade(database_url, "0038_attempt_routing_version")
         with engine.connect() as conn:
             assert (
                 conn.execute(
@@ -1505,6 +1506,29 @@ def test_0035_to_head_upgrades_a_populated_database(database_url: str) -> None:
                 ).scalar_one()
                 == 0
             )
+            assert (
+                conn.execute(
+                    text(
+                        "SELECT count(*) FROM events_0039_archive "
+                        "WHERE payload->>'marker' = '0039-downgrade-test'"
+                    )
+                ).scalar_one()
+                == 1
+            )
         migrate.upgrade(database_url)
+        with engine.connect() as conn:
+            assert (
+                conn.execute(
+                    text(
+                        "SELECT count(*) FROM events WHERE kind = 'auto_merge_updated' "
+                        "AND payload->>'marker' = '0039-downgrade-test'"
+                    )
+                ).scalar_one()
+                == 1
+            )
+            assert (
+                conn.execute(text("SELECT to_regclass('public.events_0039_archive')")).scalar()
+                is None
+            )
     finally:
         engine.dispose()
