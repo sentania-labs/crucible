@@ -20,6 +20,8 @@ def model_interruption(exit_code: int | None, *tails: str) -> Interruption | Non
             if not isinstance(event, dict):
                 continue
             kind = event.get("type")
+            if not isinstance(kind, str):
+                continue
             if kind in {"turn.completed", "response.completed"}:
                 break
             if kind not in {"provider_error", "turn.failed", "quota_exhausted"}:
@@ -29,10 +31,16 @@ def model_interruption(exit_code: int | None, *tails: str) -> Interruption | Non
                 continue
             code = error.get("code")
             status = error.get("status_code", error.get("status"))
+            if code is not None and not isinstance(code, str):
+                continue
+            if status is not None and not isinstance(status, int):
+                continue
             capacity = code in {"overloaded_error", "at_capacity"}
-            quota = kind == "quota_exhausted" or status == 429 or code in {
-                "usage_limit_reached", "rate_limit_exceeded", "insufficient_quota"
-            }
+            quota = (
+                kind == "quota_exhausted"
+                or status == 429
+                or code in {"usage_limit_reached", "rate_limit_exceeded", "insufficient_quota"}
+            )
             transport = code in {"ECONNREFUSED", "ECONNRESET", "ETIMEDOUT"}
             if capacity or quota or transport or status in {502, 503, 504}:
                 return Interruption(json.dumps(event)[:2000], capacity=capacity, quota=quota)

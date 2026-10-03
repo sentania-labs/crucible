@@ -74,6 +74,7 @@ from crucible.adapters.execution.k8sspec import (
 )
 from crucible.adapters.execution.logstream import RESUME_AT_BOUNDARY
 from crucible.adapters.execution.logstream import chunks as _chunks
+from crucible.adapters.harness.interruption import model_interruption
 from crucible.adapters.harness.registry import default_registry
 from crucible.application.credential_renewer import access_token_document, worker_credential_spec
 from crucible.application.harnesses import (
@@ -86,7 +87,6 @@ from crucible.domain.cluster_egress import ClusterEgress, parse_cluster_egress
 from crucible.domain.command_timeout import effective_command_timeout_ms
 from crucible.domain.exit_class import ExitClass
 from crucible.domain.ids import new_id
-from crucible.adapters.harness.interruption import model_interruption
 from crucible.domain.infrastructure import START_FAILURES
 from crucible.domain.role_timeouts import DEFAULT_ROLE_TIMEOUT_SECONDS, parse_role_timeouts
 from crucible.domain.secrets import redact
@@ -2271,11 +2271,7 @@ class KubernetesProvider:
             self._raise_if_unavailable(k8sspec.ROLE_BUNDLE, spec.attempt_id, bundle_exit)
             bundle_ok = bundle_exit == 0
         interruption = model_interruption(observation.exit_code, stdout_tail, stderr_tail)
-        interrupted = (
-            observation.never_started
-            or quota_checkpoint
-            or interruption is not None
-        )
+        interrupted = observation.never_started or quota_checkpoint or interruption is not None
         verifications = () if interrupted else await self._run_verifier(spec, limits)
         with tempfile.TemporaryDirectory(prefix="crucible-k8s-") as scratch:
             root = Path(scratch)

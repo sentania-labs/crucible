@@ -32,4 +32,3 @@ class Interruption:
     @property
     def exit_class(self) -> ExitClass:
         return ExitClass.QUOTA_EXHAUSTED if self.quota else ExitClass.INFRASTRUCTURE
-

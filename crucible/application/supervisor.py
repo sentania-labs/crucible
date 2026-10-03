@@ -4223,7 +4223,9 @@ class Supervisor:
                 if never_started:
                     attempt.exit_class = ExitClass.INFRASTRUCTURE
                 elif interruption is not None and attempt.exit_class in {
-                    ExitClass.CRASHED, ExitClass.UNKNOWN, ExitClass.INFRASTRUCTURE
+                    ExitClass.CRASHED,
+                    ExitClass.UNKNOWN,
+                    ExitClass.INFRASTRUCTURE,
                 }:
                     attempt.exit_class = interruption.exit_class
             interruption_detail = (
@@ -5393,7 +5395,8 @@ class Supervisor:
         contract = uow.contracts.get(task.id, execution.contract_version)
         assert contract is not None
         version_events = [
-            row for row in self._all_task_events(uow, task.id)
+            row
+            for row in self._all_task_events(uow, task.id)
             if row.payload.get("contract_version") == execution.contract_version
         ]
         already_blocked = any(
@@ -5434,8 +5437,12 @@ class Supervisor:
             )
             if not already_blocked:
                 open_escalation(
-                    uow, self._clock, task=task, attempt_id=attempt.id,
-                    question=message, summary=message,
+                    uow,
+                    self._clock,
+                    task=task,
+                    attempt_id=attempt.id,
+                    question=message,
+                    summary=message,
                     wake_reason=WakeReason.ATTEMPT_FAILED,
                 )
             return

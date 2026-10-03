@@ -13,14 +13,21 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from crucible.adapters.execution import endpoint_health, k8sspec
+from crucible.adapters.execution.docker import DockerProvider
+from crucible.adapters.harness.interruption import model_interruption
 from crucible.application.corrections import _unpublished_bundle_problem
 from crucible.application.supervisor import _Pending
 from crucible.domain.events import EventKind
 from crucible.domain.exit_class import ExitClass
 from crucible.domain.gates import GateName, GateResult, evaluate_gate
-from crucible.adapters.harness.interruption import model_interruption
 from crucible.domain.lifecycle import AttemptState, ExecutionState, TaskState
-from crucible.ports.execution import BranchBundle, CollectedOutputs, Observation, ObservationState
+from crucible.ports.execution import (
+    BranchBundle,
+    CollectedOutputs,
+    Handle,
+    Observation,
+    ObservationState,
+)
 from tests.unit.kubernetes_fixtures import build, spec
 from tests.unit.test_gates import _ev, _gi, _passing_evidence
 from tests.unit.test_routing import _routing_setup
@@ -62,7 +69,9 @@ def _running(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, Any, Any, list[Any]]
     uow.tasks.list_by_state.side_effect = lambda state, **_: (
         [pending.task] if pending.task.state is state else []
     )
-    uow.contracts.get.return_value = MagicMock(document=pending.contract, submitted_at=pending.task.created_at)
+    uow.contracts.get.return_value = MagicMock(
+        document=pending.contract, submitted_at=pending.task.created_at
+    )
     uow.evidence.add.side_effect = append_evidence
     uow.evidence.list_for_attempt.side_effect = lambda attempt_id: [
         row for row in evidence if row.attempt_id == attempt_id
@@ -89,7 +98,13 @@ def _finish(supervisor: Any, attempt: Any, message: str, **kwargs: Any) -> None:
     supervisor._finish_exited(
         attempt.id,
         1,
-        CollectedOutputs(report=None, report_raw=None, blocked_md=None, stderr_tail=message, interruption=model_interruption(1, _signal(message))),
+        CollectedOutputs(
+            report=None,
+            report_raw=None,
+            blocked_md=None,
+            stderr_tail=message,
+            interruption=model_interruption(1, _signal(message)),
+        ),
         defer_quota=True,
         **kwargs,
     )
@@ -115,9 +130,11 @@ def test_429_without_commits_skips_checkpoint_and_waits(monkeypatch: pytest.Monk
     routing["pools"]["pool-a-first"]["default_cooldown_seconds"] = 900
     routing["models"][1]["enabled"] = False
     marks: dict[str, Any] = {}
+
     def put(mark: Any) -> Any:
         marks[mark.pool] = mark
         return mark
+
     uow.pool_exhaustions.put.side_effect = put
     uow.pool_exhaustions.get.side_effect = marks.get
     uow.pool_exhaustions.list_all.side_effect = lambda: list(marks.values())
@@ -148,6 +165,12 @@ def test_capacity_refusal_excludes_model_and_reroutes_within_tier(
     )
     assert result.selected.id == "b-second"
     assert result.candidates[0]["model"] != "a-first" or not result.candidates[0]["eligible"]
+    uow.attempts.get.return_value = nxt
+    routed = supervisor._route_pending(
+        _Pending(nxt, pending.execution, pending.task, pending.contract)
+    )
+    assert routed is not None
+    assert routed.attempt.selected_model == "b-second"
 
 
 async def test_start_error_records_message_events_and_remains_correctable(
@@ -296,7 +319,9 @@ async def test_503_collection_does_not_run_verifier(monkeypatch: pytest.MonkeyPa
         ),
     )
     monkeypatch.setattr(
-        provider, "_worker_tails", AsyncMock(return_value=("", _signal("HTTP 503 Service Unavailable")))
+        provider,
+        "_worker_tails",
+        AsyncMock(return_value=("", _signal("HTTP 503 Service Unavailable"))),
     )
     verifier = AsyncMock()
     monkeypatch.setattr(provider, "_run_verifier", verifier)
@@ -440,7 +465,9 @@ async def test_readiness_probe_invalid_response(monkeypatch: pytest.MonkeyPatch)
 
 def test_fourth_interruption_after_recovery_stays_blocked(monkeypatch: pytest.MonkeyPatch) -> None:
     supervisor, pending, uow, events = _running(monkeypatch)
-    attempts = [replace(pending.attempt, id=str(i), exit_class=ExitClass.INFRASTRUCTURE) for i in range(2)]
+    attempts = [
+        replace(pending.attempt, id=str(i), exit_class=ExitClass.INFRASTRUCTURE) for i in range(2)
+    ]
     attempts.append(pending.attempt)
     uow.attempts.list_for_task.side_effect = lambda *_: attempts
     _finish(supervisor, pending.attempt, "HTTP 503 Service Unavailable")
@@ -460,7 +487,9 @@ def test_fourth_interruption_after_recovery_stays_blocked(monkeypatch: pytest.Mo
 
 def test_new_contract_gets_fresh_interruption_budget(monkeypatch: pytest.MonkeyPatch) -> None:
     supervisor, pending, uow, _events = _running(monkeypatch)
-    old = [replace(pending.attempt, id=str(i), exit_class=ExitClass.INFRASTRUCTURE) for i in range(3)]
+    old = [
+        replace(pending.attempt, id=str(i), exit_class=ExitClass.INFRASTRUCTURE) for i in range(3)
+    ]
     attached = pending.task.created_at + timedelta(seconds=1)
     uow.contracts.get.return_value.submitted_at = attached
     pending.execution.contract_version = 2
@@ -473,20 +502,48 @@ def test_new_contract_gets_fresh_interruption_budget(monkeypatch: pytest.MonkeyP
     uow.escalations.add.assert_not_called()
 
 
-@pytest.mark.parametrize("tail", ["curl: Connection refused", "psycopg: connection refused", "requests.exceptions.ReadTimeout", "status code 503 from upstream"])
-def test_command_errors_never_become_interruptions(monkeypatch: pytest.MonkeyPatch, tail: str) -> None:
+@pytest.mark.parametrize(
+    "tail",
+    [
+        "curl: Connection refused",
+        "psycopg: connection refused",
+        "requests.exceptions.ReadTimeout",
+        "status code 503 from upstream",
+    ],
+)
+def test_command_errors_never_become_interruptions(
+    monkeypatch: pytest.MonkeyPatch, tail: str
+) -> None:
     supervisor, pending, uow, _events = _running(monkeypatch)
-    supervisor._finish_exited(pending.attempt.id, 1, CollectedOutputs(
-        report=None, report_raw=None, blocked_md=None, stdout_tail=tail,
-        stderr_tail="1 failed", interruption=model_interruption(1, tail, "1 failed"),
-    ))
+    supervisor._finish_exited(
+        pending.attempt.id,
+        1,
+        CollectedOutputs(
+            report=None,
+            report_raw=None,
+            blocked_md=None,
+            stdout_tail=tail,
+            stderr_tail="1 failed",
+            interruption=model_interruption(1, tail, "1 failed"),
+        ),
+    )
     assert pending.attempt.exit_class is ExitClass.CRASHED
     assert pending.task.state is TaskState.REPORTED
     uow.attempts.add.assert_not_called()
 
 
-@pytest.mark.parametrize("classification", [ExitClass.BLOCKED, ExitClass.PROVIDER_ERROR, ExitClass.AUTH_FAILURE, ExitClass.QUOTA_EXHAUSTED])
-def test_specific_adapter_classification_wins(monkeypatch: pytest.MonkeyPatch, classification: ExitClass) -> None:
+@pytest.mark.parametrize(
+    "classification",
+    [
+        ExitClass.BLOCKED,
+        ExitClass.PROVIDER_ERROR,
+        ExitClass.AUTH_FAILURE,
+        ExitClass.QUOTA_EXHAUSTED,
+    ],
+)
+def test_specific_adapter_classification_wins(
+    monkeypatch: pytest.MonkeyPatch, classification: ExitClass
+) -> None:
     supervisor, pending, _uow, _events = _running(monkeypatch)
     adapter = MagicMock()
     adapter.classify_exit.return_value = classification
@@ -501,7 +558,6 @@ def test_specific_adapter_classification_wins(monkeypatch: pytest.MonkeyPatch, c
         mark_down.assert_called_once()
     if classification is ExitClass.BLOCKED:
         assert pending.task.state is TaskState.BLOCKED
-
 
 
 def test_quota_reroutes_without_infrastructure_delay(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -523,16 +579,26 @@ def test_terminal_quota_is_reported_with_quota_wake(monkeypatch: pytest.MonkeyPa
     assert any(row.kind == EventKind.WAKE_CREATED.value for row in events)
 
 
-async def test_docker_never_started_records_runtime_message(monkeypatch: pytest.MonkeyPatch) -> None:
-    from crucible.adapters.execution.docker import DockerProvider
-    from crucible.ports.execution import Handle
+async def test_docker_never_started_records_runtime_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
 
     provider = object.__new__(DockerProvider)
     provider.client = MagicMock()
-    monkeypatch.setattr(provider, "_call", AsyncMock(return_value={"State": {
-        "Status": "created", "StartedAt": "0001-01-01T00:00:00Z",
-        "Error": "exec format error", "ExitCode": 128,
-    }}))
+    monkeypatch.setattr(
+        provider,
+        "_call",
+        AsyncMock(
+            return_value={
+                "State": {
+                    "Status": "created",
+                    "StartedAt": "0001-01-01T00:00:00Z",
+                    "Error": "exec format error",
+                    "ExitCode": 128,
+                }
+            }
+        ),
+    )
     observation = await provider.observe(Handle("docker", "container", "attempt"))
     assert observation.never_started
     assert observation.container_message == "exec format error"
@@ -552,27 +618,90 @@ async def test_endpoint_health_retains_proxy_prefix(monkeypatch: pytest.MonkeyPa
 
 async def test_endpoint_health_deduplicates_waiting_tasks(monkeypatch: pytest.MonkeyPatch) -> None:
     supervisor, _pending, _uow, _events = _running(monkeypatch)
-    monkeypatch.setattr(supervisor, "_infrastructure_waits", lambda: [
-        ("one", "fake", "http://gateway"), ("two", "fake", "http://gateway")])
+    monkeypatch.setattr(
+        supervisor,
+        "_infrastructure_waits",
+        lambda: [("one", "fake", "http://gateway"), ("two", "fake", "http://gateway")],
+    )
     provider = MagicMock()
     provider.probe_model_endpoint = AsyncMock(return_value=True)
     monkeypatch.setattr(supervisor, "_provider", lambda _: provider)
     recorded = MagicMock()
     monkeypatch.setattr(supervisor, "_record_endpoint_health", recorded)
+
     async def db(call: Any) -> Any:
         return call()
+
     monkeypatch.setattr(supervisor, "_db", db)
     await supervisor._resume_infrastructure_waits()
     provider.probe_model_endpoint.assert_awaited_once_with("http://gateway")
     assert recorded.call_count == 2
 
 
-
-def test_start_failure_with_checkpoint_head_stays_correctable(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_start_failure_with_checkpoint_head_stays_correctable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     supervisor, pending, uow, _events = _running(monkeypatch)
     pending.task.head_sha = "checkpoint-without-bundle"
-    _finish(supervisor, pending.attempt, "", final_observation=Observation(
-        ObservationState.EXITED, exit_code=128, never_started=True,
-        detail="StartError", container_message="bad mount",
-    ))
+    _finish(
+        supervisor,
+        pending.attempt,
+        "",
+        final_observation=Observation(
+            ObservationState.EXITED,
+            exit_code=128,
+            never_started=True,
+            detail="StartError",
+            container_message="bad mount",
+        ),
+    )
     assert _unpublished_bundle_problem(uow, pending.task, "fake") is None
+
+
+def test_worker_question_survives_transport_words(monkeypatch: pytest.MonkeyPatch) -> None:
+    supervisor, pending, uow, _events = _running(monkeypatch)
+    supervisor._finish_exited(
+        pending.attempt.id,
+        75,
+        CollectedOutputs(
+            report=None,
+            report_raw=None,
+            blocked_md="Which endpoint? connection refused",
+            stderr_tail="connection refused",
+            interruption=model_interruption(75, "connection refused"),
+        ),
+    )
+    assert pending.attempt.exit_class is ExitClass.BLOCKED
+    assert pending.task.state is TaskState.BLOCKED
+    assert uow.escalations.add.call_args.args[0].question == "Which endpoint? connection refused"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        {"status_code": 502},
+        {"status_code": 503},
+        {"status_code": 504},
+        {"code": "ECONNREFUSED"},
+        {"code": "ECONNRESET"},
+        {"code": "ETIMEDOUT"},
+    ],
+)
+def test_structured_transport_events_retry(
+    monkeypatch: pytest.MonkeyPatch, error: dict[str, Any]
+) -> None:
+    supervisor, pending, _uow, _events = _running(monkeypatch)
+    event = json.dumps({"type": "provider_error", "error": error})
+    supervisor._finish_exited(
+        pending.attempt.id,
+        1,
+        CollectedOutputs(
+            report=None,
+            report_raw=None,
+            blocked_md=None,
+            stdout_tail=event,
+            interruption=model_interruption(1, event),
+        ),
+    )
+    assert pending.attempt.exit_class is ExitClass.INFRASTRUCTURE
+    assert pending.task.state is TaskState.SCHEDULED
